@@ -17,32 +17,29 @@ use valkey_module::{
     Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, ValkeyValue, raw,
 };
 
-pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
-    let raw_ctx = ctx.into_raw();
+pub(super) fn reply_with_fanout_label(ctx: &Context, label: &FanoutLabel) {
     if label.name.is_empty() {
-        raw::reply_with_null(raw_ctx);
+        raw::reply_with_null(ctx.ctx);
         return;
     }
     // A present name with an empty value means "label not on this series"
     // (SELECTED_LABELS): reply [name, nil], as reply_label does elsewhere.
     let value = (!label.value.is_empty()).then_some(label.value.as_str());
-    reply_label_ex(raw_ctx, &label.name, value);
+    reply_label_ex(ctx, &label.name, value);
 }
 
-pub(super) fn reply_with_fanout_labels<C: IntoRawCtx>(ctx: C, v: &[FanoutLabel]) {
-    let raw_ctx = ctx.into_raw();
-    reply_with_array(raw_ctx, v.len());
+pub(super) fn reply_with_fanout_labels(ctx: &Context, v: &[FanoutLabel]) {
+    reply_with_array(ctx, v.len());
     for label in v {
-        reply_with_fanout_label(raw_ctx, label);
+        reply_with_fanout_label(ctx, label);
     }
 }
 
-pub fn reply_with_fanout_sample<C: IntoRawCtx>(ctx: C, sample: &Option<FanoutSample>) {
-    let raw_ctx = ctx.into_raw();
+pub fn reply_with_fanout_sample(ctx: &Context, sample: &Option<FanoutSample>) {
     if let Some(s) = sample {
-        reply_with_sample_ex(raw_ctx, s.timestamp, s.value);
+        reply_with_sample_ex(ctx, s.timestamp, s.value);
     } else {
-        reply_with_array(raw_ctx, 0);
+        raw::reply_with_null(ctx.ctx);
     }
 }
 
@@ -165,11 +162,10 @@ pub(super) fn reply_with_mrange_series_results(
     Ok(ValkeyValue::NoReply)
 }
 
-pub(super) fn reply_with_mget_values<C: IntoRawCtx>(ctx: C, values: &[MGetValue]) -> ValkeyResult {
-    let raw_ctx = ctx.into_raw();
-    if is_resp3_client(raw_ctx) {
+pub(super) fn reply_with_mget_values(ctx: &Context, values: &[MGetValue]) -> ValkeyResult {
+    if is_resp3_client(ctx) {
         // RESP3: map keyed by series key; each value is [labels-map, sample].
-        reply_with_map(raw_ctx, values.len());
+        reply_with_map(ctx, values.len());
         for value in values {
             reply_with_slice(raw_ctx, &value.key);
             reply_with_array(raw_ctx, 2);
@@ -178,24 +174,23 @@ pub(super) fn reply_with_mget_values<C: IntoRawCtx>(ctx: C, values: &[MGetValue]
         }
         return Ok(ValkeyValue::NoReply);
     }
-    reply_with_array(raw_ctx, values.len());
+    reply_with_array(ctx, values.len());
     for value in values {
-        reply_with_mget_value(raw_ctx, value);
+        reply_with_mget_value(ctx, value);
     }
     Ok(ValkeyValue::NoReply)
 }
 
-fn reply_with_fanout_labels_map<C: IntoRawCtx>(ctx: C, labels: &[FanoutLabel]) {
-    let raw_ctx = ctx.into_raw();
+fn reply_with_fanout_labels_map(ctx: &Context, labels: &[FanoutLabel]) {
     // Nameless entries carry no renderable information in map form.
     let named = labels.iter().filter(|l| !l.name.is_empty());
-    reply_with_map(raw_ctx, named.clone().count());
+    reply_with_map(ctx, named.clone().count());
     for label in named {
-        reply_with_bulk_string(raw_ctx, &label.name);
+        reply_with_bulk_string(ctx, &label.name);
         if label.value.is_empty() {
-            raw::reply_with_null(raw_ctx);
+            raw::reply_with_null(ctx.ctx);
         } else {
-            reply_with_bulk_string(raw_ctx, &label.value);
+            reply_with_bulk_string(ctx, &label.value);
         }
     }
 }
@@ -254,7 +249,7 @@ impl ClientReplyContext {
         self.reply_with_sample_raw(sample.timestamp, sample.value)
     }
 
-    pub fn reply_with_samples(&self, samples: impl Iterator<Item = Sample>) {
+    pub fn reply_with_samples(&self, samples: impl Iterator<Item=Sample>) {
         raw::reply_with_array(self.ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long);
 
         let mut len = 0;

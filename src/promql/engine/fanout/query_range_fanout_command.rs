@@ -1,26 +1,21 @@
-use crate::common::Timestamp;
-use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
-};
+use crate::common::{Sample, Timestamp};
+use crate::fanout::{FanoutCommand, NodeInfo};
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
-    RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
-    series_selector::Matchers as ProtoMatchers,
+    Label as ProtoLabel, RangeQuery, RangeQueryResponse, RangeSample, Sample as ProtoSample,
+    SeriesSelector as ProtoSeriesSelector, series_selector::Matchers as ProtoMatchers,
 };
-use crate::promql::hashers::{FingerprintHashSet, HasFingerprint};
-use ahash::HashSetExt;
+use crate::series::index::series_by_selectors;
+use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::label::Matchers;
-use std::time::Duration;
+use std::ops::Deref;
 use valkey_module::{Context, ValkeyResult};
 
 pub struct QueryRangeFanoutCommand {
     matchers: Matchers,
     start_time: i64,
     end_time: i64,
-    timeout: Duration,
-    series: Vec<RangeSample>,
-    seen: FingerprintHashSet,
+    results: Vec<RangeSample>,
 }
 
 impl Default for QueryRangeFanoutCommand {
@@ -33,26 +28,17 @@ impl Default for QueryRangeFanoutCommand {
             matchers,
             start_time: 0,
             end_time: 0,
-            timeout: get_cluster_command_timeout(),
-            series: Vec::with_capacity(16),
-            seen: FingerprintHashSet::with_capacity(16),
+            results: vec![],
         }
     }
 }
 impl QueryRangeFanoutCommand {
-    pub fn new(
-        matchers: Matchers,
-        start_time: Timestamp,
-        end_time: Timestamp,
-        timeout: Duration,
-    ) -> Self {
+    pub fn new(matchers: Matchers, start_time: Timestamp, end_time: Timestamp) -> Self {
         Self {
             matchers,
             start_time,
             end_time,
-            timeout,
-            series: Vec::with_capacity(16),
-            seen: Default::default(),
+            results: vec![],
         }
     }
 }
@@ -62,7 +48,7 @@ impl FanoutCommand for QueryRangeFanoutCommand {
     type Response = RangeQueryResponse;
 
     fn name() -> &'static str {
-        "query-range"
+        "range-query"
     }
 
     fn get_local_response(ctx: &Context, req: RangeQuery) -> ValkeyResult<RangeQueryResponse> {
@@ -73,10 +59,6 @@ impl FanoutCommand for QueryRangeFanoutCommand {
         };
         let series_selector: SeriesSelector = selector.try_into()?;
         handle_range_query(ctx, series_selector, req.start_time, req.end_time)
-    }
-
-    fn get_timeout(&self) -> Duration {
-        self.timeout
     }
 
     fn generate_request(&self) -> RangeQuery {
@@ -92,25 +74,54 @@ impl FanoutCommand for QueryRangeFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) {
+        let mut resp = resp;
         // dedupe samples by labels - if multiple responses contain the same labels, we have an issue
         // Using prometheus semantics, series should have unique label-value pairs..
-
-        for series in resp.series.iter() {
-            let fingerprint = series.labels.fingerprint();
-            if !self.seen.insert(fingerprint) {
-                let msg = format!("Duplicate series found with labels {:?}", series.labels);
-                let err = FanoutError::custom(msg);
-                return Err(err);
-            }
-        }
-        self.series.extend(resp.series);
-        Ok(())
+        self.results.append(&mut resp.series);
     }
 
     fn get_response(self) -> Self::Response {
         RangeQueryResponse {
-            series: self.series,
+            series: self.results,
         }
     }
+}
+
+fn handle_range_query(
+    ctx: &Context,
+    selector: SeriesSelector,
+    start_time: i64,
+    end_time: i64,
+) -> ValkeyResult<RangeQueryResponse> {
+    let series = series_by_selectors(ctx, &[selector], None)?;
+    let ranges = series
+        .iter()
+        .map(|(s, _)| s.deref())
+        .iter_into_par()
+        .filter_map(|s| {
+            if s.is_empty() {
+                return None;
+            }
+            let samples = s.get_range(start_time, end_time);
+            if samples.is_empty() {
+                return None;
+            }
+            let res_samples: Vec<ProtoSample> = samples.into_iter().map(Sample::into).collect();
+            let mut labels: Vec<ProtoLabel> = Vec::with_capacity(s.labels.len());
+            for label in s.labels.iter() {
+                labels.push(ProtoLabel {
+                    name: label.name.to_string(),
+                    value: label.value.to_string(),
+                });
+            }
+            let range = RangeSample {
+                labels,
+                samples: res_samples,
+            };
+            Some(range)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(RangeQueryResponse { series: ranges })
 }

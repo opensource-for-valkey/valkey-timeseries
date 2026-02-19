@@ -1,10 +1,7 @@
+use crate::commands::parse_metric_name;
 use crate::common::Sample;
 use crate::labels::Label;
-use crate::parser::number::parse_number;
-use crate::promql::{InstantSample, Labels, QueryValue, RangeSample};
-use lazy_static::lazy_static;
-use promql_parser::util::unquote_string;
-use regex::Regex;
+use crate::promql::{Labels, RangeSample};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ============================================================================
@@ -21,21 +18,8 @@ pub struct LoadCmd {
 pub struct EvalInstantCmd {
     pub time: SystemTime,
     pub query: String,
-    pub expected: QueryValue,
+    pub expected: Vec<RangeSample>,
     pub expect_ordered: bool,
-    pub expect_fail: bool,
-    pub line_number: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct EvalRangeCmd {
-    pub start: SystemTime,
-    pub end: SystemTime,
-    pub step: Duration,
-    pub query: String,
-    pub expected: QueryValue,
-    pub expect_fail: bool,
-    pub line_number: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +35,6 @@ pub struct ResumeCmd;
 pub enum Command {
     Load(LoadCmd),
     EvalInstant(EvalInstantCmd),
-    EvalRange(EvalRangeCmd),
     Clear(ClearCmd),
     Ignore(IgnoreCmd),
     Resume(ResumeCmd),
@@ -71,13 +54,6 @@ pub struct SeriesLoad {
 // Parser
 // ============================================================================
 
-lazy_static! {
-    static ref PAT_EVAL_RANGE: Regex = Regex::new(
-        r"^eval(?:_(?:fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$"
-    )
-    .unwrap();
-}
-
 struct Parser;
 
 impl Parser {
@@ -85,20 +61,29 @@ impl Parser {
     pub fn parse_file(input: &str) -> Result<Vec<Command>, String> {
         let mut commands = Vec::new();
         let lines: Vec<&str> = input.lines().collect();
-        let mut line_idx = 0;
+        let mut i = 0;
         let mut ignoring = false;
 
-        while line_idx < lines.len() {
-            let line = lines[line_idx].trim();
-            line_idx += 1;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            i += 1;
 
             // Skip empty lines and comments
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 
-            if let Some(control_cmd) = Self::parse_control_command(line, &mut ignoring) {
-                commands.push(control_cmd);
+            // Check for ignore/resume first
+            if line == "ignore" {
+                commands.push(Command::Ignore(IgnoreCmd));
+                ignoring = true;
+                continue;
+            } else if line == "resume" {
+                commands.push(Command::Resume(ResumeCmd));
+                ignoring = false;
+                continue;
+            } else if line == "clear" {
+                commands.push(Command::Clear(ClearCmd));
                 continue;
             }
 
@@ -107,51 +92,24 @@ impl Parser {
                 continue;
             }
 
-            let cmd = Self::parse_non_control_command(line, &lines, &mut line_idx)?
-                .ok_or_else(|| format!("Unknown directive at line {}: {}", line_idx, line))?;
-            commands.push(cmd);
+            // Try each parser dispatcher in order
+            if let Some(cmd) = Self::try_parse_load(line, &lines, &mut i)? {
+                commands.push(cmd);
+            } else if let Some(cmd) = Self::try_parse_eval_instant(line, &lines, &mut i)? {
+                commands.push(cmd);
+            } else {
+                return Err(format!("Unknown directive at line {}: {}", i, line));
+            }
         }
 
         Ok(commands)
-    }
-
-    fn parse_control_command(line: &str, ignoring: &mut bool) -> Option<Command> {
-        match line {
-            "ignore" => {
-                *ignoring = true;
-                Some(Command::Ignore(IgnoreCmd))
-            }
-            "resume" => {
-                *ignoring = false;
-                Some(Command::Resume(ResumeCmd))
-            }
-            "clear" => Some(Command::Clear(ClearCmd)),
-            _ => None,
-        }
-    }
-
-    fn parse_non_control_command(
-        line: &str,
-        lines: &[&str],
-        line_idx: &mut usize,
-    ) -> Result<Option<Command>, String> {
-        if let Some(cmd) = Self::try_parse_load(line, lines, line_idx)? {
-            return Ok(Some(cmd));
-        }
-        if let Some(cmd) = Self::try_parse_eval_instant(line, lines, line_idx)? {
-            return Ok(Some(cmd));
-        }
-        if let Some(cmd) = Self::try_parse_eval_range(line, lines, line_idx)? {
-            return Ok(Some(cmd));
-        }
-        Ok(None)
     }
 
     /// Try to parse the "load" command (with indented series lines)
     fn try_parse_load(
         line: &str,
         lines: &[&str],
-        line_idx: &mut usize,
+        i: &mut usize,
     ) -> Result<Option<Command>, String> {
         let rest = match line.strip_prefix("load ") {
             Some(r) => r,
@@ -162,20 +120,20 @@ impl Parser {
         let mut series = Vec::new();
 
         // Collect indented series lines
-        while *line_idx < lines.len() {
-            let next_line = lines[*line_idx];
+        while *i < lines.len() {
+            let next_line = lines[*i];
             if !next_line.starts_with(' ') && !next_line.starts_with('\t') {
                 break;
             }
 
             let trimmed = next_line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
-                *line_idx += 1;
+                *i += 1;
                 continue;
             }
 
             series.push(parse_series(trimmed)?);
-            *line_idx += 1;
+            *i += 1;
         }
 
         Ok(Some(Command::Load(LoadCmd { interval, series })))
@@ -185,72 +143,52 @@ impl Parser {
     fn try_parse_eval_instant(
         line: &str,
         lines: &[&str],
-        line_idx: &mut usize,
+        i: &mut usize,
     ) -> Result<Option<Command>, String> {
         let rest = match line.strip_prefix("eval instant at ") {
             Some(r) => r,
             None => return Ok(None),
         };
 
-        let line_number = *line_idx;
         // Parse time and query from same line or next line
-        let (time_str, query) = Self::parse_time_and_query(rest, lines, line_idx)?;
+        let (time_str, query) = Self::parse_time_and_query(rest, lines, i)?;
         let time = parse_time(&time_str)?;
 
-        let (expected, expect_ordered) = parse_expectations(lines, line_idx)?;
+        let mut expected = Vec::new();
+        let mut expect_ordered = false;
+
+        // Collect indented expected result lines
+        while *i < lines.len() {
+            let next_line = lines[*i];
+            if !next_line.starts_with(' ') && !next_line.starts_with('\t') {
+                break;
+            }
+
+            let trimmed = next_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                *i += 1;
+                continue;
+            }
+
+            // We only implement ordering for now; other directives remain no-ops.
+            if trimmed.starts_with("expect ") {
+                if trimmed == "expect ordered" {
+                    expect_ordered = true;
+                }
+                *i += 1;
+                continue;
+            }
+
+            expected.push(parse_expected(trimmed)?);
+            *i += 1;
+        }
 
         Ok(Some(Command::EvalInstant(EvalInstantCmd {
             time,
             query,
             expected,
             expect_ordered,
-            expect_fail: false,
-            line_number,
         })))
-    }
-
-    fn try_parse_eval_range(
-        line: &str,
-        lines: &[&str],
-        line_idx: &mut usize,
-    ) -> Result<Option<Command>, String> {
-        if line.strip_prefix("eval range from ").is_none() {
-            return Ok(None);
-        };
-        // Not implemented yet, but this is where we'd parse "eval range from <start> to <end> step <step> <query>"
-        let caps = PAT_EVAL_RANGE
-            .captures(line)
-            .ok_or("invalid range vector definition")?;
-
-        let line_number = *line_idx;
-
-        let from_str = caps.get(1).unwrap().as_str();
-        let to_str = caps.get(2).unwrap().as_str();
-        let step_str = caps.get(3).unwrap().as_str();
-        let query = caps.get(4).unwrap().as_str();
-        let from =
-            parse_duration(from_str).map_err(|e| format!("Invalid 'from' duration: {}", e))?;
-        let to = parse_duration(to_str).map_err(|e| format!("Invalid 'to' duration: {}", e))?;
-        let step =
-            parse_duration(step_str).map_err(|e| format!("Invalid 'step' duration: {}", e))?;
-        // Anchor range query times to UNIX_EPOCH like `parse_time` does for
-        // instant evals. Tests and loaded series use UNIX_EPOCH-based times,
-        // so using SystemTime::now() would make ranges miss the loaded data.
-        let start = UNIX_EPOCH + from;
-        let end = UNIX_EPOCH + to;
-
-        let (expected, _expect_ordered) = parse_expectations(lines, line_idx)?;
-
-        let cmd = EvalRangeCmd {
-            start,
-            end,
-            step,
-            query: query.to_string(),
-            expected,
-            expect_fail: false, // todo
-            line_number,
-        };
-        Ok(Some(Command::EvalRange(cmd)))
     }
 
     /// Parse time and query from "eval instant at" line
@@ -259,34 +197,21 @@ impl Parser {
     fn parse_time_and_query(
         rest: &str,
         lines: &[&str],
-        line_idx: &mut usize,
+        i: &mut usize,
     ) -> Result<(String, String), String> {
-        // Robustly split the first token (time) from the rest of the line.
-        // We locate the first whitespace index and then trim only the leading
-        // whitespace from the remainder so sequences of tabs/spaces are handled
-        // correctly and the remainder preserves internal spacing of the query.
-        let time_str;
-        let remainder;
+        // Split on any whitespace (space, tab, etc.)
+        // Note: This means "eval instant at 10s\t\tmetric" is valid, which could be
+        // confusing if test files have inconsistent whitespace formatting
+        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
+        let time_str = parts[0];
 
-        if let Some(idx) = rest
-            .char_indices()
-            .find_map(|(i, c)| if c.is_whitespace() { Some(i) } else { None })
-        {
-            time_str = &rest[..idx];
-            remainder = &rest[idx..];
-        } else {
-            // No whitespace: entire rest is the time, query must be on next line
-            time_str = rest;
-            remainder = "";
-        }
-
-        let query = if !remainder.trim_start().is_empty() {
-            remainder.trim_start().to_string()
+        let query = if parts.len() > 1 && !parts[1].trim().is_empty() {
+            parts[1].trim().to_string()
         } else {
             // Query on next line
-            if *line_idx < lines.len() {
-                let query_line = lines[*line_idx];
-                *line_idx += 1;
+            if *i < lines.len() {
+                let query_line = lines[*i];
+                *i += 1;
                 query_line.trim().to_string()
             } else {
                 return Err("Missing query after 'eval instant at'".to_string());
@@ -353,25 +278,19 @@ fn parse_series(line: &str) -> Result<SeriesLoad, String> {
 }
 
 fn parse_metric(s: &str) -> Result<(String, HashMap<String, String>), String> {
-    if let Some((m, rest)) = s.split_once('{') {
-        let rest = rest
-            .strip_suffix('}')
-            .ok_or_else(|| format!("Missing closing }} in metric: '{}'", s))?;
-        let labels = parse_labels(rest, s)?;
-        Ok((m.to_string(), labels))
-    } else if s.starts_with('{') {
-        // Label-only (no metric name, used in expected results)
-        let rest = s
-            .strip_prefix('{')
-            .unwrap()
-            .strip_suffix('}')
-            .ok_or_else(|| format!("Missing closing }} in labels: '{}'", s))?;
-        let labels = parse_labels(rest, s)?;
-        Ok((String::new(), labels))
-    } else {
-        // Metric name only (no labels)
-        Ok((s.to_string(), HashMap::new()))
+    let mn = parse_metric_name(s).map_err(|e| e.to_string())?;
+    let mut mn_labels = HashMap::new();
+    let mut metric_name: String = String::new();
+
+    for Label { name, value } in mn.into_iter() {
+        if name == "__name__" {
+            metric_name = value;
+        } else {
+            mn_labels.insert(name, value);
+        }
     }
+
+    Ok((metric_name, mn_labels))
 }
 
 fn parse_labels(labels_str: &str, context: &str) -> Result<HashMap<String, String>, String> {
@@ -383,7 +302,7 @@ fn parse_labels(labels_str: &str, context: &str) -> Result<HashMap<String, Strin
         }
         let (k, v) = kv
             .split_once('=')
-            .ok_or_else(|| format!("Invalid label '{kv}' (missing =) in: '{context}'"))?;
+            .ok_or_else(|| format!("Invalid label '{}' (missing =) in: '{}'", kv, context))?;
         labels.insert(k.to_string(), v.trim_matches('"').to_string());
     }
     Ok(labels)
@@ -431,20 +350,20 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     if s.contains('+') && s.contains('x') {
         let (lhs, count_str) = s
             .split_once('x')
-            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
+            .ok_or_else(|| format!("Invalid expansion syntax: {}", s))?;
         let (start_str, step_str) = lhs
             .split_once('+')
-            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
+            .ok_or_else(|| format!("Invalid expansion syntax: {}", s))?;
 
         let start: f64 = start_str
             .parse()
-            .map_err(|_| format!("Invalid start value: {start_str}"))?;
+            .map_err(|_| format!("Invalid start value: {}", start_str))?;
         let step: f64 = step_str
             .parse()
-            .map_err(|_| format!("Invalid step value: {step_str}"))?;
+            .map_err(|_| format!("Invalid step value: {}", step_str))?;
         let count: usize = count_str
             .parse()
-            .map_err(|_| format!("Invalid count: {count_str}"))?;
+            .map_err(|_| format!("Invalid count: {}", count_str))?;
 
         Ok((0..=count)
             .map(|i| (i as i64, start + step * i as f64))
@@ -463,8 +382,7 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     }
 }
 
-fn parse_expected(line: &str) -> Result<(RangeSample, bool), String> {
-    // Parse metric/labels prefix and trailing sample value expression.
+fn parse_expected(line: &str) -> Result<RangeSample, String> {
     let mut chars = line.chars().peekable();
     let mut metric_part = String::new();
 
@@ -496,27 +414,16 @@ fn parse_expected(line: &str) -> Result<(RangeSample, bool), String> {
         }
     }
 
-    let value_expr: String = chars.collect::<String>().trim().to_string();
-    if value_expr.is_empty() {
+    let value_str: String = chars.collect::<String>().trim().to_string();
+    if value_str.is_empty() {
         return Err(format!("Missing value in expected: {}", line));
     }
 
     let (metric_name, label_map) = parse_metric(metric_part.trim())?;
+    let value = value_str
+        .parse::<f64>()
+        .map_err(|_| format!("Invalid value '{}' in expected: {}", value_str, line))?;
 
-    let labels = build_sorted_labels(metric_name, label_map);
-    let samples = parse_expected_samples(&value_expr, line)?;
-    let had_braces = line.trim_start().starts_with('{');
-
-    Ok((
-        RangeSample {
-            labels: Labels::new(labels),
-            samples,
-        },
-        had_braces,
-    ))
-}
-
-fn build_sorted_labels(metric_name: String, label_map: HashMap<String, String>) -> Vec<Label> {
     let mut labels: Vec<Label> = label_map
         .into_iter()
         .map(|(k, v)| Label::new(k, v))
@@ -525,182 +432,13 @@ fn build_sorted_labels(metric_name: String, label_map: HashMap<String, String>) 
         labels.push(Label::metric_name(metric_name));
     }
     labels.sort();
-    labels
+    Ok(RangeSample {
+        labels: Labels::new(labels),
+        samples: vec![Sample::new(0, value)],
+    })
 }
 
-fn parse_expected_samples(value_expr: &str, line: &str) -> Result<Vec<Sample>, String> {
-    if value_expr.contains('+')
-        || value_expr.contains('x')
-        || value_expr.contains(char::is_whitespace)
-    {
-        let parsed = parse_multiple_value_exprs(value_expr)
-            .map_err(|e| format!("Invalid value '{}' in expected: {}", value_expr, e))?;
-        return Ok(parsed
-            .into_iter()
-            .map(|(step, value)| Sample::new(step, value))
-            .collect());
-    }
-
-    let value = value_expr
-        .parse::<f64>()
-        .map_err(|_| format!("Invalid value '{}' in expected: {}", value_expr, line))?;
-    Ok(vec![Sample::new(0, value)])
-}
-
-enum ExpectDirective {
-    Ordered,
-    String(QueryValue),
-    Ignored,
-}
-
-fn parse_expect_directive(trimmed_line: &str) -> Result<Option<ExpectDirective>, String> {
-    if !trimmed_line.starts_with("expect ") {
-        return Ok(None);
-    }
-
-    if trimmed_line == "expect ordered" {
-        return Ok(Some(ExpectDirective::Ordered));
-    }
-
-    if let Some(raw) = trimmed_line.strip_prefix("expect string ") {
-        let raw = raw.trim();
-        let value = unquote_string(raw)
-            .map_err(|e| format!("Invalid expected string value '{}': {}", raw, e))?;
-        return Ok(Some(ExpectDirective::String(QueryValue::String(value))));
-    }
-
-    Ok(Some(ExpectDirective::Ignored))
-}
-
-fn parse_bare_scalar_expectation(trimmed_line: &str) -> Option<QueryValue> {
-    parse_number(trimmed_line)
-        .map(|value| QueryValue::Scalar {
-            timestamp_ms: 0,
-            value,
-        })
-        .ok()
-}
-
-fn consume_remaining_indented_block(lines: &[&str], line_idx: &mut usize) {
-    while *line_idx < lines.len() {
-        let next_line = lines[*line_idx];
-        if !next_line.starts_with(' ') && !next_line.starts_with('\t') {
-            break;
-        }
-        *line_idx += 1;
-    }
-}
-
-fn build_expected_query_value(
-    expected_ranges: Vec<RangeSample>,
-    expected_value: Option<QueryValue>,
-    had_label_only_syntax: Vec<bool>,
-) -> QueryValue {
-    if let Some(qv) = expected_value {
-        return qv;
-    }
-
-    if expected_ranges.is_empty() {
-        return QueryValue::Matrix(vec![]);
-    }
-
-    let is_single_implicit_scalar = expected_ranges.len() == 1
-        && expected_ranges[0].labels.is_empty()
-        && expected_ranges[0].samples.len() == 1
-        && had_label_only_syntax.first() != Some(&true);
-
-    if is_single_implicit_scalar {
-        let s = &expected_ranges[0].samples[0];
-        return QueryValue::Scalar {
-            timestamp_ms: s.timestamp,
-            value: s.value,
-        };
-    }
-
-    if expected_ranges.iter().all(|r| r.samples.len() == 1) {
-        let vec_samples: Vec<InstantSample> = expected_ranges
-            .into_iter()
-            .map(|r| {
-                let s = r.samples.into_iter().next().unwrap();
-                InstantSample {
-                    labels: r.labels,
-                    timestamp_ms: s.timestamp,
-                    value: s.value,
-                }
-            })
-            .collect();
-        return QueryValue::Vector(vec_samples);
-    }
-
-    QueryValue::Matrix(expected_ranges)
-}
-
-fn parse_expectations(lines: &[&str], line_idx: &mut usize) -> Result<(QueryValue, bool), String> {
-    let mut expected_ranges: Vec<RangeSample> = Vec::new();
-    let mut expect_ordered = false;
-    let mut expected_value: Option<QueryValue> = None;
-    let mut had_label_only_syntax: Vec<bool> = Vec::new();
-
-    // Collect indented expected result lines
-    while *line_idx < lines.len() {
-        let next_line = lines[*line_idx];
-        if !next_line.starts_with(' ') && !next_line.starts_with('\t') {
-            break;
-        }
-
-        let trimmed = next_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            *line_idx += 1;
-            continue;
-        }
-
-        if let Some(directive) = parse_expect_directive(trimmed)? {
-            match directive {
-                ExpectDirective::Ordered => {
-                    expect_ordered = true;
-                    *line_idx += 1;
-                    continue;
-                }
-                ExpectDirective::String(value) => {
-                    expected_value = Some(value);
-                    *line_idx += 1;
-                    consume_remaining_indented_block(lines, line_idx);
-                    break;
-                }
-                ExpectDirective::Ignored => {
-                    *line_idx += 1;
-                    continue;
-                }
-            }
-        }
-
-        if let Some(scalar_expectation) = parse_bare_scalar_expectation(trimmed) {
-            expected_value = Some(scalar_expectation);
-
-            if !expected_ranges.is_empty() {
-                return Err(
-                    "Cannot mix scalar expectation with range/vector expectations".to_string(),
-                );
-            }
-            // Consume the scalar expectation line so the parser does not
-            // treat it as a top-level directive on the next iteration.
-            *line_idx += 1;
-            break;
-        }
-
-        let (range_sample, had_braces) = parse_expected(trimmed)?;
-        expected_ranges.push(range_sample);
-        had_label_only_syntax.push(had_braces);
-        *line_idx += 1;
-    }
-
-    let expected =
-        build_expected_query_value(expected_ranges, expected_value, had_label_only_syntax);
-
-    Ok((expected, expect_ordered))
-}
-
-pub fn parse_duration(s: &str) -> Result<Duration, String> {
+fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
 
     // Try using promql_parser's duration parser which handles compound durations like "5m59s"
@@ -712,25 +450,24 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Some(ms) = s.strip_suffix("ms") {
         ms.parse::<u64>()
             .map(Duration::from_millis)
-            .map_err(|e| format!("Invalid duration {s}: {}", e))
+            .map_err(|e| format!("Invalid duration {}: {}", s, e))
     } else if let Some(h) = s.strip_suffix('h') {
         h.parse::<u64>()
             .map(|v| Duration::from_secs(v * 3600))
-            .map_err(|e| format!("Invalid duration {s}: {}", e))
+            .map_err(|e| format!("Invalid duration {}: {}", s, e))
     } else if let Some(m) = s.strip_suffix('m') {
         m.parse::<u64>()
             .map(|v| Duration::from_secs(v * 60))
-            .map_err(|e| format!("Invalid duration {s}: {}", e))
+            .map_err(|e| format!("Invalid duration {}: {}", s, e))
     } else if let Some(sec) = s.strip_suffix('s') {
         sec.parse::<u64>()
             .map(Duration::from_secs)
-            .map_err(|e| format!("Invalid duration {s}: {}", e))
+            .map_err(|e| format!("Invalid duration {}: {}", s, e))
     } else {
-        // Allow unitless numbers as seconds (e.g., "0", "100", "100.5")
-        if let Ok(secs) = s.parse::<f64>() {
-            return Ok(Duration::from_secs_f64(secs));
-        }
-        Err(format!("Invalid duration {s}: missing unit (ms, s, m, h)"))
+        Err(format!(
+            "Invalid duration {}: missing unit (ms, s, m, h)",
+            s
+        ))
     }
 }
 
@@ -765,7 +502,6 @@ pub fn parse_test_file(input: &str) -> Result<Vec<Command>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::QueryValue;
 
     #[test]
     fn should_parse_clear_command() {
@@ -838,11 +574,7 @@ mod tests {
         match &cmds[0] {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "metric");
-                match &cmd.expected {
-                    QueryValue::Vector(v) => assert_eq!(v.len(), 1),
-                    QueryValue::Matrix(m) => assert_eq!(m.len(), 1),
-                    _ => panic!("Unexpected expected type"),
-                }
+                assert_eq!(cmd.expected.len(), 1);
                 assert!(!cmd.expect_ordered);
             }
             _ => panic!("Expected EvalInstant command"),
@@ -863,11 +595,7 @@ mod tests {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "metric");
                 assert!(cmd.expect_ordered);
-                match &cmd.expected {
-                    QueryValue::Vector(v) => assert_eq!(v.len(), 1),
-                    QueryValue::Matrix(m) => assert_eq!(m.len(), 1),
-                    _ => panic!("Unexpected expected type"),
-                }
+                assert_eq!(cmd.expected.len(), 1);
             }
             _ => panic!("Expected EvalInstant command"),
         }
@@ -1048,11 +776,7 @@ mod tests {
         match &cmds[0] {
             Command::EvalInstant(cmd) => {
                 assert_eq!(cmd.query, "{job=\"test\"}");
-                match &cmd.expected {
-                    QueryValue::Vector(v) => assert_eq!(v[0].labels.get("job"), Some("test")),
-                    QueryValue::Matrix(m) => assert_eq!(m[0].labels.get("job"), Some("test")),
-                    _ => panic!("Unexpected expected type"),
-                }
+                assert_eq!(cmd.expected[0].labels.get("job"), Some("test"));
             }
             _ => panic!("Expected EvalInstant command"),
         }

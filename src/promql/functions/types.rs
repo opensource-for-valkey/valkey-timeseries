@@ -1,22 +1,10 @@
-use crate::common::Timestamp;
-use crate::promql::{
-    EvalContext, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult,
-};
+use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
 use promql_parser::parser::Expr;
 use promql_parser::parser::value::ValueType;
-use std::ops::Deref;
 
 pub(crate) struct FunctionCallContext<'a> {
-    pub eval_context: &'a EvalContext,
+    pub eval_timestamp_ms: i64,
     pub raw_args: &'a [Box<Expr>],
-}
-
-impl<'a> Deref for FunctionCallContext<'a> {
-    type Target = EvalContext;
-
-    fn deref(&self) -> &Self::Target {
-        self.eval_context
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,36 +133,19 @@ pub(crate) trait PromQLFunction {
             )));
         }
 
-        self.apply(args.swap_remove(0), eval_timestamp_ms)
-    }
-
-    /// Apply the function to evaluated arguments provided as a slice.
-    ///
-    /// This helper avoids allocating a temporary `Vec` in the common unary
-    /// case by directly calling `apply` when there is exactly one argument.
-    /// Callers that already have a `Vec` can use `apply_args` directly.
-    fn apply_args_slice(
-        &self,
-        args: &[PromQLArg],
-        eval_timestamp_ms: i64,
-    ) -> EvalResult<ExprResult> {
-        if args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "function requires exactly one argument, got {}",
-                args.len()
-            )));
-        }
-
-        // Clone the single argument and delegate to `apply`.
-        self.apply(args[0].clone(), eval_timestamp_ms)
+        self.apply(args.remove(0), eval_timestamp_ms)
     }
 
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
-        ctx: &EvalContext,
+        ctx: &FunctionCallContext<'_>,
     ) -> EvalResult<ExprResult> {
-        self.apply_args(evaluated_args, ctx.evaluation_ts)
+        self.apply_args(evaluated_args, ctx.eval_timestamp_ms)
+    }
+
+    fn is_experimental(&self) -> bool {
+        false
     }
 }
 
@@ -204,35 +175,4 @@ impl Default for UnaryFunction {
 
 pub struct RangeFunctionOpts {
     pub step_ms: i64,
-}
-
-#[derive(Default, Clone, Debug)]
-pub(super) struct RollupWindow<'a> {
-    /// The value preceding values if it fits the staleness interval.
-    pub(super) prev_value: f64,
-
-    /// The timestamp for prev_value.
-    pub(super) prev_timestamp: Timestamp,
-
-    /// Values that fit the window ending at curr_timestamp.
-    pub(crate) values: &'a [f64],
-
-    /// Timestamps for values.
-    pub(crate) timestamps: &'a [Timestamp],
-
-    /// Real value preceding value
-    /// Populated if the preceding value is within the staleness interval.
-    pub(super) real_prev_value: f64,
-
-    /// Real value that goes after values.
-    pub(crate) real_next_value: f64,
-
-    /// Current timestamp for rollup evaluation.
-    pub(super) curr_timestamp: Timestamp,
-
-    /// Index for the currently evaluated point relative to the time range for query evaluation.
-    pub(super) idx: usize,
-
-    /// Time window for rollup calculations.
-    pub(super) window: i64,
 }

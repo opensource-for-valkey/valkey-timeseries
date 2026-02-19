@@ -6,16 +6,29 @@ use std::os::raw::c_long;
 use valkey_module::logging::ValkeyLogLevel;
 use valkey_module::{Context, Status, ValkeyResult, raw};
 
-/// `ReplyContext` is a thin wrapper around `RedisModuleCtx` that provides efficient,
-/// zero-allocation reply helpers and automatic database state management.
-pub struct ReplyContext {
+/// Fanout reply context
+///
+/// A thin wrapper around the underlying `RedisModuleCtx` that provides convenience
+/// helpers for generating replies and managing the selected database while handling
+/// fanout responses.
+///
+/// This struct restores the original selected DB when dropped if it changed during
+/// the lifetime of the `FanoutContext`.
+///
+/// # Invariant
+/// The `FanoutContext` must ALWAYS be created and used from the Valkey main thread.
+/// In the codebase this is guaranteed because the only way to get a `FanoutContext`
+/// is from a callback invoked by `exec_command`, which executes on the main thread.
+pub struct FanoutContext {
+    save_db: Option<i32>,
     ctx: Context,
     raw_ctx: *mut raw::RedisModuleCtx,
 }
 
-impl ReplyContext {
+impl FanoutContext {
     pub(crate) fn new(ctx: *mut raw::RedisModuleCtx) -> Self {
         Self {
+            save_db: None,
             ctx: Context { ctx },
             raw_ctx: ctx,
         }
@@ -39,7 +52,8 @@ impl ReplyContext {
 
     /// Log a message at the specified `level` using the underlying context.
     pub fn log(&self, level: ValkeyLogLevel, message: &str) {
-        self.ctx.log(level, message);
+        let context = Context { ctx: self.raw_ctx };
+        context.log(level, message);
     }
 
     /// Convenience logging helpers
@@ -52,12 +66,12 @@ impl ReplyContext {
     }
 
     /// Reply with a 64-bit integer value.
-    pub fn reply_with_integer(&self, value: i64) -> Status {
+    pub fn reply_with_i64(&self, value: i64) -> Status {
         raw::reply_with_long_long(self.raw_ctx, value)
     }
 
     /// Reply with a double-precision floating point value.
-    pub fn reply_with_double(&self, value: f64) -> Status {
+    pub fn reply_with_f64(&self, value: f64) -> Status {
         raw::reply_with_double(self.raw_ctx, value)
     }
 
@@ -72,7 +86,7 @@ impl ReplyContext {
     }
 
     /// Reply with a bulk string.
-    pub fn reply_with_string(&self, value: &str) -> Status {
+    pub fn reply_with_bulk_string(&self, value: &str) -> Status {
         reply_with_bulk_string(self.raw_ctx, value)
     }
 
@@ -105,16 +119,18 @@ impl ReplyContext {
     }
 }
 
-impl Deref for ReplyContext {
+impl Drop for FanoutContext {
+    fn drop(&mut self) {
+        if let Some(db) = self.save_db {
+            self.set_current_db(db);
+        }
+    }
+}
+
+impl Deref for FanoutContext {
     type Target = Context;
 
     fn deref(&self) -> &Self::Target {
         &self.ctx
-    }
-}
-
-impl IntoRawCtx for &ReplyContext {
-    fn into_raw(self) -> *mut raw::RedisModuleCtx {
-        self.raw_ctx
     }
 }

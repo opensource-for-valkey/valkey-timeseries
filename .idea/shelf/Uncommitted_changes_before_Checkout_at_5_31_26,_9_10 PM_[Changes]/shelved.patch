@@ -1,0 +1,36 @@
+Index: Cargo.toml
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>[package]\nname = \"valkey-timeseries\"\nversion = \"0.1.0\"\nedition = \"2024\"\nrust-version = \"1.88.0\"\nreadme = \"README.md\"\nrepository = \"https://github.com/ccollie/valkey-timeseries\"\nhomepage = \"https://github.com/ccollie/valkey-timeseries\"\ndescription = \"A Timeseries data type for Valkey\"\n\n[dependencies]\nahash = { version = \"0.8\", features = [\"std\"] }\narc-swap = \"1.9\"\nblart = \"0.5.0\"\nbon = \"3.9\"\nbyte-pool = \"0.2.4\"\ncfg-if = \"1.0.4\"\ncroaring = \"2.6\"\nenquote = \"1.1.0\"\nenum_dispatch = \"0.3.13\"\nget-size2 = { version = \"0.8.0\", features = [\"derive\"] }\nhashify = { version = \"0.2\" }\nitertools = \"0.14\"\nlinkme = \"0.3\"\nlogos = \"0.16\"\norx-parallel = \"3.4\"\nmin-max-heap = \"1.3\"\nnum-traits = \"0.2\"\njoinkit = \"0.2.0\"\nkrcf = \"0.4\"\nlazy_static = \"1.5.0\"\npapaya = \"0.2\"\npco = \"1.0\"\nprost = \"0.14\"\nrand = { version = \"0.10\" }\nsmallvec = { version = \"2.0.0-alpha.12\", features = [\"std\"] }\nspeedate = \"0.17\"\nthiserror = \"2.0\"\ntopo_sort = \"0.4.0\"\nvalkey-module = \"0.1\"\nvalkey-module-macros = \"0.1\"\nrange-set-blaze = \"0.5\"\nrayon-core = \"1.13\"\nregex = \"1\"\nstrum = { version = \"0.28\", features = [\"derive\"] }\nstrum_macros = \"0.28\"\nlogger-rust = \"0.2.12\"\nsimd-json = \"0.17.0\"\nlog = \"0.4\"\nstatrs = \"0.18\"\nwelch-sde = \"0.1.0\"\nregex-syntax = \"0.8.10\"\n\n[dev-dependencies]\ntest-case = \"3.3\"\nserial_test = { version = \"3.3\", default-features = false }\n\n[build-dependencies]\nprost-build = \"0.14\"\n\n[lib]\nname=\"valkey_timeseries\"\ncrate-type=[\"cdylib\"]\n\n[features]\ndefault = [\"min-valkey-compatibility-version-8-0\", \"croaring/alloc\"]\nenable-system-alloc = [\"valkey-module/enable-system-alloc\"]\nmin-valkey-compatibility-version-8-0 = [\"valkey-module/min-valkey-compatibility-version-8-0\"]\nvalkey_8_0 = []  # Valkey-timeseries is intended to be loaded on server versions >= Valkey 8.1, and by default it is built this way (unless this flag is provided). It is however compatible with Valkey version 8.0 if the user explicitly provides this feature flag in their cargo build command.\nuse-redismodule-api = [] # We don't support this feature flag which is why it is empty.
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	(revision 95b8e09e95602ed38192f52229a65342f1d296cc)
++++ b/Cargo.toml	(date 1780272433715)
+@@ -10,6 +10,7 @@
+ 
+ [dependencies]
+ ahash = { version = "0.8", features = ["std"] }
++anofox-forecast = { version = "0.7.5", features = ["forecastability", "parallel"]  }
+ arc-swap = "1.9"
+ blart = "0.5.0"
+ bon = "3.9"
+@@ -18,7 +19,7 @@
+ croaring = "2.6"
+ enquote = "1.1.0"
+ enum_dispatch = "0.3.13"
+-get-size2 = { version = "0.8.0", features = ["derive"] }
++get-size2 = { version = "0.9.0", features = ["derive"] }
+ hashify = { version = "0.2" }
+ itertools = "0.14"
+ linkme = "0.3"
+@@ -53,7 +54,7 @@
+ 
+ [dev-dependencies]
+ test-case = "3.3"
+-serial_test = { version = "3.3", default-features = false }
++serial_test = { version = "3.5", default-features = false }
+ 
+ [build-dependencies]
+ prost-build = "0.14"

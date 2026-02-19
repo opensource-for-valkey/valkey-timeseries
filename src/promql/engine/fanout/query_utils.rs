@@ -16,7 +16,6 @@ pub(super) fn handle_instant_query(
     ctx: &Context,
     selector: SeriesSelector,
     timestamp: Timestamp,
-    lookback_delta: u64,
 ) -> ValkeyResult<InstantQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
     let samples = series
@@ -28,19 +27,29 @@ pub(super) fn handle_instant_query(
         })
         .iter_into_par()
         .filter_map(|(s, key)| {
-            // in prometheus, given a timestamp and delta, we select the latest sample in the range
-            // (ts - delta, ts], so we need to adjust the timestamp accordingly
-            let start_time = timestamp.saturating_sub(lookback_delta as i64) + 1;
-            let end_time = timestamp;
-
-            let sample = *s.get_range(start_time, end_time).last()?;
-            let labels = convert_labels(&s.labels);
-            Some(InstantSample {
-                labels,
-                value: sample.value,
-                timestamp: sample.timestamp,
-                key,
-            })
+            if s.is_empty() {
+                return None;
+            }
+            match s.get_sample(timestamp) {
+                Ok(Some(sample)) => {
+                    let labels: Vec<crate::promql::generated::Label> = s
+                        .labels
+                        .iter()
+                        .map(|label| crate::promql::generated::Label {
+                            name: label.name.to_string(),
+                            value: label.value.to_string(),
+                        })
+                        .collect();
+                    Some(InstantSample {
+                        labels,
+                        value: sample.value,
+                        timestamp: sample.timestamp,
+                        key,
+                    })
+                }
+                Ok(None) => None,
+                Err(_) => None, // todo: log error
+            }
         })
         .collect::<Vec<_>>();
 
@@ -59,17 +68,16 @@ pub(super) fn handle_range_query(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
+            if s.is_empty() {
+                return None;
+            }
             let series_samples = s.get_range(start_time, end_time);
             if series_samples.is_empty() {
                 return None;
             }
             let samples: Vec<PromSample> = series_samples.into_iter().map(Sample::into).collect();
             let labels = convert_labels(&s.labels);
-            let range = RangeSample {
-                labels,
-                samples,
-                key: "".to_string(),
-            };
+            let range = RangeSample { labels, samples };
             Some(range)
         })
         .collect::<Vec<_>>();

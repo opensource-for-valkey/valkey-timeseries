@@ -2,42 +2,25 @@ use crate::common::Timestamp;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use orx_parallel::ParIter;
-use orx_parallel::{IntoParIter, IterIntoParIter};
-use promql_parser::label::METRIC_NAME;
+use ahash::AHasher;
+use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
 use promql_parser::parser::AggregateExpr;
-use promql_parser::parser::token::{TokenType, *};
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use promql_parser::parser::token::TokenType;
+use promql_parser::parser::token::{
+    T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_GROUP, T_LIMIT_RATIO, T_LIMITK, T_MAX, T_MIN,
+    T_QUANTILE, T_STDDEV, T_STDVAR, T_SUM, T_TOPK,
+};
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum KAggregationOrder {
-    Top,
-    Bottom,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum KLimitType {
-    Limit,
-    LimitRatio,
-}
-
-pub(super) fn eval_aggregation(
+pub(crate) fn eval_aggregation(
     expr: &AggregateExpr,
-    mut samples: Vec<EvalSample>,
+    samples: Vec<EvalSample>,
     param: Option<ExprResult>,
     eval_time: Timestamp,
 ) -> EvalResult<ExprResult> {
     if samples.is_empty() {
         return Ok(ExprResult::InstantVector(Vec::new()));
-    }
-
-    // Materialize any pending __name__ drops on inner expression results before aggregation
-    // so that grouping and aggregation operate on the correct label sets (Prometheus semantics).
-    for sample in samples.iter_mut() {
-        if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
-        }
     }
 
     if is_reduction_aggregate(expr.op) {
@@ -47,10 +30,8 @@ pub(super) fn eval_aggregation(
     match expr.op.id() {
         T_QUANTILE => eval_quantile(expr, param, samples, eval_time),
         T_COUNT_VALUES => eval_count_values(expr, param, samples, eval_time),
-        T_TOPK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Top),
-        T_BOTTOMK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Bottom),
-        T_LIMITK => eval_limit_k(expr, param, samples),
-        T_LIMIT_RATIO => eval_limit_ratio(expr, param, samples),
+        T_TOPK | T_BOTTOMK => eval_top_bottom_k(expr, param, samples),
+        T_LIMITK | T_LIMIT_RATIO => eval_limit_k(expr, param, samples),
         _ => {
             let msg = format!(
                 "BUG: Invalid token ID in eval_aggregation: {:?}",
@@ -90,120 +71,36 @@ fn eval_count_values(
     Ok(ExprResult::InstantVector(out))
 }
 
-#[derive(Clone, Copy)]
-struct KHeapEntry {
-    value: f64,
-    index: usize,
-    order: KAggregationOrder,
-}
-
-impl PartialEq for KHeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.index == other.index
-            && self.order == other.order
-            && self.value.to_bits() == other.value.to_bits()
-    }
-}
-
-impl Eq for KHeapEntry {}
-
-impl PartialOrd for KHeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for KHeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap. Define "greater" as "worse" so heap.peek()
-        // returns the least desirable currently selected sample.
-        compare_k_values(self.value, other.value, self.order)
-            .then_with(|| self.index.cmp(&other.index))
-    }
-}
-
-fn select_k_indices_with_heap(
-    samples: &[EvalSample],
-    keep: usize,
-    order: KAggregationOrder,
-) -> Vec<usize> {
-    if keep == 0 || samples.is_empty() {
-        return Vec::new();
-    }
-    let mut heap = BinaryHeap::with_capacity(keep);
-    for (idx, sample) in samples.iter().enumerate() {
-        let entry = KHeapEntry {
-            value: sample.value,
-            index: idx,
-            order,
-        };
-        if heap.len() < keep {
-            heap.push(entry);
-            continue;
-        }
-
-        if let Some(worst) = heap.peek()
-            && compare_k_values(sample.value, worst.value, order).is_lt()
-        {
-            // Replace only when the candidate outranks the current worst,
-            // preserving the "peek is worst-kept" invariant.
-            heap.pop();
-            heap.push(entry);
-        }
-    }
-    heap.into_iter().map(|entry| entry.index).collect()
-}
-
 fn eval_top_bottom_k(
     expr: &AggregateExpr,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
-    order: KAggregationOrder,
 ) -> EvalResult<ExprResult> {
-    let name = if order == KAggregationOrder::Top {
-        "top_k"
-    } else {
-        "bottom_k"
-    };
-    let k = get_k_param(param, samples.len(), name)?;
+    let function_name = expr.op.to_string();
+    let k = get_param_as_usize(param, &function_name)?;
+    let op_id = expr.op.id();
 
-    if k == 0 {
-        return Ok(ExprResult::InstantVector(Vec::new()));
-    }
+    let grouped = group_samples(expr, samples);
 
-    if expr.modifier.is_none() {
-        return Ok(ExprResult::InstantVector(select_k_from_group(
-            samples, k, order,
-        )));
-    }
-
-    let out: Vec<EvalSample> = group_samples(expr, samples)
+    // sort by the appropriate comparator and take k elements.
+    let collected: Vec<EvalSample> = grouped
         .into_iter()
-        .map(|(_, (_, group))| group)
         .iter_into_par()
-        .flat_map(|group| select_k_from_group(group, k, order))
+        .flat_map(|(_, (_, mut group_samples))| {
+            match op_id {
+                T_TOPK => {
+                    group_samples.sort_by(|a, b| topk_value_cmp(a.value, b.value));
+                }
+                T_BOTTOMK => {
+                    group_samples.sort_by(|a, b| bottomk_value_cmp(a.value, b.value));
+                }
+                _ => unreachable!(),
+            }
+            group_samples.into_iter().take(k)
+        })
         .collect();
 
-    Ok(ExprResult::InstantVector(out))
-}
-
-fn select_k_from_group(
-    mut samples: Vec<EvalSample>,
-    k: usize,
-    order: KAggregationOrder,
-) -> Vec<EvalSample> {
-    let keep = k.min(samples.len());
-    let mut selected_indices = select_k_indices_with_heap(&samples, keep, order);
-    // Remove from highest index first so swap_remove cannot invalidate
-    // indices we still need to read.
-    selected_indices.sort_unstable_by(|left, right| right.cmp(left));
-
-    let mut result = Vec::with_capacity(selected_indices.len());
-    for idx in selected_indices {
-        result.push(samples.swap_remove(idx));
-    }
-    result.sort_by(|left, right| compare_k_values(left.value, right.value, order));
-    result
+    Ok(ExprResult::InstantVector(collected))
 }
 
 fn eval_limit_k(
@@ -211,28 +108,14 @@ fn eval_limit_k(
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    let k = get_k_param(param, samples.len(), "limitk")?;
+    let function_name = expr.op.to_string();
+    let k = get_param_as_scalar(param, &function_name)?;
 
-    // For each group sort deterministically by hash and take the first k samples,
-    // then flatten the per-group selections into the output vector.
-    let out: Vec<EvalSample> = group_samples(expr, samples)
-        .into_iter()
-        .iter_into_par()
-        .flat_map(|(_, (_, mut group_samples))| {
-            group_samples.sort_by_key(sample_hash);
-            select_limitk(group_samples, k)
-        })
-        .collect();
-
-    Ok(ExprResult::InstantVector(out))
-}
-
-fn eval_limit_ratio(
-    expr: &AggregateExpr,
-    param: Option<ExprResult>,
-    samples: Vec<EvalSample>,
-) -> EvalResult<ExprResult> {
-    let k = get_param_as_scalar(param, "limit_ratio")?;
+    let k_n = if !k.is_finite() || k <= 0.0 {
+        0
+    } else {
+        k.floor() as usize
+    };
 
     let groups = group_samples(expr, samples);
     let mut out = Vec::new();
@@ -240,9 +123,15 @@ fn eval_limit_ratio(
     // todo: parallelize
     for (_, (_, mut group_samples)) in groups.into_iter() {
         group_samples.sort_by_key(sample_hash);
-        let selected = select_limit_ratio(group_samples, k)?;
+        let selected = match expr.op.id() {
+            T_LIMITK => select_limitk(group_samples, k_n),
+            T_LIMIT_RATIO => select_limit_ratio(group_samples, k)?,
+            _ => unreachable!(),
+        };
 
-        out.extend(selected);
+        for sample in selected {
+            out.push(sample);
+        }
     }
 
     Ok(ExprResult::InstantVector(out))
@@ -261,26 +150,18 @@ fn eval_quantile(
             "quantile must be between 0.0 and 1.0".to_string(),
         ));
     }
-    // parallelize: compute quantile per-group in parallel
+    // todo: parallelize
     let groups = group_samples(expr, samples);
-    let groups_vec: Vec<(Labels, Vec<EvalSample>)> = groups
-        .into_iter()
-        .map(|(_, (labels, samples))| (labels, samples))
-        .collect();
-
-    let out: Vec<EvalSample> = groups_vec
-        .into_par()
-        .map(|(labels, samples)| {
-            let value = sample_quantile(&samples, phi);
-            EvalSample {
-                labels,
-                timestamp_ms: eval_time,
-                value,
-                drop_name: false,
-            }
-        })
-        .collect();
-
+    let mut out = Vec::new();
+    for (_, (labels, samples)) in groups {
+        let value = sample_quantile(&samples, phi);
+        out.push(EvalSample {
+            labels,
+            timestamp_ms: eval_time,
+            value,
+            drop_name: false,
+        });
+    }
     Ok(ExprResult::InstantVector(out))
 }
 
@@ -297,14 +178,14 @@ fn eval_reduction_aggregation(
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
 ) -> EvalResult<ExprResult> {
-    let groups = group_sample_values(expr, samples);
+    let mut groups = group_sample_values(expr, samples);
 
     let out = groups
-        .into_iter()
-        .map(|(_, (labels, samples))| (labels, samples))
+        .values_mut()
         .iter_into_par()
         .map(|(labels, samples)| {
-            let value = aggregate_group(expr.op, &samples);
+            let value = aggregate_group(expr.op, samples);
+            let labels = std::mem::take(labels);
             EvalSample {
                 labels,
                 value,
@@ -420,28 +301,31 @@ fn max_ignore_nan(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-/// Compares values for topk/bottomk aggregation.
-/// NaN values are always considered "greater" (sorted last) regardless of order.
-/// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
-fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering {
-    match (left.is_nan(), right.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Greater,
-        (false, true) => Ordering::Less,
-        (false, false) => match order {
-            KAggregationOrder::Top => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
-            KAggregationOrder::Bottom => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
-        },
+fn quantile_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
+    match (lhs.is_nan(), rhs.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => lhs.total_cmp(&rhs),
     }
 }
 
-// topk/bottomk params are scalar floats, but selection needs a bounded count.
-// Coerce once to match PromQL-like behavior: clamp to input size and treat
-// k < 1 as empty output.
-fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
-    let max_k = input_len as i64;
-    let coerced = (k_param as i64).min(max_k);
-    if coerced < 1 { 0 } else { coerced as usize }
+fn topk_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
+    match (lhs.is_nan(), rhs.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => rhs.total_cmp(&lhs),
+    }
+}
+
+fn bottomk_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
+    match (lhs.is_nan(), rhs.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => lhs.total_cmp(&rhs),
+    }
 }
 
 fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
@@ -451,30 +335,22 @@ fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
 }
 
 fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
-    if !ratio.is_finite() {
+    if !ratio.is_finite() || ratio == 0.0 || !(-1.0..=1.0).contains(&ratio) {
         return Err(EvaluationError::ArgumentError(
-            "limit_ratio parameter must be within [-1, 1]".to_string(),
+            "limit_ratio parameter must be within [-1, 1] and not equal to 0".to_string(),
         ));
     }
-    let ratio = ratio.clamp(-1.0, 1.0);
 
-    if ratio == 0.0 {
+    let len = samples.len();
+    if len == 0 {
         return Ok(Vec::new());
     }
 
-    let max = u128::MAX as f64;
+    let take = ((len as f64) * ratio.abs()).floor() as usize;
     if ratio > 0.0 {
-        Ok(samples
-            .into_iter()
-            .filter(|sample| (sample_hash(sample) as f64) / max < ratio)
-            .collect())
+        Ok(samples.into_iter().take(take).collect())
     } else {
-        // For negative ratios, select the complement side of the hash space.
-        let threshold = 1.0 + ratio;
-        Ok(samples
-            .into_iter()
-            .filter(|sample| (sample_hash(sample) as f64) / max >= threshold)
-            .collect())
+        Ok(samples.into_iter().rev().take(take).collect())
     }
 }
 
@@ -489,33 +365,24 @@ fn get_param(param: Option<ExprResult>, function_name: &str) -> EvalResult<ExprR
 
 fn get_param_as_scalar(param: Option<ExprResult>, function_name: &str) -> EvalResult<f64> {
     let param = get_param(param, function_name)?;
-    match param {
-        ExprResult::Scalar(value) => Ok(value),
-        other => {
-            let value_type = other.value_type();
-            Err(EvaluationError::ArgumentError(format!(
-                "{function_name} parameter must evaluate to a scalar, but got {value_type}"
-            )))
-        }
-    }
+    let ExprResult::Scalar(value) = param else {
+        let value_type = param.value_type();
+        return Err(EvaluationError::ArgumentError(format!(
+            "{function_name} parameter must evaluate to a scalar, but got {value_type}"
+        )));
+    };
+    Ok(value)
 }
 
 fn get_param_as_string(params: Option<ExprResult>, function_name: &str) -> EvalResult<String> {
     let param = get_param(params, function_name)?;
-    match param {
-        ExprResult::String(value) => Ok(value),
-        other => {
-            let value_type = other.value_type();
-            Err(EvaluationError::ArgumentError(format!(
-                "{function_name} parameter must evaluate to a string, but got {value_type}"
-            )))
-        }
-    }
-}
-
-fn get_k_param(param: Option<ExprResult>, sample_len: usize, name: &str) -> EvalResult<usize> {
-    let value = get_param_as_scalar(param, name)?;
-    Ok(coerce_k_size(value, sample_len))
+    let ExprResult::String(value) = param else {
+        let value_type = param.value_type();
+        return Err(EvaluationError::ArgumentError(format!(
+            "{function_name} parameter must evaluate to a string, but got {value_type}"
+        )));
+    };
+    Ok(value.clone())
 }
 
 fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usize> {
@@ -527,6 +394,8 @@ fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usiz
     }
 }
 
-fn sample_hash(sample: &EvalSample) -> u128 {
-    sample.labels.get_fingerprint()
+fn sample_hash(sample: &EvalSample) -> u64 {
+    let mut hasher: AHasher = Default::default();
+    sample.labels.hash(&mut hasher);
+    hasher.finish()
 }

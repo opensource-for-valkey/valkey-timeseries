@@ -1,19 +1,16 @@
-use crate::common::time::{current_time_millis, system_time_to_millis};
-use crate::common::{Sample, Timestamp};
-use crate::promql::engine::{QueryOptions, QueryReader};
+use crate::common::Sample;
+use crate::common::time::system_time_to_millis;
+use crate::promql::engine::SeriesQuerier;
 use crate::promql::error::QueryError;
-use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
-use crate::promql::time::step_times;
+use crate::promql::model::{InstantSample, Labels, QueryOptions, QueryValue, RangeSample};
 use crate::promql::utils::range_bounds_to_system_time;
-use crate::promql::{Evaluator, ExprResult, QueryResult};
-use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
+use crate::promql::{EvalSamples, Evaluator, ExprResult, QueryResult};
+use ahash::AHashMap;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
-use std::hash::BuildHasherDefault;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use twox_hash::XxHash64;
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
@@ -26,14 +23,14 @@ fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
 
 pub(crate) trait PromqlEngine: Send + Sync {
     /// Build a query reader
-    fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>>;
+    fn make_query_reader(&self) -> QueryResult<Arc<dyn SeriesQuerier>>;
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
     fn eval_query(
         &self,
         query: &str,
         time: Option<SystemTime>,
-        opts: QueryOptions,
+        opts: &QueryOptions,
     ) -> QueryResult<QueryValue> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
@@ -50,7 +47,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
 
         let reader = self.make_query_reader()?;
 
-        evaluate_instant(reader, stmt, query_time, opts)
+        evaluate_instant(reader, stmt, query_time)
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -60,8 +57,8 @@ pub(crate) trait PromqlEngine: Send + Sync {
         start: SystemTime,
         end: SystemTime,
         step: Duration,
-        opts: QueryOptions,
-    ) -> QueryResult<Vec<RangeSample>> {
+        opts: &QueryOptions,
+    ) -> QueryResult<Vec<EvalSamples>> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -76,7 +73,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
 
         let reader = self.make_query_reader()?;
 
-        evaluate_range(reader, stmt, opts)
+        evaluate_range(reader, stmt)
     }
 }
 
@@ -87,8 +84,8 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
     query: &str,
     range: impl RangeBounds<SystemTime>,
     step: Duration,
-    opts: QueryOptions,
-) -> QueryResult<Vec<RangeSample>> {
+    opts: &QueryOptions,
+) -> QueryResult<Vec<EvalSamples>> {
     let (start, end) = range_bounds_to_system_time(range);
     E::eval_query_range(engine, query, start, end, step, opts)
 }
@@ -96,25 +93,13 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
 // ── Shared evaluation free functions ────────────────────────────────
 
 /// Evaluate an instant PromQL query against the given reader.
-pub fn evaluate_instant(
-    reader: Arc<dyn QueryReader>,
+pub(crate) fn evaluate_instant(
+    reader: Arc<dyn SeriesQuerier>,
     stmt: EvalStmt,
     query_time: SystemTime,
-    opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
-    let deadline = opts.deadline.map_or(0, |d| d);
-    let evaluator = Evaluator::new(&reader, opts);
-
-    // Best-effort timeout: compute a deadline if set and check before/after heavy ops
-    if deadline > 0 && current_time_millis() > deadline {
-        return Err(QueryError::Timeout);
-    }
-
+    let evaluator = Evaluator::new(&reader);
     let result = evaluator.evaluate(stmt)?;
-
-    if deadline > 0 && current_time_millis() > deadline {
-        return Err(QueryError::Timeout);
-    }
 
     match result {
         ExprResult::Scalar(value) => {
@@ -148,17 +133,18 @@ pub fn evaluate_instant(
                 })
                 .collect(),
         )),
-        ExprResult::String(s) => Ok(QueryValue::String(s)),
+        ExprResult::String(_s) => Err(QueryError::Execution(
+            "string expressions not supported in instant query evaluation".to_string(),
+        )),
     }
 }
 
 /// Evaluate a range PromQL query against the given reader.
 /// Returns the result and the EvalStats for metrics publishing.
-pub fn evaluate_range(
-    reader: Arc<dyn QueryReader>,
+pub(crate) fn evaluate_range(
+    reader: Arc<dyn SeriesQuerier>,
     stmt: EvalStmt,
-    opts: QueryOptions,
-) -> QueryResult<Vec<RangeSample>> {
+) -> QueryResult<Vec<EvalSamples>> {
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;
@@ -170,54 +156,27 @@ pub fn evaluate_range(
         ));
     }
 
-    let evaluator = Evaluator::new(&reader, opts);
+    let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
+    let evaluator = Evaluator::new(&reader);
 
     evaluator
         .preload_for_range_from_stmt(&stmt)
         .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
-    if let Some(dl) = opts.deadline
-        && current_time_millis() > dl
-    {
-        return Err(QueryError::Timeout);
-    }
+    let mut current_time = start;
 
-    let start_ms = system_time_to_millis(start);
-    let end_ms = system_time_to_millis(end);
+    while current_time <= end {
+        let instant_stmt = EvalStmt {
+            expr: stmt.expr.clone(),
+            start: current_time,
+            end: current_time,
+            interval: Duration::from_secs(0),
+            lookback_delta,
+        };
 
-    // Evaluate every step in parallel, each returning its timestamp + result.
-    let step_results: Vec<(Timestamp, ExprResult)> =
-        step_times(start_ms, end_ms, step.as_millis() as i64)
-            .iter_into_par()
-            .map(|t| -> QueryResult<(Timestamp, ExprResult)> {
-                // Best-effort per-step timeout check.
-                if let Some(dl) = opts.deadline
-                    && current_time_millis() > dl
-                {
-                    return Err(QueryError::Timeout);
-                }
+        let result = evaluator.evaluate(instant_stmt)?;
+        let timestamp_ms = system_time_to_millis(current_time);
 
-                let ts = UNIX_EPOCH + Duration::from_millis(t as u64);
-
-                let instant_stmt = EvalStmt {
-                    expr: stmt.expr.clone(),
-                    start: ts,
-                    end: ts,
-                    interval: Duration::from_secs(0),
-                    lookback_delta,
-                };
-
-                let result = evaluator.evaluate(instant_stmt).map_err(QueryError::from)?;
-                Ok((t, result))
-            })
-            .into_fallible_result()
-            .collect()?;
-
-    // Merge per-step results into the series map.
-    let mut series_map =
-        halfbrown::HashMap::<Labels, Vec<Sample>, BuildHasherDefault<XxHash64>>::default();
-
-    for (current_time, result) in step_results {
         match result {
             ExprResult::InstantVector(samples) => {
                 for sample in samples {
@@ -233,7 +192,7 @@ pub fn evaluate_range(
                 series_map
                     .entry(labels)
                     .or_default()
-                    .push(Sample::new(current_time, value));
+                    .push(Sample::new(timestamp_ms, value));
             }
             ExprResult::RangeVector(_) => {
                 return Err(QueryError::Execution(
@@ -246,11 +205,17 @@ pub fn evaluate_range(
                 ));
             }
         }
+
+        current_time += step;
     }
 
-    let result = series_map
+    let result: Vec<EvalSamples> = series_map
         .into_iter()
-        .map(|(labels, samples)| RangeSample { samples, labels })
+        .map(|(labels, samples)| EvalSamples {
+            values: samples,
+            labels,
+            drop_name: false,
+        })
         .collect();
 
     Ok(result)
@@ -258,21 +223,16 @@ pub fn evaluate_range(
 
 /// Tsdb manages a unified Promql QueryReader interface
 pub(crate) struct Tsdb {
-    pub(crate) querier: Arc<dyn QueryReader>,
+    pub(crate) querier: Arc<dyn SeriesQuerier>,
 }
 
 impl Tsdb {
-    pub(crate) fn new(querier: Arc<dyn QueryReader>) -> Self {
+    pub(crate) fn new(querier: Arc<dyn SeriesQuerier>) -> Self {
         Self { querier }
     }
 
     pub fn eval(&self, stmt: EvalStmt) -> QueryResult<ExprResult> {
-        let opts = QueryOptions {
-            timeout: None,
-            lookback_delta: stmt.lookback_delta,
-            ..QueryOptions::default()
-        };
-        let evaluator = Evaluator::new(&self.querier, opts);
+        let evaluator = Evaluator::new(&self.querier);
         evaluator
             .evaluate(stmt)
             .map_err(|e| QueryError::Execution(e.to_string()))
@@ -298,15 +258,7 @@ impl Tsdb {
             lookback_delta,
         };
 
-        // Use the caller-supplied `opts` so caller-provided lookback_delta is respected,
-        // but disable the evaluator timeout here.
-        let evaluator = Evaluator::new(
-            &self.querier,
-            QueryOptions {
-                timeout: None,
-                ..*opts
-            },
-        );
+        let evaluator = Evaluator::new(&self.querier);
         let result = evaluator.evaluate(stmt)?;
 
         match result {
@@ -336,7 +288,9 @@ impl Tsdb {
                     })
                     .collect(),
             )),
-            ExprResult::String(s) => Ok(QueryValue::String(s)),
+            ExprResult::String(_s) => Err(QueryError::Execution(
+                "string expressions not supported in instant query evaluation".to_string(),
+            )),
         }
     }
 
@@ -361,12 +315,64 @@ impl Tsdb {
             lookback_delta,
         };
 
-        evaluate_range(self.querier.clone(), stmt, *opts)
+        // Step through time, collecting per-series samples
+        let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
+        let evaluator = Evaluator::new(&self.querier);
+        let mut current_time = start;
+
+        while current_time <= end {
+            let instant_stmt = EvalStmt {
+                expr: stmt.expr.clone(),
+                start: current_time,
+                end: current_time,
+                interval: Duration::ZERO,
+                lookback_delta,
+            };
+
+            let result = evaluator.evaluate(instant_stmt)?;
+            let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+
+            match result {
+                ExprResult::InstantVector(samples) => {
+                    for sample in samples {
+                        let labels = sample.labels;
+                        series_map
+                            .entry(labels)
+                            .or_default()
+                            .push(Sample::new(sample.timestamp_ms, sample.value));
+                    }
+                }
+                ExprResult::Scalar(value) => {
+                    let labels = Labels::empty();
+                    series_map
+                        .entry(labels)
+                        .or_default()
+                        .push(Sample::new(timestamp_ms, value));
+                }
+                ExprResult::RangeVector(_) => {
+                    return Err(QueryError::Execution(
+                        "range vectors not supported in range query evaluation".to_string(),
+                    ));
+                }
+                ExprResult::String(_s) => {
+                    return Err(QueryError::Execution(
+                        "string expressions not supported in range query evaluation".to_string(),
+                    ));
+                }
+            }
+
+            current_time += step;
+        }
+
+        Ok(series_map
+            .into_iter()
+            .map(|(labels, samples)| RangeSample { labels, samples })
+            .collect())
     }
 }
 
 impl PromqlEngine for Tsdb {
-    fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>> {
+    fn make_query_reader(&self) -> QueryResult<Arc<dyn SeriesQuerier>> {
         Ok(self.querier.clone())
     }
 }
@@ -469,7 +475,6 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: Duration::from_secs(10),
-            ..QueryOptions::default()
         };
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &narrow)
@@ -499,7 +504,6 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: Duration::from_secs(10),
-            ..QueryOptions::default()
         };
         let results = tsdb
             .eval_query_range("http_requests", start..=end, step, &narrow)
@@ -596,7 +600,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Offset / @ modifier tests (preloading)
+    // Offset / @ modifier tests (bucket preloading)
     // -----------------------------------------------------------------------
 
     #[test]

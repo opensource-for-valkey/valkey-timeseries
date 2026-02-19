@@ -75,13 +75,8 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Generate the request to be sent to each target node.
     fn generate_request(&self) -> Self::Request;
 
-    /// Called once per response from a target node.
-    ///
-    /// Returning `Err(FanoutError)` will be treated as a
-    /// per-shard failure (it increments the aggregated error count and will cause the
-    /// overall fanout to reply with an error at completion). Implementations should
-    /// return `Ok(())` on success.
-    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
+    /// Called once per successful response from a target node.
+    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo);
 
     fn on_error(&mut self, error: FanoutError, target: &NodeInfo) {
         // Log the error with context
@@ -95,12 +90,6 @@ pub trait FanoutCommand: Default + Send + 'static {
 
     /// Called once all responses have been received, or on timeout.
     fn on_completion(&mut self) {}
-
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
-    }
 
     /// Return the final response after the fanout operation is complete.
     /// By default, it returns a default instance of the response type.
@@ -393,6 +382,7 @@ where
                 }
             }
         }
+        self.rpc_done()
     }
 
     fn on_completion(&mut self) {
