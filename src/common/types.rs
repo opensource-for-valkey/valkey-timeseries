@@ -1,4 +1,5 @@
 use crate::common::hash::hash_f64;
+use crate::common::time::current_time_millis;
 use get_size2::GetSize;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -17,6 +18,11 @@ pub struct Sample {
 
 impl Sample {
     pub fn new(timestamp: Timestamp, value: SampleValue) -> Self {
+        Sample { timestamp, value }
+    }
+
+    pub fn now(value: SampleValue) -> Self {
+        let timestamp = current_time_millis() as Timestamp;
         Sample { timestamp, value }
     }
 }

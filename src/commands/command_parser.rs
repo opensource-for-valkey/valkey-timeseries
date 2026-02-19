@@ -4,7 +4,7 @@ use crate::common::binop::ComparisonOperator;
 use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
 };
-use crate::common::time::current_time_millis;
+use crate::common::time::{current_time_millis, timestamp_so_system_time};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::join::join_reducer::JoinReducer;
@@ -16,6 +16,7 @@ use crate::parser::{
     metric_name::parse_metric_name as parse_metric, number::parse_number as parse_number_internal,
     parse_positive_duration_value, timestamp::parse_timestamp as parse_timestamp_internal,
 };
+use crate::promql::engine::config::PromqlConfig;
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
     AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS, MRangeOptions, MatchFilterOptions,
@@ -25,6 +26,8 @@ use crate::series::types::{DuplicatePolicy, ValueFilter};
 use crate::series::{TimestampRange, TimestampValue};
 use ahash::AHashMap;
 use smallvec::SmallVec;
+use logger_rust::log_debug;
+use promql_parser::parser::{EvalStmt, Expr};
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::iter::{Peekable, Skip};
@@ -105,6 +108,7 @@ command_arg_tokens! {
     Latest => "LATEST",
     Left => "LEFT",
     Limit => "LIMIT",
+    LookbackDelta => "LOOKBACK_DELTA",
     Match => "MATCH",
     Metric => "METRIC",
     Method => "METHOD",
@@ -126,6 +130,7 @@ command_arg_tokens! {
     SignificantDigits => "SIGNIFICANT_DIGITS",
     Start => "START",
     Step => "STEP",
+    Time => "TIME",
     Timestamp => "TIMESTAMP",
     True => "TRUE",
     Uncompressed => "UNCOMPRESSED",
@@ -1305,6 +1310,151 @@ pub(super) fn find_last_token_instance(
         i -= 1;
     }
     None
+}
+
+fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> {
+    if query.is_empty() {
+        return Err(ValkeyError::Str(error_consts::MISSING_QUERY));
+    }
+    if query.len() > config.max_query_len {
+        let msg = "TSDB: query too long"; // todo: better error
+        return Err(ValkeyError::Str(msg));
+    }
+    // TODO: it may be helpful to return the exact error
+    let expr = promql_parser::parser::parse(query).map_err(|_e| {
+        log_debug!("TSDB: failed to parse query {_e:?}");
+        ValkeyError::Str(error_consts::INVALID_QUERY)
+    })?;
+
+    Ok(expr)
+}
+
+fn parse_duration_internal(arg: Option<ValkeyString>, token_name: &str) -> ValkeyResult<Duration> {
+    let Some(arg_str) = arg else {
+        let msg = format!("TSDB: missing {token_name} duration");
+        return Err(ValkeyError::String(msg));
+    };
+    parse_duration_arg(&arg_str)
+        .map_err(|_| ValkeyError::String(format!("TSDB: couldn't parse {token_name} duration")))
+}
+
+pub(super) fn parse_query_range_command_args(
+    config: &PromqlConfig,
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<EvalStmt> {
+    let query = args.next_string()?;
+    let mut start_value: Option<TimestampValue> = None;
+    let mut end_value: Option<TimestampValue> = None;
+    let mut lookback_delta: Duration = config.lookback_delta;
+    let mut step: Option<Duration> = None;
+
+    let expr = parse_promql_query(&query, config)?;
+
+    while let Some(arg) = args.next() {
+        let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        match token {
+            CommandArgToken::Start => {
+                let next = args.next_str()?;
+                start_value = Some(parse_timestamp_arg(next, token.as_str())?);
+            }
+            CommandArgToken::End => {
+                let next = args.next_str()?;
+                end_value = Some(parse_timestamp_arg(next, token.as_str())?);
+            }
+            CommandArgToken::Step => {
+                step = Some(parse_duration_internal(args.next(), token.as_str())?);
+            }
+            CommandArgToken::LookbackDelta => {
+                lookback_delta = parse_duration_internal(args.next(), token.as_str())?;
+            }
+            _ => {
+                let msg = format!("ERR invalid argument '{}'", arg);
+                return Err(ValkeyError::String(msg));
+            }
+        }
+    }
+
+    let Some(step) = step else {
+        return Err(ValkeyError::Str("TSDB: missing query STEP argument"));
+    };
+
+    let (start, end) = match (start_value, end_value) {
+        (Some(start_value), Some(end_value)) => {
+            (start_value.as_timestamp(None), end_value.as_timestamp(None))
+        }
+        (None, None) => {
+            let end = current_time_millis();
+            let start = end - lookback_delta.as_millis() as i64;
+            (start, end)
+        }
+        (Some(start_value), None) => {
+            let start = start_value.as_timestamp(None);
+            let end = current_time_millis();
+            (start, end)
+        }
+        (None, Some(end_value)) => {
+            let end = end_value.as_timestamp(None);
+            let start = end - lookback_delta.as_millis() as i64;
+            (start, end)
+        }
+    };
+
+    if start >= end {
+        return Err(ValkeyError::Str(
+            "TSDB: start cannot be greater than current time",
+        ));
+    }
+
+    let eval_stmt = EvalStmt {
+        expr,
+        start: timestamp_so_system_time(start),
+        end: timestamp_so_system_time(end),
+        interval: step,
+        lookback_delta,
+    };
+
+    Ok(eval_stmt)
+}
+
+pub(super) fn parse_query_command_args(
+    config: &PromqlConfig,
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<EvalStmt> {
+    let query = args.next_string()?;
+
+    let mut evaluation_ts: TimestampValue = TimestampValue::Now;
+    let mut lookback_delta: Duration = config.lookback_delta;
+
+    let expr = parse_promql_query(&query, config)?;
+
+    while let Some(arg) = args.next() {
+        let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        match token {
+            CommandArgToken::Time => {
+                let next = args.next_str()?;
+                evaluation_ts = parse_timestamp_arg(next, token.as_str())?;
+            }
+            CommandArgToken::LookbackDelta => {
+                lookback_delta = parse_duration_internal(args.next(), token.as_str())?;
+            }
+            _ => {
+                let msg = format!("TSDB: invalid query argument '{}'", arg);
+                return Err(ValkeyError::String(msg));
+            }
+        }
+    }
+
+    let query_time = timestamp_so_system_time(evaluation_ts.as_timestamp(None));
+
+    let eval_stmt = EvalStmt {
+        expr,
+        start: query_time,
+        end: query_time,
+        interval: Duration::from_secs(0),
+        lookback_delta,
+    };
+
+    Ok(eval_stmt)
 }
 
 #[cfg(test)]

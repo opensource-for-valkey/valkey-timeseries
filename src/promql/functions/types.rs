@@ -1,0 +1,178 @@
+use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
+use promql_parser::parser::Expr;
+use promql_parser::parser::value::ValueType;
+
+pub(crate) struct FunctionCallContext<'a> {
+    pub eval_timestamp_ms: i64,
+    pub raw_args: &'a [Box<Expr>],
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PromQLArg {
+    String(String),
+    InstantVector(Vec<EvalSample>),
+    Scalar(f64),
+    RangeVector(Vec<EvalSamples>),
+}
+
+impl PromQLArg {
+    #[cfg(test)]
+    pub fn empty_string() -> Self {
+        Self::String(String::new())
+    }
+
+    pub fn into_instant_vector(self) -> EvalResult<Vec<EvalSample>> {
+        match self {
+            Self::InstantVector(s) => Ok(s),
+            _ => Err(EvaluationError::InternalError(
+                "expected instant vector".to_string(),
+            )),
+        }
+    }
+
+    pub fn into_scalar(self) -> EvalResult<f64> {
+        match self {
+            Self::Scalar(s) => Ok(s),
+            _ => Err(EvaluationError::InternalError(
+                "expected scalar".to_string(),
+            )),
+        }
+    }
+
+    pub fn into_range_vector(self) -> EvalResult<Vec<EvalSamples>> {
+        match self {
+            Self::RangeVector(samples) => Ok(samples),
+            _ => Err(EvaluationError::InternalError(
+                "expected range vector".to_string(),
+            )),
+        }
+    }
+
+    pub fn into_string(self) -> EvalResult<String> {
+        match self {
+            Self::String(s) => Ok(s),
+            _ => Err(EvaluationError::InternalError(
+                "expected string".to_string(),
+            )),
+        }
+    }
+
+    pub fn as_string(&self) -> EvalResult<&String> {
+        match self {
+            Self::String(s) => Ok(s),
+            _ => Err(EvaluationError::InternalError(
+                "expected string".to_string(),
+            )),
+        }
+    }
+
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            PromQLArg::String(_) => ValueType::String,
+            PromQLArg::Scalar(_) => ValueType::Scalar,
+            PromQLArg::InstantVector(_) => ValueType::Vector,
+            PromQLArg::RangeVector(_) => ValueType::Matrix,
+        }
+    }
+}
+
+impl From<ExprResult> for PromQLArg {
+    fn from(value: ExprResult) -> Self {
+        match value {
+            ExprResult::String(x) => Self::String(x),
+            ExprResult::Scalar(x) => Self::Scalar(x),
+            ExprResult::InstantVector(x) => Self::InstantVector(x),
+            ExprResult::RangeVector(x) => Self::RangeVector(x),
+        }
+    }
+}
+
+impl From<f64> for PromQLArg {
+    fn from(value: f64) -> Self {
+        Self::Scalar(value)
+    }
+}
+
+impl From<usize> for PromQLArg {
+    fn from(value: usize) -> Self {
+        Self::Scalar(value as f64)
+    }
+}
+
+impl From<String> for PromQLArg {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for PromQLArg {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
+}
+
+/// Trait for PromQL functions that operate on instant vectors
+pub(crate) trait PromQLFunction {
+    /// Apply the function to the input samples.
+    /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
+    /// Returns an `ExprResult` (typically `ExprResult::InstantVector`).
+    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult>;
+
+    /// Apply the function to one or more evaluated arguments.
+    ///
+    /// Default behavior preserves current unary-function semantics.
+    fn apply_args(
+        &self,
+        mut args: Vec<PromQLArg>,
+        eval_timestamp_ms: i64,
+    ) -> EvalResult<ExprResult> {
+        if args.len() != 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "function requires exactly one argument, got {}",
+                args.len()
+            )));
+        }
+
+        self.apply(args.remove(0), eval_timestamp_ms)
+    }
+
+    fn apply_call(
+        &self,
+        evaluated_args: Vec<PromQLArg>,
+        ctx: &FunctionCallContext<'_>,
+    ) -> EvalResult<ExprResult> {
+        self.apply_args(evaluated_args, ctx.eval_timestamp_ms)
+    }
+
+    fn is_experimental(&self) -> bool {
+        false
+    }
+}
+
+/// Function that applies a unary operation to each sample
+pub(super) struct UnaryFunction {
+    pub(super) op: fn(f64) -> f64,
+}
+
+impl PromQLFunction for UnaryFunction {
+    fn apply(&self, arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        let mut samples = arg.into_instant_vector()?;
+        for sample in &mut samples {
+            sample.value = (self.op)(sample.value);
+        }
+        Ok(ExprResult::InstantVector(samples))
+    }
+}
+
+impl Default for UnaryFunction {
+    fn default() -> Self {
+        fn identity(x: f64) -> f64 {
+            x
+        }
+        UnaryFunction { op: identity }
+    }
+}
+
+pub struct RangeFunctionOpts {
+    pub step_ms: i64,
+}

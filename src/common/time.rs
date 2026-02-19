@@ -1,3 +1,5 @@
+use crate::common::Timestamp;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkey_module::{RedisModule_CachedMicroseconds, RedisModule_Milliseconds};
 
 /// Returns the time duration since UNIX_EPOCH in milliseconds.
@@ -42,4 +44,20 @@ pub fn current_time_millis() -> i64 {
             valkey_current_time_millis()
         }
     }
+}
+
+pub fn system_time_to_millis(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as i64
+}
+
+pub fn system_time_to_secs(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64
+}
+
+pub fn timestamp_so_system_time(timestamp: Timestamp) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(timestamp as u64)
 }

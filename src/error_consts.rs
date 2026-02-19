@@ -67,6 +67,9 @@ pub const ALL_KEYS_READ_PERMISSION_ERROR: &str = "TSDB: current user doesn't hav
 pub const ALL_KEYS_WRITE_PERMISSION_ERROR: &str = "TSDB: current user doesn't have write permission to one or more keys that match the specified filter";
 pub const DUPLICATE_KEY: &str = "TSDB: key already exists";
 pub const MISSING_FILTER: &str = "TSDB: please provide at least one matcher";
+pub const MISSING_QUERY: &str = "TSDB: empty or missing promql query";
+pub const INVALID_QUERY: &str =
+    "TSDB: the query string could not be parsed or is otherwise invalid.";
 pub const INVALID_TIMESTAMP_FILTER: &str = "TSDB: FILTER_BY_TS one or more arguments are missing";
 pub const INVALID_REGEX: &str = "TSDB: invalid regex";
 pub const INVALID_IGNORE_OPTIONS: &str = "TSDB: invalid ignore options";

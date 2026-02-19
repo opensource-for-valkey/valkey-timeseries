@@ -457,7 +457,7 @@ impl TimeSeries {
 
     /// Get the time series between given start and end time (both inclusive).
     pub fn get_range(&self, start_time: Timestamp, end_time: Timestamp) -> Vec<Sample> {
-        if !self.overlaps(start_time, end_time) {
+        if self.is_empty() || !self.overlaps(start_time, end_time) {
             return Vec::new();
         }
         let Some(range) = self.get_chunk_index_bounds(start_time, end_time) else {
@@ -498,6 +498,9 @@ impl TimeSeries {
     }
 
     pub fn get_sample(&self, start_time: Timestamp) -> ValkeyResult<Option<Sample>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
         let (index, found) = get_chunk_index(&self.chunks, start_time);
         if found {
             let chunk = &self.chunks[index];

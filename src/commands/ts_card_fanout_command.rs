@@ -44,6 +44,12 @@ impl FanoutClientCommand for CardFanoutCommand {
         Ok(())
     }
 
+    fn get_response(self) -> Self::Response {
+        CardinalityResponse {
+            cardinality: self.result as u64,
+        }
+    }
+
     fn reply(&mut self, ctx: &FanoutContext) -> Status {
         ctx.reply_with_integer(self.result as i64)
     }

@@ -1,3 +1,4 @@
+use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::InternedLabel;
 use enquote::enquote;
 use std::cmp::Ordering;
@@ -21,6 +22,17 @@ impl Label {
         Self {
             name: key.into(),
             value: value.into(),
+        }
+    }
+
+    /// Creates a metric name label (`__name__`).
+    ///
+    /// This is a convenience method for creating the special label that
+    /// identifies the metric name.
+    pub fn metric_name(name: impl Into<String>) -> Self {
+        Self {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: name.into(),
         }
     }
 }

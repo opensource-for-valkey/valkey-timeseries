@@ -14,12 +14,11 @@ use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString};
 
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_warning;
-use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries_mut};
 pub use index_key::IndexKey;
 pub use posting_stats::*;
-pub use postings::PostingsBitmap;
+pub use postings::{Postings, PostingsBitmap};
 pub use querier::*;
 pub use timeseries_index::*;
 

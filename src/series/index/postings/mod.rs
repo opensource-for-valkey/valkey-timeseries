@@ -79,8 +79,7 @@ impl Default for Postings {
 }
 
 impl Postings {
-    #[allow(dead_code)]
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.label_index.clear();
         self.id_to_key.clear();
         self.stale_ids.clear();
