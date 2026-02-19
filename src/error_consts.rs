@@ -106,6 +106,9 @@ pub const ACL_SCOPE_ALREADY_ENTERED: &str =
     "TSDB: internal error: an ACL scope is already active on this thread";
 pub const DUPLICATE_KEY: &str = "TSDB: key already exists";
 pub const MISSING_FILTER: &str = "TSDB: please provide at least one matcher";
+pub const MISSING_QUERY: &str = "TSDB: empty or missing promql query";
+pub const INVALID_QUERY: &str =
+    "TSDB: the query string could not be parsed or is otherwise invalid.";
 pub const INVALID_TIMESTAMP_FILTER: &str = "TSDB: FILTER_BY_TS one or more arguments are missing";
 pub const INVALID_REGEX: &str = "TSDB: invalid regex";
 pub const INVALID_IGNORE_OPTIONS: &str = "TSDB: invalid ignore options";

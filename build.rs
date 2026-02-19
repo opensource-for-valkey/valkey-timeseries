@@ -62,28 +62,48 @@ fn main() -> io::Result<()> {
     );
     let current = fs::read_to_string(GENERATED);
 
-    if current.as_deref().is_ok_and(|current| current == expected) {
-        return Ok(());
-    }
-
-    if env::var_os(REGEN_ENV).is_some() {
-        if let Some(parent) = Path::new(GENERATED).parent() {
-            fs::create_dir_all(parent)?;
+    if !current.as_deref().is_ok_and(|current| current == expected) {
+        if env::var_os(REGEN_ENV).is_some() {
+            if let Some(parent) = Path::new(GENERATED).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(GENERATED, expected)?;
+        } else {
+            // Distinguish the two failures: a stale file means someone edited the
+            // schema without regenerating, while a missing one usually means it
+            // was never committed or got ignored — different mistakes with the
+            // same remedy.
+            let problem = if current.is_err() {
+                "is missing"
+            } else {
+                "is out of date with the .proto sources"
+            };
+            return Err(io::Error::other(format!(
+                "{GENERATED} {problem}.\n\
+                 Regenerate and commit it:\n\n    {REGEN_ENV}=1 cargo build\n"
+            )));
         }
-        fs::write(GENERATED, expected)?;
-        return Ok(());
     }
 
-    // Distinguish the two failures: a stale file means someone edited the schema
-    // without regenerating, while a missing one usually means it was never
-    // committed or got ignored — different mistakes with the same remedy.
-    let problem = if current.is_err() {
-        "is missing"
-    } else {
-        "is out of date with the .proto sources"
-    };
-    Err(io::Error::other(format!(
-        "{GENERATED} {problem}.\n\
-         Regenerate and commit it:\n\n    {REGEN_ENV}=1 cargo build\n"
-    )))
+    // The promql surface has its own, unrelated proto contract; it is compiled
+    // dynamically into OUT_DIR rather than checked in like the fanout wire types.
+    println!("cargo:rerun-if-changed=src/promql/types.proto");
+    prost_build::Config::new()
+        .out_dir(&out_dir)
+        .compile_protos(&["src/promql/types.proto"], &["src/"])
+        .map_err(io::Error::other)?;
+
+    // Ensure a placeholder file for promql test generation exists so
+    // `include!(concat!(env!("OUT_DIR"), "/promql_tests_generated.rs"))`
+    // does not fail when no external generator has produced the file.
+    let dest_path = Path::new(&out_dir).join("promql_tests_generated.rs");
+    // Only write if the file does not already exist to avoid stomping real generated content.
+    if !dest_path.exists() {
+        fs::write(
+            &dest_path,
+            "// Auto-generated placeholder for promql tests\n",
+        )?;
+    }
+
+    Ok(())
 }

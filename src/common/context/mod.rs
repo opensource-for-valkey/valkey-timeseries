@@ -1,3 +1,8 @@
+mod blocked;
+mod client_reply_context;
+pub mod replies;
+mod thread_safe;
+
 use std::ffi::CString;
 use std::os::raw::c_int;
 use valkey_module::{
@@ -5,6 +10,11 @@ use valkey_module::{
     ValkeyModule_GetServerInfo, ValkeyModule_ServerInfoGetFieldSigned, ValkeyModuleCtx,
     ValkeyModuleServerInfoData, ValkeyResult, ValkeyString, raw,
 };
+
+use crate::fanout::FANOUT_ACL_USER;
+pub use blocked::*;
+pub(crate) use client_reply_context::*;
+pub use thread_safe::*;
 
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
@@ -31,11 +41,11 @@ pub fn key_for_display(key: &[u8]) -> std::borrow::Cow<'_, str> {
 }
 
 // Safety: RedisModule_GetSelectedDb is safe to call
-pub fn get_current_db(ctx: &Context) -> i32 {
+pub(crate) fn get_current_db(ctx: &Context) -> i32 {
     unsafe { RedisModule_GetSelectedDb.unwrap()(ctx.ctx) }
 }
 
-pub fn set_current_db(ctx: &Context, db: i32) -> Status {
+pub(crate) fn set_current_db(ctx: &Context, db: i32) -> Status {
     // Safety: RedisModule_SelectDb is safe to call. It is a bug in the valkey_module
     // if the function is not available.
     unsafe {
@@ -47,13 +57,13 @@ pub fn set_current_db(ctx: &Context, db: i32) -> Status {
 }
 
 #[inline]
-pub fn is_aof_client(client_id: u64) -> bool {
+pub(crate) fn is_aof_client(client_id: u64) -> bool {
     client_id == u64::MAX
 }
 
-pub fn is_real_user_client(ctx: &Context) -> bool {
+pub(crate) fn is_real_user_client(ctx: &Context) -> bool {
     let client_id = ctx.get_client_id();
-    if client_id == 0 || is_aof_client(client_id) {
+    if client_id == 0 || crate::common::context::is_aof_client(client_id) {
         return false;
     }
     if ctx.get_flags().contains(ContextFlags::REPLICATED) {
@@ -85,6 +95,32 @@ pub fn is_blocking_denied(ctx: &Context) -> bool {
 }
 
 pub fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModuleServerInfoData {
+#[inline]
+pub fn is_acl_enforced(ctx: &Context) -> bool {
+    // Replicated (master-link) and AOF-applied commands must not trigger ACL checks:
+    // the originating primary already enforced ACLs on the real client, and the
+    // replication/AOF apply context has no current user. Enforcing here would call
+    // the ACL API with a NULL username string, dereferencing a null pointer inside
+    // `RedisModule_GetModuleUserFromUserName` and crashing the server. `is_real_user_client`
+    // already excludes client_id == 0 (internal/module contexts), the AOF sentinel,
+    // and the REPLICATED flag.
+    //
+    // Fan-out request handlers run on the detached `MODULE_CONTEXT`, whose client is a
+    // real (fake-flagged) client with a non-zero id and no REPLICATED flag, so they are
+    // enforced by this same test; the fan-out ACL scope only supplies *which* user to
+    // check (see `get_acl_user`), never *whether* to check.
+    is_real_user_client(ctx)
+}
+
+pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
+    let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
+    if let Some(identity) = fanout_identity {
+        return ctx.create_string(identity.name.as_str());
+    }
+    ctx.get_current_user()
+}
+
+pub(crate) fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModuleServerInfoData {
     let info_fn = unsafe { ValkeyModule_GetServerInfo.unwrap() };
     let context = ctx.ctx as *mut ValkeyModuleCtx;
     let section_cstr = CString::new(section).expect("Failed to convert section to CString");
@@ -152,14 +188,14 @@ pub fn notify_keyspace_event(ctx: &Context, event: &std::ffi::CStr, key: &Valkey
 
 pub fn get_available_memory(ctx: &Context) -> Option<i64> {
     // Fetch INFO MEMORY
-    let info = get_server_info(ctx, "memory");
+    let info = crate::common::context::get_server_info(ctx, "memory");
 
     let used_memory: i64 = get_server_info_field_signed(info, "used_memory").ok()?;
-    let maxmemory: i64 = get_server_info_field_signed(info, "maxmemory").ok()?;
+    let max_memory: i64 = get_server_info_field_signed(info, "maxmemory").ok()?;
 
-    // Compute available = maxmemory - used_memory (clamped to >= 0)
-    if maxmemory > 0 {
-        let diff = maxmemory - used_memory;
+    // Compute available = maxm_emory - used_memory (clamped to >= 0)
+    if max_memory > 0 {
+        let diff = max_memory - used_memory;
         Some(if diff > 0 { diff } else { 0 })
     } else {
         None

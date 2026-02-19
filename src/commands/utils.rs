@@ -1,16 +1,21 @@
 use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSample};
 use crate::commands::fanout_codec::MGetValue;
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
+use crate::common::context::ClientReplyContext;
 use crate::common::replies::{
     IntoRawCtx, is_resp3_client, reply_label_ex, reply_with_array, reply_with_bulk_string,
     reply_with_labels, reply_with_labels_map, reply_with_map, reply_with_multi_samples,
     reply_with_sample_ex, reply_with_samples, reply_with_slice,
 };
+use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutTarget, client_allows_replica_fanout, compute_query_fanout_mode};
 use crate::labels::Label;
 use crate::series::chunks::ChunkOps;
 use crate::series::request_types::{MRangeOptions, MRangeSeriesResult, SeriesResultData};
-use valkey_module::{Context, Status, ValkeyResult, ValkeyValue, raw};
+use std::os::raw::c_long;
+use valkey_module::{
+    Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, ValkeyValue, raw,
+};
 
 pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
     let raw_ctx = ctx.into_raw();
@@ -212,5 +217,52 @@ pub(super) fn get_multi_command_targets(context: &Context, tags: &[String]) -> F
         FanoutTarget::HashTags(tags.to_vec())
     } else {
         FanoutTarget::HashTagsPrimary(tags.to_vec())
+    }
+}
+
+impl ClientReplyContext {
+    pub fn reply_with_label(&self, label: &str, value: &str) {
+        let value = if value.is_empty() { None } else { Some(value) };
+        self.reply_with_label_raw(label, value);
+    }
+
+    pub fn reply_with_labels(&self, labels: &[Label]) {
+        self.reply_with_array(labels.len());
+        for label in labels {
+            self.reply_with_label_raw(&label.name, Some(&label.value));
+        }
+    }
+
+    pub fn reply_with_label_raw(&self, label: &str, value: Option<&str>) {
+        self.reply_with_array(2);
+        self.reply_with_bulk_string(label);
+        if let Some(value) = value {
+            self.reply_with_bulk_string(value);
+        } else {
+            self.reply_with_null();
+        }
+    }
+
+    pub fn reply_with_sample_raw(&self, timestamp: Timestamp, value: f64) -> Status {
+        self.reply_with_array(2);
+        self.reply_with_i64(timestamp);
+        self.reply_with_f64(value)
+    }
+
+    #[inline]
+    pub fn reply_with_sample(&self, sample: &Sample) -> Status {
+        self.reply_with_sample_raw(sample.timestamp, sample.value)
+    }
+
+    pub fn reply_with_samples(&self, samples: impl Iterator<Item=Sample>) {
+        raw::reply_with_array(self.ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long);
+
+        let mut len = 0;
+        for sample in samples {
+            self.reply_with_sample(&sample);
+            len += 1;
+        }
+
+        self.reply_with_array(len);
     }
 }

@@ -17,7 +17,6 @@ use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString};
 
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_warning;
-use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
 pub use batched_querier::*;
@@ -25,7 +24,7 @@ pub use index_key::IndexKey;
 pub use key_list::KeyList;
 pub use memory::{IndexMemory, db_index_memory_usage, index_memory_usage};
 pub use posting_stats::*;
-pub use postings::PostingsBitmap;
+pub use postings::{Postings, PostingsBitmap};
 pub use querier::*;
 pub use timeseries_index::*;
 

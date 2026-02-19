@@ -10,6 +10,8 @@ use crate::common::module_options::{HANDLE_IO_ERRORS, declare_module_options};
 use crate::common::threads::init_thread_pool;
 use crate::config::register_config;
 use crate::fanout::{init_fanout, is_clustered};
+use crate::promql::register_promql;
+use logger_rust::{LogLevel, set_log_level};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 use valkey_module::{Context, Status, ValkeyString, Version, valkey_module};
@@ -27,6 +29,7 @@ pub mod iterators;
 mod join;
 mod labels;
 mod parser;
+pub mod promql;
 pub mod series;
 
 pub use labels::{Label, MetricName};
@@ -187,6 +190,11 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
             ctx.log_warning(&msg);
             return Status::Err;
         };
+        if let Err(e) = register_promql() {
+            let msg = format!("Failed to register promql: {e}");
+            ctx.log_warning(&msg);
+            return Status::Err;
+        }
     }
 
     MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());

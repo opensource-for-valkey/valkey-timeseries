@@ -5,3 +5,7 @@
 
 pub mod chunk_utils;
 pub mod generators;
+#[cfg(test)]
+pub mod test_utils;
+#[cfg(test)]
+pub(crate) use test_utils::assertions::*;

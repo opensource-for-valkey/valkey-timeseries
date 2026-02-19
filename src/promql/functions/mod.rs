@@ -1,0 +1,29 @@
+mod date_functions;
+mod deriv;
+mod dispatch;
+mod function_kind;
+mod histogram;
+mod holt_winters;
+mod irate;
+mod labels;
+mod math_functions;
+mod predict_linear;
+mod range_vector_functions;
+mod rate;
+mod registry_tests;
+mod rollup_window;
+mod sort;
+mod special_functions;
+mod types;
+pub(crate) mod utils;
+
+pub(crate) use crate::promql::exec::aggregations::*;
+pub(crate) use types::*;
+
+use crate::promql::functions::dispatch::PromQLFunctionImpl;
+
+// Return the concrete `PromQLFunctionImpl` so callers can store the concrete
+// implementation without relying on opaque `impl Trait` return types.
+pub(in crate::promql) fn resolve_function(name: &str) -> Option<PromQLFunctionImpl> {
+    PromQLFunctionImpl::from_name(name)
+}

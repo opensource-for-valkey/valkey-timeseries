@@ -76,6 +76,7 @@ The following commands are supported
 - [`TS.OUTLIERS`](docs/commands/ts.outliers.md)
 - [`TS.QUERYINDEX`](docs/commands/ts.queryindex.md)
 - [`TS.QUERYLABELS`](docs/commands/ts.querylabels.md)
+- [`TS.QUERYRANGE`](docs/commands/ts.queryrange.md)
 - [`TS.RANGE`](docs/commands/ts.range.md)
 - [`TS.READ`](docs/commands/ts.read.md)
 - [`TS.REVRANGE`](docs/commands/ts.revrange.md)

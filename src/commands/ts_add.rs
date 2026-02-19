@@ -126,35 +126,22 @@ fn handle_add(
     on_duplicate: Option<DuplicatePolicy>,
     created: bool,
 ) -> ValkeyResult {
-    let mut ignored = false;
-
     let last_ts = series.last_sample.map(|s| s.timestamp);
     // `inserted` decides whether to wake blocked `TS.READ` readers. An insert rather than
     // `!is_upsert`: an out-of-order insert *below* the tail is not an append, but it does add a
     // sample that a reader's cursor may already cover. Duplicates, ignored writes, and
     // value-only updates insert nothing and correctly do not signal.
     let (result, inserted) = series.add_reporting_insert(timestamp, value, on_duplicate);
-    let (replication_timestamp, ts, value) = match result {
+    let (replication_timestamp, sample, ignored) = match result {
         SampleAddResult::Ignored(res_ts) => {
-            ignored = true;
-            let timestamp = if timestamp_str == "*" {
-                Some(res_ts)
-            } else {
-                None
-            };
-            (timestamp, res_ts, value)
+            let replication_ts = (timestamp_str == "*").then_some(res_ts);
+            (replication_ts, Sample::new(res_ts, value), true)
         }
         SampleAddResult::Ok(added) => {
-            let timestamp = if timestamp_str == "*" {
-                Some(added.timestamp)
-            } else {
-                None
-            };
-            (timestamp, added.timestamp, added.value)
+            let replication_ts = (timestamp_str == "*").then_some(added.timestamp);
+            (replication_ts, added, false)
         }
-        res => {
-            return res.into();
-        }
+        res => return res.into(),
     };
 
     // `ignored` is true when the sample is not added because the timestamp or value delta is below
