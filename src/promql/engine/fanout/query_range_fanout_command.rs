@@ -1,5 +1,5 @@
 use crate::common::{Sample, Timestamp};
-use crate::fanout::{FanoutCommand, NodeInfo, get_cluster_command_timeout};
+use crate::fanout::{FanoutCommand, NodeInfo};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::generated::{
     Label as ProtoLabel, RangeQuery, RangeQueryResponse, RangeSample, Sample as ProtoSample,
@@ -9,7 +9,6 @@ use crate::series::index::series_by_selectors;
 use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::label::Matchers;
 use std::ops::Deref;
-use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
 
 pub struct QueryRangeFanoutCommand {
@@ -17,7 +16,6 @@ pub struct QueryRangeFanoutCommand {
     start_time: i64,
     end_time: i64,
     results: Vec<RangeSample>,
-    timeout: Duration,
 }
 
 impl Default for QueryRangeFanoutCommand {
@@ -31,23 +29,16 @@ impl Default for QueryRangeFanoutCommand {
             start_time: 0,
             end_time: 0,
             results: vec![],
-            timeout: get_cluster_command_timeout(),
         }
     }
 }
 impl QueryRangeFanoutCommand {
-    pub fn new(
-        matchers: Matchers,
-        start_time: Timestamp,
-        end_time: Timestamp,
-        timeout: Duration,
-    ) -> Self {
+    pub fn new(matchers: Matchers, start_time: Timestamp, end_time: Timestamp) -> Self {
         Self {
             matchers,
             start_time,
             end_time,
             results: vec![],
-            timeout,
         }
     }
 }
@@ -57,7 +48,7 @@ impl FanoutCommand for QueryRangeFanoutCommand {
     type Response = RangeQueryResponse;
 
     fn name() -> &'static str {
-        "query-range"
+        "range-query"
     }
 
     fn get_local_response(ctx: &Context, req: RangeQuery) -> ValkeyResult<RangeQueryResponse> {
@@ -68,10 +59,6 @@ impl FanoutCommand for QueryRangeFanoutCommand {
         };
         let series_selector: SeriesSelector = selector.try_into()?;
         handle_range_query(ctx, series_selector, req.start_time, req.end_time)
-    }
-
-    fn get_timeout(&self) -> Duration {
-        self.timeout
     }
 
     fn generate_request(&self) -> RangeQuery {
@@ -89,7 +76,7 @@ impl FanoutCommand for QueryRangeFanoutCommand {
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) {
         let mut resp = resp;
-        // todo: dedupe samples by labels - if multiple responses contain the same labels, we have an issue
+        // dedupe samples by labels - if multiple responses contain the same labels, we have an issue
         // Using prometheus semantics, series should have unique label-value pairs..
         self.results.append(&mut resp.series);
     }
@@ -113,6 +100,9 @@ fn handle_range_query(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
+            if s.is_empty() {
+                return None;
+            }
             let samples = s.get_range(start_time, end_time);
             if samples.is_empty() {
                 return None;

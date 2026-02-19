@@ -129,7 +129,6 @@ command_arg_tokens! {
     Step => "STEP",
     HashTag => "HASHTAG",
     Time => "TIME",
-    Timeout => "TIMEOUT",
     Timestamp => "TIMESTAMP",
     True => "TRUE",
     Uncompressed => "UNCOMPRESSED",
