@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
+use std::time::Duration;
 
 /// StaleNaN is a signaling NaN used as a staleness marker in Prometheus.
 ///
@@ -32,8 +33,8 @@ pub const STALE_NAN: u64 = 0x7ff0000000000002;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use valkey_timeseries::promql::model::{is_stale_nan, STALE_NAN};
+/// ```
+/// use timeseries::{is_stale_nan, STALE_NAN};
 ///
 /// let stale = f64::from_bits(STALE_NAN);
 /// assert!(is_stale_nan(stale));
@@ -228,7 +229,8 @@ impl Labels {
     }
 
     /// Construct from pairs (for tests). Sorts on construction.
-    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         let mut vec: Vec<Label> = pairs
             .iter()
             .map(|(k, v)| Label {
@@ -519,6 +521,7 @@ pub(crate) struct EvalContext {
     pub evaluation_ts: Timestamp,
     pub step_ms: i64,
     pub lookback_delta_ms: i64,
+    pub tracing_enabled: bool,
 }
 
 impl EvalContext {
@@ -529,10 +532,11 @@ impl EvalContext {
             evaluation_ts: query_time,
             step_ms: 0,
             lookback_delta_ms,
+            tracing_enabled: false,
         }
     }
 
-    pub fn expected_steps(&self) -> usize {
+    pub fn num_steps(&self) -> usize {
         if self.step_ms == 0 {
             return 0;
         }
@@ -544,7 +548,7 @@ impl EvalContext {
             return vec![];
         }
         // todo: have an upper limit
-        let capacity = self.expected_steps();
+        let capacity = self.num_steps();
         let mut timestamps = Vec::with_capacity(capacity);
         for timestamp in (self.query_start..=self.query_end).step_by(self.step_ms as usize) {
             timestamps.push(timestamp);
@@ -580,6 +584,7 @@ impl Default for EvalContext {
             lookback_delta_ms: lookback,
             step_ms: 0,
             evaluation_ts,
+            tracing_enabled: false,
         }
     }
 }
@@ -597,6 +602,7 @@ impl From<&EvalStmt> for EvalContext {
             evaluation_ts,
             lookback_delta_ms,
             step_ms: interval_ms,
+            tracing_enabled: false,
         }
     }
 }
@@ -647,6 +653,26 @@ impl From<EvalSamples> for RangeSample {
 impl RangeSample {
     pub fn fingerprint(&self) -> u128 {
         self.labels.signature()
+    }
+}
+
+/// Options for PromQL query evaluation.
+///
+/// Provides tuning knobs that apply to both instant and range queries.
+/// Use `Default::default()` for Prometheus-compatible defaults.
+#[derive(Debug, Clone)]
+pub struct QueryOptions {
+    /// How far back to look for a sample when evaluating at a given timestamp.
+    ///
+    /// Defaults to 5 minutes (the Prometheus staleness delta).
+    pub lookback_delta: Duration,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            lookback_delta: Duration::from_secs(5 * 60),
+        }
     }
 }
 

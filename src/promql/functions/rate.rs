@@ -1,63 +1,14 @@
 use crate::common::Sample;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::{IntoParIter, ParIter};
-
-#[derive(Clone, Copy, Debug)]
-pub(in crate::promql) enum RateKind {
-    Rate,
-    Increase,
-    Delta,
-}
-
-/// Rate function: calculates per-second rate of change for range vectors
-#[derive(Copy, Clone)]
-pub(in crate::promql) struct RateFunction;
-
-impl PromQLFunction for RateFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Rate)
-    }
-}
+use crate::promql::{EvalResult, ExprResult};
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DeltaFunction;
 
 impl PromQLFunction for DeltaFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Delta)
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        todo!()
     }
-}
-
-#[derive(Copy, Clone)]
-pub(in crate::promql) struct IncreaseFunction;
-
-impl PromQLFunction for IncreaseFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Increase)
-    }
-}
-
-fn calculate_rate(
-    arg: PromQLArg,
-    eval_timestamp_ms: i64,
-    kind: RateKind,
-) -> EvalResult<ExprResult> {
-    let samples = arg.into_range_vector()?;
-    let result = samples
-        .into_par()
-        .filter_map(|sample_series| {
-            let value = extrapolated_rate(&sample_series, kind)?;
-            Some(EvalSample {
-                timestamp_ms: eval_timestamp_ms,
-                value,
-                labels: sample_series.labels,
-                drop_name: false,
-            })
-        })
-        .collect();
-
-    Ok(ExprResult::InstantVector(result))
 }
 
 fn counter_increase_value(samples: &[Sample]) -> Option<f64> {
@@ -85,42 +36,36 @@ fn sample_delta_value(samples: &[Sample]) -> Option<f64> {
     Some(samples.last()?.value - samples.first()?.value)
 }
 
-/// Computes counter-reset-corrected increase for a sample series.
-/// Walks through samples and accumulates previous values at each reset point.
-fn counter_reset_increase(values: &[Sample]) -> f64 {
-    let first = &values[0];
-    let last = &values[values.len() - 1];
-    let mut result = last.value - first.value;
-    let mut prev_value = first.value;
-    for sample in &values[1..] {
-        if sample.value < prev_value {
-            result += prev_value;
-        }
-        prev_value = sample.value;
+fn idelta_value(samples: &[(i64, f64)]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
     }
-    result
+    Some(samples[samples.len() - 1].1 - samples[samples.len() - 2].1)
 }
 
-/// Computes extrapolated rate for a series as per Prometheus logic.
-pub(in crate::promql) fn extrapolated_rate(samples: &EvalSamples, kind: RateKind) -> Option<f64> {
-    if samples.values.len() < 2 {
+fn extrapolated_delta(
+    samples: &[Sample],
+    window: Option<(i64, i64)>,
+    is_counter: bool,
+    is_rate: bool,
+    units_per_second: i64,
+) -> Option<f64> {
+    if samples.len() < 2 {
         return None;
     }
 
-    let range_start = samples.range_end_ms - samples.range_ms;
-    let range_end = samples.range_end_ms;
-    let range_duration_seconds = samples.range_ms as f64 / 1000.0;
+    let (range_start, range_end) = window?;
+    let last = samples.last()?;
+    let first = samples.first()?;
 
-    let samples = &samples.values;
-    let count = samples.len();
-    let first_sample = &samples[0];
-    let last_sample = &samples[count - 1];
+    let first_ts = first.timestamp;
+    let first_value = first.value;
+    let last_ts = last.timestamp;
 
-    let first_t = first_sample.timestamp;
-    let last_t = last_sample.timestamp;
-
-    let is_counter = matches!(kind, RateKind::Rate | RateKind::Increase);
-    let is_rate = matches!(kind, RateKind::Rate);
+    let sampled_interval = last.timestamp.saturating_sub(first.timestamp);
+    if sampled_interval <= 0 {
+        return None;
+    }
 
     let mut result = if is_counter {
         counter_increase_value(samples)?
@@ -128,60 +73,41 @@ pub(in crate::promql) fn extrapolated_rate(samples: &EvalSamples, kind: RateKind
         sample_delta_value(samples)?
     };
 
-    // Duration between first/last samples and boundary of range
-    let duration_to_start = (first_t - range_start) as f64 / 1000.0;
-    let duration_to_end = (range_end - last_t) as f64 / 1000.0;
+    let average_duration_between_samples = sampled_interval as f64 / (samples.len() - 1) as f64;
+    let mut duration_to_start = first_ts.saturating_sub(range_start) as f64;
+    let duration_to_end = range_end.saturating_sub(last_ts) as f64;
 
-    let sampled_interval = (last_t - first_t) as f64 / 1000.0;
-
-    // When all samples share the same timestamp the sampled interval is 0.
-    // Division by zero below would produce ±Inf / NaN; return None so the
-    // series is excluded from the result, matching Prometheus semantics.
-    if sampled_interval == 0.0 {
-        return None;
-    }
-
-    let average_duration_between_samples = sampled_interval / (count - 1) as f64;
-
-    let extrapolation_threshold = average_duration_between_samples * 1.1;
-
-    let mut duration_to_start = if duration_to_start >= extrapolation_threshold {
-        average_duration_between_samples / 2.0
-    } else {
-        duration_to_start
-    };
-
-    if is_counter {
-        // Counters cannot be negative. If we have any slope at all
-        // (i.e., result went up), we can extrapolate the zero point
-        // of the counter. If the duration to the zero point is shorter
-        // than the durationToStart, we take the zero point as the start
-        // of the series, thereby avoiding extrapolation to negative
-        // counter values.
-        let duration_to_zero = if result > 0.0 && first_sample.value >= 0.0 {
-            sampled_interval * (first_sample.value / result)
-        } else {
-            duration_to_start
-        };
-
+    if is_counter && result > 0.0 && first_value >= 0.0 {
+        let duration_to_zero = sampled_interval as f64 * (first_value / result);
         if duration_to_zero < duration_to_start {
             duration_to_start = duration_to_zero;
         }
     }
 
-    let duration_to_end = if duration_to_end >= extrapolation_threshold {
-        average_duration_between_samples / 2.0
+    let extrapolation_threshold = average_duration_between_samples * 1.1;
+    let mut extrapolated_interval = sampled_interval as f64;
+
+    if duration_to_start < extrapolation_threshold {
+        extrapolated_interval += duration_to_start;
     } else {
-        duration_to_end
-    };
-
-    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
-
-    if is_rate {
-        factor /= range_duration_seconds;
+        extrapolated_interval += average_duration_between_samples / 2.0;
     }
 
-    result *= factor;
+    if duration_to_end < extrapolation_threshold {
+        extrapolated_interval += duration_to_end;
+    } else {
+        extrapolated_interval += average_duration_between_samples / 2.0;
+    }
+
+    result *= extrapolated_interval / sampled_interval as f64;
+
+    if is_rate {
+        let range_duration = range_end.saturating_sub(range_start);
+        if range_duration <= 0 {
+            return None;
+        }
+        result /= range_duration as f64 / units_per_second as f64;
+    }
 
     Some(result)
 }

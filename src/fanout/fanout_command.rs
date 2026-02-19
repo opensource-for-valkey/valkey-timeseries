@@ -52,7 +52,7 @@ pub trait FanoutCommand: Default + Send + 'static {
         exec_command(ctx, self, targets, timeout, f)
     }
 
-    /// Execute the fanout operation and wait synchronously.
+    /// Execute the fanout operation synchronously across cluster nodes.
     fn exec_sync(self, ctx: &Context) -> FanoutResult<Self::Response> {
         let timeout = self.get_timeout();
         let targets = self.get_targets(ctx);
@@ -62,13 +62,8 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Generate the request to be sent to each target node.
     fn generate_request(&self) -> Self::Request;
 
-    /// Called once per response from a target node.
-    ///
-    /// Returning `Err(FanoutError)` will be treated as a
-    /// per-shard failure (it increments the aggregated error count and will cause the
-    /// overall fanout to reply with an error at completion). Implementations should
-    /// return `Ok(())` on success.
-    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
+    /// Called once per successful response from a target node.
+    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo);
 
     fn on_error(&mut self, error: FanoutError, target: &NodeInfo) {
         // Log the error with context
@@ -83,11 +78,10 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Called once all responses have been received, or on timeout.
     fn on_completion(&mut self) {}
 
-    /// If true, the fanout operation should abort immediately on the first
-    /// failing `on_response`. Default is `false` to preserve existing
-    /// per-shard error aggregation behavior.
-    fn fail_fast(&self) -> bool {
-        false
+    /// Return the final response after the fanout operation is complete.
+    /// By default, it returns a default instance of the response type.
+    fn get_response(self) -> Self::Response {
+        Self::Response::default()
     }
 
     fn generate_error_reply(&self) -> FanoutError {
@@ -95,12 +89,6 @@ pub trait FanoutCommand: Default + Send + 'static {
             "Internal error in fanout operation '{}'",
             Self::name()
         ))
-    }
-
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
     }
 }
 
@@ -333,6 +321,7 @@ where
                 }
             }
         }
+        self.rpc_done()
     }
 
     fn on_completion(&mut self) {
@@ -434,7 +423,7 @@ fn spawn_local_request<OP, F>(
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     spawn(move || {
-        // Minimize the scope of GIL locking, avoiding re-entering the `GIL` which is non-reentrant.
+        // Minimize the scope of GIL locking, avoiding re-entering the GIL which is non-reentrant.
         let result = {
             let ctx = MODULE_CONTEXT.lock();
             with_fanout_user(&ctx, user.as_deref(), |ctx| {

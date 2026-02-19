@@ -1,12 +1,13 @@
 use crate::promql::common::math::sample_regression;
-use crate::promql::functions::range_vector_functions::eval_range;
 use crate::promql::functions::utils::{expect_scalar, min_arity_error};
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, ExprResult};
+use crate::promql::{EvalResult, EvalSample, ExprResult};
+use orx_parallel::IntoParIter;
+use orx_parallel::ParIter;
 
 /// `predict_linear(v range-vector, t scalar)`
 ///
-/// predicts the value of time series t seconds from now, based on the range vector v, using simple linear regression.
+/// predicts the value of time series t seconds from now, based on the range vector v, using simple linear regression .
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct PredictLinearFunction;
 
@@ -31,21 +32,30 @@ impl PromQLFunction for PredictLinearFunction {
         }
 
         let eval_time = eval_timestamp_ms as f64 / 1000_f64;
-        let result = eval_range(series, eval_timestamp_ms, |samples| {
-            let (slope, intercept) = sample_regression(samples)?;
+        let out = series
+            .into_par()
+            .filter_map(|series| {
+                let (slope, intercept) = sample_regression(&series.values)?;
 
-            let origin = samples
-                .first()
-                .map(|sample| sample.timestamp)
-                .unwrap_or(eval_timestamp_ms) as f64
-                / 1_000f64;
+                let origin = series
+                    .values
+                    .first()
+                    .map(|sample| sample.timestamp)
+                    .unwrap_or(eval_timestamp_ms) as f64
+                    / 1_000f64;
 
-            let x = eval_time + seconds_ahead - origin;
-            let value = slope * x + intercept;
+                let x = eval_time + seconds_ahead - origin;
+                let value = slope * x + intercept;
 
-            Some(value)
-        });
+                Some(EvalSample {
+                    labels: series.labels,
+                    timestamp_ms: eval_timestamp_ms,
+                    value,
+                    drop_name: false,
+                })
+            })
+            .collect();
 
-        Ok(result)
+        Ok(ExprResult::InstantVector(out))
     }
 }

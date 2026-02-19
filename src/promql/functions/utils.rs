@@ -8,6 +8,53 @@ use promql_parser::parser::Expr;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
+/// Average calculation matching Prometheus semantics.
+///
+/// Strategy:
+/// 1. Use Kahan summation for numerical stability.
+/// 2. If the intermediate sum overflows to ±Inf, switch to incremental mean
+///    to avoid poisoning the entire result.
+///
+/// This mirrors Prometheus' hybrid strategy and prevents overflow-induced
+/// divergence while maintaining IEEE-754 parity.
+pub(in crate::promql) fn avg_kahan(values: &[Sample]) -> f64 {
+    if values.len() == 1 {
+        return values[0].value;
+    }
+
+    let mut sum = values[0].value;
+    let mut c = 0.0;
+    let mut mean = 0.0;
+    let mut incremental = false;
+
+    for (i, sample) in values.iter().enumerate().skip(1) {
+        let count = (i + 1) as f64;
+
+        if !incremental {
+            let (new_sum, new_c) = kahan_inc(sample.value, sum, c);
+            if !new_sum.is_infinite() {
+                sum = new_sum;
+                c = new_c;
+                continue;
+            }
+
+            incremental = true;
+            mean = sum / (count - 1.0);
+            c /= count - 1.0;
+        }
+
+        let q = (count - 1.0) / count;
+        (mean, c) = kahan_inc(sample.value / count, q * mean, q * c);
+    }
+
+    if incremental {
+        mean + c
+    } else {
+        let count = values.len() as f64;
+        sum / count + c / count
+    }
+}
+
 /// Variance calculation using Welford's online algorithm (1962)
 /// with compensated summation for improved numerical stability.
 ///
@@ -106,17 +153,6 @@ pub(super) fn expect_exact_arg_count(
     Ok(())
 }
 
-pub(super) fn expect_min_arg_count(
-    function_name: &str,
-    expected: usize,
-    actual: usize,
-) -> EvalResult<()> {
-    if actual < expected {
-        return Err(min_arity_error(function_name, expected, actual));
-    }
-    Ok(())
-}
-
 // Prometheus' current UTF-8 label-name validation only rejects empty names.
 // Rust strings are already guaranteed to be valid UTF-8.
 pub(super) fn is_valid_label_name(label: &str) -> bool {
@@ -140,7 +176,7 @@ pub(super) fn output_labelset_key(labels: &'_ Labels, drop_name: bool) -> Cow<'_
     Cow::Owned(Labels::new(key))
 }
 
-pub(super) fn extract_string_arg(
+pub(crate) fn extract_string_arg(
     expr: &Expr,
     function_name: &str,
     arg_index: usize,
@@ -183,7 +219,7 @@ pub(super) fn expect_range_vector(value: PromQLArg, func: &str) -> EvalResult<Ve
     }
 }
 
-pub(super) fn expect_scalar(arg: PromQLArg, func: &str, param_name: &str) -> EvalResult<f64> {
+pub(crate) fn expect_scalar(arg: PromQLArg, func: &str, param_name: &str) -> EvalResult<f64> {
     match arg {
         PromQLArg::Scalar(val) => return Ok(val),
         PromQLArg::InstantVector(s) => {
@@ -248,6 +284,15 @@ pub(super) fn series_len(val: &ExprResult) -> usize {
 #[inline]
 pub fn remove_empty_series(tss: &mut Vec<EvalSamples>) {
     tss.retain(|ts| !ts.values.iter().all(|v| v.value.is_nan()));
+}
+
+/// Filter samples by time range: `(start_ms, end_ms]`.
+fn filter_samples_in_range(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
+    samples
+        .iter()
+        .filter(|s| s.timestamp > start_ms && s.timestamp <= end_ms)
+        .cloned()
+        .collect()
 }
 
 pub(super) fn is_inf(x: f64, sign: i8) -> bool {

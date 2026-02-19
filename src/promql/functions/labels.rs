@@ -1,9 +1,9 @@
-use crate::promql::functions::types::{PromQLArg, PromQLFunction};
+use crate::promql::functions::types::{FunctionCallContext, PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{
-    ensure_unique_labelsets, exact_arity_error, expect_exact_arg_count, expect_min_arg_count,
-    expect_string, is_valid_label_name, min_arity_error,
+    ensure_unique_labelsets, exact_arity_error, extract_string_arg, is_valid_label_name,
+    min_arity_error,
 };
-use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
+use crate::promql::{EvalResult, EvaluationError, ExprResult};
 use promql_parser::label::METRIC_NAME;
 use regex::Regex;
 
@@ -15,75 +15,14 @@ impl PromQLFunction for LabelReplaceFunction {
         Err(exact_arity_error("label_replace", 5, 1))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        // Expect exactly 5 evaluated arguments: instant vector, dst, replacement, src, regex
-        expect_exact_arg_count("label_replace", 5, args.len())?;
-
-        let mut args_iter = args.into_iter();
-        let PromQLArg::InstantVector(mut samples) =
-            args_iter.next().expect("validated args.len() == 5")
-        else {
-            return Err(EvaluationError::InternalError(
-                "label_replace expects an instant vector as its first argument".to_string(),
-            ));
-        };
-
-        let dst_label = args_iter
-            .next()
-            .expect("validated args.len() == 5")
-            .into_string()?;
-        let replacement = args_iter
-            .next()
-            .expect("validated args.len() == 5")
-            .into_string()?;
-        let src_label = args_iter
-            .next()
-            .expect("validated args.len() == 5")
-            .into_string()?;
-        let regex_src = args_iter
-            .next()
-            .expect("validated args.len() == 5")
-            .into_string()?;
-
-        if !is_valid_label_name(&dst_label) {
-            return Err(EvaluationError::InternalError(format!(
-                "invalid label name {:?}",
-                dst_label
-            )));
-        }
-
-        let regex = Regex::new(&format!("^(?s:{regex_src})$"))
-            .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
-
-        for sample in &mut samples {
-            let src_value = sample.labels.get(&src_label).unwrap_or_default();
-
-            if let Some(captures) = regex.captures(src_value) {
-                let mut replaced = String::new();
-                captures.expand(&replacement, &mut replaced);
-
-                if replaced.is_empty() {
-                    sample.labels.remove(&dst_label);
-                } else {
-                    sample.labels.insert(&dst_label, replaced);
-                }
-
-                if dst_label == METRIC_NAME {
-                    sample.drop_name = false;
-                }
-            }
-        }
-
-        ensure_unique_labelsets(&samples)?;
-        Ok(ExprResult::InstantVector(samples))
-    }
-
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
-        _ctx: &EvalContext,
+        ctx: &FunctionCallContext<'_>,
     ) -> EvalResult<ExprResult> {
-        expect_exact_arg_count("label_replace", 5, evaluated_args.len())?;
+        if evaluated_args.len() != 5 || ctx.raw_args.len() != 5 {
+            return Err(exact_arity_error("label_replace", 5, ctx.raw_args.len()));
+        }
 
         let mut args_iter = evaluated_args.into_iter();
         let PromQLArg::InstantVector(mut samples) = args_iter
@@ -95,34 +34,10 @@ impl PromQLFunction for LabelReplaceFunction {
             ));
         };
 
-        let dst_label = expect_string(
-            args_iter
-                .next()
-                .expect("validated evaluated_args.len() == 5"),
-            "label_replace",
-            "destination_label",
-        )?;
-        let replacement = expect_string(
-            args_iter
-                .next()
-                .expect("validated evaluated_args.len() == 5"),
-            "label_replace",
-            "replacement",
-        )?;
-        let src_label = expect_string(
-            args_iter
-                .next()
-                .expect("validated evaluated_args.len() == 5"),
-            "label_replace",
-            "source_label",
-        )?;
-        let regex_src = expect_string(
-            args_iter
-                .next()
-                .expect("validated evaluated_args.len() == 5"),
-            "label_replace",
-            "regex",
-        )?;
+        let dst_label = extract_string_arg(&ctx.raw_args[1], "label_replace", 1)?;
+        let replacement = extract_string_arg(&ctx.raw_args[2], "label_replace", 2)?;
+        let src_label = extract_string_arg(&ctx.raw_args[3], "label_replace", 3)?;
+        let regex_src = extract_string_arg(&ctx.raw_args[4], "label_replace", 4)?;
 
         if !is_valid_label_name(&dst_label) {
             return Err(EvaluationError::InternalError(format!(
@@ -164,7 +79,6 @@ impl Default for LabelReplaceFunction {
     }
 }
 
-/// `label_join(v instant-vector, dst_label string, separator string, src_label_1 string, src_label_2 string, ...)`
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct LabelJoinFunction;
 
@@ -176,10 +90,12 @@ impl PromQLFunction for LabelJoinFunction {
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
-        _ctx: &EvalContext,
+        ctx: &FunctionCallContext<'_>,
     ) -> EvalResult<ExprResult> {
-        let actual_args = evaluated_args.len();
-        expect_min_arg_count("label_join", 3, actual_args)?;
+        let actual_args = ctx.raw_args.len();
+        if actual_args < 3 || evaluated_args.len() != actual_args {
+            return Err(min_arity_error("label_join", 3, actual_args));
+        }
 
         let mut args_iter = evaluated_args.into_iter();
         let PromQLArg::InstantVector(mut samples) = args_iter
@@ -190,17 +106,13 @@ impl PromQLFunction for LabelJoinFunction {
                 "label_join expects an instant vector as its first argument".to_string(),
             ));
         };
-        let dst_arg = args_iter
-            .next()
-            .expect("validated evaluated_args.len() == 4");
-        let separator_arg = args_iter
-            .next()
-            .expect("validated evaluated_args.len() == 3");
 
-        let dst_label = expect_string(dst_arg, "label_join", "destination_label")?;
-        let separator = expect_string(separator_arg, "label_join", "separator")?;
-        let src_labels = args_iter
-            .map(|arg| expect_string(arg, "label_join", "source_label"))
+        let dst_label = extract_string_arg(&ctx.raw_args[1], "label_join", 1)?;
+        let separator = extract_string_arg(&ctx.raw_args[2], "label_join", 2)?;
+        let src_labels = ctx.raw_args[3..]
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| extract_string_arg(arg, "label_join", index + 3))
             .collect::<EvalResult<Vec<_>>>()?;
 
         if !is_valid_label_name(&dst_label) {

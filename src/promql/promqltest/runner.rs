@@ -1,9 +1,8 @@
-use crate::promql::QueryValue;
-use crate::promql::engine::promql_engine::Tsdb;
+use crate::promql::engine::Tsdb;
 use crate::promql::engine::test_utils::MockSeriesQuerier;
 use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
-use crate::promql::promqltest::evaluator::{eval_instant, eval_range};
+use crate::promql::promqltest::evaluator::eval_instant;
 use crate::promql::promqltest::loader::load_series;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,31 +103,13 @@ where
                 }
             }
 
-            Command::EvalRange(eval_cmd) => {
-                if !ignoring {
-                    eval_count += 1;
-                    let result = eval_range(
-                        &tsdb,
-                        eval_cmd.start,
-                        eval_cmd.end,
-                        eval_cmd.step,
-                        &eval_cmd.query,
-                    )?;
-                    let result = QueryValue::Matrix(result);
-                    let expected = eval_cmd.expected.clone();
-                    assert_results(result, expected, false, name, eval_count, &eval_cmd.query)?;
-                }
-            }
-
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
                     let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query)?;
-
-                    let expected = eval_cmd.expected.clone();
                     assert_results(
-                        result,
-                        expected,
+                        &result,
+                        &eval_cmd.expected,
                         eval_cmd.expect_ordered,
                         name,
                         eval_count,
@@ -149,7 +130,7 @@ where
 fn new_test_storage() -> (Tsdb, Arc<MockSeriesQuerier>) {
     let storage = Arc::new(MockSeriesQuerier::new());
     // Coerce Arc<MockSeriesQuerier> to Arc<dyn SeriesQuerier> for Tsdb
-    let querier: Arc<dyn crate::promql::engine::QueryReader> = storage.clone();
+    let querier: Arc<dyn crate::promql::engine::SeriesQuerier> = storage.clone();
     (Tsdb::new(querier), storage)
 }
 
@@ -178,11 +159,8 @@ mod tests {
         // then
         let result =
             eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(60), "test_metric").unwrap();
-        let QueryValue::Vector(result) = result else {
-            panic!("Expected instant vector result");
-        };
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 2.0);
+        assert_eq!(result[0].samples[0].value, 2.0);
     }
 
     #[test]
@@ -197,7 +175,6 @@ mod tests {
 
         // when
         let result = eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(120), "metric").unwrap();
-        let result = result.into_matrix().unwrap();
 
         // then
         assert_eq!(result.len(), 1);
@@ -221,30 +198,6 @@ eval instant at 10m
 
         // then
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn pi_test() {
-        let content = r#"
-load 1m
-    metric1{a="a"} 0+1x100
-    metric2{b="b"} 0+1x50
-
-# operator with offset
-eval instant at 90m metric1 offset 15m or metric2 offset 45m
-    metric1{a="a"} 75
-    metric2{b="b"} 45
-
-clear
-"#;
-
-        // when
-        let result = run_test("pi_test", content);
-
-        // then
-        if let Err(e) = result {
-            panic!("run_test failed: {}", e);
-        }
     }
 
     #[test]

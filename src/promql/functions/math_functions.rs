@@ -1,4 +1,3 @@
-use super::go_compat::{cosh, sinh};
 use crate::promql::common::math::{max_with_nan, min_with_nan};
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{exact_arity_error, map_scalar_or_vector};
@@ -11,7 +10,7 @@ fn exec_unary_fn(arg: PromQLArg, f: fn(f64) -> f64) -> EvalResult<ExprResult> {
 
 macro_rules! make_unary_function {
     ( $name: ident, $rf: expr ) => {
-        #[derive(Copy, Clone, Default)]
+        #[derive(Copy, Clone)]
         pub(crate) struct $name;
 
         impl $name {
@@ -37,7 +36,7 @@ make_unary_function!(AtanFunction, f64::atan);
 make_unary_function!(AtanhFunction, f64::atanh);
 make_unary_function!(CeilFunction, f64::ceil);
 make_unary_function!(CosFunction, f64::cos);
-make_unary_function!(CoshFunction, cosh);
+make_unary_function!(CoshFunction, f64::cosh);
 make_unary_function!(DegFunction, f64::to_degrees);
 make_unary_function!(ExpFunction, f64::exp);
 make_unary_function!(FloorFunction, f64::floor);
@@ -47,7 +46,7 @@ make_unary_function!(Log2Function, f64::log2);
 make_unary_function!(RadFunction, f64::to_radians);
 make_unary_function!(SgnFunction, f64::signum);
 make_unary_function!(SinFunction, f64::sin);
-make_unary_function!(SinhFunction, sinh);
+make_unary_function!(SinhFunction, f64::sinh);
 make_unary_function!(SqrtFunction, f64::sqrt);
 make_unary_function!(TanFunction, f64::tan);
 make_unary_function!(TanhFunction, f64::tanh);
@@ -75,6 +74,12 @@ impl PromQLFunction for PiFunction {
     }
 }
 
+impl Default for PiFunction {
+    fn default() -> Self {
+        PiFunction
+    }
+}
+
 /// Round function with an optional scalar second argument (`to_nearest`).
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct RoundFunction;
@@ -86,6 +91,12 @@ impl RoundFunction {
         }
         let inv = 1.0 / to_nearest;
         (value * inv + 0.5).floor() / inv
+    }
+}
+
+impl Default for RoundFunction {
+    fn default() -> Self {
+        RoundFunction
     }
 }
 
@@ -153,6 +164,12 @@ impl PromQLFunction for ClampMaxFunction {
     }
 }
 
+impl Default for ClampMaxFunction {
+    fn default() -> Self {
+        ClampMaxFunction
+    }
+}
+
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct ClampMinFunction;
 
@@ -176,6 +193,12 @@ impl PromQLFunction for ClampMinFunction {
             sample.value = max_with_nan(sample.value, min);
         }
         Ok(ExprResult::InstantVector(samples))
+    }
+}
+
+impl Default for ClampMinFunction {
+    fn default() -> Self {
+        ClampMinFunction
     }
 }
 
@@ -208,5 +231,11 @@ impl PromQLFunction for ClampFunction {
             sample.value = max_with_nan(min_with_nan(sample.value, max), min);
         }
         Ok(ExprResult::InstantVector(samples))
+    }
+}
+
+impl Default for ClampFunction {
+    fn default() -> Self {
+        ClampFunction
     }
 }

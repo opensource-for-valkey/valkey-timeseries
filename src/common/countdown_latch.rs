@@ -27,8 +27,8 @@
 //!
 //! # Example
 //!
-//! ```no_run
-//! use valkey_timeseries::common::countdown_latch::CountDownLatch;
+//! ```rust
+//! use crate::common::countdown_latch::CountDownLatch;
 //! use std::sync::Arc;
 //! use std::thread;
 //! use std::time::Duration;
@@ -46,7 +46,7 @@
 //! }
 //!
 //! // await completion of the latch
-//! latch.wait();
+//! latch.await();
 //! // print done, which will appear in the console after all "unlatching" messages
 //! println!("done");
 //! ```
@@ -55,7 +55,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
-/// A CountDownLatch is used to wait for a given number of tasks to be completed, which may be running in multiple threads
+/// A CountDownLatch is used to wait for a given number of tasks to be completed which may be running in multiple threads
 pub struct CountDownLatch {
     remaining: AtomicUsize,
     tx: mpsc::SyncSender<()>,
