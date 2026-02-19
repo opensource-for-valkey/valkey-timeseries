@@ -1,20 +1,18 @@
-use super::aggregations::eval_aggregation;
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
 use crate::promql::binops::eval_binary_expr;
-use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
+use crate::promql::engine::{CachedQueryReader, SeriesQuerier};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
-use crate::promql::functions::{FunctionCallContext, PromQLArg, resolve_function};
-use crate::promql::hashers::PreloadKey;
+use crate::promql::functions::{
+    FunctionCallContext, PromQLArg, eval_aggregation, resolve_function,
+};
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
-use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
-use crate::promql::{
-    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
-};
+use crate::promql::types::{PreloadKey, PreloadedInstantData, PreloadedInstantSeries};
+use crate::promql::{EvalResult, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap};
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParIter;
 use orx_parallel::ParallelizableCollection;
@@ -27,31 +25,25 @@ use promql_parser::parser::{
 };
 use std::sync::RwLock;
 
-pub(crate) struct Evaluator<'reader, R: QueryReader> {
+pub(crate) struct Evaluator<'reader, R: SeriesQuerier> {
     reader: CachedQueryReader<'reader, R>,
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: RwLock<PreloadMap>,
-    options: QueryOptions,
 }
 
-impl<'reader, R: QueryReader> Evaluator<'reader, R> {
-    pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
+impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
+    pub(crate) fn new(reader: &'reader R) -> Self {
         Self {
             reader: CachedQueryReader::new(reader),
             preloaded_instant: RwLock::new(PreloadMap::default()),
-            options,
         }
     }
 
     /// Preload VectorSelector data for all steps of a range query.
     /// Must be called before the step loop. Walks the AST, deduplicates selectors,
     /// and builds dense per-step sample arrays for O(1) per-step lookup.
-    pub(in crate::promql) fn preload_for_range(
-        &self,
-        expr: &Expr,
-        ctx: &EvalContext,
-    ) -> EvalResult<()> {
+    pub(crate) fn preload_for_range(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
         let selectors = collect_vector_selectors(expr);
         // Deduplicate by PreloadKey, then parallelize the loading
         let mut seen = AHashSet::new();
@@ -71,7 +63,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
     /// Convenience wrapper that builds an [`EvalContext`] from a full [`EvalStmt`]
     /// so callers outside the `exec` module don't need to construct it manually.
-    pub(in crate::promql) fn preload_for_range_from_stmt(&self, stmt: &EvalStmt) -> EvalResult<()> {
+    pub(crate) fn preload_for_range_from_stmt(&self, stmt: &EvalStmt) -> EvalResult<()> {
         let ctx = EvalContext::from(stmt);
         self.preload_for_range(&stmt.expr, &ctx)
     }
@@ -103,7 +95,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
 
-        // ── Per-series step-bucketing ─────────────────
+        // ── Per-series step-bucketing — parallelized with rayon ─────────────────
+        // Each series is fully independent: it owns its samples and produces its
+        // own `values` vec. The only shared reads are scalar step parameters
+        // and the cloned time-modifier options above.
         let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
             .into_par()
             .map(|(labels, samples)| {
@@ -161,9 +156,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         earliest_ms: i64,
         latest_ms: i64,
     ) -> EvalResult<Vec<(Labels, Vec<Sample>)>> {
-        let range_samples = self
-            .reader
-            .query_range(vs, earliest_ms, latest_ms, self.options)?;
+        let range_samples = self.reader.query_range(vs, earliest_ms, latest_ms)?;
         Ok(range_samples
             .into_iter()
             .map(|rs| (rs.labels, rs.samples))
@@ -208,9 +201,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             evaluation_ts,
             lookback_delta_ms,
             step_ms: interval_ms,
+            tracing_enabled: false,
         };
 
-        let mut result = self.evaluate_expr(&stmt.expr, &ctx, true)?;
+        let mut result = self.evaluate_expr(&stmt.expr, &ctx)?;
 
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
         if let ExprResult::InstantVector(ref mut samples) = result {
@@ -229,23 +223,22 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &'a self,
         expr: &'a Expr,
         ctx: &'a EvalContext,
-        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
         match expr {
-            Expr::Aggregate(aggregate) => self.evaluate_aggregate(aggregate, ctx, preload_eligible),
-            Expr::Unary(u) => self.evaluate_unary(u, ctx, preload_eligible),
-            Expr::Binary(b) => self.evaluate_binary_expr(b, ctx, preload_eligible),
-            Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx, preload_eligible),
+            Expr::Aggregate(aggregate) => self.evaluate_aggregate(aggregate, ctx),
+            Expr::Unary(u) => self.evaluate_unary(u, ctx),
+            Expr::Binary(b) => self.evaluate_binary_expr(b, ctx),
+            Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx),
             Expr::Subquery(q) => self.evaluate_subquery(q, ctx),
             Expr::NumberLiteral(l) => Ok(ExprResult::Scalar(l.val)),
             Expr::StringLiteral(l) => Ok(ExprResult::String(l.val.clone())),
             Expr::VectorSelector(vector_selector) => {
-                self.evaluate_vector_selector(vector_selector, ctx, preload_eligible)
+                self.evaluate_vector_selector(vector_selector, ctx)
             }
             Expr::MatrixSelector(matrix_selector) => {
                 self.evaluate_matrix_selector(matrix_selector, ctx)
             }
-            Expr::Call(call) => self.evaluate_call(call, ctx, preload_eligible),
+            Expr::Call(call) => self.evaluate_call(call, ctx),
             Expr::Extension(_) => {
                 todo!()
             }
@@ -271,7 +264,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let plan = QueryPlan::for_matrix(adjusted_eval_ts, range.as_millis() as i64);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector)
     }
 
     pub(super) fn evaluate_subquery(
@@ -348,10 +341,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 evaluation_ts: current_time_ms,
                 lookback_delta_ms: ctx.lookback_delta_ms,
                 step_ms,
+                tracing_enabled: ctx.tracing_enabled,
             };
 
-            // Disable preload fast path — subquery has its own step grid/lookback context.
-            let result = self.evaluate_expr(&subquery.expr, &new_ctx, false)?;
+            let result = self.evaluate_expr(&subquery.expr, &new_ctx)?;
 
             // PromQL requires subquery inner expression to evaluate to an instant vector.
             // Enforce this invariant at runtime.
@@ -381,8 +374,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             range_vector.push(EvalSamples {
                 values,
                 labels,
-                range_ms,
-                range_end_ms: subquery_end_ms,
                 drop_name: false,
             });
         }
@@ -409,41 +400,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             step_ms,
             lookback_delta_ms,
         );
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+
+        execute_selector_pipeline(&self.reader, &plan, vector_selector)
     }
 
     pub(super) fn evaluate_vector_selector(
         &self,
         vector_selector: &VectorSelector,
         ctx: &EvalContext,
-        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-        // Fast path: use preloaded data if available (outer range-query context only).
-        // Disabled inside subqueries which have their own step grid/lookback context.
-        if preload_eligible {
-            let preload_key = PreloadKey::from_selector(vector_selector);
-            let guard = self.preloaded_instant.read().unwrap();
-            if let Some(preloaded) = guard.get(&preload_key) {
-                let evaluation_ts = ctx.evaluation_ts;
-                // Step index from raw evaluation_ts (before modifiers) — matches outer step loop
-                let step_idx =
-                    ((evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
-
-                let mut samples = Vec::new();
-                for series in &preloaded.series {
-                    if let Some(Some(sample)) = series.values.get(step_idx) {
-                        samples.push(EvalSample {
-                            timestamp_ms: sample.timestamp,
-                            value: sample.value,
-                            labels: series.labels.clone(), // at some point use EvalLabels to avoid full clone
-                            drop_name: false,
-                        });
-                    }
-                }
-                return Ok(ExprResult::InstantVector(samples));
-            }
-        }
-
         // Apply time modifiers (offset and @)
         let adjusted_eval_ts = self.apply_time_modifiers(
             vector_selector.at.as_ref(),
@@ -455,7 +420,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let plan = QueryPlan::for_instant_vector(adjusted_eval_ts, ctx.lookback_delta_ms);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector)
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
@@ -470,7 +435,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// modifier time. Although PromQL defines the result as order-independent
     /// (e.g. `@ t offset d` == `offset d @ t`), we normalize the implementation
     /// by applying `@` first and then applying `offset`. This keeps the logic
-    /// simple and matches Prometheus' semantics.
+    /// simple and matches Prometheus semantics.
     ///
     /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
     fn apply_time_modifiers(
@@ -490,14 +455,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         call: &Call,
         idx: usize,
         ctx: &EvalContext,
-        preload_eligible: bool,
     ) -> EvalResult<PromQLArg> {
         let (arg, expected_type) = get_function_arg(call, idx)?;
-        let arg_result: PromQLArg = self.evaluate_expr(arg, ctx, preload_eligible)?.into();
+        let arg_result: PromQLArg = self.evaluate_expr(arg, ctx)?.into();
 
         let actual_type = arg_result.value_type();
         if actual_type != expected_type {
-            // maybe this is too strict?
+            // maybe this is too strict ?
             return Err(EvaluationError::ArgumentError(format!(
                 "argument {idx} for function {} expected type {}, got {}",
                 call.func.name, expected_type, actual_type
@@ -507,17 +471,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(arg_result)
     }
 
-    fn evaluate_function_args(
-        &self,
-        call: &Call,
-        ctx: &EvalContext,
-        preload_eligible: bool,
-    ) -> EvalResult<Vec<PromQLArg>> {
+    fn evaluate_function_args(&self, call: &Call, ctx: &EvalContext) -> EvalResult<Vec<PromQLArg>> {
         let args = if should_parallelize_args_evaluation(call) {
             call.args
                 .args
                 .par()
-                .map(|arg| match self.evaluate_expr(arg, ctx, preload_eligible) {
+                .map(|arg| match self.evaluate_expr(arg, ctx) {
                     Ok(arg) => Ok(PromQLArg::from(arg)),
                     Err(err) => Err(err),
                 })
@@ -526,8 +485,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         } else {
             let mut evaluated_args = Vec::with_capacity(call.args.args.len());
             for idx in 0..call.args.args.len() {
-                let arg: PromQLArg =
-                    self.evaluate_function_arg(call, idx, ctx, preload_eligible)?;
+                let arg: PromQLArg = self.evaluate_function_arg(call, idx, ctx)?;
                 evaluated_args.push(arg);
             }
             evaluated_args
@@ -536,15 +494,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(args)
     }
 
-    pub(super) fn evaluate_call(
-        &self,
-        call: &Call,
-        ctx: &EvalContext,
-        preload_eligible: bool,
-    ) -> EvalResult<ExprResult> {
-        let evaluated_args = self.evaluate_function_args(call, ctx, preload_eligible)?;
+    pub(super) fn evaluate_call(&self, call: &Call, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        let evaluated_args = self.evaluate_function_args(call, ctx)?;
 
-        // Build a unified param bag for function dispatch.
+        // Build a unified param bag for function dispatch. This sketch allows a
+        // single dispatch point to forward calls to instant functions or to
+        // range/rollup handlers in the future.
         let eval_timestamp_ms = ctx.evaluation_ts;
 
         let Some(func) = resolve_function(call.func.name) else {
@@ -583,40 +538,27 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(result)
     }
 
-    fn evaluate_binary_expr(
-        &self,
-        expr: &BinaryExpr,
-        ctx: &EvalContext,
-        preload_eligible: bool,
-    ) -> EvalResult<ExprResult> {
+    fn evaluate_binary_expr(&self, expr: &BinaryExpr, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let lhs = expr.lhs.as_ref();
         let rhs = expr.rhs.as_ref();
 
         let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
             join(
-                || self.evaluate_expr(lhs, ctx, preload_eligible),
-                || self.evaluate_expr(rhs, ctx, preload_eligible),
+                || self.evaluate_expr(lhs, ctx),
+                || self.evaluate_expr(rhs, ctx),
             )
         } else {
-            (
-                self.evaluate_expr(lhs, ctx, preload_eligible),
-                self.evaluate_expr(rhs, ctx, preload_eligible),
-            )
+            (self.evaluate_expr(lhs, ctx), self.evaluate_expr(rhs, ctx))
         };
 
         eval_binary_expr(expr, left_result?, right_result?)
     }
 
-    fn evaluate_unary(
-        &self,
-        expr: &UnaryExpr,
-        ctx: &EvalContext,
-        preload_eligible: bool,
-    ) -> EvalResult<ExprResult> {
+    fn evaluate_unary(&self, expr: &UnaryExpr, ctx: &EvalContext) -> EvalResult<ExprResult> {
         if let Expr::NumberLiteral(num) = &*expr.expr {
             return Ok(ExprResult::Scalar(-num.val));
         }
-        let res = self.evaluate_expr(&expr.expr, ctx, preload_eligible)?;
+        let res = self.evaluate_expr(&expr.expr, ctx)?;
         match res {
             ExprResult::Scalar(scalar) => Ok(ExprResult::Scalar(-scalar)),
             ExprResult::InstantVector(mut samples) => {
@@ -641,10 +583,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &self,
         aggregate: &AggregateExpr,
         ctx: &EvalContext,
-        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
         // Evaluate the inner expression to get all samples
-        let result = self.evaluate_expr(&aggregate.expr, ctx, preload_eligible)?;
+        let result = self.evaluate_expr(&aggregate.expr, ctx)?;
 
         // Extract samples from the result
         let samples = match result {
@@ -669,7 +610,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let param = if let Some(p) = &aggregate.param {
-            Some(self.evaluate_expr(p, ctx, preload_eligible)?)
+            Some(self.evaluate_expr(p, ctx)?)
         } else {
             None
         };
@@ -682,30 +623,16 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 }
 
 fn get_function_arg(call: &Call, idx: usize) -> EvalResult<(&Expr, ValueType)> {
-    // Ensure the requested argument index exists in the provided call arguments.
-    if idx >= call.args.args.len() {
-        return Err(EvaluationError::InternalError(format!(
-            "argument {idx} is out of bounds for call to function {}",
-            call.func.name
-        )));
-    }
-
-    // Determine the expected type for this argument according to the function
-    // declaration. Use the explicit type if available; if the function is
-    // variadic, use the last declared type for additional arguments. If
-    // neither applies, return an error rather than indexing out of bounds.
-    let expected_type = if idx < call.func.arg_types.len() {
+    let expected_type = if idx < call.args.args.len() {
         call.func.arg_types[idx]
     } else if call.func.variadic != 0 && !call.func.arg_types.is_empty() {
-        // Safe: last() returns Some because we checked !is_empty()
-        *call.func.arg_types.last().unwrap()
+        call.func.arg_types[call.func.arg_types.len() - 1]
     } else {
         return Err(EvaluationError::InternalError(format!(
             "argument {idx} is out of bounds for function {}",
             call.func.name
         )));
     };
-
     let arg = &call.args.args[idx];
     Ok((arg, expected_type))
 }

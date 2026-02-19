@@ -7,14 +7,12 @@ use crate::promql::generated::{
     series_selector::Matchers as ProtoMatchers,
 };
 use promql_parser::label::Matchers;
-use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
 
 pub struct QueryFanoutCommand {
     matchers: Matchers,
     timestamp: i64,
     results: Vec<InstantSample>,
-    timeout: Duration,
 }
 
 impl Default for QueryFanoutCommand {
@@ -27,17 +25,15 @@ impl Default for QueryFanoutCommand {
             matchers,
             timestamp: 0,
             results: vec![],
-            timeout: crate::fanout::get_cluster_command_timeout(),
         }
     }
 }
 impl QueryFanoutCommand {
-    pub fn new(matchers: Matchers, timestamp: Timestamp, timeout: Duration) -> Self {
+    pub fn new(matchers: Matchers, timestamp: Timestamp) -> Self {
         Self {
             matchers,
             timestamp,
             results: vec![],
-            timeout,
         }
     }
 }
@@ -47,7 +43,7 @@ impl FanoutCommand for QueryFanoutCommand {
     type Response = InstantQueryResponse;
 
     fn name() -> &'static str {
-        "query"
+        "instant-query"
     }
 
     fn get_local_response(ctx: &Context, req: InstantQuery) -> ValkeyResult<InstantQueryResponse> {
@@ -58,10 +54,6 @@ impl FanoutCommand for QueryFanoutCommand {
         let series_selector: SeriesSelector = selector.try_into()?;
         let timestamp = req.start_time;
         handle_instant_query(ctx, series_selector, timestamp)
-    }
-
-    fn get_timeout(&self) -> Duration {
-        self.timeout
     }
 
     fn generate_request(&self) -> InstantQuery {

@@ -84,6 +84,12 @@ pub trait FanoutCommand: Default + Send + 'static {
         Self::Response::default()
     }
 
+    /// Return the final response after the fanout operation is complete.
+    /// By default, it returns a default instance of the response type.
+    fn get_response(self) -> Self::Response {
+        Self::Response::default()
+    }
+
     fn generate_error_reply(&self) -> FanoutError {
         FanoutError::custom(format!(
             "Internal error in fanout operation '{}'",

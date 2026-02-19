@@ -26,6 +26,11 @@ pub struct PromqlConfig {
     /// The maximum query length in bytes
     pub max_query_len: usize,
 
+    /// The maximum amount of memory a single query may consume. Queries requiring more memory are
+    /// rejected. The total memory limit for concurrently executed queries can be estimated as
+    /// `max_memory_per_query` multiplied by -provider.maxConcurrentQueries
+    pub max_memory_per_query: usize,
+
     /// The maximum number of points per series that a subquery can generate.
     pub max_points_subquery_per_timeseries: usize,
 
@@ -37,6 +42,7 @@ pub struct PromqlConfig {
     pub lookback_delta: Duration,
 
     /// Synonym to `-provider.lookback-delta` from Prometheus.
+    /// The value is dynamically detected from the interval between time series data-points if not set.
     /// It can be overridden on a per-query basis via max_lookback arg.
     /// See also the `max_staleness_interval` flag, which has the same meaning due to historical reasons
     pub max_lookback: Duration,
@@ -78,6 +84,7 @@ impl Default for PromqlConfig {
             trace_enabled: false,
             lookback_delta: Duration::from_millis(DEFAULT_LOOKBACK_DELTA_MS),
             max_query_len: DEFAULT_MAX_QUERY_LEN,
+            max_memory_per_query: 0,
             max_points_subquery_per_timeseries: 0,
             max_response_series: DEFAULT_MAX_UNIQUE_TIMESERIES,
             max_lookback: Duration::ZERO,
