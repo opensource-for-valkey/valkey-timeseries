@@ -11,13 +11,13 @@ where ``<type>`` is one of ``"vector"``, ``"matrix"``, ``"scalar"``, or
 +-------------+----------------------------------------------------------------+
 | resultType  | result shape                                                   |
 +=============+================================================================+
-| vector      | list of { metric: {label→value}, value: [timestamp, float] }|
+| vector      | list of { metric: {label→value}, value: [timestamp_ms, float] }|
 +-------------+----------------------------------------------------------------+
 | matrix      | list of { metric: {label→value}, value: [[ts_ms, float], ...] }|
 +-------------+----------------------------------------------------------------+
-| scalar      | [timestamp, float]                                          |
+| scalar      | [timestamp_ms, float]                                          |
 +-------------+----------------------------------------------------------------+
-| string      | [timestamp, str]                                            |
+| string      | [timestamp_ms, str]                                            |
 +-------------+----------------------------------------------------------------+
 
 The ``from_raw`` constructors on every class accept the value returned directly
@@ -85,22 +85,22 @@ def _get(d: dict, *keys):
 @dataclass
 class QuerySample:
     """
-    A single ``(timestamp, value)`` data point.
+    A single ``(timestamp_ms, value)`` data point.
 
-    ``timestamp`` is the Unix timestamp in **milliseconds** as returned by
+    ``timestamp_ms`` is the Unix timestamp in **milliseconds** as returned by
     the server.  ``value`` is a ``float``.
     """
 
-    timestamp: int
+    timestamp_ms: int
     value: float
 
     @classmethod
     def from_raw(cls, raw) -> "QuerySample":
-        """Parse from a 2-element sequence ``[timestamp, value]``."""
-        return cls(timestamp=int(raw[0]), value=float(raw[1]))
+        """Parse from a 2-element sequence ``[timestamp_ms, value]``."""
+        return cls(timestamp_ms=int(raw[0]), value=float(raw[1]))
 
     def __repr__(self) -> str:
-        return f"QuerySample(timestamp={self.timestamp}, value={self.value!r})"
+        return f"QuerySample(timestamp_ms={self.timestamp_ms}, value={self.value!r})"
 
 
 @dataclass
@@ -112,7 +112,7 @@ class VectorSample:
 
         {
             "metric": { "__name__": "up", "job": "api", ... },
-            "value":  [ timestamp, float ]
+            "value":  [ timestamp_ms, float ]
         }
     """
 
@@ -151,7 +151,7 @@ class MatrixSample:
 
         {
             "metric": { "__name__": "up", "job": "api", ... },
-            "value":  [ [timestamp, float], ... ]
+            "value":  [ [timestamp_ms, float], ... ]
         }
     """
 
@@ -188,19 +188,19 @@ class ScalarResult:
 
     Corresponds to::
 
-        [ timestamp, float ]
+        [ timestamp_ms, float ]
     """
 
-    timestamp: int
+    timestamp_ms: int
     value: float
 
     @classmethod
     def from_raw(cls, raw) -> "ScalarResult":
-        """Parse from a 2-element sequence ``[timestamp, value]``."""
-        return cls(timestamp=int(raw[0]), value=float(raw[1]))
+        """Parse from a 2-element sequence ``[timestamp_ms, value]``."""
+        return cls(timestamp_ms=int(raw[0]), value=float(raw[1]))
 
     def __repr__(self) -> str:
-        return f"ScalarResult(timestamp={self.timestamp}, value={self.value!r})"
+        return f"ScalarResult(timestamp_ms={self.timestamp_ms}, value={self.value!r})"
 
 
 @dataclass
@@ -210,19 +210,19 @@ class StringResult:
 
     Corresponds to::
 
-        [ timestamp, str ]
+        [ timestamp_ms, str ]
     """
 
-    timestamp: int
+    timestamp_ms: int
     value: str
 
     @classmethod
     def from_raw(cls, raw) -> "StringResult":
-        """Parse from a 2-element sequence ``[timestamp, string_value]``."""
-        return cls(timestamp=int(raw[0]), value=_decode(raw[1]))
+        """Parse from a 2-element sequence ``[timestamp_ms, string_value]``."""
+        return cls(timestamp_ms=int(raw[0]), value=_decode(raw[1]))
 
     def __repr__(self) -> str:
-        return f"StringResult(timestamp={self.timestamp}, value={self.value!r})"
+        return f"StringResult(timestamp_ms={self.timestamp_ms}, value={self.value!r})"
 
 
 # Union alias used as the type of ``QueryResult.result``.
@@ -257,11 +257,11 @@ class QueryResult:
 
         if qr.is_vector():
             for series in qr.result:
-                print(series.name, series.value.timestamp, series.value.value)
+                print(series.name, series.value.timestamp_ms, series.value.value)
         elif qr.is_matrix():
             for series in qr.result:
                 for pt in series.values:
-                    print(series.name, pt.timestamp, pt.value)
+                    print(series.name, pt.timestamp_ms, pt.value)
         elif qr.is_scalar():
             print(qr.result.value)
         elif qr.is_string():

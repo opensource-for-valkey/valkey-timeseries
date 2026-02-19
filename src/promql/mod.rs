@@ -16,9 +16,6 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/valkey_timeseries.promql.rs"));
 }
 
-// Re-export commonly used types from submodules for public API convenience.
-pub use engine::QueryOptions;
-
 use crate::promql::engine::register_fanout_commands;
 pub use error::*;
 pub use exec::*;
