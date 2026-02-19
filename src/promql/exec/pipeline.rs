@@ -4,24 +4,21 @@
 //! subquery vector-selector fast path) share the same logical execution model:
 //!
 //! 1. **Plan** – compute concrete time bounds, bucket list, path-specific parameters
-//! 2. **LoadSamples** – load sample data for explicit (bucket, series) work items
-//! 3. **ShapeSamples** – merge/filter/dedup into evaluator-ready per-series structures
-//! 4. **Evaluate** – run PromQL expression semantics on prepared in-memory inputs
+//! 2. **ResolveMetadata** – run selector, load forward index per bucket
+//! 3. **LoadSamples** – load sample data for explicit (bucket, series) work items
+//! 4. **ShapeSamples** – merge/filter/dedup into evaluator-ready per-series structures
+//! 5. **Evaluate** – run PromQL expression semantics on prepared in-memory inputs
 //!
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
-use crate::promql::engine::{CachedQueryReader, QueryReader};
-use crate::promql::hashers::{FingerprintHashMap, HasFingerprint, SeriesFingerprint};
-use crate::promql::{
-    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
-};
+use crate::promql::engine::{CachedQueryReader, SeriesQuerier};
+use crate::promql::hashers::{FingerprintHashMap, SeriesFingerprint};
+use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels};
 use ahash::{AHashMap, AHashSet};
-use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::parser::VectorSelector;
 use std::time::Instant;
-
 // ---------------------------------------------------------------------------
 // Phase artifact types
 // ---------------------------------------------------------------------------
@@ -34,7 +31,6 @@ pub(crate) enum QueryPathKind {
     Matrix,
     /// Subquery vector-selector fast path. Merge, sort/dedup, step-bucket.
     SubqueryVectorSelector {
-        range_ms: i64,
         aligned_start_ms: i64,
         step_ms: i64,
         lookback_delta_ms: i64,
@@ -69,11 +65,7 @@ impl QueryPlan {
             QueryPathKind::InstantVector { .. } => {
                 ExprResult::InstantVector(shape_instant_results(all_bucket_data))
             }
-            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(
-                all_bucket_data,
-                self.sample_end_ms - self.sample_start_ms,
-                self.sample_end_ms,
-            )),
+            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(all_bucket_data)),
             QueryPathKind::SubqueryVectorSelector { .. } => {
                 ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self))
             }
@@ -142,13 +134,10 @@ impl QueryPlan {
                 step_ms,
                 lookback_delta_ms,
             );
-
-        let range_ms = subquery_end_ms - subquery_start_ms;
         QueryPlan {
             sample_start_ms: range_start_ms,
             sample_end_ms: range_end_ms,
             path_kind: QueryPathKind::SubqueryVectorSelector {
-                range_ms,
                 aligned_start_ms,
                 step_ms,
                 lookback_delta_ms,
@@ -222,11 +211,7 @@ pub(crate) fn shape_instant_results(series_data: Vec<LoadedSeriesSamples>) -> Ve
 ///
 /// Merges all samples per series (keyed by sorted label vector) across all
 /// buckets. Bucket data should be in chronological order.
-pub(crate) fn shape_matrix_results(
-    series_data: Vec<LoadedSeriesSamples>,
-    range_ms: i64,
-    range_end_ms: i64,
-) -> Vec<EvalSamples> {
+pub(crate) fn shape_matrix_results(series_data: Vec<LoadedSeriesSamples>) -> Vec<EvalSamples> {
     let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
 
     for series in series_data {
@@ -242,8 +227,6 @@ pub(crate) fn shape_matrix_results(
         .map(|(labels, values)| EvalSamples {
             values,
             labels,
-            range_ms,
-            range_end_ms,
             drop_name: false,
         })
         .collect()
@@ -257,79 +240,72 @@ pub(crate) fn shape_subquery_results(
     series_data: Vec<LoadedSeriesSamples>,
     plan: &QueryPlan,
 ) -> Vec<EvalSamples> {
-    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
-        match &plan.path_kind {
-            QueryPathKind::SubqueryVectorSelector {
-                range_ms,
-                aligned_start_ms,
-                step_ms,
-                lookback_delta_ms,
-                expected_steps,
-            } => (
-                *range_ms,
-                *aligned_start_ms,
-                *step_ms,
-                *lookback_delta_ms,
-                *expected_steps,
-            ),
-            _ => return Vec::new(),
-        };
+    let (aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) = match &plan.path_kind {
+        QueryPathKind::SubqueryVectorSelector {
+            aligned_start_ms,
+            step_ms,
+            lookback_delta_ms,
+            expected_steps,
+        } => (
+            *aligned_start_ms,
+            *step_ms,
+            *lookback_delta_ms,
+            *expected_steps,
+        ),
+        _ => return Vec::new(),
+    };
 
     // Merge by fingerprint
     let mut merged: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
 
-    for series in series_data {
+    for series in &series_data {
         let entry = merged
             .entry(series.fingerprint)
-            .or_insert_with(|| (series.labels, Vec::new()));
-        entry.1.extend(series.samples);
+            .or_insert_with(|| (series.labels.clone(), Vec::new()));
+        entry.1.extend(series.samples.iter().cloned());
     }
 
+    // Sort and dedup
+    for (_, samples) in merged.values_mut() {
+        samples.sort_by_key(|s| s.timestamp);
+        samples.dedup_by_key(|s| s.timestamp);
+    }
+
+    // Step-bucketing with sliding window
     let subquery_end_ms = plan.sample_end_ms;
+    let mut range_vector = Vec::with_capacity(merged.len());
 
-    let range_vector: Vec<EvalSamples> = merged
-        .into_iter()
-        .iter_into_par()
-        .filter_map(|(_fp, (labels, mut samples))| {
-            // Sort and dedup
-            samples.sort_by_key(|s| s.timestamp);
-            samples.dedup_by_key(|s| s.timestamp);
+    for (_, (labels, samples)) in merged {
+        let mut step_samples = Vec::with_capacity(expected_steps);
+        let mut i = 0usize;
+        let mut last_valid: Option<&Sample> = None;
 
-            let mut step_samples = Vec::with_capacity(expected_steps);
-            let mut i = 0usize;
-            let mut last_valid: Option<&Sample> = None;
+        for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
+            let lookback_start_ms = current_step_ms - lookback_delta_ms;
 
-            for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-                let lookback_start_ms = current_step_ms - lookback_delta_ms;
-
-                while i < samples.len() && samples[i].timestamp <= current_step_ms {
-                    last_valid = Some(&samples[i]);
-                    i += 1;
-                }
-
-                if let Some(sample) = last_valid
-                    && sample.timestamp > lookback_start_ms
-                {
-                    step_samples.push(Sample {
-                        timestamp: current_step_ms,
-                        value: sample.value,
-                    });
-                }
+            while i < samples.len() && samples[i].timestamp <= current_step_ms {
+                last_valid = Some(&samples[i]);
+                i += 1;
             }
 
-            if step_samples.is_empty() {
-                None
-            } else {
-                Some(EvalSamples {
-                    values: step_samples,
-                    labels,
-                    range_ms,
-                    range_end_ms: subquery_end_ms,
-                    drop_name: false,
-                })
+            if let Some(sample) = last_valid
+                && sample.timestamp > lookback_start_ms
+            {
+                step_samples.push(Sample {
+                    timestamp: current_step_ms,
+                    value: sample.value,
+                });
             }
-        })
-        .collect();
+        }
+
+        if !step_samples.is_empty() {
+            range_vector.push(EvalSamples {
+                values: step_samples,
+                labels,
+                drop_name: false,
+            });
+        }
+    }
 
     range_vector
 }
@@ -351,11 +327,10 @@ pub(crate) struct PipelineTimings {
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
 /// Branching on `QueryPathKind` handles the behavioral differences between
 /// instant vector selectors, matrix selectors, and subquery fast paths.
-pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
+pub(crate) fn execute_selector_pipeline<'reader, R: SeriesQuerier>(
     reader: &CachedQueryReader<'reader, R>,
     plan: &QueryPlan,
     selector: &VectorSelector,
-    options: QueryOptions,
 ) -> EvalResult<ExprResult> {
     let mut timings = PipelineTimings::default();
 
@@ -370,7 +345,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
 
     let series_data = reader
-        .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
+        .query_range(selector, query_start_inclusive, plan.sample_end_ms)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
         .into_iter()
         .map(|s| {
@@ -410,9 +385,16 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
 /// and hashes them. Two label sets that are logically identical will produce the
 /// same fingerprint regardless of the order they are stored in.
 pub(crate) fn compute_fingerprint(labels: &[Label]) -> SeriesFingerprint {
-    let mut to_hash = labels.to_vec();
-    to_hash.sort();
-    to_hash.fingerprint()
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut sorted_labels: Vec<_> = labels.iter().collect();
+    sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
+    for label in sorted_labels {
+        label.name.hash(&mut hasher);
+        hasher.write_u8(0xfe);
+        label.value.hash(&mut hasher);
+    }
+    hasher.finish() as SeriesFingerprint
 }
 
 #[cfg(test)]
@@ -459,13 +441,11 @@ mod tests {
         let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
-                range_ms,
                 aligned_start_ms,
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
             } => {
-                assert_eq!(*range_ms, 40);
                 assert_eq!(*aligned_start_ms, 20);
                 assert_eq!(*step_ms, 10);
                 assert_eq!(*lookback_delta_ms, 20);
@@ -560,7 +540,7 @@ mod tests {
             make_loaded(fp, labels_a, vec![sample(30, 3.0)]),
         ];
 
-        let results = shape_matrix_results(bucket_data, 100_000_000, 100_000_000);
+        let results = shape_matrix_results(bucket_data);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].values.len(), 3);
     }
@@ -582,7 +562,6 @@ mod tests {
             sample_start_ms: -5,
             sample_end_ms: 30,
             path_kind: QueryPathKind::SubqueryVectorSelector {
-                range_ms: 30,
                 aligned_start_ms: 10,
                 step_ms: 10,
                 lookback_delta_ms: 10,
@@ -624,7 +603,6 @@ mod tests {
             sample_start_ms: 0,
             sample_end_ms: 20,
             path_kind: QueryPathKind::SubqueryVectorSelector {
-                range_ms: 20,
                 aligned_start_ms: 10,
                 step_ms: 10,
                 lookback_delta_ms: 10,

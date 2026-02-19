@@ -27,6 +27,9 @@ pub(super) fn handle_instant_query(
         })
         .iter_into_par()
         .filter_map(|(s, key)| {
+            if s.is_empty() {
+                return None;
+            }
             match s.get_sample(timestamp) {
                 Ok(Some(sample)) => {
                     let labels: Vec<crate::promql::generated::Label> = s
@@ -65,6 +68,9 @@ pub(super) fn handle_range_query(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
+            if s.is_empty() {
+                return None;
+            }
             let series_samples = s.get_range(start_time, end_time);
             if series_samples.is_empty() {
                 return None;

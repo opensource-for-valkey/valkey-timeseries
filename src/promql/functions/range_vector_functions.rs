@@ -43,6 +43,55 @@ where
     ExprResult::InstantVector(vec)
 }
 
+/// Rate function: calculates per-second rate of change for range vectors
+#[derive(Copy, Clone)]
+pub(in crate::promql) struct RateFunction;
+
+impl PromQLFunction for RateFunction {
+    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        // TODO(rohan): handle counter-resets
+        // TODO(rohan): implement extrapolation
+        let samples = arg.into_range_vector()?;
+        let mut result = Vec::with_capacity(samples.len());
+
+        for sample_series in samples {
+            if sample_series.values.len() < 2 {
+                continue;
+            }
+
+            let first = &sample_series.values[0];
+            let last = &sample_series.values[sample_series.values.len() - 1];
+
+            let time_diff_seconds = (last.timestamp - first.timestamp) as f64 / 1000.0;
+
+            if time_diff_seconds <= 0.0 {
+                continue;
+            }
+
+            let value_diff = last.value - first.value;
+
+            let rate = value_diff / time_diff_seconds;
+
+            let rate = if rate < 0.0 { 0.0 } else { rate };
+
+            result.push(EvalSample {
+                timestamp_ms: eval_timestamp_ms,
+                value: rate,
+                labels: sample_series.labels,
+                drop_name: sample_series.drop_name,
+            });
+        }
+
+        Ok(ExprResult::InstantVector(result))
+    }
+}
+
+impl Default for RateFunction {
+    fn default() -> Self {
+        RateFunction
+    }
+}
+
 /// Sum over time function: sums all sample values in the range
 /// Uses Kahan summation for numerical stability
 /// TODO: Add histogram support when histogram types are implemented
@@ -102,7 +151,7 @@ fn get_min_sample(values: &[Sample]) -> Sample {
     // this is called in context of aggr_over_time, which ensures values is non-empty,
     // so we can safely access values[0]
     let mut min = values[0];
-    let mut min_val = min.value;
+    let mut min_val = f64::INFINITY;
 
     for sample in values.iter().skip(1) {
         let cur = sample.value;

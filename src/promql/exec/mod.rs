@@ -1,6 +1,8 @@
 mod evaluator;
+pub(crate) mod labels;
 mod pipeline;
 mod selector;
+mod top_k;
 pub mod types;
 mod utils;
 

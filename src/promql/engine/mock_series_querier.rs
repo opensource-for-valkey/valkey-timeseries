@@ -2,10 +2,10 @@ use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, MetricName};
-use crate::promql::engine::QueryReader;
+use crate::promql::engine::SeriesQuerier;
 use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::model::InstantSample;
-use crate::promql::{Labels, PromqlResult, QueryError, QueryOptions, RangeSample};
+use crate::promql::{Labels, PromqlResult, QueryError, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
@@ -36,18 +36,12 @@ impl Default for QuerierInner {
 
 /// A mock QueryReader for testing that holds data in memory.
 /// Use `MockQueryReaderBuilder` to construct instances.
-pub struct MockSeriesQuerier {
+pub(crate) struct MockSeriesQuerier {
     inner: RwLock<QuerierInner>,
 }
 
-impl Default for MockSeriesQuerier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MockSeriesQuerier {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RwLock::new(QuerierInner::default()),
         }
@@ -55,7 +49,7 @@ impl MockSeriesQuerier {
 
     /// Add a sample with labels. If a series with the same labels already exists globally,
     /// the existing series ID is reused. Otherwise, a new series is created with a global ID.
-    pub fn add_sample(&self, labels: &Labels, sample: Sample) {
+    pub(crate) fn add_sample(&self, labels: &Labels, sample: Sample) {
         let mut inner = self.inner.write().unwrap();
         let fingerprint = labels.get_fingerprint();
 
@@ -133,16 +127,8 @@ impl MockSeriesQuerier {
     }
 }
 
-impl QueryReader for MockSeriesQuerier {
-    fn query(
-        &self,
-        selector: &VectorSelector,
-        timestamp: i64,
-        _options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
-        // Mock querier ignores the deadline for now (cooperative cancellation could be
-        // implemented in tests by checking `_deadline`), and behaves like the
-        // original implementation.
+impl SeriesQuerier for MockSeriesQuerier {
+    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>> {
         self.select_series(selector, |ts| {
             let labels: Vec<Label> = metric_name_to_labels(&ts.labels);
             let Some(sample) = ts.get_sample(timestamp)? else {
@@ -161,9 +147,7 @@ impl QueryReader for MockSeriesQuerier {
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
-        _options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
-        // As with `query`, this mock ignores the deadline and returns the full range.
         self.select_series(selector, |ts| {
             let labels: Labels = (&ts.labels).into();
             let samples = ts
