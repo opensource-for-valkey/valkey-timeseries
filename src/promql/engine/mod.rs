@@ -167,7 +167,3 @@ impl SeriesQuerier for ConcreteSeriesQuerier {
         }
     }
 }
-
-pub(crate) fn create_series_queries() {
-    todo!()
-}
