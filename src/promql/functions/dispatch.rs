@@ -145,84 +145,9 @@ pub(in crate::promql) enum PromQLFunctionImpl {
 
 impl std::fmt::Debug for PromQLFunctionImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use PromQLFunctionImpl::*;
-        let name = match self {
-            Abs(_) => "Abs",
-            Acos(_) => "Acos",
-            Acosh(_) => "Acosh",
-            Asin(_) => "Asin",
-            Asinh(_) => "Asinh",
-            Atan(_) => "Atan",
-            Atanh(_) => "Atanh",
-            Clamp(_) => "Clamp",
-            ClampMax(_) => "ClampMax",
-            ClampMin(_) => "ClampMin",
-            Ceil(_) => "Ceil",
-            Cos(_) => "Cos",
-            Cosh(_) => "Cosh",
-            Deg(_) => "Deg",
-            Exp(_) => "Exp",
-            Floor(_) => "Floor",
-            Ln(_) => "Ln",
-            Log10(_) => "Log10",
-            Log2(_) => "Log2",
-            Pi(_) => "Pi",
-            Rad(_) => "Rad",
-            Round(_) => "Round",
-            Sgn(_) => "Sgn",
-            Sin(_) => "Sin",
-            Sinh(_) => "Sinh",
-            Sqrt(_) => "Sqrt",
-            Tan(_) => "Tan",
-            Tanh(_) => "Tanh",
-            DayOfMonth(_) => "DayOfMonth",
-            DayOfWeek(_) => "DayOfWeek",
-            DayOfYear(_) => "DayOfYear",
-            DaysInMonth(_) => "DaysInMonth",
-            Hour(_) => "Hour",
-            Minute(_) => "Minute",
-            Month(_) => "Month",
-            Year(_) => "Year",
-            Timestamp(_) => "Timestamp",
-            Time(_) => "Time",
-            Absent(_) => "Absent",
-            Scalar(_) => "Scalar",
-            Vector(_) => "Vector",
-            HistogramQuantile(_) => "HistogramQuantile",
-            HistogramFraction(_) => "HistogramFraction",
-            AbsentOverTime(_) => "AbsentOverTime",
-            AvgOverTime(_) => "AvgOverTime",
-            Changes(_) => "Changes",
-            CountOverTime(_) => "CountOverTime",
-            Delta(_) => "Delta",
-            Deriv(_) => "Deriv",
-            DoubleExponentialSmoothing(_) => "DoubleExponentialSmoothing",
-            FirstOverTime(_) => "FirstOverTime",
-            IRate(_) => "IRate",
-            LastOverTime(_) => "LastOverTime",
-            MadOverTime(_) => "MadOverTime",
-            MaxOverTime(_) => "MaxOverTime",
-            MinOverTime(_) => "MinOverTime",
-            PredictLinear(_) => "PredictLinear",
-            PresentOverTime(_) => "PresentOverTime",
-            QuantileOverTime(_) => "QuantileOverTime",
-            Rate(_) => "Rate",
-            Resets(_) => "Resets",
-            StddevOverTime(_) => "StddevOverTime",
-            StdvarOverTime(_) => "StdvarOverTime",
-            SumOverTime(_) => "SumOverTime",
-            TFirstOverTime(_) => "TFirstOverTime",
-            TLastOverTime(_) => "TLastOverTime",
-            TsOfMaxOverTime(_) => "TsOfMaxOverTime",
-            TsOfMinOverTime(_) => "TsOfMinOverTime",
-            LabelJoin(_) => "LabelJoin",
-            LabelReplace(_) => "LabelReplace",
-            Sort(_) => "Sort",
-            SortDesc(_) => "SortDesc",
-            SortByLabel(_) => "SortByLabel",
-            SortByLabelDesc(_) => "SortByLabelDesc",
-        };
-        write!(f, "{}", name)
+        // Delegate to the `PromqlFunctionKind` mapping so the debug
+        // representation stays in sync with the function kind.
+        write!(f, "{:?}", self.kind())
     }
 }
 
@@ -335,6 +260,101 @@ impl PromQLFunctionImpl {
                 return None;
             }
         })
+    }
+
+    /// Returns the corresponding [`PromqlFunctionKind`] for this implementation
+    /// variant.
+    pub(crate) fn kind(&self) -> PromqlFunctionKind {
+        use PromQLFunctionImpl::*;
+        match self {
+            // Math
+            Abs(_) => PromqlFunctionKind::Abs,
+            Acos(_) => PromqlFunctionKind::Acos,
+            Acosh(_) => PromqlFunctionKind::Acosh,
+            Asin(_) => PromqlFunctionKind::Asin,
+            Asinh(_) => PromqlFunctionKind::Asinh,
+            Atan(_) => PromqlFunctionKind::Atan,
+            Atanh(_) => PromqlFunctionKind::Atanh,
+            Clamp(_) => PromqlFunctionKind::Clamp,
+            ClampMax(_) => PromqlFunctionKind::ClampMax,
+            ClampMin(_) => PromqlFunctionKind::ClampMin,
+            Ceil(_) => PromqlFunctionKind::Ceil,
+            Cos(_) => PromqlFunctionKind::Cos,
+            Cosh(_) => PromqlFunctionKind::Cosh,
+            Deg(_) => PromqlFunctionKind::Deg,
+            Exp(_) => PromqlFunctionKind::Exp,
+            Floor(_) => PromqlFunctionKind::Floor,
+            Ln(_) => PromqlFunctionKind::Ln,
+            Log10(_) => PromqlFunctionKind::Log10,
+            Log2(_) => PromqlFunctionKind::Log2,
+            Pi(_) => PromqlFunctionKind::Pi,
+            Rad(_) => PromqlFunctionKind::Rad,
+            Round(_) => PromqlFunctionKind::Round,
+            Sgn(_) => PromqlFunctionKind::Sgn,
+            Sin(_) => PromqlFunctionKind::Sin,
+            Sinh(_) => PromqlFunctionKind::Sinh,
+            Sqrt(_) => PromqlFunctionKind::Sqrt,
+            Tan(_) => PromqlFunctionKind::Tan,
+            Tanh(_) => PromqlFunctionKind::Tanh,
+
+            // Date/time
+            DayOfMonth(_) => PromqlFunctionKind::DayOfMonth,
+            DayOfWeek(_) => PromqlFunctionKind::DayOfWeek,
+            DayOfYear(_) => PromqlFunctionKind::DayOfYear,
+            DaysInMonth(_) => PromqlFunctionKind::DaysInMonth,
+            Hour(_) => PromqlFunctionKind::Hour,
+            Minute(_) => PromqlFunctionKind::Minute,
+            Month(_) => PromqlFunctionKind::Month,
+            Year(_) => PromqlFunctionKind::Year,
+            Timestamp(_) => PromqlFunctionKind::Timestamp,
+            Time(_) => PromqlFunctionKind::Time,
+
+            // Special
+            Absent(_) => PromqlFunctionKind::Absent,
+            Scalar(_) => PromqlFunctionKind::Scalar,
+            Vector(_) => PromqlFunctionKind::Vector,
+
+            // Histogram
+            HistogramQuantile(_) => PromqlFunctionKind::HistogramQuantile,
+            HistogramFraction(_) => PromqlFunctionKind::HistogramFraction,
+
+            // Range-vector
+            AbsentOverTime(_) => PromqlFunctionKind::AbsentOverTime,
+            AvgOverTime(_) => PromqlFunctionKind::AvgOverTime,
+            Changes(_) => PromqlFunctionKind::Changes,
+            CountOverTime(_) => PromqlFunctionKind::CountOverTime,
+            Delta(_) => PromqlFunctionKind::Delta,
+            Deriv(_) => PromqlFunctionKind::Deriv,
+            DoubleExponentialSmoothing(_) => PromqlFunctionKind::DoubleExponentialSmoothing,
+            FirstOverTime(_) => PromqlFunctionKind::FirstOverTime,
+            IRate(_) => PromqlFunctionKind::IRate,
+            LastOverTime(_) => PromqlFunctionKind::LastOverTime,
+            MadOverTime(_) => PromqlFunctionKind::MadOverTime,
+            MaxOverTime(_) => PromqlFunctionKind::MaxOverTime,
+            MinOverTime(_) => PromqlFunctionKind::MinOverTime,
+            PredictLinear(_) => PromqlFunctionKind::PredictLinear,
+            PresentOverTime(_) => PromqlFunctionKind::PresentOverTime,
+            QuantileOverTime(_) => PromqlFunctionKind::QuantileOverTime,
+            Rate(_) => PromqlFunctionKind::Rate,
+            Resets(_) => PromqlFunctionKind::Resets,
+            StddevOverTime(_) => PromqlFunctionKind::StddevOverTime,
+            StdvarOverTime(_) => PromqlFunctionKind::StdvarOverTime,
+            SumOverTime(_) => PromqlFunctionKind::SumOverTime,
+            TFirstOverTime(_) => PromqlFunctionKind::TFirstOverTime,
+            TLastOverTime(_) => PromqlFunctionKind::TLastOverTime,
+            TsOfMaxOverTime(_) => PromqlFunctionKind::TSOfMaxOverTime,
+            TsOfMinOverTime(_) => PromqlFunctionKind::TSOfMinOverTime,
+
+            // Label helpers
+            LabelJoin(_) => PromqlFunctionKind::LabelJoin,
+            LabelReplace(_) => PromqlFunctionKind::LabelReplace,
+
+            // Sort helpers
+            Sort(_) => PromqlFunctionKind::Sort,
+            SortDesc(_) => PromqlFunctionKind::SortDesc,
+            SortByLabel(_) => PromqlFunctionKind::SortByLabel,
+            SortByLabelDesc(_) => PromqlFunctionKind::SortByLabelDesc,
+        }
     }
 }
 
