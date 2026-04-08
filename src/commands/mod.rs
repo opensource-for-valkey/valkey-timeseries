@@ -1,6 +1,7 @@
 pub mod command_parser;
 mod fanout_codec;
 mod label_search_utils;
+mod promql_utils;
 mod ts_add;
 mod ts_addbulk;
 mod ts_alter;
@@ -35,6 +36,8 @@ mod ts_queryindex;
 mod ts_queryindex_fanout_command;
 mod ts_range;
 mod utils;
+mod ts_queryrange;
+mod ts_query;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
 // each `ts_*_cmd` function (see the individual `ts_*` modules), so they no longer need to be
