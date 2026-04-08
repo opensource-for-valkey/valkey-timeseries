@@ -5,11 +5,7 @@ use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels}
 use ahash::AHasher;
 use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
 use promql_parser::parser::AggregateExpr;
-use promql_parser::parser::token::TokenType;
-use promql_parser::parser::token::{
-    T_AVG, T_BOTTOMK, T_COUNT, T_COUNT_VALUES, T_GROUP, T_LIMIT_RATIO, T_LIMITK, T_MAX, T_MIN,
-    T_QUANTILE, T_STDDEV, T_STDVAR, T_SUM, T_TOPK,
-};
+use promql_parser::parser::token::{TokenType, *};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -150,18 +146,23 @@ fn eval_quantile(
             "quantile must be between 0.0 and 1.0".to_string(),
         ));
     }
-    // todo: parallelize
-    let groups = group_samples(expr, samples);
-    let mut out = Vec::new();
-    for (_, (labels, samples)) in groups {
-        let value = sample_quantile(&samples, phi);
-        out.push(EvalSample {
-            labels,
-            timestamp_ms: eval_time,
-            value,
-            drop_name: false,
-        });
-    }
+    // parallelize: compute quantile per-group in parallel
+    let mut groups = group_samples(expr, samples);
+    let out: Vec<EvalSample> = groups
+        .values_mut()
+        .iter_into_par()
+        .map(|(labels, samples)| {
+            let value = sample_quantile(&samples, phi);
+            let labels = std::mem::take(labels);
+            EvalSample {
+                labels,
+                timestamp_ms: eval_time,
+                value,
+                drop_name: false,
+            }
+        })
+        .collect();
+
     Ok(ExprResult::InstantVector(out))
 }
 
