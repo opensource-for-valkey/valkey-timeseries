@@ -151,7 +151,7 @@ fn get_min_sample(values: &[Sample]) -> Sample {
     // this is called in context of aggr_over_time, which ensures values is non-empty,
     // so we can safely access values[0]
     let mut min = values[0];
-    let mut min_val = f64::INFINITY;
+    let mut min_val = min.value;
 
     for sample in values.iter().skip(1) {
         let cur = sample.value;
