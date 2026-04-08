@@ -32,12 +32,12 @@ mod ts_mget_fanout_command;
 mod ts_mrange;
 mod ts_mrange_fanout_command;
 mod ts_outliers;
+mod ts_query;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;
+mod ts_queryrange;
 mod ts_range;
 mod utils;
-mod ts_queryrange;
-mod ts_query;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
 // each `ts_*_cmd` function (see the individual `ts_*` modules), so they no longer need to be

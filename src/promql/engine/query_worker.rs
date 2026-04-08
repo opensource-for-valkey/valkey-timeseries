@@ -1,4 +1,6 @@
+use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
+use crate::fanout::get_cluster_command_timeout;
 use crate::fanout::{FanoutCommand, is_clustered};
 use crate::labels::Label;
 use crate::labels::filters::SeriesSelector;
@@ -6,24 +8,29 @@ use crate::promql::engine::{
     BatchRequest, BatchWorker, BatchWorkerRunner, QueryFanoutCommand, QueryRangeFanoutCommand,
 };
 use crate::promql::generated::Label as ProtoLabel;
-use crate::promql::{InstantSample, Labels, QueryError, QueryResult, QueryValue, RangeSample};
+use crate::promql::{
+    InstantSample, Labels, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
+};
 use crate::series::index::series_by_selectors;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
 use std::sync::mpsc;
+use std::time::Duration;
 use valkey_module::Context;
 
 struct InstantQueryCommand {
     matchers: Matchers,
     timestamp: Timestamp,
+    options: QueryOptions,
 }
 
 struct RangeQueryCommand {
     matchers: Matchers,
     start_timestamp: Timestamp,
     end_timestamp: Timestamp,
+    options: QueryOptions,
 }
 
 enum QueryCommand {
@@ -44,21 +51,28 @@ fn process_local(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
         QueryCommand::Instant(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-            query_instant_local(ctx, selector, timestamp).map(QueryValue::Vector)
+            query_instant_local(ctx, selector, timestamp, iqc.options).map(QueryValue::Vector)
         }
         QueryCommand::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            query_range_local(ctx, selector, start, end).map(QueryValue::Matrix)
+            query_range_local(ctx, selector, start, end, rc.options).map(QueryValue::Matrix)
         }
     }
+}
+
+fn calculate_timeout(opts: &QueryOptions) -> Duration {
+    opts.timeout.unwrap_or_else(get_cluster_command_timeout)
+    // todo: cap with promql config max query duration
 }
 
 fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
     match item {
         QueryCommand::Instant(iqc) => {
-            let cmd = QueryFanoutCommand::new(iqc.matchers, iqc.timestamp);
+            let timeout = calculate_timeout(&iqc.options);
+            let cmd = QueryFanoutCommand::new(iqc.matchers, iqc.timestamp, timeout);
+
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
                     // resp.samples: Vec<proto::InstantSample>
@@ -77,8 +91,13 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
             }
         }
         QueryCommand::Range(rc) => {
-            let cmd =
-                QueryRangeFanoutCommand::new(rc.matchers, rc.start_timestamp, rc.end_timestamp);
+            let timeout = calculate_timeout(&rc.options);
+            let cmd = QueryRangeFanoutCommand::new(
+                rc.matchers,
+                rc.start_timestamp,
+                rc.end_timestamp,
+                timeout,
+            );
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
                     let ranges = resp
@@ -144,10 +163,16 @@ impl QueryWorker {
         Self { runner }
     }
 
-    pub fn query(&self, matchers: Matchers, timestamp: Timestamp) -> QueryResult<QueryValue> {
+    pub fn query(
+        &self,
+        matchers: Matchers,
+        timestamp: Timestamp,
+        options: QueryOptions,
+    ) -> QueryResult<QueryValue> {
         let command = QueryCommand::Instant(InstantQueryCommand {
             matchers,
             timestamp,
+            options,
         });
         self.send_request(command)
     }
@@ -157,11 +182,13 @@ impl QueryWorker {
         matchers: Matchers,
         start: Timestamp,
         end: Timestamp,
+        options: QueryOptions,
     ) -> QueryResult<QueryValue> {
         let command = QueryCommand::Range(RangeQueryCommand {
             matchers,
             start_timestamp: start,
             end_timestamp: end,
+            options,
         });
         self.send_request(command)
     }
@@ -204,13 +231,19 @@ impl BatchWorker for QueryWorkerImpl {
         match item {
             QueryCommand::Instant(iqc) => {
                 let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-                query_instant_local(ctx, selector, iqc.timestamp)
+                query_instant_local(ctx, selector, iqc.timestamp, iqc.options)
                     .map(QueryValue::Vector)
                     .map_err(|e| QueryError::Execution(e.to_string()))
             }
             QueryCommand::Range(rc) => {
                 let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-                query_range_local(ctx, selector, rc.start_timestamp, rc.end_timestamp)
+                query_range_local(
+                    ctx,
+                    selector,
+                    rc.start_timestamp,
+                    rc.end_timestamp,
+                    rc.options,
+                )
                     .map(QueryValue::Matrix)
                     .map_err(|e| QueryError::Execution(e.to_string()))
             }
@@ -222,7 +255,13 @@ pub(super) fn query_instant_local(
     ctx: &Context,
     selector: SeriesSelector,
     timestamp: Timestamp,
+    options: QueryOptions,
 ) -> QueryResult<Vec<InstantSample>> {
+    if let Some(d) = options.deadline
+        && current_time_millis() > d
+    {
+        return Err(QueryError::Execution("query timed out".to_string()));
+    }
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -253,11 +292,19 @@ pub(super) fn query_range_local(
     selector: SeriesSelector,
     start_time: i64,
     end_time: i64,
+    options: QueryOptions,
 ) -> QueryResult<Vec<RangeSample>> {
+    let max_series = if options.max_series == 0 {
+        usize::MAX
+    } else {
+        options.max_series
+    };
+
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
     let ranges = series
         .iter()
+        .take(max_series)
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
