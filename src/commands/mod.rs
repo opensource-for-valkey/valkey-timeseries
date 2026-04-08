@@ -18,26 +18,26 @@ mod ts_get;
 mod ts_incr_decr_by;
 mod ts_info;
 mod ts_join;
-mod ts_label_search_fanout_command;
 mod ts_labelnames;
+mod ts_labelnames_fanout_command;
 mod ts_labelstats;
 mod ts_labelstats_fanout_command;
 mod ts_labelvalues;
+mod ts_labelvalues_fanout_command;
 mod ts_madd;
 mod ts_mdel;
 mod ts_mdel_fanout_command;
-mod ts_metricnames;
 mod ts_mget;
 mod ts_mget_fanout_command;
 mod ts_mrange;
 mod ts_mrange_fanout_command;
 mod ts_outliers;
-mod ts_query;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;
-mod ts_queryrange;
 mod ts_range;
 mod utils;
+mod ts_queryrange;
+mod ts_query;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
 // each `ts_*_cmd` function (see the individual `ts_*` modules), so they no longer need to be
@@ -52,8 +52,9 @@ use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;
 use ts_card_fanout_command::CardFanoutCommand;
-use ts_label_search_fanout_command::LabelSearchFanoutCommand;
+use ts_labelnames_fanout_command::LabelNamesFanoutCommand;
 use ts_labelstats_fanout_command::LabelStatsFanoutCommand;
+use ts_labelvalues_fanout_command::LabelValuesFanoutCommand;
 use ts_mdel_fanout_command::MDelFanoutCommand;
 use ts_mget_fanout_command::MGetFanoutCommand;
 use ts_mrange_fanout_command::MRangeFanoutCommand;
@@ -62,7 +63,8 @@ use ts_queryindex_fanout_command::QueryIndexFanoutCommand;
 pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<LabelStatsFanoutCommand>()?;
     register_fanout_operation::<CardFanoutCommand>()?;
-    register_fanout_operation::<LabelSearchFanoutCommand>()?;
+    register_fanout_operation::<LabelNamesFanoutCommand>()?;
+    register_fanout_operation::<LabelValuesFanoutCommand>()?;
     register_fanout_operation::<MDelFanoutCommand>()?;
     register_fanout_operation::<MGetFanoutCommand>()?;
     register_fanout_operation::<MRangeFanoutCommand>()?;
