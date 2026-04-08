@@ -77,8 +77,6 @@ mod ts_range;
 mod ts_read;
 mod ts_restore;
 mod utils;
-mod ts_queryrange;
-mod ts_query;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
 // each `ts_*_cmd` function (see the individual `ts_*` modules), so they no longer need to be

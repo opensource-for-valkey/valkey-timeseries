@@ -16,10 +16,10 @@ mod tests {
     use crate::commands::parse_metric_name;
     use crate::common::time::system_time_to_millis;
     use crate::labels::Label;
-    use crate::promql::engine::SeriesQuerier;
     use crate::promql::engine::test_utils::{
         MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MockSeriesQuerier,
     };
+    use crate::promql::engine::{QueryOptions, SeriesQuerier};
     use crate::tests::approx_eq;
     use promql_parser::parser::token::{T_SUB, TokenType};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -90,6 +90,13 @@ mod tests {
                 expected_value
             );
 
+            if actual_sample.labels != expected_labels {
+                // Debug output to help pinpoint regression source when tests fail.
+                eprintln!(
+                    "Sample {} labels mismatch debugging:\n  actual: {:?}\n  expected: {:?}",
+                    i, actual_sample.labels, expected_labels
+                );
+            }
             assert_eq!(
                 actual_sample.labels, expected_labels,
                 "Sample {i} labels mismatch: got {:?}, expected {:?}",
@@ -933,7 +940,13 @@ mod tests {
         #[case] expected_samples: Vec<(f64, Vec<(&str, &str)>)>,
     ) {
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let lookback_delta = Duration::from_secs(300); // 5 minutes
 
         let result = parse_and_evaluate(&evaluator, query, end_time, lookback_delta)
@@ -964,7 +977,13 @@ mod tests {
         builder.add_sample(&labels, sample);
         let reader = builder.build();
         // Create cached reader and evaluator
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate the same query multiple times
         let end_time = UNIX_EPOCH + Duration::from_millis(300002);
@@ -1006,7 +1025,13 @@ mod tests {
     fn should_evaluate_number_literal() {
         // given: create an empty mock reader
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate a number literal (should return scalar, which is unsupported)
         let end_time = UNIX_EPOCH + Duration::from_millis(1_000);
@@ -1033,7 +1058,13 @@ mod tests {
     fn should_evaluate_time_function_as_scalar() {
         // given
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let end_time = UNIX_EPOCH + Duration::from_millis(1);
 
         // when
@@ -1059,7 +1090,13 @@ mod tests {
     fn should_evaluate_pi_function_as_scalar() {
         // given
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let end_time = UNIX_EPOCH + Duration::from_secs(2_000);
 
         // when
@@ -1085,7 +1122,13 @@ mod tests {
     fn should_evaluate_scalar_function_as_scalar() {
         // given
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let end_time = UNIX_EPOCH + Duration::from_secs(2_000);
 
         // when
@@ -1111,7 +1154,13 @@ mod tests {
     fn should_allow_scalar_function_results_as_vector_arguments() {
         // given
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let end_time = UNIX_EPOCH + Duration::from_secs(5);
 
         // when
@@ -1136,7 +1185,13 @@ mod tests {
     fn should_handle_string_literal() {
         // given: create an empty mock reader
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate a string literal
         let end_time = UNIX_EPOCH + Duration::from_millis(2_000);
@@ -1163,7 +1218,13 @@ mod tests {
     fn should_evaluate_label_replace_with_raw_string_arguments() {
         // given: create an empty mock reader
         let reader = MockQueryReaderBuilder::new().build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate a function call with a string literal argument
         let end_time = UNIX_EPOCH + Duration::from_millis(2_000);
@@ -1293,7 +1354,13 @@ mod tests {
         }
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate vector selector
         let selector = VectorSelector {
@@ -1311,7 +1378,10 @@ mod tests {
 
         // then: verify results
         let ExprResult::InstantVector(samples) = result else {
-            panic!("Expected instant vector result, got {}", result.value_type())
+            panic!(
+                "Expected instant vector result, got {}",
+                result.value_type()
+            )
         };
 
         assert_eq!(samples.len(), expected.len(), "Result count mismatch");
@@ -1336,8 +1406,7 @@ mod tests {
         actual_sorted.sort_by(|a, b| a.labels.cmp(&b.labels));
 
         // Compare each series
-        for (i, (actual, expected)) in
-            actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
+        for (i, (actual, expected)) in actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
         {
             // Check that the series has the expected labels
             for Label { name, value } in expected.labels.iter() {
@@ -1355,8 +1424,10 @@ mod tests {
             );
 
             for Label { name, value } in expected.labels.iter() {
-                assert_eq!(actual.labels.get(name), Some(value.as_str()),
-                           "Sample {i} missing label {name}={value}"
+                assert_eq!(
+                    actual.labels.get(name),
+                    Some(value.as_str()),
+                    "Sample {i} missing label {name}={value}"
                 );
             }
         }
@@ -1443,7 +1514,13 @@ mod tests {
             builder.add_sample(&labels, Sample { timestamp, value });
         }
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         // when: evaluate matrix selector
         let metric_name = match expected.first() {
@@ -1473,7 +1550,6 @@ mod tests {
             evaluation_ts: query_time_ms,
             step_ms: 0,
             lookback_delta_ms: 0,
-            tracing_enabled: false,
         };
 
         let result = evaluator
@@ -1561,7 +1637,13 @@ mod tests {
     #[test]
     fn test_evaluate_call_scalar_argument() {
         let (reader, end_time) = setup_mock_reader(vec![]);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
 
         let call = Call {
             func: Function::new(
@@ -1581,7 +1663,6 @@ mod tests {
             evaluation_ts: end_time_ms,
             step_ms: 60_000,
             lookback_delta_ms: 300_000,
-            tracing_enabled: false,
         };
 
         let result = evaluator.evaluate_call(&call, &ctx).unwrap();
@@ -1604,7 +1685,13 @@ mod tests {
     #[test]
     fn test_evaluate_call_scalar_expression_argument() {
         let (reader, end_time) = setup_mock_reader(vec![]);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let call = Call {
             func: Function::new(
                 "vector",
@@ -1629,7 +1716,6 @@ mod tests {
             evaluation_ts: end_time_ms,
             step_ms: 60_000,
             lookback_delta_ms: 300_000,
-            tracing_enabled: false,
         };
         let result = evaluator.evaluate_call(&call, &ctx).unwrap();
         match result {
@@ -1650,7 +1736,7 @@ mod tests {
             ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         let clamp_result = parse_and_evaluate(
@@ -1710,7 +1796,7 @@ mod tests {
             ("test_clamp", vec![("src", "clamp-c")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         let result = parse_and_evaluate(
@@ -1752,7 +1838,7 @@ mod tests {
                 },
             );
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: evaluate rate(http_requests_total[1m])
         let query_time = UNIX_EPOCH + Duration::from_millis(6_060_000);
@@ -1770,7 +1856,6 @@ mod tests {
             evaluation_ts,
             step_ms: 15_000,
             lookback_delta_ms: 5_000,
-            tracing_enabled: false,
         };
 
         let pipeline_result = evaluator.evaluate_expr(&expr, &ctx).unwrap();
@@ -1814,7 +1899,7 @@ mod tests {
         }
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query at t=6_300_000 with positive offset 5m (look back 300_000ms)
         let selector = VectorSelector {
@@ -1860,7 +1945,7 @@ mod tests {
         );
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query at t=6_300_000 but with @ 6_000_000
         let at_time = UNIX_EPOCH + Duration::from_millis(6_000_000);
@@ -1906,7 +1991,7 @@ mod tests {
         );
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query with @ 6_000_000 and offset 5m
         // Should apply @ first (6_000_000), then subtract offset (300_000) = 5_700_000
@@ -1958,7 +2043,7 @@ mod tests {
         }
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query matrix selector with 5m range and 5m offset at t=6_300_000
         // offset 5m means look at t=6_000_000, then get [5_700_000, 6_000_000]
@@ -1978,7 +2063,6 @@ mod tests {
             query_end: query_time,
             evaluation_ts: query_time,
             step_ms: 0, // ??
-            tracing_enabled: false,
             lookback_delta_ms: 300_000,
         };
         let result = evaluator
@@ -2029,7 +2113,7 @@ mod tests {
         );
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query with @ start() where query_start = 5_700_000
         let selector_start = VectorSelector {
@@ -2048,7 +2132,6 @@ mod tests {
             evaluation_ts: query_end,
             lookback_delta_ms: 300_000,
             step_ms: 0,
-            tracing_enabled: false,
         };
 
         let result_start = evaluator
@@ -2103,7 +2186,7 @@ mod tests {
         }
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query at t=5_700_000 with negative offset -5m (look forward 300_000ms)
         let selector = VectorSelector {
@@ -2149,7 +2232,7 @@ mod tests {
         }
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: query at non-aligned timestamp with offset
         let selector = VectorSelector {
@@ -2198,7 +2281,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         let result = parse_and_evaluate(
@@ -2239,7 +2322,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         let result = parse_and_evaluate(
@@ -2280,7 +2363,7 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         let result = parse_and_evaluate(
@@ -2329,7 +2412,7 @@ mod tests {
             ("memory_bytes", vec![("env", "staging")], 4, 200.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2376,7 +2459,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2423,7 +2506,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2468,7 +2551,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2513,7 +2596,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2549,7 +2632,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2599,7 +2682,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when: ignoring(instance) removes instance from key, so key = {env, region}
@@ -2654,7 +2737,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2697,7 +2780,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2745,7 +2828,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2790,7 +2873,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2826,7 +2909,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2876,7 +2959,7 @@ mod tests {
             ),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when: ignoring(instance) removes instance from key, so key = {env, region}
@@ -2924,7 +3007,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
         let lookback_delta = Duration::from_secs(300);
 
         // when
@@ -2965,7 +3048,7 @@ mod tests {
         );
 
         let reader = builder.build();
-        let evaluator = Evaluator::new(&reader);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
 
         // when: subquery with no step in instant query context (interval = 0)
         let subquery = SubqueryExpr {
@@ -2988,7 +3071,6 @@ mod tests {
             evaluation_ts: eval_time_ms,
             step_ms: 0, // instant query context
             lookback_delta_ms: 300_000,
-            tracing_enabled: false,
         };
         let result = evaluator.evaluate_subquery(&subquery, &ctx);
 
