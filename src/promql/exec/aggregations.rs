@@ -152,7 +152,7 @@ fn eval_quantile(
         .values_mut()
         .iter_into_par()
         .map(|(labels, samples)| {
-            let value = sample_quantile(&samples, phi);
+            let value = sample_quantile(samples, phi);
             let labels = std::mem::take(labels);
             EvalSample {
                 labels,

@@ -5,7 +5,7 @@ use crate::labels::{Label, MetricName};
 use crate::promql::engine::SeriesQuerier;
 use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::model::InstantSample;
-use crate::promql::{Labels, PromqlResult, QueryError, RangeSample};
+use crate::promql::{Labels, PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
@@ -128,7 +128,15 @@ impl MockSeriesQuerier {
 }
 
 impl SeriesQuerier for MockSeriesQuerier {
-    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>> {
+    fn query(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        _options: QueryOptions,
+    ) -> PromqlResult<Vec<InstantSample>> {
+        // Mock querier ignores the deadline for now (cooperative cancellation could be
+        // implemented in tests by checking `_deadline`), and behaves like the
+        // original implementation.
         self.select_series(selector, |ts| {
             let labels: Vec<Label> = metric_name_to_labels(&ts.labels);
             let Some(sample) = ts.get_sample(timestamp)? else {
@@ -147,7 +155,9 @@ impl SeriesQuerier for MockSeriesQuerier {
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
+        _options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
+        // As with `query`, this mock ignores the deadline and returns the full range.
         self.select_series(selector, |ts| {
             let labels: Labels = (&ts.labels).into();
             let samples = ts
