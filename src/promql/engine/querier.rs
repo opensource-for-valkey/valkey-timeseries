@@ -1,7 +1,7 @@
 use crate::common::Sample;
 use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::{
-    EvalResult, EvaluationError, PromqlResult,
+    EvalResult, EvaluationError, PromqlResult, QueryOptions,
     model::{InstantSample, RangeSample},
 };
 use crate::series::SeriesRef;
@@ -11,13 +11,22 @@ use std::default::Default;
 use std::sync::Arc;
 
 pub(crate) trait SeriesQuerier: Send + Sync {
-    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>>;
+    /// Query instant samples at `timestamp`.
+    /// `deadline` is an optional absolute Instant by which the operation should complete.
+    fn query(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        options: QueryOptions,
+    ) -> PromqlResult<Vec<InstantSample>>;
 
+    /// Query range samples between `start_ms` and `end_ms` with an optional `deadline`.
     fn query_range(
         &self,
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>>;
 }
 
@@ -25,8 +34,13 @@ impl<T> SeriesQuerier for Box<T>
 where
     T: SeriesQuerier,
 {
-    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>> {
-        self.as_ref().query(selector, timestamp)
+    fn query(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        options: QueryOptions,
+    ) -> PromqlResult<Vec<InstantSample>> {
+        self.as_ref().query(selector, timestamp, options)
     }
 
     fn query_range(
@@ -34,14 +48,21 @@ where
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
-        self.as_ref().query_range(selector, start_ms, end_ms)
+        self.as_ref()
+            .query_range(selector, start_ms, end_ms, options)
     }
 }
 
 impl SeriesQuerier for Box<dyn SeriesQuerier> {
-    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>> {
-        self.as_ref().query(selector, timestamp)
+    fn query(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        options: QueryOptions,
+    ) -> PromqlResult<Vec<InstantSample>> {
+        self.as_ref().query(selector, timestamp, options)
     }
 
     fn query_range(
@@ -49,22 +70,32 @@ impl SeriesQuerier for Box<dyn SeriesQuerier> {
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
-        self.as_ref().query_range(selector, start_ms, end_ms)
+        self.as_ref()
+            .query_range(selector, start_ms, end_ms, options)
     }
 }
 
 impl SeriesQuerier for Arc<dyn SeriesQuerier> {
-    fn query(&self, selector: &VectorSelector, timestamp: i64) -> PromqlResult<Vec<InstantSample>> {
-        self.as_ref().query(selector, timestamp)
+    fn query(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        options: QueryOptions,
+    ) -> PromqlResult<Vec<InstantSample>> {
+        self.as_ref().query(selector, timestamp, options)
     }
+
     fn query_range(
         &self,
         selector: &VectorSelector,
         start_ms: i64,
         end_ms: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
-        self.as_ref().query_range(selector, start_ms, end_ms)
+        self.as_ref()
+            .query_range(selector, start_ms, end_ms, options)
     }
 }
 
@@ -116,19 +147,21 @@ impl<'reader, R: SeriesQuerier> CachedQueryReader<'reader, R> {
 impl<'reader, R: SeriesQuerier> SeriesQuerier for CachedQueryReader<'reader, R> {
     fn query(
         &self,
-        _selector: &VectorSelector,
-        _timestamp: i64,
+        selector: &VectorSelector,
+        timestamp: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<InstantSample>> {
-        self.inner.query(_selector, _timestamp)
+        self.inner.query(selector, timestamp, options)
     }
 
     fn query_range(
         &self,
         selector: &VectorSelector,
-        _start_ms: i64,
+        start_ms: i64,
         end_ms: i64,
+        options: QueryOptions,
     ) -> PromqlResult<Vec<RangeSample>> {
-        self.inner.query_range(selector, _start_ms, end_ms)
+        self.inner.query_range(selector, start_ms, end_ms, options)
     }
 }
 

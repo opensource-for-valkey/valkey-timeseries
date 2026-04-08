@@ -42,7 +42,6 @@ pub struct PromqlConfig {
     pub lookback_delta: Duration,
 
     /// Synonym to `-provider.lookback-delta` from Prometheus.
-    /// The value is dynamically detected from the interval between time series data-points if not set.
     /// It can be overridden on a per-query basis via max_lookback arg.
     /// See also the `max_staleness_interval` flag, which has the same meaning due to historical reasons
     pub max_lookback: Duration,

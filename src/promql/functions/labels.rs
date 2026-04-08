@@ -15,6 +15,71 @@ impl PromQLFunction for LabelReplaceFunction {
         Err(exact_arity_error("label_replace", 5, 1))
     }
 
+    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        // Expect exactly 5 evaluated arguments: instant vector, dst, replacement, src, regex
+        if args.len() != 5 {
+            return Err(exact_arity_error("label_replace", 5, args.len()));
+        }
+
+        let mut args_iter = args.into_iter();
+        let PromQLArg::InstantVector(mut samples) =
+            args_iter.next().expect("validated args.len() == 5")
+        else {
+            return Err(EvaluationError::InternalError(
+                "label_replace expects an instant vector as its first argument".to_string(),
+            ));
+        };
+
+        let dst_label = args_iter
+            .next()
+            .expect("validated args.len() == 5")
+            .into_string()?;
+        let replacement = args_iter
+            .next()
+            .expect("validated args.len() == 5")
+            .into_string()?;
+        let src_label = args_iter
+            .next()
+            .expect("validated args.len() == 5")
+            .into_string()?;
+        let regex_src = args_iter
+            .next()
+            .expect("validated args.len() == 5")
+            .into_string()?;
+
+        if !is_valid_label_name(&dst_label) {
+            return Err(EvaluationError::InternalError(format!(
+                "invalid label name {:?}",
+                dst_label
+            )));
+        }
+
+        let regex = Regex::new(&format!("^(?s:{regex_src})$"))
+            .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
+
+        for sample in &mut samples {
+            let src_value = sample.labels.get(&src_label).unwrap_or_default();
+
+            if let Some(captures) = regex.captures(src_value) {
+                let mut replaced = String::new();
+                captures.expand(&replacement, &mut replaced);
+
+                if replaced.is_empty() {
+                    sample.labels.remove(&dst_label);
+                } else {
+                    sample.labels.insert(&dst_label, replaced);
+                }
+
+                if dst_label == METRIC_NAME {
+                    sample.drop_name = false;
+                }
+            }
+        }
+
+        ensure_unique_labelsets(&samples)?;
+        Ok(ExprResult::InstantVector(samples))
+    }
+
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,

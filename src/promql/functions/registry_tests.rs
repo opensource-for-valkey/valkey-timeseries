@@ -151,6 +151,7 @@ mod tests {
         eval_timestamp_ms: i64,
     ) -> Vec<EvalSample> {
         let func = resolve_function(name).unwrap();
+        eprintln!("DEBUG: resolved function for '{}' -> {:?}", name, func);
         let result = func.apply_args(args, eval_timestamp_ms).unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
