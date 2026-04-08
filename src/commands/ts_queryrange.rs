@@ -23,7 +23,7 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         .read()
         .expect("Failed to acquire read lock on PROMQL_CONFIG");
     let promql_config = config_guard.deref();
-    let eval_stmt = parse_query_range_command_args(promql_config, &mut args)?;
+    let (eval_stmt, opts) = parse_query_range_command_args(promql_config, &mut args)?;
 
     let blocked_client = create_blocked_client(ctx);
     let querier = get_promql_querier(ctx);
@@ -31,7 +31,7 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     spawn(move || {
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
 
-        let result = match evaluate_range(querier, eval_stmt) {
+        let result = match evaluate_range(querier, eval_stmt, opts) {
             Ok(res) => res,
             Err(err) => {
                 let e = ValkeyError::String(err.to_string());

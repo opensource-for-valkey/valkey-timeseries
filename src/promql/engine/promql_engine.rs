@@ -1,8 +1,8 @@
 use crate::common::Sample;
-use crate::common::time::system_time_to_millis;
-use crate::promql::engine::SeriesQuerier;
+use crate::common::time::{current_time_millis, system_time_to_millis};
+use crate::promql::engine::{QueryOptions, SeriesQuerier};
 use crate::promql::error::QueryError;
-use crate::promql::model::{InstantSample, Labels, QueryOptions, QueryValue, RangeSample};
+use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
 use crate::promql::utils::range_bounds_to_system_time;
 use crate::promql::{EvalSamples, Evaluator, ExprResult, QueryResult};
 use ahash::AHashMap;
@@ -30,7 +30,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         &self,
         query: &str,
         time: Option<SystemTime>,
-        opts: &QueryOptions,
+        opts: QueryOptions,
     ) -> QueryResult<QueryValue> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
@@ -47,7 +47,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
 
         let reader = self.make_query_reader()?;
 
-        evaluate_instant(reader, stmt, query_time)
+        evaluate_instant(reader, stmt, query_time, opts)
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -57,7 +57,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         start: SystemTime,
         end: SystemTime,
         step: Duration,
-        opts: &QueryOptions,
+        opts: QueryOptions,
     ) -> QueryResult<Vec<EvalSamples>> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
@@ -73,7 +73,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
 
         let reader = self.make_query_reader()?;
 
-        evaluate_range(reader, stmt)
+        evaluate_range(reader, stmt, opts)
     }
 }
 
@@ -84,7 +84,7 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
     query: &str,
     range: impl RangeBounds<SystemTime>,
     step: Duration,
-    opts: &QueryOptions,
+    opts: QueryOptions,
 ) -> QueryResult<Vec<EvalSamples>> {
     let (start, end) = range_bounds_to_system_time(range);
     E::eval_query_range(engine, query, start, end, step, opts)
@@ -97,9 +97,21 @@ pub(crate) fn evaluate_instant(
     reader: Arc<dyn SeriesQuerier>,
     stmt: EvalStmt,
     query_time: SystemTime,
+    opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
-    let evaluator = Evaluator::new(&reader);
+    let deadline = opts.deadline.map_or(0, |d| d);
+    let evaluator = Evaluator::new(&reader, opts);
+
+    // Best-effort timeout: compute a deadline if set and check before/after heavy ops
+    if deadline > 0 && current_time_millis() > deadline {
+        return Err(QueryError::Timeout);
+    }
+
     let result = evaluator.evaluate(stmt)?;
+
+    if deadline > 0 && current_time_millis() > deadline {
+        return Err(QueryError::Timeout);
+    }
 
     match result {
         ExprResult::Scalar(value) => {
@@ -144,6 +156,7 @@ pub(crate) fn evaluate_instant(
 pub(crate) fn evaluate_range(
     reader: Arc<dyn SeriesQuerier>,
     stmt: EvalStmt,
+    opts: QueryOptions,
 ) -> QueryResult<Vec<EvalSamples>> {
     let start = stmt.start;
     let end = stmt.end;
@@ -157,15 +170,31 @@ pub(crate) fn evaluate_range(
     }
 
     let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
-    let evaluator = Evaluator::new(&reader);
+
+    // Best-effort deadline for range evaluation
+    let evaluator = Evaluator::new(&reader, opts);
 
     evaluator
         .preload_for_range_from_stmt(&stmt)
         .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
+    if let Some(dl) = opts.deadline
+        && current_time_millis() > dl
+    {
+        return Err(QueryError::Timeout);
+    }
+
     let mut current_time = start;
 
+    // todo: parallelize
     while current_time <= end {
+        // Check timeout per step
+        if let Some(dl) = opts.deadline
+            && current_time_millis() > dl
+        {
+            return Err(QueryError::Timeout);
+        }
+
         let instant_stmt = EvalStmt {
             expr: stmt.expr.clone(),
             start: current_time,
@@ -232,7 +261,13 @@ impl Tsdb {
     }
 
     pub fn eval(&self, stmt: EvalStmt) -> QueryResult<ExprResult> {
-        let evaluator = Evaluator::new(&self.querier);
+        let evaluator = Evaluator::new(
+            &self.querier,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         evaluator
             .evaluate(stmt)
             .map_err(|e| QueryError::Execution(e.to_string()))
@@ -258,7 +293,13 @@ impl Tsdb {
             lookback_delta,
         };
 
-        let evaluator = Evaluator::new(&self.querier);
+        let evaluator = Evaluator::new(
+            &self.querier,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let result = evaluator.evaluate(stmt)?;
 
         match result {
@@ -317,9 +358,16 @@ impl Tsdb {
 
         // Step through time, collecting per-series samples
         let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
-        let evaluator = Evaluator::new(&self.querier);
+        let evaluator = Evaluator::new(
+            &self.querier,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
         let mut current_time = start;
 
+        // todo: parallelize
         while current_time <= end {
             let instant_stmt = EvalStmt {
                 expr: stmt.expr.clone(),
@@ -475,6 +523,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: Duration::from_secs(10),
+            ..QueryOptions::default()
         };
         let results = tsdb
             .eval_query("http_requests", Some(query_time), &narrow)
@@ -504,6 +553,7 @@ mod tests {
 
         let narrow = QueryOptions {
             lookback_delta: Duration::from_secs(10),
+            ..QueryOptions::default()
         };
         let results = tsdb
             .eval_query_range("http_requests", start..=end, step, &narrow)

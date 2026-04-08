@@ -14,8 +14,10 @@
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::promql::engine::{CachedQueryReader, SeriesQuerier};
-use crate::promql::hashers::{FingerprintHashMap, SeriesFingerprint};
-use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels};
+use crate::promql::hashers::{FingerprintHashMap, HasFingerprint, SeriesFingerprint};
+use crate::promql::{
+    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
+};
 use ahash::{AHashMap, AHashSet};
 use promql_parser::parser::VectorSelector;
 use std::time::Instant;
@@ -331,6 +333,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: SeriesQuerier>(
     reader: &CachedQueryReader<'reader, R>,
     plan: &QueryPlan,
     selector: &VectorSelector,
+    options: QueryOptions,
 ) -> EvalResult<ExprResult> {
     let mut timings = PipelineTimings::default();
 
@@ -345,7 +348,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: SeriesQuerier>(
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
 
     let series_data = reader
-        .query_range(selector, query_start_inclusive, plan.sample_end_ms)
+        .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
         .into_iter()
         .map(|s| {
@@ -385,16 +388,9 @@ pub(crate) fn execute_selector_pipeline<'reader, R: SeriesQuerier>(
 /// and hashes them. Two label sets that are logically identical will produce the
 /// same fingerprint regardless of the order they are stored in.
 pub(crate) fn compute_fingerprint(labels: &[Label]) -> SeriesFingerprint {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut sorted_labels: Vec<_> = labels.iter().collect();
-    sorted_labels.sort_by(|a, b| a.name.cmp(&b.name));
-    for label in sorted_labels {
-        label.name.hash(&mut hasher);
-        hasher.write_u8(0xfe);
-        label.value.hash(&mut hasher);
-    }
-    hasher.finish() as SeriesFingerprint
+    let mut to_hash = labels.to_vec();
+    to_hash.sort();
+    to_hash.fingerprint()
 }
 
 #[cfg(test)]
