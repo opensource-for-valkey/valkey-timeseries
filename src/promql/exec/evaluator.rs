@@ -2,7 +2,7 @@ use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
 use crate::promql::binops::eval_binary_expr;
-use crate::promql::engine::{CachedQueryReader, SeriesQuerier};
+use crate::promql::engine::{CachedQueryReader, QueryOptions, SeriesQuerier};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
@@ -30,13 +30,15 @@ pub(crate) struct Evaluator<'reader, R: SeriesQuerier> {
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: RwLock<PreloadMap>,
+    options: QueryOptions,
 }
 
 impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
-    pub(crate) fn new(reader: &'reader R) -> Self {
+    pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
         Self {
             reader: CachedQueryReader::new(reader),
             preloaded_instant: RwLock::new(PreloadMap::default()),
+            options,
         }
     }
 
@@ -95,10 +97,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
 
-        // ── Per-series step-bucketing — parallelized with rayon ─────────────────
-        // Each series is fully independent: it owns its samples and produces its
-        // own `values` vec. The only shared reads are scalar step parameters
-        // and the cloned time-modifier options above.
+        // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
             .into_par()
             .map(|(labels, samples)| {
@@ -156,7 +155,9 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
         earliest_ms: i64,
         latest_ms: i64,
     ) -> EvalResult<Vec<(Labels, Vec<Sample>)>> {
-        let range_samples = self.reader.query_range(vs, earliest_ms, latest_ms)?;
+        let range_samples = self
+            .reader
+            .query_range(vs, earliest_ms, latest_ms, self.options)?;
         Ok(range_samples
             .into_iter()
             .map(|rs| (rs.labels, rs.samples))
@@ -201,7 +202,6 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
             evaluation_ts,
             lookback_delta_ms,
             step_ms: interval_ms,
-            tracing_enabled: false,
         };
 
         let mut result = self.evaluate_expr(&stmt.expr, &ctx)?;
@@ -264,7 +264,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
 
         let plan = QueryPlan::for_matrix(adjusted_eval_ts, range.as_millis() as i64);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
 
     pub(super) fn evaluate_subquery(
@@ -341,7 +341,6 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
                 evaluation_ts: current_time_ms,
                 lookback_delta_ms: ctx.lookback_delta_ms,
                 step_ms,
-                tracing_enabled: ctx.tracing_enabled,
             };
 
             let result = self.evaluate_expr(&subquery.expr, &new_ctx)?;
@@ -400,8 +399,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
             step_ms,
             lookback_delta_ms,
         );
-
-        execute_selector_pipeline(&self.reader, &plan, vector_selector)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
 
     pub(super) fn evaluate_vector_selector(
@@ -420,7 +418,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
 
         let plan = QueryPlan::for_instant_vector(adjusted_eval_ts, ctx.lookback_delta_ms);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
@@ -435,7 +433,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
     /// modifier time. Although PromQL defines the result as order-independent
     /// (e.g. `@ t offset d` == `offset d @ t`), we normalize the implementation
     /// by applying `@` first and then applying `offset`. This keeps the logic
-    /// simple and matches Prometheus semantics.
+    /// simple and matches Prometheus' semantics.
     ///
     /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
     fn apply_time_modifiers(
@@ -461,7 +459,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
 
         let actual_type = arg_result.value_type();
         if actual_type != expected_type {
-            // maybe this is too strict ?
+            // maybe this is too strict?
             return Err(EvaluationError::ArgumentError(format!(
                 "argument {idx} for function {} expected type {}, got {}",
                 call.func.name, expected_type, actual_type
@@ -588,7 +586,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
         let result = self.evaluate_expr(&aggregate.expr, ctx)?;
 
         // Extract samples from the result
-        let samples = match result {
+        let mut samples = match result {
             ExprResult::InstantVector(samples) => samples,
             ExprResult::RangeVector(_) => {
                 return Err(EvaluationError::InternalError(
@@ -603,6 +601,14 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
                 )));
             }
         };
+
+        // Materialize any pending __name__ drops on inner expression results before aggregation
+        // so that grouping and aggregation operate on the correct label sets (Prometheus semantics).
+        for sample in samples.iter_mut() {
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+            }
+        }
 
         // If there are no samples, return empty result
         if samples.is_empty() {
