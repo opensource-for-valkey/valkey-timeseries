@@ -243,6 +243,8 @@ pub(crate) fn evaluate_range(
         .map(|(labels, samples)| EvalSamples {
             values: samples,
             labels,
+            range_ms: 0,
+            range_end_ms: 0,
             drop_name: false,
         })
         .collect();

@@ -7,8 +7,9 @@ use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
 use crate::promql::functions::{
-    FunctionCallContext, PromQLArg, eval_aggregation, resolve_function,
+    FunctionCallContext, PromQLArg, resolve_function,
 };
+use super::aggregations::eval_aggregation;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
 use crate::promql::types::{PreloadKey, PreloadedInstantData, PreloadedInstantSeries};
@@ -45,7 +46,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
     /// Preload VectorSelector data for all steps of a range query.
     /// Must be called before the step loop. Walks the AST, deduplicates selectors,
     /// and builds dense per-step sample arrays for O(1) per-step lookup.
-    pub(crate) fn preload_for_range(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
+    pub(in crate::promql) fn preload_for_range(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
         let selectors = collect_vector_selectors(expr);
         // Deduplicate by PreloadKey, then parallelize the loading
         let mut seen = AHashSet::new();
@@ -373,6 +374,8 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
             range_vector.push(EvalSamples {
                 values,
                 labels,
+                range_ms,
+                range_end_ms: subquery_end_ms,
                 drop_name: false,
             });
         }
