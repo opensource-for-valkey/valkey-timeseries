@@ -176,7 +176,7 @@ pub(super) fn output_labelset_key(labels: &'_ Labels, drop_name: bool) -> Cow<'_
     Cow::Owned(Labels::new(key))
 }
 
-pub(crate) fn extract_string_arg(
+pub(super) fn extract_string_arg(
     expr: &Expr,
     function_name: &str,
     arg_index: usize,
@@ -219,7 +219,7 @@ pub(super) fn expect_range_vector(value: PromQLArg, func: &str) -> EvalResult<Ve
     }
 }
 
-pub(crate) fn expect_scalar(arg: PromQLArg, func: &str, param_name: &str) -> EvalResult<f64> {
+pub(super) fn expect_scalar(arg: PromQLArg, func: &str, param_name: &str) -> EvalResult<f64> {
     match arg {
         PromQLArg::Scalar(val) => return Ok(val),
         PromQLArg::InstantVector(s) => {
@@ -284,15 +284,6 @@ pub(super) fn series_len(val: &ExprResult) -> usize {
 #[inline]
 pub fn remove_empty_series(tss: &mut Vec<EvalSamples>) {
     tss.retain(|ts| !ts.values.iter().all(|v| v.value.is_nan()));
-}
-
-/// Filter samples by time range: `(start_ms, end_ms]`.
-fn filter_samples_in_range(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
-    samples
-        .iter()
-        .filter(|s| s.timestamp > start_ms && s.timestamp <= end_ms)
-        .cloned()
-        .collect()
 }
 
 pub(super) fn is_inf(x: f64, sign: i8) -> bool {
