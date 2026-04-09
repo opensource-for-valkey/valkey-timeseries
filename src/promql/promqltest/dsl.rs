@@ -205,7 +205,10 @@ impl Parser {
         let time_str;
         let remainder;
 
-        if let Some(idx) = rest.char_indices().find_map(|(i, c)| if c.is_whitespace() { Some(i) } else { None }) {
+        if let Some(idx) = rest
+            .char_indices()
+            .find_map(|(i, c)| if c.is_whitespace() { Some(i) } else { None })
+        {
             time_str = &rest[..idx];
             remainder = &rest[idx..];
         } else {

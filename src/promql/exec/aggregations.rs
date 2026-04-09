@@ -1,12 +1,12 @@
-use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::common::Timestamp;
+use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use ahash::AHasher;
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
-use promql_parser::parser::token::{TokenType, *};
 use promql_parser::parser::AggregateExpr;
+use promql_parser::parser::token::{TokenType, *};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -15,7 +15,6 @@ enum KAggregationOrder {
     Top,
     Bottom,
 }
-
 
 pub(crate) fn eval_aggregation(
     expr: &AggregateExpr,
@@ -127,7 +126,11 @@ fn eval_top_bottom_k(
     Ok(ExprResult::InstantVector(collected))
 }
 
-fn select_k_from_group(mut group_samples: Vec<EvalSample>, k: usize, order: KAggregationOrder) -> Vec<EvalSample> {
+fn select_k_from_group(
+    mut group_samples: Vec<EvalSample>,
+    k: usize,
+    order: KAggregationOrder,
+) -> Vec<EvalSample> {
     // If k is greater than or equal to the number of samples, return all samples.
     if k >= group_samples.len() {
         return group_samples;
