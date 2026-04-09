@@ -2,7 +2,7 @@
 mod tests {
     use crate::common::Sample;
     use crate::common::math::kahan_inc;
-    use crate::promql::functions::dispatch::PromQLFunctionImpl;
+    use crate::promql::functions::PromQLFunctionImpl;
     use crate::promql::functions::types::FunctionCallContext;
     use crate::promql::functions::utils::variance_kahan;
     use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
