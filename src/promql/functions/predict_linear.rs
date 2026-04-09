@@ -7,7 +7,7 @@ use orx_parallel::ParIter;
 
 /// `predict_linear(v range-vector, t scalar)`
 ///
-/// predicts the value of time series t seconds from now, based on the range vector v, using simple linear regression .
+/// predicts the value of time series t seconds from now, based on the range vector v, using simple linear regression.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct PredictLinearFunction;
 
