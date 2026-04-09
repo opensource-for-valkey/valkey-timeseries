@@ -1,13 +1,21 @@
-use crate::common::Timestamp;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
+use crate::common::Timestamp;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use ahash::AHasher;
-use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
-use promql_parser::parser::AggregateExpr;
+use orx_parallel::IntoParIter;
+use orx_parallel::ParIter;
 use promql_parser::parser::token::{TokenType, *};
+use promql_parser::parser::AggregateExpr;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum KAggregationOrder {
+    Top,
+    Bottom,
+}
+
 
 pub(crate) fn eval_aggregation(
     expr: &AggregateExpr,
@@ -70,33 +78,70 @@ fn eval_count_values(
 fn eval_top_bottom_k(
     expr: &AggregateExpr,
     param: Option<ExprResult>,
-    samples: Vec<EvalSample>,
+    mut samples: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
     let function_name = expr.op.to_string();
     let k = get_param_as_usize(param, &function_name)?;
+
+    if k == 0 {
+        return Ok(ExprResult::InstantVector(Vec::new()));
+    }
+
     let op_id = expr.op.id();
+
+    let order = match op_id {
+        T_TOPK => KAggregationOrder::Top,
+        T_BOTTOMK => KAggregationOrder::Bottom,
+        _ => {
+            return Err(EvaluationError::InternalError(format!(
+                "evaluate_k_aggregate called for non-k aggregation operator: {:?}",
+                op_id
+            )));
+        }
+    };
+
+    // k-aggregation without `by` / `without`: all samples belong to one
+    // implicit group, so skip hashmap bucketing overhead.
+    if expr.modifier.is_none() {
+        samples = select_k_from_group(samples, k, order);
+        return Ok(ExprResult::InstantVector(samples));
+    }
 
     let grouped = group_samples(expr, samples);
 
     // sort by the appropriate comparator and take k elements.
-    let collected: Vec<EvalSample> = grouped
+    // For each group select k elements in parallel, then flatten the
+    // resulting Vec<Vec<EvalSample>> into a single Vec<EvalSample>.
+    let groups_vec: Vec<Vec<EvalSample>> = grouped
         .into_iter()
-        .iter_into_par()
-        .flat_map(|(_, (_, mut group_samples))| {
-            match op_id {
-                T_TOPK => {
-                    group_samples.sort_by(|a, b| topk_value_cmp(a.value, b.value));
-                }
-                T_BOTTOMK => {
-                    group_samples.sort_by(|a, b| bottomk_value_cmp(a.value, b.value));
-                }
-                _ => unreachable!(),
-            }
-            group_samples.into_iter().take(k)
-        })
+        .map(|(_, (_, group_samples))| group_samples)
         .collect();
 
+    let nested: Vec<Vec<EvalSample>> = groups_vec
+        .into_par()
+        .map(|group_samples| select_k_from_group(group_samples, k, order))
+        .collect();
+
+    let collected: Vec<EvalSample> = nested.into_iter().flatten().collect();
+
     Ok(ExprResult::InstantVector(collected))
+}
+
+fn select_k_from_group(mut group_samples: Vec<EvalSample>, k: usize, order: KAggregationOrder) -> Vec<EvalSample> {
+    // If k is greater than or equal to the number of samples, return all samples.
+    if k >= group_samples.len() {
+        return group_samples;
+    }
+    match order {
+        KAggregationOrder::Top => {
+            group_samples.sort_by(|a, b| topk_value_cmp(a.value, b.value));
+        }
+        KAggregationOrder::Bottom => {
+            group_samples.sort_by(|a, b| bottomk_value_cmp(a.value, b.value));
+        }
+    }
+    group_samples.truncate(k);
+    group_samples
 }
 
 fn eval_limit_k(
@@ -147,13 +192,16 @@ fn eval_quantile(
         ));
     }
     // parallelize: compute quantile per-group in parallel
-    let mut groups = group_samples(expr, samples);
-    let out: Vec<EvalSample> = groups
-        .values_mut()
-        .iter_into_par()
+    let groups = group_samples(expr, samples);
+    let groups_vec: Vec<(Labels, Vec<EvalSample>)> = groups
+        .into_iter()
+        .map(|(_, (labels, samples))| (labels, samples))
+        .collect();
+
+    let out: Vec<EvalSample> = groups_vec
+        .into_par()
         .map(|(labels, samples)| {
-            let value = sample_quantile(samples, phi);
-            let labels = std::mem::take(labels);
+            let value = sample_quantile(&samples, phi);
             EvalSample {
                 labels,
                 timestamp_ms: eval_time,
@@ -179,14 +227,17 @@ fn eval_reduction_aggregation(
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
 ) -> EvalResult<ExprResult> {
-    let mut groups = group_sample_values(expr, samples);
+    let groups = group_sample_values(expr, samples);
 
-    let out = groups
-        .values_mut()
-        .iter_into_par()
+    let groups_vec: Vec<(Labels, Vec<f64>)> = groups
+        .into_iter()
+        .map(|(_, (labels, samples))| (labels, samples))
+        .collect();
+
+    let out: Vec<EvalSample> = groups_vec
+        .into_par()
         .map(|(labels, samples)| {
-            let value = aggregate_group(expr.op, samples);
-            let labels = std::mem::take(labels);
+            let value = aggregate_group(expr.op, &samples);
             EvalSample {
                 labels,
                 value,
@@ -366,24 +417,28 @@ fn get_param(param: Option<ExprResult>, function_name: &str) -> EvalResult<ExprR
 
 fn get_param_as_scalar(param: Option<ExprResult>, function_name: &str) -> EvalResult<f64> {
     let param = get_param(param, function_name)?;
-    let ExprResult::Scalar(value) = param else {
-        let value_type = param.value_type();
-        return Err(EvaluationError::ArgumentError(format!(
-            "{function_name} parameter must evaluate to a scalar, but got {value_type}"
-        )));
-    };
-    Ok(value)
+    match param {
+        ExprResult::Scalar(value) => Ok(value),
+        other => {
+            let value_type = other.value_type();
+            Err(EvaluationError::ArgumentError(format!(
+                "{function_name} parameter must evaluate to a scalar, but got {value_type}"
+            )))
+        }
+    }
 }
 
 fn get_param_as_string(params: Option<ExprResult>, function_name: &str) -> EvalResult<String> {
     let param = get_param(params, function_name)?;
-    let ExprResult::String(value) = param else {
-        let value_type = param.value_type();
-        return Err(EvaluationError::ArgumentError(format!(
-            "{function_name} parameter must evaluate to a string, but got {value_type}"
-        )));
-    };
-    Ok(value.clone())
+    match param {
+        ExprResult::String(value) => Ok(value.clone()),
+        other => {
+            let value_type = other.value_type();
+            Err(EvaluationError::ArgumentError(format!(
+                "{function_name} parameter must evaluate to a string, but got {value_type}"
+            )))
+        }
+    }
 }
 
 fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usize> {
