@@ -5,6 +5,7 @@ use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
+use num_traits::Zero;
 
 const EMPTY_STRING: &str = "";
 
@@ -63,7 +64,7 @@ pub(crate) struct RollupConfig {
     /// lookback_delta is the analog to `-query.lookback-delta` from the Prometheus world.
     pub lookback_delta: Duration,
 
-    /// The maximum number of points which can be generated per each series.
+    /// The maximum number of points that can be generated per each series.
     pub max_points_per_series: usize,
 
     /// The minimum interval for staleness calculations. This could be useful for removing gaps on
@@ -118,20 +119,20 @@ pub(super) fn bucket_samples(
     cfg: &RollupConfig,
     values: &[f64],
     timestamps: &[Timestamp],
-    window: Duration,
+    mut range: Duration,
     lookback_delta: Duration,
 ) -> EvalResult<u64> {
     let max_prev_interval = cfg.step;
-    let mut window = window;
-    if window.is_zero() {
+    if range.is_zero() {
         // Implicit window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
         // according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/784
-        window = lookback_delta;
+        range = lookback_delta;
     }
 
     let samples_scanned = values.len() as u64;
-    let window_ms = window.as_millis() as i64;
+    let window = range.as_millis() as i64;
     let max_prev_interval = max_prev_interval.as_millis() as i64;
+    let lookback = lookback_delta.as_millis() as i64;
     let sample_len = values.len();
 
     let mut i = 0;
@@ -144,7 +145,7 @@ pub(super) fn bucket_samples(
 
     let mut prev_timestamp: i64 = 0;
     for (idx, &t_end) in cfg.timestamps.iter().enumerate() {
-        let t_start = t_end - window_ms;
+        let t_start = t_end - window;
 
         ni = seek_first_timestamp_idx_after(&timestamps[i..], t_start, ni);
         i += ni;
@@ -156,7 +157,7 @@ pub(super) fn bucket_samples(
         j += nj;
 
         let mut rfa = RollupWindow {
-            window: window_ms,
+            window,
             prev_value: f64::NAN,
             prev_timestamp: t_start - max_prev_interval,
             real_prev_value: f64::NAN,
@@ -193,8 +194,8 @@ pub(super) fn bucket_samples(
                     curr_timestamp = rfa.timestamps[0];
                 }
 
-                if lookback_delta.is_zero()
-                    || (curr_timestamp - prev_timestamp) < lookback_delta.as_millis() as i64
+                if lookback.is_zero()
+                    || (curr_timestamp - prev_timestamp) < lookback
                 {
                     let prev_value = values.get_unchecked(idx);
                     rfa.real_prev_value = *prev_value;
