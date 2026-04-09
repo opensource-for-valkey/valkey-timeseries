@@ -13,7 +13,7 @@ use crate::promql::functions::labels::{LabelJoinFunction, LabelReplaceFunction};
 use crate::promql::functions::math_functions::{
     AbsFunction, AcosFunction, AcoshFunction, AsinFunction, AsinhFunction, AtanFunction,
     AtanhFunction, CeilFunction, ClampFunction, ClampMaxFunction, ClampMinFunction, CosFunction,
-    CoshFunction, DegFunction, ExpFunction, FloorFunction, LnFunction, Log10Function, Log2Function,
+    CoshFunction, DegFunction, ExpFunction, FloorFunction, LnFunction, Log2Function, Log10Function,
     PiFunction, RadFunction, RoundFunction, SgnFunction, SinFunction, SinhFunction, SqrtFunction,
     TanFunction, TanhFunction,
 };
@@ -34,7 +34,6 @@ use crate::promql::functions::special_functions::{AbsentFunction, ScalarFunction
 use std::fmt::Display;
 use strum_macros::EnumIter;
 use valkey_module::ValkeyError;
-
 
 macro_rules! impl_promql_function_kind {
     (
@@ -197,86 +196,126 @@ macro_rules! promql_function_list {
     ($target_macro:path) => {
         $target_macro!(
             // ── Math / unary ─────────────────────────────────────────────
-            (Abs,                        "abs",                          AbsFunction),
-            (Acos,                       "acos",                         AcosFunction),
-            (Acosh,                      "acosh",                        AcoshFunction),
-            (Asin,                       "asin",                         AsinFunction),
-            (Asinh,                      "asinh",                        AsinhFunction),
-            (Atan,                       "atan",                         AtanFunction),
-            (Atanh,                      "atanh",                        AtanhFunction),
-            (Clamp,                      "clamp",                        ClampFunction),
-            (ClampMax,                   "clamp_max",                    ClampMaxFunction),
-            (ClampMin,                   "clamp_min",                    ClampMinFunction),
-            (Ceil,                       "ceil",                         CeilFunction),
-            (Cos,                        "cos",                          CosFunction),
-            (Cosh,                       "cosh",                         CoshFunction),
-            (Deg,                        "deg",                          DegFunction),
-            (Exp,                        "exp",                          ExpFunction),
-            (Floor,                      "floor",                        FloorFunction),
-            (Ln,                         "ln",                           LnFunction),
-            (Log10,                      "log10",                        Log10Function),
-            (Log2,                       "log2",                         Log2Function),
-            (Pi,                         "pi",                           PiFunction),
-            (Rad,                        "rad",                          RadFunction),
-            (Round,                      "round",                        RoundFunction),
-            (Sgn,                        "sgn",                          SgnFunction),
-            (Sin,                        "sin",                          SinFunction),
-            (Sinh,                       "sinh",                         SinhFunction),
-            (Sqrt,                       "sqrt",                         SqrtFunction),
-            (Tan,                        "tan",                          TanFunction),
-            (Tanh,                       "tanh",                         TanhFunction),
+            (Abs, "abs", AbsFunction),
+            (Acos, "acos", AcosFunction),
+            (Acosh, "acosh", AcoshFunction),
+            (Asin, "asin", AsinFunction),
+            (Asinh, "asinh", AsinhFunction),
+            (Atan, "atan", AtanFunction),
+            (Atanh, "atanh", AtanhFunction),
+            (Clamp, "clamp", ClampFunction),
+            (ClampMax, "clamp_max", ClampMaxFunction),
+            (ClampMin, "clamp_min", ClampMinFunction),
+            (Ceil, "ceil", CeilFunction),
+            (Cos, "cos", CosFunction),
+            (Cosh, "cosh", CoshFunction),
+            (Deg, "deg", DegFunction),
+            (Exp, "exp", ExpFunction),
+            (Floor, "floor", FloorFunction),
+            (Ln, "ln", LnFunction),
+            (Log10, "log10", Log10Function),
+            (Log2, "log2", Log2Function),
+            (Pi, "pi", PiFunction),
+            (Rad, "rad", RadFunction),
+            (Round, "round", RoundFunction),
+            (Sgn, "sgn", SgnFunction),
+            (Sin, "sin", SinFunction),
+            (Sinh, "sinh", SinhFunction),
+            (Sqrt, "sqrt", SqrtFunction),
+            (Tan, "tan", TanFunction),
+            (Tanh, "tanh", TanhFunction),
             // ── Date / time ──────────────────────────────────────────────
-            (DayOfMonth,                 "day_of_month",                 DayOfMonthFunction),
-            (DayOfWeek,                  "day_of_week",                  DayOfWeekFunction),
-            (DayOfYear,                  "day_of_year",                  DayOfYearFunction),
-            (DaysInMonth,                "days_in_month",                DaysInMonthFunction),
-            (Hour,                       "hour",                         HourFunction),
-            (Minute,                     "minute",                       MinuteFunction),
-            (Month,                      "month",                        MonthFunction),
-            (Year,                       "year",                         YearFunction),
-            (Timestamp,                  "timestamp",                    TimestampFunction),
-            (Time,                       "time",                         TimeFunction),
+            (DayOfMonth, "day_of_month", DayOfMonthFunction),
+            (DayOfWeek, "day_of_week", DayOfWeekFunction),
+            (DayOfYear, "day_of_year", DayOfYearFunction),
+            (DaysInMonth, "days_in_month", DaysInMonthFunction),
+            (Hour, "hour", HourFunction),
+            (Minute, "minute", MinuteFunction),
+            (Month, "month", MonthFunction),
+            (Year, "year", YearFunction),
+            (Timestamp, "timestamp", TimestampFunction),
+            (Time, "time", TimeFunction),
             // ── Special ──────────────────────────────────────────────────
-            (Absent,                     "absent",                       AbsentFunction),
-            (Scalar,                     "scalar",                       ScalarFunction),
-            (Vector,                     "vector",                       VectorFunction),
+            (Absent, "absent", AbsentFunction),
+            (Scalar, "scalar", ScalarFunction),
+            (Vector, "vector", VectorFunction),
             // ── Histogram ────────────────────────────────────────────────
-            (HistogramQuantile,          "histogram_quantile",           HistogramQuantileFunction),
-            (HistogramFraction,          "histogram_fraction",           HistogramFractionFunctions),
+            (
+                HistogramQuantile,
+                "histogram_quantile",
+                HistogramQuantileFunction
+            ),
+            (
+                HistogramFraction,
+                "histogram_fraction",
+                HistogramFractionFunctions
+            ),
             // ── Range-vector ─────────────────────────────────────────────
-            (AbsentOverTime,             "absent_over_time",             AbsentOverTimeFunction),
-            (AvgOverTime,                "avg_over_time",                AvgOverTimeFunction),
-            (Changes,                    "changes",                      ChangesFunction),
-            (CountOverTime,              "count_over_time",              CountOverTimeFunction),
-            (Delta,                      "delta",                        DeltaFunction),
-            (Deriv,                      "deriv",                        DerivFunction),
-            (DoubleExponentialSmoothing, "double_exponential_smoothing", DoubleExponentialSmoothingFunction),
-            (FirstOverTime,              "first_over_time",              FirstOverTimeFunction),
-            (IRate,                      "irate",                        IRateFunction),
-            (LastOverTime,               "last_over_time",               LastOverTimeFunction),
-            (MadOverTime,                "mad_over_time",                MadOverTimeFunction),
-            (MaxOverTime,                "max_over_time",                MaxOverTimeFunction),
-            (MinOverTime,                "min_over_time",                MinOverTimeFunction),
-            (PredictLinear,              "predict_linear",               PredictLinearFunction),
-            (PresentOverTime,            "present_over_time",            PresentOverTimeFunction),
-            (QuantileOverTime,           "quantile_over_time",           QuantileOverTimeFunction),
-            (Rate,                       "rate",                         RateFunction),
-            (Resets,                     "resets",                       ResetsFunction),
-            (StddevOverTime,             "stddev_over_time",             StddevOverTimeFunction),
-            (StdvarOverTime,             "stdvar_over_time",             StdvarOverTimeFunction),
-            (SumOverTime,                "sum_over_time",                SumOverTimeFunction),
-            (TsOfMaxOverTime,            "ts_of_max_over_time",          TSOfMaxOverTimeFunction),
-            (TsOfMinOverTime,            "ts_of_min_over_time",           TSOfMinOverTimeFunction),
-            (TLastOverTime,              "ts_of_last_over_time",         TSLastOverTimeFunction),
-            (TFirstOverTime,             "ts_of_first_over_time",        TSFirstOverTimeFunction),
+            (AbsentOverTime, "absent_over_time", AbsentOverTimeFunction),
+            (AvgOverTime, "avg_over_time", AvgOverTimeFunction),
+            (Changes, "changes", ChangesFunction),
+            (CountOverTime, "count_over_time", CountOverTimeFunction),
+            (Delta, "delta", DeltaFunction),
+            (Deriv, "deriv", DerivFunction),
+            (
+                DoubleExponentialSmoothing,
+                "double_exponential_smoothing",
+                DoubleExponentialSmoothingFunction
+            ),
+            (FirstOverTime, "first_over_time", FirstOverTimeFunction),
+            (IRate, "irate", IRateFunction),
+            (LastOverTime, "last_over_time", LastOverTimeFunction),
+            (MadOverTime, "mad_over_time", MadOverTimeFunction),
+            (MaxOverTime, "max_over_time", MaxOverTimeFunction),
+            (MinOverTime, "min_over_time", MinOverTimeFunction),
+            (PredictLinear, "predict_linear", PredictLinearFunction),
+            (
+                PresentOverTime,
+                "present_over_time",
+                PresentOverTimeFunction
+            ),
+            (
+                QuantileOverTime,
+                "quantile_over_time",
+                QuantileOverTimeFunction
+            ),
+            (Rate, "rate", RateFunction),
+            (Resets, "resets", ResetsFunction),
+            (StddevOverTime, "stddev_over_time", StddevOverTimeFunction),
+            (StdvarOverTime, "stdvar_over_time", StdvarOverTimeFunction),
+            (SumOverTime, "sum_over_time", SumOverTimeFunction),
+            (
+                TsOfMaxOverTime,
+                "ts_of_max_over_time",
+                TSOfMaxOverTimeFunction
+            ),
+            (
+                TsOfMinOverTime,
+                "ts_of_min_over_time",
+                TSOfMinOverTimeFunction
+            ),
+            (
+                TLastOverTime,
+                "ts_of_last_over_time",
+                TSLastOverTimeFunction
+            ),
+            (
+                TFirstOverTime,
+                "ts_of_first_over_time",
+                TSFirstOverTimeFunction
+            ),
             // ── Label helpers ─────────────────────────────────────────────
-            (LabelJoin,                  "label_join",                   LabelJoinFunction),
-            (LabelReplace,               "label_replace",                LabelReplaceFunction),
+            (LabelJoin, "label_join", LabelJoinFunction),
+            (LabelReplace, "label_replace", LabelReplaceFunction),
             // ── Sort helpers ──────────────────────────────────────────────
-            (Sort,                       "sort",                         SortFunction),
-            (SortDesc,                   "sort_desc",                    SortDescFunction),
-            (SortByLabel,                "sort_by_label",                SortByLabelFunction),
-            (SortByLabelDesc,            "sort_by_label_desc",           SortByLabelDescFunction),
+            (Sort, "sort", SortFunction),
+            (SortDesc, "sort_desc", SortDescFunction),
+            (SortByLabel, "sort_by_label", SortByLabelFunction),
+            (
+                SortByLabelDesc,
+                "sort_by_label_desc",
+                SortByLabelDescFunction
+            ),
         );
     };
 }
@@ -285,4 +324,3 @@ macro_rules! promql_function_list {
 // `PromqlFunctionKind` enum and the helper impls for `PromQLFunctionImpl`.
 promql_function_list!(impl_promql_function_kind);
 promql_function_list!(impl_promql_function_impl);
-
