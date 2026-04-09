@@ -1,4 +1,3 @@
-use crate::commands::parse_metric_name;
 use crate::common::Sample;
 use crate::labels::Label;
 use crate::promql::{Labels, RangeSample};
@@ -199,14 +198,24 @@ impl Parser {
         lines: &[&str],
         i: &mut usize,
     ) -> Result<(String, String), String> {
-        // Split on any whitespace (space, tab, etc.)
-        // Note: This means "eval instant at 10s\t\tmetric" is valid, which could be
-        // confusing if test files have inconsistent whitespace formatting
-        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-        let time_str = parts[0];
+        // Robustly split the first token (time) from the rest of the line.
+        // We locate the first whitespace index and then trim only the leading
+        // whitespace from the remainder so sequences of tabs/spaces are handled
+        // correctly and the remainder preserves internal spacing of the query.
+        let time_str;
+        let remainder;
 
-        let query = if parts.len() > 1 && !parts[1].trim().is_empty() {
-            parts[1].trim().to_string()
+        if let Some(idx) = rest.char_indices().find_map(|(i, c)| if c.is_whitespace() { Some(i) } else { None }) {
+            time_str = &rest[..idx];
+            remainder = &rest[idx..];
+        } else {
+            // No whitespace: entire rest is the time, query must be on next line
+            time_str = rest;
+            remainder = "";
+        }
+
+        let query = if !remainder.trim_start().is_empty() {
+            remainder.trim_start().to_string()
         } else {
             // Query on next line
             if *i < lines.len() {
@@ -278,19 +287,25 @@ fn parse_series(line: &str) -> Result<SeriesLoad, String> {
 }
 
 fn parse_metric(s: &str) -> Result<(String, HashMap<String, String>), String> {
-    let mn = parse_metric_name(s).map_err(|e| e.to_string())?;
-    let mut mn_labels = HashMap::new();
-    let mut metric_name: String = String::new();
-
-    for Label { name, value } in mn.into_iter() {
-        if name == "__name__" {
-            metric_name = value;
-        } else {
-            mn_labels.insert(name, value);
-        }
+    if let Some((m, rest)) = s.split_once('{') {
+        let rest = rest
+            .strip_suffix('}')
+            .ok_or_else(|| format!("Missing closing }} in metric: '{}'", s))?;
+        let labels = parse_labels(rest, s)?;
+        Ok((m.to_string(), labels))
+    } else if s.starts_with('{') {
+        // Label-only (no metric name, used in expected results)
+        let rest = s
+            .strip_prefix('{')
+            .unwrap()
+            .strip_suffix('}')
+            .ok_or_else(|| format!("Missing closing }} in labels: '{}'", s))?;
+        let labels = parse_labels(rest, s)?;
+        Ok((String::new(), labels))
+    } else {
+        // Metric name only (no labels)
+        Ok((s.to_string(), HashMap::new()))
     }
-
-    Ok((metric_name, mn_labels))
 }
 
 fn parse_labels(labels_str: &str, context: &str) -> Result<HashMap<String, String>, String> {
