@@ -1,6 +1,8 @@
 use crate::labels::Label;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
+use twox_hash::xxhash3_128;
+
 /// Series fingerprint (hash of a label set)
 pub(crate) type SeriesFingerprint = u128;
 
@@ -16,27 +18,17 @@ impl HasFingerprint for Vec<Label> {
 
 impl HasFingerprint for [Label] {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = xxhash3_128::Hasher::new();
         for label in self {
             hash_key_value(&mut hasher, &label.name, &label.value);
         }
-
-        let digest = hasher.finalize();
-        let mut first16 = [0u8; 16];
-        first16.copy_from_slice(&digest.as_bytes()[..16]);
-
-        u128::from_le_bytes(first16)
+        hasher.finish_128()
     }
 }
 
 impl HasFingerprint for &str {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.as_bytes());
-        let digest = hasher.finalize();
-        let mut first16 = [0u8; 16];
-        first16.copy_from_slice(&digest.as_bytes()[..16]);
-        u128::from_le_bytes(first16)
+        xxhash3_128::Hasher::oneshot(self.as_bytes())
     }
 }
 
@@ -52,10 +44,10 @@ halfbrown::HashMap<SeriesFingerprint, V, BuildHasherDefault<FingerprintHasher>>;
 pub(in crate::promql) type FingerprintHashSet =
     HashSet<SeriesFingerprint, BuildHasherDefault<FingerprintHasher>>;
 
-fn hash_key_value(hasher: &mut blake3::Hasher, key: &str, value: &str) {
-    hasher.update(key.as_bytes());
-    hasher.update(b"0xfe");
-    hasher.update(value.as_bytes());
+fn hash_key_value(hasher: &mut xxhash3_128::Hasher, key: &str, value: &str) {
+    hasher.write(key.as_bytes());
+    hasher.write(b"0xfe");
+    hasher.write(value.as_bytes());
 }
 
 #[derive(Default)]
