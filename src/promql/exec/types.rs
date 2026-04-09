@@ -164,6 +164,8 @@ pub struct EvalSamples {
     /// result labels. Mirrors `EvalSample.drop_name` behavior for instant
     /// vectors so range-vector operations can defer name-dropping.
     pub(crate) drop_name: bool,
+    pub(crate) range_ms: i64,
+    pub(crate) range_end_ms: i64,
 }
 
 impl EvalSamples {
