@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use crate::common::Sample;
     use crate::common::math::kahan_inc;
     use crate::promql::functions::PromQLFunctionImpl;
@@ -27,6 +28,20 @@ mod tests {
         ) -> EvalResult<ExprResult> {
             self.inner
                 .apply(PromQLArg::RangeVector(samples), eval_timestamp_ms)
+        }
+
+        pub(crate) fn apply_with_range(
+            &self,
+            mut samples: Vec<EvalSamples>,
+            eval_timestamp_ms: i64,
+            range: Duration,
+        ) -> EvalResult<ExprResult> {
+            let range_ms = range.as_millis() as i64;
+            for s in &mut samples {
+                s.range_ms = range_ms;
+                s.range_end_ms = eval_timestamp_ms;
+            }
+            self.apply(samples, eval_timestamp_ms)
         }
     }
 
@@ -165,7 +180,8 @@ mod tests {
         eval_timestamp_ms: i64,
     ) -> Vec<EvalSample> {
         let func = get_range_function(name).unwrap();
-        let result = func.apply(samples, eval_timestamp_ms).unwrap();
+        // todo: pass in range
+        let result = func.apply_with_range(samples, eval_timestamp_ms, Duration::default()).unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
         };
@@ -1214,6 +1230,8 @@ mod tests {
         EvalSamples {
             values,
             labels: labels.into(),
+            range_ms: 0,
+            range_end_ms: 0,
             drop_name: false,
         }
     }
@@ -1233,7 +1251,14 @@ mod tests {
             labels.clone(),
         )];
 
-        let result = call_range_function("rate", samples, 3000);
+        let func = get_range_function("rate").unwrap();
+
+        // 2s range, samples sit exactly at the window edges.
+        let result = func
+            .apply_with_range(samples, 3000, Duration::from_millis(2000))
+            .unwrap()
+            .expect_instant_vector("expected an instant vector");
+
 
         assert_eq!(result.len(), 1);
         // Rate = (125 - 100) / (3000 - 1000) * 1000 = 25 / 2 = 12.5 per second
@@ -1567,6 +1592,7 @@ mod tests {
 
     #[test]
     fn should_handle_counter_reset_in_rate() {
+        let func = get_range_function("rate").unwrap();
         let labels = Labels::default();
 
         // Create sample series with counter reset (value goes down)
@@ -1578,11 +1604,169 @@ mod tests {
             labels,
         )];
 
-        let result = call_range_function("rate", samples, 2000);
+        // 1s range, samples sit exactly at the window edges.
+        // increase = (50 - 100) + 100 = 50 (counter reset correction)
+        // rate = 50.0 per second
+        let result = func
+            .apply_with_range(samples, 2000, Duration::from_millis(1000))
+            .unwrap()
+            .expect_instant_vector("expected instant vector result from rate function");
 
         assert_eq!(result.len(), 1);
-        // Rate should be 0 for negative differences (counter resets)
-        assert_eq!(result[0].value, 0.0);
+        assert_eq!(result[0].value, 50.0);
+    }
+
+    #[test]
+    fn should_handle_multiple_counter_resets_in_rate() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        // Sequence: [1, 5, 2, 4, 1, 3, 6] with 1s intervals and two resets
+        let samples = vec![create_eval_samples(
+            vec![
+                (1000, 1.0),
+                (2000, 5.0),
+                (3000, 2.0),
+                (4000, 4.0),
+                (5000, 1.0),
+                (6000, 3.0),
+                (7000, 6.0),
+            ],
+            HashMap::new(),
+        )];
+
+        // when
+        // 6s range, samples sit exactly at the window edges.
+        // increase = (6 - 1) + 5 + 4 = 14 so rate = 14.0 / 6
+        let result = func
+            .apply_with_range(samples, 7000, Duration::from_millis(6000))
+            .unwrap()
+            .expect_instant_vector("instant vector expected");
+
+        // then
+        assert_eq!(result.len(), 1);
+        let expected = 14.0 / 6.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_extrapolate_rate_to_window_boundaries() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 20.0), (3000, 30.0), (4000, 40.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        // Window: [0s, 5s], eval at 5s
+        let result = func
+            .apply_with_range(samples, 5000, Duration::from_secs(5))
+            .unwrap()
+            .expect_instant_vector("instant vector expected");
+
+        // then
+        assert_eq!(result.len(), 1);
+
+        // Prometheus extrapolation:
+        // sampled interval = 3s, avg_duration_between_samples = 1s, threshold = 1.1s
+        // duration_to_start = (1 - 0) / 1 = 1.0s (< 1.1, extrapolate to boundary)
+        // duration_to_end = (5 - 4) / 1 = 1.0s (< 1.1, extrapolate to boundary)
+        // Counter zero-point: duration_to_zero = 3.0 * (10.0 / (40.0 - 10.0)) = 1.0s
+        // duration_to_zero (1.0) == duration_to_start (1.0), so no change to duration_to_start
+        // factor = (3.0 + 1.0 + 1.0) / 3.0 / 5.0 = 5.0 / 3.0 / 5.0 = 1/3
+        // result = 30.0 * (1/3) = 10.0
+        let expected = 10.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_limit_extrapolation_when_samples_far_from_boundary() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(4000, 10.0), (5000, 20.0), (6000, 30.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        // Window: [0s, 10s], eval at 10s
+        let result = func
+            .apply_with_range(samples, 10000, Duration::from_secs(10))
+            .unwrap()
+            .expect_instant_vector("instant vector expected");
+
+        // then
+        assert_eq!(result.len(), 1);
+
+        // sampled interval = 2s, avg_duration_between_samples = 1s
+        // duration_to_start = 4.0s (> 1.1s, use avg_duration_between_samples/2 = 0.5s)
+        // duration_to_end = 4.0s (> 1.1s, similarly use 0.5s)
+        // Counter zero-point: duration_to_zero = 2.0 * (10.0 / (30.0 - 10.0)) = 1.0s
+        // duration_to_zero (1.0) > durationToStart (0.5), so no change to duration_to_start
+        // factor = (2.0 + 0.5 + 0.5) / 2.0 / 10.0 = 3.0 / 2.0 / 10.0 = 0.15
+        // result = 20.0 * 0.15 = 3.0
+        let expected = 3.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_extrapolate_rate_with_counter_reset() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![
+                (1000, 10.0),
+                (2000, 20.0),
+                (3000, 5.0), // counter reset
+                (4000, 15.0),
+            ],
+            HashMap::new(),
+        )];
+
+        // when
+        // Window: [0s, 5s], eval at 5s
+        let result = func
+            .apply_with_range(samples, 5000, Duration::from_secs(5))
+            .unwrap()
+            .expect_instant_vector("instant vector expected");
+
+        // then
+        assert_eq!(result.len(), 1);
+
+        // Counter reset correction: increase = (15 - 10) + 20 = 25
+        // sampled interval = 3s, avg_duration_between_samples = 1s, threshold = 1.1s
+        // duration_to_start = 1.0s (< 1.1, extrapolate to boundary)
+        // duration_to_end = 1.0s (< 1.1, extrapolate to boundary)
+        // Counter zero-point: duration_to_zero = 3.0 * (10.0 / 25.0) = 1.2s
+        // duration_to_zero (1.2) > duration_to_start (1.0), so no change to duration_to_start
+        // factor = (3.0 + 1.0 + 1.0) / 3.0 / 5.0 = 5/3/5 = 1/3
+        // result = 25.0 / 3
+        let expected = 25.0 / 3.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
     }
 
     #[test]
@@ -1590,7 +1774,11 @@ mod tests {
         // Create sample series with only one point
         let samples = vec![create_eval_samples(vec![(1000, 100.0)], Labels::default())];
 
-        let result = call_range_function("rate", samples, 1000);
+        let func = get_range_function("rate").unwrap();
+        let result = func
+            .apply_with_range(samples, 1000, Duration::from_millis(1000))
+            .unwrap()
+            .expect_instant_vector("instant vector expected");
 
         // Should return empty result for insufficient samples
         assert!(result.is_empty());
@@ -1805,6 +1993,63 @@ mod tests {
             "All-NaN should return NaN, got {}",
             result[0].value
         );
+    }
+
+    #[test]
+    fn should_apply_rate_zero_point_counter_guard() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        let samples = vec![create_eval_samples(
+            vec![(1000, 1.0), (4000, 10.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        // Window: [0s, 5s], eval at 5s
+        let result = func
+            .apply_with_range(samples, 5000, Duration::from_secs(5))
+            .unwrap()
+            .expect_instant_vector("instant_vector_expected");
+
+        // then
+        assert_eq!(result.len(), 1);
+
+        // increase = 9.0
+        // sampled interval = 3.0s, avg_duration_between_samples = 3s, threshold = 3.3s
+        // duration_to_start = 1.0s (< 3.3s, extrapolate to boundary)
+        // duration_to_zero = 3.0 * (1.0 / (10.0 - 1.0)) = 1/3
+        // duration_to_zero (1/3) < duration_to_start (1.0), so set duration_to_start = 1/3
+        // duration_to_end = 1.0s (< 3.3 so unchanged)
+        // factor = (3.0 + 1/3 + 1.0) / 3.0 / 5.0
+        let expected = 9.0 * (3.0 + (1.0 / 3.0) + 1.0) / 3.0 / 5.0;
+        assert!(
+            (result[0].value - expected).abs() < 1e-10,
+            "expected {}, got {}",
+            expected,
+            result[0].value
+        );
+    }
+
+    #[test]
+    fn should_skip_zero_interval_series_in_rate() {
+        // given
+        let func = get_range_function("rate").unwrap();
+
+        // Two samples at the same timestamp (sampled_interval = 0), so series skipped
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (1000, 20.0)],
+            HashMap::new(),
+        )];
+
+        // when
+        let result = func
+            .apply_with_range(samples, 2000, Duration::from_millis(2000))
+            .unwrap()
+            .expect_instant_vector("instant_vector_expected");
+
+        // then
+        assert!(result.is_empty());
     }
 
     // Property-based tests using proptest
