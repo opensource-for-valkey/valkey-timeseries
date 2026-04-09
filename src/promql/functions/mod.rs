@@ -9,14 +9,12 @@ mod math_functions;
 mod predict_linear;
 mod range_vector_functions;
 mod rate;
-mod registry_tests;
+mod functions_tests;
 mod rollup_window;
 mod sort;
 mod special_functions;
 mod types;
 pub(crate) mod utils;
-
-pub(crate) use crate::promql::exec::aggregations::*;
 pub(crate) use function_list::*;
 pub(crate) use types::*;
 
