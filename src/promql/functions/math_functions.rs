@@ -11,7 +11,8 @@ fn exec_unary_fn(arg: PromQLArg, f: fn(f64) -> f64) -> EvalResult<ExprResult> {
 macro_rules! make_unary_function {
     ( $name: ident, $rf: expr ) => {
         #[derive(Copy, Clone)]
-        pub(crate) struct $name;
+        #[derive(Default)]
+pub(crate) struct $name;
 
         impl $name {
             pub fn new() -> Self {
