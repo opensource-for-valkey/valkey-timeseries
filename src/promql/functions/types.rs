@@ -136,6 +136,23 @@ pub(crate) trait PromQLFunction {
         self.apply(args.remove(0), eval_timestamp_ms)
     }
 
+    /// Apply the function to evaluated arguments provided as a slice.
+    ///
+    /// This helper avoids allocating a temporary `Vec` in the common unary
+    /// case by directly calling `apply` when there is exactly one argument.
+    /// Callers that already have a `Vec` can use `apply_args` directly.
+    fn apply_args_slice(&self, args: &[PromQLArg], eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        if args.len() != 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "function requires exactly one argument, got {}",
+                args.len()
+            )));
+        }
+
+        // Clone the single argument and delegate to `apply`.
+        self.apply(args[0].clone(), eval_timestamp_ms)
+    }
+
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
