@@ -16,7 +16,7 @@ enum KAggregationOrder {
     Bottom,
 }
 
-pub(crate) fn eval_aggregation(
+pub(super) fn eval_aggregation(
     expr: &AggregateExpr,
     samples: Vec<EvalSample>,
     param: Option<ExprResult>,
@@ -389,7 +389,7 @@ fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
     samples
 }
 
-fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
+fn select_limit_ratio(mut samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
     if !ratio.is_finite() || ratio == 0.0 || !(-1.0..=1.0).contains(&ratio) {
         return Err(EvaluationError::ArgumentError(
             "limit_ratio parameter must be within [-1, 1] and not equal to 0".to_string(),
@@ -402,11 +402,12 @@ fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<Ev
     }
 
     let take = ((len as f64) * ratio.abs()).floor() as usize;
-    if ratio > 0.0 {
-        Ok(samples.into_iter().take(take).collect())
-    } else {
-        Ok(samples.into_iter().rev().take(take).collect())
+    if ratio < 0.0 {
+        samples.reverse();
     }
+
+    samples.truncate(take);
+    Ok(samples)
 }
 
 fn get_param(param: Option<ExprResult>, function_name: &str) -> EvalResult<ExprResult> {
