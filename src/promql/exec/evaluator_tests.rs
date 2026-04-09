@@ -1581,6 +1581,8 @@ mod tests {
                         labels,
                         values: samples,
                         drop_name: false,
+                        range_end_ms: 0,
+                        range_ms: 0
                     }
                 })
                 .collect();
