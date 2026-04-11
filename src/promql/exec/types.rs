@@ -1,13 +1,10 @@
 use crate::common::Sample;
-use crate::common::time::system_time_to_millis;
-use crate::promql::Labels;
 use crate::promql::error::QueryError;
-use crate::promql::hashers::SeriesFingerprint;
+use crate::promql::hashers::{PreloadKey, SeriesFingerprint};
+use crate::promql::Labels;
 use ahash::RandomState;
 use promql_parser::parser::value::ValueType;
-use promql_parser::parser::{AtModifier, Offset, VectorSelector};
 use std::fmt::{Display, Formatter};
-use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone)]
 pub enum EvaluationError {
@@ -40,40 +37,6 @@ impl std::error::Error for EvaluationError {}
 
 pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
-/// Canonical key for caching selector results across steps.
-/// Derived from VectorSelector's matchers (which determine which series match).
-/// Offset and @ modifiers are excluded — they affect time windows, not series selection.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
-pub(crate) struct SelectorKey(u64);
-
-impl SelectorKey {
-    pub(crate) fn from_selector(selector: &VectorSelector) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        selector.name.hash(&mut hasher);
-        selector.matchers.matchers.hash(&mut hasher);
-        selector.matchers.or_matchers.hash(&mut hasher);
-        Self(hasher.finish())
-    }
-}
-
-/// Structural key for preloaded instant vector data.
-/// Captures selector identity + time modifiers that affect which samples map to which steps.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) struct PreloadKey {
-    selector: SelectorKey,
-    offset: Option<OffsetKey>,
-    at: Option<AtKey>,
-}
-
-impl PreloadKey {
-    pub(crate) fn from_selector(vs: &VectorSelector) -> Self {
-        Self {
-            selector: SelectorKey::from_selector(vs),
-            offset: vs.offset.as_ref().map(OffsetKey::from),
-            at: vs.at.as_ref().map(AtKey::from),
-        }
-    }
-}
 
 /// Type alias for complex HashMap used in matrix selector evaluation.
 /// Maps from a label key (sorted vector of label pairs) to samples vector
@@ -82,39 +45,6 @@ pub type SeriesMap = halfbrown::HashMap<Labels, Vec<Sample>, RandomState>;
 pub(in crate::promql) type PreloadMap =
 halfbrown::HashMap<PreloadKey, PreloadedInstantData, RandomState>;
 
-/// Hashable representation of Offset
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum OffsetKey {
-    Pos(i64),
-    Neg(i64),
-}
-
-impl From<&Offset> for OffsetKey {
-    fn from(offset: &Offset) -> Self {
-        match offset {
-            Offset::Pos(d) => OffsetKey::Pos(d.as_millis() as i64),
-            Offset::Neg(d) => OffsetKey::Neg(d.as_millis() as i64),
-        }
-    }
-}
-
-/// Hashable representation of AtModifier
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-enum AtKey {
-    At(i64),
-    Start,
-    End,
-}
-
-impl From<&AtModifier> for AtKey {
-    fn from(at: &AtModifier) -> Self {
-        match at {
-            AtModifier::At(t) => AtKey::At(system_time_to_millis(*t)),
-            AtModifier::Start => AtKey::Start,
-            AtModifier::End => AtKey::End,
-        }
-    }
-}
 
 /// Preloaded per-step evaluation data for a VectorSelector across a range query.
 pub(in crate::promql) struct PreloadedInstantData {

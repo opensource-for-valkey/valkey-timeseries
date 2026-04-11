@@ -1,7 +1,47 @@
 use crate::labels::Label;
+use blart::AsBytes;
+use promql_parser::label::{MatchOp, Matcher};
+use promql_parser::parser::{AtModifier, Offset, VectorSelector};
+use smallvec::{smallvec, SmallVec};
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 use twox_hash::xxhash3_128;
+use crate::common::time::system_time_to_millis;
+
+/// Hashable representation of Offset
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) enum OffsetKey {
+    Pos(i64),
+    Neg(i64),
+}
+
+impl From<&Offset> for OffsetKey {
+    fn from(offset: &Offset) -> Self {
+        match offset {
+            Offset::Pos(d) => OffsetKey::Pos(d.as_millis() as i64),
+            Offset::Neg(d) => OffsetKey::Neg(d.as_millis() as i64),
+        }
+    }
+}
+
+/// Hashable representation of AtModifier
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) enum AtKey {
+    At(i64),
+    Start,
+    End,
+}
+
+impl From<&AtModifier> for AtKey {
+    fn from(at: &AtModifier) -> Self {
+        match at {
+            AtModifier::At(t) => AtKey::At(system_time_to_millis(*t)),
+            AtModifier::Start => AtKey::Start,
+            AtModifier::End => AtKey::End,
+        }
+    }
+}
 
 /// Series fingerprint (hash of a label set)
 pub(crate) type SeriesFingerprint = u128;
@@ -15,6 +55,13 @@ impl HasFingerprint for Vec<Label> {
         self.as_slice().fingerprint()
     }
 }
+
+const HASH_SEED: u64 = 0xa4d3f1c2b7e98d5f;
+#[inline]
+fn create_hasher() -> xxhash3_128::Hasher {
+    xxhash3_128::Hasher::with_seed(HASH_SEED)
+}
+
 
 impl HasFingerprint for [Label] {
     fn fingerprint(&self) -> SeriesFingerprint {
@@ -35,6 +82,83 @@ impl HasFingerprint for &str {
 impl HasFingerprint for String {
     fn fingerprint(&self) -> SeriesFingerprint {
         self.as_str().fingerprint()
+    }
+}
+
+impl HasFingerprint for VectorSelector {
+    fn fingerprint(&self) -> SeriesFingerprint {
+        let mut hasher = create_hasher();
+        update_hasher_for_vector_selector(self, &mut hasher);
+        hasher.finish_128()
+    }
+}
+
+pub(in crate::promql) fn update_hasher_for_vector_selector(vs: &VectorSelector, hasher: &mut xxhash3_128::Hasher) {
+    fn update_list(list: &Vec<Matcher>, hasher: &mut xxhash3_128::Hasher) {
+        let mut keys: SmallVec<&Matcher, 6> = smallvec![];
+        for m in list {
+            keys.push(m);
+        }
+
+        keys.sort_by(|&a, &b| {
+            a.name.cmp(&b.name).then(a.value.cmp(&b.value))
+        });
+
+        for m in keys {
+            update_hash_for_matcher(m, hasher);
+        }
+    }
+
+    if let Some(name) = &vs.name {
+        hasher.write(name.as_bytes());
+    }
+
+    update_list(&vs.matchers.matchers, hasher);
+
+    // Sort or_matchers lists to ensure order-independent hashing
+    let mut sorted_or_matchers: SmallVec<&Vec<Matcher>, 8> = smallvec![];
+    for m in &vs.matchers.or_matchers {
+        sorted_or_matchers.push(m);
+    }
+
+    sorted_or_matchers.sort_by(|&a, &b| {
+        // Compare lists lexicographically
+        for (ma, mb) in a.iter().zip(b.iter()) {
+            match ma.name.cmp(&mb.name) {
+                Ordering::Equal => {
+                    match ma.value.cmp(&mb.value) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                other => return other,
+            }
+        }
+        a.len().cmp(&b.len())
+    });
+
+    for m in &sorted_or_matchers {
+        update_list(m, hasher);
+    }
+}
+
+fn update_hash_for_matcher(m: &Matcher, hasher: &mut xxhash3_128::Hasher) {
+    hash_key_value(hasher, &m.name, &m.value);
+    match &m.op {
+        MatchOp::Equal => {
+            hasher.write(b"=");
+        },
+        MatchOp::NotEqual => {
+            hasher.write(b"!");
+        },
+        MatchOp::Re(r) => {
+            hasher.write(b"=");
+            hasher.write(r.as_str().as_bytes())
+        },
+        MatchOp::NotRe(regex) => {
+            hasher.write(b"!");
+            hasher.write(regex.as_str().as_bytes())
+        }
     }
 }
 
@@ -80,5 +204,58 @@ impl Hasher for FingerprintHasher {
 
     fn write_usize(&mut self, value: usize) {
         self.0 = value as u64;
+    }
+}
+
+/// Canonical key for caching selector results across steps.
+/// Derived from VectorSelector's matchers (which determine which series match).
+/// Offset and @ modifiers are excluded — they affect time windows, not series selection.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
+pub(in crate::promql) struct SelectorKey(u128);
+
+impl SelectorKey {
+    pub(crate) fn from_selector(selector: &VectorSelector) -> Self {
+        let signature = selector.fingerprint();
+        Self(signature)
+    }
+}
+
+/// Structural key for preloaded instant vector data.
+/// Captures selector identity + time modifiers that affect which samples map to which steps.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) struct PreloadKey {
+    selector: SelectorKey,
+    offset: Option<OffsetKey>,
+    at: Option<AtKey>,
+}
+
+impl PreloadKey {
+    pub(crate) fn from_selector(vs: &VectorSelector) -> Self {
+        Self {
+            selector: SelectorKey::from_selector(vs),
+            offset: vs.offset.as_ref().map(OffsetKey::from),
+            at: vs.at.as_ref().map(AtKey::from),
+        }
+    }
+}
+
+impl HasFingerprint for PreloadKey {
+    fn fingerprint(&self) -> SeriesFingerprint {
+        let mut hasher = xxhash3_128::Hasher::new();
+        hasher.write(self.selector.0.to_le_bytes().as_ref());
+        if let Some(offset) = &self.offset {
+            match offset {
+                OffsetKey::Pos(p) => hasher.write(&p.to_le_bytes()),
+                OffsetKey::Neg(p) => hasher.write(&p.to_le_bytes()),
+            }
+        }
+        if let Some(at) = &self.at {
+            match at {
+                AtKey::Start => hasher.write(b"-"),
+                AtKey::End => hasher.write(b"+"),
+                AtKey::At(v) => hasher.write(&v.to_le_bytes()),
+            }
+        }
+        hasher.finish_128()
     }
 }
