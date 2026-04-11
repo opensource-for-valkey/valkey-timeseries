@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use crate::common::Sample;
     use crate::common::math::kahan_inc;
     use crate::promql::functions::PromQLFunctionImpl;
@@ -12,6 +11,7 @@ mod tests {
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::{Expr, ParenExpr, StringLiteral};
     use rstest::rstest;
+    use std::time::Duration;
     // ========================================================================
     // Test helpers
     // ========================================================================
@@ -181,7 +181,9 @@ mod tests {
     ) -> Vec<EvalSample> {
         let func = get_range_function(name).unwrap();
         // todo: pass in range
-        let result = func.apply_with_range(samples, eval_timestamp_ms, Duration::default()).unwrap();
+        let result = func
+            .apply_with_range(samples, eval_timestamp_ms, Duration::default())
+            .unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
         };
@@ -1258,7 +1260,6 @@ mod tests {
             .apply_with_range(samples, 3000, Duration::from_millis(2000))
             .unwrap()
             .expect_instant_vector("expected an instant vector");
-
 
         assert_eq!(result.len(), 1);
         // Rate = (125 - 100) / (3000 - 1000) * 1000 = 25 / 2 = 12.5 per second

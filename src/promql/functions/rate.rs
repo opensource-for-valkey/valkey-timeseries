@@ -32,7 +32,6 @@ impl Default for RateFunction {
     }
 }
 
-
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DeltaFunction;
 
