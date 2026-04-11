@@ -1,11 +1,11 @@
 use crate::common::Timestamp;
 use crate::common::humanize::humanize_duration;
 use crate::promql::EvalResult;
+use num_traits::Zero;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
-use num_traits::Zero;
 
 const EMPTY_STRING: &str = "";
 
@@ -194,9 +194,7 @@ pub(super) fn bucket_samples(
                     curr_timestamp = rfa.timestamps[0];
                 }
 
-                if lookback.is_zero()
-                    || (curr_timestamp - prev_timestamp) < lookback
-                {
+                if lookback.is_zero() || (curr_timestamp - prev_timestamp) < lookback {
                     let prev_value = values.get_unchecked(idx);
                     rfa.real_prev_value = *prev_value;
                 }

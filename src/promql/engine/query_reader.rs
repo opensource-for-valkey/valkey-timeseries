@@ -1,8 +1,8 @@
-use crate::common::{Timestamp};
-use crate::promql::hashers::{update_hasher_for_vector_selector, FingerprintHashMap};
+use crate::common::Timestamp;
+use crate::promql::hashers::{FingerprintHashMap, update_hasher_for_vector_selector};
 use crate::promql::{
-    model::{InstantSample, RangeSample}, EvalResult, PromqlResult,
-    QueryOptions,
+    EvalResult, PromqlResult, QueryOptions,
+    model::{InstantSample, RangeSample},
 };
 use crate::series::SeriesRef;
 use promql_parser::parser::VectorSelector;
@@ -78,12 +78,22 @@ impl QueryReaderEvalCache {
         }
     }
 
-    pub fn cache_samples(&self, vs: &VectorSelector, start: Timestamp, end: Timestamp, samples: Vec<InstantSample>) -> bool {
+    pub fn cache_samples(
+        &self,
+        vs: &VectorSelector,
+        start: Timestamp,
+        end: Timestamp,
+        samples: Vec<InstantSample>,
+    ) -> bool {
         let key = SeriesSampleRangeKey::new(vs, start, end);
         self.cache_samples_raw(key, Arc::new(samples))
     }
 
-    fn cache_samples_raw(&self, key: SeriesSampleRangeKey, samples: Arc<Vec<InstantSample>>) -> bool {
+    fn cache_samples_raw(
+        &self,
+        key: SeriesSampleRangeKey,
+        samples: Arc<Vec<InstantSample>>,
+    ) -> bool {
         let mut guard = self.samples.write().unwrap();
         if let Some(current) = guard.get(&key.0) {
             // merge current and new samples into a new Vec and replace
@@ -96,12 +106,20 @@ impl QueryReaderEvalCache {
         }
     }
 
-    pub(crate) fn get_samples(&self, vs: &VectorSelector, start: Timestamp, end: Timestamp) -> Option<Arc<Vec<InstantSample>>> {
+    pub(crate) fn get_samples(
+        &self,
+        vs: &VectorSelector,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Option<Arc<Vec<InstantSample>>> {
         let key = SeriesSampleRangeKey::new(vs, start, end);
         self.get_samples_raw(key)
     }
 
-    pub(crate) fn get_samples_raw(&self, key: SeriesSampleRangeKey) -> Option<Arc<Vec<InstantSample>>> {
+    pub(crate) fn get_samples_raw(
+        &self,
+        key: SeriesSampleRangeKey,
+    ) -> Option<Arc<Vec<InstantSample>>> {
         let guard = self.samples.read().unwrap();
         guard.get(&key.0).cloned()
     }
@@ -130,7 +148,9 @@ impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
         if let Some(samples) = self.cache.get_samples_raw(key) {
             return Ok(samples);
         }
-        let samples = self.inner.query(selector, start_ms, QueryOptions::default())?;
+        let samples = self
+            .inner
+            .query(selector, start_ms, QueryOptions::default())?;
         let arc = Arc::new(samples);
         // cache_samples_raw takes an Arc<Vec<Sample>>
         self.cache.cache_samples_raw(key, arc.clone());
@@ -163,10 +183,10 @@ pub(crate) mod test_utils {
     use super::*;
     use crate::commands::parse_metric_name;
     use crate::common::Sample;
-    pub(crate) use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
     use crate::promql::Labels;
-    use crate::series::index::TimeSeriesIndex;
+    pub(crate) use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
     use crate::series::TimeSeries;
+    use crate::series::index::TimeSeriesIndex;
     use std::collections::HashMap;
 
     /// Builder for creating MockQueryReader instances from test data.

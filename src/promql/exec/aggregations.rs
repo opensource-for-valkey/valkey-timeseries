@@ -5,11 +5,11 @@ use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels}
 use ahash::AHasher;
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
+use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
-use promql_parser::label::METRIC_NAME;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum KAggregationOrder {
