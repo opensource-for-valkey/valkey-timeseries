@@ -1374,7 +1374,9 @@ mod tests {
         };
 
         let ctx = EvalContext::for_vector_selector(query_time_ms, lookback_ms);
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: verify results
         let ExprResult::InstantVector(samples) = result else {
@@ -1667,7 +1669,7 @@ mod tests {
             lookback_delta_ms: 300_000,
         };
 
-        let result = evaluator.evaluate_call(&call, &ctx).unwrap();
+        let result = evaluator.evaluate_call(&call, &ctx, false).unwrap();
 
         match result {
             ExprResult::InstantVector(samples) => {
@@ -1719,7 +1721,7 @@ mod tests {
             step_ms: 60_000,
             lookback_delta_ms: 300_000,
         };
-        let result = evaluator.evaluate_call(&call, &ctx).unwrap();
+        let result = evaluator.evaluate_call(&call, &ctx, false).unwrap();
         match result {
             ExprResult::InstantVector(samples) => {
                 assert_eq!(samples.len(), 1);
@@ -1860,7 +1862,7 @@ mod tests {
             lookback_delta_ms: 5_000,
         };
 
-        let pipeline_result = evaluator.evaluate_expr(&expr, &ctx).unwrap();
+        let pipeline_result = evaluator.evaluate_expr(&expr, &ctx, false).unwrap();
 
         if let ExprResult::InstantVector(instant_samples) = pipeline_result {
             assert_eq!(instant_samples.len(), 1, "Expected 1 result from pipeline");
@@ -1913,7 +1915,9 @@ mod tests {
 
         let query_time = 6_300_000;
         let ctx = EvalContext::for_vector_selector(query_time, 300_000);
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: should get the sample from t=6_000_000 (value 20.0)
         if let ExprResult::InstantVector(samples) = result {
@@ -1960,7 +1964,9 @@ mod tests {
 
         let query_time = 6_300_000;
         let ctx = EvalContext::for_vector_selector(query_time, 300_000);
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: should get the sample from @ time (value 20.0)
         if let ExprResult::InstantVector(samples) = result {
@@ -2007,7 +2013,9 @@ mod tests {
 
         let query_time = 6_300_000;
         let ctx = EvalContext::for_vector_selector(query_time, 300_000);
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: should get the sample from @ time - offset (value 30.0 at t=5_700_000)
         if let ExprResult::InstantVector(samples) = result {
@@ -2137,7 +2145,7 @@ mod tests {
         };
 
         let result_start = evaluator
-            .evaluate_vector_selector(&selector_start, &ctx)
+            .evaluate_vector_selector(&selector_start, &ctx, false)
             .unwrap();
 
         // then: should get sample at query_start (value 10.0)
@@ -2158,7 +2166,7 @@ mod tests {
         };
 
         let result_end = evaluator
-            .evaluate_vector_selector(&selector_end, &ctx)
+            .evaluate_vector_selector(&selector_end, &ctx, false)
             .unwrap();
 
         // then: should get sample at query_end (value 30.0)
@@ -2200,7 +2208,9 @@ mod tests {
 
         let query_time = 5_700_000;
         let ctx = EvalContext::for_vector_selector(query_time, 300_000);
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: should get the sample from t=6_000_000 (value 20.0)
         if let ExprResult::InstantVector(samples) = result {
@@ -2247,7 +2257,9 @@ mod tests {
         let query_time = 6_234_567;
         let ctx = EvalContext::for_vector_selector(query_time, 300_000);
 
-        let result = evaluator.evaluate_vector_selector(&selector, &ctx).unwrap();
+        let result = evaluator
+            .evaluate_vector_selector(&selector, &ctx, false)
+            .unwrap();
 
         // then: should get the sample closest to (6_234_567 - 250_000 = 5_984_567)
         // Lookback window: (5_684_567, 5_984_567]
