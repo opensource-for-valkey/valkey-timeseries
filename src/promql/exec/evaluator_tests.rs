@@ -19,7 +19,7 @@ mod tests {
     use crate::promql::engine::test_utils::{
         MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MockSeriesQuerier,
     };
-    use crate::promql::engine::{QueryOptions, SeriesQuerier};
+    use crate::promql::engine::{QueryOptions, QueryReader};
     use crate::tests::approx_eq;
     use promql_parser::parser::token::{T_SUB, TokenType};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,7 +32,7 @@ mod tests {
     type VectorSelectorExpectedResults = Vec<(f64, Vec<(&'static str, &'static str)>)>;
 
     /// Helper to parse a PromQL query and evaluate it
-    fn parse_and_evaluate<'reader, R: SeriesQuerier>(
+    fn parse_and_evaluate<'reader, R: QueryReader>(
         evaluator: &Evaluator<'reader, R>,
         query: &str,
         end_time: SystemTime,
