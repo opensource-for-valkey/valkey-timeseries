@@ -444,7 +444,7 @@ fn get_param_as_scalar(param: Option<ExprResult>, function_name: &str) -> EvalRe
 fn get_param_as_string(params: Option<ExprResult>, function_name: &str) -> EvalResult<String> {
     let param = get_param(params, function_name)?;
     match param {
-        ExprResult::String(value) => Ok(value.clone()),
+        ExprResult::String(value) => Ok(value),
         other => {
             let value_type = other.value_type();
             Err(EvaluationError::ArgumentError(format!(
