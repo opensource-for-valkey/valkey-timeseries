@@ -389,7 +389,6 @@ impl From<Vec<Label>> for Labels {
     }
 }
 
-
 /// The result of an instant PromQL query.
 ///
 /// PromQL expressions evaluate to either a scalar (e.g. `1+1`), a
