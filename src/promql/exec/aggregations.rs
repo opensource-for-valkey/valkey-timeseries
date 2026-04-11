@@ -9,6 +9,7 @@ use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use promql_parser::label::METRIC_NAME;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum KAggregationOrder {
@@ -18,12 +19,20 @@ enum KAggregationOrder {
 
 pub(super) fn eval_aggregation(
     expr: &AggregateExpr,
-    samples: Vec<EvalSample>,
+    mut samples: Vec<EvalSample>,
     param: Option<ExprResult>,
     eval_time: Timestamp,
 ) -> EvalResult<ExprResult> {
     if samples.is_empty() {
         return Ok(ExprResult::InstantVector(Vec::new()));
+    }
+
+    // Materialize any pending __name__ drops on inner expression results before aggregation
+    // so that grouping and aggregation operate on the correct label sets (Prometheus semantics).
+    for sample in samples.iter_mut() {
+        if sample.drop_name {
+            sample.labels.remove(METRIC_NAME);
+        }
     }
 
     if is_reduction_aggregate(expr.op) {

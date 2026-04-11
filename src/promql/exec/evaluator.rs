@@ -2,7 +2,7 @@ use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
 use crate::promql::binops::eval_binary_expr;
-use crate::promql::engine::{CachedQueryReader, QueryOptions, SeriesQuerier};
+use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
@@ -12,7 +12,7 @@ use crate::promql::functions::{
 use super::aggregations::eval_aggregation;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
-use crate::promql::types::{PreloadKey, PreloadedInstantData, PreloadedInstantSeries};
+use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{EvalResult, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap};
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParIter;
@@ -25,8 +25,9 @@ use promql_parser::parser::{
     SubqueryExpr, UnaryExpr, VectorSelector,
 };
 use std::sync::RwLock;
+use crate::promql::hashers::PreloadKey;
 
-pub(crate) struct Evaluator<'reader, R: SeriesQuerier> {
+pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
@@ -34,7 +35,7 @@ pub(crate) struct Evaluator<'reader, R: SeriesQuerier> {
     options: QueryOptions,
 }
 
-impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
+impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
         Self {
             reader: CachedQueryReader::new(reader),
@@ -66,7 +67,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
 
     /// Convenience wrapper that builds an [`EvalContext`] from a full [`EvalStmt`]
     /// so callers outside the `exec` module don't need to construct it manually.
-    pub(crate) fn preload_for_range_from_stmt(&self, stmt: &EvalStmt) -> EvalResult<()> {
+    pub(in crate::promql) fn preload_for_range_from_stmt(&self, stmt: &EvalStmt) -> EvalResult<()> {
         let ctx = EvalContext::from(stmt);
         self.preload_for_range(&stmt.expr, &ctx)
     }
@@ -498,9 +499,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
     pub(super) fn evaluate_call(&self, call: &Call, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let evaluated_args = self.evaluate_function_args(call, ctx)?;
 
-        // Build a unified param bag for function dispatch. This sketch allows a
-        // single dispatch point to forward calls to instant functions or to
-        // range/rollup handlers in the future.
+        // Build a unified param bag for function dispatch.
         let eval_timestamp_ms = ctx.evaluation_ts;
 
         let Some(func) = resolve_function(call.func.name) else {
@@ -589,7 +588,7 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
         let result = self.evaluate_expr(&aggregate.expr, ctx)?;
 
         // Extract samples from the result
-        let mut samples = match result {
+        let samples = match result {
             ExprResult::InstantVector(samples) => samples,
             ExprResult::RangeVector(_) => {
                 return Err(EvaluationError::InternalError(
@@ -604,14 +603,6 @@ impl<'reader, R: SeriesQuerier> Evaluator<'reader, R> {
                 )));
             }
         };
-
-        // Materialize any pending __name__ drops on inner expression results before aggregation
-        // so that grouping and aggregation operate on the correct label sets (Prometheus semantics).
-        for sample in samples.iter_mut() {
-            if sample.drop_name {
-                sample.labels.remove(METRIC_NAME);
-            }
-        }
 
         // If there are no samples, return empty result
         if samples.is_empty() {
