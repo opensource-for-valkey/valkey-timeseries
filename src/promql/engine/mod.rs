@@ -3,7 +3,7 @@ pub mod config;
 mod fanout;
 mod mock_series_querier;
 mod promql_engine;
-mod querier;
+mod query_reader;
 mod query_stats;
 mod query_worker;
 
@@ -20,7 +20,7 @@ pub(crate) use fanout::*;
 pub(crate) use promql_engine::*;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
-pub(crate) use querier::*;
+pub(crate) use query_reader::*;
 use std::sync::LazyLock;
 use std::time::Duration;
 use valkey_module::Context;
@@ -66,7 +66,7 @@ impl Default for QueryOptions {
 
 pub struct ValkeySeriesQuerier;
 
-impl SeriesQuerier for ValkeySeriesQuerier {
+impl QueryReader for ValkeySeriesQuerier {
     fn query(
         &self,
         selector: &VectorSelector,
@@ -129,7 +129,7 @@ impl ConcreteSeriesQuerier {
         }
     }
 
-    pub fn as_series_querier(&self) -> &dyn SeriesQuerier {
+    pub fn as_series_querier(&self) -> &dyn QueryReader {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local,
             ConcreteSeriesQuerier::Mock(mock) => mock,
@@ -137,7 +137,7 @@ impl ConcreteSeriesQuerier {
     }
 }
 
-impl SeriesQuerier for ConcreteSeriesQuerier {
+impl QueryReader for ConcreteSeriesQuerier {
     fn query(
         &self,
         selector: &VectorSelector,
