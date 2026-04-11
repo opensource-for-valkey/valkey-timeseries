@@ -74,6 +74,7 @@ The following commands are supported
 - [`TS.NRANGE`](docs/commands/ts.nrange.md)
 - [`TS.NREVRANGE`](docs/commands/ts.nrevrange.md)
 - [`TS.OUTLIERS`](docs/commands/ts.outliers.md)
+- [`TS.QUERY`](docs/commands/ts.query.md)
 - [`TS.QUERYINDEX`](docs/commands/ts.queryindex.md)
 - [`TS.QUERYLABELS`](docs/commands/ts.querylabels.md)
 - [`TS.QUERYRANGE`](docs/commands/ts.queryrange.md)
