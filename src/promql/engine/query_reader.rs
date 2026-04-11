@@ -1,4 +1,4 @@
-use crate::common::{Sample, Timestamp};
+use crate::common::{Timestamp};
 use crate::promql::hashers::{update_hasher_for_vector_selector, FingerprintHashMap};
 use crate::promql::{
     model::{InstantSample, RangeSample}, EvalResult, PromqlResult,
