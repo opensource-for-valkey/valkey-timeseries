@@ -255,22 +255,23 @@ pub(crate) fn shape_subquery_results(
     series_data: Vec<LoadedSeriesSamples>,
     plan: &QueryPlan,
 ) -> Vec<EvalSamples> {
-    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) = match &plan.path_kind {
-        QueryPathKind::SubqueryVectorSelector {
-            range_ms,
-            aligned_start_ms,
-            step_ms,
-            lookback_delta_ms,
-            expected_steps,
-        } => (
-            *range_ms,
-            *aligned_start_ms,
-            *step_ms,
-            *lookback_delta_ms,
-            *expected_steps,
-        ),
-        _ => return Vec::new(),
-    };
+    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
+        match &plan.path_kind {
+            QueryPathKind::SubqueryVectorSelector {
+                range_ms,
+                aligned_start_ms,
+                step_ms,
+                lookback_delta_ms,
+                expected_steps,
+            } => (
+                *range_ms,
+                *aligned_start_ms,
+                *step_ms,
+                *lookback_delta_ms,
+                *expected_steps,
+            ),
+            _ => return Vec::new(),
+        };
 
     // Merge by fingerprint
     let mut merged: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
