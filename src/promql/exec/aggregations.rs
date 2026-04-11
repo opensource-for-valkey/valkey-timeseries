@@ -8,6 +8,7 @@ use orx_parallel::ParIter;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -144,15 +145,10 @@ fn select_k_from_group(
     if k >= group_samples.len() {
         return group_samples;
     }
-    match order {
-        KAggregationOrder::Top => {
-            group_samples.sort_by(|a, b| topk_value_cmp(a.value, b.value));
-        }
-        KAggregationOrder::Bottom => {
-            group_samples.sort_by(|a, b| bottomk_value_cmp(a.value, b.value));
-        }
-    }
+
+    group_samples.sort_by(|a, b| compare_k_values(a.value, b.value, order));
     group_samples.truncate(k);
+
     group_samples
 }
 
@@ -367,28 +363,25 @@ fn max_ignore_nan(lhs: f64, rhs: f64) -> f64 {
 
 fn quantile_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
     match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
         (false, false) => lhs.total_cmp(&rhs),
     }
 }
 
-fn topk_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
-    match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => rhs.total_cmp(&lhs),
-    }
-}
-
-fn bottomk_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
-    match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => std::cmp::Ordering::Equal,
-        (true, false) => std::cmp::Ordering::Greater,
-        (false, true) => std::cmp::Ordering::Less,
-        (false, false) => lhs.total_cmp(&rhs),
+/// Compares values for topk/bottomk aggregation.
+/// NaN values are always considered "greater" (sorted last) regardless of order.
+/// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
+fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => match order {
+            KAggregationOrder::Top => right.partial_cmp(&left).unwrap_or(Ordering::Equal),
+            KAggregationOrder::Bottom => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+        },
     }
 }
 
