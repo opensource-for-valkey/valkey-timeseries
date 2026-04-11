@@ -74,7 +74,7 @@ with two extensions: the `ignore` and `resume` directives.
 
 ### Ignore and Resume Directives
 
-The `ignore` directive skips all later commands until `resume` or `clear`. This allows copying test files directly
+The `ignore` directive skips all later commands until `resume`. This allows copying test files directly
 from Prometheus's test suite while marking unimplemented features.
 
 ```
