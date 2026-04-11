@@ -1,16 +1,17 @@
-use crate::common::Sample;
-use crate::promql::hashers::SeriesFingerprint;
+use crate::common::{Sample, Timestamp};
+use crate::promql::hashers::{update_hasher_for_vector_selector, FingerprintHashMap};
 use crate::promql::{
-    EvalResult, EvaluationError, PromqlResult, QueryOptions,
-    model::{InstantSample, RangeSample},
+    model::{InstantSample, RangeSample}, EvalResult, PromqlResult,
+    QueryOptions,
 };
 use crate::series::SeriesRef;
-use ahash::AHashMap;
 use promql_parser::parser::VectorSelector;
 use std::default::Default;
-use std::sync::Arc;
+use std::hash::Hash;
+use std::sync::{Arc, RwLock};
+use twox_hash::xxhash3_128;
 
-pub(crate) trait SeriesQuerier: Send + Sync {
+pub(crate) trait QueryReader: Send + Sync {
     /// Query instant samples at `timestamp`.
     /// `deadline` is an optional absolute Instant by which the operation should complete.
     fn query(
@@ -30,10 +31,7 @@ pub(crate) trait SeriesQuerier: Send + Sync {
     ) -> PromqlResult<Vec<RangeSample>>;
 }
 
-impl<T> SeriesQuerier for Box<T>
-where
-    T: SeriesQuerier,
-{
+impl QueryReader for Arc<dyn QueryReader> {
     fn query(
         &self,
         selector: &VectorSelector,
@@ -55,53 +53,22 @@ where
     }
 }
 
-impl SeriesQuerier for Box<dyn SeriesQuerier> {
-    fn query(
-        &self,
-        selector: &VectorSelector,
-        timestamp: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
-        self.as_ref().query(selector, timestamp, options)
-    }
+#[derive(Debug, Hash, Eq, PartialEq, Copy, Clone)]
+pub(in crate::promql) struct SeriesSampleRangeKey(u128);
 
-    fn query_range(
-        &self,
-        selector: &VectorSelector,
-        start_ms: i64,
-        end_ms: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
-        self.as_ref()
-            .query_range(selector, start_ms, end_ms, options)
-    }
-}
-
-impl SeriesQuerier for Arc<dyn SeriesQuerier> {
-    fn query(
-        &self,
-        selector: &VectorSelector,
-        timestamp: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
-        self.as_ref().query(selector, timestamp, options)
-    }
-
-    fn query_range(
-        &self,
-        selector: &VectorSelector,
-        start_ms: i64,
-        end_ms: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
-        self.as_ref()
-            .query_range(selector, start_ms, end_ms, options)
+impl SeriesSampleRangeKey {
+    fn new(vs: &VectorSelector, start: i64, end: i64) -> Self {
+        let mut hasher = xxhash3_128::Hasher::new();
+        update_hasher_for_vector_selector(vs, &mut hasher);
+        hasher.write(&start.to_le_bytes());
+        hasher.write(&end.to_le_bytes());
+        Self(hasher.finish_128())
     }
 }
 
 #[derive(Default)]
-pub(crate) struct QueryReaderEvalCache {
-    samples: AHashMap<SeriesFingerprint, Vec<Sample>>,
+pub(in crate::promql) struct QueryReaderEvalCache {
+    samples: RwLock<FingerprintHashMap<Arc<Vec<InstantSample>>>>,
 }
 
 impl QueryReaderEvalCache {
@@ -111,40 +78,67 @@ impl QueryReaderEvalCache {
         }
     }
 
-    pub(crate) fn cache_samples(&mut self, series_id: SeriesFingerprint, samples: Vec<Sample>) {
-        self.samples.insert(series_id, samples);
+    pub fn cache_samples(&self, vs: &VectorSelector, start: Timestamp, end: Timestamp, samples: Vec<InstantSample>) -> bool {
+        let key = SeriesSampleRangeKey::new(vs, start, end);
+        self.cache_samples_raw(key, Arc::new(samples))
     }
 
-    pub(crate) fn get_samples(&self, series_id: &SeriesFingerprint) -> Option<&Vec<Sample>> {
-        self.samples.get(series_id)
+    fn cache_samples_raw(&self, key: SeriesSampleRangeKey, samples: Arc<Vec<InstantSample>>) -> bool {
+        let mut guard = self.samples.write().unwrap();
+        if let Some(current) = guard.get(&key.0) {
+            // merge current and new samples into a new Vec and replace
+            let mut new_samples = (**current).clone();
+            new_samples.extend((*samples).iter().cloned());
+            guard.insert(key.0, Arc::new(new_samples));
+            false
+        } else {
+            guard.insert(key.0, samples).is_none()
+        }
+    }
+
+    pub(crate) fn get_samples(&self, vs: &VectorSelector, start: Timestamp, end: Timestamp) -> Option<Arc<Vec<InstantSample>>> {
+        let key = SeriesSampleRangeKey::new(vs, start, end);
+        self.get_samples_raw(key)
+    }
+
+    pub(crate) fn get_samples_raw(&self, key: SeriesSampleRangeKey) -> Option<Arc<Vec<InstantSample>>> {
+        let guard = self.samples.read().unwrap();
+        guard.get(&key.0).cloned()
     }
 }
 
-pub struct CachedQueryReader<'querier, Q: SeriesQuerier> {
+pub struct CachedQueryReader<'querier, Q: QueryReader> {
     inner: &'querier Q,
+    cache: QueryReaderEvalCache,
 }
 
-impl<'reader, R: SeriesQuerier> CachedQueryReader<'reader, R> {
+impl<'reader, R: QueryReader> CachedQueryReader<'reader, R> {
     pub(crate) fn new(reader: &'reader R) -> Self {
-        Self { inner: reader }
+        Self {
+            inner: reader,
+            cache: QueryReaderEvalCache::new(),
+        }
     }
 
     pub(crate) fn samples(
         &self,
-        _series_id: SeriesFingerprint,
-        _start_ms: i64,
-        _end_ms: i64,
-    ) -> EvalResult<Vec<Sample>> {
-        // Caching by SeriesFingerprint is not supported with the current SeriesQuerier
-        // abstraction (which operates on selectors). Keep the API but return an error
-        // if called. The cached reader still forwards selector-based queries.
-        Err(EvaluationError::InternalError(
-            "CachedQueryReader.samples is not supported in this build".to_string(),
-        ))
+        selector: &VectorSelector,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> EvalResult<Arc<Vec<InstantSample>>> {
+        let key = SeriesSampleRangeKey::new(selector, start_ms, end_ms);
+        if let Some(samples) = self.cache.get_samples_raw(key) {
+            return Ok(samples);
+        }
+        let samples = self.inner.query(selector, start_ms, QueryOptions::default())?;
+        let arc = Arc::new(samples);
+        // cache_samples_raw takes an Arc<Vec<Sample>>
+        self.cache.cache_samples_raw(key, arc.clone());
+        Ok(arc)
     }
 }
 
-impl<'reader, R: SeriesQuerier> SeriesQuerier for CachedQueryReader<'reader, R> {
+impl<'reader, R: QueryReader> QueryReader for CachedQueryReader<'reader, R> {
     fn query(
         &self,
         selector: &VectorSelector,
@@ -169,10 +163,10 @@ pub(crate) mod test_utils {
     use super::*;
     use crate::commands::parse_metric_name;
     use crate::common::Sample;
-    use crate::promql::Labels;
     pub(crate) use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
-    use crate::series::TimeSeries;
+    use crate::promql::Labels;
     use crate::series::index::TimeSeriesIndex;
+    use crate::series::TimeSeries;
     use std::collections::HashMap;
 
     /// Builder for creating MockQueryReader instances from test data.
