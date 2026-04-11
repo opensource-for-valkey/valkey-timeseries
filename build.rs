@@ -56,6 +56,7 @@ fn main() -> io::Result<()> {
         .compile_fds(file_descriptors)
         .map_err(io::Error::other)?;
 
+<<<<<<< HEAD
     let expected = format!(
         "{HEADER}{}",
         fs::read_to_string(Path::new(&out_dir).join(PROST_OUTPUT))?
