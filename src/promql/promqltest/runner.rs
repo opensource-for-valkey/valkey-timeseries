@@ -130,7 +130,7 @@ where
 fn new_test_storage() -> (Tsdb, Arc<MockSeriesQuerier>) {
     let storage = Arc::new(MockSeriesQuerier::new());
     // Coerce Arc<MockSeriesQuerier> to Arc<dyn SeriesQuerier> for Tsdb
-    let querier: Arc<dyn crate::promql::engine::SeriesQuerier> = storage.clone();
+    let querier: Arc<dyn crate::promql::engine::QueryReader> = storage.clone();
     (Tsdb::new(querier), storage)
 }
 

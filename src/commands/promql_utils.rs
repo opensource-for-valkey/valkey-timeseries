@@ -1,13 +1,13 @@
 use crate::common::context::ClientReplyContext;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
-use crate::promql::engine::{ConcreteSeriesQuerier, SeriesQuerier};
+use crate::promql::engine::{ConcreteSeriesQuerier, QueryReader};
 use crate::promql::{EvalSample, EvalSamples, ExprResult, QueryValue};
 use promql_parser::parser::value::ValueType;
 use std::sync::Arc;
 use valkey_module::{Context, Status};
 
-pub(super) fn get_promql_querier(ctx: &Context) -> Arc<dyn SeriesQuerier> {
+pub(super) fn get_promql_querier(ctx: &Context) -> Arc<dyn QueryReader> {
     let querier = ConcreteSeriesQuerier::create(ctx);
     Arc::new(querier)
 }

@@ -2,7 +2,7 @@ use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, MetricName};
-use crate::promql::engine::SeriesQuerier;
+use crate::promql::engine::QueryReader;
 use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::model::InstantSample;
 use crate::promql::{Labels, PromqlResult, QueryError, QueryOptions, RangeSample};
@@ -127,7 +127,7 @@ impl MockSeriesQuerier {
     }
 }
 
-impl SeriesQuerier for MockSeriesQuerier {
+impl QueryReader for MockSeriesQuerier {
     fn query(
         &self,
         selector: &VectorSelector,
