@@ -1,7 +1,7 @@
 use crate::common::Sample;
+use crate::promql::Labels;
 use crate::promql::error::QueryError;
 use crate::promql::hashers::{PreloadKey, SeriesFingerprint};
-use crate::promql::Labels;
 use ahash::RandomState;
 use promql_parser::parser::value::ValueType;
 use std::fmt::{Display, Formatter};
@@ -37,14 +37,12 @@ impl std::error::Error for EvaluationError {}
 
 pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
-
 /// Type alias for complex HashMap used in matrix selector evaluation.
 /// Maps from a label key (sorted vector of label pairs) to samples vector
 pub type SeriesMap = halfbrown::HashMap<Labels, Vec<Sample>, RandomState>;
 
 pub(in crate::promql) type PreloadMap =
 halfbrown::HashMap<PreloadKey, PreloadedInstantData, RandomState>;
-
 
 /// Preloaded per-step evaluation data for a VectorSelector across a range query.
 pub(in crate::promql) struct PreloadedInstantData {
