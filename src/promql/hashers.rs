@@ -1,13 +1,13 @@
+use crate::common::time::system_time_to_millis;
 use crate::labels::Label;
 use blart::AsBytes;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, Offset, VectorSelector};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 use twox_hash::xxhash3_128;
-use crate::common::time::system_time_to_millis;
 
 /// Hashable representation of Offset
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -62,7 +62,6 @@ fn create_hasher() -> xxhash3_128::Hasher {
     xxhash3_128::Hasher::with_seed(HASH_SEED)
 }
 
-
 impl HasFingerprint for [Label] {
     fn fingerprint(&self) -> SeriesFingerprint {
         let mut hasher = xxhash3_128::Hasher::new();
@@ -93,16 +92,17 @@ impl HasFingerprint for VectorSelector {
     }
 }
 
-pub(in crate::promql) fn update_hasher_for_vector_selector(vs: &VectorSelector, hasher: &mut xxhash3_128::Hasher) {
+pub(in crate::promql) fn update_hasher_for_vector_selector(
+    vs: &VectorSelector,
+    hasher: &mut xxhash3_128::Hasher,
+) {
     fn update_list(list: &Vec<Matcher>, hasher: &mut xxhash3_128::Hasher) {
         let mut keys: SmallVec<&Matcher, 6> = smallvec![];
         for m in list {
             keys.push(m);
         }
 
-        keys.sort_by(|&a, &b| {
-            a.name.cmp(&b.name).then(a.value.cmp(&b.value))
-        });
+        keys.sort_by(|&a, &b| a.name.cmp(&b.name).then(a.value.cmp(&b.value)));
 
         for m in keys {
             update_hash_for_matcher(m, hasher);
@@ -125,12 +125,10 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(vs: &VectorSelector, 
         // Compare lists lexicographically
         for (ma, mb) in a.iter().zip(b.iter()) {
             match ma.name.cmp(&mb.name) {
-                Ordering::Equal => {
-                    match ma.value.cmp(&mb.value) {
-                        Ordering::Equal => continue,
-                        other => return other,
-                    }
-                }
+                Ordering::Equal => match ma.value.cmp(&mb.value) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                },
                 other => return other,
             }
         }
@@ -147,14 +145,14 @@ fn update_hash_for_matcher(m: &Matcher, hasher: &mut xxhash3_128::Hasher) {
     match &m.op {
         MatchOp::Equal => {
             hasher.write(b"=");
-        },
+        }
         MatchOp::NotEqual => {
             hasher.write(b"!");
-        },
+        }
         MatchOp::Re(r) => {
             hasher.write(b"=");
             hasher.write(r.as_str().as_bytes())
-        },
+        }
         MatchOp::NotRe(regex) => {
             hasher.write(b"!");
             hasher.write(regex.as_str().as_bytes())
