@@ -3,7 +3,7 @@ use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, q
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use ahash::AHasher;
-use orx_parallel::IntoParIter;
+use orx_parallel::{IntoParIter, IterIntoParIter};
 use orx_parallel::ParIter;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::AggregateExpr;
@@ -16,6 +16,12 @@ use std::hash::{Hash, Hasher};
 enum KAggregationOrder {
     Top,
     Bottom,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum KLimitType {
+    Limit,
+    LimitRatio,
 }
 
 pub(super) fn eval_aggregation(
@@ -43,8 +49,10 @@ pub(super) fn eval_aggregation(
     match expr.op.id() {
         T_QUANTILE => eval_quantile(expr, param, samples, eval_time),
         T_COUNT_VALUES => eval_count_values(expr, param, samples, eval_time),
-        T_TOPK | T_BOTTOMK => eval_top_bottom_k(expr, param, samples),
-        T_LIMITK | T_LIMIT_RATIO => eval_limit_k(expr, param, samples),
+        T_TOPK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Top),
+        T_BOTTOMK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Bottom),
+        T_LIMITK => eval_limit_k(expr, param, samples),
+        T_LIMIT_RATIO => eval_limit_ratio(expr, param, samples),
         _ => {
             let msg = format!(
                 "BUG: Invalid token ID in eval_aggregation: {:?}",
@@ -87,53 +95,28 @@ fn eval_count_values(
 fn eval_top_bottom_k(
     expr: &AggregateExpr,
     param: Option<ExprResult>,
-    mut samples: Vec<EvalSample>,
+    samples: Vec<EvalSample>,
+    order: KAggregationOrder,
 ) -> EvalResult<ExprResult> {
-    let function_name = expr.op.to_string();
-    let k = get_param_as_usize(param, &function_name)?;
+    let name = if order == KAggregationOrder::Top { "top_k" } else { "bottom_k" };
+    let k = get_k_param(param, samples.len(), name)?;
 
     if k == 0 {
         return Ok(ExprResult::InstantVector(Vec::new()));
     }
 
-    let op_id = expr.op.id();
-
-    let order = match op_id {
-        T_TOPK => KAggregationOrder::Top,
-        T_BOTTOMK => KAggregationOrder::Bottom,
-        _ => {
-            return Err(EvaluationError::InternalError(format!(
-                "evaluate_k_aggregate called for non-k aggregation operator: {:?}",
-                op_id
-            )));
-        }
-    };
-
-    // k-aggregation without `by` / `without`: all samples belong to one
-    // implicit group, so skip hashmap bucketing overhead.
     if expr.modifier.is_none() {
-        samples = select_k_from_group(samples, k, order);
-        return Ok(ExprResult::InstantVector(samples));
+        return Ok(ExprResult::InstantVector(select_k_from_group(samples, k, order)));
     }
 
-    let grouped = group_samples(expr, samples);
-
-    // sort by the appropriate comparator and take k elements.
-    // For each group select k elements in parallel, then flatten the
-    // resulting Vec<Vec<EvalSample>> into a single Vec<EvalSample>.
-    let groups_vec: Vec<Vec<EvalSample>> = grouped
+    let out: Vec<EvalSample> = group_samples(expr, samples)
         .into_iter()
-        .map(|(_, (_, group_samples))| group_samples)
+        .map(|(_, (_, group))| group)
+        .iter_into_par()
+        .flat_map(|group| select_k_from_group(group, k, order))
         .collect();
 
-    let nested: Vec<Vec<EvalSample>> = groups_vec
-        .into_par()
-        .map(|group_samples| select_k_from_group(group_samples, k, order))
-        .collect();
-
-    let collected: Vec<EvalSample> = nested.into_iter().flatten().collect();
-
-    Ok(ExprResult::InstantVector(collected))
+    Ok(ExprResult::InstantVector(out))
 }
 
 fn select_k_from_group(
@@ -157,14 +140,28 @@ fn eval_limit_k(
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    let function_name = expr.op.to_string();
-    let k = get_param_as_scalar(param, &function_name)?;
+    let k = get_k_param(param, samples.len(), "limitk")?;
 
-    let k_n = if !k.is_finite() || k <= 0.0 {
-        0
-    } else {
-        k.floor() as usize
-    };
+    // For each group sort deterministically by hash and take the first k samples,
+    // then flatten the per-group selections into the output vector.
+    let out: Vec<EvalSample> = group_samples(expr, samples)
+        .into_iter()
+        .iter_into_par()
+        .flat_map(|(_, (_, mut group_samples))| {
+            group_samples.sort_by_key(sample_hash);
+            select_limitk(group_samples, k)
+        })
+        .collect();
+
+    Ok(ExprResult::InstantVector(out))
+}
+
+fn eval_limit_ratio(
+    expr: &AggregateExpr,
+    param: Option<ExprResult>,
+    samples: Vec<EvalSample>,
+) -> EvalResult<ExprResult> {
+    let k = get_param_as_scalar(param, "limit_ratio")?;
 
     let groups = group_samples(expr, samples);
     let mut out = Vec::new();
@@ -172,15 +169,9 @@ fn eval_limit_k(
     // todo: parallelize
     for (_, (_, mut group_samples)) in groups.into_iter() {
         group_samples.sort_by_key(sample_hash);
-        let selected = match expr.op.id() {
-            T_LIMITK => select_limitk(group_samples, k_n),
-            T_LIMIT_RATIO => select_limit_ratio(group_samples, k)?,
-            _ => unreachable!(),
-        };
+        let selected = select_limit_ratio(group_samples, k)?;
 
-        for sample in selected {
-            out.push(sample);
-        }
+        out.extend(selected);
     }
 
     Ok(ExprResult::InstantVector(out))
@@ -237,13 +228,10 @@ fn eval_reduction_aggregation(
 ) -> EvalResult<ExprResult> {
     let groups = group_sample_values(expr, samples);
 
-    let groups_vec: Vec<(Labels, Vec<f64>)> = groups
+    let out = groups
         .into_iter()
         .map(|(_, (labels, samples))| (labels, samples))
-        .collect();
-
-    let out: Vec<EvalSample> = groups_vec
-        .into_par()
+        .iter_into_par()
         .map(|(labels, samples)| {
             let value = aggregate_group(expr.op, &samples);
             EvalSample {
@@ -361,15 +349,6 @@ fn max_ignore_nan(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-fn quantile_value_cmp(lhs: f64, rhs: f64) -> std::cmp::Ordering {
-    match (lhs.is_nan(), rhs.is_nan()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (false, false) => lhs.total_cmp(&rhs),
-    }
-}
-
 /// Compares values for topk/bottomk aggregation.
 /// NaN values are always considered "greater" (sorted last) regardless of order.
 /// Uses partial_cmp for IEEE 754 semantics (-0.0 == +0.0), matching Prometheus.
@@ -383,6 +362,15 @@ fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering
             KAggregationOrder::Bottom => left.partial_cmp(&right).unwrap_or(Ordering::Equal),
         },
     }
+}
+
+// topk/bottomk params are scalar floats, but selection needs a bounded count.
+// Coerce once to match PromQL-like behavior: clamp to input size and treat
+// k < 1 as empty output.
+fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
+    let max_k = input_len as i64;
+    let coerced = (k_param as i64).min(max_k);
+    if coerced < 1 { 0 } else { coerced as usize }
 }
 
 fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
@@ -445,6 +433,11 @@ fn get_param_as_string(params: Option<ExprResult>, function_name: &str) -> EvalR
             )))
         }
     }
+}
+
+fn get_k_param(param: Option<ExprResult>, sample_len: usize, name: &str) -> EvalResult<usize> {
+    let value = get_param_as_scalar(param, name)?;
+    Ok(coerce_k_size(value, sample_len))
 }
 
 fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usize> {
