@@ -401,6 +401,20 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
 }
 
 fn parse_expected(line: &str) -> Result<RangeSample, String> {
+    let trimmed = line.trim();
+
+    // If the entire trimmed line is a number, treat it as a
+    // bare value expectation (no metric/labels). This covers cases like:
+    //   3.141592653589793
+    // which should be accepted as an expected scalar result.
+    if let Ok(value) = trimmed.parse::<f64>() {
+        return Ok(RangeSample {
+            labels: Labels::empty(),
+            samples: vec![Sample::new(0, value)],
+        });
+    }
+
+    // Fall back to existing parsing logic: metric (optional), label set (opt), value
     let mut chars = line.chars().peekable();
     let mut metric_part = String::new();
 
@@ -468,23 +482,22 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     if let Some(ms) = s.strip_suffix("ms") {
         ms.parse::<u64>()
             .map(Duration::from_millis)
-            .map_err(|e| format!("Invalid duration {}: {}", s, e))
+            .map_err(|e| format!("Invalid duration {s}: {}", e))
     } else if let Some(h) = s.strip_suffix('h') {
         h.parse::<u64>()
             .map(|v| Duration::from_secs(v * 3600))
-            .map_err(|e| format!("Invalid duration {}: {}", s, e))
+            .map_err(|e| format!("Invalid duration {s}: {}", e))
     } else if let Some(m) = s.strip_suffix('m') {
         m.parse::<u64>()
             .map(|v| Duration::from_secs(v * 60))
-            .map_err(|e| format!("Invalid duration {}: {}", s, e))
+            .map_err(|e| format!("Invalid duration {s}: {}", e))
     } else if let Some(sec) = s.strip_suffix('s') {
         sec.parse::<u64>()
             .map(Duration::from_secs)
-            .map_err(|e| format!("Invalid duration {}: {}", s, e))
+            .map_err(|e| format!("Invalid duration {s}: {}", e))
     } else {
         Err(format!(
-            "Invalid duration {}: missing unit (ms, s, m, h)",
-            s
+            "Invalid duration {s}: missing unit (ms, s, m, h)"
         ))
     }
 }
