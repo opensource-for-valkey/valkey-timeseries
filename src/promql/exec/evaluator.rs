@@ -12,7 +12,9 @@ use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
-use crate::promql::{EvalResult, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap};
+use crate::promql::{
+    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
+};
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParIter;
 use orx_parallel::ParallelizableCollection;
@@ -208,7 +210,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             step_ms: interval_ms,
         };
 
-        let mut result = self.evaluate_expr(&stmt.expr, &ctx)?;
+        let mut result = self.evaluate_expr(&stmt.expr, &ctx, true)?;
 
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
         if let ExprResult::InstantVector(ref mut samples) = result {
@@ -227,22 +229,23 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &'a self,
         expr: &'a Expr,
         ctx: &'a EvalContext,
+        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
         match expr {
-            Expr::Aggregate(aggregate) => self.evaluate_aggregate(aggregate, ctx),
-            Expr::Unary(u) => self.evaluate_unary(u, ctx),
-            Expr::Binary(b) => self.evaluate_binary_expr(b, ctx),
-            Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx),
+            Expr::Aggregate(aggregate) => self.evaluate_aggregate(aggregate, ctx, preload_eligible),
+            Expr::Unary(u) => self.evaluate_unary(u, ctx, preload_eligible),
+            Expr::Binary(b) => self.evaluate_binary_expr(b, ctx, preload_eligible),
+            Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx, preload_eligible),
             Expr::Subquery(q) => self.evaluate_subquery(q, ctx),
             Expr::NumberLiteral(l) => Ok(ExprResult::Scalar(l.val)),
             Expr::StringLiteral(l) => Ok(ExprResult::String(l.val.clone())),
             Expr::VectorSelector(vector_selector) => {
-                self.evaluate_vector_selector(vector_selector, ctx)
+                self.evaluate_vector_selector(vector_selector, ctx, preload_eligible)
             }
             Expr::MatrixSelector(matrix_selector) => {
                 self.evaluate_matrix_selector(matrix_selector, ctx)
             }
-            Expr::Call(call) => self.evaluate_call(call, ctx),
+            Expr::Call(call) => self.evaluate_call(call, ctx, preload_eligible),
             Expr::Extension(_) => {
                 todo!()
             }
@@ -347,7 +350,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 step_ms,
             };
 
-            let result = self.evaluate_expr(&subquery.expr, &new_ctx)?;
+            // Disable preload fast path — subquery has its own step grid/lookback context.
+            let result = self.evaluate_expr(&subquery.expr, &new_ctx, false)?;
 
             // PromQL requires subquery inner expression to evaluate to an instant vector.
             // Enforce this invariant at runtime.
@@ -412,7 +416,34 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &self,
         vector_selector: &VectorSelector,
         ctx: &EvalContext,
+        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
+        // Fast path: use preloaded data if available (outer range-query context only).
+        // Disabled inside subqueries which have their own step grid/lookback context.
+        if preload_eligible {
+            let preload_key = PreloadKey::from_selector(vector_selector);
+            let guard = self.preloaded_instant.read().unwrap();
+            if let Some(preloaded) = guard.get(&preload_key) {
+                let evaluation_ts = ctx.evaluation_ts;
+                // Step index from raw evaluation_ts (before modifiers) — matches outer step loop
+                let step_idx =
+                    ((evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
+
+                let mut samples = Vec::new();
+                for series in &preloaded.series {
+                    if let Some(Some(sample)) = series.values.get(step_idx) {
+                        samples.push(EvalSample {
+                            timestamp_ms: sample.timestamp,
+                            value: sample.value,
+                            labels: series.labels.clone(), // at some point use EvalLabels to avoid full clone
+                            drop_name: false,
+                        });
+                    }
+                }
+                return Ok(ExprResult::InstantVector(samples));
+            }
+        }
+
         // Apply time modifiers (offset and @)
         let adjusted_eval_ts = self.apply_time_modifiers(
             vector_selector.at.as_ref(),
@@ -459,9 +490,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         call: &Call,
         idx: usize,
         ctx: &EvalContext,
+        preload_eligible: bool,
     ) -> EvalResult<PromQLArg> {
         let (arg, expected_type) = get_function_arg(call, idx)?;
-        let arg_result: PromQLArg = self.evaluate_expr(arg, ctx)?.into();
+        let arg_result: PromQLArg = self.evaluate_expr(arg, ctx, preload_eligible)?.into();
 
         let actual_type = arg_result.value_type();
         if actual_type != expected_type {
@@ -475,12 +507,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(arg_result)
     }
 
-    fn evaluate_function_args(&self, call: &Call, ctx: &EvalContext) -> EvalResult<Vec<PromQLArg>> {
+    fn evaluate_function_args(
+        &self,
+        call: &Call,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<Vec<PromQLArg>> {
         let args = if should_parallelize_args_evaluation(call) {
             call.args
                 .args
                 .par()
-                .map(|arg| match self.evaluate_expr(arg, ctx) {
+                .map(|arg| match self.evaluate_expr(arg, ctx, preload_eligible) {
                     Ok(arg) => Ok(PromQLArg::from(arg)),
                     Err(err) => Err(err),
                 })
@@ -489,7 +526,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         } else {
             let mut evaluated_args = Vec::with_capacity(call.args.args.len());
             for idx in 0..call.args.args.len() {
-                let arg: PromQLArg = self.evaluate_function_arg(call, idx, ctx)?;
+                let arg: PromQLArg =
+                    self.evaluate_function_arg(call, idx, ctx, preload_eligible)?;
                 evaluated_args.push(arg);
             }
             evaluated_args
@@ -498,8 +536,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(args)
     }
 
-    pub(super) fn evaluate_call(&self, call: &Call, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        let evaluated_args = self.evaluate_function_args(call, ctx)?;
+    pub(super) fn evaluate_call(
+        &self,
+        call: &Call,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<ExprResult> {
+        let evaluated_args = self.evaluate_function_args(call, ctx, preload_eligible)?;
 
         // Build a unified param bag for function dispatch.
         let eval_timestamp_ms = ctx.evaluation_ts;
@@ -540,27 +583,40 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(result)
     }
 
-    fn evaluate_binary_expr(&self, expr: &BinaryExpr, ctx: &EvalContext) -> EvalResult<ExprResult> {
+    fn evaluate_binary_expr(
+        &self,
+        expr: &BinaryExpr,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<ExprResult> {
         let lhs = expr.lhs.as_ref();
         let rhs = expr.rhs.as_ref();
 
         let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
             join(
-                || self.evaluate_expr(lhs, ctx),
-                || self.evaluate_expr(rhs, ctx),
+                || self.evaluate_expr(lhs, ctx, preload_eligible),
+                || self.evaluate_expr(rhs, ctx, preload_eligible),
             )
         } else {
-            (self.evaluate_expr(lhs, ctx), self.evaluate_expr(rhs, ctx))
+            (
+                self.evaluate_expr(lhs, ctx, preload_eligible),
+                self.evaluate_expr(rhs, ctx, preload_eligible),
+            )
         };
 
         eval_binary_expr(expr, left_result?, right_result?)
     }
 
-    fn evaluate_unary(&self, expr: &UnaryExpr, ctx: &EvalContext) -> EvalResult<ExprResult> {
+    fn evaluate_unary(
+        &self,
+        expr: &UnaryExpr,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<ExprResult> {
         if let Expr::NumberLiteral(num) = &*expr.expr {
             return Ok(ExprResult::Scalar(-num.val));
         }
-        let res = self.evaluate_expr(&expr.expr, ctx)?;
+        let res = self.evaluate_expr(&expr.expr, ctx, preload_eligible)?;
         match res {
             ExprResult::Scalar(scalar) => Ok(ExprResult::Scalar(-scalar)),
             ExprResult::InstantVector(mut samples) => {
@@ -585,9 +641,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &self,
         aggregate: &AggregateExpr,
         ctx: &EvalContext,
+        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
         // Evaluate the inner expression to get all samples
-        let result = self.evaluate_expr(&aggregate.expr, ctx)?;
+        let result = self.evaluate_expr(&aggregate.expr, ctx, preload_eligible)?;
 
         // Extract samples from the result
         let samples = match result {
@@ -612,7 +669,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let param = if let Some(p) = &aggregate.param {
-            Some(self.evaluate_expr(p, ctx)?)
+            Some(self.evaluate_expr(p, ctx, preload_eligible)?)
         } else {
             None
         };
