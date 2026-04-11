@@ -21,10 +21,9 @@ use crate::promql::functions::predict_linear::PredictLinearFunction;
 use crate::promql::functions::range_vector_functions::{
     AbsentOverTimeFunction, AvgOverTimeFunction, ChangesFunction, CountOverTimeFunction,
     FirstOverTimeFunction, LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction,
-    MinOverTimeFunction, PresentOverTimeFunction, QuantileOverTimeFunction,
-    ResetsFunction, StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction,
-    TSFirstOverTimeFunction, TSLastOverTimeFunction, TSOfMaxOverTimeFunction,
-    TSOfMinOverTimeFunction,
+    MinOverTimeFunction, PresentOverTimeFunction, QuantileOverTimeFunction, ResetsFunction,
+    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TSFirstOverTimeFunction,
+    TSLastOverTimeFunction, TSOfMaxOverTimeFunction, TSOfMinOverTimeFunction,
 };
 use crate::promql::functions::rate::{DeltaFunction, RateFunction};
 use crate::promql::functions::sort::{

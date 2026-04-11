@@ -1,6 +1,7 @@
 mod date_functions;
 mod deriv;
 mod function_list;
+mod functions_tests;
 mod histogram;
 mod holt_winters;
 mod irate;
@@ -9,7 +10,6 @@ mod math_functions;
 mod predict_linear;
 mod range_vector_functions;
 mod rate;
-mod functions_tests;
 mod rollup_window;
 mod sort;
 mod special_functions;
