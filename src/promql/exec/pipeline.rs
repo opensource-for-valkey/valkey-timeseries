@@ -12,7 +12,7 @@
 
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
-use crate::promql::engine::{CachedQueryReader, SeriesQuerier};
+use crate::promql::engine::{CachedQueryReader, QueryReader};
 use crate::promql::hashers::{FingerprintHashMap, HasFingerprint, SeriesFingerprint};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
@@ -346,7 +346,7 @@ pub(crate) struct PipelineTimings {
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
 /// Branching on `QueryPathKind` handles the behavioral differences between
 /// instant vector selectors, matrix selectors, and subquery fast paths.
-pub(crate) fn execute_selector_pipeline<'reader, R: SeriesQuerier>(
+pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     reader: &CachedQueryReader<'reader, R>,
     plan: &QueryPlan,
     selector: &VectorSelector,

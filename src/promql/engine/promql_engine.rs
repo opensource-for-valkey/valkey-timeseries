@@ -1,6 +1,6 @@
 use crate::common::Sample;
 use crate::common::time::{current_time_millis, system_time_to_millis};
-use crate::promql::engine::{QueryOptions, SeriesQuerier};
+use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
 use crate::promql::utils::range_bounds_to_system_time;
@@ -23,7 +23,7 @@ fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
 
 pub(crate) trait PromqlEngine: Send + Sync {
     /// Build a query reader
-    fn make_query_reader(&self) -> QueryResult<Arc<dyn SeriesQuerier>>;
+    fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>>;
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
     fn eval_query(
@@ -94,7 +94,7 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
 
 /// Evaluate an instant PromQL query against the given reader.
 pub(crate) fn evaluate_instant(
-    reader: Arc<dyn SeriesQuerier>,
+    reader: Arc<dyn QueryReader>,
     stmt: EvalStmt,
     query_time: SystemTime,
     opts: QueryOptions,
@@ -154,7 +154,7 @@ pub(crate) fn evaluate_instant(
 /// Evaluate a range PromQL query against the given reader.
 /// Returns the result and the EvalStats for metrics publishing.
 pub(crate) fn evaluate_range(
-    reader: Arc<dyn SeriesQuerier>,
+    reader: Arc<dyn QueryReader>,
     stmt: EvalStmt,
     opts: QueryOptions,
 ) -> QueryResult<Vec<EvalSamples>> {
@@ -254,11 +254,11 @@ pub(crate) fn evaluate_range(
 
 /// Tsdb manages a unified Promql QueryReader interface
 pub(crate) struct Tsdb {
-    pub(crate) querier: Arc<dyn SeriesQuerier>,
+    pub(crate) querier: Arc<dyn QueryReader>,
 }
 
 impl Tsdb {
-    pub(crate) fn new(querier: Arc<dyn SeriesQuerier>) -> Self {
+    pub(crate) fn new(querier: Arc<dyn QueryReader>) -> Self {
         Self { querier }
     }
 
@@ -422,7 +422,7 @@ impl Tsdb {
 }
 
 impl PromqlEngine for Tsdb {
-    fn make_query_reader(&self) -> QueryResult<Arc<dyn SeriesQuerier>> {
+    fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>> {
         Ok(self.querier.clone())
     }
 }
