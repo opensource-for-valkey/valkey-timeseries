@@ -3,13 +3,13 @@ use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, q
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use ahash::AHasher;
-use orx_parallel::{IntoParIter, IterIntoParIter};
 use orx_parallel::ParIter;
+use orx_parallel::{IntoParIter, IterIntoParIter};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -92,13 +92,81 @@ fn eval_count_values(
     Ok(ExprResult::InstantVector(out))
 }
 
+#[derive(Clone, Copy)]
+struct KHeapEntry {
+    value: f64,
+    index: usize,
+    order: KAggregationOrder,
+}
+
+impl PartialEq for KHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.order == other.order
+            && self.value.to_bits() == other.value.to_bits()
+    }
+}
+
+impl Eq for KHeapEntry {}
+
+impl PartialOrd for KHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap. Define "greater" as "worse" so heap.peek()
+        // returns the least desirable currently selected sample.
+        compare_k_values(self.value, other.value, self.order)
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+fn select_k_indices_with_heap(
+    samples: &[EvalSample],
+    keep: usize,
+    order: KAggregationOrder,
+) -> Vec<usize> {
+    if keep == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    let mut heap = BinaryHeap::with_capacity(keep);
+    for (idx, sample) in samples.iter().enumerate() {
+        let entry = KHeapEntry {
+            value: sample.value,
+            index: idx,
+            order,
+        };
+        if heap.len() < keep {
+            heap.push(entry);
+            continue;
+        }
+
+        if let Some(worst) = heap.peek()
+            && compare_k_values(sample.value, worst.value, order).is_lt()
+        {
+            // Replace only when the candidate outranks the current worst,
+            // preserving the "peek is worst-kept" invariant.
+            heap.pop();
+            heap.push(entry);
+        }
+    }
+    heap.into_iter().map(|entry| entry.index).collect()
+}
+
 fn eval_top_bottom_k(
     expr: &AggregateExpr,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     order: KAggregationOrder,
 ) -> EvalResult<ExprResult> {
-    let name = if order == KAggregationOrder::Top { "top_k" } else { "bottom_k" };
+    let name = if order == KAggregationOrder::Top {
+        "top_k"
+    } else {
+        "bottom_k"
+    };
     let k = get_k_param(param, samples.len(), name)?;
 
     if k == 0 {
@@ -106,7 +174,9 @@ fn eval_top_bottom_k(
     }
 
     if expr.modifier.is_none() {
-        return Ok(ExprResult::InstantVector(select_k_from_group(samples, k, order)));
+        return Ok(ExprResult::InstantVector(select_k_from_group(
+            samples, k, order,
+        )));
     }
 
     let out: Vec<EvalSample> = group_samples(expr, samples)
@@ -120,19 +190,22 @@ fn eval_top_bottom_k(
 }
 
 fn select_k_from_group(
-    mut group_samples: Vec<EvalSample>,
+    mut samples: Vec<EvalSample>,
     k: usize,
     order: KAggregationOrder,
 ) -> Vec<EvalSample> {
-    // If k is greater than or equal to the number of samples, return all samples.
-    if k >= group_samples.len() {
-        return group_samples;
+    let keep = k.min(samples.len());
+    let mut selected_indices = select_k_indices_with_heap(&samples, keep, order);
+    // Remove from highest index first so swap_remove cannot invalidate
+    // indices we still need to read.
+    selected_indices.sort_unstable_by(|left, right| right.cmp(left));
+
+    let mut result = Vec::with_capacity(selected_indices.len());
+    for idx in selected_indices {
+        result.push(samples.swap_remove(idx));
     }
-
-    group_samples.sort_by(|a, b| compare_k_values(a.value, b.value, order));
-    group_samples.truncate(k);
-
-    group_samples
+    result.sort_by(|left, right| compare_k_values(left.value, right.value, order));
+    result
 }
 
 fn eval_limit_k(
