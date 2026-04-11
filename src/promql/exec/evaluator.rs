@@ -1,3 +1,4 @@
+use super::aggregations::eval_aggregation;
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
@@ -6,10 +7,8 @@ use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
-use crate::promql::functions::{
-    FunctionCallContext, PromQLArg, resolve_function,
-};
-use super::aggregations::eval_aggregation;
+use crate::promql::functions::{FunctionCallContext, PromQLArg, resolve_function};
+use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
@@ -25,7 +24,6 @@ use promql_parser::parser::{
     SubqueryExpr, UnaryExpr, VectorSelector,
 };
 use std::sync::RwLock;
-use crate::promql::hashers::PreloadKey;
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
@@ -47,7 +45,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// Preload VectorSelector data for all steps of a range query.
     /// Must be called before the step loop. Walks the AST, deduplicates selectors,
     /// and builds dense per-step sample arrays for O(1) per-step lookup.
-    pub(in crate::promql) fn preload_for_range(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
+    pub(in crate::promql) fn preload_for_range(
+        &self,
+        expr: &Expr,
+        ctx: &EvalContext,
+    ) -> EvalResult<()> {
         let selectors = collect_vector_selectors(expr);
         // Deduplicate by PreloadKey, then parallelize the loading
         let mut seen = AHashSet::new();
@@ -623,16 +625,30 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 }
 
 fn get_function_arg(call: &Call, idx: usize) -> EvalResult<(&Expr, ValueType)> {
-    let expected_type = if idx < call.args.args.len() {
+    // Ensure the requested argument index exists in the provided call arguments.
+    if idx >= call.args.args.len() {
+        return Err(EvaluationError::InternalError(format!(
+            "argument {idx} is out of bounds for call to function {}",
+            call.func.name
+        )));
+    }
+
+    // Determine the expected type for this argument according to the function
+    // declaration. Use the explicit type if available; if the function is
+    // variadic, use the last declared type for additional arguments. If
+    // neither applies, return an error rather than indexing out of bounds.
+    let expected_type = if idx < call.func.arg_types.len() {
         call.func.arg_types[idx]
     } else if call.func.variadic != 0 && !call.func.arg_types.is_empty() {
-        call.func.arg_types[call.func.arg_types.len() - 1]
+        // Safe: last() returns Some because we checked !is_empty()
+        *call.func.arg_types.last().unwrap()
     } else {
         return Err(EvaluationError::InternalError(format!(
             "argument {idx} is out of bounds for function {}",
             call.func.name
         )));
     };
+
     let arg = &call.args.args[idx];
     Ok((arg, expected_type))
 }
