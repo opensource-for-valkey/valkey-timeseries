@@ -12,7 +12,7 @@ use crate::promql::{EvalSample, EvalSamples, ExprResult, QueryError, QueryResult
 use ahash::{AHashMap, AHashSet};
 use enquote::enquote;
 use promql_parser::parser::value::ValueType;
-use promql_parser::parser::{AtModifier, EvalStmt, LabelModifier, Offset};
+use promql_parser::parser::{EvalStmt, LabelModifier};
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
