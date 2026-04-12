@@ -1,10 +1,10 @@
 use crate::common::Sample;
 use crate::labels::Label;
 use crate::promql::{Labels, RangeSample};
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ============================================================================
 // Command Types
 // ============================================================================
@@ -21,7 +21,7 @@ pub struct EvalInstantCmd {
     pub query: String,
     pub expected: Vec<RangeSample>,
     pub expect_ordered: bool,
-    pub expect_fail: bool
+    pub expect_fail: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ pub struct EvalRangeCmd {
     pub step: Duration,
     pub query: String,
     pub expected: Vec<RangeSample>,
-    pub expect_fail: bool
+    pub expect_fail: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -226,7 +226,7 @@ impl Parser {
             query,
             expected,
             expect_ordered,
-            expect_fail: false
+            expect_fail: false,
         })))
     }
 
@@ -235,28 +235,28 @@ impl Parser {
         lines: &[&str],
         i: &mut usize,
     ) -> Result<Option<Command>, String> {
-        let rest = match line.strip_prefix("eval range from ") {
-            Some(r) => r,
-            None => return Ok(None),
+        if line.strip_prefix("eval range from ").is_none() {
+            return Ok(None);
         };
         // Not implemented yet, but this is where we'd parse "eval range from <start> to <end> step <step> <query>"
         let caps = PAT_EVAL_RANGE
             .captures(line)
-            .ok_or_else(|| "invalid range vector definition")?;
+            .ok_or("invalid range vector definition")?;
 
         let from_str = caps.get(1).unwrap().as_str();
         let to_str = caps.get(2).unwrap().as_str();
         let step_str = caps.get(3).unwrap().as_str();
         let query = caps.get(4).unwrap().as_str();
-        let from = parse_duration(from_str).map_err(|e| format!("Invalid 'from' duration: {}", e))?;
+        let from =
+            parse_duration(from_str).map_err(|e| format!("Invalid 'from' duration: {}", e))?;
         let to = parse_duration(to_str).map_err(|e| format!("Invalid 'to' duration: {}", e))?;
-        let step = parse_duration(step_str).map_err(|e| format!("Invalid 'step' duration: {}", e))?;
+        let step =
+            parse_duration(step_str).map_err(|e| format!("Invalid 'step' duration: {}", e))?;
         let now = SystemTime::now();
         let start = now + from;
         let end = now + to;
 
         let mut expected = Vec::new();
-        let mut expect_ordered = false;
 
         // Collect indented expected result lines
         while *i < lines.len() {
@@ -273,9 +273,6 @@ impl Parser {
 
             // We only implement ordering for now; other directives remain no-ops.
             if trimmed.starts_with("expect ") {
-                if trimmed == "expect ordered" {
-                    expect_ordered = true;
-                }
                 *i += 1;
                 continue;
             }
@@ -577,12 +574,10 @@ fn parse_expected(line: &str) -> Result<RangeSample, String> {
     })
 }
 
-fn parse_expect_range_vector(
-    line: &str,
-) -> Result<(SystemTime, SystemTime, Duration), String> {
+fn parse_expect_range_vector(line: &str) -> Result<(SystemTime, SystemTime, Duration), String> {
     let caps = PAT_EXPECT_RANGE
         .captures(line)
-        .ok_or_else(|| "invalid range vector definition")?;
+        .ok_or("invalid range vector definition")?;
     let from_str = caps.get(1).unwrap().as_str();
     let to_str = caps.get(2).unwrap().as_str();
     let step_str = caps.get(3).unwrap().as_str();
