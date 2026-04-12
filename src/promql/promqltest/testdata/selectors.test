@@ -20,18 +20,14 @@ eval instant at 18000s rate(http_requests_total[1m])
 	{job="api-server", instance="0", group="canary"} 8
 	{job="api-server", instance="1", group="canary"} 4
 
-# ignoring regex patterns (=~)
-ignore
 eval instant at 8000s rate(http_requests_total{group=~"pro.*"}[1m])
 	{job="api-server", instance="0", group="production"} 1
 	{job="api-server", instance="1", group="production"} 2
 
 eval instant at 18000s rate(http_requests_total{group=~".*ry", instance="1"}[1m])
 	{job="api-server", instance="1", group="canary"} 4
-resume
 
 # ignoring != matcher combined with offset
-ignore
 eval instant at 18000s rate(http_requests_total{instance!="3"}[1m] offset 10000s)
 	{job="api-server", instance="0", group="production"} 1
 	{job="api-server", instance="1", group="production"} 2
@@ -43,16 +39,13 @@ eval instant at 4000s rate(http_requests_total{instance!="3"}[1m] offset -4000s)
 	{job="api-server", instance="1", group="production"} 2
 	{job="api-server", instance="0", group="canary"} 3
 	{job="api-server", instance="1", group="canary"} 4
-resume
 
 # ignoring binary operation with offset
-ignore
 eval instant at 18000s rate(http_requests_total[40s]) - rate(http_requests_total[1m] offset 10000s)
 	{job="api-server", instance="0", group="production"} 2
 	{job="api-server", instance="1", group="production"} 1
 	{job="api-server", instance="0", group="canary"} 5
 	{job="api-server", instance="1", group="canary"} 0
-resume
 
 # https://github.com/prometheus/prometheus/issues/3575
 eval instant at 0s http_requests_total{foo!="bar"}
@@ -67,8 +60,7 @@ eval instant at 0s http_requests_total{foo!="bar", job="api-server"}
 	http_requests_total{job="api-server", instance="0", group="canary"} 0
 	http_requests_total{job="api-server", instance="1", group="canary"} 0
 
-# ignoring regex patterns (!~) and != matcher
-ignore
+# regex patterns (!~) and != matcher
 eval instant at 0s http_requests_total{foo!~"bar", job="api-server"}
 	http_requests_total{job="api-server", instance="0", group="production"} 0
 	http_requests_total{job="api-server", instance="1", group="production"} 0
@@ -123,19 +115,16 @@ eval instant at 8000s rate(http_requests_total{group=~".*(?i:C).*"}[1m])
 	{job="api-server", instance="1", group="production"} 2
 	{job="api-server", instance="0", group="canary"} 3
 	{job="api-server", instance="1", group="canary"} 4
-resume
 
 clear
 load 1m
     metric1{a="a"} 0+1x100
     metric2{b="b"} 0+1x50
 
-# ignoring or operator with offset
-ignore
+# operator with offset
 eval instant at 90m metric1 offset 15m or metric2 offset 45m
     metric1{a="a"} 75
     metric2{b="b"} 45
-resume
 
 clear
 
@@ -161,15 +150,10 @@ load 5m
 	http_requests_total{job="app-server", instance="0", group="canary"}		0+70x10
 	http_requests_total{job="app-server", instance="1", group="canary"}		0+80x10
 
-# ignoring single-letter label names
-ignore
 # Single-letter label names and values.
 eval instant at 50m x{y="testvalue"}
 	x{y="testvalue"} 100
-resume
 
-# ignoring regex patterns (=~, !~) and != matcher
-ignore
 # Basic Regex
 eval instant at 50m {__name__=~".+"}
 	http_requests_total{group="canary", instance="0", job="api-server"} 300
@@ -212,7 +196,6 @@ eval instant at 50m http_requests_total{job!~"api-.+",group!="canary"}
 eval instant at 50m http_requests_total{group="production",job=~"api-.+"}
 	http_requests_total{group="production", instance="0", job="api-server"} 100
 	http_requests_total{group="production", instance="1", job="api-server"} 200
-resume
 
 eval instant at 50m http_requests_total{group="production",job="api-server"} offset 5m
 	http_requests_total{group="production", instance="0", job="api-server"} 90
@@ -226,11 +209,9 @@ load 1h
 	testmetric{aa="bb"} 1
 	testmetric{a="abb"} 2
 
-# ignoring single-letter label names
-ignore
+# single-letter label names
 eval instant at 0h testmetric
 	testmetric{aa="bb"} 1
 	testmetric{a="abb"} 2
-resume
 
 clear
