@@ -31,14 +31,9 @@ load 10s
   http_requests_total{job="api-server", instance="0", group="canary"}  0+30x1000 300+80x1000
   http_requests_total{job="api-server", instance="1", group="canary"}  0+40x2000
 
-# ignore regex
-ignore
-
 eval instant at 8000s rate(http_requests_total{group=~"pro.*"}[1m:10s])
   {job="api-server", instance="0", group="production"} 1
   {job="api-server", instance="1", group="production"} 2
-
-resume
 
 eval instant at 20000s avg_over_time(rate(http_requests_total[1m])[1m:1s])
   {job="api-server", instance="0", group="canary"}     8
@@ -107,12 +102,9 @@ eval instant at 1000s rate(sum_over_time(metric3_total[30s:10s])[50s:10s])
   {} 0.9
 
 # ignore binary operation
-ignore
-
 eval instant at 1000s rate(sum_over_time((metric1_total+metric2_total+metric3_total)[30s:10s])[30s:10s])
   {} 1.8
 
-resume
 clear
 
 # Fibonacci sequence, to ensure the rate is not constant.
@@ -168,7 +160,7 @@ resume
 
 clear
 
-# Native histograms not yet supported
+# Native histograms not supported
 ignore
 
 # This native histogram series has a counter reset at 5m.
