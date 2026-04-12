@@ -164,7 +164,6 @@ pub fn new_test_engine(
         lookback_delta,
         enable_delayed_name_removal: true,
         parser: test_parser_opts(),
-        ..Default::default()
     })
 }
 
@@ -260,9 +259,9 @@ impl LoadCmd {
     }
 
     fn append(&self, app: &mut dyn AppenderV2) -> Result<(), String> {
-        for (h, smpls) in &self.defs {
+        for (h, samples) in &self.defs {
             let m = &self.metrics[h];
-            for s in smpls {
+            for s in samples {
                 append_sample(app, s, m)?;
             }
         }
@@ -647,7 +646,7 @@ impl<'a> Test<'a> {
     ) -> Result<(SystemTime, SystemTime, Duration), String> {
         let caps = PAT_EXPECT_RANGE
             .captures(line)
-            .ok_or_else(|| "invalid range vector definition")?;
+            .ok_or("invalid range vector definition")?;
         let from_str = caps.get(1).unwrap().as_str();
         let to_str = caps.get(2).unwrap().as_str();
         let step_str = caps.get(3).unwrap().as_str();
@@ -673,7 +672,7 @@ impl<'a> Test<'a> {
                 load.append(&mut *app)?;
             }
             TestCommand::Eval(eval) => {
-                let engine = engine.ok_or_else(|| "eval command needs an engine".to_string())?;
+                let engine = engine.ok_or("eval command needs an engine".to_string())?;
                 self.exec_eval(eval, engine)?;
             }
         }
@@ -714,7 +713,7 @@ impl<'a> Test<'a> {
             let res = q.exec();
             if let Err(err) = &res {
                 if cmd.is_fail() {
-                    check_expected_failure(cmd, &err)?;
+                    check_expected_failure(cmd, err)?;
                     continue;
                 }
                 return Err(err.to_string());
@@ -815,7 +814,7 @@ fn parse_load(
     let line = &lines[i];
     let caps = PAT_LOAD
         .captures(line)
-        .ok_or_else(|| "invalid load command".to_string())?;
+        .ok_or("invalid load command".to_string())?;
     let with_nhcb = caps.get(1).map(|m| m.as_str()) == Some("with_nhcb");
     let step_str = caps.get(2).unwrap().as_str();
     let gap = parse_duration(step_str)?;
@@ -943,7 +942,7 @@ fn parse_duration_prefix(s: &str) -> Result<i64, String> {
         return Err("empty duration".to_string());
     }
     let negative = s.starts_with('-');
-    let s = s.trim_start_matches(|c| c == '+' || c == '-');
+    let s = s.trim_start_matches(|c| ['+', '-'].contains(&c));
     let num: f64 = s.parse().map_err(|_| "Error parsing f64".to_string())?;
     let ms = (num * 1000.0) as i64;
     Ok(if negative { -ms } else { ms })
@@ -957,7 +956,7 @@ fn parse_series(def_line: &str, line: usize) -> Result<(Labels, Vec<SequenceValu
 fn parse_expect(def_line: &str) -> Result<(ExpectCmdType, ExpectCmd), String> {
     let caps = PAT_EXPECT
         .captures(def_line.trim())
-        .ok_or_else(|| "invalid expect statement")?;
+        .ok_or("invalid expect statement")?;
     let mode = caps.get(1).unwrap().as_str();
     let expect_type = match mode {
         "ordered" => ExpectCmdType::Ordered,
@@ -1102,21 +1101,21 @@ fn check_expected_failure(cmd: &EvalCmd, actual_err: &str) -> Result<(), String>
             cmd.expected_fail_message, err_str
         ));
     }
-    if let Some(re) = &cmd.expected_fail_regexp {
-        if !re.is_match(&err_str) {
-            return Err(format!(
-                "expected error matching pattern {:?} but got {:?}",
-                re, err_str
-            ));
-        }
+    if let Some(re) = &cmd.expected_fail_regexp
+        && !re.is_match(&err_str)
+    {
+        return Err(format!(
+            "expected error matching pattern {:?} but got {:?}",
+            re, err_str
+        ));
     }
-    if let Some(exp_fail) = cmd.expected_cmds.get(&ExpectCmdType::Fail) {
-        if !exp_fail[0].check_match(&err_str) {
-            return Err(format!(
-                "expected error matching {:?} but got {:?}",
-                exp_fail[0], err_str
-            ));
-        }
+    if let Some(exp_fail) = cmd.expected_cmds.get(&ExpectCmdType::Fail)
+        && !exp_fail[0].check_match(&err_str)
+    {
+        return Err(format!(
+            "expected error matching {:?} but got {:?}",
+            exp_fail[0], err_str
+        ));
     }
     Ok(())
 }
@@ -1137,7 +1136,7 @@ fn compare_result(cmd: &EvalCmd, val: &QueryValue) -> Result<(), String> {
                 let exp_entry = cmd
                     .expected
                     .get(&h)
-                    .ok_or_else(|| format!("unexpected metric {:?}", series.labels))?;
+                    .ok_or(format!("unexpected metric {:?}", series.labels))?;
                 seen.insert(h);
 
                 let mut expected_floats = Vec::new();
@@ -1179,7 +1178,7 @@ fn compare_result(cmd: &EvalCmd, val: &QueryValue) -> Result<(), String> {
                     }
                 }
             }
-            for (h, _) in &cmd.expected {
+            for h in cmd.expected.keys() {
                 if !seen.contains(h) {
                     return Err(format!(
                         "expected metric {:?} not found",
@@ -1198,7 +1197,7 @@ fn compare_result(cmd: &EvalCmd, val: &QueryValue) -> Result<(), String> {
                 let exp_entry = cmd
                     .expected
                     .get(&h)
-                    .ok_or_else(|| format!("unexpected metric {:?}", sample.labels))?;
+                    .ok_or(format!("unexpected metric {:?}", sample.labels))?;
                 if cmd.is_ordered() && exp_entry.pos != pos + 1 {
                     return Err(format!(
                         "expected metric at position {} but got {}",
@@ -1215,7 +1214,7 @@ fn compare_result(cmd: &EvalCmd, val: &QueryValue) -> Result<(), String> {
                 }
                 seen.insert(h);
             }
-            for (h, _) in &cmd.expected {
+            for h in cmd.expected.keys() {
                 if !seen.contains(h) {
                     return Err(format!(
                         "expected metric {:?} not found",
