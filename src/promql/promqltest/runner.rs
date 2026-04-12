@@ -2,7 +2,7 @@ use crate::promql::engine::Tsdb;
 use crate::promql::engine::test_utils::MockSeriesQuerier;
 use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
-use crate::promql::promqltest::evaluator::eval_instant;
+use crate::promql::promqltest::evaluator::{eval_instant, eval_range};
 use crate::promql::promqltest::loader::load_series;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,6 +103,27 @@ where
                 }
             }
 
+            Command::EvalRange(eval_cmd) => {
+                if !ignoring {
+                    eval_count += 1;
+                    let result = eval_range(
+                        &tsdb,
+                        eval_cmd.start,
+                        eval_cmd.end,
+                        eval_cmd.step,
+                        &eval_cmd.query,
+                    )?;
+                    assert_results(
+                        &result,
+                        &eval_cmd.expected,
+                        false,
+                        name,
+                        eval_count,
+                        &eval_cmd.query,
+                    )?;
+                }
+            }
+
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
@@ -195,6 +216,19 @@ eval instant at 10m
 
         // when
         let result = run_test("simple_test", content);
+
+        // then
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn pi_test() {
+        let content = r#"
+eval instant at 0s pi()
+	3.141592653589793
+"#;
+        // when
+        let result = run_test("pi_test", content);
 
         // then
         assert!(result.is_ok());
