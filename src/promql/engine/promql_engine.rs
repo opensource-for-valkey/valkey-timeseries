@@ -1,16 +1,19 @@
-use crate::common::Sample;
 use crate::common::time::{current_time_millis, system_time_to_millis};
+use crate::common::{Sample, Timestamp};
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
+use crate::promql::time::step_times;
 use crate::promql::utils::range_bounds_to_system_time;
-use crate::promql::{EvalSamples, Evaluator, ExprResult, QueryResult};
-use ahash::AHashMap;
+use crate::promql::{Evaluator, ExprResult, QueryResult};
+use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
+use std::hash::BuildHasherDefault;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use twox_hash::XxHash64;
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
@@ -58,7 +61,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         end: SystemTime,
         step: Duration,
         opts: QueryOptions,
-    ) -> QueryResult<Vec<EvalSamples>> {
+    ) -> QueryResult<Vec<RangeSample>> {
         let expr = promql_parser::parser::parse(query)
             .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
@@ -85,7 +88,7 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
     range: impl RangeBounds<SystemTime>,
     step: Duration,
     opts: QueryOptions,
-) -> QueryResult<Vec<EvalSamples>> {
+) -> QueryResult<Vec<RangeSample>> {
     let (start, end) = range_bounds_to_system_time(range);
     E::eval_query_range(engine, query, start, end, step, opts)
 }
@@ -157,7 +160,7 @@ pub(crate) fn evaluate_range(
     reader: Arc<dyn QueryReader>,
     stmt: EvalStmt,
     opts: QueryOptions,
-) -> QueryResult<Vec<EvalSamples>> {
+) -> QueryResult<Vec<RangeSample>> {
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;
@@ -169,9 +172,6 @@ pub(crate) fn evaluate_range(
         ));
     }
 
-    let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
-
-    // Best-effort deadline for range evaluation
     let evaluator = Evaluator::new(&reader, opts);
 
     evaluator
@@ -184,28 +184,42 @@ pub(crate) fn evaluate_range(
         return Err(QueryError::Timeout);
     }
 
-    let mut current_time = start;
+    let start_ms = system_time_to_millis(start);
+    let end_ms = system_time_to_millis(end);
 
-    // todo: parallelize
-    while current_time <= end {
-        // Check timeout per step
-        if let Some(dl) = opts.deadline
-            && current_time_millis() > dl
-        {
-            return Err(QueryError::Timeout);
-        }
+    // Evaluate every step in parallel, each returning its timestamp + result.
+    let step_results: Vec<(Timestamp, ExprResult)> =
+        step_times(start_ms, end_ms, step.as_millis() as i64)
+            .iter_into_par()
+            .map(|t| -> QueryResult<(Timestamp, ExprResult)> {
+                // Best-effort per-step timeout check.
+                if let Some(dl) = opts.deadline
+                    && current_time_millis() > dl
+                {
+                    return Err(QueryError::Timeout);
+                }
 
-        let instant_stmt = EvalStmt {
-            expr: stmt.expr.clone(),
-            start: current_time,
-            end: current_time,
-            interval: Duration::from_secs(0),
-            lookback_delta,
-        };
+                let ts = UNIX_EPOCH + Duration::from_millis(t as u64);
 
-        let result = evaluator.evaluate(instant_stmt)?;
-        let timestamp_ms = system_time_to_millis(current_time);
+                let instant_stmt = EvalStmt {
+                    expr: stmt.expr.clone(),
+                    start: ts,
+                    end: ts,
+                    interval: Duration::from_secs(0),
+                    lookback_delta,
+                };
 
+                let result = evaluator.evaluate(instant_stmt).map_err(QueryError::from)?;
+                Ok((t, result))
+            })
+            .into_fallible_result()
+            .collect()?;
+
+    // Merge per-step results into the series map.
+    let mut series_map =
+        halfbrown::HashMap::<Labels, Vec<Sample>, BuildHasherDefault<XxHash64>>::default();
+
+    for (current_time, result) in step_results {
         match result {
             ExprResult::InstantVector(samples) => {
                 for sample in samples {
@@ -221,7 +235,7 @@ pub(crate) fn evaluate_range(
                 series_map
                     .entry(labels)
                     .or_default()
-                    .push(Sample::new(timestamp_ms, value));
+                    .push(Sample::new(current_time, value));
             }
             ExprResult::RangeVector(_) => {
                 return Err(QueryError::Execution(
@@ -234,19 +248,11 @@ pub(crate) fn evaluate_range(
                 ));
             }
         }
-
-        current_time += step;
     }
 
-    let result: Vec<EvalSamples> = series_map
+    let result = series_map
         .into_iter()
-        .map(|(labels, samples)| EvalSamples {
-            values: samples,
-            labels,
-            range_ms: 0,
-            range_end_ms: 0,
-            drop_name: false,
-        })
+        .map(|(labels, samples)| RangeSample { samples, labels })
         .collect();
 
     Ok(result)
@@ -358,66 +364,7 @@ impl Tsdb {
             lookback_delta,
         };
 
-        // Step through time, collecting per-series samples
-        let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
-        let evaluator = Evaluator::new(
-            &self.querier,
-            QueryOptions {
-                timeout: None,
-                ..QueryOptions::default()
-            },
-        );
-        let mut current_time = start;
-
-        // todo: parallelize
-        while current_time <= end {
-            let instant_stmt = EvalStmt {
-                expr: stmt.expr.clone(),
-                start: current_time,
-                end: current_time,
-                interval: Duration::ZERO,
-                lookback_delta,
-            };
-
-            let result = evaluator.evaluate(instant_stmt)?;
-            let timestamp_ms = current_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-
-            match result {
-                ExprResult::InstantVector(samples) => {
-                    for sample in samples {
-                        let labels = sample.labels;
-                        series_map
-                            .entry(labels)
-                            .or_default()
-                            .push(Sample::new(sample.timestamp_ms, sample.value));
-                    }
-                }
-                ExprResult::Scalar(value) => {
-                    let labels = Labels::empty();
-                    series_map
-                        .entry(labels)
-                        .or_default()
-                        .push(Sample::new(timestamp_ms, value));
-                }
-                ExprResult::RangeVector(_) => {
-                    return Err(QueryError::Execution(
-                        "range vectors not supported in range query evaluation".to_string(),
-                    ));
-                }
-                ExprResult::String(_s) => {
-                    return Err(QueryError::Execution(
-                        "string expressions not supported in range query evaluation".to_string(),
-                    ));
-                }
-            }
-
-            current_time += step;
-        }
-
-        Ok(series_map
-            .into_iter()
-            .map(|(labels, samples)| RangeSample { labels, samples })
-            .collect())
+        evaluate_range(self.querier.clone(), stmt, *opts)
     }
 }
 
@@ -652,7 +599,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Offset / @ modifier tests (bucket preloading)
+    // Offset / @ modifier tests (preloading)
     // -----------------------------------------------------------------------
 
     #[test]
