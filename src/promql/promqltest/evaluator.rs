@@ -12,3 +12,16 @@ pub(super) fn eval_instant(
         .map_err(|e| e.to_string())
         .and_then(|qv| qv.into_matrix().map_err(|e| e.to_string()))
 }
+
+pub(super) fn eval_range(
+    tsdb: &Tsdb,
+    start: SystemTime,
+    end: SystemTime,
+    step: std::time::Duration,
+    query: &str,
+) -> Result<Vec<RangeSample>, String> {
+    let options = QueryOptions::default();
+    let range = start..=end;
+    tsdb.eval_query_range(query, range, step, &options)
+        .map_err(|e| e.to_string())
+}
