@@ -1,9 +1,9 @@
 use crate::commands::command_parser::parse_query_range_command_args;
-use crate::commands::promql_utils::{get_promql_querier, reply_with_expr_result};
+use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
-use crate::promql::ExprResult;
+use crate::promql::QueryValue;
 use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::evaluate_range;
 use std::ops::Deref;
@@ -40,9 +40,8 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
             }
         };
 
-        let res = ExprResult::RangeVector(result);
         let ctx = thread_ctx.get_write_context();
-        reply_with_expr_result(&ctx, res, current_time_millis());
+        reply_with_query_value(&ctx, QueryValue::Matrix(result), current_time_millis());
     });
 
     // We will reply later, from the thread
