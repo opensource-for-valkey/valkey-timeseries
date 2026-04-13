@@ -5,6 +5,7 @@ This module tests the TS.QUERY command that allows executing PromQL instant quer
 against TimeSeries data in a non-clustered (single-node) environment.
 """
 from __future__ import annotations
+import math
 import pytest
 from datetime import datetime, timezone, timedelta
 from valkey import ResponseError
@@ -16,6 +17,7 @@ from query_result import (
     VectorSample, MatrixSample,
     ScalarResult, StringResult,
 )
+
 
 class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
     """Tests for TS.QUERY command in non-clustered mode."""
@@ -255,11 +257,14 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         for i in range(1000):
             self.client.execute_command('TS.ADD', 'many_points', i * 1000, i)
 
-        result = self.client.execute_command('TS.QUERY', 'many_points', "time", 4000)
-        print("result = ", result)
-        assert result is None
+        result = self.instant_query('many_points', 4000)
 
-    def test_query_error_on_invalid_time_format(self):
+        assert result.is_vector(), "expected a vector"
+        value = result.result[0].value
+        assert value.timestamp == 4000
+        assert value.value == 4, "expected the value from the most recent point at or before the query time"
+
+    def test_error_on_invalid_time_format(self):
         """Test TS.QUERY with invalid TIME format."""
         self.setup_simple_series()
 
@@ -268,7 +273,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.QUERY', 'http_requests',
                                         'TIME', 'invalid_time_format')
 
-    def test_query_error_on_invalid_lookback_format(self):
+    def test_error_on_invalid_lookback_format(self):
         """Test TS.QUERY with invalid LOOKBACK_DELTA format."""
         self.setup_simple_series()
 
@@ -277,7 +282,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.QUERY', 'http_requests',
                                         'LOOKBACK_DELTA', 'not_a_duration')
 
-    def test_query_expression_with_constants(self):
+    def test_expression_with_constants(self):
         """Test TS.QUERY with arithmetic expressions involving constants."""
         self.setup_simple_series()
 
@@ -298,8 +303,8 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             # If sum() isn't supported or works differently, that's ok
             pass
 
-    def test_expression_with_on_ignoring(self):
-        query = 'http_requests_total{job=~"web.*"} / on(job, env) node_cpu_usage_seconds_total{job=~"web.*"}'
+    def test_operator_with_on(self):
+        query = 'http_requests_total{job=~"web.*"} / on(job, env) group_left() node_cpu_usage_seconds_total{job=~"web.*"}'
         client = self.client
 
         client.execute_command("TS.CREATE", "prod-web-1-requests", 'METRIC',
@@ -325,5 +330,110 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         client.execute_command("TS.ADD", "staging-api-cpu-usage-seconds", timestamp, 1200)
 
         result = self.instant_query(query, timestamp)
-        print(result)
-        assert false
+        assert result.is_vector()
+        assert len(result.result) == 4
+
+    def setup_http_requests_scenario(self):
+        client = self.client
+
+        fleet = [
+            ("web-prod-1", 'http_requests_total{server="web_prod_1", environment="production"}', 100, 110),
+            ("web-prod-2", 'http_requests_total{server="web_prod_2", environment="production"}', 200, 220),
+            ("web-prod-3", 'http_requests_total{server="web_prod_3", environment="production"}', 300, 330),
+            ("web-stg-1", 'http_requests_total{server="web_stg_1", environment="staging"}', 10, 20),
+        ]
+
+        t0 = "2026-04-06T20:00:00Z"
+        t1 = "2026-04-06T20:01:00Z"
+
+        for key, metric, v0, v1 in fleet:
+            client.execute_command("TS.CREATE", key, "METRIC", metric)
+            client.execute_command("TS.ADD", key, t0, v0)
+            client.execute_command("TS.ADD", key, t1, v1)
+
+        return t1
+
+    def _vector_values_by_label(self, query_result: QueryResult, label: str) -> dict[str, float]:
+        assert query_result.is_vector(), f"expected vector result, got {query_result.result_type}"
+        return {sample.metric[label]: sample.value.value for sample in query_result.result}
+
+    def _assert_single_value(self, query_result: QueryResult, expected: float):
+        if query_result.is_scalar():
+            actual = query_result.result.value
+        else:
+            assert query_result.is_vector(), f"expected scalar/vector, got {query_result.result_type}"
+            assert len(query_result.result) == 1, f"expected one sample, got {len(query_result.result)}"
+            actual = query_result.result[0].value.value
+        assert math.isclose(actual, expected, rel_tol=1e-9), f"expected {expected}, got {actual}"
+
+    def test_metric_selector_returns_all_servers(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query("http_requests_total", time)
+        values = self._vector_values_by_label(result, "server")
+
+        assert len(values) == 4
+        assert values["web_prod_1"] == 110
+        assert values["web_prod_2"] == 220
+        assert values["web_prod_3"] == 330
+        assert values["web_stg_1"] == 20
+
+    def test_label_exact_matcher_filters_environment(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('http_requests_total{environment="production"}', time)
+        values = self._vector_values_by_label(result, "server")
+
+        assert sorted(values.keys()) == ["web_prod_1", "web_prod_2", "web_prod_3"]
+
+    def test_label_not_equal_matcher(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('http_requests_total{environment!="production"}', time)
+        values = self._vector_values_by_label(result, "server")
+
+        assert sorted(values.keys()) == ["web_stg_1"]
+
+    def test_label_regex_matcher(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('http_requests_total{server=~".*_stg_.*"}', time)
+        values = self._vector_values_by_label(result, "server")
+
+        assert sorted(values.keys()) == ["web_stg_1"]
+
+    def test_label_negative_regex_matcher(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('http_requests_total{server!~".*_stg_.*"}', time)
+        values = self._vector_values_by_label(result, "server")
+
+        assert sorted(values.keys()) == ["web_prod_1", "web_prod_2", "web_prod_3"]
+
+    def test_aggregation_sum(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('sum(http_requests_total{environment="production"})', time)
+        self._assert_single_value(result, 660.0)
+
+    def test_aggregation_avg(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('avg(http_requests_total{environment="production"})', time)
+        self._assert_single_value(result, 220.0)
+
+    def test_aggregation_min_and_max(self):
+        time = self.setup_http_requests_scenario()
+
+        min_result = self.instant_query('min(http_requests_total{environment="production"})', time)
+        max_result = self.instant_query('max(http_requests_total{environment="production"})', time)
+
+        self._assert_single_value(min_result, 110.0)
+        self._assert_single_value(max_result, 330.0)
+
+    @pytest.mark.xfail(reason="increase() support may be partial; keep scenario covered from cheat sheet")
+    def test_range_increase_production(self):
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('sum(increase(http_requests_total{environment="production"}[1m]))', time)
+        self._assert_single_value(result, 60.0)
