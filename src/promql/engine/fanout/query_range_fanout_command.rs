@@ -57,7 +57,7 @@ impl FanoutCommand for QueryRangeFanoutCommand {
     type Response = RangeQueryResponse;
 
     fn name() -> &'static str {
-        "range-query"
+        "query-range"
     }
 
     fn get_local_response(ctx: &Context, req: RangeQuery) -> ValkeyResult<RangeQueryResponse> {
@@ -89,7 +89,7 @@ impl FanoutCommand for QueryRangeFanoutCommand {
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) {
         let mut resp = resp;
-        // dedupe samples by labels - if multiple responses contain the same labels, we have an issue
+        // todo: dedupe samples by labels - if multiple responses contain the same labels, we have an issue
         // Using prometheus semantics, series should have unique label-value pairs..
         self.results.append(&mut resp.series);
     }
@@ -113,9 +113,6 @@ fn handle_range_query(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
-            if s.is_empty() {
-                return None;
-            }
             let samples = s.get_range(start_time, end_time);
             if samples.is_empty() {
                 return None;
