@@ -2,6 +2,7 @@ mod date_functions;
 mod deriv;
 mod function_list;
 mod functions_tests;
+mod go_compat;
 mod histogram;
 mod holt_winters;
 mod irate;
@@ -15,6 +16,7 @@ mod sort;
 mod special_functions;
 mod types;
 pub(crate) mod utils;
+
 pub(crate) use function_list::*;
 pub(crate) use types::*;
 
