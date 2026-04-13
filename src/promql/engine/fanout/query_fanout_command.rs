@@ -47,7 +47,7 @@ impl FanoutCommand for QueryFanoutCommand {
     type Response = InstantQueryResponse;
 
     fn name() -> &'static str {
-        "instant-query"
+        "query"
     }
 
     fn get_local_response(ctx: &Context, req: InstantQuery) -> ValkeyResult<InstantQueryResponse> {
