@@ -1,23 +1,33 @@
+use orx_parallel::ParIter;
 use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use ahash::{AHashMap, AHashSet};
+use orx_parallel::IntoParIter;
 use promql_parser::label::METRIC_NAME;
+use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS};
 use promql_parser::parser::{BinaryExpr, VectorMatchCardinality};
+use twox_hash::xxhash32::RandomState;
 
-// Vector-Vector operations: many-to-many not supported
+// Vector-Vector operations
 pub(super) fn eval_binop_vector_vector(
     expr: &BinaryExpr,
     left_vector: Vec<EvalSample>,
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
+    // Set operators (or, and, unless) use ManyToMany cardinality and have
+    // completely different semantics from arithmetic/comparison operators.
+    if expr.op.is_set_operator() {
+        return eval_set_op(expr, left_vector, right_vector);
+    }
+
     let mut left_vector = left_vector;
     let mut right_vector = right_vector;
 
     let card = match expr.modifier.as_ref().map(|m| &m.card) {
         Some(VectorMatchCardinality::ManyToMany) => {
             return Err(EvaluationError::InternalError(
-                "many-to-many cardinality not supported".to_string(),
+                "many-to-many cardinality not supported for non-set operators".to_string(),
             ));
         }
         Some(c) => c,
@@ -220,3 +230,129 @@ pub(super) fn eval_binop_vector_vector(
 
     Ok(ExprResult::InstantVector(result))
 }
+
+// ============================================================================
+// Set operators: or, and, unless
+// ============================================================================
+
+/// Evaluate PromQL set binary operators (`or`, `and`, `unless`).
+///
+/// Set operators work on label matching without performing arithmetic:
+///   - `or`:     all LHS samples, plus RHS samples whose match key is not in LHS
+///   - `and`:    LHS samples whose match key exists in RHS (values from LHS)
+///   - `unless`: LHS samples whose match key does NOT exist in RHS
+fn eval_set_op(
+    expr: &BinaryExpr,
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
+) -> EvalResult<ExprResult> {
+    let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
+
+    // Materialize pending __name__ drops before matching
+    for sample in left_vector.iter_mut() {
+        if sample.drop_name {
+            sample.labels.remove(METRIC_NAME);
+        }
+    }
+    for sample in right_vector.iter_mut() {
+        if sample.drop_name {
+            sample.labels.remove(METRIC_NAME);
+        }
+    }
+
+    match expr.op.id() {
+        T_LOR => eval_set_or(left_vector, right_vector, matching),
+        T_LAND => eval_set_and(left_vector, right_vector, matching),
+        T_LUNLESS => eval_set_unless(left_vector, right_vector, matching),
+        _ => Err(EvaluationError::InternalError(format!(
+            "Unknown set operator: {:?}",
+            expr.op
+        ))),
+    }
+}
+
+/// `or`: returns all LHS samples, plus any RHS samples whose match key
+/// does not appear on the LHS.
+fn eval_set_or(
+    left_vector: Vec<EvalSample>,
+    right_vector: Vec<EvalSample>,
+    matching: Option<&promql_parser::parser::LabelModifier>,
+) -> EvalResult<ExprResult> {
+    if left_vector.is_empty() {
+        return Ok(ExprResult::InstantVector(right_vector));
+    }
+    if right_vector.is_empty() {
+        return Ok(ExprResult::InstantVector(left_vector))
+    }
+    // Build a set of match keys from the left side
+    let left_keys: halfbrown::HashMap<Labels, (), RandomState> = left_vector
+        .iter()
+        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
+        .collect();
+
+    let mut result = left_vector;
+
+    // Append right-side samples whose match key is NOT present on the left
+    for sample in right_vector {
+        let key = compute_binary_match_key(&sample.labels, matching);
+        if !left_keys.contains_key(&key) {
+            result.push(sample);
+        }
+    }
+
+    Ok(ExprResult::InstantVector(result))
+}
+
+/// `and`: returns LHS samples that have a matching label set on the RHS.
+/// Values always come from the LHS.
+fn eval_set_and(
+    left_vector: Vec<EvalSample>,
+    right_vector: Vec<EvalSample>,
+    matching: Option<&promql_parser::parser::LabelModifier>,
+) -> EvalResult<ExprResult> {
+    if left_vector.is_empty() || right_vector.is_empty() {
+        return Ok(ExprResult::InstantVector(vec![]));
+    }
+    // Build a set of match keys from the right side
+    let right_keys: halfbrown::HashMap<Labels, (), RandomState> = right_vector
+        .iter()
+        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
+        .collect();
+
+    let result: Vec<EvalSample> = left_vector
+        .into_iter()
+        .filter(|s| {
+            let key = compute_binary_match_key(&s.labels, matching);
+            right_keys.contains_key(&key)
+        })
+        .collect();
+
+    Ok(ExprResult::InstantVector(result))
+}
+
+/// `unless`: returns LHS samples that do NOT have a matching label set on the RHS.
+fn eval_set_unless(
+    left_vector: Vec<EvalSample>,
+    right_vector: Vec<EvalSample>,
+    matching: Option<&promql_parser::parser::LabelModifier>,
+) -> EvalResult<ExprResult> {
+    if left_vector.is_empty() || right_vector.is_empty() {
+        return Ok(ExprResult::InstantVector(left_vector));
+    }
+    // Build a set of match keys from the right side
+    let right_keys: halfbrown::HashMap<Labels, (), RandomState> = right_vector
+        .iter()
+        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
+        .collect();
+
+    let result: Vec<EvalSample> = left_vector
+        .into_par()
+        .filter(|s| {
+            let key = compute_binary_match_key(&s.labels, matching);
+            !right_keys.contains_key(&key)
+        })
+        .collect();
+
+    Ok(ExprResult::InstantVector(result))
+}
+
