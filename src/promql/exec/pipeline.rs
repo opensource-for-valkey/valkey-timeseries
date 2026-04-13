@@ -20,6 +20,8 @@ use crate::promql::{
 use ahash::{AHashMap, AHashSet};
 use promql_parser::parser::VectorSelector;
 use std::time::Instant;
+use orx_parallel::{ParIter, IterIntoParIter};
+
 // ---------------------------------------------------------------------------
 // Phase artifact types
 // ---------------------------------------------------------------------------
@@ -283,49 +285,49 @@ pub(crate) fn shape_subquery_results(
         entry.1.extend(series.samples);
     }
 
-    // Sort and dedup
-    for (_, samples) in merged.values_mut() {
-        samples.sort_by_key(|s| s.timestamp);
-        samples.dedup_by_key(|s| s.timestamp);
-    }
-
-    // Step-bucketing with sliding window
     let subquery_end_ms = plan.sample_end_ms;
-    let mut range_vector = Vec::with_capacity(merged.len());
 
-    for (_, (labels, mut samples)) in merged {
-        let mut step_samples = Vec::with_capacity(expected_steps);
-        let mut i = 0usize;
-        let mut last_valid: Option<&Sample> = None;
+    let range_vector: Vec<EvalSamples> = merged
+        .into_iter()
+        .iter_into_par()
+        .filter_map(|(_fp, (labels, mut samples))| {
+            // Sort and dedup
+            samples.sort_by_key(|s| s.timestamp);
+            samples.dedup_by_key(|s| s.timestamp);
 
-        for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-            let lookback_start_ms = current_step_ms - lookback_delta_ms;
+            let mut step_samples = Vec::with_capacity(expected_steps);
+            let mut i = 0usize;
+            let mut last_valid: Option<&Sample> = None;
 
-            while i < samples.len() && samples[i].timestamp <= current_step_ms {
-                last_valid = Some(&samples[i]);
-                i += 1;
+            for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
+                let lookback_start_ms = current_step_ms - lookback_delta_ms;
+
+                while i < samples.len() && samples[i].timestamp <= current_step_ms {
+                    last_valid = Some(&samples[i]);
+                    i += 1;
+                }
+
+                if let Some(sample) = last_valid && sample.timestamp > lookback_start_ms {
+                    step_samples.push(Sample {
+                        timestamp: current_step_ms,
+                        value: sample.value,
+                    });
+                }
             }
 
-            if let Some(sample) = last_valid
-                && sample.timestamp > lookback_start_ms
-            {
-                step_samples.push(Sample {
-                    timestamp: current_step_ms,
-                    value: sample.value,
-                });
+            if step_samples.is_empty() {
+                None
+            } else {
+                Some(EvalSamples {
+                    values: step_samples,
+                    labels,
+                    range_ms,
+                    range_end_ms: subquery_end_ms,
+                    drop_name: false,
+                })
             }
-        }
-
-        if !step_samples.is_empty() {
-            range_vector.push(EvalSamples {
-                values: step_samples,
-                labels,
-                range_ms,
-                range_end_ms: subquery_end_ms,
-                drop_name: false,
-            });
-        }
-    }
+        })
+        .collect();
 
     range_vector
 }
