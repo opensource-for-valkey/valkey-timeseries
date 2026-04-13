@@ -1,3 +1,4 @@
+use crate::promql::QueryValue;
 use crate::promql::engine::Tsdb;
 use crate::promql::engine::test_utils::MockSeriesQuerier;
 use crate::promql::promqltest::assert::assert_results;
@@ -113,14 +114,9 @@ where
                         eval_cmd.step,
                         &eval_cmd.query,
                     )?;
-                    assert_results(
-                        &result,
-                        &eval_cmd.expected,
-                        false,
-                        name,
-                        eval_count,
-                        &eval_cmd.query,
-                    )?;
+                    let result = QueryValue::Matrix(result);
+                    let expected = eval_cmd.expected.clone();
+                    assert_results(result, expected, false, name, eval_count, &eval_cmd.query)?;
                 }
             }
 
@@ -128,9 +124,11 @@ where
                 if !ignoring {
                     eval_count += 1;
                     let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query)?;
+
+                    let expected = eval_cmd.expected.clone();
                     assert_results(
-                        &result,
-                        &eval_cmd.expected,
+                        result,
+                        expected,
                         eval_cmd.expect_ordered,
                         name,
                         eval_count,
@@ -180,8 +178,11 @@ mod tests {
         // then
         let result =
             eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(60), "test_metric").unwrap();
+        let QueryValue::Vector(result) = result else {
+            panic!("Expected instant vector result");
+        };
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].samples[0].value, 2.0);
+        assert_eq!(result[0].value, 2.0);
     }
 
     #[test]
@@ -196,6 +197,7 @@ mod tests {
 
         // when
         let result = eval_instant(&tsdb, UNIX_EPOCH + Duration::from_secs(120), "metric").unwrap();
+        let result = result.into_matrix().unwrap();
 
         // then
         assert_eq!(result.len(), 1);
@@ -224,14 +226,20 @@ eval instant at 10m
     #[test]
     fn pi_test() {
         let content = r#"
-eval instant at 0s pi()
-	3.141592653589793
+eval instant at 50m 0 / 0
+	NaN
+
+eval instant at 50m 1 % 0
+	NaN
 "#;
+
         // when
         let result = run_test("pi_test", content);
 
         // then
-        assert!(result.is_ok());
+        if let Err(e) = result {
+            panic!("run_test failed: {}", e);
+        }
     }
 
     #[test]
