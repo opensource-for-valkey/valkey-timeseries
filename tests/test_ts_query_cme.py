@@ -109,7 +109,7 @@ class TestTsQueryCluster(ValkeyTimeSeriesTestCaseBase):
         client.execute_command("TS.ADD", "prod-web-2-requests:{shard1}", timestamp, 2200)
         client.execute_command("TS.ADD", "prod-web-cpu-usage-seconds:{shard0}", timestamp, 45.5)
 
-        query = 'http_requests_total{job=~"web.*"} / on(job, env) node_cpu_usage_seconds_total{job=~"web.*"}'
+        query = 'http_requests_total{job=~"web.*"} / on(job, env) group_left() node_cpu_usage_seconds_total{job=~"web.*"}'
         result = self.instant_query(query, timestamp)
 
         assert result.is_vector()
