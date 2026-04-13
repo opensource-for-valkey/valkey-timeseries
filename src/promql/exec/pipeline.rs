@@ -276,11 +276,11 @@ pub(crate) fn shape_subquery_results(
     // Merge by fingerprint
     let mut merged: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
 
-    for series in &series_data {
+    for series in series_data {
         let entry = merged
             .entry(series.fingerprint)
-            .or_insert_with(|| (series.labels.clone(), Vec::new()));
-        entry.1.extend(series.samples.iter().cloned());
+            .or_insert_with(|| (series.labels, Vec::new()));
+        entry.1.extend(series.samples);
     }
 
     // Sort and dedup
@@ -293,7 +293,7 @@ pub(crate) fn shape_subquery_results(
     let subquery_end_ms = plan.sample_end_ms;
     let mut range_vector = Vec::with_capacity(merged.len());
 
-    for (_, (labels, samples)) in merged {
+    for (_, (labels, mut samples)) in merged {
         let mut step_samples = Vec::with_capacity(expected_steps);
         let mut i = 0usize;
         let mut last_valid: Option<&Sample> = None;
