@@ -35,8 +35,9 @@ eval instant at 1m atan(trig)
 	{l="y"} 1.5208379310729538
 	{l="NaN"} NaN
 
+# Note - the first values in the original test were wrong, as sinh(10) and cosh(10) are not the same. The correct values are shown here.
 eval instant at 1m sinh(trig)
-	{l="x"} 11013.232920103324
+	{l="x"} 11013.232874703393
 	{l="y"} 2.4258259770489514e+08
 	{l="NaN"} NaN
 
