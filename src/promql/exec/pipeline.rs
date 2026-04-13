@@ -18,9 +18,9 @@ use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
 };
 use ahash::{AHashMap, AHashSet};
+use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::parser::VectorSelector;
 use std::time::Instant;
-use orx_parallel::{ParIter, IterIntoParIter};
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -307,7 +307,9 @@ pub(crate) fn shape_subquery_results(
                     i += 1;
                 }
 
-                if let Some(sample) = last_valid && sample.timestamp > lookback_start_ms {
+                if let Some(sample) = last_valid
+                    && sample.timestamp > lookback_start_ms
+                {
                     step_samples.push(Sample {
                         timestamp: current_step_ms,
                         value: sample.value,

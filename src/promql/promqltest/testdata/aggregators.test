@@ -221,7 +221,6 @@ eval instant at 50m stddev(http_requests)
 eval instant at 50m stdvar(http_requests)
   {} 0.0
 
-
 # Regression test for missing separator byte in labelsToGroupingKey.
 
 resume
