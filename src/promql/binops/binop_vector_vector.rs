@@ -90,7 +90,7 @@ pub(super) fn eval_binop_vector_vector(
         // match multiple many-side entries to the same one-side entry.
         // We check this here rather than upfront so that unmatched duplicates are
         // silently dropped (no error for unmatched many-side duplicates).
-        if is_one_to_one && !is_comparison && !one_to_one_seen.insert(key.clone()) {
+        if is_one_to_one && !is_comparison && !one_to_one_seen.insert(key) {
             return Err(EvaluationError::InternalError(
                 "many-to-many matching not allowed: found duplicate series on the left side of the operation"
                     .to_string(),
