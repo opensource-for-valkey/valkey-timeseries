@@ -90,13 +90,6 @@ mod tests {
                 expected_value
             );
 
-            if actual_sample.labels != expected_labels {
-                // Debug output to help pinpoint regression source when tests fail.
-                eprintln!(
-                    "Sample {} labels mismatch debugging:\n  actual: {:?}\n  expected: {:?}",
-                    i, actual_sample.labels, expected_labels
-                );
-            }
             assert_eq!(
                 actual_sample.labels, expected_labels,
                 "Sample {i} labels mismatch: got {:?}, expected {:?}",
