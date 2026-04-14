@@ -15,15 +15,39 @@ pub(super) fn eval_binop_vector_vector(
     left_vector: Vec<EvalSample>,
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    // Set operators (or, and, unless) use ManyToMany cardinality and have
-    // completely different semantics from arithmetic/comparison operators.
-    if expr.op.is_set_operator() {
-        return eval_set_op(expr, left_vector, right_vector);
+    let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
+
+    match expr.op.id() {
+        T_LOR => eval_set_or(left_vector, right_vector, matching),
+        T_LAND => eval_set_and(left_vector, right_vector, matching),
+        T_LUNLESS => eval_set_unless(left_vector, right_vector, matching),
+        _ => eval_arith_ops(expr, left_vector, right_vector),
     }
+}
 
-    let mut left_vector = left_vector;
-    let mut right_vector = right_vector;
+fn drop_names_if_necessary(
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
+) -> (Vec<EvalSample>, Vec<EvalSample>) {
+    // Materialize pending __name__ drops before matching
+    for sample in left_vector.iter_mut() {
+        if sample.drop_name {
+            sample.labels.remove(METRIC_NAME);
+        }
+    }
+    for sample in right_vector.iter_mut() {
+        if sample.drop_name {
+            sample.labels.remove(METRIC_NAME);
+        }
+    }
+    (left_vector, right_vector)
+}
 
+fn eval_arith_ops(
+    expr: &BinaryExpr,
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
+) -> EvalResult<ExprResult> {
     let card = match expr.modifier.as_ref().map(|m| &m.card) {
         Some(VectorMatchCardinality::ManyToMany) => {
             return Err(EvaluationError::InternalError(
@@ -35,17 +59,22 @@ pub(super) fn eval_binop_vector_vector(
     };
 
     let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
+    let is_comparison = expr.op.is_comparison_operator();
+    // With `bool` modifier, comparison ops return 0/1 for all pairs instead of filtering
+    let return_bool = expr.return_bool();
 
-    // Materialize pending __name__ drops before matching so that
-    // stale names don't participate in match keys or result labels
-    for sample in left_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
+    // Arithmetic (non-comparison) operations always drop `__name__`, even for unmatched series that are carried through from the "many" side.
+    // This matches Prometheus's behavior and ensures that stale metric names don't interfere with matching or result labels.
+    if !is_comparison {
+        for sample in left_vector.iter_mut() {
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+            }
         }
-    }
-    for sample in right_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
+        for sample in right_vector.iter_mut() {
+            if sample.drop_name {
+                sample.labels.remove(METRIC_NAME);
+            }
         }
     }
 
@@ -61,10 +90,11 @@ pub(super) fn eval_binop_vector_vector(
         (right_vector, left_vector)
     };
 
+
     // Build "one" side index keyed by match signature
     // For comparisons, allow multiple samples with the same matching key
     let mut one_map: FingerprintHashMap<Vec<EvalSample>> = Default::default();
-    let is_comparison = expr.op.is_comparison_operator();
+
     for sample in one_vec {
         let key = compute_binary_match_key(&sample.labels, matching);
         if one_map.contains_key(&key) && !is_comparison {
@@ -166,7 +196,11 @@ pub(super) fn eval_binop_vector_vector(
                             // No explicit labels or empty: copy labels from the "one" side that are not on the "many" side
                             // This preserves the many-side labels while adding only new labels from the one-side
                             let many_label_names: halfbrown::HashMap<&str, (), RandomState> =
-                                many_sample.labels.iter().map(|l| (l.name.as_str(), ())).collect();
+                                many_sample
+                                    .labels
+                                    .iter()
+                                    .map(|l| (l.name.as_str(), ()))
+                                    .collect();
                             for label in one_sample.labels.iter() {
                                 if label.name != METRIC_NAME
                                     && !many_label_names.contains_key(label.name.as_str())
@@ -177,10 +211,6 @@ pub(super) fn eval_binop_vector_vector(
                         }
                     }
 
-                    // Check if this is a comparison operation (filters results in PromQL)
-                    let is_comparison = operator.is_comparison_operator();
-                    // With `bool` modifier, comparison ops return 0/1 for all pairs instead of filtering
-                    let return_bool = expr.return_bool();
 
                     let drop_name = many_sample.drop_name || return_bool;
 
@@ -231,45 +261,10 @@ pub(super) fn eval_binop_vector_vector(
     Ok(ExprResult::InstantVector(result))
 }
 
+
 // ============================================================================
 // Set operators: or, and, unless
 // ============================================================================
-
-/// Evaluate PromQL set binary operators (`or`, `and`, `unless`).
-///
-/// Set operators work on label matching without performing arithmetic:
-///   - `or`:     all LHS samples, plus RHS samples whose match key is not in LHS
-///   - `and`:    LHS samples whose match key exists in RHS (values from LHS)
-///   - `unless`: LHS samples whose match key does NOT exist in RHS
-fn eval_set_op(
-    expr: &BinaryExpr,
-    mut left_vector: Vec<EvalSample>,
-    mut right_vector: Vec<EvalSample>,
-) -> EvalResult<ExprResult> {
-    let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
-
-    // Materialize pending __name__ drops before matching
-    for sample in left_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
-        }
-    }
-    for sample in right_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
-        }
-    }
-
-    match expr.op.id() {
-        T_LOR => eval_set_or(left_vector, right_vector, matching),
-        T_LAND => eval_set_and(left_vector, right_vector, matching),
-        T_LUNLESS => eval_set_unless(left_vector, right_vector, matching),
-        _ => Err(EvaluationError::InternalError(format!(
-            "Unknown set operator: {:?}",
-            expr.op
-        ))),
-    }
-}
 
 /// `or`: returns all LHS samples, plus any RHS samples whose match key
 /// does not appear on the LHS.
@@ -284,6 +279,9 @@ fn eval_set_or(
     if right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(left_vector));
     }
+
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+
     // Build a set of match keys from the left side
     let left_keys: FingerprintHashMap<()> = left_vector
         .iter()
@@ -312,6 +310,9 @@ fn eval_set_and(
     if left_vector.is_empty() || right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(vec![]));
     }
+
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+
     // Build a set of match keys from the right side
     let right_keys: FingerprintHashMap<()> = right_vector
         .iter()
@@ -338,6 +339,9 @@ fn eval_set_unless(
     if left_vector.is_empty() || right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(left_vector));
     }
+
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+
     // Build a set of match keys from the right side
     let right_keys: FingerprintHashMap<()> = right_vector
         .iter()
