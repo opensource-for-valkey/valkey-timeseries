@@ -1,7 +1,10 @@
+use crate::labels::Label;
 use crate::promql::Labels;
+use crate::promql::hashers::SeriesFingerprint;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LOR, T_MUL, T_SUB, TokenType};
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
+use twox_hash::xxhash3_128;
 
 /// Returns true if the binary operation changes the metric schema, meaning
 /// `__name__` should be dropped from the result. Mirrors Prometheus's `resultMetric`
@@ -18,28 +21,33 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
 /// This is intentionally separated from `compute_grouping_labels` because their `None`
 /// cases have opposite semantics (aggregation groups everything together; binary ops
 /// match on all labels).
-pub(super) fn compute_binary_match_key(
+pub(in crate::promql) fn compute_binary_match_key(
     labels: &Labels,
     matching: Option<&LabelModifier>,
-) -> Labels {
-    let items = match matching {
+) -> SeriesFingerprint {
+    let mut hasher: xxhash3_128::Hasher = Default::default();
+    // labels is assumed to be sorted, so no need for pre-processing
+    match matching {
         None => labels
             .iter()
             .filter(|&k| k.name != METRIC_NAME)
-            .cloned()
-            .collect(),
+            .for_each(|label| hash_label(&mut hasher, label)),
         Some(LabelModifier::Include(label_list)) => labels
             .iter()
             .filter(|&l| label_list.labels.contains(&l.name))
-            .cloned()
-            .collect(),
+            .for_each(|label| hash_label(&mut hasher, label)),
         Some(LabelModifier::Exclude(label_list)) => labels
             .iter()
             .filter(|&l| l.name != METRIC_NAME && !label_list.labels.contains(&l.name))
-            .cloned()
-            .collect(),
+            .for_each(|label| hash_label(&mut hasher, label)),
     };
-    Labels::new(items)
+    hasher.finish_128()
+}
+
+fn hash_label(hasher: &mut xxhash3_128::Hasher, label: &Label) {
+    hasher.write(label.name.as_bytes());
+    hasher.write(b"0xfe");
+    hasher.write(label.value.as_bytes());
 }
 
 pub fn compute_grouping_labels(mut labels: Labels, modifier: Option<&LabelModifier>) -> Labels {
