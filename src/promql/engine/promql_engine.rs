@@ -148,9 +148,7 @@ pub(crate) fn evaluate_instant(
                 })
                 .collect(),
         )),
-        ExprResult::String(_s) => Err(QueryError::Execution(
-            "string expressions not supported in instant query evaluation".to_string(),
-        )),
+        ExprResult::String(s) => Ok(QueryValue::String(s)),
     }
 }
 
@@ -337,9 +335,7 @@ impl Tsdb {
                     })
                     .collect(),
             )),
-            ExprResult::String(_s) => Err(QueryError::Execution(
-                "string expressions not supported in instant query evaluation".to_string(),
-            )),
+            ExprResult::String(s) => Ok(QueryValue::String(s)),
         }
     }
 
