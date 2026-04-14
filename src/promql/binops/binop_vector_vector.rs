@@ -2,7 +2,7 @@ use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use ahash::AHashSet;
+use ahash::{AHashSet, RandomState};
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 use promql_parser::label::METRIC_NAME;
@@ -165,11 +165,11 @@ pub(super) fn eval_binop_vector_vector(
                         _ => {
                             // No explicit labels or empty: copy labels from the "one" side that are not on the "many" side
                             // This preserves the many-side labels while adding only new labels from the one-side
-                            let many_label_names: AHashSet<&str> =
-                                many_sample.labels.iter().map(|l| l.name.as_str()).collect();
+                            let many_label_names: halfbrown::HashMap<&str, (), RandomState> =
+                                many_sample.labels.iter().map(|l| (l.name.as_str(), ())).collect();
                             for label in one_sample.labels.iter() {
                                 if label.name != METRIC_NAME
-                                    && !many_label_names.contains(label.name.as_str())
+                                    && !many_label_names.contains_key(label.name.as_str())
                                 {
                                     result_labels.insert(&label.name, label.value.clone());
                                 }
@@ -290,15 +290,14 @@ fn eval_set_or(
         .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
         .collect();
 
-    let mut result = left_vector;
-
     // Append right-side samples whose match key is NOT present on the left
-    for sample in right_vector {
-        let key = compute_binary_match_key(&sample.labels, matching);
-        if !left_keys.contains_key(&key) {
-            result.push(sample);
-        }
-    }
+    let result = right_vector
+        .into_par()
+        .filter(|s| {
+            let key = compute_binary_match_key(&s.labels, matching);
+            !left_keys.contains_key(&key)
+        })
+        .collect_into(left_vector);
 
     Ok(ExprResult::InstantVector(result))
 }
@@ -320,7 +319,7 @@ fn eval_set_and(
         .collect();
 
     let result: Vec<EvalSample> = left_vector
-        .into_iter()
+        .into_par()
         .filter(|s| {
             let key = compute_binary_match_key(&s.labels, matching);
             right_keys.contains_key(&key)
