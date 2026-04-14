@@ -1,13 +1,13 @@
-use orx_parallel::ParIter;
 use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
+use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use orx_parallel::IntoParIter;
+use orx_parallel::ParIter;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS};
 use promql_parser::parser::{BinaryExpr, VectorMatchCardinality};
-use twox_hash::xxhash32::RandomState;
 
 // Vector-Vector operations
 pub(super) fn eval_binop_vector_vector(
@@ -63,7 +63,7 @@ pub(super) fn eval_binop_vector_vector(
 
     // Build "one" side index keyed by match signature
     // For comparisons, allow multiple samples with the same matching key
-    let mut one_map: AHashMap<Labels, Vec<EvalSample>> = AHashMap::new();
+    let mut one_map: FingerprintHashMap<Vec<EvalSample>> = Default::default();
     let is_comparison = expr.op.is_comparison_operator();
     for sample in one_vec {
         let key = compute_binary_match_key(&sample.labels, matching);
@@ -79,7 +79,7 @@ pub(super) fn eval_binop_vector_vector(
     }
 
     let mut result = Vec::new();
-    let mut one_to_one_seen: AHashSet<Labels> = AHashSet::new();
+    let mut one_to_one_seen: FingerprintHashMap<()> = Default::default();
     // PromQL grouped matching (`group_left` / `group_right`) requires every
     // output time series to remain uniquely identifiable. Two different matches
     // are not allowed to collapse to the same final output labels.
@@ -100,7 +100,7 @@ pub(super) fn eval_binop_vector_vector(
         // match multiple many-side entries to the same one-side entry.
         // We check this here rather than upfront so that unmatched duplicates are
         // silently dropped (no error for unmatched many-side duplicates).
-        if is_one_to_one && !is_comparison && !one_to_one_seen.insert(key) {
+        if is_one_to_one && !is_comparison && one_to_one_seen.insert(key, ()).is_some() {
             return Err(EvaluationError::InternalError(
                 "many-to-many matching not allowed: found duplicate series on the left side of the operation"
                     .to_string(),
@@ -282,10 +282,10 @@ fn eval_set_or(
         return Ok(ExprResult::InstantVector(right_vector));
     }
     if right_vector.is_empty() {
-        return Ok(ExprResult::InstantVector(left_vector))
+        return Ok(ExprResult::InstantVector(left_vector));
     }
     // Build a set of match keys from the left side
-    let left_keys: halfbrown::HashMap<Labels, (), RandomState> = left_vector
+    let left_keys: FingerprintHashMap<()> = left_vector
         .iter()
         .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
         .collect();
@@ -314,7 +314,7 @@ fn eval_set_and(
         return Ok(ExprResult::InstantVector(vec![]));
     }
     // Build a set of match keys from the right side
-    let right_keys: halfbrown::HashMap<Labels, (), RandomState> = right_vector
+    let right_keys: FingerprintHashMap<()> = right_vector
         .iter()
         .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
         .collect();
@@ -340,7 +340,7 @@ fn eval_set_unless(
         return Ok(ExprResult::InstantVector(left_vector));
     }
     // Build a set of match keys from the right side
-    let right_keys: halfbrown::HashMap<Labels, (), RandomState> = right_vector
+    let right_keys: FingerprintHashMap<()> = right_vector
         .iter()
         .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
         .collect();
@@ -355,4 +355,3 @@ fn eval_set_unless(
 
     Ok(ExprResult::InstantVector(result))
 }
-
