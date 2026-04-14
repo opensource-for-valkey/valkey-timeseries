@@ -1,8 +1,9 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::Label;
+use crate::promql::Labels;
 use blart::AsBytes;
-use promql_parser::label::{MatchOp, Matcher};
-use promql_parser::parser::{AtModifier, Offset, VectorSelector};
+use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
+use promql_parser::parser::{AtModifier, LabelModifier, Offset, VectorSelector};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::collections::HashSet;
