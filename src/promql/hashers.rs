@@ -3,7 +3,7 @@ use crate::labels::Label;
 use blart::AsBytes;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, Offset, VectorSelector};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
