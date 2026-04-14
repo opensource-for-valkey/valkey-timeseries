@@ -1,8 +1,7 @@
 use crate::promql::{EvalResult, EvaluationError, ExprResult};
 use promql_parser::parser::BinaryExpr;
 use promql_parser::parser::token::{
-    T_ADD, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MUL, T_NEQ, T_SUB, T_MOD,
-    TokenType,
+    T_ADD, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MOD, T_MUL, T_NEQ, T_SUB, TokenType,
 };
 
 mod binop_range_scalar;

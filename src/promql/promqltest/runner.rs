@@ -226,11 +226,16 @@ eval instant at 10m
     #[test]
     fn pi_test() {
         let content = r#"
-eval instant at 50m 0 / 0
-	NaN
+load 1m
+    metric1{a="a"} 0+1x100
+    metric2{b="b"} 0+1x50
 
-eval instant at 50m 1 % 0
-	NaN
+# operator with offset
+eval instant at 90m metric1 offset 15m or metric2 offset 45m
+    metric1{a="a"} 75
+    metric2{b="b"} 45
+
+clear
 "#;
 
         // when
