@@ -36,12 +36,12 @@ impl Default for QuerierInner {
 
 /// A mock QueryReader for testing that holds data in memory.
 /// Use `MockQueryReaderBuilder` to construct instances.
-pub(crate) struct MockSeriesQuerier {
+pub struct MockSeriesQuerier {
     inner: RwLock<QuerierInner>,
 }
 
 impl MockSeriesQuerier {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: RwLock::new(QuerierInner::default()),
         }
@@ -49,7 +49,7 @@ impl MockSeriesQuerier {
 
     /// Add a sample with labels. If a series with the same labels already exists globally,
     /// the existing series ID is reused. Otherwise, a new series is created with a global ID.
-    pub(crate) fn add_sample(&self, labels: &Labels, sample: Sample) {
+    pub fn add_sample(&self, labels: &Labels, sample: Sample) {
         let mut inner = self.inner.write().unwrap();
         let fingerprint = labels.get_fingerprint();
 
