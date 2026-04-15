@@ -96,7 +96,7 @@ pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
 // ── Shared evaluation free functions ────────────────────────────────
 
 /// Evaluate an instant PromQL query against the given reader.
-pub(crate) fn evaluate_instant(
+pub fn evaluate_instant(
     reader: Arc<dyn QueryReader>,
     stmt: EvalStmt,
     query_time: SystemTime,
@@ -154,7 +154,7 @@ pub(crate) fn evaluate_instant(
 
 /// Evaluate a range PromQL query against the given reader.
 /// Returns the result and the EvalStats for metrics publishing.
-pub(crate) fn evaluate_range(
+pub fn evaluate_range(
     reader: Arc<dyn QueryReader>,
     stmt: EvalStmt,
     opts: QueryOptions,
