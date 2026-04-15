@@ -1,4 +1,3 @@
-mod batch_worker;
 pub mod config;
 mod fanout;
 mod mock_series_querier;
@@ -14,7 +13,6 @@ use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
 use crate::promql::engine::query_worker::QueryWorker;
 use crate::promql::model::{InstantSample, RangeSample};
 use crate::promql::{PromqlResult, QueryError, QueryResult, QueryValue};
-pub(crate) use batch_worker::*;
 use cfg_if::cfg_if;
 pub(crate) use fanout::*;
 pub(crate) use promql_engine::*;
