@@ -11,7 +11,7 @@ use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 use twox_hash::xxhash3_128;
 
-pub(crate) trait QueryReader: Send + Sync {
+pub trait QueryReader: Send + Sync {
     /// Query instant samples at `timestamp`.
     /// `deadline` is an optional absolute Instant by which the operation should complete.
     fn query(
