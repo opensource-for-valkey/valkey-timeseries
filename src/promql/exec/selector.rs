@@ -1,8 +1,5 @@
-use crate::labels::Label;
-use promql_parser::label::{METRIC_NAME, MatchOp};
-use promql_parser::parser::VectorSelector;
-use regex_syntax::Parser;
 use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::Parser;
 
 fn parse_literal(hir: &Hir, pattern: &str) -> Result<String, String> {
     match hir.kind() {
@@ -47,45 +44,10 @@ fn parse_limited_regex(pattern: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// Extract equality terms from the selector (simplified version for compatibility).
-fn extract_equality_terms(selector: &VectorSelector) -> Result<Vec<Label>, String> {
-    let mut terms = Vec::new();
-    if let Some(ref name) = selector.name {
-        terms.push(Label {
-            name: METRIC_NAME.to_string(),
-            value: name.clone(),
-        });
-    }
-
-    for matcher in &selector.matchers.matchers {
-        match &matcher.op {
-            MatchOp::Equal => {
-                // For empty string matchers, we skip adding them to terms
-                // and handle them later with post-filtering
-                if !matcher.value.is_empty() {
-                    terms.push(Label {
-                        name: matcher.name.clone(),
-                        value: matcher.value.clone(),
-                    });
-                }
-            }
-            MatchOp::Re(_) => {
-                // Regex validation only - actual handling done in find_candidates_with_regex_support
-                let _values = parse_limited_regex(&matcher.value)?;
-            }
-            _ => {
-                // Other match operations handled elsewhere
-            }
-        }
-    }
-
-    Ok(terms)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_parser::label::{Matcher, Matchers};
+    use promql_parser::label::{MatchOp, Matcher, Matchers};
     use rstest::rstest;
 
     fn empty_matchers() -> Matchers {
