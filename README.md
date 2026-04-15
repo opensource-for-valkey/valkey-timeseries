@@ -96,6 +96,27 @@ To run all unit tests, follow these steps:
 
     $ cargo test --features enable-system-alloc
 
+#### Running Criterion benchmarks
+
+The PromQL benchmark target is `promql_engine` and requires `enable-system-alloc`.
+
+Default (local) profile uses longer warmup/measurement windows for more stable results:
+
+```zsh
+cargo bench --bench promql_engine --features enable-system-alloc
+```
+
+CI profile uses faster settings and flat sampling:
+
+```zsh
+BENCH_PROFILE=ci cargo bench --bench promql_engine --features enable-system-alloc
+```
+
+`BENCH_PROFILE` is read by `benches/promql_engine.rs`:
+
+- unset (or any value other than `ci`): local/stable profile
+- `ci`: fast profile (`SamplingMode::Flat`, shorter run time)
+
 #### Local development script to build, run format checks, run unit / integration tests, and for cargo release:
 ```
 # Builds the valkey-server (unstable) for integration testing.
