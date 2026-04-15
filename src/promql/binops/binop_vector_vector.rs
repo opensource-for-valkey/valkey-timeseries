@@ -128,55 +128,65 @@ fn eval_arith_ops(
             ));
         }
 
-        for one_sample in one_samples {
-            let (lhs, rhs) = if is_group_right {
-                (one_sample.value, many_sample.value)
-            } else {
-                (many_sample.value, one_sample.value)
-            };
+        result = one_samples
+            .into_par()
+            .filter_map(|one_sample| {
+                let (lhs, rhs) = if is_group_right {
+                    (one_sample.value, many_sample.value)
+                } else {
+                    (many_sample.value, one_sample.value)
+                };
 
-            let value = apply_binary_op(operator, lhs, rhs)?;
+                let value = match apply_binary_op(operator, lhs, rhs) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        unreachable!("binary operator {:?} should not fail on valid f64 inputs: {}", operator, e);
+                    }
+                };
 
-            // Comparison filter: skip false results unless `bool` modifier is used.
-            if is_comparison && !return_bool && value == 0.0 {
-                continue;
-            }
-
-            // For comparison ops without `bool`, propagate the original LHS value.
-            let output_value = if is_comparison && !return_bool {
-                lhs
-            } else {
-                value
-            };
-            let drop_name = many_sample.drop_name || return_bool;
-
-            let result_labels = build_result_labels(
-                &many_sample,
-                one_sample,
-                operator,
-                if is_one_to_one { matching } else { None },
-                group_labels,
-                is_group_right,
-            );
-
-            // Duplicate detection for grouped matching must occur after comparison
-            // filtering so that comparisons can naturally reduce duplicates.
-            if !is_one_to_one {
-                let fp = result_fingerprint(&result_labels, drop_name);
-                if grouped_result_seen.insert(fp, ()).is_some() {
-                    return Err(EvaluationError::InternalError(
-                        "multiple matches for labels: grouping labels must ensure unique matches"
-                            .to_string(),
-                    ));
+                // Comparison filter: skip false results unless `bool` modifier is used.
+                if is_comparison && !return_bool && value == 0.0 {
+                    return None;
                 }
-            }
 
-            result.push(EvalSample {
-                timestamp_ms: many_sample.timestamp_ms,
-                value: output_value,
-                labels: result_labels,
-                drop_name,
-            });
+                // For comparison ops without `bool`, propagate the original LHS value.
+                let output_value = if is_comparison && !return_bool {
+                    lhs
+                } else {
+                    value
+                };
+                let drop_name = many_sample.drop_name || return_bool;
+
+                let result_labels = build_result_labels(
+                    &many_sample,
+                    one_sample,
+                    operator,
+                    if is_one_to_one { matching } else { None },
+                    group_labels,
+                    is_group_right,
+                );
+
+                Some(EvalSample {
+                    timestamp_ms: many_sample.timestamp_ms,
+                    value: output_value,
+                    labels: result_labels,
+                    drop_name,
+                })
+            })
+            .collect_into(result);
+    }
+
+    // Duplicate detection for grouped matching must occur after comparison
+    // filtering so that comparisons can naturally reduce duplicates.
+    if !is_one_to_one {
+        for sample in result.iter() {
+            let fp = result_fingerprint(&sample.labels, sample.drop_name);
+            if grouped_result_seen.insert(fp, ()).is_some() {
+                return Err(EvaluationError::InternalError(
+                    "multiple matches for labels: grouping labels must ensure unique matches"
+                        .to_string(),
+                ));
+            }
         }
     }
 
