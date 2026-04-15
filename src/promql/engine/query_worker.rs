@@ -1,11 +1,12 @@
+use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::get_cluster_command_timeout;
-use crate::fanout::{FanoutCommand, is_clustered};
-use crate::labels::Label;
+use crate::fanout::{is_clustered, FanoutCommand};
 use crate::labels::filters::SeriesSelector;
+use crate::labels::Label;
 use crate::promql::engine::{
-    BatchRequest, BatchWorker, BatchWorkerRunner, QueryFanoutCommand, QueryRangeFanoutCommand,
+    QueryFanoutCommand, QueryRangeFanoutCommand,
 };
 use crate::promql::generated::Label as ProtoLabel;
 use crate::promql::{
@@ -18,7 +19,7 @@ use promql_parser::label::Matchers;
 use std::ops::Deref;
 use std::sync::mpsc;
 use std::time::Duration;
-use valkey_module::Context;
+use valkey_module::{Context, MODULE_CONTEXT};
 
 struct InstantQueryCommand {
     matchers: Matchers,
@@ -36,6 +37,97 @@ struct RangeQueryCommand {
 enum QueryCommand {
     Instant(InstantQueryCommand),
     Range(RangeQueryCommand),
+}
+
+/// A single batched request for a `BatchWorker`.
+struct BatchRequest {
+    pub item: QueryCommand,
+    /// responder receives the processed result (Ok) or the error (Err)
+    pub responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+}
+
+
+/// A worker responsible for executing PromQL query tasks as part of a keyspace batch operation.
+///
+/// The `QueryWorker` optimizes latency in the PromQL evaluator (especially in cluster mode) by:
+///
+/// - Serializing access to the Valkey keyspace so the worker thread can safely hold the GIL while
+///   processing requests.
+/// - Collecting incoming query requests into a batch and processing the batch in a single lock
+///   acquisition to reduce locking overhead.
+///
+/// # Example
+/// ```rust
+/// // Create a worker handle and perform queries via the provided API.
+/// let query_worker = QueryWorker::new();
+/// let _ = query_worker.query("up".parse().unwrap(), 1_600_000_000_000i64);
+/// ```
+///
+/// The concrete worker implementation is internal; callers use `QueryWorker::new()` and the
+/// `query` / `query_range` methods exposed on the handle.
+pub struct QueryWorker {
+    // Runner is parameterized by the concrete worker implementation type.
+    runner: mpsc::Sender<BatchRequest>,
+}
+
+impl QueryWorker {
+    pub fn new() -> Self {
+        let runner = spawn_worker();
+        Self { runner }
+    }
+
+    pub fn query(
+        &self,
+        matchers: Matchers,
+        timestamp: Timestamp,
+        options: QueryOptions,
+    ) -> QueryResult<QueryValue> {
+        let command = QueryCommand::Instant(InstantQueryCommand {
+            matchers,
+            timestamp,
+            options,
+        });
+        self.send_request(command)
+    }
+
+    pub fn query_range(
+        &self,
+        matchers: Matchers,
+        start: Timestamp,
+        end: Timestamp,
+        options: QueryOptions,
+    ) -> QueryResult<QueryValue> {
+        let command = QueryCommand::Range(RangeQueryCommand {
+            matchers,
+            start_timestamp: start,
+            end_timestamp: end,
+            options,
+        });
+        self.send_request(command)
+    }
+
+    fn send_request(&self, command: QueryCommand) -> QueryResult<QueryValue> {
+        let (responder_tx, responder_rx) = mpsc::sync_channel(1);
+        let request = BatchRequest {
+            item: command,
+            responder: responder_tx,
+        };
+        // Forward request to the runner's sender
+        self.runner.send(request).unwrap_or_else(|e| {
+            eprintln!("Failed to send query request: {}", e);
+        });
+
+        match responder_rx.recv() {
+            Ok(res) => match res {
+                Ok(val) => Ok(val),
+                Err(err) => Err(err),
+            },
+            Err(e) => {
+                let msg = format!("Failed to receive query response: {}", e);
+                Err(QueryError::Execution(msg))
+            }
+        }
+    }
 }
 
 fn process_command(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
@@ -132,124 +224,40 @@ fn convert_labels(labels: Vec<ProtoLabel>) -> Labels {
     Labels::new(labels)
 }
 
-/// A worker responsible for executing PromQL query tasks as part of a batch operation.
-///
-/// The `QueryWorker` optimizes latency in the PromQL evaluator (especially in cluster mode) by:
-///
-/// - Serializing access to the Valkey keyspace so the worker thread can safely hold the GIL while
-///   processing requests.
-/// - Collecting incoming query requests into a batch and processing the batch in a single lock
-///   acquisition to reduce locking overhead.
-///
-/// # Example
-/// ```rust
-/// // Create a worker handle and perform queries via the provided API.
-/// let query_worker = QueryWorker::new();
-/// let _ = query_worker.query("up".parse().unwrap(), 1_600_000_000_000i64);
-/// ```
-///
-/// The concrete worker implementation is internal; callers use `QueryWorker::new()` and the
-/// `query` / `query_range` methods exposed on the handle.
-pub struct QueryWorker {
-    // Runner is parameterized by the concrete worker implementation type.
-    runner: BatchWorkerRunner<QueryWorkerImpl>,
-}
 
-impl QueryWorker {
-    pub fn new() -> Self {
-        // Create the concrete worker implementation and spawn it atomically via the trait method.
-        let impl_instance = QueryWorkerImpl;
-        let runner: BatchWorkerRunner<QueryWorkerImpl> = impl_instance.spawn_worker();
-        Self { runner }
-    }
+/// Spawn the worker thread and return a channel Sender that accepts `BatchRequest`s.
+fn spawn_worker() -> mpsc::Sender<BatchRequest>
+{
+    let (tx, rx) = mpsc::channel::<BatchRequest>();
 
-    pub fn query(
-        &self,
-        matchers: Matchers,
-        timestamp: Timestamp,
-        options: QueryOptions,
-    ) -> QueryResult<QueryValue> {
-        let command = QueryCommand::Instant(InstantQueryCommand {
-            matchers,
-            timestamp,
-            options,
-        });
-        self.send_request(command)
-    }
+    spawn(move || {
+        // Worker loop: wait for the first request, then drain additional pending requests
+        // to form a batch. Hold the MODULE_CONTEXT for the duration of processing
+        // the batch to serialize access to valkey keyspace.
+        loop {
+            let first = match rx.recv() {
+                Ok(r) => r,
+                Err(_) => break, // channel closed, exit thread
+            };
 
-    pub fn query_range(
-        &self,
-        matchers: Matchers,
-        start: Timestamp,
-        end: Timestamp,
-        options: QueryOptions,
-    ) -> QueryResult<QueryValue> {
-        let command = QueryCommand::Range(RangeQueryCommand {
-            matchers,
-            start_timestamp: start,
-            end_timestamp: end,
-            options,
-        });
-        self.send_request(command)
-    }
+            let mut batch = vec![first];
+            while let Ok(r) = rx.try_recv() {
+                batch.push(r);
+            }
 
-    fn send_request(&self, command: QueryCommand) -> QueryResult<QueryValue> {
-        let (responder_tx, responder_rx) = mpsc::sync_channel(1);
-        let request = BatchRequest {
-            item: command,
-            responder: responder_tx,
-        };
-        // Forward request to the runner's sender
-        self.runner.sender().send(request).unwrap_or_else(|e| {
-            eprintln!("Failed to send query request: {}", e);
-        });
-
-        match responder_rx.recv() {
-            Ok(res) => match res {
-                Ok(val) => Ok(val),
-                Err(err) => Err(err),
-            },
-            Err(e) => {
-                let msg = format!("Failed to receive query response: {}", e);
-                Err(QueryError::Execution(msg))
+            let ctx = MODULE_CONTEXT.lock();
+            for req in batch {
+                let res = process_command(&ctx, req.item);
+                req.responder.send(res).unwrap_or_else(|e| {
+                    eprintln!("Failed to send batch response: {}", e);
+                });
             }
         }
-    }
+    });
+
+    tx
 }
 
-/// Internal worker implementation. This type implements `BatchWorker` and is
-/// consumed by `spawn_worker` to create the actual worker thread. Keeping a
-/// separate implementation type prevents the public `QueryWorker` handle from
-/// needing an Option or being partially constructed.
-struct QueryWorkerImpl;
-impl BatchWorker for QueryWorkerImpl {
-    type WorkItem = QueryCommand;
-    type Output = QueryValue;
-    type Error = QueryError;
-
-    fn process(&self, ctx: &Context, item: Self::WorkItem) -> Result<Self::Output, Self::Error> {
-        match item {
-            QueryCommand::Instant(iqc) => {
-                let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-                query_instant_local(ctx, selector, iqc.timestamp, iqc.options)
-                    .map(QueryValue::Vector)
-                    .map_err(|e| QueryError::Execution(e.to_string()))
-            }
-            QueryCommand::Range(rc) => {
-                let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-                query_range_local(
-                    ctx,
-                    selector,
-                    rc.start_timestamp,
-                    rc.end_timestamp,
-                    rc.options,
-                )
-                    .map(QueryValue::Matrix)
-                    .map_err(|e| QueryError::Execution(e.to_string()))
-            }
-        }
-    }
-}
 
 pub(super) fn query_instant_local(
     ctx: &Context,
