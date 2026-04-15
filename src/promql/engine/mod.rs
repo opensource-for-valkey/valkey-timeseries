@@ -1,8 +1,8 @@
 pub mod config;
 mod fanout;
-mod mock_series_querier;
-mod promql_engine;
-mod query_reader;
+pub mod mock_series_querier;
+pub mod promql_engine;
+pub mod query_reader;
 mod query_stats;
 mod query_worker;
 
@@ -15,10 +15,10 @@ use crate::promql::model::{InstantSample, RangeSample};
 use crate::promql::{PromqlResult, QueryError, QueryResult, QueryValue};
 use cfg_if::cfg_if;
 pub(crate) use fanout::*;
-pub(crate) use promql_engine::*;
+pub use promql_engine::{evaluate_instant, evaluate_range};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
-pub(crate) use query_reader::*;
+pub use query_reader::*;
 use std::sync::LazyLock;
 use std::time::Duration;
 use valkey_module::Context;
