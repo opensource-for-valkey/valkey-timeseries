@@ -262,6 +262,7 @@ macro_rules! promql_function_list {
                 DoubleExponentialSmoothingFunction
             ),
             (FirstOverTime, "first_over_time", FirstOverTimeFunction),
+            (HoltWinters, "holt_winters", DoubleExponentialSmoothingFunction),
             (IRate, "irate", IRateFunction),
             (LastOverTime, "last_over_time", LastOverTimeFunction),
             (MadOverTime, "mad_over_time", MadOverTimeFunction),
