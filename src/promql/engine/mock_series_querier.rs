@@ -40,6 +40,12 @@ pub struct MockSeriesQuerier {
     inner: RwLock<QuerierInner>,
 }
 
+impl Default for MockSeriesQuerier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockSeriesQuerier {
     pub fn new() -> Self {
         Self {
