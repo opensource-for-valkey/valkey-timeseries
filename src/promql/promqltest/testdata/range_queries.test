@@ -91,19 +91,11 @@ resume
 load 1m
   some_metric{env="1"} 0+1x4
   some_metric{env="2"} 0+2x4
-  some_metric_with_stale_marker 0 1 stale 3
 
 eval instant at 2m some_metric[2m]
   expect range vector from 1m to 2m step 60s
     some_metric{env="1"} 1 2
     some_metric{env="2"} 2 4
-
-# we dont support stale markers, so we expect the same result as above
-ignore
-
-eval instant at 3m some_metric_with_stale_marker[3m]
-    expect range vector from 1m to 3m step 60s
- 	some_metric_with_stale_marker{} 1 _ 3
 
 eval instant at 1m some_nonexistent_metric[1m]
     expect range vector from 10s to 1m step 10s
