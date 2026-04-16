@@ -228,8 +228,7 @@ impl Labels {
     }
 
     /// Construct from pairs (for tests). Sorts on construction.
-    #[cfg(test)]
-    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         let mut vec: Vec<Label> = pairs
             .iter()
             .map(|(k, v)| Label {
