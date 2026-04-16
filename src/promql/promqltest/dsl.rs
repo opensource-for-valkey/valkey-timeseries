@@ -24,6 +24,7 @@ pub struct EvalInstantCmd {
     pub expected: QueryValue,
     pub expect_ordered: bool,
     pub expect_fail: bool,
+    pub line_number: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +35,7 @@ pub struct EvalRangeCmd {
     pub query: String,
     pub expected: QueryValue,
     pub expect_fail: bool,
+    pub line_number: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +192,7 @@ impl Parser {
             None => return Ok(None),
         };
 
+        let line_number = *line_idx;
         // Parse time and query from same line or next line
         let (time_str, query) = Self::parse_time_and_query(rest, lines, line_idx)?;
         let time = parse_time(&time_str)?;
@@ -202,6 +205,7 @@ impl Parser {
             expected,
             expect_ordered,
             expect_fail: false,
+            line_number
         })))
     }
 
@@ -218,6 +222,8 @@ impl Parser {
             .captures(line)
             .ok_or("invalid range vector definition")?;
 
+        let line_number = *line_idx;
+
         let from_str = caps.get(1).unwrap().as_str();
         let to_str = caps.get(2).unwrap().as_str();
         let step_str = caps.get(3).unwrap().as_str();
@@ -227,9 +233,11 @@ impl Parser {
         let to = parse_duration(to_str).map_err(|e| format!("Invalid 'to' duration: {}", e))?;
         let step =
             parse_duration(step_str).map_err(|e| format!("Invalid 'step' duration: {}", e))?;
-        let now = SystemTime::now();
-        let start = now + from;
-        let end = now + to;
+        // Anchor range query times to UNIX_EPOCH like `parse_time` does for
+        // instant evals. Tests and loaded series use UNIX_EPOCH-based times,
+        // so using SystemTime::now() would make ranges miss the loaded data.
+        let start = UNIX_EPOCH + from;
+        let end = UNIX_EPOCH + to;
 
         let (expected, _expect_ordered) = parse_expectations(lines, line_idx)?;
 
@@ -240,6 +248,7 @@ impl Parser {
             query: query.to_string(),
             expected,
             expect_fail: false, // todo
+            line_number
         };
         Ok(Some(Command::EvalRange(cmd)))
     }
