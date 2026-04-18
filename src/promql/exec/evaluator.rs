@@ -15,6 +15,7 @@ use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
 };
+use std::time::Duration;
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParIter;
 use orx_parallel::ParallelizableCollection;
@@ -453,9 +454,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ctx.evaluation_ts,
         )?;
 
+        let mut options = self.options;
+        // Ensure the query options carry the lookback delta from the evaluation context so
+        // that QueryReader::query implementations (including mocks) can compute the
+        // correct time window when applying lookback semantics.
+        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+
         let plan = QueryPlan::for_instant_vector(adjusted_eval_ts, ctx.lookback_delta_ms);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+        execute_selector_pipeline(&self.reader, &plan, vector_selector, options)
     }
 
     /// Apply offset and @ modifiers to adjust the evaluation time.
