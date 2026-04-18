@@ -1,5 +1,5 @@
 use crate::common::Timestamp;
-use crate::fanout::{FanoutCommand, NodeInfo, FanoutCommandResult};
+use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
@@ -102,7 +102,8 @@ impl FanoutCommand for QueryFanoutCommand {
                 return Err(format!(
                     "TSDB: received duplicate sample with labels {:?} in instant query response",
                     s.labels
-                ).into());
+                )
+                    .into());
             }
         }
         self.results.append(&mut resp.samples);
