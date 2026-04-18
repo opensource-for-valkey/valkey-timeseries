@@ -1,5 +1,6 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::Label;
+use crate::promql::generated::Label as ProtoLabel;
 use blart::AsBytes;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, Offset, VectorSelector};
@@ -64,7 +65,17 @@ fn create_hasher() -> xxhash3_128::Hasher {
 
 impl HasFingerprint for [Label] {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = xxhash3_128::Hasher::new();
+        let mut hasher = create_hasher();
+        for label in self {
+            hash_key_value(&mut hasher, &label.name, &label.value);
+        }
+        hasher.finish_128()
+    }
+}
+
+impl HasFingerprint for [ProtoLabel] {
+    fn fingerprint(&self) -> SeriesFingerprint {
+        let mut hasher = create_hasher();
         for label in self {
             hash_key_value(&mut hasher, &label.name, &label.value);
         }
