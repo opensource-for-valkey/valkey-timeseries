@@ -1,6 +1,6 @@
+use crate::promql::engine::promql_engine::Tsdb;
 use crate::promql::{QueryOptions, QueryValue, RangeSample};
 use std::time::SystemTime;
-use crate::promql::engine::promql_engine::Tsdb;
 
 /// Execute instant query and return structured results
 pub(super) fn eval_instant(

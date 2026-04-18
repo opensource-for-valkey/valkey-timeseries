@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{
-    BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main};
 use promql_parser::parser::{EvalStmt, parse};
+use rand::distr::{Alphanumeric, SampleString};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkey_timeseries::common::Sample;
-use valkey_timeseries::promql::engine::mock_series_querier::MockSeriesQuerier;
-use valkey_timeseries::promql::engine::{QueryOptions, QueryReader, evaluate_instant, evaluate_range};
 use valkey_timeseries::promql::Labels;
-use rand::distr::{Alphanumeric, SampleString};
+use valkey_timeseries::promql::engine::mock_series_querier::MockSeriesQuerier;
+use valkey_timeseries::promql::engine::{
+    QueryOptions, QueryReader, evaluate_instant, evaluate_range,
+};
 
 fn benchmark_config() -> Criterion {
     // BENCH_PROFILE=ci keeps runs quick; default local profile favors stable statistics.
@@ -55,7 +55,12 @@ fn series_labels(metric: &str, instance: usize) -> Labels {
     labels
 }
 
-fn build_reader(series_count: usize, points_per_series: usize, start_ms: i64, step_ms: i64) -> Arc<dyn QueryReader> {
+fn build_reader(
+    series_count: usize,
+    points_per_series: usize,
+    start_ms: i64,
+    step_ms: i64,
+) -> Arc<dyn QueryReader> {
     let querier = Arc::new(MockSeriesQuerier::new());
 
     for series_idx in 0..series_count {
@@ -113,24 +118,30 @@ fn bench_evaluate_instant(c: &mut Criterion) {
 // -----------------------------------------------------------------------------
 
 /// Setup data for range query benchmarks.
-fn setup_range_query_test_data(
-    interval_ms: i64,
-    num_intervals: usize,
-) -> Arc<dyn QueryReader> {
+fn setup_range_query_test_data(interval_ms: i64, num_intervals: usize) -> Arc<dyn QueryReader> {
     let mut metrics = Vec::new();
 
     // a_one, b_one, h_one (with le buckets)
     metrics.push(Labels::from_pairs(&[("__name__", "a_one")]));
     metrics.push(Labels::from_pairs(&[("__name__", "b_one")]));
     for j in 0..10 {
-        metrics.push(Labels::from_pairs(&[("__name__", "h_one"), ("le", &j.to_string())]));
+        metrics.push(Labels::from_pairs(&[
+            ("__name__", "h_one"),
+            ("le", &j.to_string()),
+        ]));
     }
     metrics.push(Labels::from_pairs(&[("__name__", "h_one"), ("le", "+Inf")]));
 
     // a_ten, b_ten, h_ten (10 variants)
     for i in 0..10 {
-        metrics.push(Labels::from_pairs(&[("__name__", "a_ten"), ("l", &i.to_string())]));
-        metrics.push(Labels::from_pairs(&[("__name__", "b_ten"), ("l", &i.to_string())]));
+        metrics.push(Labels::from_pairs(&[
+            ("__name__", "a_ten"),
+            ("l", &i.to_string()),
+        ]));
+        metrics.push(Labels::from_pairs(&[
+            ("__name__", "b_ten"),
+            ("l", &i.to_string()),
+        ]));
         for j in 0..10 {
             metrics.push(Labels::from_pairs(&[
                 ("__name__", "h_ten"),
@@ -182,23 +193,16 @@ fn setup_range_query_test_data(
         }
         // sparse series
         let val = (s / points_per_sparse_series).to_string();
-        let sparse_labels = Labels::from_pairs(&[
-            ("__name__", "sparse"),
-            ("l", &val),
-        ]);
+        let sparse_labels = Labels::from_pairs(&[("__name__", "sparse"), ("l", &val)]);
 
         let value = s as f64 / metrics.len() as f64;
-        let sample = Sample {
-            timestamp,
-            value,
-        };
+        let sample = Sample { timestamp, value };
 
         querier.add_sample(&sparse_labels, sample);
     }
 
     Arc::new(querier)
 }
-
 
 /// All range query cases.
 fn range_query_cases() -> Vec<(String, usize)> {
@@ -240,7 +244,10 @@ fn range_query_cases() -> Vec<(String, usize)> {
         ("limit_ratio(-0.5, a_X)", 0),
         ("rate(a_X[1m]) + rate(b_X[1m])", 0),
         ("sum without (l)(rate(a_X[1m]))", 0),
-        ("sum without (l)(rate(a_X[1m])) / sum without (l)(rate(b_X[1m]))", 0),
+        (
+            "sum without (l)(rate(a_X[1m])) / sum without (l)(rate(b_X[1m]))",
+            0,
+        ),
         ("histogram_quantile(0.9, rate(h_X[5m]))", 0),
         ("a_X + on(l) group_right a_one", 0),
         ("count({__name__!=\"\"})", 1),
@@ -295,31 +302,33 @@ fn bench_range_query(c: &mut Criterion) {
     };
 
     for (expr, steps) in cases {
-
         // Adjust end time based on steps
-        let actual_end = SystemTime::UNIX_EPOCH
-            + Duration::from_secs((num_intervals - steps) as u64 * 10);
+        let actual_end =
+            SystemTime::UNIX_EPOCH + Duration::from_secs((num_intervals - steps) as u64 * 10);
         let id = format!("expr={},steps={}", expr, steps);
         let ast = parse(&expr).expect("valid range benchmark query");
 
-        group.bench_with_input(BenchmarkId::new("range_query", id), &(ast, actual_end), |b, (ast, end)| {
-            b.iter(|| {
-                let stmt = EvalStmt {
-                    expr: ast.clone(),
-                    start,
-                    end: *end,
-                    interval: step,
-                    lookback_delta: opts.lookback_delta,
-                };
-                let result = evaluate_range(reader.clone(), stmt, opts)
-                    .expect("range benchmark should evaluate");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("range_query", id),
+            &(ast, actual_end),
+            |b, (ast, end)| {
+                b.iter(|| {
+                    let stmt = EvalStmt {
+                        expr: ast.clone(),
+                        start,
+                        end: *end,
+                        interval: step,
+                        lookback_delta: opts.lookback_delta,
+                    };
+                    let result = evaluate_range(reader.clone(), stmt, opts)
+                        .expect("range benchmark should evaluate");
+                    black_box(result);
+                });
+            },
+        );
     }
     group.finish();
 }
-
 
 /// Setup join query test data.
 fn setup_join_query_test_data(
@@ -369,7 +378,6 @@ fn setup_join_query_test_data(
 
     Arc::new(querier)
 }
-
 
 /// Benchmark: Join Query
 fn bench_join_query(c: &mut Criterion) {

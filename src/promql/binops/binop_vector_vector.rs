@@ -140,7 +140,10 @@ fn eval_arith_ops(
                 let value = match apply_binary_op(operator, lhs, rhs) {
                     Ok(v) => v,
                     Err(e) => {
-                        unreachable!("binary operator {:?} should not fail on valid f64 inputs: {}", operator, e);
+                        unreachable!(
+                            "binary operator {:?} should not fail on valid f64 inputs: {}",
+                            operator, e
+                        );
                     }
                 };
 
