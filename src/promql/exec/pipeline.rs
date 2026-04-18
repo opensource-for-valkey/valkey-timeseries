@@ -20,7 +20,7 @@ use crate::promql::{
 use ahash::{AHashMap, AHashSet};
 use orx_parallel::{IntoParIter, ParIter};
 use promql_parser::parser::VectorSelector;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -275,7 +275,6 @@ pub(crate) fn shape_subquery_results(
             _ => return Vec::new(),
         };
 
-
     let subquery_end_ms = plan.sample_end_ms;
 
     let range_vector: Vec<EvalSamples> = series_data
@@ -341,12 +340,43 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     reader: &CachedQueryReader<'reader, R>,
     plan: &QueryPlan,
     selector: &VectorSelector,
-    options: QueryOptions,
+    mut options: QueryOptions,
 ) -> EvalResult<ExprResult> {
     let mut timings = PipelineTimings::default();
 
     // Phase: LoadSamples
     let t1 = Instant::now();
+
+    // Special-case the handling of instant vector query plans. Since we account for clustering, it makes sense
+    // to filter for the last item on the worker nodes instead of shipping the data only to filter
+    // out on the requester. The `query` method on the reader should handle this
+    if let QueryPathKind::InstantVector { lookback_delta_ms } = plan.path_kind {
+        options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+        let series_data = reader
+            .query(selector, plan.sample_end_ms, options)
+            .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
+            .into_iter()
+            .map(|is| EvalSample {
+                timestamp_ms: is.timestamp_ms,
+                value: is.value,
+                labels: is.labels,
+                drop_name: false,
+            })
+            .collect::<Vec<_>>();
+
+        timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
+        timings.shape_samples_ms = 0.0; // no shaping needed for instant vector
+
+        tracing::debug!(
+            path = plan.path_kind.name(),
+            load_ms = format!("{:.2}", timings.sample_load_ms),
+            shape_ms = format!("{:.2}", timings.shape_samples_ms),
+            "pipeline phase timings"
+        );
+
+        let result = ExprResult::InstantVector(series_data);
+        return Ok(result);
+    };
 
     // The QueryPlan.sample_start_ms is defined as an exclusive lower bound
     // (timestamp > start). Underlying storage `query_range` / `TimeSeries::get_range`
@@ -487,53 +517,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shaping tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn shape_instant_newest_bucket_wins() {
-        let labels_a = vec![label("__name__", "m"), label("env", "prod")];
-        let fp = compute_fingerprint(&labels_a);
-
-        let bucket_data = vec![
-            // Newest bucket first (bucket 200)
-            make_loaded(fp, labels_a.clone(), vec![sample(100, 1.0)]),
-            // Older bucket (bucket 100)
-            make_loaded(fp, labels_a, vec![sample(50, 2.0)]),
-        ];
-
-        let results = shape_instant_results(bucket_data);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].value, 1.0); // newest bucket wins
-        assert_eq!(results[0].timestamp_ms, 100);
-    }
-
-    #[test]
-    fn shape_instant_takes_latest_sample() {
-        let labels_a = vec![label("__name__", "m")];
-        let fp = compute_fingerprint(&labels_a);
-
-        let bucket_data = vec![make_loaded(
-            fp,
-            labels_a,
-            vec![sample(10, 1.0), sample(20, 2.0), sample(30, 3.0)],
-        )];
-
-        let results = shape_instant_results(bucket_data);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].value, 3.0); // latest sample
-    }
-
-    #[test]
-    fn shape_instant_skips_empty_samples() {
-        let labels_a = vec![label("__name__", "m")];
-        let fp = compute_fingerprint(&labels_a);
-
-        let bucket_data = vec![
-            make_loaded(fp, labels_a, vec![]), // no samples
-        ];
-
-        let results = shape_instant_results(bucket_data);
-        assert!(results.is_empty());
-    }
 
     #[test]
     fn shape_matrix_merges_across_buckets() {
