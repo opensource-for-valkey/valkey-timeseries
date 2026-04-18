@@ -2,12 +2,10 @@ use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::get_cluster_command_timeout;
-use crate::fanout::{is_clustered, FanoutCommand};
-use crate::labels::filters::SeriesSelector;
+use crate::fanout::{FanoutCommand, is_clustered};
 use crate::labels::Label;
-use crate::promql::engine::{
-    QueryFanoutCommand, QueryRangeFanoutCommand,
-};
+use crate::labels::filters::SeriesSelector;
+use crate::promql::engine::{QueryFanoutCommand, QueryRangeFanoutCommand};
 use crate::promql::generated::Label as ProtoLabel;
 use crate::promql::{
     InstantSample, Labels, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -45,7 +43,6 @@ struct BatchRequest {
     /// responder receives the processed result (Ok) or the error (Err)
     pub responder: mpsc::SyncSender<QueryResult<QueryValue>>,
 }
-
 
 /// A worker responsible for executing PromQL query tasks as part of a keyspace batch operation.
 ///
@@ -163,7 +160,9 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
     match item {
         QueryCommand::Instant(iqc) => {
             let timeout = calculate_timeout(&iqc.options);
-            let cmd = QueryFanoutCommand::new(iqc.matchers, iqc.timestamp, timeout);
+            let timestamp = iqc.timestamp;
+            let lookback_delta = iqc.options.lookback_delta.as_millis() as u64;
+            let cmd = QueryFanoutCommand::new(iqc.matchers, timestamp, lookback_delta, timeout);
 
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
@@ -224,10 +223,8 @@ fn convert_labels(labels: Vec<ProtoLabel>) -> Labels {
     Labels::new(labels)
 }
 
-
 /// Spawn the worker thread and return a channel Sender that accepts `BatchRequest`s.
-fn spawn_worker() -> mpsc::Sender<BatchRequest>
-{
+fn spawn_worker() -> mpsc::Sender<BatchRequest> {
     let (tx, rx) = mpsc::channel::<BatchRequest>();
 
     spawn(move || {
@@ -257,7 +254,6 @@ fn spawn_worker() -> mpsc::Sender<BatchRequest>
 
     tx
 }
-
 
 pub(super) fn query_instant_local(
     ctx: &Context,

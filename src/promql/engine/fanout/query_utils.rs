@@ -16,6 +16,7 @@ pub(super) fn handle_instant_query(
     ctx: &Context,
     selector: SeriesSelector,
     timestamp: Timestamp,
+    lookback_delta: u64,
 ) -> ValkeyResult<InstantQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
     let samples = series
@@ -27,26 +28,19 @@ pub(super) fn handle_instant_query(
         })
         .iter_into_par()
         .filter_map(|(s, key)| {
-            match s.get_sample(timestamp) {
-                Ok(Some(sample)) => {
-                    let labels: Vec<crate::promql::generated::Label> = s
-                        .labels
-                        .iter()
-                        .map(|label| crate::promql::generated::Label {
-                            name: label.name.to_string(),
-                            value: label.value.to_string(),
-                        })
-                        .collect();
-                    Some(InstantSample {
-                        labels,
-                        value: sample.value,
-                        timestamp: sample.timestamp,
-                        key,
-                    })
-                }
-                Ok(None) => None,
-                Err(_) => None, // todo: log error
-            }
+            // in prometheus, given a timestamp and delta, we select the latest sample in the range
+            // (ts - delta, ts], so we need to adjust the timestamp accordingly
+            let start_time = timestamp.saturating_sub(lookback_delta as i64) + 1;
+            let end_time = timestamp;
+
+            let sample = *s.get_range(start_time, end_time).last()?;
+            let labels = convert_labels(&s.labels);
+            Some(InstantSample {
+                labels,
+                value: sample.value,
+                timestamp: sample.timestamp,
+                key,
+            })
         })
         .collect::<Vec<_>>();
 
