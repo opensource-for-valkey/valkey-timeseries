@@ -1,10 +1,12 @@
 use crate::common::Timestamp;
-use crate::fanout::{get_cluster_command_timeout, FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo};
+use crate::fanout::{
+    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
+};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
-    series_selector::Matchers as ProtoMatchers, RangeQuery, RangeQueryResponse, RangeSample,
-    SeriesSelector as ProtoSeriesSelector,
+    RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
+    series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::hashers::{FingerprintHashSet, HasFingerprint};
 use ahash::HashSetExt;
@@ -107,6 +109,8 @@ impl FanoutCommand for QueryRangeFanoutCommand {
     }
 
     fn get_response(self) -> Self::Response {
-        RangeQueryResponse { series: self.series }
+        RangeQueryResponse {
+            series: self.series,
+        }
     }
 }
