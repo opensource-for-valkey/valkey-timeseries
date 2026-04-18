@@ -1,13 +1,13 @@
 use crate::common::Timestamp;
-use crate::fanout::{FanoutCommand, NodeInfo, get_cluster_command_timeout};
+use crate::fanout::{get_cluster_command_timeout, FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
-    RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
-    series_selector::Matchers as ProtoMatchers,
+    series_selector::Matchers as ProtoMatchers, RangeQuery, RangeQueryResponse, RangeSample,
+    SeriesSelector as ProtoSeriesSelector,
 };
-use crate::promql::hashers::{FingerprintHashMap, HasFingerprint};
-use orx_parallel::{IterIntoParIter, ParIter};
+use crate::promql::hashers::{FingerprintHashSet, HasFingerprint};
+use ahash::HashSetExt;
 use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
@@ -17,8 +17,8 @@ pub struct QueryRangeFanoutCommand {
     start_time: i64,
     end_time: i64,
     timeout: Duration,
-    merged: FingerprintHashMap<(RangeSample, usize)>,
-    need_sort_dedup: bool,
+    series: Vec<RangeSample>,
+    seen: FingerprintHashSet,
 }
 
 impl Default for QueryRangeFanoutCommand {
@@ -32,8 +32,8 @@ impl Default for QueryRangeFanoutCommand {
             start_time: 0,
             end_time: 0,
             timeout: get_cluster_command_timeout(),
-            merged: Default::default(),
-            need_sort_dedup: false,
+            series: Vec::with_capacity(16),
+            seen: FingerprintHashSet::with_capacity(16),
         }
     }
 }
@@ -49,8 +49,8 @@ impl QueryRangeFanoutCommand {
             start_time,
             end_time,
             timeout,
-            merged: Default::default(),
-            need_sort_dedup: false,
+            series: Vec::with_capacity(16),
+            seen: Default::default(),
         }
     }
 }
@@ -90,43 +90,23 @@ impl FanoutCommand for QueryRangeFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) {
+    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
         // dedupe samples by labels - if multiple responses contain the same labels, we have an issue
         // Using prometheus semantics, series should have unique label-value pairs..
-        for series in resp.series {
+
+        for series in resp.series.iter() {
             let fingerprint = series.labels.fingerprint();
-            let entry = self.merged.entry(fingerprint).or_insert_with(|| {
-                let len = series.samples.len();
-                let rs = RangeSample {
-                    labels: series.labels,
-                    samples: Vec::with_capacity(len),
-                };
-                (rs, 1)
-            });
-            entry.0.samples.extend(series.samples);
-            entry.1 += 1;
-            if entry.1 > 1 {
-                self.need_sort_dedup = true;
+            if !self.seen.insert(fingerprint) {
+                let msg = format!("Duplicate series found with labels {:?}", series.labels);
+                let err = FanoutError::custom(msg);
+                return Err(err);
             }
         }
+        self.series.extend(resp.series);
+        Ok(())
     }
 
     fn get_response(self) -> Self::Response {
-        let series = if self.need_sort_dedup {
-            self.merged
-                .into_iter()
-                .iter_into_par()
-                .map(|(_, (mut r, cnt))| {
-                    if cnt > 1 {
-                        r.samples.sort_unstable_by_key(|s| s.timestamp);
-                        r.samples.dedup_by_key(|s| s.timestamp);
-                    }
-                    r
-                })
-                .collect()
-        } else {
-            self.merged.into_iter().map(|(_, (r, _))| r).collect()
-        };
-        RangeQueryResponse { series }
+        RangeQueryResponse { series: self.series }
     }
 }
