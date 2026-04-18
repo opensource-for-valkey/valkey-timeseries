@@ -1,5 +1,5 @@
-use regex_syntax::hir::{Hir, HirKind};
 use regex_syntax::Parser;
+use regex_syntax::hir::{Hir, HirKind};
 
 fn parse_literal(hir: &Hir, pattern: &str) -> Result<String, String> {
     match hir.kind() {
