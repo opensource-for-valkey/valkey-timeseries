@@ -1,4 +1,5 @@
 use crate::promql::QueryValue;
+use crate::promql::engine::promql_engine::Tsdb;
 use crate::promql::engine::test_utils::MockSeriesQuerier;
 use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
@@ -7,7 +8,6 @@ use crate::promql::promqltest::loader::load_series;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use crate::promql::engine::promql_engine::Tsdb;
 // ============================================================================
 // Test Discovery
 // ============================================================================

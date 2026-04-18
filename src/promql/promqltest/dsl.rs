@@ -205,7 +205,7 @@ impl Parser {
             expected,
             expect_ordered,
             expect_fail: false,
-            line_number
+            line_number,
         })))
     }
 
@@ -248,7 +248,7 @@ impl Parser {
             query: query.to_string(),
             expected,
             expect_fail: false, // todo
-            line_number
+            line_number,
         };
         Ok(Some(Command::EvalRange(cmd)))
     }
