@@ -114,7 +114,8 @@ message InstantSample {
 
 message InstantQuery {
   SeriesSelector selector = 1;
-  int64 start_time = 2;
+  int64 timestamp = 2;
+  uint64 lookback_delta = 3;
 }
 
 message InstantQueryResponse {

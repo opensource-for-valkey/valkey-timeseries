@@ -13,12 +13,12 @@
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::promql::engine::{CachedQueryReader, QueryReader};
-use crate::promql::hashers::{FingerprintHashMap, HasFingerprint, SeriesFingerprint};
+use crate::promql::hashers::{HasFingerprint, SeriesFingerprint};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
 };
 use ahash::{AHashMap, AHashSet};
-use orx_parallel::{IterIntoParIter, ParIter};
+use orx_parallel::{IntoParIter, ParIter};
 use promql_parser::parser::VectorSelector;
 use std::time::Instant;
 
@@ -275,26 +275,12 @@ pub(crate) fn shape_subquery_results(
             _ => return Vec::new(),
         };
 
-    // Merge by fingerprint
-    let mut merged: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
-
-    for series in series_data {
-        let entry = merged
-            .entry(series.fingerprint)
-            .or_insert_with(|| (series.labels, Vec::new()));
-        entry.1.extend(series.samples);
-    }
 
     let subquery_end_ms = plan.sample_end_ms;
 
-    let range_vector: Vec<EvalSamples> = merged
-        .into_iter()
-        .iter_into_par()
-        .filter_map(|(_fp, (labels, mut samples))| {
-            // Sort and dedup
-            samples.sort_by_key(|s| s.timestamp);
-            samples.dedup_by_key(|s| s.timestamp);
-
+    let range_vector: Vec<EvalSamples> = series_data
+        .into_par()
+        .filter_map(|sample| {
             let mut step_samples = Vec::with_capacity(expected_steps);
             let mut i = 0usize;
             let mut last_valid: Option<&Sample> = None;
@@ -302,8 +288,8 @@ pub(crate) fn shape_subquery_results(
             for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
                 let lookback_start_ms = current_step_ms - lookback_delta_ms;
 
-                while i < samples.len() && samples[i].timestamp <= current_step_ms {
-                    last_valid = Some(&samples[i]);
+                while i < sample.samples.len() && sample.samples[i].timestamp <= current_step_ms {
+                    last_valid = Some(&sample.samples[i]);
                     i += 1;
                 }
 
@@ -322,7 +308,7 @@ pub(crate) fn shape_subquery_results(
             } else {
                 Some(EvalSamples {
                     values: step_samples,
-                    labels,
+                    labels: sample.labels,
                     range_ms,
                     range_end_ms: subquery_end_ms,
                     drop_name: false,
@@ -603,44 +589,6 @@ mod tests {
         // Step 30: latest sample <= 30 with ts > 20 -> sample at t=25, value=3.0
         assert_eq!(values[2].timestamp, 30);
         assert_eq!(values[2].value, 3.0);
-    }
-
-    #[test]
-    fn shape_subquery_deduplicates_across_buckets() {
-        let labels_a = vec![label("__name__", "m")];
-        let fp = compute_fingerprint(&labels_a);
-
-        // Same timestamp in two buckets
-        let bucket_data = vec![
-            make_loaded(fp, labels_a.clone(), vec![sample(10, 1.0), sample(20, 2.0)]),
-            make_loaded(
-                fp,
-                labels_a,
-                vec![sample(10, 1.0), sample(15, 1.5)], // t=10 is duplicate
-            ),
-        ];
-
-        let plan = QueryPlan {
-            sample_start_ms: 0,
-            sample_end_ms: 20,
-            path_kind: QueryPathKind::SubqueryVectorSelector {
-                range_ms: 20,
-                aligned_start_ms: 10,
-                step_ms: 10,
-                lookback_delta_ms: 10,
-                expected_steps: 2,
-            },
-        };
-
-        let results = shape_subquery_results(bucket_data, &plan);
-        assert_eq!(results.len(), 1);
-        // After merge+dedup: samples at t=10, t=15, t=20
-        // Step 10: sample at t=10, value=1.0
-        // Step 20: sample at t=20, value=2.0
-        let values = &results[0].values;
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[0].value, 1.0);
-        assert_eq!(values[1].value, 2.0);
     }
 
     // -----------------------------------------------------------------------

@@ -1,11 +1,13 @@
 use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, NodeInfo};
 use crate::labels::filters::SeriesSelector;
+use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, InstantSample, SeriesSelector as ProtoSeriesSelector,
     series_selector::Matchers as ProtoMatchers,
 };
+use crate::promql::hashers::{FingerprintHashSet, HasFingerprint};
 use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
@@ -13,8 +15,10 @@ use valkey_module::{Context, ValkeyResult};
 pub struct QueryFanoutCommand {
     matchers: Matchers,
     timestamp: i64,
+    lookback_delta: u64,
     results: Vec<InstantSample>,
     timeout: Duration,
+    seen: FingerprintHashSet,
 }
 
 impl Default for QueryFanoutCommand {
@@ -23,21 +27,34 @@ impl Default for QueryFanoutCommand {
             matchers: vec![],
             or_matchers: vec![],
         };
+        let lookback_delta = {
+            let guard = PROMQL_CONFIG.read().unwrap();
+            guard.lookback_delta.as_millis() as u64
+        };
         Self {
             matchers,
             timestamp: 0,
             results: vec![],
             timeout: crate::fanout::get_cluster_command_timeout(),
+            seen: FingerprintHashSet::default(),
+            lookback_delta,
         }
     }
 }
 impl QueryFanoutCommand {
-    pub fn new(matchers: Matchers, timestamp: Timestamp, timeout: Duration) -> Self {
+    pub fn new(
+        matchers: Matchers,
+        timestamp: Timestamp,
+        lookback_delta: u64,
+        timeout: Duration,
+    ) -> Self {
         Self {
             matchers,
             timestamp,
+            lookback_delta,
             results: vec![],
             timeout,
+            seen: FingerprintHashSet::default(),
         }
     }
 }
@@ -56,8 +73,7 @@ impl FanoutCommand for QueryFanoutCommand {
             return Ok(InstantQueryResponse { samples: vec![] });
         };
         let series_selector: SeriesSelector = selector.try_into()?;
-        let timestamp = req.start_time;
-        handle_instant_query(ctx, series_selector, timestamp)
+        handle_instant_query(ctx, series_selector, req.timestamp, req.lookback_delta)
     }
 
     fn get_timeout(&self) -> Duration {
@@ -72,14 +88,19 @@ impl FanoutCommand for QueryFanoutCommand {
         };
         InstantQuery {
             selector: Some(selector),
-            start_time: self.timestamp,
+            timestamp: self.timestamp,
+            lookback_delta: self.lookback_delta,
         }
     }
 
-    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) {
-        let mut resp = resp;
-        // todo: dedupe samples by labels - if multiple responses contain the same labels, we have an issue
-        // Using prometheus semantics, series should have unique label-value pairs..
+    fn on_response(&mut self, mut resp: Self::Response, _target: &NodeInfo) {
+        for s in resp.samples.iter() {
+            let fingerprint = s.labels.fingerprint();
+            if !self.seen.insert(fingerprint) {
+                // error. we have a duplicate
+                // Using prometheus semantics, series should have unique label-value pairs..
+            }
+        }
         self.results.append(&mut resp.samples);
     }
 
