@@ -1,5 +1,5 @@
 use crate::common::Timestamp;
-use crate::fanout::{FanoutCommand, NodeInfo};
+use crate::fanout::{FanoutCommand, NodeInfo, FanoutCommandResult};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
@@ -93,15 +93,20 @@ impl FanoutCommand for QueryFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, mut resp: Self::Response, _target: &NodeInfo) {
+    fn on_response(&mut self, mut resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
         for s in resp.samples.iter() {
             let fingerprint = s.labels.fingerprint();
             if !self.seen.insert(fingerprint) {
                 // error. we have a duplicate
                 // Using prometheus semantics, series should have unique label-value pairs..
+                return Err(format!(
+                    "TSDB: received duplicate sample with labels {:?} in instant query response",
+                    s.labels
+                ).into());
             }
         }
         self.results.append(&mut resp.samples);
+        Ok(())
     }
 
     fn get_response(self) -> Self::Response {
