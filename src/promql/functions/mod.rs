@@ -16,6 +16,7 @@ mod sort;
 mod special_functions;
 mod types;
 pub(crate) mod utils;
+mod rollup_fns;
 
 pub(crate) use function_list::*;
 pub(crate) use types::*;

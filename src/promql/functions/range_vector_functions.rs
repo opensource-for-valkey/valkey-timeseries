@@ -122,7 +122,7 @@ fn get_min_sample(values: &[Sample]) -> Sample {
 /// Prometheus semantics:
 /// - If the first value is NaN and later values are real numbers,
 ///   NaN is replaced by the first real number.
-/// - If all values are NaN, result must remain NaN.
+/// - If all values are NaN, the result must remain NaN.
 ///
 /// A naive fold starting from +inf would incorrectly return +inf
 /// for all-NaN input. This manual loop preserves exact PromQL behavior.
@@ -165,7 +165,7 @@ fn get_max_sample(values: &[Sample]) -> Sample {
 ///
 /// Prometheus semantics:
 /// - NaN is replaced by any subsequent real value.
-/// - If all values are NaN, result must remain NaN.
+/// - If all values are NaN, the result must remain NaN.
 ///
 /// A naive fold starting from -inf would incorrectly return -inf
 /// for all-NaN input. This manual loop guarantees semantic parity
@@ -440,7 +440,7 @@ impl PromQLFunction for LastOverTimeFunction {
     }
 }
 
-/// the timestamp of last sample in the specified interval.
+/// the timestamp of the last sample in the specified interval.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct TSLastOverTimeFunction;
 
