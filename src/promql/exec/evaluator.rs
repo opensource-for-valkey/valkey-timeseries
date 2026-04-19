@@ -326,7 +326,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         // Align start time to the step interval to ensure consistent evaluation points.
         // Prometheus: newEv.startTimestamp = newEv.interval * ((ev.startTimestamp - offset - range) / newEv.interval)
-        // Go's division truncates toward zero, but we need floor division for negative timestamps.
+        // Go's division truncates toward zero, but we need a floor division for negative timestamps.
         // Example: -41ms / 10ms
         //   Go (truncate): -41 / 10 = -4, then -4 * 10 = -40ms (wrong for negatives)
         //   Rust div_euclid (floor): -41 / 10 = -5, then -5 * 10 = -50ms (correct)
