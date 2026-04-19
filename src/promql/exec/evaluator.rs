@@ -4,10 +4,10 @@ use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
 use crate::promql::binops::eval_binary_expr;
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
-use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
+use crate::promql::exec::pipeline::{execute_selector_pipeline, QueryPlan};
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::PromQLFunction;
-use crate::promql::functions::{FunctionCallContext, PromQLArg, resolve_function};
+use crate::promql::functions::{resolve_function, PromQLArg};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
@@ -15,7 +15,6 @@ use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
 };
-use std::time::Duration;
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParIter;
 use orx_parallel::ParallelizableCollection;
@@ -27,6 +26,7 @@ use promql_parser::parser::{
     SubqueryExpr, UnaryExpr, VectorSelector,
 };
 use std::sync::RwLock;
+use std::time::Duration;
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: CachedQueryReader<'reader, R>,
@@ -97,7 +97,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // Fetch all series + samples for the full time range
         let series_samples = self.fetch_series_samples(vs, earliest_ms, latest_ms)?;
 
-        let num_steps = ctx.num_steps();
+        let num_steps = ctx.expected_steps();
 
         // Clone the time-modifier options so they can be captured across parallel tasks.
         // AtModifier and Offset are small Copy-like enums; cloning is cheap.
@@ -551,9 +551,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ) -> EvalResult<ExprResult> {
         let evaluated_args = self.evaluate_function_args(call, ctx, preload_eligible)?;
 
-        // Build a unified param bag for function dispatch.
-        let eval_timestamp_ms = ctx.evaluation_ts;
-
         let Some(func) = resolve_function(call.func.name) else {
             return Err(EvaluationError::InternalError(format!(
                 "Unknown instant/scalar function: {}",
@@ -561,10 +558,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         };
 
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms,
-            raw_args: &call.args.args,
-        };
         let result = func.apply_call(evaluated_args, &ctx)?;
         if call.func.return_type == ValueType::Scalar {
             return match result {
