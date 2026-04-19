@@ -23,5 +23,5 @@ pub(crate) use types::*;
 // Return the concrete `PromQLFunctionImpl` so callers can store the concrete
 // implementation without relying on opaque `impl Trait` return types.
 pub(in crate::promql) fn resolve_function(name: &str) -> Option<PromQLFunctionImpl> {
-    PromQLFunctionImpl::from_name(name)
+    PromQLFunctionImpl::try_from(name).ok()
 }
