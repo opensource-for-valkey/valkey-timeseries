@@ -1,13 +1,29 @@
-use crate::common::humanize::humanize_duration;
+//! This module provides the core engine for executing PromQL rollup (range vector) functions.
+//!
+//! The main entry point is `exec_rollups`, which evaluates a rollup function over a given
+//! time range and step interval.
+//!
+//! ### Optimization Highlights
+//!
+//! *   **Allocation Efficiency:** To minimize overhead during query evaluation, particularly for
+//!     queries with many steps, this module avoids per-step allocations. It performs a single
+//!     pass to extract raw timestamps and values into contiguous vectors before starting the
+//!     parallel evaluation.
+//! *   **Performance & Vectorization:** Rollup functions operate on slices of `f64` values and
+//!     `i64` timestamps rather than vectors of `Sample` objects. This layout is significantly
+//!     more cache-friendly and allows the compiler to better leverage SIMD auto-vectorization
+//!     when calculating aggregates over the rollup windows.
+//! *   **Parallel Execution:** Rollup evaluation is performed in parallel using `orx-parallel`,
+//!     partitioning the work across the query's time steps.
+
 use crate::common::{Sample, Timestamp};
-use crate::promql::EvalSamples;
 use crate::promql::time::step_times;
+use crate::promql::{EvalContext, EvalSamples};
 use num_traits::Zero;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
-use std::fmt;
-use std::fmt::{Display, Formatter};
 use std::time::Duration;
+
 
 #[derive(Default, Clone, Debug)]
 pub struct RollupWindow<'a> {
@@ -42,83 +58,45 @@ pub struct RollupWindow<'a> {
 
 pub(crate) type RollupFunc = fn(rfa: &RollupWindow) -> f64;
 
-#[derive(Clone)]
-pub(crate) struct RollupConfig {
-    pub start: Timestamp,
-    pub end: Timestamp,
-    pub step: Duration,
-    pub window: Duration,
 
-    /// lookback_delta is the analog to `-query.lookback-delta` from the Prometheus world.
-    pub lookback_delta: Duration,
-
-    /// The estimated number of samples scanned per Func call.
-    ///
-    /// If zero, then it is considered that Func scans all the samples passed to it.
-    pub samples_scanned_per_call: usize,
-}
-
-impl RollupConfig {
-    fn expected_steps(&self) -> usize {
-        let step_ms = self.step.as_millis() as i64;
-        let range_ms = self.end.saturating_sub(self.start);
-        (range_ms / step_ms + 1) as usize
-    }
-}
-
-impl Default for RollupConfig {
-    fn default() -> Self {
-        Self {
-            start: 0,
-            end: 0,
-            step: Duration::ZERO,
-            window: Duration::ZERO,
-            lookback_delta: Duration::ZERO,
-            samples_scanned_per_call: 0,
-        }
-    }
-}
-
-impl Display for RollupConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "RollupConfig(start={}, end={}, step={}, window={})",
-            self.start,
-            self.end,
-            humanize_duration(&self.step),
-            humanize_duration(&self.window),
-        )
-    }
-}
-
-/// calculates rollup for the given timestamps and values, appends
-/// them to dst_values and returns results.
+/// Evaluates a rollup function over a given time range and step interval.
 ///
-/// rc.timestamps are used as timestamps for dst_values.
+/// This function is the primary engine for executing PromQL range vector functions (e.g., `rate`, `sum_over_time`).
+/// It processes each time series by iterating through the query's time steps and applying the provided `rollup_fn`
+/// to the samples falling within the specified `range` (the "range" in range vector).
 ///
-/// timestamps must cover time range `[rc.start - rc.window - MAX_SILENCE_INTERVAL ... rc.end]`.
+/// ### Arguments
+///
+/// *   `ctx` - The evaluation context containing query parameters like start/end times, step interval, and lookback delta.
+/// *   `series` - The input time series data. Note that `series.values` is reused as a buffer for the output samples
+///     to minimize allocations.
+/// *   `range` - The duration of the range vector window (e.g., the `5m` in `rate(http_requests_total[5m])`).
+/// *   `rollup_fn` - The specific rollup calculation to perform (e.g., sum, average, rate).
+///
+/// ### Implementation Details
+///
+/// 1.  **De-interleaving:** It first extracts timestamps and values from the `Sample` structs into two separate
+///     parallel vectors. This improves cache locality and enables the compiler to use SIMD instructions for
+///     the subsequent rollup calculations.
+/// 2.  **Parallel Mapping:** It iterates over the query's time steps in parallel. For each step, it identifies
+///      the subset of samples ("window") that fall within the specified `range` before the step's timestamp.
+/// 3.  **Rollup Application:** It constructs a `RollupWindow` providing the `rollup_fn` with the relevant
+///     slices of values and timestamps, as well as metadata like preceding/following values for functions
+///     that require them (e.g., `deriv`, `rate`).
+/// 4.  **In-place Collection:** The resulting samples are collected back into the original `series.values`
+///     vector, effectively reusing the memory.
 pub(super) fn exec_rollups<F>(
-    cfg: &RollupConfig,
+    ctx: &EvalContext,
     mut series: EvalSamples,
-    mut range: Duration,
-    lookback_delta: Duration,
+    range: Duration,
     rollup_fn: F,
 ) -> EvalSamples
 where
     F: Fn(&RollupWindow) -> f64 + Sync + Clone,
 {
-    let max_prev_interval = cfg.step;
-    if range.is_zero() {
-        // Implicit window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
-        // according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/784
-        range = lookback_delta;
-    }
-
     let window = range.as_millis() as i64;
-    let max_prev_interval = max_prev_interval.as_millis() as i64;
-    let lookback = lookback_delta.as_millis() as i64;
-    let step = cfg.step.as_millis() as i64;
+    let lookback = ctx.lookback_delta_ms;
+    let step = ctx.step_ms;
 
     let sample_len = series.values.len();
 
@@ -137,7 +115,7 @@ where
     series.values.clear();
     let samples = std::mem::take(&mut series.values);
 
-    series.values = step_times(cfg.start, cfg.end, step)
+    series.values = step_times(ctx.query_start, ctx.query_end, step)
         .enumerate()
         .iter_into_par()
         .map(move |(idx, t_end)| {
@@ -151,7 +129,7 @@ where
             let mut rollup_window = RollupWindow {
                 window,
                 prev_value: f64::NAN,
-                prev_timestamp: t_start - max_prev_interval,
+                prev_timestamp: t_start - step,
                 real_prev_value: f64::NAN,
                 ..Default::default()
             };
