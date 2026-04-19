@@ -1,10 +1,19 @@
-use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
 use promql_parser::parser::Expr;
 use promql_parser::parser::value::ValueType;
+use std::ops::Deref;
 
 pub(crate) struct FunctionCallContext<'a> {
-    pub eval_timestamp_ms: i64,
+    pub eval_context: &'a EvalContext,
     pub raw_args: &'a [Box<Expr>],
+}
+
+impl<'a> Deref for FunctionCallContext<'a> {
+    type Target = EvalContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.eval_context
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,7 +142,7 @@ pub(crate) trait PromQLFunction {
             )));
         }
 
-        self.apply(args.remove(0), eval_timestamp_ms)
+        self.apply(args.swap_remove(0), eval_timestamp_ms)
     }
 
     /// Apply the function to evaluated arguments provided as a slice.
@@ -160,9 +169,9 @@ pub(crate) trait PromQLFunction {
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
-        ctx: &FunctionCallContext<'_>,
+        ctx: &EvalContext,
     ) -> EvalResult<ExprResult> {
-        self.apply_args(evaluated_args, ctx.eval_timestamp_ms)
+        self.apply_args(evaluated_args, ctx.evaluation_ts)
     }
 
     fn is_experimental(&self) -> bool {

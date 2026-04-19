@@ -88,6 +88,7 @@ macro_rules! impl_promql_function_impl {
         use $crate::promql::functions::types::PromQLArg;
         use $crate::promql::{EvalResult, ExprResult};
         use $crate::promql::functions::types::PromQLFunction;
+        use $crate::promql::model::EvalContext;
 
         #[allow(clippy::large_enum_variant)]
         #[derive(Copy, Clone)]
@@ -148,31 +149,27 @@ macro_rules! impl_promql_function_impl {
         }
 
         impl PromQLFunction for PromQLFunctionImpl {
-            #[inline]
             fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
                 match self {
-                    $( PromQLFunctionImpl::$Variant(f) => f.apply(arg, eval_timestamp_ms), )*
+                    $( Self::$Variant(f) => f.apply(arg, eval_timestamp_ms), )*
                 }
             }
 
-            #[inline]
             fn apply_args(&self, args: Vec<PromQLArg>, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
                 match self {
-                    $( PromQLFunctionImpl::$Variant(f) => f.apply_args(args, eval_timestamp_ms), )*
+                    $( Self::$Variant(f) => f.apply_args(args, eval_timestamp_ms), )*
                 }
             }
 
-            #[inline]
-            fn apply_call(&self, evaluated_args: Vec<PromQLArg>, ctx: &$crate::promql::functions::types::FunctionCallContext<'_>) -> EvalResult<ExprResult> {
+            fn apply_call(&self, evaluated_args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
                 match self {
-                    $( PromQLFunctionImpl::$Variant(f) => f.apply_call(evaluated_args, ctx), )*
+                    $( Self::$Variant(f) => f.apply_call(evaluated_args, ctx), )*
                 }
             }
 
-            #[inline]
             fn is_experimental(&self) -> bool {
                 match self {
-                    $( PromQLFunctionImpl::$Variant(f) => f.is_experimental(), )*
+                    $( Self::$Variant(f) => f.is_experimental(), )*
                 }
             }
         }
@@ -332,7 +329,6 @@ macro_rules! promql_function_list {
     };
 }
 
-// Expand the canonical list into this module. This will generate the
-// `PromqlFunctionKind` enum and the helper impls for `PromQLFunctionImpl`.
+// This will generate the `PromqlFunctionKind` enum and the helper impls for `PromQLFunctionImpl`.
 promql_function_list!(impl_promql_function_kind);
 promql_function_list!(impl_promql_function_impl);

@@ -20,8 +20,8 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::time::step_times;
 use crate::promql::{EvalContext, EvalSamples};
 use num_traits::Zero;
-use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
+use orx_parallel::{IntoParIter, IterIntoParIter};
 
 
 #[derive(Default, Clone, Debug)]
@@ -230,6 +230,59 @@ fn seek_first_timestamp_idx_after(
         match slice.binary_search(&(seek_timestamp + 1)) {
             Ok(pos) | Err(pos) => pos,
         }
-    }
-        .saturating_add(slice_start)
+    }.saturating_add(slice_start)
+}
+
+pub(super) fn eval_range_basic<F>(series_data: Vec<EvalSamples>, ctx: &EvalContext, f: F) -> Vec<EvalSamples>
+where
+    F: Fn(&[Sample]) -> f64 + Sync,
+{
+    let lookback_delta = ctx.lookback_delta_ms;
+    let step_ms = ctx.step_ms;
+    let range_ms = ctx.query_end - ctx.query_start;
+    let end_ms = ctx.query_end;
+    let start = ctx.query_start;
+    let aligned_start = start - start % step_ms;
+    let end = ctx.query_end;
+
+    series_data
+        .into_par()
+        .filter_map(|sample| {
+            if sample.values.is_empty() {
+                return None;
+            }
+
+            let step_samples: Vec<Sample> = step_times(aligned_start, end, step_ms)
+                .iter_into_par()
+                .filter_map(|current_step_ms| {
+                    let lookback_start_ms = current_step_ms - lookback_delta;
+                    let i = sample.values.partition_point(|s| s.timestamp < lookback_start_ms);
+                    let j = sample.values.partition_point(|s| s.timestamp <= current_step_ms);
+                    let window_samples = &sample.values[i..j];
+
+                    if window_samples.is_empty() {
+                        return None;
+                    }
+
+                    let value = f(window_samples);
+                    Some(Sample {
+                        value,
+                        timestamp: current_step_ms,
+                    })
+                })
+                .collect();
+
+            if step_samples.is_empty() {
+                None
+            } else {
+                Some(EvalSamples {
+                    values: step_samples,
+                    labels: sample.labels,
+                    drop_name: false,
+                    range_ms,
+                    range_end_ms: end_ms,
+                })
+            }
+        })
+        .collect()
 }

@@ -19,7 +19,7 @@ use crate::promql::{
 };
 use ahash::{AHashMap, AHashSet};
 use orx_parallel::{IntoParIter, ParIter};
-use promql_parser::parser::VectorSelector;
+use promql_parser::parser::{VectorSelector};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -64,16 +64,16 @@ pub(crate) struct QueryPlan {
 
 impl QueryPlan {
     /// Shape all loaded bucket data into the final ExprResult for this path.
-    fn shape(&self, all_bucket_data: Vec<LoadedSeriesSamples>) -> ExprResult {
+    fn shape(&self, all_bucket_data: Vec<EvalSamples>) -> ExprResult {
         match &self.path_kind {
             QueryPathKind::InstantVector { .. } => {
-                ExprResult::InstantVector(shape_instant_results(all_bucket_data))
+                shape_instant_results(all_bucket_data)
             }
-            QueryPathKind::Matrix => ExprResult::RangeVector(shape_matrix_results(
+            QueryPathKind::Matrix => shape_matrix_results(
                 all_bucket_data,
                 self.sample_end_ms - self.sample_start_ms,
                 self.sample_end_ms,
-            )),
+            ),
             QueryPathKind::SubqueryVectorSelector { .. } => {
                 ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self))
             }
@@ -81,12 +81,6 @@ impl QueryPlan {
     }
 }
 
-/// Loaded samples for one series.
-pub(crate) struct LoadedSeriesSamples {
-    pub fingerprint: SeriesFingerprint,
-    pub labels: Labels,
-    pub samples: Vec<Sample>,
-}
 
 // ---------------------------------------------------------------------------
 // Phase 1: Planning
@@ -195,27 +189,29 @@ fn compute_subquery_alignment(
 /// Takes the latest sample per fingerprint. Bucket data should already be in
 /// newest-first order (from `QueryPlan::for_instant_vector`). A fingerprint
 /// dedup pass ensures within-bucket duplicates are also handled.
-pub(crate) fn shape_instant_results(series_data: Vec<LoadedSeriesSamples>) -> Vec<EvalSample> {
+pub(crate) fn shape_instant_results(series_data: Vec<EvalSamples>) -> ExprResult {
     let mut seen: AHashSet<SeriesFingerprint> = AHashSet::new();
     let mut results = Vec::new();
 
     for series in series_data {
-        if seen.contains(&series.fingerprint) {
+        if series.values.is_empty() {
+            continue;
+        }
+        let fingerprint = series.labels.get_fingerprint();
+        if !seen.insert(fingerprint) {
             // todo: append values
             continue;
         }
-        if let Some(best) = series.samples.last() {
-            results.push(EvalSample {
-                timestamp_ms: best.timestamp,
-                value: best.value,
-                labels: series.labels,
-                drop_name: false,
-            });
-            seen.insert(series.fingerprint);
-        }
+        let last = series.values[series.values.len() - 1];
+        results.push(EvalSample {
+            timestamp_ms: last.timestamp,
+            value: last.value,
+            labels: series.labels,
+            drop_name: false,
+        });
     }
 
-    results
+    ExprResult::InstantVector(results)
 }
 
 /// Shape loaded data for matrix selector.
@@ -223,21 +219,21 @@ pub(crate) fn shape_instant_results(series_data: Vec<LoadedSeriesSamples>) -> Ve
 /// Merges all samples per series (keyed by sorted label vector) across all
 /// buckets. Bucket data should be in chronological order.
 pub(crate) fn shape_matrix_results(
-    series_data: Vec<LoadedSeriesSamples>,
+    series_data: Vec<EvalSamples>,
     range_ms: i64,
     range_end_ms: i64,
-) -> Vec<EvalSamples> {
+) -> ExprResult {
     let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
 
     for series in series_data {
         if let Some(samples) = series_map.get_mut(&series.labels) {
-            samples.extend(series.samples);
+            samples.extend(series.values);
         } else {
-            series_map.insert(series.labels, series.samples);
+            series_map.insert(series.labels, series.values);
         }
     }
 
-    series_map
+    let result = series_map
         .into_iter()
         .map(|(labels, values)| EvalSamples {
             values,
@@ -246,7 +242,9 @@ pub(crate) fn shape_matrix_results(
             range_end_ms,
             drop_name: false,
         })
-        .collect()
+        .collect();
+
+    ExprResult::RangeVector(result)
 }
 
 /// Shape loaded data for the subquery vector-selector fast path.
@@ -254,7 +252,7 @@ pub(crate) fn shape_matrix_results(
 /// Merges by fingerprint across buckets, sorts/deduplicates, then applies
 /// the sliding-window step-bucketing algorithm.
 pub(crate) fn shape_subquery_results(
-    series_data: Vec<LoadedSeriesSamples>,
+    series_data: Vec<EvalSamples>,
     plan: &QueryPlan,
 ) -> Vec<EvalSamples> {
     let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
@@ -280,6 +278,10 @@ pub(crate) fn shape_subquery_results(
     let range_vector: Vec<EvalSamples> = series_data
         .into_par()
         .filter_map(|sample| {
+            if sample.values.is_empty() {
+                return None;
+            }
+
             let mut step_samples = Vec::with_capacity(expected_steps);
             let mut i = 0usize;
             let mut last_valid: Option<&Sample> = None;
@@ -287,8 +289,10 @@ pub(crate) fn shape_subquery_results(
             for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
                 let lookback_start_ms = current_step_ms - lookback_delta_ms;
 
-                while i < sample.samples.len() && sample.samples[i].timestamp <= current_step_ms {
-                    last_valid = Some(&sample.samples[i]);
+                while i < sample.values.len() && sample.values[i].timestamp <= current_step_ms {
+                    // SAFETY: we know above that !sample.values.is_smpty(), and the bounds-check
+                    // above ensures that `i` is in bounds
+                    last_valid = unsafe { Some(sample.values.get_unchecked(i)) };
                     i += 1;
                 }
 
@@ -384,17 +388,19 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     // 1ms to enforce the exclusive lower-bound semantics expected by the
     // pipeline. Use saturating_add to avoid overflow on extreme values.
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
+    let range = plan.sample_end_ms - plan.sample_start_ms;
 
     let series_data = reader
         .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
         .into_iter()
         .map(|s| {
-            let fingerprint = s.labels.signature();
-            LoadedSeriesSamples {
-                fingerprint,
-                samples: s.samples,
+            EvalSamples {
                 labels: s.labels,
+                drop_name: false,
+                range_ms: range,
+                values: s.samples,
+                range_end_ms: plan.sample_end_ms,
             }
         })
         .collect::<Vec<_>>();
@@ -444,14 +450,15 @@ mod tests {
     }
 
     fn make_loaded(
-        fingerprint: SeriesFingerprint,
         labels: Vec<Label>,
         samples: Vec<Sample>,
-    ) -> LoadedSeriesSamples {
-        LoadedSeriesSamples {
-            fingerprint,
+    ) -> EvalSamples {
+        EvalSamples {
             labels: Labels::new(labels),
-            samples,
+            drop_name: false,
+            range_ms: 0,
+            values: samples,
+            range_end_ms: 0,
         }
     }
 
@@ -522,14 +529,16 @@ mod tests {
     fn shape_matrix_merges_across_buckets() {
         let labels_a = vec![label("__name__", "m"), label("env", "prod")];
 
-        let fp = compute_fingerprint(&labels_a);
-
         let bucket_data = vec![
-            make_loaded(fp, labels_a.clone(), vec![sample(10, 1.0), sample(20, 2.0)]),
-            make_loaded(fp, labels_a, vec![sample(30, 3.0)]),
+            make_loaded(labels_a.clone(), vec![sample(10, 1.0), sample(20, 2.0)]),
+            make_loaded(labels_a, vec![sample(30, 3.0)]),
         ];
 
         let results = shape_matrix_results(bucket_data, 100_000_000, 100_000_000);
+        let ExprResult::RangeVector(results) = results else {
+            panic!("expected range vector result");
+        };
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].values.len(), 3);
     }
@@ -537,11 +546,9 @@ mod tests {
     #[test]
     fn shape_subquery_step_bucketing() {
         let labels_a = vec![label("__name__", "m")];
-        let fp = compute_fingerprint(&labels_a);
 
         // Samples at t=5, t=15, t=25
         let bucket_data = vec![make_loaded(
-            fp,
             labels_a,
             vec![sample(5, 1.0), sample(15, 2.0), sample(25, 3.0)],
         )];

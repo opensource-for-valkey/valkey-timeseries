@@ -254,7 +254,7 @@ fn preload_ranges_inner(
 ///
 /// Returns an empty Vec when the expression contains no selectors
 /// (e.g. `1 + 2`), allowing the caller to fall back to the default window.
-pub(crate) fn compute_preload_ranges(
+pub(in crate::promql) fn compute_preload_ranges(
     expr: &Expr,
     query_start: SystemTime,
     query_end: SystemTime,

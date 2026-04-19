@@ -532,7 +532,7 @@ impl EvalContext {
         }
     }
 
-    pub fn num_steps(&self) -> usize {
+    pub fn expected_steps(&self) -> usize {
         if self.step_ms == 0 {
             return 0;
         }
@@ -544,7 +544,7 @@ impl EvalContext {
             return vec![];
         }
         // todo: have an upper limit
-        let capacity = self.num_steps();
+        let capacity = self.expected_steps();
         let mut timestamps = Vec::with_capacity(capacity);
         for timestamp in (self.query_start..=self.query_end).step_by(self.step_ms as usize) {
             timestamps.push(timestamp);
