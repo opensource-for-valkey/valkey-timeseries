@@ -22,11 +22,10 @@ use crate::promql::{EvalContext, EvalSamples};
 use num_traits::Zero;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
-use std::time::Duration;
 
 
 #[derive(Default, Clone, Debug)]
-pub struct RollupWindow<'a> {
+pub(super) struct RollupWindow<'a> {
     /// The value preceding values if it fits the staleness interval.
     pub(super) prev_value: f64,
 
@@ -55,8 +54,6 @@ pub struct RollupWindow<'a> {
     /// Time window for rollup calculations.
     pub(super) window: i64,
 }
-
-pub(crate) type RollupFunc = fn(rfa: &RollupWindow) -> f64;
 
 
 /// Evaluates a rollup function over a given time range and step interval.
@@ -88,13 +85,12 @@ pub(crate) type RollupFunc = fn(rfa: &RollupWindow) -> f64;
 pub(super) fn exec_rollups<F>(
     ctx: &EvalContext,
     mut series: EvalSamples,
-    range: Duration,
     rollup_fn: F,
 ) -> EvalSamples
 where
     F: Fn(&RollupWindow) -> f64 + Sync + Clone,
 {
-    let window = range.as_millis() as i64;
+    let window = series.range_ms;
     let lookback = ctx.lookback_delta_ms;
     let step = ctx.step_ms;
 
@@ -118,7 +114,7 @@ where
     series.values = step_times(ctx.query_start, ctx.query_end, step)
         .enumerate()
         .iter_into_par()
-        .map(move |(idx, t_end)| {
+        .filter_map(move |(idx, t_end)| {
             let t_start = t_end - window;
 
             // Compute absolute start/end indexes for this timestamp. We don't rely on
@@ -146,6 +142,10 @@ where
             rollup_window.values = &values[i..j];
             rollup_window.timestamps = &timestamps[i..j];
 
+            if rollup_window.values.is_empty() {
+                return None;
+            }
+
             if i > 0 {
                 let prev_idx = i - 1;
 
@@ -154,7 +154,6 @@ where
                     // set real_prev_value if rc.lookback_delta == 0
                     // or if the distance between datapoint in the prev interval and the beginning of this interval
                     // doesn't exceed lookback_delta.
-                    // https://github.com/VictoriaMetrics/VictoriaMetrics/pull/1381
                     // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/894
                     // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8045
                     // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8935
@@ -178,14 +177,17 @@ where
             } else {
                 f64::NAN
             };
+
             rollup_window.curr_timestamp = t_end;
             rollup_window.idx = idx;
 
             let value = rollup_fn(&rollup_window);
-            Sample {
-                value,
-                timestamp: rollup_window.curr_timestamp,
-            }
+            Some(
+                Sample {
+                    value,
+                    timestamp: rollup_window.curr_timestamp,
+                }
+            )
         })
         .collect_into(samples);
 
@@ -230,30 +232,4 @@ fn seek_first_timestamp_idx_after(
         }
     }
         .saturating_add(slice_start)
-}
-
-const fn get_max_prev_interval(scrape_interval: Duration) -> Duration {
-    let scrape_interval = scrape_interval.as_millis() as i64;
-    // Increase scrape_interval more for smaller scrape intervals to hide possible gaps
-    // when high jitter is present.
-    // See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/139
-    let interval = if scrape_interval <= 2_000i64 {
-        scrape_interval + 4 * scrape_interval
-    } else if scrape_interval <= 4_000i64 {
-        scrape_interval + 2 * scrape_interval
-    } else if scrape_interval <= 8_000i64 {
-        scrape_interval + scrape_interval
-    } else if scrape_interval <= 16_000i64 {
-        scrape_interval + scrape_interval / 2
-    } else if scrape_interval <= 32_000i64 {
-        scrape_interval + scrape_interval / 4
-    } else {
-        scrape_interval + scrape_interval / 8
-    };
-
-    if interval < 0 {
-        Duration::ZERO
-    } else {
-        Duration::from_millis(interval as u64)
-    }
 }
