@@ -189,7 +189,7 @@ fn change_below_tolerance(v: f64, prev_value: f64) -> bool {
     (v - prev_value).abs() < tolerance
 }
 
-pub(super) fn rollup_changes_prometheus(rfa: &RollupWindow) -> f64 {
+pub(super) fn rollup_changes(rfa: &RollupWindow) -> f64 {
     // Do not take into account rfa.prev_value like Prometheus does.
     let mut prev_value = rfa.values[0];
     let mut n = 0;
