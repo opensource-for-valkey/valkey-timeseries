@@ -153,6 +153,17 @@ pub(super) fn expect_exact_arg_count(
     Ok(())
 }
 
+pub(super) fn expect_min_arg_count(
+    function_name: &str,
+    expected: usize,
+    actual: usize,
+) -> EvalResult<()> {
+    if expected < actual {
+        return Err(min_arity_error(function_name, expected, actual));
+    }
+    Ok(())
+}
+
 // Prometheus' current UTF-8 label-name validation only rejects empty names.
 // Rust strings are already guaranteed to be valid UTF-8.
 pub(super) fn is_valid_label_name(label: &str) -> bool {

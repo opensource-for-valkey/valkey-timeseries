@@ -1,12 +1,11 @@
 #[cfg(test)]
 mod tests {
-    use crate::common::Sample;
     use crate::common::math::kahan_inc;
-    use crate::promql::functions::PromQLFunctionImpl;
-    use crate::promql::functions::types::FunctionCallContext;
+    use crate::common::Sample;
     use crate::promql::functions::utils::variance_kahan;
-    use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
-    use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, Labels, is_stale_nan};
+    use crate::promql::functions::PromQLFunctionImpl;
+    use crate::promql::functions::{resolve_function, PromQLArg, PromQLFunction};
+    use crate::promql::{is_stale_nan, EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult, Labels};
     use ahash::AHashMap as HashMap;
     use promql_parser::label::METRIC_NAME;
     use promql_parser::parser::{Expr, ParenExpr, StringLiteral};
@@ -193,7 +192,7 @@ mod tests {
     fn create_vector_arg(_values: Vec<f64>) -> PromQLArg {
         PromQLArg::InstantVector(vec![create_sample_with_labels(
             1.0,
-            &[(METRIC_NAME, "testmetric"), ("src", "source\nvalue-10")],
+            &[(METRIC_NAME, "test_metric"), ("src", "source\nvalue-10")],
         )])
     }
 
@@ -303,15 +302,9 @@ mod tests {
     fn should_apply_label_replace_with_full_string_match() {
         let func = resolve_function("label_replace").unwrap();
 
-        let raw_args = box_exprs(label_replace_raw_args(
-            "dst",
-            "destination-value-$1",
-            "src",
-            "source-value-(.*)",
-        ));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -320,11 +313,11 @@ mod tests {
                     PromQLArg::InstantVector(vec![
                         create_sample_with_labels(
                             1.0,
-                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                            &[(METRIC_NAME, "test_metric"), ("src", "source-value-10")],
                         ),
                         create_sample_with_labels(
                             2.0,
-                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-20")],
+                            &[(METRIC_NAME, "test_metric"), ("src", "source-value-20")],
                         ),
                     ]),
                     "dst".into(),
@@ -348,19 +341,13 @@ mod tests {
     #[test]
     fn should_apply_label_replace_with_dotall_regex() {
         let _func = resolve_function("label_replace").unwrap();
-        let _raw_args = box_exprs(label_replace_raw_args(
-            "dst",
-            "matched",
-            "src",
-            "source.*10",
-        ));
 
         let result = call_apply_args(
             "label_replace",
             vec![
                 PromQLArg::InstantVector(vec![create_sample_with_labels(
                     1.0,
-                    &[(METRIC_NAME, "testmetric"), ("src", "source\nvalue-10")],
+                    &[(METRIC_NAME, "test_metric"), ("src", "source\nvalue-10")],
                 )]),
                 "dst".into(),
                 "matched".into(),
@@ -376,15 +363,10 @@ mod tests {
     #[test]
     fn should_not_apply_label_replace_on_substring_match() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args(
-            "dst",
-            "value-$1",
-            "src",
-            "value-(.*)",
-        ));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -393,7 +375,7 @@ mod tests {
                     PromQLArg::InstantVector(vec![create_sample_with_labels(
                         1.0,
                         &[
-                            (METRIC_NAME, "testmetric"),
+                            (METRIC_NAME, "test_metric"),
                             ("src", "source-value-10"),
                             ("dst", "original-destination-value"),
                         ],
@@ -420,10 +402,10 @@ mod tests {
     #[test]
     fn should_drop_destination_label_when_label_replace_replacement_is_empty() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args("dst", "", "dst", ".*"));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -432,7 +414,7 @@ mod tests {
                     PromQLArg::InstantVector(vec![create_sample_with_labels(
                         1.0,
                         &[
-                            (METRIC_NAME, "testmetric"),
+                            (METRIC_NAME, "test_metric"),
                             ("src", "source-value-10"),
                             ("dst", "original-destination-value"),
                         ],
@@ -456,15 +438,10 @@ mod tests {
     #[test]
     fn should_apply_label_replace_with_utf8_destination_label_name() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args(
-            "\u{00ff}",
-            "value-$1",
-            "src",
-            "source-value-(.*)",
-        ));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -472,7 +449,7 @@ mod tests {
                 vec![
                     PromQLArg::InstantVector(vec![create_sample_with_labels(
                         1.0,
-                        &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                        &[(METRIC_NAME, "test_metric"), ("src", "source-value-10")],
                     )]),
                     "\u{00ff}".into(),
                     "value-$1".into(),
@@ -493,10 +470,10 @@ mod tests {
     #[test]
     fn should_error_when_label_replace_destination_label_is_empty() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args("", "", "src", "(.*)"));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let err = func
@@ -504,7 +481,7 @@ mod tests {
                 vec![
                     PromQLArg::InstantVector(vec![create_sample_with_labels(
                         1.0,
-                        &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                        &[(METRIC_NAME, "test_metric"), ("src", "source-value-10")],
                     )]),
                     "".into(),
                     "".into(),
@@ -525,10 +502,10 @@ mod tests {
     #[test]
     fn should_error_when_label_replace_produces_duplicate_output_labelsets() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args("src", "", "", ""));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let err = func
@@ -537,11 +514,11 @@ mod tests {
                     PromQLArg::InstantVector(vec![
                         create_sample_with_labels(
                             1.0,
-                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-10")],
+                            &[(METRIC_NAME, "test_metric"), ("src", "source-value-10")],
                         ),
                         create_sample_with_labels(
                             2.0,
-                            &[(METRIC_NAME, "testmetric"), ("src", "source-value-20")],
+                            &[(METRIC_NAME, "test_metric"), ("src", "source-value-20")],
                         ),
                     ]),
                     "src".into(),
@@ -564,10 +541,10 @@ mod tests {
     #[test]
     fn should_apply_label_join_with_source_labels_in_order() {
         let func = resolve_function("label_join").unwrap();
-        let raw_args = box_exprs(label_join_raw_args("dst", "-", &["src", "src1", "src2"]));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -577,7 +554,7 @@ mod tests {
                         create_sample_with_labels(
                             1.0,
                             &[
-                                (METRIC_NAME, "testmetric"),
+                                (METRIC_NAME, "test_metric"),
                                 ("src", "a"),
                                 ("src1", "b"),
                                 ("src2", "c"),
@@ -586,18 +563,18 @@ mod tests {
                         create_sample_with_labels(
                             2.0,
                             &[
-                                (METRIC_NAME, "testmetric"),
+                                (METRIC_NAME, "test_metric"),
                                 ("src", "d"),
                                 ("src1", "e"),
                                 ("src2", "f"),
                             ],
                         ),
                     ]),
-                    "".into(),
-                    "".into(),
-                    "".into(),
-                    "".into(),
-                    "".into(),
+                    "dst".into(),
+                    "-".into(),
+                    "src".into(),
+                    "src1".into(),
+                    "src2".into(),
                 ],
                 &ctx,
             )
@@ -614,10 +591,10 @@ mod tests {
     #[test]
     fn should_apply_label_join_without_source_labels() {
         let func = resolve_function("label_join").unwrap();
-        let raw_args = box_exprs(label_join_raw_args("dst", ", ", &[]));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
 
         let result = func
@@ -626,7 +603,7 @@ mod tests {
                     PromQLArg::InstantVector(vec![create_sample_with_labels(
                         1.0,
                         &[
-                            (METRIC_NAME, "testmetric"),
+                            (METRIC_NAME, "test_metric"),
                             ("src", "a"),
                             ("src1", "b"),
                             ("dst", "original-destination-value"),
@@ -661,7 +638,7 @@ mod tests {
     //             vec![
     //                 PromQLArg::InstantVector(vec![create_sample_with_labels(
     //                     1.0,
-    //                     &[(METRIC_NAME, "testmetric"), ("src", "a")],
+    //                     &[(METRIC_NAME, "test_metric"), ("src", "a")],
     //                 )]),
     //                 None,
     //                 None,
@@ -720,13 +697,12 @@ mod tests {
     #[test]
     fn should_preserve_metric_name_when_label_replace_writes_name_label() {
         let func = resolve_function("label_replace").unwrap();
-        let raw_args = box_exprs(label_replace_raw_args(
-            "__name__", "rate_$1", "__name__", "(.+)",
-        ));
-        let ctx = FunctionCallContext {
-            eval_timestamp_ms: 1000,
-            raw_args: &raw_args,
+
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
         };
+
         let mut sample =
             create_sample_with_labels(1.0, &[(METRIC_NAME, "metric_total"), ("env", "1")]);
         sample.drop_name = true;
@@ -735,10 +711,10 @@ mod tests {
             .apply_call(
                 vec![
                     PromQLArg::InstantVector(vec![sample]),
-                    "".into(),
-                    "".into(),
-                    "".into(),
-                    "".into(),
+                    "__name__".into(),
+                    "rate_$1".into(),
+                    "__name__".into(),
+                    "(.+)".into(),
                 ],
                 &ctx,
             )
