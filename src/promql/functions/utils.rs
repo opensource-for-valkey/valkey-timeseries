@@ -158,7 +158,7 @@ pub(super) fn expect_min_arg_count(
     expected: usize,
     actual: usize,
 ) -> EvalResult<()> {
-    if expected < actual {
+    if actual < expected {
         return Err(min_arity_error(function_name, expected, actual));
     }
     Ok(())
