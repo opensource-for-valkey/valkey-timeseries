@@ -1,6 +1,6 @@
 use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
-use crate::promql::hashers::FingerprintHashMap;
+use crate::promql::hashers::{FingerprintHashMap, SeriesFingerprint};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
@@ -17,23 +17,19 @@ pub(super) fn eval_binop_vector_vector(
 ) -> EvalResult<ExprResult> {
     let matching = expr.modifier.as_ref().and_then(|m| m.matching.as_ref());
 
-    // Fill modifiers are not meaningful for set operators (or / and / unless).
-    let has_fill = expr
-        .modifier
-        .as_ref()
-        .map(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some())
-        .unwrap_or(false);
-
-    if has_fill && matches!(expr.op.id(), T_LOR | T_LAND | T_LUNLESS) {
-        return Err(EvaluationError::InternalError(
-            "fill modifiers (fill, fill_left, fill_right) are not supported on set operators (or, and, unless)".to_string(),
-        ));
-    }
-
     match expr.op.id() {
-        T_LOR => eval_set_or(left_vector, right_vector, matching),
-        T_LAND => eval_set_and(left_vector, right_vector, matching),
-        T_LUNLESS => eval_set_unless(left_vector, right_vector, matching),
+        T_LOR => {
+            validate_non_fill(expr)?;
+            eval_set_or(left_vector, right_vector, matching)
+        }
+        T_LAND => {
+            validate_non_fill(expr)?;
+            eval_set_and(left_vector, right_vector, matching)
+        }
+        T_LUNLESS => {
+            validate_non_fill(expr)?;
+            eval_set_unless(left_vector, right_vector, matching)
+        }
         _ => eval_arith_ops(expr, left_vector, right_vector),
     }
 }
@@ -77,8 +73,7 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
             let card = match &modifier.card {
                 VectorMatchCardinality::ManyToMany => {
                     return Err(EvaluationError::InternalError(
-                        "many-to-many cardinality not supported for non-set operators"
-                            .to_string(),
+                        "many-to-many cardinality not supported for non-set operators".to_string(),
                     ));
                 }
                 c => c,
@@ -97,12 +92,6 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
     let return_bool = expr.return_bool();
     let has_fill = fill_left.is_some() || fill_right.is_some();
 
-    if has_fill && return_bool {
-        return Err(EvaluationError::InternalError(
-            "fill modifiers cannot be combined with the bool modifier".to_string(),
-        ));
-    }
-
     let is_group_right = matches!(card, VectorMatchCardinality::OneToMany(_));
 
     Ok(ArithOpContext {
@@ -115,8 +104,16 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
         is_group_right,
         is_one_to_one: matches!(card, VectorMatchCardinality::OneToOne),
         group_labels: card.labels().map(|l| &l.labels),
-        fill_for_one: if is_group_right { fill_left } else { fill_right },
-        fill_for_many: if is_group_right { fill_right } else { fill_left },
+        fill_for_one: if is_group_right {
+            fill_left
+        } else {
+            fill_right
+        },
+        fill_for_many: if is_group_right {
+            fill_right
+        } else {
+            fill_left
+        },
     })
 }
 
@@ -140,43 +137,149 @@ fn make_fill_many_sample(one_sample: &EvalSample, fill_value: f64) -> EvalSample
     }
 }
 
+// ============================================================================
+// Fast-path for no-modifier arithmetic / comparison ops
+// ============================================================================
+
+/// Returns `true` when the expression carries no modifier — meaning OneToOne
+/// cardinality, no on/ignoring label matching, no fill values, and no
+/// `return_bool`. In this state both sides are matched purely on their full
+/// label set minus `__name__`, so a hashmap-free merge-join is safe and correct.
+fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
+    ctx.is_one_to_one && ctx.matching.is_none() && !ctx.has_fill && !ctx.return_bool
+}
+
+/// Evaluates arithmetic or comparison operations on two vectors using a merge join, assuming the operation
+/// has no modifiers (`fill`, `bool`, `on`/ `ignoring`, e.t.c).
+///
+fn eval_arith_ops_fast_path(
+    operator: TokenType,
+    is_comparison: bool,
+    left_vector: Vec<EvalSample>,
+    right_vector: Vec<EvalSample>,
+) -> EvalResult<ExprResult> {
+    use std::cmp::Ordering;
+
+    let mut left_sorted: Vec<(SeriesFingerprint, EvalSample)> = left_vector
+        .into_par()
+        .map(|s| (compute_binary_match_key(&s.labels, None), s))
+        .collect();
+
+    let mut right_sorted: Vec<(SeriesFingerprint, EvalSample)> = right_vector
+        .into_par()
+        .map(|s| (compute_binary_match_key(&s.labels, None), s))
+        .collect();
+
+    left_sorted.sort_unstable_by_key(|x| x.0);
+    right_sorted.sort_unstable_by_key(|x| x.0);
+
+    let mut result: Vec<EvalSample> = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+
+    while i < left_sorted.len() && j < right_sorted.len() {
+        let lhs_fp = left_sorted[i].0;
+        let rhs_fp = right_sorted[j].0;
+
+        match lhs_fp.cmp(&rhs_fp) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                let i_end = i + left_sorted[i..].partition_point(|x| x.0 == lhs_fp);
+                let j_end = j + right_sorted[j..].partition_point(|x| x.0 == rhs_fp);
+
+                if !is_comparison && (i_end - i > 1 || j_end - j > 1) {
+                    let side = if i_end - i > 1 { "left" } else { "right" };
+                    return Err(EvaluationError::InternalError(format!(
+                        "many-to-many matching not allowed: found duplicate series on the {side} side of the operation"
+                    )));
+                }
+
+                for li in i..i_end {
+                    let (_, lhs) = &left_sorted[li];
+                    for rj in j..j_end {
+                        let (_, rhs) = &right_sorted[rj];
+
+                        let value = match apply_binary_op(operator, lhs.value, rhs.value) {
+                            Ok(v) => v,
+                            Err(e) => unreachable!(
+                                "binary operator {:?} should not fail on valid f64 inputs: {}",
+                                operator, e
+                            ),
+                        };
+
+                        if is_comparison && value == 0.0 {
+                            continue;
+                        }
+
+                        let output_value = if is_comparison { lhs.value } else { value };
+                        let labels = result_metric(lhs.labels.clone(), operator, None);
+
+                        result.push(EvalSample {
+                            timestamp_ms: lhs.timestamp_ms,
+                            value: output_value,
+                            labels,
+                            drop_name: lhs.drop_name,
+                        });
+                    }
+                }
+
+                i = i_end;
+                j = j_end;
+            }
+        }
+    }
+
+    Ok(ExprResult::InstantVector(result))
+}
+
 fn build_result_sample(
     ctx: &ArithOpContext<'_>,
     many_sample: &EvalSample,
     one_sample: &EvalSample,
 ) -> Option<EvalSample> {
-    let (lhs, rhs) = if ctx.is_group_right {
-        (one_sample.value, many_sample.value)
+    // Determine operand order based on grouping, then apply the operator.
+    let lhs_val = if ctx.is_group_right {
+        one_sample.value
     } else {
-        (many_sample.value, one_sample.value)
+        many_sample.value
+    };
+    let rhs_val = if ctx.is_group_right {
+        many_sample.value
+    } else {
+        one_sample.value
     };
 
-    let value = match apply_binary_op(ctx.operator, lhs, rhs) {
+    let op_result = match apply_binary_op(ctx.operator, lhs_val, rhs_val) {
         Ok(v) => v,
-        Err(e) => {
-            unreachable!(
-                "binary operator {:?} should not fail on valid f64 inputs: {}",
-                ctx.operator, e
-            );
-        }
+        Err(e) => unreachable!(
+            "binary operator {:?} should not fail on valid f64 inputs: {}",
+            ctx.operator, e
+        ),
     };
 
-    if ctx.is_comparison && !ctx.return_bool && value == 0.0 {
+    // For non-bool comparisons, filter out false results (0.0).
+    if ctx.is_comparison && !ctx.return_bool && op_result == 0.0 {
         return None;
     }
 
     let output_value = if ctx.is_comparison && !ctx.return_bool {
-        lhs
+        lhs_val
     } else {
-        value
+        op_result
     };
+
     let drop_name = many_sample.drop_name || ctx.return_bool;
 
     let result_labels = build_result_labels(
         many_sample,
         one_sample,
         ctx.operator,
-        if ctx.is_one_to_one { ctx.matching } else { None },
+        if ctx.is_one_to_one {
+            ctx.matching
+        } else {
+            None
+        },
         ctx.group_labels,
         ctx.is_group_right,
     );
@@ -209,16 +312,24 @@ fn eval_arith_ops(
 
     // Arithmetic (non-comparison) operations always drop `__name__`.
     if !ctx.is_comparison {
+        (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
         for sample in left_vector.iter_mut() {
-            if sample.drop_name {
-                sample.labels.remove(METRIC_NAME);
-            }
+            sample.labels.remove(METRIC_NAME);
         }
         for sample in right_vector.iter_mut() {
-            if sample.drop_name {
-                sample.labels.remove(METRIC_NAME);
-            }
+            sample.labels.remove(METRIC_NAME);
         }
+    }
+
+    // Fast-path: no modifier (OneToOne, no matching, no fills, no bool) —
+    // avoid building a hashmap by using a fingerprint-based merge.
+    if can_use_fast_path(&ctx) {
+        return eval_arith_ops_fast_path(
+            ctx.operator,
+            ctx.is_comparison,
+            left_vector,
+            right_vector,
+        );
     }
 
     // Determine which side is "one" vs. "many" for matching purposes.
@@ -247,6 +358,7 @@ fn eval_arith_ops(
     let mut result = Vec::with_capacity(many_vec.len());
     let mut one_to_one_seen: FingerprintHashMap<()> = Default::default();
     // Track output label fingerprints for grouped matching to detect duplicates.
+    // todo: could these be simple bitsets ?
     let mut grouped_result_seen: FingerprintHashMap<()> = Default::default();
     // Track one_map keys that were matched during the main pass (used by the
     // fill_for_many pass below to find truly unmatched "one" entries).
@@ -397,6 +509,22 @@ fn result_fingerprint(labels: &Labels, drop_name: bool) -> u128 {
 // Set operators: or, and, unless
 // ============================================================================
 
+fn validate_non_fill(expr: &BinaryExpr) -> EvalResult<()> {
+    // Fill modifiers are not meaningful for set operators (or / and / unless).
+    let has_fill = expr
+        .modifier
+        .as_ref()
+        .map(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some())
+        .unwrap_or(false);
+
+    if has_fill {
+        return Err(EvaluationError::InternalError(
+            "fill modifiers (fill, fill_left, fill_right) are not supported on set operators (or, and, unless)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// `or`: returns all LHS samples, plus any RHS samples whose match key
 /// does not appear on the LHS.
 fn eval_set_or(
@@ -490,11 +618,149 @@ fn eval_set_unless(
     Ok(ExprResult::InstantVector(result))
 }
 
+// ------------------------- Benchmark helpers -------------------------------
+// These helpers are compiled only when the `bench` feature is enabled and are
+// intended to be called from external Criterion benchmark crates. They live in
+// this module so they can reuse internal types without duplicating logic.
+
+#[cfg(feature = "bench")]
+pub fn bench_eval_aligned(n: usize) -> usize {
+    use promql_parser::parser::token::T_ADD;
+    use promql_parser::parser::{BinaryExpr, Expr, NumberLiteral};
+
+    // build a simple BinaryExpr with no modifier to hit the fast-path
+    let expr = BinaryExpr {
+        op: TokenType::new(T_ADD),
+        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        modifier: None,
+    };
+
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let mut labels = Labels::empty();
+        labels.insert("id", i.to_string());
+
+        left.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels: labels.clone(),
+            drop_name: false,
+        });
+
+        right.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels,
+            drop_name: false,
+        });
+    }
+
+    match eval_binop_vector_vector(&expr, left, right) {
+        Ok(ExprResult::InstantVector(v)) => v.len(),
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_eval_unaligned(n: usize) -> usize {
+    use promql_parser::parser::token::T_ADD;
+    use promql_parser::parser::{BinaryExpr, Expr, NumberLiteral};
+
+    // build a simple BinaryExpr with no modifier to hit the fast-path
+    let expr = BinaryExpr {
+        op: TokenType::new(T_ADD),
+        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        modifier: None,
+    };
+
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let mut labels = Labels::empty();
+        labels.insert("id", i.to_string());
+
+        left.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels: labels.clone(),
+            drop_name: false,
+        });
+
+        right.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels,
+            drop_name: false,
+        });
+    }
+
+    // reverse the right vector to force the sort-merge path in the fast-path
+    right.reverse();
+
+    match eval_binop_vector_vector(&expr, left, right) {
+        Ok(ExprResult::InstantVector(v)) => v.len(),
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_eval_with_fill(n: usize) -> usize {
+    use promql_parser::parser::token::T_ADD;
+    use promql_parser::parser::{
+        BinModifier, BinaryExpr, Expr, NumberLiteral, VectorMatchFillValues,
+    };
+
+    // build an expression with fill modifiers to force the hashmap-based path
+    let modifier = BinModifier::default()
+        .with_fill_values(VectorMatchFillValues::default().with_lhs(0.0).with_rhs(0.0));
+
+    let expr = BinaryExpr {
+        op: TokenType::new(T_ADD),
+        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+        modifier: Some(modifier),
+    };
+
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let mut labels = Labels::empty();
+        labels.insert("id", i.to_string());
+
+        left.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels: labels.clone(),
+            drop_name: false,
+        });
+
+        right.push(EvalSample {
+            timestamp_ms: 1,
+            value: i as f64,
+            labels,
+            drop_name: false,
+        });
+    }
+
+    match eval_binop_vector_vector(&expr, left, right) {
+        Ok(ExprResult::InstantVector(v)) => v.len(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_parser::parser::token::{T_ADD, T_DIV, T_EQLC, T_GTR, TokenType};
-    use promql_parser::parser::{BinModifier, BinaryExpr, Expr, NumberLiteral, VectorMatchFillValues};
+    use promql_parser::parser::token::{T_ADD, T_DIV, T_GTR, TokenType};
+    use promql_parser::parser::{
+        BinModifier, BinaryExpr, Expr, NumberLiteral, VectorMatchFillValues,
+    };
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -542,9 +808,10 @@ mod tests {
 
         let expr = make_expr(
             T_ADD,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(0.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -557,7 +824,8 @@ mod tests {
         assert_eq!(prod.value, 13.0);
 
         // staging: 5 + fill(0) = 5
-        let staging = find_sample(&result, "staging").expect("staging sample missing (fill_right should emit it)");
+        let staging = find_sample(&result, "staging")
+            .expect("staging sample missing (fill_right should emit it)");
         assert_eq!(staging.value, 5.0);
 
         assert_eq!(result.len(), 2);
@@ -578,9 +846,10 @@ mod tests {
 
         let expr = make_expr(
             T_ADD,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_lhs(1.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_lhs(1.0)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -593,7 +862,8 @@ mod tests {
         assert_eq!(prod.value, 13.0);
 
         // staging: fill(1) + 7 = 8
-        let staging = find_sample(&result, "staging").expect("staging sample missing (fill_left should emit it)");
+        let staging = find_sample(&result, "staging")
+            .expect("staging sample missing (fill_left should emit it)");
         assert_eq!(staging.value, 8.0);
 
         assert_eq!(result.len(), 2);
@@ -673,9 +943,10 @@ mod tests {
 
         let expr = make_expr(
             T_GTR,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(10.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(10.0)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -683,7 +954,11 @@ mod tests {
             .into_instant_vector()
             .unwrap();
 
-        assert_eq!(result.len(), 1, "false comparison result should be filtered");
+        assert_eq!(
+            result.len(),
+            1,
+            "false comparison result should be filtered"
+        );
         let prod = find_sample(&result, "prod").expect("prod should pass the filter");
         assert_eq!(prod.value, 5.0); // propagates original LHS value
     }
@@ -698,9 +973,10 @@ mod tests {
 
         let expr = make_expr(
             T_GTR,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(5.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(5.0)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -710,32 +986,6 @@ mod tests {
 
         let dev = find_sample(&result, "dev").expect("dev should pass fill > comparison");
         assert_eq!(dev.value, 20.0);
-    }
-
-    // ── bool + fill → error ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_fill_with_bool_returns_error() {
-        let lhs = vec![sample(1000, 5.0, &[("env", "prod")])];
-        let rhs = vec![sample(1000, 3.0, &[("env", "staging")])]; // no match
-
-        let expr = make_expr(
-            T_EQLC,
-            Some(
-                BinModifier::default()
-                    .with_return_bool(true)
-                    .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
-            ),
-        );
-
-        let err = eval_binop_vector_vector(&expr, lhs, rhs);
-        assert!(err.is_err(), "fill + bool should return an error");
-        match err.unwrap_err() {
-            EvaluationError::InternalError(msg) => {
-                assert!(msg.contains("bool"), "error should mention bool modifier");
-            }
-            other => panic!("unexpected error: {other}"),
-        }
     }
 
     // ── fill on set operators → error ─────────────────────────────────────────
@@ -749,16 +999,20 @@ mod tests {
 
         let expr = make_expr(
             T_LOR,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(0.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
+            ),
         );
 
         let err = eval_binop_vector_vector(&expr, lhs, rhs);
         assert!(err.is_err(), "fill on set op should return an error");
         match err.unwrap_err() {
             EvaluationError::InternalError(msg) => {
-                assert!(msg.contains("set operators"), "error should mention set operators");
+                assert!(
+                    msg.contains("set operators"),
+                    "error should mention set operators"
+                );
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -776,9 +1030,10 @@ mod tests {
 
         let expr = make_expr(
             T_ADD,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(f64::NAN),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(f64::NAN)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -787,7 +1042,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 2);
-        let staging = find_sample(&result, "staging").expect("staging should be emitted via NaN fill");
+        let staging =
+            find_sample(&result, "staging").expect("staging should be emitted via NaN fill");
         assert!(staging.value.is_nan(), "5 + NaN should be NaN");
     }
 
@@ -802,9 +1058,10 @@ mod tests {
 
         let expr = make_expr(
             T_DIV,
-            Some(BinModifier::default().with_fill_values(
-                VectorMatchFillValues::default().with_rhs(0.0),
-            )),
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
+            ),
         );
 
         let result = eval_binop_vector_vector(&expr, lhs, rhs)
@@ -816,4 +1073,3 @@ mod tests {
         assert!(prod.value.is_nan(), "10 / fill(0) should be NaN");
     }
 }
-
