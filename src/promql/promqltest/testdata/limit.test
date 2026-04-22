@@ -26,7 +26,7 @@ eval instant at 50m count(limitk by (group) (2, http_requests) and http_requests
     {} 4
 
 eval instant at 50m count(limitk(100, http_requests) and http_requests)
-    {} 8
+    {} 6
 
 # Exercise k==1 special case (as sample is added before the main series loop).
 eval instant at 50m count(limitk by (group) (1, http_requests) and http_requests)
@@ -36,7 +36,7 @@ eval instant at 50m count(limitk by (group) (2, http_requests) and http_requests
     {} 4
 
 eval instant at 50m count(limitk(100, http_requests) and http_requests)
-    {} 8
+    {} 6
 
 # Bug #15971.
 eval range from 0m to 50m step 5m count(limitk(scalar(foo), http_requests))
