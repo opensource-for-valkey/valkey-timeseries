@@ -4,7 +4,6 @@ use crate::promql::functions::rollup_window::RollupWindow;
 
 const NAN: f64 = f64::NAN;
 
-
 macro_rules! make_factory {
     ( $name: ident, $rf: expr ) => {
         #[inline]
@@ -13,8 +12,6 @@ macro_rules! make_factory {
         }
     };
 }
-
-
 
 /// Removes resets for rollup functions over counters - see rollupFuncsRemoveCounterResetsAdd comment.
 /// It doesn't remove resets between samples with staleNaNs, or samples that exceed maxStalenessInterval
@@ -241,7 +238,6 @@ pub(super) fn rollup_increases(rfa: &RollupWindow) -> f64 {
 
     n as f64
 }
-
 
 pub(super) fn rollup_resets(rfa: &RollupWindow) -> f64 {
     let mut values = &rfa.values[0..];

@@ -23,7 +23,6 @@ use num_traits::Zero;
 use orx_parallel::ParIter;
 use orx_parallel::{IntoParIter, IterIntoParIter};
 
-
 #[derive(Default, Clone, Debug)]
 pub(super) struct RollupWindow<'a> {
     /// The value preceding values if it fits the staleness interval.
@@ -55,7 +54,6 @@ pub(super) struct RollupWindow<'a> {
     pub(super) window: i64,
 }
 
-
 /// Evaluates a rollup function over a given time range and step interval.
 ///
 /// This function is the primary engine for executing PromQL range vector functions (e.g., `rate`, `sum_over_time`).
@@ -76,7 +74,7 @@ pub(super) struct RollupWindow<'a> {
 ///     parallel vectors. This improves cache locality and enables the compiler to use SIMD instructions for
 ///     the subsequent rollup calculations.
 /// 2.  **Parallel Mapping:** It iterates over the query's time steps in parallel. For each step, it identifies
-///      the subset of samples ("window") that fall within the specified `range` before the step's timestamp.
+///     the subset of samples ("window") that fall within the specified `range` before the step's timestamp.
 /// 3.  **Rollup Application:** It constructs a `RollupWindow` providing the `rollup_fn` with the relevant
 ///     slices of values and timestamps, as well as metadata like preceding/following values for functions
 ///     that require them (e.g., `deriv`, `rate`).
@@ -182,12 +180,10 @@ where
             rollup_window.idx = idx;
 
             let value = rollup_fn(&rollup_window);
-            Some(
-                Sample {
-                    value,
-                    timestamp: rollup_window.curr_timestamp,
-                }
-            )
+            Some(Sample {
+                value,
+                timestamp: rollup_window.curr_timestamp,
+            })
         })
         .collect_into(samples);
 
@@ -230,10 +226,15 @@ fn seek_first_timestamp_idx_after(
         match slice.binary_search(&(seek_timestamp + 1)) {
             Ok(pos) | Err(pos) => pos,
         }
-    }.saturating_add(slice_start)
+    }
+        .saturating_add(slice_start)
 }
 
-pub(super) fn eval_range_basic<F>(series_data: Vec<EvalSamples>, ctx: &EvalContext, f: F) -> Vec<EvalSamples>
+pub(super) fn eval_range_basic<F>(
+    series_data: Vec<EvalSamples>,
+    ctx: &EvalContext,
+    f: F,
+) -> Vec<EvalSamples>
 where
     F: Fn(&[Sample]) -> f64 + Sync,
 {
@@ -256,8 +257,12 @@ where
                 .iter_into_par()
                 .filter_map(|current_step_ms| {
                     let lookback_start_ms = current_step_ms - lookback_delta;
-                    let i = sample.values.partition_point(|s| s.timestamp < lookback_start_ms);
-                    let j = sample.values.partition_point(|s| s.timestamp <= current_step_ms);
+                    let i = sample
+                        .values
+                        .partition_point(|s| s.timestamp < lookback_start_ms);
+                    let j = sample
+                        .values
+                        .partition_point(|s| s.timestamp <= current_step_ms);
                     let window_samples = &sample.values[i..j];
 
                     if window_samples.is_empty() {
