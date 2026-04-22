@@ -104,16 +104,12 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
         is_group_right,
         is_one_to_one: matches!(card, VectorMatchCardinality::OneToOne),
         group_labels: card.labels().map(|l| &l.labels),
-        fill_for_one: if is_group_right {
-            fill_left
-        } else {
-            fill_right
-        },
-        fill_for_many: if is_group_right {
-            fill_right
-        } else {
-            fill_left
-        },
+        // Fill values are operand-side based, not cardinality-side based:
+        // - fill_left applies when LHS is missing
+        // - fill_right applies when RHS is missing
+        // This must remain true for both group_left and group_right.
+        fill_for_one: fill_right,
+        fill_for_many: fill_left,
     })
 }
 
