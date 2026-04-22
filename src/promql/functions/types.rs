@@ -1,4 +1,6 @@
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
+use crate::promql::{
+    EvalContext, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult,
+};
 use promql_parser::parser::Expr;
 use promql_parser::parser::value::ValueType;
 use std::ops::Deref;

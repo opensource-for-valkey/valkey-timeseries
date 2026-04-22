@@ -65,7 +65,11 @@ pub(super) fn handle_range_query(
             }
             let samples: Vec<PromSample> = series_samples.into_iter().map(Sample::into).collect();
             let labels = convert_labels(&s.labels);
-            let range = RangeSample { labels, samples, key: "".to_string() };
+            let range = RangeSample {
+                labels,
+                samples,
+                key: "".to_string(),
+            };
             Some(range)
         })
         .collect::<Vec<_>>();
