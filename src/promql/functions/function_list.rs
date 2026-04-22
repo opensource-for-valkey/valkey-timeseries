@@ -66,7 +66,7 @@ macro_rules! impl_promql_function_kind {
             type Error = ValkeyError;
 
             fn try_from(value: &str) -> Result<Self, Self::Error> {
-                let v = hashify::tiny_map_ignore_case! {
+                let v = hashify::tiny_map! {
                     value.as_bytes(),
                     $( $name => PromqlFunctionKind::$Variant, )*
                 };
