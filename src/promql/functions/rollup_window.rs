@@ -18,7 +18,7 @@
 
 use crate::common::{Sample, Timestamp};
 use crate::promql::time::step_times;
-use crate::promql::{EvalContext, EvalSamples};
+use crate::promql::{EvalContext, EvalResult, EvalSamples};
 use num_traits::Zero;
 use orx_parallel::ParIter;
 use orx_parallel::{IntoParIter, IterIntoParIter};
@@ -54,6 +54,20 @@ pub(super) struct RollupWindow<'a> {
     pub(super) window: i64,
 }
 
+pub(super) fn exec_rollups(
+    ctx: &EvalContext,
+    range_vec: Vec<EvalSamples>,
+    rollup_fn: fn(&RollupWindow) -> f64,
+) -> EvalResult<Vec<EvalSamples>>
+{
+    let results = range_vec
+        .into_par()
+        .map(|series| exec_series_rollup(ctx, series, rollup_fn))
+        .collect();
+
+    Ok(results)
+}
+
 /// Evaluates a rollup function over a given time range and step interval.
 ///
 /// This function is the primary engine for executing PromQL range vector functions (e.g., `rate`, `sum_over_time`).
@@ -80,13 +94,11 @@ pub(super) struct RollupWindow<'a> {
 ///     that require them (e.g., `deriv`, `rate`).
 /// 4.  **In-place Collection:** The resulting samples are collected back into the original `series.values`
 ///     vector, effectively reusing the memory.
-pub(super) fn exec_rollups<F>(
+pub(super) fn exec_series_rollup(
     ctx: &EvalContext,
     mut series: EvalSamples,
-    rollup_fn: F,
+    rollup_fn: fn(&RollupWindow) -> f64,
 ) -> EvalSamples
-where
-    F: Fn(&RollupWindow) -> f64 + Sync + Clone,
 {
     let window = series.range_ms;
     let lookback = ctx.lookback_delta_ms;
@@ -115,8 +127,7 @@ where
         .filter_map(move |(idx, t_end)| {
             let t_start = t_end - window;
 
-            // Compute absolute start/end indexes for this timestamp. We don't rely on
-            // shared mutable hints here, so the closure is Clone + Sync-friendly for parallel execution.
+            // Compute absolute start/end indexes for this step.
             let i = seek_first_timestamp_idx_after(&timestamps, t_start, 0);
             let j = seek_first_timestamp_idx_after(&timestamps, t_end, i);
 
@@ -179,6 +190,7 @@ where
             rollup_window.curr_timestamp = t_end;
             rollup_window.idx = idx;
 
+            // Call the wrapped function via a reference to the inner Fn.
             let value = rollup_fn(&rollup_window);
             Some(Sample {
                 value,
@@ -230,9 +242,12 @@ fn seek_first_timestamp_idx_after(
         .saturating_add(slice_start)
 }
 
-pub(super) fn eval_range_basic<F>(
-    series_data: Vec<EvalSamples>,
+/// An alternate implementation of rollup evaluation that operates directly on `Sample` objects without de-interleaving
+/// into separate vectors. It can be used for testing or as a fallback for simpler rollup functions that don't benefit
+/// from vectorization like `absent_over_time` and `count_over_time`
+pub(super) fn eval_rollups_basic<F>(
     ctx: &EvalContext,
+    series_data: Vec<EvalSamples>,
     f: F,
 ) -> Vec<EvalSamples>
 where

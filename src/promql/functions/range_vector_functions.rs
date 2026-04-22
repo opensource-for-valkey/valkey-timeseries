@@ -9,6 +9,41 @@ use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 
+/// Generic aggregator for range vector functions. As opposed to `aggr_over_time`, this operates
+/// over the entire range rather than bucketed windows.
+///
+/// Invariant:
+/// - Each input series is reduced to a single output sample at eval_timestamp_ms.
+/// - Empty series are skipped (matching Prometheus behavior).
+/// - Aggregation function `f` must implement PromQL float semantics exactly.
+pub(super) fn eval_range<F>(
+    series: Vec<EvalSamples>,
+    eval_timestamp_ms: i64,
+    f: F,
+) -> ExprResult
+where
+    F: Fn(&[Sample]) -> f64 + Send + Sync,
+{
+    let res = series
+        .into_par()
+        .filter_map(|series| {
+            if series.values.is_empty() {
+                None
+            } else {
+                let value = f(&series.values);
+                Some(EvalSample {
+                    timestamp_ms: eval_timestamp_ms,
+                    value,
+                    labels: series.labels,
+                    drop_name: series.drop_name,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    ExprResult::InstantVector(res)
+}
+
 /// Generic aggregator for range vector functions.
 ///
 /// Invariant:
@@ -45,7 +80,6 @@ where
 
 /// Sum over time function: sums all sample values in the range
 /// Uses Kahan summation for numerical stability
-/// TODO: Add histogram support when histogram types are implemented
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct SumOverTimeFunction;
 
@@ -312,7 +346,7 @@ pub(in crate::promql) struct ResetsFunction;
 impl PromQLFunction for ResetsFunction {
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+        Ok(eval_range(samples, eval_timestamp_ms, |values| {
             if values.is_empty() {
                 return 0.0;
             }
@@ -348,7 +382,7 @@ pub(in crate::promql) struct ChangesFunction;
 impl PromQLFunction for ChangesFunction {
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(aggr_over_time(samples, eval_timestamp_ms, |values| {
+        Ok(eval_range(samples, eval_timestamp_ms, |values| {
             if values.is_empty() {
                 return 0.0;
             }
@@ -377,6 +411,14 @@ impl Default for ChangesFunction {
         Self
     }
 }
+
+pub(in crate::promql) struct IncreaseFunction;
+impl PromQLFunction for IncreaseFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        todo!()
+    }
+}
+
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct TSOfMinOverTimeFunction;
