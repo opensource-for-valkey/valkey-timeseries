@@ -19,7 +19,7 @@ use crate::promql::{
 };
 use ahash::{AHashMap, AHashSet};
 use orx_parallel::{IntoParIter, ParIter};
-use promql_parser::parser::{VectorSelector};
+use promql_parser::parser::VectorSelector;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -66,9 +66,7 @@ impl QueryPlan {
     /// Shape all loaded bucket data into the final ExprResult for this path.
     fn shape(&self, all_bucket_data: Vec<EvalSamples>) -> ExprResult {
         match &self.path_kind {
-            QueryPathKind::InstantVector { .. } => {
-                shape_instant_results(all_bucket_data)
-            }
+            QueryPathKind::InstantVector { .. } => shape_instant_results(all_bucket_data),
             QueryPathKind::Matrix => shape_matrix_results(
                 all_bucket_data,
                 self.sample_end_ms - self.sample_start_ms,
@@ -80,7 +78,6 @@ impl QueryPlan {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Phase 1: Planning
@@ -394,14 +391,12 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
         .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
         .into_iter()
-        .map(|s| {
-            EvalSamples {
-                labels: s.labels,
-                drop_name: false,
-                range_ms: range,
-                values: s.samples,
-                range_end_ms: plan.sample_end_ms,
-            }
+        .map(|s| EvalSamples {
+            labels: s.labels,
+            drop_name: false,
+            range_ms: range,
+            values: s.samples,
+            range_end_ms: plan.sample_end_ms,
         })
         .collect::<Vec<_>>();
 
@@ -449,10 +444,7 @@ mod tests {
         Sample::new(ts, val)
     }
 
-    fn make_loaded(
-        labels: Vec<Label>,
-        samples: Vec<Sample>,
-    ) -> EvalSamples {
+    fn make_loaded(labels: Vec<Label>, samples: Vec<Sample>) -> EvalSamples {
         EvalSamples {
             labels: Labels::new(labels),
             drop_name: false,
