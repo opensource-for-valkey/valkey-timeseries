@@ -11,12 +11,12 @@ mod math_functions;
 mod predict_linear;
 mod range_vector_functions;
 mod rate;
+mod rollup_fns;
 mod rollup_window;
 mod sort;
 mod special_functions;
 mod types;
 pub(crate) mod utils;
-mod rollup_fns;
 
 pub(crate) use function_list::*;
 pub(crate) use types::*;
