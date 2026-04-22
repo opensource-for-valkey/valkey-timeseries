@@ -19,11 +19,7 @@ pub(super) fn eval_binop_scalar_vector(
                 if is_comparison && !return_bool && value == 0.0 {
                     false
                 } else {
-                    // For non-bool comparison ops, keep the original vector (RHS) value.
-                    // Only overwrite the value for arithmetic ops or bool comparisons.
-                    if !is_comparison || return_bool {
-                        sample.value = value;
-                    }
+                    sample.value = value;
                     sample.drop_name |= changes_metric_schema(expr.op) || return_bool;
                     true
                 }
