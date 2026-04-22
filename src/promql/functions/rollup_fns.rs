@@ -1,17 +1,66 @@
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
-use crate::promql::functions::rollup_window::RollupWindow;
+use crate::common::Sample;
+use crate::promql::functions::rollup_window::{eval_rollups_basic, exec_rollups, RollupWindow};
+use crate::promql::functions::utils::expect_exact_arg_count;
+use crate::promql::functions::PromQLArg;
+use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
+use crate::promql::functions::PromQLFunction;
 // https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmselect/promql/rollup.go
 
 const NAN: f64 = f64::NAN;
 
-macro_rules! make_factory {
-    ( $name: ident, $rf: expr ) => {
-        #[inline]
-        pub(super) fn $name(_: &[QueryValue]) -> RuntimeResult<RollupHandler> {
-            Ok(RollupHandler::wrap($rf))
+
+pub(super) fn exec_rollup_fn(name: &str, mut args: Vec<PromQLArg>, ctx: &EvalContext, f: fn(&RollupWindow) -> f64) -> EvalResult<ExprResult> {
+    expect_exact_arg_count(name, 1, args.len())?;
+    let range = args.swap_remove(0).into_range_vector()?;
+    let rollups = exec_rollups(ctx, range, f)?;
+    Ok(ExprResult::RangeVector(rollups))
+}
+
+pub(super) fn exec_basic_rollup_fn(name: &str, mut args: Vec<PromQLArg>, ctx: &EvalContext, f: fn(&[Sample]) -> f64) -> EvalResult<ExprResult> {
+    expect_exact_arg_count(name, 1, args.len())?;
+    let range = args.swap_remove(0).into_range_vector()?;
+    let rollups = eval_rollups_basic(ctx, range, f);
+    Ok(ExprResult::RangeVector(rollups))
+}
+
+macro_rules! make_rollup_function {
+    ( $type_name: ident, $name: expr, $rf: expr) => {
+        #[derive(Copy, Clone, Default)]
+        pub(in crate::promql) struct $type_name;
+
+        impl $type_name {
+            pub fn new() -> Self {
+                Self
+            }
+        }
+
+        impl PromQLFunction for $type_name {
+            fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+                Err(EvaluationError::ArgumentError(format!(
+                    "invalid invocation of rollup function '{}'",
+                    $name
+                )))
+            }
+
+            fn apply_call(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+                exec_rollup_fn($name, args, ctx, $rf)
+            }
         }
     };
 }
+
+
+make_rollup_function!(RollupAvgFunction, "avg_over_time", rollup_avg);
+make_rollup_function!(RollupMinFunction, "min_over_time", rollup_min);
+make_rollup_function!(RollupMadFunction, "mad_over_time", rollup_mad);
+make_rollup_function!(RollupMaxFunction, "max_over_time", rollup_max);
+make_rollup_function!(RollupSumFunction, "sum_over_time", rollup_sum);
+make_rollup_function!(RollupTminFunction, "ts_of_min_over_time", rollup_ts_of_min);
+make_rollup_function!(RollupTmaxFunction, "ts_of_max_over_time", rollup_ts_of_max);
+make_rollup_function!(RollupStddevFunction, "stddev_over_time", rollup_stddev);
+make_rollup_function!(RollupStdvarFunction, "stdvar_over_time", rollup_stdvar);
+
 
 /// Removes resets for rollup functions over counters - see rollupFuncsRemoveCounterResetsAdd comment.
 /// It doesn't remove resets between samples with staleNaNs, or samples that exceed maxStalenessInterval
@@ -69,11 +118,11 @@ pub(super) fn remove_counter_resets(
     }
 }
 
-pub(super) fn rollup_avg(rfa: &RollupWindow) -> f64 {
+fn rollup_avg(rfa: &RollupWindow) -> f64 {
     kahan_avg(rfa.values)
 }
 
-pub(super) fn rollup_min(rfa: &RollupWindow) -> f64 {
+fn rollup_min(rfa: &RollupWindow) -> f64 {
     let mut min = rfa.values[0];
 
     for &cur in rfa.values.iter().skip(1) {
@@ -84,7 +133,7 @@ pub(super) fn rollup_min(rfa: &RollupWindow) -> f64 {
     min
 }
 
-pub(crate) fn rollup_mad(rfa: &RollupWindow) -> f64 {
+fn rollup_mad(rfa: &RollupWindow) -> f64 {
     let mut values = rfa.values.to_vec();
 
     let median = quantile(&mut values, 0.5);
@@ -97,8 +146,9 @@ pub(crate) fn rollup_mad(rfa: &RollupWindow) -> f64 {
     quantile(&mut values, 0.5)
 }
 
+
 /// max with prometheus semantics
-pub(super) fn rollup_max(rfa: &RollupWindow) -> f64 {
+fn rollup_max(rfa: &RollupWindow) -> f64 {
     let mut max = rfa.values[0];
     for &cur in rfa.values.iter().skip(1) {
         if cur > max || max.is_nan() {
@@ -108,7 +158,7 @@ pub(super) fn rollup_max(rfa: &RollupWindow) -> f64 {
     max
 }
 
-pub(super) fn rollup_tmin(rfa: &RollupWindow) -> f64 {
+fn rollup_ts_of_min(rfa: &RollupWindow) -> f64 {
     let values = rfa.values;
     let mut min_value = values[0];
     let mut min_timestamp = rfa.timestamps[0];
@@ -127,7 +177,7 @@ pub(super) fn rollup_tmin(rfa: &RollupWindow) -> f64 {
     min_timestamp as f64 / 1e3_f64
 }
 
-pub(super) fn rollup_tmax(rfa: &RollupWindow) -> f64 {
+fn rollup_ts_of_max(rfa: &RollupWindow) -> f64 {
     let mut max_value = rfa.values[0];
     let mut max_timestamp = rfa.timestamps[0];
 
@@ -147,139 +197,48 @@ pub(super) fn rollup_tmax(rfa: &RollupWindow) -> f64 {
     max_timestamp as f64 / 1e3_f64
 }
 
-pub(super) fn rollup_tfirst(rfa: &RollupWindow) -> f64 {
-    if rfa.timestamps.is_empty() {
-        // do not take into account rfa.prev_timestamp, since it may lead
-        // to inconsistent results comparing to Prometheus on broken time series
-        // with irregular data points.
-        return NAN;
-    }
-    rfa.timestamps[0] as f64 / 1e3_f64
-}
 
-pub(super) fn rollup_tlast(rfa: &RollupWindow) -> f64 {
-    let timestamps = rfa.timestamps;
-    if timestamps.is_empty() {
-        // do not take into account rfa.prev_timestamp, since it may lead
-        // to inconsistent results comparing to Prometheus on broken time series
-        // with irregular data points.
-        return NAN;
-    }
-    timestamps[timestamps.len() - 1] as f64 / 1e3_f64
-}
-
-pub(super) fn rollup_sum(rfa: &RollupWindow) -> f64 {
+fn rollup_sum(rfa: &RollupWindow) -> f64 {
     kahan_sum(rfa.values)
 }
 
-pub(super) fn rollup_stddev(rfa: &RollupWindow) -> f64 {
+fn rollup_stddev(rfa: &RollupWindow) -> f64 {
     kahan_std_dev(rfa.values)
 }
 
-pub(super) fn rollup_stdvar(rfa: &RollupWindow) -> f64 {
+fn rollup_stdvar(rfa: &RollupWindow) -> f64 {
     kahan_variance(rfa.values)
 }
 
-#[inline]
-fn change_below_tolerance(v: f64, prev_value: f64) -> bool {
-    let tolerance = 1e-12 * v.abs();
-    (v - prev_value).abs() < tolerance
+
+fn rollup_present(samples: &[Sample]) -> f64 {
+    if !samples.is_empty() {
+        1.0
+    } else {
+        0.0
+    }
 }
 
-pub(super) fn rollup_changes(rfa: &RollupWindow) -> f64 {
-    // Do not take into account rfa.prev_value like Prometheus does.
-    let mut prev_value = rfa.values[0];
-    let mut n = 0;
-    for v in rfa.values.iter().copied().skip(1) {
-        if v != prev_value {
-            if change_below_tolerance(v, prev_value) {
-                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                continue;
-            }
-            n += 1;
-            prev_value = v;
-        }
-    }
-
-    n as f64
+fn rollup_count(samples: &[Sample]) -> f64 {
+    samples.len() as f64
 }
 
-pub(super) fn rollup_increases(rfa: &RollupWindow) -> f64 {
-    let mut prev_value = rfa.prev_value;
-    let mut values = &rfa.values[0..];
-
-    if values.is_empty() {
-        if prev_value.is_nan() {
-            return NAN;
-        }
-        return 0.0;
-    }
-
-    if prev_value.is_nan() {
-        prev_value = values[0];
-        values = &values[1..];
-    }
-
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let mut n = 0;
-    for val in values.iter().copied() {
-        if val > prev_value {
-            if change_below_tolerance(val, prev_value) {
-                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                continue;
-            }
-            n += 1;
-        }
-        prev_value = val;
-    }
-
-    n as f64
+fn rollup_tfirst(samples: &[Sample]) -> f64 {
+    // Safety: the caller ensures !samples.is_empty()
+    samples[0].timestamp as f64 / 1e3_f64
 }
 
-pub(super) fn rollup_resets(rfa: &RollupWindow) -> f64 {
-    let mut values = &rfa.values[0..];
-    if values.is_empty() {
-        if rfa.prev_value.is_nan() {
-            return NAN;
-        }
-        return 0.0;
-    }
-
-    let mut prev_value = rfa.prev_value;
-    if prev_value.is_nan() {
-        prev_value = values[0];
-        values = &values[1..];
-    }
-
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let mut n = 0;
-    for val in values.iter().copied() {
-        if val < prev_value {
-            if change_below_tolerance(val, prev_value) {
-                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                continue;
-            }
-            n += 1;
-        }
-        prev_value = val;
-    }
-
-    n as f64
+fn rollup_tlast(samples: &[Sample]) -> f64 {
+    // Safety: the caller ensures !samples.is_empty()
+    samples[samples.len()].timestamp as f64 / 1e3_f64
 }
 
-pub(super) fn rollup_first(rfa: &RollupWindow) -> f64 {
-    let values = rfa.values;
-    if values.is_empty() {
-        // do not take into account rfa.prev_value, since it may lead
-        // to inconsistent results comparing to Prometheus on broken time series
-        // with irregular data points.
-        return NAN;
-    }
-    values[0]
+fn rollup_first(samples: &[Sample]) -> f64 {
+    // Safety: the caller ensures !samples.is_empty()
+    samples[0].value
+}
+
+fn rollup_last(samples: &[Sample]) -> f64 {
+    // Safety: the caller ensures !samples.is_empty()
+    samples[samples.len() - 1].value
 }
