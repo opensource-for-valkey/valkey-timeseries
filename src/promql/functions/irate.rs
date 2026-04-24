@@ -1,3 +1,4 @@
+use crate::promql::functions::range_vector_functions::eval_range;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalResult, ExprResult};
 
@@ -7,7 +8,7 @@ pub(in crate::promql) struct IRateFunction;
 impl PromQLFunction for IRateFunction {
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(super::range_vector_functions::eval_range(samples, eval_timestamp_ms, |samples| {
+        Ok(eval_range(samples, eval_timestamp_ms, |samples| {
             if samples.len() < 2 {
                 return None;
             }

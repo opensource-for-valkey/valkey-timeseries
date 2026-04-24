@@ -1,3 +1,4 @@
+use crate::common::Timestamp;
 use crate::promql::{
     EvalContext, EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult,
 };
@@ -207,4 +208,35 @@ impl Default for UnaryFunction {
 
 pub struct RangeFunctionOpts {
     pub step_ms: i64,
+}
+
+#[derive(Default, Clone, Debug)]
+pub(super) struct RollupWindow<'a> {
+    /// The value preceding values if it fits the staleness interval.
+    pub(super) prev_value: f64,
+
+    /// The timestamp for prev_value.
+    pub(super) prev_timestamp: Timestamp,
+
+    /// Values that fit the window ending at curr_timestamp.
+    pub(crate) values: &'a [f64],
+
+    /// Timestamps for values.
+    pub(crate) timestamps: &'a [Timestamp],
+
+    /// Real value preceding value
+    /// Populated if the preceding value is within the staleness interval.
+    pub(super) real_prev_value: f64,
+
+    /// Real value that goes after values.
+    pub(crate) real_next_value: f64,
+
+    /// Current timestamp for rollup evaluation.
+    pub(super) curr_timestamp: Timestamp,
+
+    /// Index for the currently evaluated point relative to the time range for query evaluation.
+    pub(super) idx: usize,
+
+    /// Time window for rollup calculations.
+    pub(super) window: i64,
 }

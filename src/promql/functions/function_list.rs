@@ -1,6 +1,3 @@
-//! Single-source-of-truth macro prototype for PromQL function mappings.
-//! This module defines the `PromqlFunctionKind` enum and the `PromQLFunctionImpl` dispatch enum, both
-//!
 use crate::promql::functions::date_functions::{
     DayOfMonthFunction, DayOfWeekFunction, DayOfYearFunction, DaysInMonthFunction, HourFunction,
     MinuteFunction, MonthFunction, TimeFunction, TimestampFunction, YearFunction,
@@ -8,8 +5,8 @@ use crate::promql::functions::date_functions::{
 use crate::promql::functions::deriv::DerivFunction;
 use crate::promql::functions::histogram::{HistogramFractionFunctions, HistogramQuantileFunction};
 use crate::promql::functions::holt_winters::DoubleExponentialSmoothingFunction;
-use crate::promql::functions::irate::IRateFunction;
 use crate::promql::functions::idelta::IDeltaFunction;
+use crate::promql::functions::irate::IRateFunction;
 use crate::promql::functions::labels::{LabelJoinFunction, LabelReplaceFunction};
 use crate::promql::functions::math_functions::{
     AbsFunction, AcosFunction, AcoshFunction, AsinFunction, AsinhFunction, AtanFunction,
@@ -20,14 +17,14 @@ use crate::promql::functions::math_functions::{
 };
 use crate::promql::functions::predict_linear::PredictLinearFunction;
 use crate::promql::functions::range_vector_functions::{ChangesFunction, ResetsFunction};
-use crate::promql::functions::rollups::{
-    AbsentOverTimeFunction, AvgOverTimeFunction, CountOverTimeFunction,
-    FirstOverTimeFunction, LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction,
-    MinOverTimeFunction, PresentOverTimeFunction, QuantileOverTimeFunction,
-    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
+use crate::promql::functions::rate::{DeltaFunction, IncreaseFunction, RateFunction};
+use crate::promql::functions::rollup_functions::{
+    AbsentOverTimeFunction, AvgOverTimeFunction, CountOverTimeFunction, FirstOverTimeFunction,
+    LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction, MinOverTimeFunction,
+    PresentOverTimeFunction, QuantileOverTimeFunction, StddevOverTimeFunction,
+    StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
     TsOfLastOverTimeFunction, TsOfMaxOverTimeFunction, TsOfMinOverTimeFunction,
 };
-use crate::promql::functions::rate::{DeltaFunction, RateFunction, IncreaseFunction};
 use crate::promql::functions::sort::{
     SortByLabelDescFunction, SortByLabelFunction, SortDescFunction, SortFunction,
 };
@@ -106,14 +103,6 @@ macro_rules! impl_promql_function_impl {
                 }
             }
 
-            #[inline]
-            pub(crate) fn from_kind(kind: PromqlFunctionKind) -> Option<Self> {
-                use PromqlFunctionKind::*;
-                Some(match kind {
-                    $( $Variant => Self::$Variant($Ty), )*
-                })
-            }
-
             pub(crate) fn kind(&self) -> PromqlFunctionKind {
                 match self {
                     $( Self::$Variant(_) => PromqlFunctionKind::$Variant, )*
@@ -178,7 +167,7 @@ macro_rules! impl_promql_function_impl {
     };
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// Single canonical list.
+// Single canonical list of promql functions.
 //
 // ADD NEW FUNCTIONS HERE.  Each entry:
 //   (MyFunction, "my_function", MyFunction)
