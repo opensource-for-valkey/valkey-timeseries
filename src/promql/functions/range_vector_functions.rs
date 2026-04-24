@@ -12,11 +12,7 @@ use orx_parallel::ParIter;
 /// - Each input series is reduced to a single output sample at eval_timestamp_ms.
 /// - Empty series are skipped (matching Prometheus behavior).
 /// - Aggregation function `f` must implement PromQL float semantics exactly.
-pub(super) fn eval_range<F>(
-    series: Vec<EvalSamples>,
-    eval_timestamp_ms: i64,
-    f: F,
-) -> ExprResult
+pub(super) fn eval_range<F>(series: Vec<EvalSamples>, eval_timestamp_ms: i64, f: F) -> ExprResult
 where
     F: Fn(&[Sample]) -> Option<f64> + Send + Sync,
 {
@@ -73,7 +69,6 @@ where
     ExprResult::InstantVector(vec)
 }
 
-
 /// Returns the number of counter-resets within the provided time range as an instant vector. Any decrease in the value
 /// between two consecutive float samples is interpreted as a counter-reset.
 #[derive(Copy, Clone)]
@@ -102,12 +97,6 @@ impl PromQLFunction for ResetsFunction {
 
             Some(n as f64)
         }))
-    }
-}
-
-impl Default for ResetsFunction {
-    fn default() -> Self {
-        Self
     }
 }
 

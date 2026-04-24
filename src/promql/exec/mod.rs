@@ -1,6 +1,5 @@
 mod evaluator;
 mod pipeline;
-mod selector;
 pub mod types;
 mod utils;
 

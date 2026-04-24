@@ -1,6 +1,6 @@
 use crate::promql::common::math::sample_regression;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
+use crate::promql::{EvalResult, EvalSample, ExprResult};
 use orx_parallel::{IntoParIter, ParIter};
 
 #[derive(Copy, Clone)]
@@ -13,12 +13,15 @@ impl PromQLFunction for DerivFunction {
         let out = series
             .into_par()
             .filter_map(|series| {
-                let value = deriv_value(&series)?;
+                let (slope, _intercept) = sample_regression(&series.values)?;
+                if slope.is_nan() {
+                    return None;
+                }
 
                 Some(EvalSample {
                     labels: series.labels,
                     timestamp_ms: eval_timestamp_ms,
-                    value,
+                    value: slope,
                     drop_name: false,
                 })
             })
@@ -26,12 +29,4 @@ impl PromQLFunction for DerivFunction {
 
         Ok(ExprResult::InstantVector(out))
     }
-}
-
-fn deriv_value(series: &EvalSamples) -> Option<f64> {
-    let (slope, _intercept) = sample_regression(&series.values)?;
-    if slope.is_nan() {
-        return None;
-    }
-    Some(slope)
 }

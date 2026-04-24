@@ -20,12 +20,6 @@ impl PromQLFunction for TimestampFunction {
     }
 }
 
-impl Default for TimestampFunction {
-    fn default() -> Self {
-        TimestampFunction
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DateTimePart {
     Year,
@@ -173,11 +167,5 @@ impl PromQLFunction for TimeFunction {
             labels: Default::default(),
             drop_name: false,
         }]))
-    }
-}
-
-impl Default for TimeFunction {
-    fn default() -> Self {
-        TimeFunction
     }
 }

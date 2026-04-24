@@ -104,6 +104,16 @@ impl EvalSamples {
     pub fn label_value(&self, label: &str) -> Option<&str> {
         self.labels.get(label)
     }
+
+    #[cfg(test)]
+    pub fn first_sample(&self) -> Option<&Sample> {
+        self.values.first()
+    }
+
+    #[cfg(test)]
+    pub fn last_sample(&self) -> Option<&Sample> {
+        self.values.last()
+    }
 }
 
 #[derive(Debug)]

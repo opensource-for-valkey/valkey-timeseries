@@ -11,9 +11,8 @@
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
 use crate::common::{Sample, Timestamp};
-use crate::labels::Label;
 use crate::promql::engine::{CachedQueryReader, QueryReader};
-use crate::promql::hashers::{HasFingerprint, SeriesFingerprint};
+use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
 };
@@ -366,12 +365,10 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
             .collect::<Vec<_>>();
 
         timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
-        timings.shape_samples_ms = 0.0; // no shaping needed for instant vector
 
         tracing::debug!(
             path = plan.path_kind.name(),
             load_ms = format!("{:.2}", timings.sample_load_ms),
-            shape_ms = format!("{:.2}", timings.shape_samples_ms),
             "pipeline phase timings"
         );
 
@@ -385,56 +382,72 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     // 1ms to enforce the exclusive lower-bound semantics expected by the
     // pipeline. Use saturating_add to avoid overflow on extreme values.
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
-    let range = plan.sample_end_ms - plan.sample_start_ms;
 
-    let series_data = reader
+    let raw_range_samples = reader
         .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
-        .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
-        .into_iter()
-        .map(|s| EvalSamples {
-            labels: s.labels,
-            drop_name: false,
-            range_ms: range,
-            values: s.samples,
-            range_end_ms: plan.sample_end_ms,
-        })
-        .collect::<Vec<_>>();
+        .map_err(|e| EvaluationError::InternalError(e.to_string()))?; // todo: audit error
 
     timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
     // Phase: ShapeSamples
     let t2 = Instant::now();
-    let result = plan.shape(series_data);
+
+    let result = match &plan.path_kind {
+        QueryPathKind::SubqueryVectorSelector { .. } => {
+            // For the subquery fast path the fetch range includes a backward
+            // extension by `lookback_delta_ms` so the first step has data.
+            // The raw samples therefore span more than the declared subquery
+            // range; we must apply the per-step sliding-window bucketing
+            // (`shape_subquery_results`) so that:
+            //   1. Only the sample most-recently-seen at each step is kept.
+            //   2. `range_ms` on the returned `EvalSamples` reflects the
+            //      actual subquery range (not the extended fetch range).
+            let series: Vec<EvalSamples> = raw_range_samples
+                .into_iter()
+                .map(|s| EvalSamples {
+                    labels: s.labels,
+                    drop_name: false,
+                    range_ms: 0, // overwritten by shape_subquery_results
+                    values: s.samples,
+                    range_end_ms: plan.sample_end_ms,
+                })
+                .collect();
+            let shaped = shape_subquery_results(series, plan);
+            ExprResult::RangeVector(shaped)
+        }
+        _ => {
+            // Matrix selector: the fetch range equals the declared query range,
+            // so `range_ms` can be computed directly from the plan bounds.
+            let range = plan.sample_end_ms - plan.sample_start_ms;
+            let series: Vec<EvalSamples> = raw_range_samples
+                .into_iter()
+                .map(|s| EvalSamples {
+                    labels: s.labels,
+                    drop_name: false,
+                    range_ms: range,
+                    values: s.samples,
+                    range_end_ms: plan.sample_end_ms,
+                })
+                .collect();
+            ExprResult::RangeVector(series)
+        }
+    };
+
     timings.shape_samples_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
     tracing::debug!(
         path = plan.path_kind.name(),
         load_ms = format!("{:.2}", timings.sample_load_ms),
-        shape_ms = format!("{:.2}", timings.shape_samples_ms),
         "pipeline phase timings"
     );
 
     Ok(result)
 }
 
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
-
-/// Compute a fingerprint from a label slice for series deduplication.
-///
-/// Sorts labels by name (consistent with the existing evaluator implementation)
-/// and hashes them. Two label sets that are logically identical will produce the
-/// same fingerprint regardless of the order they are stored in.
-pub(crate) fn compute_fingerprint(labels: &[Label]) -> SeriesFingerprint {
-    let mut to_hash = labels.to_vec();
-    to_hash.sort();
-    to_hash.fingerprint()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::labels::Label;
 
     fn label(name: &str, value: &str) -> Label {
         Label::new(name, value)
@@ -571,19 +584,5 @@ mod tests {
         // Step 30: latest sample <= 30 with ts > 20 -> sample at t=25, value=3.0
         assert_eq!(values[2].timestamp, 30);
         assert_eq!(values[2].value, 3.0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Utility tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn fingerprint_order_independent() {
-        let labels_a = vec![label("b", "2"), label("a", "1")];
-        let labels_b = vec![label("a", "1"), label("b", "2")];
-        assert_eq!(
-            compute_fingerprint(&labels_a),
-            compute_fingerprint(&labels_b)
-        );
     }
 }
