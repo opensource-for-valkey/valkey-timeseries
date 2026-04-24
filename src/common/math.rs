@@ -134,7 +134,7 @@ pub(crate) fn kahan_variance(values: &[f64]) -> f64 {
 
 pub(crate) fn kahan_std_dev(values: &[f64]) -> f64 {
     if values.len() == 1 {
-        return values[0];
+        return 0.0;
     }
     let variance = kahan_variance(values);
     variance.sqrt()

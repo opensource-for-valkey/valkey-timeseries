@@ -24,12 +24,6 @@ impl PromQLFunction for AbsentFunction {
     }
 }
 
-impl Default for AbsentFunction {
-    fn default() -> Self {
-        AbsentFunction
-    }
-}
-
 /// Scalar function: converts a single-element vector to scalar (returns as-is or empty)
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct ScalarFunction;
@@ -52,12 +46,6 @@ impl PromQLFunction for ScalarFunction {
     }
 }
 
-impl Default for ScalarFunction {
-    fn default() -> Self {
-        ScalarFunction
-    }
-}
-
 /// Vector function: converts a scalar value to a single-element instant vector with no labels.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct VectorFunction;
@@ -70,11 +58,5 @@ impl PromQLFunction for VectorFunction {
             labels: Default::default(),
             drop_name: false,
         }]))
-    }
-}
-
-impl Default for VectorFunction {
-    fn default() -> Self {
-        VectorFunction
     }
 }

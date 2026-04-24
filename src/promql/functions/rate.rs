@@ -4,7 +4,7 @@ use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
 use orx_parallel::{IntoParIter, ParIter};
 
 #[derive(Clone, Copy, Debug)]
-enum RateKind {
+pub(in crate::promql) enum RateKind {
     Rate,
     Increase,
     Delta,
@@ -38,25 +38,27 @@ impl PromQLFunction for IncreaseFunction {
     }
 }
 
-fn calculate_rate(arg: PromQLArg, eval_timestamp_ms: i64, kind: RateKind) -> EvalResult<ExprResult> {
+fn calculate_rate(
+    arg: PromQLArg,
+    eval_timestamp_ms: i64,
+    kind: RateKind,
+) -> EvalResult<ExprResult> {
     let samples = arg.into_range_vector()?;
     let result = samples
         .into_par()
         .filter_map(|sample_series| {
-            let Some(value) = extrapolated_rate(&sample_series, kind) else {
-                return None;
-            };
+            let value = extrapolated_rate(&sample_series, kind)?;
             Some(EvalSample {
                 timestamp_ms: eval_timestamp_ms,
                 value,
                 labels: sample_series.labels,
                 drop_name: false,
             })
-        }).collect();
+        })
+        .collect();
 
     Ok(ExprResult::InstantVector(result))
 }
-
 
 fn counter_increase_value(samples: &[Sample]) -> Option<f64> {
     let mut total = 0.0;
@@ -83,7 +85,6 @@ fn sample_delta_value(samples: &[Sample]) -> Option<f64> {
     Some(samples.last()?.value - samples.first()?.value)
 }
 
-
 /// Computes counter-reset-corrected increase for a sample series.
 /// Walks through samples and accumulates previous values at each reset point.
 fn counter_reset_increase(values: &[Sample]) -> f64 {
@@ -101,10 +102,7 @@ fn counter_reset_increase(values: &[Sample]) -> f64 {
 }
 
 /// Computes extrapolated rate for a series as per Prometheus logic.
-pub(super) fn extrapolated_rate(
-    samples: &EvalSamples,
-    kind: RateKind,
-) -> Option<f64> {
+pub(in crate::promql) fn extrapolated_rate(samples: &EvalSamples, kind: RateKind) -> Option<f64> {
     if samples.values.len() < 2 {
         return None;
     }
@@ -130,12 +128,19 @@ pub(super) fn extrapolated_rate(
         sample_delta_value(samples)?
     };
 
-
     // Duration between first/last samples and boundary of range
     let duration_to_start = (first_t - range_start) as f64 / 1000.0;
     let duration_to_end = (range_end - last_t) as f64 / 1000.0;
 
     let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+
+    // When all samples share the same timestamp the sampled interval is 0.
+    // Division by zero below would produce ±Inf / NaN; return None so the
+    // series is excluded from the result, matching Prometheus semantics.
+    if sampled_interval == 0.0 {
+        return None;
+    }
+
     let average_duration_between_samples = sampled_interval / (count - 1) as f64;
 
     let extrapolation_threshold = average_duration_between_samples * 1.1;
@@ -153,8 +158,7 @@ pub(super) fn extrapolated_rate(
         // than the durationToStart, we take the zero point as the start
         // of the series, thereby avoiding extrapolation to negative
         // counter values.
-        let duration_to_zero = if result > 0.0
-            && first_sample.value >= 0.0 {
+        let duration_to_zero = if result > 0.0 && first_sample.value >= 0.0 {
             sampled_interval * (first_sample.value / result)
         } else {
             duration_to_start
