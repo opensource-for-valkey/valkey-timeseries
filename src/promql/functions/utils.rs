@@ -8,53 +8,6 @@ use promql_parser::parser::Expr;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 
-/// Average calculation matching Prometheus semantics.
-///
-/// Strategy:
-/// 1. Use Kahan summation for numerical stability.
-/// 2. If the intermediate sum overflows to ±Inf, switch to incremental mean
-///    to avoid poisoning the entire result.
-///
-/// This mirrors Prometheus' hybrid strategy and prevents overflow-induced
-/// divergence while maintaining IEEE-754 parity.
-pub(in crate::promql) fn avg_kahan(values: &[Sample]) -> f64 {
-    if values.len() == 1 {
-        return values[0].value;
-    }
-
-    let mut sum = values[0].value;
-    let mut c = 0.0;
-    let mut mean = 0.0;
-    let mut incremental = false;
-
-    for (i, sample) in values.iter().enumerate().skip(1) {
-        let count = (i + 1) as f64;
-
-        if !incremental {
-            let (new_sum, new_c) = kahan_inc(sample.value, sum, c);
-            if !new_sum.is_infinite() {
-                sum = new_sum;
-                c = new_c;
-                continue;
-            }
-
-            incremental = true;
-            mean = sum / (count - 1.0);
-            c /= count - 1.0;
-        }
-
-        let q = (count - 1.0) / count;
-        (mean, c) = kahan_inc(sample.value / count, q * mean, q * c);
-    }
-
-    if incremental {
-        mean + c
-    } else {
-        let count = values.len() as f64;
-        sum / count + c / count
-    }
-}
-
 /// Variance calculation using Welford's online algorithm (1962)
 /// with compensated summation for improved numerical stability.
 ///

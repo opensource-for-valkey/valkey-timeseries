@@ -1,12 +1,13 @@
-use crate::promql::{EvalResult, ExprResult};
+use crate::promql::functions::range_vector_functions::eval_range;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
+use crate::promql::{EvalResult, ExprResult};
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::promql) struct IDeltaFunction;
 impl PromQLFunction for IDeltaFunction {
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(super::range_vector_functions::eval_range(samples, eval_timestamp_ms, |samples| {
+        Ok(eval_range(samples, eval_timestamp_ms, |samples| {
             if samples.len() < 2 {
                 return None;
             }

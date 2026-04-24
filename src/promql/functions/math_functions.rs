@@ -75,12 +75,6 @@ impl PromQLFunction for PiFunction {
     }
 }
 
-impl Default for PiFunction {
-    fn default() -> Self {
-        PiFunction
-    }
-}
-
 /// Round function with an optional scalar second argument (`to_nearest`).
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct RoundFunction;
@@ -92,12 +86,6 @@ impl RoundFunction {
         }
         let inv = 1.0 / to_nearest;
         (value * inv + 0.5).floor() / inv
-    }
-}
-
-impl Default for RoundFunction {
-    fn default() -> Self {
-        RoundFunction
     }
 }
 
@@ -165,12 +153,6 @@ impl PromQLFunction for ClampMaxFunction {
     }
 }
 
-impl Default for ClampMaxFunction {
-    fn default() -> Self {
-        ClampMaxFunction
-    }
-}
-
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct ClampMinFunction;
 
@@ -194,12 +176,6 @@ impl PromQLFunction for ClampMinFunction {
             sample.value = max_with_nan(sample.value, min);
         }
         Ok(ExprResult::InstantVector(samples))
-    }
-}
-
-impl Default for ClampMinFunction {
-    fn default() -> Self {
-        ClampMinFunction
     }
 }
 
@@ -232,11 +208,5 @@ impl PromQLFunction for ClampFunction {
             sample.value = max_with_nan(min_with_nan(sample.value, max), min);
         }
         Ok(ExprResult::InstantVector(samples))
-    }
-}
-
-impl Default for ClampFunction {
-    fn default() -> Self {
-        ClampFunction
     }
 }

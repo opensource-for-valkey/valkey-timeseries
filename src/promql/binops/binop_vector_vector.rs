@@ -191,17 +191,11 @@ fn eval_arith_ops_fast_path(
                     )));
                 }
 
-                for li in i..i_end {
-                    let (_, lhs) = &left_sorted[li];
-                    for rj in j..j_end {
-                        let (_, rhs) = &right_sorted[rj];
-
-                        let value = match apply_binary_op(operator, lhs.value, rhs.value) {
-                            Ok(v) => v,
-                            Err(e) => unreachable!(
-                                "binary operator {:?} should not fail on valid f64 inputs: {}",
-                                operator, e
-                            ),
+                for (_, lhs) in &left_sorted[i..i_end] {
+                    for (_, rhs) in &right_sorted[j..j_end] {
+                        let Some(value) = apply_binary_op(operator, lhs.value, rhs.value).ok()
+                        else {
+                            continue;
                         };
 
                         if is_comparison && value == 0.0 {

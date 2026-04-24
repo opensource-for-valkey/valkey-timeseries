@@ -34,12 +34,6 @@ impl PromQLFunction for SortDescFunction {
     }
 }
 
-impl Default for SortDescFunction {
-    fn default() -> Self {
-        Self
-    }
-}
-
 /// `sort_by_label(v instant-vector, label string, ...)`
 ///
 /// returns vector elements sorted by the values of the given labels in ascending order
@@ -60,12 +54,6 @@ impl PromQLFunction for SortByLabelFunction {
     }
 }
 
-impl Default for SortByLabelFunction {
-    fn default() -> Self {
-        Self
-    }
-}
-
 /// `sort_by_label_desc(v instant-vector, label string, ...)`
 ///
 /// returns vector elements sorted by the values of the given labels in descending order
@@ -83,12 +71,6 @@ impl PromQLFunction for SortByLabelDescFunction {
 
     fn is_experimental(&self) -> bool {
         true
-    }
-}
-
-impl Default for SortByLabelDescFunction {
-    fn default() -> Self {
-        Self
     }
 }
 

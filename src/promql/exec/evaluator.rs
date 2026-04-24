@@ -558,7 +558,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         };
 
-        let result = func.apply_call(evaluated_args, &ctx)?;
+        let result = func.apply_call(evaluated_args, ctx)?;
         if call.func.return_type == ValueType::Scalar {
             return match result {
                 ExprResult::Scalar(_) => Ok(result),
