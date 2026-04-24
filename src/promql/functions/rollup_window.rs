@@ -57,12 +57,13 @@ pub(super) struct RollupWindow<'a> {
 pub(super) fn exec_rollups(
     ctx: &EvalContext,
     range_vec: Vec<EvalSamples>,
-    rollup_fn: fn(&RollupWindow) -> f64,
+    optional_param: Option<f64>,
+    rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
 ) -> EvalResult<Vec<EvalSamples>>
 {
     let results = range_vec
         .into_par()
-        .map(|series| exec_series_rollup(ctx, series, rollup_fn))
+        .map(|series| exec_series_rollup(ctx, series, optional_param, rollup_fn))
         .collect();
 
     Ok(results)
@@ -80,13 +81,14 @@ pub(super) fn exec_rollups(
 /// *   `series` - The input time series data. Note that `series.values` is reused as a buffer for the output samples
 ///     to minimize allocations.
 /// *   `range` - The duration of the range vector window (e.g., the `5m` in `rate(http_requests_total[5m])`).
+/// *   `optional_param` - An optional parameter that some rollup functions may require (e.g., the `phi` in `quantile_over_time`).
 /// *   `rollup_fn` - The specific rollup calculation to perform (e.g., sum, average, rate).
 ///
 /// ### Implementation Details
 ///
 /// 1.  **De-interleaving:** It first extracts timestamps and values from the `Sample` structs into two separate
 ///     parallel vectors. This improves cache locality and enables the compiler to use SIMD instructions for
-///     the subsequent rollup calculations.
+///     the later rollup calculations.
 /// 2.  **Parallel Mapping:** It iterates over the query's time steps in parallel. For each step, it identifies
 ///     the subset of samples ("window") that fall within the specified `range` before the step's timestamp.
 /// 3.  **Rollup Application:** It constructs a `RollupWindow` providing the `rollup_fn` with the relevant
@@ -97,7 +99,8 @@ pub(super) fn exec_rollups(
 pub(super) fn exec_series_rollup(
     ctx: &EvalContext,
     mut series: EvalSamples,
-    rollup_fn: fn(&RollupWindow) -> f64,
+    optional_param: Option<f64>,
+    rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
 ) -> EvalSamples
 {
     let window = series.range_ms;
@@ -191,7 +194,7 @@ pub(super) fn exec_series_rollup(
             rollup_window.idx = idx;
 
             // Call the wrapped function via a reference to the inner Fn.
-            let value = rollup_fn(&rollup_window);
+            let value = rollup_fn(&rollup_window, optional_param);
             Some(Sample {
                 value,
                 timestamp: rollup_window.curr_timestamp,
