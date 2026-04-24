@@ -1,6 +1,14 @@
 use crate::common::Sample;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
+use orx_parallel::{IntoParIter, ParIter};
+
+#[derive(Clone, Copy, Debug)]
+enum RateKind {
+    Rate,
+    Increase,
+    Delta,
+}
 
 /// Rate function: calculates per-second rate of change for range vectors
 #[derive(Copy, Clone)]
@@ -8,27 +16,7 @@ pub(in crate::promql) struct RateFunction;
 
 impl PromQLFunction for RateFunction {
     fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        let samples = arg.into_range_vector()?;
-        let mut result = Vec::with_capacity(samples.len());
-
-        for sample_series in samples {
-            if let Some(rate) = extrapolated_rate(&sample_series) {
-                result.push(EvalSample {
-                    timestamp_ms: eval_timestamp_ms,
-                    value: rate,
-                    labels: sample_series.labels,
-                    drop_name: false,
-                });
-            }
-        }
-
-        Ok(ExprResult::InstantVector(result))
-    }
-}
-
-impl Default for RateFunction {
-    fn default() -> Self {
-        RateFunction
+        calculate_rate(arg, eval_timestamp_ms, RateKind::Rate)
     }
 }
 
@@ -36,10 +24,39 @@ impl Default for RateFunction {
 pub(in crate::promql) struct DeltaFunction;
 
 impl PromQLFunction for DeltaFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        todo!()
+    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        calculate_rate(arg, eval_timestamp_ms, RateKind::Delta)
     }
 }
+
+#[derive(Copy, Clone)]
+pub(in crate::promql) struct IncreaseFunction;
+
+impl PromQLFunction for IncreaseFunction {
+    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        calculate_rate(arg, eval_timestamp_ms, RateKind::Increase)
+    }
+}
+
+fn calculate_rate(arg: PromQLArg, eval_timestamp_ms: i64, kind: RateKind) -> EvalResult<ExprResult> {
+    let samples = arg.into_range_vector()?;
+    let result = samples
+        .into_par()
+        .filter_map(|sample_series| {
+            let Some(value) = extrapolated_rate(&sample_series, kind) else {
+                return None;
+            };
+            Some(EvalSample {
+                timestamp_ms: eval_timestamp_ms,
+                value,
+                labels: sample_series.labels,
+                drop_name: false,
+            })
+        }).collect();
+
+    Ok(ExprResult::InstantVector(result))
+}
+
 
 fn counter_increase_value(samples: &[Sample]) -> Option<f64> {
     let mut total = 0.0;
@@ -66,12 +83,6 @@ fn sample_delta_value(samples: &[Sample]) -> Option<f64> {
     Some(samples.last()?.value - samples.first()?.value)
 }
 
-fn idelta_value(samples: &[(i64, f64)]) -> Option<f64> {
-    if samples.len() < 2 {
-        return None;
-    }
-    Some(samples[samples.len() - 1].1 - samples[samples.len() - 2].1)
-}
 
 /// Computes counter-reset-corrected increase for a sample series.
 /// Walks through samples and accumulates previous values at each reset point.
@@ -90,53 +101,83 @@ fn counter_reset_increase(values: &[Sample]) -> f64 {
 }
 
 /// Computes extrapolated rate for a series as per Prometheus logic.
-pub(super) fn extrapolated_rate(series: &EvalSamples) -> Option<f64> {
-    if series.values.len() < 2 {
+pub(super) fn extrapolated_rate(
+    samples: &EvalSamples,
+    kind: RateKind,
+) -> Option<f64> {
+    if samples.values.len() < 2 {
         return None;
     }
 
-    let range_seconds = series.range_ms as f64 / 1000.0;
-    let range_start = series.range_end_ms - series.range_ms;
-    let range_end = series.range_end_ms;
+    let range_start = samples.range_end_ms - samples.range_ms;
+    let range_end = samples.range_end_ms;
+    let range_duration_seconds = samples.range_ms as f64 / 1000.0;
 
-    let first = &series.values[0];
-    let last = &series.values[series.values.len() - 1];
+    let samples = &samples.values;
+    let count = samples.len();
+    let first_sample = &samples[0];
+    let last_sample = &samples[count - 1];
 
-    let time_diff_seconds = (last.timestamp - first.timestamp) as f64 / 1000.0;
+    let first_t = first_sample.timestamp;
+    let last_t = last_sample.timestamp;
 
-    if time_diff_seconds <= 0.0 {
-        return None;
+    let is_counter = matches!(kind, RateKind::Rate | RateKind::Increase);
+    let is_rate = matches!(kind, RateKind::Rate);
+
+    let mut result = if is_counter {
+        counter_increase_value(samples)?
+    } else {
+        sample_delta_value(samples)?
+    };
+
+
+    // Duration between first/last samples and boundary of range
+    let duration_to_start = (first_t - range_start) as f64 / 1000.0;
+    let duration_to_end = (range_end - last_t) as f64 / 1000.0;
+
+    let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+    let average_duration_between_samples = sampled_interval / (count - 1) as f64;
+
+    let extrapolation_threshold = average_duration_between_samples * 1.1;
+
+    let mut duration_to_start = if duration_to_start >= extrapolation_threshold {
+        average_duration_between_samples / 2.0
+    } else {
+        duration_to_start
+    };
+
+    if is_counter {
+        // Counters cannot be negative. If we have any slope at all
+        // (i.e., result went up), we can extrapolate the zero point
+        // of the counter. If the duration to the zero point is shorter
+        // than the durationToStart, we take the zero point as the start
+        // of the series, thereby avoiding extrapolation to negative
+        // counter values.
+        let duration_to_zero = if result > 0.0
+            && first_sample.value >= 0.0 {
+            sampled_interval * (first_sample.value / result)
+        } else {
+            duration_to_start
+        };
+
+        if duration_to_zero < duration_to_start {
+            duration_to_start = duration_to_zero;
+        }
     }
 
-    let mut result = counter_reset_increase(&series.values);
+    let duration_to_end = if duration_to_end >= extrapolation_threshold {
+        average_duration_between_samples / 2.0
+    } else {
+        duration_to_end
+    };
 
-    let num_samples_minus_one = (series.values.len() - 1) as f64;
-    let avg_duration_between_samples = time_diff_seconds / num_samples_minus_one;
-    let extrapolation_threshold = avg_duration_between_samples * 1.1;
+    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
 
-    let mut duration_to_start = (first.timestamp - range_start) as f64 / 1000.0;
-    let mut duration_to_end = (range_end - last.timestamp) as f64 / 1000.0;
-
-    if duration_to_start >= extrapolation_threshold {
-        duration_to_start = avg_duration_between_samples / 2.0;
+    if is_rate {
+        factor /= range_duration_seconds;
     }
-
-    // Avoid extrapolating to negative values by considering the zero point of the counter.
-    let mut duration_to_zero = duration_to_start;
-    if result > 0.0 && first.value >= 0.0 {
-        duration_to_zero = time_diff_seconds * (first.value / result);
-    }
-    if duration_to_zero < duration_to_start {
-        duration_to_start = duration_to_zero;
-    }
-    if duration_to_end >= extrapolation_threshold {
-        duration_to_end = avg_duration_between_samples / 2.0;
-    }
-
-    let factor = (time_diff_seconds + duration_to_start + duration_to_end)
-        / time_diff_seconds
-        / range_seconds;
 
     result *= factor;
+
     Some(result)
 }
