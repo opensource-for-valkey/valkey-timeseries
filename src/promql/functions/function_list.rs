@@ -9,6 +9,7 @@ use crate::promql::functions::deriv::DerivFunction;
 use crate::promql::functions::histogram::{HistogramFractionFunctions, HistogramQuantileFunction};
 use crate::promql::functions::holt_winters::DoubleExponentialSmoothingFunction;
 use crate::promql::functions::irate::IRateFunction;
+use crate::promql::functions::idelta::IDeltaFunction;
 use crate::promql::functions::labels::{LabelJoinFunction, LabelReplaceFunction};
 use crate::promql::functions::math_functions::{
     AbsFunction, AcosFunction, AcoshFunction, AsinFunction, AsinhFunction, AtanFunction,
@@ -18,14 +19,15 @@ use crate::promql::functions::math_functions::{
     TanFunction, TanhFunction,
 };
 use crate::promql::functions::predict_linear::PredictLinearFunction;
-use crate::promql::functions::range_vector_functions::{
-    AbsentOverTimeFunction, AvgOverTimeFunction, ChangesFunction, CountOverTimeFunction,
+use crate::promql::functions::range_vector_functions::{ChangesFunction, ResetsFunction};
+use crate::promql::functions::rollups::{
+    AbsentOverTimeFunction, AvgOverTimeFunction, CountOverTimeFunction,
     FirstOverTimeFunction, LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction,
-    MinOverTimeFunction, PresentOverTimeFunction, QuantileOverTimeFunction, ResetsFunction,
-    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TSFirstOverTimeFunction,
-    TSLastOverTimeFunction, TSOfMaxOverTimeFunction, TSOfMinOverTimeFunction,
+    MinOverTimeFunction, PresentOverTimeFunction, QuantileOverTimeFunction,
+    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
+    TsOfLastOverTimeFunction, TsOfMaxOverTimeFunction, TsOfMinOverTimeFunction,
 };
-use crate::promql::functions::rate::{DeltaFunction, RateFunction};
+use crate::promql::functions::rate::{DeltaFunction, RateFunction, IncreaseFunction};
 use crate::promql::functions::sort::{
     SortByLabelDescFunction, SortByLabelFunction, SortDescFunction, SortFunction,
 };
@@ -273,6 +275,7 @@ macro_rules! promql_function_list {
                 DoubleExponentialSmoothingFunction
             ),
             (IRate, "irate", IRateFunction),
+            (IDelta, "idelta", IDeltaFunction),
             (LastOverTime, "last_over_time", LastOverTimeFunction),
             (MadOverTime, "mad_over_time", MadOverTimeFunction),
             (MaxOverTime, "max_over_time", MaxOverTimeFunction),
@@ -289,6 +292,7 @@ macro_rules! promql_function_list {
                 QuantileOverTimeFunction
             ),
             (Rate, "rate", RateFunction),
+            (Increase, "increase", IncreaseFunction),
             (Resets, "resets", ResetsFunction),
             (StddevOverTime, "stddev_over_time", StddevOverTimeFunction),
             (StdvarOverTime, "stdvar_over_time", StdvarOverTimeFunction),
@@ -296,22 +300,22 @@ macro_rules! promql_function_list {
             (
                 TsOfMaxOverTime,
                 "ts_of_max_over_time",
-                TSOfMaxOverTimeFunction
+                TsOfMaxOverTimeFunction
             ),
             (
                 TsOfMinOverTime,
                 "ts_of_min_over_time",
-                TSOfMinOverTimeFunction
+                TsOfMinOverTimeFunction
             ),
             (
                 TLastOverTime,
                 "ts_of_last_over_time",
-                TSLastOverTimeFunction
+                TsOfLastOverTimeFunction
             ),
             (
                 TFirstOverTime,
                 "ts_of_first_over_time",
-                TSFirstOverTimeFunction
+                TsOfFirstOverTimeFunction
             ),
             // ── Label helpers ─────────────────────────────────────────────
             (LabelJoin, "label_join", LabelJoinFunction),
