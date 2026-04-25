@@ -115,12 +115,17 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 for step_idx in 0..num_steps {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
 
-                    // Per-step instant stmt sets query_start = query_end = eval_ts
+                    // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
+                    // timestamp, however when resolving `@ start()` / `@ end()` inside the
+                    // preloading phase we must use the outer query bounds so that
+                    // `@ start()`/`@ end()` sweep the full query range across steps.
+                    // Pass `eval_start_ms`/`eval_end_ms` as the `query_start`/`query_end`
+                    // parameters so AtModifier::Start/End resolve correctly during preload.
                     let adjusted_ts = apply_time_modifiers_ms(
                         at_modifier.as_ref(),
                         offset_mod.as_ref(),
-                        eval_ts_i,
-                        eval_ts_i,
+                        eval_start_ms,
+                        eval_end_ms,
                         eval_ts_i,
                     );
                     let lookback_start = adjusted_ts - lookback_delta_ms;
@@ -551,7 +556,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 call.func.name
             )));
         };
-        
+
         if call.func.experimental && !self.options.enable_experimental_functions {
             return Err(EvaluationError::InternalError(format!(
                 "Experimental function {} is not enabled for this request",

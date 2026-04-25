@@ -16,12 +16,6 @@ impl PromQLFunction for SortFunction {
     }
 }
 
-impl Default for SortFunction {
-    fn default() -> Self {
-        SortFunction
-    }
-}
-
 /// `sort_desc(v instant-vector)`
 ///
 /// returns vector elements sorted descending by their float sample values
@@ -48,10 +42,6 @@ impl PromQLFunction for SortByLabelFunction {
     fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         sort_by_label(args, false)
     }
-
-    fn is_experimental(&self) -> bool {
-        true
-    }
 }
 
 /// `sort_by_label_desc(v instant-vector, label string, ...)`
@@ -67,10 +57,6 @@ impl PromQLFunction for SortByLabelDescFunction {
 
     fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
         sort_by_label(args, false)
-    }
-
-    fn is_experimental(&self) -> bool {
-        true
     }
 }
 
