@@ -3079,7 +3079,7 @@ mod tests {
             step_ms: 0, // instant query context
             lookback_delta_ms: 300_000,
         };
-        let result = evaluator.evaluate_subquery(&subquery, &ctx);
+        let result = evaluator.evaluate_subquery(&subquery, &ctx, false);
 
         // then: should not panic or infinite loop, should use fallback step
         assert!(result.is_ok());
