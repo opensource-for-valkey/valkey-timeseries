@@ -38,6 +38,7 @@ pub(crate) enum QueryPathKind {
         step_ms: i64,
         lookback_delta_ms: i64,
         expected_steps: usize,
+        is_rollup: bool,
     },
 }
 
@@ -124,6 +125,7 @@ impl QueryPlan {
         subquery_end_ms: Timestamp,
         step_ms: Timestamp,
         lookback_delta_ms: Timestamp,
+        is_rollup: bool,
     ) -> Self {
         let (aligned_start_ms, range_start_ms, range_end_ms, expected_steps) =
             compute_subquery_alignment(
@@ -143,6 +145,7 @@ impl QueryPlan {
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
+                is_rollup,
             },
         }
     }
@@ -251,7 +254,7 @@ pub(crate) fn shape_subquery_results(
     series_data: Vec<EvalSamples>,
     plan: &QueryPlan,
 ) -> Vec<EvalSamples> {
-    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
+    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps, is_rollup) =
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 range_ms,
@@ -259,15 +262,21 @@ pub(crate) fn shape_subquery_results(
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
+                is_rollup,
             } => (
                 *range_ms,
                 *aligned_start_ms,
                 *step_ms,
                 *lookback_delta_ms,
                 *expected_steps,
+                *is_rollup,
             ),
             _ => return Vec::new(),
         };
+
+    if is_rollup {
+        return series_data;
+    }
 
     let subquery_end_ms = plan.sample_end_ms;
 
@@ -383,7 +392,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     // pipeline. Use saturating_add to avoid overflow on extreme values.
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
 
-    let raw_range_samples = reader
+    let mut raw_range_samples = reader
         .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))?; // todo: audit error
 
@@ -484,7 +493,7 @@ mod tests {
         // aligned_start = ceil_to_next_step(15, 10) = 20
         // expected_steps = (55 - 20) / 10 + 1 = 4 (steps at 20, 30, 40, 50)
         // range_start = 20 - 20 = 0
-        let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20);
+        let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20, false);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 range_ms,
@@ -492,6 +501,7 @@ mod tests {
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
+                ..
             } => {
                 assert_eq!(*range_ms, 40);
                 assert_eq!(*aligned_start_ms, 20);
@@ -511,7 +521,7 @@ mod tests {
         // div_euclid(-41, 10) = -5, aligned = -50, since -50 <= -41, aligned = -40
         // expected_steps = (0 - (-40)) / 10 + 1 = 5
         // range_start = -40 - 5 = -45
-        let plan = QueryPlan::for_subquery_vector_selector(-41, 0, 10, 5);
+        let plan = QueryPlan::for_subquery_vector_selector(-41, 0, 10, 5, false);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 aligned_start_ms,
@@ -568,6 +578,7 @@ mod tests {
                 step_ms: 10,
                 lookback_delta_ms: 10,
                 expected_steps: 3,
+                is_rollup: false,
             },
         };
 
