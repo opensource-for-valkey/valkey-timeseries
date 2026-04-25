@@ -388,7 +388,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     // pipeline. Use saturating_add to avoid overflow on extreme values.
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
 
-    let mut raw_range_samples = reader
+    let raw_range_samples = reader
         .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
         .map_err(|e| EvaluationError::InternalError(e.to_string()))?; // todo: audit error
 
