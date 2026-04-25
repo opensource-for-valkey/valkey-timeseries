@@ -551,6 +551,13 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 call.func.name
             )));
         };
+        
+        if call.func.experimental && !self.options.enable_experimental_functions {
+            return Err(EvaluationError::InternalError(format!(
+                "Experimental function {} is not enabled for this request",
+                call.func.name
+            )));
+        }
 
         let evaluated_args = self.evaluate_function_args(ctx, call, func, preload_eligible)?;
 
