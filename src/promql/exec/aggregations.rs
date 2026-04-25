@@ -2,7 +2,6 @@ use crate::common::Timestamp;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use ahash::AHasher;
 use orx_parallel::ParIter;
 use orx_parallel::{IntoParIter, IterIntoParIter};
 use promql_parser::label::METRIC_NAME;
@@ -10,7 +9,6 @@ use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum KAggregationOrder {
@@ -452,25 +450,32 @@ fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
     samples
 }
 
-fn select_limit_ratio(mut samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
-    if !ratio.is_finite() || ratio == 0.0 || !(-1.0..=1.0).contains(&ratio) {
+fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
+    if !ratio.is_finite() {
         return Err(EvaluationError::ArgumentError(
-            "limit_ratio parameter must be within [-1, 1] and not equal to 0".to_string(),
+            "limit_ratio parameter must be within [-1, 1]".to_string(),
         ));
     }
+    let ratio = ratio.clamp(-1.0, 1.0);
 
-    let len = samples.len();
-    if len == 0 {
+    if ratio == 0.0 {
         return Ok(Vec::new());
     }
 
-    let take = ((len as f64) * ratio.abs()).floor() as usize;
-    if ratio < 0.0 {
-        samples.reverse();
+    let max = u128::MAX as f64;
+    if ratio > 0.0 {
+        Ok(samples
+            .into_iter()
+            .filter(|sample| (sample_hash(sample) as f64) / max < ratio)
+            .collect())
+    } else {
+        // For negative ratios, select the complement side of the hash space.
+        let threshold = 1.0 + ratio;
+        Ok(samples
+            .into_iter()
+            .filter(|sample| (sample_hash(sample) as f64) / max >= threshold)
+            .collect())
     }
-
-    samples.truncate(take);
-    Ok(samples)
 }
 
 fn get_param(param: Option<ExprResult>, function_name: &str) -> EvalResult<ExprResult> {
@@ -522,8 +527,6 @@ fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usiz
     }
 }
 
-fn sample_hash(sample: &EvalSample) -> u64 {
-    let mut hasher: AHasher = Default::default();
-    sample.labels.hash(&mut hasher);
-    hasher.finish()
+fn sample_hash(sample: &EvalSample) -> u128 {
+    sample.labels.get_fingerprint()
 }
