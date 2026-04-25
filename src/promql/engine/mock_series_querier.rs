@@ -182,7 +182,7 @@ impl QueryReader for MockSeriesQuerier {
         // As with `query`, this mock ignores the deadline and returns the full range.
         self.select_series(selector, |ts| {
             let labels: Labels = (&ts.labels).into();
-            let samples = ts
+            let samples: Vec<Sample> = ts
                 .get_range(start_ms, end_ms)
                 .into_iter()
                 .map(|s| Sample {
@@ -190,6 +190,11 @@ impl QueryReader for MockSeriesQuerier {
                     value: s.value,
                 })
                 .collect();
+
+            if samples.is_empty() {
+                return Ok(None);
+            }
+
             Ok(Some(RangeSample { labels, samples }))
         })
     }
