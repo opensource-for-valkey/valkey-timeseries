@@ -254,7 +254,7 @@ pub(crate) fn shape_subquery_results(
     series_data: Vec<EvalSamples>,
     plan: &QueryPlan,
 ) -> Vec<EvalSamples> {
-    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps, is_rollup) =
+    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps, _is_rollup) =
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 range_ms,
@@ -273,10 +273,6 @@ pub(crate) fn shape_subquery_results(
             ),
             _ => return Vec::new(),
         };
-
-    if is_rollup {
-        return series_data;
-    }
 
     let subquery_end_ms = plan.sample_end_ms;
 
