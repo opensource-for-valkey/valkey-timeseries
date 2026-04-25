@@ -108,6 +108,26 @@ macro_rules! impl_promql_function_impl {
                     $( Self::$Variant(_) => PromqlFunctionKind::$Variant, )*
                 }
             }
+
+            pub(in crate::promql) fn is_rollup(&self) -> bool {
+                matches!(self.kind(), PromqlFunctionKind::AbsentOverTime
+                    | PromqlFunctionKind::AvgOverTime
+                    | PromqlFunctionKind::CountOverTime
+                    | PromqlFunctionKind::FirstOverTime
+                    | PromqlFunctionKind::LastOverTime
+                    | PromqlFunctionKind::MadOverTime
+                    | PromqlFunctionKind::MaxOverTime
+                    | PromqlFunctionKind::MinOverTime
+                    | PromqlFunctionKind::PresentOverTime
+                    | PromqlFunctionKind::QuantileOverTime
+                    | PromqlFunctionKind::StddevOverTime
+                    | PromqlFunctionKind::StdvarOverTime
+                    | PromqlFunctionKind::SumOverTime
+                    | PromqlFunctionKind::TsOfFirstOverTime
+                    | PromqlFunctionKind::TsOfLastOverTime
+                    | PromqlFunctionKind::TsOfMaxOverTime
+                    | PromqlFunctionKind::TsOfMinOverTime)
+            }
         }
 
         impl TryFrom<&str> for PromQLFunctionImpl {
@@ -167,7 +187,8 @@ macro_rules! impl_promql_function_impl {
     };
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// Single canonical list of promql functions.
+// Single canonical list of promql functions. Generate the enum variants, the static dispatch arms, and the
+// registry table from this list.
 //
 // ADD NEW FUNCTIONS HERE.  Each entry:
 //   (MyFunction, "my_function", MyFunction)
@@ -297,12 +318,12 @@ macro_rules! promql_function_list {
                 TsOfMinOverTimeFunction
             ),
             (
-                TLastOverTime,
+                TsOfLastOverTime,
                 "ts_of_last_over_time",
                 TsOfLastOverTimeFunction
             ),
             (
-                TFirstOverTime,
+                TsOfFirstOverTime,
                 "ts_of_first_over_time",
                 TsOfFirstOverTimeFunction
             ),
