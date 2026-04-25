@@ -6,7 +6,7 @@ use crate::promql::binops::eval_binary_expr;
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
-use crate::promql::functions::PromQLFunction;
+use crate::promql::functions::{PromQLFunction, PromQLFunctionImpl};
 use crate::promql::functions::{PromQLArg, resolve_function};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
@@ -237,7 +237,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             Expr::Unary(u) => self.evaluate_unary(u, ctx, preload_eligible),
             Expr::Binary(b) => self.evaluate_binary_expr(b, ctx, preload_eligible),
             Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx, preload_eligible),
-            Expr::Subquery(q) => self.evaluate_subquery(q, ctx),
+            Expr::Subquery(q) => self.evaluate_subquery(q, ctx, false),
             Expr::NumberLiteral(l) => Ok(ExprResult::Scalar(l.val)),
             Expr::StringLiteral(l) => Ok(ExprResult::String(l.val.clone())),
             Expr::VectorSelector(vector_selector) => {
@@ -275,10 +275,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
 
+
     pub(super) fn evaluate_subquery(
         &self,
         subquery: &SubqueryExpr,
         ctx: &EvalContext,
+        is_rollup: bool,
     ) -> EvalResult<ExprResult> {
         let adjusted_eval_ts = self.apply_time_modifiers(
             subquery.at.as_ref(),
@@ -321,6 +323,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 subquery_end_ms,
                 step_ms,
                 ctx.lookback_delta_ms,
+                is_rollup,
             );
         }
 
@@ -403,12 +406,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         subquery_end_ms: i64,
         step_ms: i64,
         lookback_delta_ms: i64,
+        is_rollup: bool,
     ) -> EvalResult<ExprResult> {
         let plan = QueryPlan::for_subquery_vector_selector(
             subquery_start_ms,
             subquery_end_ms,
             step_ms,
             lookback_delta_ms,
+            is_rollup,
         );
         execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
@@ -492,56 +497,46 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(ms)
     }
 
-    fn evaluate_function_arg(
-        &self,
-        call: &Call,
-        idx: usize,
-        ctx: &EvalContext,
-        preload_eligible: bool,
-    ) -> EvalResult<PromQLArg> {
-        let (arg, expected_type) = get_function_arg(call, idx)?;
-        let arg_result: PromQLArg = self.evaluate_expr(arg, ctx, preload_eligible)?.into();
-
-        let actual_type = arg_result.value_type();
-        if actual_type != expected_type {
-            // maybe this is too strict?
-            return Err(EvaluationError::ArgumentError(format!(
-                "argument {idx} for function {} expected type {}, got {}",
-                call.func.name, expected_type, actual_type
-            )));
-        }
-
-        Ok(arg_result)
-    }
-
     fn evaluate_function_args(
         &self,
-        call: &Call,
         ctx: &EvalContext,
+        call: &Call,
+        func: PromQLFunctionImpl,
         preload_eligible: bool,
     ) -> EvalResult<Vec<PromQLArg>> {
-        let args = if should_parallelize_args_evaluation(call) {
-            call.args
-                .args
-                .par()
-                .map(|arg| match self.evaluate_expr(arg, ctx, preload_eligible) {
-                    Ok(arg) => Ok(PromQLArg::from(arg)),
-                    Err(err) => Err(err),
-                })
-                .into_fallible_result()
-                .collect::<Vec<_>>()?
-        } else {
-            let mut evaluated_args = Vec::with_capacity(call.args.args.len());
-            for idx in 0..call.args.args.len() {
-                let arg: PromQLArg =
-                    self.evaluate_function_arg(call, idx, ctx, preload_eligible)?;
-                evaluated_args.push(arg);
-            }
-            evaluated_args
-        };
+        let args = &call.args.args;
+        let is_rollup = func.is_rollup();
+        let mut evaluated_args = Vec::with_capacity(args.len());
+        for (idx, arg) in args.iter().enumerate() {
+            let (arg_expr, expected_type) = get_function_arg(call, idx)?;
 
-        Ok(args)
+            // Fast path for rollup functions with VectorSelector args: if the argument is a VectorSelector subquery,
+            // we can evaluate it directly as a range vector without going through the bucketing process. The rollup
+            // machinery has a more efficient path for handling range vectors, so this avoids the unnecessary overhead
+            // of evaluating the subquery at each step.
+            let arg_result = if is_rollup
+                && let Expr::Subquery(subquery) = arg_expr
+                && matches!(*subquery.expr, Expr::VectorSelector(_)) {
+                self.evaluate_subquery(subquery, ctx, true)?
+            } else {
+                self.evaluate_expr(arg, ctx, preload_eligible)?
+            };
+
+            let actual_type = arg_result.value_type();
+            if actual_type != expected_type {
+                // maybe this is too strict?
+                return Err(EvaluationError::ArgumentError(format!(
+                    "argument {idx} for function {} expected type {}, got {}",
+                    call.func.name, expected_type, actual_type
+                )));
+            }
+
+            evaluated_args.push(arg_result.into());
+        }
+
+        Ok(evaluated_args)
     }
+
 
     pub(super) fn evaluate_call(
         &self,
@@ -549,7 +544,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-        let evaluated_args = self.evaluate_function_args(call, ctx, preload_eligible)?;
 
         let Some(func) = resolve_function(call.func.name) else {
             return Err(EvaluationError::InternalError(format!(
@@ -557,6 +551,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 call.func.name
             )));
         };
+
+        let evaluated_args = self.evaluate_function_args(ctx, call, func, preload_eligible)?;
 
         let result = func.apply_call(evaluated_args, ctx)?;
         if call.func.return_type == ValueType::Scalar {
