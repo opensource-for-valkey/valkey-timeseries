@@ -80,7 +80,6 @@ pub(super) fn exec_series_rollup(
     let samples = std::mem::take(&mut series.values);
 
     series.values = step_times(start_ms, end_ms, step)
-        .into_iter()
         .enumerate()
         .iter_into_par()
         .filter_map(move |(idx, t_end)| {
@@ -214,7 +213,7 @@ pub(super) fn eval_rollups_basic<F>(
 where
     F: Fn(&[Sample]) -> f64 + Sync,
 {
-    let lookback_delta = ctx.lookback_delta_ms;
+    let _lookback_delta = ctx.lookback_delta_ms;
     let step_ms = ctx.step_ms;
     let range_ms = ctx.query_end - ctx.query_start;
     let end_ms = ctx.query_end;
