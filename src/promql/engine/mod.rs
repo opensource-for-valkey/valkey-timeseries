@@ -45,6 +45,8 @@ pub struct QueryOptions {
     pub max_series: usize,
     /// Enable tracing for the current request
     pub is_tracing: bool,
+    /// Enable experimental functions for the current request
+    pub enable_experimental_functions: bool,
 }
 
 impl Default for QueryOptions {
@@ -52,12 +54,14 @@ impl Default for QueryOptions {
         let config = PROMQL_CONFIG.read().unwrap();
         let timeout = config.max_query_duration;
         let deadline = current_time_millis().saturating_add(timeout.as_millis() as i64);
+        let enable_experimental_functions = config.enable_experimental_functions;
         Self {
             lookback_delta: config.lookback_delta,
             timeout: Some(config.max_query_duration),
             deadline: Some(deadline),
             max_series: config.max_response_series,
             is_tracing: false,
+            enable_experimental_functions,
         }
     }
 }
