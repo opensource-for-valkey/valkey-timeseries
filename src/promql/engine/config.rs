@@ -51,6 +51,10 @@ pub struct PromqlConfig {
 
     /// Whether to optimize the query before execution
     pub optimize_queries: bool,
+
+    /// Whether to enable experimental functions. This may be useful for testing new functions
+    /// before they are ready for production use.
+    pub enable_experimental_functions: bool,
 }
 
 impl PromqlConfig {
@@ -84,6 +88,7 @@ impl Default for PromqlConfig {
             set_lookback_to_step: false,
             max_query_duration: Duration::from_secs(30),
             optimize_queries: false,
+            enable_experimental_functions: true, // TODO: set to false before release
         }
     }
 }
