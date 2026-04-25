@@ -176,10 +176,6 @@ pub(crate) trait PromQLFunction {
     ) -> EvalResult<ExprResult> {
         self.apply_args(evaluated_args, ctx.evaluation_ts)
     }
-
-    fn is_experimental(&self) -> bool {
-        false
-    }
 }
 
 /// Function that applies a unary operation to each sample
