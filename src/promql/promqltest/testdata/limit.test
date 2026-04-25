@@ -71,28 +71,28 @@ eval range from 0 to 50m step 5m count(limit_ratio(0.5, http_requests) and http_
 
 # All samples.
 eval range from 0 to 50m step 5m count(limit_ratio(1.0, http_requests) and http_requests)
-    {} 8+0x10
+    {} 6+0x10
 
 # All samples.
 eval range from 0 to 50m step 5m count(limit_ratio(-1.0, http_requests) and http_requests)
-    {} 8+0x10
+    {} 6+0x10
 
 # Capped to 1.0 -> all samples.
 eval range from 0 to 50m step 5m count(limit_ratio(1.1, http_requests) and http_requests)
 	expect warn msg: PromQL warning: ratio value should be between -1 and 1, got 1.1, capping to 1
-    {} 8+0x10
+    {} 6+0x10
 
 # Capped to -1.0 -> all samples.
 eval range from 0 to 50m step 5m count(limit_ratio(-1.1, http_requests) and http_requests)
 	expect warn msg: PromQL warning: ratio value should be between -1 and 1, got -1.1, capping to -1
-    {} 8+0x10
+    {} 6+0x10
 
 # Verify that limit_ratio(value) and limit_ratio(1.0-value) return the "complement" of each other.
 # Complement below for [0.2, -0.8].
 #
 # Complement 1of2: `or` should return all samples.
 eval range from 0 to 50m step 5m count(limit_ratio(0.2, http_requests) or limit_ratio(-0.8, http_requests))
-    {} 8+0x10
+    {} 6+0x10
 
 # Complement 2of2: `and` should return no samples.
 eval range from 0 to 50m step 5m count(limit_ratio(0.2, http_requests) and limit_ratio(-0.8, http_requests))
@@ -100,14 +100,14 @@ eval range from 0 to 50m step 5m count(limit_ratio(0.2, http_requests) and limit
 
 # Complement below for [0.5, -0.5].
 eval range from 0 to 50m step 5m count(limit_ratio(0.5, http_requests) or limit_ratio(-0.5, http_requests))
-    {} 8+0x10
+    {} 6+0x10
 
 eval range from 0 to 50m step 5m count(limit_ratio(0.5, http_requests) and limit_ratio(-0.5, http_requests))
 # empty
 
 # Complement below for [0.8, -0.2].
 eval range from 0 to 50m step 5m count(limit_ratio(0.8, http_requests) or limit_ratio(-0.2, http_requests))
-    {} 8+0x10
+    {} 6+0x10
 
 eval range from 0 to 50m step 5m count(limit_ratio(0.8, http_requests) and limit_ratio(-0.2, http_requests))
 # empty
@@ -115,11 +115,11 @@ eval range from 0 to 50m step 5m count(limit_ratio(0.8, http_requests) and limit
 # Complement below for [some_ratio, - (1.0 - some_ratio)], some_ratio derived from time(),
 # using a small prime number to avoid rounded ratio values, and a small set of them.
 eval range from 0 to 50m step 5m count(limit_ratio(time() % 17/17, http_requests) or limit_ratio( - (1.0 - (time() % 17/17)), http_requests))
-    {} 8+0x10
+    {} 6+0x10
 
 eval range from 0 to 50m step 5m count(limit_ratio(time() % 17/17, http_requests) and limit_ratio( - (1.0 - (time() % 17/17)), http_requests))
 # empty
 
 # Bug #15971.
 eval range from 0m to 50m step 5m count(limit_ratio(scalar(bar), http_requests))
-	{} _ 8 _ 8 _ 8 _ 8 _ 8 _
+	{} _ 6 _ 6 _ 6 _ 6 _ 6 _
