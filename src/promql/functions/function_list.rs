@@ -177,12 +177,6 @@ macro_rules! impl_promql_function_impl {
                     $( Self::$Variant(f) => f.apply_call(evaluated_args, ctx), )*
                 }
             }
-
-            fn is_experimental(&self) -> bool {
-                match self {
-                    $( Self::$Variant(f) => f.is_experimental(), )*
-                }
-            }
         }
     };
 }
