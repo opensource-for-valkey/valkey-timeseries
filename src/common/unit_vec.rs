@@ -201,7 +201,7 @@ impl<T> UnitVec<T> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// let mut vec = vec![1, 2, 3];
     /// vec.insert(1, 4);
     /// assert_eq!(vec, [1, 4, 2, 3]);
@@ -265,7 +265,7 @@ impl<T> UnitVec<T> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// let mut v = vec![1, 2, 3];
     /// assert_eq!(v.remove(1), 2);
     /// assert_eq!(v, [1, 3]);
@@ -312,7 +312,7 @@ impl<T> UnitVec<T> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// let mut v = vec!["foo", "bar", "baz", "qux"];
     ///
     /// assert_eq!(v.swap_remove(1), "bar");

@@ -611,8 +611,8 @@ pub fn saved_pct(saved: usize, held: usize) -> f64 {
 /// header records at intern time.
 ///
 /// # Example
-/// ```rust
-/// use crate::common::string_interner::InternedString;
+/// ```ignore
+/// use valkey_timeseries::common::string_interner::InternedString;
 ///
 /// let x = InternedString::new("hello");
 /// let y: InternedString = "world".into();

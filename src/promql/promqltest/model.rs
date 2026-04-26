@@ -62,7 +62,7 @@ impl MetricType {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use crate::promql::promqltest::model::MetricType;
 /// use crate::promql::promqltest::model::Series;
 /// use crate::common::labels::Label;

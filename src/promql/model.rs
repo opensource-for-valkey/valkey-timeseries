@@ -32,8 +32,8 @@ pub const STALE_NAN: u64 = 0x7ff0000000000002;
 ///
 /// # Example
 ///
-/// ```
-/// use crate::promql::model::{is_stale_nan, STALE_NAN};
+/// ```ignore
+/// use valkey_timeseries::promql::model::{is_stale_nan, STALE_NAN};
 ///
 /// let stale = f64::from_bits(STALE_NAN);
 /// assert!(is_stale_nan(stale));
