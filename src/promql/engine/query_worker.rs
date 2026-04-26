@@ -53,11 +53,34 @@ struct BatchRequest {
 /// - Collecting incoming query requests into a batch and processing the batch in a single lock
 ///   acquisition to reduce locking overhead.
 ///
+/// # Note
+/// The `QueryWorker` is designed for internal use within the PromQL engine and is not intended to be
+/// used directly by external callers. It is exposed as a handle that can be used to perform queries,
+/// but the internal implementation details are abstracted away.
+///
+/// # Important Considerations
+/// The `QueryWorker` consumes a thread from the thread pool for the duration of its lifetime.
+///  - the worker thread should be taken into account when sizing the thread pool.
+///  - it is important to reuse the same `QueryWorker` instance.
+///  - the worker thread holds the GIL while processing requests, so it should not be used for long-running or blocking operations to avoid starving other tasks that require the GIL.
+///
 /// # Example
 /// ```rust
+/// use crate::promql::engine::query_worker::QueryWorker;
+/// use crate::promql::engine::QueryOptions;
+/// use promql_parser::label::Matchers;
+///
+///
 /// // Create a worker handle and perform queries via the provided API.
 /// let query_worker = QueryWorker::new();
-/// let _ = query_worker.query("up".parse().unwrap(), 1_600_000_000_000i64);
+/// let now = current_time_millis();
+/// let options = QueryOptions {
+///     timeout: Some(now + 60_000), // 1 minute from now
+///     lookback_delta: None,
+///     max_series: 1000,
+/// };
+/// let matchers = vec![Matcher::new("job", "=", "prometheus")];
+/// let _ = query_worker.query(matchers, now, options);
 /// ```
 ///
 /// The concrete worker implementation is internal; callers use `QueryWorker::new()` and the

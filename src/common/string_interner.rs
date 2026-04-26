@@ -27,7 +27,7 @@
 //!
 //! # Example
 //! ```rust
-//! use valkey_timeseries::common::string_interner::InternedString;
+//! use crate::common::string_interner::InternedString;
 //! let x = InternedString::new("hello");
 //! let y: InternedString = "world".into();
 //! assert_ne!(x, y);
@@ -186,7 +186,7 @@ pub struct Stats {
 ///
 /// # Example
 /// ```rust
-/// use valkey_timeseries::common::string_interner::InternedString;
+/// use crate::common::string_interner::InternedString;
 ///
 /// let x = InternedString::new("hello");
 /// let y: InternedString = "world".into();
