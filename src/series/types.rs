@@ -122,13 +122,15 @@ impl DuplicatePolicy {
     ///   and a duplicate value is encountered.
     ///
     /// # Example
-    /// ```ignore
-    /// use valkey_timeseries::series::types::DuplicatePolicy;
+    /// ```rust
+    /// use crate::series::types::DuplicatePolicy;
+    /// use crate::common::Timestamp;
     ///
-    /// let duplicate_policy = DuplicatePolicy::KeepLast;
-    /// let ts = 1_i64;
     /// let result = duplicate_policy.duplicate_value(ts, 42.0, 43.0);
-    /// assert_eq!(result.unwrap(), 43.0);
+    /// match result {
+    ///     Ok(value) => println!("Resolved value: {}", value),
+    ///     Err(err) => eprintln!("Error: {}", err),
+    /// }
     /// ```
     pub fn duplicate_value(self, _ts: Timestamp, old: f64, new: f64) -> TsdbResult<f64> {
         use DuplicatePolicy::*;

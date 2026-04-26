@@ -63,7 +63,10 @@ impl MetricType {
 /// # Example
 ///
 /// ```
-/// use timeseries::{Series, Label, Sample};
+/// use crate::promql::promqltest::model::MetricType;
+/// use crate::promql::promqltest::model::Series;
+/// use crate::common::labels::Label;
+/// use crate::common::Sample;
 ///
 /// let series = Series::new(
 ///     "http_requests_total",
