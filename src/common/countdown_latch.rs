@@ -27,8 +27,8 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use crate::common::countdown_latch::CountDownLatch;
+//! ```no_run
+//! use valkey_timeseries::common::countdown_latch::CountDownLatch;
 //! use std::sync::Arc;
 //! use std::thread;
 //! use std::time::Duration;
