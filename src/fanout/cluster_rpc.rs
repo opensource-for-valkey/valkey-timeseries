@@ -112,9 +112,9 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 ///
 /// There's no need for global uniqueness because:
 ///
-/// - Each node only looks up requests in its own INFLIGHT_REQUESTS map
-/// - Request IDs never need to be coordinated across nodes
-/// - Two different nodes can safely use the same ID simultaneously for different requests
+/// - Each node only looks up requests in its own `INFLIGHT_REQUESTS` map.
+/// - Request IDs never need to be coordinated across nodes.
+/// - Two different nodes can safely use the same ID simultaneously for different requests.
 ///
 fn generate_id() -> u64 {
     loop {

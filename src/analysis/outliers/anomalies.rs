@@ -90,6 +90,10 @@ impl AnomalyOptions {
 /// # Example
 ///
 /// ```ignore
+/// use valkey_timeseries::analysis::outliers::anomalies::{
+///     AnomalyDetectionMethodOptions, AnomalyOptions, detect_anomalies,
+/// };
+///
 /// // Create a time series with some anomalies
 /// let mut values = vec![0.0; 100];
 /// for i in 0..100 {

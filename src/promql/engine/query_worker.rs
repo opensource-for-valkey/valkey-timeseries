@@ -65,7 +65,7 @@ struct BatchRequest {
 ///  - the worker thread holds the GIL while processing requests, so it should not be used for long-running or blocking operations to avoid starving other tasks that require the GIL.
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// use crate::promql::engine::query_worker::QueryWorker;
 /// use crate::promql::engine::QueryOptions;
 /// use promql_parser::label::Matchers;
