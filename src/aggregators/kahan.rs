@@ -171,12 +171,12 @@ pub trait KahanSummator {
     /// Computes the Kahan sum of an iterator.
     /// # Example
     ///
-    /// ```ignore
-    /// use valkey_timeseries::aggregators::kahan::KahanSummator;
-    ///
-    /// let summands = [10000.0f64, 3.14159, 2.71828];
+    /// ```
+    /// use crate::aggregators::kahan::*;
+    /// let summands = [10000.0f32, 3.14159, 2.71828];
     /// let kahan_sum = summands.iter().kahan_sum();
-    /// assert!((10005.85987 - kahan_sum.value()).abs() < 1e-10);
+    /// assert_eq!(10005.86f32, kahan_sum.sum());
+    /// assert_eq!(0.0004813671f32, kahan_sum.err());
     /// ```
     fn kahan_sum(self) -> KahanSum;
 }

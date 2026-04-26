@@ -113,8 +113,8 @@ where
 /// - `callback`: The closure to be executed on the main thread.
 ///
 /// # Example
-/// ```no_run
-/// use valkey_timeseries::common::threads::run_on_main_thread;
+/// ```rust
+/// use crate::common::threads::run_on_main_thread;
 ///
 /// // A simple closure to be executed on the main thread
 /// run_on_main_thread(false, || {

@@ -26,8 +26,8 @@
 //!   standard library and does not contain any unsafe code.
 //!
 //! # Example
-//! ```ignore
-//! use valkey_timeseries::common::string_interner::InternedString;
+//! ```rust
+//! use crate::common::string_interner::InternedString;
 //! let x = InternedString::new("hello");
 //! let y: InternedString = "world".into();
 //! assert_ne!(x, y);
@@ -185,8 +185,8 @@ pub struct Stats {
 /// reference count reaches zero.
 ///
 /// # Example
-/// ```ignore
-/// use valkey_timeseries::common::string_interner::InternedString;
+/// ```rust
+/// use crate::common::string_interner::InternedString;
 ///
 /// let x = InternedString::new("hello");
 /// let y: InternedString = "world".into();
