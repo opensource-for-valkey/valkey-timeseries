@@ -123,9 +123,9 @@ impl DuplicatePolicy {
     ///
     /// # Example
     /// ```rust
-    /// use valkey_timeseries::series::DuplicatePolicy;
-    /// let duplicate_policy = DuplicatePolicy::KeepLast;
-    /// let ts: i64 = 0;
+    /// use crate::series::types::DuplicatePolicy;
+    /// use crate::common::Timestamp;
+    ///
     /// let result = duplicate_policy.duplicate_value(ts, 42.0, 43.0);
     /// match result {
     ///     Ok(value) => println!("Resolved value: {}", value),
