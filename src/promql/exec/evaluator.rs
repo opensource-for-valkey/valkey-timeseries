@@ -6,19 +6,19 @@ use crate::promql::binops::eval_binary_expr;
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
-use crate::promql::functions::{PromQLFunction, PromQLFunctionImpl};
 use crate::promql::functions::{PromQLArg, resolve_function};
+use crate::promql::functions::{PromQLFunction, PromQLFunctionImpl};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
-use crate::promql::time::{apply_time_modifiers_ms, selector_bounds};
+use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
 };
 use ahash::{AHashSet, RandomState};
-use orx_parallel::ParIter;
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
+use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
@@ -280,7 +280,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
     }
 
-
     pub(super) fn evaluate_subquery(
         &self,
         subquery: &SubqueryExpr,
@@ -345,32 +344,35 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             aligned_start_ms += step_ms;
         }
 
+        let expected_steps = ((subquery_end_ms - aligned_start_ms) / step_ms) as usize + 1;
+
+        let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
+        const PARALLEL_SUBQUERY_STEP_THRESHOLD: usize = 4;
+
         // Evaluate the inner expression at each step within the subquery range
+        let mut step_results: Vec<(i64, Vec<EvalSample>)> =
+            if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
+                let mut results = Vec::with_capacity(expected_steps);
+                for current_time_ms in steps {
+                    let res = self.eval_subquery_step(subquery, ctx, current_time_ms)?;
+                    results.push(res);
+                }
+                results
+            } else {
+                steps
+                    .iter_into_par()
+                    .map(|eval_ts| self.eval_subquery_step(subquery, ctx, eval_ts))
+                    .into_fallible_result()
+                    .collect()?
+            };
+
+        // Ensure deterministic merge ordering for per-step sample appends.
+        step_results.sort_unstable_by_key(|(ts, _)| *ts);
+
         let mut series_map: halfbrown::HashMap<Labels, Vec<Sample>, RandomState> =
             Default::default();
-
-        // todo: possibly parallelize
-        for current_time_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-            let new_ctx = EvalContext {
-                query_start: ctx.query_start,
-                query_end: ctx.query_end,
-                evaluation_ts: current_time_ms,
-                lookback_delta_ms: ctx.lookback_delta_ms,
-                step_ms,
-            };
-
-            // Disable preload fast path — subquery has its own step grid/lookback context.
-            let result = self.evaluate_expr(&subquery.expr, &new_ctx, false)?;
-
-            // PromQL requires subquery inner expression to evaluate to an instant vector.
-            // Enforce this invariant at runtime.
-            let ExprResult::InstantVector(samples) = result else {
-                return Err(EvaluationError::InternalError(
-                    "subquery inner expression must return instant vector".to_string(),
-                ));
-            };
-
-            // DO NOT use the .entry() api here, as it would force an unnecessary copy in the
+        for (current_time_ms, samples) in step_results {
+            // DO NOT use the .entry() api here, as it would force an unnecessary clone in the
             // case that an entry already exists
             for sample in samples {
                 let _sample = Sample {
@@ -385,18 +387,23 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             }
         }
 
-        let mut range_vector = Vec::new();
-        for (labels, values) in series_map {
-            range_vector.push(EvalSamples {
-                values,
-                labels,
-                range_ms,
-                range_end_ms: subquery_end_ms,
-                drop_name: false,
-            });
-        }
+        let vector = series_map
+            .into_iter()
+            .map(|(labels, values)| {
+                // todo: do we need to sort samples by timestamp here? query_range guarantees sorted samples,
+                // but we are merging multiple steps together which could be out of order. We could optimize by
+                // ensuring step_results is processed in timestamp order.
+                EvalSamples {
+                    values,
+                    labels,
+                    range_ms,
+                    range_end_ms: subquery_end_ms,
+                    drop_name: false,
+                }
+            })
+            .collect();
 
-        Ok(ExprResult::RangeVector(range_vector))
+        Ok(ExprResult::RangeVector(vector))
     }
 
     /// Fast path for VectorSelector subqueries using range-based evaluation.
@@ -475,6 +482,37 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         execute_selector_pipeline(&self.reader, &plan, vector_selector, options)
     }
 
+    fn eval_subquery_step(
+        &self,
+        subquery: &SubqueryExpr,
+        ctx: &EvalContext,
+        current_time_ms: i64,
+    ) -> EvalResult<(i64, Vec<EvalSample>)> {
+        let new_ctx = EvalContext {
+            query_start: ctx.query_start,
+            query_end: ctx.query_end,
+            evaluation_ts: current_time_ms,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            // Inner expression evaluation for a subquery step is an instant
+            // evaluation at `current_time_ms`; keep `query_start/query_end`
+            // unchanged so @start()/@end() still resolve to the outer query
+            // bounds.
+            step_ms: 0,
+        };
+
+        // Disable preload fast path — subquery has its own step grid/lookback context.
+        let result = self.evaluate_expr(&subquery.expr, &new_ctx, false)?;
+
+        // PromQL requires subquery inner expression to evaluate to an instant vector. Enforce this invariant at runtime.
+        let ExprResult::InstantVector(samples) = result else {
+            return Err(EvaluationError::InternalError(
+                "subquery inner expression must return instant vector".to_string(),
+            ));
+        };
+
+        Ok((current_time_ms, samples))
+    }
+
     /// Apply offset and @ modifiers to adjust the evaluation time.
     ///
     /// Implements PromQL time modifier semantics per the Prometheus specification:
@@ -521,7 +559,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             // of evaluating the subquery at each step.
             let arg_result = if is_rollup
                 && let Expr::Subquery(subquery) = arg_expr
-                && matches!(*subquery.expr, Expr::VectorSelector(_)) {
+                && matches!(*subquery.expr, Expr::VectorSelector(_))
+            {
                 self.evaluate_subquery(subquery, ctx, true)?
             } else {
                 self.evaluate_expr(arg, ctx, preload_eligible)?
@@ -542,14 +581,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(evaluated_args)
     }
 
-
     pub(super) fn evaluate_call(
         &self,
         call: &Call,
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-
         let Some(func) = resolve_function(call.func.name) else {
             return Err(EvaluationError::InternalError(format!(
                 "Unknown instant/scalar function: {}",
