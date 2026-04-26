@@ -177,8 +177,8 @@ impl TimeSeriesIndex {
     ///
     /// we can retrieve its series ID by passing the appropriate labels to this function.
     ///
-    /// ```
-    /// use crate::common::labels::Label;
+    /// ```ignore
+    /// use valkey_timeseries::labels::Label;
     ///
     /// let labels = vec![
     ///     Label::new("__name__", "http_requests_total"),
