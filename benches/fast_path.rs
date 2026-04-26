@@ -1,11 +1,15 @@
+#[cfg(feature = "bench")]
 use criterion::{BenchmarkId, Criterion};
+#[cfg(feature = "bench")]
 use criterion::{criterion_group, criterion_main};
 
+#[cfg(feature = "bench")]
 // These functions are provided by the crate under the `bench` feature.
 use valkey_timeseries::promql::binops::{
     bench_eval_aligned, bench_eval_unaligned, bench_eval_with_fill,
 };
 
+#[cfg(feature = "bench")]
 fn bench_paths(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_vector_ops");
 
@@ -34,6 +38,7 @@ fn bench_paths(c: &mut Criterion) {
 
     group.finish();
 }
-
+#[cfg(feature = "bench")]
 criterion_group!(benches, bench_paths);
+#[cfg(feature = "bench")]
 criterion_main!(benches);

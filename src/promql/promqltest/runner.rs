@@ -107,7 +107,6 @@ where
             Command::EvalRange(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
-                    // debug: eval number and query
                     let result = eval_range(
                         &tsdb,
                         eval_cmd.start,
@@ -124,7 +123,6 @@ where
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
-                    // debug: eval number and query
                     let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query)?;
 
                     let expected = eval_cmd.expected.clone();

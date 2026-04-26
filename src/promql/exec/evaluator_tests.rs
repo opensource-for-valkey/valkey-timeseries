@@ -3086,6 +3086,69 @@ mod tests {
     }
 
     #[test]
+    fn should_preserve_subquery_step_order_when_parallelized() {
+        // given: a metric with samples every 10s
+        let mut builder = MockQueryReaderBuilder::new();
+        let labels = Labels::new(vec![Label::new("__name__", "metric")]);
+        builder.add_sample(
+            &labels,
+            Sample {
+                timestamp: 0,
+                value: 1.0,
+            },
+        );
+        builder.add_sample(
+            &labels,
+            Sample {
+                timestamp: 10_000,
+                value: 2.0,
+            },
+        );
+        builder.add_sample(
+            &labels,
+            Sample {
+                timestamp: 20_000,
+                value: 3.0,
+            },
+        );
+
+        let reader = builder.build();
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+
+        // when: evaluate a non-VectorSelector subquery (forces generic subquery path)
+        // with 5 steps so it takes the parallel branch.
+        let expr = promql_parser::parser::parse("abs(metric)[25s:5s]").unwrap();
+        let Expr::Subquery(subquery) = expr else {
+            panic!("expected parsed expression to be a subquery");
+        };
+
+        let eval_time_ms = 20_000i64;
+        let ctx = EvalContext {
+            query_start: eval_time_ms,
+            query_end: eval_time_ms,
+            evaluation_ts: eval_time_ms,
+            step_ms: 0,
+            lookback_delta_ms: 300_000,
+        };
+
+        let result = evaluator.evaluate_subquery(&subquery, &ctx, false).unwrap();
+        let ExprResult::RangeVector(mut range_vector) = result else {
+            panic!("expected range vector result");
+        };
+
+        assert_eq!(range_vector.len(), 1);
+        let timestamps: Vec<_> = range_vector
+            .pop()
+            .unwrap()
+            .values
+            .into_iter()
+            .map(|s| s.timestamp)
+            .collect();
+
+        assert_eq!(timestamps, vec![0, 5_000, 10_000, 15_000, 20_000]);
+    }
+
+    #[test]
     fn should_align_negative_timestamps_correctly() {
         // Test floor division alignment for negative timestamps
         let subquery_start_ms = -41i64;
