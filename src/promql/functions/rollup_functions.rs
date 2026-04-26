@@ -40,7 +40,9 @@ pub(super) fn exec_rollup_fn(
     expect_exact_arg_count(name, 1, args.len())?;
     let range = args.swap_remove(0).into_range_vector()?;
     let rollups = eval_rollups(ctx, range, optional_param, f)?;
-    Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(rollups)))
+    Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(
+        rollups,
+    )))
 }
 
 pub(super) fn exec_basic_rollup_fn(
@@ -52,7 +54,9 @@ pub(super) fn exec_basic_rollup_fn(
     expect_exact_arg_count(name, 1, args.len())?;
     let range = args.swap_remove(0).into_range_vector()?;
     let rollups = eval_rollups_basic(ctx, range, f);
-    Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(rollups)))
+    Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(
+        rollups,
+    )))
 }
 
 macro_rules! make_rollup_function {
@@ -346,6 +350,8 @@ impl PromQLFunction for QuantileOverTimeFunction {
             quantile(&mut values, phi)
         })?;
 
-        Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(rollups)))
+        Ok(ExprResult::InstantVector(rollup_vec_to_instant_vector(
+            rollups,
+        )))
     }
 }
