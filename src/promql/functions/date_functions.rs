@@ -21,7 +21,7 @@ impl PromQLFunction for TimestampFunction {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) enum DateTimePart {
+pub(in crate::promql) enum DateTimePart {
     Year,
     Month,
     DayOfMonth,
@@ -33,7 +33,7 @@ pub(super) enum DateTimePart {
 }
 
 impl DateTimePart {
-    fn extract(&self, dt: DateTime<Utc>) -> f64 {
+    pub fn extract(&self, dt: DateTime<Utc>) -> f64 {
         match self {
             Self::Year => dt.year() as f64,
             Self::Month => dt.month() as f64,
@@ -47,7 +47,7 @@ impl DateTimePart {
     }
 }
 
-fn datetime_from_seconds(value: f64) -> Option<DateTime<Utc>> {
+pub(in crate::promql) fn datetime_from_seconds(value: f64) -> Option<DateTime<Utc>> {
     if !value.is_finite() {
         return None;
     }
@@ -64,7 +64,7 @@ fn datetime_from_millis(value: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(value / 1000, 0)
 }
 
-fn days_in_month(dt: DateTime<Utc>) -> u32 {
+pub(in crate::promql) fn days_in_month(dt: DateTime<Utc>) -> u32 {
     let start_of_month =
         NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).expect("valid start of month");
     let start_of_next_month = if dt.month() == 12 {
@@ -78,7 +78,11 @@ fn days_in_month(dt: DateTime<Utc>) -> u32 {
         .num_days() as u32
 }
 
-fn eval_datetime_function(samples: &mut [EvalSample], eval_timestamp_ms: i64, part: DateTimePart) {
+pub(in crate::promql) fn eval_datetime_function(
+    samples: &mut [EvalSample],
+    eval_timestamp_ms: i64,
+    part: DateTimePart,
+) {
     for sample in samples {
         sample.value = datetime_from_seconds(sample.value)
             .map(|dt| part.extract(dt))

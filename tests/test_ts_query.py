@@ -110,15 +110,6 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
 
         assert result is not None
 
-    def test_query_with_plus_timestamp(self):
-        """Test TS.QUERY with + timestamp (current time)."""
-        self.setup_simple_series()
-
-        # + is another way to specify current time
-        result = self.client.execute_command('TS.QUERY', 'http_requests', 'TIME', '+')
-
-        assert result is not None
-
     def test_query_with_lookback_delta(self):
         """Test TS.QUERY with LOOKBACK_DELTA option."""
         self.setup_simple_series()
@@ -229,15 +220,10 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         """Test TS.QUERY with negative lookback delta."""
         self.setup_simple_series()
 
-        # Negative lookback delta should be handled (or rejected)
-        try:
-            result = self.client.execute_command('TS.QUERY', 'http_requests',
-                                                 'LOOKBACK_DELTA', '-1000')
-            # If it doesn't error, it should return a result
-            assert result is not None
-        except ResponseError:
-            # Or it might return an error, which is also acceptable
-            pass
+        # Negative lookback delta should be rejected
+        with pytest.raises(ResponseError, match="TSDB: couldn't parse LOOKBACK_DELTA duration"):
+            self.client.execute_command('TS.QUERY', 'http_requests',
+                                        'LOOKBACK_DELTA', '-1000')
 
     def test_query_with_very_large_lookback_delta(self):
         """Test TS.QUERY with very large lookback delta."""

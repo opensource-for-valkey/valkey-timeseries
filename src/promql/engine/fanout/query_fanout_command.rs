@@ -103,7 +103,7 @@ impl FanoutCommand for QueryFanoutCommand {
                     "TSDB: received duplicate sample with labels {:?} in instant query response",
                     s.labels
                 )
-                    .into());
+                .into());
             }
         }
         self.results.append(&mut resp.samples);
