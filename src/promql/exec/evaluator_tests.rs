@@ -962,7 +962,7 @@ mod tests {
                 value: "server1".to_string(),
             },
         ]
-            .into();
+        .into();
         let sample = Sample {
             timestamp: 300001,
             value: 100.0,
@@ -1742,7 +1742,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .unwrap();
+        .unwrap();
         assert_results_match(
             &clamp_result,
             &[
@@ -1758,7 +1758,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .unwrap();
+        .unwrap();
         assert_results_match(
             &clamp_min_result,
             &[
@@ -1774,7 +1774,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .unwrap();
+        .unwrap();
         assert_results_match(
             &clamp_max_result,
             &[
@@ -1802,7 +1802,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .unwrap();
+        .unwrap();
 
         assert!(result.is_empty());
     }
@@ -1887,7 +1887,7 @@ mod tests {
                         value: "prod".to_string(),
                     },
                 ]
-                    .into(),
+                .into(),
                 Sample {
                     timestamp: ts,
                     value: val,
@@ -2429,7 +2429,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_left query should evaluate successfully");
+        .expect("group_left query should evaluate successfully");
 
         // then: result labels come from the many (left) side, __name__ dropped by arithmetic
         assert_results_match(
@@ -2476,7 +2476,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_left with extra labels should evaluate successfully");
+        .expect("group_left with extra labels should evaluate successfully");
 
         // then: result has many-side labels plus the extra "region" from one side
         assert_results_match(
@@ -2523,7 +2523,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_left comparison should evaluate successfully");
+        .expect("group_left comparison should evaluate successfully");
 
         // then: only the 150 > 100 result survives; non-bool comparison propagates lhs sample value
         assert_results_match(
@@ -2649,7 +2649,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_left with no match should return empty");
+        .expect("group_left with no match should return empty");
 
         // then: empty - no env matches
         assert!(
@@ -2699,7 +2699,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_left with ignoring should evaluate successfully");
+        .expect("group_left with ignoring should evaluate successfully");
 
         // then: only region="us-east" matches; region="eu-west" is dropped (no one-side match)
         assert_results_match(
@@ -2754,7 +2754,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_right query should evaluate successfully");
+        .expect("group_right query should evaluate successfully");
 
         // then: result labels come from the many (right) side, __name__ dropped by arithmetic
         assert_results_match(
@@ -2797,7 +2797,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_right with extra labels should evaluate successfully");
+        .expect("group_right with extra labels should evaluate successfully");
 
         // then: result has many-side labels plus the extra "region" from one (left) side
         // Since cpu_usage doesn't have a "region" label, the region from memory_bytes is preserved
@@ -2845,7 +2845,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_right comparison should evaluate successfully");
+        .expect("group_right comparison should evaluate successfully");
 
         // then: only 150 > 100 survives; non-bool comparison propagates lhs sample value
         assert_results_match(
@@ -2926,7 +2926,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_right with no match should return empty");
+        .expect("group_right with no match should return empty");
 
         // then: empty - no env matches
         assert!(
@@ -2976,7 +2976,7 @@ mod tests {
             end_time,
             lookback_delta,
         )
-            .expect("group_right with ignoring should evaluate successfully");
+        .expect("group_right with ignoring should evaluate successfully");
 
         // then: only region="us-east" matches; region="eu-west" is dropped (no one-side match)
         assert_results_match(

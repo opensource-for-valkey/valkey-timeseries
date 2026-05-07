@@ -42,7 +42,7 @@ pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 pub type SeriesMap = halfbrown::HashMap<Labels, Vec<Sample>, RandomState>;
 
 pub(in crate::promql) type PreloadMap =
-halfbrown::HashMap<PreloadKey, PreloadedInstantData, RandomState>;
+    halfbrown::HashMap<PreloadKey, PreloadedInstantData, RandomState>;
 
 /// Preloaded per-step evaluation data for a VectorSelector across a range query.
 pub(in crate::promql) struct PreloadedInstantData {
