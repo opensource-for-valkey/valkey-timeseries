@@ -297,8 +297,20 @@ impl Hash for RegexMatcher {
 }
 
 impl RegexMatcher {
-    pub(crate) fn new(regex: Regex, value: String) -> Self {
-        Self { regex, value }
+    fn new(regex: Regex, value: String) -> Self {
+        Self::from_parts(regex, value, None)
+    }
+
+    pub(crate) fn from_parts(regex: Regex, value: String, prefix: Option<String>) -> Self {
+        let required_literals = extract_ordered_required_literals(&value, prefix.as_deref()).into();
+        let suffix = extract_stable_suffix_hint(&value, prefix.as_deref());
+        Self {
+            regex,
+            value,
+            prefix,
+            suffix,
+            required_literals,
+        }
     }
 
     pub fn create(value: &str) -> Result<Self, ParseError> {
@@ -875,12 +887,6 @@ impl DerefMut for FilterList {
 impl From<Vec<LabelFilter>> for FilterList {
     fn from(value: Vec<LabelFilter>) -> Self {
         Self::new(value)
-    }
-}
-
-impl From<SmallVec<LabelFilter, 3>> for FilterList {
-    fn from(value: SmallVec<LabelFilter, 3>) -> Self {
-        Self(value)
     }
 }
 
