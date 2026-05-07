@@ -9,6 +9,7 @@ mod model;
 mod time;
 mod utils;
 
+pub mod optimizer;
 #[cfg(test)]
 pub(crate) mod promqltest;
 

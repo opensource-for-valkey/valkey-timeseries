@@ -3,6 +3,7 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
+use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::range_bounds_to_system_time;
 use crate::promql::{Evaluator, ExprResult, QueryResult};
@@ -24,6 +25,16 @@ fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
     }
 }
 
+fn parse_query(query: &str, options: &QueryOptions) -> QueryResult<Expr> {
+    let mut expr = promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)?;
+    if options.optimize_queries {
+        // todo: better error handling for optimization errors (e.g. include original query in error message)
+        expr = optimize_expr(expr)
+            .map_err(|e| QueryError::InvalidQuery(format!("optimization error: {e}")))?;
+    }
+    Ok(expr)
+}
+
 pub(crate) trait PromqlEngine: Send + Sync {
     /// Build a query reader
     fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>>;
@@ -35,8 +46,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         time: Option<SystemTime>,
         opts: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let expr = parse_query(query, &opts)?;
 
         let query_time = time.unwrap_or_else(SystemTime::now);
         let lookback_delta = opts.lookback_delta;
@@ -62,8 +72,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         step: Duration,
         opts: QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let expr = parse_query(query, &opts)?;
 
         let lookback_delta = opts.lookback_delta;
         let stmt = EvalStmt {
@@ -285,8 +294,7 @@ impl Tsdb {
         time: Option<SystemTime>,
         opts: &QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let expr = parse_query(query, opts)?;
 
         let query_time = time.unwrap_or_else(SystemTime::now);
         let lookback_delta = opts.lookback_delta;
@@ -349,8 +357,7 @@ impl Tsdb {
         opts: &QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
         let (start, end) = range_bounds_to_system_time(range);
-        let expr = promql_parser::parser::parse(query)
-            .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        let expr = parse_query(query, opts)?;
 
         let lookback_delta = opts.lookback_delta;
         let stmt = EvalStmt {

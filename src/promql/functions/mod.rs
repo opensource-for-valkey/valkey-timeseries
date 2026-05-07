@@ -19,6 +19,7 @@ mod special_functions;
 mod types;
 pub(crate) mod utils;
 
+pub(in crate::promql) use date_functions::{DateTimePart, datetime_from_seconds};
 pub(crate) use function_list::*;
 pub(crate) use types::*;
 

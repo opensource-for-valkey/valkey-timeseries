@@ -47,6 +47,9 @@ pub struct QueryOptions {
     pub is_tracing: bool,
     /// Enable experimental functions for the current request
     pub enable_experimental_functions: bool,
+    /// Whether to optimize the queries by simplify the query plan and pushing down filters to the data source.
+    /// This can improve performance but may cause higher memory usage and slower response times for some queries.
+    pub optimize_queries: bool,
 }
 
 impl Default for QueryOptions {
@@ -62,6 +65,7 @@ impl Default for QueryOptions {
             max_series: config.max_response_series,
             is_tracing: false,
             enable_experimental_functions,
+            optimize_queries: config.optimize_queries,
         }
     }
 }

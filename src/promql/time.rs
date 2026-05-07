@@ -310,7 +310,7 @@ pub(crate) fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     merged
 }
 
-pub fn step_times(start: i64, end: i64, step: i64) -> impl Iterator<Item=i64> {
+pub fn step_times(start: i64, end: i64, step: i64) -> impl Iterator<Item = i64> {
     let mut current = start;
     std::iter::from_fn(move || {
         if current > end {
@@ -428,7 +428,7 @@ mod tests {
             let expr = promql_parser::parser::parse(
                 "max(metric_name offset 1h) - max(metric_name offset 2h)",
             )
-                .unwrap();
+            .unwrap();
             let result = compute_preload_ranges(&expr, t(7200), t(7200), Duration::from_secs(300));
             assert_eq!(result, vec![(-300, 0), (3300, 3600)]);
         }
