@@ -1,8 +1,8 @@
 use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
-use crate::fanout::get_cluster_command_timeout;
-use crate::fanout::{FanoutCommand, is_clustered};
+use crate::fanout::is_clustered;
+use crate::fanout::{FanoutCommand, get_cluster_command_timeout};
 use crate::labels::Label;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::{QueryFanoutCommand, QueryRangeFanoutCommand};

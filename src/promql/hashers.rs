@@ -172,7 +172,7 @@ fn update_hash_for_matcher(m: &Matcher, hasher: &mut xxhash3_128::Hasher) {
 }
 
 pub(in crate::promql) type FingerprintHashMap<V> =
-halfbrown::HashMap<SeriesFingerprint, V, BuildHasherDefault<FingerprintHasher>>;
+    halfbrown::HashMap<SeriesFingerprint, V, BuildHasherDefault<FingerprintHasher>>;
 
 pub(in crate::promql) type FingerprintHashSet =
     HashSet<SeriesFingerprint, BuildHasherDefault<FingerprintHasher>>;

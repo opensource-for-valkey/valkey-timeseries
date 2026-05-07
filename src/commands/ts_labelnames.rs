@@ -1,7 +1,6 @@
 use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::label_search_utils::run_label_search;
 use valkey_module::{Context, ValkeyResult, ValkeyString};
-
 // see https://github.com/tcp13equals2/proposals/blob/c56fb4b25f1151de148f58f0a51799c339185922/proposals/0074-new-labels-values-api.md
 
 /// TS.LABELNAMES

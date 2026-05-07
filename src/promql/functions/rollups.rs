@@ -199,7 +199,7 @@ fn seek_first_timestamp_idx_after(
             Ok(pos) | Err(pos) => pos,
         }
     }
-        .saturating_add(slice_start)
+    .saturating_add(slice_start)
 }
 
 /// An alternate implementation of rollup evaluation that operates directly on `Sample` objects without de-interleaving

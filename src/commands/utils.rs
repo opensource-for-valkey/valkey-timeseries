@@ -116,7 +116,7 @@ impl ClientReplyContext {
         self.reply_with_sample_raw(sample.timestamp, sample.value)
     }
 
-    pub fn reply_with_samples(&self, samples: impl Iterator<Item=Sample>) {
+    pub fn reply_with_samples(&self, samples: impl Iterator<Item = Sample>) {
         raw::reply_with_array(self.ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long);
 
         let mut len = 0;
