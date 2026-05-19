@@ -1,9 +1,8 @@
 use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
-use crate::promql::hashers::{FingerprintHashMap, SeriesFingerprint};
+use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet, SeriesFingerprint};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use orx_parallel::IntoParIter;
-use orx_parallel::ParIter;
+use orx_parallel::{IntoParIter, ParIter};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
@@ -330,19 +329,7 @@ fn eval_arith_ops(
     };
 
     // Build "one" side index keyed by match signature.
-    let mut one_map: FingerprintHashMap<Vec<EvalSample>> =
-        FingerprintHashMap::with_capacity_and_hasher(one_vec.len(), Default::default());
-
-    for sample in one_vec {
-        let key = compute_binary_match_key(&sample.labels, ctx.matching);
-        if !ctx.is_comparison && one_map.contains_key(&key) {
-            return Err(EvaluationError::InternalError(format!(
-                "many-to-many matching not allowed: found duplicate series on the {} side of the operation",
-                if ctx.is_group_right { "left" } else { "right" }
-            )));
-        }
-        one_map.entry(key).or_default().push(sample);
-    }
+    let one_map = construct_one_side_map(&ctx, one_vec)?;
 
     let mut result = Vec::with_capacity(many_vec.len());
     let mut one_to_one_seen: FingerprintHashMap<()> = Default::default();
@@ -431,6 +418,54 @@ fn eval_arith_ops(
     Ok(ExprResult::InstantVector(result))
 }
 
+/// Build "one" side index keyed by match signature.
+fn construct_one_side_map(ctx: &ArithOpContext, one_vec: Vec<EvalSample>) -> EvalResult<FingerprintHashMap<Vec<EvalSample>>> {
+    // Parallelize fingerprint computation, then group sequentially to populate one_map.
+    let mut one_map: FingerprintHashMap<Vec<EvalSample>> =
+        FingerprintHashMap::with_capacity_and_hasher(one_vec.len(), Default::default());
+
+    // Compute (key, sample) pairs in parallel (hashing is the expensive part).
+    let mut kvs: Vec<(SeriesFingerprint, EvalSample)> = one_vec
+        .into_par()
+        .map(|s| {
+            let key = compute_binary_match_key(&s.labels, ctx.matching);
+            (key, s)
+        })
+        .collect();
+
+    kvs.sort_unstable_by_key(|(k, _s)| *k);
+
+    // Consume the sorted pairs, grouping samples for each key and inserting into one_map.
+    let mut it = kvs.into_iter().peekable();
+    while let Some((key, first_sample)) = it.next() {
+        // start a new group for `key`
+        let mut group = Vec::new();
+        group.push(first_sample);
+
+        // collect following samples with the same key
+        while let Some((next_key, _)) = it.peek() {
+            if *next_key != key {
+                break;
+            }
+            let (_k, s) = it.next().unwrap();
+            group.push(s);
+        }
+
+        // `if !ctx.is_comparison && one_map.contains_key(&key) { return Err(...) }`
+        // now we ensure the same semantics by checking group length:
+        if !ctx.is_comparison && group.len() > 1 {
+            return Err(EvaluationError::InternalError(format!(
+                "many-to-many matching not allowed: found duplicate series on the {} side of the operation",
+                if ctx.is_group_right { "left" } else { "right" }
+            )));
+        }
+
+        one_map.insert(key, group);
+    }
+
+    Ok(one_map)
+}
+
 /// Build the result label set for a matched pair.
 ///
 /// Handles `group_left(<labels>)` / `group_right(<labels>)` semantics:
@@ -466,8 +501,8 @@ fn build_result_labels(
         _ => {
             // Copy labels from "one" side not already present on "many" side.
             // Uses binary search via Labels::contains — no heap allocation.
-            for label in one_sample.labels.iter() {
-                if label.name != METRIC_NAME && !many_sample.labels.contains(&label.name) {
+            for label in one_sample.labels.iter().filter(|&l| l.name != METRIC_NAME) {
+                if !many_sample.labels.contains(&label.name) {
                     labels.insert(&label.name, label.value.clone());
                 }
             }
@@ -531,17 +566,14 @@ fn eval_set_or(
     let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
 
     // Build a set of match keys from the left side
-    let left_keys: FingerprintHashMap<()> = left_vector
-        .iter()
-        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
-        .collect();
+    let left_keys = get_sample_fingerprints(&left_vector, matching);
 
     // Append right-side samples whose match key is NOT present on the left
     let result = right_vector
         .into_par()
         .filter(|s| {
             let key = compute_binary_match_key(&s.labels, matching);
-            !left_keys.contains_key(&key)
+            !left_keys.contains(&key)
         })
         .collect_into(left_vector);
 
@@ -562,16 +594,13 @@ fn eval_set_and(
     let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
 
     // Build a set of match keys from the right side
-    let right_keys: FingerprintHashMap<()> = right_vector
-        .iter()
-        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
-        .collect();
+    let right_keys = get_sample_fingerprints(&right_vector, matching);
 
     let result: Vec<EvalSample> = left_vector
         .into_par()
         .filter(|s| {
             let key = compute_binary_match_key(&s.labels, matching);
-            right_keys.contains_key(&key)
+            right_keys.contains(&key)
         })
         .collect();
 
@@ -591,20 +620,26 @@ fn eval_set_unless(
     let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
 
     // Build a set of match keys from the right side
-    let right_keys: FingerprintHashMap<()> = right_vector
-        .iter()
-        .map(|s| (compute_binary_match_key(&s.labels, matching), ()))
-        .collect();
+    let right_keys = get_sample_fingerprints(&right_vector, matching);
 
     let result: Vec<EvalSample> = left_vector
         .into_par()
         .filter(|s| {
             let key = compute_binary_match_key(&s.labels, matching);
-            !right_keys.contains_key(&key)
+            !right_keys.contains(&key)
         })
         .collect();
 
     Ok(ExprResult::InstantVector(result))
+}
+
+fn get_sample_fingerprints(samples: &Vec<EvalSample>, matching: Option<&LabelModifier>) -> FingerprintHashSet {
+    let fingerprints: Vec<SeriesFingerprint> = samples
+        .into_par()
+        .map(|s| compute_binary_match_key(&s.labels, matching))
+        .collect();
+    // not sure if I like the extra allocation here :-(
+    fingerprints.into_iter().collect()
 }
 
 // ------------------------- Benchmark helpers -------------------------------
@@ -894,7 +929,7 @@ mod tests {
         assert_eq!(find_sample(&result, "c").map(|s| s.value), Some(9.0));
     }
 
-    // ── no fill — existing behaviour unchanged ────────────────────────────────
+    // ── no fill — existing behavior unchanged ────────────────────────────────
 
     #[test]
     fn test_no_fill_drops_unmatched_series() {
@@ -920,9 +955,9 @@ mod tests {
     #[test]
     fn test_fill_right_with_comparison_filters_false() {
         // LHS: {env="prod", v=5}, {env="dev", v=2}
-        // RHS: {env="prod", v=3}  (no dev on RHS)
+        // RHS: {env="prod", v=3} (no dev on RHS)
         // fill_right(10):
-        //   prod:  5 > 3 = true  → output value = lhs = 5
+        //   prod:  5 > 3 = true → output value = lhs = 5
         //   dev:   2 > fill(10)  = 2 > 10 = false → filtered out (comparison, no bool)
         let lhs = vec![
             sample(1000, 5.0, &[("env", "prod")]),
