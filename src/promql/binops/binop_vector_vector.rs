@@ -302,7 +302,6 @@ fn eval_arith_ops(
 
     // Arithmetic (non-comparison) operations always drop `__name__`.
     if !ctx.is_comparison {
-        (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
         for sample in left_vector.iter_mut() {
             sample.labels.remove(METRIC_NAME);
         }
