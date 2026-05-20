@@ -2,7 +2,7 @@ use super::labels::{compute_binary_match_key, result_metric};
 use crate::promql::binops::apply_binary_op;
 use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet, SeriesFingerprint};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::{IntoParIter, ParIter, ParallelizableCollection};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
@@ -328,12 +328,9 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
-
     let mut result = Vec::with_capacity(many_vec.len());
     let mut one_to_one_seen: FingerprintHashMap<()> = Default::default();
     // Track output label fingerprints for grouped matching to detect duplicates.
-    // todo: could these be simple bitsets ?
-    let mut grouped_result_seen: FingerprintHashMap<()> = Default::default();
     // Track one_map keys that were matched during the main pass (used by the
     // fill_for_many pass below to find truly unmatched "one" entries).
     let mut one_map_matched: FingerprintHashMap<()> = Default::default();
@@ -358,10 +355,13 @@ fn eval_arith_ops(
 
             match one_map.get(&key) {
                 Some(one_samples) => {
-                    // todo: measure and possibly parallelize here if the number of matches is large enough to matter (e.g. group_left with many matches per key)
+                    // todo: measure and possibly parallelize here if the number of matches is large
+                    // enough to matter (e.g. group_left with many matches per key)
                     let out: Vec<EvalSample> = one_samples
                         .iter()
-                        .filter_map(|one_sample| build_result_sample(&ctx, &many_sample, one_sample))
+                        .filter_map(|one_sample| {
+                            build_result_sample(&ctx, &many_sample, one_sample)
+                        })
                         .collect();
 
                     ManySideEval {
@@ -398,7 +398,8 @@ fn eval_arith_ops(
                 one_map_matched.insert(key, ());
             }
 
-            if ctx.is_one_to_one && !ctx.is_comparison && one_to_one_seen.insert(key, ()).is_some() {
+            if ctx.is_one_to_one && !ctx.is_comparison && one_to_one_seen.insert(key, ()).is_some()
+            {
                 return Err(EvaluationError::InternalError(
                     "many-to-many matching not allowed: found duplicate series on the left side of the operation"
                         .to_string(),
@@ -423,16 +424,18 @@ fn eval_arith_ops(
                 if one_map_matched.contains_key(key) {
                     continue; // already handled in the main pass
                 }
-                for one_sample in one_samples {
-                    // Synthesize a "many" sample whose labels match the "one" sample.
-                    // This ensures build_result_labels produces the right output labels
-                    // (they come from the "many" base, but since they equal the "one"
-                    // labels here, the correct series identity is preserved).
-                    let fill_many = make_fill_many_sample(one_sample, fill_val);
-                    if let Some(sample) = build_result_sample(&ctx, &fill_many, one_sample) {
-                        result.push(sample);
-                    }
-                }
+
+                result = one_samples
+                    .par()
+                    .filter_map(|one_sample| {
+                        // Synthesize a "many" sample whose labels match the "one" sample.
+                        // This ensures build_result_labels produces the right output labels
+                        // (they come from the "many" base, but since they equal the "one"
+                        // labels here, the correct series identity is preserved).
+                        let fill_many = make_fill_many_sample(one_sample, fill_val);
+                        build_result_sample(&ctx, &fill_many, one_sample)
+                    })
+                    .collect_into(result);
             }
         }
     }
@@ -440,14 +443,18 @@ fn eval_arith_ops(
     // Duplicate detection for grouped matching must occur after comparison
     // filtering so that comparisons can naturally reduce duplicates.
     if !ctx.is_one_to_one {
-        for sample in result.iter() {
-            let fp = result_fingerprint(&sample.labels, sample.drop_name);
-            if grouped_result_seen.insert(fp, ()).is_some() {
-                return Err(EvaluationError::InternalError(
-                    "multiple matches for labels: grouping labels must ensure unique matches"
-                        .to_string(),
-                ));
-            }
+        let mut fps: Vec<u128> = result
+            .par()
+            .map(|sample| result_fingerprint(&sample.labels, sample.drop_name))
+            .collect();
+
+        fps.sort_unstable();
+
+        if fps.windows(2).any(|w| w[0] == w[1]) {
+            return Err(EvaluationError::InternalError(
+                "multiple matches for labels: grouping labels must ensure unique matches"
+                    .to_string(),
+            ));
         }
     }
 
