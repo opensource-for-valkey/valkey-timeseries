@@ -358,7 +358,7 @@ fn eval_arith_ops(
 
             match one_map.get(&key) {
                 Some(one_samples) => {
-                    // todo: measure and possibly paralellize here if the number of matches is large enough to matter (e.g. group_left with many matches per key)
+                    // todo: measure and possibly parallelize here if the number of matches is large enough to matter (e.g. group_left with many matches per key)
                     let out: Vec<EvalSample> = one_samples
                         .iter()
                         .filter_map(|one_sample| build_result_sample(&ctx, &many_sample, one_sample))
@@ -416,18 +416,22 @@ fn eval_arith_ops(
     // The phantom sample uses the real "one" sample's labels so that result
     // label construction produces the correct output series identity.
     if let Some(fill_val) = ctx.fill_for_many {
-        for (key, one_samples) in &one_map {
-            if one_map_matched.contains_key(key) {
-                continue; // already handled in the main pass
-            }
-            for one_sample in one_samples {
-                // Synthesize a "many" sample whose labels match the "one" sample.
-                // This ensures build_result_labels produces the right output labels
-                // (they come from the "many" base, but since they equal the "one"
-                // labels here, the correct series identity is preserved).
-                let fill_many = make_fill_many_sample(one_sample, fill_val);
-                if let Some(sample) = build_result_sample(&ctx, &fill_many, one_sample) {
-                    result.push(sample);
+        // Fast skip: if every one-side key matched during the main pass, there
+        // are no unmatched one-side entries to backfill.
+        if one_map_matched.len() != one_map.len() {
+            for (key, one_samples) in &one_map {
+                if one_map_matched.contains_key(key) {
+                    continue; // already handled in the main pass
+                }
+                for one_sample in one_samples {
+                    // Synthesize a "many" sample whose labels match the "one" sample.
+                    // This ensures build_result_labels produces the right output labels
+                    // (they come from the "many" base, but since they equal the "one"
+                    // labels here, the correct series identity is preserved).
+                    let fill_many = make_fill_many_sample(one_sample, fill_val);
+                    if let Some(sample) = build_result_sample(&ctx, &fill_many, one_sample) {
+                        result.push(sample);
+                    }
                 }
             }
         }
