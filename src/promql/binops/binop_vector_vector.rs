@@ -328,8 +328,6 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
-    // Build "one" side index keyed by match signature.
-    let one_map = construct_one_side_map(&ctx, one_vec)?;
 
     let mut result = Vec::with_capacity(many_vec.len());
     let mut one_to_one_seen: FingerprintHashMap<()> = Default::default();
@@ -340,41 +338,75 @@ fn eval_arith_ops(
     // fill_for_many pass below to find truly unmatched "one" entries).
     let mut one_map_matched: FingerprintHashMap<()> = Default::default();
 
-    for many_sample in many_vec {
-        let key = compute_binary_match_key(&many_sample.labels, ctx.matching);
+    // Build "one" side index keyed by match signature.
+    let one_map = construct_one_side_map(&ctx, one_vec)?;
 
-        let one_samples = match one_map.get(&key) {
-            Some(s) => s,
-            None => {
-                // No match found for this "many" sample.  If a fill value was
-                // supplied for the "one" side, synthesize a phantom one_sample
-                // with that value and empty labels, then emit the result.
-                if let Some(fill_val) = ctx.fill_for_one {
-                    let fill_one = make_fill_one_sample(&many_sample, fill_val);
-                    if let Some(sample) = build_result_sample(&ctx, &many_sample, &fill_one) {
-                        result.push(sample);
+    struct ManySideEval {
+        idx: usize,
+        matched_key: Option<SeriesFingerprint>,
+        out: Vec<EvalSample>,
+    }
+
+    // Evaluate each many-side sample in parallel, then merge deterministically.
+    let mut per_many: Vec<ManySideEval> = many_vec
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_par()
+        .map(|(idx, many_sample)| {
+            let key = compute_binary_match_key(&many_sample.labels, ctx.matching);
+
+            match one_map.get(&key) {
+                Some(one_samples) => {
+                    // todo: measure and possibly paralellize here if the number of matches is large enough to matter (e.g. group_left with many matches per key)
+                    let out: Vec<EvalSample> = one_samples
+                        .iter()
+                        .filter_map(|one_sample| build_result_sample(&ctx, &many_sample, one_sample))
+                        .collect();
+
+                    ManySideEval {
+                        idx,
+                        matched_key: Some(key),
+                        out,
                     }
                 }
-                continue;
+                None => {
+                    let mut out = Vec::with_capacity(1);
+                    if let Some(fill_val) = ctx.fill_for_one {
+                        let fill_one = make_fill_one_sample(&many_sample, fill_val);
+                        if let Some(sample) = build_result_sample(&ctx, &many_sample, &fill_one) {
+                            out.push(sample);
+                        }
+                    }
+
+                    ManySideEval {
+                        idx,
+                        matched_key: None,
+                        out,
+                    }
+                }
             }
-        };
+        })
+        .collect();
 
-        // Record this key as matched so the fill_for_many pass skips it.
-        if ctx.has_fill {
-            one_map_matched.insert(key, ());
+    per_many.sort_unstable_by_key(|r| r.idx);
+
+    for item in per_many {
+        if let Some(key) = item.matched_key {
+            // Record this key as matched so the fill_for_many pass skips it.
+            if ctx.has_fill {
+                one_map_matched.insert(key, ());
+            }
+
+            if ctx.is_one_to_one && !ctx.is_comparison && one_to_one_seen.insert(key, ()).is_some() {
+                return Err(EvaluationError::InternalError(
+                    "many-to-many matching not allowed: found duplicate series on the left side of the operation"
+                        .to_string(),
+                ));
+            }
         }
 
-        if ctx.is_one_to_one && !ctx.is_comparison && one_to_one_seen.insert(key, ()).is_some() {
-            return Err(EvaluationError::InternalError(
-                "many-to-many matching not allowed: found duplicate series on the left side of the operation"
-                    .to_string(),
-            ));
-        }
-
-        result = one_samples
-            .into_par()
-            .filter_map(|one_sample| build_result_sample(&ctx, &many_sample, one_sample))
-            .collect_into(result);
+        result.extend(item.out);
     }
 
     // Fill pass for unmatched "one" side entries.
@@ -419,7 +451,10 @@ fn eval_arith_ops(
 }
 
 /// Build "one" side index keyed by match signature.
-fn construct_one_side_map(ctx: &ArithOpContext, one_vec: Vec<EvalSample>) -> EvalResult<FingerprintHashMap<Vec<EvalSample>>> {
+fn construct_one_side_map(
+    ctx: &ArithOpContext,
+    one_vec: Vec<EvalSample>,
+) -> EvalResult<FingerprintHashMap<Vec<EvalSample>>> {
     // Parallelize fingerprint computation, then group sequentially to populate one_map.
     let mut one_map: FingerprintHashMap<Vec<EvalSample>> =
         FingerprintHashMap::with_capacity_and_hasher(one_vec.len(), Default::default());
@@ -633,7 +668,10 @@ fn eval_set_unless(
     Ok(ExprResult::InstantVector(result))
 }
 
-fn get_sample_fingerprints(samples: &Vec<EvalSample>, matching: Option<&LabelModifier>) -> FingerprintHashSet {
+fn get_sample_fingerprints(
+    samples: &Vec<EvalSample>,
+    matching: Option<&LabelModifier>,
+) -> FingerprintHashSet {
     let fingerprints: Vec<SeriesFingerprint> = samples
         .into_par()
         .map(|s| compute_binary_match_key(&s.labels, matching))
