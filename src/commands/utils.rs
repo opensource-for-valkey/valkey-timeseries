@@ -1,7 +1,8 @@
 use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSample};
+use crate::commands::fanout_codec::MGetValue;
 use crate::common::context::ClientReplyContext;
-use crate::common::context::replies::{
-    reply_label_ex, reply_with_array, reply_with_bulk_string, reply_with_labels,
+use crate::common::replies::{
+    IntoRawCtx, reply_label_ex, reply_with_array, reply_with_bulk_string, reply_with_labels,
     reply_with_sample_ex, reply_with_samples,
 };
 use crate::common::replies::reply_with_multi_samples;
@@ -13,26 +14,29 @@ use valkey_module::{
     Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, ValkeyValue, raw,
 };
 
-pub(super) fn reply_with_fanout_label(ctx: &Context, label: &FanoutLabel) {
+pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
+    let raw_ctx = ctx.into_raw();
     if label.name.is_empty() {
-        raw::reply_with_null(ctx.ctx);
+        raw::reply_with_null(raw_ctx);
         return;
     }
-    reply_label_ex(ctx, &label.name, Some(&label.value));
+    reply_label_ex(raw_ctx, &label.name, Some(&label.value));
 }
 
-pub(super) fn reply_with_fanout_labels(ctx: &Context, v: &[FanoutLabel]) {
-    reply_with_array(ctx, v.len());
+pub(super) fn reply_with_fanout_labels<C: IntoRawCtx>(ctx: C, v: &[FanoutLabel]) {
+    let raw_ctx = ctx.into_raw();
+    reply_with_array(raw_ctx, v.len());
     for label in v {
-        reply_with_fanout_label(ctx, label);
+        reply_with_fanout_label(raw_ctx, label);
     }
 }
 
-pub fn reply_with_fanout_sample(ctx: &Context, sample: &Option<FanoutSample>) {
+pub fn reply_with_fanout_sample<C: IntoRawCtx>(ctx: C, sample: &Option<FanoutSample>) {
+    let raw_ctx = ctx.into_raw();
     if let Some(s) = sample {
-        reply_with_sample_ex(ctx, s.timestamp, s.value);
+        reply_with_sample_ex(raw_ctx, s.timestamp, s.value);
     } else {
-        raw::reply_with_null(ctx.ctx);
+        reply_with_array(raw_ctx, 0);
     }
 }
 
@@ -106,4 +110,22 @@ impl ClientReplyContext {
 
         self.reply_with_array(len);
     }
+}
+
+pub(super) fn reply_with_mget_values<C: IntoRawCtx>(ctx: C, values: &[MGetValue]) -> ValkeyResult {
+    let raw_ctx = ctx.into_raw();
+    reply_with_array(raw_ctx, values.len());
+    for value in values {
+        reply_with_mget_value(raw_ctx, value);
+    }
+    Ok(ValkeyValue::NoReply)
+}
+
+fn reply_with_mget_value<C: IntoRawCtx>(ctx: C, value: &MGetValue) -> Status {
+    let raw_ctx = ctx.into_raw();
+    reply_with_array(raw_ctx, 3);
+    reply_with_bulk_string(raw_ctx, value.key.as_str());
+    reply_with_fanout_labels(raw_ctx, &value.labels);
+    reply_with_fanout_sample(raw_ctx, &value.sample);
+    Status::Ok
 }
