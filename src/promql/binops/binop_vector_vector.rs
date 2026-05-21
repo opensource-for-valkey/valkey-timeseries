@@ -137,24 +137,26 @@ fn make_fill_many_sample(one_sample: &EvalSample, fill_value: f64) -> EvalSample
 // ============================================================================
 
 /// Returns `true` when the expression carries no modifier — meaning OneToOne
-/// cardinality, no on/ignoring label matching, no fill values, and no
-/// `return_bool`. In this state both sides are matched purely on their full
-/// label set minus `__name__`, so a hashmap-free merge-join is safe and correct.
+/// cardinality, no on/ignoring label matching, and no fill values.
+/// In this state both sides are matched purely on their full label set
+/// minus `__name__`, so a hashmap-free merge-join is safe and correct.
 fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
-    ctx.is_one_to_one && ctx.matching.is_none() && !ctx.has_fill && !ctx.return_bool
+    // One-to-one, no on/ignoring matching, no fill values => safe merge-join.
+    // We also support the `bool` modifier here; the fast-path will emit
+    // explicit 0.0 results for unmatched LHS entries when needed.
+    ctx.is_one_to_one && ctx.matching.is_none() && !ctx.has_fill
 }
 
-/// Evaluates arithmetic or comparison operations on two vectors using a merge join, assuming the operation
-/// has no modifiers (`fill`, `bool`, `on`/ `ignoring`, e.t.c).
+/// Evaluates arithmetic or comparison operations on two vectors, assuming the operation
+/// has no modifiers (`fill`, `on`/ `ignoring`, e.t.c).
 ///
 fn eval_arith_ops_fast_path(
     operator: TokenType,
     is_comparison: bool,
+    return_bool: bool,
     left_vector: Vec<EvalSample>,
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    use std::cmp::Ordering;
-
     let mut left_sorted: Vec<(SeriesFingerprint, EvalSample)> = left_vector
         .into_par()
         .map(|s| (compute_binary_match_key(&s.labels, None), s))
@@ -168,56 +170,67 @@ fn eval_arith_ops_fast_path(
     left_sorted.sort_unstable_by_key(|x| x.0);
     right_sorted.sort_unstable_by_key(|x| x.0);
 
-    let mut result: Vec<EvalSample> = Vec::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
+    let result: Vec<EvalSample> = left_sorted
+        .into_par()
+        .flat_map(|(lhs_fp, mut lhs)| {
+            let mut sub_res = Vec::new();
+            let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
+            let mut k = start;
+            let mut matched = false;
 
-    while i < left_sorted.len() && j < right_sorted.len() {
-        let lhs_fp = left_sorted[i].0;
-        let rhs_fp = right_sorted[j].0;
+            while k < right_sorted.len() && right_sorted[k].0 == lhs_fp {
+                matched = true;
+                let (_, rhs) = &right_sorted[k];
+                k += 1;
 
-        match lhs_fp.cmp(&rhs_fp) {
-            Ordering::Less => i += 1,
-            Ordering::Greater => j += 1,
-            Ordering::Equal => {
-                let i_end = i + left_sorted[i..].partition_point(|x| x.0 == lhs_fp);
-                let j_end = j + right_sorted[j..].partition_point(|x| x.0 == rhs_fp);
+                let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
+                    continue;
+                };
 
-                if !is_comparison && (i_end - i > 1 || j_end - j > 1) {
-                    let side = if i_end - i > 1 { "left" } else { "right" };
-                    return Err(EvaluationError::InternalError(format!(
-                        "many-to-many matching not allowed: found duplicate series on the {side} side of the operation"
-                    )));
+                // For non-bool comparisons, filter out false results (0.0).
+                if is_comparison && !return_bool && op_value == 0.0 {
+                    continue;
                 }
 
-                for (_, lhs) in &left_sorted[i..i_end] {
-                    for (_, rhs) in &right_sorted[j..j_end] {
-                        let Some(value) = apply_binary_op(operator, lhs.value, rhs.value).ok()
-                        else {
-                            continue;
-                        };
+                // Output value:
+                // - comparison & not bool: propagate LHS value when true
+                // - comparison & bool: output op_value (1.0 or 0.0)
+                // - arithmetic: output op_value
+                let output_value = if is_comparison && !return_bool {
+                    lhs.value
+                } else {
+                    op_value
+                };
 
-                        if is_comparison && value == 0.0 {
-                            continue;
-                        }
+                let is_last = k == right_sorted.len() || right_sorted[k].0 != lhs_fp;
 
-                        let output_value = if is_comparison { lhs.value } else { value };
-                        let labels = result_metric(lhs.labels.clone(), operator, None);
+                let labels = if is_last {
+                    result_metric(std::mem::take(&mut lhs.labels), operator, None)
+                } else {
+                    result_metric(lhs.labels.clone(), operator, None)
+                };
 
-                        result.push(EvalSample {
-                            timestamp_ms: lhs.timestamp_ms,
-                            value: output_value,
-                            labels,
-                            drop_name: lhs.drop_name,
-                        });
-                    }
-                }
-
-                i = i_end;
-                j = j_end;
+                sub_res.push(EvalSample {
+                    timestamp_ms: lhs.timestamp_ms,
+                    value: output_value,
+                    labels,
+                    drop_name: lhs.drop_name || return_bool,
+                });
             }
-        }
-    }
+
+            if !matched && is_comparison && return_bool {
+                let labels = result_metric(std::mem::take(&mut lhs.labels), operator, None);
+                sub_res.push(EvalSample {
+                    timestamp_ms: lhs.timestamp_ms,
+                    value: 0.0,
+                    labels,
+                    drop_name: lhs.drop_name || return_bool,
+                });
+            }
+
+            sub_res
+        })
+        .collect();
 
     Ok(ExprResult::InstantVector(result))
 }
@@ -309,12 +322,13 @@ fn eval_arith_ops(
         }
     }
 
-    // Fast-path: no modifier (OneToOne, no matching, no fills, no bool) —
+    // Fast-path: no modifier (OneToOne, no matching, no fills) —
     // avoid building a hashmap by using a fingerprint-based merge.
     if can_use_fast_path(&ctx) {
         return eval_arith_ops_fast_path(
             ctx.operator,
             ctx.is_comparison,
+            ctx.return_bool,
             left_vector,
             right_vector,
         );
@@ -1144,5 +1158,117 @@ mod tests {
 
         let prod = find_sample(&result, "prod").expect("prod should be emitted");
         assert!(prod.value.is_nan(), "10 / fill(0) should be NaN");
+    }
+
+    // ── bool modifier fast-path ─────────────────────────────────────────────
+
+    #[test]
+    fn test_bool_fast_path_emits_false_for_unmatched_lhs() {
+        // LHS: {env="prod", v=5}, {env="dev", v=2}
+        // RHS: {env="prod", v=3} (no dev on RHS)
+        // op: > bool
+        // prod: 5 > 3 = 1.0 (true)
+        // dev:  no match = 0.0 (false)
+        let lhs = vec![
+            sample(1000, 5.0, &[("env", "prod")]),
+            sample(1000, 2.0, &[("env", "dev")]),
+        ];
+        let rhs = vec![sample(1000, 3.0, &[("env", "prod")])];
+
+        let expr = make_expr(T_GTR, Some(BinModifier::default().with_return_bool(true)));
+
+        let result = eval_binop_vector_vector(&expr, lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        let prod = find_sample(&result, "prod").expect("prod sample missing");
+        assert_eq!(prod.value, 1.0);
+        assert!(prod.drop_name);
+
+        let dev =
+            find_sample(&result, "dev").expect("dev sample missing (bool should emit it as 0.0)");
+        assert_eq!(dev.value, 0.0);
+        assert!(dev.drop_name);
+    }
+
+    #[test]
+    fn test_bool_fast_path_arithmetic() {
+        // LHS: {env="prod", v=10}
+        // RHS: {env="prod", v=3}
+        // op: + bool
+        // Prometheus: 10 + 3 = 13, but __name__ is dropped and it behaves like bool in terms of drop_name
+        let lhs = vec![sample(1000, 10.0, &[("env", "prod")])];
+        let rhs = vec![sample(1000, 3.0, &[("env", "prod")])];
+
+        let expr = make_expr(T_ADD, Some(BinModifier::default().with_return_bool(true)));
+
+        let result = eval_binop_vector_vector(&expr, lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 13.0);
+        assert!(result[0].drop_name);
+    }
+
+    #[test]
+    fn test_bool_fast_path_true_and_false() {
+        // LHS: {id="1", v=10}, {id="2", v=5}, {id="3", v=1}
+        // RHS: {id="1", v=2}, {id="2", v=7}, {id="4", v=10}
+        // op: > bool
+        // 1: 10 > 2 = 1.0
+        // 2: 5 > 7 = 0.0
+        // 3: no match = 0.0
+        // (RHS id=4 doesn't match anything on LHS, so it's dropped)
+        let lhs = vec![
+            sample(1000, 10.0, &[("id", "1")]),
+            sample(1000, 5.0, &[("id", "2")]),
+            sample(1000, 1.0, &[("id", "3")]),
+        ];
+        let rhs = vec![
+            sample(1000, 2.0, &[("id", "1")]),
+            sample(1000, 7.0, &[("id", "2")]),
+            sample(1000, 10.0, &[("id", "4")]),
+        ];
+
+        let expr = make_expr(T_GTR, Some(BinModifier::default().with_return_bool(true)));
+
+        let mut result = eval_binop_vector_vector(&expr, lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+        result.sort_by(|x, y| x.labels.cmp(&y.labels));
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result
+                .iter()
+                .find(|s| s.labels.get("id") == Some("1"))
+                .unwrap()
+                .value,
+            1.0
+        );
+        assert_eq!(
+            result
+                .iter()
+                .find(|s| s.labels.get("id") == Some("2"))
+                .unwrap()
+                .value,
+            0.0
+        );
+        assert_eq!(
+            result
+                .iter()
+                .find(|s| s.labels.get("id") == Some("3"))
+                .unwrap()
+                .value,
+            0.0
+        );
+        for s in &result {
+            assert!(s.drop_name);
+        }
     }
 }
