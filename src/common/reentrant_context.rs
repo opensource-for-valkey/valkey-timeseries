@@ -350,24 +350,4 @@ mod tests {
         assert!(state.raw_ctx.is_null());
         assert!(state.guard.is_none());
     }
-
-    /// Verify depth counter arithmetic for simulated reentrant calls.
-    #[test]
-    fn depth_counter_increments_and_decrements() {
-        // Simulate the counter logic without touching the actual GIL.
-        let depth = Arc::new(AtomicUsize::new(0));
-
-        let d = Arc::clone(&depth);
-        // Simulate 3 reentrant lock() calls
-        d.fetch_add(1, Ordering::SeqCst); // depth = 1 (owner)
-        d.fetch_add(1, Ordering::SeqCst); // depth = 2 (reentrant)
-        d.fetch_add(1, Ordering::SeqCst); // depth = 3 (reentrant)
-        assert_eq!(d.load(Ordering::SeqCst), 3);
-
-        // Simulate 3 guard drops
-        d.fetch_sub(1, Ordering::SeqCst); // depth = 2
-        d.fetch_sub(1, Ordering::SeqCst); // depth = 1
-        d.fetch_sub(1, Ordering::SeqCst); // depth = 0 → GIL would be released
-        assert_eq!(d.load(Ordering::SeqCst), 0);
-    }
 }
