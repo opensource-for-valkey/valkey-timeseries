@@ -218,7 +218,8 @@ METHOD RCF [NUM_TREES trees]
            [SAMPLE_SIZE size] 
            [THRESHOLD|CONTAMINATION threshold]
            [SHINGLE_SIZE shingle]
-           [OUTPUT_AFTER warmup] [DECAY decay]
+           [OUTPUT_AFTER warmup]
+           [DECAY decay]
 ```
 
 **Options:**

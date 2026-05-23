@@ -219,7 +219,7 @@ pub(crate) fn submit_valkey_task_and_forget(task: ValkeyTask<()>) {
 pub(crate) fn send_with_payload<F, T>(
     task: F,
     payload: T,
-) -> Option<Result<(), String>>
+) -> Result<(), String>
 where
     T: Send + 'static,
     F: Fn(&Context, T) -> Result<(), String> + Send + 'static,
@@ -228,5 +228,8 @@ where
         let _ = task(ctx, payload);
     });
 
-    submit_valkey_task(closure)
+    let Some(result) = submit_valkey_task(closure) else {
+        return Err("Failed to submit valkey task with payload".to_string());
+    };
+    result
 }
