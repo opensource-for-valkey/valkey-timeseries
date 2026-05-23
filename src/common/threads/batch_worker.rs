@@ -1,8 +1,9 @@
 use crate::common::context::{get_current_db, set_current_db};
-use crate::common::threads::spawn;
+use smallvec::SmallVec;
 use std::num::NonZeroUsize;
 use std::sync::LazyLock;
 use std::sync::mpsc;
+use std::thread;
 use valkey_module::{Context, MODULE_CONTEXT};
 
 pub type Task = Box<dyn FnOnce() + Send>;
@@ -104,7 +105,7 @@ where
     {
         let (tx, rx) = mpsc::channel::<BatchRequest<ITEM, OUTPUT, ERROR>>();
         let batch_size = batch_size.get();
-        spawn(move || {
+        thread::spawn(move || {
             // Worker loop: wait for the first request, then drain additional pending requests
             // to form a batch. Hold the MODULE_CONTEXT for the duration of processing
             // the batch to serialize access to valkey keyspace.
@@ -114,8 +115,10 @@ where
                     Err(_) => break, // channel closed, exit thread
                 };
 
+                let mut batch: SmallVec<BatchRequest<ITEM, OUTPUT, ERROR>, 6> = SmallVec::new();
+                batch.push(first);
+
                 let mut count = 1;
-                let mut batch = vec![first];
                 while count < batch_size
                     && let Ok(r) = rx.try_recv()
                 {
@@ -153,11 +156,9 @@ where
             item,
             responder: responder_tx,
         };
-
-        if let Err(e) = self.sender.send(request) {
+        self.sender.send(request).unwrap_or_else(|e| {
             eprintln!("Failed to send query request: {}", e);
-            return None;
-        }
+        });
 
         match responder_rx.recv() {
             Ok(res) => match res {
@@ -171,13 +172,24 @@ where
             }
         }
     }
+
+    pub fn send_and_forget(&self, item: ITEM) {
+        let (responder_tx, _responder_rx) = mpsc::sync_channel(1);
+        let request = BatchRequest {
+            item,
+            responder: responder_tx,
+        };
+        self.sender.send(request).unwrap_or_else(|e| {
+            eprintln!("Failed to send query request: {}", e);
+        });
+    }
 }
 
 /// Dispatcher for generic thread-based tasks requiring access to the Valkey keyspace.
 pub struct ValkeyTaskDispatcher;
 
 impl<T: Send + 'static, E: Send + 'static> BatchProcessor<ValkeyTask<T>, T, E>
-    for ValkeyTaskDispatcher
+for ValkeyTaskDispatcher
 {
     fn process(&self, ctx: &Context, task: ValkeyTask<T>) -> Result<T, E> {
         Ok(task(ctx))
@@ -196,26 +208,25 @@ pub fn global_valkey_task_worker() -> &'static ValkeyTaskWorker<(), String> {
     &GLOBAL_VALKEY_TASK_WORKER
 }
 
-pub fn submit_valkey_task(task: ValkeyTask<()>) -> Option<Result<(), String>> {
+pub(crate) fn submit_valkey_task(task: ValkeyTask<()>) -> Option<Result<(), String>> {
     global_valkey_task_worker().send(task)
 }
 
-pub fn submit_task_with_payload<P: Send + 'static>(
-    payload: P,
-    task_fn: impl Fn(&Context, P) -> Result<(), String> + Send + 'static,
-) -> Option<Result<(), String>> {
-    let (tx, rx) = mpsc::sync_channel(1);
-    let task = Box::new(move |ctx: &Context| {
-        let res = task_fn(ctx, payload);
-        let _ = tx.send(res);
-    }) as ValkeyTask<()>;
-
-    match submit_valkey_task(task)? {
-        Ok(()) => rx.recv().ok(),
-        Err(e) => Some(Err(e)),
-    }
+pub(crate) fn submit_valkey_task_and_forget(task: ValkeyTask<()>) {
+    global_valkey_task_worker().send_and_forget(task);
 }
 
-pub fn submit_task_no_wait(task: ValkeyTask<()>) {
-    let _ = submit_valkey_task(task);
+pub(crate) fn send_with_payload<F, T>(
+    task: F,
+    payload: T,
+) -> Option<Result<(), String>>
+where
+    T: Send + 'static,
+    F: Fn(&Context, T) -> Result<(), String> + Send + 'static,
+{
+    let closure: ValkeyTask<()> = Box::new(move |ctx: &Context| {
+        let _ = task(ctx, payload);
+    });
+
+    submit_valkey_task(closure)
 }
