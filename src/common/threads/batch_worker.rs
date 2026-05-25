@@ -233,3 +233,26 @@ where
     };
     result
 }
+
+
+pub(crate) fn exec_with_payload<F, T, R>(
+    task: F,
+    payload: T,
+) -> Result<R, String>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(&Context, T) -> Result<R, String> + Send + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(1);
+    let closure: ValkeyTask<()> = Box::new(move |ctx: &Context| {
+        let result = task(ctx, payload);
+        tx.send(result).unwrap();
+    });
+
+    let Some(_result) = submit_valkey_task(closure) else {
+        return Err("Failed to submit valkey task with payload".to_string());
+    };
+
+    rx.recv().map_err(|e| e.to_string())?
+}
