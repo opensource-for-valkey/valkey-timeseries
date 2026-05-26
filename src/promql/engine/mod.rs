@@ -50,6 +50,8 @@ pub struct QueryOptions {
     /// Whether to optimize the queries by simplify the query plan and pushing down filters to the data source.
     /// This can improve performance but may cause higher memory usage and slower response times for some queries.
     pub optimize_queries: bool,
+    /// The db in which to execute the query
+    pub db: i32,
 }
 
 impl Default for QueryOptions {
@@ -66,6 +68,7 @@ impl Default for QueryOptions {
             is_tracing: false,
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,
+            db: 0,
         }
     }
 }

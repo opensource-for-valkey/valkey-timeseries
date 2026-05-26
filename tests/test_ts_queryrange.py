@@ -88,6 +88,33 @@ class TestTsQueryRange(ValkeyTimeSeriesTestCaseBase):
             args.extend(["END", str(end)])
         return self.client.execute_command(*args)
 
+    def test_queryrange_respects_selected_db(self):
+        client = self.client
+
+        client.select(0)
+        client.execute_command("TS.CREATE", "db0_metric", "LABELS", "__name__", "db_scoped_range", "db", "0")
+        client.execute_command("TS.ADD", "db0_metric", 1000, 1)
+        client.execute_command("TS.ADD", "db0_metric", 2000, 2)
+
+        client.select(1)
+        client.execute_command("TS.CREATE", "db1_metric", "LABELS", "__name__", "db_scoped_range", "db", "1")
+        client.execute_command("TS.ADD", "db1_metric", 1000, 10)
+        client.execute_command("TS.ADD", "db1_metric", 2000, 20)
+
+        client.select(0)
+        db0_raw = self.range_query("db_scoped_range", "1000", start=1000, end=2000)
+        db0_result = QueryResult.from_raw(db0_raw)
+        assert db0_result.is_matrix()
+        assert len(db0_result.result) == 1
+        assert db0_result.result[0].metric["db"] == "0"
+
+        client.select(1)
+        db1_raw = self.range_query("db_scoped_range", "1000", start=1000, end=2000)
+        db1_result = QueryResult.from_raw(db1_raw)
+        assert db1_result.is_matrix()
+        assert len(db1_result.result) == 1
+        assert db1_result.result[0].metric["db"] == "1"
+
     def test_queryrange_returns_matrix_for_metric(self):
         self.setup_simple_series()
 

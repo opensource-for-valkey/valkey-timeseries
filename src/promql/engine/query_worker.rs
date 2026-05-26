@@ -1,3 +1,4 @@
+use crate::common::context::{get_current_db, set_current_db};
 use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
@@ -35,6 +36,15 @@ struct RangeQueryCommand {
 enum QueryCommand {
     Instant(InstantQueryCommand),
     Range(RangeQueryCommand),
+}
+
+impl QueryCommand {
+    fn db(&self) -> i32 {
+        match self {
+            QueryCommand::Instant(iqc) => iqc.options.db,
+            QueryCommand::Range(rc) => rc.options.db,
+        }
+    }
 }
 
 /// A single batched request for a `BatchWorker`.
@@ -151,11 +161,24 @@ impl QueryWorker {
 }
 
 fn process_command(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
-    if is_clustered(ctx) {
+    let original_db = get_current_db(ctx);
+    let target_db = item.db();
+
+    if target_db != original_db {
+        let _ = set_current_db(ctx, target_db);
+    }
+
+    let result = if is_clustered(ctx) {
         process_cluster(ctx, item)
     } else {
         process_local(ctx, item)
+    };
+
+    if target_db != original_db {
+        let _ = set_current_db(ctx, original_db);
     }
+
+    result
 }
 
 fn process_local(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
@@ -292,15 +315,25 @@ pub(super) fn query_instant_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
+    // PromQL instant-query semantics: return the most recent sample per series
+    // whose timestamp falls within the lookback window (timestamp - lookback_delta, timestamp].
+    // This mirrors the Prometheus staleness semantics described in:
+    // https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness
+    let lookback_delta_ms = options.lookback_delta.as_millis() as Timestamp;
+    // The lower bound is exclusive per PromQL spec, so subtract 1 to make the
+    // TimeSeries::get_range inclusive-lower-bound call behave correctly.
+    let lookback_start_ms = timestamp
+        .saturating_sub(lookback_delta_ms)
+        .saturating_add(1);
+
     let samples = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
-            // todo: log error if any
-            let Ok(Some(sample)) = s.get_sample(timestamp) else {
-                return None;
-            };
+            // Fetch all samples within [lookback_start_ms, timestamp] and pick the last one.
+            let range = s.get_range(lookback_start_ms, timestamp);
+            let sample = range.last()?;
 
             let labels: Labels = (&s.labels).into();
             Some(InstantSample {
