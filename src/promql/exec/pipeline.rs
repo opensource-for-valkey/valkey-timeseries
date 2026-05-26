@@ -179,10 +179,6 @@ fn compute_subquery_alignment(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Phase 5: Shaping
-// ---------------------------------------------------------------------------
-
 /// Shape loaded data for instant vector selector.
 ///
 /// Takes the latest sample per fingerprint. Bucket data should already be in
