@@ -1,7 +1,7 @@
 use crate::commands::command_parser::parse_query_command_args;
 use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
+use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
-use crate::common::threads::spawn;
 use crate::common::time::system_time_to_millis;
 use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::evaluate_instant;
@@ -18,13 +18,18 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let config_guard = PROMQL_CONFIG.read()?;
     let mut args = args.into_iter().skip(1).peekable();
     let promql_config = config_guard.deref();
-    let (eval_stmt, opts) = parse_query_command_args(promql_config, &mut args)?;
+    let (eval_stmt, mut opts) = parse_query_command_args(promql_config, &mut args)?;
+    // Capture the client's selected database from the per-client command context
+    // before we move into a background thread. This ensures the query is evaluated
+    // against the correct database regardless of what the module-global context
+    // happens to have selected at the time the worker thread runs.
+    opts.db = get_current_db(ctx);
 
     let blocked_client = create_blocked_client(ctx);
     let eval_ts = eval_stmt.start;
 
     let querier = get_promql_querier(ctx);
-    spawn(move || {
+    std::thread::spawn(move || {
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
 
         let result = match evaluate_instant(querier, eval_stmt, eval_ts, opts) {

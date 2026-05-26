@@ -27,6 +27,12 @@ class TestTsQueryCluster(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(*args)
         return QueryResult.from_raw(result)
 
+    def _select_db_or_skip(self, db: int):
+        try:
+            self.client.execute_command("SELECT", db)
+        except ResponseError as e:
+            pytest.skip(f"cluster does not allow SELECT {db}: {e}")
+
     def setup_http_requests_cluster(self):
         """Create a small fleet of metrics distributed across shards using hash-tags."""
         client = self.client
@@ -121,3 +127,35 @@ class TestTsQueryCluster(ValkeyTimeSeriesTestCaseBase):
 
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.QUERY', 'invalid {[}')
+
+    def test_query_fanout_respects_selected_db(self):
+        """Fanout instant queries should execute in the caller-selected DB."""
+        client = self.client
+        t0 = "2026-04-06T20:00:00Z"
+
+        self._select_db_or_skip(0)
+        client.execute_command('TS.CREATE', 'db0-a:{shard0}', 'METRIC', 'db_fanout_metric{db="0",series="a"}')
+        client.execute_command('TS.CREATE', 'db0-b:{shard1}', 'METRIC', 'db_fanout_metric{db="0",series="b"}')
+        client.execute_command('TS.ADD', 'db0-a:{shard0}', t0, 10)
+        client.execute_command('TS.ADD', 'db0-b:{shard1}', t0, 20)
+
+        self._select_db_or_skip(1)
+        client.execute_command('TS.CREATE', 'db1-a:{shard0}', 'METRIC', 'db_fanout_metric{db="1",series="a"}')
+        client.execute_command('TS.CREATE', 'db1-b:{shard2}', 'METRIC', 'db_fanout_metric{db="1",series="b"}')
+        client.execute_command('TS.ADD', 'db1-a:{shard0}', t0, 100)
+        client.execute_command('TS.ADD', 'db1-b:{shard2}', t0, 200)
+
+        self._select_db_or_skip(0)
+        db0_result = self.instant_query('db_fanout_metric', t0)
+        assert db0_result.is_vector()
+        assert len(db0_result.result) == 2
+        assert {sample.metric['db'] for sample in db0_result.result} == {'0'}
+        assert sorted(sample.value.value for sample in db0_result.result) == [10.0, 20.0]
+
+        self._select_db_or_skip(1)
+        db1_result = self.instant_query('db_fanout_metric', t0)
+        assert db1_result.is_vector()
+        assert len(db1_result.result) == 2
+        assert {sample.metric['db'] for sample in db1_result.result} == {'1'}
+        assert sorted(sample.value.value for sample in db1_result.result) == [100.0, 200.0]
+

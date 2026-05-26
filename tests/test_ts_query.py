@@ -66,6 +66,33 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(*args)
         return QueryResult.from_raw(result)
 
+    def test_query_respects_selected_db(self):
+        client = self.client
+
+        client.select(0)
+        client.execute_command('TS.CREATE', 'db0_metric', 'LABELS', '__name__', 'db_scoped_metric', 'db', '0')
+        client.execute_command('TS.ADD', 'db0_metric', 1000, 11)
+        client.execute_command('TS.ADD', 'db0_metric', 2000, 12)
+
+        client.select(1)
+        client.execute_command('TS.CREATE', 'db1_metric', 'LABELS', '__name__', 'db_scoped_metric', 'db', '1')
+        client.execute_command('TS.ADD', 'db1_metric', 1000, 21)
+        client.execute_command('TS.ADD', 'db1_metric', 2000, 22)
+
+        client.select(0)
+        db0_result = self.instant_query('db_scoped_metric', 2)
+        assert db0_result.is_vector()
+        assert len(db0_result.result) == 1
+        assert db0_result.result[0].metric['db'] == '0'
+        assert db0_result.result[0].value.value == 12
+
+        client.select(1)
+        db1_result = self.instant_query('db_scoped_metric', 2)
+        assert db1_result.is_vector()
+        assert len(db1_result.result) == 1
+        assert db1_result.result[0].metric['db'] == '1'
+        assert db1_result.result[0].value.value == 22
+
     def test_query_basic_metric_name(self):
         """Test basic TS.QUERY with just a metric name."""
         self.setup_simple_series()
@@ -235,19 +262,23 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert result is not None
 
     def test_query_series_with_many_points(self):
-        """Test TS.QUERY on series with many data points."""
+        """Test TS.QUERY on a series with many data points."""
         # Create series with many points
         self.client.execute_command('TS.CREATE', 'many_points', 'LABELS', '__name__', 'many_points')
 
-        # Add 1000 data points
+        # Add 1000 data points. Timestamps are in milliseconds (i * 1000), values are i.
+        # So i=4 → timestamp=4000ms, value=4.
         for i in range(1000):
             self.client.execute_command('TS.ADD', 'many_points', i * 1000, i)
 
-        result = self.instant_query('many_points', 4000)
+        # TIME follows the PromQL/Prometheus HTTP API convention: plain integers are
+        # Unix *seconds*, not milliseconds.  Pass 4 (seconds) = 4000 ms so that
+        # the lookback window includes the data point at timestamp 4000 ms (value 4).
+        result = self.instant_query('many_points', 4)
 
         assert result.is_vector(), "expected a vector"
         value = result.result[0].value
-        assert value.timestamp == 4000
+        assert value.timestamp == 4000, f"expected timestamp 4000 ms, got {value.timestamp}"
         assert value.value == 4, "expected the value from the most recent point at or before the query time"
 
     def test_error_on_invalid_time_format(self):
