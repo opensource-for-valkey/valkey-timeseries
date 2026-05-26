@@ -4,7 +4,7 @@ use crate::common::binop::ComparisonOperator;
 use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
 };
-use crate::common::time::{current_time_millis, timestamp_so_system_time};
+use crate::common::time::{current_time_millis, timestamp_to_system_time};
 use crate::config::is_strict_rts_compat;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
