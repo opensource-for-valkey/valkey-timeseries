@@ -58,6 +58,6 @@ pub fn system_time_to_secs(t: SystemTime) -> i64 {
         .as_secs() as i64
 }
 
-pub fn timestamp_so_system_time(timestamp: Timestamp) -> SystemTime {
+pub fn timestamp_to_system_time(timestamp: Timestamp) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(timestamp as u64)
 }
