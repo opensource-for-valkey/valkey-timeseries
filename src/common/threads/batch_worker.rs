@@ -189,7 +189,7 @@ where
 pub struct ValkeyTaskDispatcher;
 
 impl<T: Send + 'static, E: Send + 'static> BatchProcessor<ValkeyTask<T>, T, E>
-for ValkeyTaskDispatcher
+    for ValkeyTaskDispatcher
 {
     fn process(&self, ctx: &Context, task: ValkeyTask<T>) -> Result<T, E> {
         Ok(task(ctx))
@@ -216,10 +216,7 @@ pub(crate) fn submit_valkey_task_and_forget(task: ValkeyTask<()>) {
     global_valkey_task_worker().send_and_forget(task);
 }
 
-pub(crate) fn send_with_payload<F, T>(
-    task: F,
-    payload: T,
-) -> Result<(), String>
+pub(crate) fn send_with_payload<F, T>(task: F, payload: T) -> Result<(), String>
 where
     T: Send + 'static,
     F: Fn(&Context, T) -> Result<(), String> + Send + 'static,
@@ -234,11 +231,7 @@ where
     result
 }
 
-
-pub(crate) fn exec_with_payload<F, T, R>(
-    task: F,
-    payload: T,
-) -> Result<R, String>
+pub(crate) fn exec_with_payload<F, T, R>(task: F, payload: T) -> Result<R, String>
 where
     T: Send + 'static,
     R: Send + 'static,
