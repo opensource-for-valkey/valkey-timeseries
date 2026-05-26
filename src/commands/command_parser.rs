@@ -196,6 +196,45 @@ pub fn parse_timestamp_arg(arg: &str, name: &str) -> Result<TimestampValue, Valk
     })
 }
 
+/// Parse a PromQL-style timestamp argument where plain integers are treated as Unix seconds
+/// (following the Prometheus HTTP API convention: `/query?time=<unix_time_in_seconds>`).
+///
+/// A plain integer `N` is multiplied by 1000 to produce milliseconds, so `TIME 2` means
+/// 2 seconds from the Unix epoch (= 2000 ms).  RFC 3339 strings and special tokens
+/// (`*`, `+`, `-`) are handled the same as `parse_timestamp_arg`.
+pub(super) fn parse_promql_time_arg(arg: &str, name: &str) -> Result<TimestampValue, ValkeyError> {
+    // Delegate special tokens and RFC-3339 dates to the existing parser.
+    match arg {
+        "-" => return Ok(TimestampValue::Earliest),
+        "+" => return Ok(TimestampValue::Latest),
+        "*" => return Ok(TimestampValue::Now),
+        _ => {}
+    }
+
+    // Relative durations like "+5m" or "-1h"
+    if let Some(ch) = arg.chars().next()
+        && (ch == '-' || ch == '+')
+        && arg.len() > 1
+    {
+        return parse_timestamp_range_value(arg).map_err(|_| {
+            let msg = format!("TSDB: invalid {name} timestamp");
+            ValkeyError::String(msg)
+        });
+    }
+
+    // Use auto_scale = true so that small integers are treated as Unix seconds.
+    match parse_timestamp_internal(arg, true) {
+        Ok(ms) if ms >= 0 => Ok(TimestampValue::Specific(ms)),
+        _ => {
+            // Fall back to the RFC-3339 / full parser for date strings.
+            parse_timestamp_range_value(arg).map_err(|_| {
+                let msg = format!("TSDB: invalid {name} timestamp");
+                ValkeyError::String(msg)
+            })
+        }
+    }
+}
+
 pub fn parse_timestamp_range_value(arg: &str) -> ValkeyResult<TimestampValue> {
     TimestampValue::try_from(arg)
 }
@@ -1444,7 +1483,10 @@ pub(super) fn parse_query_command_args(
         match token {
             CommandArgToken::Time => {
                 let next = args.next_str()?;
-                evaluation_ts = parse_timestamp_arg(next, token.as_str())?;
+                // PromQL TIME follows the Prometheus HTTP API convention where plain
+                // integers are Unix seconds (not milliseconds).  Use the dedicated
+                // PromQL timestamp parser so that e.g. `TIME 2` means 2 s = 2000 ms.
+                evaluation_ts = parse_promql_time_arg(next, token.as_str())?;
             }
             CommandArgToken::LookbackDelta => {
                 lookback_delta = parse_duration_internal(args.next(), token.as_str())?;
