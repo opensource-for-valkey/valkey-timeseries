@@ -202,10 +202,19 @@ fn calculate_timeout(opts: &QueryOptions) -> Duration {
     // todo: cap with promql config max query duration
 }
 
+fn effective_max_series(max_series: usize) -> usize {
+    if max_series == 0 {
+        usize::MAX
+    } else {
+        max_series
+    }
+}
+
 fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
     match item {
         QueryCommand::Instant(iqc) => {
             let timeout = calculate_timeout(&iqc.options);
+            let max_series = effective_max_series(iqc.options.max_series);
             let timestamp = iqc.timestamp;
             let lookback_delta = iqc.options.lookback_delta.as_millis() as u64;
             let cmd = QueryFanoutCommand::new(iqc.matchers, timestamp, lookback_delta, timeout);
@@ -222,6 +231,7 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
                             value: s.value,
                         });
                     }
+                    samples.truncate(max_series);
                     Ok(QueryValue::Vector(samples))
                 }
                 Err(e) => Err(QueryError::Execution(e.to_string())),
@@ -229,6 +239,7 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
         }
         QueryCommand::Range(rc) => {
             let timeout = calculate_timeout(&rc.options);
+            let max_series = effective_max_series(rc.options.max_series);
             let cmd = QueryRangeFanoutCommand::new(
                 rc.matchers,
                 rc.start_timestamp,
@@ -237,7 +248,7 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
             );
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
-                    let ranges = resp
+                    let mut ranges: Vec<RangeSample> = resp
                         .series
                         .into_iter()
                         .map(|rs| {
@@ -250,6 +261,7 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
                             RangeSample { labels, samples }
                         })
                         .collect();
+                    ranges.truncate(max_series);
                     Ok(QueryValue::Matrix(ranges))
                 }
                 Err(e) => Err(QueryError::Execution(e.to_string())),
@@ -310,7 +322,7 @@ pub(super) fn query_instant_local(
     if let Some(d) = options.deadline
         && current_time_millis() > d
     {
-        return Err(QueryError::Execution("query timed out".to_string()));
+        return Err(QueryError::Timeout);
     }
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
@@ -326,7 +338,8 @@ pub(super) fn query_instant_local(
         .saturating_sub(lookback_delta_ms)
         .saturating_add(1);
 
-    let samples = series
+    let max_series = effective_max_series(options.max_series);
+    let mut samples = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par()
@@ -344,6 +357,8 @@ pub(super) fn query_instant_local(
         })
         .collect::<Vec<_>>();
 
+    samples.truncate(max_series);
+
     Ok(samples)
 }
 
@@ -354,17 +369,12 @@ pub(super) fn query_range_local(
     end_time: i64,
     options: QueryOptions,
 ) -> QueryResult<Vec<RangeSample>> {
-    let max_series = if options.max_series == 0 {
-        usize::MAX
-    } else {
-        options.max_series
-    };
+    let max_series = effective_max_series(options.max_series);
 
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
-    let ranges = series
+    let mut ranges = series
         .iter()
-        .take(max_series)
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
@@ -379,6 +389,8 @@ pub(super) fn query_range_local(
             Some(range)
         })
         .collect::<Vec<_>>();
+
+    ranges.truncate(max_series);
 
     Ok(ranges)
 }

@@ -37,7 +37,10 @@ pub(in crate::promql) fn can_pushdown_filters(expr: &Expr) -> bool {
             .iter()
             .any(|x| can_pushdown_filters(x.deref())),
         Binary(be) => can_pushdown_filters(&be.lhs) || can_pushdown_filters(&be.rhs),
-        Aggregate(agg) => agg.param.as_ref().is_some_and(|e| can_pushdown_filters(e)),
+        Aggregate(agg) => {
+            can_pushdown_filters(&agg.expr)
+                || agg.param.as_ref().is_some_and(|e| can_pushdown_filters(e))
+        }
         Unary(unary) => can_pushdown_filters(&unary.expr),
         Subquery(s) => can_pushdown_filters(&s.expr),
         _ => false,
@@ -64,6 +67,7 @@ pub(super) fn optimize_in_place(expr: &mut Expr) {
             }
         }
         Aggregate(agg) => {
+            optimize_in_place(&mut agg.expr);
             if let Some(param) = agg.param.as_mut() {
                 optimize_in_place(param);
             }

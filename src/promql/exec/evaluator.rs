@@ -252,9 +252,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.evaluate_matrix_selector(matrix_selector, ctx)
             }
             Expr::Call(call) => self.evaluate_call(call, ctx, preload_eligible),
-            Expr::Extension(_) => {
-                todo!()
-            }
+            Expr::Extension(_) => Err(EvaluationError::InternalError(
+                "unsupported PromQL extension expression".to_string(),
+            )),
         }
     }
 
