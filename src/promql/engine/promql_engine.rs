@@ -35,6 +35,16 @@ fn parse_query(query: &str, options: &QueryOptions) -> QueryResult<Expr> {
     Ok(expr)
 }
 
+fn resolve_deadline_ms(opts: QueryOptions) -> i64 {
+    if let Some(deadline) = opts.deadline {
+        return deadline;
+    }
+    if let Some(timeout) = opts.timeout {
+        return current_time_millis().saturating_add(timeout.as_millis() as i64);
+    }
+    0
+}
+
 pub(crate) trait PromqlEngine: Send + Sync {
     /// Build a query reader
     fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>>;
@@ -111,7 +121,7 @@ pub fn evaluate_instant(
     query_time: SystemTime,
     opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
-    let deadline = opts.deadline.map_or(0, |d| d);
+    let deadline = resolve_deadline_ms(opts);
     let evaluator = Evaluator::new(&reader, opts);
 
     // Best-effort timeout: compute a deadline if set and check before/after heavy ops
@@ -180,14 +190,13 @@ pub fn evaluate_range(
     }
 
     let evaluator = Evaluator::new(&reader, opts);
+    let deadline = resolve_deadline_ms(opts);
 
     evaluator
         .preload_for_range_from_stmt(&stmt)
         .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
 
-    if let Some(dl) = opts.deadline
-        && current_time_millis() > dl
-    {
+    if deadline > 0 && current_time_millis() > deadline {
         return Err(QueryError::Timeout);
     }
 
@@ -200,9 +209,7 @@ pub fn evaluate_range(
             .iter_into_par()
             .map(|t| -> QueryResult<(Timestamp, ExprResult)> {
                 // Best-effort per-step timeout check.
-                if let Some(dl) = opts.deadline
-                    && current_time_millis() > dl
-                {
+                if deadline > 0 && current_time_millis() > deadline {
                     return Err(QueryError::Timeout);
                 }
 
@@ -234,7 +241,7 @@ pub fn evaluate_range(
                     series_map
                         .entry(labels)
                         .or_default()
-                        .push(Sample::new(sample.timestamp_ms, sample.value));
+                        .push(Sample::new(current_time, sample.value));
                 }
             }
             ExprResult::Scalar(value) => {
@@ -587,6 +594,27 @@ mod tests {
         assert_eq!(results[0].samples.len(), 2); // two steps: 100s and 160s
         assert_eq!(results[0].samples[0].value, 2.0);
         assert_eq!(results[0].samples[1].value, 2.0);
+    }
+
+    #[test]
+    fn eval_query_range_vector_samples_use_step_timestamps() {
+        let tsdb = create_tsdb_with_data();
+        let start = UNIX_EPOCH + Duration::from_secs(4100);
+        let end = UNIX_EPOCH + Duration::from_secs(4220);
+        let step = Duration::from_secs(60);
+
+        let opts = QueryOptions::default();
+        let mut results = tsdb
+            .eval_query_range("http_requests", start..=end, step, &opts)
+            .unwrap();
+        results.sort_by(|a, b| a.labels.get("env").cmp(&b.labels.get("env")));
+
+        assert_eq!(results.len(), 2);
+        for rs in results {
+            let mut ts: Vec<_> = rs.samples.into_iter().map(|s| s.timestamp).collect();
+            ts.sort_unstable();
+            assert_eq!(ts, vec![4_100_000, 4_160_000, 4_220_000]);
+        }
     }
 
     #[test]
