@@ -22,7 +22,7 @@ cargo fmt --check
 cargo clippy --profile release --all-targets -- -D clippy::all
 
 echo "Running cargo build release..."
-RUSTFLAGS="-D warnings" cargo build --all --all-targets  --release
+RUSTFLAGS="-D warnings" cargo build --all --release
 
 # Only run unit tests if no specific integration test is specified
 if [[ -z "$TEST_PATTERN" ]]; then
