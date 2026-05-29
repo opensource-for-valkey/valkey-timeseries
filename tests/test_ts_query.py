@@ -108,7 +108,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert qr.is_vector()
 
     def test_query_with_explicit_timestamp(self):
-        """Test TS.QUERY with explicit unix timestamp."""
+        """Test TS.QUERY with an explicit unix timestamp."""
         self.setup_simple_series()
 
         # Query at a specific timestamp (in seconds)
@@ -138,7 +138,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert result is not None
 
     def test_query_with_lookback_delta(self):
-        """Test TS.QUERY with LOOKBACK_DELTA option."""
+        """Test TS.QUERY with the LOOKBACK_DELTA option."""
         self.setup_simple_series()
 
         # Query with custom lookback delta
@@ -194,7 +194,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.QUERY', 'invalid {[}')
 
     def test_query_missing_query_argument(self):
-        """Test TS.QUERY without required query argument."""
+        """Test TS.QUERY without the required query argument."""
         # Command requires at least one argument (the query)
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.QUERY')
@@ -231,7 +231,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert qr.is_scalar(), "expected a scalar result"
 
     def test_query_after_series_deletion(self):
-        """Test TS.QUERY behavior after series has been deleted."""
+        """Test TS.QUERY behavior after a series has been deleted."""
         self.setup_simple_series()
 
         # Delete the series
@@ -244,7 +244,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert result is not None
 
     def test_query_with_negative_lookback_delta(self):
-        """Test TS.QUERY with negative lookback delta."""
+        """Test TS.QUERY with a negative lookback delta."""
         self.setup_simple_series()
 
         # Negative lookback delta should be rejected
@@ -253,7 +253,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
                                         'LOOKBACK_DELTA', '-1000')
 
     def test_query_with_very_large_lookback_delta(self):
-        """Test TS.QUERY with very large lookback delta."""
+        """Test TS.QUERY with a very large lookback delta."""
         self.setup_simple_series()
 
         result = self.client.execute_command('TS.QUERY', 'http_requests',
@@ -282,7 +282,7 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert value.value == 4, "expected the value from the most recent point at or before the query time"
 
     def test_error_on_invalid_time_format(self):
-        """Test TS.QUERY with invalid TIME format."""
+        """Test TS.QUERY with an invalid TIME format."""
         self.setup_simple_series()
 
         # Invalid time format should raise error
@@ -448,9 +448,32 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         self._assert_single_value(min_result, 110.0)
         self._assert_single_value(max_result, 330.0)
 
-    @pytest.mark.xfail(reason="increase() support may be partial; keep scenario covered from cheat sheet")
-    def test_range_increase_production(self):
+
+    def test_range_increase_production_two_samples_in_window(self):
+        """increase() returns a non-zero extrapolated value when two samples
+        fall strictly inside the range window (range_start, range_end].
+
+        setup_http_requests_scenario records data at:
+            t0 = 2026-04-06T20:00:00Z  (values 100, 200, 300, 10)
+            t1 = 2026-04-06T20:01:00Z  (values 110, 220, 330, 20)  ← query time
+
+        Using [2m] at t1: window is (19:59:00Z, t1].
+        Both t0 and t1 fall strictly inside, so each series contributes 2 samples.
+
+        Extrapolation for each production server (identical arithmetic):
+            duration_to_start = t0 − (t1 − 2 min) = 60 s
+            sampled_interval  = t1 − t0            = 60 s
+            average_duration  = 60 s,  threshold   = 60 × 1.1 = 66 s
+            60 s < 66 s  →  duration_to_start is kept as-is (no capping)
+            duration_to_end   = 0 s  (last sample is at range_end)
+            factor = (60 + 60 + 0) / 60 = 2.0
+
+        Raw increases: 10, 20, 30  →  extrapolated: 20, 40, 60  →  sum = 120.0
+        """
         time = self.setup_http_requests_scenario()
 
-        result = self.instant_query('sum(increase(http_requests_total{environment="production"}[1m]))', time)
-        self._assert_single_value(result, 60.0)
+        result = self.instant_query(
+            'sum(increase(http_requests_total{environment="production"}[2m]))', time
+        )
+        self._assert_single_value(result, 120.0)
+
