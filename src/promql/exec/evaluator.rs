@@ -116,7 +116,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
 
                     // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
-                    // timestamp, however when resolving `@ start()` / `@ end()` inside the
+                    // timestamp; however, when resolving `@ start()` / `@ end()` inside the
                     // preloading phase we must use the outer query bounds so that
                     // `@ start()`/`@ end()` sweep the full query range across steps.
                     // Pass `eval_start_ms`/`eval_end_ms` as the `query_start`/`query_end`
