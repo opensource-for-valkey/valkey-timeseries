@@ -322,8 +322,7 @@ fn eval_arith_ops(
         }
     }
 
-    // Fast-path: no modifier (OneToOne, no matching, no fills) —
-    // avoid building a hashmap by using a fingerprint-based merge.
+    // Fast-path: no modifier (OneToOne, no matching, no fills)
     if can_use_fast_path(&ctx) {
         return eval_arith_ops_fast_path(
             ctx.operator,
