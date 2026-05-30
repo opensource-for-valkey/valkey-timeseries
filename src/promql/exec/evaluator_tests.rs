@@ -3171,4 +3171,410 @@ mod tests {
             "Regular division != floor division for negatives"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // eval_vector_vector_binop – filter-pushdown tests
+    //
+    // These tests exercise the fast path in `Evaluator::eval_vector_vector_binop`
+    // where common label filters derived from the first-evaluated side are pushed
+    // down into the selector for the second side, pruning unnecessary series before
+    // the binary-op matching step.
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Multiplication where the single LHS series has `env="prod"`.
+    /// The pushdown injects `env="prod"` and `job="api"` into the RHS selector so
+    /// the `env="staging"` RHS series is excluded *before* the binary-op matching
+    /// step.  Uses no `on()`/`ignoring()` modifier so the fast-path is exercised
+    /// and there are no grouped-cardinality duplicate-detection issues.
+    #[test]
+    fn pushdown_injects_common_lhs_label_into_rhs_selector() {
+        // given
+        let test_data: TestSampleData = vec![
+            // LHS – single series, env="prod"
+            ("metric_a", vec![("env", "prod"), ("job", "api")], 0, 10.0),
+            // RHS – one matching (env="prod"), one non-matching (env="staging").
+            // Without pushdown both RHS series are fetched; with pushdown the
+            // common filters env="prod" and job="api" are injected into the
+            // metric_b selector so the staging series is pruned before matching.
+            ("metric_b", vec![("env", "prod"), ("job", "api")], 1, 2.0),
+            (
+                "metric_b",
+                vec![("env", "staging"), ("job", "api")],
+                2,
+                99.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when – no explicit on/ignoring: matches on all labels except __name__
+        let mut result =
+            parse_and_evaluate(&evaluator, "metric_a * metric_b", end_time, lookback_delta)
+                .expect("pushdown multiplication should succeed");
+
+        // then – only the prod pair matched; staging series must be absent
+        sort_samples_by_labels(&mut result);
+        assert_eq!(result.len(), 1, "staging series must not appear in result");
+        assert_results_match(&result, &[(20.0, vec![("env", "prod"), ("job", "api")])]);
+    }
+
+    /// When every LHS series shares *multiple* labels the pushdown should derive
+    /// a filter for each shared label and apply them all to the RHS selector.
+    #[test]
+    fn pushdown_injects_multiple_common_lhs_labels_into_rhs_selector() {
+        // given
+        let test_data: TestSampleData = vec![
+            // LHS – all series share env="prod" AND region="us-east"
+            (
+                "requests",
+                vec![("env", "prod"), ("region", "us-east"), ("job", "api")],
+                0,
+                100.0,
+            ),
+            (
+                "requests",
+                vec![("env", "prod"), ("region", "us-east"), ("job", "worker")],
+                1,
+                200.0,
+            ),
+            // RHS – two matching, one non-matching (different env+region)
+            (
+                "errors",
+                vec![("env", "prod"), ("region", "us-east"), ("job", "api")],
+                2,
+                5.0,
+            ),
+            (
+                "errors",
+                vec![("env", "prod"), ("region", "us-east"), ("job", "worker")],
+                3,
+                10.0,
+            ),
+            (
+                "errors",
+                vec![("env", "staging"), ("region", "eu-west"), ("job", "api")],
+                4,
+                1.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "requests - on(env, region, job) errors",
+            end_time,
+            lookback_delta,
+        )
+        .expect("multi-label pushdown subtraction should succeed");
+
+        // then – only the two prod/us-east pairs survive
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[
+                (
+                    95.0,
+                    vec![("env", "prod"), ("job", "api"), ("region", "us-east")],
+                ),
+                (
+                    190.0,
+                    vec![("env", "prod"), ("job", "worker"), ("region", "us-east")],
+                ),
+            ],
+        );
+    }
+
+    /// When LHS series do *not* share a common value for a label the pushdown
+    /// must not add a restricting filter for that label, so all RHS series remain
+    /// accessible for matching.
+    #[test]
+    fn pushdown_skips_filter_when_lhs_label_values_differ() {
+        // given – LHS has both env="prod" and env="staging", so no common env filter
+        let test_data: TestSampleData = vec![
+            ("metric_a", vec![("env", "prod"), ("job", "api")], 0, 10.0),
+            (
+                "metric_a",
+                vec![("env", "staging"), ("job", "api")],
+                1,
+                20.0,
+            ),
+            ("metric_b", vec![("env", "prod"), ("job", "api")], 2, 3.0),
+            ("metric_b", vec![("env", "staging"), ("job", "api")], 3, 4.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "metric_a + on(env, job) metric_b",
+            end_time,
+            lookback_delta,
+        )
+        .expect("mixed-label pushdown should still return all matched pairs");
+
+        // then – both env pairs match
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[
+                (13.0, vec![("env", "prod"), ("job", "api")]),
+                (24.0, vec![("env", "staging"), ("job", "api")]),
+            ],
+        );
+    }
+
+    /// For the AND operator the evaluator swaps evaluation order: RHS is fetched
+    /// first and its common filters are pushed down into the LHS selector.
+    /// Only LHS series that match an RHS series (by all labels except __name__)
+    /// are returned.
+    #[test]
+    fn pushdown_and_operator_evaluates_rhs_first_and_filters_lhs() {
+        // given
+        let test_data: TestSampleData = vec![
+            // LHS – two environments
+            ("metric_a", vec![("env", "prod"), ("job", "api")], 0, 42.0),
+            (
+                "metric_a",
+                vec![("env", "staging"), ("job", "api")],
+                1,
+                99.0,
+            ),
+            // RHS – only prod; pushdown should suppress the staging LHS series
+            ("metric_b", vec![("env", "prod"), ("job", "api")], 2, 1.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "metric_a and metric_b",
+            end_time,
+            lookback_delta,
+        )
+        .expect("AND pushdown should succeed");
+
+        // then – only the prod series passes the AND filter; value and metric name come
+        // from the LHS (metric_a), which is correct PromQL AND semantics.
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[(
+                42.0,
+                vec![("__name__", "metric_a"), ("env", "prod"), ("job", "api")],
+            )],
+        );
+    }
+
+    /// The OR operator must NOT push down filters: both sides are evaluated
+    /// independently so that series present only on one side are still returned.
+    #[test]
+    fn pushdown_or_operator_returns_union_without_filter_restriction() {
+        // given – disjoint label sets
+        let test_data: TestSampleData = vec![
+            ("metric_a", vec![("env", "prod")], 0, 10.0),
+            ("metric_b", vec![("env", "staging")], 1, 20.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result =
+            parse_and_evaluate(&evaluator, "metric_a or metric_b", end_time, lookback_delta)
+                .expect("OR should return union");
+
+        // then – both series appear; OR never pushes a filter that would drop one
+        sort_samples_by_labels(&mut result);
+        assert_eq!(result.len(), 2, "OR must return series from both sides");
+        assert_results_match(
+            &result,
+            &[
+                (10.0, vec![("__name__", "metric_a"), ("env", "prod")]),
+                (20.0, vec![("__name__", "metric_b"), ("env", "staging")]),
+            ],
+        );
+    }
+
+    /// UNLESS: only LHS series with *no* matching RHS series survive.
+    /// The pushdown path is active (UNLESS is not LOR), so common LHS filters
+    /// are injected into the RHS selector.  Because an RHS match *removes* the
+    /// LHS series, the result must be empty when every LHS series has a
+    /// corresponding RHS series.
+    #[test]
+    fn pushdown_unless_removes_lhs_series_matched_by_rhs() {
+        // given
+        let test_data: TestSampleData = vec![
+            ("metric_a", vec![("env", "prod"), ("job", "api")], 0, 5.0),
+            ("metric_b", vec![("env", "prod"), ("job", "api")], 1, 9.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &evaluator,
+            "metric_a unless metric_b",
+            end_time,
+            lookback_delta,
+        )
+        .expect("UNLESS with full overlap should return empty");
+
+        // then – every LHS series was cancelled by its RHS counterpart
+        assert!(
+            result.is_empty(),
+            "UNLESS should produce an empty result when all LHS series are matched; got {result:?}"
+        );
+    }
+
+    /// UNLESS where only *some* LHS series have a matching RHS series:
+    /// unmatched LHS series must survive.
+    #[test]
+    fn pushdown_unless_keeps_unmatched_lhs_series() {
+        // given
+        let test_data: TestSampleData = vec![
+            // LHS – two series
+            ("metric_a", vec![("env", "prod")], 0, 10.0),
+            ("metric_a", vec![("env", "staging")], 1, 20.0),
+            // RHS – only prod matches
+            ("metric_b", vec![("env", "prod")], 2, 1.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "metric_a unless metric_b",
+            end_time,
+            lookback_delta,
+        )
+        .expect("UNLESS partial overlap should succeed");
+
+        // then – only the staging series (no RHS counterpart) survives
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[(20.0, vec![("__name__", "metric_a"), ("env", "staging")])],
+        );
+    }
+
+    /// When the LHS returns no series and the op is not OR, the result must be
+    /// empty (nothing to match against, regardless of what RHS holds).
+    #[test]
+    fn pushdown_returns_empty_when_lhs_has_no_series() {
+        // given – "ghost_metric" has no samples in the mock store
+        let test_data: TestSampleData = vec![("real_metric", vec![("env", "prod")], 0, 42.0)];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when – LHS is absent; the AND short-circuit path fires when AND is used,
+        // but for multiplication the result is also empty because there is nothing
+        // to match on the left side.
+        let result = parse_and_evaluate(
+            &evaluator,
+            "ghost_metric * real_metric",
+            end_time,
+            lookback_delta,
+        )
+        .expect("empty LHS multiplication should return empty, not error");
+
+        // then
+        assert!(
+            result.is_empty(),
+            "Expected empty result when LHS is absent; got {result:?}"
+        );
+    }
+
+    /// Comparison operator (==) with `bool` modifier: the pushdown path is taken
+    /// for comparison ops, and the result value is 0.0 or 1.0 per PromQL bool semantics.
+    #[test]
+    fn pushdown_comparison_bool_modifier_produces_zero_one_values() {
+        // given
+        let test_data: TestSampleData = vec![
+            ("threshold", vec![("env", "prod"), ("job", "api")], 0, 10.0),
+            (
+                "threshold",
+                vec![("env", "prod"), ("job", "worker")],
+                1,
+                20.0,
+            ),
+            ("value", vec![("env", "prod"), ("job", "api")], 2, 10.0), // equal → 1
+            ("value", vec![("env", "prod"), ("job", "worker")], 3, 99.0), // not equal → 0
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "value == bool on(env, job) threshold",
+            end_time,
+            lookback_delta,
+        )
+        .expect("bool comparison via pushdown path should succeed");
+
+        // then
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[
+                (1.0, vec![("env", "prod"), ("job", "api")]),
+                (0.0, vec![("env", "prod"), ("job", "worker")]),
+            ],
+        );
+    }
+
+    /// group_left fan-out: one RHS series matched by multiple LHS series.
+    /// The pushdown must not alter the fan-out semantics.
+    #[test]
+    fn pushdown_group_left_fanout_matches_multiple_lhs_to_single_rhs() {
+        // given
+        let test_data: TestSampleData = vec![
+            // LHS – multiple instances, all env="prod"
+            ("cpu", vec![("env", "prod"), ("instance", "i1")], 0, 10.0),
+            ("cpu", vec![("env", "prod"), ("instance", "i2")], 1, 20.0),
+            ("cpu", vec![("env", "prod"), ("instance", "i3")], 2, 30.0),
+            // RHS – single series for the whole env
+            ("scale", vec![("env", "prod")], 3, 2.0),
+            // Decoy on RHS that should be suppressed by pushdown
+            ("scale", vec![("env", "staging")], 4, 99.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when – group_left() retains all many-side (cpu) labels including instance;
+        // group_left(instance) would incorrectly try to copy instance from the one-side
+        // (scale), which does not carry that label, collapsing all outputs to {env="prod"}.
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "cpu * on(env) group_left() scale",
+            end_time,
+            lookback_delta,
+        )
+        .expect("group_left fan-out via pushdown path should succeed");
+
+        // then – three output series, one per LHS instance, staging decoy absent
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[
+                (20.0, vec![("env", "prod"), ("instance", "i1")]),
+                (40.0, vec![("env", "prod"), ("instance", "i2")]),
+                (60.0, vec![("env", "prod"), ("instance", "i3")]),
+            ],
+        );
+    }
 }

@@ -1,5 +1,5 @@
 mod const_evaluator;
-mod pushdown;
+pub mod pushdown;
 #[cfg(test)]
 mod pushdown_tests;
 pub mod simplifier;

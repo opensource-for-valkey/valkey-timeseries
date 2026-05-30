@@ -9,7 +9,10 @@ mod binop_scalar_vector;
 mod binop_string_string;
 mod binop_vector_scalar;
 mod binop_vector_vector;
+mod common;
 mod labels;
+
+pub(in crate::promql) use common::*;
 
 pub(crate) fn eval_binary_expr(
     expr: &BinaryExpr,

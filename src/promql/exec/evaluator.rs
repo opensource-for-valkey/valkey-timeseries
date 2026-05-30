@@ -2,7 +2,7 @@ use super::aggregations::eval_aggregation;
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
-use crate::promql::binops::eval_binary_expr;
+use crate::promql::binops::{can_push_down_common_filters, eval_binary_expr, push_down_filters};
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
@@ -20,6 +20,7 @@ use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
 use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::label::METRIC_NAME;
+use promql_parser::parser::token::{T_LAND, T_LOR};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, Offset,
@@ -53,10 +54,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         expr: &Expr,
         ctx: &EvalContext,
     ) -> EvalResult<()> {
-        let selectors = collect_vector_selectors(expr);
         // Deduplicate by PreloadKey, then parallelize the loading
         let mut seen = AHashSet::new();
-        let unique_selectors: Vec<_> = selectors
+        let unique_selectors: Vec<_> = collect_vector_selectors(expr)
             .into_iter()
             .filter(|&vs| seen.insert(PreloadKey::from_selector(vs)))
             .collect();
@@ -201,19 +201,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         }
 
-        // Convert SystemTime to Timestamp at entry point
-        let query_start = system_time_to_millis(stmt.start);
-        let query_end = system_time_to_millis(stmt.end);
-        let evaluation_ts = query_end; // using end follows the "as-of" convention
-        let interval_ms = stmt.interval.as_millis() as i64;
-        let lookback_delta_ms = stmt.lookback_delta.as_millis() as i64;
-
         let ctx = EvalContext {
-            query_start,
-            query_end,
-            evaluation_ts,
-            lookback_delta_ms,
-            step_ms: interval_ms,
+            query_start: system_time_to_millis(stmt.start),
+            query_end: system_time_to_millis(stmt.end),
+            evaluation_ts: system_time_to_millis(stmt.end),
+            lookback_delta_ms: stmt.lookback_delta.as_millis() as i64,
+            step_ms: stmt.interval.as_millis() as i64,
         };
 
         let mut result = self.evaluate_expr(&stmt.expr, &ctx, true)?;
@@ -602,22 +595,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let evaluated_args = self.evaluate_function_args(ctx, call, func, preload_eligible)?;
-
         let result = func.apply_call(evaluated_args, ctx)?;
+
         if call.func.return_type == ValueType::Scalar {
             return match result {
                 ExprResult::Scalar(_) => Ok(result),
-                ExprResult::InstantVector(samples) => {
-                    if samples.len() != 1 {
-                        return Err(EvaluationError::InternalError(format!(
-                            "scalar-returning function {} must return exactly one sample, got {}",
-                            call.func.name,
-                            samples.len()
-                        )));
-                    }
-                    let sample = &samples[0];
-                    Ok(ExprResult::Scalar(sample.value))
+                ExprResult::InstantVector(samples) if samples.len() == 1 => {
+                    Ok(ExprResult::Scalar(samples[0].value))
                 }
+                ExprResult::InstantVector(samples) => Err(EvaluationError::InternalError(format!(
+                    "scalar-returning function {} must return exactly one sample, got {}",
+                    call.func.name,
+                    samples.len()
+                ))),
                 _ => Err(EvaluationError::InternalError(format!(
                     "expected a scalar for function {}, got {}",
                     call.func.name,
@@ -625,6 +615,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 ))),
             };
         }
+
         Ok(result)
     }
 
@@ -634,22 +625,112 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
+        // Unwrap parentheses to find bare VectorSelectors eligible for filter pushdown
+        fn unwrap_paren_selector(e: &Expr) -> Option<&Expr> {
+            match e {
+                Expr::VectorSelector(_) => Some(e),
+                Expr::Paren(pe) if matches!(*pe.expr, Expr::VectorSelector(_)) => {
+                    Some(pe.expr.as_ref())
+                }
+                _ => None,
+            }
+        }
+
         let lhs = expr.lhs.as_ref();
         let rhs = expr.rhs.as_ref();
 
-        let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
-            join(
-                || self.evaluate_expr(lhs, ctx, preload_eligible),
-                || self.evaluate_expr(rhs, ctx, preload_eligible),
-            )
-        } else {
-            (
-                self.evaluate_expr(lhs, ctx, preload_eligible),
-                self.evaluate_expr(rhs, ctx, preload_eligible),
-            )
-        };
+        match (unwrap_paren_selector(lhs), unwrap_paren_selector(rhs)) {
+            (Some(l), Some(r)) => {
+                if expr.op.id() == T_LAND {
+                    // Fetch right-side series at first, since it usually contains a lower number of time series for `and` operator.
+                    // This should produce more specific label filters for the left side of the query.
+                    // This, in turn, should reduce the time to select series for the left side of the query.
+                    self.eval_vector_vector_binop(ctx, expr, r, l, preload_eligible)
+                } else {
+                    self.eval_vector_vector_binop(ctx, expr, l, r, preload_eligible)
+                }
+            }
+            _ => {
+                let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
+                    join(
+                        || self.evaluate_expr(lhs, ctx, preload_eligible),
+                        || self.evaluate_expr(rhs, ctx, preload_eligible),
+                    )
+                } else {
+                    (
+                        self.evaluate_expr(lhs, ctx, preload_eligible),
+                        self.evaluate_expr(rhs, ctx, preload_eligible),
+                    )
+                };
 
-        eval_binary_expr(expr, left_result?, right_result?)
+                eval_binary_expr(expr, left_result?, right_result?)
+            }
+        }
+    }
+
+    fn eval_vector_vector_binop(
+        &self,
+        ctx: &EvalContext,
+        be: &BinaryExpr,
+        expr_first: &Expr,
+        expr_second: &Expr,
+        preload_eligible: bool,
+    ) -> EvalResult<ExprResult> {
+        let op = be.op.id();
+
+        if !can_push_down_common_filters(be) {
+            let (left, right) = join(
+                || self.evaluate_expr(expr_first, ctx, preload_eligible),
+                || self.evaluate_expr(expr_second, ctx, preload_eligible),
+            );
+            return eval_binary_expr(be, left?, right?);
+        }
+
+        // Execute the binary operation in the following way:
+        //
+        // 1) execute the expr_first
+        // 2) get common label filters for series returned at step 1
+        // 3) push down the found common label filters to expr_second. This filters out unneeded series
+        //    during expr_second execution instead of spending compute resources on extracting and
+        //    processing these series before they are dropped later when matching time series according to
+        //    https://prometheus.io/docs/prometheus/latest/querying/operators/#vector-matching
+        // 4) execute the expr_second with possible additional filters found at step 3
+        //
+        // Typical use cases:
+        // - Kubernetes-related: show pod creation time with the node name:
+        //
+        //     kube_pod_created{namespace="prod"} * on (uid) group_left(node) kube_pod_info
+        //
+        //   Without the optimization `kube_pod_info` would select and spend compute resources
+        //   for more time series than needed. The selected time series would be dropped later
+        //   when matching time series on the right and left sides of binary operand.
+        //
+        // - Generic alerting queries, which rely on `info` metrics.
+        //   See https://grafana.com/blog/2021/08/04/how-to-use-promql-joins-for-more-effective-queries-of-prometheus-metrics-at-scale/
+        //
+        // - Queries, which get additional labels from `info` metrics.
+        //   See https://www.robustperception.io/exposing-the-software-version-to-prometheus
+        //
+        // Invariant: be.lhs and be.rhs are both ExprResult::InstantVector
+        let first = self.evaluate_expr(expr_first, ctx, preload_eligible)?;
+
+        // if first.is_empty() && be.op == Or, the result will be empty,
+        // since `first` OR `second` would return an empty result in any case.
+        if first.is_empty() && op == T_LOR {
+            return Ok(ExprResult::InstantVector(vec![]));
+        }
+        let sec_expr = push_down_filters(be, &first, expr_second)?;
+        let second = self.evaluate_expr(&sec_expr, ctx, preload_eligible)?;
+
+        // For AND the caller swapped (expr_first=RHS, expr_second=LHS) so that the
+        // smaller RHS set is evaluated first for filter extraction.  We must restore
+        // the original (LHS, RHS) argument order before calling eval_binary_expr, since
+        // set-AND semantics return values from the LEFT (LHS) operand.
+        if op == T_LAND {
+            eval_binary_expr(be, second, first)
+        } else {
+            eval_binary_expr(be, first, second)
+        }
     }
 
     fn evaluate_unary(

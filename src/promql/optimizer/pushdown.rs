@@ -17,7 +17,7 @@ use std::vec::Vec;
 ///
 /// - Adds missing filters to `foo{filters1} op bar{filters2}`
 ///   according to https://utcc.utoronto.ca/~cks/space/blog/sysadmin/PrometheusLabelNonOptimization
-pub(in crate::promql) fn push_down_filters(expr: &Expr) -> Cow<'_, Expr> {
+pub fn push_down_filters(expr: &Expr) -> Cow<'_, Expr> {
     if can_pushdown_filters(expr) {
         let mut clone = expr.clone();
         optimize_in_place(&mut clone);
@@ -27,7 +27,7 @@ pub(in crate::promql) fn push_down_filters(expr: &Expr) -> Cow<'_, Expr> {
     }
 }
 
-pub(in crate::promql) fn can_pushdown_filters(expr: &Expr) -> bool {
+pub fn can_pushdown_filters(expr: &Expr) -> bool {
     use Expr::*;
 
     match expr {
@@ -47,7 +47,7 @@ pub(in crate::promql) fn can_pushdown_filters(expr: &Expr) -> bool {
     }
 }
 
-pub(super) fn optimize_in_place(expr: &mut Expr) {
+pub fn optimize_in_place(expr: &mut Expr) {
     use Expr::*;
 
     match expr {
@@ -85,7 +85,7 @@ pub(super) fn optimize_in_place(expr: &mut Expr) {
     }
 }
 
-pub(in crate::promql) fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
+pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
     use Expr::*;
 
     match e {
@@ -247,7 +247,10 @@ fn trim_filters_by_aggr_modifier(lfs: &mut Vec<Matcher>, afe: &AggregateExpr) {
 /// - It returns lfs as is if be doesn't contain any group modifier
 /// - It returns only filters specified in on()
 /// - It drops filters specified inside ignoring()
-fn trim_filters_by_match_modifier(lfs: &mut Vec<Matcher>, group_modifier: &Option<LabelModifier>) {
+pub fn trim_filters_by_match_modifier(
+    lfs: &mut Vec<Matcher>,
+    group_modifier: &Option<LabelModifier>,
+) {
     match group_modifier {
         None => {}
         Some(modifier) => match modifier {
@@ -294,10 +297,7 @@ fn get_label_filters_without_metric_name(lfs: &[Matcher]) -> Vec<Matcher> {
 ///
 /// The `{x="y"}` cannot be pushed down to `sum(bar)`, since this
 /// may change binary operation results.
-pub(super) fn pushdown_binary_op_filters(
-    expr: &Expr,
-    common_filters: Vec<Matcher>,
-) -> Cow<'_, Expr> {
+pub fn pushdown_binary_op_filters(expr: &Expr, common_filters: Vec<Matcher>) -> Cow<'_, Expr> {
     // according to pushdown_binary_op_filters_in_place, only the following types need to be
     // handled, so exit otherwise
     if common_filters.is_empty() || !can_pushdown_op_filters(expr) {
@@ -338,7 +338,7 @@ fn push_filters_to_matchers(matchers: &mut Matchers, common_filters: &[Matcher])
     }
 }
 
-fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut Vec<Matcher>) {
+pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut Vec<Matcher>) {
     use Expr::*;
 
     if common_filters.is_empty() {

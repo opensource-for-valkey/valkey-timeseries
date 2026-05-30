@@ -158,6 +158,15 @@ impl ExprResult {
             ExprResult::String(_) => ValueType::String,
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ExprResult::InstantVector(samples) => samples.is_empty(),
+            ExprResult::RangeVector(samples) => samples.is_empty(),
+            ExprResult::String(s) => s.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 impl From<f64> for ExprResult {
