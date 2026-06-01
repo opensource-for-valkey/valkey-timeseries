@@ -1,8 +1,9 @@
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
+use crate::labels::Labels;
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
-use crate::promql::model::{InstantSample, Labels, QueryValue, RangeSample};
+use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::range_bounds_to_system_time;

@@ -3,7 +3,7 @@ mod tests {
     use crate::common::Sample;
     use crate::promql::EvalContext;
     use crate::promql::{
-        EvalResult, EvalSample, EvalSamples, EvaluationError, Evaluator, ExprResult, Labels,
+        EvalResult, EvalSample, EvalSamples, EvaluationError, Evaluator, ExprResult,
     };
     use promql_parser::label::{METRIC_NAME, Matchers};
     use promql_parser::parser::value::ValueType;
@@ -15,7 +15,7 @@ mod tests {
 
     use crate::commands::parse_metric_name;
     use crate::common::time::system_time_to_millis;
-    use crate::labels::Label;
+    use crate::labels::{Label, Labels};
     use crate::promql::engine::test_utils::{
         MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MockSeriesQuerier,
     };

@@ -2,11 +2,12 @@
 mod tests {
     use crate::common::Sample;
     use crate::common::math::kahan_inc;
+    use crate::labels::Labels;
     use crate::promql::functions::PromQLFunctionImpl;
     use crate::promql::functions::utils::variance_kahan;
     use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
     use crate::promql::{
-        EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult, Labels, is_stale_nan,
+        EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult, is_stale_nan,
     };
     use ahash::AHashMap as HashMap;
     use promql_parser::label::METRIC_NAME;

@@ -1,7 +1,7 @@
 use crate::common::Sample;
-use crate::labels::Label;
+use crate::labels::{Label, Labels};
 use crate::parser::number::parse_number;
-use crate::promql::{InstantSample, Labels, QueryValue, RangeSample};
+use crate::promql::{InstantSample, QueryValue, RangeSample};
 use lazy_static::lazy_static;
 use promql_parser::util::unquote_string;
 use regex::Regex;

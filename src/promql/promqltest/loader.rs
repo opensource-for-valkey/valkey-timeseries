@@ -1,5 +1,5 @@
 use crate::common::Sample;
-use crate::promql::Labels;
+use crate::labels::Labels;
 use crate::promql::engine::test_utils::MockSeriesQuerier;
 use crate::promql::promqltest::dsl::SeriesLoad;
 use std::sync::Arc;

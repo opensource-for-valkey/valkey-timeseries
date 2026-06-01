@@ -1,27 +1,27 @@
-//! PromQL test framework – idiomatic Rust translation.
 //! Original source: https://github.com/prometheus/prometheus/blob/main/promqltest/test.go
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-#![allow(unused)] // many stubbed types/methods; remove in production
-
+#[allow(dead_code)]
 use crate::common::Sample;
 use crate::common::time::system_time_to_millis;
-use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::promqltest::dsl::parse_duration;
-use crate::promql::{Labels, QueryValue, RangeSample};
+use crate::promql::{QueryValue, RangeSample};
 use lazy_static::lazy_static;
 use regex::Regex;
-use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::error::Error;
 use std::fmt;
-use std::fmt::format;
-use std::path::Path;
-use std::rc::Rc;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnotationKind {
@@ -53,7 +53,7 @@ pub struct SequenceValue {
 
 mod prometheus_stubs {
     use super::*;
-    use crate::promql::Labels;
+    use crate::labels::Labels;
 
     // Engine & Storage traits
     pub trait QueryEngine: Send + Sync {
@@ -103,8 +103,8 @@ mod prometheus_stubs {
         panic!("parse_series_desc not implemented in stub")
     }
 }
+use crate::labels::{Labels, SeriesFingerprint};
 use prometheus_stubs::*;
-
 // ============================================================================
 // Actual translation of promqltest.go
 // ============================================================================
@@ -153,7 +153,7 @@ pub fn test_parser_opts() -> ParserOptions {
 
 /// Creates a new PromQL engine with the given options.
 pub fn new_test_engine(
-    enable_per_step_stats: bool,
+    _enable_per_step_stats: bool,
     lookback_delta: Duration,
     max_samples: usize,
 ) -> Box<dyn QueryEngine> {
@@ -236,14 +236,14 @@ impl LoadCmd {
         }
     }
 
-    fn set(&mut self, m: Labels, vals: Vec<SequenceValue>, st_vals: Option<Vec<SequenceValue>>) {
+    fn set(&mut self, m: Labels, vals: Vec<SequenceValue>, _st_vals: Option<Vec<SequenceValue>>) {
         let h = m.get_fingerprint();
         let mut samples = Vec::new();
         let mut ts = self.start_time;
-        for (i, v) in vals.iter().enumerate() {
+        for v in vals.iter() {
             let ts_ms = system_time_to_millis(ts);
             if !v.omitted {
-                let mut s = SampleST {
+                let s = SampleST {
                     sample: Sample {
                         timestamp: ts_ms,
                         value: v.value,
@@ -442,7 +442,7 @@ fn new_test<'a>(
     tb: &'a mut dyn fmt::Write,
     input: &str,
     testing_mode: bool,
-    new_storage: fn(&mut dyn fmt::Write) -> TestStorage,
+    _new_storage: fn(&mut dyn fmt::Write) -> TestStorage,
 ) -> Result<Test<'a>, String> {
     let mut test = Test {
         tb: Some(tb),
@@ -815,7 +815,7 @@ fn parse_load(
     let caps = PAT_LOAD
         .captures(line)
         .ok_or("invalid load command".to_string())?;
-    let with_nhcb = caps.get(1).map(|m| m.as_str()) == Some("with_nhcb");
+    // let with_nhcb = caps.get(1).map(|m| m.as_str()) == Some("with_nhcb");
     let step_str = caps.get(2).unwrap().as_str();
     let gap = parse_duration(step_str)?;
     // NOTE: with_nhcb is not supported in this stubbed implementation; ignore it
@@ -1268,7 +1268,7 @@ fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
     (a - b).abs() < epsilon || (a - b).abs() / a.abs().max(b.abs()) < epsilon
 }
 
-fn append_sample(app: &mut dyn AppenderV2, s: &SampleST, m: &Labels) -> Result<(), String> {
+fn append_sample(app: &mut dyn AppenderV2, s: &SampleST, _m: &Labels) -> Result<(), String> {
     // Stub: in real code, this would append to the storage. Here we just check that the sample is valid.
     Ok(())
 }

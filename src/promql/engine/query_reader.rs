@@ -183,7 +183,7 @@ pub(crate) mod test_utils {
     use super::*;
     use crate::commands::parse_metric_name;
     use crate::common::Sample;
-    use crate::promql::Labels;
+    use crate::labels::Labels;
     pub(crate) use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
     use crate::series::TimeSeries;
     use crate::series::index::TimeSeriesIndex;

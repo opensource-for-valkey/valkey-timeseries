@@ -5,8 +5,7 @@
 
 use super::model::{MetricType, Series, Temporality};
 use crate::common::Sample;
-use crate::labels::Label;
-use crate::promql::hashers::HasFingerprint;
+use crate::labels::{HasFingerprint, Label};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 

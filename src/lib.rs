@@ -27,7 +27,7 @@ pub mod error_consts;
 mod fanout;
 pub mod iterators;
 mod join;
-mod labels;
+pub mod labels;
 mod parser;
 pub mod promql;
 pub mod series;

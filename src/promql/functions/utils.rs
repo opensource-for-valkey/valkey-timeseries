@@ -1,7 +1,8 @@
 use crate::common::Sample;
 use crate::common::math::kahan_inc;
+use crate::labels::Labels;
 use crate::promql::functions::PromQLArg;
-use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels};
+use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
 use ahash::AHashSet;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::Expr;

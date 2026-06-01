@@ -115,8 +115,7 @@ fn compare_scalar_results(
 mod tests {
     use super::*;
     use crate::common::Sample;
-    use crate::labels::Label;
-    use crate::promql::model::Labels;
+    use crate::labels::{Label, Labels};
 
     fn labels_from(pairs: &[(&str, &str)]) -> Labels {
         let mut labels: Vec<Label> = pairs.iter().map(|(k, v)| Label::new(*k, *v)).collect();
