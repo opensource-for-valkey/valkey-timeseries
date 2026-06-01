@@ -1,7 +1,8 @@
 use super::labels::{compute_binary_match_key, result_metric};
+use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::binops::apply_binary_op;
-use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet, SeriesFingerprint};
-use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult, Labels};
+use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
+use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::{IntoParIter, ParIter, ParallelizableCollection};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};

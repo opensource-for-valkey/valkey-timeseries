@@ -11,10 +11,10 @@
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
 use crate::common::{Sample, Timestamp};
+use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::engine::{CachedQueryReader, QueryReader};
-use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::{
-    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, QueryOptions,
+    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, QueryOptions,
 };
 use ahash::{AHashMap, AHashSet};
 use orx_parallel::{IntoParIter, ParIter};

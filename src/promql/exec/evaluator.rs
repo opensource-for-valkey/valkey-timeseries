@@ -2,6 +2,7 @@ use super::aggregations::eval_aggregation;
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
+use crate::labels::Labels;
 use crate::promql::binops::{can_push_down_common_filters, eval_binary_expr, push_down_filters};
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
@@ -12,9 +13,7 @@ use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
-use crate::promql::{
-    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, Labels, PreloadMap,
-};
+use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, PreloadMap};
 use ahash::{AHashSet, RandomState};
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};

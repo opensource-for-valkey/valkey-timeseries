@@ -107,7 +107,7 @@ fn remove_start_end_anchors(expr: &str) -> &str {
     cursor
 }
 
-pub(crate) fn is_match_all_regex_pattern(expr: &str) -> bool {
+pub fn is_match_all_regex_pattern(expr: &str) -> bool {
     remove_start_end_anchors(expr) == ".*"
 }
 
@@ -494,7 +494,7 @@ pub fn decompose_regex(expr: &str) -> Result<RegexDecomposition, RegexError> {
     Ok(RegexDecomposition::Regex(compile_regex(expr)?))
 }
 
-pub(crate) fn compile_regex(expr: &str) -> Result<Regex, RegexError> {
+pub fn compile_regex(expr: &str) -> Result<Regex, RegexError> {
     let anchored = format!("^(?:{})$", expr);
     build_with_repeat_fallback(&anchored)
 }

@@ -19,7 +19,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkey_timeseries::common::Sample;
-use valkey_timeseries::promql::Labels;
+use valkey_timeseries::labels::Labels;
 use valkey_timeseries::promql::engine::mock_series_querier::MockSeriesQuerier;
 use valkey_timeseries::promql::engine::{
     QueryOptions, QueryReader, evaluate_instant, evaluate_range,

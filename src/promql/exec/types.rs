@@ -1,7 +1,7 @@
 use crate::common::Sample;
-use crate::promql::Labels;
+use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::error::QueryError;
-use crate::promql::hashers::{PreloadKey, SeriesFingerprint};
+use crate::promql::hashers::PreloadKey;
 use ahash::RandomState;
 use promql_parser::parser::value::ValueType;
 use std::fmt::{Display, Formatter};

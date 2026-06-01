@@ -1,5 +1,5 @@
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::labels::InternedLabel;
+use crate::labels::{HasFingerprint, InternedLabel, SeriesFingerprint};
 use enquote::enquote;
 use std::cmp::Ordering;
 use std::fmt::Display;
@@ -124,4 +124,14 @@ fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
     state.write(name.as_bytes());
     state.write_u8(SEP);
     state.write(value.as_bytes());
+}
+
+impl HasFingerprint for [Label] {
+    fn fingerprint(&self) -> SeriesFingerprint {
+        let mut hasher = super::hash::create_hasher();
+        for label in self {
+            super::hash::hash_key_value(&mut hasher, &label.name, &label.value);
+        }
+        hasher.finish_128()
+    }
 }

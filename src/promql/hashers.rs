@@ -1,7 +1,6 @@
 use crate::common::time::system_time_to_millis;
-use crate::labels::Label;
+use crate::labels::{HasFingerprint, SeriesFingerprint, create_hasher, hash_key_value};
 use crate::promql::generated::Label as ProtoLabel;
-use blart::AsBytes;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, Offset, VectorSelector};
 use smallvec::{SmallVec, smallvec};
@@ -44,35 +43,6 @@ impl From<&AtModifier> for AtKey {
     }
 }
 
-/// Series fingerprint (hash of a label set)
-pub(crate) type SeriesFingerprint = u128;
-
-pub(crate) trait HasFingerprint {
-    fn fingerprint(&self) -> SeriesFingerprint;
-}
-
-impl HasFingerprint for Vec<Label> {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        self.as_slice().fingerprint()
-    }
-}
-
-const HASH_SEED: u64 = 0xa4d3f1c2b7e98d5f;
-#[inline]
-fn create_hasher() -> xxhash3_128::Hasher {
-    xxhash3_128::Hasher::with_seed(HASH_SEED)
-}
-
-impl HasFingerprint for [Label] {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = create_hasher();
-        for label in self {
-            hash_key_value(&mut hasher, &label.name, &label.value);
-        }
-        hasher.finish_128()
-    }
-}
-
 impl HasFingerprint for [ProtoLabel] {
     fn fingerprint(&self) -> SeriesFingerprint {
         let mut hasher = create_hasher();
@@ -80,18 +50,6 @@ impl HasFingerprint for [ProtoLabel] {
             hash_key_value(&mut hasher, &label.name, &label.value);
         }
         hasher.finish_128()
-    }
-}
-
-impl HasFingerprint for &str {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        xxhash3_128::Hasher::oneshot(self.as_bytes())
-    }
-}
-
-impl HasFingerprint for String {
-    fn fingerprint(&self) -> SeriesFingerprint {
-        self.as_str().fingerprint()
     }
 }
 
@@ -184,12 +142,6 @@ pub(in crate::promql) type FingerprintHashMap<V> =
 
 pub(in crate::promql) type FingerprintHashSet =
     HashSet<SeriesFingerprint, BuildHasherDefault<FingerprintHasher>>;
-
-fn hash_key_value(hasher: &mut xxhash3_128::Hasher, key: &str, value: &str) {
-    hasher.write(key.as_bytes());
-    hasher.write(b"0xfe");
-    hasher.write(value.as_bytes());
-}
 
 #[derive(Default)]
 pub struct FingerprintHasher(u64);

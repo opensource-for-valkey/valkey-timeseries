@@ -2,13 +2,13 @@ use crate::common::Timestamp;
 use crate::fanout::{
     FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
 };
-use crate::labels::filters::SeriesSelector;
+use crate::labels::{HasFingerprint, filters::SeriesSelector};
 use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
     RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
     series_selector::Matchers as ProtoMatchers,
 };
-use crate::promql::hashers::{FingerprintHashSet, HasFingerprint};
+use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
 use promql_parser::label::Matchers;
 use std::time::Duration;

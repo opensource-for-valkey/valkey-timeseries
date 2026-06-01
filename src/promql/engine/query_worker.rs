@@ -5,11 +5,12 @@ use crate::common::{Sample, Timestamp};
 use crate::fanout::get_cluster_command_timeout;
 use crate::fanout::{FanoutCommand, is_clustered};
 use crate::labels::Label;
+use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::{QueryFanoutCommand, QueryRangeFanoutCommand};
 use crate::promql::generated::Label as ProtoLabel;
 use crate::promql::{
-    InstantSample, Labels, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
+    InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
 };
 use crate::series::index::series_by_selectors;
 use orx_parallel::IterIntoParIter;

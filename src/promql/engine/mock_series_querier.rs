@@ -1,11 +1,10 @@
 use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
-use crate::labels::{Label, MetricName};
+use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::engine::QueryReader;
-use crate::promql::hashers::SeriesFingerprint;
 use crate::promql::model::InstantSample;
-use crate::promql::{Labels, PromqlResult, QueryError, QueryOptions, RangeSample};
+use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
