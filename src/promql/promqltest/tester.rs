@@ -1268,7 +1268,7 @@ fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
     (a - b).abs() < epsilon || (a - b).abs() / a.abs().max(b.abs()) < epsilon
 }
 
-fn append_sample(app: &mut dyn AppenderV2, s: &SampleST, _m: &Labels) -> Result<(), String> {
+fn append_sample(_app: &mut dyn AppenderV2, _s: &SampleST, _m: &Labels) -> Result<(), String> {
     // Stub: in real code, this would append to the storage. Here we just check that the sample is valid.
     Ok(())
 }
