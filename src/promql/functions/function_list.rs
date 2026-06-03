@@ -12,8 +12,8 @@ use crate::promql::functions::math_functions::{
     AbsFunction, AcosFunction, AcoshFunction, AsinFunction, AsinhFunction, AtanFunction,
     AtanhFunction, CeilFunction, ClampFunction, ClampMaxFunction, ClampMinFunction, CosFunction,
     CoshFunction, DegFunction, ExpFunction, FloorFunction, LnFunction, Log2Function, Log10Function,
-    PiFunction, RadFunction, RoundFunction, SgnFunction, SinFunction, SinhFunction, SqrtFunction,
-    TanFunction, TanhFunction,
+    MaxOfFunction, MinOfFunction, PiFunction, RadFunction, RoundFunction, SgnFunction, SinFunction, SinhFunction,
+    SqrtFunction, TanFunction, TanhFunction,
 };
 use crate::promql::functions::predict_linear::PredictLinearFunction;
 use crate::promql::functions::range_vector_functions::{ChangesFunction, ResetsFunction};
@@ -232,6 +232,8 @@ macro_rules! promql_function_list {
             (Sin, "sin", SinFunction),
             (Sinh, "sinh", SinhFunction),
             (Sqrt, "sqrt", SqrtFunction),
+            (MaxOf, "max_of", MaxOfFunction),
+            (MinOf, "min_of", MinOfFunction),
             (Tan, "tan", TanFunction),
             (Tanh, "tanh", TanhFunction),
             // ── Date / time ──────────────────────────────────────────────

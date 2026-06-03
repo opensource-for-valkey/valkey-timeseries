@@ -210,3 +210,45 @@ impl PromQLFunction for ClampFunction {
         Ok(ExprResult::InstantVector(samples))
     }
 }
+
+/// max_of returns the maximum of two scalars as a scalar.
+#[derive(Copy, Clone)]
+pub(in crate::promql) struct MaxOfFunction;
+
+impl PromQLFunction for MaxOfFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        Err(exact_arity_error("max_of", 2, 1))
+    }
+
+    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        if args.len() != 2 {
+            return Err(exact_arity_error("max_of", 2, args.len()));
+        }
+
+        let mut args_iter = args.into_iter();
+        let a = args_iter.next().expect("validated args.len() == 2").into_scalar()?;
+        let b = args_iter.next().expect("validated args.len() == 2").into_scalar()?;
+        Ok(ExprResult::Scalar(max_with_nan(a, b)))
+    }
+}
+
+/// min_of returns the minimum of two scalars as a scalar.
+#[derive(Copy, Clone)]
+pub(in crate::promql) struct MinOfFunction;
+
+impl PromQLFunction for MinOfFunction {
+    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        Err(exact_arity_error("min_of", 2, 1))
+    }
+
+    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+        if args.len() != 2 {
+            return Err(exact_arity_error("min_of", 2, args.len()));
+        }
+
+        let mut args_iter = args.into_iter();
+        let a = args_iter.next().expect("validated args.len() == 2").into_scalar()?;
+        let b = args_iter.next().expect("validated args.len() == 2").into_scalar()?;
+        Ok(ExprResult::Scalar(min_with_nan(a, b)))
+    }
+}
