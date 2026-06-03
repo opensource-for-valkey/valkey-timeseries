@@ -214,17 +214,17 @@ pub fn evaluate_range(
                     return Err(QueryError::Timeout);
                 }
 
-                let ts = UNIX_EPOCH + Duration::from_millis(t as u64);
-
-                let instant_stmt = EvalStmt {
-                    expr: stmt.expr.clone(),
-                    start: ts,
-                    end: ts,
-                    interval: Duration::from_secs(0),
-                    lookback_delta,
+                let ctx = crate::promql::EvalContext {
+                    query_start: start_ms,
+                    query_end: end_ms,
+                    evaluation_ts: t,
+                    lookback_delta_ms: lookback_delta.as_millis() as i64,
+                    step_ms: step.as_millis() as i64,
                 };
 
-                let result = evaluator.evaluate(instant_stmt).map_err(QueryError::from)?;
+                let result = evaluator
+                    .evaluate_with_context(&stmt.expr, ctx)
+                    .map_err(QueryError::from)?;
                 Ok((t, result))
             })
             .into_fallible_result()

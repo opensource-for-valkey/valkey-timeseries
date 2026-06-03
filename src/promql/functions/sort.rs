@@ -1,7 +1,7 @@
 use crate::promql::common::strings::compare_str_alphanumeric;
 use crate::promql::functions::utils::{expect_instant_vector, min_arity_error};
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
 use std::cmp::Ordering;
 
 /// `sort(v instant-vector)`
@@ -11,7 +11,7 @@ use std::cmp::Ordering;
 pub(in crate::promql) struct SortFunction;
 
 impl PromQLFunction for SortFunction {
-    fn apply(&self, arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort(arg, false)
     }
 }
@@ -23,7 +23,7 @@ impl PromQLFunction for SortFunction {
 pub(in crate::promql) struct SortDescFunction;
 
 impl PromQLFunction for SortDescFunction {
-    fn apply(&self, arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort(arg, true)
     }
 }
@@ -35,11 +35,11 @@ impl PromQLFunction for SortDescFunction {
 pub(in crate::promql) struct SortByLabelFunction;
 
 impl PromQLFunction for SortByLabelFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(min_arity_error("sort_by_label", 2, 1))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort_by_label(args, false)
     }
 }
@@ -51,11 +51,11 @@ impl PromQLFunction for SortByLabelFunction {
 pub(in crate::promql) struct SortByLabelDescFunction;
 
 impl PromQLFunction for SortByLabelDescFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(min_arity_error("sort_by_label_desc", 2, 1))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         sort_by_label(args, false)
     }
 }

@@ -126,18 +126,14 @@ impl From<&str> for PromQLArg {
 /// Trait for PromQL functions
 pub(crate) trait PromQLFunction {
     /// Apply the function to the input samples.
-    /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
+    /// `ctx` provides the evaluation context (timestamp, query range, step, etc.).
     /// Returns an `ExprResult` (typically `ExprResult::InstantVector`).
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult>;
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult>;
 
     /// Apply the function to one or more evaluated arguments.
     ///
     /// Default behavior preserves current unary-function semantics.
-    fn apply_args(
-        &self,
-        mut args: Vec<PromQLArg>,
-        eval_timestamp_ms: i64,
-    ) -> EvalResult<ExprResult> {
+    fn apply_args(&self, mut args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         if args.len() != 1 {
             return Err(EvaluationError::InternalError(format!(
                 "function requires exactly one argument, got {}",
@@ -145,7 +141,7 @@ pub(crate) trait PromQLFunction {
             )));
         }
 
-        self.apply(args.swap_remove(0), eval_timestamp_ms)
+        self.apply(args.swap_remove(0), ctx)
     }
 
     /// Apply the function to evaluated arguments provided as a slice.
@@ -153,11 +149,7 @@ pub(crate) trait PromQLFunction {
     /// This helper avoids allocating a temporary `Vec` in the common unary
     /// case by directly calling `apply` when there is exactly one argument.
     /// Callers that already have a `Vec` can use `apply_args` directly.
-    fn apply_args_slice(
-        &self,
-        args: &[PromQLArg],
-        eval_timestamp_ms: i64,
-    ) -> EvalResult<ExprResult> {
+    fn apply_args_slice(&self, args: &[PromQLArg], ctx: &EvalContext) -> EvalResult<ExprResult> {
         if args.len() != 1 {
             return Err(EvaluationError::InternalError(format!(
                 "function requires exactly one argument, got {}",
@@ -166,7 +158,7 @@ pub(crate) trait PromQLFunction {
         }
 
         // Clone the single argument and delegate to `apply`.
-        self.apply(args[0].clone(), eval_timestamp_ms)
+        self.apply(args[0].clone(), ctx)
     }
 
     fn apply_call(
@@ -174,7 +166,7 @@ pub(crate) trait PromQLFunction {
         evaluated_args: Vec<PromQLArg>,
         ctx: &EvalContext,
     ) -> EvalResult<ExprResult> {
-        self.apply_args(evaluated_args, ctx.evaluation_ts)
+        self.apply_args(evaluated_args, ctx)
     }
 }
 
@@ -184,7 +176,7 @@ pub(super) struct UnaryFunction {
 }
 
 impl PromQLFunction for UnaryFunction {
-    fn apply(&self, arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         let mut samples = arg.into_instant_vector()?;
         for sample in &mut samples {
             sample.value = (self.op)(sample.value);

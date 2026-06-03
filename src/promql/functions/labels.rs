@@ -11,11 +11,11 @@ use regex::Regex;
 pub(in crate::promql) struct LabelReplaceFunction;
 
 impl PromQLFunction for LabelReplaceFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(exact_arity_error("label_replace", 5, 1))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         // Expect exactly 5 evaluated arguments: instant vector, dst, replacement, src, regex
         expect_exact_arg_count("label_replace", 5, args.len())?;
 
@@ -169,7 +169,7 @@ impl Default for LabelReplaceFunction {
 pub(in crate::promql) struct LabelJoinFunction;
 
 impl PromQLFunction for LabelJoinFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(min_arity_error("label_join", 3, 1))
     }
 

@@ -28,8 +28,11 @@ mod tests {
             samples: Vec<EvalSamples>,
             eval_timestamp_ms: i64,
         ) -> EvalResult<ExprResult> {
-            self.inner
-                .apply(PromQLArg::RangeVector(samples), eval_timestamp_ms)
+            let ctx = EvalContext {
+                evaluation_ts: eval_timestamp_ms,
+                ..Default::default()
+            };
+            self.inner.apply(PromQLArg::RangeVector(samples), &ctx)
         }
 
         pub(crate) fn apply_with_range(
@@ -194,7 +197,11 @@ mod tests {
 
     fn call_apply(name: &str, arg: PromQLArg, eval_timestamp_ms: i64) -> Vec<EvalSample> {
         let func = resolve_function(name).unwrap();
-        let result = func.apply(arg, eval_timestamp_ms).unwrap();
+        let ctx = EvalContext {
+            evaluation_ts: eval_timestamp_ms,
+            ..Default::default()
+        };
+        let result = func.apply(arg, &ctx).unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
         };
@@ -208,7 +215,11 @@ mod tests {
     ) -> Vec<EvalSample> {
         let func = resolve_function(name).unwrap();
 
-        let result = func.apply_args(args, eval_timestamp_ms).unwrap();
+        let ctx = EvalContext {
+            evaluation_ts: eval_timestamp_ms,
+            ..Default::default()
+        };
+        let result = func.apply_args(args, &ctx).unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
         };
@@ -315,6 +326,7 @@ mod tests {
     fn should_error_when_round_has_too_many_arguments() {
         let func = resolve_function("round").unwrap();
 
+        let ctx = EvalContext::default();
         let err = func
             .apply_args(
                 vec![
@@ -322,7 +334,7 @@ mod tests {
                     PromQLArg::Scalar(0.1),
                     PromQLArg::Scalar(0.2),
                 ],
-                1000,
+                &ctx,
             )
             .unwrap_err();
 
@@ -338,13 +350,14 @@ mod tests {
     fn should_error_when_round_second_argument_is_not_scalar() {
         let func = resolve_function("round").unwrap();
 
+        let ctx = EvalContext::default();
         let err = func
             .apply_args(
                 vec![
                     PromQLArg::InstantVector(vec![create_sample(1.0)]),
                     PromQLArg::InstantVector(vec![create_sample(0.1)]),
                 ],
-                1000,
+                &ctx,
             )
             .unwrap_err();
 
@@ -359,8 +372,9 @@ mod tests {
     fn should_error_when_round_first_argument_is_not_vector() {
         let func = resolve_function("round").unwrap();
 
+        let ctx = EvalContext::default();
         let err = func
-            .apply_args(vec![PromQLArg::Scalar(1.0), PromQLArg::Scalar(0.1)], 1000)
+            .apply_args(vec![PromQLArg::Scalar(1.0), PromQLArg::Scalar(0.1)], &ctx)
             .unwrap_err();
 
         assert!(
@@ -833,8 +847,9 @@ mod tests {
     #[test]
     fn should_include_actual_argument_count_in_clamp_errors() {
         let clamp = resolve_function("clamp").unwrap();
+        let ctx = EvalContext::default();
 
-        let err = clamp.apply_args(vec![], 1000).unwrap_err();
+        let err = clamp.apply_args(vec![], &ctx).unwrap_err();
         assert!(
             err.to_string()
                 .contains("clamp requires exactly 3 argument(s), got 0"),
@@ -850,7 +865,7 @@ mod tests {
                     PromQLArg::Scalar(1.0),
                     PromQLArg::Scalar(2.0),
                 ],
-                1000,
+                &ctx,
             )
             .unwrap_err();
         assert!(
@@ -864,8 +879,9 @@ mod tests {
     #[test]
     fn should_include_actual_argument_count_in_clamp_min_errors() {
         let clamp_min = resolve_function("clamp_min").unwrap();
+        let ctx = EvalContext::default();
 
-        let err = clamp_min.apply_args(vec![], 1000).unwrap_err();
+        let err = clamp_min.apply_args(vec![], &ctx).unwrap_err();
         assert!(
             err.to_string()
                 .contains("clamp_min requires exactly 2 argument(s), got 0"),
@@ -880,7 +896,7 @@ mod tests {
                     PromQLArg::Scalar(0.0),
                     PromQLArg::Scalar(1.0),
                 ],
-                1000,
+                &ctx,
             )
             .unwrap_err();
         assert!(
@@ -894,8 +910,9 @@ mod tests {
     #[test]
     fn should_include_actual_argument_count_in_clamp_max_errors() {
         let clamp_max = resolve_function("clamp_max").unwrap();
+        let ctx = EvalContext::default();
 
-        let err = clamp_max.apply_args(vec![], 1000).unwrap_err();
+        let err = clamp_max.apply_args(vec![], &ctx).unwrap_err();
         assert!(
             err.to_string()
                 .contains("clamp_max requires exactly 2 argument(s), got 0"),
@@ -910,7 +927,7 @@ mod tests {
                     PromQLArg::Scalar(0.0),
                     PromQLArg::Scalar(1.0),
                 ],
-                1000,
+                &ctx,
             )
             .unwrap_err();
         assert!(
@@ -1157,8 +1174,9 @@ mod tests {
         let func = resolve_function("scalar").unwrap();
 
         // A single element should be returned as a scalar-encoded sample.
+        let ctx = EvalContext::default();
         let result = func
-            .apply(PromQLArg::InstantVector(vec![create_sample(42.0)]), 1000)
+            .apply(PromQLArg::InstantVector(vec![create_sample(42.0)]), &ctx)
             .unwrap();
         let ExprResult::Scalar(f) = result else {
             panic!("expected Scalar result")
@@ -1166,7 +1184,7 @@ mod tests {
         assert_eq!(f, 42.0);
 
         // Zero or multiple elements should return NaN encoded as a scalar sample.
-        let result = func.apply(PromQLArg::InstantVector(vec![]), 1000).unwrap();
+        let result = func.apply(PromQLArg::InstantVector(vec![]), &ctx).unwrap();
         let ExprResult::Scalar(_value) = result else {
             panic!("expected Scalar result")
         };
@@ -1174,7 +1192,7 @@ mod tests {
         let result = func
             .apply(
                 PromQLArg::InstantVector(vec![create_sample(1.0), create_sample(2.0)]),
-                1000,
+                &ctx,
             )
             .unwrap();
 

@@ -3,19 +3,19 @@ use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::{IntoParIter, ParIter};
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DoubleExponentialSmoothingFunction;
 
 impl PromQLFunction for DoubleExponentialSmoothingFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(exact_arity_error("double_exponential_smoothing", 3, 1))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        eval_double_exponential_smoothing(args, eval_timestamp_ms)
+    fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        eval_double_exponential_smoothing(args, ctx.evaluation_ts)
     }
 }
 

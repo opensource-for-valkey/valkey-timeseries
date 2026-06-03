@@ -208,7 +208,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             step_ms: stmt.interval.as_millis() as i64,
         };
 
-        let mut result = self.evaluate_expr(&stmt.expr, &ctx, true)?;
+        self.evaluate_with_context(&stmt.expr, ctx)
+    }
+
+    pub(crate) fn evaluate_with_context(
+        &self,
+        expr: &Expr,
+        ctx: EvalContext,
+    ) -> EvalResult<ExprResult> {
+        let mut result = self.evaluate_expr(expr, &ctx, true)?;
 
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
         if let ExprResult::InstantVector(ref mut samples) = result {

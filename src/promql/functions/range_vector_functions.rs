@@ -1,7 +1,7 @@
 use crate::common::Sample;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::change_below_tolerance;
-use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 
@@ -75,9 +75,9 @@ where
 pub(in crate::promql) struct ResetsFunction;
 
 impl PromQLFunction for ResetsFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, eval_timestamp_ms, |values| {
+        Ok(eval_range(samples, ctx.evaluation_ts, |values| {
             if values.is_empty() {
                 return Some(0.0);
             }
@@ -105,9 +105,9 @@ impl PromQLFunction for ResetsFunction {
 pub(in crate::promql) struct ChangesFunction;
 
 impl PromQLFunction for ChangesFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, eval_timestamp_ms, |values| {
+        Ok(eval_range(samples, ctx.evaluation_ts, |values| {
             if values.is_empty() {
                 return Some(0.0);
             }
