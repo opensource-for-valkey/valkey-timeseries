@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use criterion::{BenchmarkId, Criterion, SamplingMode, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main};
 use promql_parser::parser::{EvalStmt, parse};
 use rand::distr::{Alphanumeric, SampleString};
 use std::env;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkey_timeseries::common::Sample;
