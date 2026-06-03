@@ -71,7 +71,7 @@ macro_rules! make_rollup_function {
         }
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
                 Err(EvaluationError::ArgumentError(format!(
                     "invalid invocation of rollup function '{}'",
                     $name
@@ -101,7 +101,7 @@ macro_rules! basic_rollup_function {
         }
 
         impl PromQLFunction for $type_name {
-            fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+            fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
                 Err(EvaluationError::ArgumentError(format!(
                     "invalid invocation of rollup function '{}'",
                     $name
@@ -305,7 +305,7 @@ fn rollup_last(samples: &[Sample]) -> f64 {
 pub(in crate::promql) struct AbsentOverTimeFunction;
 
 impl PromQLFunction for AbsentOverTimeFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let series = arg.into_range_vector()?;
         // todo: what labels should the output sample have?
         let has_samples = series.iter().any(|s| !s.values.is_empty());
@@ -313,7 +313,7 @@ impl PromQLFunction for AbsentOverTimeFunction {
             Ok(ExprResult::InstantVector(vec![]))
         } else {
             Ok(ExprResult::InstantVector(vec![EvalSample {
-                timestamp_ms: eval_timestamp_ms,
+                timestamp_ms: ctx.evaluation_ts,
                 value: 1.0,
                 labels: Default::default(),
                 drop_name: false,
@@ -329,7 +329,7 @@ impl PromQLFunction for AbsentOverTimeFunction {
 pub(in crate::promql) struct QuantileOverTimeFunction;
 
 impl PromQLFunction for QuantileOverTimeFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(exact_arity_error("quantile_over_time", 2, 0))
     }
 

@@ -15,9 +15,11 @@
 #[allow(dead_code)]
 use crate::common::Sample;
 use crate::common::time::system_time_to_millis;
+use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::promqltest::dsl::parse_duration;
 use crate::promql::{QueryValue, RangeSample};
 use lazy_static::lazy_static;
+use prometheus_stubs::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
@@ -98,13 +100,12 @@ mod prometheus_stubs {
     }
 
     // Helper for test parsing
-    pub fn parse_series_desc(line: &str) -> Result<(Labels, Vec<SequenceValue>), String> {
+    pub fn parse_series_desc(_line: &str) -> Result<(Labels, Vec<SequenceValue>), String> {
         // Stub: in real code this would use the PromQL parser.
         panic!("parse_series_desc not implemented in stub")
     }
 }
-use crate::labels::{Labels, SeriesFingerprint};
-use prometheus_stubs::*;
+
 // ============================================================================
 // Actual translation of promqltest.go
 // ============================================================================
@@ -657,7 +658,7 @@ impl<'a> Test<'a> {
     }
 
     fn clear(&mut self) {
-        let tb = self.tb.as_mut().unwrap();
+        let _tb = self.tb.as_mut().unwrap();
     }
 
     fn exec_cmd(
@@ -948,7 +949,7 @@ fn parse_duration_prefix(s: &str) -> Result<i64, String> {
     Ok(if negative { -ms } else { ms })
 }
 
-fn parse_series(def_line: &str, line: usize) -> Result<(Labels, Vec<SequenceValue>), String> {
+fn parse_series(def_line: &str, _line: usize) -> Result<(Labels, Vec<SequenceValue>), String> {
     // Use the stub from prometheus_stubs
     parse_series_desc(def_line)
 }
@@ -1025,8 +1026,8 @@ fn parse_as_string_literal(line: &str) -> Result<String, String> {
 }
 
 fn at_modifier_test_cases(
-    expr: &str,
-    eval_time: SystemTime,
+    _expr: &str,
+    _eval_time: SystemTime,
 ) -> Result<Vec<(String, SystemTime)>, String> {
     // Stub: return empty in this translation.
     // In real code, this would parse the expression and generate additional eval times.

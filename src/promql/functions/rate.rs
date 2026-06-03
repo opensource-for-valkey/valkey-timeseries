@@ -1,6 +1,6 @@
 use crate::common::Sample;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
-use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
 use orx_parallel::{IntoParIter, ParIter};
 
 #[derive(Clone, Copy, Debug)]
@@ -15,8 +15,8 @@ pub(in crate::promql) enum RateKind {
 pub(in crate::promql) struct RateFunction;
 
 impl PromQLFunction for RateFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Rate)
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        calculate_rate(arg, ctx.evaluation_ts, RateKind::Rate)
     }
 }
 
@@ -24,8 +24,8 @@ impl PromQLFunction for RateFunction {
 pub(in crate::promql) struct DeltaFunction;
 
 impl PromQLFunction for DeltaFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Delta)
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        calculate_rate(arg, ctx.evaluation_ts, RateKind::Delta)
     }
 }
 
@@ -33,8 +33,8 @@ impl PromQLFunction for DeltaFunction {
 pub(in crate::promql) struct IncreaseFunction;
 
 impl PromQLFunction for IncreaseFunction {
-    fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
-        calculate_rate(arg, eval_timestamp_ms, RateKind::Increase)
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        calculate_rate(arg, ctx.evaluation_ts, RateKind::Increase)
     }
 }
 

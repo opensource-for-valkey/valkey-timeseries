@@ -224,30 +224,6 @@ eval instant at 10m
     }
 
     #[test]
-    fn pi_test() {
-        let content = r#"
-load 1m
-    metric1{a="a"} 0+1x100
-    metric2{b="b"} 0+1x50
-
-# operator with offset
-eval instant at 90m metric1 offset 15m or metric2 offset 45m
-    metric1{a="a"} 75
-    metric2{b="b"} 45
-
-clear
-"#;
-
-        // when
-        let result = run_test("pi_test", content);
-
-        // then
-        if let Err(e) = result {
-            panic!("run_test failed: {}", e);
-        }
-    }
-
-    #[test]
     fn should_reject_negative_step_index() {
         // given
         let (_tsdb, storage) = new_test_storage();

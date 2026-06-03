@@ -12,8 +12,8 @@ use crate::promql::functions::math_functions::{
     AbsFunction, AcosFunction, AcoshFunction, AsinFunction, AsinhFunction, AtanFunction,
     AtanhFunction, CeilFunction, ClampFunction, ClampMaxFunction, ClampMinFunction, CosFunction,
     CoshFunction, DegFunction, ExpFunction, FloorFunction, LnFunction, Log2Function, Log10Function,
-    MaxOfFunction, MinOfFunction, PiFunction, RadFunction, RoundFunction, SgnFunction, SinFunction, SinhFunction,
-    SqrtFunction, TanFunction, TanhFunction,
+    MaxOfFunction, MinOfFunction, PiFunction, RadFunction, RoundFunction, SgnFunction, SinFunction,
+    SinhFunction, SqrtFunction, TanFunction, TanhFunction,
 };
 use crate::promql::functions::predict_linear::PredictLinearFunction;
 use crate::promql::functions::range_vector_functions::{ChangesFunction, ResetsFunction};
@@ -28,7 +28,10 @@ use crate::promql::functions::rollup_functions::{
 use crate::promql::functions::sort::{
     SortByLabelDescFunction, SortByLabelFunction, SortDescFunction, SortFunction,
 };
-use crate::promql::functions::special_functions::{AbsentFunction, ScalarFunction, VectorFunction};
+use crate::promql::functions::special_functions::{
+    AbsentFunction, EndFunction, RangeFunction, ScalarFunction, StartFunction, StepFunction,
+    VectorFunction,
+};
 use std::fmt::Display;
 use strum_macros::EnumIter;
 use valkey_module::ValkeyError;
@@ -160,15 +163,15 @@ macro_rules! impl_promql_function_impl {
         }
 
         impl PromQLFunction for PromQLFunctionImpl {
-            fn apply(&self, arg: PromQLArg, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+            fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
                 match self {
-                    $( Self::$Variant(f) => f.apply(arg, eval_timestamp_ms), )*
+                    $( Self::$Variant(f) => f.apply(arg, ctx), )*
                 }
             }
 
-            fn apply_args(&self, args: Vec<PromQLArg>, eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+            fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
                 match self {
-                    $( Self::$Variant(f) => f.apply_args(args, eval_timestamp_ms), )*
+                    $( Self::$Variant(f) => f.apply_args(args, ctx), )*
                 }
             }
 
@@ -251,6 +254,10 @@ macro_rules! promql_function_list {
             (Absent, "absent", AbsentFunction),
             (Scalar, "scalar", ScalarFunction),
             (Vector, "vector", VectorFunction),
+            (Start, "start", StartFunction),
+            (End, "end", EndFunction),
+            (Range, "range", RangeFunction),
+            (Step, "step", StepFunction),
             // ── Histogram ────────────────────────────────────────────────
             (
                 HistogramQuantile,

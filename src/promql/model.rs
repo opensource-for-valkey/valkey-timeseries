@@ -210,6 +210,14 @@ impl EvalContext {
             self.query_end += self.step_ms - adjust
         }
     }
+
+    pub fn is_range_selector(&self) -> bool {
+        self.step_ms > 0 && self.query_end > self.query_start
+    }
+
+    pub fn is_instant_selector(&self) -> bool {
+        self.step_ms == 0
+    }
 }
 
 const DEFAULT_LOOKBACK_DELTA: i64 = (5 * MILLIS_PER_MIN) as i64;

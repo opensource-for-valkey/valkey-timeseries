@@ -7,7 +7,7 @@ use crate::promql::functions::utils::{
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::hashers::FingerprintHashMap;
-use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashMap;
 
 static ELLIPSIS: &str = "...";
@@ -17,11 +17,11 @@ static LE: &str = "le";
 pub(in crate::promql) struct HistogramFractionFunctions;
 
 impl PromQLFunction for HistogramFractionFunctions {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(exact_arity_error("histogram_fraction", 3, 0))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         histogram_fraction(args)
     }
 }
@@ -30,11 +30,11 @@ impl PromQLFunction for HistogramFractionFunctions {
 pub(in crate::promql) struct HistogramQuantileFunction;
 
 impl PromQLFunction for HistogramQuantileFunction {
-    fn apply(&self, _arg: PromQLArg, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         Err(exact_arity_error("histogram_quantile", 2, 0))
     }
 
-    fn apply_args(&self, args: Vec<PromQLArg>, _eval_timestamp_ms: i64) -> EvalResult<ExprResult> {
+    fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
         histogram_quantile(args)
     }
 }
