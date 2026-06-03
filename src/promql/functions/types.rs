@@ -123,7 +123,7 @@ impl From<&str> for PromQLArg {
     }
 }
 
-/// Trait for PromQL functions that operate on instant vectors
+/// Trait for PromQL functions
 pub(crate) trait PromQLFunction {
     /// Apply the function to the input samples.
     /// `eval_timestamp_ms` is the evaluation timestamp in milliseconds since UNIX epoch.
