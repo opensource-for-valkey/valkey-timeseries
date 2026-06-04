@@ -1,6 +1,9 @@
 use crate::common::replies::{IntoRawCtx, ReplyContext};
+use std::borrow::Borrow;
+use std::ops::Deref;
 use std::os::raw::c_int;
 use std::ptr;
+use valkey_module::logging::ValkeyLogLevel;
 use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
 
 /// A lightweight "fork" of the BlockedClient in `valkey_module` to allow raw client replies from background threads
@@ -67,6 +70,33 @@ pub struct ThreadSafeReplyContext {
     blocked_client: BlockedClient,
 }
 
+pub struct ContextGuard {
+    ctx: Context,
+}
+
+impl Drop for ContextGuard {
+    fn drop(&mut self) {
+        unsafe {
+            raw::RedisModule_ThreadSafeContextUnlock.unwrap()(self.ctx.ctx);
+            raw::RedisModule_FreeThreadSafeContext.unwrap()(self.ctx.ctx);
+        };
+    }
+}
+
+impl Deref for ContextGuard {
+    type Target = Context;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+impl Borrow<Context> for ContextGuard {
+    fn borrow(&self) -> &Context {
+        &self.ctx
+    }
+}
+
 /// SAFETY:
 /// This is copied from the implementation of `ThreadSafeContext` in `thread_safe.rs`, with the same safety guarantees.
 /// The Valkey modules API does not require locking for `Reply` functions, and the `ReplyContext` constructed has its context
@@ -94,6 +124,37 @@ impl ThreadSafeReplyContext {
 
     pub fn get_reply_context(&self) -> ReplyContext {
         ReplyContext::new(self.ctx)
+    }
+
+    /// All non-reply APIs require locking, so we mirror
+    /// `valkey_module::ThreadSafeContext::lock` semantics.
+    pub fn lock(&self) -> ContextGuard {
+        unsafe { raw::RedisModule_ThreadSafeContextLock.unwrap()(self.ctx) };
+        let ctx = unsafe { raw::RedisModule_GetThreadSafeContext.unwrap()(ptr::null_mut()) };
+        let ctx = Context::new(ctx);
+        ContextGuard { ctx }
+    }
+
+    /// Log a message at the specified `level` using the underlying context.
+    pub fn log(&self, level: ValkeyLogLevel, message: &str) {
+        Context::new(self.ctx).log(level, message);
+    }
+
+    /// Convenience logging helpers.
+    pub fn log_debug(&self, message: &str) {
+        self.log(ValkeyLogLevel::Debug, message);
+    }
+
+    pub fn log_notice(&self, message: &str) {
+        self.log(ValkeyLogLevel::Notice, message);
+    }
+
+    pub fn log_verbose(&self, message: &str) {
+        self.log(ValkeyLogLevel::Verbose, message);
+    }
+
+    pub fn log_warning(&self, message: &str) {
+        self.log(ValkeyLogLevel::Warning, message);
     }
 }
 
