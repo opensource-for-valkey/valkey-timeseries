@@ -1,0 +1,91 @@
+# Full source-build Dockerfile for valkey-timeseries module
+#
+# Builds Valkey server from source AND compiles the Rust module,
+# all in one container. Use this when you need:
+#   - A specific Valkey commit or branch (unstable / main)
+#   - Full control over Valkey build options
+#   - A self-contained image without external base image dependencies
+#
+# Build arguments:
+#   SERVER_VERSION  - Valkey branch/tag to build (default: 8.1)
+#   FEATURES        - Cargo features to pass (e.g., "valkey_8_0")
+#
+# Examples:
+#   docker build -f Dockerfile.source -t valkey-timeseries:source .
+#   docker build -f Dockerfile.source --build-arg SERVER_VERSION=unstable -t valkey-timeseries:unstable .
+
+# ── Stage 1: Build Valkey + Module ──────────────────────────────────
+FROM rust:1.92-slim-bookworm AS builder
+
+ARG SERVER_VERSION=9.1
+ARG FEATURES=""
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        git \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# ── Build Valkey server from source ─────────────────────────────────
+RUN git clone --depth 1 --branch ${SERVER_VERSION} https://github.com/valkey-io/valkey.git /build/valkey
+
+WORKDIR /build/valkey
+RUN make -j$(nproc) BUILD_TLS=yes
+
+# ── Build the timeseries module ─────────────────────────────────────
+WORKDIR /build/module
+
+# Copy manifests first for dependency caching
+COPY Cargo.toml Cargo.lock* build.rs ./
+
+# Copy source code
+COPY src/ ./src/
+
+# Build the module (release, cdylib)
+RUN if [ -z "$FEATURES" ]; then \
+        cargo build --release; \
+    else \
+        cargo build --release --features "$FEATURES"; \
+    fi
+
+RUN strip target/release/libvalkey_timeseries.so 2>/dev/null || true
+
+# ── Stage 2: Minimal runtime image ─────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Valkey server binary
+COPY --from=builder /build/valkey/src/valkey-server /usr/local/bin/valkey-server
+COPY --from=builder /build/valkey/src/valkey-cli /usr/local/bin/valkey-cli
+
+# Copy the timeseries module
+COPY --from=builder /build/module/target/release/libvalkey_timeseries.so /usr/local/lib/
+
+# Copy default configuration
+COPY valkey.conf /usr/local/etc/valkey/valkey.conf
+
+# Copy entrypoint script
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+RUN mkdir -p /data && chown -R nobody:nogroup /data /usr/local/etc/valkey
+USER nobody
+
+EXPOSE 6379
+VOLUME ["/data"]
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["valkey-server", "/usr/local/etc/valkey/valkey.conf"]
