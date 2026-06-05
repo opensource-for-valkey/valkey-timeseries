@@ -14,7 +14,7 @@ use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use std::hash::BuildHasherDefault;
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use twox_hash::XxHash64;
 
 /// Parse a match[] selector string into a VectorSelector
@@ -391,6 +391,7 @@ mod tests {
     use super::*;
     use crate::labels::Label;
     use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
+    use std::time::UNIX_EPOCH;
 
     fn create_tsdb() -> Tsdb {
         let querier = Arc::new(MockSeriesQuerier::new());
