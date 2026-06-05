@@ -6,6 +6,11 @@ Purpose
 
 Quick start (commands you can run)
 
+- Docker (containerized):
+    - `make docker-build && make docker-up`  # build image, start standalone container
+    - `make docker-up-cluster`               # start 3-node cluster for fanout testing
+    - `make docker-test`                     # run integration tests against container
+    - `make docker-down`                     # stop and remove containers
 - Build + checks:
   `cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release`
 - Local dev script (recommended):
@@ -250,6 +255,11 @@ Where to look first (key files & directories)
     - `wire_report.rs` — serialized payload bytes and round-trip cost swept across sample counts, plus the correctness
       gate; the tool behind `WIRE_COMPRESSION_MIN_SAMPLES` ("is shipping this compressed worth it").
 - `build.sh` — canonical developer flow for formatting, linting, building, and running tests.
+- `Dockerfile` / `Dockerfile.source` — containerized builds (official Valkey base vs. full source).
+- `docker-compose.yml` / `docker-compose.cluster.yml` — standalone and 3-node cluster testing.
+- `scripts/docker-entrypoint.sh` — runtime configuration via env vars for Docker containers.
+- `scripts/build-docker.sh` — helper for building Docker images with different versions/features.
+- `Makefile` — unified interface wrapping Docker and host-native commands.
 - `README.md`, `docs/COMMANDS.md`, and `docs/commands/` — human-facing command descriptions and examples.
 
 Quick tips for code changes
@@ -266,6 +276,8 @@ Quick tips for code changes
   (named `fanout_codec` rather than `fanout` so it does not collide with the `src/fanout/` transport layer).
 - When changing `src/promql/types.proto` or `src/promql/promqltest/testdata/*.test`, rerun `cargo test` or `./build.sh`
   so `build.rs` regenerates the derived Rust files.
+- When changing the Docker setup, rebuild with `make docker-build` (or `./scripts/build-docker.sh` for custom
+  versions); the `Dockerfile.source` variant is for testing against unreleased Valkey versions.
 
 Limitations of this document
 

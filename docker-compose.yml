@@ -1,0 +1,37 @@
+# Standalone valkey-timeseries for local testing
+#
+# Usage:
+#   docker compose up -d              # start in background
+#   docker compose logs -f            # follow logs
+#   valkey-cli -h localhost ping      # test connectivity
+#   docker compose down -v            # stop and remove volumes
+
+services:
+  valkey-timeseries:
+    image: valkey-timeseries:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: valkey-timeseries
+    ports:
+      - "6379:6379"
+    volumes:
+      # Mount custom config (optional — defaults work for most cases)
+      - ./valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
+      # Persistent data
+      - valkey-data:/data
+    environment:
+      - VALKEY_LOGLEVEL=notice
+      # Uncomment to enable cluster mode on a single node (for cluster API testing):
+      # - VALKEY_CLUSTER_ENABLED=yes
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-h", "localhost", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  valkey-data:
+    driver: local

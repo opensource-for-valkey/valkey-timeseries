@@ -130,6 +130,60 @@ ASAN_BUILD=true
 ```
 
 ## Load the Module
+
+### Docker (recommended for quick start)
+The easiest way to run valkey-timeseries is with Docker:
+
+```bash
+# Build the image and start a standalone instance
+make docker-build
+make docker-up
+
+# Or start a 3-node cluster for testing cluster features
+make docker-up-cluster
+
+# Connect and test
+valkey-cli -h localhost TS.ADD test 1000 42
+valkey-cli -h localhost TS.GET test
+```
+
+**Available Docker targets:**
+
+| Command | Description |
+|---|---|
+| `make docker-build` | Build production image (official `valkey/valkey` base) |
+| `make docker-build-source` | Build from source (Valkey + module compiled together) |
+| `make docker-up` | Start standalone container on port 6379 |
+| `make docker-down` | Stop and remove standalone container |
+| `make docker-up-cluster` | Start 3-node cluster (ports 6379-6381) |
+| `make docker-down-cluster` | Stop and remove cluster |
+| `make docker-shell` | Open a shell in the running container |
+| `make docker-logs` | Follow container logs |
+| `make docker-test` | Run integration tests against running container |
+
+**Custom builds:**
+
+```bash
+# Build for Valkey 8.0 with the valkey_8_0 feature flag
+./scripts/build-docker.sh prod 8.0 valkey_8_0
+
+# Build from Valkey's unstable/main branch
+./scripts/build-docker.sh source unstable
+```
+
+**Runtime configuration via environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `VALKEY_PORT` | `6379` | Listen port |
+| `VALKEY_CLUSTER_ENABLED` | (unset) | Set to `yes` to enable cluster mode |
+| `VALKEY_LOGLEVEL` | `notice` | Log verbosity |
+| `VALKEY_REQUIREPASS` | (unset) | Set a password |
+| `VALKEY_SAVE` | (unset) | RDB save directive (e.g., `900 1`) |
+| `VALKEY_APPENDONLY` | (unset) | Set to `yes` for AOF persistence |
+| `VALKEY_EXTRA_ARGS` | (unset) | Extra args passed to valkey-server |
+
+### Manual (host-native)
 To test the module with a Valkey, you can load the module in the following ways:
 
 #### Using valkey.conf:

@@ -1,0 +1,52 @@
+# Rust build artifacts
+target/
+.cargo/
+
+# Test infrastructure (cloned/built by build.sh, not needed for Docker)
+tests/build/
+tests/valkeytestframework/
+tests/.venv/
+test-data/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+
+# Documentation (not needed for builds)
+docs/
+*.md
+
+# CI/Git
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmarks (not needed for module build)
+benches/
+
+# Build script (uses host-specific paths, not for Docker)
+build.sh
+
+# Python test config
+pytest.ini
+pyproject.toml
+requirements.txt
+uv.lock
+
+# License
+LICENSE

@@ -1,0 +1,98 @@
+# Cluster-mode override for valkey-timeseries local testing
+#
+# Extends the base docker-compose.yml to create a 3-node Valkey cluster
+# with the timeseries module loaded on all nodes. Useful for testing
+# cluster fanout / cross-node query functionality.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml down -v
+#
+# After startup, check cluster status:
+#   valkey-cli -h localhost -p 6379 cluster info
+#   valkey-cli -h localhost -p 6379 cluster nodes
+
+services:
+  valkey-timeseries:
+    # Override the standalone service for cluster mode
+    environment:
+      - VALKEY_CLUSTER_ENABLED=yes
+      - VALKEY_CLUSTER_CONFIG=/data/nodes.conf
+    ports:
+      - "6379:6379"
+      - "16379:16379"   # cluster bus
+
+  valkey-timeseries-2:
+    image: valkey-timeseries:latest
+    container_name: valkey-timeseries-2
+    ports:
+      - "6380:6379"
+      - "16380:16379"
+    volumes:
+      - ./valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
+      - valkey-data-2:/data
+    environment:
+      - VALKEY_CLUSTER_ENABLED=yes
+      - VALKEY_CLUSTER_CONFIG=/data/nodes.conf
+      - VALKEY_PORT=6379
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-h", "localhost", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  valkey-timeseries-3:
+    image: valkey-timeseries:latest
+    container_name: valkey-timeseries-3
+    ports:
+      - "6381:6379"
+      - "16381:16379"
+    volumes:
+      - ./valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
+      - valkey-data-3:/data
+    environment:
+      - VALKEY_CLUSTER_ENABLED=yes
+      - VALKEY_CLUSTER_CONFIG=/data/nodes.conf
+      - VALKEY_PORT=6379
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-h", "localhost", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot container that forms the cluster once all nodes are healthy
+  cluster-init:
+    image: valkey-timeseries:latest
+    container_name: valkey-timeseries-cluster-init
+    depends_on:
+      valkey-timeseries:
+        condition: service_healthy
+      valkey-timeseries-2:
+        condition: service_healthy
+      valkey-timeseries-3:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c '
+        echo "Creating 3-node cluster..."
+        echo "yes" | valkey-cli --cluster create \
+          valkey-timeseries:6379 \
+          valkey-timeseries-2:6379 \
+          valkey-timeseries-3:6379 \
+          --cluster-replicas 0
+        echo "Cluster created. Checking status..."
+        valkey-cli -h valkey-timeseries cluster info
+      '
+    # init: true ensures the container exits after running
+    init: true
+
+volumes:
+  valkey-data:
+    driver: local
+  valkey-data-2:
+    driver: local
+  valkey-data-3:
+    driver: local
