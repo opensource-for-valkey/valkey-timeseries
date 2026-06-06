@@ -70,11 +70,7 @@ impl PromQLFunction for StartFunction {
         Ok(ExprResult::Scalar(ctx.query_start as f64 / 1000.0))
     }
 
-    fn apply_call(
-        &self,
-        _evaluated_args: Vec<PromQLArg>,
-        ctx: &crate::promql::EvalContext,
-    ) -> EvalResult<ExprResult> {
+    fn apply_args(&self, _args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         Ok(ExprResult::Scalar(ctx.query_start as f64 / 1000.0))
     }
 }
@@ -114,11 +110,7 @@ impl PromQLFunction for RangeFunction {
         Ok(ExprResult::Scalar(range_seconds))
     }
 
-    fn apply_call(
-        &self,
-        _evaluated_args: Vec<PromQLArg>,
-        ctx: &crate::promql::EvalContext,
-    ) -> EvalResult<ExprResult> {
+    fn apply_args(&self, _args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let range_seconds = Self::range_seconds(ctx);
         Ok(ExprResult::Scalar(range_seconds))
     }
@@ -144,11 +136,7 @@ impl PromQLFunction for StepFunction {
         Ok(ExprResult::Scalar(step_seconds))
     }
 
-    fn apply_call(
-        &self,
-        _evaluated_args: Vec<PromQLArg>,
-        ctx: &crate::promql::EvalContext,
-    ) -> EvalResult<ExprResult> {
+    fn apply_args(&self, _args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let step_seconds = Self::step_seconds(ctx);
         Ok(ExprResult::Scalar(step_seconds))
     }
