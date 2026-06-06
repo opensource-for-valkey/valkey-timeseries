@@ -1,6 +1,7 @@
 use crate::labels::{Label, Labels, SeriesFingerprint};
+use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
-use crate::promql::{EvalResult, EvalSample, ExprResult};
+use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LOR, T_MUL, T_SUB, TokenType};
@@ -91,6 +92,55 @@ pub(super) fn result_metric(
         None => {}
     }
     labels
+}
+
+pub fn get_metric_signature(labels: &Labels, drop_name: bool) -> SeriesFingerprint {
+    if !drop_name {
+        return labels.get_fingerprint();
+    }
+    let mut hasher: xxhash3_128::Hasher = Default::default();
+
+    labels
+        .iter()
+        .filter(|&l| l.name != METRIC_NAME)
+        .for_each(|label| {
+            hash_label(&mut hasher, label);
+        });
+
+    hasher.finish_128()
+}
+
+pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
+    let mut seen_label_sets = FingerprintHashSet::default();
+    for sample in samples {
+        let key = get_metric_signature(&sample.labels, sample.drop_name);
+        if !seen_label_sets.insert(key) {
+            return Err(EvaluationError::DuplicateLabelSet);
+        }
+    }
+
+    Ok(())
+}
+
+// vector_contains_same_label_set checks if a vector has samples with the same labelset
+// Such a behavior is semantically undefined
+// https://github.com/prometheus/prometheus/issues/4562
+pub fn vector_contains_same_label_set(v: &[EvalSample]) -> bool {
+    match v {
+        [] => false,
+        [_first] => false,
+        [first, second] => first.labels.signature() == second.labels.signature(),
+        _ => {
+            let mut seen = FingerprintHashSet::default();
+            for sample in v {
+                let hash = sample.labels.signature();
+                if !seen.insert(hash) {
+                    return true;
+                }
+            }
+            false
+        }
+    }
 }
 
 pub(in crate::promql) fn push_down_filters<'a>(

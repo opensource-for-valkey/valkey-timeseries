@@ -113,8 +113,19 @@ where
                         eval_cmd.end,
                         eval_cmd.step,
                         &eval_cmd.query,
-                    )?;
-                    let result = QueryValue::Matrix(result);
+                    );
+
+                    if eval_cmd.expect_fail {
+                        if result.is_ok() {
+                            return Err(format!(
+                                "expected eval to fail in {}: eval {} ({})",
+                                name, eval_count, eval_cmd.query
+                            ));
+                        }
+                        continue;
+                    }
+
+                    let result = QueryValue::Matrix(result?);
                     let expected = eval_cmd.expected.clone();
                     assert_results(result, expected, false, name, eval_count, &eval_cmd.query)?;
                 }
@@ -123,7 +134,19 @@ where
             Command::EvalInstant(eval_cmd) => {
                 if !ignoring {
                     eval_count += 1;
-                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query)?;
+                    let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query);
+
+                    if eval_cmd.expect_fail {
+                        if result.is_ok() {
+                            return Err(format!(
+                                "expected eval to fail in {}: eval {} ({})",
+                                name, eval_count, eval_cmd.query
+                            ));
+                        }
+                        continue;
+                    }
+
+                    let result = result?;
 
                     let expected = eval_cmd.expected.clone();
                     assert_results(
@@ -238,5 +261,40 @@ eval instant at 10m
         // then
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Negative step index"));
+    }
+
+    #[test]
+    fn temp_test() {
+        let content = r#"
+        load 1s
+      node_namespace_pod:kube_pod_info:{namespace="observability",node="gke-search-infra-custom-96-253440-fli-d135b119-jx00",pod="node-exporter-l454v"} 1
+      node_cpu_seconds_total{cpu="10",endpoint="https",instance="10.253.57.87:9100",job="node-exporter",mode="idle",namespace="observability",pod="node-exporter-l454v",service="node-exporter"} 449
+      node_cpu_seconds_total{cpu="35",endpoint="https",instance="10.253.57.87:9100",job="node-exporter",mode="idle",namespace="observability",pod="node-exporter-l454v",service="node-exporter"} 449
+      node_cpu_seconds_total{cpu="89",endpoint="https",instance="10.253.57.87:9100",job="node-exporter",mode="idle",namespace="observability",pod="node-exporter-l454v",service="node-exporter"} 449
+
+    eval instant at 4s count by(namespace, pod, cpu) (node_cpu_seconds_total{cpu=~".*",job="node-exporter",mode="idle",namespace="observability",pod="node-exporter-l454v"}) * on(namespace, pod) group_left(node) node_namespace_pod:kube_pod_info:{namespace="observability",pod="node-exporter-l454v"}
+        {cpu="10",namespace="observability",node="gke-search-infra-custom-96-253440-fli-d135b119-jx00",pod="node-exporter-l454v"} 1
+        {cpu="35",namespace="observability",node="gke-search-infra-custom-96-253440-fli-d135b119-jx00",pod="node-exporter-l454v"} 1
+        {cpu="89",namespace="observability",node="gke-search-infra-custom-96-253440-fli-d135b119-jx00",pod="node-exporter-l454v"} 1
+
+clear
+
+
+# Test duplicate labelset in promql output.
+load 5m
+  testmetric1{src="a",dst="b"} 0
+  testmetric2{src="a",dst="b"} 1
+
+eval instant at 0m ceil({__name__=~'testmetric1|testmetric2'})
+  expect fail
+
+clear
+    "#;
+
+        // when
+        let result = run_test("simple_test", content);
+
+        // then
+        assert!(result.is_ok());
     }
 }

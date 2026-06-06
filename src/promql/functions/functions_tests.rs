@@ -253,7 +253,7 @@ mod tests {
         // Compute a range that covers all samples in an instant evaluation.
         // The rollup window is (t_end - range_ms, t_end], so adding 1 ms
         // ensures the earliest sample (first.timestamp) falls inside the window.
-        // When samples are empty we still forward the call so empty-series
+        // When samples are empty, we still forward the call, so empty-series
         // filtering inside the function is exercised.
         let range = match samples.first().and_then(|s| s.first_sample()) {
             None => Duration::from_millis(1),
@@ -281,7 +281,10 @@ mod tests {
 
     #[test]
     fn should_apply_abs_function() {
-        let samples = vec![create_sample(-5.0), create_sample(3.0)];
+        let samples = vec![
+            create_sample_with_labels(-5.0, &[("instance", "a")]),
+            create_sample_with_labels(3.0, &[("instance", "b")]),
+        ];
         let result = call_apply("abs", PromQLArg::InstantVector(samples), 1000);
 
         assert_eq!(result.len(), 2);
@@ -292,10 +295,10 @@ mod tests {
     #[test]
     fn should_apply_round_with_optional_to_nearest() {
         let samples = vec![
-            create_sample(1.24),
-            create_sample(1.25),
-            create_sample(1.26),
-            create_sample(-1.25),
+            create_sample_with_labels(1.24, &[("instance", "a")]),
+            create_sample_with_labels(1.25, &[("instance", "b")]),
+            create_sample_with_labels(1.26, &[("instance", "c")]),
+            create_sample_with_labels(-1.25, &[("instance", "d")]),
         ];
         let result = call_apply_args(
             "round",

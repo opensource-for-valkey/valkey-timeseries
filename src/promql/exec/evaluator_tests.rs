@@ -262,10 +262,10 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (10.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]),
-            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]),
-            (30.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]),
-            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]),
+            (10.0, vec![("env", "prod"), ("method", "GET")]),
+            (20.0, vec![("env", "prod"), ("method", "POST")]),
+            (30.0, vec![("env", "staging"), ("method", "GET")]),
+            (40.0, vec![("env", "staging"), ("method", "POST")]),
         ]
     )]
     #[case(
@@ -275,7 +275,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (10.0, vec![("__name__", "memory_bytes"), ("env", "prod")]), // sqrt(100) = 10
+            (10.0, vec![("env", "prod")]), // sqrt(100) = 10
         ]
     )]
     #[case(
@@ -286,8 +286,8 @@ mod tests {
             ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
         ],
         vec![
-            (50.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
-            (60.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i2")]),
+            (50.0, vec![("env", "prod"), ("instance", "i1")]),
+            (60.0, vec![("env", "prod"), ("instance", "i2")]),
         ]
     )]
     #[case(
@@ -298,8 +298,8 @@ mod tests {
             ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
         ],
         vec![
-            (50.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
-            (60.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i2")]),
+            (50.0, vec![("env", "prod"), ("instance", "i1")]),
+            (60.0, vec![("env", "prod"), ("instance", "i2")]),
         ]
     )]
     #[case(
@@ -310,8 +310,8 @@ mod tests {
             ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
         ],
         vec![
-            (50.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
-            (60.0, vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i2")]),
+            (50.0, vec![("env", "prod"), ("instance", "i1")]),
+            (60.0, vec![("env", "prod"), ("instance", "i2")]),
         ]
     )]
     // Function Calls - Trigonometry
@@ -323,8 +323,8 @@ mod tests {
             ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
         ],
         vec![
-            (50.0_f64.sin(), vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
-            (60.0_f64.sin(), vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i2")]),
+            (50.0_f64.sin(), vec![("env", "prod"), ("instance", "i1")]),
+            (60.0_f64.sin(), vec![("env", "prod"), ("instance", "i2")]),
         ]
     )]
     #[case(
@@ -335,8 +335,8 @@ mod tests {
             ("cpu_usage", vec![("env", "prod"), ("instance", "i2")], 1, 60.0),
         ],
         vec![
-            (50.0_f64.cos(), vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i1")]),
-            (60.0_f64.cos(), vec![("__name__", "cpu_usage"), ("env", "prod"), ("instance", "i2")]),
+            (50.0_f64.cos(), vec![("env", "prod"), ("instance", "i1")]),
+            (60.0_f64.cos(), vec![("env", "prod"), ("instance", "i2")]),
         ]
     )]
     // Function Calls - Logarithms
@@ -347,7 +347,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (100.0_f64.ln(), vec![("__name__", "memory_bytes"), ("env", "prod")]),
+            (100.0_f64.ln(), vec![("env", "prod")]),
         ]
     )]
     #[case(
@@ -357,7 +357,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (100.0_f64.log10(), vec![("__name__", "memory_bytes"), ("env", "prod")]), // log10(100) = 2
+            (100.0_f64.log10(), vec![("env", "prod")]), // log10(100) = 2
         ]
     )]
     #[case(
@@ -367,7 +367,7 @@ mod tests {
             ("memory_bytes", vec![("env", "prod")], 0, 100.0),
         ],
         vec![
-            (100.0_f64.log2(), vec![("__name__", "memory_bytes"), ("env", "prod")]),
+            (100.0_f64.log2(), vec![("env", "prod")]),
         ]
     )]
     // Function Calls - Special

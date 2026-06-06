@@ -1,5 +1,6 @@
 use crate::common::Sample;
 use crate::labels::{Labels, SeriesFingerprint};
+use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::hashers::PreloadKey;
 use ahash::RandomState;
@@ -11,6 +12,7 @@ pub enum EvaluationError {
     StorageError(String),
     InternalError(String),
     ArgumentError(String),
+    DuplicateLabelSet,
     UnsupportedFunction(String),
 }
 
@@ -26,6 +28,9 @@ impl Display for EvaluationError {
             EvaluationError::StorageError(err) => write!(f, "PromQL evaluation error: {err}"),
             EvaluationError::InternalError(err) => write!(f, "PromQL internal error: {err}"),
             EvaluationError::ArgumentError(err) => write!(f, "PromQL argument error: {err}"),
+            EvaluationError::DuplicateLabelSet => {
+                write!(f, "vector cannot contain metrics with the same labelset")
+            }
             EvaluationError::UnsupportedFunction(func_name) => {
                 write!(f, "PromQL unknown function: {func_name}")
             }
@@ -80,7 +85,7 @@ impl EvalSample {
     }
 
     pub fn fingerprint(&self) -> SeriesFingerprint {
-        self.labels.get_fingerprint()
+        get_metric_signature(&self.labels, self.drop_name)
     }
 }
 
@@ -113,6 +118,10 @@ impl EvalSamples {
     #[cfg(test)]
     pub fn last_sample(&self) -> Option<&Sample> {
         self.values.last()
+    }
+
+    pub fn fingerprint(&self) -> SeriesFingerprint {
+        get_metric_signature(&self.labels, self.drop_name)
     }
 }
 
