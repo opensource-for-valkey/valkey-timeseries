@@ -1,9 +1,10 @@
 The following commands are supported
 
 ```aiignore
-[TS.CREATE-SERIES](./create.md)
+[TS.CREATE-SERIES](./ts.create.md)
 TS.ALTER
 TS.ADD
+TS.AUTOFORECAST
 TS.CARD
 TS.MADD
 TS.DEL

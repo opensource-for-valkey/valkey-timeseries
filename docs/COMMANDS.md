@@ -1,11 +1,13 @@
 # Command List
 
 - [`TS.ADD`](commands/ts.add.md)
+- [`TS.AUTOFORECAST`](commands/ts.autoforcast.md)
 - [`TS.ADDBULK`](commands/ts.addbulk.md)
 - [`TS.ALTER`](commands/ts.alter.md)
 - [`TS.CARD`](commands/ts.card.md)
 - [`TS.CREATE`](commands/ts.create.md)
 - [`TS.CREATERULE`](commands/ts.createrule.md)
+- [`TS.DECOMPOSE`](commands/ts.decompose.md)
 - [`TS.DECRBY`](commands/ts.decrby.md)
 - [`TS.DEL`](commands/ts.del.md)
 - [`TS.DELETERULE`](commands/ts.deleterule.md)

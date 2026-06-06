@@ -12,6 +12,7 @@ mod ts_create;
 mod ts_createrule;
 mod ts_debug;
 mod ts_debug_configs;
+mod ts_decompose;
 mod ts_del;
 mod ts_deleterule;
 mod ts_get;
@@ -46,6 +47,7 @@ pub use command_parser::*;
 pub use ts_asm_restore::*;
 pub(crate) use ts_autoforecast::*;
 pub use ts_debug::*;
+pub use ts_decompose::*;
 pub use ts_mget::*;
 use valkey_module::ValkeyResult;
 
