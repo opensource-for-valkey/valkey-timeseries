@@ -3,7 +3,9 @@ use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
-use crate::promql::binops::{can_push_down_common_filters, eval_binary_expr, push_down_filters};
+use crate::promql::binops::{
+    can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
+};
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::utils::collect_vector_selectors;
@@ -219,15 +221,34 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let mut result = self.evaluate_expr(expr, &ctx, true)?;
 
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
-        if let ExprResult::InstantVector(ref mut samples) = result {
-            for sample in samples.iter_mut() {
-                if sample.drop_name {
-                    sample.labels.remove(METRIC_NAME);
-                }
-            }
-        }
+        Self::cleanup_metric_labels(&mut result)?;
 
         Ok(result)
+    }
+
+    /// Remove `__name__` label from the result if `drop_name` is true. Mirrors Prometheus's `cleanupMetricLabels` logic in engine.go.
+    fn cleanup_metric_labels(v: &mut ExprResult) -> EvalResult<()> {
+        match v {
+            ExprResult::RangeVector(mat) => {
+                for v in mat.iter_mut() {
+                    if v.drop_name {
+                        v.labels.retain(|l| l.name != METRIC_NAME);
+                    }
+                }
+            }
+            ExprResult::InstantVector(vec) => {
+                for v in vec.iter_mut() {
+                    if v.drop_name {
+                        v.labels.retain(|l| l.name != METRIC_NAME);
+                    }
+                }
+
+                ensure_unique_labelsets(vec)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     // this call recurses to evaluate sub-expressions
@@ -699,11 +720,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // 2) get common label filters for series returned at step 1
         // 3) push down the found common label filters to expr_second. This filters out unneeded series
         //    during expr_second execution instead of spending compute resources on extracting and
-        //    processing these series before they are dropped later when matching time series according to
+        //    processing these series before they are dropped later when matching time series, according to
         //    https://prometheus.io/docs/prometheus/latest/querying/operators/#vector-matching
         // 4) execute the expr_second with possible additional filters found at step 3
         //
-        // Typical use cases:
+        // Typical use-cases:
         // - Kubernetes-related: show pod creation time with the node name:
         //
         //     kube_pod_created{namespace="prod"} * on (uid) group_left(node) kube_pod_info

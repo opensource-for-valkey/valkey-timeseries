@@ -3,7 +3,6 @@ use crate::common::math::kahan_inc;
 use crate::labels::Labels;
 use crate::promql::functions::PromQLArg;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
-use ahash::AHashSet;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::Expr;
 use std::borrow::Cow;
@@ -206,20 +205,6 @@ pub(super) fn expect_scalar(arg: PromQLArg, func: &str, param_name: &str) -> Eva
     Err(EvaluationError::ArgumentError(msg))
 }
 
-pub(super) fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
-    let mut seen_label_sets = AHashSet::with_capacity(samples.len());
-    for sample in samples {
-        let labelset_key = output_labelset_key(&sample.labels, sample.drop_name);
-        if !seen_label_sets.insert(labelset_key) {
-            return Err(EvaluationError::InternalError(
-                "vector cannot contain metrics with the same labelset".to_string(),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 pub(super) fn map_scalar_or_vector(
     value: PromQLArg,
     map: impl Fn(f64) -> f64,
@@ -229,6 +214,7 @@ pub(super) fn map_scalar_or_vector(
         PromQLArg::InstantVector(mut vector) => {
             for sample in &mut vector {
                 sample.value = map(sample.value);
+                sample.drop_name = true;
             }
             Ok(ExprResult::InstantVector(vector))
         }

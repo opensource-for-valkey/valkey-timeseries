@@ -197,14 +197,14 @@ impl Parser {
         let (time_str, query) = Self::parse_time_and_query(rest, lines, line_idx)?;
         let time = parse_time(&time_str)?;
 
-        let (expected, expect_ordered) = parse_expectations(lines, line_idx)?;
+        let (expected, expect_ordered, expect_fail) = parse_expectations(lines, line_idx)?;
 
         Ok(Some(Command::EvalInstant(EvalInstantCmd {
             time,
             query,
             expected,
             expect_ordered,
-            expect_fail: false,
+            expect_fail,
             line_number,
         })))
     }
@@ -239,7 +239,7 @@ impl Parser {
         let start = UNIX_EPOCH + from;
         let end = UNIX_EPOCH + to;
 
-        let (expected, _expect_ordered) = parse_expectations(lines, line_idx)?;
+        let (expected, _expect_ordered, expect_fail) = parse_expectations(lines, line_idx)?;
 
         let cmd = EvalRangeCmd {
             start,
@@ -247,7 +247,7 @@ impl Parser {
             step,
             query: query.to_string(),
             expected,
-            expect_fail: false, // todo
+            expect_fail,
             line_number,
         };
         Ok(Some(Command::EvalRange(cmd)))
@@ -549,6 +549,7 @@ fn parse_expected_samples(value_expr: &str, line: &str) -> Result<Vec<Sample>, S
 
 enum ExpectDirective {
     Ordered,
+    Fail,
     String(QueryValue),
     Ignored,
 }
@@ -560,6 +561,10 @@ fn parse_expect_directive(trimmed_line: &str) -> Result<Option<ExpectDirective>,
 
     if trimmed_line == "expect ordered" {
         return Ok(Some(ExpectDirective::Ordered));
+    }
+
+    if trimmed_line == "expect fail" {
+        return Ok(Some(ExpectDirective::Fail));
     }
 
     if let Some(raw) = trimmed_line.strip_prefix("expect string ") {
@@ -635,9 +640,13 @@ fn build_expected_query_value(
     QueryValue::Matrix(expected_ranges)
 }
 
-fn parse_expectations(lines: &[&str], line_idx: &mut usize) -> Result<(QueryValue, bool), String> {
+fn parse_expectations(
+    lines: &[&str],
+    line_idx: &mut usize,
+) -> Result<(QueryValue, bool, bool), String> {
     let mut expected_ranges: Vec<RangeSample> = Vec::new();
     let mut expect_ordered = false;
+    let mut expect_fail = false;
     let mut expected_value: Option<QueryValue> = None;
     let mut had_label_only_syntax: Vec<bool> = Vec::new();
 
@@ -658,6 +667,11 @@ fn parse_expectations(lines: &[&str], line_idx: &mut usize) -> Result<(QueryValu
             match directive {
                 ExpectDirective::Ordered => {
                     expect_ordered = true;
+                    *line_idx += 1;
+                    continue;
+                }
+                ExpectDirective::Fail => {
+                    expect_fail = true;
                     *line_idx += 1;
                     continue;
                 }
@@ -697,7 +711,7 @@ fn parse_expectations(lines: &[&str], line_idx: &mut usize) -> Result<(QueryValu
     let expected =
         build_expected_query_value(expected_ranges, expected_value, had_label_only_syntax);
 
-    Ok((expected, expect_ordered))
+    Ok((expected, expect_ordered, expect_fail))
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {

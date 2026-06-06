@@ -94,6 +94,7 @@ impl PromQLFunction for RoundFunction {
         let mut samples = arg.into_instant_vector()?;
         for sample in &mut samples {
             sample.value = Self::round_to_nearest(sample.value, 1.0);
+            sample.drop_name = true;
         }
         Ok(ExprResult::InstantVector(samples))
     }
@@ -122,6 +123,7 @@ impl PromQLFunction for RoundFunction {
 
         for sample in &mut samples {
             sample.value = Self::round_to_nearest(sample.value, to_nearest);
+            sample.drop_name = true;
         }
         Ok(ExprResult::InstantVector(samples))
     }
