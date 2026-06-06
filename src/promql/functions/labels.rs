@@ -1,14 +1,53 @@
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{
-    ensure_unique_labelsets, exact_arity_error, expect_exact_arg_count, expect_min_arg_count,
+    exact_arity_error, expect_exact_arg_count, expect_min_arg_count,
     expect_string, is_valid_label_name, min_arity_error,
 };
-use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use promql_parser::label::METRIC_NAME;
 use regex::Regex;
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct LabelReplaceFunction;
+
+fn apply_label_replace_to_samples(
+    mut samples: Vec<EvalSample>,
+    dst_label: &str,
+    replacement: &str,
+    src_label: &str,
+    regex_src: &str,
+) -> EvalResult<ExprResult> {
+    if !is_valid_label_name(dst_label) {
+        return Err(EvaluationError::InternalError(format!(
+            "invalid label name {:?}",
+            dst_label
+        )));
+    }
+
+    let regex =
+        Regex::new(&format!("^(?s:{regex_src})$")).map_err(|err| EvaluationError::InternalError(err.to_string()))?;
+
+    for sample in &mut samples {
+        let src_value = sample.labels.get(src_label).unwrap_or_default();
+
+        if let Some(captures) = regex.captures(src_value) {
+            let mut replaced = String::new();
+            captures.expand(replacement, &mut replaced);
+
+            if replaced.is_empty() {
+                sample.labels.remove(dst_label);
+            } else {
+                sample.labels.insert(dst_label, replaced);
+            }
+
+            if dst_label == METRIC_NAME {
+                sample.drop_name = false;
+            }
+        }
+    }
+
+    Ok(ExprResult::InstantVector(samples))
+}
 
 impl PromQLFunction for LabelReplaceFunction {
     fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
@@ -20,7 +59,7 @@ impl PromQLFunction for LabelReplaceFunction {
         expect_exact_arg_count("label_replace", 5, args.len())?;
 
         let mut args_iter = args.into_iter();
-        let PromQLArg::InstantVector(mut samples) =
+        let PromQLArg::InstantVector(samples) =
             args_iter.next().expect("validated args.len() == 5")
         else {
             return Err(EvaluationError::InternalError(
@@ -45,37 +84,7 @@ impl PromQLFunction for LabelReplaceFunction {
             .expect("validated args.len() == 5")
             .into_string()?;
 
-        if !is_valid_label_name(&dst_label) {
-            return Err(EvaluationError::InternalError(format!(
-                "invalid label name {:?}",
-                dst_label
-            )));
-        }
-
-        let regex = Regex::new(&format!("^(?s:{regex_src})$"))
-            .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
-
-        for sample in &mut samples {
-            let src_value = sample.labels.get(&src_label).unwrap_or_default();
-
-            if let Some(captures) = regex.captures(src_value) {
-                let mut replaced = String::new();
-                captures.expand(&replacement, &mut replaced);
-
-                if replaced.is_empty() {
-                    sample.labels.remove(&dst_label);
-                } else {
-                    sample.labels.insert(&dst_label, replaced);
-                }
-
-                if dst_label == METRIC_NAME {
-                    sample.drop_name = false;
-                }
-            }
-        }
-
-        ensure_unique_labelsets(&samples)?;
-        Ok(ExprResult::InstantVector(samples))
+        apply_label_replace_to_samples(samples, &dst_label, &replacement, &src_label, &regex_src)
     }
 
     fn apply_call(
@@ -86,7 +95,7 @@ impl PromQLFunction for LabelReplaceFunction {
         expect_exact_arg_count("label_replace", 5, evaluated_args.len())?;
 
         let mut args_iter = evaluated_args.into_iter();
-        let PromQLArg::InstantVector(mut samples) = args_iter
+        let PromQLArg::InstantVector(samples) = args_iter
             .next()
             .expect("validated evaluated_args.len() == 5")
         else {
@@ -124,37 +133,7 @@ impl PromQLFunction for LabelReplaceFunction {
             "regex",
         )?;
 
-        if !is_valid_label_name(&dst_label) {
-            return Err(EvaluationError::InternalError(format!(
-                "invalid label name {:?}",
-                dst_label
-            )));
-        }
-
-        let regex = Regex::new(&format!("^(?s:{regex_src})$"))
-            .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
-
-        for sample in &mut samples {
-            let src_value = sample.labels.get(&src_label).unwrap_or_default();
-
-            if let Some(captures) = regex.captures(src_value) {
-                let mut replaced = String::new();
-                captures.expand(&replacement, &mut replaced);
-
-                if replaced.is_empty() {
-                    sample.labels.remove(&dst_label);
-                } else {
-                    sample.labels.insert(&dst_label, replaced);
-                }
-
-                if dst_label == METRIC_NAME {
-                    sample.drop_name = false;
-                }
-            }
-        }
-
-        ensure_unique_labelsets(&samples)?;
-        Ok(ExprResult::InstantVector(samples))
+        apply_label_replace_to_samples(samples, &dst_label, &replacement, &src_label, &regex_src)
     }
 }
 
@@ -231,8 +210,7 @@ impl PromQLFunction for LabelJoinFunction {
                 sample.drop_name = false;
             }
         }
-
-        ensure_unique_labelsets(&samples)?;
+        
         Ok(ExprResult::InstantVector(samples))
     }
 }
