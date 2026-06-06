@@ -49,6 +49,7 @@ The following commands are supported
 
 ```aiignore
 TS.ADD
+TS.AUTOFORECAST
 TS.ADDBULK
 TS.ALTER
 TS.CARD
