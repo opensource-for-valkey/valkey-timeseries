@@ -29,3 +29,13 @@ impl From<ForecastError> for TsdbError {
         TsdbError::ForecastError(err.to_string())
     }
 }
+
+pub fn normalize_model_name(selected_model: &str) -> &str {
+    match selected_model {
+        "AutoARIMA (SARIMA)" => "SARIMA",
+        "AutoARIMA" => "ARIMA",
+        "AutoTheta" => "Theta",
+        "AutoETS" => "ETS",
+        other => other, // fallback to original name if it doesn't match known models
+    }
+}

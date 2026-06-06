@@ -139,7 +139,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         assert len(forecasts) == 5, f"Expected 5 forecast values, got {len(forecasts)}"
         # The selected model should be one of the known families
         model = parsed["selected_model"]
-        assert model in ("AutoARIMA", "AutoETS", "AutoTheta", "unknown"), \
+        assert model in ("ARIMA", "SARIMA", "ETS", "Theta", "unknown"), \
             f"Unexpected model name: {model}"
 
     def test_forecast_with_level(self):
@@ -220,7 +220,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model == "AutoARIMA", f"Expected AutoARIMA, got {model}"
+        assert model == "ARIMA", f"Expected AutoARIMA, got {model}"
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 5
 
@@ -236,7 +236,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model == "AutoETS", f"Expected AutoETS, got {model}"
+        assert model == "ETS", f"Expected ETS, got {model}"
 
     def test_models_single_theta(self):
         """Test with only Theta model selected."""
@@ -250,7 +250,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model == "AutoTheta", f"Expected AutoTheta, got {model}"
+        assert model == "Theta", f"Expected Theta, got {model}"
 
     def test_models_multiple(self):
         """Test with multiple model families specified."""
@@ -264,8 +264,8 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model in ("AutoARIMA", "AutoETS"), \
-            f"Expected AutoARIMA or AutoETS, got {model}"
+        assert model in ("ARIMA", "SARIMA", "ETS"), \
+            f"Expected ARIMA, SARIMA or ETS, got {model}"
 
     def test_models_all_three(self):
         """Test with all three model families."""
@@ -279,7 +279,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model in ("AutoARIMA", "AutoETS", "AutoTheta"), \
+        assert model in ("ARIMA", "SARIMA", "ETS", "Theta"), \
             f"Unexpected model: {model}"
 
     def test_models_case_insensitive(self):
@@ -294,7 +294,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model in ("AutoARIMA", "AutoETS", "AutoTheta"), \
+        assert model in ("ARIMA", "SARIMA", "ETS", "Theta"), \
             f"Unexpected model: {model}"
 
     def test_models_auto_prefix(self):
@@ -309,7 +309,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_forecast_response(result)
         model = parsed["selected_model"]
-        assert model == "AutoARIMA", f"Expected AutoARIMA, got {model}"
+        assert model == "ARIMA", f"Expected ARIMA, got {model}"
 
     # ── SEASONALITY option ───────────────────────────────────────────────
 
@@ -328,8 +328,8 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 10
         model = parsed["selected_model"]
-        assert model in ("AutoARIMA", "AutoETS"), \
-            f"Expected AutoARIMA or AutoETS, got {model}"
+        assert model in ("ARIMA", "SARIMA", "ETS"), \
+            f"Expected ARIMA, SARIMA or ETS, got {model}"
 
     def test_seasonality_sine(self):
         """Test with seasonality on a pure sine wave."""
@@ -423,8 +423,8 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         # Stored key should now have the forecast values
         stored = self.client.execute_command("TS.RANGE", store_key, "-", "+")
-        assert len(stored) == 3, \
-            f"Expected 3 stored samples after update, got {len(stored)}"
+        assert len(stored) == 4, \
+            f"Expected 4 stored samples after merge (1 existing + 3 forecast), got {len(stored)}"
 
     def test_store_timestamps_are_sequential(self):
         """Test that stored forecast timestamps are in proper sequence."""

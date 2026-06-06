@@ -1,8 +1,8 @@
-use crate::analysis::forecasting::make_forecast_time_series;
+use crate::analysis::forecasting::{make_forecast_time_series, normalize_model_name};
 use crate::commands::{CommandArgIterator, parse_timestamp_range};
 use crate::common::Sample;
 use crate::common::replies::{
-    ThreadSafeReplyContext, block_client, reply_with_array_len, reply_with_double, reply_with_map,
+    ThreadSafeReplyContext, block_client, reply_with_array, reply_with_double, reply_with_map,
     reply_with_str,
 };
 use crate::error_consts;
@@ -198,7 +198,7 @@ fn run_forecasting_thread(
     let mut model = AutoForecast::with_config(options.config);
 
     let res = if let Some(level) = options.level {
-        model.fit_predict_with_intervals(&series, options.horizon, level)
+        model.fit_predict_with_intervals(&series, options.horizon, level / 100.0)
     } else {
         model.fit_predict(&series, options.horizon)
     };
@@ -215,7 +215,7 @@ fn run_forecasting_thread(
     };
 
     // { model: "ARIMA", horizon: 5, forecast: [...], lower_interval: [...], upper_interval: [...] }
-    let selected_model = model.selected_model_name().unwrap_or("unknown");
+    let selected_model = normalize_model_name(model.selected_model_name().unwrap_or("unknown"));
     let predicted_values = forecast.primary();
     let lower_interval = get_lower_interval(&forecast);
     let upper_interval = get_upper_interval(&forecast);
@@ -232,6 +232,7 @@ fn run_forecasting_thread(
 
                 let lock = ctx.lock();
                 let key = lock.create_string(store_key);
+
                 if let Err(e) =
                     create_or_update_series_with_samples(&lock, &key, None, &samples, None)
                 {
@@ -303,7 +304,7 @@ fn reply_with_interval_array(ctx: &ThreadSafeReplyContext, name: &'static str, v
 }
 
 fn reply_with_double_array(ctx: &ThreadSafeReplyContext, values: &[f64]) {
-    reply_with_array_len(ctx, values.len());
+    reply_with_array(ctx, values.len());
     for value in values {
         reply_with_double(ctx, *value);
     }
