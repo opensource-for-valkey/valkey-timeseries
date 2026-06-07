@@ -16,6 +16,7 @@ pub mod module_options;
 pub mod math;
 pub mod pool;
 pub mod rdb;
+pub mod replies;
 pub mod rounding;
 pub mod string_interner;
 pub mod strings;
@@ -24,5 +25,4 @@ pub mod threads;
 pub mod time;
 mod types;
 pub mod unit_vec;
-
 pub use types::*;

@@ -1,6 +1,7 @@
 use crate::commands::CommandArgIterator;
 use crate::common::context::replies::*;
 use crate::common::humanize::humanize_duration;
+use crate::common::replies::reply_with_integer;
 use crate::config::{CONFIG_VALUE_NONE, CONFIGS, ConfigDesc, ConfigValue};
 use std::time::Duration;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
