@@ -1,0 +1,50 @@
+# Sample data override for valkey-timeseries
+#
+# Adds a data-loader service that loads sample datasets into the
+# running valkey-timeseries container. The loader runs once and exits.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.data.yml up -d
+#   docker compose -f docker-compose.yml -f docker-compose.data.yml down -v
+#
+# Or use the Makefile shortcut:
+#   make docker-up-with-data
+#
+# Environment variables (set on the data-loader service):
+#   LOAD_SAMPLE_DATA   Comma-separated datasets: cpu,memory,power,web
+#                      or "all" (default: cpu,memory)
+#
+# Examples:
+#   LOAD_SAMPLE_DATA=all docker compose -f docker-compose.yml -f docker-compose.data.yml up -d
+#   LOAD_SAMPLE_DATA=cpu,memory docker compose -f docker-compose.yml -f docker-compose.data.yml up -d
+
+services:
+  data-loader:
+    image: python:3.12-slim
+    container_name: valkey-timeseries-data-loader
+    depends_on:
+      valkey-timeseries:
+        condition: service_healthy
+    volumes:
+      # Mount the sample data directory (must be at /scripts/data/
+      # so data_helpers.py can find it via its internal DATA_DIR)
+      - ./tests/data:/scripts/data:ro
+      # Mount the loader script and helpers
+      - ./scripts/load-sample-data.py:/scripts/load-sample-data.py:ro
+      - ./tests/data_helpers.py:/scripts/data_helpers.py:ro
+    environment:
+      - VALKEY_HOST=valkey-timeseries
+      - VALKEY_PORT=6379
+      - SAMPLE_DATA_DIR=/scripts/data
+      - LOAD_SAMPLE_DATA=${LOAD_SAMPLE_DATA:-cpu,memory}
+    entrypoint: |
+      /bin/sh -c '
+        set -e
+        echo "Installing valkey Python package..."
+        pip install --quiet valkey
+        echo "Running sample data loader..."
+        cd /scripts
+        python3 load-sample-data.py --host $${VALKEY_HOST} --port $${VALKEY_PORT} --data-dir $${SAMPLE_DATA_DIR} --datasets "$${LOAD_SAMPLE_DATA}"
+        echo "Sample data loading complete."
+      '
+    init: true

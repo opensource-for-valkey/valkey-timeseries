@@ -20,6 +20,7 @@
 .PHONY: help build test lint clean
 .PHONY: docker-build docker-build-source docker-up docker-down
 .PHONY: docker-up-cluster docker-down-cluster docker-shell docker-logs docker-test
+.PHONY: docker-up-with-data docker-load-data
 
 # ── Default target ──────────────────────────────────────────────────
 help:
@@ -35,6 +36,8 @@ help:
 	@echo "    make docker-shell              Open a shell in the running container"
 	@echo "    make docker-logs               Follow container logs"
 	@echo "    make docker-test               Run integration tests against running container"
+	@echo "    make docker-up-with-data       Start container + load sample datasets"
+	@echo "    make docker-load-data          Load sample data into running container"
 	@echo ""
 	@echo "  Host (native):"
 	@echo "    make build                     Build module on host (cargo build --release)"
@@ -85,6 +88,35 @@ docker-test:
 		VALKEY_HOST=localhost \
 		VALKEY_PORT=6379 \
 		python3 -m pytest --cache-clear -v . -k "$(TEST_PATTERN)"
+
+# ── Sample data loading ────────────────────────────────────────
+
+docker-up-with-data:
+	docker compose -f docker-compose.yml -f docker-compose.data.yml up -d
+	@echo ""
+	@echo "Valkey with timeseries module is running (sample data loading in background)."
+	@echo "  Connect:  valkey-cli -h localhost -p 6379"
+	@echo "  Check data loader logs:  docker compose -f docker-compose.yml -f docker-compose.data.yml logs data-loader"
+	@echo "  Query CPU data:  valkey-cli -h localhost TS.RANGE system:cpu - +"
+
+# Load data into an already-running container (standalone or cluster)
+# Usage:
+#   make docker-load-data                                    # default: cpu,memory
+#   LOAD_SAMPLE_DATA=all make docker-load-data               # all datasets
+#   LOAD_SAMPLE_DATA=cpu,memory,web make docker-load-data    # specific datasets
+docker-load-data:
+	@if ! docker compose -f docker-compose.yml -f docker-compose.data.yml ps --status running 2>/dev/null | grep -q valkey-timeseries; then \
+		echo "ERROR: valkey-timeseries container is not running."; \
+		echo "  Start it first with: make docker-up"; \
+		exit 1; \
+	fi
+	@echo "Loading sample data into running valkey-timeseries container..."
+	@echo "  Datasets: $${LOAD_SAMPLE_DATA:-cpu,memory}"
+	docker compose -f docker-compose.yml -f docker-compose.data.yml run --rm data-loader
+	@echo ""
+	@echo "Data loading complete. Check with:"
+	@echo "  valkey-cli -h localhost TS.INFO system:cpu"
+	@echo "  valkey-cli -h localhost TS.INFO system:memory"
 
 # ════════════════════════════════════════════════════════════════════
 # Host-native targets
