@@ -99,7 +99,7 @@ impl PromQLFunction for LabelReplaceFunction {
             // should never occur!
             panic!("Invalid return value in LabelReplaceFunction");
         };
-        ensure_unique_labelsets(&iv)?;
+        ensure_unique_labelsets(iv)?;
         Ok(result)
     }
 }

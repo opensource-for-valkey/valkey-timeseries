@@ -62,8 +62,13 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Generate the request to be sent to each target node.
     fn generate_request(&self) -> Self::Request;
 
-    /// Called once per successful response from a target node.
-    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo);
+    /// Called once per response from a target node.
+    ///
+    /// Returning `Err(FanoutError)` will be treated as a
+    /// per-shard failure (it increments the aggregated error count and will cause the
+    /// overall fanout to reply with an error at completion). Implementations should
+    /// return `Ok(())` on success.
+    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 
     fn on_error(&mut self, error: FanoutError, target: &NodeInfo) {
         // Log the error with context
@@ -78,10 +83,11 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Called once all responses have been received, or on timeout.
     fn on_completion(&mut self) {}
 
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
+    /// If true, the fanout operation should abort immediately on the first
+    /// failing `on_response`. Default is `false` to preserve existing
+    /// per-shard error aggregation behavior.
+    fn fail_fast(&self) -> bool {
+        false
     }
 
     /// Return the final response after the fanout operation is complete.
@@ -293,12 +299,16 @@ where
     }
 
     fn on_response(&mut self, resp: OP::Response, target: &NodeInfo) {
+<<<<<<< HEAD
         // See `on_error`: after completion `self.operation` is a `mem::take`
         // placeholder, so drop late responses instead of accumulating into it.
         if self.lifecycle == FanoutLifecycleState::Completed {
             return;
         }
         self.activate();
+=======
+        self.is_init = true;
+>>>>>>> 22a4235b (compile fixes)
         if self.timed_out {
             // We already timed out; ignore responses but mark RPC as done.
             self.rpc_done();
@@ -327,7 +337,6 @@ where
                 }
             }
         }
-        self.rpc_done()
     }
 
     fn on_completion(&mut self) {
@@ -429,7 +438,7 @@ fn spawn_local_request<OP, F>(
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     spawn(move || {
-        // Minimize the scope of GIL locking, avoiding re-entering the GIL which is non-reentrant.
+        // Minimize the scope of GIL locking, avoiding re-entering the `GIL` which is non-reentrant.
         let result = {
             let ctx = MODULE_CONTEXT.lock();
             with_fanout_user(&ctx, user.as_deref(), |ctx| {

@@ -244,6 +244,7 @@ impl TryFrom<ProtoLabelMatcher> for LabelFilter {
                     PredicateMatch::RegexNotEqual(matcher)
                 }
             }
+            _ => unreachable!("Invalid branch reached"),
         };
 
         Ok(LabelFilter {
@@ -351,6 +352,7 @@ impl From<Matcher> for LabelFilter {
                     PredicateMatch::RegexNotEqual(regex_matcher)
                 }
             }
+            _ => unreachable!("All match operators should be covered in the match statement above"),
         };
 
         LabelFilter {
@@ -393,6 +395,7 @@ impl From<&Matcher> for LabelFilter {
                     PredicateMatch::RegexNotEqual(regex_matcher)
                 }
             }
+            _ => unreachable!("All match operators should be covered in the match statement above"),
         };
 
         LabelFilter {
