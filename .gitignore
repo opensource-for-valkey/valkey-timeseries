@@ -40,3 +40,4 @@ test-data
 tests/build
 .pytest_cache
 /tests/valkeytestframework/
+.idea/workspace.xml
