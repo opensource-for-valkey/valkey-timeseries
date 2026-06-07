@@ -24,7 +24,7 @@ services:
     container_name: valkey-timeseries-data-loader
     depends_on:
       valkey-timeseries:
-        condition: service_healthy
+        condition: service_started
     volumes:
       # Mount the sample data directory (must be at /scripts/data/
       # so data_helpers.py can find it via its internal DATA_DIR)

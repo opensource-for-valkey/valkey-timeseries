@@ -13,8 +13,10 @@
 #   docker build --build-arg VALKEY_VERSION=8.0 --build-arg FEATURES=valkey_8_0 -t valkey-timeseries:8.0 .
 #   docker build --build-arg INCLUDE_SAMPLE_DATA=true -t valkey-timeseries:latest .
 
+ARG VALKEY_VERSION=9.1
+
 # ── Stage 1: Build the Rust module ──────────────────────────────────
-FROM rust:1.92-slim-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
 ARG FEATURES=""
 
@@ -23,6 +25,8 @@ RUN apt-get update && \
         protobuf-compiler \
         pkg-config \
         libssl-dev \
+        llvm \
+        clang \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -44,7 +48,6 @@ RUN if [ -z "$FEATURES" ]; then \
 RUN strip target/release/libvalkey_timeseries.so 2>/dev/null || true
 
 # ── Stage 2: Production image ───────────────────────────────────────
-ARG VALKEY_VERSION=9.1
 FROM valkey/valkey:${VALKEY_VERSION}
 
 ARG INCLUDE_SAMPLE_DATA=""
@@ -73,4 +76,4 @@ COPY tests/data/ /sample_data/
 EXPOSE 6379
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["valkey-server", "/usr/local/etc/valkey/valkey.conf"]
+CMD ["valkey-server"]
