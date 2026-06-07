@@ -299,16 +299,12 @@ where
     }
 
     fn on_response(&mut self, resp: OP::Response, target: &NodeInfo) {
-<<<<<<< HEAD
         // See `on_error`: after completion `self.operation` is a `mem::take`
         // placeholder, so drop late responses instead of accumulating into it.
         if self.lifecycle == FanoutLifecycleState::Completed {
             return;
         }
         self.activate();
-=======
-        self.is_init = true;
->>>>>>> 22a4235b (compile fixes)
         if self.timed_out {
             // We already timed out; ignore responses but mark RPC as done.
             self.rpc_done();
