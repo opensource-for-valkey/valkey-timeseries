@@ -26,10 +26,11 @@ venv
 .ai
 .junie
 .venv
+.idea
 .ai
 .hypothesis
 .junie
-.idea
+.venv
 .vscode
 /target
 tests/.build
