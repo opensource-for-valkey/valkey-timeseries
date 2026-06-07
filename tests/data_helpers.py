@@ -114,6 +114,129 @@ class PowerConsumptionRecord:
                 .format(self.region, self.location_type))
 
 
+class AmazonWebTrafficRecord:
+    """Data class representing a single row from the Amazon web traffic dataset.
+
+    CSV columns:
+    Country, Timestamp, Device Category, Key Actions, Page Path, Source,
+    Avg Session Duration, Bounce Rate, Conversions, New Users, Page Views,
+    Returning Users, Unique Page Views, Average time on home page (min),
+    Website, Date, Time, Day
+    """
+
+    def __init__(self, country, timestamp_str, device_category, key_actions,
+                 page_path, source, avg_session_duration, bounce_rate,
+                 conversions, new_users, page_views, returning_users,
+                 unique_page_views, avg_time_on_home_page, website, date_str,
+                 time_str, day):
+        self.country = country
+        self.timestamp = self._parse_timestamp(timestamp_str)
+        self.device_category = device_category
+        self.key_actions = key_actions
+        self.page_path = page_path
+        self.source = source
+        self.avg_session_duration = int(avg_session_duration)
+        self.bounce_rate = int(bounce_rate)
+        self.conversions = int(conversions)
+        self.new_users = int(new_users)
+        self.page_views = int(page_views)
+        self.returning_users = int(returning_users)
+        self.unique_page_views = int(unique_page_views)
+        self.avg_time_on_home_page = float(avg_time_on_home_page)
+        self.website = website
+        self.date_str = date_str
+        self.time_str = time_str
+        self.day = day
+
+    def __repr__(self):
+        return (f"AmazonWebTrafficRecord(country={self.country}, "
+                f"timestamp={self.timestamp}, device_category={self.device_category}, "
+                f"key_actions={self.key_actions}, page_path={self.page_path}, "
+                f"source={self.source}, page_views={self.page_views}, "
+                f"website={self.website}, day={self.day})")
+
+    def key(self):
+        """Return a unique time series key based on country, website, and device category."""
+        return 'web_traffic:aws:{}:{}:{}'.format(
+            self.country.lower().replace(' ', '_'),
+            self.website.lower().replace(' ', '_'),
+            self.device_category.lower().replace(' ', '_'))
+
+    def metric(self):
+        """Return a Prometheus-style metric string with labels."""
+        return ('web_traffic{{country="{}",website="{}",device_category="{}",'
+                'page_path="{}",source="{}",key_actions="{}"}}'
+                .format(self.country, self.website, self.device_category,
+                        self.page_path, self.source, self.key_actions))
+
+    @staticmethod
+    def _parse_timestamp(timestamp_str):
+        """Parse 'DD-MM-YYYY HH:MM' format into a Unix timestamp in milliseconds."""
+        dt = datetime.strptime(timestamp_str, '%d-%m-%Y %H:%M')
+        return calendar.timegm(dt.timetuple()) * 1000
+
+
+def load_amazon_web_traffic_data():
+    """Generator function to load rows from the Amazon web traffic CSV dataset.
+
+    Yields:
+        AmazonWebTrafficRecord: One record per CSV row (header skipped).
+    """
+    # Column indexes matching the CSV header:
+    # Country, Timestamp, Device Category, Key Actions, Page Path, Source,
+    # Avg Session Duration, Bounce Rate, Conversions, New Users, Page Views,
+    # Returning Users, Unique Page Views, Average time on home page (min),
+    # Website, Date, Time, Day
+    country_idx = 0
+    timestamp_idx = 1
+    device_category_idx = 2
+    key_actions_idx = 3
+    page_path_idx = 4
+    source_idx = 5
+    avg_session_duration_idx = 6
+    bounce_rate_idx = 7
+    conversions_idx = 8
+    new_users_idx = 9
+    page_views_idx = 10
+    returning_users_idx = 11
+    unique_page_views_idx = 12
+    avg_time_on_home_page_idx = 13
+    website_idx = 14
+    date_idx = 15
+    time_idx = 16
+    day_idx = 17
+
+    data_path = os.path.join(DATA_DIR, 'amazon-web-traffic-dataset.csv')
+
+    with open(data_path, 'r') as csv_file:
+        csv_reader = csv.reader(csv_file)
+        for row in csv_reader:
+            if row[country_idx] == 'Country':
+                continue
+
+            record = AmazonWebTrafficRecord(
+                country=row[country_idx],
+                timestamp_str=row[timestamp_idx],
+                device_category=row[device_category_idx],
+                key_actions=row[key_actions_idx],
+                page_path=row[page_path_idx],
+                source=row[source_idx],
+                avg_session_duration=row[avg_session_duration_idx],
+                bounce_rate=row[bounce_rate_idx],
+                conversions=row[conversions_idx],
+                new_users=row[new_users_idx],
+                page_views=row[page_views_idx],
+                returning_users=row[returning_users_idx],
+                unique_page_views=row[unique_page_views_idx],
+                avg_time_on_home_page=row[avg_time_on_home_page_idx],
+                website=row[website_idx],
+                date_str=row[date_idx],
+                time_str=row[time_idx],
+                day=row[day_idx],
+            )
+            yield record
+
+
 def load_json_rows(file_path):
     """
     Generator function to load rows from a JSON file.
@@ -216,6 +339,32 @@ def load_cpu_data(start=None, step=None):
 def load_memory_data(start=None, step=None):
     data_path = os.path.join(DATA_DIR, 'memory-values.txt')
     return load_samples_from_file(data_path, start, step)
+
+def _ingest_samples(valkey_conn, samples, key_prefix, metric_name):
+    print(f"Loading {metric_name} data into valkey...")
+    r = valkey_conn.pipeline(transaction=False)
+    count = 0
+
+    for timestamp, value in samples:
+        key = f"{key_prefix}:{metric_name}"
+        if count > PIPELINE_SIZE:
+            r.execute()
+            count = 0
+            r = valkey_conn.pipeline(transaction=False)
+
+        r.execute_command('TS.ADD', key, int(timestamp.timestamp() * 1000), value)
+        count += 1
+
+    r.execute()
+    return count
+
+def ingest_cpu_data(valkey_conn, start=None, step=None):
+    samples = load_cpu_data(start, step)
+    return _ingest_samples(valkey_conn, samples, 'system', 'cpu')
+
+def ingest_memory_data(valkey_conn, start=None, step=None):
+    samples = load_memory_data(start, step)
+    return _ingest_samples(valkey_conn, samples, 'system', 'memory')
 
 def ingest_temperature_data(valkey_conn):
     print("Loading data into valkey...")
