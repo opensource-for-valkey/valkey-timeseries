@@ -25,6 +25,7 @@
 - [`TS.MRANGE`](commands/ts.mrange.md)
 - [`TS.MREVRANGE`](commands/ts.mrevrange.md)
 - [`TS.OUTLIERS`](commands/ts.outliers.md)
+- [`TS.PERIODS`](commands/ts.periods.md)
 - [`TS.QUERYINDEX`](commands/ts.queryindex.md)
 - [`TS.RANGE`](commands/ts.range.md)
 - [`TS.REVRANGE`](commands/ts.revrange.md)

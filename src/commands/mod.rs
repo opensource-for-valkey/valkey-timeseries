@@ -33,6 +33,7 @@ mod ts_mget_fanout_command;
 mod ts_mrange;
 mod ts_mrange_fanout_command;
 mod ts_outliers;
+mod ts_periods;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;
 mod ts_range;
@@ -49,6 +50,7 @@ pub(crate) use ts_autoforecast::*;
 pub use ts_debug::*;
 pub use ts_decompose::*;
 pub use ts_mget::*;
+pub use ts_periods::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;

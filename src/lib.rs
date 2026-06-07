@@ -249,6 +249,7 @@ valkey_module! {
         // `assign_command_acl_categories`, since the command-info path does not set them.
         ["TS.AUTOFORECAST", commands::ts_autoforecast_cmd, "write deny-oom", 1, 1, 1, "read write timeseries"],
         ["TS.DECOMPOSE", commands::ts_decompose_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
+        ["TS.PERIODS", commands::ts_periods_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
         ["TS._DEBUG", commands::ts_debug_cmd, "readonly", 0, 0, 0, "read timeseries admin"],
         ["TS._RESTORE", commands::ts_asm_restore_cmd, "write deny-oom", 1, 1, 1, "write timeseries admin"],
     ]
