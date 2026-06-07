@@ -7,7 +7,7 @@
 #   - A self-contained image without external base image dependencies
 #
 # Build arguments:
-#   SERVER_VERSION         - Valkey branch/tag to build (default: 9.1)
+#   SERVER_VERSION         - Valkey branch/tag to build (default: 8.1)
 #   FEATURES               - Cargo features to pass (e.g., "valkey_8_0")
 #   INCLUDE_SAMPLE_DATA    - Set to "true" to include sample datasets in the image
 #
@@ -17,9 +17,9 @@
 #   docker build -f Dockerfile.source --build-arg INCLUDE_SAMPLE_DATA=true -t valkey-timeseries:source .
 
 # ── Stage 1: Build Valkey + Module ──────────────────────────────────
-FROM rust:1.92-slim-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
-ARG SERVER_VERSION=9.1
+ARG SERVER_VERSION=8.1
 ARG FEATURES=""
 
 # Install build dependencies
@@ -96,4 +96,4 @@ EXPOSE 6379
 VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["valkey-server", "/usr/local/etc/valkey/valkey.conf"]
+CMD ["valkey-server"]
