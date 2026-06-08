@@ -82,7 +82,7 @@ def load_text_dataset(conn, filepath, key_prefix, metric_name, chunk_size=512):
 
     key = f"{key_prefix}:{metric_name}"
     try:
-        conn.execute_command('TS.CREATE', key, 'CHUNK_SIZE', chunk_size)
+        conn.execute_command('TS.CREATE', key, 'CHUNK_SIZE', chunk_size, 'LABELS', '__name__', metric_name)
     except Exception:
         pass  # key may already exist
 

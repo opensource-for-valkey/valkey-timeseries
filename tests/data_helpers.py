@@ -342,11 +342,20 @@ def load_memory_data(start=None, step=None):
 
 def _ingest_samples(valkey_conn, samples, key_prefix, metric_name):
     print(f"Loading {metric_name} data into valkey...")
-    r = valkey_conn.pipeline(transaction=False)
     count = 0
 
+    key = f"{key_prefix}:{metric_name}"
+
+    valkey_conn.execute_command('TS.CREATE', key,
+                                'ENCODING', 'COMPRESSED',
+                                'CHUNK_SIZE_BYTES', '2ki',
+                                'LABELS', '__name__', metric_name)
+
+    print(f"Created series: {key}, metric={metric}")
+
+    r = valkey_conn.pipeline(transaction=False)
+
     for timestamp, value in samples:
-        key = f"{key_prefix}:{metric_name}"
         if count > PIPELINE_SIZE:
             r.execute()
             count = 0
@@ -360,11 +369,11 @@ def _ingest_samples(valkey_conn, samples, key_prefix, metric_name):
 
 def ingest_cpu_data(valkey_conn, start=None, step=None):
     samples = load_cpu_data(start, step)
-    return _ingest_samples(valkey_conn, samples, 'system', 'cpu')
+    return _ingest_samples(valkey_conn, samples, 'system', 'cpu_usage_user')
 
 def ingest_memory_data(valkey_conn, start=None, step=None):
     samples = load_memory_data(start, step)
-    return _ingest_samples(valkey_conn, samples, 'system', 'memory')
+    return _ingest_samples(valkey_conn, samples, 'system', 'process_resident_memory_bytes')
 
 def ingest_temperature_data(valkey_conn):
     print("Loading data into valkey...")
@@ -415,6 +424,7 @@ def ingest_power_consumption_data(valkey_conn, encoding='COMPRESSED', chunk_size
     print("Loading rows...")
 
     for key, values in load_power_consumption_data().items():
+        key_name = "power_consumption:{}".format(key)
         region, location_type = key.split(':')
         metric = 'power_consumption{{region="{}",location_type="{}"}}'.format(region, location_type)
         valkey_conn.execute_command('TS.CREATE', key, metric, 'ENCODING', encoding, 'CHUNK_SIZE_BYTES', chunk_size_bytes, 'DECIMAL_DIGITS', 1, 'LABELS', 'region', region, 'location_type', location_type)
@@ -426,7 +436,100 @@ def ingest_power_consumption_data(valkey_conn, encoding='COMPRESSED', chunk_size
                 count = 0
                 r = valkey_conn.pipeline(transaction=False)
 
-            r.execute_command('TS.ADD', key, ts, consumption)
+            r.execute_command('TS.ADD', key_name, ts, consumption)
             count += 1
 
     r.execute()
+
+
+# --- Amazon Web Traffic helpers ---
+
+def _sanitize_label_value(value):
+    """Normalize a label value for use in a time-series key."""
+    return value.lower().replace(' ', '_').replace('/', '_')
+
+
+def _make_web_traffic_key(country, device_category, page_path, source,
+                          website, key_actions, metric_name):
+    """Build a deterministic time-series key from label values + metric name."""
+    parts = [country, device_category, page_path, source, website, key_actions]
+    sanitized = [_sanitize_label_value(p) for p in parts]
+    return 'web_traffic:aws:{}:{}'.format(metric_name, ':'.join(sanitized))
+
+
+def ingest_amazon_web_traffic_data(valkey_conn):
+    """Ingest the Amazon web traffic CSV dataset into Valkey time series.
+
+    Creates 8 time series per unique combination of the shared label dimensions
+    (country, device_category, page_path, source, website, key_actions):
+
+    ================================  ==============================
+    Metric name                        Source column
+    ================================  ==============================
+    page_views_total                   Page Views
+    unique_page_views_total            Unique Page Views
+    new_users_total                    New Users
+    returning_users_total              Returning Users
+    session_duration_avg_seconds       Avg Session Duration
+    home_page_dwell_avg_minutes        Average time on home page
+    bounce_rate_percent                Bounce Rate
+    conversions_total                  Conversions
+    ================================  ==============================
+
+    Sample timestamps are derived from the ``timestamp_str`` CSV column
+    (parsed by :class:`AmazonWebTrafficRecord`).
+    """
+    # (metric_name, record_attr, is_float)
+    metrics = [
+        ('page_views_total',             'page_views',             False),
+        ('unique_page_views_total',      'unique_page_views',      False),
+        ('new_users_total',              'new_users',              False),
+        ('returning_users_total',        'returning_users',        False),
+        ('session_duration_avg_seconds', 'avg_session_duration',   False),
+        ('home_page_dwell_avg_minutes',  'avg_time_on_home_page',  True),
+        ('bounce_rate_percent',          'bounce_rate',            False),
+        ('conversions_total',            'conversions',            False),
+    ]
+
+    print("Loading Amazon web traffic data into valkey...")
+    pipeline = valkey_conn.pipeline(transaction=False)
+    cmd_count = 0
+    created_keys = set()
+
+    for record in load_amazon_web_traffic_data():
+        if cmd_count > PIPELINE_SIZE:
+            pipeline.execute()
+            cmd_count = 0
+            pipeline = valkey_conn.pipeline(transaction=False)
+
+        for metric_name, attr, is_float in metrics:
+            key = _make_web_traffic_key(
+                record.country, record.device_category, record.page_path,
+                record.source, record.website, record.key_actions,
+                metric_name,
+            )
+
+            # Create the series once per unique key
+            if key not in created_keys:
+                created_keys.add(key)
+                create_args = ['TS.CREATE', key, "CHUNK_SIZE", 512]
+                if is_float:
+                    create_args.extend(['DECIMAL_DIGITS', 2])
+                create_args.extend([
+                    'LABELS',
+                    '__name__',         metric_name,
+                    'country',          record.country,
+                    'device_category',  record.device_category,
+                    'page_path',        record.page_path,
+                    'source',           record.source,
+                    'website',          record.website,
+                    'key_actions',      record.key_actions,
+                ])
+                valkey_conn.execute_command(*create_args)
+
+            value = getattr(record, attr)
+            pipeline.execute_command('TS.ADD', key, record.timestamp, value)
+            cmd_count += 1
+
+    pipeline.execute()
+    print(f"Ingested {cmd_count} data points into {len(created_keys)} time series.")
