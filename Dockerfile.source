@@ -29,6 +29,8 @@ RUN apt-get update && \
         pkg-config \
         libssl-dev \
         protobuf-compiler \
+        llvm \
+        clang \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
