@@ -1,11 +1,11 @@
 use crate::commands::parse_timestamp_range;
-use crate::common::replies::{
-    reply_with_array, reply_with_double, reply_with_integer,
-};
+use crate::common::replies::{reply_with_array, reply_with_double, reply_with_integer};
 use crate::error_consts;
 use crate::series::get_timeseries;
 use anofox_forecast::detection::period::{PeriodDetectionConfig, detect_periods};
-use valkey_module::{AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{
+    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
+};
 
 /// ```text
 /// TS.PERIODS key startTimestamp endTimestamp [MIN_STRENGTH minStrength] [DOMINANT]
@@ -41,9 +41,9 @@ pub fn ts_periods_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         if arg.as_slice().eq_ignore_ascii_case(b"MIN_STRENGTH") {
             args.next(); // consume MIN_STRENGTH
             let val = args.next_arg()?;
-            let strength = val.parse_float().map_err(|_| {
-                ValkeyError::Str("TSDB: invalid MIN_STRENGTH value")
-            })?;
+            let strength = val
+                .parse_float()
+                .map_err(|_| ValkeyError::Str("TSDB: invalid MIN_STRENGTH value"))?;
             if strength < 0.0 || strength > 1.0 {
                 return Err(ValkeyError::String(format!(
                     "TSDB: MIN_STRENGTH must be between 0 and 1, got {}",
