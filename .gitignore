@@ -26,9 +26,6 @@ venv
 .ai
 .junie
 .venv
-.ai
-.junie
-.idea
 .vscode
 /target
 tests/.build
