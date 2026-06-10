@@ -4,10 +4,11 @@ use anofox_forecast::features::autocorrelation;
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
+use crate::commands::parse_timestamp_range;
 
 /// ```text
-/// TS.AUTOCORRELATION key lag
-/// [PARTIAL | TRA | AGGREGATED <mean|var|median>]
+/// TS.AUTOCORRELATION key startTime endTime lag
+/// [PARTIAL | TRA | AGGREGATED <mean|var|std|median>]
 /// ```
 ///
 /// `TS.AUTOCORRELATION` computes autocorrelation-based statistics on a time series.
@@ -20,13 +21,15 @@ use valkey_module::{
 /// - `AGGREGATED <mean|var|std|median>`: Returns aggregated autocorrelation across lags
 ///   1..=lag, using the specified aggregation function.
 pub fn ts_autocorrelation_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 3 {
+    if args.len() < 5 {
         return Err(ValkeyError::WrongArity);
     }
 
     let mut args = args.into_iter().skip(1).peekable();
 
     let key = args.next_arg()?;
+ 
+    let date_range = parse_timestamp_range(&mut args)?;
 
     // Parse lag
     let lag_str = args.next_arg()?;
@@ -47,7 +50,9 @@ pub fn ts_autocorrelation_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyR
         Err(e) => return Err(e),
     };
 
-    let samples = series.get_range(series.first_timestamp, i64::MAX);
+    let (start, end) = date_range.get_series_range(&series, None, false);
+    let samples = series.get_range(start, end);
+
     let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
 
     if values.len() <= lag {

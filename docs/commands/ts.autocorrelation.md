@@ -5,8 +5,8 @@ Compute autocorrelation-based statistics on a time series.
 ## Syntax
 
 ```
-TS.AUTOCORRELATION key lag 
-    [PARTIAL | TRA | AGGREGATED mean|var|median]
+TS.AUTOCORRELATION key startTime endTime lag 
+    [PARTIAL | TRA | AGGREGATED mean|var|std|median]
 ```
 
 [Examples](#examples)
@@ -17,6 +17,18 @@ TS.AUTOCORRELATION key lag
 <summary><code>key</code></summary>
 
 Key name for the time series.
+</details>
+
+<details open>
+<summary><code>startTime</code></summary>
+
+Start timestamp for the range query. Use `-` for the earliest sample.
+</details>
+
+<details open>
+<summary><code>endTime</code></summary>
+
+End timestamp for the range query. Use `+` for the latest sample.
 </details>
 
 <details open>
@@ -91,35 +103,37 @@ OK
 127.0.0.1:6379> TS.ADD temp:readings 3000 22.0
 127.0.0.1:6379> TS.ADD temp:readings 4000 23.0
 127.0.0.1:6379> TS.ADD temp:readings 5000 24.0
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 1
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 1
 1
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 2
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 2
 1
 ```
 
 ### Partial autocorrelation
 
 ```valkey
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 1 PARTIAL
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 1 PARTIAL
 1
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 2 PARTIAL
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 2 PARTIAL
 0
 ```
 
 ### Time reversal asymmetry
 
 ```valkey
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 1 TRA
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 1 TRA
 0
 ```
 
 ### Aggregated autocorrelation
 
 ```valkey
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 3 AGGREGATED mean
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 3 AGGREGATED mean
 1
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 3 AGGREGATED var
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 3 AGGREGATED var
 0
-127.0.0.1:6379> TS.AUTOCORRELATION temp:readings 3 AGGREGATED median
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 3 AGGREGATED std
+0
+127.0.0.1:6379> TS.AUTOCORRELATION temp:readings - + 3 AGGREGATED median
 1
 ```
