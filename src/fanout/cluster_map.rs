@@ -1,6 +1,6 @@
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
-use crate::fanout::calculate_hash_slot;
+use crate::fanout::{calculate_hash_slot, key_hash_slot};
 use ahash::{AHashMap, HashSet, HashSetExt};
 use rand::{Rng, RngExt, rng};
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze, RangesIter};
@@ -470,12 +470,13 @@ impl ShardInfo {
         self.primary.is_none() && self.replicas.is_empty()
     }
 
+    /// Slot ownership checks
     pub fn i_own_slot(&self, slot: u16) -> bool {
         self.owned_slots.contains(slot)
     }
 
-    pub fn owns_key(&self, key: &[u8]) -> bool {
-        let slot = calculate_hash_slot(key);
+    pub fn i_own_key(&self, key: &[u8]) -> bool {
+        let slot = key_hash_slot(key);
         self.i_own_slot(slot)
     }
 }
@@ -571,13 +572,16 @@ impl ClusterMap {
         &self.shards
     }
 
+    /// Get the local shard — the shard whose slots are owned by the current node.
+    /// Returns `None` if no local shard is registered (e.g. the cluster map
+    /// hasn't been built yet or the node doesn't own any slots).
+    pub fn get_local_shard(&self) -> Option<&ShardInfo> {
+        self.shards.iter().find(|&shard| shard.is_local)
+    }
+
     /// Get cluster level slot fingerprint
     pub fn cluster_slots_fingerprint(&self) -> u64 {
         self.cluster_slots_fingerprint
-    }
-
-    pub fn get_local_shard(&self) -> Option<&ShardInfo> {
-        self.shards.get(&self.local_node_id)
     }
 
     /// Helper function to refresh targets in CreateNewClusterMap

@@ -44,7 +44,7 @@ pub fn ts_periods_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             let strength = val
                 .parse_float()
                 .map_err(|_| ValkeyError::Str("TSDB: invalid MIN_STRENGTH value"))?;
-            if strength < 0.0 || strength > 1.0 {
+            if !(0.0..=1.0).contains(&strength) {
                 return Err(ValkeyError::String(format!(
                     "TSDB: MIN_STRENGTH must be between 0 and 1, got {}",
                     strength
