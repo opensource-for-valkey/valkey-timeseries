@@ -5,6 +5,7 @@ The following commands are supported
 TS.ALTER
 TS.ADD
 TS.AUTOFORECAST
+TS.AUTOTREND
 TS.CARD
 TS.MADD
 TS.DEL

@@ -43,3 +43,29 @@ pub fn current_time_millis() -> i64 {
         }
     }
 }
+
+/// Compute the median step between consecutive timestamps (in milliseconds).
+///
+/// Returns `None` if there are fewer than 2 timestamps or no positive intervals exist.
+///
+/// # Examples
+///
+/// ```
+/// let ts = vec![1000, 2000, 3000, 5000, 8000];
+/// assert_eq!(compute_median_step_ms(&ts), Some(1500)); // steps: 1000, 1000, 2000, 3000 → median 1500
+/// ```
+pub fn compute_median_step_ms(timestamps: &[i64]) -> Option<i64> {
+    if timestamps.len() < 2 {
+        return None;
+    }
+    let mut diffs: Vec<i64> = timestamps
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0)
+        .collect();
+    if diffs.is_empty() {
+        return None;
+    }
+    diffs.sort_unstable();
+    Some(diffs[diffs.len() / 2])
+}
