@@ -106,3 +106,4 @@ pub const COMPACTION_CIRCULAR_DEPENDENCY: &str = "TSDB: circular dependency in c
 pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exist";
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";
 pub const TOO_MANY_SAMPLES: &str = "TSDB: too many samples";
+pub const WRONG_SLOT: &str = "TSDB: key does not belong to a slot owned by the current node";

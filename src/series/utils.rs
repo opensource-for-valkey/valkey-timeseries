@@ -17,6 +17,7 @@ use valkey_module::key::ValkeyKeyWritable;
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
 };
+use crate::fanout::key_belongs_to_local_node;
 
 pub fn with_timeseries<R>(
     ctx: &Context,
@@ -104,6 +105,12 @@ pub fn create_series(
     options: TimeSeriesOptions,
     ctx: &Context,
 ) -> ValkeyResult<TimeSeries> {
+    // Ensure that the key belongs to the current node in cluster mode, to prevent creating a series on the wrong shard.
+    //  In non-cluster mode, this is a no-op.
+    if !key_belongs_to_local_node(ctx, key.as_slice()) {
+        return Err(ValkeyError::Str(error_consts::WRONG_SLOT));
+    }
+    
     let mut ts = TimeSeries::with_options(options)?;
     if ts.id == 0 {
         ts.id = next_timeseries_id();
