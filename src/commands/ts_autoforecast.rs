@@ -5,13 +5,13 @@ use crate::common::replies::{
     ThreadSafeReplyContext, block_client, reply_with_array, reply_with_double, reply_with_map,
     reply_with_str,
 };
+use crate::common::time::compute_median_step_ms;
 use crate::error_consts;
 use crate::series::{TimestampRange, create_or_update_series_with_samples, get_timeseries};
 use anofox_forecast::core::TimeSeries;
 use anofox_forecast::models::Forecaster;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
 use anofox_forecast::prelude::Forecast;
-use chrono::{DateTime, Utc};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
@@ -20,7 +20,7 @@ struct AutoForecastOptions {
     date_range: TimestampRange,
     horizon: usize,
     level: Option<f64>,
-    store_key: Option<String>,
+    destination: Option<String>,
     config: AutoForecastConfig,
 }
 
@@ -30,7 +30,7 @@ impl Default for AutoForecastOptions {
             date_range: TimestampRange::default(),
             horizon: 5,
             level: None,
-            store_key: None,
+            destination: None,
             config: AutoForecastConfig::default(),
         }
     }
@@ -85,7 +85,7 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
         date_range: TimestampRange::default(),
         horizon: 5,
         level: None,
-        store_key: None,
+        destination: None,
         config: AutoForecastConfig::default(),
     };
     let mut horizon_set = false;
@@ -119,7 +119,7 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
                 "STORE" => {
                     let value = args.next_string()
                         .map_err(|_| ValkeyError::Str("TSDB: Missing value for STORE"))?;
-                    options.store_key = Some(value);
+                    options.destination = Some(value);
                 },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: Unknown argument: {}", arg)));
@@ -161,23 +161,6 @@ fn process_request(ctx: &Context, key: ValkeyString, options: AutoForecastOption
     Ok(ValkeyValue::NoReply)
 }
 
-/// Compute the median step between consecutive timestamps (in milliseconds).
-/// Returns `None` if there are fewer than 2 timestamps or no positive intervals exist.
-fn compute_forecast_step_ms(timestamps: &[DateTime<Utc>]) -> Option<i64> {
-    if timestamps.len() < 2 {
-        return None;
-    }
-    let mut diffs: Vec<i64> = timestamps
-        .windows(2)
-        .map(|w| (w[1] - w[0]).num_milliseconds())
-        .filter(|&d| d > 0)
-        .collect();
-    if diffs.is_empty() {
-        return None;
-    }
-    diffs.sort_unstable();
-    Some(diffs[diffs.len() / 2])
-}
 
 fn run_forecasting_thread(
     ctx: ThreadSafeReplyContext,
@@ -186,11 +169,18 @@ fn run_forecasting_thread(
 ) {
     // Capture timestamp metadata before the model consumes the series reference.
     let last_timestamp_ms = series.timestamps().last().map(|dt| dt.timestamp_millis());
-    let step_ms = if options.store_key.is_some() {
+    let step_ms = if options.destination.is_some() {
         series
             .frequency()
             .map(|d| d.num_milliseconds())
-            .or_else(|| compute_forecast_step_ms(series.timestamps()))
+            .or_else(|| {
+                let timestamps: Vec<i64> = series
+                    .timestamps()
+                    .iter()
+                    .map(|dt| dt.timestamp_millis())
+                    .collect();
+                compute_median_step_ms(&timestamps)
+            })
     } else {
         None
     };
@@ -221,7 +211,7 @@ fn run_forecasting_thread(
     let upper_interval = get_upper_interval(&forecast);
 
     // If STORE was specified, persist the predicted values into the target timeseries key.
-    if let Some(store_key) = options.store_key {
+    if let Some(destination) = options.destination {
         match (last_timestamp_ms, step_ms) {
             (Some(last_ts), Some(step)) => {
                 let samples: Vec<Sample> = predicted_values
@@ -231,7 +221,7 @@ fn run_forecasting_thread(
                     .collect();
 
                 let lock = ctx.lock();
-                let key = lock.create_string(store_key);
+                let key = lock.create_string(destination);
 
                 if let Err(e) =
                     create_or_update_series_with_samples(&lock, &key, None, &samples, None)

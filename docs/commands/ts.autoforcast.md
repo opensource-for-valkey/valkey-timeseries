@@ -14,7 +14,7 @@ TS.AUTOFORECAST key fromTimestamp toTimestamp
   [SEASONALITY period]
   [MODELS family1[,family2 ...]]
   [LEVEL confidence_level]
-  [STORE key1]
+  [STORE destination]
 ```
 
 [Examples](#examples)
@@ -93,7 +93,7 @@ For each point `i`, `lower_interval[i] <= forecast[i] <= upper_interval[i]`.
 </details>
 
 <details open>
-<summary><code>STORE key1</code></summary>
+<summary><code>STORE destination</code></summary>
 
 Persist the forecast values into a time series key. The predicted values are stored as samples with timestamps continuing
 from the last observed timestamp using the series' median sampling interval.
