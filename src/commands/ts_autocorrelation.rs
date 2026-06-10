@@ -1,10 +1,10 @@
+use crate::commands::parse_timestamp_range;
 use crate::error_consts;
 use crate::series::get_timeseries;
 use anofox_forecast::features::autocorrelation;
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
-use crate::commands::parse_timestamp_range;
 
 /// ```text
 /// TS.AUTOCORRELATION key startTime endTime lag
@@ -28,7 +28,7 @@ pub fn ts_autocorrelation_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyR
     let mut args = args.into_iter().skip(1).peekable();
 
     let key = args.next_arg()?;
- 
+
     let date_range = parse_timestamp_range(&mut args)?;
 
     // Parse lag
