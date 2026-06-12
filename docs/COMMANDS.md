@@ -31,5 +31,6 @@
 - [`TS.PERIODS`](commands/ts.periods.md)
 - [`TS.QUERYINDEX`](commands/ts.queryindex.md)
 - [`TS.RANGE`](commands/ts.range.md)
+- [`TS.STATIONARITY`](commands/ts.stationarity.md)
 - [`TS.REVRANGE`](commands/ts.revrange.md)
 - [`TS._DEBUG`](commands/ts._debug.md)
