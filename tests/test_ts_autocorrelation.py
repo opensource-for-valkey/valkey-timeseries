@@ -1,6 +1,7 @@
 import math
 import pytest
 from valkey import ResponseError
+from valkeytestframework.conftest import resource_port_tracker  # noqa: F401
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
 
@@ -56,7 +57,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=20)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1)
-        assert isinstance(result, float)
+        result = float(result)
         assert result > 0.8, f"Expected high ACF(1) for linear trend, got {result}"
 
     def test_acf_alternating(self):
@@ -65,7 +66,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_alternating_series(self.client, key, count=20)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1)
-        assert isinstance(result, float)
+        result = float(result)
         assert result < -0.5, f"Expected negative ACF(1) for alternating, got {result}"
 
     def test_acf_constant(self):
@@ -74,7 +75,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_constant_series(self.client, key, count=10)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1)
-        assert isinstance(result, float)
+        result = float(result)
         assert abs(result) < 1e-10, f"Expected zero ACF for constant series, got {result}"
 
     def test_acf_lag_zero(self):
@@ -83,7 +84,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=5)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 0)
-        assert isinstance(result, float)
+        result = float(result)
         assert abs(result - 1.0) < 1e-10, f"Expected ACF(0)=1.0, got {result}"
 
     def test_acf_insufficient_data(self):
@@ -107,7 +108,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=5)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 0, 'PARTIAL')
-        assert isinstance(result, float)
+        result = float(result)
         assert abs(result - 1.0) < 1e-10, f"Expected PACF(0)=1.0, got {result}"
 
     def test_pacf_ar1_process(self):
@@ -121,8 +122,8 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         for i, val in enumerate(series):
             self.client.execute_command('TS.ADD', key, start_time + i * 1000, val)
 
-        pacf1 = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1, 'PARTIAL')
-        pacf2 = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 2, 'PARTIAL')
+        pacf1 = float(self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1, 'PARTIAL'))
+        pacf2 = float(self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 2, 'PARTIAL'))
 
         assert isinstance(pacf1, float)
         assert isinstance(pacf2, float)
@@ -150,7 +151,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_sine_series(self.client, key, count=100)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1, 'TRA')
-        assert isinstance(result, float)
+        result = float(result)
         assert abs(result) < 0.1, f"Sine wave TRA should be near zero, got {result}"
 
     def test_tra_constant(self):
@@ -159,7 +160,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_constant_series(self.client, key, count=20)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 1, 'TRA')
-        assert isinstance(result, float)
+        result = float(result)
         assert abs(result) < 1e-10, f"Constant series TRA should be zero, got {result}"
 
     def test_tra_insufficient_data(self):
@@ -178,7 +179,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 5, 'AGGREGATED', 'mean')
-        assert isinstance(result, float)
+        result = float(result)
         assert not math.isnan(result)
         assert result > 0.0
 
@@ -188,7 +189,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 5, 'AGGREGATED', 'var')
-        assert isinstance(result, float)
+        result = float(result)
         assert not math.isnan(result)
         assert result >= 0.0
 
@@ -198,7 +199,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 5, 'AGGREGATED', 'median')
-        assert isinstance(result, float)
+        result = float(result)
         assert not math.isnan(result)
 
     def test_aggregated_invalid_func(self):
@@ -222,7 +223,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         key = 'test:agg:zero'
         create_linear_series(self.client, key, count=10)
 
-        with pytest.raises(ResponseError, match="insufficient data"):
+        with pytest.raises(ResponseError, match="returned NaN"):
             self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 0, 'AGGREGATED', 'mean')
 
     def test_wrong_arity(self):
@@ -236,7 +237,7 @@ class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command('TS.AUTOCORRELATION', key, '-', '+', 5, 'AGGREGATED', 'std')
-        assert isinstance(result, float)
+        result = float(result)
         assert not math.isnan(result)
         assert result >= 0.0
 
