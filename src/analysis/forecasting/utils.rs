@@ -1,5 +1,6 @@
 use crate::common::Sample;
 use crate::error::TsdbError;
+use anofox_forecast::seasonality::auto_trend::TrendCriterion;
 use anofox_forecast::{ForecastError, core::TimeSeries as ForecastTimeSeries};
 use chrono::{DateTime, Utc};
 
@@ -37,5 +38,17 @@ pub fn normalize_model_name(selected_model: &str) -> &str {
         "AutoTheta" => "Theta",
         "AutoETS" => "ETS",
         other => other, // fallback to original name if it doesn't match known models
+    }
+}
+
+pub fn try_parse_trend_criterion(s: &str) -> Result<TrendCriterion, TsdbError> {
+    match s.to_lowercase().as_str() {
+        "aicc" => Ok(TrendCriterion::AICc),
+        "bic" => Ok(TrendCriterion::BIC),
+        "holdout" => Ok(TrendCriterion::Holdout),
+        other => Err(TsdbError::ForecastError(format!(
+            "TSDB: Invalid trend criterion '{}'. Valid options are: AICc, BIC, and Holdout.",
+            other
+        ))),
     }
 }

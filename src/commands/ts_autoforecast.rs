@@ -12,6 +12,7 @@ use anofox_forecast::core::TimeSeries;
 use anofox_forecast::models::Forecaster;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
 use anofox_forecast::prelude::Forecast;
+use anofox_forecast::utils::{AccuracyMetrics, calculate_metrics};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
@@ -20,6 +21,7 @@ struct AutoForecastOptions {
     date_range: TimestampRange,
     horizon: usize,
     level: Option<f64>,
+    metrics: bool,
     destination: Option<String>,
     config: AutoForecastConfig,
 }
@@ -30,6 +32,7 @@ impl Default for AutoForecastOptions {
             date_range: TimestampRange::default(),
             horizon: 5,
             level: None,
+            metrics: false,
             destination: None,
             config: AutoForecastConfig::default(),
         }
@@ -42,6 +45,7 @@ impl Default for AutoForecastOptions {
 ///     [SEASONALITY <period>]
 ///     [MODELS <family1>,<family2> ...]
 ///     [LEVEL <confidence_level>]
+///     [METRICS]
 ///     [STORE <key1>]
 ///```
 /// `TS.AUTOFORECAST` fits all enabled auto models (AutoARIMA, AutoETS, AutoTheta)
@@ -85,6 +89,7 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
         date_range: TimestampRange::default(),
         horizon: 5,
         level: None,
+        metrics: false,
         destination: None,
         config: AutoForecastConfig::default(),
     };
@@ -115,6 +120,9 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
                         return Err(ValkeyError::String(format!("TSDB: LEVEL must be between 0 and 100, got {}", value)));
                     }
                     options.level = Some(value);
+                },
+                "METRICS" => {
+                    options.metrics = true;
                 },
                 "STORE" => {
                     let value = args.next_string()
@@ -161,7 +169,6 @@ fn process_request(ctx: &Context, key: ValkeyString, options: AutoForecastOption
     Ok(ValkeyValue::NoReply)
 }
 
-
 fn run_forecasting_thread(
     ctx: ThreadSafeReplyContext,
     series: TimeSeries,
@@ -185,6 +192,7 @@ fn run_forecasting_thread(
         None
     };
 
+    let seasonal_period = options.config.seasonal_period;
     let mut model = AutoForecast::with_config(options.config);
 
     let res = if let Some(level) = options.level {
@@ -196,7 +204,7 @@ fn run_forecasting_thread(
     let forecast = match res {
         Ok(prediction) => prediction,
         Err(e) => {
-            let msg = format!("TSDB: forecast error: {}", e);
+            let msg = format!("TSDB: {}", e);
             // write error
             ctx.log_warning(&msg);
             ctx.reply(Err(ValkeyError::String(msg)));
@@ -209,6 +217,29 @@ fn run_forecasting_thread(
     let predicted_values = forecast.primary();
     let lower_interval = get_lower_interval(&forecast);
     let upper_interval = get_upper_interval(&forecast);
+    let metrics = if options.metrics {
+        let fitted = match model.fitted_values() {
+            Some(v) => v,
+            None => {
+                let msg = "TSDB: metrics error: fitted values are unavailable for selected model";
+                ctx.log_warning(msg);
+                let _ = ctx.reply(Err(ValkeyError::Str(msg)));
+                return;
+            }
+        };
+
+        match calculate_metrics(series.primary_values(), fitted, seasonal_period) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                let msg = format!("TSDB: metrics error: {}", e);
+                ctx.log_warning(&msg);
+                let _ = ctx.reply(Err(ValkeyError::String(msg)));
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // If STORE was specified, persist the predicted values into the target timeseries key.
     if let Some(destination) = options.destination {
@@ -250,6 +281,9 @@ fn run_forecasting_thread(
     if upper_interval.is_some() {
         map_len += 1;
     }
+    if metrics.is_some() {
+        map_len += 1;
+    }
     reply_with_map(&ctx, map_len);
 
     reply_with_str(&ctx, "selected_model");
@@ -269,6 +303,10 @@ fn run_forecasting_thread(
     }
     if let Some(upper_values) = upper_interval {
         reply_with_interval_array(&ctx, "upper_interval", upper_values);
+    }
+
+    if let Some(m) = metrics.as_ref() {
+        reply_with_accuracy_metrics(&ctx, m);
     }
 }
 
@@ -298,6 +336,38 @@ fn reply_with_double_array(ctx: &ThreadSafeReplyContext, values: &[f64]) {
     for value in values {
         reply_with_double(ctx, *value);
     }
+}
+
+fn reply_with_accuracy_metrics(ctx: &ThreadSafeReplyContext, metrics: &AccuracyMetrics) {
+    reply_with_str(ctx, "metrics");
+    reply_with_map(ctx, 7);
+
+    reply_with_str(ctx, "mae");
+    reply_with_double(ctx, metrics.mae);
+
+    reply_with_str(ctx, "mse");
+    reply_with_double(ctx, metrics.mse);
+
+    reply_with_str(ctx, "rmse");
+    reply_with_double(ctx, metrics.rmse);
+
+    reply_with_str(ctx, "mape");
+    match metrics.mape {
+        Some(v) => reply_with_double(ctx, v),
+        None => crate::common::replies::reply_with_null(ctx),
+    };
+
+    reply_with_str(ctx, "smape");
+    reply_with_double(ctx, metrics.smape);
+
+    reply_with_str(ctx, "mase");
+    match metrics.mase {
+        Some(v) => reply_with_double(ctx, v),
+        None => crate::common::replies::reply_with_null(ctx),
+    };
+
+    reply_with_str(ctx, "r_squared");
+    reply_with_double(ctx, metrics.r_squared);
 }
 
 fn parse_single_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {

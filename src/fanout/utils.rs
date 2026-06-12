@@ -33,11 +33,12 @@ pub fn key_belongs_to_local_node(ctx: &Context, key: &[u8]) -> bool {
     let Some(current_shard) = current_shard else {
         // If we don't have a local shard, we can't own any slots, though this should not happen
         // in a healthy cluster setup.
-        log_warning("Cluster mode is enabled but no local shard found in cluster map. Assuming key does not belong to local node.");
+        log_warning(
+            "Cluster mode is enabled but no local shard found in cluster map. Assuming key does not belong to local node.",
+        );
         return false;
     };
     current_shard.i_own_key(key)
-
 }
 
 /// Compute the Valkey/Redis hash slot (0..=16383) for a key byte slice.
@@ -49,11 +50,7 @@ pub fn key_hash_slot(key: &[u8]) -> u16 {
         let after_open = &key[open + 1..];
         if let Some(close) = after_open.iter().position(|&b| b == b'}') {
             let tag = &after_open[..close];
-            if !tag.is_empty() {
-                tag
-            } else {
-                key
-            }
+            if !tag.is_empty() { tag } else { key }
         } else {
             key
         }

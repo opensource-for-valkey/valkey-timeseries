@@ -7,7 +7,6 @@ mod ts_alter;
 mod ts_asm_restore;
 mod ts_autocorrelation;
 mod ts_autoforecast;
-mod ts_autotrend;
 mod ts_card;
 mod ts_card_fanout_command;
 mod ts_create;
@@ -17,6 +16,7 @@ mod ts_debug_configs;
 mod ts_decompose;
 mod ts_del;
 mod ts_deleterule;
+mod ts_features;
 mod ts_get;
 mod ts_incr_decr_by;
 mod ts_info;
@@ -39,6 +39,7 @@ mod ts_periods;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;
 mod ts_range;
+mod ts_trend;
 mod utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
@@ -53,8 +54,10 @@ pub(crate) use ts_autoforecast::*;
 pub use ts_autotrend::*;
 pub use ts_debug::*;
 pub use ts_decompose::*;
+pub use ts_features::*;
 pub use ts_mget::*;
 pub use ts_periods::*;
+pub use ts_trend::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;

@@ -14,6 +14,7 @@ TS.AUTOFORECAST key fromTimestamp toTimestamp
   [SEASONALITY period]
   [MODELS family1[,family2 ...]]
   [LEVEL confidence_level]
+  [METRICS]
   [STORE destination]
 ```
 
@@ -93,6 +94,25 @@ For each point `i`, `lower_interval[i] <= forecast[i] <= upper_interval[i]`.
 </details>
 
 <details open>
+<summary><code>METRICS</code></summary>
+
+When specified, the response includes a `metrics` map computed with
+`anofox-forecast`'s `calculate_metrics` using in-sample observed values and
+fitted values from the selected model.
+
+Returned fields:
+
+- `mae`
+- `mse`
+- `rmse`
+- `mape` (may be `null` when actual contains zeros)
+- `smape`
+- `mase` (may be `null` when insufficient scaling history)
+- `r_squared`
+
+</details>
+
+<details open>
 <summary><code>STORE destination</code></summary>
 
 Persist the forecast values into a time series key. The predicted values are stored as samples with timestamps continuing
@@ -115,6 +135,7 @@ The response is a flat key-value map (array of alternating keys and values) with
 | `level` | double | No | Confidence level (only when `LEVEL` is specified) |
 | `lower_interval` | array of double | No | Lower prediction interval bounds |
 | `upper_interval` | array of double | No | Upper prediction interval bounds |
+| `metrics` | map | No | Accuracy metrics map (only when `METRICS` is specified) |
 
 ### Example Response
 
@@ -179,6 +200,14 @@ Predict 10 points with 95% confidence intervals:
 
 ```
 TS.AUTOFORECAST temperature:sensor1 - + HORIZON 10 LEVEL 95
+```
+
+### With Accuracy Metrics
+
+Include in-sample accuracy metrics for the selected model:
+
+```
+TS.AUTOFORECAST temperature:sensor1 - + HORIZON 10 METRICS
 ```
 
 ### With Specific Model

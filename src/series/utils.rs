@@ -2,13 +2,15 @@ use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::get_current_db;
 use crate::error_consts;
+use crate::fanout::key_belongs_to_local_node;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::check_key_permissions;
 use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
-    DuplicatePolicy, SampleAddResult, SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions, create_compaction_rules_from_config
+    DuplicatePolicy, SampleAddResult, SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions,
+    create_compaction_rules_from_config,
 };
 use std::ops::Deref;
 use std::time::Duration;
@@ -16,7 +18,6 @@ use valkey_module::key::ValkeyKeyWritable;
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
 };
-use crate::fanout::key_belongs_to_local_node;
 
 pub fn with_timeseries<R>(
     ctx: &Context,
@@ -109,7 +110,7 @@ pub fn create_series(
     if !key_belongs_to_local_node(ctx, key.as_slice()) {
         return Err(ValkeyError::Str(error_consts::WRONG_SLOT));
     }
-    
+
     let mut ts = TimeSeries::with_options(options)?;
     if ts.id == 0 {
         ts.id = next_timeseries_id();

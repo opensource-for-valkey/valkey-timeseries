@@ -4,6 +4,7 @@ Integration tests for TS.AUTOFORECAST command.
 Covers:
 - Basic forecasting with minimal arguments
 - LEVEL option for prediction intervals
+- METRICS option for in-sample metrics
 - SEASONALITY option
 - MODELS option (individual model families and combinations)
 - STORE option (persisting forecast to a key)
@@ -15,7 +16,7 @@ Covers:
 """
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import pytest
 from valkey import ResponseError
@@ -23,53 +24,12 @@ from valkey import ResponseError
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import *
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-def _add(client, key: str, start_ms: int, values: List[float],
-         step_ms: int = 1000) -> None:
-    """Bulk-add a list of values to *key* starting at *start_ms*."""
-    for i, v in enumerate(values):
-        client.execute_command("TS.ADD", key, start_ms + i * step_ms, v)
-
-
-def _create_linear_series(client, key: str, start_ms: int = 1000,
-                          count: int = 200, slope: float = 0.5,
-                          intercept: float = 10.0,
-                          step_ms: int = 60000) -> None:
-    """Create a time series with a linear trend (good for forecasting)."""
-    values = [intercept + slope * i for i in range(count)]
-    _add(client, key, start_ms, values, step_ms)
-
-
-def _create_sine_series(client, key: str, start_ms: int = 1000,
-                        count: int = 200, amplitude: float = 20.0,
-                        base: float = 100.0, period: int = 24,
-                        step_ms: int = 3600000) -> None:
-    """Create a time series with a sinusoidal pattern (good for seasonal forecasting)."""
-    values = [
-        base + amplitude * math.sin(2 * math.pi * i / period)
-        for i in range(count)
-    ]
-    _add(client, key, start_ms, values, step_ms)
-
-
-def _create_daily_seasonal_series(client, key: str, days: int = 30,
-                                  start_ms: int = 1000) -> None:
-    """Create a series with daily seasonality and an upward trend."""
-    values = []
-    for day in range(days):
-        for hour in range(24):
-            # Business-hours pattern
-            if 9 <= hour <= 17:
-                value = 80.0 + 20.0 * math.sin((hour - 13) * math.pi / 8)
-            else:
-                value = 40.0 + 10.0 * math.sin(hour * math.pi / 12)
-            # Add a gentle upward trend
-            value += day * 0.5
-            values.append(value)
-    _add(client, key, start_ms, values, 3600000)
+from data_helpers import (
+    _add,
+    _create_daily_seasonal_series,
+    _create_linear_series,
+    _create_sine_series,
+)
 
 
 def parse_forecast_response(response: List[Any]) -> Dict[str, Any]:
@@ -82,6 +42,7 @@ def parse_forecast_response(response: List[Any]) -> Dict[str, Any]:
     - forecast, lower_interval, upper_interval → list of float
     - horizon → int
     - level → float
+    - metrics → dict of {str: float|None}
     - selected_model → str
     """
     if not response:
@@ -100,6 +61,14 @@ def parse_forecast_response(response: List[Any]) -> Dict[str, Any]:
             result[key_str] = int(value)
         elif key_str == "level":
             result[key_str] = float(value)
+        elif key_str == "metrics":
+            metrics_dict = {}
+            m_it = iter(value)
+            for m_key in m_it:
+                m_key_str = m_key.decode("utf-8") if isinstance(m_key, bytes) else str(m_key)
+                m_val = next(m_it)
+                metrics_dict[m_key_str] = None if m_val is None else float(m_val)
+            result[key_str] = metrics_dict
         else:
             result[key_str] = value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
@@ -177,6 +146,31 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         ):
             assert lo <= f <= hi, \
                 f"At index {i}: lower={lo} forecast={f} upper={hi} violates lo <= f <= hi"
+
+    def test_forecast_with_metrics(self):
+        """Test forecast with METRICS option for in-sample accuracy metrics."""
+        key = "test:autoforecast:metrics"
+        _create_linear_series(self.client, key, count=150)
+
+        result = self.client.execute_command(
+            "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "5", "METRICS"
+        )
+
+        parsed = parse_forecast_response(result)
+        assert "metrics" in parsed, \
+            f"Expected metrics in response, got keys: {list(parsed.keys())}"
+
+        metrics = parsed["metrics"]
+        required = ["mae", "mse", "rmse", "mape", "smape", "mase", "r_squared"]
+        for field in required:
+            assert field in metrics, \
+                f"Missing metrics field '{field}', got: {list(metrics.keys())}"
+
+        assert metrics["mae"] >= 0.0
+        assert metrics["mse"] >= 0.0
+        assert metrics["rmse"] >= 0.0
+        assert metrics["smape"] >= 0.0
+
 
     def test_forecast_with_horizon_one(self):
         """Test forecast with HORIZON 1 (single point prediction)."""
@@ -553,6 +547,17 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         assert "lower_interval" in parsed_with
         assert "upper_interval" in parsed_with
 
+    def test_response_without_metrics_omits_field(self):
+        """Test that metrics field is omitted when METRICS is not specified."""
+        key = "test:autoforecast:format:no_metrics"
+        _create_linear_series(self.client, key, count=120)
+
+        result = self.client.execute_command(
+            "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "3"
+        )
+        parsed = parse_forecast_response(result)
+        assert "metrics" not in parsed
+
     # ── error handling ───────────────────────────────────────────────────
 
     def test_error_nonexistent_key(self):
@@ -718,6 +723,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
             "SEASONALITY", "24",
             "MODELS", "ARIMA,ETS",
             "LEVEL", "95",
+            "METRICS",
             "STORE", store_key,
         )
 
@@ -727,6 +733,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         assert "level" in parsed
         assert "lower_interval" in parsed
         assert "upper_interval" in parsed
+        assert "metrics" in parsed
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 7
 

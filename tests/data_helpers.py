@@ -1,12 +1,14 @@
 import calendar
 import csv
 import json
+import math
 import os.path
 import datetime
 import os
 import tempfile
 import zipfile
 from datetime import datetime
+from typing import List, Optional
 
 PIPELINE_SIZE = 1000
 DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
@@ -281,3 +283,119 @@ def ingest_power_consumption_data(valkey_conn, encoding='COMPRESSED', chunk_size
             count += 1
 
     r.execute()
+
+
+def _add(client, key: str, start_ms: int, values: List[float],
+         step_ms: int = 1000) -> None:
+    """Bulk-add a list of values to *key* starting at *start_ms*."""
+    for i, v in enumerate(values):
+        client.execute_command("TS.ADD", key, start_ms + i * step_ms, v)
+
+
+def _create_linear_series(client, key: str, start_ms: int = 1000,
+                          count: int = 100, slope: float = 2.0,
+                          intercept: float = 1.0,
+                          step_ms: int = 1000) -> None:
+    """Create a time series with a perfect linear trend."""
+    values = [intercept + slope * i for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_quadratic_series(client, key: str, start_ms: int = 1000,
+                              count: int = 100,
+                              step_ms: int = 1000) -> None:
+    """Create a time series with a quadratic trend: 0.01*t^2 + 0.5*t + 10."""
+    values = [0.01 * (i * i) + 0.5 * i + 10.0 for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_exponential_series(client, key: str, start_ms: int = 1000,
+                                count: int = 100,
+                                step_ms: int = 1000) -> None:
+    """Create a time series with an exponential trend: 2 * exp(0.05 * i)."""
+    values = [2.0 * math.exp(0.05 * i) for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_negative_linear_series(client, key: str, start_ms: int = 1000,
+                                    count: int = 100,
+                                    step_ms: int = 1000) -> None:
+    """Create a time series with all-negative values."""
+    values = [-(i + 1.0) for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_constant_series(client, key: str, start_ms: int = 1000,
+                             count: int = 10, value: float = 5.0,
+                             step_ms: int = 1000) -> None:
+    """Create a time series with constant values."""
+    for i in range(count):
+        client.execute_command("TS.ADD", key, start_ms + i * step_ms, value)
+
+
+def _create_sine_series(client, key: str, start_ms: int = 1000,
+                        count: int = 100, step_ms: int = 1000,
+                        amplitude: Optional[float] = None,
+                        base: Optional[float] = None,
+                        period: Optional[int] = None) -> None:
+    """Create a time series with sinusoidal values.
+
+    Two modes:
+    - Simple (default): values = sin(i * 0.1) for i in range(count)
+    - Seasonal (when *period* is provided):
+      values = base + amplitude * sin(2 * pi * i / period)
+    """
+    if period is not None:
+        amp = amplitude if amplitude is not None else 20.0
+        b = base if base is not None else 100.0
+        values = [b + amp * math.sin(2 * math.pi * i / period) for i in range(count)]
+    else:
+        values = [math.sin(i * 0.1) for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_alternating_series(client, key: str, start_ms: int = 1000,
+                                count: int = 20, step_ms: int = 1000) -> None:
+    """Create a time series with alternating values."""
+    values = [1.0 if i % 2 == 0 else -1.0 for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_daily_seasonal_series(client, key: str, days: int = 30,
+                                  start_ms: int = 1000) -> None:
+    """Create a series with daily seasonality and an upward trend."""
+    values = []
+    for day in range(days):
+        for hour in range(24):
+            # Business-hours pattern
+            if 9 <= hour <= 17:
+                value = 80.0 + 20.0 * math.sin((hour - 13) * math.pi / 8)
+            else:
+                value = 40.0 + 10.0 * math.sin(hour * math.pi / 12)
+            # Add a gentle upward trend
+            value += day * 0.5
+            values.append(value)
+    _add(client, key, start_ms, values, 3600000)
+
+def _create_quadratic_series(client, key: str, start_ms: int = 1000,
+                              count: int = 100,
+                              step_ms: int = 1000) -> None:
+    """Create a time series with a quadratic trend: 0.01*t^2 + 0.5*t + 10."""
+    values = [0.01 * (i * i) + 0.5 * i + 10.0 for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_exponential_series(client, key: str, start_ms: int = 1000,
+                                count: int = 100,
+                                step_ms: int = 1000) -> None:
+    """Create a time series with an exponential trend: 2 * exp(0.05 * i)."""
+    values = [2.0 * math.exp(0.05 * i) for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)
+
+
+def _create_negative_linear_series(client, key: str, start_ms: int = 1000,
+                                    count: int = 100,
+                                    step_ms: int = 1000) -> None:
+    """Create a time series with all-negative values."""
+    values = [-(i + 1.0) for i in range(count)]
+    _add(client, key, start_ms, values, step_ms)

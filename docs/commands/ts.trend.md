@@ -1,20 +1,26 @@
-# TS.AUTOTREND
+# TS.TREND
 
-Automatically select the best trend component for a time series.
+Fit trend components to a time series, with optional automatic model selection.
 
-`TS.AUTOTREND` fits multiple candidate trend models (Linear, Quadratic, Exponential,
-TheilSen, PiecewiseLinear) and selects the best one using an information criterion
-(AICc by default). The fitted trend values, selection scores, and optional predictions
-are returned.
+`TS.TREND` can operate in two modes:
+
+- **Auto mode** (default): Fits multiple candidate trend models (Linear, Quadratic,
+  Exponential, TheilSen, PiecewiseLinear) and selects the best one using an information
+  criterion (AICc by default).
+- **Specific model mode**: Fits a single specified trend model (Exponential, Logistic,
+  Polynomial, or TheilSen).
+
+The fitted trend values, optional predictions, model features, and optional accuracy metrics are returned.
 
 ## Syntax
 
 ```
-TS.AUTOTREND key fromTimestamp toTimestamp
-  [CRITERION <AICc|BIC|HOLDOUT>]
-  [RECENCY <FULL|WINDOW n|FRACTION f>]
+TS.TREND key fromTimestamp toTimestamp
+  [MODEL <Exponential|Logistic|Polynomial|TheilSen|Auto> [AICc|BIC|HOLDOUT]]
+  [RECENCY <FULL|WINDOW n|FRACTION f|AUTO>]
   [PREDICT <horizon>]
   [FEATURES]
+   [METRICS]
   [STORE <destination>]
 ```
 
@@ -47,13 +53,20 @@ Use `+` to denote the latest timestamp in the series.
 ## Optional arguments
 
 <details open>
-<summary><code>CRITERION</code></summary>
+<summary><code>MODEL</code></summary>
 
-Information criterion used to select the best trend model.
+Trend model to fit. If omitted, `Auto` is assumed.
 
-* `AICc` (default) — Corrected Akaike Information Criterion. Balances goodness-of-fit with model complexity, with a correction for small sample sizes.
-* `BIC` — Bayesian Information Criterion. Penalizes model complexity more heavily than AICc.
-* `HOLDOUT` — Holdout evaluation. Reserves the last 20% of data as a test set and selects the model with the best out-of-sample fit.
+* `Auto` (default) — Fit multiple candidate trend components and select the best one
+  using an information criterion. Optionally followed by a criterion name:
+  `AICc` (default), `BIC`, or `HOLDOUT`.
+* `Exponential` — Fit an exponential trend: `y = exp(a + b*t)`.
+* `Logistic` — Fit a logistic (S-curve) trend: `y = K / (1 + exp(-steepness * (t - midpoint)))`.
+* `Polynomial` — Fit a quadratic polynomial trend (degree 2).
+* `TheilSen` — Fit a robust linear trend using the Theil-Sen estimator (median of pairwise slopes).
+
+When `MODEL` is `Auto`, the response includes `selected_series`, `criterion`, and `scores`.
+When a specific model is given, the response includes `model` instead.
 
 </details>
 
@@ -66,6 +79,7 @@ the most recent trend is usually what matters.
 * `FULL` — Use all data.
 * `WINDOW n` — Use only the last `n` observations (minimum 4).
 * `FRACTION f` (default: `0.3`) — Use the last fraction of data (e.g., `0.3` = last 30%).
+* `AUTO` — Automatically detect the recency window via changepoint analysis (PELT).
 
 The fitted values still cover the full series (the portion before the recency window
 is filled by evaluating the fitted model at earlier indices — backwards extrapolation).
@@ -74,6 +88,7 @@ Examples:
 - `RECENCY FULL` — fit on all data
 - `RECENCY WINDOW 50` — fit on last 50 observations
 - `RECENCY FRACTION 0.5` — fit on last 50% of data
+- `RECENCY AUTO` — automatically detect recency window
 
 </details>
 
@@ -97,6 +112,24 @@ fitted trend component. The exact features depend on the selected model.
 </details>
 
 <details open>
+<summary><code>METRICS</code></summary>
+
+When specified, the response includes a `metrics` map computed by
+`anofox-forecast`'s `calculate_metrics` over observed values vs fitted trend values.
+
+Returned metrics:
+
+- `mae`
+- `mse`
+- `rmse`
+- `mape` (may be `null` when actual contains zeros)
+- `smape`
+- `mase` (may be `null` when insufficient data for scaling)
+- `r_squared`
+
+</details>
+
+<details open>
 <summary><code>STORE destination</code></summary>
 
 Persist the fitted trend values into a time series key. The fitted values are stored with their
@@ -114,24 +147,38 @@ predicted values are skipped with a warning (fitted values are still stored).
 
 ## Return
 
-`TS.AUTOTREND` returns a map (key-value pairs) with the following fields:
+`TS.TREND` returns a map (key-value pairs). The fields depend on whether `MODEL Auto`
+(or default) or a specific model was used.
 
-- `selected_trend` — Name of the selected trend model (e.g., "Linear", "Quadratic", "Exponential", "TheilSen", "PiecewiseLinear").
+### Auto mode response
+
+- `selected_series` — Name of the selected trend model (e.g., "Linear", "Quadratic", "Exponential", "TheilSen", "PiecewiseLinear").
 - `criterion` — The criterion used for selection: `AICc`, `BIC`, or `HOLDOUT`.
 - `fitted_trend` — Array of in-sample fitted trend values (same length as the input data).
 - `scores` — Array of `[name, score]` pairs for all candidate models, sorted from best to worst. Lower scores are better.
 - `n_params` — Number of free parameters in the selected model.
 
+### Specific model response
+
+- `model` — Name of the trend model used (e.g., "Exponential", "Logistic", "Polynomial", "TheilSen").
+- `fitted_trend` — Array of in-sample fitted trend values (same length as the input data).
+- `n_params` — Number of free parameters in the fitted model.
+
+### Optional response fields (both modes)
+
 If `PREDICT` is specified:
 - `predicted_trend` — Array of predicted trend values (length = `horizon`).
 
 If `FEATURES` is specified:
-- `features` — Map of named feature values for the selected component.
+- `features` — Map of named feature values for the fitted component.
 
-### Example response
+If `METRICS` is specified:
+- `metrics` — Map of forecast accuracy metrics (`mae`, `mse`, `rmse`, `mape`, `smape`, `mase`, `r_squared`) computed from observed vs fitted values.
+
+### Example response (Auto mode)
 
 ```
-1) "selected_trend"
+1) "selected_series"
 2) "Linear"
 3) "criterion"
 4) "AICc"
@@ -150,6 +197,20 @@ If `FEATURES` is specified:
     ...
 9) "n_params"
 10) (integer) 2
+```
+
+### Example response (specific model)
+
+```
+1) "model"
+2) "Exponential"
+3) "fitted_trend"
+4) 1) (double) 20.1
+   2) (double) 20.3
+   3) (double) 20.5
+   ...
+5) "n_params"
+6) (integer) 2
 ```
 
 ## Examples
@@ -173,8 +234,8 @@ OK
 (integer) 4000
 127.0.0.1:6379> TS.ADD temperature 5000 21.0
 (integer) 5000
-127.0.0.1:6379> TS.AUTOTREND temperature - +
-1) "selected_trend"
+127.0.0.1:6379> TS.TREND temperature - +
+1) "selected_series"
 2) "Linear"
 3) "criterion"
 4) "AICc"
@@ -197,11 +258,11 @@ OK
 
 ## Select trend with BIC and predict ahead
 
-Use BIC for selection and predict the next 5 trend values.
+Use BIC for selection (via MODEL Auto) and predict the next 5 trend values.
 
 ```
-127.0.0.1:6379> TS.AUTOTREND temperature - + CRITERION BIC PREDICT 5
-1) "selected_trend"
+127.0.0.1:6379> TS.TREND temperature - + MODEL Auto BIC PREDICT 5
+1) "selected_series"
 2) "Linear"
 3) "criterion"
 4) "BIC"
@@ -228,12 +289,79 @@ Use BIC for selection and predict the next 5 trend values.
 12) (integer) 2
 ```
 
+## Use MODEL Auto with holdout criterion
+
+Use auto model selection with the holdout criterion, specified inline after MODEL Auto.
+
+```
+127.0.0.1:6379> TS.TREND temperature - + MODEL Auto HOLDOUT
+1) "selected_series"
+2) "Quadratic"
+3) "criterion"
+4) "HOLDOUT"
+5) "fitted_trend"
+6) 1) (double) 20.08
+   2) (double) 20.31
+   3) (double) 20.54
+   4) (double) 20.77
+   5) (double) 21.0
+7) "scores"
+8) 1) 1) "Quadratic"
+       2) (double) 0.001
+    2) 1) "Linear"
+       2) (double) 0.002
+9) "n_params"
+10) (integer) 2
+```
+
+## Fit a specific exponential trend
+
+Fit only an exponential trend model (no auto-selection).
+
+```
+127.0.0.1:6379> TS.TREND temperature - + MODEL Exponential
+1) "model"
+2) "Exponential"
+3) "fitted_trend"
+4) 1) (double) 20.08
+   2) (double) 20.31
+   3) (double) 20.54
+   4) (double) 20.77
+   5) (double) 21.0
+5) "n_params"
+6) (integer) 2
+```
+
+## Fit a specific Theil-Sen trend with prediction
+
+Fit a robust Theil-Sen trend and predict ahead.
+
+```
+127.0.0.1:6379> TS.TREND temperature - + MODEL TheilSen PREDICT 5
+1) "model"
+2) "TheilSen"
+3) "fitted_trend"
+4) 1) (double) 20.08
+   2) (double) 20.31
+   3) (double) 20.54
+   4) (double) 20.77
+   5) (double) 21.0
+5) "predicted_trend"
+6) 1) (double) 21.23
+   2) (double) 21.46
+   3) (double) 21.69
+   4) (double) 21.92
+   5) (double) 22.15
+7) "n_params"
+8) (integer) 2
+```
+
 ## Fit on recent data only
 
 Use only the last window of observations for trend fitting.
 
 ```
-127.0.0.1:6379> TS.AUTOTREND temperature - + RECENCY WINDOW 20
+127.0.0.1:6379> TS.TREND temperature - + RECENCY WINDOW 20
 ```
 
 ## Include feature details
@@ -241,7 +369,15 @@ Use only the last window of observations for trend fitting.
 Request additional features from the fitted trend component.
 
 ```
-127.0.0.1:6379> TS.AUTOTREND temperature - + FEATURES
+127.0.0.1:6379> TS.TREND temperature - + FEATURES
+```
+
+## Include fitted accuracy metrics
+
+Request accuracy metrics computed from observed vs fitted values.
+
+```
+127.0.0.1:6379> TS.TREND temperature - + METRICS
 ```
 
 ## See also
