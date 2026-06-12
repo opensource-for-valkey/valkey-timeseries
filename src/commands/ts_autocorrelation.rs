@@ -37,8 +37,8 @@ pub fn ts_autocorrelation_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyR
         .parse_integer()
         .map_err(|_| ValkeyError::Str("TSDB: invalid lag value"))?;
 
-    if lag <= 0 {
-        return Err(ValkeyError::Str("TSDB: lag must be a positive integer"));
+    if lag < 0 {
+        return Err(ValkeyError::Str("TSDB: lag must be a non-negative integer"));
     }
 
     let lag = lag as usize;
