@@ -28,10 +28,10 @@ from valkey import ResponseError
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from data_helpers import (
     _add,
-    _create_exponential_series,
-    _create_linear_series,
-    _create_negative_linear_series,
-    _create_quadratic_series,
+    create_exponential_series,
+    create_linear_series,
+    create_negative_linear_series,
+    create_quadratic_series,
 )
 
 def parse_trend_response(response: List[Any]) -> Dict[str, Any]:
@@ -110,7 +110,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: selects_linear_for_linear_data
         """
         key = "test:trend:select:linear"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -152,7 +152,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: selects_exponential_for_exponential_data
         """
         key = "test:trend:select:exponential"
-        _create_exponential_series(self.client, key, count=100)
+        create_exponential_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -170,7 +170,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: selects_quadratic_for_quadratic_data
         """
         key = "test:trend:select:quadratic"
-        _create_quadratic_series(self.client, key, count=100)
+        create_quadratic_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -193,7 +193,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: selection_result_has_all_candidates
         """
         key = "test:trend:scores:all_candidates"
-        _create_exponential_series(self.client, key, count=100)
+        create_exponential_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -211,7 +211,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: scores_are_sorted_ascending
         """
         key = "test:trend:scores:sorted"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -236,7 +236,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: bic_criterion_works
         """
         key = "test:trend:criterion:bic"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -255,7 +255,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: holdout_criterion_works
         """
         key = "test:trend:criterion:holdout"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -270,7 +270,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_default_criterion_is_aicc(self):
         """Default criterion should be AICc when not specified."""
         key = "test:trend:criterion:default"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -315,7 +315,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_predict_without_predict_omits_field(self):
         """Without PREDICT, predicted_trend should be absent from response."""
         key = "test:trend:predict:absent"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -490,7 +490,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: features_delegate_to_winner
         """
         key = "test:trend:features:basic"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -507,7 +507,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_features_without_features_omits_field(self):
         """Without FEATURES, features should be absent from response."""
         key = "test:trend:features:absent"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -524,7 +524,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_metrics_returns_metrics_map(self):
         """METRICS returns a metrics map with expected keys."""
         key = "test:trend:metrics:basic"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -550,7 +550,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_metrics_without_metrics_omits_field(self):
         """Without METRICS, metrics should be absent from response."""
         key = "test:trend:metrics:absent"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -563,7 +563,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_metrics_with_specific_model(self):
         """METRICS also works for specific-model mode."""
         key = "test:trend:metrics:specific_model"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -583,7 +583,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_recency_full(self):
         """RECENCY FULL uses all data and returns valid fitted trend."""
         key = "test:trend:recency:full"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -596,7 +596,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_recency_window(self):
         """RECENCY WINDOW n uses last n observations for fitting."""
         key = "test:trend:recency:window"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "WINDOW", "50"
@@ -610,7 +610,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_recency_fraction(self):
         """RECENCY FRACTION f uses the last fraction of data."""
         key = "test:trend:recency:fraction"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+",
@@ -624,7 +624,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_recency_default_is_fraction_0_3(self):
         """Default recency is FRACTION 0.3 (when RECENCY not specified)."""
         key = "test:trend:recency:default"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+"
@@ -644,7 +644,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         Corresponds to Rust: negative_data_excludes_exponential
         """
         key = "test:trend:negative:exponential"
-        _create_negative_linear_series(self.client, key, count=100)
+        create_negative_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -663,7 +663,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_response_is_flat_map(self):
         """Response should be a flat key-value list with even length."""
         key = "test:trend:format:flat"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -678,7 +678,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         """Response must contain selected_series, criterion, fitted_trend,
         scores, and n_params."""
         key = "test:trend:format:required"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -694,7 +694,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_response_selected_series_is_string(self):
         """selected_series should be a non-empty string."""
         key = "test:trend:format:selected_str"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -708,7 +708,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_response_with_predict_features_and_metrics(self):
         """When PREDICT, FEATURES, and METRICS are specified, all optional fields appear."""
         key = "test:trend:format:all_fields"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -759,7 +759,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_invalid_model_value(self):
         """Error with an invalid criterion value after MODEL Auto."""
         key = "test:trend:err:bad_model_value"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Invalid MODEL"):
             self.client.execute_command(
@@ -770,7 +770,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_invalid_recency(self):
         """Error with an unknown recency value."""
         key = "test:trend:err:bad_recency"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="invalid RECENCY"):
             self.client.execute_command(
@@ -781,7 +781,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_window_too_small(self):
         """Error when RECENCY WINDOW is less than 4."""
         key = "test:trend:err:small_window"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="WINDOW must be at least 4"):
             self.client.execute_command(
@@ -792,7 +792,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_fraction_invalid(self):
         """Error when RECENCY FRACTION is <= 0 or > 1."""
         key = "test:trend:err:bad_fraction"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="FRACTION must be between 0 and 1"):
             self.client.execute_command(
@@ -803,7 +803,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_predict_zero_or_negative(self):
         """Error when PREDICT is 0 or negative."""
         key = "test:trend:err:predict_zero"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="PREDICT must be greater than 0"):
             self.client.execute_command(
@@ -814,7 +814,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_predict_value(self):
         """Error when PREDICT has no value."""
         key = "test:trend:err:predict_missing"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Missing value for PREDICT"):
             self.client.execute_command(
@@ -825,7 +825,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_window_value(self):
         """Error when RECENCY WINDOW has no window size."""
         key = "test:trend:err:window_missing"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Missing window size for RECENCY WINDOW"):
             self.client.execute_command(
@@ -836,7 +836,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_store_value(self):
         """Error when STORE has no value."""
         key = "test:trend:err:store_missing"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Missing value for STORE"):
             self.client.execute_command(
@@ -847,7 +847,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_unknown_argument(self):
         """Error with an unknown argument."""
         key = "test:trend:err:unknown_arg"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Unknown argument"):
             self.client.execute_command(
@@ -876,7 +876,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_large_dataset(self):
         """Test with a larger dataset to ensure no performance issues."""
         key = "test:trend:edge:large"
-        _create_linear_series(self.client, key, count=500,
+        create_linear_series(self.client, key, count=500,
                               slope=1.0, intercept=0.0)
 
         result = self.client.execute_command(
@@ -926,7 +926,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_aicc_and_bic_produce_different_scores(self):
         """AICc and BIC should produce different score values for the same data."""
         key = "test:trend:edge:aicc_vs_bic"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result_aicc = self.client.execute_command(
@@ -962,7 +962,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_auto_explicit(self):
         """MODEL Auto (explicit) behaves like the default and includes selected_series."""
         key = "test:trend:model:auto_explicit"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -980,7 +980,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_auto_with_inline_criterion(self):
         """MODEL Auto BIC sets criterion via the inline syntax."""
         key = "test:trend:model:auto_inline_criterion"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -995,7 +995,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_auto_with_inline_holdout(self):
         """MODEL Auto HOLDOUT sets criterion via the inline syntax."""
         key = "test:trend:model:auto_inline_holdout"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1010,7 +1010,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_exponential(self):
         """MODEL Exponential fits only an exponential trend."""
         key = "test:trend:model:exponential"
-        _create_exponential_series(self.client, key, count=100)
+        create_exponential_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+",
@@ -1055,7 +1055,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_polynomial(self):
         """MODEL Polynomial fits a quadratic trend."""
         key = "test:trend:model:polynomial"
-        _create_quadratic_series(self.client, key, count=100)
+        create_quadratic_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+",
@@ -1078,7 +1078,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_theilsen(self):
         """MODEL TheilSen fits a robust Theil-Sen linear trend."""
         key = "test:trend:model:theilsen"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1095,7 +1095,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_with_predict(self):
         """Specific MODEL with PREDICT returns predicted_trend."""
         key = "test:trend:model:with_predict"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1111,7 +1111,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_with_features(self):
         """Specific MODEL with FEATURES returns features map."""
         key = "test:trend:model:with_features"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1128,7 +1128,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         """Specific MODEL with STORE persists fitted values."""
         key = "test:trend:model:store_src"
         store_key = "test:trend:model:store_dst"
-        _create_linear_series(self.client, key, count=50,
+        create_linear_series(self.client, key, count=50,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1147,7 +1147,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_model_default_is_auto(self):
         """When no MODEL is specified, Auto is assumed (selected_series present)."""
         key = "test:trend:model:default_auto"
-        _create_linear_series(self.client, key, count=100,
+        create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
 
         result = self.client.execute_command(
@@ -1166,7 +1166,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_invalid_model(self):
         """Error with an unknown MODEL value."""
         key = "test:trend:err:bad_model"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Invalid MODEL"):
             self.client.execute_command(
@@ -1177,7 +1177,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_criterion_without_auto_model(self):
         """Error when CRITERION is used as a standalone argument (no longer supported)."""
         key = "test:trend:err:criterion_standalone"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Unknown argument"):
             self.client.execute_command(
@@ -1188,7 +1188,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_model_value(self):
         """Error when MODEL has no value."""
         key = "test:trend:err:model_missing"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Missing value for MODEL"):
             self.client.execute_command(

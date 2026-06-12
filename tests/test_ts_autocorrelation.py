@@ -3,37 +3,7 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.conftest import resource_port_tracker  # noqa: F401
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
-
-
-def create_linear_series(client, key, start_time=1000, count=20):
-    """Create a time series with linear trend."""
-    for i in range(count):
-        client.execute_command('TS.ADD', key, start_time + i * 1000, float(i))
-    return start_time, count
-
-
-def create_alternating_series(client, key, start_time=1000, count=20):
-    """Create a time series with alternating values."""
-    for i in range(count):
-        val = 1.0 if i % 2 == 0 else -1.0
-        client.execute_command('TS.ADD', key, start_time + i * 1000, val)
-    return start_time, count
-
-
-def create_constant_series(client, key, start_time=1000, count=10):
-    """Create a time series with constant values."""
-    for i in range(count):
-        client.execute_command('TS.ADD', key, start_time + i * 1000, 5.0)
-    return start_time, count
-
-
-def create_sine_series(client, key, start_time=1000, count=100):
-    """Create a time series with sinusoidal values."""
-    for i in range(count):
-        val = math.sin(i * 0.1)
-        client.execute_command('TS.ADD', key, start_time + i * 1000, val)
-    return start_time, count
-
+from data_helpers import create_linear_series, create_alternating_series, create_constant_series, create_sine_series
 
 class TestAutocorrelation(ValkeyTimeSeriesTestCaseBase):
     """Test suite for TS.AUTOCORRELATION command."""

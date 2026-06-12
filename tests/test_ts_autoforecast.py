@@ -26,9 +26,9 @@ from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import *
 from data_helpers import (
     _add,
-    _create_daily_seasonal_series,
-    _create_linear_series,
-    _create_sine_series,
+    create_daily_seasonal_series,
+    create_linear_series,
+    create_sine_series,
 )
 
 
@@ -94,7 +94,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_basic_forecast(self):
         """Test basic autoforecast with minimal arguments (key, range, HORIZON)."""
         key = "test:autoforecast:basic"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "5"
@@ -114,7 +114,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_with_level(self):
         """Test forecast with LEVEL for prediction intervals."""
         key = "test:autoforecast:level"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "3", "LEVEL", "95"
@@ -150,7 +150,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_with_metrics(self):
         """Test forecast with METRICS option for in-sample accuracy metrics."""
         key = "test:autoforecast:metrics"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "5", "METRICS"
@@ -175,7 +175,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_with_horizon_one(self):
         """Test forecast with HORIZON 1 (single point prediction)."""
         key = "test:autoforecast:horizon1"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "1"
@@ -189,7 +189,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_with_larger_horizon(self):
         """Test forecast with a larger HORIZON value."""
         key = "test:autoforecast:horizon_large"
-        _create_linear_series(self.client, key, count=200)
+        create_linear_series(self.client, key, count=200)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "20"
@@ -205,7 +205,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_single_arima(self):
         """Test with only ARIMA model selected."""
         key = "test:autoforecast:models:arima"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -221,7 +221,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_single_ets(self):
         """Test with only ETS model selected."""
         key = "test:autoforecast:models:ets"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -235,7 +235,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_single_theta(self):
         """Test with only Theta model selected."""
         key = "test:autoforecast:models:theta"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -249,7 +249,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_multiple(self):
         """Test with multiple model families specified."""
         key = "test:autoforecast:models:multi"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -264,7 +264,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_all_three(self):
         """Test with all three model families."""
         key = "test:autoforecast:models:all"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -279,7 +279,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_case_insensitive(self):
         """Test that model names are case-insensitive."""
         key = "test:autoforecast:models:case"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -294,7 +294,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_models_auto_prefix(self):
         """Test that AUTOARIMA/AUTOETS/AUTOTHETA aliases work."""
         key = "test:autoforecast:models:auto"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -310,7 +310,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_seasonality_daily(self):
         """Test with daily seasonality on seasonal data."""
         key = "test:autoforecast:seasonality:daily"
-        _create_daily_seasonal_series(self.client, key, days=21)
+        create_daily_seasonal_series(self.client, key, days=21)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -328,7 +328,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_seasonality_sine(self):
         """Test with seasonality on a pure sine wave."""
         key = "test:autoforecast:seasonality:sine"
-        _create_sine_series(self.client, key, count=200, period=24)
+        create_sine_series(self.client, key, count=200, period=24)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -350,7 +350,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         """Test STORE persists forecast into a new timeseries key."""
         key = "test:autoforecast:store:src"
         store_key = "test:autoforecast:store:dst"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -379,7 +379,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         """Test STORE with LEVEL (both together)."""
         key = "test:autoforecast:store:level:src"
         store_key = "test:autoforecast:store:level:dst"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -400,7 +400,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         """Test STORE on an existing key (should overwrite/update)."""
         key = "test:autoforecast:store:exist:src"
         store_key = "test:autoforecast:store:exist:dst"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         # Pre-create the destination key
         self.client.execute_command("TS.CREATE", store_key)
@@ -424,7 +424,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         """Test that stored forecast timestamps are in proper sequence."""
         key = "test:autoforecast:store:timestamps:src"
         store_key = "test:autoforecast:store:timestamps:dst"
-        _create_linear_series(self.client, key, count=100, step_ms=60000)
+        create_linear_series(self.client, key, count=100, step_ms=60000)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -491,7 +491,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_response_flat_map_format(self):
         """Test that the response is a flat key-value map."""
         key = "test:autoforecast:format"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "3"
@@ -527,7 +527,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_response_with_level_has_intervals(self):
         """Test that LEVEL adds interval fields but omits them without LEVEL."""
         key = "test:autoforecast:format:level"
-        _create_linear_series(self.client, key, count=120)
+        create_linear_series(self.client, key, count=120)
 
         # Without LEVEL
         result_no_level = self.client.execute_command(
@@ -550,7 +550,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_response_without_metrics_omits_field(self):
         """Test that metrics field is omitted when METRICS is not specified."""
         key = "test:autoforecast:format:no_metrics"
-        _create_linear_series(self.client, key, count=120)
+        create_linear_series(self.client, key, count=120)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+", "HORIZON", "3"
@@ -571,7 +571,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_horizon(self):
         """Test that HORIZON is required."""
         key = "test:autoforecast:err:no_horizon"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         with pytest.raises(ResponseError):
             self.client.execute_command(
@@ -593,7 +593,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_invalid_model(self):
         """Test error with an unknown model name."""
         key = "test:autoforecast:err:bad_model"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="unknown auto-forecast model"):
             self.client.execute_command(
@@ -604,7 +604,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_invalid_model_among_valid(self):
         """Test error with a mix of valid and invalid models."""
         key = "test:autoforecast:err:mixed_models"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="unknown auto-forecast model"):
             self.client.execute_command(
@@ -615,7 +615,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_level_zero(self):
         """Test error when LEVEL is 0 (must be > 0)."""
         key = "test:autoforecast:err:level_zero"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="TSDB: LEVEL must be between 0 and 100"):
             self.client.execute_command(
@@ -626,7 +626,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_level_100(self):
         """Test error when LEVEL is 100 (must be < 100)."""
         key = "test:autoforecast:err:level_100"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="LEVEL must be between 0 and 100"):
             self.client.execute_command(
@@ -637,7 +637,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_level_negative(self):
         """Test error when LEVEL is negative."""
         key = "test:autoforecast:err:level_neg"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="LEVEL must be between 0 and 100"):
             self.client.execute_command(
@@ -648,7 +648,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_unknown_argument(self):
         """Test error with an unknown argument."""
         key = "test:autoforecast:err:unknown_arg"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError, match="Unknown argument"):
             self.client.execute_command(
@@ -659,7 +659,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_error_missing_store_value(self):
         """Test error when STORE has no key value."""
         key = "test:autoforecast:err:store_missing"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         with pytest.raises(ResponseError):
             self.client.execute_command(
@@ -715,7 +715,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         """Test with all options combined together."""
         key = "test:autoforecast:combined"
         store_key = "test:autoforecast:combined:dst"
-        _create_daily_seasonal_series(self.client, key, days=28)
+        create_daily_seasonal_series(self.client, key, days=28)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -745,7 +745,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_level_boundary_90(self):
         """Test LEVEL with boundary value 90 (high confidence)."""
         key = "test:autoforecast:boundary:level90"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
@@ -765,7 +765,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
     def test_forecast_level_boundary_20(self):
         """Test LEVEL with boundary value 20 (low confidence, intervals still produced)."""
         key = "test:autoforecast:boundary:level20"
-        _create_linear_series(self.client, key, count=150)
+        create_linear_series(self.client, key, count=150)
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
