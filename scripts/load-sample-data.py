@@ -173,9 +173,9 @@ def main():
                         help='Valkey host (default: localhost)')
     parser.add_argument('--port', default=int(os.environ.get('VALKEY_PORT', '6379')),
                         type=int, help='Valkey port (default: 6379)')
-    parser.add_argument('--data-dir', default=os.environ.get('SAMPLE_DATA_DIR', '/sample_data'),
+    parser.add_argument('--data-dir', default=os.environ.get('SAMPLE_DATA_DIR', '/data'),
                         help='Path to sample data files')
-    parser.add_argument('--datasets', default=os.environ.get('LOAD_SAMPLE_DATA', 'cpu,memory'),
+    parser.add_argument('--datasets', default=os.environ.get('LOAD_SAMPLE_DATA', 'cpu,memory,power_consumption,web'),
                         help='Comma-separated datasets to load: cpu,memory,power,web or "all"')
     args = parser.parse_args()
 
