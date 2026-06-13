@@ -130,10 +130,6 @@ fn simplify_internal(expr: Expr) -> Expr {
                 //
                 // (..A..) AND A --> ..A..  (unwrap a single-level Paren if present)
                 T_LAND if expr_contains(&lhs, &rhs, TokenType::new(T_LAND)) => {
-                    if std::env::var("SIMPL_DEBUG").is_ok() {
-                        eprintln!("SIMPL_DEBUG T_LAND lhs={}", lhs.as_ref().prettify());
-                        eprintln!("SIMPL_DEBUG T_LAND rhs={}", rhs.as_ref().prettify());
-                    }
                     // if both sides are identical (e.g., `(A) AND (A)`), preserve the original
                     // wrapper by returning lhs as-is. Otherwise unwrap a single-level Paren.
                     if *lhs == *rhs {
