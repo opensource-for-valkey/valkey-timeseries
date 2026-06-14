@@ -72,6 +72,16 @@ impl PromqlConfig {
         self.stats_enabled = stats_enabled;
         self
     }
+
+    /// Apply configuration values that are shared with the Valkey module's global config.
+    ///
+    /// This is called during module initialization and whenever the Valkey config changes
+    /// (via `config_changed_event_handler`), so that `PROMQL_CONFIG` stays in sync with
+    /// the Valkey-level settings.
+    pub fn apply_ts_config(&mut self, is_debug_mode: bool) {
+        self.stats_enabled = is_debug_mode;
+        self.trace_enabled = is_debug_mode;
+    }
 }
 
 impl Default for PromqlConfig {
