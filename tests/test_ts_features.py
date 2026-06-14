@@ -19,9 +19,9 @@ from valkey import ResponseError
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from valkeytestframework.conftest import resource_port_tracker  # noqa: F401
 from data_helpers import (
-    _create_constant_series,
-    _create_linear_series,
-    _create_sine_series,
+    create_constant_series,
+    create_linear_series,
+    create_sine_series,
 )
 
 
@@ -49,7 +49,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_basic_category(self):
         """Test basic category returns expected features."""
         key = "test:features:basic"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "basic"
@@ -71,7 +71,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_distribution_category(self):
         """Test distribution category returns skewness and kurtosis."""
         key = "test:features:dist"
-        _create_sine_series(self.client, key, count=100)
+        create_sine_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "distribution"
@@ -86,7 +86,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_autocorrelation_category(self):
         """Test autocorrelation category returns ACF at lags 1,2,3."""
         key = "test:features:acf"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "autocorrelation"
@@ -104,7 +104,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_trend_category(self):
         """Test trend category returns linear trend features."""
         key = "test:features:trend"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "trend"
@@ -121,7 +121,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_multiple_categories(self):
         """Test combining multiple categories."""
         key = "test:features:multicat"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "basic,trend"
@@ -137,7 +137,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
     def test_category_case_insensitive(self):
         """Test that category names are case-insensitive."""
         key = "test:features:case"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result_lower = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "CATEGORY", "basic"
@@ -159,7 +159,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_simple_features(self):
         """Test specifying individual simple features."""
         key = "test:features:simple"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "mean,median,variance,minimum,maximum"
@@ -173,7 +173,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_feature_case_insensitive(self):
         """Test that feature names are case-insensitive."""
         key = "test:features:featcase"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result_lower = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "mean"
@@ -191,7 +191,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_quantile_feature(self):
         """Test quantile parameterized feature."""
         key = "test:features:quantile"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "quantile:0.5"
@@ -206,7 +206,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_quantile_multiple(self):
         """Test multiple quantile features."""
         key = "test:features:quantiles"
-        _create_linear_series(self.client, key, count=100)
+        create_linear_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+",
@@ -220,7 +220,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_autocorrelation_feature(self):
         """Test autocorrelation parameterized feature with custom lag."""
         key = "test:features:acf:custom"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "autocorrelation:5"
@@ -233,7 +233,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_partial_autocorrelation_feature(self):
         """Test partial autocorrelation parameterized feature."""
         key = "test:features:pacf"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "partial_autocorrelation:2"
@@ -246,7 +246,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_pacf_alias(self):
         """Test PACF alias works the same as partial_autocorrelation."""
         key = "test:features:pacf:alias"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result_full = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "partial_autocorrelation:2"
@@ -265,7 +265,7 @@ class TestFeaturesIndividual(ValkeyTimeSeriesTestCaseBase):
     def test_combined_features(self):
         """Test multiple individual features together."""
         key = "test:features:combined"
-        _create_sine_series(self.client, key, count=100)
+        create_sine_series(self.client, key, count=100)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+",
@@ -283,7 +283,7 @@ class TestFeaturesCombined(ValkeyTimeSeriesTestCaseBase):
     def test_category_and_feature(self):
         """Test combining CATEGORY and FEATURE yields union."""
         key = "test:features:catandfeat"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+",
@@ -300,7 +300,7 @@ class TestFeaturesCombined(ValkeyTimeSeriesTestCaseBase):
     def test_deduplication(self):
         """Test that duplicate features (from category + explicit) are deduplicated."""
         key = "test:features:dedup"
-        _create_linear_series(self.client, key, count=50)
+        create_linear_series(self.client, key, count=50)
 
         # "mean" is in the basic category; specifying it again should deduplicate
         result = self.client.execute_command(
@@ -320,7 +320,7 @@ class TestFeaturesCombined(ValkeyTimeSeriesTestCaseBase):
     def test_nan_handling(self):
         """Test that NaN values are returned as null."""
         key = "test:features:nan"
-        _create_constant_series(self.client, key, count=10)
+        create_constant_series(self.client, key, count=10)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "variance"
@@ -453,7 +453,7 @@ class TestFeaturesResponseFormat(ValkeyTimeSeriesTestCaseBase):
     def test_response_is_flat_map(self):
         """Test that the response is a flat alternating key-value list."""
         key = "test:features:format"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "mean,median"
@@ -467,7 +467,7 @@ class TestFeaturesResponseFormat(ValkeyTimeSeriesTestCaseBase):
     def test_response_sorted_alphabetically(self):
         """Test that features are returned in alphabetical order."""
         key = "test:features:sorted"
-        _create_linear_series(self.client, key, count=10)
+        create_linear_series(self.client, key, count=10)
 
         result = self.client.execute_command(
             "TS.FEATURES", key, "-", "+", "FEATURE", "maximum,mean,minimum"
