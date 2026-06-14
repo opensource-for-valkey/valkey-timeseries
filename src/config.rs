@@ -27,6 +27,8 @@ use valkey_module::{
     ValkeyResult, ValkeyString, raw,
 };
 
+use crate::promql::engine::config::PROMQL_CONFIG;
+
 /// Minimal Valkey version that supports the TimeSeries Module
 pub const TIMESERIES_MIN_SUPPORTED_VERSION: &[i64; 3] = &[8, 0, 0];
 pub const SPLIT_FACTOR: f64 = 1.2;
@@ -1156,6 +1158,11 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
         return Err(ValkeyError::Str(
             "TSDB: invalid startup configuration; see the preceding errors in the server log",
         ));
+    }
+
+    // Initialize PROMQL_CONFIG from the freshly loaded Valkey config
+    if let Ok(mut prom_guard) = PROMQL_CONFIG.write() {
+        prom_guard.apply_ts_config(is_debug_mode_enabled());
     }
 
     Ok(())
