@@ -59,6 +59,7 @@ valkey-timeseries = { path = ".", features = ["test-utils"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.10"
 rand_distr = "0.6"
+approx = "0.5"
 test-case = "3.3"
 serial_test = { version = "3.5", default-features = false }
 proptest = "1"
