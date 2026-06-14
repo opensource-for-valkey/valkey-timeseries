@@ -6,16 +6,16 @@
 //! - Gap filling to create regular time series from irregular data.
 //! - Seasonal and trend strength estimation via STL decomposition.
 //! - Outlier detection and replacement with local median.
-use chrono::{DateTime, Datelike, Duration, Utc};
-use smallvec::SmallVec;
-use std::collections::{HashMap, BTreeMap};
-use anofox_forecast::core::{CalendarAnnotations, Frequency, MissingValuePolicy};
-use anofox_forecast::detection::{detect_outliers, OutlierConfig};
+use crate::common::Sample;
 use anofox_forecast::ForecastError;
+use anofox_forecast::core::{CalendarAnnotations, Frequency, MissingValuePolicy};
+use anofox_forecast::detection::{OutlierConfig, detect_outliers};
 use anofox_forecast::seasonality::STL;
 use anofox_forecast::utils::stats::{nan_mean, nan_median};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use simd_json::prelude::{ArrayTrait, IndexedMut};
-use crate::common::Sample;
+use smallvec::SmallVec;
+use std::collections::{BTreeMap, HashMap};
 
 /// A time series with timestamps and values.
 #[derive(Debug, Clone)]
@@ -70,13 +70,11 @@ impl TimeSeries {
     }
 
     /// Create a simple time series.
-    pub fn univariate(timestamps: Vec<DateTime<Utc>>, values: Vec<f64>) -> Result<TimeSeries, ForecastError> {
-        Self::new(
-            timestamps,
-            values,
-            None,
-            None,
-        )
+    pub fn univariate(
+        timestamps: Vec<DateTime<Utc>>,
+        values: Vec<f64>,
+    ) -> Result<TimeSeries, ForecastError> {
+        Self::new(timestamps, values, None, None)
     }
 
     /// Get the number of observations.
@@ -134,9 +132,7 @@ impl TimeSeries {
 
     /// Check if series has missing values (NaN or Inf).
     pub fn has_missing_values(&self) -> bool {
-        self.values
-            .iter()
-            .any(|v| !v.is_finite())
+        self.values.iter().any(|v| !v.is_finite())
     }
 
     /// Return a sanitized copy with missing values handled.
@@ -162,17 +158,19 @@ impl TimeSeries {
                 }
             }
             MissingValuePolicy::Fill(fill_value) => {
-                self
-                    .values
+                self.values
                     .iter_mut()
                     .zip(self.timestamps.iter())
                     .filter(|(v, _)| !v.is_finite())
                     .for_each(|(v, &timestamp)| {
                         *v = fill_value;
-                        self.delta.insert(timestamp, Sample {
-                            timestamp: timestamp.timestamp(),
-                            value: *v,
-                        });
+                        self.delta.insert(
+                            timestamp,
+                            Sample {
+                                timestamp: timestamp.timestamp(),
+                                value: *v,
+                            },
+                        );
                     });
             }
             MissingValuePolicy::ForwardFill => {
@@ -181,10 +179,13 @@ impl TimeSeries {
                     if !v.is_finite() {
                         let value_to_use = last_valid.unwrap_or(*v);
                         *v = value_to_use;
-                        self.delta.insert(timestamp, Sample {
-                            timestamp: timestamp.timestamp(),
-                            value: *v,
-                        });
+                        self.delta.insert(
+                            timestamp,
+                            Sample {
+                                timestamp: timestamp.timestamp(),
+                                value: *v,
+                            },
+                        );
                     } else {
                         last_valid = Some(*v);
                     }
@@ -198,10 +199,13 @@ impl TimeSeries {
                         if let Some(v) = next_valid {
                             *val = v;
                             let timestamp = self.timestamps[i];
-                            self.delta.insert(timestamp, Sample {
-                                timestamp: timestamp.timestamp(),
-                                value: *val,
-                            });
+                            self.delta.insert(
+                                timestamp,
+                                Sample {
+                                    timestamp: timestamp.timestamp(),
+                                    value: *val,
+                                },
+                            );
                         }
                     } else {
                         next_valid = Some(*val);
@@ -210,33 +214,39 @@ impl TimeSeries {
             }
             MissingValuePolicy::FillMean => {
                 let m = nan_mean(&self.values);
-                self
-                    .timestamps.iter()
+                self.timestamps
+                    .iter()
                     .zip(self.values.iter_mut())
-                    .for_each(|(i, v)|
+                    .for_each(|(i, v)| {
                         if !v.is_finite() {
                             *v = m;
-                            self.delta.insert(*i, Sample {
-                                timestamp: i.timestamp(),
-                                value: *v,
-                            });
+                            self.delta.insert(
+                                *i,
+                                Sample {
+                                    timestamp: i.timestamp(),
+                                    value: *v,
+                                },
+                            );
                         }
-                    )
+                    })
             }
             MissingValuePolicy::FillMedian => {
                 let med = nan_median(&self.values);
-                self
-                    .timestamps.iter()
+                self.timestamps
+                    .iter()
                     .zip(self.values.iter_mut())
-                    .for_each(|(i, v)|
+                    .for_each(|(i, v)| {
                         if !v.is_finite() {
                             *v = med;
-                            self.delta.insert(*i, Sample {
-                                timestamp: i.timestamp(),
-                                value: *v,
-                            });
+                            self.delta.insert(
+                                *i,
+                                Sample {
+                                    timestamp: i.timestamp(),
+                                    value: *v,
+                                },
+                            );
                         }
-                    )
+                    })
             }
             MissingValuePolicy::Interpolate => self.interpolate(true),
         }
@@ -268,10 +278,13 @@ impl TimeSeries {
                 let timestamp = self.timestamps[i];
                 let value_to_use = last_valid.unwrap_or(value);
                 *v = value_to_use;
-                self.delta.insert(timestamp, Sample {
-                    timestamp: timestamp.timestamp(),
-                    value: value_to_use,
-                });
+                self.delta.insert(
+                    timestamp,
+                    Sample {
+                        timestamp: timestamp.timestamp(),
+                        value: value_to_use,
+                    },
+                );
             } else {
                 last_valid = Some(value);
             }
@@ -285,10 +298,13 @@ impl TimeSeries {
                     let ts = self.timestamps[i];
                     let timestamp = ts.timestamp();
                     *value = v;
-                    self.delta.insert(ts, Sample {
-                        timestamp,
-                        value: *value,
-                    });
+                    self.delta.insert(
+                        ts,
+                        Sample {
+                            timestamp,
+                            value: *value,
+                        },
+                    );
                 }
             } else {
                 next_valid = Some(*value);
@@ -387,9 +403,7 @@ impl TimeSeries {
                     f64::NAN
                 } else {
                     let mut sorted = b.clone();
-                    sorted.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let len = sorted.len();
                     if len % 2 == 0 {
                         (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
@@ -411,15 +425,13 @@ impl TimeSeries {
         // Validate: check that no seasonal bucket had >50% NaN
         let mut bucket_total: Vec<usize> = vec![0; period];
         let mut bucket_missing: Vec<usize> = vec![0; period];
-        for (i, &v) in self.values.iter().enumerate() { 
+        for (i, &v) in self.values.iter().enumerate() {
             bucket_total[i % period] += 1;
             if !v.is_finite() {
                 bucket_missing[i % period] += 1;
             }
         }
-        for (b, (&total, &missing)) in
-            bucket_total.iter().zip(bucket_missing.iter()).enumerate()
-        {
+        for (b, (&total, &missing)) in bucket_total.iter().zip(bucket_missing.iter()).enumerate() {
             if total > 0 && missing as f64 / total as f64 > 0.5 {
                 return Err(ForecastError::InvalidParameter(format!(
                     "seasonal bucket {} has >50% missing values ({}/{})",
@@ -436,7 +448,10 @@ impl TimeSeries {
     /// Applies the policy to each regressor vector independently.
     /// Only `Fill`, `ForwardFill`, `BackwardFill`, `FillMean`, `FillMedian`,
     /// and `Interpolate` are supported. `Drop` and `Error` return an error.
-    pub fn with_imputed_regressors(&self, policy: MissingValuePolicy) -> Result<TimeSeries, ForecastError> {
+    pub fn with_imputed_regressors(
+        &self,
+        policy: MissingValuePolicy,
+    ) -> Result<TimeSeries, ForecastError> {
         match policy {
             MissingValuePolicy::Drop | MissingValuePolicy::Error => {
                 return Err(ForecastError::InvalidParameter(
@@ -454,13 +469,7 @@ impl TimeSeries {
                 let imputed = match policy {
                     MissingValuePolicy::Fill(fill_value) => values
                         .iter()
-                        .map(|&v| {
-                            if !v.is_finite() {
-                                fill_value
-                            } else {
-                                v
-                            }
-                        })
+                        .map(|&v| if !v.is_finite() { fill_value } else { v })
                         .collect(),
                     MissingValuePolicy::ForwardFill => {
                         let mut res = Vec::with_capacity(values.len());
@@ -500,13 +509,7 @@ impl TimeSeries {
                         let med = nan_median(values);
                         values
                             .iter()
-                            .map(|&v| {
-                                if !v.is_finite() {
-                                    med
-                                } else {
-                                    v
-                                }
-                            })
+                            .map(|&v| if !v.is_finite() { med } else { v })
                             .collect()
                     }
                     MissingValuePolicy::Interpolate => interpolate_series(values, true),
@@ -892,7 +895,12 @@ impl TimeSeries {
 
             if neighbors.is_empty() {
                 // Fallback: use overall median
-                let mut all: Vec<f64> = self.values.iter().copied().filter(|v| v.is_finite()).collect();
+                let mut all: Vec<f64> = self
+                    .values
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .collect();
                 all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 if !all.is_empty() {
                     self.values[idx] = all[all.len() / 2];
@@ -905,7 +913,6 @@ impl TimeSeries {
         Ok(())
     }
 }
-
 
 /// Generate a sequence of timestamps from start to end (inclusive) with the given frequency.
 fn generate_timestamps(
@@ -1112,11 +1119,10 @@ fn fill_nan_segment(segment: &mut [f64], left: Option<f64>, right: Option<f64>, 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use approx::assert_relative_eq;
     use super::*;
+    use approx::assert_relative_eq;
     use chrono::TimeZone;
 
     fn create_timestamp(year: i32, month: u32, day: u32, hour: u32) -> i64 {
@@ -1564,7 +1570,7 @@ mod tests {
     fn backward_fill_basic() {
         let timestamps = make_timestamps(5);
         let values = vec![1.0, 2.0, 3.0, f64::NAN, f64::NAN];
-        let mut result  = TimeSeries::univariate(timestamps, values).unwrap();
+        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
         result.sanitize(MissingValuePolicy::BackwardFill).unwrap();
         // Trailing NaN left as NaN (no next valid value)
         assert_relative_eq!(result.values()[0], 1.0);
@@ -1659,14 +1665,12 @@ mod tests {
         let mut via_policy = TimeSeries::univariate(timestamps, values).unwrap();
         let mut via_method = via_policy.clone();
 
-        via_policy.sanitize(MissingValuePolicy::Interpolate).unwrap();
+        via_policy
+            .sanitize(MissingValuePolicy::Interpolate)
+            .unwrap();
         via_method.interpolate(true);
 
-        for (a, b) in via_policy
-            .values()
-            .iter()
-            .zip(via_method.values().iter())
-        {
+        for (a, b) in via_policy.values().iter().zip(via_method.values().iter()) {
             assert_relative_eq!(a, b, epsilon = 1e-10);
         }
     }
@@ -1810,9 +1814,10 @@ mod tests {
         let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
         ts.set_calendar(calendar);
 
-        assert!(ts
-            .with_imputed_regressors(MissingValuePolicy::Drop)
-            .is_err());
+        assert!(
+            ts.with_imputed_regressors(MissingValuePolicy::Drop)
+                .is_err()
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2075,7 +2080,7 @@ mod tests {
         // First and last
         assert_eq!(result[0], ymd(2024, 1, 2));
         assert_eq!(result[364], ymd(2024, 12, 31)); // 2024 is leap => 366 days, so day 366 = Dec 31
-                                                    // Strictly increasing
+        // Strictly increasing
         for w in result.windows(2) {
             assert!(w[1] > w[0]);
         }
