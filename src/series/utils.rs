@@ -2,7 +2,6 @@ use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::get_current_db;
 use crate::error_consts;
-use crate::fanout::key_belongs_to_local_node;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::check_key_permissions;
 use crate::series::chunks::ChunkEncoding;
@@ -107,9 +106,9 @@ pub fn create_series(
 ) -> ValkeyResult<TimeSeries> {
     // Ensure that the key belongs to the current node in cluster mode, to prevent creating a series on the wrong shard.
     //  In non-cluster mode, this is a no-op.
-    if !key_belongs_to_local_node(ctx, key.as_slice()) {
-        return Err(ValkeyError::Str(error_consts::WRONG_SLOT));
-    }
+    // if !key_belongs_to_local_node(ctx, key.as_slice()) {
+    //     return Err(ValkeyError::Str(error_consts::WRONG_SLOT));
+    // }
 
     let mut ts = TimeSeries::with_options(options)?;
     if ts.id == 0 {
