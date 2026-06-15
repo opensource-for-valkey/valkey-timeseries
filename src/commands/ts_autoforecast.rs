@@ -228,7 +228,13 @@ fn run_forecasting_thread(
             }
         };
 
-        match calculate_metrics(series.primary_values(), fitted, seasonal_period) {
+        let actual = series.primary_values();
+        let actual = if fitted.len() < actual.len() {
+            &actual[actual.len() - fitted.len()..]
+        } else {
+            actual
+        };
+        match calculate_metrics(actual, fitted, seasonal_period) {
             Ok(m) => Some(m),
             Err(e) => {
                 let msg = format!("TSDB: metrics error: {}", e);

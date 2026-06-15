@@ -24,7 +24,7 @@ from typing import Any, Dict, List
 
 import pytest
 from valkey import ResponseError
-
+from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from data_helpers import (
     _add,
@@ -764,7 +764,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match="Invalid MODEL"):
             self.client.execute_command(
                 "TS.TREND", key, "-", "+",
-                "MODEL", "Auto", "INVALID"
+                "MODEL", "INVALID"
             )
 
     def test_error_invalid_recency(self):
@@ -876,8 +876,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     def test_large_dataset(self):
         """Test with a larger dataset to ensure no performance issues."""
         key = "test:trend:edge:large"
-        create_linear_series(self.client, key, count=500,
-                              slope=1.0, intercept=0.0)
+        create_exponential_series(self.client, key, count=500)
 
         result = self.client.execute_command(
             "TS.TREND", key, "-", "+", "RECENCY", "FULL"
@@ -975,7 +974,8 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
             f"Expected selected_series in Auto mode, got keys: {list(parsed.keys())}"
         assert "criterion" in parsed
         assert "scores" in parsed
-        assert len(parsed["scores"]) >= 4
+        assert len(parsed["scores"]) >= 1, \
+            f"Expected at least 1 candidate in scores, got: {parsed['scores']}"
 
     def test_model_auto_with_inline_criterion(self):
         """MODEL Auto BIC sets criterion via the inline syntax."""

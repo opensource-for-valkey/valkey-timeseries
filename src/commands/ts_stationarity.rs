@@ -102,6 +102,42 @@ pub fn ts_stationarity_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResu
         )));
     }
 
+    // Constant series (all values identical) is trivially stationary.
+    // The ADF/KPSS regression would fail with zero variance, so handle
+    // this edge case by returning a stationary result directly.
+    let is_constant = values.len() >= 2
+        && values
+            .windows(2)
+            .all(|w| (w[0] - w[1]).abs() < f64::EPSILON);
+
+    if is_constant {
+        let const_result = StationarityResult {
+            statistic: 0.0,
+            p_value: 1.0,
+            lags: 0,
+            is_stationary: true,
+            critical_values: stationarity::CriticalValues::default(),
+        };
+        return match test_type {
+            TestType::Combined => {
+                reply_with_map(ctx, 4);
+                reply_with_str(ctx, "test");
+                reply_with_str(ctx, "combined");
+                reply_with_str(ctx, "conclusion");
+                reply_with_str(ctx, "stationary");
+                reply_with_str(ctx, "adf");
+                reply_with_map(ctx, 7);
+                reply_result_fields(ctx, &const_result);
+                reply_with_str(ctx, "kpss");
+                reply_with_map(ctx, 7);
+                reply_result_fields(ctx, &const_result);
+                Ok(ValkeyValue::NoReply)
+            }
+            TestType::Adf => reply_single_test(ctx, &const_result, "adf"),
+            TestType::Kpss => reply_single_test(ctx, &const_result, "kpss"),
+        };
+    }
+
     // Run test(s) and build response
     match test_type {
         TestType::Combined => reply_combined_test(ctx, &values),
@@ -198,10 +234,9 @@ fn reply_combined_test(ctx: &Context, values: &[f64]) -> ValkeyResult {
     Ok(ValkeyValue::NoReply)
 }
 
-
 fn parse_test_type(arg: &str) -> ValkeyResult<TestType> {
     match arg.len() {
-        3 if arg.eq_ignore_ascii_case("adf") => Ok(TestType::Adf), 
+        3 if arg.eq_ignore_ascii_case("adf") => Ok(TestType::Adf),
         4 if arg.eq_ignore_ascii_case("kpss") => Ok(TestType::Kpss),
         8 if arg.eq_ignore_ascii_case("combined") => Ok(TestType::Combined),
         _ => Err(ValkeyError::String(format!(

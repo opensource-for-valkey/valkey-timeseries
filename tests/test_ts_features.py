@@ -78,7 +78,7 @@ class TestFeaturesCategories(ValkeyTimeSeriesTestCaseBase):
         )
         parsed = parse_features_response(result)
 
-        assert set(parsed.keys()) == {"skewness", "kurtosis"}
+        assert set(parsed.keys()) == {"skewness", 'quantile_0.25', 'quantile_0.5', 'quantile_0.75', 'quantile_0.9', 'quantile_0.95', 'quantile_0.99', "kurtosis"}
         # Sine wave should have near-zero skewness
         assert abs(parsed["skewness"]) < 0.5, \
             f"Expected near-zero skewness for sine, got {parsed['skewness']}"

@@ -161,6 +161,10 @@ fn execute_auto_trend(
     let fitted_trend = auto_trend.fitted_trend();
     let selection = auto_trend.selection_result();
     let trend_name = auto_trend.trend_name();
+    let selected_series = selection
+        .as_ref()
+        .map(|result| result.selected.as_str())
+        .unwrap_or(trend_name);
     let n_params = auto_trend.n_params();
     let predicted = if options.predict > 0 {
         Some(auto_trend.predict_trend(options.predict))
@@ -201,7 +205,7 @@ fn execute_auto_trend(
 
     // selected_series
     reply_with_str(ctx, "selected_series");
-    reply_with_str(ctx, trend_name);
+    reply_with_str(ctx, selected_series);
 
     // criterion
     reply_with_str(ctx, "criterion");
