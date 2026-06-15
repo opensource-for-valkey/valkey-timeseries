@@ -16,7 +16,7 @@ use crate::parser::{
     metric_name::parse_metric_name as parse_metric, number::parse_number as parse_number_internal,
     parse_positive_duration_value, timestamp::parse_timestamp as parse_timestamp_internal,
 };
-use crate::promql::engine::config::PromqlConfig;
+use crate::promql::engine::promql_config::PromqlConfig;
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
     AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS, MRangeOptions, MatchFilterOptions,
@@ -1385,7 +1385,7 @@ pub(super) fn parse_query_range_command_args(
     let query = args.next_string()?;
     let mut start_value: Option<TimestampValue> = None;
     let mut end_value: Option<TimestampValue> = None;
-    let mut lookback_delta: Duration = config.lookback_delta;
+    let mut lookback_delta: Option<Duration> = None;
     let mut step: Option<Duration> = None;
     let mut options = crate::promql::QueryOptions::default();
 
@@ -1406,7 +1406,8 @@ pub(super) fn parse_query_range_command_args(
                 step = Some(parse_duration_internal(args.next(), token.as_str())?);
             }
             CommandArgToken::LookbackDelta => {
-                lookback_delta = parse_duration_internal(args.next(), token.as_str())?;
+                let delta = parse_duration_internal(args.next(), token.as_str())?;
+                lookback_delta = Some(delta);
             }
             CommandArgToken::Timeout => {
                 let mut timeout = parse_duration_internal(args.next(), token.as_str())?;
@@ -1427,6 +1428,8 @@ pub(super) fn parse_query_range_command_args(
     let Some(step) = step else {
         return Err(ValkeyError::Str("TSDB: missing query STEP argument"));
     };
+
+    let lookback_delta = normalize_lookback(config, lookback_delta, step);
 
     let (start, end) = match (start_value, end_value) {
         (Some(start_value), Some(end_value)) => {
@@ -1464,6 +1467,26 @@ pub(super) fn parse_query_range_command_args(
     };
 
     Ok((eval_stmt, options))
+}
+
+fn normalize_lookback(
+    config: &PromqlConfig,
+    look_back: Option<Duration>,
+    step: Duration,
+) -> Duration {
+    if config.set_lookback_to_step && !step.is_zero() {
+        return step;
+    }
+    if let Some(lb) = look_back {
+        if lb.is_zero() {
+            return config.lookback_delta;
+        }
+        lb
+    } else if step > config.lookback_delta {
+        step
+    } else {
+        config.lookback_delta
+    }
 }
 
 pub(super) fn parse_query_command_args(

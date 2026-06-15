@@ -1,8 +1,8 @@
 use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
 use crate::labels::{HasFingerprint, filters::SeriesSelector};
-use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
+use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, InstantSample, SeriesSelector as ProtoSeriesSelector,
     series_selector::Matchers as ProtoMatchers,

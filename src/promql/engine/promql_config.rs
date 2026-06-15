@@ -17,17 +17,14 @@ pub struct PromqlConfig {
     /// should we log query stats?
     pub stats_enabled: bool,
 
-    /// Whether to disable response caching. This may be useful during data back filling
-    pub disable_cache: bool,
-
     /// Whether query tracing is enabled.
     pub trace_enabled: bool,
 
     /// The maximum query length in bytes
     pub max_query_len: usize,
 
-    /// The maximum number of points per series that a subquery can generate.
-    pub max_points_subquery_per_timeseries: usize,
+    /// The maximum number of points that a query can generate.
+    pub max_points_per_timeseries: usize,
 
     /// The maximum number of unique time series to be returned from instant or range queries
     /// This option allows limiting memory usage
@@ -63,24 +60,9 @@ impl PromqlConfig {
         Default::default()
     }
 
-    pub fn with_cache(mut self, caching: bool) -> Self {
-        self.disable_cache = !caching;
-        self
-    }
-
     pub fn with_stats_enabled(mut self, stats_enabled: bool) -> Self {
         self.stats_enabled = stats_enabled;
         self
-    }
-
-    /// Apply configuration values that are shared with the Valkey module's global config.
-    ///
-    /// This is called during module initialization and whenever the Valkey config changes
-    /// (via `config_changed_event_handler`), so that `PROMQL_CONFIG` stays in sync with
-    /// the Valkey-level settings.
-    pub fn apply_ts_config(&mut self, is_debug_mode: bool) {
-        self.stats_enabled = is_debug_mode;
-        self.trace_enabled = is_debug_mode;
     }
 }
 
@@ -88,11 +70,10 @@ impl Default for PromqlConfig {
     fn default() -> Self {
         PromqlConfig {
             stats_enabled: false,
-            disable_cache: false,
             trace_enabled: false,
             lookback_delta: Duration::from_millis(DEFAULT_LOOKBACK_DELTA_MS),
             max_query_len: DEFAULT_MAX_QUERY_LEN,
-            max_points_subquery_per_timeseries: 0,
+            max_points_per_timeseries: 0,
             max_response_series: DEFAULT_MAX_UNIQUE_TIMESERIES,
             max_lookback: Duration::ZERO,
             set_lookback_to_step: false,
@@ -101,4 +82,9 @@ impl Default for PromqlConfig {
             enable_experimental_functions: true, // TODO: set to false before release
         }
     }
+}
+
+pub(crate) fn update_prom_config<F: FnMut(&mut PromqlConfig)>(mut f: F) {
+    let mut promql_config = PROMQL_CONFIG.write().unwrap();
+    f(&mut promql_config);
 }

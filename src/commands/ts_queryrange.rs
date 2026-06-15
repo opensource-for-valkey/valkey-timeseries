@@ -4,8 +4,7 @@ use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::current_time_millis;
 use crate::promql::QueryValue;
-use crate::promql::engine::config::PROMQL_CONFIG;
-use crate::promql::engine::evaluate_range;
+use crate::promql::engine::{evaluate_range, PROMQL_CONFIG};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 

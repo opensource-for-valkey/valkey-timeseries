@@ -1,6 +1,6 @@
-pub mod config;
 mod fanout;
 pub mod mock_series_querier;
+pub mod promql_config;
 pub mod promql_engine;
 pub mod query_reader;
 mod query_stats;
@@ -8,7 +8,6 @@ mod query_worker;
 
 use crate::common::Timestamp;
 use crate::common::time::current_time_millis;
-use crate::promql::engine::config::PROMQL_CONFIG;
 use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
 use crate::promql::engine::query_worker::QueryWorker;
 use crate::promql::model::{InstantSample, RangeSample};
@@ -22,6 +21,8 @@ pub use query_reader::*;
 use std::sync::LazyLock;
 use std::time::Duration;
 use valkey_module::Context;
+
+pub use promql_config::*;
 
 pub static QUERY_WORKER: LazyLock<QueryWorker> = LazyLock::new(QueryWorker::new);
 
@@ -43,6 +44,9 @@ pub struct QueryOptions {
     pub deadline: Option<Timestamp>,
     /// The maximum number of series to return from instant or range queries. This option allows limiting memory usage.
     pub max_series: usize,
+    /// The maximum number of data points to return per series for each series. This is to help guard against
+    /// OOMs and accidental self-DOS, especially in cluster mode.
+    pub max_points_per_series: Option<usize>,
     /// Enable tracing for the current request
     pub is_tracing: bool,
     /// Enable experimental functions for the current request
@@ -65,6 +69,13 @@ impl Default for QueryOptions {
             timeout: Some(config.max_query_duration),
             deadline: Some(deadline),
             max_series: config.max_response_series,
+            max_points_per_series: if config.max_points_per_timeseries > 0
+                && config.max_points_per_timeseries != usize::MAX
+            {
+                Some(config.max_points_per_timeseries)
+            } else {
+                None
+            },
             is_tracing: false,
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,
