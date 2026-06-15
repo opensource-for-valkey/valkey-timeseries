@@ -1,4 +1,5 @@
 use crate::common::context::{get_current_db, set_current_db};
+use crate::common::logging::log_warning;
 use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
@@ -211,6 +212,40 @@ fn effective_max_series(max_series: usize) -> usize {
     }
 }
 
+const MAX_SERIES_ERROR_MSG: &str = "the query returns more than the configured max series limit";
+const MAX_POINTS_PER_SERIES_ERROR_MSG: &str =
+    "the query returns a series with more points than the configured max points per series limit";
+
+fn validate_max_series(series_count: usize, max_series: usize) -> QueryResult<()> {
+    if max_series > 0 && series_count > max_series {
+        let msg = format!(
+            "{}: {} > {}",
+            MAX_SERIES_ERROR_MSG, series_count, max_series
+        );
+        log_warning(&msg);
+        return Err(QueryError::Execution(msg));
+    }
+    Ok(())
+}
+
+fn validate_max_points_per_series(
+    points_count: usize,
+    max_points: Option<usize>,
+) -> QueryResult<()> {
+    if let Some(max) = max_points
+        && max > 0
+        && points_count > max
+    {
+        let msg = format!(
+            "{}: {} > {}",
+            MAX_POINTS_PER_SERIES_ERROR_MSG, points_count, max
+        );
+        log_warning(&msg);
+        return Err(QueryError::Execution(msg));
+    }
+    Ok(())
+}
+
 fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
     match item {
         QueryCommand::Instant(iqc) => {
@@ -240,7 +275,6 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
         }
         QueryCommand::Range(rc) => {
             let timeout = calculate_timeout(&rc.options);
-            let max_series = effective_max_series(rc.options.max_series);
             let cmd = QueryRangeFanoutCommand::new(
                 rc.matchers,
                 rc.start_timestamp,
@@ -249,20 +283,21 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
             );
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
-                    let mut ranges: Vec<RangeSample> = resp
-                        .series
-                        .into_iter()
-                        .map(|rs| {
-                            let samples: Vec<Sample> = rs
-                                .samples
-                                .into_iter()
-                                .map(|s| Sample::new(s.timestamp, s.value))
-                                .collect();
-                            let labels = convert_labels(rs.labels);
-                            RangeSample { labels, samples }
-                        })
-                        .collect();
-                    ranges.truncate(max_series);
+                    validate_max_series(resp.series.len(), rc.options.max_series)?;
+                    let mut ranges: Vec<RangeSample> = Vec::with_capacity(resp.series.len());
+                    for rs in resp.series {
+                        validate_max_points_per_series(
+                            rs.samples.len(),
+                            rc.options.max_points_per_series,
+                        )?;
+                        let samples: Vec<Sample> = rs
+                            .samples
+                            .into_iter()
+                            .map(|s| Sample::new(s.timestamp, s.value))
+                            .collect();
+                        let labels = convert_labels(rs.labels);
+                        ranges.push(RangeSample { labels, samples });
+                    }
                     Ok(QueryValue::Matrix(ranges))
                 }
                 Err(e) => Err(QueryError::Execution(e.to_string())),
@@ -328,6 +363,11 @@ pub(super) fn query_instant_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
+    validate_max_series(series.len(), options.max_series)?;
+    // for instant queries, series length == number of returned samples, so should probably
+    // coalesce this with the max points per series validation.
+    validate_max_points_per_series(series.len(), options.max_points_per_series)?;
+
     // PromQL instant-query semantics: return the most recent sample per series
     // whose timestamp falls within the lookback window (timestamp - lookback_delta, timestamp].
     // This mirrors the Prometheus staleness semantics described in:
@@ -339,14 +379,14 @@ pub(super) fn query_instant_local(
         .saturating_sub(lookback_delta_ms)
         .saturating_add(1);
 
-    let max_series = effective_max_series(options.max_series);
-    let mut samples = series
+    let samples = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
             // Fetch all samples within [lookback_start_ms, timestamp] and pick the last one.
             let range = s.get_range(lookback_start_ms, timestamp);
+
             let sample = range.last()?;
 
             let labels: Labels = (&s.labels).into();
@@ -357,8 +397,6 @@ pub(super) fn query_instant_local(
             })
         })
         .collect::<Vec<_>>();
-
-    samples.truncate(max_series);
 
     Ok(samples)
 }
@@ -374,6 +412,9 @@ pub(super) fn query_range_local(
 
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
+
+    validate_max_series(series.len(), options.max_series)?;
+
     let mut ranges = series
         .iter()
         .map(|(s, _)| s.deref())
@@ -391,6 +432,9 @@ pub(super) fn query_range_local(
         })
         .collect::<Vec<_>>();
 
+    for range in &ranges {
+        validate_max_points_per_series(range.samples.len(), options.max_points_per_series)?;
+    }
     ranges.truncate(max_series);
 
     Ok(ranges)
