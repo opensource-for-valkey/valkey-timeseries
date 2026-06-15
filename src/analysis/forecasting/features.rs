@@ -40,6 +40,9 @@ impl FeatureCategory {
                 Quantile { q: 0.25 },
                 Quantile { q: 0.5 },
                 Quantile { q: 0.75 },
+                Quantile { q: 0.9 },
+                Quantile { q: 0.95 },
+                Quantile { q: 0.99 },
             ],
             FeatureCategory::Autocorrelation => &[
                 Autocorrelation { lag: 1 },
