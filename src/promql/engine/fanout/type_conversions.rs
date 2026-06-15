@@ -4,7 +4,7 @@ use crate::labels::filters::{
     FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
 };
-use crate::labels::{InternedLabel, Label, MetricName, SeriesLabel};
+use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel};
 use crate::promql::generated::{
     InstantSample as ProtoInstantSample, Label as ProtoLabel, LabelMatcher as ProtoLabelMatcher,
     LabelMatcherList, OrMatcherList, RangeSample as ProtoRangeSample, Sample as ProtoSample,
@@ -199,6 +199,14 @@ impl From<MetricName> for Vec<ProtoLabel> {
     fn from(metric_name: MetricName) -> Self {
         metric_name.iter().map(ProtoLabel::from).collect()
     }
+}
+
+pub(in crate::promql) fn proto_labels_to_labels(labels: Vec<ProtoLabel>) -> Labels {
+    Labels::new(labels.into_iter().map(Label::from).collect())
+}
+
+pub(in crate::promql) fn metric_name_to_proto_labels(metric_name: &MetricName) -> Vec<ProtoLabel> {
+    metric_name.iter().map(ProtoLabel::from).collect()
 }
 
 impl From<label_matcher::Type> for MatchOp {

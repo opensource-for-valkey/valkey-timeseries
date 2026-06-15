@@ -1,8 +1,8 @@
 use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
 use crate::labels::{HasFingerprint, filters::SeriesSelector};
-use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::engine::PROMQL_CONFIG;
+use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, InstantSample, SeriesSelector as ProtoSeriesSelector,
     series_selector::Matchers as ProtoMatchers,
@@ -16,6 +16,8 @@ pub struct QueryFanoutCommand {
     matchers: Matchers,
     timestamp: i64,
     lookback_delta: u64,
+    max_series: u64,
+    max_points_per_series: u64,
     results: Vec<InstantSample>,
     timeout: Duration,
     seen: FingerprintHashSet,
@@ -34,10 +36,12 @@ impl Default for QueryFanoutCommand {
         Self {
             matchers,
             timestamp: 0,
+            lookback_delta,
+            max_series: 0,
+            max_points_per_series: 0,
             results: vec![],
             timeout: crate::fanout::get_cluster_command_timeout(),
             seen: FingerprintHashSet::default(),
-            lookback_delta,
         }
     }
 }
@@ -46,12 +50,16 @@ impl QueryFanoutCommand {
         matchers: Matchers,
         timestamp: Timestamp,
         lookback_delta: u64,
+        max_series: u64,
+        max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
         Self {
             matchers,
             timestamp,
             lookback_delta,
+            max_series,
+            max_points_per_series,
             results: vec![],
             timeout,
             seen: FingerprintHashSet::default(),
@@ -73,7 +81,14 @@ impl FanoutCommand for QueryFanoutCommand {
             return Ok(InstantQueryResponse { samples: vec![] });
         };
         let series_selector: SeriesSelector = selector.try_into()?;
-        handle_instant_query(ctx, series_selector, req.timestamp, req.lookback_delta)
+        handle_instant_query(
+            ctx,
+            series_selector,
+            req.timestamp,
+            req.lookback_delta,
+            req.max_series,
+            req.max_points_per_series,
+        )
     }
 
     fn get_timeout(&self) -> Duration {
@@ -90,6 +105,8 @@ impl FanoutCommand for QueryFanoutCommand {
             selector: Some(selector),
             timestamp: self.timestamp,
             lookback_delta: self.lookback_delta,
+            max_series: self.max_series,
+            max_points_per_series: self.max_points_per_series,
         }
     }
 

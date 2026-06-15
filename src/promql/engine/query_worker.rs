@@ -5,11 +5,12 @@ use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::get_cluster_command_timeout;
 use crate::fanout::{FanoutCommand, is_clustered};
-use crate::labels::Label;
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::{QueryFanoutCommand, QueryRangeFanoutCommand};
-use crate::promql::generated::Label as ProtoLabel;
+use crate::promql::engine::{
+    QueryFanoutCommand, QueryRangeFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
+    validate_max_points, validate_max_series,
+};
 use crate::promql::{
     InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
 };
@@ -204,24 +205,8 @@ fn calculate_timeout(opts: &QueryOptions) -> Duration {
     // todo: cap with promql config max query duration
 }
 
-fn effective_max_series(max_series: usize) -> usize {
-    if max_series == 0 {
-        usize::MAX
-    } else {
-        max_series
-    }
-}
-
-const MAX_SERIES_ERROR_MSG: &str = "the query returns more than the configured max series limit";
-const MAX_POINTS_PER_SERIES_ERROR_MSG: &str =
-    "the query returns a series with more points than the configured max points per series limit";
-
-fn validate_max_series(series_count: usize, max_series: usize) -> QueryResult<()> {
-    if max_series > 0 && series_count > max_series {
-        let msg = format!(
-            "{}: {} > {}",
-            MAX_SERIES_ERROR_MSG, series_count, max_series
-        );
+fn validate_max_series_(series_count: usize, max_series: usize) -> QueryResult<()> {
+    if let Err(msg) = validate_max_series(series_count, max_series) {
         log_warning(&msg);
         return Err(QueryError::Execution(msg));
     }
@@ -234,14 +219,10 @@ fn validate_max_points_per_series(
 ) -> QueryResult<()> {
     if let Some(max) = max_points
         && max > 0
-        && points_count > max
+        && let Err(err) = validate_max_points(points_count, Some(max))
     {
-        let msg = format!(
-            "{}: {} > {}",
-            MAX_POINTS_PER_SERIES_ERROR_MSG, points_count, max
-        );
-        log_warning(&msg);
-        return Err(QueryError::Execution(msg));
+        log_warning(&err);
+        return Err(QueryError::Execution(err));
     }
     Ok(())
 }
@@ -250,24 +231,30 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
     match item {
         QueryCommand::Instant(iqc) => {
             let timeout = calculate_timeout(&iqc.options);
-            let max_series = effective_max_series(iqc.options.max_series);
             let timestamp = iqc.timestamp;
             let lookback_delta = iqc.options.lookback_delta.as_millis() as u64;
-            let cmd = QueryFanoutCommand::new(iqc.matchers, timestamp, lookback_delta, timeout);
+            let cmd = QueryFanoutCommand::new(
+                iqc.matchers,
+                timestamp,
+                lookback_delta,
+                iqc.options.max_series as u64,
+                iqc.options.max_points_per_series.unwrap_or(0) as u64,
+                timeout,
+            );
 
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
                     // resp.samples: Vec<proto::InstantSample>
                     let mut samples: Vec<InstantSample> = Vec::with_capacity(resp.samples.len());
                     for s in resp.samples {
-                        let labels = convert_labels(s.labels);
+                        let labels = proto_labels_to_labels(s.labels);
                         samples.push(InstantSample {
                             labels,
                             timestamp_ms: s.timestamp,
                             value: s.value,
                         });
                     }
-                    samples.truncate(max_series);
+                    validate_max_series_(samples.len(), iqc.options.max_series)?;
                     Ok(QueryValue::Vector(samples))
                 }
                 Err(e) => Err(QueryError::Execution(e.to_string())),
@@ -279,11 +266,13 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
                 rc.matchers,
                 rc.start_timestamp,
                 rc.end_timestamp,
+                rc.options.max_series as u64,
+                rc.options.max_points_per_series.unwrap_or(0) as u64,
                 timeout,
             );
             match cmd.exec_sync(ctx) {
                 Ok(resp) => {
-                    validate_max_series(resp.series.len(), rc.options.max_series)?;
+                    validate_max_series_(resp.series.len(), rc.options.max_series)?;
                     let mut ranges: Vec<RangeSample> = Vec::with_capacity(resp.series.len());
                     for rs in resp.series {
                         validate_max_points_per_series(
@@ -295,7 +284,7 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
                             .into_iter()
                             .map(|s| Sample::new(s.timestamp, s.value))
                             .collect();
-                        let labels = convert_labels(rs.labels);
+                        let labels = proto_labels_to_labels(rs.labels);
                         ranges.push(RangeSample { labels, samples });
                     }
                     Ok(QueryValue::Matrix(ranges))
@@ -304,17 +293,6 @@ fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue>
             }
         }
     }
-}
-
-fn convert_labels(labels: Vec<ProtoLabel>) -> Labels {
-    let labels = labels
-        .into_iter()
-        .map(|x| Label {
-            name: x.name,
-            value: x.value,
-        })
-        .collect();
-    Labels::new(labels)
 }
 
 /// Spawn the worker thread and return a channel Sender that accepts `BatchRequest`s.
@@ -349,7 +327,7 @@ fn spawn_worker() -> mpsc::Sender<BatchRequest> {
     tx
 }
 
-pub(super) fn query_instant_local(
+pub(in crate::promql) fn query_instant_local(
     ctx: &Context,
     selector: SeriesSelector,
     timestamp: Timestamp,
@@ -363,7 +341,7 @@ pub(super) fn query_instant_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
-    validate_max_series(series.len(), options.max_series)?;
+    validate_max_series_(series.len(), options.max_series)?;
     // for instant queries, series length == number of returned samples, so should probably
     // coalesce this with the max points per series validation.
     validate_max_points_per_series(series.len(), options.max_points_per_series)?;
@@ -375,9 +353,7 @@ pub(super) fn query_instant_local(
     let lookback_delta_ms = options.lookback_delta.as_millis() as Timestamp;
     // The lower bound is exclusive per PromQL spec, so subtract 1 to make the
     // TimeSeries::get_range inclusive-lower-bound call behave correctly.
-    let lookback_start_ms = timestamp
-        .saturating_sub(lookback_delta_ms)
-        .saturating_add(1);
+    let lookback_start_ms = instant_lookback_start_ms(timestamp, lookback_delta_ms);
 
     let samples = series
         .iter()
@@ -401,21 +377,19 @@ pub(super) fn query_instant_local(
     Ok(samples)
 }
 
-pub(super) fn query_range_local(
+pub(in crate::promql) fn query_range_local(
     ctx: &Context,
     selector: SeriesSelector,
     start_time: i64,
     end_time: i64,
     options: QueryOptions,
 ) -> QueryResult<Vec<RangeSample>> {
-    let max_series = effective_max_series(options.max_series);
-
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
-    validate_max_series(series.len(), options.max_series)?;
+    validate_max_series_(series.len(), options.max_series)?;
 
-    let mut ranges = series
+    let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par()
@@ -435,7 +409,6 @@ pub(super) fn query_range_local(
     for range in &ranges {
         validate_max_points_per_series(range.samples.len(), options.max_points_per_series)?;
     }
-    ranges.truncate(max_series);
 
     Ok(ranges)
 }

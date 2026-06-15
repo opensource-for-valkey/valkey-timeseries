@@ -1,7 +1,9 @@
 use crate::common::{Sample, Timestamp};
-use crate::labels::MetricName;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::generated::Label as PromLabel;
+use crate::promql::engine::{
+    instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
+    validate_max_series,
+};
 use crate::promql::generated::Sample as PromSample;
 use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
@@ -17,6 +19,8 @@ pub(super) fn handle_instant_query(
     selector: SeriesSelector,
     timestamp: Timestamp,
     lookback_delta: u64,
+    max_series: u64,
+    _max_points_per_series: u64,
 ) -> ValkeyResult<InstantQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
     let samples = series
@@ -30,11 +34,11 @@ pub(super) fn handle_instant_query(
         .filter_map(|(s, key)| {
             // in prometheus, given a timestamp and delta, we select the latest sample in the range
             // (ts - delta, ts], so we need to adjust the timestamp accordingly
-            let start_time = timestamp.saturating_sub(lookback_delta as i64) + 1;
+            let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
             let end_time = timestamp;
 
             let sample = *s.get_range(start_time, end_time).last()?;
-            let labels = convert_labels(&s.labels);
+            let labels = metric_name_to_proto_labels(&s.labels);
             Some(InstantSample {
                 labels,
                 value: sample.value,
@@ -44,6 +48,9 @@ pub(super) fn handle_instant_query(
         })
         .collect::<Vec<_>>();
 
+    validate_max_series(samples.len(), max_series as usize)
+        .map_err(valkey_module::ValkeyError::String)?;
+
     Ok(InstantQueryResponse { samples })
 }
 
@@ -52,6 +59,8 @@ pub(super) fn handle_range_query(
     selector: SeriesSelector,
     start_time: i64,
     end_time: i64,
+    max_series: u64,
+    max_points_per_series: u64,
 ) -> ValkeyResult<RangeQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
     let ranges = series
@@ -64,7 +73,7 @@ pub(super) fn handle_range_query(
                 return None;
             }
             let samples: Vec<PromSample> = series_samples.into_iter().map(Sample::into).collect();
-            let labels = convert_labels(&s.labels);
+            let labels = metric_name_to_proto_labels(&s.labels);
             let range = RangeSample {
                 labels,
                 samples,
@@ -74,14 +83,16 @@ pub(super) fn handle_range_query(
         })
         .collect::<Vec<_>>();
 
-    Ok(RangeQueryResponse { series: ranges })
-}
+    validate_max_series(ranges.len(), max_series as usize)
+        .map_err(valkey_module::ValkeyError::String)?;
 
-fn convert_labels(mn: &MetricName) -> Vec<PromLabel> {
-    mn.iter()
-        .map(|label| PromLabel {
-            name: label.name.to_string(),
-            value: label.value.to_string(),
-        })
-        .collect()
+    if max_points_per_series > 0 && max_points_per_series != u64::MAX {
+        let limit = max_points_per_series as usize;
+        for range in &ranges {
+            validate_max_points(range.samples.len(), Some(limit))
+                .map_err(valkey_module::ValkeyError::String)?;
+        }
+    }
+
+    Ok(RangeQueryResponse { series: ranges })
 }

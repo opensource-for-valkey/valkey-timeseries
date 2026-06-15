@@ -18,6 +18,8 @@ pub struct QueryRangeFanoutCommand {
     matchers: Matchers,
     start_time: i64,
     end_time: i64,
+    max_series: u64,
+    max_points_per_series: u64,
     timeout: Duration,
     series: Vec<RangeSample>,
     seen: FingerprintHashSet,
@@ -33,6 +35,8 @@ impl Default for QueryRangeFanoutCommand {
             matchers,
             start_time: 0,
             end_time: 0,
+            max_series: 0,
+            max_points_per_series: 0,
             timeout: get_cluster_command_timeout(),
             series: Vec::with_capacity(16),
             seen: FingerprintHashSet::with_capacity(16),
@@ -44,12 +48,16 @@ impl QueryRangeFanoutCommand {
         matchers: Matchers,
         start_time: Timestamp,
         end_time: Timestamp,
+        max_series: u64,
+        max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
         Self {
             matchers,
             start_time,
             end_time,
+            max_series,
+            max_points_per_series,
             timeout,
             series: Vec::with_capacity(16),
             seen: Default::default(),
@@ -72,7 +80,14 @@ impl FanoutCommand for QueryRangeFanoutCommand {
             return Ok(RangeQueryResponse { series: vec![] });
         };
         let series_selector: SeriesSelector = selector.try_into()?;
-        handle_range_query(ctx, series_selector, req.start_time, req.end_time)
+        handle_range_query(
+            ctx,
+            series_selector,
+            req.start_time,
+            req.end_time,
+            req.max_series,
+            req.max_points_per_series,
+        )
     }
 
     fn get_timeout(&self) -> Duration {
@@ -89,6 +104,8 @@ impl FanoutCommand for QueryRangeFanoutCommand {
             selector: Some(selector),
             start_time: self.start_time,
             end_time: self.end_time,
+            max_series: self.max_series,
+            max_points_per_series: self.max_points_per_series,
         }
     }
 

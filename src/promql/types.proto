@@ -106,6 +106,8 @@ message InstantQuery {
   SeriesSelector selector = 1;
   int64 timestamp = 2;
   uint64 lookback_delta = 3;
+  uint64 max_series = 4;
+  uint64 max_points_per_series = 5;
 }
 
 message InstantQueryResponse {
@@ -128,6 +130,8 @@ message RangeQuery {
   SeriesSelector selector = 1;
   int64 start_time = 2;
   int64 end_time = 3;
+  uint64 max_series = 4;
+  uint64 max_points_per_series = 5;
 }
 
 message RangeQueryResponse {
