@@ -2285,10 +2285,13 @@ mod tests {
 
                 let computed_stddev = result[0].value;
 
-                // Compute expected stddev from the deltas (more numerically stable)
-                let delta_mean = small_deltas.iter().sum::<f64>() / small_deltas.len() as f64;
-                let delta_variance = small_deltas.iter().map(|d| (d - delta_mean).powi(2)).sum::<f64>() / small_deltas.len() as f64;
-                let expected_stddev = delta_variance.sqrt();
+                // Compute expected stddev from the actual values (after f64 rounding)
+                // using a stable two-pass algorithm as the reference.
+                // Using values (not small_deltas) accounts for precision loss when
+                // base + delta rounds in f64.
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let variance = values.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+                let expected_stddev = variance.sqrt();
 
                 // Skip if overflow occurred or variance is too small
                 if computed_stddev.is_infinite() || expected_stddev.is_infinite() || expected_stddev < 1e-10 {

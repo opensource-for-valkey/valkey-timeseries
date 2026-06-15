@@ -94,9 +94,12 @@ pub(crate) fn kahan_avg(values: &[f64]) -> f64 {
 ///   variance = M2 / count   (population variance)
 ///
 /// Enhancement:
-///   Kahan compensated summation is applied to the incremental
-///   updates of both the running mean and M2 accumulators,
-///   reducing floating-point rounding error in long sequences.
+///   Kahan compensated summation is applied to the M2 accumulator
+///   to reduce floating-point rounding error in long sequences.
+///   The mean update uses standard Welford (without Kahan) because
+///   Kahan compensation on the running mean can introduce inconsistent
+///   rounding between the mean update and delta2 computation, causing
+///   catastrophic precision loss when values are extremely close.
 ///
 /// Semantics:
 ///   - Computes population variance (divides by n)
@@ -117,15 +120,14 @@ pub(crate) fn kahan_variance(values: &[f64]) -> f64 {
 
     let mut count = 0.0;
     let mut mean = 0.0;
-    let mut c_mean = 0.0;
     let mut m2 = 0.0;
     let mut c_m2 = 0.0;
 
     for &value in values {
         count += 1.0;
-        let delta = value - (mean + c_mean);
-        (mean, c_mean) = kahan_inc(delta / count, mean, c_mean);
-        let new_delta = value - (mean + c_mean);
+        let delta = value - mean;
+        mean += delta / count;
+        let new_delta = value - mean;
         (m2, c_m2) = kahan_inc(delta * new_delta, m2, c_m2);
     }
 
