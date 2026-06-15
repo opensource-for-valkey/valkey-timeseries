@@ -3,8 +3,7 @@ use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::system_time_to_millis;
-use crate::promql::engine::config::PROMQL_CONFIG;
-use crate::promql::engine::evaluate_instant;
+use crate::promql::engine::{evaluate_instant, PROMQL_CONFIG};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
