@@ -9,6 +9,7 @@ use crate::common::time::compute_median_step_ms;
 use crate::error_consts;
 use crate::series::{TimestampRange, create_or_update_series_with_samples, get_timeseries};
 use anofox_forecast::core::TimeSeries;
+use anofox_forecast::detection::detect_dominant_period;
 use anofox_forecast::models::Forecaster;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
 use anofox_forecast::prelude::Forecast;
@@ -24,6 +25,7 @@ struct AutoForecastOptions {
     metrics: bool,
     destination: Option<String>,
     config: AutoForecastConfig,
+    auto_seasonality: bool,
 }
 
 impl Default for AutoForecastOptions {
@@ -35,6 +37,7 @@ impl Default for AutoForecastOptions {
             metrics: false,
             destination: None,
             config: AutoForecastConfig::default(),
+            auto_seasonality: false,
         }
     }
 }
@@ -85,14 +88,7 @@ fn get_store_key_pos(args: &[ValkeyString]) -> ValkeyResult<Option<usize>> {
 }
 
 fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoForecastOptions> {
-    let mut options = AutoForecastOptions {
-        date_range: TimestampRange::default(),
-        horizon: 5,
-        level: None,
-        metrics: false,
-        destination: None,
-        config: AutoForecastConfig::default(),
-    };
+    let mut options = AutoForecastOptions::default();
     let mut horizon_set = false;
 
     while let Some(arg) = args.next() {
@@ -107,6 +103,12 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
                 },
                 "SEASONALITY" => {
                     // parse seasonality value
+                    if let Some(str) = args.peek()
+                        && str.as_slice().eq_ignore_ascii_case(b"AUTO") {
+                            options.auto_seasonality = true;
+                            args.next(); // consume AUTO
+                            continue;
+                        }
                     let period = parse_single_value(args, "SEASONALITY")? as usize;
                     options.config.seasonal_period = Some(period);
                 },
@@ -172,7 +174,7 @@ fn process_request(ctx: &Context, key: ValkeyString, options: AutoForecastOption
 fn run_forecasting_thread(
     ctx: ThreadSafeReplyContext,
     series: TimeSeries,
-    options: AutoForecastOptions,
+    mut options: AutoForecastOptions,
 ) {
     // Capture timestamp metadata before the model consumes the series reference.
     let last_timestamp_ms = series.timestamps().last().map(|dt| dt.timestamp_millis());
@@ -192,7 +194,12 @@ fn run_forecasting_thread(
         None
     };
 
+    if options.config.seasonal_period.is_none() && options.auto_seasonality {
+        options.config.seasonal_period = detect_dominant_period(series.primary_values());
+    }
+
     let seasonal_period = options.config.seasonal_period;
+
     let mut model = AutoForecast::with_config(options.config);
 
     let res = if let Some(level) = options.level {
@@ -410,6 +417,15 @@ fn parse_models(model_str: &str, config: &mut AutoForecastConfig) -> ValkeyResul
             "THETA" | "AUTOTHETA" => {
                 config.include_theta = true;
             }
+            "TBATS" => {
+                config.include_tbats = true;
+            }
+            "MFLES" => {
+                config.include_mfles = true;
+            }
+            "MSTL" => {
+                config.include_mstl = true;
+            }
             _ => {
                 return Err(ValkeyError::String(format!(
                     "TSDB: unknown auto-forecast model: {}",
@@ -419,7 +435,13 @@ fn parse_models(model_str: &str, config: &mut AutoForecastConfig) -> ValkeyResul
         }
     }
 
-    if !config.include_arima && !config.include_ets && !config.include_theta {
+    if !config.include_arima
+        && !config.include_ets
+        && !config.include_theta
+        && !config.include_tbats
+        && !config.include_mfles
+        && !config.include_mstl
+    {
         return Err(ValkeyError::Str(
             "TSDB: at least one valid model must be specified in MODELS",
         ));
