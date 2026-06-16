@@ -866,7 +866,7 @@ impl TimeSeries {
     /// let clean = ts.with_outliers_replaced(&OutlierConfig::default(), 5).unwrap();
     ///
     /// // The outlier at index 25 has been replaced
-    /// assert!((clean.values()[25] - 1000.0).abs() > 1.0);
+    /// assert!((clean.values(0).unwrap()[25] - 1000.0).abs() > 1.0);
     /// ```
     pub fn with_outliers_replaced(
         &mut self,

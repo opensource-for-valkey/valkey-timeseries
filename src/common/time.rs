@@ -51,8 +51,9 @@ pub fn current_time_millis() -> i64 {
 /// # Examples
 ///
 /// ```
+/// # use valkey_timeseries::common::time::compute_median_step_ms;
 /// let ts = vec![1000, 2000, 3000, 5000, 8000];
-/// assert_eq!(compute_median_step_ms(&ts), Some(1500)); // steps: 1000, 1000, 2000, 3000 → median 1500
+/// assert_eq!(compute_median_step_ms(&ts), Some(2000)); // steps: 1000, 1000, 2000, 3000 → upper median is 2000
 /// ```
 pub fn compute_median_step_ms(timestamps: &[i64]) -> Option<i64> {
     if timestamps.len() < 2 {
