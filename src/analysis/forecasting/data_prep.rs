@@ -13,26 +13,11 @@ use anofox_forecast::detection::{OutlierConfig, detect_outliers};
 use anofox_forecast::seasonality::STL;
 use anofox_forecast::utils::stats::{nan_mean, nan_median};
 use chrono::{DateTime, Datelike, Duration, Utc};
-use simd_json::prelude::{ArrayTrait, IndexedMut};
-use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
-
-fn parse_missing_value_policy(policy: &str) -> Option<MissingValuePolicy> {
-    match policy {
-        "Drop" => Some(MissingValuePolicy::Drop),
-        "FillWithMean" => Some(MissingValuePolicy::FillMean),
-        "FillWithMedian" => Some(MissingValuePolicy::FillMedian),
-        "ForwardFill" => Some(MissingValuePolicy::ForwardFill),
-        "BackwardFill" => Some(MissingValuePolicy::BackwardFill),
-        "Interpolate" => Some(MissingValuePolicy::Interpolate),
-        "Error" => Some(MissingValuePolicy::Error),
-        _ => None,
-    }
-}
 
 /// A time series with timestamps and values.
 #[derive(Debug, Clone)]
-pub struct TimeSeries {
+pub struct TimeSeriesFiller {
     timestamps: Vec<DateTime<Utc>>,
     /// Values stored in observation order.
     values: Vec<f64>,
@@ -41,7 +26,7 @@ pub struct TimeSeries {
     delta: BTreeMap<DateTime<Utc>, Sample>,
 }
 
-impl TimeSeries {
+impl TimeSeriesFiller {
     /// Create a new TimeSeries with full configuration.
     pub fn new(
         timestamps: Vec<DateTime<Utc>>,
@@ -86,7 +71,7 @@ impl TimeSeries {
     pub fn univariate(
         timestamps: Vec<DateTime<Utc>>,
         values: Vec<f64>,
-    ) -> Result<TimeSeries, ForecastError> {
+    ) -> Result<TimeSeriesFiller, ForecastError> {
         Self::new(timestamps, values, None, None)
     }
 
@@ -148,124 +133,6 @@ impl TimeSeries {
         self.values.iter().any(|v| !v.is_finite())
     }
 
-    /// Return a sanitized copy with missing values handled.
-    pub fn sanitize(&mut self, policy: MissingValuePolicy) -> Result<(), ForecastError> {
-        match policy {
-            MissingValuePolicy::Error => {
-                if self.has_missing_values() {
-                    return Err(ForecastError::MissingValues);
-                }
-            }
-            MissingValuePolicy::Drop => {
-                // Find indices of valid observations
-                let mut dropped_indices: SmallVec<usize, 32> = SmallVec::new();
-                for i in 0..self.len() {
-                    if self.values[i].is_finite() {
-                        continue;
-                    }
-                    dropped_indices.push(i);
-                }
-                self.values.retain_mut(|v| v.is_finite());
-                for i in dropped_indices.iter().rev() {
-                    self.timestamps.remove(*i);
-                }
-            }
-            MissingValuePolicy::Fill(fill_value) => {
-                self.values
-                    .iter_mut()
-                    .zip(self.timestamps.iter())
-                    .filter(|(v, _)| !v.is_finite())
-                    .for_each(|(v, &timestamp)| {
-                        *v = fill_value;
-                        self.delta.insert(
-                            timestamp,
-                            Sample {
-                                timestamp: timestamp.timestamp(),
-                                value: *v,
-                            },
-                        );
-                    });
-            }
-            MissingValuePolicy::ForwardFill => {
-                let mut last_valid = None;
-                for (v, &timestamp) in self.values.iter_mut().zip(self.timestamps.iter()) {
-                    if !v.is_finite() {
-                        let value_to_use = last_valid.unwrap_or(*v);
-                        *v = value_to_use;
-                        self.delta.insert(
-                            timestamp,
-                            Sample {
-                                timestamp: timestamp.timestamp(),
-                                value: *v,
-                            },
-                        );
-                    } else {
-                        last_valid = Some(*v);
-                    }
-                }
-            }
-            MissingValuePolicy::BackwardFill => {
-                let mut next_valid = None;
-                for i in (0..self.values.len()).rev() {
-                    let val = self.values.get_mut(i).unwrap();
-                    if !val.is_finite() {
-                        if let Some(v) = next_valid {
-                            *val = v;
-                            let timestamp = self.timestamps[i];
-                            self.delta.insert(
-                                timestamp,
-                                Sample {
-                                    timestamp: timestamp.timestamp(),
-                                    value: *val,
-                                },
-                            );
-                        }
-                    } else {
-                        next_valid = Some(*val);
-                    }
-                }
-            }
-            MissingValuePolicy::FillMean => {
-                let m = nan_mean(&self.values);
-                self.timestamps
-                    .iter()
-                    .zip(self.values.iter_mut())
-                    .for_each(|(i, v)| {
-                        if !v.is_finite() {
-                            *v = m;
-                            self.delta.insert(
-                                *i,
-                                Sample {
-                                    timestamp: i.timestamp(),
-                                    value: *v,
-                                },
-                            );
-                        }
-                    })
-            }
-            MissingValuePolicy::FillMedian => {
-                let med = nan_median(&self.values);
-                self.timestamps
-                    .iter()
-                    .zip(self.values.iter_mut())
-                    .for_each(|(i, v)| {
-                        if !v.is_finite() {
-                            *v = med;
-                            self.delta.insert(
-                                *i,
-                                Sample {
-                                    timestamp: i.timestamp(),
-                                    value: *v,
-                                },
-                            );
-                        }
-                    })
-            }
-            MissingValuePolicy::Interpolate => self.interpolate(true),
-        }
-        Ok(())
-    }
-
     /// Return a copy with linear interpolation for NaN values.
     pub fn interpolate(&mut self, fill_edges: bool) {
         self.values = interpolate_series(&self.values, fill_edges);
@@ -281,181 +148,6 @@ impl TimeSeries {
         self.values.iter().filter(|v| v.is_finite()).count()
     }
 
-    /// Forward-fill then backward-fill — handles both leading and trailing NaNs.
-    pub fn impute_forward_backward(&mut self) -> Result<(), ForecastError> {
-        // Forward fill
-        let mut last_valid = None;
-        for (i, v) in self.values.iter_mut().enumerate() {
-            let value = *v;
-            if !v.is_finite() {
-                let timestamp = self.timestamps[i];
-                let value_to_use = last_valid.unwrap_or(value);
-                *v = value_to_use;
-                self.delta.insert(
-                    timestamp,
-                    Sample {
-                        timestamp: timestamp.timestamp(),
-                        value: value_to_use,
-                    },
-                );
-            } else {
-                last_valid = Some(value);
-            }
-        }
-        // Backward fill remaining (leading NaNs)
-        let mut next_valid = None;
-        for i in (0..self.values.len()).rev() {
-            let value = self.values.get_mut(i).unwrap();
-            if !value.is_finite() {
-                if let Some(v) = next_valid {
-                    let ts = self.timestamps[i];
-                    let timestamp = ts.timestamp();
-                    *value = v;
-                    self.delta.insert(
-                        ts,
-                        Sample {
-                            timestamp,
-                            value: *value,
-                        },
-                    );
-                }
-            } else {
-                next_valid = Some(*value);
-            }
-        }
-        Ok(())
-    }
-
-    /// Impute NaN using mean of valid values in a centered window.
-    ///
-    /// Window must be odd. Multi-pass (up to 3) for adjacent NaNs.
-    /// Remaining NaNs filled with global mean.
-    pub fn impute_moving_average(&mut self, window: usize) -> Result<(), ForecastError> {
-        if window == 0 || window.is_multiple_of(2) {
-            return Err(ForecastError::InvalidParameter(
-                "moving average window must be odd and > 0".to_string(),
-            ));
-        }
-
-        let half = window / 2;
-        let mut result = self.values.clone();
-        let n = result.len();
-
-        // Multi-pass: up to 3 passes to handle adjacent NaNs
-        for _ in 0..3 {
-            let mut changed = false;
-            let snapshot = result.clone();
-            for i in 0..n {
-                if snapshot[i].is_finite() {
-                    continue;
-                }
-                let start = i.saturating_sub(half);
-                let end = (i + half + 1).min(n);
-                let mut sum = 0.0;
-                let mut count = 0usize;
-                for (j, value) in snapshot.iter().enumerate().take(end).skip(start) {
-                    if j != i && value.is_finite() {
-                        sum += *value;
-                        count += 1;
-                    }
-                }
-                if count > 0 {
-                    result[i] = sum / count as f64;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // Fill any remaining NaNs with global mean
-        let global_mean = nan_mean(&result);
-        for v in &mut result {
-            if !v.is_finite() {
-                *v = global_mean;
-            }
-        }
-        self.values = result;
-        Ok(())
-    }
-
-    /// Impute NaN using the median of observed values at the same seasonal position.
-    ///
-    /// Groups values by (index % period), computes median per group, fills NaN.
-    /// Returns error if period is 0 or if >50% of values in any seasonal bucket are NaN.
-    pub fn impute_seasonal(&mut self, period: usize) -> Result<(), ForecastError> {
-        if period == 0 {
-            return Err(ForecastError::InvalidParameter(
-                "seasonal period must be > 0".to_string(),
-            ));
-        }
-        if self.len() < period {
-            return Err(ForecastError::InsufficientData {
-                needed: period,
-                got: self.len(),
-                hint: None,
-            });
-        }
-
-        let n = self.values.len();
-
-        // Collect finite values per seasonal bucket
-        let mut buckets: Vec<Vec<f64>> = vec![Vec::new(); period];
-        for (i, &v) in self.values.iter().enumerate() {
-            if v.is_finite() {
-                buckets[i % period].push(v);
-            }
-        }
-
-        // Compute median per bucket
-        let medians: Vec<f64> = buckets
-            .iter()
-            .map(|b| {
-                if b.is_empty() {
-                    f64::NAN
-                } else {
-                    let mut sorted = b.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                    let len = sorted.len();
-                    if len % 2 == 0 {
-                        (sorted[len / 2 - 1] + sorted[len / 2]) / 2.0
-                    } else {
-                        sorted[len / 2]
-                    }
-                }
-            })
-            .collect();
-
-        // Fill NaN with seasonal median
-        let mut result = self.values.clone();
-        for i in 0..n {
-            if !result[i].is_finite() {
-                result[i] = medians[i % period];
-            }
-        }
-
-        // Validate: check that no seasonal bucket had >50% NaN
-        let mut bucket_total: Vec<usize> = vec![0; period];
-        let mut bucket_missing: Vec<usize> = vec![0; period];
-        for (i, &v) in self.values.iter().enumerate() {
-            bucket_total[i % period] += 1;
-            if !v.is_finite() {
-                bucket_missing[i % period] += 1;
-            }
-        }
-        for (b, (&total, &missing)) in bucket_total.iter().zip(bucket_missing.iter()).enumerate() {
-            if total > 0 && missing as f64 / total as f64 > 0.5 {
-                return Err(ForecastError::InvalidParameter(format!(
-                    "seasonal bucket {} has >50% missing values ({}/{})",
-                    b, missing, total
-                )));
-            }
-        }
-        self.values = result;
-        Ok(())
-    }
-
     /// Impute NaN values in all regressors using the given policy.
     ///
     /// Applies the policy to each regressor vector independently.
@@ -464,7 +156,7 @@ impl TimeSeries {
     pub fn with_imputed_regressors(
         &self,
         policy: MissingValuePolicy,
-    ) -> Result<TimeSeries, ForecastError> {
+    ) -> Result<TimeSeriesFiller, ForecastError> {
         match policy {
             MissingValuePolicy::Drop | MissingValuePolicy::Error => {
                 return Err(ForecastError::InvalidParameter(
@@ -683,122 +375,6 @@ impl TimeSeries {
         Ok(())
     }
 
-    /// Fill missing timestamps in the time series with NULL (NaN) values.
-    ///
-    /// This method generates a complete sequence of timestamps based on the specified
-    ///  frequency and fills in missing timestamps with NaN values. This is useful for
-    /// ensuring a time series has regular intervals before analysis or forecasting.
-    ///
-    /// # Arguments
-    ///
-    /// * `frequency` - The frequency to use for gap filling. Can be:
-    ///   - Polars-style string: "30m", "1h", "1d", "1w", "1mo", "1q", "1y"
-    ///   - Duration: `Frequency::Duration(Duration::hours(1))`
-    ///   - Months: `Frequency::Months(1)` for monthly
-    ///   - Years: `Frequency::Years(1)` for yearly
-    ///
-    /// # Returns
-    ///
-    /// A new `TimeSeries` with all gaps filled with NaN values.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use anofox_forecast::core::{TimeSeries, Frequency};
-    /// use chrono::{TimeZone, Utc};
-    ///
-    /// // Create a time series with gaps
-    /// let timestamps = vec![
-    ///     Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-    ///     Utc.with_ymd_and_hms(2024, 1, 1, 1, 0, 0).unwrap(),
-    ///     // Gap at 2:00
-    ///     Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap(),
-    /// ];
-    /// let values = vec![1.0, 2.0, 4.0];
-    ///
-    /// let ts = TimeSeries::univariate(timestamps, values).unwrap();
-    /// let filled = ts.fill_gaps(Frequency::parse("1h").unwrap()).unwrap();
-    ///
-    /// assert_eq!(filled.len(), 4); // Now includes 2:00
-    /// ```
-    pub fn fill_gaps(&mut self, frequency: Frequency) -> Result<(), ForecastError> {
-        if self.len() <= 1 {
-            return Ok(());
-        }
-
-        let start = self.timestamps[0];
-        // SAFETY: `self.is_empty()` and `self.len() == 1` are handled above, so timestamps has >= 2 elements.
-        let end = *self.timestamps.last().unwrap();
-
-        // Generate the expected timestamps based on frequency
-        let expected_timestamps = generate_timestamps(start, end, &frequency)?;
-
-        if expected_timestamps.is_empty() {
-            return Ok(());
-        }
-
-        // Build a map from existing timestamps to their indices
-        let existing: HashMap<DateTime<Utc>, usize> = self
-            .timestamps
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (*t, i))
-            .collect();
-
-        let mut new_values = Vec::with_capacity(expected_timestamps.len());
-
-        // Create new timestamps and values
-        self.timestamps.clear();
-
-        for ts in expected_timestamps {
-            self.timestamps.push(ts);
-            if let Some(&idx) = existing.get(&ts) {
-                new_values.push(self.values[idx]);
-            } else {
-                new_values.push(f64::NAN);
-            }
-        }
-
-        self.values = new_values;
-
-        self.frequency = match &frequency {
-            Frequency::Duration(d) => Some(*d),
-            _ => self.frequency,
-        };
-
-        Ok(())
-    }
-
-    /// Fill gaps using a Polars-style frequency string.
-    ///
-    /// This is a convenience method that parses the frequency string and calls `fill_gaps`.
-    ///
-    /// # Arguments
-    ///
-    /// * `frequency` - A Polars-style frequency string like "30m", "1h", "1d", etc.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use anofox_forecast::core::TimeSeries;
-    /// use chrono::{TimeZone, Utc};
-    ///
-    /// let timestamps = vec![
-    ///     Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-    ///     Utc.with_ymd_and_hms(2024, 1, 1, 2, 0, 0).unwrap(), // Gap at 1:00
-    /// ];
-    /// let values = vec![1.0, 3.0];
-    ///
-    /// let ts = TimeSeries::univariate(timestamps, values).unwrap();
-    /// let filled = ts.fill_gaps_str("1h").unwrap();
-    ///
-    /// assert_eq!(filled.len(), 3);
-    /// ```
-    pub fn fill_gaps_str(&mut self, frequency: &str) -> Result<(), ForecastError> {
-        let freq = Frequency::parse(frequency)?;
-        self.fill_gaps(freq)
-    }
-
     /// Compute the seasonal strength via STL decomposition.
     ///
     /// Returns a value between 0 and 1, where values close to 1 indicate
@@ -927,41 +503,6 @@ impl TimeSeries {
     }
 }
 
-/// Generate a sequence of timestamps from start to end (inclusive) with the given frequency.
-fn generate_timestamps(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    frequency: &Frequency,
-) -> Result<Vec<DateTime<Utc>>, ForecastError> {
-    validate_frequency_positive(frequency)?;
-
-    let mut timestamps = Vec::new();
-    let mut current = start;
-    while current <= end {
-        timestamps.push(current);
-        current = advance_timestamp(current, frequency);
-    }
-
-    Ok(timestamps)
-}
-
-/// Validate that a frequency value is positive.
-#[inline]
-fn validate_frequency_positive(frequency: &Frequency) -> Result<(), ForecastError> {
-    let valid = match frequency {
-        Frequency::Duration(d) => d.num_seconds() > 0,
-        Frequency::Months(m) => *m > 0,
-        Frequency::Years(y) => *y > 0,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(ForecastError::InvalidParameter(
-            "frequency must be positive".to_string(),
-        ))
-    }
-}
-
 /// Generate future timestamps by advancing from a starting point.
 ///
 /// Uses calendar-aware arithmetic for monthly/quarterly/yearly frequencies
@@ -1004,26 +545,6 @@ pub fn generate_future_timestamps(
         result.push(current);
     }
     result
-}
-
-/// Advance a timestamp by one frequency step.
-#[inline]
-fn advance_timestamp(current: DateTime<Utc>, frequency: &Frequency) -> DateTime<Utc> {
-    match frequency {
-        Frequency::Duration(duration) => current + *duration,
-        Frequency::Months(months) => add_months(current, *months),
-        Frequency::Years(years) => add_months(current, *years * 12),
-    }
-}
-
-/// Add months to a DateTime, handling month-end edge cases.
-///
-/// Uses the *original* day (stored in the Frequency step chain via generate_future_timestamps)
-/// rather than the current timestamp's day. This prevents month-end drift:
-/// Jan 31 → Feb 29 → Mar 31 → Apr 30 (correct)
-/// instead of Jan 31 → Feb 29 → Mar 29 → Apr 29 (drift bug).
-fn add_months(dt: DateTime<Utc>, months: i32) -> DateTime<Utc> {
-    add_months_with_target_day(dt, months, dt.day())
 }
 
 /// Add months with a specific target day. If the target day exceeds the
@@ -1135,7 +656,6 @@ fn fill_nan_segment(segment: &mut [f64], left: Option<f64>, right: Option<f64>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_relative_eq;
     use chrono::TimeZone;
 
     fn create_timestamp(year: i32, month: u32, day: u32, hour: u32) -> i64 {
@@ -1163,7 +683,7 @@ mod tests {
         let timestamps = make_timestamps(3);
         let values = vec![1.0, 2.0, 3.0];
 
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let mut ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
 
         assert!(ts.frequency().is_none());
 
@@ -1184,7 +704,7 @@ mod tests {
         ];
         let values = vec![1.0, 2.0, 3.0];
 
-        let result = TimeSeries::univariate(timestamps, values);
+        let result = TimeSeriesFiller::univariate(timestamps, values);
         assert!(matches!(result, Err(ForecastError::TimestampError(_))));
 
         // Duplicate timestamps
@@ -1195,504 +715,15 @@ mod tests {
         ];
         let values = vec![1.0, 2.0, 3.0];
 
-        let result = TimeSeries::univariate(timestamps, values);
+        let result = TimeSeriesFiller::univariate(timestamps, values);
         assert!(matches!(result, Err(ForecastError::TimestampError(_))));
-    }
-
-    #[test]
-    fn time_series_sanitizes_missing_values() {
-        let timestamps = make_timestamps(5);
-
-        // Drop policy
-        let values = vec![1.0, f64::NAN, 3.0, f64::INFINITY, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps.clone(), values).unwrap();
-        assert!(ts.has_missing_values());
-        ts.sanitize(MissingValuePolicy::Drop).unwrap();
-        assert_eq!(ts.len(), 3);
-        assert_eq!(ts.values(), &[1.0, 3.0, 5.0]);
-
-        // Fill policy
-        let values = vec![1.0, f64::NAN, 3.0, f64::INFINITY, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps.clone(), values).unwrap();
-        ts.sanitize(MissingValuePolicy::Fill(0.0)).unwrap();
-        assert_eq!(ts.len(), 5);
-        assert_eq!(ts.values(), &[1.0, 0.0, 3.0, 0.0, 5.0]);
-
-        // ForwardFill policy
-        let values = vec![1.0, f64::NAN, 3.0, f64::INFINITY, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps.clone(), values).unwrap();
-        ts.sanitize(MissingValuePolicy::ForwardFill).unwrap();
-        assert_eq!(ts.values(), &[1.0, 1.0, 3.0, 3.0, 5.0]);
-
-        // Error policy
-        let values = vec![1.0, f64::NAN, 3.0, f64::INFINITY, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        let result = ts.sanitize(MissingValuePolicy::Error);
-        assert!(matches!(result, Err(ForecastError::MissingValues)));
-    }
-
-    #[test]
-    fn calendar_aware_frequency_inference_skips_weekends() {
-        // Create timestamps for a week (Mon-Fri, skipping Sat-Sun)
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(), // Mon
-            Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(), // Tue
-            Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap(), // Wed
-            Utc.with_ymd_and_hms(2024, 1, 4, 0, 0, 0).unwrap(), // Thu
-            Utc.with_ymd_and_hms(2024, 1, 5, 0, 0, 0).unwrap(), // Fri
-            Utc.with_ymd_and_hms(2024, 1, 8, 0, 0, 0).unwrap(), // Mon (skip weekend)
-            Utc.with_ymd_and_hms(2024, 1, 9, 0, 0, 0).unwrap(), // Tue
-        ];
-        let values: Vec<f64> = (0..7).map(|i| i as f64).collect();
-
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        ts.set_calendar(CalendarAnnotations::new());
-
-        let freq = ts.infer_frequency_calendar(0.5).unwrap();
-        assert_eq!(freq, Duration::days(1));
-    }
-
-    #[test]
-    fn time_series_linear_interpolation_fills_gaps() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, f64::NAN, f64::NAN, 4.0, 5.0];
-
-        let mut interpolated = TimeSeries::univariate(timestamps, values).unwrap();
-        interpolated.interpolate(true);
-
-        let result = interpolated.values();
-        assert_relative_eq!(result[0], 1.0, epsilon = 1e-10);
-        assert_relative_eq!(result[1], 2.0, epsilon = 1e-10);
-        assert_relative_eq!(result[2], 3.0, epsilon = 1e-10);
-        assert_relative_eq!(result[3], 4.0, epsilon = 1e-10);
-        assert_relative_eq!(result[4], 5.0, epsilon = 1e-10);
-    }
-
-    #[test]
-    fn time_series_interpolation_fills_edges() {
-        let timestamps = make_timestamps(5);
-        let values = vec![f64::NAN, f64::NAN, 3.0, 4.0, f64::NAN];
-
-        // With edge filling
-        let mut interpolated = TimeSeries::univariate(timestamps.clone(), values.clone()).unwrap();
-        interpolated.interpolate(true);
-        let result = interpolated.values();
-        assert_relative_eq!(result[0], 3.0, epsilon = 1e-10); // Filled with first valid
-        assert_relative_eq!(result[1], 3.0, epsilon = 1e-10);
-        assert_relative_eq!(result[4], 4.0, epsilon = 1e-10); // Filled with last valid
-
-        // Without edge filling — use a fresh copy so NaN edges are present
-        let mut interpolated = TimeSeries::univariate(timestamps, values).unwrap();
-        interpolated.interpolate(false);
-        let result = interpolated.values();
-        assert!(result[0].is_nan()); // Not filled
-        assert!(result[4].is_nan()); // Not filled
-    }
-
-    #[test]
-    fn time_series_infers_regular_frequency() {
-        // Hourly data
-        let timestamps = make_timestamps(10);
-        let values: Vec<f64> = (0..10).map(|i| i as f64).collect();
-
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
-        let freq = ts.infer_frequency(0.5).unwrap();
-
-        assert_eq!(freq, Duration::hours(1));
-    }
-
-    #[test]
-    fn time_series_frequency_inference_requires_unique_modal_spacing() {
-        // Irregular timestamps with no clear pattern
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 1, 0, 0).unwrap(), // 1 hour
-            Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap(), // 2 hours
-            Utc.with_ymd_and_hms(2024, 1, 1, 6, 0, 0).unwrap(), // 3 hours
-            Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap(), // 4 hours
-        ];
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
-        let result = ts.infer_frequency(0.8); // High tolerance
-
-        assert!(matches!(result, Err(ForecastError::FrequencyInference(_))));
-    }
-
-    #[test]
-    fn time_series_detects_partial_day_holiday_occurrences() {
-        // Create timestamps within a single day
-        let base_date = Utc.with_ymd_and_hms(2024, 12, 25, 0, 0, 0).unwrap(); // Christmas
-        let timestamps: Vec<DateTime<Utc>> =
-            (0..24).map(|h| base_date + Duration::hours(h)).collect();
-        let values: Vec<f64> = (0..24).map(|i| i as f64).collect();
-
-        let calendar = CalendarAnnotations::new().with_holidays(vec![base_date]);
-
-        let mut ts = TimeSeries::univariate(timestamps.clone(), values).unwrap();
-        ts.set_calendar(calendar);
-
-        // All timestamps on Christmas day should be holidays
-        for t in &timestamps {
-            assert!(ts.is_holiday(t), "Expected {} to be a holiday", t);
-        }
-
-        // Non-Christmas day should not be a holiday
-        let non_holiday = Utc.with_ymd_and_hms(2024, 12, 26, 12, 0, 0).unwrap();
-        assert!(!ts.is_holiday(&non_holiday));
-    }
-
-    // Gap filling tests
-
-    #[test]
-    fn fill_gaps_with_hourly_frequency() {
-        // Create timestamps with a gap at hour 2
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 1, 0, 0).unwrap(),
-            // Gap at 2:00
-            Utc.with_ymd_and_hms(2024, 1, 1, 3, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 4, 0, 0).unwrap(),
-        ];
-        let values = vec![0.0, 1.0, 3.0, 4.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps_str("1h").unwrap();
-
-        assert_eq!(filled.len(), 5);
-        assert_eq!(
-            filled.timestamps()[2],
-            Utc.with_ymd_and_hms(2024, 1, 1, 2, 0, 0).unwrap()
-        );
-
-        let vals = filled.values();
-        assert_relative_eq!(vals[0], 0.0);
-        assert_relative_eq!(vals[1], 1.0);
-        assert!(vals[2].is_nan()); // Gap filled with NaN
-        assert_relative_eq!(vals[3], 3.0);
-        assert_relative_eq!(vals[4], 4.0);
-    }
-
-    #[test]
-    fn fill_gaps_with_daily_frequency() {
-        // Create timestamps with gaps
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            // Gap at Jan 2
-            Utc.with_ymd_and_hms(2024, 1, 3, 0, 0, 0).unwrap(),
-            // Gap at Jan 4
-            Utc.with_ymd_and_hms(2024, 1, 5, 0, 0, 0).unwrap(),
-        ];
-        let values = vec![1.0, 3.0, 5.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps_str("1d").unwrap();
-
-        assert_eq!(filled.len(), 5);
-
-        let vals = filled.values();
-        assert_relative_eq!(vals[0], 1.0);
-        assert!(vals[1].is_nan()); // Jan 2 - gap
-        assert_relative_eq!(vals[2], 3.0);
-        assert!(vals[3].is_nan()); // Jan 4 - gap
-        assert_relative_eq!(vals[4], 5.0);
-    }
-
-    #[test]
-    fn fill_gaps_with_weekly_frequency() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(), // Week 1
-            Utc.with_ymd_and_hms(2024, 1, 8, 0, 0, 0).unwrap(), // Week 2
-            // Gap at Week 3 (Jan 15)
-            Utc.with_ymd_and_hms(2024, 1, 22, 0, 0, 0).unwrap(), // Week 4
-        ];
-        let values = vec![1.0, 2.0, 4.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps_str("1w").unwrap();
-
-        assert_eq!(filled.len(), 4);
-        assert!(filled.values()[2].is_nan()); // Gap at week 3
-    }
-
-    #[test]
-    fn fill_gaps_with_monthly_frequency() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            // Gap at Feb
-            Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap(),
-        ];
-        let values = vec![1.0, 3.0, 4.0];
-
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        ts.fill_gaps(Frequency::Months(1)).unwrap();
-
-        assert_eq!(ts.len(), 4);
-        assert_eq!(
-            ts.timestamps()[1],
-            Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
-        );
-        assert!(ts.values()[1].is_nan()); // Feb is filled with NaN
-    }
-
-    #[test]
-    fn fill_gaps_with_quarterly_frequency() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(), // Q1
-            // Gap at Q2 (Apr)
-            Utc.with_ymd_and_hms(2024, 7, 1, 0, 0, 0).unwrap(), // Q3
-        ];
-        let values = vec![1.0, 3.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps_str("1q").unwrap();
-
-        assert_eq!(filled.len(), 3);
-        assert_eq!(
-            filled.timestamps()[1],
-            Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap()
-        );
-        assert!(filled.values()[1].is_nan());
-    }
-
-    #[test]
-    fn fill_gaps_with_yearly_frequency() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
-            // Gap at 2021
-            Utc.with_ymd_and_hms(2022, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap(),
-        ];
-        let values = vec![1.0, 3.0, 4.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps(Frequency::Years(1)).unwrap();
-
-        assert_eq!(filled.len(), 4);
-        assert_eq!(
-            filled.timestamps()[1],
-            Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap()
-        );
-        assert!(filled.values()[1].is_nan());
-    }
-
-    #[test]
-    fn fill_gaps_with_30_minute_frequency() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 30, 0).unwrap(),
-            // Gap at 1:00
-            Utc.with_ymd_and_hms(2024, 1, 1, 1, 30, 0).unwrap(),
-        ];
-        let values = vec![1.0, 2.0, 4.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps_str("30m").unwrap();
-
-        assert_eq!(filled.len(), 4);
-        assert_eq!(
-            filled.timestamps()[2],
-            Utc.with_ymd_and_hms(2024, 1, 1, 1, 0, 0).unwrap()
-        );
-        assert!(filled.values()[2].is_nan());
-    }
-
-    #[test]
-    fn fill_gaps_handles_empty_series() {
-        let mut filled = TimeSeries::univariate(vec![], vec![]).unwrap();
-        filled.fill_gaps_str("1h").unwrap();
-        assert!(filled.is_empty());
-    }
-
-    #[test]
-    fn fill_gaps_handles_single_element() {
-        let timestamps = vec![Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()];
-        let values = vec![1.0];
-
-        let mut filled = TimeSeries::univariate(timestamps.clone(), values.clone()).unwrap();
-        filled.fill_gaps_str("1h").unwrap();
-
-        assert_eq!(filled.len(), 1);
-        assert_eq!(filled.timestamps(), &timestamps);
-        assert_eq!(filled.values(), &values);
-    }
-
-    #[test]
-    fn fill_gaps_handles_no_gaps() {
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 1, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 2, 0, 0).unwrap(),
-        ];
-        let values = vec![1.0, 2.0, 3.0];
-
-        let mut filled = TimeSeries::univariate(timestamps.clone(), values.clone()).unwrap();
-        filled.fill_gaps_str("1h").unwrap();
-
-        assert_eq!(filled.len(), 3);
-        assert_eq!(filled.timestamps(), &timestamps);
-        assert_eq!(filled.values(), &values);
-        assert!(!filled.has_missing_values());
-    }
-
-    #[test]
-    fn fill_gaps_month_end_handling() {
-        // Test that month-end dates are handled correctly
-        // Using first-of-month dates to avoid month-end complications
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
-            // Gap at Feb 1
-            Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap(),
-        ];
-        let values = vec![1.0, 3.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps(Frequency::Months(1)).unwrap();
-
-        assert_eq!(filled.len(), 3);
-        // Feb 1 should be generated
-        assert_eq!(
-            filled.timestamps()[1],
-            Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
-        );
-        assert!(filled.values()[1].is_nan());
-    }
-
-    #[test]
-    fn fill_gaps_handles_end_of_month_dates() {
-        // When using month-end dates, ensure they still align correctly
-        // Jan 31 -> Feb 29 (leap year) -> Mar 29 (not 31!)
-        let timestamps = vec![
-            Utc.with_ymd_and_hms(2024, 1, 31, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2024, 2, 29, 0, 0, 0).unwrap(), // Feb 29 exists in original
-        ];
-        let values = vec![1.0, 2.0];
-
-        let mut filled = TimeSeries::univariate(timestamps, values).unwrap();
-        filled.fill_gaps(Frequency::Months(1)).unwrap();
-
-        // Jan 31 + 1mo = Feb 29 (clamped), which matches existing timestamp
-        assert_eq!(filled.len(), 2);
-        assert!(!filled.has_missing_values());
-    }
-
-    // === Missing value imputation tests ===
-
-    #[test]
-    fn backward_fill_basic() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, 2.0, 3.0, f64::NAN, f64::NAN];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::BackwardFill).unwrap();
-        // Trailing NaN left as NaN (no next valid value)
-        assert_relative_eq!(result.values()[0], 1.0);
-        assert_relative_eq!(result.values()[1], 2.0);
-        assert_relative_eq!(result.values()[2], 3.0);
-        assert!(result.values()[3].is_nan());
-        assert!(result.values()[4].is_nan());
-    }
-
-    #[test]
-    fn backward_fill_interior() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, f64::NAN, f64::NAN, 4.0, 5.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::BackwardFill).unwrap();
-        assert_relative_eq!(result.values()[0], 1.0);
-        assert_relative_eq!(result.values()[1], 4.0);
-        assert_relative_eq!(result.values()[2], 4.0);
-        assert_relative_eq!(result.values()[3], 4.0);
-        assert_relative_eq!(result.values()[4], 5.0);
-    }
-
-    #[test]
-    fn backward_fill_leading_nan() {
-        let timestamps = make_timestamps(4);
-        let values = vec![f64::NAN, f64::NAN, 3.0, 4.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::BackwardFill).unwrap();
-        assert_relative_eq!(result.values()[0], 3.0);
-        assert_relative_eq!(result.values()[1], 3.0);
-        assert_relative_eq!(result.values()[2], 3.0);
-        assert_relative_eq!(result.values()[3], 4.0);
-    }
-
-    #[test]
-    fn fill_mean_basic() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::FillMean).unwrap();
-        // Mean of [1, 3, 5] = 3.0
-        assert_relative_eq!(result.values()[0], 1.0);
-        assert_relative_eq!(result.values()[1], 3.0);
-        assert_relative_eq!(result.values()[2], 3.0);
-        assert_relative_eq!(result.values()[3], 3.0);
-        assert_relative_eq!(result.values()[4], 5.0);
-    }
-
-    #[test]
-    fn fill_median_basic() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, f64::NAN, 3.0, f64::NAN, 10.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::FillMedian).unwrap();
-        // Median of [1, 3, 10] = 3.0
-        assert_relative_eq!(result.values()[0], 1.0);
-        assert_relative_eq!(result.values()[1], 3.0);
-        assert_relative_eq!(result.values()[2], 3.0);
-        assert_relative_eq!(result.values()[3], 3.0);
-        assert_relative_eq!(result.values()[4], 10.0);
-    }
-
-    #[test]
-    fn fill_mean_all_nan() {
-        let timestamps = make_timestamps(3);
-        let values = vec![f64::NAN, f64::NAN, f64::NAN];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::FillMean).unwrap();
-        // All-NaN produces NaN fill
-        assert!(result.values()[0].is_nan());
-        assert!(result.values()[1].is_nan());
-        assert!(result.values()[2].is_nan());
-    }
-
-    #[test]
-    fn fill_mean_with_inf() {
-        let timestamps = make_timestamps(4);
-        let values = vec![2.0, f64::INFINITY, 4.0, f64::NAN];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.sanitize(MissingValuePolicy::FillMean).unwrap();
-        // Mean of [2, 4] = 3.0, Inf and NaN both replaced
-        assert_relative_eq!(result.values()[0], 2.0);
-        assert_relative_eq!(result.values()[1], 3.0);
-        assert_relative_eq!(result.values()[2], 4.0);
-        assert_relative_eq!(result.values()[3], 3.0);
-    }
-
-    #[test]
-    fn interpolate_policy_matches_interpolated() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, f64::NAN, f64::NAN, 4.0, 5.0];
-        let mut via_policy = TimeSeries::univariate(timestamps, values).unwrap();
-        let mut via_method = via_policy.clone();
-
-        via_policy
-            .sanitize(MissingValuePolicy::Interpolate)
-            .unwrap();
-        via_method.interpolate(true);
-
-        for (a, b) in via_policy.values().iter().zip(via_method.values().iter()) {
-            assert_relative_eq!(a, b, epsilon = 1e-10);
-        }
     }
 
     #[test]
     fn missing_mask_correct() {
         let timestamps = make_timestamps(5);
         let values = vec![1.0, f64::NAN, 3.0, f64::INFINITY, 5.0];
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
         let mask = ts.missing_mask();
         assert_eq!(mask, vec![false, true, false, true, false]);
     }
@@ -1701,120 +732,8 @@ mod tests {
     fn missing_count_basic() {
         let timestamps = make_timestamps(4);
         let values = vec![1.0, f64::NAN, 3.0, f64::NAN];
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
         assert_eq!(ts.missing_count(), 2);
-    }
-
-    #[test]
-    fn forward_backward_handles_leading() {
-        let timestamps = make_timestamps(5);
-        let values = vec![f64::NAN, f64::NAN, 3.0, f64::NAN, 5.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.impute_forward_backward().unwrap();
-        // Leading NaN filled backward from 3.0, interior NaN filled forward from 3.0
-        assert_relative_eq!(result.values()[0], 3.0);
-        assert_relative_eq!(result.values()[1], 3.0);
-        assert_relative_eq!(result.values()[2], 3.0);
-        assert_relative_eq!(result.values()[3], 3.0);
-        assert_relative_eq!(result.values()[4], 5.0);
-    }
-
-    #[test]
-    fn forward_backward_handles_trailing() {
-        let timestamps = make_timestamps(4);
-        let values = vec![1.0, 2.0, f64::NAN, f64::NAN];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.impute_forward_backward().unwrap();
-        assert_relative_eq!(result.values()[0], 1.0);
-        assert_relative_eq!(result.values()[1], 2.0);
-        // Trailing NaN forward-filled from 2.0
-        assert_relative_eq!(result.values()[2], 2.0);
-        assert_relative_eq!(result.values()[3], 2.0);
-    }
-
-    #[test]
-    fn moving_average_single_gap() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, 2.0, f64::NAN, 4.0, 5.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.impute_moving_average(3).unwrap();
-        // Window of 3: neighbors are 2.0 and 4.0 → mean = 3.0
-        assert_relative_eq!(result.values()[2], 3.0, epsilon = 1e-10);
-    }
-
-    #[test]
-    fn moving_average_adjacent_gaps() {
-        let timestamps = make_timestamps(6);
-        let values = vec![1.0, f64::NAN, f64::NAN, 4.0, 5.0, 6.0];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.impute_moving_average(3).unwrap();
-        // After multi-pass, gaps should be filled
-        assert!(result.values[1].is_finite());
-        assert!(result.values[2].is_finite());
-    }
-
-    #[test]
-    fn moving_average_rejects_even_window() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        assert!(ts.impute_moving_average(4).is_err());
-    }
-
-    #[test]
-    fn moving_average_rejects_zero_window() {
-        let timestamps = make_timestamps(3);
-        let values = vec![1.0, 2.0, 3.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        assert!(ts.impute_moving_average(0).is_err());
-    }
-
-    #[test]
-    fn seasonal_imputation_basic() {
-        // Period 3: positions 0,1,2,0,1,2,0,1,2
-        let timestamps = make_timestamps(9);
-        let values = vec![
-            10.0,
-            20.0,
-            30.0, // cycle 1
-            11.0,
-            21.0,
-            31.0, // cycle 2
-            f64::NAN,
-            22.0,
-            32.0, // cycle 3 - NaN at position 0
-        ];
-        let mut result = TimeSeries::univariate(timestamps, values).unwrap();
-        result.impute_seasonal(3).unwrap();
-        // Position 0 values: [10.0, 11.0], median = 10.5
-        assert_relative_eq!(result.values()[6], 10.5, epsilon = 1e-10);
-    }
-
-    #[test]
-    fn seasonal_imputation_insufficient_data() {
-        let timestamps = make_timestamps(3);
-        let values = vec![1.0, f64::NAN, 3.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        // Period 4 but only 3 data points
-        assert!(ts.impute_seasonal(4).is_err());
-    }
-
-    #[test]
-    fn seasonal_imputation_rejects_zero_period() {
-        let timestamps = make_timestamps(5);
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        assert!(ts.impute_seasonal(0).is_err());
-    }
-
-    #[test]
-    fn seasonal_imputation_rejects_too_many_missing() {
-        // Period 2: bucket 0 has indices [0, 2, 4], bucket 1 has [1, 3, 5]
-        let timestamps = make_timestamps(6);
-        let values = vec![f64::NAN, 1.0, f64::NAN, 2.0, f64::NAN, 3.0];
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
-        // Bucket 0 is 100% NaN (3/3)
-        assert!(ts.impute_seasonal(2).is_err());
     }
 
     #[test]
@@ -1824,7 +743,7 @@ mod tests {
         let calendar =
             CalendarAnnotations::new().with_regressor("x".to_string(), vec![1.0, f64::NAN, 3.0]);
 
-        let mut ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let mut ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
         ts.set_calendar(calendar);
 
         assert!(
@@ -2004,7 +923,7 @@ mod tests {
             .map(|i| ymd(2024, 1, 1) + Duration::days(i))
             .collect();
         let values: Vec<f64> = (0..30).map(|i| i as f64).collect();
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
 
         let future = ts.future_timestamps(5).unwrap();
         assert_eq!(future.len(), 5);
@@ -2022,7 +941,7 @@ mod tests {
             .map(|i| ymd(2024, 1, 1) + Duration::weeks(i))
             .collect();
         let values: Vec<f64> = (0..10).map(|i| i as f64).collect();
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
 
         let future = ts.future_timestamps(3).unwrap();
         assert_eq!(future.len(), 3);
@@ -2037,7 +956,7 @@ mod tests {
         // Build a monthly series using first-of-month dates
         let timestamps: Vec<DateTime<Utc>> = (0..12).map(|i| ymd(2024, 1 + i as u32, 1)).collect();
         let values: Vec<f64> = (0..12).map(|i| i as f64).collect();
-        let ts = TimeSeries::univariate(timestamps, values).unwrap();
+        let ts = TimeSeriesFiller::univariate(timestamps, values).unwrap();
 
         // future_timestamps detects ~30-day spacing and uses Frequency::Months(1)
         let future = ts.future_timestamps(3).unwrap();
@@ -2052,7 +971,7 @@ mod tests {
 
     #[test]
     fn future_timestamps_empty_series_returns_error() {
-        let ts = TimeSeries::univariate(vec![], vec![]).unwrap();
+        let ts = TimeSeriesFiller::univariate(vec![], vec![]).unwrap();
         let result = ts.future_timestamps(5);
         assert!(result.is_err());
         assert!(matches!(result, Err(ForecastError::EmptyData)));
