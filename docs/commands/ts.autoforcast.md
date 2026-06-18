@@ -2,9 +2,10 @@
 
 Automatically select and fit the best forecasting model for a time series, returning predicted future values.
 
-`TS.AUTOFORECAST` evaluates all enabled auto-forecasting model families (AutoARIMA, AutoETS, AutoTheta) and selects the
-best model based on cross-validation error. The command returns the predicted values, model selection metadata, and
-optionally prediction intervals and the ability to persist forecasts into a new or existing time series key.
+`TS.AUTOFORECAST` evaluates all enabled auto-forecasting model families and selects the best model based on
+cross-validation error. By default, AutoARIMA, AutoETS, and AutoTheta are enabled; AutoTBATS, MFLES, and
+MSTL can be enabled via the `MODELS` argument. The command returns the predicted values, model selection
+metadata, and optionally prediction intervals and the ability to persist forecasts into a new or existing time series key.
 
 ## Syntax
 
@@ -69,13 +70,16 @@ When provided, the forecasting models will account for seasonal patterns in the 
 
 Comma-separated list of model families to evaluate. Supported values (case-insensitive):
 
-| Value | Aliases | Description |
-|-------|---------|-------------|
-| `ARIMA` | `AUTOARIMA` | Auto-selected ARIMA/SARIMA model |
-| `ETS` | `AUTOETS` | Automatic exponential smoothing |
-| `THETA` | `AUTOTHETA` | Theta method for forecasting |
+| Value   | Aliases     | Default | Description                                                                 |
+|---------|-------------|---------|-----------------------------------------------------------------------------|
+| `ARIMA` | `AUTOARIMA` | Yes     | Auto-selected ARIMA/SARIMA model                                            |
+| `ETS`   | `AUTOETS`   | Yes     | Automatic exponential smoothing                                             |
+| `THETA` | `AUTOTHETA` | Yes     | Theta method for forecasting                                                |
+| `TBATS` | `AUTOTBATS` | No      | Handles data with complex, multiple seasonalities                           |
+| `MFLES` | —           | No      | Fourier seasonal decomposition with trend learning                          |
+| `MSTL`  | —           | No      | Multiple seasonal-trend decomposition with LOESS                            |
 
-If omitted, all three model families are enabled by default. At least one valid model must be specified.
+If omitted, ARIMA, ETS, and THETA are enabled by default. At least one valid model must be specified.
 </details>
 
 <details open>
@@ -127,15 +131,15 @@ from the last observed timestamp using the series' median sampling interval.
 
 The response is a flat key-value map (array of alternating keys and values) with the following fields:
 
-| Field | Type | Always Present | Description |
-|-------|------|----------------|-------------|
-| `selected_model` | string | Yes | Name of the best model selected (`ARIMA`, `SARIMA`, `ETS`, or `Theta`) |
-| `horizon` | string (int) | Yes | Number of forecast points |
-| `forecast` | array of double | Yes | Predicted values in order |
-| `level` | double | No | Confidence level (only when `LEVEL` is specified) |
-| `lower_interval` | array of double | No | Lower prediction interval bounds |
-| `upper_interval` | array of double | No | Upper prediction interval bounds |
-| `metrics` | map | No | Accuracy metrics map (only when `METRICS` is specified) |
+| Field            | Type            | Always Present | Description                                                                                                    |
+|------------------|-----------------|----------------|----------------------------------------------------------------------------------------------------------------|
+| `model`          | string          | Yes            | Name of the best model selected (`ARIMA`, `SARIMA`, `ETS`, `Theta`, `AutoTBATS`, `MFLES`, or `MSTLForecaster`) |
+| `horizon`        | string (int)    | Yes            | Number of forecast points                                                                                      |
+| `forecast`       | array of double | Yes            | Predicted values in order                                                                                      |
+| `level`          | double          | No             | Confidence level (only when `LEVEL` is specified)                                                              |
+| `lower_interval` | array of double | No             | Lower prediction interval bounds                                                                               |
+| `upper_interval` | array of double | No             | Upper prediction interval bounds                                                                               |
+| `metrics`        | map             | No             | Accuracy metrics map (only when `METRICS` is specified)                                                        |
 
 ### Example Response
 
@@ -174,15 +178,26 @@ cross-validation performance. The model with the lowest error is selected to pro
 - **AutoARIMA**: Automatically determines the optimal ARIMA (p,d,q) or SARIMA (P,D,Q,m) parameters.
 - **AutoETS**: Automatically selects the best ETS (Error-Trend-Seasonality) model.
 - **AutoTheta**: Fits the Theta method, which decomposes the series into short-term and long-term components.
+- **AutoTBATS**: Automatically configures TBATS (Trigonometric seasonality, Box-Cox transformation, ARMA errors,
+  Trend, and Seasonal components). Designed for data with complex, multiple, or non-integer seasonality.
+  Requires `SEASONALITY` to be set.
+- **MFLES**: Multiplicative-Fourier Least-squares Ensemble with Shrinkage. Uses Fourier basis functions for
+  seasonal decomposition with a learned trend component. Supports robust mode and multiplicative handling.
+- **MSTL**: Multiple Seasonal-Trend decomposition using LOESS. Decomposes the series into trend and
+  multiple seasonal components, then forecasts each separately. Supports configurable trend and seasonal
+  forecasting methods.
 
 The returned model name reflects the concrete model variant:
 
-| Internal Name | Returned Name |
-|---------------|---------------|
-| `AutoARIMA` | `ARIMA` |
-| `AutoARIMA (SARIMA)` | `SARIMA` |
-| `AutoETS` | `ETS` |
-| `AutoTheta` | `Theta` |
+| Internal Name        | Returned Name |
+|----------------------|---------------|
+| `AutoARIMA`          | `ARIMA`       |
+| `AutoARIMA (SARIMA)` | `SARIMA`      |
+| `AutoETS`            | `ETS`         |
+| `AutoTheta`          | `Theta`       |
+| `AutoTBATS`          | `AutoTBATS`   |
+| `MFLES`              | `MFLES`       |
+| `MSTL`               | `MSTL`        |
 
 ## Examples
 
