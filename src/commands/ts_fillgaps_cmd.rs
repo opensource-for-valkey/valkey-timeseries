@@ -1,0 +1,158 @@
+use crate::analysis::forecasting::infer_frequency_from_samples;
+use crate::commands::command_parser::{parse_duration_arg, parse_timestamp_range};
+use crate::commands::{CommandArgIterator, parse_timestamp, parse_value_arg};
+use crate::common::{Sample, Timestamp};
+use crate::error_consts;
+use crate::series::{DuplicatePolicy, get_timeseries_mut};
+use std::collections::BTreeSet;
+use std::time::Duration;
+use valkey_module::{
+    AclPermissions, Context, NextArg, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
+    ValkeyValue,
+};
+
+/// ```text
+/// TS.FILLGAPS key startTimestamp endTimestamp
+///   [VALUE value]
+///   [FREQUENCY duration]
+///   [ALIGN alignment_timestamp|start|-]
+///```
+/// Fills missing timestamps in the time series with a fill value (default is NaN)
+/// between startTimestamp and endTimestamp (inclusive).
+///
+/// If FREQUENCY is not specified, the frequency is inferred from the existing data
+/// using a two-step approach: first finding the modal (most common) interval, then
+/// checking whether the GCD of all intervals recovers a finer base frequency (useful
+/// when samples have been deleted from a uniformly-spaced series). At least 2 samples
+/// are required for inference.
+///
+/// If ALIGN is specified, timestamps are snapped to a frequency grid anchored at the
+/// given alignment reference. Use `ALIGN 0` to align to epoch, `ALIGN <timestamp>` for
+/// a custom reference, or `ALIGN start` (or `-`) to align to startTimestamp.
+/// Only timestamps within [startTimestamp, endTimestamp] are filled.
+///
+/// Returns the number of gaps filled.
+pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() < 4 {
+        return Err(ValkeyError::WrongArity);
+    }
+
+    let mut args = args.into_iter().skip(1).peekable();
+
+    let key = args.next_arg()?;
+    let date_range = parse_timestamp_range(&mut args)?;
+    // Get the series (must exist)
+    let mut series = get_timeseries_mut(ctx, &key, true, Some(AclPermissions::UPDATE))?.unwrap();
+
+    let (start_ts, end_ts) = date_range.get_series_range(&series, None, false);
+
+    let mut frequency: Option<Duration> = None;
+    let mut align_timestamp: Option<Timestamp> = None;
+    let mut fill_value = f64::NAN;
+
+    // Parse optional arguments
+    while let Some(arg) = args.next() {
+        hashify::fnc_map_ignore_case!(
+            arg.as_slice(),
+            "FREQUENCY" => {
+                let freq_arg = args.next_arg()?;
+                frequency = Some(parse_duration_arg(&freq_arg)?);
+            },
+            "ALIGN" => {
+                align_timestamp = Some(parse_align(&mut args, start_ts)?);
+            },
+            "VALUE" => {
+                let value_arg = args.next_arg()?;
+                fill_value = parse_value_arg(&value_arg)?;
+            },
+            _ => {
+                return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
+            }
+        );
+    }
+
+    // Get existing samples in the range
+    let existing_samples = series.get_range(start_ts, end_ts);
+
+    // Build a set of existing timestamps for O(1) lookup
+    let existing_timestamps: BTreeSet<Timestamp> =
+        existing_samples.iter().map(|s| s.timestamp).collect();
+
+    // Determine frequency
+    let frequency = match frequency {
+        Some(dur) => dur,
+        None => {
+            // Infer frequency from existing samples
+            infer_frequency_from_samples(&existing_samples)
+        }?,
+    };
+
+    if frequency.is_zero() {
+        return Err(ValkeyError::String(
+            "TSDB: frequency must be positive".to_string(),
+        ));
+    }
+
+    // Generate expected timestamps and find gaps
+    let mut gap_samples = Vec::new();
+    let aligned_start = calc_range_start(start_ts, align_timestamp, frequency);
+
+    let freq_ms = frequency.as_millis() as i64;
+    let mut current_ts = aligned_start;
+    while current_ts <= end_ts {
+        if current_ts >= start_ts && !existing_timestamps.contains(&current_ts) {
+            gap_samples.push(Sample::new(current_ts, fill_value));
+        }
+
+        match current_ts.checked_add(freq_ms) {
+            Some(next) => current_ts = next,
+            None => break,
+        }
+    }
+
+    let gaps_filled = gap_samples.len();
+
+    if gaps_filled > 0 {
+        // Sort samples by timestamp for merge
+        gap_samples.sort_by_key(|s| s.timestamp);
+        let results = series.merge_samples(&gap_samples, Some(DuplicatePolicy::Block))?;
+
+        let any_valid = results.iter().any(|res| res.is_ok());
+        if any_valid {
+            handle_replication(ctx, &key);
+        }
+    }
+
+    Ok(ValkeyValue::from(gaps_filled as i64))
+}
+
+fn parse_align(args: &mut CommandArgIterator, start_ts: Timestamp) -> ValkeyResult<Timestamp> {
+    // ALIGN token already seen
+    let alignment_str = args.next_str()?.to_lowercase();
+    // accept "start", "-", or a timestamp as alignment options
+    if alignment_str == "start" || alignment_str == "-" {
+        return Ok(start_ts);
+    }
+    parse_timestamp(&alignment_str)
+        .map_err(|_| ValkeyError::Str("TSDB: invalid ALIGN timestamp value"))
+}
+
+fn handle_replication(ctx: &Context, key: &ValkeyString) {
+    ctx.replicate_verbatim();
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.fillgaps", key);
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", key);
+}
+
+fn calc_range_start(
+    start_ts: Timestamp,
+    align_timestamp: Option<Timestamp>,
+    freq: Duration,
+) -> Timestamp {
+    let align_ts = match align_timestamp {
+        None => return start_ts,
+        Some(ts) => ts,
+    };
+    let diff = start_ts - align_ts;
+    let delta = freq.as_millis() as i64;
+    (start_ts - ((diff % delta + delta) % delta)).max(0)
+}

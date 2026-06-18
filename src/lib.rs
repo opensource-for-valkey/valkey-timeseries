@@ -255,6 +255,7 @@ valkey_module! {
         ["TS.PERIODS", commands::ts_periods_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
         ["TS.AUTOCORRELATION", commands::ts_autocorrelation_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
         ["TS.TREND", commands::ts_trend_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
+        ["TS.FILLGAPS", commands::ts_fillgaps_cmd, "write deny-oom", 1, 1, 1, "write timeseries"],
         ["TS.FEATURES", commands::ts_features_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
         ["TS.STATIONARITY", commands::ts_stationarity_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
         ["TS._DEBUG", commands::ts_debug_cmd, "readonly", 0, 0, 0, "read timeseries admin"],
