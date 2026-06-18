@@ -1,15 +1,16 @@
 mod data_prep;
 pub mod features;
-mod utils;
+mod imputation;
 mod parsers;
+mod utils;
 
-pub use utils::*;
 pub use parsers::*;
+pub use utils::*;
 
 // for some reason, Forecaster is not implemented for Box<dyn Forecaster> in the anofox_forecast crate, so we need to re-export it here
-use anofox_forecast::models::{BoxedForecaster, FittedParams, Forecaster};
 use anofox_forecast::core::{Forecast, TimeSeries};
 use anofox_forecast::error::Result;
+use anofox_forecast::models::{BoxedForecaster, FittedParams, Forecaster};
 
 pub struct DynForecaster(BoxedForecaster);
 
@@ -149,6 +150,7 @@ impl Forecaster for DynForecaster {
         future_regressors: &std::collections::HashMap<String, Vec<f64>>,
         level: f64,
     ) -> Result<Forecast> {
-        self.0.predict_with_exog_intervals(horizon, future_regressors, level)
+        self.0
+            .predict_with_exog_intervals(horizon, future_regressors, level)
     }
 }
