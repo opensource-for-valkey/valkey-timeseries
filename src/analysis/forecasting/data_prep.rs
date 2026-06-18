@@ -17,6 +17,19 @@ use simd_json::prelude::{ArrayTrait, IndexedMut};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 
+fn parse_missing_value_policy(policy: &str) -> Option<MissingValuePolicy> {
+    match policy {
+        "Drop" => Some(MissingValuePolicy::Drop),
+        "FillWithMean" => Some(MissingValuePolicy::FillMean),
+        "FillWithMedian" => Some(MissingValuePolicy::FillMedian),
+        "ForwardFill" => Some(MissingValuePolicy::ForwardFill),
+        "BackwardFill" => Some(MissingValuePolicy::BackwardFill),
+        "Interpolate" => Some(MissingValuePolicy::Interpolate),
+        "Error" => Some(MissingValuePolicy::Error),
+        _ => None,
+    }
+}
+
 /// A time series with timestamps and values.
 #[derive(Debug, Clone)]
 pub struct TimeSeries {
