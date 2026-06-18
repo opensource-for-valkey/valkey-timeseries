@@ -1,22 +1,21 @@
-mod utils;
 mod model_parser;
 mod model_spec_parser;
+mod utils;
 
 pub use model_parser::*;
-pub use model_spec_parser::parse_model_specs;
 pub use utils::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, strum::EnumString, strum::Display)]
 pub enum ForecastModelKind {
-    ARIMA,
-    AutoARIMA,
-    SARIMA,
-    TBATS,
-    AutoTBATS,
+    Arima,
+    AutoArima,
+    Sarima,
+    Tbats,
+    AutoTbats,
     Theta,
-    MSTL,
-    MFLES,
+    Mstl,
+    Mfles,
     Naive,
-    ETS,
-    AutoETS,
+    Ets,
+    AutoEts,
 }

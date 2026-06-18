@@ -24,15 +24,15 @@ pub fn build_models_from_specs(input: &str) -> Result<Vec<BoxedForecaster>, Mode
 
 pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     match spec.model_type {
-        ForecastModelKind::ARIMA => {
+        ForecastModelKind::Arima => {
             spec.ensure_arity(3)?;
             let ints = spec.get_positionals_as_usize()?;
             Ok(Box::new(ARIMA::new(ints[0], ints[1], ints[2])))
         }
-        ForecastModelKind::AutoARIMA => handle_auto_arima(&mut spec),
-        ForecastModelKind::ETS => handle_ets(&mut spec),
-        ForecastModelKind::AutoETS => handle_auto_ets(&mut spec), // Fallback (should have returned earlier)
-        ForecastModelKind::SARIMA => {
+        ForecastModelKind::AutoArima => handle_auto_arima(&mut spec),
+        ForecastModelKind::Ets => handle_ets(&mut spec),
+        ForecastModelKind::AutoEts => handle_auto_ets(&mut spec), // Fallback (should have returned earlier)
+        ForecastModelKind::Sarima => {
             let ints = spec.get_positionals_as_usize()?;
             let forecaster = match spec.positional_args.len() {
                 3 => SARIMA::new(ints[0], ints[1], ints[2], 0, 0, 0, 0),
@@ -47,11 +47,11 @@ pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelS
             };
             Ok(Box::new(forecaster))
         }
-        ForecastModelKind::TBATS => handle_tbats(&mut spec),
-        ForecastModelKind::AutoTBATS => handle_auto_tbats(&mut spec),
+        ForecastModelKind::Tbats => handle_tbats(&mut spec),
+        ForecastModelKind::AutoTbats => handle_auto_tbats(&mut spec),
         ForecastModelKind::Theta => handle_theta(&mut spec),
-        ForecastModelKind::MSTL => handle_mstl(&mut spec),
-        ForecastModelKind::MFLES => handle_mfles(&mut spec),
+        ForecastModelKind::Mstl => handle_mstl(&mut spec),
+        ForecastModelKind::Mfles => handle_mfles(&mut spec),
         ForecastModelKind::Naive => handle_naive(&mut spec),
     }
 }
@@ -66,18 +66,18 @@ fn try_as_seasonal_period(arg: &SpecValue) -> Result<usize, ModelSpecError> {
 }
 
 pub fn get_seasonal_period(spec: &mut ModelSpec) -> Result<Option<usize>, ModelSpecError> {
-    match get_seasonal_periods(spec)? {
-        Some(mut periods) => {
-            if periods.len() > 1 {
-                return Err(ModelSpecError::new(format!(
-                    "Expected 'seasonal_period' argument for model {} to be a single positive integer, but got a list of multiple periods",
-                    spec.model_name
-                )));
-            }
-            Ok(periods.pop())
-        }
-        None => Ok(None),
+    let Some(mut periods) = get_seasonal_periods(spec)? else {
+        return Ok(None);
+    };
+
+    if periods.len() > 1 {
+        return Err(ModelSpecError::new(format!(
+            "Expected 'seasonal_period' argument for model {} to be a single positive integer, but got a list of multiple periods",
+            spec.model_name
+        )));
     }
+
+    Ok(periods.pop())
 }
 
 pub fn get_seasonal_periods(spec: &mut ModelSpec) -> Result<Option<Vec<usize>>, ModelSpecError> {
@@ -132,28 +132,22 @@ fn handle_auto_arima(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecE
         ));
     }
 
-    let forecaster = if let Some(period) = get_seasonal_period(spec)? {
+    Ok(Box::new(if let Some(period) = get_seasonal_period(spec)? {
         AutoARIMA::seasonal(period)
     } else {
         AutoARIMA::new()
-    };
-
-    Ok(Box::new(forecaster))
+    }))
 }
 
 fn handle_mfles(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     // MFLES requires at least one seasonal period, so if none provided, return error instead of defaulting to 12.
     // This is how the current library code functions internally currently
-    let periods = if let Some(periods) = get_seasonal_periods(spec)? {
-        periods
-    } else {
-        vec![12]
-    };
+    let periods = get_seasonal_periods(spec)?.unwrap_or_else(|| vec![12]);
 
     let mut forecaster = MFLES::new(periods);
 
     if let Some(max_rounds) = get_usize_kwarg(spec, "max_rounds")? {
-        forecaster = forecaster.with_max_rounds(max_rounds as usize);
+        forecaster = forecaster.with_max_rounds(max_rounds);
     }
 
     if let Some(seasonal_lr) = get_float_kwarg(spec, "seasonal_lr")? {
@@ -187,21 +181,14 @@ fn handle_mstl(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> 
 
     let mut forecaster = MSTLForecaster::new(ints);
 
-    if let Some(iterations) =
-        crate::analysis::forecasting::parsers::model_spec_parser::get_usize_kwarg(
-            spec,
-            "iterations",
-        )?
-    {
+    if let Some(iterations) = get_usize_kwarg(spec, "iterations")? {
         forecaster = forecaster.with_iterations(iterations);
     }
 
     if let Some(robust) = get_kwarg_as_flag(spec, "robust")?
         && robust
     {
-        if robust {
-            forecaster = forecaster.robust();
-        }
+        forecaster = forecaster.robust();
     }
 
     if let Some(trend_method) = get_trend_forecast_method(spec)? {
@@ -223,9 +210,7 @@ fn handle_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError>
         ));
     }
 
-    let forecaster = Naive::new();
-
-    Ok(Box::new(forecaster))
+    Ok(Box::new(Naive::new()))
 }
 fn handle_tbats(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     let ints = spec.get_positionals_as_usize()?;
@@ -308,13 +293,11 @@ fn handle_auto_ets(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecErr
         ));
     }
 
-    let forecaster = if let Some(period) = get_seasonal_period(spec)? {
+    Ok(Box::new(if let Some(period) = get_seasonal_period(spec)? {
         AutoETS::with_period(period)
     } else {
         AutoETS::new()
-    };
-
-    Ok(Box::new(forecaster))
+    }))
 }
 
 // ETS/AutoETS have mixed positional args (notation string + optional integer),
@@ -394,11 +377,11 @@ fn get_trend_forecast_method(
     spec: &mut ModelSpec,
 ) -> Result<Option<TrendForecastMethod>, ModelSpecError> {
     if let Some(arg) = spec.remove_kwarg("trend_forecast_method") {
-        if let SpecValue::Ident(arg) = &arg {
-            if let Some(method) = parse_trend_forecast_method(arg.as_str()) {
-                return Ok(Some(method));
-            };
-        }
+        if let SpecValue::Ident(arg) = &arg
+            && let Some(method) = parse_trend_forecast_method(arg.as_str())
+        {
+            return Ok(Some(method));
+        };
         Err(ModelSpecError::new(format!(
             "Invalid trend forecast method '{arg}' for model {}",
             spec.model_name
@@ -412,11 +395,11 @@ fn get_seasonal_forecast_method(
     spec: &mut ModelSpec,
 ) -> Result<Option<SeasonalForecastMethod>, ModelSpecError> {
     if let Some(arg) = spec.remove_kwarg("seasonal_forecast_method") {
-        if let SpecValue::Ident(arg) | SpecValue::String(arg) = &arg {
-            if let Some(method) = parse_seasonal_forecast_method(arg.as_str()) {
-                return Ok(Some(method));
-            };
-        }
+        if let SpecValue::Ident(arg) | SpecValue::String(arg) = &arg
+            && let Some(method) = parse_seasonal_forecast_method(arg.as_str())
+        {
+            return Ok(Some(method));
+        };
         Err(ModelSpecError::new(format!(
             "Invalid seasonal forecast method '{arg}' for model {}",
             spec.model_name
