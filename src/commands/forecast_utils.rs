@@ -1,14 +1,14 @@
 use crate::analysis::forecasting::make_forecast_time_series;
+use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::parse_series_range_samples;
 use crate::commands::ts_autoforecast::reply_with_interval_array;
 use crate::commands::utils::{get_store_key_pos, reply_with_double_array};
-use crate::commands::CommandArgIterator;
 use crate::common::replies::{
-    reply_with_double, reply_with_map, reply_with_str, reply_with_usize, ThreadSafeReplyContext,
+    ThreadSafeReplyContext, reply_with_double, reply_with_map, reply_with_str, reply_with_usize,
 };
 use anofox_forecast::core::{Forecast, TimeSeries as ForecastTimeSeries};
 use anofox_forecast::models::Forecaster;
-use anofox_forecast::prelude::{calculate_metrics, AccuracyMetrics};
+use anofox_forecast::prelude::{AccuracyMetrics, calculate_metrics};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
 pub(super) fn handle_forecast_key_pos_request(
@@ -17,7 +17,7 @@ pub(super) fn handle_forecast_key_pos_request(
 ) -> ValkeyResult<bool> {
     if ctx.is_keys_position_request() {
         ctx.key_at_pos(1); // key is always at position 1
-        if let Some(store_pos) = get_store_key_pos(&args)? {
+        if let Some(store_pos) = get_store_key_pos(args)? {
             ctx.key_at_pos(store_pos as i32);
         }
         return Ok(true);
@@ -34,7 +34,7 @@ pub(super) fn parse_timeseries_for_forecast(
         .map_err(|_e| ValkeyError::Str("TSDB: Failed to prepare time series for forecasting"))
 }
 
-pub struct ForecastOutput{
+pub struct ForecastOutput {
     pub(crate) model_name: String,
     horizon: usize,
     level: Option<f64>,
@@ -51,9 +51,9 @@ pub(super) fn run_forecast<T: Forecaster>(
     seasonal_period: Option<usize>,
 ) -> Result<ForecastOutput, ValkeyError> {
     let res = if let Some(level) = level {
-        model.fit_predict_with_intervals(&series, horizon, level / 100.0)
+        model.fit_predict_with_intervals(series, horizon, level / 100.0)
     } else {
-        model.fit_predict(&series, horizon)
+        model.fit_predict(series, horizon)
     };
 
     let forecast = match res {
@@ -180,7 +180,7 @@ pub(super) fn reply_with_forecast_output(
     reply_with_str(ctx, "horizon");
     reply_with_usize(ctx, forecast_output.horizon);
     reply_with_str(ctx, "forecast");
-    reply_with_double_array(&ctx, predicted_values);
+    reply_with_double_array(ctx, predicted_values);
 
     if forecast.has_lower() || forecast.has_upper() {
         reply_with_str(ctx, "level");
@@ -191,13 +191,13 @@ pub(super) fn reply_with_forecast_output(
     }
 
     if let Some(lower_values) = lower_interval {
-        reply_with_interval_array(&ctx, "lower_interval", lower_values);
+        reply_with_interval_array(ctx, "lower_interval", lower_values);
     }
     if let Some(upper_values) = upper_interval {
-        reply_with_interval_array(&ctx, "upper_interval", upper_values);
+        reply_with_interval_array(ctx, "upper_interval", upper_values);
     }
 
     if let Some(m) = forecast_output.metrics.as_ref() {
-        reply_with_accuracy_metrics(&ctx, m);
+        reply_with_accuracy_metrics(ctx, m);
     }
 }
