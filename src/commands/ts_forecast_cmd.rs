@@ -1,12 +1,17 @@
+use crate::analysis::forecasting::DynForecaster;
 use crate::analysis::forecasting::build_models_from_specs;
-use crate::commands::command_parser::{parse_forecast_confidence_level, parse_forecast_horizon_value};
-use crate::commands::forecast_utils::{handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output, run_forecast, ForecastOutput};
 use crate::commands::CommandArgIterator;
-use crate::common::replies::{block_client, reply_with_array, ThreadSafeReplyContext};
+use crate::commands::command_parser::{
+    parse_forecast_confidence_level, parse_forecast_horizon_value,
+};
+use crate::commands::forecast_utils::{
+    ForecastOutput, handle_forecast_key_pos_request, parse_timeseries_for_forecast,
+    reply_with_forecast_output, run_forecast,
+};
+use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_array};
 use crate::series::TimestampRange;
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::models::BoxedForecaster;
-use crate::analysis::forecasting::DynForecaster;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 #[derive(Default)]
@@ -51,14 +56,18 @@ pub(crate) fn ts_forecast_command(ctx: &mut Context, args: Vec<ValkeyString>) ->
     Ok(ValkeyValue::NoReply)
 }
 
-fn process_forecast(ctx: ThreadSafeReplyContext, series: ForecastTimeSeries, options: ForecastOptions) {
+fn process_forecast(
+    ctx: ThreadSafeReplyContext,
+    series: ForecastTimeSeries,
+    options: ForecastOptions,
+) {
     let models = match build_models_from_specs(&options.models_spec) {
         Ok(models) => models,
         Err(e) => {
             let err = ValkeyError::String(format!("TSDB: error parsing MODELS: {:?}", e));
             ctx.reply(Err(err));
             return;
-        },
+        }
     };
 
     let results = match process_models(&series, models, &options) {
@@ -66,7 +75,7 @@ fn process_forecast(ctx: ThreadSafeReplyContext, series: ForecastTimeSeries, opt
         Err(e) => {
             ctx.reply(Err(e));
             return;
-        },
+        }
     };
 
     reply_with_array(&ctx, results.len());
@@ -79,11 +88,11 @@ fn process_models(
     series: &ForecastTimeSeries,
     models: Vec<BoxedForecaster>,
     options: &ForecastOptions,
-) -> ValkeyResult<Vec<ForecastOutput>>{
-     let mut results = Vec::new();
-     let mut models: Vec<DynForecaster> = models.into_iter().map(DynForecaster::from).collect();
-     for model in models.iter_mut() {
-         let output = run_forecast(
+) -> ValkeyResult<Vec<ForecastOutput>> {
+    let mut results = Vec::new();
+    let mut models: Vec<DynForecaster> = models.into_iter().map(DynForecaster::from).collect();
+    for model in models.iter_mut() {
+        let output = run_forecast(
             series,
             model,
             options.horizon,
@@ -127,10 +136,12 @@ fn parse_forecast_args(args: &mut CommandArgIterator) -> ValkeyResult<ForecastOp
     if !horizon_set {
         return Err(ValkeyError::Str("TSDB: HORIZON is required"));
     }
-    
+
     if options.models_spec.is_empty() {
-        return Err(ValkeyError::Str("TSDB: MODELS must contain at least one model specification"));
+        return Err(ValkeyError::Str(
+            "TSDB: MODELS must contain at least one model specification",
+        ));
     }
-    
+
     Ok(options)
 }

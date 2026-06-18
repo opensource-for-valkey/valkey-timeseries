@@ -1,5 +1,6 @@
 pub mod command_parser;
 mod fanout_codec;
+mod forecast_utils;
 mod label_search_utils;
 mod ts_add;
 mod ts_addbulk;
@@ -18,6 +19,7 @@ mod ts_del;
 mod ts_deleterule;
 mod ts_features;
 mod ts_fillgaps_cmd;
+mod ts_forecast_cmd;
 mod ts_get;
 mod ts_incr_decr_by;
 mod ts_info;
@@ -43,8 +45,6 @@ mod ts_range;
 mod ts_stationarity;
 mod ts_trend;
 mod utils;
-mod ts_forecast_cmd;
-mod forecast_utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
 // each `ts_*_cmd` function (see the individual `ts_*` modules), so they no longer need to be

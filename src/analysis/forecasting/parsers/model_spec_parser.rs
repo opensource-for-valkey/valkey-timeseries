@@ -1,7 +1,7 @@
+use super::ForecastModelKind;
 use logos::Logos;
 use std::collections::HashSet;
 use std::fmt::Display;
-use super::ForecastModelKind;
 
 #[derive(Clone, PartialEq)]
 pub enum ValueType {
@@ -29,7 +29,7 @@ pub enum SpecValue {
     Number(f64),
     Ident(String),
     String(String),
-    Flag(bool), // For flag-style kwargs like "seasonal=True"
+    Flag(bool),           // For flag-style kwargs like "seasonal=True"
     List(Vec<SpecValue>), // to support list-style kwargs like "seasonal_periods=[12,24]"
 }
 
@@ -95,12 +95,14 @@ impl SpecValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+pub type KeywordArgs = Vec<(String, SpecValue)>;
+
+#[derive(Debug, Clone)]
 pub struct ModelSpec {
     pub model_name: String,
     pub model_type: ForecastModelKind,
     pub positional_args: Vec<SpecValue>,
-    pub keyword_args: Vec<(String, SpecValue)>,
+    pub keyword_args: KeywordArgs,
 }
 
 impl ModelSpec {
@@ -180,8 +182,7 @@ impl ModelSpec {
     }
 
     pub fn get_positionals_as_usize(&self) -> Result<Vec<usize>, ModelSpecError> {
-        self
-            .positional_args
+        self.positional_args
             .iter()
             .map(as_usize)
             .collect::<Result<Vec<_>, _>>()
@@ -199,9 +200,9 @@ impl Display for ModelSpec {
         }
         for (i, (k, v)) in self.keyword_args.iter().enumerate() {
             if i == 0 && self.positional_args.is_empty() {
-                write!(f, "{}", format!("{}={}", k, v))?;
+                write!(f, "{}={}", k, v)?;
             } else {
-                write!(f, ", {}", format!("{}={}", k, v))?;
+                write!(f, ", {}={}", k, v)?;
             }
         }
         write!(f, ")")?;
@@ -289,9 +290,9 @@ fn parse_ident(lex: &mut logos::Lexer<Token>) -> Option<String> {
 }
 
 pub fn parse_model_specs(input: &str) -> Result<Vec<ModelSpec>, ModelSpecError> {
-    let mut lexer = Token::lexer(input);
+    let lexer = Token::lexer(input);
     let mut tokens = Vec::new();
-    while let Some(token) = lexer.next() {
+    for token in lexer {
         let token =
             token.map_err(|_| ModelSpecError::new("Invalid token in model specification"))?;
         tokens.push(token);
@@ -300,7 +301,10 @@ pub fn parse_model_specs(input: &str) -> Result<Vec<ModelSpec>, ModelSpecError> 
     parser.parse_input()
 }
 
-pub(super) fn get_usize_kwarg(spec: &mut ModelSpec, key: &str) -> Result<Option<usize>, ModelSpecError> {
+pub(super) fn get_usize_kwarg(
+    spec: &mut ModelSpec,
+    key: &str,
+) -> Result<Option<usize>, ModelSpecError> {
     if let Some(arg) = spec.remove_kwarg(key) {
         return match arg {
             SpecValue::Number(n) if n >= 0.0 && n.fract() == 0.0 => Ok(Some(n as usize)),
@@ -313,7 +317,10 @@ pub(super) fn get_usize_kwarg(spec: &mut ModelSpec, key: &str) -> Result<Option<
     Ok(None)
 }
 
-pub(super) fn get_float_kwarg(spec: &mut ModelSpec, key: &str) -> Result<Option<f64>, ModelSpecError> {
+pub(super) fn get_float_kwarg(
+    spec: &mut ModelSpec,
+    key: &str,
+) -> Result<Option<f64>, ModelSpecError> {
     if let Some(arg) = spec.remove_kwarg(key) {
         match arg {
             SpecValue::Number(n) => Ok(Some(n)),
@@ -327,7 +334,10 @@ pub(super) fn get_float_kwarg(spec: &mut ModelSpec, key: &str) -> Result<Option<
     }
 }
 
-pub(super) fn get_kwarg_as_flag(spec: &mut ModelSpec, key: &str) -> Result<Option<bool>, ModelSpecError> {
+pub(super) fn get_kwarg_as_flag(
+    spec: &mut ModelSpec,
+    key: &str,
+) -> Result<Option<bool>, ModelSpecError> {
     if let Some(value) = spec.remove_kwarg(key) {
         match value {
             SpecValue::Flag(n) => Ok(Some(n)),
@@ -405,7 +415,10 @@ impl Parser {
         let specs = self.parse_model_spec_sequence(has_brackets)?;
 
         if has_brackets {
-            self.expect(&Token::RBracket, "Expected ']' after model specification list")?;
+            self.expect(
+                &Token::RBracket,
+                "Expected ']' after model specification list",
+            )?;
         }
 
         if !self.is_eof() {
@@ -472,9 +485,7 @@ impl Parser {
         })
     }
 
-    fn parse_arg_list(
-        &mut self,
-    ) -> Result<(Vec<SpecValue>, Vec<(String, SpecValue)>), ModelSpecError> {
+    fn parse_arg_list(&mut self) -> Result<(Vec<SpecValue>, KeywordArgs), ModelSpecError> {
         let mut positional = Vec::new();
         let mut keyword = Vec::new();
         let mut seen_keyword = false;
@@ -587,7 +598,7 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_model_specs, SpecValue};
+    use super::{SpecValue, parse_model_specs};
 
     #[test]
     fn parses_multiple_models_with_numbers_and_ident_values() {

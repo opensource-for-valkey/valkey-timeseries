@@ -1,21 +1,21 @@
 use crate::analysis::forecasting::normalize_model_name;
-use crate::commands::command_parser::{parse_forecast_confidence_level, parse_forecast_horizon_value};
-use crate::commands::forecast_utils::{handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output, run_forecast};
-use crate::commands::utils::reply_with_double_array;
 use crate::commands::CommandArgIterator;
-use crate::common::replies::{
-    block_client, reply_with_str,
-    ThreadSafeReplyContext,
+use crate::commands::command_parser::{
+    parse_forecast_confidence_level, parse_forecast_horizon_value,
 };
+use crate::commands::forecast_utils::{
+    handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output,
+    run_forecast,
+};
+use crate::commands::utils::reply_with_double_array;
+use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_str};
 use crate::common::time::compute_median_step_ms;
 use crate::common::{Sample, Timestamp};
-use crate::series::{create_or_update_series_with_samples, TimestampRange};
+use crate::series::{TimestampRange, create_or_update_series_with_samples};
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::detection::detect_dominant_period;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
-use valkey_module::{
-    Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 struct AutoForecastOptions {
     date_range: TimestampRange,
@@ -75,7 +75,6 @@ pub(crate) fn ts_autoforecast_cmd(ctx: &Context, args: Vec<ValkeyString>) -> Val
     // Reply will be sent from the background thread
     Ok(ValkeyValue::NoReply)
 }
-
 
 fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoForecastOptions> {
     let mut options = AutoForecastOptions::default();
@@ -163,7 +162,10 @@ fn process_forecast(
     let model = AutoForecast::with_config(options.config);
 
     // { model: "ARIMA", horizon: 5, forecast: [...], lower_interval: [...], upper_interval: [...] }
-    let model_name = model.selected_model_name().map(|s| s.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let model_name = model
+        .selected_model_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let selected_model = normalize_model_name(&model_name);
     let mut model_ = Box::new(model);
     let output = run_forecast(
@@ -174,7 +176,7 @@ fn process_forecast(
         options.metrics,
         seasonal_period,
     );
-    
+
     let mut output = match output {
         Ok(o) => o,
         Err(err) => {
@@ -189,14 +191,22 @@ fn process_forecast(
 
     let forecast = &output.forecast;
     // If STORE was specified, persist the predicted values into the target timeseries key.
-    if let Some(dest) = destination && !dest.is_empty() {
-        store_if_necessary(&ctx, dest, &forecast.primary(), last_timestamp_ms, step_ms);
+    if let Some(dest) = destination
+        && !dest.is_empty()
+    {
+        store_if_necessary(&ctx, dest, forecast.primary(), last_timestamp_ms, step_ms);
     }
 
     reply_with_forecast_output(&ctx, &output);
 }
 
-fn store_if_necessary(ctx: &ThreadSafeReplyContext, destination: String, forecast: &[f64], last_ts: Option<Timestamp>, step_ms: Option<i64>) {
+fn store_if_necessary(
+    ctx: &ThreadSafeReplyContext,
+    destination: String,
+    forecast: &[f64],
+    last_ts: Option<Timestamp>,
+    step_ms: Option<i64>,
+) {
     // Attempt to store the forecasted values in the specified key, but don't fail the entire command if this doesn't work.
     let lock = ctx.lock();
     let key = lock.create_string(destination);
@@ -208,9 +218,7 @@ fn store_if_necessary(ctx: &ThreadSafeReplyContext, destination: String, forecas
             .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value))
             .collect();
 
-        if let Err(e) =
-            create_or_update_series_with_samples(&lock, &key, None, &samples, None)
-        {
+        if let Err(e) = create_or_update_series_with_samples(&lock, &key, None, &samples, None) {
             let msg = format!("TSDB: failed to store forecast in key '{}': {}", key, e);
             ctx.log_warning(&msg);
         }
@@ -221,7 +229,11 @@ fn store_if_necessary(ctx: &ThreadSafeReplyContext, destination: String, forecas
     }
 }
 
-pub(super) fn reply_with_interval_array(ctx: &ThreadSafeReplyContext, name: &'static str, values: &[f64]) {
+pub(super) fn reply_with_interval_array(
+    ctx: &ThreadSafeReplyContext,
+    name: &'static str,
+    values: &[f64],
+) {
     reply_with_str(ctx, name);
     reply_with_double_array(ctx, values);
 }
