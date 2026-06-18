@@ -1,5 +1,5 @@
 use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
-use crate::common::Timestamp;
+use crate::common::{Sample, Timestamp};
 use crate::common::binop::ComparisonOperator;
 use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
@@ -22,7 +22,7 @@ use crate::series::request_types::{
     MetaDateRangeFilter, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
-use crate::series::{TimestampRange, TimestampValue};
+use crate::series::{get_timeseries, TimestampRange, TimestampValue};
 use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
@@ -31,7 +31,7 @@ use std::iter::{Peekable, Skip};
 use std::time::Duration;
 use std::vec::IntoIter;
 use strum_macros::EnumIter;
-use valkey_module::{NextArg, ValkeyError, ValkeyResult, ValkeyString};
+use valkey_module::{AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
 pub const MAX_TS_VALUES_FILTER: usize = 128;
 
@@ -304,6 +304,25 @@ pub fn parse_timestamp_range(args: &mut CommandArgIterator) -> ValkeyResult<Time
         TimestampValue::Latest
     };
     TimestampRange::new(start, end_value)
+}
+
+/// Parses arguments for a command that retrieves a range of samples from a time series.
+/// Useful for commands like TS.RANGE or TS.FORECAST where a time series key and a date range are provided to fetch relevant samples.
+/// The expected arguments are:
+/// 1. Key of the time series
+/// 2. Start timestamp
+/// 3. End timestamp
+pub(super) fn parse_series_range_samples(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<Vec<Sample>> {
+    let key = args.next_arg()?;
+    let date_range = parse_timestamp_range(args)?;
+    match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
+        Ok(Some(series)) => {
+            let (start, end) = date_range.get_series_range(&series, None, false);
+            Ok(series.get_range(start, end))
+        }
+        Ok(None) => Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn parse_retention(args: &mut CommandArgIterator) -> ValkeyResult<Duration> {
@@ -1305,6 +1324,30 @@ pub(super) fn find_last_token_instance(
         i -= 1;
     }
     None
+}
+
+pub(super) fn parse_forecast_horizon_value(
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<usize> {
+    if args.peek().is_none() {
+        return Err(ValkeyError::Str("TSDB: missing forecast horizon value"));
+    }
+    let next = args.next_i64()?;
+    if next <= 0 {
+        return Err(ValkeyError::Str("TSDB: forecast horizon must be greater than 0"));
+    }
+    Ok(next as usize)
+}
+
+pub(super) fn parse_forecast_confidence_level(
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<f64> {
+    let value = args.next_f64()
+        .map_err(|_| ValkeyError::Str("TSDB: missing forecast confidence level"))?;
+    if value <= 0.0 || value >= 100.0 {
+        return Err(ValkeyError::Str("TSDB: LEVEL must be between 0 and 100"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
