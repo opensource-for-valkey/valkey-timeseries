@@ -1,6 +1,8 @@
 mod data_prep;
 pub mod features;
-mod imputation;
+pub mod imputation;
+pub mod stats;
+
 mod parsers;
 mod utils;
 
