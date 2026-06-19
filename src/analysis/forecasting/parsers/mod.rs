@@ -16,6 +16,7 @@ pub enum ForecastModelKind {
     Holt,
     Imapa,
     Sarima,
+    SeasonalEs,
     SeasonalNaive,
     Ses,
     Sma,

@@ -9,7 +9,7 @@ use crate::analysis::forecasting::parsers::{
 use anofox_forecast::models::arima::{ARIMA, AutoARIMA, SARIMA};
 use anofox_forecast::models::baseline::{Naive, SeasonalNaive, SimpleMovingAverage};
 use anofox_forecast::models::exponential::{
-    AutoETS, ETS, ETSSpec, HoltLinearTrend, HoltWinters, SeasonalType,
+    AutoETS, ETS, ETSSpec, HoltLinearTrend, HoltWinters, SeasonalES, SeasonalType,
     SimpleExponentialSmoothing,
 };
 use anofox_forecast::models::intermittent::{ADIDA, Croston, IMAPA, TSB};
@@ -62,6 +62,7 @@ pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelS
         ForecastModelKind::Adida => handle_adida(&mut spec),
         ForecastModelKind::Croston => handle_croston(&mut spec),
         ForecastModelKind::Imapa => handle_imapa(&mut spec),
+        ForecastModelKind::SeasonalEs => handle_seasonal_es(&mut spec),
         ForecastModelKind::Tsb => handle_tsb(&mut spec),
         ForecastModelKind::Ses => handle_ses(&mut spec),
         ForecastModelKind::Garch => handle_garch(&mut spec),
@@ -343,6 +344,38 @@ fn handle_tsb(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     if nums.len() > 2 {
         return Err(ModelSpecError::new(
             "TSB accepts at most 2 positional arguments (alpha_d, alpha_p)",
+        ));
+    }
+
+    Ok(Box::new(forecaster))
+}
+
+fn handle_seasonal_es(
+    spec: &mut ModelSpec,
+) -> Result<BoxedForecaster, ModelSpecError> {
+    let nums = spec.get_positionals_as_usize()?;
+
+    // Period is required — from positional or keyword arg.
+    let positional_period = nums.first().copied();
+    let keyword_period = get_usize_kwarg(spec, "period")?;
+    let period = positional_period
+        .or(keyword_period)
+        .ok_or_else(|| ModelSpecError::new("SeasonalES requires a seasonal period, e.g. SeasonalES(12) or SeasonalES(period=12)"))?;
+
+    let alpha = get_float_kwarg(spec, "alpha")?;
+    let optimized = get_kwarg_as_flag(spec, "optimized")?.unwrap_or(false);
+
+    let forecaster = if optimized {
+        SeasonalES::optimized(period)
+    } else if let Some(a) = alpha {
+        SeasonalES::with_params(period, a, 0.0)
+    } else {
+        SeasonalES::new(period)
+    };
+
+    if nums.len() > 1 {
+        return Err(ModelSpecError::new(
+            "SeasonalES accepts at most 1 positional argument (period)",
         ));
     }
 
@@ -729,10 +762,10 @@ mod tests {
     #[test]
     fn constructs_all_supported_models_from_canonical_specs() {
         let models = build_models_from_specs(
-            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES()",
+            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalES(12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES()",
         )
             .unwrap();
-        assert_eq!(models.len(), 20);
+        assert_eq!(models.len(), 21);
     }
 
     #[test]
