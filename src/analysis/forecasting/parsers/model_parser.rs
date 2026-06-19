@@ -12,7 +12,7 @@ use anofox_forecast::models::exponential::{
     AutoETS, ETS, ETSSpec, HoltLinearTrend, HoltWinters, SeasonalType,
     SimpleExponentialSmoothing,
 };
-use anofox_forecast::models::intermittent::{ADIDA, Croston};
+use anofox_forecast::models::intermittent::{ADIDA, Croston, IMAPA, TSB};
 use anofox_forecast::models::theta::{DecompositionType, Theta};
 use anofox_forecast::models::{
     AutoTBATS, BoxedForecaster, GARCH, MFLES, MSTLForecaster, SeasonalForecastMethod, TBATS,
@@ -61,6 +61,8 @@ pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelS
         ForecastModelKind::Sma => handle_sma(&mut spec),
         ForecastModelKind::Adida => handle_adida(&mut spec),
         ForecastModelKind::Croston => handle_croston(&mut spec),
+        ForecastModelKind::Imapa => handle_imapa(&mut spec),
+        ForecastModelKind::Tsb => handle_tsb(&mut spec),
         ForecastModelKind::Ses => handle_ses(&mut spec),
         ForecastModelKind::Garch => handle_garch(&mut spec),
         ForecastModelKind::Holt => handle_holt(&mut spec),
@@ -300,6 +302,48 @@ fn handle_croston(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecErro
         forecaster = forecaster.sba();
     } else if optimized {
         forecaster = forecaster.optimized();
+    }
+
+    Ok(Box::new(forecaster))
+}
+
+fn handle_imapa(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
+    spec.ensure_arity(0)?;
+
+    let mut forecaster = IMAPA::new();
+
+    if let Some(max_level) = get_usize_kwarg(spec, "max_aggregation")? {
+        forecaster = forecaster.with_max_aggregation(max_level);
+    }
+
+    Ok(Box::new(forecaster))
+}
+
+fn handle_tsb(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
+    let nums = spec.get_positionals_as_numbers()?;
+
+    let positional_alpha_d = nums.first().copied();
+    let positional_alpha_p = nums.get(1).copied();
+    let keyword_alpha_d = get_float_kwarg(spec, "alpha_d")?;
+    let keyword_alpha_p = get_float_kwarg(spec, "alpha_p")?;
+
+    let alpha_d = positional_alpha_d.or(keyword_alpha_d);
+    let alpha_p = positional_alpha_p.or(keyword_alpha_p);
+
+    let forecaster = match (alpha_d, alpha_p) {
+        (Some(d), Some(p)) => TSB::new().with_params(d, p),
+        (None, None) => TSB::new(),
+        _ => {
+            return Err(ModelSpecError::new(
+                "TSB requires either both alpha_d and alpha_p, or neither for defaults",
+            ));
+        }
+    };
+
+    if nums.len() > 2 {
+        return Err(ModelSpecError::new(
+            "TSB accepts at most 2 positional arguments (alpha_d, alpha_p)",
+        ));
     }
 
     Ok(Box::new(forecaster))
@@ -685,10 +729,10 @@ mod tests {
     #[test]
     fn constructs_all_supported_models_from_canonical_specs() {
         let models = build_models_from_specs(
-            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), SARIMA(1,1,1,1,1,1,12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES()",
+            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES()",
         )
             .unwrap();
-        assert_eq!(models.len(), 18);
+        assert_eq!(models.len(), 20);
     }
 
     #[test]
