@@ -1,3 +1,4 @@
+use anofox_forecast::models::exponential::SeasonalType;
 use anofox_forecast::models::theta::DecompositionType;
 use anofox_forecast::models::{SeasonalForecastMethod, TrendForecastMethod};
 
@@ -23,6 +24,14 @@ pub fn parse_seasonal_forecast_method(input: &str) -> Option<SeasonalForecastMet
     match input {
         "Naive" => Some(SeasonalForecastMethod::Naive),
         "Average" => Some(SeasonalForecastMethod::Average),
+        _ => None,
+    }
+}
+
+pub fn parse_seasonal_type(input: &str) -> Option<SeasonalType> {
+    match input {
+        "additive" => Some(SeasonalType::Additive),
+        "multiplicative" => Some(SeasonalType::Multiplicative),
         _ => None,
     }
 }

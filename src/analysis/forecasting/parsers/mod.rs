@@ -6,10 +6,18 @@ pub use model_parser::*;
 pub use utils::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, strum::EnumString, strum::Display)]
+#[strum(ascii_case_insensitive)]
 pub enum ForecastModelKind {
+    Adida,
     Arima,
     AutoArima,
+    Croston,
+    Garch,
+    Holt,
     Sarima,
+    SeasonalNaive,
+    Ses,
+    Sma,
     Tbats,
     AutoTbats,
     Theta,
@@ -18,4 +26,5 @@ pub enum ForecastModelKind {
     Naive,
     Ets,
     AutoEts,
+    HoltWinters,
 }
