@@ -39,8 +39,8 @@ High-level architecture (big picture)
 - Command implementations live in `src/commands/*` and are registered in `src/lib.rs` with a one-to-one mapping to
   Valkey commands. Example:
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
-- Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
-  `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
+- Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Init helpers
+  `init_croaring_allocator()`, `init_background_tasks()`, and `init_thread_pool()` are all invoked from `src/lib.rs`.
   - `src/series/chunks/` implements three encoding formats: **Chimp** (ELF-on-Chimp, default),
     **Gorilla**, **Uncompressed**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
     Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
@@ -48,9 +48,13 @@ High-level architecture (big picture)
   - ACL filtering per series: `src/series/acl.rs`.
 - Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use the protobuf wire
   contract in `proto/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
-  cluster-wide queries.
-- Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score, RCF
-  variants) exposed via the `TS.OUTLIERS` command.
+  cluster-wide queries. Registered fanout operations: `LabelStatsFanoutCommand`, `CardFanoutCommand`,
+  `LabelSearchFanoutCommand`, `MDelFanoutCommand`, `MGetFanoutCommand`, `MRangeFanoutCommand`,
+  `QueryIndexFanoutCommand`.
+- Analysis / ML layer lives in `src/analysis/` (submodules: `forecasting`, `math`, `outliers`,
+  `quantile_estimators`, `seasonality`). Sourced from SciRS2, Perfolizer, and Anofox libraries.
+  - Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score,
+    RCF variants) exposed via the `TS.OUTLIERS` command.
 - Aggregation: `src/aggregators/` — aggregation handlers and iterators used by range queries.
 - Supporting subsystems (all referenced from `src/lib.rs`):
   - `src/common/` — shared utilities: encoding, logging, thread pool, RDB helpers, string interning.
@@ -58,11 +62,18 @@ High-level architecture (big picture)
   - `src/parser/` — Prometheus-compatible filter syntax, metric name, timestamp, and duration parsing.
   - `src/iterators/` — sample and row iterators consumed by range and multi-range queries.
   - `src/join/` — ASOF join logic backing `TS.JOIN`.
+- Key event handling: `src/server_events.rs` registers `@GENERIC @LOADED @TRIMMED` handlers via
+  `register_server_events(ctx)` called during `initialize()`.
 
 Project-specific conventions and patterns
 
 - All Valkey commands are declared in the `valkey_module!` macro in `src/lib.rs`; change there to add/remove commands.
+  The module currently registers 37 commands including analysis commands (`TS.OUTLIERS`, `TS.AUTOFORECAST`,
+  `TS.DECOMPOSE`, `TS.PERIODS`, `TS.AUTOCORRELATION`, `TS.TREND`, `TS.FILLGAPS`, `TS.SANITIZE`, `TS.STATIONARITY`,
+  `TS.FEATURES`, `TS.STATS`) and data management commands (`TS.ADDBULK`, `TS.JOIN`, `TS.MDEL`, `TS.CARD`,
+  `TS.LABELNAMES`, `TS.LABELVALUES`, `TS.METRICNAMES`, `TS.LABELSTATS`, `TS.CREATERULE`, `TS.DELETERULE`).
 - Command files follow `ts_<command>.rs` naming and export `ts_<command>_cmd` functions (see `src/commands/mod.rs`).
+  Shared command utilities live in `src/commands/forecast_utils.rs` and `src/commands/label_search_utils.rs`.
 - Fanout pattern: synchronous local implementation + `*_fanout_command.rs` files which marshal/unmarshal protobuf
   messages for cluster aggregation. Seven operations are currently registered (see `register_fanout_operations` in
   `src/commands/mod.rs`): `LabelStatsFanoutCommand`, `CardFanoutCommand`, `LabelSearchFanoutCommand`,
@@ -218,6 +229,10 @@ Where to look first (key files & directories)
 - `src/lib.rs` — module entrypoint, command registration, lifecycle (preload/init/deinit).
 - `src/commands/` — implementations and command parsing utilities (`command_parser.rs`).
 - `src/series/` — core storage, encodings, indexes, background tasks.
+- `src/analysis/` — ML/statistical algorithms for analysis commands; see `src/analysis/README.md` for sources.
+- `src/common/` — shared utilities: thread pool (`threads/`), string interner, encoding, RDB helpers, replies.
+- `src/config.rs` — module configuration and `TIMESERIES_MIN_SUPPORTED_VERSION` constant.
+- `src/server_events.rs` — key event handlers registered during module init.
 - `src/fanout/` — cluster communication primitives.
 - `src/analysis/` — outlier detection algorithms (`src/analysis/outliers/`).
 - `src/aggregators/` — aggregation handlers for range queries.
@@ -250,10 +265,12 @@ Quick tips for code changes
   TS.DEL, TS.DECRBY, TS.INCRBY, TS.JOIN, TS.MDEL, TS.MRANGE, TS.MREVRANGE, TS.RANGE, TS.REVRANGE, TS.INFO,
   TS.QUERYINDEX, TS.CARD, TS.LABELNAMES, TS.LABELVALUES, TS.METRICNAMES, TS.LABELSTATS, TS.CREATERULE,
   TS.DELETERULE, TS.OUTLIERS, TS._DEBUG (hidden admin command, no user-facing docs needed).
+- Add new analysis commands: follow the pattern in `ts_outliers.rs` or `ts_decompose.rs` — call into `src/analysis/`
+  internals, register with `"readonly deny-oom"` flags, and classify as `"read timeseries"` in ACL.
 - Documentation: When adding or modifying commands, remember to update the human-facing docs in `docs/commands/` and the
   supported list in `README.md`. TS._DEBUG is intentionally undocumented.
 - When making cluster changes, search for `*_fanout_command.rs` to copy the fanout pattern and add protobuf messages in
-  `proto/v1/`.
+  `proto/v1/`, then register the new `FanoutCommand` in `register_fanout_operations()`.
 - Protobuf codegen is **checked in** at `proto/v1/generated/valkey_timeseries.fanout.v1.rs`. After editing any `.proto`, run
   `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file; a normal build fails with instructions if the
   two disagree, so drift cannot land silently. Local↔wire conversions live beside it in `src/commands/fanout_codec/`
