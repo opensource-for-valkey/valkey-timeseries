@@ -65,7 +65,7 @@ pub trait FanoutCommand: Default + Send + 'static {
         exec_command(ctx, self, targets, timeout, f)
     }
 
-    /// Execute the fanout operation synchronously across cluster nodes.
+    /// Execute the fanout operation across nodes and wait synchronously for the response.
     fn exec_sync(self, ctx: &Context) -> FanoutResult<Self::Response> {
         let timeout = self.get_timeout();
         let targets = self.get_targets(ctx);
