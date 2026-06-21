@@ -1,14 +1,13 @@
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
-use crate::common::threads::spawn;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
-use crate::fanout::get_cluster_command_timeout;
 use crate::fanout::{FanoutCommand, is_clustered};
+use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeout};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::{
-    QueryFanoutCommand, QueryRangeFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
+    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
     validate_max_points, validate_max_series,
 };
 use crate::promql::{
@@ -19,52 +18,78 @@ use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
 
-struct InstantQueryCommand {
+/// Max number of requests to process in a single batch to
+/// avoid excessively locking the GIL and starving other tasks.
+const MAX_BATCH_SIZE: usize = 4;
+
+struct InstantVectorSelectorCommand {
     matchers: Matchers,
     timestamp: Timestamp,
     options: QueryOptions,
 }
 
-struct RangeQueryCommand {
+struct RangeSelectorCommand {
     matchers: Matchers,
     start_timestamp: Timestamp,
     end_timestamp: Timestamp,
     options: QueryOptions,
 }
 
-enum QueryCommand {
-    Instant(InstantQueryCommand),
-    Range(RangeQueryCommand),
+enum SelectorCommand {
+    Vector(InstantVectorSelectorCommand),
+    Range(RangeSelectorCommand),
 }
 
-impl QueryCommand {
+impl SelectorCommand {
     fn db(&self) -> i32 {
         match self {
-            QueryCommand::Instant(iqc) => iqc.options.db,
-            QueryCommand::Range(rc) => rc.options.db,
+            SelectorCommand::Vector(iqc) => iqc.options.db,
+            SelectorCommand::Range(rc) => rc.options.db,
         }
     }
 }
 
-/// A single batched request for a `BatchWorker`.
-struct BatchRequest {
-    pub item: QueryCommand,
+/// A single batched request for a `QueryWorker`.
+struct SelectorRequest {
+    item: SelectorCommand,
     /// responder receives the processed result (Ok) or the error (Err)
-    pub responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
 }
 
-/// A worker responsible for executing PromQL query tasks as part of a keyspace batch operation.
+impl SelectorRequest {
+    fn db(&self) -> i32 {
+        self.item.db()
+    }
+}
+
+/// A worker responsible for executing PromQL selectors as part of a keyspace batch operation.
 ///
 /// The `QueryWorker` optimizes latency in the PromQL evaluator (especially in cluster mode) by:
 ///
-/// - Serializing access to the Valkey keyspace so the worker thread can safely hold the GIL while
-///   processing requests.
+/// - Serializing access to the Valkey keyspace via `MODULE_CONTEXT` to avoid deadlocks, ensuring that
+///   we can query safely from multiple threads.
 /// - Collecting incoming query requests into a batch and processing the batch in a single lock
 ///   acquisition to reduce locking overhead.
+///
+/// # Design
+///
+/// Unlike a traditional worker that spawns a dedicated background thread, `QueryWorker` uses
+/// **cooperative batching**: each caller that sends a request attempts to become the "processor"
+/// by acquiring the receiver lock. The processor drains all pending requests from the shared
+/// channel with `try_recv()`, processes them under a single `MODULE_CONTEXT` acquisition, then
+/// releases the lock. This eliminates the need for a dedicated thread while preserving batching
+/// behaviour.
+///
+/// For local queries, the worker processes the request directly, so processing is essentially serialized.
+/// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
+/// is executed in parallel across all target cluster nodes, and results are returned asynchronously without 
+/// holding the GIL.
+///  
+/// This design allows us to achieve good performance without needing multiple background threads for processing queries concurrently.
 ///
 /// # Note
 /// The `QueryWorker` is designed for internal use within the PromQL engine and is not intended to be
@@ -72,10 +97,9 @@ struct BatchRequest {
 /// but the internal implementation details are abstracted away.
 ///
 /// # Important Considerations
-/// The `QueryWorker` consumes a thread from the thread pool for the duration of its lifetime.
-///  - the worker thread should be taken into account when sizing the thread pool.
-///  - it is important to reuse the same `QueryWorker` instance.
-///  - the worker thread holds the GIL while processing requests, so it should not be used for long-running or blocking operations to avoid starving other tasks that require the GIL.
+///  - Reuse the same `QueryWorker` instance (it is a global `LazyLock`).
+///  - The processor holds `MODULE_CONTEXT` while processing requests, so it should not be used for
+///    long-running or blocking operations to avoid starving other tasks that require the GIL.
 ///
 /// # Example
 /// ```ignore
@@ -95,18 +119,18 @@ struct BatchRequest {
 /// let matchers = vec![Matcher::new("job", "=", "prometheus")];
 /// let _ = query_worker.query(matchers, now, options);
 /// ```
-///
-/// The concrete worker implementation is internal; callers use `QueryWorker::new()` and the
-/// `query` / `query_range` methods exposed on the handle.
 pub struct QueryWorker {
-    // Runner is parameterized by the concrete worker implementation type.
-    runner: mpsc::Sender<BatchRequest>,
+    sender: mpsc::Sender<SelectorRequest>,
+    receiver: Mutex<mpsc::Receiver<SelectorRequest>>,
 }
 
 impl QueryWorker {
     pub fn new() -> Self {
-        let runner = spawn_worker();
-        Self { runner }
+        let (tx, rx) = mpsc::channel();
+        Self {
+            sender: tx,
+            receiver: Mutex::new(rx),
+        }
     }
 
     pub fn query(
@@ -115,7 +139,7 @@ impl QueryWorker {
         timestamp: Timestamp,
         options: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let command = QueryCommand::Instant(InstantQueryCommand {
+        let command = SelectorCommand::Vector(InstantVectorSelectorCommand {
             matchers,
             timestamp,
             options,
@@ -130,7 +154,7 @@ impl QueryWorker {
         end: Timestamp,
         options: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let command = QueryCommand::Range(RangeQueryCommand {
+        let command = SelectorCommand::Range(RangeSelectorCommand {
             matchers,
             start_timestamp: start,
             end_timestamp: end,
@@ -139,16 +163,23 @@ impl QueryWorker {
         self.send_request(command)
     }
 
-    fn send_request(&self, command: QueryCommand) -> QueryResult<QueryValue> {
+    fn send_request(&self, command: SelectorCommand) -> QueryResult<QueryValue> {
         let (responder_tx, responder_rx) = mpsc::sync_channel(1);
-        let request = BatchRequest {
+        let request = SelectorRequest {
             item: command,
             responder: responder_tx,
         };
-        // Forward request to the runner's sender
-        self.runner.send(request).unwrap_or_else(|e| {
-            eprintln!("Failed to send query request: {}", e);
-        });
+
+        // Send our request to the shared channel.
+        if let Err(e) = self.sender.send(request) {
+            let msg = format!("promql: failed to send query request to worker: {e}");
+            log_warning(msg.clone());
+            return Err(QueryError::Execution(msg));
+        }
+
+        // Try to become the processor. If another caller is already processing,
+        // we simply wait for our result — they will handle our request too.
+        self.try_process_batches();
 
         match responder_rx.recv() {
             Ok(res) => match res {
@@ -161,37 +192,90 @@ impl QueryWorker {
             }
         }
     }
+
+    /// Attempt to become the batch processor. Drains all pending requests from
+    /// the shared channel and processes them under a single `MODULE_CONTEXT`
+    /// acquisition. Repeats until the channel is empty.
+    ///
+    /// The receiver lock is released between drain-and-process cycles so that
+    /// other callers can step in if needed, and to avoid holding the lock
+    /// across potentially long `MODULE_CONTEXT` critical sections.
+    fn try_process_batches(&self) {
+        loop {
+            let batch = {
+                // Scope the receiver lock to just draining — release before
+                // we acquire MODULE_CONTEXT to avoid lock inversion.
+                let rx = match self.receiver.try_lock() {
+                    Ok(rx) => rx,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        // Another thread is currently draining / processing.
+                        // Our request is already in the channel; the other
+                        // thread will pick it up in its next drain iteration.
+                        return;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        // A previous processor panicked. The channel is still
+                        // intact; continue and recover.
+                        continue;
+                    }
+                };
+
+                let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
+                while let Ok(req) = rx.try_recv() {
+                    batch.push(req);
+                    if batch.len() >= MAX_BATCH_SIZE {
+                        break;
+                    }
+                }
+                batch
+                // MutexGuard dropped here — receiver lock released
+            };
+
+            if batch.is_empty() {
+                break; // nothing left to process
+            }
+
+            let ctx = MODULE_CONTEXT.lock();
+            for req in batch {
+                process_request(&ctx, req);
+            }
+            // ctx dropped here — MODULE_CONTEXT released
+
+            // Loop back to check for requests that arrived while we were
+            // inside the MODULE_CONTEXT critical section.
+        }
+    }
 }
 
-fn process_command(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
+fn process_request(ctx: &Context, request: SelectorRequest) {
     let original_db = get_current_db(ctx);
-    let target_db = item.db();
+    let target_db = request.db();
 
     if target_db != original_db {
         let _ = set_current_db(ctx, target_db);
     }
 
-    let result = if is_clustered(ctx) {
-        process_cluster(ctx, item)
+    if is_clustered(ctx) {
+        // In cluster mode, process_cluster handles sending the response itself.
+        process_cluster(ctx, request)
     } else {
-        process_local(ctx, item)
+        let result = process_local(ctx, request.item);
+        send_to_responder(&request.responder, result);
     };
 
     if target_db != original_db {
         let _ = set_current_db(ctx, original_db);
     }
-
-    result
 }
 
-fn process_local(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
-    match item {
-        QueryCommand::Instant(iqc) => {
+fn process_local(ctx: &Context, command: SelectorCommand) -> QueryResult<QueryValue> {
+    match command {
+        SelectorCommand::Vector(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
             query_instant_local(ctx, selector, timestamp, iqc.options).map(QueryValue::Vector)
         }
-        QueryCommand::Range(rc) => {
+        SelectorCommand::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
@@ -227,104 +311,144 @@ fn validate_max_points_per_series(
     Ok(())
 }
 
-fn process_cluster(ctx: &Context, item: QueryCommand) -> QueryResult<QueryValue> {
-    match item {
-        QueryCommand::Instant(iqc) => {
-            let timeout = calculate_timeout(&iqc.options);
-            let timestamp = iqc.timestamp;
-            let lookback_delta = iqc.options.lookback_delta.as_millis() as u64;
-            let cmd = QueryFanoutCommand::new(
-                iqc.matchers,
-                timestamp,
-                lookback_delta,
-                iqc.options.max_series as u64,
-                iqc.options.max_points_per_series.unwrap_or(0) as u64,
-                timeout,
-            );
+fn send_to_responder(
+    responder: &mpsc::SyncSender<QueryResult<QueryValue>>,
+    result: QueryResult<QueryValue>,
+) {
+    if responder.send(result).is_err() {
+        log_warning("promql: failed to send query response to requester");
+    }
+}
 
-            match cmd.exec_sync(ctx) {
-                Ok(resp) => {
-                    // resp.samples: Vec<proto::InstantSample>
-                    let mut samples: Vec<InstantSample> = Vec::with_capacity(resp.samples.len());
-                    for s in resp.samples {
-                        let labels = proto_labels_to_labels(s.labels);
-                        samples.push(InstantSample {
-                            labels,
-                            timestamp_ms: s.timestamp,
-                            value: s.value,
-                        });
-                    }
-                    validate_max_series_(samples.len(), iqc.options.max_series)?;
-                    Ok(QueryValue::Vector(samples))
+fn run_clustered_vector_selector(
+    ctx: &Context,
+    iqc: InstantVectorSelectorCommand,
+    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+) {
+    let timeout = calculate_timeout(&iqc.options);
+    let timestamp = iqc.timestamp;
+    let lookback_delta = iqc.options.lookback_delta.as_millis() as u64;
+    let cmd = InstantVectorSelectorFanoutCommand::new(
+        iqc.matchers,
+        timestamp,
+        lookback_delta,
+        iqc.options.max_series as u64,
+        iqc.options.max_points_per_series.unwrap_or(0) as u64,
+        timeout,
+    );
+
+    let max_series = iqc.options.max_series;
+    let targets = cmd.get_targets(ctx);
+    let responder = Arc::new(responder);
+    let cloned_responder = responder.clone();
+
+    let handler = move |cmd: InstantVectorSelectorFanoutCommand, result: FanoutCommandResult| {
+        let query_result = match result {
+            Ok(()) => {
+                let resp = cmd.get_response();
+                let mut samples: Vec<InstantSample> = Vec::with_capacity(resp.samples.len());
+
+                for s in resp.samples {
+                    let labels = proto_labels_to_labels(s.labels);
+                    samples.push(InstantSample {
+                        labels,
+                        timestamp_ms: s.timestamp,
+                        value: s.value,
+                    });
                 }
-                Err(e) => Err(QueryError::Execution(e.to_string())),
+
+                validate_max_series_(samples.len(), max_series).map(|_| QueryValue::Vector(samples))
             }
-        }
-        QueryCommand::Range(rc) => {
-            let timeout = calculate_timeout(&rc.options);
-            let cmd = QueryRangeFanoutCommand::new(
-                rc.matchers,
-                rc.start_timestamp,
-                rc.end_timestamp,
-                rc.options.max_series as u64,
-                rc.options.max_points_per_series.unwrap_or(0) as u64,
-                timeout,
-            );
-            match cmd.exec_sync(ctx) {
-                Ok(resp) => {
-                    validate_max_series_(resp.series.len(), rc.options.max_series)?;
+            Err(e) => {
+                log_warning(format!(
+                    "promql: cluster command failed for instant query: {e}"
+                ));
+
+                // Return empty result on error to avoid failing the entire batch.
+                Ok(QueryValue::Vector(vec![]))
+            }
+        };
+
+        send_to_responder(&responder, query_result);
+    };
+
+    if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
+        send_to_responder(&cloned_responder, Err(e.into()));
+    }
+}
+
+fn run_clustered_range_selector(
+    ctx: &Context,
+    rc: RangeSelectorCommand,
+    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+) {
+    let timeout = calculate_timeout(&rc.options);
+    let cmd = RangeVectorSelectorFanoutCommand::new(
+        rc.matchers,
+        rc.start_timestamp,
+        rc.end_timestamp,
+        rc.options.max_series as u64,
+        rc.options.max_points_per_series.unwrap_or(0) as u64,
+        timeout,
+    );
+
+    let max_series = rc.options.max_series;
+    let max_points_per_series = rc.options.max_points_per_series;
+    let targets = cmd.get_targets(ctx);
+    let responder = Arc::new(responder);
+    let cloned_responder = responder.clone();
+
+    let handler = move |cmd: RangeVectorSelectorFanoutCommand, result: FanoutCommandResult| {
+        let query_result = match result {
+            Ok(()) => {
+                let resp = cmd.get_response();
+
+                validate_max_series_(resp.series.len(), max_series).and_then(|_| {
                     let mut ranges: Vec<RangeSample> = Vec::with_capacity(resp.series.len());
+
                     for rs in resp.series {
-                        validate_max_points_per_series(
-                            rs.samples.len(),
-                            rc.options.max_points_per_series,
-                        )?;
+                        validate_max_points_per_series(rs.samples.len(), max_points_per_series)?;
+
                         let samples: Vec<Sample> = rs
                             .samples
                             .into_iter()
                             .map(|s| Sample::new(s.timestamp, s.value))
                             .collect();
+
                         let labels = proto_labels_to_labels(rs.labels);
                         ranges.push(RangeSample { labels, samples });
                     }
+
                     Ok(QueryValue::Matrix(ranges))
-                }
-                Err(e) => Err(QueryError::Execution(e.to_string())),
+                })
             }
-        }
+            Err(e) => {
+                log_warning(format!(
+                    "promql: cluster command failed for range query: {e}"
+                ));
+
+                // Return empty result on error to avoid failing the entire batch.
+                Ok(QueryValue::Matrix(vec![]))
+            }
+        };
+
+        send_to_responder(&responder, query_result);
+    };
+
+    if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
+        send_to_responder(&cloned_responder, Err(e.into()));
     }
 }
 
-/// Spawn the worker thread and return a channel Sender that accepts `BatchRequest`s.
-fn spawn_worker() -> mpsc::Sender<BatchRequest> {
-    let (tx, rx) = mpsc::channel::<BatchRequest>();
-
-    spawn(move || {
-        // Worker loop: wait for the first request, then drain additional pending requests
-        // to form a batch. Hold the MODULE_CONTEXT for the duration of processing
-        // the batch to serialize access to valkey keyspace.
-        loop {
-            let first = match rx.recv() {
-                Ok(r) => r,
-                Err(_) => break, // channel closed, exit thread
-            };
-
-            let mut batch = vec![first];
-            while let Ok(r) = rx.try_recv() {
-                batch.push(r);
-            }
-
-            let ctx = MODULE_CONTEXT.lock();
-            for req in batch {
-                let res = process_command(&ctx, req.item);
-                req.responder.send(res).unwrap_or_else(|e| {
-                    eprintln!("Failed to send batch response: {}", e);
-                });
-            }
+fn process_cluster(ctx: &Context, batch_request: SelectorRequest) {
+    match batch_request.item {
+        SelectorCommand::Vector(iqc) => {
+            run_clustered_vector_selector(ctx, iqc, batch_request.responder);
         }
-    });
-
-    tx
+        SelectorCommand::Range(rc) => {
+            run_clustered_range_selector(ctx, rc, batch_request.responder);
+        }
+    }
 }
 
 pub(in crate::promql) fn query_instant_local(
