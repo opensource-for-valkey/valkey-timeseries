@@ -262,15 +262,12 @@ fn eval_quantile(
             "quantile must be between 0.0 and 1.0".to_string(),
         ));
     }
-    // parallelize: compute quantile per-group in parallel
     let groups = group_samples(expr, samples);
-    let groups_vec: Vec<(Labels, Vec<EvalSample>)> = groups
+
+    let out: Vec<EvalSample> = groups
         .into_iter()
         .map(|(_, (labels, samples))| (labels, samples))
-        .collect();
-
-    let out: Vec<EvalSample> = groups_vec
-        .into_par()
+        .iter_into_par()
         .map(|(labels, samples)| {
             let value = sample_quantile(&samples, phi);
             EvalSample {
