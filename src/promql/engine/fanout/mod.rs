@@ -1,6 +1,6 @@
 mod instant_vector_selector_fanout_command;
-mod range_vector_selector_fanout_command;
 mod query_utils;
+mod range_vector_selector_fanout_command;
 mod type_conversions;
 
 pub(in crate::promql) use instant_vector_selector_fanout_command::InstantVectorSelectorFanoutCommand;

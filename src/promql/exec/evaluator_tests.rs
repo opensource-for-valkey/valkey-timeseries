@@ -3373,6 +3373,42 @@ mod tests {
         );
     }
 
+    /// Structural regression for `and`: even when selectors are wrapped in
+    /// parentheses (still eligible for the vector-vector fast path), the result
+    /// must remain LHS-owned.
+    #[test]
+    fn pushdown_and_with_parenthesized_selectors_preserves_lhs_ownership() {
+        let test_data: TestSampleData = vec![
+            ("metric_a", vec![("env", "prod"), ("job", "api")], 0, 11.0),
+            (
+                "metric_a",
+                vec![("env", "staging"), ("job", "api")],
+                1,
+                88.0,
+            ),
+            ("metric_b", vec![("env", "prod"), ("job", "api")], 2, 7.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+
+        let mut result = parse_and_evaluate(
+            &evaluator,
+            "(metric_a) and (metric_b)",
+            end_time,
+            Duration::from_secs(300),
+        )
+        .expect("parenthesized AND should succeed");
+
+        sort_samples_by_labels(&mut result);
+        assert_results_match(
+            &result,
+            &[(
+                11.0,
+                vec![("__name__", "metric_a"), ("env", "prod"), ("job", "api")],
+            )],
+        );
+    }
+
     /// The OR operator must NOT push down filters: both sides are evaluated
     /// independently so that series present only on one side are still returned.
     #[test]

@@ -668,16 +668,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let rhs = expr.rhs.as_ref();
 
         match (unwrap_paren_selector(lhs), unwrap_paren_selector(rhs)) {
-            (Some(l), Some(r)) => {
-                if expr.op.id() == T_LAND {
-                    // Fetch right-side series at first, since it usually contains a lower number of time series for `and` operator.
-                    // This should produce more specific label filters for the left side of the query.
-                    // This, in turn, should reduce the time to select series for the left side of the query.
-                    self.eval_vector_vector_binop(ctx, expr, r, l, preload_eligible)
-                } else {
-                    self.eval_vector_vector_binop(ctx, expr, l, r, preload_eligible)
-                }
-            }
+            (Some(l), Some(r)) => self.eval_vector_vector_binop(ctx, expr, l, r, preload_eligible),
             _ => {
                 let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
                     join(
@@ -706,12 +697,27 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ) -> EvalResult<ExprResult> {
         let op = be.op.id();
 
+        let (eval_first_expr, eval_second_expr, is_swapped_for_eval) = if op == T_LAND {
+            // For `AND` we can still evaluate RHS first (often smaller) to derive
+            // narrower pushdown filters for LHS, while keeping semantic LHS/RHS
+            // ownership explicit and stable inside this function.
+            (expr_second, expr_first, true)
+        } else {
+            (expr_first, expr_second, false)
+        };
+
         if !can_push_down_common_filters(be) {
             let (left, right) = join(
-                || self.evaluate_expr(expr_first, ctx, preload_eligible),
-                || self.evaluate_expr(expr_second, ctx, preload_eligible),
+                || self.evaluate_expr(eval_first_expr, ctx, preload_eligible),
+                || self.evaluate_expr(eval_second_expr, ctx, preload_eligible),
             );
-            return eval_binary_expr(be, left?, right?);
+            let first = left?;
+            let second = right?;
+            return if is_swapped_for_eval {
+                eval_binary_expr(be, second, first)
+            } else {
+                eval_binary_expr(be, first, second)
+            };
         }
 
         // Execute the binary operation in the following way:
@@ -740,21 +746,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         //   See https://www.robustperception.io/exposing-the-software-version-to-prometheus
         //
         // Invariant: be.lhs and be.rhs are both ExprResult::InstantVector
-        let first = self.evaluate_expr(expr_first, ctx, preload_eligible)?;
+        let first = self.evaluate_expr(eval_first_expr, ctx, preload_eligible)?;
 
         // if first.is_empty() && be.op == Or, the result will be empty,
         // since `first` OR `second` would return an empty result in any case.
         if first.is_empty() && op == T_LOR {
             return Ok(ExprResult::InstantVector(vec![]));
         }
-        let sec_expr = push_down_filters(be, &first, expr_second)?;
+        let sec_expr = push_down_filters(be, &first, eval_second_expr)?;
         let second = self.evaluate_expr(&sec_expr, ctx, preload_eligible)?;
 
-        // For AND the caller swapped (expr_first=RHS, expr_second=LHS) so that the
-        // smaller RHS set is evaluated first for filter extraction.  We must restore
-        // the original (LHS, RHS) argument order before calling eval_binary_expr, since
-        // set-AND semantics return values from the LEFT (LHS) operand.
-        if op == T_LAND {
+        // For `and`, evaluation order is intentionally swapped for optimization,
+        // but final binary-op argument order must remain semantic (LHS, RHS).
+        if is_swapped_for_eval {
             eval_binary_expr(be, second, first)
         } else {
             eval_binary_expr(be, first, second)
