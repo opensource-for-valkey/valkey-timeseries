@@ -14,7 +14,7 @@ use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
 
-pub struct QueryRangeFanoutCommand {
+pub struct RangeVectorSelectorFanoutCommand {
     matchers: Matchers,
     start_time: i64,
     end_time: i64,
@@ -25,7 +25,7 @@ pub struct QueryRangeFanoutCommand {
     seen: FingerprintHashSet,
 }
 
-impl Default for QueryRangeFanoutCommand {
+impl Default for RangeVectorSelectorFanoutCommand {
     fn default() -> Self {
         let matchers = Matchers {
             matchers: vec![],
@@ -43,7 +43,7 @@ impl Default for QueryRangeFanoutCommand {
         }
     }
 }
-impl QueryRangeFanoutCommand {
+impl RangeVectorSelectorFanoutCommand {
     pub fn new(
         matchers: Matchers,
         start_time: Timestamp,
@@ -65,7 +65,7 @@ impl QueryRangeFanoutCommand {
     }
 }
 
-impl FanoutCommand for QueryRangeFanoutCommand {
+impl FanoutCommand for RangeVectorSelectorFanoutCommand {
     type Request = RangeQuery;
     type Response = RangeQueryResponse;
 

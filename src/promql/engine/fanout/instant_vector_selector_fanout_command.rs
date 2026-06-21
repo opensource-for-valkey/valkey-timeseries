@@ -1,6 +1,7 @@
 use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
-use crate::labels::{HasFingerprint, filters::SeriesSelector};
+use crate::labels::HasFingerprint;
+use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::generated::{
@@ -12,7 +13,7 @@ use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
 
-pub struct QueryFanoutCommand {
+pub struct InstantVectorSelectorFanoutCommand {
     matchers: Matchers,
     timestamp: i64,
     lookback_delta: u64,
@@ -23,7 +24,7 @@ pub struct QueryFanoutCommand {
     seen: FingerprintHashSet,
 }
 
-impl Default for QueryFanoutCommand {
+impl Default for InstantVectorSelectorFanoutCommand {
     fn default() -> Self {
         let matchers = Matchers {
             matchers: vec![],
@@ -45,7 +46,7 @@ impl Default for QueryFanoutCommand {
         }
     }
 }
-impl QueryFanoutCommand {
+impl InstantVectorSelectorFanoutCommand {
     pub fn new(
         matchers: Matchers,
         timestamp: Timestamp,
@@ -67,7 +68,7 @@ impl QueryFanoutCommand {
     }
 }
 
-impl FanoutCommand for QueryFanoutCommand {
+impl FanoutCommand for InstantVectorSelectorFanoutCommand {
     type Request = InstantQuery;
     type Response = InstantQueryResponse;
 
