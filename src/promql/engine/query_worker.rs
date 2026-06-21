@@ -7,8 +7,8 @@ use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeo
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::{
-    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
-    validate_max_points, validate_max_series,
+    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand,
+    instant_lookback_start_ms, proto_labels_to_labels, validate_max_points, validate_max_series,
 };
 use crate::promql::{
     InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -86,7 +86,7 @@ impl SelectorRequest {
 ///
 /// For local queries, the worker processes the request directly, so processing is essentially serialized.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
-/// is executed in parallel across all target cluster nodes, and results are returned asynchronously without 
+/// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
 ///  
 /// This design allows us to achieve good performance without needing multiple background threads for processing queries concurrently.
