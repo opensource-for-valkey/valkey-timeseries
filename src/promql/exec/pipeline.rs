@@ -181,8 +181,7 @@ fn compute_subquery_alignment(
 
 /// Shape loaded data for instant vector selector.
 ///
-/// Takes the latest sample per fingerprint. Bucket data should already be in
-/// newest-first order (from `QueryPlan::for_instant_vector`). A fingerprint
+/// Takes the latest sample per fingerprint. A fingerprint
 /// dedup pass ensures within-bucket duplicates are also handled.
 pub(crate) fn shape_instant_results(series_data: Vec<EvalSamples>) -> ExprResult {
     let mut seen: AHashSet<SeriesFingerprint> = AHashSet::new();
@@ -244,12 +243,9 @@ pub(crate) fn shape_matrix_results(
 
 /// Shape loaded data for the subquery vector-selector fast path.
 ///
-/// Merges by fingerprint across buckets, sorts/deduplicates, then applies
+/// Merges by fingerprint across series, sorts/deduplicates, then applies
 /// the sliding-window step-bucketing algorithm.
-pub(crate) fn shape_subquery_results(
-    series_data: Vec<EvalSamples>,
-    plan: &QueryPlan,
-) -> Vec<EvalSamples> {
+fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Vec<EvalSamples> {
     let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps, _is_rollup) =
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
