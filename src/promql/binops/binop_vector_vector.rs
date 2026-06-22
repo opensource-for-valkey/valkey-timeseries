@@ -335,6 +335,9 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
+    let is_fill_one = ctx.fill_for_one.is_some();
+    let is_fill_many = ctx.fill_for_many.is_some();
+
     let mut result = Vec::with_capacity(many_vec.len());
 
     // Convert both sides to sorted `(fingerprint, EvalSample)` vectors and run a
@@ -353,25 +356,43 @@ fn eval_arith_ops(
             (None, None) => break,
             // Only "many" entries remain — all unmatched.
             (Some(many_key), None) => {
-                let many_samples = take_group(&mut many_it, many_key);
-                emit_fill_for_one(&ctx, &many_samples, &mut result);
+                if is_fill_one {
+                    let many_samples = take_group(&mut many_it, many_key);
+                    emit_fill_for_one(&ctx, &many_samples, &mut result);
+                } else {
+                    skip_group(&mut many_it, many_key);
+                }
             }
             // Only "one" entries remain — all unmatched.
             (None, Some(one_key)) => {
-                let one_samples = take_group(&mut one_it, one_key);
-                validate_one_group(&ctx, &one_samples)?;
-                emit_fill_for_many(&ctx, &one_samples, &mut result);
+                if is_fill_many {
+                    let one_samples = take_group(&mut one_it, one_key);
+                    validate_one_group(&ctx, &one_samples)?;
+                    emit_fill_for_many(&ctx, &one_samples, &mut result);
+                } else {
+                    let one_group_len = skip_group_count(&mut one_it, one_key);
+                    validate_one_group_len(&ctx, one_group_len)?;
+                }
             }
             (Some(many_key), Some(one_key)) => {
                 if many_key < one_key {
                     // "many" key has no "one" partner — unmatched.
-                    let many_samples = take_group(&mut many_it, many_key);
-                    emit_fill_for_one(&ctx, &many_samples, &mut result);
+                    if is_fill_one {
+                        let many_samples = take_group(&mut many_it, many_key);
+                        emit_fill_for_one(&ctx, &many_samples, &mut result);
+                    } else {
+                        skip_group(&mut many_it, many_key);
+                    }
                 } else if many_key > one_key {
                     // "one" key has no "many" partner — unmatched.
-                    let one_samples = take_group(&mut one_it, one_key);
-                    validate_one_group(&ctx, &one_samples)?;
-                    emit_fill_for_many(&ctx, &one_samples, &mut result);
+                    if is_fill_many {
+                        let one_samples = take_group(&mut one_it, one_key);
+                        validate_one_group(&ctx, &one_samples)?;
+                        emit_fill_for_many(&ctx, &one_samples, &mut result);
+                    } else {
+                        let one_group_len = skip_group_count(&mut one_it, one_key);
+                        validate_one_group_len(&ctx, one_group_len)?;
+                    }
                 } else {
                     // Matched key on both sides.
                     let many_samples = take_group(&mut many_it, many_key);
@@ -444,11 +465,39 @@ fn take_group(
     group
 }
 
+/// Consume the leading run of samples sharing `key` from a sorted, peekable
+/// `(fingerprint, EvalSample)` iterator without collecting values.
+#[inline]
+fn skip_group(
+    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    key: SeriesFingerprint,
+) {
+    while it.next_if(|(next_key, _)| *next_key == key).is_some() {}
+}
+
+/// Same as `skip_group`, but returns the number of consumed items.
+#[inline]
+fn skip_group_count(
+    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    key: SeriesFingerprint,
+) -> usize {
+    let mut count = 0;
+    while it.next_if(|(next_key, _)| *next_key == key).is_some() {
+        count += 1;
+    }
+    count
+}
+
 /// Validate that a "one" side group does not contain duplicates when grouped
 /// (non one-to-one) matching is in effect for a non-comparison operator.
 #[inline]
 fn validate_one_group(ctx: &ArithOpContext, one_samples: &[EvalSample]) -> EvalResult<()> {
-    if !ctx.is_one_to_one && !ctx.is_comparison && one_samples.len() > 1 {
+    validate_one_group_len(ctx, one_samples.len())
+}
+
+#[inline]
+fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalResult<()> {
+    if !ctx.is_one_to_one && !ctx.is_comparison && one_group_len > 1 {
         return Err(duplicate_side_error(if ctx.is_group_right {
             "left"
         } else {
