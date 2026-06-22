@@ -390,11 +390,11 @@ impl PromqlEngine for Tsdb {
 mod tests {
     use super::*;
     use crate::labels::Label;
-    use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
+    use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
     use std::time::UNIX_EPOCH;
 
     fn create_tsdb() -> Tsdb {
-        let querier = Arc::new(MockSeriesQuerier::new());
+        let querier = Arc::new(MemorySeriesQuerier::new());
         Tsdb::new(querier)
     }
 
@@ -424,7 +424,7 @@ mod tests {
     // ── Native read method tests ─────────────────────────────────────
 
     fn create_tsdb_with_data() -> Tsdb {
-        let querier = MockSeriesQuerier::new();
+        let querier = MemorySeriesQuerier::new();
 
         // Ingest two series into a bucket at minute 60 (covers 3,600,000–7,199,999 ms)
         let series = vec![
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn eval_query_with_offset_before_epoch_should_not_error() {
         // Query at 100s with offset 1h → effective time = -3500s (before epoch).
-        let querier = Arc::new(MockSeriesQuerier::new());
+        let querier = Arc::new(MemorySeriesQuerier::new());
         let tsdb = Tsdb::new(querier);
         let query_time = UNIX_EPOCH + Duration::from_secs(100);
         let opts = QueryOptions::default();
