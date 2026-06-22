@@ -17,7 +17,7 @@ mod tests {
     use crate::common::time::system_time_to_millis;
     use crate::labels::{Label, Labels};
     use crate::promql::engine::test_utils::{
-        MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MemorySeriesQuerier,
+        MemorySeriesQuerier, MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder,
     };
     use crate::promql::engine::{QueryOptions, QueryReader};
     use crate::tests::approx_eq;
