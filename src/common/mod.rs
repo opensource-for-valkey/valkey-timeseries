@@ -3,7 +3,6 @@ pub mod binary_search;
 pub mod binop;
 pub mod constants;
 pub mod context;
-pub mod countdown_latch;
 pub mod encoding;
 pub mod hash;
 pub mod humanize;
