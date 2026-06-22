@@ -35,17 +35,17 @@ impl Default for QuerierInner {
 
 /// A mock QueryReader for testing that holds data in memory.
 /// Use `MockQueryReaderBuilder` to construct instances.
-pub struct MockSeriesQuerier {
+pub struct MemorySeriesQuerier {
     inner: RwLock<QuerierInner>,
 }
 
-impl Default for MockSeriesQuerier {
+impl Default for MemorySeriesQuerier {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MockSeriesQuerier {
+impl MemorySeriesQuerier {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(QuerierInner::default()),
@@ -132,7 +132,7 @@ impl MockSeriesQuerier {
     }
 }
 
-impl QueryReader for MockSeriesQuerier {
+impl QueryReader for MemorySeriesQuerier {
     fn query(
         &self,
         selector: &VectorSelector,

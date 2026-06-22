@@ -1,13 +1,13 @@
 use crate::common::Sample;
 use crate::labels::Labels;
-use crate::promql::engine::test_utils::MockSeriesQuerier;
+use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::promqltest::dsl::SeriesLoad;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 /// Load series data into TSDB
 pub(super) fn load_series(
-    storage: Arc<MockSeriesQuerier>,
+    storage: Arc<MemorySeriesQuerier>,
     interval: std::time::Duration,
     series: &[SeriesLoad],
 ) -> Result<(), String> {

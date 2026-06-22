@@ -184,7 +184,7 @@ pub(crate) mod test_utils {
     use crate::commands::parse_metric_name;
     use crate::common::Sample;
     use crate::labels::Labels;
-    pub(crate) use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
+    pub(crate) use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
     use crate::series::TimeSeries;
     use crate::series::index::TimeSeriesIndex;
     use std::collections::HashMap;
@@ -227,7 +227,7 @@ pub(crate) mod test_utils {
             self.add_sample(&labels, sample)
         }
 
-        pub(crate) fn build(self) -> MockSeriesQuerier {
+        pub(crate) fn build(self) -> MemorySeriesQuerier {
             self.inner.build()
         }
     }
@@ -235,13 +235,13 @@ pub(crate) mod test_utils {
     /// Builder for creating MockQueryReader instances from test data.
     /// Supports multi-bucket scenarios.
     pub(crate) struct MockMultiBucketQueryReaderBuilder {
-        reader: MockSeriesQuerier,
+        reader: MemorySeriesQuerier,
     }
 
     impl MockMultiBucketQueryReaderBuilder {
         pub(crate) fn new() -> Self {
             Self {
-                reader: MockSeriesQuerier::new(),
+                reader: MemorySeriesQuerier::new(),
             }
         }
 
@@ -252,7 +252,7 @@ pub(crate) mod test_utils {
             self
         }
 
-        pub(crate) fn build(self) -> MockSeriesQuerier {
+        pub(crate) fn build(self) -> MemorySeriesQuerier {
             self.reader
         }
     }

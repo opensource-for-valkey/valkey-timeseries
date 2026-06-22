@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use valkey_timeseries::common::Sample;
 use valkey_timeseries::labels::Labels;
-use valkey_timeseries::promql::engine::mock_series_querier::MockSeriesQuerier;
+use valkey_timeseries::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use valkey_timeseries::promql::engine::{
     QueryOptions, QueryReader, evaluate_instant, evaluate_range,
 };
@@ -62,7 +62,7 @@ fn build_reader(
     start_ms: i64,
     step_ms: i64,
 ) -> Arc<dyn QueryReader> {
-    let querier = Arc::new(MockSeriesQuerier::new());
+    let querier = Arc::new(MemorySeriesQuerier::new());
 
     for series_idx in 0..series_count {
         let labels = series_labels("http_requests_total", series_idx);
@@ -183,7 +183,7 @@ fn setup_range_query_test_data(interval_ms: i64, num_intervals: usize) -> Arc<dy
 
     let points_per_sparse_series = num_intervals / 50;
 
-    let querier = MockSeriesQuerier::new();
+    let querier = MemorySeriesQuerier::new();
 
     for s in 0..num_intervals {
         let timestamp = (s as i64) * interval_ms;
@@ -366,7 +366,7 @@ fn setup_join_query_test_data(
         metrics.push(lbls);
     }
 
-    let querier = MockSeriesQuerier::new();
+    let querier = MemorySeriesQuerier::new();
 
     for s in 0..num_intervals {
         let timestamp = (s as i64) * interval_ms;

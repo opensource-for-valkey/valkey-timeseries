@@ -17,7 +17,7 @@ mod tests {
     use crate::common::time::system_time_to_millis;
     use crate::labels::{Label, Labels};
     use crate::promql::engine::test_utils::{
-        MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MockSeriesQuerier,
+        MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder, MemorySeriesQuerier,
     };
     use crate::promql::engine::{QueryOptions, QueryReader};
     use crate::tests::approx_eq;
@@ -123,7 +123,7 @@ mod tests {
     ///
     /// data: Vec of (metric_name, labels, timestamp_offset_ms, value)
     /// Returns (MockQueryReader, end_time) where end_time is suitable for querying
-    fn setup_mock_reader(data: TestSampleData) -> (MockSeriesQuerier, SystemTime) {
+    fn setup_mock_reader(data: TestSampleData) -> (MemorySeriesQuerier, SystemTime) {
         let mut builder = MockQueryReaderBuilder::new();
 
         // Base timestamp: 300001ms (ensures samples are > start_ms with 5min lookback)

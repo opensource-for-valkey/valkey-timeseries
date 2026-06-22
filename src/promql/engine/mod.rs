@@ -1,5 +1,5 @@
 mod fanout;
-pub mod mock_series_querier;
+pub mod memory_series_querier;
 pub mod promql_config;
 pub mod promql_engine;
 mod query_limits;
@@ -9,7 +9,7 @@ mod query_worker;
 
 use crate::common::Timestamp;
 use crate::common::time::current_time_millis;
-use crate::promql::engine::mock_series_querier::MockSeriesQuerier;
+use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_worker::QueryWorker;
 use crate::promql::model::{InstantSample, RangeSample};
 use crate::promql::{PromqlResult, QueryError, QueryResult, QueryValue};
@@ -137,14 +137,14 @@ fn extract_matchers(selector: &VectorSelector) -> Matchers {
 
 pub(crate) enum ConcreteSeriesQuerier {
     Actual(ValkeySeriesQuerier),
-    Mock(MockSeriesQuerier),
+    Mock(MemorySeriesQuerier),
 }
 
 impl ConcreteSeriesQuerier {
     pub fn create(_ctx: &Context) -> Self {
         cfg_if! {
             if #[cfg(test)] {
-                ConcreteSeriesQuerier::Mock(MockSeriesQuerier::new())
+                ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new())
             } else {
                 ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier)
             }
