@@ -5,7 +5,6 @@ pub mod binop;
 pub mod block_on_keys;
 pub mod constants;
 pub mod context;
-pub mod countdown_latch;
 pub mod encoding;
 pub mod hash;
 pub mod humanize;
