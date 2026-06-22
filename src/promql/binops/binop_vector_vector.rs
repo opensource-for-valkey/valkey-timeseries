@@ -1,7 +1,7 @@
 use super::labels::{compute_binary_match_key, result_metric};
 use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::binops::apply_binary_op;
-use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
+use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::{IntoParIter, ParIter, ParallelizableCollection};
 use promql_parser::label::METRIC_NAME;
@@ -160,24 +160,15 @@ fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
 /// has no modifiers (`fill`, `on`/ `ignoring`, e.t.c).
 ///
 fn eval_arith_ops_fast_path(
-    operator: TokenType,
-    is_comparison: bool,
-    return_bool: bool,
+    ctx: &ArithOpContext<'_>,
     left_vector: Vec<EvalSample>,
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    let mut left_sorted: Vec<(SeriesFingerprint, EvalSample)> = left_vector
-        .into_par()
-        .map(|s| (compute_binary_match_key(&s.labels, None), s))
-        .collect();
-
-    let mut right_sorted: Vec<(SeriesFingerprint, EvalSample)> = right_vector
-        .into_par()
-        .map(|s| (compute_binary_match_key(&s.labels, None), s))
-        .collect();
-
-    left_sorted.sort_unstable_by_key(|x| x.0);
-    right_sorted.sort_unstable_by_key(|x| x.0);
+    let left_sorted = collect_fingerprints(ctx, left_vector);
+    let right_sorted = collect_fingerprints(ctx, right_vector);
+    let operator = ctx.operator;
+    let is_comparison = ctx.is_comparison;
+    let return_bool = ctx.return_bool;
 
     let result: Vec<EvalSample> = left_sorted
         .into_par()
@@ -333,13 +324,7 @@ fn eval_arith_ops(
 
     // Fast-path: no modifier (OneToOne, no matching, no fills)
     if can_use_fast_path(&ctx) {
-        return eval_arith_ops_fast_path(
-            ctx.operator,
-            ctx.is_comparison,
-            ctx.return_bool,
-            left_vector,
-            right_vector,
-        );
+        return eval_arith_ops_fast_path(&ctx, left_vector, right_vector);
     }
 
     // Determine which side is "one" vs. "many" for matching purposes.
@@ -351,99 +336,75 @@ fn eval_arith_ops(
     };
 
     let mut result = Vec::with_capacity(many_vec.len());
-    // Track output label fingerprints for grouped matching to detect duplicates.
-    // Track one_map keys that were matched during the main pass (used by the
-    // fill_for_many pass below to find truly unmatched "one" entries).
-    let mut one_map_matched: FingerprintHashMap<()> = Default::default();
 
-    // Build "one" side index keyed by match signature.
-    let one_map = construct_one_side_map(&ctx, one_vec)?;
+    // Convert both sides to sorted `(fingerprint, EvalSample)` vectors and run a
+    // zip-merge (merge-join) over the two sorted sequences. Because both sides
+    // are sorted by match key, unmatched items on either side fall out of the
+    // merge naturally and are handled inline via the fill modifiers —
+    // no separate "unmatched" pass is required.
+    let mut many_it = collect_fingerprints(&ctx, many_vec).into_iter().peekable();
+    let mut one_it = collect_fingerprints(&ctx, one_vec).into_iter().peekable();
 
-    // Precompute many-side match keys in parallel, then process grouped sorted keys.
-    let keyed_many = collect_fingerprints(&ctx, many_vec);
-
-    let mut keyed_many_it = keyed_many.into_iter().peekable();
-    while let Some((key, many_sample)) = keyed_many_it.next() {
-        let mut many_samples_for_key = Vec::new();
-        many_samples_for_key.push(many_sample);
-
-        while let Some((_same_key, sample)) = keyed_many_it.next_if(|(next_key, _)| *next_key == key)
-        {
-            many_samples_for_key.push(sample);
-        }
-
-        if let Some(one_samples) = one_map.get(&key) {
-            // Record this key as matched so the fill_for_many pass skips it.
-            if ctx.has_fill {
-                one_map_matched.insert(key, ());
+    loop {
+        match (
+            many_it.peek().map(|(k, _)| *k),
+            one_it.peek().map(|(k, _)| *k),
+        ) {
+            (None, None) => break,
+            // Only "many" entries remain — all unmatched.
+            (Some(many_key), None) => {
+                let many_samples = take_group(&mut many_it, many_key);
+                emit_fill_for_one(&ctx, &many_samples, &mut result);
             }
-
-            if ctx.is_one_to_one && !ctx.is_comparison {
-                if one_samples.len() > 1 {
-                    return Err(duplicate_side_error(if ctx.is_group_right {
-                        "left"
-                    } else {
-                        "right"
-                    }));
-                }
-
-                if many_samples_for_key.len() > 1 {
-                    return Err(duplicate_side_error(if ctx.is_group_right {
-                        "right"
-                    } else {
-                        "left"
-                    }));
-                }
+            // Only "one" entries remain — all unmatched.
+            (None, Some(one_key)) => {
+                let one_samples = take_group(&mut one_it, one_key);
+                validate_one_group(&ctx, &one_samples)?;
+                emit_fill_for_many(&ctx, &one_samples, &mut result);
             }
+            (Some(many_key), Some(one_key)) => {
+                if many_key < one_key {
+                    // "many" key has no "one" partner — unmatched.
+                    let many_samples = take_group(&mut many_it, many_key);
+                    emit_fill_for_one(&ctx, &many_samples, &mut result);
+                } else if many_key > one_key {
+                    // "one" key has no "many" partner — unmatched.
+                    let one_samples = take_group(&mut one_it, one_key);
+                    validate_one_group(&ctx, &one_samples)?;
+                    emit_fill_for_many(&ctx, &one_samples, &mut result);
+                } else {
+                    // Matched key on both sides.
+                    let many_samples = take_group(&mut many_it, many_key);
+                    let one_samples = take_group(&mut one_it, one_key);
 
-            // todo: measure and possibly parallelize here if the number of matches is large
-            // enough to matter (e.g. group_left with many matches per key)
-            for many_sample in many_samples_for_key {
-                result.extend(
-                    one_samples
-                        .iter()
-                        .filter_map(|one_sample| {
-                            build_result_sample(&ctx, &many_sample, one_sample)
-                        })
-                        .collect::<Vec<_>>(),
-                );
-            }
-        } else if let Some(fill_val) = ctx.fill_for_one {
-            for many_sample in many_samples_for_key {
-                let fill_one = make_fill_one_sample(&many_sample, fill_val);
-                if let Some(sample) = build_result_sample(&ctx, &many_sample, &fill_one) {
-                    result.push(sample);
+                    validate_one_group(&ctx, &one_samples)?;
+
+                    if ctx.is_one_to_one && !ctx.is_comparison {
+                        if one_samples.len() > 1 {
+                            return Err(duplicate_side_error(if ctx.is_group_right {
+                                "left"
+                            } else {
+                                "right"
+                            }));
+                        }
+
+                        if many_samples.len() > 1 {
+                            return Err(duplicate_side_error(if ctx.is_group_right {
+                                "right"
+                            } else {
+                                "left"
+                            }));
+                        }
+                    }
+
+                    // todo: measure and possibly parallelize here if the number of matches is large
+                    // enough to matter (e.g. group_left with many matches per key)
+                    for many_sample in &many_samples {
+                        result.extend(one_samples.iter().filter_map(|one_sample| {
+                            build_result_sample(&ctx, many_sample, one_sample)
+                        }));
+                    }
                 }
-            }
-        }
-    }
-
-    // Fill pass for unmatched "one" side entries.
-    //
-    // For every series on the "one" side that had no matching "many" partner,
-    // synthesize a phantom "many" sample using fill_for_many and emit a result.
-    // The phantom sample uses the real "one" sample's labels so that result
-    // label construction produces the correct output series identity.
-    if let Some(fill_val) = ctx.fill_for_many {
-        // Fast skip: if every one-side key matched during the main pass, there
-        // are no unmatched one-side entries to backfill.
-        if one_map_matched.len() != one_map.len() {
-            for (key, one_samples) in &one_map {
-                if one_map_matched.contains_key(key) {
-                    continue; // already handled in the main pass
-                }
-
-                result = one_samples
-                    .par()
-                    .filter_map(|one_sample| {
-                        // Synthesize a "many" sample whose labels match the "one" sample.
-                        // This ensures build_result_labels produces the right output labels
-                        // (they come from the "many" base, but since they equal the "one"
-                        // labels here, the correct series identity is preserved).
-                        let fill_many = make_fill_many_sample(one_sample, fill_val);
-                        build_result_sample(&ctx, &fill_many, one_sample)
-                    })
-                    .collect_into(result);
             }
         }
     }
@@ -469,42 +430,70 @@ fn eval_arith_ops(
     Ok(ExprResult::InstantVector(result))
 }
 
-/// Build "one" side index keyed by match signature.
-fn construct_one_side_map(
-    ctx: &ArithOpContext,
-    one_vec: Vec<EvalSample>,
-) -> EvalResult<FingerprintHashMap<Vec<EvalSample>>> {
-    // Parallelize fingerprint computation, then group sequentially to populate one_map.
-    let mut one_map: FingerprintHashMap<Vec<EvalSample>> =
-        FingerprintHashMap::with_capacity_and_hasher(one_vec.len(), Default::default());
-
-    // Compute (key, sample) pairs in parallel (hashing is the expensive part).
-    let kvs = collect_fingerprints(ctx, one_vec);
-
-    // Consume the sorted pairs, grouping samples for each key and inserting into one_map.
-    let mut it = kvs.into_iter().peekable();
-    while let Some((key, first_sample)) = it.next() {
-        // start a new group for `key`
-        let mut group = Vec::new();
-        group.push(first_sample);
-
-        // collect following samples with the same key
-        while let Some((_k, s)) = it.next_if(|(next_key, _)| *next_key == key) {
-            group.push(s);
-        }
-
-        if !ctx.is_one_to_one && !ctx.is_comparison && group.len() > 1 {
-            return Err(duplicate_side_error(if ctx.is_group_right {
-                "left"
-            } else {
-                "right"
-            }));
-        }
-
-        one_map.insert(key, group);
+/// Consume the leading run of samples sharing `key` from a sorted, peekable
+/// `(fingerprint, EvalSample)` iterator, returning them as a group.
+#[inline]
+fn take_group(
+    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    key: SeriesFingerprint,
+) -> Vec<EvalSample> {
+    let mut group = Vec::new();
+    while let Some((_k, s)) = it.next_if(|(next_key, _)| *next_key == key) {
+        group.push(s);
     }
+    group
+}
 
-    Ok(one_map)
+/// Validate that a "one" side group does not contain duplicates when grouped
+/// (non one-to-one) matching is in effect for a non-comparison operator.
+#[inline]
+fn validate_one_group(ctx: &ArithOpContext, one_samples: &[EvalSample]) -> EvalResult<()> {
+    if !ctx.is_one_to_one && !ctx.is_comparison && one_samples.len() > 1 {
+        return Err(duplicate_side_error(if ctx.is_group_right {
+            "left"
+        } else {
+            "right"
+        }));
+    }
+    Ok(())
+}
+
+/// Emit results for "many" samples whose match key had no "one" partner.
+/// Uses `fill_for_one` to synthesize the missing "one" operand; a no-op when
+/// no left/right fill is configured for the missing side.
+#[inline]
+fn emit_fill_for_one(
+    ctx: &ArithOpContext,
+    many_samples: &[EvalSample],
+    result: &mut Vec<EvalSample>,
+) {
+    if let Some(fill_val) = ctx.fill_for_one {
+        for many_sample in many_samples {
+            let fill_one = make_fill_one_sample(many_sample, fill_val);
+            if let Some(sample) = build_result_sample(ctx, many_sample, &fill_one) {
+                result.push(sample);
+            }
+        }
+    }
+}
+
+/// Emit results for "one" samples whose match key had no "many" partner.
+/// Synthesizes a phantom "many" sample (using the "one" sample's labels so the
+/// output series identity is preserved) filled with `fill_for_many`.
+#[inline]
+fn emit_fill_for_many(
+    ctx: &ArithOpContext,
+    one_samples: &[EvalSample],
+    result: &mut Vec<EvalSample>,
+) {
+    if let Some(fill_val) = ctx.fill_for_many {
+        for one_sample in one_samples {
+            let fill_many = make_fill_many_sample(one_sample, fill_val);
+            if let Some(sample) = build_result_sample(ctx, &fill_many, one_sample) {
+                result.push(sample);
+            }
+        }
+    }
 }
 
 fn collect_fingerprints(
