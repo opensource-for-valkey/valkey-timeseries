@@ -3,10 +3,13 @@ use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::binops::apply_binary_op;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
+use ahash::HashSetExt;
 use orx_parallel::{IntoParIter, ParIter, ParallelizableCollection};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
+use std::iter::Peekable;
+use std::vec::IntoIter;
 use twox_hash::xxhash3_128;
 
 const MATCH_PARALLEL_THRESHOLD: usize = 10;
@@ -337,9 +340,6 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
-    let is_fill_one = ctx.fill_for_one.is_some();
-    let is_fill_many = ctx.fill_for_many.is_some();
-
     let mut result = Vec::with_capacity(many_vec.len());
 
     // Convert both sides to sorted `(fingerprint, EvalSample)` vectors and run a
@@ -358,19 +358,18 @@ fn eval_arith_ops(
             (None, None) => break,
             // Only "many" entries remain — all unmatched.
             (Some(many_key), None) => {
-                if is_fill_one {
+                if let Some(fill_val) = ctx.fill_for_one {
                     let many_samples = take_group(&mut many_it, many_key);
-                    emit_fill_for_one(&ctx, many_samples, &mut result);
+                    emit_fill_for_one(&ctx, many_samples, fill_val, &mut result);
                 } else {
                     skip_group(&mut many_it, many_key);
                 }
             }
             // Only "one" entries remain — all unmatched.
             (None, Some(one_key)) => {
-                if is_fill_many {
-                    let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
-                    validate_one_group(&ctx, &one_samples)?;
-                    emit_fill_for_many(&ctx, one_samples, &mut result);
+                if let Some(fill_val) = ctx.fill_for_many {
+                    let one_samples = take_group(&mut one_it, one_key);
+                    emit_fill_for_many(&ctx, one_samples, fill_val, &mut result)?;
                 } else {
                     let one_group_len = skip_group_count(&mut one_it, one_key);
                     validate_one_group_len(&ctx, one_group_len)?;
@@ -379,18 +378,17 @@ fn eval_arith_ops(
             (Some(many_key), Some(one_key)) => {
                 if many_key < one_key {
                     // "many" key has no "one" partner — unmatched.
-                    if is_fill_one {
+                    if let Some(fill_val) = ctx.fill_for_one {
                         let many_samples = take_group(&mut many_it, many_key);
-                        emit_fill_for_one(&ctx, many_samples, &mut result);
+                        emit_fill_for_one(&ctx, many_samples, fill_val, &mut result);
                     } else {
                         skip_group(&mut many_it, many_key);
                     }
                 } else if many_key > one_key {
                     // "one" key has no "many" partner — unmatched.
-                    if is_fill_many {
-                        let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
-                        validate_one_group(&ctx, &one_samples)?;
-                        emit_fill_for_many(&ctx, one_samples, &mut result);
+                    if let Some(fill_val) = ctx.fill_for_many {
+                        let one_samples = take_group(&mut one_it, one_key);
+                        emit_fill_for_many(&ctx, one_samples, fill_val, &mut result)?;
                     } else {
                         let one_group_len = skip_group_count(&mut one_it, one_key);
                         validate_one_group_len(&ctx, one_group_len)?;
@@ -460,18 +458,15 @@ fn eval_arith_ops(
     // Duplicate detection for grouped matching must occur after comparison
     // filtering so that comparisons can naturally reduce duplicates.
     if !ctx.is_one_to_one {
-        let mut fps: Vec<u128> = result
-            .par()
-            .map(|sample| result_fingerprint(&sample.labels, sample.drop_name))
-            .collect();
-
-        fps.sort_unstable();
-
-        if fps.windows(2).any(|w| w[0] == w[1]) {
-            return Err(EvaluationError::InternalError(
-                "multiple matches for labels: grouping labels must ensure unique matches"
-                    .to_string(),
-            ));
+        let mut seen = FingerprintHashSet::with_capacity(result.len());
+        for sample in &result {
+            let fp = result_fingerprint(&sample.labels, sample.drop_name);
+            if !seen.insert(fp) {
+                return Err(EvaluationError::InternalError(
+                    "multiple matches for labels: grouping labels must ensure unique matches"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -480,7 +475,7 @@ fn eval_arith_ops(
 
 #[inline]
 fn take_group(
-    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
     key: SeriesFingerprint,
 ) -> impl Iterator<Item = EvalSample> + '_ {
     std::iter::from_fn(move || it.next_if(|(next_key, _)| *next_key == key).map(|(_, s)| s))
@@ -488,7 +483,7 @@ fn take_group(
 
 #[inline]
 fn skip_group(
-    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
     key: SeriesFingerprint,
 ) {
     while it.next_if(|(next_key, _)| *next_key == key).is_some() {}
@@ -497,7 +492,7 @@ fn skip_group(
 /// Same as `skip_group`, but returns the number of consumed items.
 #[inline]
 fn skip_group_count(
-    it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
+    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
     key: SeriesFingerprint,
 ) -> usize {
     let mut count = 0;
@@ -505,13 +500,6 @@ fn skip_group_count(
         count += 1;
     }
     count
-}
-
-/// Validate that a "one" side group does not contain duplicates when grouped
-/// (non one-to-one) matching is in effect for a non-comparison operator.
-#[inline]
-fn validate_one_group(ctx: &ArithOpContext, one_samples: &[EvalSample]) -> EvalResult<()> {
-    validate_one_group_len(ctx, one_samples.len())
 }
 
 #[inline]
@@ -533,35 +521,62 @@ fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalRes
 fn emit_fill_for_one(
     ctx: &ArithOpContext,
     many_samples: impl IntoIterator<Item = EvalSample>,
+    fill_val: f64,
     result: &mut Vec<EvalSample>,
 ) {
-    if let Some(fill_val) = ctx.fill_for_one {
-        for many_sample in many_samples {
-            let fill_one = make_fill_one_sample(&many_sample, fill_val);
-            if let Some(sample) = build_result_sample(ctx, &many_sample, &fill_one) {
-                result.push(sample);
-            }
+    for many_sample in many_samples {
+        let fill_one = make_fill_one_sample(&many_sample, fill_val);
+        if let Some(sample) = build_result_sample(ctx, &many_sample, &fill_one) {
+            result.push(sample);
         }
     }
 }
 
 /// Emit results for "one" samples whose match key had no "many" partner.
 /// Synthesizes a phantom "many" sample (using the "one" sample's labels so the
-/// output series identity is preserved) filled with `fill_for_many`.
+/// output series identity is preserved) filled with `fill_val`.
 #[inline]
 fn emit_fill_for_many(
     ctx: &ArithOpContext,
     one_samples: impl IntoIterator<Item = EvalSample>,
+    fill_val: f64,
     result: &mut Vec<EvalSample>,
-) {
-    if let Some(fill_val) = ctx.fill_for_many {
-        for one_sample in one_samples {
-            let fill_many = make_fill_many_sample(&one_sample, fill_val);
-            if let Some(sample) = build_result_sample(ctx, &fill_many, &one_sample) {
-                result.push(sample);
-            }
+) -> EvalResult<()> {
+    let should_check_duplicates = !ctx.is_comparison && !ctx.is_one_to_one;
+
+    fn process_one(
+        ctx: &ArithOpContext,
+        one_sample: &EvalSample,
+        fill_val: f64,
+        result: &mut Vec<EvalSample>,
+    ) {
+        let fill_many = make_fill_many_sample(one_sample, fill_val);
+        if let Some(sample) = build_result_sample(ctx, &fill_many, one_sample) {
+            result.push(sample);
         }
     }
+
+    // Validate that a "one" side group does not contain duplicates when grouped
+    // (non one-to-one) matching is in effect for a non-comparison operator.
+    if should_check_duplicates {
+        for (i, sample) in one_samples.into_iter().enumerate() {
+            process_one(ctx, &sample, fill_val, result);
+            if i == 1 {
+                return Err(duplicate_side_error(if ctx.is_group_right {
+                    "right"
+                } else {
+                    "left"
+                }));
+            }
+        }
+        return Ok(());
+    }
+
+    for one_sample in one_samples {
+        process_one(ctx, &one_sample, fill_val, result);
+    }
+
+    Ok(())
 }
 
 fn collect_fingerprints(
@@ -943,7 +958,7 @@ mod tests {
     #[test]
     fn test_fill_right_emits_unmatched_lhs_with_fill_value() {
         // LHS: {env="prod", v=10}, {env="staging", v=5}
-        // RHS: {env="prod", v=3}   (no staging on the right)
+        // RHS: {env="prod", v=3} (no staging on the right)
         // fill_right(0): staging has no RHS match → use RHS=0, emit staging
         let lhs = vec![
             sample(1000, 10.0, &[("env", "prod")]),
@@ -981,7 +996,7 @@ mod tests {
     #[test]
     fn test_fill_left_emits_unmatched_rhs_with_fill_value() {
         // LHS: {env="prod", v=10}
-        // RHS: {env="prod", v=3}, {env="staging", v=7}  (no staging on the left)
+        // RHS: {env="prod", v=3}, {env="staging", v=7} (no staging on the left)
         // fill_left(1): staging has no LHS match → use LHS=1, emit staging
         let lhs = vec![sample(1000, 10.0, &[("env", "prod")])];
         let rhs = vec![
@@ -1256,7 +1271,7 @@ mod tests {
         // LHS: {env="prod", v=10}
         // RHS: {env="prod", v=3}
         // op: + bool
-        // Prometheus: 10 + 3 = 13, but __name__ is dropped and it behaves like bool in terms of drop_name
+        // Prometheus: 10 + 3 = 13, but __name__ is dropped, and it behaves like bool in terms of drop_name
         let lhs = vec![sample(1000, 10.0, &[("env", "prod")])];
         let rhs = vec![sample(1000, 3.0, &[("env", "prod")])];
 
