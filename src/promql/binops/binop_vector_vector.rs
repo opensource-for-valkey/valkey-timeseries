@@ -9,6 +9,8 @@ use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
 use twox_hash::xxhash3_128;
 
+const MATCH_PARALLEL_THRESHOLD: usize = 10;
+
 // Vector-Vector operations
 pub(super) fn eval_binop_vector_vector(
     expr: &BinaryExpr,
@@ -358,7 +360,7 @@ fn eval_arith_ops(
             (Some(many_key), None) => {
                 if is_fill_one {
                     let many_samples = take_group(&mut many_it, many_key);
-                    emit_fill_for_one(&ctx, &many_samples, &mut result);
+                    emit_fill_for_one(&ctx, many_samples, &mut result);
                 } else {
                     skip_group(&mut many_it, many_key);
                 }
@@ -366,9 +368,9 @@ fn eval_arith_ops(
             // Only "one" entries remain — all unmatched.
             (None, Some(one_key)) => {
                 if is_fill_many {
-                    let one_samples = take_group(&mut one_it, one_key);
+                    let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                     validate_one_group(&ctx, &one_samples)?;
-                    emit_fill_for_many(&ctx, &one_samples, &mut result);
+                    emit_fill_for_many(&ctx, one_samples, &mut result);
                 } else {
                     let one_group_len = skip_group_count(&mut one_it, one_key);
                     validate_one_group_len(&ctx, one_group_len)?;
@@ -379,28 +381,41 @@ fn eval_arith_ops(
                     // "many" key has no "one" partner — unmatched.
                     if is_fill_one {
                         let many_samples = take_group(&mut many_it, many_key);
-                        emit_fill_for_one(&ctx, &many_samples, &mut result);
+                        emit_fill_for_one(&ctx, many_samples, &mut result);
                     } else {
                         skip_group(&mut many_it, many_key);
                     }
                 } else if many_key > one_key {
                     // "one" key has no "many" partner — unmatched.
                     if is_fill_many {
-                        let one_samples = take_group(&mut one_it, one_key);
+                        let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                         validate_one_group(&ctx, &one_samples)?;
-                        emit_fill_for_many(&ctx, &one_samples, &mut result);
+                        emit_fill_for_many(&ctx, one_samples, &mut result);
                     } else {
                         let one_group_len = skip_group_count(&mut one_it, one_key);
                         validate_one_group_len(&ctx, one_group_len)?;
                     }
                 } else {
                     // Matched key on both sides.
+                    // Collect groups so we can safely inspect cardinality and then
+                    // iterate over all combinations.
+                    let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                     let many_samples = take_group(&mut many_it, many_key);
-                    let one_samples = take_group(&mut one_it, one_key);
 
-                    validate_one_group(&ctx, &one_samples)?;
+                    #[inline]
+                    fn handle_match(
+                        ctx: &ArithOpContext,
+                        many_sample: &EvalSample,
+                        one_samples: &[EvalSample],
+                    ) -> impl Iterator<Item = EvalSample> {
+                        one_samples.iter().filter_map(move |one_sample| {
+                            build_result_sample(ctx, many_sample, one_sample)
+                        })
+                    }
 
-                    if ctx.is_one_to_one && !ctx.is_comparison {
+                    let should_check_duplicates = !ctx.is_comparison;
+
+                    if should_check_duplicates {
                         if one_samples.len() > 1 {
                             return Err(duplicate_side_error(if ctx.is_group_right {
                                 "left"
@@ -408,22 +423,34 @@ fn eval_arith_ops(
                                 "right"
                             }));
                         }
-
-                        if many_samples.len() > 1 {
-                            return Err(duplicate_side_error(if ctx.is_group_right {
-                                "right"
-                            } else {
-                                "left"
-                            }));
+                        if ctx.is_one_to_one {
+                            let mut iter = many_samples.into_iter();
+                            let sample = iter.next().unwrap();
+                            if iter.next().is_some() {
+                                return Err(duplicate_side_error(if ctx.is_group_right {
+                                    "right"
+                                } else {
+                                    "left"
+                                }));
+                            }
+                            result.extend(handle_match(&ctx, &sample, &one_samples));
+                            continue;
                         }
                     }
 
-                    // todo: measure and possibly parallelize here if the number of matches is large
-                    // enough to matter (e.g. group_left with many matches per key)
-                    for many_sample in &many_samples {
-                        result.extend(one_samples.iter().filter_map(|one_sample| {
-                            build_result_sample(&ctx, many_sample, one_sample)
-                        }));
+                    if one_samples.len() < MATCH_PARALLEL_THRESHOLD {
+                        for many_sample in many_samples {
+                            result.extend(handle_match(&ctx, &many_sample, &one_samples));
+                        }
+                    } else {
+                        for many_sample in many_samples {
+                            result = one_samples
+                                .par()
+                                .filter_map(|one_sample| {
+                                    build_result_sample(&ctx, &many_sample, one_sample)
+                                })
+                                .collect_into(result);
+                        }
                     }
                 }
             }
@@ -451,22 +478,14 @@ fn eval_arith_ops(
     Ok(ExprResult::InstantVector(result))
 }
 
-/// Consume the leading run of samples sharing `key` from a sorted, peekable
-/// `(fingerprint, EvalSample)` iterator, returning them as a group.
 #[inline]
 fn take_group(
     it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
     key: SeriesFingerprint,
-) -> Vec<EvalSample> {
-    let mut group = Vec::new();
-    while let Some((_k, s)) = it.next_if(|(next_key, _)| *next_key == key) {
-        group.push(s);
-    }
-    group
+) -> impl Iterator<Item = EvalSample> + '_ {
+    std::iter::from_fn(move || it.next_if(|(next_key, _)| *next_key == key).map(|(_, s)| s))
 }
 
-/// Consume the leading run of samples sharing `key` from a sorted, peekable
-/// `(fingerprint, EvalSample)` iterator without collecting values.
 #[inline]
 fn skip_group(
     it: &mut std::iter::Peekable<std::vec::IntoIter<(SeriesFingerprint, EvalSample)>>,
@@ -513,13 +532,13 @@ fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalRes
 #[inline]
 fn emit_fill_for_one(
     ctx: &ArithOpContext,
-    many_samples: &[EvalSample],
+    many_samples: impl IntoIterator<Item = EvalSample>,
     result: &mut Vec<EvalSample>,
 ) {
     if let Some(fill_val) = ctx.fill_for_one {
         for many_sample in many_samples {
-            let fill_one = make_fill_one_sample(many_sample, fill_val);
-            if let Some(sample) = build_result_sample(ctx, many_sample, &fill_one) {
+            let fill_one = make_fill_one_sample(&many_sample, fill_val);
+            if let Some(sample) = build_result_sample(ctx, &many_sample, &fill_one) {
                 result.push(sample);
             }
         }
@@ -532,13 +551,13 @@ fn emit_fill_for_one(
 #[inline]
 fn emit_fill_for_many(
     ctx: &ArithOpContext,
-    one_samples: &[EvalSample],
+    one_samples: impl IntoIterator<Item = EvalSample>,
     result: &mut Vec<EvalSample>,
 ) {
     if let Some(fill_val) = ctx.fill_for_many {
         for one_sample in one_samples {
-            let fill_many = make_fill_many_sample(one_sample, fill_val);
-            if let Some(sample) = build_result_sample(ctx, &fill_many, one_sample) {
+            let fill_many = make_fill_many_sample(&one_sample, fill_val);
+            if let Some(sample) = build_result_sample(ctx, &fill_many, &one_sample) {
                 result.push(sample);
             }
         }
@@ -598,10 +617,12 @@ fn build_result_labels(
         _ => {
             // Copy labels from "one" side not already present on "many" side.
             // Uses binary search via Labels::contains — no heap allocation.
-            for label in one_sample.labels.iter().filter(|&l| l.name != METRIC_NAME) {
-                if !many_sample.labels.contains(&label.name) {
-                    labels.insert(&label.name, label.value.clone());
-                }
+            for label in one_sample
+                .labels
+                .iter()
+                .filter(|&l| l.name != METRIC_NAME && !many_sample.labels.contains(&l.name))
+            {
+                labels.insert(&label.name, label.value.clone());
             }
         }
     }
