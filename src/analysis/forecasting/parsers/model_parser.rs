@@ -228,9 +228,7 @@ fn handle_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError>
     Ok(Box::new(Naive::new()))
 }
 
-fn handle_seasonal_naive(
-    spec: &mut ModelSpec,
-) -> Result<BoxedForecaster, ModelSpecError> {
+fn handle_seasonal_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     let nums = spec.get_positionals_as_usize()?;
 
     let positional_period = nums.first().copied();
@@ -350,17 +348,17 @@ fn handle_tsb(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     Ok(Box::new(forecaster))
 }
 
-fn handle_seasonal_es(
-    spec: &mut ModelSpec,
-) -> Result<BoxedForecaster, ModelSpecError> {
+fn handle_seasonal_es(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     let nums = spec.get_positionals_as_usize()?;
 
     // Period is required — from positional or keyword arg.
     let positional_period = nums.first().copied();
     let keyword_period = get_usize_kwarg(spec, "period")?;
-    let period = positional_period
-        .or(keyword_period)
-        .ok_or_else(|| ModelSpecError::new("SeasonalES requires a seasonal period, e.g. SeasonalES(12) or SeasonalES(period=12)"))?;
+    let period = positional_period.or(keyword_period).ok_or_else(|| {
+        ModelSpecError::new(
+            "SeasonalES requires a seasonal period, e.g. SeasonalES(12) or SeasonalES(period=12)",
+        )
+    })?;
 
     let alpha = get_float_kwarg(spec, "alpha")?;
     let optimized = get_kwarg_as_flag(spec, "optimized")?.unwrap_or(false);
@@ -587,17 +585,25 @@ fn handle_holt_winters(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpe
     let gamma = get_float_kwarg(spec, "gamma")?;
 
     let param_offset = if nums.is_empty() { 0 } else { 1 }; // skip seasonal period
-    let alpha = if nums.len() > param_offset { Some(nums[param_offset]) } else { alpha };
-    let beta = if nums.len() > param_offset + 1 { Some(nums[param_offset + 1]) } else { beta };
-    let gamma = if nums.len() > param_offset + 2 { Some(nums[param_offset + 2]) } else { gamma };
+    let alpha = if nums.len() > param_offset {
+        Some(nums[param_offset])
+    } else {
+        alpha
+    };
+    let beta = if nums.len() > param_offset + 1 {
+        Some(nums[param_offset + 1])
+    } else {
+        beta
+    };
+    let gamma = if nums.len() > param_offset + 2 {
+        Some(nums[param_offset + 2])
+    } else {
+        gamma
+    };
 
     let forecaster = match (alpha, beta, gamma) {
-        (Some(a), Some(b), Some(g)) => {
-            HoltWinters::new(a, b, g, seasonal_period, seasonal_type)
-        }
-        (None, None, None) => {
-            HoltWinters::auto(seasonal_period, seasonal_type)
-        }
+        (Some(a), Some(b), Some(g)) => HoltWinters::new(a, b, g, seasonal_period, seasonal_type),
+        (None, None, None) => HoltWinters::auto(seasonal_period, seasonal_type),
         _ => {
             return Err(ModelSpecError::new(
                 "HoltWinters requires either all three smoothing parameters (alpha, beta, gamma) or none for auto-optimization",
@@ -615,9 +621,7 @@ fn handle_holt_winters(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpe
     Ok(Box::new(forecaster))
 }
 
-fn get_seasonal_type_kwarg(
-    spec: &mut ModelSpec,
-) -> Result<Option<SeasonalType>, ModelSpecError> {
+fn get_seasonal_type_kwarg(spec: &mut ModelSpec) -> Result<Option<SeasonalType>, ModelSpecError> {
     const KEY: &str = "seasonal_type";
     let msg = format!(
         "Expected argument '{KEY}' for model {} to be 'additive' or 'multiplicative'",
@@ -666,8 +670,8 @@ fn handle_ets(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
         }
         [SpecValue::Ident(notation)] => {
             // ETS(ANN) style with a 3-char notation string as a single identifier
-            let ets_spec = ETSSpec::from_notation(notation)
-                .map_err(|e| ModelSpecError::new(e.to_string()))?;
+            let ets_spec =
+                ETSSpec::from_notation(notation).map_err(|e| ModelSpecError::new(e.to_string()))?;
             if let Some(period) = get_seasonal_period(spec)? {
                 ETS::new(ets_spec, period)
             } else {
@@ -677,15 +681,15 @@ fn handle_ets(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
         [SpecValue::Ident(notation), SpecValue::Number(_period)] => {
             // ETS(ANN, 12) style with notation string and seasonal period
             let period = try_as_seasonal_period(&args[1])?;
-            let ets_spec = ETSSpec::from_notation(notation)
-                .map_err(|e| ModelSpecError::new(e.to_string()))?;
+            let ets_spec =
+                ETSSpec::from_notation(notation).map_err(|e| ModelSpecError::new(e.to_string()))?;
             ETS::new(ets_spec, period)
         }
         [SpecValue::Number(_p), SpecValue::Ident(notation)] => {
             // ETS(12, ANN) style with period first then notation
             let period = try_as_seasonal_period(&args[0])?;
-            let ets_spec = ETSSpec::from_notation(notation)
-                .map_err(|e| ModelSpecError::new(e.to_string()))?;
+            let ets_spec =
+                ETSSpec::from_notation(notation).map_err(|e| ModelSpecError::new(e.to_string()))?;
             ETS::new(ets_spec, period)
         }
         _ => {

@@ -33,7 +33,6 @@ pub enum SpecValue {
     List(Vec<SpecValue>), // to support list-style kwargs like "seasonal_periods=[12,24]"
 }
 
-
 impl Display for SpecValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -95,7 +94,10 @@ impl SpecValue {
 
     pub fn as_usize_list(&self) -> Result<Vec<usize>, ModelSpecError> {
         if let SpecValue::List(items) = self {
-            items.iter().map(|x| x.as_usize()).collect::<Result<Vec<_>, _>>()
+            items
+                .iter()
+                .map(|x| x.as_usize())
+                .collect::<Result<Vec<_>, _>>()
         } else {
             Err(ModelSpecError::new("Expected a list value"))
         }
@@ -103,7 +105,10 @@ impl SpecValue {
 
     pub fn as_float_list(&self) -> Result<Vec<f64>, ModelSpecError> {
         if let SpecValue::List(items) = self {
-            items.iter().map(|x| x.as_float()).collect::<Result<Vec<_>, _>>()
+            items
+                .iter()
+                .map(|x| x.as_float())
+                .collect::<Result<Vec<_>, _>>()
         } else {
             Err(ModelSpecError::new("Expected a list value"))
         }
@@ -153,7 +158,8 @@ impl ModelSpec {
             match value {
                 SpecValue::Number(n) => Ok(Some(*n)),
                 _ => Err(ModelSpecError::new(format!(
-                    "Expected keyword argument '{key}' for model {} to be a number", self.model_name
+                    "Expected keyword argument '{key}' for model {} to be a number",
+                    self.model_name
                 ))),
             }
         } else {
@@ -166,7 +172,8 @@ impl ModelSpec {
             match value {
                 SpecValue::Flag(n) => Ok(Some(*n)),
                 _ => Err(ModelSpecError::new(format!(
-                    "Expected keyword argument '{key}' for model {} to be a flag", self.model_name
+                    "Expected keyword argument '{key}' for model {} to be a flag",
+                    self.model_name
                 ))),
             }
         } else {
@@ -181,16 +188,11 @@ impl ModelSpec {
         })
     }
 
-    pub fn get_usize_kwarg(
-        &mut self,
-        key: &str,
-    ) -> Result<Option<usize>, ModelSpecError> {
+    pub fn get_usize_kwarg(&mut self, key: &str) -> Result<Option<usize>, ModelSpecError> {
         if let Some(arg) = self.remove_kwarg(key) {
-            let value = arg.as_usize()
-                .map_err(|_| ModelSpecError::new(format!(
-                    "{} must be a non-negative integer",
-                    key
-                )))?;
+            let value = arg.as_usize().map_err(|_| {
+                ModelSpecError::new(format!("{} must be a non-negative integer", key))
+            })?;
             return Ok(Some(value));
         }
         Ok(None)
@@ -202,12 +204,14 @@ impl ModelSpec {
     ) -> Result<Option<Vec<f64>>, ModelSpecError> {
         match self.remove_kwarg(key) {
             Some(value) => {
-                let value = value.as_float_list().map_err(|_| ModelSpecError::new(format!(
-                    "Expected argument '{key}' for model {} to be a list of float values",
-                    self.model_name
-                )))?;
+                let value = value.as_float_list().map_err(|_| {
+                    ModelSpecError::new(format!(
+                        "Expected argument '{key}' for model {} to be a list of float values",
+                        self.model_name
+                    ))
+                })?;
                 Ok(Some(value))
-            },
+            }
             None => Ok(None),
         }
     }
