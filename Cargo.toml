@@ -49,7 +49,6 @@ strum_macros = "0.28"
 simd-json = "0.17.0"
 log = "0.4"
 statrs = "0.18"
-welch-sde = "0.1.0"
 regex-syntax = "0.8.10"
 crc16 = "0.4.0"
 
