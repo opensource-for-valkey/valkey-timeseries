@@ -24,7 +24,7 @@ const MAX_SEASONALITY_PERIODS: usize = 4;
 /// trend, seasonality, and residual.
 ///
 /// If SEASONALITY is "auto", the seasonal period(s) are automatically inferred
-/// from the data using a periodogram.
+/// from the data.
 ///
 /// If a single period is specified, STL decomposition is used.
 /// If multiple periods are specified, MSTL decomposition is used.

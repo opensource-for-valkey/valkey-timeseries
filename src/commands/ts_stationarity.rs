@@ -22,7 +22,7 @@ use valkey_module::{
 ///
 /// Options:
 /// - `TEST`: Which test to run. Defaults to `combined`.
-///   - `adf` — Augmented Dickey-Fuller test (null: series has unit root, i.e. non-stationary)
+///   - `adf` — Augmented Dickey-Fuller test (null: series has unit root, i.e., non-stationary)
 ///   - `kpss` — KPSS test (null: series is stationary)
 ///   - `combined` — Runs both ADF and KPSS and returns an overall conclusion
 /// - `LAGS n`: Number of lags for the test (integer ≥ 0). Only valid with `TEST adf` or `TEST kpss`.

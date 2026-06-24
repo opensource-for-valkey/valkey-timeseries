@@ -11,9 +11,7 @@ use valkey_module::{
 /// TS.PERIODS key startTimestamp endTimestamp [MIN_STRENGTH minStrength] [DOMINANT]
 /// ```
 ///
-/// `TS.PERIODS` detects seasonal periods in a time series using periodogram-based
-/// spectral analysis (with the `seasonal-detection` feature, the SAZED ensemble
-/// from fdars-core is used instead).
+/// `TS.PERIODS` detects seasonal periods in a time series using the SAZED algorithm.
 ///
 /// By default, all detected periods are returned as an array of arrays with
 /// metadata about each period (period, power, strength, acf, n_cycles).
@@ -22,7 +20,7 @@ use valkey_module::{
 /// (integer) is returned, or `nil` if no significant period is found.
 ///
 /// `MIN_STRENGTH` sets the minimum seasonal differencing strength (0–1) for a
-/// period to be accepted. Default is 0.05. Set to 0 to disable strength filtering.
+/// period to be accepted. The default is 0.05. Set to 0 to disable strength filtering.
 pub fn ts_periods_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
