@@ -2,10 +2,8 @@
 
 Detect seasonal periods in a time series using spectral analysis.
 
-`TS.PERIODS` uses periodogram-based spectral analysis (or the SAZED ensemble from
-fdars-core when the `seasonal-detection` feature is enabled) to identify periodic
-patterns in the data. Each detected period is returned with metadata about its
-strength and reliability.
+`TS.PERIODS` uses the SAZED ensemble to identify periodic patterns in the data. Each detected period is returned with metadata 
+about its strength and reliability.
 
 If the `DOMINANT` option is specified, only the single most significant period
 is returned as an integer, or `nil` if no significant period is found.
