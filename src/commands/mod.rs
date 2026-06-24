@@ -19,7 +19,7 @@ mod ts_del;
 mod ts_deleterule;
 mod ts_features;
 mod ts_fillgaps;
-mod ts_forecast_cmd;
+mod ts_forecast;
 mod ts_get;
 mod ts_incr_decr_by;
 mod ts_info;
