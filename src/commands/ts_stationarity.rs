@@ -1,13 +1,11 @@
-use crate::commands::parse_timestamp_range;
+use crate::commands::command_parser::parse_series_range_samples;
 use crate::common::replies::{
     reply_with_double, reply_with_integer, reply_with_map, reply_with_str,
 };
-use crate::error_consts;
-use crate::series::get_timeseries;
 use anofox_forecast::validation::stationarity::{self, StationarityResult};
-use valkey_module::{
-    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+
+const MIN_SAMPLES: usize = 10;
 
 /// ```text
 /// TS.STATIONARITY key startTime endTime
@@ -36,9 +34,17 @@ pub fn ts_stationarity_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResu
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    let key = args.next_arg()?;
+    // Get the time series and extract sample values
+    let samples = parse_series_range_samples(ctx, &mut args)?;
+    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
 
-    let date_range = parse_timestamp_range(&mut args)?;
+    // Minimum data check
+    if values.len() < MIN_SAMPLES {
+        return Err(ValkeyError::String(format!(
+            "TSDB: insufficient data for stationarity test. Need at least {MIN_SAMPLES} samples, got {}",
+            values.len()
+        )));
+    }
 
     // Parse optional TEST and LAGS
     let mut test_type = TestType::Combined;
@@ -79,27 +85,6 @@ pub fn ts_stationarity_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResu
         return Err(ValkeyError::Str(
             "TSDB: LAGS option is not supported with TEST combined",
         ));
-    }
-
-    // Get the time series and extract sample values
-    let series = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
-        Ok(Some(series)) => series,
-        Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
-        Err(e) => return Err(e),
-    };
-
-    let (start, end) = date_range.get_series_range(&series, None, false);
-    let samples = series.get_range(start, end);
-
-    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
-
-    // Minimum data check
-    const MIN_SAMPLES: usize = 10;
-    if values.len() < MIN_SAMPLES {
-        return Err(ValkeyError::String(format!(
-            "TSDB: insufficient data for stationarity test. Need at least {MIN_SAMPLES} samples, got {}",
-            values.len()
-        )));
     }
 
     // Constant series (all values identical) is trivially stationary.

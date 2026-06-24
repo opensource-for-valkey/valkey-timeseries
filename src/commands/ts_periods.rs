@@ -1,11 +1,7 @@
-use crate::commands::parse_timestamp_range;
+use crate::commands::command_parser::parse_series_range_samples;
 use crate::common::replies::{reply_with_array, reply_with_double, reply_with_integer};
-use crate::error_consts;
-use crate::series::get_timeseries;
 use anofox_forecast::detection::period::{PeriodDetectionConfig, detect_periods};
-use valkey_module::{
-    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// ```text
 /// TS.PERIODS key startTimestamp endTimestamp [MIN_STRENGTH minStrength] [DOMINANT]
@@ -28,8 +24,15 @@ pub fn ts_periods_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    let key = args.next_arg()?;
-    let date_range = parse_timestamp_range(&mut args)?;
+    // Get the time series and extract sample values
+    let samples = parse_series_range_samples(ctx, &mut args)?;
+    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
+
+    if values.len() < 4 {
+        return Err(ValkeyError::Str(
+            "TSDB: insufficient data for period detection. Need at least 4 samples.",
+        ));
+    }
 
     // Parse optional arguments: MIN_STRENGTH and DOMINANT
     let mut min_strength: Option<f64> = None;
@@ -61,24 +64,6 @@ pub fn ts_periods_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     args.done()?;
-
-    let samples = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
-        Ok(Some(series)) => {
-            let (start, end) = date_range.get_series_range(&series, None, false);
-            series.get_range(start, end)
-        }
-        Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
-        Err(e) => return Err(e),
-    };
-
-    // Extract values
-    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
-
-    if values.len() < 4 {
-        return Err(ValkeyError::Str(
-            "TSDB: insufficient data for period detection. Need at least 4 samples.",
-        ));
-    }
 
     let config = PeriodDetectionConfig {
         min_strength: min_strength.unwrap_or(0.05),

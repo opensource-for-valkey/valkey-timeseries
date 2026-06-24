@@ -1,22 +1,20 @@
 use crate::analysis::forecasting::try_parse_trend_criterion;
+use crate::commands::CommandArgIterator;
+use crate::commands::command_parser::parse_series_range_samples;
 use crate::commands::utils::reply_with_accuracy_metrics;
-use crate::commands::{CommandArgIterator, parse_timestamp_range};
 use crate::common::Sample;
 use crate::common::replies::{
     reply_with_array, reply_with_double, reply_with_integer, reply_with_map, reply_with_str,
 };
 use crate::common::time::compute_median_step_ms;
-use crate::error_consts;
-use crate::series::{create_or_update_series_with_samples, get_timeseries};
+use crate::series::create_or_update_series_with_samples;
 use anofox_forecast::seasonality::auto_trend::{AutoTrend, TrendCriterion};
 use anofox_forecast::seasonality::traits::{Recency, TrendComponent};
 use anofox_forecast::seasonality::{
     AutoRecencyConfig, ExponentialTrend, LogisticTrend, PolynomialTrend, TheilSenTrend,
 };
 use anofox_forecast::utils::{AccuracyMetrics, calculate_metrics};
-use valkey_module::{
-    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// Trend model selection: either Auto (with optional criterion) or a specific model.
 #[derive(Debug, Clone)]
@@ -83,21 +81,8 @@ pub fn ts_trend_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    let key = args.next_arg()?;
-    let date_range = parse_timestamp_range(&mut args)?;
-    let options = parse_trend_args(&mut args)?;
-
-    args.done()?;
-
-    let samples = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
-        Ok(Some(series)) => {
-            let (start, end) = date_range.get_series_range(&series, None, false);
-            series.get_range(start, end)
-        }
-        Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
-        Err(e) => return Err(e),
-    };
-
+    // Get the time series and extract sample values
+    let samples = parse_series_range_samples(ctx, &mut args)?;
     let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
 
     if values.len() < 4 {
@@ -105,6 +90,10 @@ pub fn ts_trend_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             "TSDB: insufficient data for trend fitting. Need at least 4 samples.",
         ));
     }
+
+    let options = parse_trend_args(&mut args)?;
+
+    args.done()?;
 
     // Fit the trend based on the selected model
     if let TrendModel::Auto(criterion) = options.model {
