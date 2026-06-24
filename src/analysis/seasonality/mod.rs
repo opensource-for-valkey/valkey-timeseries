@@ -1,12 +1,8 @@
-pub mod mstl;
-mod periodogram;
-pub mod stl;
 mod test_data;
 
-use crate::analysis::seasonality::mstl::Mstl;
-use crate::analysis::seasonality::stl::Stl;
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
-pub use periodogram::Detector as PeriodogramDetector;
+use anofox_forecast::detection::{PeriodDetectionConfig, detect_periods};
+use anofox_forecast::seasonality::{MSTL, STL};
 
 /// A detector of periodic signals in a time series.
 pub trait SeasonalityDetector {
@@ -28,9 +24,9 @@ pub fn seasonally_adjust(
     let mut periods = match seasonality {
         Seasonality::Periods(periods) => periods.clone(),
         Seasonality::Auto => {
-            // use periodogram to detect periods
-            let detector = PeriodogramDetector::default();
-            detector.detect(ts).iter().map(|&x| x as usize).collect()
+            let config = PeriodDetectionConfig::default();
+            let periods = detect_periods(ts, &config);
+            periods.iter().map(|x| x.period).collect()
         }
     };
 
@@ -45,7 +41,7 @@ pub fn seasonally_adjust(
         let required = 2 * periods[0];
         validate_insufficient_data::<Vec<f64>>(required, n)?;
 
-        Stl::new(periods[0])
+        STL::new(periods[0])
             .robust()
             .decompose(ts)
             .map(|res| res.remainder)
@@ -57,7 +53,7 @@ pub fn seasonally_adjust(
         let required = 2 * max_period;
         validate_insufficient_data::<Vec<f64>>(required, n)?;
 
-        Mstl::new(periods.to_vec())
+        MSTL::new(periods.to_vec())
             .robust()
             .decompose(ts)
             .map(|res| res.remainder)

@@ -1,17 +1,14 @@
 use crate::analysis::seasonality::{
-    PeriodogramDetector, Seasonality,
-    mstl::{MSTLResult, Mstl},
-    stl::{STLResult, Stl},
+    Seasonality,
 };
-use crate::commands::{CommandArgIterator, parse_timestamp_range};
+use crate::commands::command_parser::parse_series_range_samples;
+use crate::commands::CommandArgIterator;
 use crate::common::replies::{
     reply_with_array, reply_with_double, reply_with_integer, reply_with_str,
 };
-use crate::error_consts;
-use crate::series::get_timeseries;
-use valkey_module::{
-    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
-};
+use anofox_forecast::detection::{detect_periods, PeriodDetectionConfig};
+use anofox_forecast::seasonality::{MSTL, STL, MSTLResult, STLResult};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 const MAX_SEASONALITY_PERIODS: usize = 4;
 
@@ -35,39 +32,21 @@ pub fn ts_decompose_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult 
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    let key = args.next_arg()?;
-    let date_range = parse_timestamp_range(&mut args)?;
+    // Get the time series and extract sample values
+    let samples = parse_series_range_samples(ctx, &mut args)?;
+    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
+
     let seasonality = parse_seasonality(&mut args)?;
 
     args.done()?;
-
-    let samples = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
-        Ok(Some(series)) => {
-            let (start, end) = date_range.get_series_range(&series, None, false);
-            series.get_range(start, end)
-        }
-        Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
-        Err(e) => return Err(e),
-    };
-
-    let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
 
     // Determine periods
     let periods = match &seasonality {
         Seasonality::Periods(periods) => periods.clone(),
         Seasonality::Auto => {
-            let detector = PeriodogramDetector::default();
-            let detected: Vec<usize> = detector
-                .detect(&values)
-                .iter()
-                .map(|&x| x as usize)
-                .collect();
-            if detected.is_empty() {
-                return Err(ValkeyError::Str(
-                    "TSDB: could not automatically detect seasonality in the data",
-                ));
-            }
-            detected
+            let config = PeriodDetectionConfig::default();
+            let periods = detect_periods(&values, &config);
+            periods.iter().map(|p| p.period).collect()
         }
     };
 
@@ -91,7 +70,7 @@ pub fn ts_decompose_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult 
             )));
         }
 
-        let result = Stl::new(period)
+        let result = STL::new(period)
             .robust()
             .decompose(&values)
             .ok_or(ValkeyError::Str("TSDB: STL decomposition failed"))?;
@@ -108,7 +87,7 @@ pub fn ts_decompose_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult 
             )));
         }
 
-        let result = Mstl::new(periods)
+        let result = MSTL::new(periods)
             .robust()
             .decompose(&values)
             .ok_or(ValkeyError::Str("TSDB: MSTL decomposition failed"))?;
@@ -169,10 +148,10 @@ fn parse_seasonality(args: &mut CommandArgIterator) -> ValkeyResult<Seasonality>
 /// Reply with STL decomposition result.
 ///
 /// Response format (array of 4):
-///   "original"  -> [[ts, val], ...]
-///   "trend"     -> [[ts, val], ...]
-///   "seasonal"  -> [[ts, val], ...]
-///   "residual"  -> [[ts, val], ...]
+///   "original" -> [[ts, val], ...]
+///   "trend" -> [[ts, val], ...]
+///   "seasonal" -> [[ts, val], ...]
+///   "residual" -> [[ts, val], ...]
 fn reply_stl_result(
     ctx: &Context,
     timestamps: &[i64],
