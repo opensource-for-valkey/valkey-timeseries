@@ -20,11 +20,7 @@ use valkey_module::{
 /// Fills missing timestamps in the time series with a fill value (default is NaN)
 /// between startTimestamp and endTimestamp (inclusive).
 ///
-/// If FREQUENCY is not specified, the frequency is inferred from the existing data
-/// using a two-step approach: first finding the modal (most common) interval, then
-/// checking whether the GCD of all intervals recovers a finer base frequency (useful
-/// when samples have been deleted from a uniformly-spaced series). At least 2 samples
-/// are required for inference.
+/// If FREQUENCY is not specified, the frequency is inferred from the existing data.
 ///
 /// If ALIGN is specified, timestamps are snapped to a frequency grid anchored at the
 /// given alignment reference. Use `ALIGN 0` to align to epoch, `ALIGN <timestamp>` for
@@ -139,7 +135,6 @@ fn parse_align(args: &mut CommandArgIterator, start_ts: Timestamp) -> ValkeyResu
 
 fn handle_replication(ctx: &Context, key: &ValkeyString) {
     ctx.replicate_verbatim();
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.fillgaps", key);
     ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", key);
 }
 
