@@ -149,17 +149,17 @@ valkey-cli -h localhost TS.GET test
 
 **Available Docker targets:**
 
-| Command | Description |
-|---|---|
-| `make docker-build` | Build production image (official `valkey/valkey` base) |
-| `make docker-build-source` | Build from source (Valkey + module compiled together) |
-| `make docker-up` | Start standalone container on port 6379 |
-| `make docker-down` | Stop and remove standalone container |
-| `make docker-up-cluster` | Start 3-node cluster (ports 6379-6381) |
-| `make docker-down-cluster` | Stop and remove cluster |
-| `make docker-shell` | Open a shell in the running container |
-| `make docker-logs` | Follow container logs |
-| `make docker-test` | Run integration tests against running container |
+| Command                    | Description                                            |
+|----------------------------|--------------------------------------------------------|
+| `make docker-build`        | Build production image (official `valkey/valkey` base) |
+| `make docker-build-source` | Build from source (Valkey + module compiled together)  |
+| `make docker-up`           | Start standalone container on port 6379                |
+| `make docker-down`         | Stop and remove standalone container                   |
+| `make docker-up-cluster`   | Start 3-node cluster (ports 6379-6381)                 |
+| `make docker-down-cluster` | Stop and remove cluster                                |
+| `make docker-shell`        | Open a shell in the running container                  |
+| `make docker-logs`         | Follow container logs                                  |
+| `make docker-test`         | Run integration tests against running container        |
 
 **Custom builds:**
 
