@@ -1,4 +1,5 @@
-use crate::labels::{Label, Labels, SeriesFingerprint};
+use crate::labels::{HasFingerprint, Label, Labels, SeriesFingerprint};
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
@@ -26,11 +27,11 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
 /// cases have opposite semantics (aggregation groups everything together; binary ops
 /// match on all labels).
 pub(in crate::promql) fn compute_binary_match_key(
-    labels: &Labels,
+    labels: impl AsRef<[Label]>,
     matching: Option<&LabelModifier>,
 ) -> SeriesFingerprint {
+    let labels = labels.as_ref();
     let mut hasher: xxhash3_128::Hasher = Default::default();
-    // labels is assumed to be sorted, so no need for pre-processing
     match matching {
         None => labels
             .iter()
@@ -75,10 +76,10 @@ pub fn compute_grouping_labels(mut labels: Labels, modifier: Option<&LabelModifi
 /// 1. Arithmetic ops always drop `__name__`
 /// 2. `on()` keeps only listed labels; `ignoring()` removes listed labels
 pub(super) fn result_metric(
-    mut labels: Labels,
+    mut labels: EvalLabels,
     op: TokenType,
     matching: Option<&LabelModifier>,
-) -> Labels {
+) -> EvalLabels {
     if changes_metric_schema(op) {
         labels.remove(METRIC_NAME);
     }
@@ -94,9 +95,11 @@ pub(super) fn result_metric(
     labels
 }
 
-pub fn get_metric_signature(labels: &Labels, drop_name: bool) -> SeriesFingerprint {
+/// Slice-based variant of `get_metric_signature` for contexts where only a
+/// `&[Label]` is available (e.g., from `EvalLabels::as_ref()`).
+pub(crate) fn get_metric_signature(labels: &[Label], drop_name: bool) -> SeriesFingerprint {
     if !drop_name {
-        return labels.get_fingerprint();
+        return labels.fingerprint();
     }
     let mut hasher: xxhash3_128::Hasher = Default::default();
 
@@ -113,7 +116,7 @@ pub fn get_metric_signature(labels: &Labels, drop_name: bool) -> SeriesFingerpri
 pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
     let mut seen_label_sets = FingerprintHashSet::default();
     for sample in samples {
-        let key = get_metric_signature(&sample.labels, sample.drop_name);
+        let key = get_metric_signature(sample.labels.as_ref(), sample.drop_name);
         if !seen_label_sets.insert(key) {
             return Err(EvaluationError::DuplicateLabelSet);
         }
@@ -129,11 +132,11 @@ pub fn vector_contains_same_label_set(v: &[EvalSample]) -> bool {
     match v {
         [] => false,
         [_first] => false,
-        [first, second] => first.labels.signature() == second.labels.signature(),
+        [first, second] => first.labels.fingerprint() == second.labels.fingerprint(),
         _ => {
             let mut seen = FingerprintHashSet::default();
             for sample in v {
-                let hash = sample.labels.signature();
+                let hash = sample.labels.fingerprint();
                 if !seen.insert(hash) {
                     return true;
                 }

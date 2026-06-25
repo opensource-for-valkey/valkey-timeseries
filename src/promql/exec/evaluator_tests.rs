@@ -91,9 +91,11 @@ mod tests {
             );
 
             assert_eq!(
-                actual_sample.labels, expected_labels,
+                actual_sample.labels.as_ref(),
+                expected_labels.as_ref(),
                 "Sample {i} labels mismatch: got {:?}, expected {:?}",
-                actual_sample.labels, expected_labels
+                actual_sample.labels,
+                expected_labels
             );
         }
     }
@@ -1387,7 +1389,7 @@ mod tests {
         let mut expected_sorted = expected
             .iter()
             .map(|(value, labels)| {
-                let labels = Labels::from_pairs(labels);
+                let labels = Labels::from_pairs(labels).into();
                 EvalSample {
                     timestamp_ms: query_time_ms,
                     value: *value,
@@ -1573,7 +1575,7 @@ mod tests {
                         samples.push(Sample::new(*ts, *value));
                     }
                     EvalSamples {
-                        labels,
+                        labels: labels.into(),
                         values: samples,
                         drop_name: false,
                         range_end_ms: 0,

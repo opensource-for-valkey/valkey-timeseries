@@ -1,6 +1,7 @@
 use crate::common::Timestamp;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
-use crate::labels::Labels;
+use crate::labels::HasFingerprint;
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::ParIter;
@@ -349,19 +350,20 @@ fn is_reduction_aggregate(op: TokenType) -> bool {
 fn group_samples(
     expr: &AggregateExpr,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<(Labels, Vec<EvalSample>)> {
+) -> FingerprintHashMap<(EvalLabels, Vec<EvalSample>)> {
     let modifier = expr.modifier.as_ref();
 
     let keyed: Vec<_> = samples
         .into_par()
         .map(|sample| {
             let labels = sample.labels.compute_grouping_labels(modifier);
-            let key = labels.get_fingerprint();
+            let key = labels.fingerprint();
             (key, labels, sample)
         })
         .collect();
 
-    let mut groups: FingerprintHashMap<(Labels, Vec<EvalSample>)> = FingerprintHashMap::default();
+    let mut groups: FingerprintHashMap<(EvalLabels, Vec<EvalSample>)> =
+        FingerprintHashMap::default();
     for (key, labels, sample) in keyed {
         let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
         entry.1.push(sample);
@@ -372,14 +374,14 @@ fn group_samples(
 fn group_sample_values(
     expr: &AggregateExpr,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<(Labels, Vec<f64>)> {
-    let mut groups: FingerprintHashMap<(Labels, Vec<f64>)> = FingerprintHashMap::default();
+) -> FingerprintHashMap<(EvalLabels, Vec<f64>)> {
+    let mut groups: FingerprintHashMap<(EvalLabels, Vec<f64>)> = FingerprintHashMap::default();
 
     for sample in samples {
         let labels = sample
             .labels
             .compute_grouping_labels(expr.modifier.as_ref());
-        let key = labels.get_fingerprint();
+        let key = labels.fingerprint();
 
         let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
         entry.1.push(sample.value);
@@ -526,5 +528,5 @@ fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usiz
 }
 
 fn sample_hash(sample: &EvalSample) -> u128 {
-    sample.labels.get_fingerprint()
+    sample.labels.fingerprint()
 }

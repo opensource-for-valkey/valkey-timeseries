@@ -5,6 +5,7 @@ use crate::labels::filters::{
     SeriesSelector,
 };
 use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel};
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::generated::{
     InstantSample as ProtoInstantSample, Label as ProtoLabel, LabelMatcher as ProtoLabelMatcher,
     LabelMatcherList, OrMatcherList, RangeSample as ProtoRangeSample, Sample as ProtoSample,
@@ -12,7 +13,6 @@ use crate::promql::generated::{
     series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::{EvalSample, RangeSample};
-use ahash::AHashMap;
 use promql_parser::label::{Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
 use valkey_module::ValkeyError;
@@ -296,15 +296,19 @@ impl TryFrom<ProtoSeriesSelector> for SeriesSelector {
 
 impl From<ProtoInstantSample> for EvalSample {
     fn from(proto: ProtoInstantSample) -> Self {
-        let mut labels: AHashMap<String, String> = AHashMap::default();
-        for label in proto.labels.iter() {
-            labels.insert(label.name.clone(), label.value.clone());
-        }
+        let labels = proto
+            .labels
+            .into_iter()
+            .map(|l| Label {
+                name: l.name,
+                value: l.value,
+            })
+            .collect();
 
         EvalSample {
             timestamp_ms: proto.timestamp,
             value: proto.value,
-            labels: labels.into(),
+            labels: EvalLabels::shared(labels),
             drop_name: false,
         }
     }

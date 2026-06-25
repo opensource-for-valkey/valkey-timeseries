@@ -8,6 +8,7 @@ use crate::promql::binops::{
 };
 use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::collect_vector_selectors;
 use crate::promql::functions::{PromQLArg, resolve_function};
 use crate::promql::functions::{PromQLFunction, PromQLFunctionImpl};
@@ -20,7 +21,6 @@ use ahash::{AHashSet, RandomState};
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
 use orx_parallel::{IterIntoParIter, ParIter};
-use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
@@ -150,7 +150,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     }
                 }
 
-                PreloadedInstantSeries { labels, values }
+                PreloadedInstantSeries {
+                    labels: labels.into(),
+                    values,
+                }
             })
             .collect();
 
@@ -232,14 +235,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ExprResult::RangeVector(mat) => {
                 for v in mat.iter_mut() {
                     if v.drop_name {
-                        v.labels.retain(|l| l.name != METRIC_NAME);
+                        v.labels.drop_name();
                     }
                 }
             }
             ExprResult::InstantVector(vec) => {
                 for v in vec.iter_mut() {
                     if v.drop_name {
-                        v.labels.retain(|l| l.name != METRIC_NAME);
+                        v.labels.drop_name();
                     }
                 }
 
@@ -390,7 +393,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // Ensure deterministic merge ordering for per-step sample appends.
         step_results.sort_unstable_by_key(|(ts, _)| *ts);
 
-        let mut series_map: halfbrown::HashMap<Labels, Vec<Sample>, RandomState> =
+        let mut series_map: halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState> =
             Default::default();
         for (current_time_ms, samples) in step_results {
             // DO NOT use the .entry() api here, as it would force an unnecessary clone in the
@@ -474,7 +477,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                         samples.push(EvalSample {
                             timestamp_ms: sample.timestamp,
                             value: sample.value,
-                            labels: series.labels.clone(), // at some point use EvalLabels to avoid full clone
+                            labels: series.labels.clone(),
                             drop_name: false,
                         });
                     }

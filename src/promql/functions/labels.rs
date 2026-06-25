@@ -38,7 +38,7 @@ fn apply_label_replace_to_samples(
             if replaced.is_empty() {
                 sample.labels.remove(dst_label);
             } else {
-                sample.labels.insert(dst_label, replaced);
+                sample.labels.set(dst_label, replaced);
             }
 
             if dst_label == METRIC_NAME {
@@ -166,7 +166,7 @@ impl PromQLFunction for LabelJoinFunction {
             if joined.is_empty() {
                 sample.labels.remove(&dst_label);
             } else {
-                sample.labels.insert(&dst_label, joined);
+                sample.labels.set(&dst_label, joined);
             }
 
             if dst_label == METRIC_NAME {
