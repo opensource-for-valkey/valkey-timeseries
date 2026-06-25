@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::labels::HasFingerprint;
 use crate::parser::number::parse_number;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_instant_vector, expect_scalar, expect_string, is_inf,
@@ -67,13 +68,13 @@ impl Bucket {
         let src = self.ts.borrow();
         let mut ts = src.clone();
         ts.value = 0.0;
-        ts.labels.insert(LE, le_str.to_string());
+        ts.labels.set(LE, le_str.to_string());
         Rc::new(RefCell::new(ts))
     }
 
     fn set_le(&mut self, end_str: &str) {
         let mut ts = self.ts.borrow_mut();
-        ts.labels.insert(LE, end_str.to_string());
+        ts.labels.set(LE, end_str.to_string());
     }
 
     pub fn pop_timeseries(&mut self) -> Option<EvalSample> {
@@ -136,7 +137,7 @@ fn vmrange_buckets_to_le(tss: Vec<EvalSample>) -> Vec<EvalSample> {
         _ts.labels.remove(LE);
         _ts.labels.remove("vmrange");
 
-        let key = _ts.labels.signature();
+        let key = _ts.labels.fingerprint();
         // series.push(_ts);
         let shared_ts = Rc::new(RefCell::new(_ts));
 
@@ -421,10 +422,10 @@ pub(super) fn histogram_quantile(args: Vec<PromQLArg>) -> EvalResult<ExprResult>
 
         let (mut ts_lower, mut ts_upper) = if !bounds_label.is_empty() {
             let mut ts_lower = xss[0].ts.clone(); // todo: use take and clone instead of 2 clones ?
-            ts_lower.labels.insert(&bounds_label, "lower".to_string());
+            ts_lower.labels.set(&bounds_label, "lower".to_string());
 
             let mut ts_upper = xss[0].ts.clone();
-            ts_upper.labels.insert(&bounds_label, "upper".to_string());
+            ts_upper.labels.set(&bounds_label, "upper".to_string());
             (ts_lower, ts_upper)
         } else {
             (EvalSample::default(), EvalSample::default())
@@ -469,9 +470,9 @@ fn group_le_timeseries(tss: &mut [EvalSample]) -> FingerprintHashMap<Vec<LeTimes
             }
 
             if let Ok(le) = parse_number(tag_value) {
-                ts.labels.reset_metric_group();
+                ts.labels.drop_name();
                 ts.labels.remove("le");
-                let key = ts.labels.signature();
+                let key = ts.labels.fingerprint();
 
                 m.entry(key).or_default().push(LeTimeseries {
                     le,

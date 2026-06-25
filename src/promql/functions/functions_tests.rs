@@ -3,6 +3,7 @@ mod tests {
     use crate::common::Sample;
     use crate::common::math::kahan_inc;
     use crate::labels::Labels;
+    use crate::promql::exec::types::EvalLabels;
     use crate::promql::functions::PromQLFunctionImpl;
     use crate::promql::functions::utils::variance_kahan;
     use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
@@ -153,7 +154,7 @@ mod tests {
         EvalSample {
             timestamp_ms: 1000,
             value,
-            labels: Labels::from_pairs(labels),
+            labels: Labels::from_pairs(labels).into(),
             drop_name: false,
         }
     }
@@ -1211,7 +1212,7 @@ mod tests {
         let samples = vec![EvalSample {
             timestamp_ms: 10_000,
             value: 123.0,
-            labels: Labels::from_pairs(&[(METRIC_NAME, "metric"), ("job", "api")]),
+            labels: Labels::from_pairs(&[(METRIC_NAME, "metric"), ("job", "api")]).into(),
             drop_name: false,
         }];
 
@@ -1251,7 +1252,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 1970.0);
         assert_eq!(result[0].timestamp_ms, 0);
-        assert_eq!(result[0].labels, Labels::default());
+        assert_eq!(result[0].labels.as_ref(), Labels::default().as_ref());
         assert!(!result[0].drop_name);
     }
 
@@ -1300,7 +1301,7 @@ mod tests {
             .collect::<Vec<_>>();
         EvalSamples {
             values,
-            labels: labels.into(),
+            labels: EvalLabels::from(labels.into()),
             range_ms: 0,
             range_end_ms: 0,
             drop_name: false,
@@ -1334,7 +1335,10 @@ mod tests {
         // Rate = (125 - 100) / (3000 - 1000) * 1000 = 25 / 2 = 12.5 per second
         assert_eq!(result[0].value, 12.5);
         assert_eq!(result[0].timestamp_ms, 3000);
-        assert_eq!(result[0].labels, labels.into());
+        assert_eq!(
+            result[0].labels.as_ref(),
+            Labels::from(labels.clone()).as_ref()
+        );
     }
 
     #[test]

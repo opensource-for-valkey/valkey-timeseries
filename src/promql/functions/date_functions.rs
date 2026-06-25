@@ -1,3 +1,4 @@
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{exact_arity_error, max_arity_error};
 use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
@@ -125,7 +126,7 @@ macro_rules! make_datetime_function {
                         value: datetime_from_millis(ctx.evaluation_ts)
                             .map(|dt| sample_value($part, dt))
                             .unwrap_or(f64::NAN),
-                        labels: Default::default(),
+                        labels: EvalLabels::default(),
                         drop_name: false,
                     }])),
                     1 => self.apply(args.into_iter().next().expect("single arg"), ctx),

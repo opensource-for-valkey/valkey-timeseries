@@ -1,8 +1,8 @@
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
-use crate::labels::Labels;
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
@@ -148,7 +148,7 @@ pub fn evaluate_instant(
             samples
                 .into_iter()
                 .map(|s| InstantSample {
-                    labels: s.labels,
+                    labels: s.labels.into_labels(),
                     timestamp_ms: s.timestamp_ms,
                     value: s.value,
                 })
@@ -162,7 +162,7 @@ pub fn evaluate_instant(
                         s.labels.remove(METRIC_NAME);
                     }
                     RangeSample {
-                        labels: s.labels,
+                        labels: s.labels.into_labels(),
                         samples: s.values,
                     }
                 })
@@ -232,7 +232,7 @@ pub fn evaluate_range(
 
     // Merge per-step results into the series map.
     let mut series_map =
-        halfbrown::HashMap::<Labels, Vec<Sample>, BuildHasherDefault<XxHash64>>::default();
+        halfbrown::HashMap::<EvalLabels, Vec<Sample>, BuildHasherDefault<XxHash64>>::default();
 
     for (current_time, result) in step_results {
         match result {
@@ -246,7 +246,7 @@ pub fn evaluate_range(
                 }
             }
             ExprResult::Scalar(value) => {
-                let labels = Labels::empty();
+                let labels = EvalLabels::empty();
                 series_map
                     .entry(labels)
                     .or_default()
@@ -267,7 +267,10 @@ pub fn evaluate_range(
 
     let result = series_map
         .into_iter()
-        .map(|(labels, samples)| RangeSample { samples, labels })
+        .map(|(labels, samples)| RangeSample {
+            samples,
+            labels: labels.into_labels(),
+        })
         .collect();
 
     Ok(result)
@@ -337,7 +340,7 @@ impl Tsdb {
                 samples
                     .into_iter()
                     .map(|s| InstantSample {
-                        labels: s.labels,
+                        labels: s.labels.into_labels(),
                         timestamp_ms: s.timestamp_ms,
                         value: s.value,
                     })
@@ -347,7 +350,7 @@ impl Tsdb {
                 samples
                     .into_iter()
                     .map(|s| RangeSample {
-                        labels: s.labels,
+                        labels: s.labels.into_labels(),
                         samples: s.values,
                     })
                     .collect(),
@@ -416,7 +419,7 @@ mod tests {
         }
         labels.sort();
         RangeSample {
-            labels: Labels::new(labels),
+            labels: crate::labels::Labels::new(labels),
             samples: vec![Sample { timestamp, value }],
         }
     }

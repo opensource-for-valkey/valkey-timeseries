@@ -11,8 +11,9 @@
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
 use crate::common::{Sample, Timestamp};
-use crate::labels::{Labels, SeriesFingerprint};
+use crate::labels::{HasFingerprint, SeriesFingerprint};
 use crate::promql::engine::{CachedQueryReader, QueryReader};
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, QueryOptions,
 };
@@ -191,7 +192,7 @@ pub(crate) fn shape_instant_results(series_data: Vec<EvalSamples>) -> ExprResult
         if series.values.is_empty() {
             continue;
         }
-        let fingerprint = series.labels.get_fingerprint();
+        let fingerprint = series.labels.fingerprint();
         if !seen.insert(fingerprint) {
             // todo: append values
             continue;
@@ -217,7 +218,7 @@ pub(crate) fn shape_matrix_results(
     range_ms: i64,
     range_end_ms: i64,
 ) -> ExprResult {
-    let mut series_map: AHashMap<Labels, Vec<Sample>> = AHashMap::new();
+    let mut series_map: AHashMap<EvalLabels, Vec<Sample>> = AHashMap::new();
 
     for series in series_data {
         if let Some(samples) = series_map.get_mut(&series.labels) {
@@ -356,7 +357,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
             .map(|is| EvalSample {
                 timestamp_ms: is.timestamp_ms,
                 value: is.value,
-                labels: is.labels,
+                labels: EvalLabels::from(is.labels),
                 drop_name: false,
             })
             .collect::<Vec<_>>();
@@ -402,7 +403,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
             let series: Vec<EvalSamples> = raw_range_samples
                 .into_iter()
                 .map(|s| EvalSamples {
-                    labels: s.labels,
+                    labels: EvalLabels::from(s.labels),
                     drop_name: false,
                     range_ms: 0, // overwritten by shape_subquery_results
                     values: s.samples,
@@ -419,7 +420,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
             let series: Vec<EvalSamples> = raw_range_samples
                 .into_iter()
                 .map(|s| EvalSamples {
-                    labels: s.labels,
+                    labels: EvalLabels::from(s.labels),
                     drop_name: false,
                     range_ms: range,
                     values: s.samples,
@@ -456,7 +457,7 @@ mod tests {
 
     fn make_loaded(labels: Vec<Label>, samples: Vec<Sample>) -> EvalSamples {
         EvalSamples {
-            labels: Labels::new(labels),
+            labels: EvalLabels::from(crate::labels::Labels::new(labels)),
             drop_name: false,
             range_ms: 0,
             values: samples,

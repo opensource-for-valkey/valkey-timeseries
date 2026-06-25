@@ -272,7 +272,7 @@ pub struct InstantSample {
 impl From<EvalSample> for InstantSample {
     fn from(sample: EvalSample) -> Self {
         Self {
-            labels: sample.labels,
+            labels: sample.labels.into_labels(),
             value: sample.value,
             timestamp_ms: sample.timestamp_ms,
         }
@@ -293,7 +293,7 @@ pub struct RangeSample {
 impl From<EvalSamples> for RangeSample {
     fn from(samples: EvalSamples) -> Self {
         Self {
-            labels: samples.labels,
+            labels: samples.labels.into_labels(),
             samples: samples.values,
         }
     }

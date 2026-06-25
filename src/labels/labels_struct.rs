@@ -17,7 +17,7 @@ use std::fmt::Display;
 /// for looking up label values and the metric name. This is the type returned
 /// by read/query APIs to identify each result series.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-pub struct Labels(Vec<Label>);
+pub struct Labels(pub(crate) Vec<Label>);
 
 impl Labels {
     pub fn with_capacity(capacity: usize) -> Self {
@@ -132,7 +132,7 @@ impl Labels {
         self.0.fingerprint()
     }
 
-    pub fn into_inner(self) -> Vec<Label> {
+    pub(crate) fn into_inner(self) -> Vec<Label> {
         self.0
     }
 

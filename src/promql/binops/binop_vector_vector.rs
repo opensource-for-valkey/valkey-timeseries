@@ -1,6 +1,7 @@
 use super::labels::{compute_binary_match_key, result_metric};
-use crate::labels::{Labels, SeriesFingerprint};
+use crate::labels::SeriesFingerprint;
 use crate::promql::binops::apply_binary_op;
+use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::HashSetExt;
@@ -123,7 +124,7 @@ fn make_fill_one_sample(many_sample: &EvalSample, fill_value: f64) -> EvalSample
     EvalSample {
         timestamp_ms: many_sample.timestamp_ms,
         value: fill_value,
-        labels: Labels::empty(),
+        labels: EvalLabels::empty(),
         drop_name: false,
     }
 }
@@ -609,7 +610,7 @@ fn build_result_labels(
     matching: Option<&LabelModifier>,
     group_labels: Option<&Vec<String>>,
     is_group_right: bool,
-) -> Labels {
+) -> EvalLabels {
     let mut labels = result_metric(many_sample.labels.clone(), operator, matching);
 
     match group_labels {
@@ -617,7 +618,7 @@ fn build_result_labels(
             for name in extra {
                 match one_sample.labels.get(name) {
                     Some(v) => {
-                        labels.insert(name, v.to_string());
+                        labels.set(name, v.to_string());
                     }
                     None if !is_group_right => {
                         // group_left: right is "one" side — remove if absent.
@@ -631,14 +632,14 @@ fn build_result_labels(
         }
         _ => {
             // Copy labels from "one" side not already present on "many" side.
-            // Uses binary search via Labels::contains — no heap allocation.
-            for label in one_sample
+            // Uses binary search via EvalLabels::contains — no heap allocation.
+            let to_copy = one_sample
                 .labels
                 .iter()
                 .filter(|&l| l.name != METRIC_NAME && !many_sample.labels.contains(&l.name))
-            {
-                labels.insert(&label.name, label.value.clone());
-            }
+                .cloned();
+
+            labels.extend(to_copy);
         }
     }
 
@@ -649,9 +650,9 @@ fn build_result_labels(
 /// When `drop_name` is true, `__name__` is excluded from the hash to match
 /// the effective output labels.
 #[inline]
-fn result_fingerprint(labels: &Labels, drop_name: bool) -> u128 {
+fn result_fingerprint(labels: impl AsRef<[crate::Label]>, drop_name: bool) -> u128 {
     let mut hasher: xxhash3_128::Hasher = Default::default();
-    for label in labels.iter() {
+    for label in labels.as_ref().iter() {
         if drop_name && label.name == METRIC_NAME {
             continue;
         }
@@ -800,8 +801,8 @@ pub fn bench_eval_aligned(n: usize) -> usize {
     let mut right = Vec::with_capacity(n);
 
     for i in 0..n {
-        let mut labels = Labels::empty();
-        labels.insert("id", i.to_string());
+        let mut labels = EvalLabels::empty();
+        labels.set("id", i.to_string());
 
         left.push(EvalSample {
             timestamp_ms: 1,
@@ -841,8 +842,8 @@ pub fn bench_eval_unaligned(n: usize) -> usize {
     let mut right = Vec::with_capacity(n);
 
     for i in 0..n {
-        let mut labels = Labels::empty();
-        labels.insert("id", i.to_string());
+        let mut labels = EvalLabels::empty();
+        labels.set("id", i.to_string());
 
         left.push(EvalSample {
             timestamp_ms: 1,
@@ -890,8 +891,8 @@ pub fn bench_eval_with_fill(n: usize) -> usize {
     let mut right = Vec::with_capacity(n);
 
     for i in 0..n {
-        let mut labels = Labels::empty();
-        labels.insert("id", i.to_string());
+        let mut labels = EvalLabels::empty();
+        labels.set("id", i.to_string());
 
         left.push(EvalSample {
             timestamp_ms: 1,
@@ -944,7 +945,7 @@ mod tests {
         EvalSample {
             timestamp_ms: ts,
             value,
-            labels: Labels::from_pairs(labels),
+            labels: EvalLabels::from_pairs(labels),
             drop_name: false,
         }
     }
