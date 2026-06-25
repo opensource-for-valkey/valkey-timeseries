@@ -1,13 +1,11 @@
-use crate::analysis::seasonality::{
-    Seasonality,
-};
-use crate::commands::command_parser::parse_series_range_samples;
+use crate::analysis::seasonality::Seasonality;
 use crate::commands::CommandArgIterator;
+use crate::commands::command_parser::parse_series_range_samples;
 use crate::common::replies::{
     reply_with_array, reply_with_double, reply_with_integer, reply_with_str,
 };
-use anofox_forecast::detection::{detect_periods, PeriodDetectionConfig};
-use anofox_forecast::seasonality::{MSTL, STL, MSTLResult, STLResult};
+use anofox_forecast::detection::{PeriodDetectionConfig, detect_periods};
+use anofox_forecast::seasonality::{MSTL, MSTLResult, STL, STLResult};
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 const MAX_SEASONALITY_PERIODS: usize = 4;

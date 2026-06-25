@@ -144,7 +144,7 @@ The response is a flat key-value map (array of alternating keys and values) with
 ### Example Response
 
 ```
-1) "selected_model"
+1) "model"
 2) "ARIMA"
 3) "horizon"
 4) "5"

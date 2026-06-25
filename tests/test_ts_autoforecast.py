@@ -11,7 +11,7 @@ Covers:
 - Time-range filtering
 - Error handling: nonexistent key, missing HORIZON, invalid model,
   invalid LEVEL, insufficient data, unknown argument
-- Response format validation (map structure with selected_model,
+- Response format validation (map structure with model,
   horizon, forecast, and optional level/lower_interval/upper_interval)
 """
 
@@ -36,14 +36,14 @@ def parse_forecast_response(response: List[Any]) -> Dict[str, Any]:
     """Parse the flat key-value list response from TS.AUTOFORECAST into a dict.
 
     The response is a flat list of alternating key-value pairs:
-    [selected_model, "ARIMA", horizon, "5", forecast, [...], ...]
+    [model, "ARIMA", horizon, "5", forecast, [...], ...]
 
     All values are decoded to their native Python types:
     - forecast, lower_interval, upper_interval → list of float
     - horizon → int
     - level → float
     - metrics → dict of {str: float|None}
-    - selected_model → str
+    - model → str
     """
     if not response:
         return {}
@@ -72,7 +72,7 @@ def parse_forecast_response(response: List[Any]) -> Dict[str, Any]:
         else:
             result[key_str] = value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
-    assert "selected_model" in result, f"Missing selected_model in {result}"
+    assert "model" in result, f"Missing model in {result}"
     assert "horizon" in result, f"Missing horizon in {result}"
     assert "forecast" in result, f"Missing forecast in {result}"
 
@@ -107,7 +107,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 5, f"Expected 5 forecast values, got {len(forecasts)}"
         # The selected model should be one of the known families
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model in ("ARIMA", "SARIMA", "ETS", "Theta", "unknown"), \
             f"Unexpected model name: {model}"
 
@@ -121,7 +121,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        assert "selected_model" in parsed
+        assert "model" in parsed
         assert "horizon" in parsed
         assert "forecast" in parsed
         assert "level" in parsed
@@ -213,7 +213,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model == "ARIMA", f"Expected AutoARIMA, got {model}"
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 5
@@ -229,7 +229,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model == "ETS", f"Expected ETS, got {model}"
 
     def test_models_single_theta(self):
@@ -243,7 +243,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model == "Theta", f"Expected Theta, got {model}"
 
     def test_models_multiple(self):
@@ -257,7 +257,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model in ("ARIMA", "SARIMA", "ETS"), \
             f"Expected ARIMA, SARIMA or ETS, got {model}"
 
@@ -272,7 +272,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model in ("ARIMA", "SARIMA", "ETS", "Theta"), \
             f"Unexpected model: {model}"
 
@@ -287,7 +287,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model in ("ARIMA", "SARIMA", "ETS", "Theta"), \
             f"Unexpected model: {model}"
 
@@ -302,7 +302,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model == "ARIMA", f"Expected ARIMA, got {model}"
 
     # ── SEASONALITY option ───────────────────────────────────────────────
@@ -321,7 +321,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         parsed = parse_forecast_response(result)
         forecasts = get_forecast_values(parsed)
         assert len(forecasts) == 10
-        model = parsed["selected_model"]
+        model = parsed["model"]
         assert model in ("ARIMA", "SARIMA", "ETS"), \
             f"Expected ARIMA, SARIMA or ETS, got {model}"
 
@@ -506,14 +506,14 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         parsed = parse_forecast_response(result)
 
         # Required fields
-        assert "selected_model" in parsed
+        assert "model" in parsed
         assert "horizon" in parsed
         assert "forecast" in parsed
 
-        # selected_model should be a string/bytes
-        model = parsed["selected_model"]
+        # model should be a string/bytes
+        model = parsed["model"]
         assert isinstance(model, (str, bytes)), \
-            f"selected_model should be string/bytes, got {type(model)}"
+            f"model should be string/bytes, got {type(model)}"
 
         # horizon should be a string/bytes representing an integer
         horizon = parsed["horizon"]
@@ -728,7 +728,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_forecast_response(result)
-        assert "selected_model" in parsed
+        assert "model" in parsed
         assert int(parsed["horizon"]) == 7
         assert "level" in parsed
         assert "lower_interval" in parsed

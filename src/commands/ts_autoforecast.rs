@@ -159,18 +159,12 @@ fn process_forecast(
     let seasonal_period = options.config.seasonal_period;
     let destination = options.destination;
 
-    let model = AutoForecast::with_config(options.config);
+    let mut model = AutoForecast::with_config(options.config);
 
     // { model: "ARIMA", horizon: 5, forecast: [...], lower_interval: [...], upper_interval: [...] }
-    let model_name = model
-        .selected_model_name()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let selected_model = normalize_model_name(&model_name);
-    let mut model_ = Box::new(model);
     let output = run_forecast(
         &series,
-        &mut *model_,
+        &mut model,
         options.horizon,
         options.level,
         options.metrics,
@@ -187,6 +181,12 @@ fn process_forecast(
         }
     };
 
+    // selected_model_name() must be called AFTER fit_predict so the best model is known
+    let model_name = model
+        .selected_model_name()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let selected_model = normalize_model_name(&model_name);
     output.model_name = selected_model.to_string();
 
     let forecast = &output.forecast;
