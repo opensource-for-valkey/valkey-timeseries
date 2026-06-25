@@ -22,7 +22,7 @@ use crate::series::request_types::{
     MetaDateRangeFilter, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
-use crate::series::{TimestampRange, TimestampValue, get_timeseries};
+use crate::series::{TimeSeriesOptions, TimestampRange, TimestampValue, get_timeseries};
 use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
@@ -96,16 +96,20 @@ command_arg_tokens! {
     FilterByTs => "FILTER_BY_TS",
     FilterByValue => "FILTER_BY_VALUE",
     FilterByRange => "FILTER_BY_RANGE",
+    Frequency => "FREQUENCY",
     Full => "FULL",
     GroupBy => "GROUPBY",
+    Horizon => "HORIZON",
     Ignore => "IGNORE",
     Inner => "INNER",
     Label => "LABEL",
     Labels => "LABELS",
     Latest => "LATEST",
     Left => "LEFT",
+    Level => "LEVEL",
     Limit => "LIMIT",
     Match => "MATCH",
+    Merge => "MERGE",
     Metric => "METRIC",
     Method => "METHOD",
     Name => "NAME",
@@ -126,9 +130,11 @@ command_arg_tokens! {
     SignificantDigits => "SIGNIFICANT_DIGITS",
     Start => "START",
     Step => "STEP",
+    Store => "STORE",
     Timestamp => "TIMESTAMP",
     True => "TRUE",
     Uncompressed => "UNCOMPRESSED",
+    Value => "VALUE",
     WithLabels => "WITHLABELS",
 }
 
@@ -1327,6 +1333,94 @@ pub(super) fn find_last_token_instance(
         i -= 1;
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationWriteMode {
+    Merge,
+    Overwrite,
+}
+
+/// STORE key
+///     [MERGE] 
+///     [RETENTION retentionTime] 
+///     [CHUNK_SIZE chunkSize]
+///     [DUPLICATE_POLICY policy]
+///     [DECIMAL_DIGITS digits]
+///     [SIGNIFICANT_DIGITS digits]
+///     [ENCODING encoding]
+///     [IGNORE maxTimeDiff maxValDiff]
+///     [METRIC metric]
+pub(super) fn parse_store_clause(
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<(TimeSeriesOptions, ValkeyString, DestinationWriteMode)> {
+    let mut write_mode = DestinationWriteMode::Overwrite;
+    let mut options = TimeSeriesOptions::from_config();
+
+    let key = args
+        .next_arg()
+        .map_err(|_| ValkeyError::Str(error_consts::MISSING_KEY))?;
+
+    while let Some(arg) = args.next() {
+        let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        match token {
+            CommandArgToken::ChunkSize => {
+                let arg = args
+                    .next_str()
+                    .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_CHUNK_SIZE))?;
+                options.chunk_size = Some(parse_chunk_size(arg)?)
+            }
+            CommandArgToken::Encoding => {
+                options.chunk_compression = parse_chunk_compression(args)?;
+            }
+            CommandArgToken::DecimalDigits => {
+                if options.rounding.is_some() {
+                    return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
+                }
+                let rounding = parse_decimal_digit_rounding(args)?;
+                options.rounding = Some(rounding);
+            }
+            CommandArgToken::DuplicatePolicy => {
+                let Some(arg) = args.next() else {
+                    return Err(ValkeyError::Str(error_consts::MISSING_DUPLICATE_POLICY));
+                };
+                let policy: DuplicatePolicy = DuplicatePolicy::try_from(arg.as_slice())?;
+                let mut ignore_options = options.sample_duplicate_policy.unwrap_or_default();
+                ignore_options.policy = Some(policy);
+                options.sample_duplicate_policy = Some(ignore_options);
+            }
+            CommandArgToken::OnDuplicate => {
+                options.on_duplicate = Some(parse_duplicate_policy(args)?);
+            }
+            CommandArgToken::Metric => {
+                let metric = args.next_string()?;
+                options.labels = Some(parse_metric_name(&metric)?);
+            }
+            CommandArgToken::Ignore => {
+                let (ignore_max_timediff, ignore_max_val_diff) =
+                    parse_ignore_options(args)?;
+                let mut ignore_options = options.sample_duplicate_policy.unwrap_or_default();
+                ignore_options.max_time_delta = ignore_max_timediff as u64;
+                ignore_options.max_value_delta = ignore_max_val_diff;
+                options.sample_duplicate_policy = Some(ignore_options);
+            }
+            CommandArgToken::Retention => options.retention(parse_retention(args)?),
+            CommandArgToken::SignificantDigits => {
+                if options.rounding.is_some() {
+                    return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
+                }
+                options.rounding = Some(parse_significant_digit_rounding(args)?);
+            }
+            CommandArgToken::Merge => {
+                write_mode = DestinationWriteMode::Merge;
+            }
+            _ => {
+                break;
+            }
+        };
+    }
+
+    Ok((options, key, write_mode))
 }
 
 pub(super) fn parse_forecast_horizon_value(args: &mut CommandArgIterator) -> ValkeyResult<usize> {

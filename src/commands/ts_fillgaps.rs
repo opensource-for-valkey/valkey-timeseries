@@ -1,13 +1,15 @@
 use crate::analysis::forecasting::infer_frequency_from_samples;
-use crate::commands::command_parser::{parse_duration_arg, parse_timestamp_range};
-use crate::commands::{CommandArgIterator, parse_timestamp, parse_value_arg};
+use crate::commands::command_parser::{parse_duration_arg, parse_store_clause, parse_timestamp_range};
+use crate::commands::utils::write_samples_to_destination;
+use crate::commands::{parse_timestamp, parse_value_arg, CommandArgIterator};
+use crate::common::replies::reply_with_samples;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::series::{DuplicatePolicy, get_timeseries_mut};
+use crate::series::get_timeseries_mut;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use valkey_module::{
-    AclPermissions, Context, NextArg, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
+    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString,
     ValkeyValue,
 };
 
@@ -16,6 +18,16 @@ use valkey_module::{
 ///   [VALUE value]
 ///   [FREQUENCY duration]
 ///   [ALIGN alignment_timestamp|start|-]
+///   [STORE destinationKey
+///     [MERGE]
+///     [RETENTION retentionPeriod]
+///     [ENCODING <pco|gorilla|uncompressed|compressed>]
+///     [CHUNK_SIZE chunkSize]
+///     [DUPLICATE_POLICY duplicatePolicy]
+///     [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+///     [METRIC metric]
+///     [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
+///   ]
 ///```
 /// Fills missing timestamps in the time series with a fill value (default is NaN)
 /// between startTimestamp and endTimestamp (inclusive).
@@ -45,6 +57,7 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let mut frequency: Option<Duration> = None;
     let mut align_timestamp: Option<Timestamp> = None;
     let mut fill_value = f64::NAN;
+    let mut destination = None;
 
     // Parse optional arguments
     while let Some(arg) = args.next() {
@@ -60,6 +73,9 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             "VALUE" => {
                 let value_arg = args.next_arg()?;
                 fill_value = parse_value_arg(&value_arg)?;
+            },
+            "STORE" => {
+                destination = Some(parse_store_clause(&mut args)?);
             },
             _ => {
                 return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
@@ -109,17 +125,15 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let gaps_filled = gap_samples.len();
 
     if gaps_filled > 0 {
-        // Sort samples by timestamp for merge
-        gap_samples.sort_by_key(|s| s.timestamp);
-        let results = series.merge_samples(&gap_samples, Some(DuplicatePolicy::Block))?;
-
-        let any_valid = results.iter().any(|res| res.is_ok());
-        if any_valid {
-            handle_replication(ctx, &key);
+        if let Some((dest_opts, dest_key, write_mode)) = destination {
+            let written = write_samples_to_destination(ctx, &dest_key, dest_opts, write_mode, &gap_samples)?;
+            return Ok(ValkeyValue::from(written));
         }
     }
 
-    Ok(ValkeyValue::from(gaps_filled as i64))
+    reply_with_samples(ctx, gap_samples.iter().cloned());
+
+    Ok(ValkeyValue::NoReply)
 }
 
 fn parse_align(args: &mut CommandArgIterator, start_ts: Timestamp) -> ValkeyResult<Timestamp> {
@@ -131,11 +145,6 @@ fn parse_align(args: &mut CommandArgIterator, start_ts: Timestamp) -> ValkeyResu
     }
     parse_timestamp(&alignment_str)
         .map_err(|_| ValkeyError::Str("TSDB: invalid ALIGN timestamp value"))
-}
-
-fn handle_replication(ctx: &Context, key: &ValkeyString) {
-    ctx.replicate_verbatim();
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", key);
 }
 
 fn calc_range_start(

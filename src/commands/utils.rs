@@ -7,7 +7,10 @@ use crate::common::replies::{
 };
 use crate::series::request_types::{MRangeSeriesResult, SeriesResultData};
 use anofox_forecast::utils::AccuracyMetrics;
-use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};
+use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw, NotifyEvent};
+use crate::commands::DestinationWriteMode;
+use crate::common::{Sample, Timestamp};
+use crate::series::{get_or_create_series, DuplicatePolicy, TimeSeriesOptions};
 
 pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
     let raw_ctx = ctx.into_raw();
@@ -129,3 +132,41 @@ pub(super) fn get_store_key_pos(args: &[ValkeyString]) -> ValkeyResult<Option<us
     }
     Ok(None)
 }
+
+pub(super) fn write_samples_to_destination(
+    ctx: &Context,
+    dest_key: &ValkeyString,
+    dest_opts: TimeSeriesOptions,
+    write_mode: DestinationWriteMode,
+    samples: &[Sample],
+) -> ValkeyResult<usize> {
+    if samples.is_empty() {
+        return Ok(0);
+    }
+    let mut dest_series = get_or_create_series(ctx, dest_key, Some(dest_opts))?;
+
+    let mut delete_count = 0;
+    if write_mode == DestinationWriteMode::Overwrite {
+        // Clear the destination before writing
+        delete_count = dest_series
+            .remove_range(0, Timestamp::MAX)
+            .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+    }
+
+    let merged = dest_series
+        .merge_samples(samples, Some(DuplicatePolicy::KeepLast))
+        .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+
+    let valid_merged = merged.iter().filter(|r| r.is_ok()).count();
+    if valid_merged > 0 || delete_count > 0 {
+        ctx.replicate_verbatim();
+        if delete_count > 0 {
+            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.del", dest_key);
+        }
+        if valid_merged > 0 {
+            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", dest_key);
+        }
+    }
+
+    Ok(valid_merged)
+} 

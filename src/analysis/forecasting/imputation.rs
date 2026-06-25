@@ -37,6 +37,9 @@ pub fn sanitize(
     policy: ImputationPolicy,
 ) -> Result<Vec<Sample>, ForecastError> {
     let mut map = Vec::new();
+    if samples.is_empty() {
+        return Ok(map);
+    }
     match policy {
         ImputationPolicy::Error => {
             if samples.iter().any(|s| !s.value.is_finite()) {

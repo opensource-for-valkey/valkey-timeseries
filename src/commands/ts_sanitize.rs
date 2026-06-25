@@ -1,21 +1,37 @@
-use crate::analysis::forecasting::imputation::{ImputationPolicy, sanitize};
-use crate::commands::command_parser::parse_timestamp_range;
+use crate::analysis::forecasting::imputation::{sanitize, ImputationPolicy};
+use crate::commands::command_parser::{
+    parse_command_arg_token, parse_store_clause, CommandArgToken
+    ,
+};
+use crate::commands::parse_series_range_samples;
+use crate::common::replies::reply_with_samples;
 use crate::common::Sample;
 use crate::error_consts;
-use crate::series::{DuplicatePolicy, get_timeseries_mut};
 use anofox_forecast::detection::detect_dominant_period;
 use valkey_module::{
-    AclPermissions, Context, NextArg, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
+    Context, NextArg, ValkeyError, ValkeyResult, ValkeyString,
     ValkeyValue,
 };
+use crate::commands::utils::write_samples_to_destination;
 
 /// ```text
-/// TS.SANITIZE key fromTimestamp toTimestamp POLICY <policy> [options]
+/// TS.SANITIZE key fromTimestamp toTimestamp 
+///     [POLICY <policy> [options]]
+///     [STORE destKey 
+///         [MERGE]
+///         [RETENTION retentionPeriod]
+///         [ENCODING encoding]
+///         [CHUNK_SIZE chunkSize]
+///         [DUPLICATE_POLICY duplicatePolicy]
+///         [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+///         [METRIC metric]
+///         [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
+///     ]
 ///```
 /// Sanitizes missing (NaN/infinite) values in a time series within the given
 /// timestamp range (inclusive).
 ///
-/// POLICY is one of:
+/// POLICY is optional and defaults to DROP. When specified, POLICY is one of:
 ///   - DROP                   - Drop all samples with missing values.
 ///   - FILL value             - Replace missing values with a constant fill value.
 ///   - FORWARDFILL            - Forward-fill missing values.
@@ -27,101 +43,72 @@ use valkey_module::{
 ///   - MOVINGAVERAGE window   - Replace with moving average (window must be odd > 0).
 ///   - SEASONAL period|<auto> - Replace with seasonal median (period must be > 0).
 ///
-/// Returns the number of samples that were sanitized (imputed or dropped).
+/// If STORE is specified, results are written to the destination key instead of
+/// being returned inline. With MERGE, samples are merged into an existing
+/// destination series; without MERGE (overwrite mode), the destination is
+/// cleared first. Returns the number of samples written.
+///
+/// Without STORE, returns the number of samples that were sanitized (imputed or dropped).
 pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 5 {
+    if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
     }
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    let key = args.next_arg()?;
-    let date_range = parse_timestamp_range(&mut args)?;
+    // Get the time series and extract sample values
+    let mut samples = parse_series_range_samples(ctx, &mut args)?;
 
-    // POLICY keyword
-    let policy_kw = args.next_str()?;
-    if !policy_kw.eq_ignore_ascii_case("policy") {
-        return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
-    }
-
-    // Get the series (must exist)
-    let mut series = get_timeseries_mut(ctx, &key, true, Some(AclPermissions::UPDATE))?.unwrap();
-
-    let (start_ts, end_ts) = date_range.get_series_range(&series, None, false);
-
-    // Get existing samples in the range
-    let mut samples = series.get_range(start_ts, end_ts);
-
-    // Parse the policy name and any policy-specific options
-    let policy_token = args.next_str()?.to_uppercase();
-    let policy = parse_policy(&policy_token, &mut args, &samples)?;
-
-    if samples.is_empty() {
-        return Ok(ValkeyValue::from(0_i64));
-    }
-
-    // Determine the policy category before moving `policy` into sanitize().
-    // - ReplaceAll: Drop, MovingAverage, Seasonal — need remove+reinsert
-    // - InPlace: all others — modify in-place, merge map back
-    enum PolicyCategory {
-        ReplaceAll,
-        InPlace,
-    }
-
-    let category = match &policy {
+    // POLICY is optional; defaults to DROP.
+    let policy = if args
+        .peek()
+        .is_some_and(|s| s.as_slice().eq_ignore_ascii_case(b"policy"))
+    {
+        args.next(); // consume POLICY
+        let policy_token = args.next_str()?.to_uppercase();
+        parse_policy(&policy_token, &mut args, &samples)?
+    } else {
         ImputationPolicy::Drop
-        | ImputationPolicy::MovingAverage(_)
-        | ImputationPolicy::Seasonal(_) => PolicyCategory::ReplaceAll,
-        _ => PolicyCategory::InPlace,
     };
 
-    // For Drop specifically, we need to know if the policy is Drop to decide
-    // whether to use `samples` (modified in-place) or `map` (full result).
-    let is_drop = matches!(&policy, ImputationPolicy::Drop);
+    // STORE destination (optional)
+    let destination = if args
+        .peek()
+        .is_some_and(|s| parse_command_arg_token(s) == Some(CommandArgToken::Store))
+    {
+        args.next(); // consume STORE
+        Some(parse_store_clause(&mut args)?)
+    } else {
+        None
+    };
+
+    // Capture policy variant before moving `policy` into sanitize().
+    // - is_ma_or_seasonal: samples is NOT modified; `map` is the full imputed result.
+    // - InPlace (all others): samples is modified in-place; `map` has changed entries.
+    let is_ma_or_seasonal = matches!(
+        &policy,
+        ImputationPolicy::MovingAverage(_) | ImputationPolicy::Seasonal(_)
+    );
 
     // Apply the sanitization policy
-    let map = sanitize(&mut samples, policy)
+    let sanitized = sanitize(&mut samples, policy)
         .map_err(|e| ValkeyError::String(format!("TSDB: sanitize error: {e}")))?;
 
-    let sanitized_count = map.len();
+    // - MovingAverage/Seasonal: sanitized is the full imputed result.
+    // - All others (including Drop): samples has been modified in-place.
+    let to_return: &Vec<Sample> = if is_ma_or_seasonal { &sanitized } else { &samples };
 
-    if sanitized_count > 0 {
-        match category {
-            PolicyCategory::ReplaceAll => {
-                // Remove the entire range and re-insert the sanitized samples
-                series
-                    .remove_range(start_ts, end_ts)
-                    .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+    if let Some((dest_opts, dest_key, write_mode)) = destination {
+        // --- STORE destination path ---
+        let written = write_samples_to_destination(ctx, &dest_key, dest_opts, write_mode, to_return)?;
 
-                // For Drop: samples has been filtered to only valid entries.
-                // For MovingAverage/Seasonal: map is the full imputed result.
-                let to_merge = if is_drop { &samples } else { &map };
-
-                if !to_merge.is_empty() {
-                    let mut sorted = to_merge.to_vec();
-                    sorted.sort_by_key(|s| s.timestamp);
-                    series
-                        .merge_samples(&sorted, Some(DuplicatePolicy::KeepLast))
-                        .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
-                }
-            }
-            PolicyCategory::InPlace => {
-                // Merge the imputed samples back into the series.
-                // Since these samples share timestamps with existing samples,
-                // they will update the values in-place via upsert with KeepLast.
-                let mut sorted = map.clone();
-                sorted.sort_by_key(|s| s.timestamp);
-                series
-                    .merge_samples(&sorted, Some(DuplicatePolicy::KeepLast))
-                    .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
-            }
-        }
-
-        handle_replication(ctx, &key, is_drop);
+        return Ok(ValkeyValue::from(written));
     }
 
-    Ok(ValkeyValue::from(sanitized_count as i64))
+    reply_with_samples(ctx, to_return.iter().cloned());
+    Ok(ValkeyValue::NoReply)
 }
+
 
 /// Parse the imputation policy and any policy-specific arguments.
 fn parse_policy(
@@ -173,12 +160,6 @@ fn parse_policy(
         _ => { return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT)); }
     );
     Ok(policy)
-}
-
-fn handle_replication(ctx: &Context, key: &ValkeyString, is_drop: bool) {
-    ctx.replicate_verbatim();
-    let action = if is_drop { "ts.del" } else { "ts.add" };
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, action, key);
 }
 
 fn infer_seasonal_period(args: &[Sample]) -> ValkeyResult<usize> {

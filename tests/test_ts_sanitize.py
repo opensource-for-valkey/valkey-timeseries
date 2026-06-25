@@ -407,7 +407,7 @@ class TestTimeSeriesSanitize(ValkeyTimeSeriesTestCaseBase):
             (2000, 2.0),
             (3000, 3.0),
         ])
-        with pytest.raises(ResponseError, match='invalid parameter'):
+        with pytest.raises(ResponseError, match='odd positive integer'):
             self.client.execute_command(
                 'TS.SANITIZE', 'ts1', 1000, 3000,
                 'POLICY', 'MOVINGAVERAGE', 4
@@ -420,7 +420,7 @@ class TestTimeSeriesSanitize(ValkeyTimeSeriesTestCaseBase):
             (2000, 2.0),
             (3000, 3.0),
         ])
-        with pytest.raises(ResponseError, match='invalid parameter'):
+        with pytest.raises(ResponseError, match='odd positive integer'):
             self.client.execute_command(
                 'TS.SANITIZE', 'ts1', 1000, 3000,
                 'POLICY', 'MOVINGAVERAGE', 0
