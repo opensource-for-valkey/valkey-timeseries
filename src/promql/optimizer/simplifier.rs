@@ -25,10 +25,10 @@ use crate::promql::optimizer::pushdown::optimize_in_place;
 use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
 };
+use promql_parser::label::{Matcher, Matchers};
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
 use promql_parser::parser::{BinaryExpr, Expr};
 use std::ops::Deref;
-use promql_parser::label::{Matcher, Matchers};
 // https://prometheus.io/docs/prometheus/latest/querying/operators
 // Expression simplification API
 
@@ -117,6 +117,36 @@ fn dedupe_matchers_in_expr(expr: &mut Expr) {
 /// * `expr == NaN` and `expr != NaN` to `NaN`
 fn simplify_internal(expr: Expr) -> Expr {
     match expr {
+        Expr::Paren(p) => simplify_internal(*p.expr),
+        Expr::Subquery(mut sq) => {
+            *sq.expr = simplify_internal(*sq.expr);
+            Expr::Subquery(sq)
+        }
+        Expr::Aggregate(mut agg) => {
+            *agg.expr = simplify_internal(*agg.expr);
+            if let Some(param) = agg.param {
+                let mut param = param;
+                *param = simplify_internal(*param);
+                agg.param = Some(param);
+            }
+            Expr::Aggregate(agg)
+        }
+        Expr::Call(mut call) => {
+            call.args.args = call
+                .args
+                .args
+                .into_iter()
+                .map(|mut arg| {
+                    *arg = simplify_internal(*arg);
+                    arg
+                })
+                .collect();
+            Expr::Call(call)
+        }
+        Expr::Unary(mut unary) => {
+            *unary.expr = simplify_internal(*unary.expr);
+            Expr::Unary(unary)
+        }
         Expr::Binary(BinaryExpr {
             lhs,
             rhs,
@@ -276,6 +306,7 @@ fn dedupe_matchers(matchers: Matchers) -> Matchers {
 
     // In-place stable dedupe to avoid allocating a second matcher buffer.
     // Keep the first occurrence of each structural matcher.
+    // NOTE: this is O(n^2) in the number of matchers, but the number of matchers is expected to be small.
     let mut unique_len = 0;
     for idx in 0..existing.len() {
         if existing[..unique_len]
@@ -583,6 +614,13 @@ mod tests {
         assert_string_simplify("1.0 == bool 1.0", "1.0");
     }
 
+    #[test]
+    fn test_simplify_nested_variants() {
+        assert_string_simplify("abs(c1 + 0.0)", "abs(c1)");
+        assert_string_simplify("sum(c1 + 0.0)", "sum(c1)");
+        assert_string_simplify("-(c1 + 0.0)", "-c1");
+    }
+
     // ------------------------------
     // ----- Simplifier tests -------
     // ------------------------------
@@ -638,6 +676,4 @@ mod tests {
         let expected = "c1 != foo";
         assert_string_simplify(expected, actual);
     }
-
-    // TODO: BinaryExpr
 }
