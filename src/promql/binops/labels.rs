@@ -1,13 +1,13 @@
-use crate::labels::{HasFingerprint, Label, Labels, SeriesFingerprint};
+use crate::labels::{HasFingerprint, Label, SeriesFingerprint};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
-use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
-use promql_parser::parser::token::{T_ADD, T_DIV, T_LOR, T_MUL, T_SUB, TokenType};
+use promql_parser::label::{MatchOp, Matcher, METRIC_NAME};
+use promql_parser::parser::token::{TokenType, T_ADD, T_DIV, T_LOR, T_MUL, T_SUB};
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
-use regex::{Regex, escape};
+use regex::{escape, Regex};
 use std::borrow::Cow;
 use twox_hash::xxhash3_128;
 
@@ -55,22 +55,6 @@ fn hash_label(hasher: &mut xxhash3_128::Hasher, label: &Label) {
     hasher.write(label.value.as_bytes());
 }
 
-pub fn compute_grouping_labels(mut labels: Labels, modifier: Option<&LabelModifier>) -> Labels {
-    match modifier {
-        None => Labels::default(), // No grouping, return empty labels
-        Some(LabelModifier::Include(label_list)) => {
-            // Keep only specified labels
-            labels.retain(|k| label_list.labels.contains(&k.name));
-            labels
-        }
-        Some(LabelModifier::Exclude(label_list)) => {
-            // Remove specified labels
-            labels.retain(|k| !label_list.labels.contains(&k.name));
-            labels
-        }
-    }
-}
-
 /// Compute the result labels for a vector-vector binary operation.
 /// Mirrors Prometheus's `resultMetric` (engine.go L3062-3104):
 /// 1. Arithmetic ops always drop `__name__`
@@ -81,7 +65,7 @@ pub(super) fn result_metric(
     matching: Option<&LabelModifier>,
 ) -> EvalLabels {
     if changes_metric_schema(op) {
-        labels.remove(METRIC_NAME);
+        labels.drop_name();
     }
     match matching {
         Some(LabelModifier::Include(label_list)) => {

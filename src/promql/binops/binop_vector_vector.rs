@@ -47,12 +47,12 @@ fn drop_names_if_necessary(
     // Materialize pending __name__ drops before matching
     for sample in left_vector.iter_mut() {
         if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
+            sample.labels.drop_name();
         }
     }
     for sample in right_vector.iter_mut() {
         if sample.drop_name {
-            sample.labels.remove(METRIC_NAME);
+            sample.labels.drop_name();
         }
     }
     (left_vector, right_vector)
@@ -321,10 +321,10 @@ fn eval_arith_ops(
     // Arithmetic (non-comparison) operations always drop `__name__`.
     if !ctx.is_comparison {
         for sample in left_vector.iter_mut() {
-            sample.labels.remove(METRIC_NAME);
+            sample.labels.drop_name();
         }
         for sample in right_vector.iter_mut() {
-            sample.labels.remove(METRIC_NAME);
+            sample.labels.drop_name();
         }
     }
 

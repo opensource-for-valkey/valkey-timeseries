@@ -9,7 +9,6 @@ use crate::promql::time::step_times;
 use crate::promql::utils::range_bounds_to_system_time;
 use crate::promql::{Evaluator, ExprResult, QueryResult};
 use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
-use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
 use std::hash::BuildHasherDefault;
 use std::ops::RangeBounds;
@@ -159,7 +158,7 @@ pub fn evaluate_instant(
                 .into_iter()
                 .map(|mut s| {
                     if s.drop_name {
-                        s.labels.remove(METRIC_NAME);
+                        s.labels.drop_name();
                     }
                     RangeSample {
                         labels: s.labels.into_labels(),
