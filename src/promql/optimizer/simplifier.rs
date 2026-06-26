@@ -20,7 +20,7 @@
 
 use crate::parser::ParseResult;
 use crate::promql::binops::apply_binary_op;
-use crate::promql::optimizer::const_evaluator::const_simplify;
+use crate::promql::optimizer::const_evaluator::fold_constants;
 use crate::promql::optimizer::pushdown::optimize_in_place;
 use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
@@ -28,6 +28,7 @@ use crate::promql::optimizer::utils::{
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
 use promql_parser::parser::{BinaryExpr, Expr};
 use std::ops::Deref;
+use promql_parser::label::{Matcher, Matchers};
 // https://prometheus.io/docs/prometheus/latest/querying/operators
 // Expression simplification API
 
@@ -46,12 +47,64 @@ use std::ops::Deref;
 /// `b > 2`
 ///
 pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
-    let expr = const_simplify(expr);
+    let expr = fold_constants(expr);
 
     let mut expr = simplify_internal(expr);
+    dedupe_matchers_in_expr(&mut expr);
     // push down filters
     optimize_in_place(&mut expr);
     Ok(expr)
+}
+
+/// Recursively deduplicate matchers for all selector nodes in an [`Expr`].
+fn dedupe_matchers_in_expr(expr: &mut Expr) {
+    match expr {
+        Expr::VectorSelector(vs) => {
+            let matchers = std::mem::replace(
+                &mut vs.matchers,
+                Matchers {
+                    matchers: vec![],
+                    or_matchers: vec![],
+                },
+            );
+            vs.matchers = dedupe_matchers(matchers);
+        }
+        Expr::MatrixSelector(ms) => {
+            let matchers = std::mem::replace(
+                &mut ms.vs.matchers,
+                Matchers {
+                    matchers: vec![],
+                    or_matchers: vec![],
+                },
+            );
+            ms.vs.matchers = dedupe_matchers(matchers);
+        }
+        Expr::Subquery(sq) => {
+            dedupe_matchers_in_expr(sq.expr.as_mut());
+        }
+        Expr::Aggregate(agg) => {
+            dedupe_matchers_in_expr(agg.expr.as_mut());
+            if let Some(param) = agg.param.as_mut() {
+                dedupe_matchers_in_expr(param.as_mut());
+            }
+        }
+        Expr::Binary(b) => {
+            dedupe_matchers_in_expr(b.lhs.as_mut());
+            dedupe_matchers_in_expr(b.rhs.as_mut());
+        }
+        Expr::Paren(p) => {
+            dedupe_matchers_in_expr(p.expr.as_mut());
+        }
+        Expr::Call(call) => {
+            for arg in &mut call.args.args {
+                dedupe_matchers_in_expr(arg.as_mut());
+            }
+        }
+        Expr::Unary(u) => {
+            dedupe_matchers_in_expr(u.expr.as_mut());
+        }
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+    }
 }
 
 /// Simplifies [`Expr`]s by applying algebraic transformation rules
@@ -213,11 +266,52 @@ fn simplify_internal(expr: Expr) -> Expr {
     }
 }
 
-// see https://prometheus.io/docs/prometheus/latest/querying/operators/
+/// Remove duplicate `(op, name, value)` matchers from a parser
+/// [`Matchers`] while preserving first-occurrence order.
+fn dedupe_matchers(matchers: Matchers) -> Matchers {
+    let Matchers {
+        matchers: mut existing,
+        or_matchers,
+    } = matchers;
+
+    // In-place stable dedupe to avoid allocating a second matcher buffer.
+    // Keep the first occurrence of each structural matcher.
+    let mut unique_len = 0;
+    for idx in 0..existing.len() {
+        if existing[..unique_len]
+            .iter()
+            .any(|seen| matcher_eq(seen, &existing[idx]))
+        {
+            continue;
+        }
+
+        if idx != unique_len {
+            existing.swap(unique_len, idx);
+        }
+        unique_len += 1;
+    }
+
+    existing.truncate(unique_len);
+
+    Matchers {
+        matchers: existing,
+        or_matchers,
+    }
+}
+
+/// Structural matcher equality. `MatchOp` already derives `PartialEq` in
+/// promql-parser 0.8 (regex compares on source string), so `Matcher`'s
+/// derived `PartialEq` is a complete structural check. Helper kept as a
+/// one-liner for readability / to isolate the dependency on the derived
+/// impl in case promql-parser semantics shift.
+fn matcher_eq(a: &Matcher, b: &Matcher) -> bool {
+    a == b
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use promql_parser::label::MatchOp;
 
     fn parse(expr: &str) -> Expr {
         promql_parser::parser::parse(expr).unwrap()
@@ -257,6 +351,57 @@ mod tests {
     #[test]
     fn api_basic() {
         assert_string_simplify("1.0 + 2.0", "3.0");
+    }
+
+    #[test]
+    fn test_dedupe_matchers_keeps_first_occurrence_order() {
+        let a = Matcher::new(MatchOp::Equal, "job", "api");
+        let b = Matcher::new(MatchOp::Equal, "env", "prod");
+        let c = Matcher::new(MatchOp::NotEqual, "zone", "us-east");
+
+        let matchers = Matchers {
+            matchers: vec![a.clone(), b.clone(), a.clone(), c.clone(), b.clone()],
+            or_matchers: vec![],
+        };
+
+        let deduped = dedupe_matchers(matchers);
+
+        assert_eq!(deduped.matchers, vec![a, b, c]);
+        assert!(deduped.or_matchers.is_empty());
+    }
+
+    #[test]
+    fn test_dedupe_matchers_preserves_or_matchers() {
+        let and_matcher = Matcher::new(MatchOp::Equal, "job", "api");
+        let or_left = Matcher::new(MatchOp::Equal, "instance", "a");
+        let or_right = Matcher::new(MatchOp::Equal, "instance", "b");
+
+        let or_matchers = vec![vec![or_left.clone()], vec![or_right.clone()]];
+        let matchers = Matchers {
+            matchers: vec![and_matcher.clone(), and_matcher.clone()],
+            or_matchers: or_matchers.clone(),
+        };
+
+        let deduped = dedupe_matchers(matchers);
+
+        assert_eq!(deduped.matchers, vec![and_matcher]);
+        assert_eq!(deduped.or_matchers, or_matchers);
+    }
+
+    #[test]
+    fn test_dedupe_matchers_in_expr_vector_selector() {
+        assert_string_simplify(
+            "http_requests_total{job=\"api\",job=\"api\",env=\"prod\"}",
+            "http_requests_total{job=\"api\",env=\"prod\"}",
+        );
+    }
+
+    #[test]
+    fn test_dedupe_matchers_in_expr_matrix_selector_nested_call() {
+        assert_string_simplify(
+            "sum(rate(http_requests_total{job=\"api\",job=\"api\"}[5m]))",
+            "sum(rate(http_requests_total{job=\"api\"}[5m]))",
+        );
     }
 
     #[test]
