@@ -20,14 +20,12 @@
 
 use crate::parser::ParseResult;
 use crate::promql::binops::apply_binary_op;
-use crate::promql::functions::PromqlFunctionKind;
-use crate::promql::functions::resolve_function;
 use crate::promql::optimizer::const_evaluator::const_simplify;
 use crate::promql::optimizer::pushdown::optimize_in_place;
 use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
 };
-use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MOD, T_MUL, TokenType};
+use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
 use promql_parser::parser::{BinaryExpr, Expr};
 use std::ops::Deref;
 // https://prometheus.io/docs/prometheus/latest/querying/operators
@@ -98,8 +96,12 @@ fn simplify_internal(expr: Expr) -> Expr {
                 // Our use case envisions that this expression involving metric selectors
                 // will need to make network calls to evaluate. If both sides are the same
                 // we can optimize by multiplying by 2 and only making one network call.
+                // Guard: only safe when no matching modifier is present; a modifier such as
+                // `on(label)` or `group_left()` is only meaningful for vector–vector ops and
+                // cannot be mapped onto the resulting vector–scalar multiplication.
                 T_ADD
                     if *lhs == *rhs
+                        && modifier.is_none()
                         && matches!(
                             lhs.deref(),
                             Expr::VectorSelector(_) | Expr::Subquery(_) | Expr::Aggregate(_)
@@ -118,8 +120,6 @@ fn simplify_internal(expr: Expr) -> Expr {
                 //
                 // (..A..) OR A --> (..A..)
                 T_LOR if expr_contains(&lhs, &rhs, TokenType::new(T_LOR)) => *lhs,
-                // A OR (..A..) --> (..A..)
-                T_LOR if expr_contains(&rhs, &lhs, TokenType::new(T_LOR)) => *rhs,
                 // A OR (A AND B) --> A
                 T_LOR if is_op_with(TokenType::new(T_LAND), &rhs, &lhs) => *lhs,
                 // (A AND B) OR A --> A
@@ -182,20 +182,12 @@ fn simplify_internal(expr: Expr) -> Expr {
                 T_MUL if is_one(&rhs) => *lhs,
                 // 1 * A --> A
                 T_MUL if is_one(&lhs) => *rhs,
-                // A * NaN --> NaN
-                T_MUL if is_null(&rhs) => *rhs,
-                // NaN * A --> NaN
-                T_MUL if is_null(&lhs) => *lhs,
 
                 //
                 // Rules for Div
                 //
                 // A / 1 --> A
                 T_DIV if is_one(&rhs) => *lhs,
-                // NaN / A --> NaN
-                T_DIV if is_null(&lhs) => *lhs,
-                // A / NaN --> NaN
-                T_DIV if is_null(&rhs) => *rhs,
                 // A / A --> NAN if A.is_nan() else 1.0. The NaN comparison can be valid for
                 // NumberLiteral, but not for VectorSelector, Subquery, Aggregation, etc.
                 T_DIV if lhs == rhs && is_number(&lhs) => {
@@ -205,41 +197,9 @@ fn simplify_internal(expr: Expr) -> Expr {
                         Expr::from(1.0)
                     }
                 }
-                // A / 0 -> NaN
-                T_DIV if is_zero(&rhs) => {
-                    // if we have an instant vector or sample, check if we need to maintain
-                    // the label set
-                    let should_keep_metric_names = {
-                        if let Expr::Call(fe) = &lhs.as_ref() {
-                            if let Some(func) = resolve_function(fe.func.name) {
-                                use PromqlFunctionKind::*;
-                                let kind = func.kind();
-                                matches!(kind, LabelReplace | LabelJoin)
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    };
-                    if should_keep_metric_names {
-                        return Expr::Binary(BinaryExpr {
-                            lhs,
-                            rhs,
-                            op,
-                            modifier,
-                        });
-                    }
-
-                    Expr::from(f64::NAN)
-                }
                 //
                 // Rules for Mod
                 //
-                // A % NaN --> NaN
-                T_MOD if is_null(&rhs) => *rhs,
-                // NaN % A --> NaN
-                T_MOD if is_null(&lhs) => *lhs,
                 // no additional rewrites possible
                 _ => Expr::Binary(BinaryExpr {
                     lhs,
@@ -338,10 +298,13 @@ mod tests {
 
     #[test]
     fn test_simplify_mul_by_nan() {
-        // A * NAN --> NAN
-        assert_string_simplify("c2 * NaN", "NaN");
-        // NAN * A --> NAN
-        assert_string_simplify("NaN * c2", "NaN");
+        // Scalar * NaN / NaN * Scalar are handled by const_simplify (both NumberLiterals)
+        assert_string_simplify("5.0 * NaN", "NaN");
+        assert_string_simplify("NaN * 5.0", "NaN");
+        // Vector * NaN must NOT fold — it would change the expression type from
+        // instant vector to scalar, breaking downstream aggregations.
+        assert_string_simplify("c2 * NaN", "c2 * NaN");
+        assert_string_simplify("NaN * c2", "NaN * c2");
     }
 
     #[test]
@@ -392,12 +355,12 @@ mod tests {
 
     #[test]
     fn test_simplify_div_nan() {
-        // A / NAN --> NAN
-        assert_string_simplify("c1 / NaN", "NaN");
-        // NAN / A --> NAN
-        assert_string_simplify("NaN / c2", "NaN");
-        // NAN / NAN --> NAN
+        // Scalar ÷ Scalar NaN cases are handled by const_simplify (both NumberLiterals)
         assert_string_simplify("NaN / NaN", "NaN");
+        // Vector / NaN and NaN / Vector must NOT fold — type change from instant
+        // vector to scalar would break downstream operators such as sum() or rate().
+        assert_string_simplify("c1 / NaN", "c1 / NaN");
+        assert_string_simplify("NaN / c2", "NaN / c2");
     }
 
     #[test]
@@ -409,16 +372,21 @@ mod tests {
 
     #[test]
     fn test_simplify_div_by_zero() {
-        // A / 0 -> NaN
-        assert_string_simplify("c2 / 0.0", "NaN");
+        // Scalar / 0 is folded by the NumberLiteral early-return (apply_binary_op returns NaN)
+        assert_string_simplify("5.0 / 0.0", "NaN");
+        // Vector / 0 must NOT fold — replacing an instant vector with scalar NaN
+        // changes the result type and breaks any aggregation that wraps this expression.
+        assert_string_simplify("c2 / 0.0", "c2 / 0.0");
     }
 
     #[test]
     fn test_simplify_mod_by_nan() {
-        // A % NaN --> NaN
-        assert_string_simplify("c2 % NaN", "NaN");
-        // NaN % A --> NaN
-        assert_string_simplify("NaN % c2", "NaN");
+        // Scalar % NaN is handled by const_simplify (both NumberLiterals)
+        assert_string_simplify("5.0 % NaN", "NaN");
+        assert_string_simplify("NaN % 5.0", "NaN");
+        // Vector % NaN and NaN % Vector must NOT fold — same type-change issue as MUL/DIV.
+        assert_string_simplify("c2 % NaN", "c2 % NaN");
+        assert_string_simplify("NaN % c2", "NaN % c2");
     }
 
     #[test]
