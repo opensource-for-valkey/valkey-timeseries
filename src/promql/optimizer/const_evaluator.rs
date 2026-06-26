@@ -8,7 +8,7 @@ use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, Expr, ParenExpr, SubqueryExpr, UnaryExpr,
 };
 
-pub(super) fn const_simplify(expr: Expr) -> Expr {
+pub(super) fn fold_constants(expr: Expr) -> Expr {
     match expr {
         Expr::Unary(uo) => handle_unary_expr(uo),
         Expr::Binary(_) => handle_binop_internal(expr),
@@ -16,7 +16,7 @@ pub(super) fn const_simplify(expr: Expr) -> Expr {
         Expr::Aggregate(ae) => handle_aggregation_expr(ae),
         Expr::Subquery(s) => handle_rollup_expr(s),
         Expr::Paren(p) => {
-            let expr = const_simplify(*p.expr);
+            let expr = fold_constants(*p.expr);
             if let Expr::NumberLiteral(_) = expr {
                 return expr;
             }
@@ -61,12 +61,12 @@ fn handle_binop_internal(be: Expr) -> Expr {
         let left = if let Expr::Binary(_) = *lhs {
             handle_binop_internal(*lhs)
         } else {
-            const_simplify(*lhs)
+            fold_constants(*lhs)
         };
         let right = if let Expr::Binary(_) = *rhs {
             handle_binop_internal(*rhs)
         } else {
-            const_simplify(*rhs)
+            fold_constants(*rhs)
         };
         let new_be = BinaryExpr {
             lhs: Box::new(left),
@@ -221,7 +221,7 @@ fn handle_function_expr(fe: Call) -> Expr {
         .args
         .args
         .into_iter()
-        .map(|b| Box::new(const_simplify(*b)))
+        .map(|b| Box::new(fold_constants(*b)))
         .collect();
     let arg_count = fe.args.len();
     let Ok(kind) = PromqlFunctionKind::try_from(fe.func.name) else {
@@ -258,7 +258,7 @@ pub(crate) fn extract_datetime_part(epoch_secs: f64, part: DateTimePart) -> Opti
 
 fn handle_aggregation_expr(ae: AggregateExpr) -> Expr {
     if let Some(param) = ae.param {
-        let arg = const_simplify(*param);
+        let arg = fold_constants(*param);
         let ae = AggregateExpr {
             param: Some(Box::new(arg)),
             ..ae
@@ -269,7 +269,7 @@ fn handle_aggregation_expr(ae: AggregateExpr) -> Expr {
 }
 
 fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
-    let expr = const_simplify(*re.expr);
+    let expr = fold_constants(*re.expr);
     let new_expr = SubqueryExpr {
         expr: Box::new(expr),
         ..re
@@ -278,7 +278,7 @@ fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
 }
 
 fn handle_expr_vecs(args: Vec<Expr>) -> Vec<Expr> {
-    args.into_iter().map(const_simplify).collect::<Vec<Expr>>()
+    args.into_iter().map(fold_constants).collect::<Vec<Expr>>()
 }
 
 #[cfg(test)]
@@ -291,7 +291,7 @@ mod tests {
     // --- ConstEvaluator tests -----
     // ------------------------------
     fn test_const_simplify(input_expr: Expr, expected_expr: Expr) {
-        let evaluated_expr = const_simplify(input_expr.clone());
+        let evaluated_expr = fold_constants(input_expr.clone());
         assert_eq!(
             &evaluated_expr, &expected_expr,
             "Mismatch evaluating {input_expr}\n  Expected:{expected_expr}\n  Got:{evaluated_expr}"
@@ -301,7 +301,7 @@ mod tests {
     fn test_simplify(input_expr: &str, expected_expr: &str) {
         let input = parse(input_expr).expect("parse failed");
         let expected = parse(expected_expr).expect("parse failed");
-        let simplified = const_simplify(input);
+        let simplified = fold_constants(input);
         assert_eq!(
             &simplified,
             &expected,
@@ -340,7 +340,7 @@ mod tests {
 
     fn test_math_fn(name: &str, arg: f64, expected: f64) {
         let expr = format!("{}(vector({}))", name, arg);
-        let simplified = const_simplify(parse(&expr).expect("parse failed")).prettify();
+        let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let simplified_value = parse_number(&simplified).unwrap();
         if expected.is_nan() {
             assert!(
@@ -431,7 +431,7 @@ mod tests {
 
     fn test_date_part_fn(name: &str, epoch_secs: f64, part: DateTimePart) {
         let expr = format!("{name}(vector({epoch_secs}))");
-        let simplified = const_simplify(parse(&expr).expect("parse failed")).prettify();
+        let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
         let expected = extract_datetime_part(epoch_secs, part).unwrap();
         let actual = parse_number(&simplified).unwrap();
         assert_eq!(
