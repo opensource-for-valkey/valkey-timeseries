@@ -1,8 +1,8 @@
 use crate::labels::HasFingerprint;
-use crate::promql::functions::{resolve_function, PromqlFunctionKind};
+use crate::promql::functions::{PromqlFunctionKind, resolve_function};
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
-use promql_parser::label::{Matcher, Matchers, METRIC_NAME};
+use promql_parser::label::{METRIC_NAME, Matcher, Matchers};
 use promql_parser::parser::token::{T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, Expr, LabelModifier, VectorMatchCardinality};
