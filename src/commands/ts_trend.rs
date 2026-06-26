@@ -50,7 +50,7 @@ impl Default for TrendModel {
 /// When a specific `MODEL` is given, only that trend component is fitted.
 ///
 /// Returns a map. For **Auto** mode:
-/// - `selected_series`: name of the selected trend model
+/// - `model`: name of the selected trend model
 /// - `criterion`: criterion used for selection (AICc, BIC, HOLDOUT)
 /// - `fitted_trend`: the in-sample fitted trend values
 /// - `scores`: array of [name, score] pairs for all candidates, sorted by score
@@ -150,8 +150,7 @@ fn execute_auto_trend(
     let fitted_trend = auto_trend.fitted_trend();
     let selection = auto_trend.selection_result();
     let trend_name = auto_trend.trend_name();
-    let selected_series = selection
-        .as_ref()
+    let selected_model = selection
         .map(|result| result.selected.as_str())
         .unwrap_or(trend_name);
     let n_params = auto_trend.n_params();
@@ -192,9 +191,9 @@ fn execute_auto_trend(
 
     reply_with_map(ctx, map_len);
 
-    // selected_series
-    reply_with_str(ctx, "selected_series");
-    reply_with_str(ctx, selected_series);
+    // selected_model
+    reply_with_str(ctx, "model");
+    reply_with_str(ctx, selected_model);
 
     // criterion
     reply_with_str(ctx, "criterion");
@@ -333,7 +332,7 @@ fn reply_with_common_tail(
 
     // metrics (optional)
     if let Some(m) = metrics {
-        reply_with_str(ctx, "metrics");
+        reply_with_str(ctx, "accuracy_metrics");
         reply_with_accuracy_metrics(ctx, m);
     }
 
@@ -361,11 +360,10 @@ fn store_trend(
         let timestamps: Vec<i64> = samples.iter().map(|s| s.timestamp).collect();
         if let Some(step) = compute_median_step_ms(&timestamps) {
             let last_ts = samples.last().map(|s| s.timestamp).unwrap_or(0);
-            let predicted_samples: Vec<Sample> = predicted_values
+            let predicted_samples  = predicted_values
                 .iter()
                 .enumerate()
-                .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value))
-                .collect();
+                .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value));
             store_samples.extend(predicted_samples);
         } else {
             ctx.log_warning(

@@ -20,7 +20,7 @@ TS.TREND key fromTimestamp toTimestamp
   [RECENCY <FULL|WINDOW n|FRACTION f|AUTO>]
   [PREDICT <horizon>]
   [FEATURES]
-   [METRICS]
+  [METRICS]
   [STORE <destination>]
 ```
 
@@ -114,18 +114,17 @@ fitted trend component. The exact features depend on the selected model.
 <details open>
 <summary><code>METRICS</code></summary>
 
-When specified, the response includes a `metrics` map computed by
-`anofox-forecast`'s `calculate_metrics` over observed values vs fitted trend values.
+When specified, the response includes a `accuracy_metrics` which measure the magnitude of the deviation over observed values vs. fitted trend values.
 
 Returned metrics:
 
-- `mae`
-- `mse`
-- `rmse`
-- `mape` (may be `null` when actual contains zeros)
-- `smape`
-- `mase` (may be `null` when insufficient data for scaling)
-- `r_squared`
+- `mae` (Mean Absolute Error): Average of absolute differences.
+- `mse` (Mean Squared Error): Average of squared differences.
+- `rmse` (Root Mean Squared Error): Square root of the mean squared error.
+- `mape` (Mean Absolute Percentage Error): Average of absolute percentage differences (may be `null` when actual contains zeros).
+- `smape` (Symmetric Mean Absolute Percentage Error): Average of symmetric absolute percentage differences.
+- `mase` (Mean Absolute Scaled Error): Average of absolute errors scaled by the in-sample mean absolute error (may be `null` when insufficient data for scaling).
+- `r_squared` (Coefficient of Determination): Proportion of variance explained by the model.
 
 </details>
 
@@ -140,7 +139,7 @@ original timestamps from the input series.
 
 When `STORE` is combined with `PREDICT`, the predicted trend values are appended after the fitted
 values with timestamps continuing from the last observed timestamp using the series' median
-sampling interval. If the series has fewer than 2 timestamps or no positive time intervals,
+sampling interval. If the series has fewer than two timestamps or no positive time intervals,
 predicted values are skipped with a warning (fitted values are still stored).
 
 </details>
@@ -152,7 +151,7 @@ predicted values are skipped with a warning (fitted values are still stored).
 
 ### Auto mode response
 
-- `selected_series` — Name of the selected trend model (e.g., "Linear", "Quadratic", "Exponential", "TheilSen", "PiecewiseLinear").
+- `model` — Name of the selected trend model (e.g., "Linear", "Quadratic", "Exponential", "TheilSen", "PiecewiseLinear").
 - `criterion` — The criterion used for selection: `AICc`, `BIC`, or `HOLDOUT`.
 - `fitted_trend` — Array of in-sample fitted trend values (same length as the input data).
 - `scores` — Array of `[name, score]` pairs for all candidate models, sorted from best to worst. Lower scores are better.
@@ -178,7 +177,7 @@ If `METRICS` is specified:
 ### Example response (Auto mode)
 
 ```
-1) "selected_series"
+1) "model"
 2) "Linear"
 3) "criterion"
 4) "AICc"
@@ -235,7 +234,7 @@ OK
 127.0.0.1:6379> TS.ADD temperature 5000 21.0
 (integer) 5000
 127.0.0.1:6379> TS.TREND temperature - +
-1) "selected_series"
+1) "model"
 2) "Linear"
 3) "criterion"
 4) "AICc"
@@ -262,7 +261,7 @@ Use BIC for selection (via MODEL Auto) and predict the next 5 trend values.
 
 ```
 127.0.0.1:6379> TS.TREND temperature - + MODEL Auto BIC PREDICT 5
-1) "selected_series"
+1) "model"
 2) "Linear"
 3) "criterion"
 4) "BIC"
@@ -295,7 +294,7 @@ Use auto model selection with the holdout criterion, specified inline after MODE
 
 ```
 127.0.0.1:6379> TS.TREND temperature - + MODEL Auto HOLDOUT
-1) "selected_series"
+1) "model"
 2) "Quadratic"
 3) "criterion"
 4) "HOLDOUT"
