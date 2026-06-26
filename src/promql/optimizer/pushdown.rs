@@ -1,9 +1,8 @@
-use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::HasFingerprint;
-use crate::promql::functions::{PromqlFunctionKind, resolve_function};
+use crate::promql::functions::{resolve_function, PromqlFunctionKind};
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
-use promql_parser::label::{Matcher, Matchers};
+use promql_parser::label::{Matcher, Matchers, METRIC_NAME};
 use promql_parser::parser::token::{T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, Expr, LabelModifier, VectorMatchCardinality};
@@ -55,7 +54,7 @@ pub fn optimize_in_place(expr: &mut Expr) {
         VectorSelector(vs) => {
             if vs.name.is_none()
                 && let Some(pos) = vs.matchers.matchers.iter().position(|m| {
-                    m.name == "__name__" && m.op == promql_parser::label::MatchOp::Equal
+                    m.name == METRIC_NAME && m.op == promql_parser::label::MatchOp::Equal
                 })
             {
                 let m = vs.matchers.matchers.remove(pos);
@@ -284,7 +283,7 @@ fn get_common_label_filters_without_metric_name(matchers: &Matchers) -> Vec<Matc
 // todo: use lifetimes instead of cloning
 fn get_label_filters_without_metric_name(lfs: &[Matcher]) -> Vec<Matcher> {
     lfs.iter()
-        .filter(|&x| x.name != METRIC_NAME_LABEL)
+        .filter(|&x| x.name != METRIC_NAME)
         .cloned()
         .collect::<Vec<_>>()
 }
