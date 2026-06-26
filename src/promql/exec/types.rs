@@ -164,11 +164,6 @@ impl EvalLabels {
         self.insert(key.to_string(), value);
     }
 
-    /// Remove all labels except `__name__` (resets the metric group).
-    pub(crate) fn reset_metric_group(&mut self) {
-        self.retain(|label| label.name == METRIC_NAME_LABEL);
-    }
-
     /// Compute grouping labels for aggregation and binary operations.
     ///
     /// Mirrors `Labels::compute_grouping_labels` / `Labels::into_grouping_labels`.
