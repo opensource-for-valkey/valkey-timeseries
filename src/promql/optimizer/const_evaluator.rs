@@ -36,11 +36,14 @@ fn handle_unary_expr(ue: UnaryExpr) -> Expr {
             return Expr::from(-n.val);
         }
         Expr::Unary(u2) => {
-            let exp = const_simplify(*u2.expr);
-            if let Expr::NumberLiteral(n) = exp {
+            // Fully evaluate the inner UnaryExpr before applying the outer negation.
+            let inner_result = handle_unary_expr(u2);
+            if let Expr::NumberLiteral(n) = inner_result {
+                // inner produced a numeric constant; apply the outer negation
                 return Expr::from(-n.val);
             }
-            ue.expr = Box::new(exp);
+            // inner could not be reduced to a literal; preserve the nested structure
+            ue.expr = Box::new(inner_result);
         }
         _ => {}
     }
