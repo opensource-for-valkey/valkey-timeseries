@@ -21,7 +21,7 @@
 use crate::parser::ParseResult;
 use crate::promql::binops::apply_binary_op;
 use crate::promql::optimizer::const_evaluator::fold_constants;
-use crate::promql::optimizer::pushdown::optimize_in_place;
+use crate::promql::optimizer::pushdown::pushdown_filters_in_place;
 use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
 };
@@ -52,7 +52,7 @@ pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
     let mut expr = simplify_internal(expr);
     dedupe_matchers_in_expr(&mut expr);
     // push down filters
-    optimize_in_place(&mut expr);
+    pushdown_filters_in_place(&mut expr);
     Ok(expr)
 }
 

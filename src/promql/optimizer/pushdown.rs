@@ -20,7 +20,7 @@ use std::vec::Vec;
 pub fn push_down_filters(expr: &Expr) -> Cow<'_, Expr> {
     if can_pushdown_filters(expr) {
         let mut clone = expr.clone();
-        optimize_in_place(&mut clone);
+        pushdown_filters_in_place(&mut clone);
         Cow::Owned(clone)
     } else {
         Cow::Borrowed(expr)
@@ -47,7 +47,7 @@ pub fn can_pushdown_filters(expr: &Expr) -> bool {
     }
 }
 
-pub fn optimize_in_place(expr: &mut Expr) {
+pub fn pushdown_filters_in_place(expr: &mut Expr) {
     use Expr::*;
 
     match expr {
@@ -63,24 +63,24 @@ pub fn optimize_in_place(expr: &mut Expr) {
         }
         Call(f) => {
             for arg in f.args.args.iter_mut() {
-                optimize_in_place(arg);
+                pushdown_filters_in_place(arg);
             }
         }
         Aggregate(agg) => {
-            optimize_in_place(&mut agg.expr);
+            pushdown_filters_in_place(&mut agg.expr);
             if let Some(param) = agg.param.as_mut() {
-                optimize_in_place(param);
+                pushdown_filters_in_place(param);
             }
         }
         Binary(be) => {
-            optimize_in_place(&mut be.lhs);
-            optimize_in_place(&mut be.rhs);
+            pushdown_filters_in_place(&mut be.lhs);
+            pushdown_filters_in_place(&mut be.rhs);
             let mut lfs = get_common_label_filters(expr);
             push_down_binary_op_filters_in_place(expr, &mut lfs);
         }
-        Unary(unary) => optimize_in_place(&mut unary.expr),
-        Paren(p) => optimize_in_place(&mut p.expr),
-        Subquery(s) => optimize_in_place(&mut s.expr),
+        Unary(unary) => pushdown_filters_in_place(&mut unary.expr),
+        Paren(p) => pushdown_filters_in_place(&mut p.expr),
+        Subquery(s) => pushdown_filters_in_place(&mut s.expr),
         _ => {}
     }
 }
