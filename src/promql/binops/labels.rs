@@ -4,10 +4,10 @@ use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
-use promql_parser::label::{MatchOp, Matcher, METRIC_NAME};
-use promql_parser::parser::token::{TokenType, T_ADD, T_DIV, T_LOR, T_MUL, T_SUB};
+use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
+use promql_parser::parser::token::{T_ADD, T_DIV, T_LOR, T_MUL, T_SUB, TokenType};
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
-use regex::{escape, Regex};
+use regex::{Regex, escape};
 use std::borrow::Cow;
 use twox_hash::xxhash3_128;
 

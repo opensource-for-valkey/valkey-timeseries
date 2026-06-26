@@ -2,6 +2,7 @@ use crate::Label;
 use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{HasFingerprint, Labels, SeriesFingerprint};
+use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::hashers::PreloadKey;
 use ahash::RandomState;
@@ -11,7 +12,6 @@ use promql_parser::parser::value::ValueType;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use crate::promql::binops::get_metric_signature;
 
 #[derive(Debug, Clone)]
 pub enum EvaluationError {
