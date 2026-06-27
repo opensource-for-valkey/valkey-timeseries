@@ -436,6 +436,25 @@ impl ValueFilter {
     }
 }
 
+/// Options for how to write to a destination time series when using the STORE option
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DestinationWriteMode {
+    /// Append the samples to the destination time series
+    Merge,
+    /// Overwrite the destination time series with the new samples
+    #[default]
+    Overwrite,
+}
+
+impl Display for DestinationWriteMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DestinationWriteMode::Merge => write!(f, "MERGE"),
+            DestinationWriteMode::Overwrite => write!(f, "OVERWRITE"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::DuplicatePolicy;

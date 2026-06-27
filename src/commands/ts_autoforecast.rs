@@ -1,17 +1,15 @@
 use crate::analysis::forecasting::normalize_model_name;
-use crate::commands::CommandArgIterator;
-use crate::commands::command_parser::{
-    parse_forecast_confidence_level, parse_forecast_horizon_value,
-};
+use crate::commands::command_parser::{parse_forecast_confidence_level, parse_forecast_horizon_value, parse_store_clause};
 use crate::commands::forecast_utils::{
     handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output,
     run_forecast,
 };
 use crate::commands::utils::reply_with_double_array;
-use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_str};
+use crate::commands::CommandArgIterator;
+use crate::common::replies::{block_client, reply_with_str, ThreadSafeReplyContext};
 use crate::common::time::compute_median_step_ms;
 use crate::common::{Sample, Timestamp};
-use crate::series::{TimestampRange, create_or_update_series_with_samples};
+use crate::series::{create_or_update_series_with_samples, DestinationWriteMode, TimeSeriesOptions, TimestampRange};
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::detection::detect_dominant_period;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
@@ -22,7 +20,9 @@ struct AutoForecastOptions {
     horizon: usize,
     level: Option<f64>,
     metrics: bool,
-    destination: Option<String>,
+    destination_key: Option<String>,
+    create_options: Option<TimeSeriesOptions>,
+    write_mode: Option<DestinationWriteMode>,
     config: AutoForecastConfig,
     auto_seasonality: bool,
 }
@@ -34,7 +34,9 @@ impl Default for AutoForecastOptions {
             horizon: 5,
             level: None,
             metrics: false,
-            destination: None,
+            destination_key: None,
+            create_options: None,
+            write_mode: None,
             config: AutoForecastConfig::default(),
             auto_seasonality: false,
         }
@@ -48,7 +50,16 @@ impl Default for AutoForecastOptions {
 ///     [MODELS <family1>,<family2> ...]
 ///     [LEVEL <confidence_level>]
 ///     [METRICS]
-///     [STORE <key1>]
+///     [STORE destinationKey
+///         [MERGE]
+///         [RETENTION retentionPeriod]
+///         [ENCODING encoding]
+///         [CHUNK_SIZE chunkSize]
+///         [DUPLICATE_POLICY duplicatePolicy]
+///         [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+///         [METRIC metric]
+///         [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
+///     ]
 ///```
 /// `TS.AUTOFORECAST` fits all enabled auto models (AutoARIMA, AutoETS, AutoTheta)
 /// and selects the best one based on cross-validation error.
@@ -110,9 +121,11 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
                     options.metrics = true;
                 },
                 "STORE" => {
-                    let value = args.next_string()
-                        .map_err(|_| ValkeyError::Str("TSDB: Missing value for STORE"))?;
-                    options.destination = Some(value);
+                    let store_options = parse_store_clause(args)?;
+                    // todo: this is fishy. Keys are binary safe 
+                    options.destination_key = Some(store_options.key.to_string_lossy());
+                    options.create_options = Some(store_options.options);
+                    options.write_mode = Some(store_options.write_mode);
                 },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: Unknown argument: {}", arg)));
@@ -136,7 +149,7 @@ fn process_forecast(
 ) {
     // Capture timestamp metadata before the model consumes the series reference.
     let last_timestamp_ms = series.timestamps().last().map(|dt| dt.timestamp_millis());
-    let step_ms = if options.destination.is_some() {
+    let step_ms = if options.destination_key.is_some() {
         series
             .frequency()
             .map(|d| d.num_milliseconds())
@@ -157,9 +170,8 @@ fn process_forecast(
     }
 
     let seasonal_period = options.config.seasonal_period;
-    let destination = options.destination;
 
-    let mut model = AutoForecast::with_config(options.config);
+    let mut model = AutoForecast::with_config(options.config.clone());
 
     // { model: "ARIMA", horizon: 5, forecast: [...], lower_interval: [...], upper_interval: [...] }
     let output = run_forecast(
@@ -191,10 +203,8 @@ fn process_forecast(
 
     let forecast = &output.forecast;
     // If STORE was specified, persist the predicted values into the target timeseries key.
-    if let Some(dest) = destination
-        && !dest.is_empty()
-    {
-        store_if_necessary(&ctx, dest, forecast.primary(), last_timestamp_ms, step_ms);
+    if options.destination_key.is_some() {
+        store_if_necessary(&ctx, &options, forecast.primary(), last_timestamp_ms, step_ms);
     }
 
     reply_with_forecast_output(&ctx, &output);
@@ -202,14 +212,19 @@ fn process_forecast(
 
 fn store_if_necessary(
     ctx: &ThreadSafeReplyContext,
-    destination: String,
+    store_options: &AutoForecastOptions,
     forecast: &[f64],
     last_ts: Option<Timestamp>,
     step_ms: Option<i64>,
 ) {
+    let key = match store_options.destination_key {
+        Some(ref k) => k,
+        None => "",
+    };
     // Attempt to store the forecasted values in the specified key, but don't fail the entire command if this doesn't work.
     let lock = ctx.lock();
-    let key = lock.create_string(destination);
+    let key = lock.create_string(key.as_bytes());
+    let mode = store_options.write_mode.unwrap_or_default();
 
     if let (Some(last_ts), Some(step)) = (last_ts, step_ms) {
         let samples: Vec<Sample> = forecast
@@ -218,7 +233,7 @@ fn store_if_necessary(
             .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value))
             .collect();
 
-        if let Err(e) = create_or_update_series_with_samples(&lock, &key, None, &samples, None) {
+        if let Err(e) = create_or_update_series_with_samples(&lock, &key, None, mode, &samples, None) { 
             let msg = format!("TSDB: failed to store forecast in key '{}': {}", key, e);
             ctx.log_warning(&msg);
         }

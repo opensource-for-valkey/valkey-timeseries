@@ -1,23 +1,19 @@
-use crate::analysis::forecasting::imputation::{sanitize, ImputationPolicy};
+use crate::analysis::forecasting::imputation::{ImputationPolicy, sanitize};
 use crate::commands::command_parser::{
-    parse_command_arg_token, parse_store_clause, CommandArgToken
-    ,
+    CommandArgToken, parse_command_arg_token, parse_store_clause,
 };
 use crate::commands::parse_series_range_samples;
-use crate::common::replies::reply_with_samples;
 use crate::common::Sample;
+use crate::common::replies::reply_with_samples;
 use crate::error_consts;
+use crate::series::create_or_update_series_with_samples;
 use anofox_forecast::detection::detect_dominant_period;
-use valkey_module::{
-    Context, NextArg, ValkeyError, ValkeyResult, ValkeyString,
-    ValkeyValue,
-};
-use crate::commands::utils::write_samples_to_destination;
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// ```text
-/// TS.SANITIZE key fromTimestamp toTimestamp 
+/// TS.SANITIZE key fromTimestamp toTimestamp
 ///     [POLICY <policy> [options]]
-///     [STORE destKey 
+///     [STORE destKey
 ///         [MERGE]
 ///         [RETENTION retentionPeriod]
 ///         [ENCODING encoding]
@@ -96,11 +92,21 @@ pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // - MovingAverage/Seasonal: sanitized is the full imputed result.
     // - All others (including Drop): samples has been modified in-place.
-    let to_return: &Vec<Sample> = if is_ma_or_seasonal { &sanitized } else { &samples };
+    let to_return: &Vec<Sample> = if is_ma_or_seasonal {
+        &sanitized
+    } else {
+        &samples
+    };
 
-    if let Some((dest_opts, dest_key, write_mode)) = destination {
-        // --- STORE destination path ---
-        let written = write_samples_to_destination(ctx, &dest_key, dest_opts, write_mode, to_return)?;
+    if let Some(dest) = destination {
+        let written = create_or_update_series_with_samples(
+            ctx,
+            &dest.key,
+            Some(dest.options),
+            dest.write_mode,
+            to_return,
+            None,
+        )?;
 
         return Ok(ValkeyValue::from(written));
     }
@@ -108,7 +114,6 @@ pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     reply_with_samples(ctx, to_return.iter().cloned());
     Ok(ValkeyValue::NoReply)
 }
-
 
 /// Parse the imputation policy and any policy-specific arguments.
 fn parse_policy(

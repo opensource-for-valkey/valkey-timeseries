@@ -1,13 +1,15 @@
 use crate::analysis::forecasting::try_parse_trend_criterion;
 use crate::commands::CommandArgIterator;
-use crate::commands::command_parser::parse_series_range_samples;
+use crate::commands::command_parser::{
+    StoreOptions, parse_series_range_samples, parse_store_clause,
+};
 use crate::commands::utils::reply_with_accuracy_metrics;
 use crate::common::Sample;
 use crate::common::replies::{
     reply_with_array, reply_with_double, reply_with_integer, reply_with_map, reply_with_str,
 };
 use crate::common::time::compute_median_step_ms;
-use crate::series::create_or_update_series_with_samples;
+use crate::series::{DestinationWriteMode, create_or_update_series_with_samples};
 use anofox_forecast::seasonality::auto_trend::{AutoTrend, TrendCriterion};
 use anofox_forecast::seasonality::traits::{Recency, TrendComponent};
 use anofox_forecast::seasonality::{
@@ -39,7 +41,16 @@ impl Default for TrendModel {
 ///     [PREDICT <horizon>]
 ///     [FEATURES]
 ///     [METRICS]
-///     [STORE <destination>]
+///     [STORE destKey
+///         [MERGE]
+///         [RETENTION retentionPeriod]
+///         [ENCODING encoding]
+///         [CHUNK_SIZE chunkSize]
+///         [DUPLICATE_POLICY duplicatePolicy]
+///         [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+///         [METRIC metric]
+///         [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
+///     ]
 /// ```
 ///
 /// `TS.TREND` fits one or more trend components to a time series.
@@ -64,8 +75,7 @@ impl Default for TrendModel {
 /// Optional response fields:
 /// - `predicted_trend`: predicted trend values (when PREDICT is specified)
 /// - `features`: map of named features from the fitted component (when FEATURES is specified)
-/// - `metrics`: accuracy metrics from `calculate_metrics` between observed and fitted values (when METRICS is specified)
-/// - `destination`: if STORE is specified, the key where fitted (and optionally predicted) values are stored
+/// - `metrics`: accuracy metrics between observed and fitted values (when METRICS is specified)
 pub fn ts_trend_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
@@ -97,11 +107,11 @@ pub fn ts_trend_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Fit the trend based on the selected model
     if let TrendModel::Auto(criterion) = options.model {
-        execute_auto_trend(ctx, &options, criterion, &samples, &values)
+        execute_auto_trend(ctx, options, criterion, &samples, &values)
     } else {
         let (model_name, trend) = build_specific_trend(&options.model, &options.recency)
             .ok_or(ValkeyError::Str("TSDB: invalid trend model configuration"))?;
-        execute_specific_trend(ctx, &options, model_name, &samples, &values, trend)
+        execute_specific_trend(ctx, options, model_name, &samples, &values, trend)
     }
 }
 
@@ -133,7 +143,7 @@ fn build_specific_trend(
 /// Execute auto-trend: fit all candidates and select the best one.
 fn execute_auto_trend(
     ctx: &Context,
-    options: &TrendOptions,
+    options: TrendOptions,
     criterion: Option<TrendCriterion>,
     samples: &[Sample],
     values: &[f64],
@@ -171,14 +181,14 @@ fn execute_auto_trend(
     };
 
     // If STORE was specified, persist the fitted (and optionally predicted) trend values.
-    if let Some(destination) = options.destination.clone() {
-        store_trend(
+    if let Some(destination) = options.store_options {
+        return store_trend(
             ctx,
-            &destination,
+            destination,
             samples,
             fitted_trend,
             predicted.as_deref(),
-        )?;
+        );
     }
 
     // Build the response map for Auto mode
@@ -228,7 +238,7 @@ fn execute_auto_trend(
 /// Execute a specific trend model (Exponential, Logistic, Polynomial, TheilSen).
 fn execute_specific_trend(
     ctx: &Context,
-    options: &TrendOptions,
+    options: TrendOptions,
     model_name: &str,
     samples: &[Sample],
     values: &[f64],
@@ -257,14 +267,14 @@ fn execute_specific_trend(
     };
 
     // If STORE was specified, persist the fitted (and optionally predicted) trend values.
-    if let Some(destination) = options.destination.clone() {
-        store_trend(
+    if let Some(store_options) = options.store_options {
+        return store_trend(
             ctx,
-            &destination,
+            store_options,
             samples,
             fitted_trend,
             predicted.as_deref(),
-        )?;
+        );
     }
 
     // Build the response map for specific model mode
@@ -344,12 +354,12 @@ fn reply_with_common_tail(
 /// Persist fitted (and optionally predicted) trend values to a destination key.
 fn store_trend(
     ctx: &Context,
-    destination: &str,
+    store_options: StoreOptions,
     samples: &[Sample],
     fitted_trend: &[f64],
     predicted: Option<&[f64]>,
-) -> ValkeyResult<()> {
-    let destination = ctx.create_string(destination);
+) -> ValkeyResult<ValkeyValue> {
+    let destination = store_options.key;
     let mut store_samples: Vec<Sample> = fitted_trend
         .iter()
         .enumerate()
@@ -360,7 +370,7 @@ fn store_trend(
         let timestamps: Vec<i64> = samples.iter().map(|s| s.timestamp).collect();
         if let Some(step) = compute_median_step_ms(&timestamps) {
             let last_ts = samples.last().map(|s| s.timestamp).unwrap_or(0);
-            let predicted_samples  = predicted_values
+            let predicted_samples = predicted_values
                 .iter()
                 .enumerate()
                 .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value));
@@ -372,8 +382,15 @@ fn store_trend(
         }
     }
 
-    create_or_update_series_with_samples(ctx, &destination, None, &store_samples, None)?;
-    Ok(())
+    let written = create_or_update_series_with_samples(
+        ctx,
+        &destination,
+        Some(store_options.options),
+        DestinationWriteMode::Merge,
+        &store_samples,
+        None,
+    )?;
+    Ok(ValkeyValue::Integer(written as i64))
 }
 
 fn compute_accuracy_metrics(actual: &[f64], predicted: &[f64]) -> ValkeyResult<AccuracyMetrics> {
@@ -387,7 +404,7 @@ struct TrendOptions {
     predict: usize,
     features: bool,
     metrics: bool,
-    destination: Option<String>,
+    store_options: Option<StoreOptions>,
 }
 
 impl Default for TrendOptions {
@@ -398,7 +415,7 @@ impl Default for TrendOptions {
             predict: 0,
             features: false,
             metrics: false,
-            destination: None,
+            store_options: None,
         }
     }
 }
@@ -483,9 +500,8 @@ fn parse_trend_args(args: &mut CommandArgIterator) -> ValkeyResult<TrendOptions>
                 options.metrics = true;
             },
             "STORE" => {
-                let key = args.next_string()
-                    .map_err(|_| ValkeyError::Str("TSDB: Missing value for STORE"))?;
-                options.destination = Some(key);
+                let opts = parse_store_clause(args)?;
+                options.store_options = Some(opts);
             },
             _ => {
                 // Unknown argument

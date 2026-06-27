@@ -22,7 +22,7 @@ use crate::series::request_types::{
     MetaDateRangeFilter, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
-use crate::series::{TimeSeriesOptions, TimestampRange, TimestampValue, get_timeseries};
+use crate::series::{TimeSeriesOptions, TimestampRange, TimestampValue, get_timeseries, DestinationWriteMode};
 use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
@@ -1335,10 +1335,10 @@ pub(super) fn find_last_token_instance(
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DestinationWriteMode {
-    Merge,
-    Overwrite,
+pub(super) struct StoreOptions {
+    pub options: TimeSeriesOptions,
+    pub key: ValkeyString,
+    pub write_mode: DestinationWriteMode,
 }
 
 /// STORE key
@@ -1353,8 +1353,8 @@ pub enum DestinationWriteMode {
 ///     [METRIC metric]
 pub(super) fn parse_store_clause(
     args: &mut CommandArgIterator,
-) -> ValkeyResult<(TimeSeriesOptions, ValkeyString, DestinationWriteMode)> {
-    let mut write_mode = DestinationWriteMode::Overwrite;
+) -> ValkeyResult<StoreOptions> {
+    let mut write_mode = DestinationWriteMode::default();
     let mut options = TimeSeriesOptions::from_config();
 
     let key = args
@@ -1420,7 +1420,11 @@ pub(super) fn parse_store_clause(
         };
     }
 
-    Ok((options, key, write_mode))
+    Ok(StoreOptions {
+        options,
+        key,
+        write_mode,
+    })
 }
 
 pub(super) fn parse_forecast_horizon_value(args: &mut CommandArgIterator) -> ValkeyResult<usize> {

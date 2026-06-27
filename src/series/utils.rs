@@ -1,16 +1,13 @@
-use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::get_current_db;
+use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::check_key_permissions;
 use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
-use crate::series::{
-    DuplicatePolicy, SampleAddResult, SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions,
-    create_compaction_rules_from_config,
-};
+use crate::series::{create_compaction_rules_from_config, DestinationWriteMode, DuplicatePolicy, SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions};
 use std::ops::Deref;
 use std::time::Duration;
 use valkey_module::key::ValkeyKeyWritable;
@@ -192,24 +189,53 @@ pub fn get_or_create_series<'a>(
     }
 }
 
-pub fn create_or_update_series_with_samples<'a>(
-    ctx: &'a Context,
-    key: &ValkeyString,
-    creation_options: Option<TimeSeriesOptions>,
+/// If STORE is specified for a command, results are written to the destination key instead of
+/// being returned inline. With MERGE, samples are merged into an existing
+/// destination series; without MERGE (overwrite mode), the destination is
+/// cleared first. Returns the number of samples written.
+pub fn create_or_update_series_with_samples(
+    ctx: &Context,
+    dest_key: &ValkeyString,
+    dest_opts: Option<TimeSeriesOptions>,
+    write_mode: DestinationWriteMode,
     samples: &[Sample],
     policy_override: Option<DuplicatePolicy>,
-) -> ValkeyResult<(SeriesGuardMut<'a>, Vec<SampleAddResult>)> {
-    let mut series = get_or_create_series(ctx, key, creation_options)?;
+) -> ValkeyResult<usize> {
+    if samples.is_empty() {
+        return Ok(0);
+    }
+    let mut dest_series = get_or_create_series(ctx, dest_key, dest_opts)?;
 
-    let merge_results = if !samples.is_empty() {
-        let mut sorted_samples = samples.to_vec();
-        sorted_samples.sort_by_key(|sample| sample.timestamp);
-        series.merge_samples(&sorted_samples, policy_override)?
+    let mut delete_count = 0;
+    if write_mode == DestinationWriteMode::Overwrite {
+        // Clear the destination before writing
+        delete_count = dest_series
+            .remove_range(0, Timestamp::MAX)
+            .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+    }
+
+    let policy_override = if policy_override.is_none() && write_mode == DestinationWriteMode::Merge {
+        Some(DuplicatePolicy::KeepLast)
     } else {
-        Vec::new()
+        policy_override
     };
 
-    Ok((series, merge_results))
+    let merged = dest_series
+        .merge_samples(samples, policy_override)
+        .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+
+    let valid_merged = merged.iter().filter(|r| r.is_ok()).count();
+    if valid_merged > 0 || delete_count > 0 {
+        ctx.replicate_verbatim();
+        if delete_count > 0 {
+            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.del", dest_key);
+        }
+        if valid_merged > 0 {
+            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", dest_key);
+        }
+    }
+
+    Ok(valid_merged)
 }
 
 fn add_default_compactions(

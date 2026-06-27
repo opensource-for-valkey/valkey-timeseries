@@ -1,11 +1,10 @@
 use crate::analysis::forecasting::infer_frequency_from_samples;
 use crate::commands::command_parser::{parse_duration_arg, parse_store_clause, parse_timestamp_range};
-use crate::commands::utils::write_samples_to_destination;
 use crate::commands::{parse_timestamp, parse_value_arg, CommandArgIterator};
 use crate::common::replies::reply_with_samples;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::series::get_timeseries_mut;
+use crate::series::{create_or_update_series_with_samples, get_timeseries_mut};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use valkey_module::{
@@ -50,7 +49,7 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let key = args.next_arg()?;
     let date_range = parse_timestamp_range(&mut args)?;
     // Get the series (must exist)
-    let mut series = get_timeseries_mut(ctx, &key, true, Some(AclPermissions::UPDATE))?.unwrap();
+    let series = get_timeseries_mut(ctx, &key, true, Some(AclPermissions::UPDATE))?.unwrap();
 
     let (start_ts, end_ts) = date_range.get_series_range(&series, None, false);
 
@@ -124,11 +123,13 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let gaps_filled = gap_samples.len();
 
-    if gaps_filled > 0 {
-        if let Some((dest_opts, dest_key, write_mode)) = destination {
-            let written = write_samples_to_destination(ctx, &dest_key, dest_opts, write_mode, &gap_samples)?;
-            return Ok(ValkeyValue::from(written));
+
+    if let Some(dest) = destination {
+        if gaps_filled == 0 {
+            return Ok(ValkeyValue::from(0_i64));
         }
+        let written = create_or_update_series_with_samples(ctx, &dest.key, Some(dest.options), dest.write_mode, &gap_samples, None)?;
+        return Ok(ValkeyValue::from(written));
     }
 
     reply_with_samples(ctx, gap_samples.iter().cloned());
