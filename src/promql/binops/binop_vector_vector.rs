@@ -333,6 +333,59 @@ fn eval_arith_ops(
         return eval_arith_ops_fast_path(&ctx, left_vector, right_vector);
     }
 
+    #[inline]
+    fn handle_match(
+        ctx: &ArithOpContext,
+        many_sample: &EvalSample,
+        one_samples: &[EvalSample],
+    ) -> impl Iterator<Item = EvalSample> {
+        one_samples
+            .iter()
+            .filter_map(move |one_sample| build_result_sample(ctx, many_sample, one_sample))
+    }
+
+    #[inline]
+    fn handle_unmatched_many(
+        ctx: &ArithOpContext,
+        many_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
+        many_key: SeriesFingerprint,
+        result: &mut Vec<EvalSample>,
+    ) {
+        if let Some(fill_val) = ctx.fill_for_one {
+            let many_samples = take_group(many_it, many_key);
+            emit_fill_for_one(ctx, many_samples, fill_val, result);
+        } else {
+            skip_group(many_it, many_key);
+        }
+    }
+
+    #[inline]
+    fn handle_unmatched_one(
+        ctx: &ArithOpContext,
+        one_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
+        one_key: SeriesFingerprint,
+        result: &mut Vec<EvalSample>,
+    ) -> EvalResult<()> {
+        if let Some(fill_val) = ctx.fill_for_many {
+            let one_samples = take_group(one_it, one_key);
+            emit_fill_for_many(ctx, one_samples, fill_val, result)?;
+        } else {
+            let one_group_len = skip_group_count(one_it, one_key);
+            validate_one_group_len(ctx, one_group_len)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn duplicate_many_side(ctx: &ArithOpContext) -> &'static str {
+        if ctx.is_group_right { "right" } else { "left" }
+    }
+
+    #[inline]
+    fn duplicate_one_side(ctx: &ArithOpContext) -> &'static str {
+        if ctx.is_group_right { "left" } else { "right" }
+    }
+
     // Determine which side is "one" vs. "many" for matching purposes.
     // For one-to-one mappings, we treat the right-hand side as the "one" side.
     let (one_vec, many_vec) = if ctx.is_group_right {
@@ -359,41 +412,19 @@ fn eval_arith_ops(
             (None, None) => break,
             // Only "many" entries remain — all unmatched.
             (Some(many_key), None) => {
-                if let Some(fill_val) = ctx.fill_for_one {
-                    let many_samples = take_group(&mut many_it, many_key);
-                    emit_fill_for_one(&ctx, many_samples, fill_val, &mut result);
-                } else {
-                    skip_group(&mut many_it, many_key);
-                }
+                handle_unmatched_many(&ctx, &mut many_it, many_key, &mut result);
             }
             // Only "one" entries remain — all unmatched.
             (None, Some(one_key)) => {
-                if let Some(fill_val) = ctx.fill_for_many {
-                    let one_samples = take_group(&mut one_it, one_key);
-                    emit_fill_for_many(&ctx, one_samples, fill_val, &mut result)?;
-                } else {
-                    let one_group_len = skip_group_count(&mut one_it, one_key);
-                    validate_one_group_len(&ctx, one_group_len)?;
-                }
+                handle_unmatched_one(&ctx, &mut one_it, one_key, &mut result)?;
             }
             (Some(many_key), Some(one_key)) => {
                 if many_key < one_key {
                     // "many" key has no "one" partner — unmatched.
-                    if let Some(fill_val) = ctx.fill_for_one {
-                        let many_samples = take_group(&mut many_it, many_key);
-                        emit_fill_for_one(&ctx, many_samples, fill_val, &mut result);
-                    } else {
-                        skip_group(&mut many_it, many_key);
-                    }
+                    handle_unmatched_many(&ctx, &mut many_it, many_key, &mut result);
                 } else if many_key > one_key {
                     // "one" key has no "many" partner — unmatched.
-                    if let Some(fill_val) = ctx.fill_for_many {
-                        let one_samples = take_group(&mut one_it, one_key);
-                        emit_fill_for_many(&ctx, one_samples, fill_val, &mut result)?;
-                    } else {
-                        let one_group_len = skip_group_count(&mut one_it, one_key);
-                        validate_one_group_len(&ctx, one_group_len)?;
-                    }
+                    handle_unmatched_one(&ctx, &mut one_it, one_key, &mut result)?;
                 } else {
                     // Matched key on both sides.
                     // Collect groups so we can safely inspect cardinality and then
@@ -401,36 +432,17 @@ fn eval_arith_ops(
                     let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                     let many_samples = take_group(&mut many_it, many_key);
 
-                    #[inline]
-                    fn handle_match(
-                        ctx: &ArithOpContext,
-                        many_sample: &EvalSample,
-                        one_samples: &[EvalSample],
-                    ) -> impl Iterator<Item = EvalSample> {
-                        one_samples.iter().filter_map(move |one_sample| {
-                            build_result_sample(ctx, many_sample, one_sample)
-                        })
-                    }
-
                     let should_check_duplicates = !ctx.is_comparison;
 
                     if should_check_duplicates {
                         if one_samples.len() > 1 {
-                            return Err(duplicate_side_error(if ctx.is_group_right {
-                                "left"
-                            } else {
-                                "right"
-                            }));
+                            return Err(duplicate_side_error(duplicate_one_side(&ctx)));
                         }
                         if ctx.is_one_to_one {
                             let mut iter = many_samples.into_iter();
                             let sample = iter.next().unwrap();
                             if iter.next().is_some() {
-                                return Err(duplicate_side_error(if ctx.is_group_right {
-                                    "right"
-                                } else {
-                                    "left"
-                                }));
+                                return Err(duplicate_side_error(duplicate_many_side(&ctx)));
                             }
                             result.extend(handle_match(&ctx, &sample, &one_samples));
                             continue;
