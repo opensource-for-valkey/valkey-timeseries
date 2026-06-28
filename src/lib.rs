@@ -13,7 +13,6 @@ use crate::common::threads::init_thread_pool;
 use crate::config::register_config;
 use crate::fanout::{init_fanout, is_clustered};
 use crate::promql::register_promql;
-use logger_rust::{LogLevel, set_log_level};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::ThreadId;
 use valkey_module::{Context, Status, ValkeyString, Version, valkey_module};
