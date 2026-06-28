@@ -1,8 +1,8 @@
-mod const_evaluator;
+mod const_folding;
 pub mod pushdown;
 #[cfg(test)]
 mod pushdown_tests;
-pub mod simplifier;
+mod optimize;
 mod utils;
 
-pub use simplifier::optimize_expr;
+pub use optimize::optimize_expr;
