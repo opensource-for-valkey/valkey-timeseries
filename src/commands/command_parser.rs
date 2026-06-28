@@ -1,6 +1,7 @@
 use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
 use crate::common::Timestamp;
 use crate::common::binop::ComparisonOperator;
+use crate::common::logging::log_debug;
 use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
 };
