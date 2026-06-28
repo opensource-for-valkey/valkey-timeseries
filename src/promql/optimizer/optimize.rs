@@ -19,20 +19,18 @@
 // https://github.com/apache/arrow-datafusion/blob/e222bd627b6e7974133364fed4600d74b4da6811/datafusion/optimizer/src/utils.rs
 
 use crate::parser::ParseResult;
-use crate::promql::binops::apply_binary_op;
-use crate::promql::optimizer::const_evaluator::fold_constants;
+use crate::promql::optimizer::const_folding::fold_constants;
 use crate::promql::optimizer::pushdown::pushdown_filters_in_place;
 use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
 };
 use promql_parser::label::{Matcher, Matchers};
-use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
+use promql_parser::parser::token::{TokenType, T_ADD, T_DIV, T_LAND, T_LOR, T_MUL};
 use promql_parser::parser::{BinaryExpr, Expr};
-use std::ops::Deref;
 // https://prometheus.io/docs/prometheus/latest/querying/operators
-// Expression simplification API
+// Expression optimization API
 
-/// Simplifies this [`Expr`]`s as much as possible, evaluating
+/// Optimizes this [`Expr`]`s as much as possible, evaluating
 /// constants and applying simplifications.
 ///
 /// The types of the expression must match what operators expect,
@@ -47,63 +45,163 @@ use std::ops::Deref;
 /// `b > 2`
 ///
 pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
-    let expr = fold_constants(expr);
+    const MAX_OPTIMIZATION_PASSES: usize = 4;
 
-    let mut expr = simplify_internal(expr);
-    dedupe_matchers_in_expr(&mut expr);
+    let mut expr = expr;
+    for _ in 0..MAX_OPTIMIZATION_PASSES {
+        let previous = expr.clone();
+        expr = optimize_internal(fold_constants(expr));
+        if expr == previous {
+            break;
+        }
+    }
+
     // push down filters
     pushdown_filters_in_place(&mut expr);
     Ok(expr)
 }
 
-/// Recursively deduplicate matchers for all selector nodes in an [`Expr`].
-fn dedupe_matchers_in_expr(expr: &mut Expr) {
-    match expr {
-        Expr::VectorSelector(vs) => {
-            let matchers = std::mem::replace(
-                &mut vs.matchers,
-                Matchers {
-                    matchers: vec![],
-                    or_matchers: vec![],
-                },
-            );
-            vs.matchers = dedupe_matchers(matchers);
+/// Apply algebraic optimization rules to a binary expression.
+///
+/// This covers constant folding (both sides are number literals) and
+/// operator-specific rewrites such as `A + 0 → A`, `A + A → A * 2`,
+/// `A OR (A AND B) → A`, `A * 1 → A`, `A / 1 → A`, etc.
+fn optimize_binary(binary: BinaryExpr) -> Expr {
+    let BinaryExpr {
+        lhs,
+        rhs,
+        op,
+        modifier,
+    } = binary;
+
+    let left = optimize_internal(*lhs);
+    let right = optimize_internal(*rhs);
+    match op.id() {
+        //
+        // Rules for Add
+        //
+
+        // A + 0 --> A
+        T_ADD if is_zero(&right) => left,
+
+        // 0 + A --> A
+        T_ADD if is_zero(&left) => right,
+
+        // A + A --> A * 2
+        // Our use case envisions that this expression involving metric selectors
+        // will need to make network calls to evaluate. If both sides are the same
+        // we can optimize by multiplying by 2 and only making one network call.
+        // Guard: only safe when no matching modifier is present; a modifier such as
+        // `on(label)` or `group_left()` is only meaningful for vector–vector ops and
+        // cannot be mapped onto the resulting vector–scalar multiplication.
+        T_ADD
+            if left == right
+                && modifier.is_none()
+                && matches!(
+                    &left,
+                    Expr::VectorSelector(_) | Expr::Subquery(_) | Expr::Aggregate(_)
+                ) =>
+        {
+            let two = Expr::from(2.0);
+            Expr::Binary(BinaryExpr {
+                rhs: Box::new(two),
+                lhs: Box::new(left),
+                op: TokenType::new(T_MUL),
+                modifier,
+            })
         }
-        Expr::MatrixSelector(ms) => {
-            let matchers = std::mem::replace(
-                &mut ms.vs.matchers,
-                Matchers {
-                    matchers: vec![],
-                    or_matchers: vec![],
-                },
-            );
-            ms.vs.matchers = dedupe_matchers(matchers);
-        }
-        Expr::Subquery(sq) => {
-            dedupe_matchers_in_expr(sq.expr.as_mut());
-        }
-        Expr::Aggregate(agg) => {
-            dedupe_matchers_in_expr(agg.expr.as_mut());
-            if let Some(param) = agg.param.as_mut() {
-                dedupe_matchers_in_expr(param.as_mut());
+
+        // Rules for OR
+        //
+        // (..A..) OR A --> (..A..)
+        T_LOR if expr_contains(&left, &right, TokenType::new(T_LOR)) => left,
+        // A OR (A AND B) --> A
+        T_LOR if is_op_with(TokenType::new(T_LAND), &right, &left) => left,
+        // (A AND B) OR A --> A
+        T_LOR if is_op_with(TokenType::new(T_LAND), &left, &right) => right,
+
+        //
+        // Rules for AND
+        //
+        // (..A..) AND A --> ..A..  (unwrap a single-level Paren if present)
+        T_LAND if expr_contains(&left, &right, TokenType::new(T_LAND)) => {
+            // if both sides are identical (e.g., `(A) AND (A)`), preserve the original
+            // wrapper by returning lhs as-is. Otherwise, unwrap a single-level Paren.
+            if left == right {
+                left
+            } else {
+                match left {
+                    Expr::Paren(p) => *p.expr,
+                    other => other,
+                }
             }
         }
-        Expr::Binary(b) => {
-            dedupe_matchers_in_expr(b.lhs.as_mut());
-            dedupe_matchers_in_expr(b.rhs.as_mut());
-        }
-        Expr::Paren(p) => {
-            dedupe_matchers_in_expr(p.expr.as_mut());
-        }
-        Expr::Call(call) => {
-            for arg in &mut call.args.args {
-                dedupe_matchers_in_expr(arg.as_mut());
+        // A AND (..A..) --> A..
+        T_LAND if expr_contains(&right, &left, TokenType::new(T_LAND)) => {
+            if left == right {
+                right
+            } else {
+                match right {
+                    Expr::Paren(p) => *p.expr,
+                    other => other,
+                }
             }
         }
-        Expr::Unary(u) => {
-            dedupe_matchers_in_expr(u.expr.as_mut());
+        // A AND (A OR B) --> A
+        T_LAND if is_op_with(TokenType::new(T_LOR), &right, &left) => {
+            if left == right {
+                left
+            } else {
+                match left {
+                    Expr::Paren(p) => *p.expr,
+                    other => other,
+                }
+            }
         }
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+        // (A OR B) AND A --> A
+        T_LAND if is_op_with(TokenType::new(T_LOR), &left, &right) => {
+            if left == right {
+                right
+            } else {
+                match right {
+                    Expr::Paren(p) => *p.expr,
+                    other => other,
+                }
+            }
+        }
+
+        //
+        // Rules for Mul
+        //
+        // A * 1 --> A
+        T_MUL if is_one(&right) => left,
+        // 1 * A --> A
+        T_MUL if is_one(&left) => right,
+
+        //
+        // Rules for Div
+        //
+        // A / 1 --> A
+        T_DIV if is_one(&right) => left,
+        // A / A --> NAN if A.is_nan() else 1.0. The NaN comparison can be valid for
+        // NumberLiteral, but not for VectorSelector, Subquery, Aggregation, etc.
+        T_DIV if left == right && is_number(&left) => {
+            if is_null(&right) {
+                Expr::from(f64::NAN)
+            } else {
+                Expr::from(1.0)
+            }
+        }
+        //
+        // Rules for Mod
+        //
+        // no additional rewrites possible
+        _ => Expr::Binary(BinaryExpr {
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            op,
+            modifier,
+        }),
     }
 }
 
@@ -115,18 +213,18 @@ fn dedupe_matchers_in_expr(expr: &mut Expr) {
 /// * `1 == bool 1` to `1`
 /// * `0 == bool 1` to `0`
 /// * `expr == NaN` and `expr != NaN` to `NaN`
-fn simplify_internal(expr: Expr) -> Expr {
+fn optimize_internal(expr: Expr) -> Expr {
     match expr {
-        Expr::Paren(p) => simplify_internal(*p.expr),
+        Expr::Paren(p) => optimize_internal(*p.expr),
         Expr::Subquery(mut sq) => {
-            *sq.expr = simplify_internal(*sq.expr);
+            *sq.expr = optimize_internal(*sq.expr);
             Expr::Subquery(sq)
         }
         Expr::Aggregate(mut agg) => {
-            *agg.expr = simplify_internal(*agg.expr);
+            *agg.expr = optimize_internal(*agg.expr);
             if let Some(param) = agg.param {
                 let mut param = param;
-                *param = simplify_internal(*param);
+                *param = optimize_internal(*param);
                 agg.param = Some(param);
             }
             Expr::Aggregate(agg)
@@ -137,161 +235,26 @@ fn simplify_internal(expr: Expr) -> Expr {
                 .args
                 .into_iter()
                 .map(|mut arg| {
-                    *arg = simplify_internal(*arg);
+                    *arg = optimize_internal(*arg);
                     arg
                 })
                 .collect();
             Expr::Call(call)
         }
         Expr::Unary(mut unary) => {
-            *unary.expr = simplify_internal(*unary.expr);
+            *unary.expr = optimize_internal(*unary.expr);
             Expr::Unary(unary)
         }
-        Expr::Binary(BinaryExpr {
-            lhs,
-            rhs,
-            op,
-            modifier,
-        }) => {
-            if let Expr::NumberLiteral(left) = &*lhs
-                && let Expr::NumberLiteral(right) = &*rhs
-            {
-                // properly constructed expressions (from the parser) should not panic
-                let n = apply_binary_op(op, left.val, right.val).expect("binary operation failed");
-                let return_bool = matches!(modifier, Some(m) if m.return_bool);
-                if return_bool {
-                    return Expr::from(if n.is_nan() || n == 0.0 { 0.0 } else { 1.0 });
-                }
-                return Expr::from(n);
-            };
-            match op.id() {
-                //
-                // Rules for Add
-                //
-
-                // A + 0 --> A
-                T_ADD if is_zero(&rhs) => *lhs,
-
-                // 0 + A --> A
-                T_ADD if is_zero(&lhs) => *rhs,
-
-                // A + A --> A * 2
-                // Our use case envisions that this expression involving metric selectors
-                // will need to make network calls to evaluate. If both sides are the same
-                // we can optimize by multiplying by 2 and only making one network call.
-                // Guard: only safe when no matching modifier is present; a modifier such as
-                // `on(label)` or `group_left()` is only meaningful for vector–vector ops and
-                // cannot be mapped onto the resulting vector–scalar multiplication.
-                T_ADD
-                    if *lhs == *rhs
-                        && modifier.is_none()
-                        && matches!(
-                            lhs.deref(),
-                            Expr::VectorSelector(_) | Expr::Subquery(_) | Expr::Aggregate(_)
-                        ) =>
-                {
-                    let two = Expr::from(2.0);
-                    Expr::Binary(BinaryExpr {
-                        rhs: Box::new(two),
-                        lhs,
-                        op: TokenType::new(T_MUL),
-                        modifier,
-                    })
-                }
-
-                // Rules for OR
-                //
-                // (..A..) OR A --> (..A..)
-                T_LOR if expr_contains(&lhs, &rhs, TokenType::new(T_LOR)) => *lhs,
-                // A OR (A AND B) --> A
-                T_LOR if is_op_with(TokenType::new(T_LAND), &rhs, &lhs) => *lhs,
-                // (A AND B) OR A --> A
-                T_LOR if is_op_with(TokenType::new(T_LAND), &lhs, &rhs) => *rhs,
-
-                //
-                // Rules for AND
-                //
-                // (..A..) AND A --> ..A..  (unwrap a single-level Paren if present)
-                T_LAND if expr_contains(&lhs, &rhs, TokenType::new(T_LAND)) => {
-                    // if both sides are identical (e.g., `(A) AND (A)`), preserve the original
-                    // wrapper by returning lhs as-is. Otherwise unwrap a single-level Paren.
-                    if *lhs == *rhs {
-                        *lhs
-                    } else {
-                        match *lhs {
-                            Expr::Paren(p) => *p.expr,
-                            other => other,
-                        }
-                    }
-                }
-                // A AND (..A..) --> ..A..
-                T_LAND if expr_contains(&rhs, &lhs, TokenType::new(T_LAND)) => {
-                    if *lhs == *rhs {
-                        *rhs
-                    } else {
-                        match *rhs {
-                            Expr::Paren(p) => *p.expr,
-                            other => other,
-                        }
-                    }
-                }
-                // A AND (A OR B) --> A
-                T_LAND if is_op_with(TokenType::new(T_LOR), &rhs, &lhs) => {
-                    if *lhs == *rhs {
-                        *lhs
-                    } else {
-                        match *lhs {
-                            Expr::Paren(p) => *p.expr,
-                            other => other,
-                        }
-                    }
-                }
-                // (A OR B) AND A --> A
-                T_LAND if is_op_with(TokenType::new(T_LOR), &lhs, &rhs) => {
-                    if *lhs == *rhs {
-                        *rhs
-                    } else {
-                        match *rhs {
-                            Expr::Paren(p) => *p.expr,
-                            other => other,
-                        }
-                    }
-                }
-
-                //
-                // Rules for Mul
-                //
-                // A * 1 --> A
-                T_MUL if is_one(&rhs) => *lhs,
-                // 1 * A --> A
-                T_MUL if is_one(&lhs) => *rhs,
-
-                //
-                // Rules for Div
-                //
-                // A / 1 --> A
-                T_DIV if is_one(&rhs) => *lhs,
-                // A / A --> NAN if A.is_nan() else 1.0. The NaN comparison can be valid for
-                // NumberLiteral, but not for VectorSelector, Subquery, Aggregation, etc.
-                T_DIV if lhs == rhs && is_number(&lhs) => {
-                    if is_null(&rhs) {
-                        Expr::from(f64::NAN)
-                    } else {
-                        Expr::from(1.0)
-                    }
-                }
-                //
-                // Rules for Mod
-                //
-                // no additional rewrites possible
-                _ => Expr::Binary(BinaryExpr {
-                    lhs,
-                    rhs,
-                    op,
-                    modifier,
-                }),
-            }
+        Expr::VectorSelector(mut vs) => {
+            // Simplify any label matchers within the vector selector
+            vs.matchers = dedupe_matchers(vs.matchers);
+            Expr::VectorSelector(vs)
         }
+        Expr::MatrixSelector(mut mst) => {
+            mst.vs.matchers = dedupe_matchers(mst.vs.matchers);
+            Expr::MatrixSelector(mst)
+        }
+        Expr::Binary(binary) => optimize_binary(binary),
         expr => expr,
     }
 }
