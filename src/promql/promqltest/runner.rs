@@ -1,5 +1,5 @@
 use crate::promql::QueryValue;
-use crate::promql::engine::promql_engine::Tsdb;
+use crate::promql::engine::promql_engine::PromqlQuerier;
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::promqltest::assert::assert_results;
 use crate::promql::promqltest::dsl::*;
@@ -41,7 +41,7 @@ fn run_builtin_tests() -> Result<(), String> {
 /// Run all tests with a custom storage factory (matches Prometheus RunBuiltinTestsWithStorage)
 fn run_builtin_tests_with_storage<F>(storage_factory: F) -> Result<(), String>
 where
-    F: Fn() -> (Tsdb, Arc<MemorySeriesQuerier>),
+    F: Fn() -> (PromqlQuerier, Arc<MemorySeriesQuerier>),
 {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
@@ -74,7 +74,7 @@ pub fn run_test(name: &str, content: &str) -> Result<(), String> {
 /// Run a single test file with custom storage (matches Prometheus RunTestWithStorage)
 fn run_test_with_storage<F>(name: &str, content: &str, storage_factory: &F) -> Result<(), String>
 where
-    F: Fn() -> (Tsdb, Arc<MemorySeriesQuerier>),
+    F: Fn() -> (PromqlQuerier, Arc<MemorySeriesQuerier>),
 {
     let commands = parse_test_file(content)?;
     let (mut tsdb, mut storage) = storage_factory();
@@ -169,11 +169,11 @@ where
 // Storage Factory
 // ============================================================================
 
-fn new_test_storage() -> (Tsdb, Arc<MemorySeriesQuerier>) {
+fn new_test_storage() -> (PromqlQuerier, Arc<MemorySeriesQuerier>) {
     let storage = Arc::new(MemorySeriesQuerier::new());
     // Coerce Arc<MockSeriesQuerier> to Arc<dyn SeriesQuerier> for Tsdb
     let querier: Arc<dyn crate::promql::engine::QueryReader> = storage.clone();
-    (Tsdb::new(querier), storage)
+    (PromqlQuerier::with_query_reader(querier), storage)
 }
 
 #[cfg(test)]
