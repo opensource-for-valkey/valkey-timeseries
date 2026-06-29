@@ -39,52 +39,52 @@ struct RangeSelectorCommand {
     options: QueryOptions,
 }
 
-enum SelectorCommand {
+enum SelectorTaskKind {
     Vector(InstantVectorSelectorCommand),
     Range(RangeSelectorCommand),
 }
 
-impl SelectorCommand {
+impl SelectorTaskKind {
     fn db(&self) -> i32 {
         match self {
-            SelectorCommand::Vector(iqc) => iqc.options.db,
-            SelectorCommand::Range(rc) => rc.options.db,
+            SelectorTaskKind::Vector(iqc) => iqc.options.db,
+            SelectorTaskKind::Range(rc) => rc.options.db,
         }
     }
 }
 
-/// A single batched request for a `QueryWorker`.
-struct SelectorRequest {
-    item: SelectorCommand,
+/// A single batched request for a `SelectorBatchExecutor`.
+struct SelectorTask {
+    kind: SelectorTaskKind,
     /// responder receives the processed result (Ok) or the error (Err)
     responder: mpsc::SyncSender<QueryResult<QueryValue>>,
 }
 
-impl SelectorRequest {
+impl SelectorTask {
     fn db(&self) -> i32 {
-        self.item.db()
+        self.kind.db()
     }
 }
 
-/// A worker responsible for executing PromQL selectors as part of a keyspace batch operation.
+/// An executor responsible for executing PromQL selectors as part of a keyspace batch operation.
 ///
-/// The `QueryWorker` optimizes latency in the PromQL evaluator (especially in cluster mode) by:
+/// The `SelectorBatchExecutor` optimizes latency in the PromQL evaluator (especially in cluster mode) by:
 ///
 /// - Serializing access to the Valkey keyspace via `MODULE_CONTEXT` to avoid deadlocks, ensuring that
 ///   we can query safely from multiple threads.
-/// - Collecting incoming query requests into a batch and processing the batch in a single lock
+/// - Collecting incoming selector tasks into a batch and processing the batch in a single lock
 ///   acquisition to reduce locking overhead.
 ///
 /// # Design
 ///
-/// Unlike a traditional worker that spawns a dedicated background thread, `QueryWorker` uses
-/// **cooperative batching**: each caller that sends a request attempts to become the "processor"
-/// by acquiring the receiver lock. The processor drains all pending requests from the shared
+/// Unlike a traditional executor that spawns a dedicated background thread, `SelectorBatchExecutor` uses
+/// **cooperative batching**: each caller that submits a task attempts to become the "processor"
+/// by acquiring the receiver lock. The processor drains all pending tasks from the shared
 /// channel with `try_recv()`, processes them under a single `MODULE_CONTEXT` acquisition, then
 /// releases the lock. This eliminates the need for a dedicated thread while preserving batching
 /// behaviour.
 ///
-/// For local queries, the worker processes the request directly, so processing is essentially serialized.
+/// For local queries, the executor processes the task directly, so processing is essentially serialized.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
 /// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
@@ -92,24 +92,19 @@ impl SelectorRequest {
 /// This design allows us to achieve good performance without needing multiple background threads for processing queries concurrently.
 ///
 /// # Note
-/// The `QueryWorker` is designed for internal use within the PromQL engine and is not intended to be
+/// The `SelectorBatchExecutor` is designed for internal use within the PromQL engine and is not intended to be
 /// used directly by external callers. It is exposed as a handle that can be used to perform queries,
 /// but the internal implementation details are abstracted away.
 ///
-/// # Important Considerations
-///  - Reuse the same `QueryWorker` instance (it is a global `LazyLock`).
-///  - The processor holds `MODULE_CONTEXT` while processing requests, so it should not be used for
-///    long-running or blocking operations to avoid starving other tasks that require the GIL.
-///
 /// # Example
 /// ```ignore
-/// use crate::promql::engine::query_worker::QueryWorker;
+/// use crate::promql::engine::SelectorBatchExecutor;
 /// use crate::promql::engine::QueryOptions;
 /// use promql_parser::label::Matchers;
 ///
 ///
-/// // Create a worker handle and perform queries via the provided API.
-/// let query_worker = QueryWorker::new();
+/// // Create an executor handle and perform queries via the provided API.
+/// let executor = SelectorBatchExecutor::new();
 /// let now = current_time_millis();
 /// let options = QueryOptions {
 ///     timeout: Some(now + 60_000), // 1 minute from now
@@ -117,14 +112,14 @@ impl SelectorRequest {
 ///     max_series: 1000,
 /// };
 /// let matchers = vec![Matcher::new("job", "=", "prometheus")];
-/// let _ = query_worker.query(matchers, now, options);
+/// let _ = executor.query(matchers, now, options);
 /// ```
-pub struct QueryWorker {
-    sender: mpsc::Sender<SelectorRequest>,
-    receiver: Mutex<mpsc::Receiver<SelectorRequest>>,
+pub struct SelectorBatchExecutor {
+    sender: mpsc::Sender<SelectorTask>,
+    receiver: Mutex<mpsc::Receiver<SelectorTask>>,
 }
 
-impl QueryWorker {
+impl SelectorBatchExecutor {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
@@ -139,12 +134,12 @@ impl QueryWorker {
         timestamp: Timestamp,
         options: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let command = SelectorCommand::Vector(InstantVectorSelectorCommand {
+        let command = SelectorTaskKind::Vector(InstantVectorSelectorCommand {
             matchers,
             timestamp,
             options,
         });
-        self.send_request(command)
+        self.submit_selector_task(command)
     }
 
     pub fn query_range(
@@ -154,34 +149,34 @@ impl QueryWorker {
         end: Timestamp,
         options: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let command = SelectorCommand::Range(RangeSelectorCommand {
+        let command = SelectorTaskKind::Range(RangeSelectorCommand {
             matchers,
             start_timestamp: start,
             end_timestamp: end,
             options,
         });
-        self.send_request(command)
+        self.submit_selector_task(command)
     }
 
-    fn send_request(&self, command: SelectorCommand) -> QueryResult<QueryValue> {
-        let (responder_tx, responder_rx) = mpsc::sync_channel(1);
-        let request = SelectorRequest {
-            item: command,
-            responder: responder_tx,
+    fn submit_selector_task(&self, command: SelectorTaskKind) -> QueryResult<QueryValue> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let task = SelectorTask {
+            kind: command,
+            responder: result_tx,
         };
 
-        // Send our request to the shared channel.
-        if let Err(e) = self.sender.send(request) {
-            let msg = format!("promql: failed to send query request to worker: {e}");
+        // Send our task to the shared channel.
+        if let Err(e) = self.sender.send(task) {
+            let msg = format!("promql: failed to submit selector task to executor: {e}");
             log_warning(msg.clone());
             return Err(QueryError::Execution(msg));
         }
 
         // Try to become the processor. If another caller is already processing,
-        // we simply wait for our result — they will handle our request too.
-        self.try_process_batches();
+        // we simply wait for our result — they will handle our task too.
+        self.try_drain_and_execute_batches();
 
-        match responder_rx.recv() {
+        match result_rx.recv() {
             Ok(res) => match res {
                 Ok(val) => Ok(val),
                 Err(err) => Err(err),
@@ -200,7 +195,7 @@ impl QueryWorker {
     /// The receiver lock is released between drain-and-process cycles so that
     /// other callers can step in if needed, and to avoid holding the lock
     /// across potentially long `MODULE_CONTEXT` critical sections.
-    fn try_process_batches(&self) {
+    fn try_drain_and_execute_batches(&self) {
         loop {
             let batch = {
                 // Scope the receiver lock to just draining — release before
@@ -237,7 +232,7 @@ impl QueryWorker {
 
             let ctx = MODULE_CONTEXT.lock();
             for req in batch {
-                process_request(&ctx, req);
+                execute_selector_task(&ctx, req);
             }
             // ctx dropped here — MODULE_CONTEXT released
 
@@ -247,20 +242,20 @@ impl QueryWorker {
     }
 }
 
-fn process_request(ctx: &Context, request: SelectorRequest) {
+fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     let original_db = get_current_db(ctx);
-    let target_db = request.db();
+    let target_db = task.db();
 
     if target_db != original_db {
         let _ = set_current_db(ctx, target_db);
     }
 
     if is_clustered(ctx) {
-        // In cluster mode, process_cluster handles sending the response itself.
-        process_cluster(ctx, request)
+        // In cluster mode, execute_selector_task_cluster handles sending the response itself.
+        execute_selector_task_cluster(ctx, task)
     } else {
-        let result = process_local(ctx, request.item);
-        send_to_responder(&request.responder, result);
+        let result = execute_selector_task_local(ctx, task.kind);
+        deliver_task_result(&task.responder, result);
     };
 
     if target_db != original_db {
@@ -268,14 +263,14 @@ fn process_request(ctx: &Context, request: SelectorRequest) {
     }
 }
 
-fn process_local(ctx: &Context, command: SelectorCommand) -> QueryResult<QueryValue> {
+fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> QueryResult<QueryValue> {
     match command {
-        SelectorCommand::Vector(iqc) => {
+        SelectorTaskKind::Vector(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
             query_instant_local(ctx, selector, timestamp, iqc.options).map(QueryValue::Vector)
         }
-        SelectorCommand::Range(rc) => {
+        SelectorTaskKind::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
@@ -311,7 +306,7 @@ fn validate_max_points_per_series(
     Ok(())
 }
 
-fn send_to_responder(
+fn deliver_task_result(
     responder: &mpsc::SyncSender<QueryResult<QueryValue>>,
     result: QueryResult<QueryValue>,
 ) {
@@ -320,7 +315,7 @@ fn send_to_responder(
     }
 }
 
-fn run_clustered_vector_selector(
+fn execute_cluster_vector_selector(
     ctx: &Context,
     iqc: InstantVectorSelectorCommand,
     responder: mpsc::SyncSender<QueryResult<QueryValue>>,
@@ -369,15 +364,15 @@ fn run_clustered_vector_selector(
             }
         };
 
-        send_to_responder(&responder, query_result);
+        deliver_task_result(&responder, query_result);
     };
 
     if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
-        send_to_responder(&cloned_responder, Err(e.into()));
+        deliver_task_result(&cloned_responder, Err(e.into()));
     }
 }
 
-fn run_clustered_range_selector(
+fn execute_cluster_range_selector(
     ctx: &Context,
     rc: RangeSelectorCommand,
     responder: mpsc::SyncSender<QueryResult<QueryValue>>,
@@ -432,21 +427,21 @@ fn run_clustered_range_selector(
             }
         };
 
-        send_to_responder(&responder, query_result);
+        deliver_task_result(&responder, query_result);
     };
 
     if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
-        send_to_responder(&cloned_responder, Err(e.into()));
+        deliver_task_result(&cloned_responder, Err(e.into()));
     }
 }
 
-fn process_cluster(ctx: &Context, batch_request: SelectorRequest) {
-    match batch_request.item {
-        SelectorCommand::Vector(iqc) => {
-            run_clustered_vector_selector(ctx, iqc, batch_request.responder);
+fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
+    match task.kind {
+        SelectorTaskKind::Vector(iqc) => {
+            execute_cluster_vector_selector(ctx, iqc, task.responder);
         }
-        SelectorCommand::Range(rc) => {
-            run_clustered_range_selector(ctx, rc, batch_request.responder);
+        SelectorTaskKind::Range(rc) => {
+            execute_cluster_range_selector(ctx, rc, task.responder);
         }
     }
 }
