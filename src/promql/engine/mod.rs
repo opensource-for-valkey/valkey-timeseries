@@ -5,28 +5,19 @@ pub mod promql_engine;
 mod query_limits;
 pub mod query_reader;
 mod query_stats;
-mod query_worker;
+mod selector_batch_executor;
+mod querier;
 
-use crate::common::Timestamp;
 use crate::common::time::current_time_millis;
-use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
-use crate::promql::engine::query_worker::QueryWorker;
-use crate::promql::model::{InstantSample, RangeSample};
-use crate::promql::{PromqlResult, QueryError, QueryResult, QueryValue};
-use cfg_if::cfg_if;
+use crate::common::Timestamp;
 pub(crate) use fanout::*;
 pub use promql_engine::{evaluate_instant, evaluate_range};
-use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
-use promql_parser::parser::VectorSelector;
 pub(in crate::promql) use query_limits::*;
 pub use query_reader::*;
-use std::sync::LazyLock;
 use std::time::Duration;
-use valkey_module::Context;
 
 pub use promql_config::*;
-
-pub static QUERY_WORKER: LazyLock<QueryWorker> = LazyLock::new(QueryWorker::new);
+pub use querier::*;
 
 /// Options for PromQL query evaluation.
 ///
@@ -82,110 +73,6 @@ impl Default for QueryOptions {
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,
             db: 0,
-        }
-    }
-}
-
-pub struct ValkeySeriesQuerier;
-
-impl QueryReader for ValkeySeriesQuerier {
-    fn query(
-        &self,
-        selector: &VectorSelector,
-        timestamp: i64,
-        options: QueryOptions,
-    ) -> QueryResult<Vec<InstantSample>> {
-        let matchers: Matchers = extract_matchers(selector);
-        match QUERY_WORKER.query(matchers, timestamp, options) {
-            Ok(QueryValue::Vector(samples)) => Ok(samples),
-            Err(e) => Err(e),
-            _ => Err(QueryError::Execution(
-                "unexpected query result type".to_string(),
-            )),
-        }
-    }
-
-    fn query_range(
-        &self,
-        selector: &VectorSelector,
-        start_ms: i64,
-        end_ms: i64,
-        options: QueryOptions,
-    ) -> QueryResult<Vec<RangeSample>> {
-        let matchers: Matchers = extract_matchers(selector);
-        match QUERY_WORKER.query_range(matchers, start_ms, end_ms, options) {
-            Ok(QueryValue::Matrix(samples)) => Ok(samples),
-            Err(e) => Err(e),
-            _ => Err(QueryError::Execution(
-                "unexpected query result type".to_string(),
-            )),
-        }
-    }
-}
-
-fn extract_matchers(selector: &VectorSelector) -> Matchers {
-    let mut matchers = selector.matchers.clone();
-    if let Some(ref name) = selector.name {
-        matchers.matchers.push(Matcher {
-            op: MatchOp::Equal,
-            name: METRIC_NAME.to_string(),
-            value: name.clone(),
-        });
-    }
-    matchers
-}
-
-pub(crate) enum ConcreteSeriesQuerier {
-    Actual(ValkeySeriesQuerier),
-    Mock(MemorySeriesQuerier),
-}
-
-impl ConcreteSeriesQuerier {
-    pub fn create(_ctx: &Context) -> Self {
-        cfg_if! {
-            if #[cfg(test)] {
-                ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new())
-            } else {
-                ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier)
-            }
-        }
-    }
-
-    pub fn as_series_querier(&self) -> &dyn QueryReader {
-        match self {
-            ConcreteSeriesQuerier::Actual(local) => local,
-            ConcreteSeriesQuerier::Mock(mock) => mock,
-        }
-    }
-}
-
-impl QueryReader for ConcreteSeriesQuerier {
-    fn query(
-        &self,
-        selector: &VectorSelector,
-        timestamp: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
-        match self {
-            ConcreteSeriesQuerier::Actual(local) => local.query(selector, timestamp, options),
-            ConcreteSeriesQuerier::Mock(mock) => mock.query(selector, timestamp, options),
-        }
-    }
-
-    fn query_range(
-        &self,
-        selector: &VectorSelector,
-        start_ms: i64,
-        end_ms: i64,
-        options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
-        match self {
-            ConcreteSeriesQuerier::Actual(local) => {
-                local.query_range(selector, start_ms, end_ms, options)
-            }
-            ConcreteSeriesQuerier::Mock(mock) => {
-                mock.query_range(selector, start_ms, end_ms, options)
-            }
         }
     }
 }
