@@ -1,10 +1,10 @@
-use crate::promql::engine::promql_engine::Tsdb;
+use crate::promql::engine::promql_engine::PromqlQuerier;
 use crate::promql::{QueryOptions, QueryValue, RangeSample};
 use std::time::SystemTime;
 
 /// Execute instant query and return structured results
 pub(super) fn eval_instant(
-    tsdb: &Tsdb,
+    tsdb: &PromqlQuerier,
     time: SystemTime,
     query: &str,
 ) -> Result<QueryValue, String> {
@@ -42,7 +42,7 @@ pub(super) fn eval_instant(
 }
 
 pub(super) fn eval_range(
-    tsdb: &Tsdb,
+    tsdb: &PromqlQuerier,
     start: SystemTime,
     end: SystemTime,
     step: std::time::Duration,

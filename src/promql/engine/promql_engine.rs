@@ -1,6 +1,6 @@
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
-use crate::promql::engine::{QueryOptions, QueryReader};
+use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
@@ -15,6 +15,8 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use twox_hash::XxHash64;
+use valkey_module::Context;
+use crate::promql::engine::test_utils::MemorySeriesQuerier;
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
@@ -276,12 +278,22 @@ pub fn evaluate_range(
 }
 
 /// Tsdb manages a unified Promql QueryReader interface
-pub(crate) struct Tsdb {
+pub(crate) struct PromqlQuerier {
     pub(crate) querier: Arc<dyn QueryReader>,
 }
 
-impl Tsdb {
-    pub(crate) fn new(querier: Arc<dyn QueryReader>) -> Self {
+impl PromqlQuerier {
+    pub fn new(ctx: &Context) -> Self {
+        let querier = ConcreteSeriesQuerier::create(ctx);
+        Self::with_query_reader(Arc::new(querier))
+    }
+
+    pub fn in_memory() -> Self {
+        let querier = Arc::new(MemorySeriesQuerier::new());
+        Self::with_query_reader(querier)
+    }
+
+    pub(crate) fn with_query_reader(querier: Arc<dyn QueryReader>) -> Self {
         Self { querier }
     }
 
@@ -316,46 +328,7 @@ impl Tsdb {
             lookback_delta,
         };
 
-        // Use the caller-supplied `opts` so caller-provided lookback_delta is respected,
-        // but disable the evaluator timeout here.
-        let evaluator = Evaluator::new(
-            &self.querier,
-            QueryOptions {
-                timeout: None,
-                ..*opts
-            },
-        );
-        let result = evaluator.evaluate(stmt)?;
-
-        match result {
-            ExprResult::Scalar(value) => {
-                let timestamp_ms = system_time_to_millis(query_time);
-                Ok(QueryValue::Scalar {
-                    timestamp_ms,
-                    value,
-                })
-            }
-            ExprResult::InstantVector(samples) => Ok(QueryValue::Vector(
-                samples
-                    .into_iter()
-                    .map(|s| InstantSample {
-                        labels: s.labels.into_labels(),
-                        timestamp_ms: s.timestamp_ms,
-                        value: s.value,
-                    })
-                    .collect(),
-            )),
-            ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
-                samples
-                    .into_iter()
-                    .map(|s| RangeSample {
-                        labels: s.labels.into_labels(),
-                        samples: s.values,
-                    })
-                    .collect(),
-            )),
-            ExprResult::String(s) => Ok(QueryValue::String(s)),
-        }
+        evaluate_instant(self.querier.clone(), stmt, query_time, *opts)
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
@@ -382,7 +355,7 @@ impl Tsdb {
     }
 }
 
-impl PromqlEngine for Tsdb {
+impl PromqlEngine for PromqlQuerier {
     fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>> {
         Ok(self.querier.clone())
     }
@@ -395,9 +368,9 @@ mod tests {
     use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
     use std::time::UNIX_EPOCH;
 
-    fn create_tsdb() -> Tsdb {
+    fn create_tsdb() -> PromqlQuerier {
         let querier = Arc::new(MemorySeriesQuerier::new());
-        Tsdb::new(querier)
+        PromqlQuerier::with_query_reader(querier)
     }
 
     fn create_sample(
@@ -425,7 +398,7 @@ mod tests {
 
     // ── Native read method tests ─────────────────────────────────────
 
-    fn create_tsdb_with_data() -> Tsdb {
+    fn create_tsdb_with_data() -> PromqlQuerier {
         let querier = MemorySeriesQuerier::new();
 
         // Ingest two series into a bucket at minute 60 (covers 3,600,000–7,199,999 ms)
@@ -440,7 +413,7 @@ mod tests {
             }
         }
 
-        Tsdb::new(Arc::new(querier))
+        PromqlQuerier::with_query_reader(Arc::new(querier))
     }
 
     #[test]
@@ -675,7 +648,7 @@ mod tests {
     fn eval_query_with_offset_before_epoch_should_not_error() {
         // Query at 100s with offset 1h → effective time = -3500s (before epoch).
         let querier = Arc::new(MemorySeriesQuerier::new());
-        let tsdb = Tsdb::new(querier);
+        let tsdb = PromqlQuerier::with_query_reader(querier);
         let query_time = UNIX_EPOCH + Duration::from_secs(100);
         let opts = QueryOptions::default();
 
