@@ -14,6 +14,7 @@
 - [`TS.DEL`](commands/ts.del.md)
 - [`TS.DELETERULE`](commands/ts.deleterule.md)
 - [`TS.FEATURES`](commands/ts.features.md)
+- [`TS.FORECAST`](commands/ts.forecast.md)
 - [`TS.GET`](commands/ts.get.md)
 - [`TS.INCRBY`](commands/ts.incrby.md)
 - [`TS.INFO`](commands/ts.info.md)
