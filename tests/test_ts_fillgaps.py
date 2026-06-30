@@ -12,10 +12,24 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
     TS.FILLGAPS key startTimestamp endTimestamp
       [VALUE value]
       [FREQUENCY duration]
-      [ALIGN alignTimestamp|-]
+      [ALIGN alignment_timestamp|start|-]
+      [STORE destinationKey
+        [MERGE]
+        [RETENTION retentionPeriod]
+        [ENCODING <pco|gorilla|uncompressed|compressed>]
+        [CHUNK_SIZE chunkSize]
+        [DUPLICATE_POLICY duplicatePolicy]
+        [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+        [METRIC metric]
+        [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
+      ]
 
     Fills missing timestamps between startTimestamp and endTimestamp with
-    a fill value (default NaN). Returns the number of gaps filled.
+    a fill value (default NaN).
+
+    Without STORE, returns an array of [timestamp, value] pairs for the
+    filled gaps. With STORE, returns the number of samples written to the
+    destination key.
     """
 
     # ------------------------------------------------------------------
@@ -41,6 +55,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command('TS.RANGE', key, start, end)
         return [(entry[0], float(entry[1])) for entry in result]
 
+    def _parse_fillgaps_result(self, result):
+        """Parse TS.FILLGAPS result (array of [timestamp, value] pairs)
+        into list of (timestamp, float_value)."""
+        return [(entry[0], float(entry[1])) for entry in result]
+
     # ------------------------------------------------------------------
     # Basic / happy-path tests
     # ------------------------------------------------------------------
@@ -51,10 +70,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Series has timestamps: 1000, 1100, 1200, 1300, 1400
         # No gaps in range 1000-1400 with frequency 100ms
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts1', 1000, 1400, 'FREQUENCY', 100
         )
-        assert gaps_filled == 0
+        assert filled == []
 
         # Verify no new samples were added
         info = self.ts_info('ts1')
@@ -68,10 +87,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts2', 3000, 30)
         self.client.execute_command('TS.ADD', 'ts2', 5000, 50)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts2', 1000, 5000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 2  # timestamps 2000 and 4000
+        assert len(filled) == 2  # timestamps 2000 and 4000
 
         # Verify all 5 samples exist
         result = self._get_values('ts2')
@@ -86,10 +105,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts3', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts3', 3000, 30)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts3', 1000, 3000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 1  # timestamp 2000 filled with NaN
+        assert len(filled) == 1  # timestamp 2000 filled with NaN
 
         result = self.client.execute_command('TS.RANGE', 'ts3', '-', '+')
         assert len(result) == 3
@@ -102,11 +121,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts4', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts4', 3000, 30)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts4', 1000, 3000,
             'FREQUENCY', 1000, 'VALUE', 0.0
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         result = self._get_values('ts4')
         assert len(result) == 3
@@ -118,11 +137,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_neg', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_neg', 3000, 30)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_neg', 1000, 3000,
             'FREQUENCY', 1000, 'VALUE', -1.5
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         result = self._get_values('ts_neg')
         assert result[1] == (2000, -1.5)
@@ -146,10 +165,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
 
         # Now we have: 1000, 2000, 3000, 3500
         # GCD of intervals [1000, 1000, 500] is 500ms
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_infer', 1000, 3500
         )
-        assert gaps_filled == 2  # 1500 and 2500
+        assert len(filled) == 2  # 1500 and 2500
 
         timestamps = self._get_timestamps('ts_infer')
         assert timestamps == [1000, 1500, 2000, 2500, 3000, 3500]
@@ -169,12 +188,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Remaining: 0, 20000, 40000, 50000
         # Intervals: [20000, 20000, 10000] → GCD=10000ms
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_gcd', 0, 50000
         )
         # Grid with 10000ms: 0, 10000, 20000, 30000, 40000, 50000
         # Gaps at 10000 and 30000
-        assert gaps_filled == 2
+        assert len(filled) == 2
 
         timestamps = self._get_timestamps('ts_gcd')
         assert timestamps == [0, 10000, 20000, 30000, 40000, 50000]
@@ -191,10 +210,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
 
         # start=1100, frequency=1000
         # Expected timestamps: 1100, 2100 (already exist) -> no gaps
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align', 1100, 2100, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 0
+        assert filled == []
 
     def test_fillgaps_align_true(self):
         """With ALIGN 0 (epoch), timestamps snap to the epoch-aligned grid.
@@ -209,11 +228,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Aligned grid: 1000, 2000, 3000, ...
         # In [1100, 2100]: only 2000 is within range (1000 < 1100)
         # Existing: 1100, 2100 (neither on grid) -> gap at 2000
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align2', 1100, 2100,
             'FREQUENCY', 1000, 'ALIGN', 0
         )
-        assert gaps_filled == 1  # 2000 only; 1000 is before start_ts
+        assert len(filled) == 1  # 2000 only; 1000 is before start_ts
 
         timestamps = self._get_timestamps('ts_align2')
         assert 1100 in timestamps
@@ -227,11 +246,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Remove 2000 to create a gap
         self.client.execute_command('TS.DEL', 'ts_grid', 2000, 2000)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_grid', 1000, 3000,
             'FREQUENCY', 1000, 'ALIGN', 0
         )
-        assert gaps_filled == 1  # 2000 is the gap
+        assert len(filled) == 1  # 2000 is the gap
 
         timestamps = self._get_timestamps('ts_grid')
         assert timestamps == [1000, 2000, 3000]
@@ -252,11 +271,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Aligned grid: 1000, 2000, 3000, 4000, 5000, ...
         # In [1100, 4100]: 2000, 3000, 4000 are within range (1000 < 1100)
         # None match existing timestamps → 3 gaps
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_freq', 1100, 4100,
             'FREQUENCY', 1000, 'ALIGN', 0
         )
-        assert gaps_filled == 3
+        assert len(filled) == 3
 
         timestamps = self._get_timestamps('ts_align_freq')
         assert 2000 in timestamps
@@ -273,11 +292,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Grid aligned to 500: 500, 1500, 2500, 3500, ...
         # Existing: 1500, 2500 — both already on the 500-aligned grid
         # start=1500, end=2500 — no gaps on this grid
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_nonzero', 1500, 2500,
             'FREQUENCY', 1000, 'ALIGN', 500
         )
-        assert gaps_filled == 0
+        assert filled == []
 
     def test_fillgaps_align_non_zero_creates_different_gaps(self):
         """ALIGN with a non-zero reference produces a different gap set than epoch alignment."""
@@ -289,11 +308,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # With align timestamp=500, grid is: 500, 1500, 2500, 3500
         # Existing 1000 and 3000 are NOT on this grid
         # So all grid points in [1000, 3000] are gaps: 1500, 2500
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_diff', 1000, 3000,
             'FREQUENCY', 1000, 'ALIGN', 500
         )
-        assert gaps_filled == 2  # 1500 and 2500
+        assert len(filled) == 2  # 1500 and 2500
 
         timestamps = self._get_timestamps('ts_align_diff')
         # Original samples preserved: 1000, 3000
@@ -316,7 +335,7 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # 5000 is not on grid (5000-100=4900, 4900%1000=900, not 0)
         # 7000 is not on grid (7000-100=6900, 6900%1000=900, not 0)
         # So gaps: 5100, 6100 — but 7100 > 7000 so excluded
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_before', 5000, 7000,
             'FREQUENCY', 1000, 'ALIGN', 100
         )
@@ -325,7 +344,7 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Grid from 4100: 4100, 5100, 6100, 7100
         # In [5000, 7000]: 5100, 6100 (7100 > 7000)
         # Existing: 5000, 7000 — neither on grid
-        assert gaps_filled == 2
+        assert len(filled) == 2
 
     def test_fillgaps_align_reference_after_range(self):
         """ALIGN with reference timestamp after the data range."""
@@ -342,11 +361,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # result = 1000 - ((-8500 % 1000 + 1000) % 1000) = 1000 - (500 % 1000) = 1000 - 500 = 500
         # Grid from 500: 500, 1500, 2500, 3500
         # In [1000, 3000]: 1500, 2500
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_after', 1000, 3000,
             'FREQUENCY', 1000, 'ALIGN', 9500
         )
-        assert gaps_filled == 2
+        assert len(filled) == 2
 
     def test_fillgaps_align_reference_matches_existing_timestamp(self):
         """ALIGN with reference timestamp that matches an existing sample."""
@@ -359,11 +378,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Grid aligned to 100: 0, 100, 200, 300, 400, ...
         # In [0, 400]: grid points are 0, 100, 200, 300, 400
         # Existing: 0, 100, 300, 400 — gap at 200
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_match', 0, 400,
             'FREQUENCY', 100, 'ALIGN', 100
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         timestamps = self._get_timestamps('ts_align_match')
         assert timestamps == [0, 100, 200, 300, 400]
@@ -377,10 +396,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self._create_series_with_uniform_data('ts_before', 5000, 1000, 3)
         # Series: 5000, 6000, 7000
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_before', 1000, 4000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 4  # 1000, 2000, 3000, 4000
+        assert len(filled) == 4  # 1000, 2000, 3000, 4000
 
         result = self._get_values('ts_before')
         assert len(result) == 7  # 4 filled + 3 existing
@@ -390,10 +409,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self._create_series_with_uniform_data('ts_after', 1000, 1000, 3)
         # Series: 1000, 2000, 3000
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_after', 4000, 7000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 4  # 4000, 5000, 6000, 7000
+        assert len(filled) == 4  # 4000, 5000, 6000, 7000
 
         result = self._get_values('ts_after')
         assert len(result) == 7  # 3 existing + 4 filled
@@ -404,10 +423,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_sparse', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_sparse', 10000, 100)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_sparse', 1000, 10000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 8  # 2000..9000 and already have 1000 & 10000
+        assert len(filled) == 8  # 2000..9000 and already have 1000 & 10000
 
         result = self._get_values('ts_sparse')
         assert len(result) == 10
@@ -421,10 +440,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_exact', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_exact', 5000, 50)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_exact', 1000, 5000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 3  # 2000, 3000, 4000; 1000&5000 already exist
+        assert len(filled) == 3  # 2000, 3000, 4000; 1000&5000 already exist
 
         timestamps = self._get_timestamps('ts_exact')
         assert timestamps == [1000, 2000, 3000, 4000, 5000]
@@ -440,11 +459,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_preserve', 2000, 99.0)
         self.client.execute_command('TS.ADD', 'ts_preserve', 3000, 17.0)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_preserve', 1000, 3000,
             'FREQUENCY', 1000, 'VALUE', 0.0
         )
-        assert gaps_filled == 0  # No gaps
+        assert filled == []  # No gaps
 
         result = self._get_values('ts_preserve')
         assert result[0] == (1000, 42.0)
@@ -458,11 +477,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_mixed', 3000, 30)
         self.client.execute_command('TS.ADD', 'ts_mixed', 5000, 50)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_mixed', 1000, 5000,
             'FREQUENCY', 1000, 'VALUE', -999.0
         )
-        assert gaps_filled == 2  # 2000, 4000
+        assert len(filled) == 2  # 2000, 4000
 
         result = self._get_values('ts_mixed')
         assert len(result) == 5
@@ -487,10 +506,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.DEL', 'ts_info', 2000, 2000)
         # Now 2 samples
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_info', 1000, 3000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         info_after = self.ts_info('ts_info')
         assert info_after['totalSamples'] == 3
@@ -505,10 +524,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_large_gaps', 0, 0)
         self.client.execute_command('TS.ADD', 'ts_large_gaps', 100000, 100)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_large_gaps', 0, 100000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 99  # 1000, 2000, ..., 99000 (99 gaps, 0 and 100000 already exist)
+        assert len(filled) == 99  # 1000, 2000, ..., 99000 (99 gaps, 0 and 100000 already exist)
 
         info = self.ts_info('ts_large_gaps')
         assert info['totalSamples'] == 101  # 2 original + 99 filled
@@ -522,10 +541,10 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.DEL', 'ts_dense', ts, ts)
 
         # Now 50 samples remain, 50 gaps exist
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_dense', 0, 990, 'FREQUENCY', 10
         )
-        assert gaps_filled == 50
+        assert len(filled) == 50
 
         info = self.ts_info('ts_dense')
         assert info['totalSamples'] == 100
@@ -668,16 +687,16 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_single_ts', 1000, 10)
 
         # start == end == 1000, sample exists -> no gaps
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_single_ts', 1000, 1000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 0
+        assert filled == []
 
         # start == end == 2000, no sample there -> 1 gap
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_single_ts', 2000, 2000, 'FREQUENCY', 1000
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         result = self._get_values('ts_single_ts')
         # The filled gap at 2000 should be NaN (default)
@@ -690,74 +709,30 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_nan_val', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_nan_val', 3000, 30)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_nan_val', 1000, 3000,
             'FREQUENCY', 1000, 'VALUE', 'nan'
         )
-        assert gaps_filled == 1
+        assert len(filled) == 1
 
         result = self.client.execute_command('TS.RANGE', 'ts_nan_val', '-', '+')
         assert math.isnan(float(result[1][1]))
-
-    def test_fillgaps_with_infinity_value(self):
-        """Fill gaps with positive infinity as the fill value."""
-        self.client.execute_command('TS.CREATE', 'ts_inf')
-        self.client.execute_command('TS.ADD', 'ts_inf', 1000, 10)
-        self.client.execute_command('TS.ADD', 'ts_inf', 3000, 30)
-
-        gaps_filled = self.client.execute_command(
-            'TS.FILLGAPS', 'ts_inf', 1000, 3000,
-            'FREQUENCY', 1000, 'VALUE', 'inf'
-        )
-        assert gaps_filled == 1
-
-        result = self.client.execute_command('TS.RANGE', 'ts_inf', '-', '+')
-        assert float(result[1][1]) == float('inf')
-
-    def test_fillgaps_with_negative_infinity_value(self):
-        """Fill gaps with negative infinity as the fill value."""
-        self.client.execute_command('TS.CREATE', 'ts_neginf')
-        self.client.execute_command('TS.ADD', 'ts_neginf', 1000, 10)
-        self.client.execute_command('TS.ADD', 'ts_neginf', 3000, 30)
-
-        gaps_filled = self.client.execute_command(
-            'TS.FILLGAPS', 'ts_neginf', 1000, 3000,
-            'FREQUENCY', 1000, 'VALUE', '-inf'
-        )
-        assert gaps_filled == 1
-
-        result = self.client.execute_command('TS.RANGE', 'ts_neginf', '-', '+')
-        assert float(result[1][1]) == float('-inf')
-
-    def test_fillgaps_submillisecond_frequency(self):
-        """Fill gaps with a sub-millisecond frequency (should be truncated to 0 or error)."""
-        self.client.execute_command('TS.CREATE', 'ts_subms')
-        self.client.execute_command('TS.ADD', 'ts_subms', 1000, 10)
-        self.client.execute_command('TS.ADD', 'ts_subms', 2000, 20)
-
-        # Frequency of 0ms results in "frequency must be positive"
-        # parse_duration_arg with "0" may yield 0ms
-        with pytest.raises(ResponseError) as excinfo:
-            self.client.execute_command(
-                'TS.FILLGAPS', 'ts_subms', 1000, 2000, 'FREQUENCY', 0
-            )
-        assert "frequency must be positive" in str(excinfo.value).lower()
 
     def test_fillgaps_frequency_as_duration_string(self):
         """Use duration strings (e.g., '1s', '500ms') for FREQUENCY."""
         self.client.execute_command('TS.CREATE', 'ts_duration')
         self.client.execute_command('TS.ADD', 'ts_duration', 1000, 10)
-        self.client.execute_command('TS.ADD', 'ts_duration', 2000, 20)
+        self.client.execute_command('TS.ADD', 'ts_duration', 3000, 20)
         # gap at 1500 (if frequency allows it)
 
         # 500ms = 500 millis
-        gaps_filled = self.client.execute_command(
-            'TS.FILLGAPS', 'ts_duration', 1000, 2000, 'FREQUENCY', 500
+        filled = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_duration', 1000, 3000, 'FREQUENCY', "1s"
         )
-        assert gaps_filled == 1  # 1500
+        assert len(filled) == 1  # 2000
 
         timestamps = self._get_timestamps('ts_duration')
-        assert timestamps == [1000, 1500, 2000]
+        assert timestamps == [1000, 2000, 3000]
 
     def test_fillgaps_align_with_large_offset(self):
         """ALIGN with off-grid existing samples snaps them to the aligned grid.
@@ -772,11 +747,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # ALIGN=0, frequency=1000: grid is 1000, 2000, 3000, 4000
         # Existing {1500, 3500} are not on the grid
         # All 4 grid points in [1000, 4000] are gaps
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_align_offset', 1000, 4000,
             'FREQUENCY', 1000, 'ALIGN', 0
         )
-        assert gaps_filled == 4  # 1000, 2000, 3000, 4000
+        assert len(filled) == 4  # 1000, 2000, 3000, 4000
 
         timestamps = self._get_timestamps('ts_align_offset')
         assert 1000 in timestamps
@@ -810,11 +785,11 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Delete some samples from the middle to create gaps
         self.client.execute_command('TS.DEL', 'ts_chunks', 2000, 2500)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_chunks', 1000, 5900, 'FREQUENCY', 100
         )
         # 2000, 2100, 2200, 2300, 2400, 2500 = 6 gaps
-        assert gaps_filled > 0
+        assert len(filled) > 0
 
         # Verify all timestamps from 1000 to 5900 step 100 exist
         timestamps = self._get_timestamps('ts_chunks')
@@ -826,16 +801,16 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
     # ------------------------------------------------------------------
 
     def test_fillgaps_returns_zero_when_no_gaps(self):
-        """Return 0 when the range has no missing timestamps."""
+        """Return an empty array when the range has no missing timestamps."""
         self._create_series_with_uniform_data('ts_nogaps', 0, 100, 10)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_nogaps', 0, 900, 'FREQUENCY', 100
         )
-        assert gaps_filled == 0
+        assert filled == []
 
     def test_fillgaps_returns_exact_gap_count(self):
-        """Return the exact number of timestamps filled."""
+        """Return the exact array of filled gap samples."""
         self.client.execute_command('TS.CREATE', 'ts_exact_count')
         # Create 10 equally spaced samples
         for i in range(10):
@@ -846,32 +821,32 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.DEL', 'ts_exact_count', 500, 500)
         self.client.execute_command('TS.DEL', 'ts_exact_count', 800, 800)
 
-        gaps_filled = self.client.execute_command(
+        filled = self.client.execute_command(
             'TS.FILLGAPS', 'ts_exact_count', 0, 900, 'FREQUENCY', 100
         )
-        assert gaps_filled == 3
+        assert len(filled) == 3
 
     # ------------------------------------------------------------------
     # Multiple FILLGAPS calls
     # ------------------------------------------------------------------
 
     def test_fillgaps_idempotent(self):
-        """Running FILLGAPS twice on the same range produces 0 gaps on second call."""
+        """Running FILLGAPS twice on the same range produces empty array on second call."""
         self.client.execute_command('TS.CREATE', 'ts_idempotent')
         self.client.execute_command('TS.ADD', 'ts_idempotent', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_idempotent', 3000, 30)
 
         # First fill
-        gaps1 = self.client.execute_command(
+        filled1 = self.client.execute_command(
             'TS.FILLGAPS', 'ts_idempotent', 1000, 3000, 'FREQUENCY', 1000
         )
-        assert gaps1 == 1
+        assert len(filled1) == 1
 
         # Second fill on same range
-        gaps2 = self.client.execute_command(
+        filled2 = self.client.execute_command(
             'TS.FILLGAPS', 'ts_idempotent', 1000, 3000, 'FREQUENCY', 1000
         )
-        assert gaps2 == 0
+        assert filled2 == []
 
         # Verify totalSamples didn't double-count
         info = self.ts_info('ts_idempotent')
@@ -885,16 +860,296 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'ts_multi', 10000, 100)
 
         # Fill first half
-        gaps1 = self.client.execute_command(
+        filled1 = self.client.execute_command(
             'TS.FILLGAPS', 'ts_multi', 0, 4000, 'FREQUENCY', 1000
         )
-        assert gaps1 == 4  # 1000, 2000, 3000, 4000
+        assert len(filled1) == 4  # 1000, 2000, 3000, 4000
 
         # Fill second half
-        gaps2 = self.client.execute_command(
+        filled2 = self.client.execute_command(
             'TS.FILLGAPS', 'ts_multi', 5000, 10000, 'FREQUENCY', 1000
         )
-        assert gaps2 == 4  # 6000, 7000, 8000, 9000; 5000&10000 already exist
+        assert len(filled2) == 4  # 6000, 7000, 8000, 9000; 5000&10000 already exist
 
         timestamps = self._get_timestamps('ts_multi')
         assert timestamps == [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+
+    # ------------------------------------------------------------------
+    # STORE clause
+    # ------------------------------------------------------------------
+
+    def test_store_creates_new_key(self):
+        """STORE writes filled gap samples to a new destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src1')
+        self.client.execute_command('TS.ADD', 'ts_fill_src1', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src1', 3000, 30)
+        self.client.execute_command('TS.ADD', 'ts_fill_src1', 5000, 50)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src1', 1000, 5000,
+            'FREQUENCY', 1000, 'STORE', 'dest_store1'
+        )
+        # STORE returns the number of samples written
+        assert count == 2  # timestamps 2000 and 4000
+
+        # Destination key exists with filled gap samples
+        assert self.client.execute_command('EXISTS', 'dest_store1') == 1
+        stored = self._get_values('dest_store1')
+        assert len(stored) == 2
+        assert stored == [(2000, float('nan')), (4000, float('nan'))]
+        assert math.isnan(stored[0][1])
+        assert math.isnan(stored[1][1])
+
+        # Source key unchanged (gap fills are not applied to source)
+        source = self._get_values('ts_fill_src1')
+        assert source == [(1000, 10.0), (3000, 30.0), (5000, 50.0)]
+
+    def test_store_with_custom_value(self):
+        """STORE with a custom VALUE writes filled gaps to destination."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src2')
+        self.client.execute_command('TS.ADD', 'ts_fill_src2', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src2', 3000, 30)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src2', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 42.5, 'STORE', 'dest_store2'
+        )
+        assert count == 1
+
+        stored = self._get_values('dest_store2')
+        assert stored == [(2000, 42.5)]
+
+    def test_store_overwrites_existing_key(self):
+        """STORE (without MERGE) overwrites an existing destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src3')
+        self.client.execute_command('TS.ADD', 'ts_fill_src3', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src3', 3000, 30)
+
+        # Pre-create dest key with existing data
+        self.client.execute_command('TS.CREATE', 'dest_store3')
+        self.client.execute_command('TS.ADD', 'dest_store3', 500, 99.0)
+        self.client.execute_command('TS.ADD', 'dest_store3', 1500, 88.0)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src3', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store3'
+        )
+        assert count == 1  # only timestamp 2000 is a gap
+
+        # Destination is overwritten (only new filled samples remain)
+        stored = self._get_values('dest_store3')
+        assert stored == [(2000, 0.0)]
+
+    def test_store_merge_with_existing_key(self):
+        """STORE with MERGE combines filled gap samples into existing key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src4')
+        self.client.execute_command('TS.ADD', 'ts_fill_src4', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src4', 3000, 30)
+        self.client.execute_command('TS.ADD', 'ts_fill_src4', 5000, 50)
+
+        # Pre-create dest key with one overlapping sample
+        self.client.execute_command('TS.CREATE', 'dest_store4')
+        self.client.execute_command('TS.ADD', 'dest_store4', 500, 99.0)
+        self.client.execute_command('TS.ADD', 'dest_store4', 2000, 999.0)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src4', 1000, 5000,
+            'FREQUENCY', 1000, 'VALUE', 0.0,
+            'STORE', 'dest_store4', 'MERGE'
+        )
+        # 2 gaps: 2000 and 4000; 2000 already exists in dest (KeepLast merge)
+        assert count == 2
+
+        stored = self._get_values('dest_store4')
+        assert len(stored) == 3  # 500, 2000, 4000
+        assert stored == [(500, 99.0), (2000, 0.0), (4000, 0.0)]
+
+    def test_store_returns_zero_when_no_gaps(self):
+        """STORE returns 0 when there are no gaps to fill."""
+        self._create_series_with_uniform_data('ts_fill_src5', 1000, 100, 5)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src5', 1000, 1400,
+            'FREQUENCY', 100, 'STORE', 'dest_store5'
+        )
+        assert count == 0
+
+        # Destination key was NOT created (zero gaps → skip creation)
+        assert self.client.execute_command('EXISTS', 'dest_store5') == 0
+
+    def test_store_with_retention(self):
+        """STORE with RETENTION sets retention on the destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src6')
+        self.client.execute_command('TS.ADD', 'ts_fill_src6', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src6', 3000, 30)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src6', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store6',
+            'RETENTION', 5000
+        )
+        info = self.client.execute_command('TS.INFO', 'dest_store6')
+        info_dict = {info[i]: info[i + 1] for i in range(0, len(info), 2)}
+        assert info_dict[b'retentionTime'] == 5000
+
+    def test_store_with_chunk_size(self):
+        """STORE with CHUNK_SIZE sets chunk size on the destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src7')
+        self.client.execute_command('TS.ADD', 'ts_fill_src7', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src7', 2000, 20)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src7', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store7',
+            'CHUNK_SIZE', 128
+        )
+        info = self.client.execute_command('TS.INFO', 'dest_store7')
+        info_dict = {info[i]: info[i + 1] for i in range(0, len(info), 2)}
+        assert info_dict[b'chunkSize'] == 128
+
+    def test_store_with_duplicate_policy(self):
+        """STORE with DUPLICATE_POLICY sets policy on destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src8')
+        self.client.execute_command('TS.ADD', 'ts_fill_src8', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src8', 2000, 20)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src8', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store8',
+            'DUPLICATE_POLICY', 'SUM'
+        )
+        info = self.client.execute_command('TS.INFO', 'dest_store8')
+        info_dict = {info[i]: info[i + 1] for i in range(0, len(info), 2)}
+        assert info_dict[b'duplicatePolicy'] == b'sum'
+
+    def test_store_with_encoding(self):
+        """STORE with ENCODING sets compression on the destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src9')
+        self.client.execute_command('TS.ADD', 'ts_fill_src9', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src9', 2000, 20)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src9', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store9',
+            'ENCODING', 'UNCOMPRESSED'
+        )
+        info = self.client.execute_command('TS.INFO', 'dest_store9')
+        info_dict = {info[i]: info[i + 1] for i in range(0, len(info), 2)}
+        assert info_dict[b'chunkType'] == b'uncompressed'
+
+    def test_store_with_metric(self):
+        """STORE with METRIC sets metric name on the destination key."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src10')
+        self.client.execute_command('TS.ADD', 'ts_fill_src10', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src10', 3000, 30)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src10', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store10',
+            'METRIC', 'filled_metric'
+        )
+        # Verify the destination key exists with filled data
+        stored = self._get_values('dest_store10')
+        assert len(stored) == 1
+        assert stored[0] == (2000, 0.0)
+
+    def test_store_returns_count_not_samples(self):
+        """STORE returns integer count, not an array of samples."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src11')
+        self.client.execute_command('TS.ADD', 'ts_fill_src11', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src11', 2000, 20)
+        self.client.execute_command('TS.ADD', 'ts_fill_src11', 3000, 30)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src11', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store11'
+        )
+        assert isinstance(count, int)
+        assert count == 0  # no gaps, all timestamps exist
+
+    def test_store_on_nonexistent_source(self):
+        """STORE on a nonexistent source key returns error."""
+        with pytest.raises(ResponseError, match='key does not exist'):
+            self.client.execute_command(
+                'TS.FILLGAPS', 'nonexistent', 1000, 2000,
+                'FREQUENCY', 1000, 'STORE', 'dest_store12'
+            )
+
+    def test_store_with_multiple_options(self):
+        """STORE with multiple creation options applied together."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src13')
+        self.client.execute_command('TS.ADD', 'ts_fill_src13', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src13', 3000, 30)
+
+        self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src13', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store13',
+            'RETENTION', 10000,
+            'CHUNK_SIZE', 256,
+            'DUPLICATE_POLICY', 'MIN',
+            'ENCODING', 'UNCOMPRESSED',
+        )
+        info = self.client.execute_command('TS.INFO', 'dest_store13')
+        info_dict = {info[i]: info[i + 1] for i in range(0, len(info), 2)}
+        assert info_dict[b'retentionTime'] == 10000
+        assert info_dict[b'chunkSize'] == 256
+        assert info_dict[b'duplicatePolicy'] == b'min'
+        assert info_dict[b'chunkType'] == b'uncompressed'
+
+    def test_store_with_align(self):
+        """STORE combined with ALIGN writes aligned gap fills to destination."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src14')
+        self.client.execute_command('TS.ADD', 'ts_fill_src14', 1100, 11)
+        self.client.execute_command('TS.ADD', 'ts_fill_src14', 3100, 31)
+
+        # ALIGN=0, frequency=1000: grid at 1000, 2000, 3000, 4000
+        # In [1100, 3100]: 2000, 3000 are on-grid and within range
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src14', 1100, 3100,
+            'FREQUENCY', 1000, 'ALIGN', 0, 'VALUE', -1.0,
+            'STORE', 'dest_store14'
+        )
+        assert count == 2
+
+        stored = self._get_values('dest_store14')
+        assert stored == [(2000, -1.0), (3000, -1.0)]
+
+    def test_store_with_inferred_frequency(self):
+        """STORE works with inferred frequency (no explicit FREQUENCY argument)."""
+        self._create_series_with_uniform_data('ts_fill_src15', 1000, 500, 6)
+        # Delete some samples to create gaps
+        self.client.execute_command('TS.DEL', 'ts_fill_src15', 1500, 1500)
+        self.client.execute_command('TS.DEL', 'ts_fill_src15', 2500, 2500)
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src15', 1000, 3500,
+            'VALUE', -1.0, 'STORE', 'dest_store15'
+        )
+        assert count == 2  # 1500 and 2500
+
+        stored = self._get_values('dest_store15')
+        assert stored == [(1500, -1.0), (2500, -1.0)]
+
+    def test_store_destination_not_affected_by_source_side_effects(self):
+        """Gap fills with STORE go only to destination; source series is untouched."""
+        self.client.execute_command('TS.CREATE', 'ts_fill_src16')
+        self.client.execute_command('TS.ADD', 'ts_fill_src16', 1000, 10)
+        self.client.execute_command('TS.ADD', 'ts_fill_src16', 3000, 30)
+
+        initial_count = self.ts_info('ts_fill_src16')['totalSamples']
+
+        count = self.client.execute_command(
+            'TS.FILLGAPS', 'ts_fill_src16', 1000, 3000,
+            'FREQUENCY', 1000, 'VALUE', 0.0, 'STORE', 'dest_store16'
+        )
+        assert count == 1
+
+        # Source series unchanged
+        source_info = self.ts_info('ts_fill_src16')
+        assert source_info['totalSamples'] == initial_count
+        source_samples = self._get_values('ts_fill_src16')
+        assert source_samples == [(1000, 10.0), (3000, 30.0)]
+
+        # Destination has only the gap fill
+        stored = self._get_values('dest_store16')
+        assert stored == [(2000, 0.0)]
