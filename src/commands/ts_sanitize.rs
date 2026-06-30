@@ -1,19 +1,21 @@
 use crate::analysis::forecasting::imputation::{ImputationPolicy, sanitize};
 use crate::commands::command_parser::{
-    CommandArgToken, parse_command_arg_token, parse_store_clause,
+    CommandArgToken, parse_command_arg_token, parse_store_clause, parse_timestamp_range,
 };
-use crate::commands::parse_series_range_samples;
 use crate::common::Sample;
 use crate::common::replies::reply_with_samples;
 use crate::error_consts;
-use crate::series::create_or_update_series_with_samples;
+use crate::series::{DuplicatePolicy, create_or_update_series_with_samples, get_timeseries_mut};
 use anofox_forecast::detection::detect_dominant_period;
-use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{
+    AclPermissions, Context, NextArg, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
+    ValkeyValue,
+};
 
 /// ```text
 /// TS.SANITIZE key fromTimestamp toTimestamp
 ///     [POLICY <policy> [options]]
-///     [STORE destKey
+///     [STORE destinationKey
 ///         [MERGE]
 ///         [RETENTION retentionPeriod]
 ///         [ENCODING encoding]
@@ -52,8 +54,16 @@ pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let mut args = args.into_iter().skip(1).peekable();
 
-    // Get the time series and extract sample values
-    let mut samples = parse_series_range_samples(ctx, &mut args)?;
+    // Parse key and timestamp range
+    let key = args.next_arg()?;
+    let date_range = parse_timestamp_range(&mut args)?;
+
+    // Get a mutable reference to the series (must exist, need UPDATE permission)
+    let mut series = get_timeseries_mut(ctx, &key, true, Some(AclPermissions::UPDATE))?.unwrap();
+    let (start_ts, end_ts) = date_range.get_series_range(&series, None, false);
+
+    // Get existing samples in the range
+    let mut samples = series.get_range(start_ts, end_ts);
 
     // POLICY is optional; defaults to DROP.
     let policy = if args
@@ -79,8 +89,8 @@ pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     // Capture policy variant before moving `policy` into sanitize().
-    // - is_ma_or_seasonal: samples is NOT modified; `map` is the full imputed result.
-    // - InPlace (all others): samples is modified in-place; `map` has changed entries.
+    // - MA/Seasonal: samples is NOT modified; `sanitized` is the full imputed result.
+    // - All others (including Drop): samples is modified in-place.
     let is_ma_or_seasonal = matches!(
         &policy,
         ImputationPolicy::MovingAverage(_) | ImputationPolicy::Seasonal(_)
@@ -97,6 +107,24 @@ pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     } else {
         &samples
     };
+
+    // --- Write sanitized samples back to the source series ---
+    // Remove the old range, then merge the sanitized result.
+    series
+        .remove_range(start_ts, end_ts)
+        .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+
+    if !to_return.is_empty() {
+        let mut sorted = to_return.to_vec();
+        sorted.sort_by_key(|s| s.timestamp);
+        series
+            .merge_samples(&sorted, Some(DuplicatePolicy::KeepLast))
+            .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
+    }
+
+    ctx.replicate_verbatim();
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.sanitize", &key);
+    // --- End write-back ---
 
     if let Some(dest) = destination {
         let written = create_or_update_series_with_samples(
@@ -124,6 +152,7 @@ fn parse_policy(
     let mut policy = ImputationPolicy::Error;
     hashify::fnc_map_ignore_case!(
         token.as_bytes(),
+        "Error" => { /* already the default */ },
         "Drop" => { policy = ImputationPolicy::Drop; },
         "Fill" => {
             let value_str = args.next_str()?;
