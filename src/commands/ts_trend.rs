@@ -41,7 +41,7 @@ impl Default for TrendModel {
 ///     [PREDICT <horizon>]
 ///     [FEATURES]
 ///     [METRICS]
-///     [STORE destKey
+///     [STORE destinationKey
 ///         [MERGE]
 ///         [RETENTION retentionPeriod]
 ///         [ENCODING encoding]
@@ -386,7 +386,7 @@ fn store_trend(
         ctx,
         &destination,
         Some(store_options.options),
-        DestinationWriteMode::Merge,
+        store_options.write_mode,
         &store_samples,
         None,
     )?;
