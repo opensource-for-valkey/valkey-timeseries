@@ -9,7 +9,7 @@ use crate::common::replies::{
     reply_with_array, reply_with_double, reply_with_integer, reply_with_map, reply_with_str,
 };
 use crate::common::time::compute_median_step_ms;
-use crate::series::{DestinationWriteMode, create_or_update_series_with_samples};
+use crate::series::{create_or_update_series_with_samples};
 use anofox_forecast::seasonality::auto_trend::{AutoTrend, TrendCriterion};
 use anofox_forecast::seasonality::traits::{Recency, TrendComponent};
 use anofox_forecast::seasonality::{
