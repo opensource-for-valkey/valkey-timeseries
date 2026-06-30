@@ -1,6 +1,8 @@
 use crate::analysis::forecasting::infer_frequency_from_samples;
-use crate::commands::command_parser::{parse_duration_arg, parse_store_clause, parse_timestamp_range};
-use crate::commands::{parse_timestamp, parse_value_arg, CommandArgIterator};
+use crate::commands::command_parser::{
+    parse_duration_arg, parse_store_clause, parse_timestamp_range,
+};
+use crate::commands::{CommandArgIterator, parse_timestamp, parse_value_arg};
 use crate::common::replies::reply_with_samples;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
@@ -8,14 +10,13 @@ use crate::series::{create_or_update_series_with_samples, get_timeseries_mut};
 use std::collections::BTreeSet;
 use std::time::Duration;
 use valkey_module::{
-    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString,
-    ValkeyValue,
+    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
 /// ```text
 /// TS.FILLGAPS key startTimestamp endTimestamp
 ///   [VALUE value]
-///   [FREQUENCY duration]
+///   [FREQUENCY duration|"auto"]
 ///   [ALIGN alignment_timestamp|start|-]
 ///   [STORE destinationKey
 ///     [MERGE]
@@ -53,6 +54,9 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let (start_ts, end_ts) = date_range.get_series_range(&series, None, false);
 
+    // Get existing samples in the range
+    let existing_samples = series.get_range(start_ts, end_ts);
+
     let mut frequency: Option<Duration> = None;
     let mut align_timestamp: Option<Timestamp> = None;
     let mut fill_value = f64::NAN;
@@ -64,7 +68,12 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             arg.as_slice(),
             "FREQUENCY" => {
                 let freq_arg = args.next_arg()?;
-                frequency = Some(parse_duration_arg(&freq_arg)?);
+                if freq_arg.eq_ignore_ascii_case(b"auto") {
+                    // Infer frequency from existing samples
+                    frequency = Some(infer_frequency_from_samples(&existing_samples)?);
+                } else {
+                    frequency = Some(parse_duration_arg(&freq_arg)?);
+                }
             },
             "ALIGN" => {
                 align_timestamp = Some(parse_align(&mut args, start_ts)?);
@@ -81,9 +90,6 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             }
         );
     }
-
-    // Get existing samples in the range
-    let existing_samples = series.get_range(start_ts, end_ts);
 
     // Build a set of existing timestamps for O(1) lookup
     let existing_timestamps: BTreeSet<Timestamp> =
@@ -123,12 +129,18 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let gaps_filled = gap_samples.len();
 
-
     if let Some(dest) = destination {
         if gaps_filled == 0 {
             return Ok(ValkeyValue::from(0_i64));
         }
-        let written = create_or_update_series_with_samples(ctx, &dest.key, Some(dest.options), dest.write_mode, &gap_samples, None)?;
+        let written = create_or_update_series_with_samples(
+            ctx,
+            &dest.key,
+            Some(dest.options),
+            dest.write_mode,
+            &gap_samples,
+            None,
+        )?;
         return Ok(ValkeyValue::from(written));
     }
 
