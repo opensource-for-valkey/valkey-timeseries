@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::ops::Deref;
 use std::vec::Vec;
 
-/// `push_down_filters` optimizes e to improve its performance.
+/// `push_down_filters` optimizes expressions to improve their performance.
 ///
 /// It performs the following optimizations:
 ///
@@ -41,6 +41,7 @@ pub fn can_pushdown_filters(expr: &Expr) -> bool {
             can_pushdown_filters(&agg.expr)
                 || agg.param.as_ref().is_some_and(|e| can_pushdown_filters(e))
         }
+        Paren(p) => can_pushdown_filters(&p.expr),
         Unary(unary) => can_pushdown_filters(&unary.expr),
         Subquery(s) => can_pushdown_filters(&s.expr),
         _ => false,
