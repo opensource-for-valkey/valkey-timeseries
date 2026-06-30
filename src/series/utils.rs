@@ -7,7 +7,10 @@ use crate::series::acl::check_key_permissions;
 use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
-use crate::series::{create_compaction_rules_from_config, DestinationWriteMode, DuplicatePolicy, SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions};
+use crate::series::{
+    DestinationWriteMode, DuplicatePolicy, SeriesGuard, SeriesGuardMut, TimeSeries,
+    TimeSeriesOptions, create_compaction_rules_from_config,
+};
 use std::ops::Deref;
 use std::time::Duration;
 use valkey_module::key::ValkeyKeyWritable;
@@ -214,7 +217,8 @@ pub fn create_or_update_series_with_samples(
             .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?;
     }
 
-    let policy_override = if policy_override.is_none() && write_mode == DestinationWriteMode::Merge {
+    let policy_override = if policy_override.is_none() && write_mode == DestinationWriteMode::Merge
+    {
         Some(DuplicatePolicy::KeepLast)
     } else {
         policy_override

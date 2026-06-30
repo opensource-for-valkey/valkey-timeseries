@@ -22,7 +22,9 @@ use crate::series::request_types::{
     MetaDateRangeFilter, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
-use crate::series::{TimeSeriesOptions, TimestampRange, TimestampValue, get_timeseries, DestinationWriteMode};
+use crate::series::{
+    DestinationWriteMode, TimeSeriesOptions, TimestampRange, TimestampValue, get_timeseries,
+};
 use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeSet;
@@ -1342,8 +1344,8 @@ pub(super) struct StoreOptions {
 }
 
 /// STORE key
-///     [MERGE] 
-///     [RETENTION retentionTime] 
+///     [MERGE]
+///     [RETENTION retentionTime]
 ///     [CHUNK_SIZE chunkSize]
 ///     [DUPLICATE_POLICY policy]
 ///     [DECIMAL_DIGITS digits]
@@ -1351,9 +1353,7 @@ pub(super) struct StoreOptions {
 ///     [ENCODING encoding]
 ///     [IGNORE maxTimeDiff maxValDiff]
 ///     [METRIC metric]
-pub(super) fn parse_store_clause(
-    args: &mut CommandArgIterator,
-) -> ValkeyResult<StoreOptions> {
+pub(super) fn parse_store_clause(args: &mut CommandArgIterator) -> ValkeyResult<StoreOptions> {
     let mut write_mode = DestinationWriteMode::default();
     let mut options = TimeSeriesOptions::from_config();
 
@@ -1397,8 +1397,7 @@ pub(super) fn parse_store_clause(
                 options.labels = Some(parse_metric_name(&metric)?);
             }
             CommandArgToken::Ignore => {
-                let (ignore_max_timediff, ignore_max_val_diff) =
-                    parse_ignore_options(args)?;
+                let (ignore_max_timediff, ignore_max_val_diff) = parse_ignore_options(args)?;
                 let mut ignore_options = options.sample_duplicate_policy.unwrap_or_default();
                 ignore_options.max_time_delta = ignore_max_timediff as u64;
                 ignore_options.max_value_delta = ignore_max_val_diff;

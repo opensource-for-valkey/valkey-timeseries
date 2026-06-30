@@ -640,7 +640,7 @@ impl TimeSeries {
         if self.is_empty() || !self.overlaps(start_ts, end_ts) {
             return Ok(0);
         }
-        
+
         let mut deleted_samples = 0;
 
         fn remove_internal(

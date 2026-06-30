@@ -7,7 +7,7 @@ use crate::common::replies::{
 };
 use crate::series::request_types::{MRangeSeriesResult, SeriesResultData};
 use anofox_forecast::utils::AccuracyMetrics;
-use valkey_module::{raw, Context, Status, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};
 
 pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
     let raw_ctx = ctx.into_raw();

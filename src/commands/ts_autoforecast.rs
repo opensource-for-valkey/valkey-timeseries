@@ -1,15 +1,19 @@
 use crate::analysis::forecasting::normalize_model_name;
-use crate::commands::command_parser::{parse_forecast_confidence_level, parse_forecast_horizon_value, parse_store_clause};
+use crate::commands::CommandArgIterator;
+use crate::commands::command_parser::{
+    parse_forecast_confidence_level, parse_forecast_horizon_value, parse_store_clause,
+};
 use crate::commands::forecast_utils::{
     handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output,
     run_forecast,
 };
 use crate::commands::utils::reply_with_double_array;
-use crate::commands::CommandArgIterator;
-use crate::common::replies::{block_client, reply_with_str, ThreadSafeReplyContext};
+use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_str};
 use crate::common::time::compute_median_step_ms;
 use crate::common::{Sample, Timestamp};
-use crate::series::{create_or_update_series_with_samples, DestinationWriteMode, TimeSeriesOptions, TimestampRange};
+use crate::series::{
+    DestinationWriteMode, TimeSeriesOptions, TimestampRange, create_or_update_series_with_samples,
+};
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::detection::detect_dominant_period;
 use anofox_forecast::models::auto_forecast::{AutoForecast, AutoForecastConfig};
@@ -122,7 +126,7 @@ fn parse_autoforecast_args(args: &mut CommandArgIterator) -> ValkeyResult<AutoFo
                 },
                 "STORE" => {
                     let store_options = parse_store_clause(args)?;
-                    // todo: this is fishy. Keys are binary safe 
+                    // todo: this is fishy. Keys are binary safe
                     options.destination_key = Some(store_options.key.to_string_lossy());
                     options.create_options = Some(store_options.options);
                     options.write_mode = Some(store_options.write_mode);
@@ -204,7 +208,13 @@ fn process_forecast(
     let forecast = &output.forecast;
     // If STORE was specified, persist the predicted values into the target timeseries key.
     if options.destination_key.is_some() {
-        store_if_necessary(&ctx, &options, forecast.primary(), last_timestamp_ms, step_ms);
+        store_if_necessary(
+            &ctx,
+            &options,
+            forecast.primary(),
+            last_timestamp_ms,
+            step_ms,
+        );
     }
 
     reply_with_forecast_output(&ctx, &output);
@@ -233,7 +243,9 @@ fn store_if_necessary(
             .map(|(i, &value)| Sample::new(last_ts + step * (i as i64 + 1), value))
             .collect();
 
-        if let Err(e) = create_or_update_series_with_samples(&lock, &key, None, mode, &samples, None) { 
+        if let Err(e) =
+            create_or_update_series_with_samples(&lock, &key, None, mode, &samples, None)
+        {
             let msg = format!("TSDB: failed to store forecast in key '{}': {}", key, e);
             ctx.log_warning(&msg);
         }
