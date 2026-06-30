@@ -1,15 +1,15 @@
-use crate::analysis::forecasting::DynForecaster;
 use crate::analysis::forecasting::build_models_from_specs;
-use crate::commands::CommandArgIterator;
+use crate::analysis::forecasting::DynForecaster;
 use crate::commands::command_parser::{
     parse_forecast_confidence_level, parse_forecast_horizon_value,
 };
 use crate::commands::forecast_utils::{
-    ForecastOutput, handle_forecast_key_pos_request, parse_timeseries_for_forecast,
-    reply_with_forecast_output, run_forecast,
+    handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output,
+    run_forecast, ForecastOutput,
 };
 use crate::commands::parse_store_clause;
-use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_array};
+use crate::commands::CommandArgIterator;
+use crate::common::replies::{block_client, reply_with_array, ThreadSafeReplyContext};
 use crate::common::time::compute_median_step_ms;
 use crate::common::Sample;
 use crate::series::create_or_update_series_with_samples;
@@ -24,6 +24,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, V
 struct ForecastOptions {
     series_key: String,
     models_spec: String,
+    transforms_spec: Option<String>,
     timestamp_range: TimestampRange,
     horizon: usize,
     include_metrics: bool,
@@ -39,6 +40,8 @@ struct ForecastOptions {
 ///  TS.FORECAST key start_timestamp end_timestamp
 ///   MODELS model spec, ..
 ///   HORIZON horizon
+///   [LEVEL confidenceLevel]
+///   [TRANSFORMS transform spec, ..]
 ///   [WITH_METRICS]
 ///   [STORE destinationKey
 ///     [MERGE]
@@ -221,6 +224,10 @@ fn parse_forecast_args(args: &mut CommandArgIterator) -> ValkeyResult<ForecastOp
                 "LEVEL" => {
                     let value = parse_forecast_confidence_level(args)?;
                     options.level = Some(value);
+                },
+                "TRANSFORMS" => {
+                    let transforms = args.next_string().map_err(|_| ValkeyError::Str("TSDB: missing value for TRANSFORMS"))?;
+                    options.transforms_spec = Some(transforms);
                 },
                 "WITH_METRICS" => {
                     options.include_metrics = true;
