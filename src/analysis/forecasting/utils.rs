@@ -1,6 +1,7 @@
 use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::error::TsdbError;
+use anofox_forecast::models::ensemble::CombinationMethod;
 use anofox_forecast::seasonality::auto_trend::TrendCriterion;
 use anofox_forecast::{ForecastError, core::TimeSeries as ForecastTimeSeries};
 use chrono::{DateTime, Utc};
@@ -51,6 +52,22 @@ pub fn try_parse_trend_criterion(s: &str) -> Result<TrendCriterion, TsdbError> {
         "holdout" => Ok(TrendCriterion::Holdout),
         other => Err(TsdbError::ForecastError(format!(
             "TSDB: Invalid trend criterion '{}'. Valid options are: AICc, BIC, and Holdout.",
+            other
+        ))),
+    }
+}
+
+pub fn try_parse_combination_method(s: &str) -> Result<CombinationMethod, TsdbError> {
+    match s.to_lowercase().as_str() {
+        "mean" => Ok(CombinationMethod::Mean),
+        "median" => Ok(CombinationMethod::Median),
+        "weightedmse" => Ok(CombinationMethod::WeightedMSE),
+        "custom" => Ok(CombinationMethod::Custom),
+        "inverseaic" => Ok(CombinationMethod::InverseAIC),
+        "horizonadaptive" => Ok(CombinationMethod::HorizonAdaptive),
+
+        other => Err(TsdbError::ForecastError(format!(
+            "TSDB: Invalid combination method '{}'. Valid options are: Mean, Median, WeightedMSE, Custom, InverseAIC, HorizonAdaptive.",
             other
         ))),
     }
