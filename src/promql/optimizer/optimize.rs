@@ -25,8 +25,8 @@ use crate::promql::optimizer::utils::{
     expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
 };
 use promql_parser::label::{Matcher, Matchers};
-use promql_parser::parser::token::{TokenType, T_ADD, T_DIV, T_LAND, T_LOR, T_MUL};
-use promql_parser::parser::{BinaryExpr, Expr};
+use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
+use promql_parser::parser::{BinaryExpr, Expr, ParenExpr};
 // https://prometheus.io/docs/prometheus/latest/querying/operators
 // Expression optimization API
 
@@ -215,7 +215,28 @@ fn optimize_binary(binary: BinaryExpr) -> Expr {
 /// * `expr == NaN` and `expr != NaN` to `NaN`
 fn optimize_internal(expr: Expr) -> Expr {
     match expr {
-        Expr::Paren(p) => optimize_internal(*p.expr),
+        Expr::Paren(p) => {
+            // Determine whether the inner expression was originally a Binary
+            // so we can decide whether to preserve the Paren after optimization.
+            let was_binary = matches!(&*p.expr, Expr::Binary(_));
+            let inner = optimize_internal(*p.expr);
+            // Strip the Paren wrapper only when the inner was a Binary that
+            // simplified to a leaf (e.g., `(A + 0)` → `A`). In all other
+            // cases—unchanged Binaries, VectorSelectors with `@` modifiers,
+            // Aggregates, Calls, etc.—preserve the Paren so that simplification
+            // rules can inspect and unwrap it, and so that operator precedence
+            // is preserved in the output.
+            if was_binary && !matches!(&inner, Expr::Binary(_)) {
+                inner
+            } else {
+                match inner {
+                    Expr::Paren(_) => inner,
+                    _ => Expr::Paren(ParenExpr {
+                        expr: Box::new(inner),
+                    }),
+                }
+            }
+        }
         Expr::Subquery(mut sq) => {
             *sq.expr = optimize_internal(*sq.expr);
             Expr::Subquery(sq)
