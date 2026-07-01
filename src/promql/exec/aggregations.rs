@@ -1,13 +1,13 @@
-use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::common::Timestamp;
+use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::labels::HasFingerprint;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::ParIter;
 use orx_parallel::{IntoParIter, IterIntoParIter};
-use promql_parser::parser::token::{TokenType, *};
 use promql_parser::parser::AggregateExpr;
+use promql_parser::parser::token::{TokenType, *};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 

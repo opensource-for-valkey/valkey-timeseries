@@ -263,7 +263,10 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     }
 }
 
-fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> QueryResult<QueryValue> {
+fn execute_selector_task_local(
+    ctx: &Context,
+    command: SelectorTaskKind,
+) -> QueryResult<QueryValue> {
     match command {
         SelectorTaskKind::Vector(iqc) => {
             let timestamp = iqc.timestamp;
