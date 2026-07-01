@@ -10,7 +10,7 @@ use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::collect_vector_selectors;
-use crate::promql::functions::{PromQLFunction, PromQLArg, PromQLFunctionImpl, resolve_function};
+use crate::promql::functions::{PromQLArg, PromQLFunction, PromQLFunctionImpl, resolve_function};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};

@@ -1,5 +1,6 @@
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
+use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::exec::types::EvalLabels;
@@ -16,7 +17,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use twox_hash::XxHash64;
 use valkey_module::Context;
-use crate::promql::engine::test_utils::MemorySeriesQuerier;
 
 /// Parse a match[] selector string into a VectorSelector
 fn parse_selector(selector: &str) -> Result<VectorSelector, String> {

@@ -2,14 +2,14 @@ mod fanout;
 pub mod memory_series_querier;
 pub mod promql_config;
 pub mod promql_engine;
+mod querier;
 mod query_limits;
 pub mod query_reader;
 mod query_stats;
 mod selector_batch_executor;
-mod querier;
 
-use crate::common::time::current_time_millis;
 use crate::common::Timestamp;
+use crate::common::time::current_time_millis;
 pub(crate) use fanout::*;
 pub use promql_engine::{evaluate_instant, evaluate_range};
 pub(in crate::promql) use query_limits::*;

@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use crate::promql::optimizer::optimize_expr;
     use crate::promql::optimizer::pushdown::{
         get_common_label_filters, pushdown_binary_op_filters,
     };
-    use crate::promql::optimizer::optimize_expr;
     use promql_parser::label::Matchers;
     use promql_parser::parser::{Expr, parse};
     use rstest::rstest;

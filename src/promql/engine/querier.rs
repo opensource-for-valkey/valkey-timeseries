@@ -1,16 +1,17 @@
-use std::sync::LazyLock;
-use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::QueryReader;
+use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
+use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{
     InstantSample, PromqlResult, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
 };
 use cfg_if::cfg_if;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
+use std::sync::LazyLock;
 use valkey_module::Context;
-use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 
-pub static SERIES_SELECTOR: LazyLock<SelectorBatchExecutor> = LazyLock::new(SelectorBatchExecutor::new);
+pub static SERIES_SELECTOR: LazyLock<SelectorBatchExecutor> =
+    LazyLock::new(SelectorBatchExecutor::new);
 
 /// A concrete implementation of QueryReader that queries the Valkey keyspace.
 pub struct ValkeySeriesQuerier;
