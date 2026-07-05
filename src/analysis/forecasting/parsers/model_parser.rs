@@ -7,7 +7,7 @@ use crate::analysis::forecasting::parsers::{
     ForecastModelKind, parse_seasonal_forecast_method, parse_trend_forecast_method,
 };
 use anofox_forecast::models::arima::{ARIMA, AutoARIMA, SARIMA};
-use anofox_forecast::models::baseline::{Naive, SeasonalNaive, SimpleMovingAverage};
+use anofox_forecast::models::baseline::{Naive, RandomWalkWithDrift, SeasonalNaive, SimpleMovingAverage};
 use anofox_forecast::models::exponential::{
     AutoETS, ETS, ETSSpec, HoltLinearTrend, HoltWinters, SeasonalES, SeasonalType,
     SimpleExponentialSmoothing,
@@ -68,6 +68,7 @@ pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelS
         ForecastModelKind::Garch => handle_garch(&mut spec),
         ForecastModelKind::Holt => handle_holt(&mut spec),
         ForecastModelKind::HoltWinters => handle_holt_winters(&mut spec),
+        ForecastModelKind::RandomWalkWithDrift => handle_random_walk_with_drift(&mut spec),
     }
 }
 
@@ -226,6 +227,27 @@ fn handle_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError>
     }
 
     Ok(Box::new(Naive::new()))
+}
+
+fn handle_random_walk_with_drift(
+    spec: &mut ModelSpec,
+) -> Result<BoxedForecaster, ModelSpecError> {
+    let nums = spec.get_positionals_as_usize()?;
+
+    let positional_changepoint = nums.first().copied();
+    let keyword_changepoint = get_usize_kwarg(spec, "changepoint")?;
+    let changepoint = positional_changepoint.or(keyword_changepoint);
+
+    if nums.len() > 1 {
+        return Err(ModelSpecError::new(
+            "RandomWalkWithDrift accepts at most 1 positional argument (changepoint)",
+        ));
+    }
+
+    match changepoint {
+        Some(cp) => Ok(Box::new(RandomWalkWithDrift::new().with_changepoint(cp))),
+        None => Ok(Box::new(RandomWalkWithDrift::new())),
+    }
 }
 
 fn handle_seasonal_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
@@ -766,10 +788,10 @@ mod tests {
     #[test]
     fn constructs_all_supported_models_from_canonical_specs() {
         let models = build_models_from_specs(
-            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalES(12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES()",
+            "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalES(12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES(), RandomWalkWithDrift()",
         )
             .unwrap();
-        assert_eq!(models.len(), 21);
+        assert_eq!(models.len(), 22);
     }
 
     #[test]

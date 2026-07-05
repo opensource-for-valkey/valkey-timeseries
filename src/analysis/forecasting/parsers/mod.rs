@@ -35,6 +35,7 @@ pub enum ForecastModelKind {
     Ets,
     AutoEts,
     HoltWinters,
+    RandomWalkWithDrift,
 }
 
 impl ForecastModelKind {

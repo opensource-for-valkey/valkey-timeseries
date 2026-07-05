@@ -75,7 +75,8 @@ At least one model must be specified. All models are case-insensitive.
 | `SES`            | `SES(alpha=0.3)` or `SES(0.3)`                          | Simple Exponential Smoothing                                                   |
 | `Holt`           | `Holt()` or `Holt(alpha=0.3, beta=0.1, ...)`            | Holt linear trend model                                                        |
 | `HoltWinters`    | `HoltWinters()` or `HoltWinters(alpha=0.3, beta=0.1, gamma=0.1, seasonal_type="add", seasonal_period=12)` | Holt-Winters seasonal model |
-| `Naive`          | `Naive()`                                               | Naive (random walk drift) forecaster                                           |
+| `Naive`          | `Naive()`                                               | Naive (last value) forecaster                                                   |
+| `RandomWalkWithDrift` | `RandomWalkWithDrift()` or `RandomWalkWithDrift(changepoint=N)` | Random walk with drift forecaster; drift estimated from first differences |
 | `SeasonalNaive`  | `SeasonalNaive(12)` or `SeasonalNaive(period=12)`       | Seasonal naive forecaster                                                      |
 | `SMA`            | `SMA(5)` or `SMA(window=5)`                             | Simple Moving Average                                                          |
 | `Theta`          | `Theta()` or `Theta(theta_lines=2, decomposition="multiplicative")` | Theta method for forecasting                                        |
@@ -110,6 +111,7 @@ At least one model must be specified. All models are case-insensitive.
 | `trend_method`      | string          | Trend forecasting method (`"auto"`, `"arima"`, `"linear"`, etc.) |
 | `seasonal_method`   | string          | Seasonal forecasting method (`"auto"`, `"arima"`, `"naive"`, etc.) |
 | `multiplicative`    | boolean         | Use multiplicative seasonality (MFLES)                       |
+| `changepoint`       | integer         | Start index for drift estimation (RandomWalkWithDrift)      |
 </details>
 
 <details open>
