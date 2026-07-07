@@ -162,9 +162,9 @@ fn eval_top_bottom_k(
     order: KAggregationOrder,
 ) -> EvalResult<ExprResult> {
     let name = if order == KAggregationOrder::Top {
-        "top_k"
+        "topk"
     } else {
-        "bottom_k"
+        "bottomk"
     };
     let k = get_k_param(param, samples.len(), name)?;
 
@@ -434,9 +434,10 @@ fn compare_k_values(left: f64, right: f64, order: KAggregationOrder) -> Ordering
     }
 }
 
-// topk/bottomk params are scalar floats, but selection needs a bounded count.
-// Coerce once to match PromQL-like behavior: clamp to input size and treat
-// k < 1 as empty output.
+// topk/bottomk/limitk params are scalar floats, but selection needs a bounded
+// count. Mirrors Prometheus: k <= 0 selects nothing, +Inf keeps everything
+// (`as i64` saturates, matching Prometheus's MaxInt64 clamp), and k is capped
+// at the input size. NaN is rejected earlier by `get_k_param`.
 fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
     let max_k = input_len as i64;
     let coerced = (k_param as i64).min(max_k);
@@ -450,9 +451,11 @@ fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
 }
 
 fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
-    if !ratio.is_finite() {
+    // Prometheus rejects NaN ratios and clamps everything else (including
+    // ±Inf) to [-1, 1], emitting a warning annotation we don't support.
+    if ratio.is_nan() {
         return Err(EvaluationError::ArgumentError(
-            "limit_ratio parameter must be within [-1, 1]".to_string(),
+            "Ratio value is NaN".to_string(),
         ));
     }
     let ratio = ratio.clamp(-1.0, 1.0);
@@ -514,16 +517,13 @@ fn get_param_as_string(params: Option<ExprResult>, function_name: &str) -> EvalR
 
 fn get_k_param(param: Option<ExprResult>, sample_len: usize, name: &str) -> EvalResult<usize> {
     let value = get_param_as_scalar(param, name)?;
-    Ok(coerce_k_size(value, sample_len))
-}
-
-fn get_param_as_usize(params: Option<ExprResult>, name: &str) -> EvalResult<usize> {
-    let value = get_param_as_scalar(params, name)?;
-    if !value.is_finite() || value <= 0.0 {
-        Ok(0)
-    } else {
-        Ok(value.floor() as usize)
+    // Prometheus rejects NaN k parameters for topk/bottomk/limitk.
+    if value.is_nan() {
+        return Err(EvaluationError::ArgumentError(
+            "Parameter value is NaN".to_string(),
+        ));
     }
+    Ok(coerce_k_size(value, sample_len))
 }
 
 fn sample_hash(sample: &EvalSample) -> u128 {

@@ -951,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn should_cache_samples_across_evaluations() {
+    fn should_return_identical_results_across_evaluations() {
         // given: mock reader with data in specific bucket
         let mut builder = MockQueryReaderBuilder::new();
         let labels: Labels = vec![
@@ -971,7 +971,6 @@ mod tests {
         };
         builder.add_sample(&labels, sample);
         let reader = builder.build();
-        // Create cached reader and evaluator
         let evaluator = Evaluator::new(
             &reader,
             QueryOptions {
@@ -996,24 +995,18 @@ mod tests {
             .evaluate(stmt.clone())
             .unwrap()
             .expect_instant_vector("Expected instant vector result");
-        // Second evaluation - should use cached data
+        // Second evaluation
         let result2 = evaluator
             .evaluate(stmt.clone())
             .unwrap()
             .expect_instant_vector("Expected instant vector result");
 
-        // then: results should be identical (sample caching disabled for now)
+        // then: results should be identical
         assert_eq!(result1.len(), 1);
         assert_eq!(result2.len(), 1);
         assert_eq!(result1[0].value, 100.0);
         assert_eq!(result2[0].value, 100.0);
         assert_eq!(result1[0].labels, result2[0].labels);
-
-        // Note: Sample caching is disabled for now to avoid time range issues
-        // assert!(cache.get_samples(&bucket, &0).is_some());
-        // let cached_samples = cache.get_samples(&bucket, &0).unwrap();
-        // assert_eq!(cached_samples.len(), 1);
-        // assert_eq!(cached_samples[0].value, 100.0);
     }
 
     #[test]
@@ -2312,6 +2305,91 @@ mod tests {
     }
 
     #[test]
+    fn k_aggregations_nan_parameter_should_error() {
+        // Prometheus rejects NaN k parameters ("Parameter value is NaN")
+        // instead of silently returning an empty result.
+        let test_data: TestSampleData = vec![
+            ("http_requests_total", vec![("env", "prod")], 0, 10.0),
+            ("http_requests_total", vec![("env", "staging")], 1, 20.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        for query in [
+            "topk(NaN, http_requests_total)",
+            "bottomk(NaN, http_requests_total)",
+            "limitk(NaN, http_requests_total)",
+        ] {
+            let result = parse_and_evaluate(&evaluator, query, end_time, lookback_delta);
+            assert!(result.is_err(), "{query} should error on NaN parameter");
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Parameter value is NaN"),
+                "unexpected error for {query}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn k_aggregations_infinite_k_keeps_all_series() {
+        // Prometheus clamps k parameters above MaxInt64 (e.g. +Inf) rather
+        // than erroring; with k = +Inf every series is kept.
+        let test_data: TestSampleData = vec![
+            ("http_requests_total", vec![("env", "prod")], 0, 10.0),
+            ("http_requests_total", vec![("env", "staging")], 1, 20.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        let result = parse_and_evaluate(
+            &evaluator,
+            "topk(Inf, http_requests_total)",
+            end_time,
+            lookback_delta,
+        )
+        .expect("topk(Inf, ...) should succeed");
+        assert_eq!(result.len(), 2, "+Inf k should keep all series");
+    }
+
+    #[test]
+    fn limit_ratio_nan_should_error_and_inf_should_clamp() {
+        let test_data: TestSampleData = vec![
+            ("http_requests_total", vec![("env", "prod")], 0, 10.0),
+            ("http_requests_total", vec![("env", "staging")], 1, 20.0),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // NaN ratio is an error in Prometheus ("Ratio value is NaN").
+        let result = parse_and_evaluate(
+            &evaluator,
+            "limit_ratio(NaN, http_requests_total)",
+            end_time,
+            lookback_delta,
+        );
+        assert!(result.is_err(), "limit_ratio(NaN, ...) should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Ratio value is NaN"),
+            "unexpected error: {err}"
+        );
+
+        // Ratios outside [-1, 1] (including +Inf) are clamped, not rejected.
+        // ratio clamped to 1.0 selects every series.
+        let result = parse_and_evaluate(
+            &evaluator,
+            "limit_ratio(Inf, http_requests_total)",
+            end_time,
+            lookback_delta,
+        )
+        .expect("limit_ratio(Inf, ...) should clamp to 1.0 and succeed");
+        assert_eq!(result.len(), 2, "clamped ratio 1.0 should keep all series");
+    }
+
+    #[test]
     fn binary_vector_vector_duplicate_left_key_matched_error() {
         // Two left-side series that collapse to the same match key with on(env),
         // and there IS a matching right-side series.
@@ -3081,7 +3159,7 @@ mod tests {
             step_ms: 0, // instant query context
             lookback_delta_ms: 300_000,
         };
-        let result = evaluator.evaluate_subquery(&subquery, &ctx, false);
+        let result = evaluator.evaluate_subquery(&subquery, &ctx);
 
         // then: should not panic or infinite loop, should use fallback step
         assert!(result.is_ok());
@@ -3133,7 +3211,7 @@ mod tests {
             lookback_delta_ms: 300_000,
         };
 
-        let result = evaluator.evaluate_subquery(&subquery, &ctx, false).unwrap();
+        let result = evaluator.evaluate_subquery(&subquery, &ctx).unwrap();
         let ExprResult::RangeVector(mut range_vector) = result else {
             panic!("expected range vector result");
         };

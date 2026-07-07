@@ -1,7 +1,7 @@
 mod evaluator;
 mod pipeline;
 pub mod types;
-mod utils;
+pub(in crate::promql) mod utils;
 
 pub mod aggregations;
 #[cfg(test)]

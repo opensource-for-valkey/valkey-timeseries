@@ -8,7 +8,7 @@ use crate::promql::EvaluationError;
 /// Error type for PromQL query and discovery operations.
 ///
 /// This is returned by the read/query methods on `TimeSeriesDb`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum QueryError {
     /// The query string could not be parsed or is otherwise invalid.
     #[error("invalid query: {0}")]
@@ -25,7 +25,13 @@ pub enum QueryError {
 
 impl From<EvaluationError> for QueryError {
     fn from(err: EvaluationError) -> Self {
-        QueryError::Execution(err.to_string())
+        match err {
+            // Unwrap reader/nested-query errors so the original kind survives
+            // the evaluator round trip (e.g. Timeout stays Timeout instead of
+            // becoming an Execution string).
+            EvaluationError::Query(err) => err,
+            other => QueryError::Execution(other.to_string()),
+        }
     }
 }
 
