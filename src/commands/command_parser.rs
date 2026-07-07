@@ -1371,7 +1371,7 @@ pub(super) fn parse_store_clause(args: &mut CommandArgIterator) -> ValkeyResult<
                 options.chunk_size = Some(parse_chunk_size(arg)?)
             }
             CommandArgToken::Encoding => {
-                options.chunk_compression = parse_chunk_compression(args)?;
+                options.chunk_encoding = parse_chunk_compression(args)?;
             }
             CommandArgToken::DecimalDigits => {
                 if options.rounding.is_some() {
