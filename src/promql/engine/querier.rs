@@ -23,7 +23,7 @@ impl QueryReader for ValkeySeriesQuerier {
         timestamp: i64,
         options: QueryOptions,
     ) -> QueryResult<Vec<InstantSample>> {
-        let matchers: Matchers = extract_matchers(selector);
+        let matchers: Matchers = normalize_selector(selector);
         match SERIES_SELECTOR.query(matchers, timestamp, options) {
             Ok(QueryValue::Vector(samples)) => Ok(samples),
             Err(e) => Err(e),
@@ -40,7 +40,7 @@ impl QueryReader for ValkeySeriesQuerier {
         end_ms: i64,
         options: QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
-        let matchers: Matchers = extract_matchers(selector);
+        let matchers: Matchers = normalize_selector(selector);
         match SERIES_SELECTOR.query_range(matchers, start_ms, end_ms, options) {
             Ok(QueryValue::Matrix(samples)) => Ok(samples),
             Err(e) => Err(e),
@@ -51,16 +51,57 @@ impl QueryReader for ValkeySeriesQuerier {
     }
 }
 
-fn extract_matchers(selector: &VectorSelector) -> Matchers {
-    let mut matchers = selector.matchers.clone();
-    if let Some(ref name) = selector.name {
-        matchers.matchers.push(Matcher {
-            op: MatchOp::Equal,
-            name: METRIC_NAME.to_string(),
-            value: name.clone(),
-        });
+/// Normalize a parsed [`VectorSelector`] into the [`Matchers`] representation consumed by
+/// the selector executor, folding the optional metric name into an explicit `__name__`
+/// equality matcher.
+///
+/// This is the single point at which the query path performs this transformation: the
+/// resulting `Matchers` is the shared normalized form that both the local execution path
+/// (`Matchers` -> `SeriesSelector`) and the fanout path (`Matchers` -> proto request) build
+/// from, so the two stay in sync. `Matchers` is used as the intermediate — rather than the
+/// crate-native `SeriesSelector` — because it preserves the original regex source strings
+/// needed for lossless fanout serialization.
+fn normalize_selector(selector: &VectorSelector) -> Matchers {
+    let Some(ref name) = selector.name else {
+        return selector.matchers.clone();
+    };
+
+    let name_matcher = Matcher {
+        op: MatchOp::Equal,
+        name: METRIC_NAME.to_string(),
+        value: name.clone(),
+    };
+
+    let src = &selector.matchers;
+    if src.or_matchers.is_empty() {
+        // Build in a single pass with the name matcher up front to avoid the extra
+        // reallocation a clone-then-push incurs.
+        let mut matchers = Vec::with_capacity(src.matchers.len() + 1);
+        matchers.push(name_matcher);
+        matchers.extend(src.matchers.iter().cloned());
+        Matchers {
+            matchers,
+            or_matchers: Vec::new(),
+        }
+    } else {
+        // A vector selector produced by the parser never carries top-level OR groups, but
+        // handle it defensively so the metric name is folded into every group rather than
+        // silently dropped by the downstream `matchers`-first conversion.
+        let or_matchers = src
+            .or_matchers
+            .iter()
+            .map(|group| {
+                let mut g = Vec::with_capacity(group.len() + 1);
+                g.push(name_matcher.clone());
+                g.extend(group.iter().cloned());
+                g
+            })
+            .collect();
+        Matchers {
+            matchers: src.matchers.clone(),
+            or_matchers,
+        }
     }
-    matchers
 }
 
 /// A concrete implementation of QueryReader that can be either a ValkeySeriesQuerier or a MemorySeriesQuerier.

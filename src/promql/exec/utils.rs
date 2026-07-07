@@ -1,5 +1,25 @@
-use crate::common::Sample;
+use crate::common::{Sample, Timestamp};
+use crate::promql::exec::types::{EvalSample, SeriesMap};
 use promql_parser::parser::{Expr, VectorSelector};
+
+/// Append one evaluation step's instant-vector samples into a per-series map,
+/// stamping each sample with the step timestamp.
+///
+/// Shared by the range-query step merge (`evaluate_range`) and the subquery
+/// step merge (`evaluate_subquery`). Callers must feed steps in ascending
+/// timestamp order so the per-series sample vectors stay chronologically sorted.
+pub(in crate::promql) fn merge_step_into_series_map(
+    series_map: &mut SeriesMap,
+    step_ts: Timestamp,
+    samples: Vec<EvalSample>,
+) {
+    for sample in samples {
+        series_map
+            .entry(sample.labels)
+            .or_default()
+            .push(Sample::new(step_ts, sample.value));
+    }
+}
 
 /// Filter samples to (start_ms, end_ms] using binary search on sorted timestamps.
 /// Samples are sorted by timestamp_ms (storage invariant), so we use partition_point

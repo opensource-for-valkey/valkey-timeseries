@@ -20,11 +20,15 @@ pub enum EvaluationError {
     ArgumentError(String),
     DuplicateLabelSet,
     UnsupportedFunction(String),
+    /// A `QueryError` surfaced by a `QueryReader` (or nested query evaluation),
+    /// wrapped without loss so that converting back to `QueryError` preserves
+    /// the original kind (e.g. `Timeout` stays `Timeout`).
+    Query(QueryError),
 }
 
 impl From<QueryError> for EvaluationError {
     fn from(err: QueryError) -> Self {
-        EvaluationError::InternalError(err.to_string())
+        EvaluationError::Query(err)
     }
 }
 
@@ -40,6 +44,7 @@ impl Display for EvaluationError {
             EvaluationError::UnsupportedFunction(func_name) => {
                 write!(f, "PromQL unknown function: {func_name}")
             }
+            EvaluationError::Query(err) => write!(f, "{err}"),
         }
     }
 }

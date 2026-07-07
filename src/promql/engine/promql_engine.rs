@@ -3,29 +3,19 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
-use crate::promql::exec::types::EvalLabels;
+use crate::promql::exec::types::{EvalLabels, SeriesMap};
+use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::range_bounds_to_system_time;
 use crate::promql::{Evaluator, ExprResult, QueryResult};
 use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
-use promql_parser::parser::{EvalStmt, Expr, VectorSelector};
-use std::hash::BuildHasherDefault;
+use promql_parser::parser::{EvalStmt, Expr};
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use twox_hash::XxHash64;
 use valkey_module::Context;
-
-/// Parse a match[] selector string into a VectorSelector
-fn parse_selector(selector: &str) -> Result<VectorSelector, String> {
-    let expr = promql_parser::parser::parse(selector).map_err(|e| e.to_string())?;
-    match expr {
-        Expr::VectorSelector(vs) => Ok(vs),
-        _ => Err("Expected a vector selector".to_string()),
-    }
-}
 
 fn parse_query(query: &str, options: &QueryOptions) -> QueryResult<Expr> {
     let mut expr = promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)?;
@@ -101,19 +91,6 @@ pub(crate) trait PromqlEngine: Send + Sync {
     }
 }
 
-/// Evaluate a range query using Rust range bounds, converting to
-/// `(start, end)` exactly once before dispatching to `TsdbReadEngine`.
-pub(crate) fn eval_query_range_bounds<E: PromqlEngine + ?Sized>(
-    engine: &E,
-    query: &str,
-    range: impl RangeBounds<SystemTime>,
-    step: Duration,
-    opts: QueryOptions,
-) -> QueryResult<Vec<RangeSample>> {
-    let (start, end) = range_bounds_to_system_time(range);
-    E::eval_query_range(engine, query, start, end, step, opts)
-}
-
 // ── Shared evaluation free functions ────────────────────────────────
 
 /// Evaluate an instant PromQL query against the given reader.
@@ -155,17 +132,14 @@ pub fn evaluate_instant(
                 })
                 .collect(),
         )),
+        // __name__ drops were already materialized by cleanup_metric_labels
+        // inside evaluate_with_context.
         ExprResult::RangeVector(samples) => Ok(QueryValue::Matrix(
             samples
                 .into_iter()
-                .map(|mut s| {
-                    if s.drop_name {
-                        s.labels.drop_name();
-                    }
-                    RangeSample {
-                        labels: s.labels.into_labels(),
-                        samples: s.values,
-                    }
+                .map(|s| RangeSample {
+                    labels: s.labels.into_labels(),
+                    samples: s.values,
                 })
                 .collect(),
         )),
@@ -196,7 +170,7 @@ pub fn evaluate_range(
 
     evaluator
         .preload_for_range_from_stmt(&stmt)
-        .map_err(|e| QueryError::InvalidQuery(e.to_string()))?;
+        .map_err(QueryError::from)?;
 
     if deadline > 0 && current_time_millis() > deadline {
         return Err(QueryError::Timeout);
@@ -231,25 +205,20 @@ pub fn evaluate_range(
             .into_fallible_result()
             .collect()?;
 
-    // Merge per-step results into the series map.
-    let mut series_map =
-        halfbrown::HashMap::<EvalLabels, Vec<Sample>, BuildHasherDefault<XxHash64>>::default();
+    // Merge per-step results into the series map. orx-parallel's `collect`
+    // preserves input order, so `step_results` is in ascending step-timestamp
+    // order and the per-series sample vectors built here are chronologically
+    // sorted without an extra sort.
+    let mut series_map = SeriesMap::default();
 
     for (current_time, result) in step_results {
         match result {
             ExprResult::InstantVector(samples) => {
-                for sample in samples {
-                    let labels = sample.labels;
-                    series_map
-                        .entry(labels)
-                        .or_default()
-                        .push(Sample::new(current_time, sample.value));
-                }
+                merge_step_into_series_map(&mut series_map, current_time, samples);
             }
             ExprResult::Scalar(value) => {
-                let labels = EvalLabels::empty();
                 series_map
-                    .entry(labels)
+                    .entry(EvalLabels::empty())
                     .or_default()
                     .push(Sample::new(current_time, value));
             }
@@ -258,7 +227,7 @@ pub fn evaluate_range(
                     "range vectors not supported in range query evaluation".to_string(),
                 ));
             }
-            ExprResult::String(_s) => {
+            ExprResult::String(_) => {
                 return Err(QueryError::Execution(
                     "string expressions not supported in range query evaluation".to_string(),
                 ));
@@ -304,34 +273,23 @@ impl PromqlQuerier {
             ..QueryOptions::default()
         };
         let evaluator = Evaluator::new(&self.querier, opts);
-        evaluator
-            .evaluate(stmt)
-            .map_err(|e| QueryError::Execution(e.to_string()))
+        evaluator.evaluate(stmt).map_err(QueryError::from)
     }
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
+    /// Convenience wrapper over [`PromqlEngine::eval_query`].
     pub fn eval_query(
         &self,
         query: &str,
         time: Option<SystemTime>,
         opts: &QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let expr = parse_query(query, opts)?;
-
-        let query_time = time.unwrap_or_else(SystemTime::now);
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start: query_time,
-            end: query_time,
-            interval: Duration::ZERO,
-            lookback_delta,
-        };
-
-        evaluate_instant(self.querier.clone(), stmt, query_time, *opts)
+        PromqlEngine::eval_query(self, query, time, *opts)
     }
 
     /// Evaluate a range PromQL query, returning typed `RangeSample`s.
+    /// Convenience wrapper over [`PromqlEngine::eval_query_range`] that accepts
+    /// Rust range bounds.
     pub fn eval_query_range(
         &self,
         query: &str,
@@ -340,18 +298,7 @@ impl PromqlQuerier {
         opts: &QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
         let (start, end) = range_bounds_to_system_time(range);
-        let expr = parse_query(query, opts)?;
-
-        let lookback_delta = opts.lookback_delta;
-        let stmt = EvalStmt {
-            expr,
-            start,
-            end,
-            interval: step,
-            lookback_delta,
-        };
-
-        evaluate_range(self.querier.clone(), stmt, *opts)
+        PromqlEngine::eval_query_range(self, query, start, end, step, *opts)
     }
 }
 

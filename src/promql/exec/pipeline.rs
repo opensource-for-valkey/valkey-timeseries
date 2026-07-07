@@ -11,13 +11,9 @@
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
 use crate::common::{Sample, Timestamp};
-use crate::labels::{HasFingerprint, SeriesFingerprint};
-use crate::promql::engine::{CachedQueryReader, QueryReader};
+use crate::promql::engine::QueryReader;
 use crate::promql::exec::types::EvalLabels;
-use crate::promql::{
-    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, QueryOptions,
-};
-use ahash::{AHashMap, AHashSet};
+use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::{IntoParIter, ParIter};
 use promql_parser::parser::VectorSelector;
 use std::time::{Duration, Instant};
@@ -39,7 +35,6 @@ pub(crate) enum QueryPathKind {
         step_ms: i64,
         lookback_delta_ms: i64,
         expected_steps: usize,
-        is_rollup: bool,
     },
 }
 
@@ -61,23 +56,6 @@ pub(crate) struct QueryPlan {
     pub sample_end_ms: Timestamp,
     /// Path-specific behavior and parameters.
     pub path_kind: QueryPathKind,
-}
-
-impl QueryPlan {
-    /// Shape all loaded bucket data into the final ExprResult for this path.
-    fn shape(&self, all_bucket_data: Vec<EvalSamples>) -> ExprResult {
-        match &self.path_kind {
-            QueryPathKind::InstantVector { .. } => shape_instant_results(all_bucket_data),
-            QueryPathKind::Matrix => shape_matrix_results(
-                all_bucket_data,
-                self.sample_end_ms - self.sample_start_ms,
-                self.sample_end_ms,
-            ),
-            QueryPathKind::SubqueryVectorSelector { .. } => {
-                ExprResult::RangeVector(shape_subquery_results(all_bucket_data, self))
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +104,6 @@ impl QueryPlan {
         subquery_end_ms: Timestamp,
         step_ms: Timestamp,
         lookback_delta_ms: Timestamp,
-        is_rollup: bool,
     ) -> Self {
         let (aligned_start_ms, range_start_ms, range_end_ms, expected_steps) =
             compute_subquery_alignment(
@@ -146,7 +123,6 @@ impl QueryPlan {
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
-                is_rollup,
             },
         }
     }
@@ -158,7 +134,7 @@ impl QueryPlan {
 ///
 /// Uses `div_euclid` for correct floor division with negative timestamps
 /// (e.g. `-41ms / 10ms` → `-50ms`, not `-40ms`).
-fn compute_subquery_alignment(
+pub(crate) fn compute_subquery_alignment(
     subquery_start_ms: Timestamp,
     subquery_end_ms: Timestamp,
     step_ms: Timestamp,
@@ -180,66 +156,36 @@ fn compute_subquery_alignment(
     )
 }
 
-/// Shape loaded data for instant vector selector.
+/// Walk `steps` (non-decreasing timestamps) over `samples` (ascending by
+/// timestamp), invoking `on_step` for each step with the most recent sample at
+/// or before the step timestamp, or `None` if that sample falls outside the
+/// lookback window (`sample.timestamp <= step_ts - lookback_delta_ms`).
 ///
-/// Takes the latest sample per fingerprint. A fingerprint
-/// dedup pass ensures within-bucket duplicates are also handled.
-pub(crate) fn shape_instant_results(series_data: Vec<EvalSamples>) -> ExprResult {
-    let mut seen: AHashSet<SeriesFingerprint> = AHashSet::new();
-    let mut results = Vec::new();
+/// Shared by the range-query preload path and the subquery vector-selector
+/// fast path so the lookback boundary semantics live in one place.
+pub(crate) fn for_each_step_sample<I, F>(
+    samples: &[Sample],
+    steps: I,
+    lookback_delta_ms: i64,
+    mut on_step: F,
+) where
+    I: Iterator<Item = i64>,
+    F: FnMut(i64, Option<&Sample>),
+{
+    let mut i = 0usize;
+    let mut last_valid: Option<&Sample> = None;
 
-    for series in series_data {
-        if series.values.is_empty() {
-            continue;
+    for step_ts in steps {
+        let lookback_start = step_ts - lookback_delta_ms;
+
+        while i < samples.len() && samples[i].timestamp <= step_ts {
+            last_valid = Some(&samples[i]);
+            i += 1;
         }
-        let fingerprint = series.labels.fingerprint();
-        if !seen.insert(fingerprint) {
-            // todo: append values
-            continue;
-        }
-        let last = series.values[series.values.len() - 1];
-        results.push(EvalSample {
-            timestamp_ms: last.timestamp,
-            value: last.value,
-            labels: series.labels,
-            drop_name: false,
-        });
+
+        let within_lookback = last_valid.filter(|s| s.timestamp > lookback_start);
+        on_step(step_ts, within_lookback);
     }
-
-    ExprResult::InstantVector(results)
-}
-
-/// Shape loaded data for matrix selector.
-///
-/// Merges all samples per series (keyed by sorted label vector) across all
-/// buckets. Bucket data should be in chronological order.
-pub(crate) fn shape_matrix_results(
-    series_data: Vec<EvalSamples>,
-    range_ms: i64,
-    range_end_ms: i64,
-) -> ExprResult {
-    let mut series_map: AHashMap<EvalLabels, Vec<Sample>> = AHashMap::new();
-
-    for series in series_data {
-        if let Some(samples) = series_map.get_mut(&series.labels) {
-            samples.extend(series.values);
-        } else {
-            series_map.insert(series.labels, series.values);
-        }
-    }
-
-    let result = series_map
-        .into_iter()
-        .map(|(labels, values)| EvalSamples {
-            values,
-            labels,
-            range_ms,
-            range_end_ms,
-            drop_name: false,
-        })
-        .collect();
-
-    ExprResult::RangeVector(result)
 }
 
 /// Shape loaded data for the subquery vector-selector fast path.
@@ -247,7 +193,7 @@ pub(crate) fn shape_matrix_results(
 /// Merges by fingerprint across series, sorts/deduplicates, then applies
 /// the sliding-window step-bucketing algorithm.
 fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Vec<EvalSamples> {
-    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps, _is_rollup) =
+    let (range_ms, aligned_start_ms, step_ms, lookback_delta_ms, expected_steps) =
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 range_ms,
@@ -255,14 +201,12 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
                 step_ms,
                 lookback_delta_ms,
                 expected_steps,
-                is_rollup,
             } => (
                 *range_ms,
                 *aligned_start_ms,
                 *step_ms,
                 *lookback_delta_ms,
                 *expected_steps,
-                *is_rollup,
             ),
             _ => return Vec::new(),
         };
@@ -277,28 +221,20 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
             }
 
             let mut step_samples = Vec::with_capacity(expected_steps);
-            let mut i = 0usize;
-            let mut last_valid: Option<&Sample> = None;
-
-            for current_step_ms in (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize) {
-                let lookback_start_ms = current_step_ms - lookback_delta_ms;
-
-                while i < sample.values.len() && sample.values[i].timestamp <= current_step_ms {
-                    // SAFETY: we know above that !sample.values.is_smpty(), and the bounds-check
-                    // above ensures that `i` is in bounds
-                    last_valid = unsafe { Some(sample.values.get_unchecked(i)) };
-                    i += 1;
-                }
-
-                if let Some(sample) = last_valid
-                    && sample.timestamp > lookback_start_ms
-                {
-                    step_samples.push(Sample {
-                        timestamp: current_step_ms,
-                        value: sample.value,
-                    });
-                }
-            }
+            let steps = (aligned_start_ms..=subquery_end_ms).step_by(step_ms as usize);
+            for_each_step_sample(
+                &sample.values,
+                steps,
+                lookback_delta_ms,
+                |current_step_ms, latest| {
+                    if let Some(latest) = latest {
+                        step_samples.push(Sample {
+                            timestamp: current_step_ms,
+                            value: latest.value,
+                        });
+                    }
+                },
+            );
 
             if step_samples.is_empty() {
                 None
@@ -324,7 +260,6 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
 /// Aggregate phase timings for the selector pipeline.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PipelineTimings {
-    pub metadata_resolve_ms: f64,
     pub sample_load_ms: f64,
     pub shape_samples_ms: f64,
 }
@@ -334,8 +269,8 @@ pub(crate) struct PipelineTimings {
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
 /// Branching on `QueryPathKind` handles the behavioral differences between
 /// instant vector selectors, matrix selectors, and subquery fast paths.
-pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
-    reader: &CachedQueryReader<'reader, R>,
+pub(crate) fn execute_selector_pipeline<R: QueryReader>(
+    reader: &R,
     plan: &QueryPlan,
     selector: &VectorSelector,
     mut options: QueryOptions,
@@ -351,8 +286,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     if let QueryPathKind::InstantVector { lookback_delta_ms } = plan.path_kind {
         options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
         let series_data = reader
-            .query(selector, plan.sample_end_ms, options)
-            .map_err(|e| EvaluationError::InternalError(e.to_string()))? // todo: audit error
+            .query(selector, plan.sample_end_ms, options)?
             .into_iter()
             .map(|is| EvalSample {
                 timestamp_ms: is.timestamp_ms,
@@ -381,9 +315,8 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     // pipeline. Use saturating_add to avoid overflow on extreme values.
     let query_start_inclusive = plan.sample_start_ms.saturating_add(1);
 
-    let raw_range_samples = reader
-        .query_range(selector, query_start_inclusive, plan.sample_end_ms, options)
-        .map_err(|e| EvaluationError::InternalError(e.to_string()))?; // todo: audit error
+    let raw_range_samples =
+        reader.query_range(selector, query_start_inclusive, plan.sample_end_ms, options)?;
 
     timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
@@ -436,6 +369,7 @@ pub(crate) fn execute_selector_pipeline<'reader, R: QueryReader>(
     tracing::debug!(
         path = plan.path_kind.name(),
         load_ms = format!("{:.2}", timings.sample_load_ms),
+        shape_ms = format!("{:.2}", timings.shape_samples_ms),
         "pipeline phase timings"
     );
 
@@ -482,7 +416,7 @@ mod tests {
         // aligned_start = ceil_to_next_step(15, 10) = 20
         // expected_steps = (55 - 20) / 10 + 1 = 4 (steps at 20, 30, 40, 50)
         // range_start = 20 - 20 = 0
-        let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20, false);
+        let plan = QueryPlan::for_subquery_vector_selector(15, 55, 10, 20);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 range_ms,
@@ -510,7 +444,7 @@ mod tests {
         // div_euclid(-41, 10) = -5, aligned = -50, since -50 <= -41, aligned = -40
         // expected_steps = (0 - (-40)) / 10 + 1 = 5
         // range_start = -40 - 5 = -45
-        let plan = QueryPlan::for_subquery_vector_selector(-41, 0, 10, 5, false);
+        let plan = QueryPlan::for_subquery_vector_selector(-41, 0, 10, 5);
         match &plan.path_kind {
             QueryPathKind::SubqueryVectorSelector {
                 aligned_start_ms,
@@ -528,24 +462,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Shaping tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn shape_matrix_merges_across_buckets() {
-        let labels_a = vec![label("__name__", "m"), label("env", "prod")];
-
-        let bucket_data = vec![
-            make_loaded(labels_a.clone(), vec![sample(10, 1.0), sample(20, 2.0)]),
-            make_loaded(labels_a, vec![sample(30, 3.0)]),
-        ];
-
-        let results = shape_matrix_results(bucket_data, 100_000_000, 100_000_000);
-        let ExprResult::RangeVector(results) = results else {
-            panic!("expected range vector result");
-        };
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].values.len(), 3);
-    }
 
     #[test]
     fn shape_subquery_step_bucketing() {
@@ -567,7 +483,6 @@ mod tests {
                 step_ms: 10,
                 lookback_delta_ms: 10,
                 expected_steps: 3,
-                is_rollup: false,
             },
         };
 

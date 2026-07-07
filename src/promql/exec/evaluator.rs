@@ -6,31 +6,32 @@ use crate::labels::Labels;
 use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
-use crate::promql::engine::{CachedQueryReader, QueryOptions, QueryReader};
-use crate::promql::exec::pipeline::{QueryPlan, execute_selector_pipeline};
-use crate::promql::exec::types::EvalLabels;
-use crate::promql::exec::utils::collect_vector_selectors;
-use crate::promql::functions::{PromQLArg, PromQLFunction, PromQLFunctionImpl, resolve_function};
+use crate::promql::engine::{QueryOptions, QueryReader};
+use crate::promql::exec::pipeline::{
+    QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
+};
+use crate::promql::exec::types::SeriesMap;
+use crate::promql::exec::utils::{collect_vector_selectors, merge_step_into_series_map};
+use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, PreloadMap};
-use ahash::{AHashSet, RandomState};
+use ahash::AHashSet;
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
 use orx_parallel::{IterIntoParIter, ParIter};
 use promql_parser::parser::token::{T_LAND, T_LOR};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
-    AggregateExpr, AtModifier, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, Offset,
-    SubqueryExpr, UnaryExpr, VectorSelector,
+    AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, SubqueryExpr, UnaryExpr,
+    VectorSelector,
 };
 use std::sync::RwLock;
-use std::time::Duration;
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
-    reader: CachedQueryReader<'reader, R>,
+    reader: &'reader R,
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: RwLock<PreloadMap>,
@@ -40,7 +41,7 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
 impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
         Self {
-            reader: CachedQueryReader::new(reader),
+            reader,
             preloaded_instant: RwLock::new(PreloadMap::default()),
             options,
         }
@@ -108,46 +109,27 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
             .into_par()
             .map(|(labels, samples)| {
-                let mut values = Vec::with_capacity(num_steps);
-                let mut i = 0usize;
-                let mut last_valid: Option<&Sample> = None;
-
-                for step_idx in 0..num_steps {
+                // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
+                // timestamp; however, when resolving `@ start()` / `@ end()` inside the
+                // preloading phase we must use the outer query bounds so that
+                // `@ start()`/`@ end()` sweep the full query range across steps.
+                // Pass `eval_start_ms`/`eval_end_ms` as the `query_start`/`query_end`
+                // parameters so AtModifier::Start/End resolve correctly during preload.
+                let steps = (0..num_steps).map(|step_idx| {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
-
-                    // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
-                    // timestamp; however, when resolving `@ start()` / `@ end()` inside the
-                    // preloading phase we must use the outer query bounds so that
-                    // `@ start()`/`@ end()` sweep the full query range across steps.
-                    // Pass `eval_start_ms`/`eval_end_ms` as the `query_start`/`query_end`
-                    // parameters so AtModifier::Start/End resolve correctly during preload.
-                    let adjusted_ts = apply_time_modifiers_ms(
+                    apply_time_modifiers_ms(
                         at_modifier.as_ref(),
                         offset_mod.as_ref(),
                         eval_start_ms,
                         eval_end_ms,
                         eval_ts_i,
-                    );
-                    let lookback_start = adjusted_ts - lookback_delta_ms;
+                    )
+                });
 
-                    while i < samples.len() && samples[i].timestamp <= adjusted_ts {
-                        last_valid = Some(&samples[i]);
-                        i += 1;
-                    }
-
-                    if let Some(sample) = last_valid {
-                        if sample.timestamp > lookback_start {
-                            values.push(Some(Sample {
-                                timestamp: sample.timestamp,
-                                value: sample.value,
-                            }));
-                        } else {
-                            values.push(None);
-                        }
-                    } else {
-                        values.push(None);
-                    }
-                }
+                let mut values = Vec::with_capacity(num_steps);
+                for_each_step_sample(&samples, steps, lookback_delta_ms, |_, latest| {
+                    values.push(latest.copied());
+                });
 
                 PreloadedInstantSeries {
                     labels: labels.into(),
@@ -265,7 +247,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             Expr::Unary(u) => self.evaluate_unary(u, ctx, preload_eligible),
             Expr::Binary(b) => self.evaluate_binary_expr(b, ctx, preload_eligible),
             Expr::Paren(p) => self.evaluate_expr(&p.expr, ctx, preload_eligible),
-            Expr::Subquery(q) => self.evaluate_subquery(q, ctx, false),
+            Expr::Subquery(q) => self.evaluate_subquery(q, ctx),
             Expr::NumberLiteral(l) => Ok(ExprResult::Scalar(l.val)),
             Expr::StringLiteral(l) => Ok(ExprResult::String(l.val.clone())),
             Expr::VectorSelector(vector_selector) => {
@@ -290,32 +272,31 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let range = matrix_selector.range;
 
         // Apply time modifiers to evaluation_ts
-        let adjusted_eval_ts = self.apply_time_modifiers(
+        let adjusted_eval_ts = apply_time_modifiers_ms(
             vector_selector.at.as_ref(),
             vector_selector.offset.as_ref(),
             ctx.query_start,
             ctx.query_end,
             ctx.evaluation_ts,
-        )?;
+        );
 
         let plan = QueryPlan::for_matrix(adjusted_eval_ts, range.as_millis() as i64);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
     }
 
     pub(super) fn evaluate_subquery(
         &self,
         subquery: &SubqueryExpr,
         ctx: &EvalContext,
-        is_rollup: bool,
     ) -> EvalResult<ExprResult> {
-        let adjusted_eval_ts = self.apply_time_modifiers(
+        let adjusted_eval_ts = apply_time_modifiers_ms(
             subquery.at.as_ref(),
             subquery.offset.as_ref(),
             ctx.query_start,
             ctx.query_end,
             ctx.evaluation_ts,
-        )?;
+        );
 
         // Calculate subquery time range: [adjusted_eval_ts - range, adjusted_eval_ts]
         let subquery_end_ms = adjusted_eval_ts;
@@ -350,30 +331,22 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 subquery_end_ms,
                 step_ms,
                 ctx.lookback_delta_ms,
-                is_rollup,
             );
         }
 
-        // Align start time to the step interval to ensure consistent evaluation points.
-        // Prometheus: newEv.startTimestamp = newEv.interval * ((ev.startTimestamp - offset - range) / newEv.interval)
-        // Go's division truncates toward zero, but we need a floor division for negative timestamps.
-        // Example: -41ms / 10ms
-        //   Go (truncate): -41 / 10 = -4, then -4 * 10 = -40ms (wrong for negatives)
-        //   Rust div_euclid (floor): -41 / 10 = -5, then -5 * 10 = -50ms (correct)
-        // This ensures steps align consistently regardless of whether timestamps are negative.
-        let div = subquery_start_ms.div_euclid(step_ms);
-        let mut aligned_start_ms = div * step_ms;
-        if aligned_start_ms <= subquery_start_ms {
-            aligned_start_ms += step_ms;
-        }
-
-        let expected_steps = ((subquery_end_ms - aligned_start_ms) / step_ms) as usize + 1;
+        // Align start time to the step interval to ensure consistent evaluation points
+        // (see compute_subquery_alignment for the negative-timestamp rationale).
+        let (aligned_start_ms, _, _, expected_steps) =
+            compute_subquery_alignment(subquery_start_ms, subquery_end_ms, step_ms, 0);
 
         let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
         const PARALLEL_SUBQUERY_STEP_THRESHOLD: usize = 4;
 
-        // Evaluate the inner expression at each step within the subquery range
-        let mut step_results: Vec<(i64, Vec<EvalSample>)> =
+        // Evaluate the inner expression at each step within the subquery range.
+        // orx-parallel's `collect` preserves input order, so `step_results` is in
+        // ascending step-timestamp order and per-series sample appends below
+        // produce chronologically sorted vectors without an extra sort.
+        let step_results: Vec<(i64, Vec<EvalSample>)> =
             if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
                 let mut results = Vec::with_capacity(expected_steps);
                 for current_time_ms in steps {
@@ -389,40 +362,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .collect()?
             };
 
-        // Ensure deterministic merge ordering for per-step sample appends.
-        step_results.sort_unstable_by_key(|(ts, _)| *ts);
-
-        let mut series_map: halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState> =
-            Default::default();
+        let mut series_map = SeriesMap::default();
         for (current_time_ms, samples) in step_results {
-            // DO NOT use the .entry() api here, as it would force an unnecessary clone in the
-            // case that an entry already exists
-            for sample in samples {
-                let _sample = Sample {
-                    timestamp: current_time_ms,
-                    value: sample.value,
-                };
-                if let Some(values) = series_map.get_mut(&sample.labels) {
-                    values.push(_sample);
-                } else {
-                    series_map.insert(sample.labels.clone(), vec![_sample]);
-                }
-            }
+            merge_step_into_series_map(&mut series_map, current_time_ms, samples);
         }
 
         let vector = series_map
             .into_iter()
-            .map(|(labels, values)| {
-                // todo: do we need to sort samples by timestamp here? query_range guarantees sorted samples,
-                // but we are merging multiple steps together which could be out of order. We could optimize by
-                // ensuring step_results is processed in timestamp order.
-                EvalSamples {
-                    values,
-                    labels,
-                    range_ms,
-                    range_end_ms: subquery_end_ms,
-                    drop_name: false,
-                }
+            .map(|(labels, values)| EvalSamples {
+                values,
+                labels,
+                range_ms,
+                range_end_ms: subquery_end_ms,
+                drop_name: false,
             })
             .collect();
 
@@ -441,16 +393,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         subquery_end_ms: i64,
         step_ms: i64,
         lookback_delta_ms: i64,
-        is_rollup: bool,
     ) -> EvalResult<ExprResult> {
         let plan = QueryPlan::for_subquery_vector_selector(
             subquery_start_ms,
             subquery_end_ms,
             step_ms,
             lookback_delta_ms,
-            is_rollup,
         );
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, self.options)
+        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
     }
 
     pub(super) fn evaluate_vector_selector(
@@ -486,23 +436,19 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         // Apply time modifiers (offset and @)
-        let adjusted_eval_ts = self.apply_time_modifiers(
+        let adjusted_eval_ts = apply_time_modifiers_ms(
             vector_selector.at.as_ref(),
             vector_selector.offset.as_ref(),
             ctx.query_start,
             ctx.query_end,
             ctx.evaluation_ts,
-        )?;
+        );
 
-        let mut options = self.options;
-        // Ensure the query options carry the lookback delta from the evaluation context so
-        // that QueryReader::query implementations (including mocks) can compute the
-        // correct time window when applying lookback semantics.
-        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
-
+        // The pipeline's instant-vector path stamps `lookback_delta` from the plan
+        // onto the options before calling QueryReader::query.
         let plan = QueryPlan::for_instant_vector(adjusted_eval_ts, ctx.lookback_delta_ms);
 
-        execute_selector_pipeline(&self.reader, &plan, vector_selector, options)
+        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
     }
 
     fn eval_subquery_step(
@@ -536,58 +482,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok((current_time_ms, samples))
     }
 
-    /// Apply offset and @ modifiers to adjust the evaluation time.
-    ///
-    /// Implements PromQL time modifier semantics per the Prometheus specification:
-    /// - `offset <duration>`: Shifts evaluation time backward (positive) or forward (negative)
-    /// - `@ <timestamp>`: Sets absolute evaluation time
-    /// - `@ start()`: Uses query start time
-    /// - `@ end()`: Uses query end time
-    ///
-    /// When both modifiers are present, `offset` is applied relative to the `@`
-    /// modifier time. Although PromQL defines the result as order-independent
-    /// (e.g. `@ t offset d` == `offset d @ t`), we normalize the implementation
-    /// by applying `@` first and then applying `offset`. This keeps the logic
-    /// simple and matches Prometheus' semantics.
-    ///
-    /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#offset-modifier>
-    fn apply_time_modifiers(
-        &self,
-        at: Option<&AtModifier>,
-        offset: Option<&Offset>,
-        query_start: Timestamp,
-        query_end: Timestamp,
-        evaluation_ts: Timestamp,
-    ) -> EvalResult<Timestamp> {
-        let ms = apply_time_modifiers_ms(at, offset, query_start, query_end, evaluation_ts);
-        Ok(ms)
-    }
-
     fn evaluate_function_args(
         &self,
         ctx: &EvalContext,
         call: &Call,
-        func: PromQLFunctionImpl,
         preload_eligible: bool,
     ) -> EvalResult<Vec<PromQLArg>> {
         let args = &call.args.args;
-        let is_rollup = func.is_rollup();
         let mut evaluated_args = Vec::with_capacity(args.len());
         for (idx, arg) in args.iter().enumerate() {
-            let (arg_expr, expected_type) = get_function_arg(call, idx)?;
+            let (_, expected_type) = get_function_arg(call, idx)?;
 
-            // Fast path for rollup functions with VectorSelector args: if the argument is a VectorSelector subquery,
-            // we can evaluate it directly as a range vector without going through the bucketing process. The rollup
-            // machinery has a more efficient path for handling range vectors, so this avoids the unnecessary overhead
-            // of evaluating the subquery at each step.
-            let arg_result = if is_rollup
-                && let Expr::Subquery(subquery) = arg_expr
-                && matches!(*subquery.expr, Expr::VectorSelector(_))
-            {
-                self.evaluate_subquery(subquery, ctx, true)?
-            } else {
-                self.evaluate_expr(arg, ctx, preload_eligible)?
-            };
+            // VectorSelector subqueries take the range-based fast path inside
+            // evaluate_subquery, avoiding per-step evaluation.
+            let arg_result = self.evaluate_expr(arg, ctx, preload_eligible)?;
 
             let actual_type = arg_result.value_type();
             if actual_type != expected_type {
@@ -624,7 +532,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         }
 
-        let evaluated_args = self.evaluate_function_args(ctx, call, func, preload_eligible)?;
+        let evaluated_args = self.evaluate_function_args(ctx, call, preload_eligible)?;
         let result = func.apply_call(evaluated_args, ctx)?;
 
         if call.func.return_type == ValueType::Scalar {
@@ -888,13 +796,4 @@ fn is_selector(expr: &Expr) -> bool {
 
 fn should_parallelize_binary_expr(be: &BinaryExpr) -> bool {
     is_selector(be.lhs.as_ref()) && is_selector(be.rhs.as_ref())
-}
-
-fn should_parallelize_args_evaluation(call: &Call) -> bool {
-    call.args
-        .args
-        .iter()
-        .filter(|&arg| is_selector(arg))
-        .count()
-        > 1
 }

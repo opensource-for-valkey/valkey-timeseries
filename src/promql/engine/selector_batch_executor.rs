@@ -464,9 +464,9 @@ pub(in crate::promql) fn query_instant_local(
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
     validate_max_series_(series.len(), options.max_series)?;
-    // for instant queries, series length == number of returned samples, so should probably
-    // coalesce this with the max points per series validation.
-    validate_max_points_per_series(series.len(), options.max_points_per_series)?;
+    // No max-points-per-series validation here: an instant query yields at most one
+    // sample per series, so the per-series point limit can never be exceeded. The
+    // series count itself is bounded by `validate_max_series_` above.
 
     // PromQL instant-query semantics: return the most recent sample per series
     // whose timestamp falls within the lookback window (timestamp - lookback_delta, timestamp].

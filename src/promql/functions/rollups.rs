@@ -98,12 +98,9 @@ pub(super) fn exec_series_rollup(
             };
 
             if i < sample_len && i > 0 && timestamps[i - 1] > rollup_window.prev_timestamp {
-                // SAFETY: range is checked above
-                unsafe {
-                    let prev_idx = i - 1;
-                    rollup_window.prev_value = *values.get_unchecked(prev_idx);
-                    rollup_window.prev_timestamp = *timestamps.get_unchecked(prev_idx);
-                }
+                let prev_idx = i - 1;
+                rollup_window.prev_value = values[prev_idx];
+                rollup_window.prev_timestamp = timestamps[prev_idx];
             }
 
             rollup_window.values = &values[i..j];
@@ -116,28 +113,24 @@ pub(super) fn exec_series_rollup(
             if i > 0 {
                 let prev_idx = i - 1;
 
-                // SAFETY: i > 0 is checked above
-                unsafe {
-                    // set real_prev_value if rc.lookback_delta == 0
-                    // or if the distance between datapoint in the prev interval and the beginning of this interval
-                    // doesn't exceed lookback_delta.
-                    // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/894
-                    // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8045
-                    // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8935
+                // set real_prev_value if rc.lookback_delta == 0
+                // or if the distance between datapoint in the prev interval and the beginning of this interval
+                // doesn't exceed lookback_delta.
+                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/894
+                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8045
+                // https://github.com/VictoriaMetrics/VictoriaMetrics/issues/8935
 
-                    let mut curr_timestamp = t_start;
-                    if !rollup_window.timestamps.is_empty() {
-                        curr_timestamp = *rollup_window.timestamps.get_unchecked(0);
-                    }
+                let mut curr_timestamp = t_start;
+                if !rollup_window.timestamps.is_empty() {
+                    curr_timestamp = rollup_window.timestamps[0];
+                }
 
-                    // Use the actual timestamp of the preceding sample for the staleness
-                    // check, not a synthetic value of 0 or t_start.
-                    let prev_ts = *timestamps.get_unchecked(prev_idx);
+                // Use the actual timestamp of the preceding sample for the staleness
+                // check, not a synthetic value of 0 or t_start.
+                let prev_ts = timestamps[prev_idx];
 
-                    if lookback.is_zero() || (curr_timestamp - prev_ts) < lookback {
-                        let prev_value = values.get_unchecked(prev_idx);
-                        rollup_window.real_prev_value = *prev_value;
-                    }
+                if lookback.is_zero() || (curr_timestamp - prev_ts) < lookback {
+                    rollup_window.real_prev_value = values[prev_idx];
                 }
             }
 
