@@ -183,7 +183,7 @@ fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
     }
 }
 
-fn validate_cluster_exec(ctx: &Context) -> ValkeyResult<()> {
+pub(super) fn validate_cluster_exec(ctx: &Context) -> ValkeyResult<()> {
     if !is_clustered(ctx) {
         return Err(ValkeyError::Str("Cluster mode is not enabled"));
     }
@@ -230,8 +230,8 @@ pub(super) fn send_cluster_request(
     response_handler: FanoutResponseCallback,
     timeout: Option<Duration>,
 ) -> ValkeyResult<()> {
-    validate_cluster_exec(ctx)?;
-
+    // Note: cluster-mode / MULTI / Lua validation is performed earlier at the
+    // fanout entry point (`exec_command`), before any machinery is set up.
     let id = generate_id();
     let db = get_current_db(ctx);
     let user = get_fanout_user(ctx);

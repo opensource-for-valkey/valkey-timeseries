@@ -1,5 +1,5 @@
 use super::acl::{get_fanout_user, with_fanout_user};
-use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
+use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc, validate_cluster_exec};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
@@ -115,6 +115,11 @@ pub fn exec_command<OP: FanoutCommand, F>(
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
+    // Validate up front (cluster mode enabled, not in MULTI/Lua) so we fail early
+    // with a clear error before setting up any fanout machinery or dispatching
+    // local/remote requests.
+    validate_cluster_exec(ctx)?;
+
     let op = command;
 
     let FanoutTargets {
