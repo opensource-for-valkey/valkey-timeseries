@@ -27,6 +27,11 @@ fn parse_query(query: &str, options: &QueryOptions) -> QueryResult<Expr> {
     Ok(expr)
 }
 
+/// Number of range-query steps evaluated in parallel and folded into the series
+/// map per batch. Bounds peak intermediate memory to this many step results
+/// rather than materializing every step at once (see `evaluate_range`).
+const STEP_MERGE_CHUNK_SIZE: usize = 64;
+
 fn resolve_deadline_ms(opts: QueryOptions) -> i64 {
     if let Some(deadline) = opts.deadline {
         return deadline;
@@ -179,58 +184,70 @@ pub fn evaluate_range(
     let start_ms = system_time_to_millis(start);
     let end_ms = system_time_to_millis(end);
 
-    // Evaluate every step in parallel, each returning its timestamp + result.
-    let step_results: Vec<(Timestamp, ExprResult)> =
-        step_times(start_ms, end_ms, step.as_millis() as i64)
+    let step_ms = step.as_millis() as i64;
+    let lookback_delta_ms = lookback_delta.as_millis() as i64;
+
+    let eval_step = |t: Timestamp| -> QueryResult<(Timestamp, ExprResult)> {
+        // Best-effort per-step timeout check.
+        if deadline > 0 && current_time_millis() > deadline {
+            return Err(QueryError::Timeout);
+        }
+
+        let ctx = crate::promql::EvalContext {
+            query_start: start_ms,
+            query_end: end_ms,
+            evaluation_ts: t,
+            lookback_delta_ms,
+            step_ms,
+        };
+
+        let result = evaluator
+            .evaluate_with_context(&stmt.expr, ctx)
+            .map_err(QueryError::from)?;
+        Ok((t, result))
+    };
+
+    // Process steps in bounded chunks rather than materializing every step's
+    // result at once. Each chunk is evaluated in parallel and folded into the
+    // series map before the next chunk starts, so peak intermediate memory is
+    // bounded to `STEP_MERGE_CHUNK_SIZE` step results instead of O(steps).
+    //
+    // Ordering is preserved: `collect` keeps input order within a
+    // chunk, and chunks are drained in ascending step order, so the per-series
+    // sample vectors stay chronologically sorted without an extra sort.
+    let step_ts: Vec<Timestamp> = step_times(start_ms, end_ms, step_ms).collect();
+    let mut series_map = SeriesMap::default();
+
+    for chunk in step_ts.chunks(STEP_MERGE_CHUNK_SIZE) {
+        let chunk_results: Vec<(Timestamp, ExprResult)> = chunk
+            .iter()
+            .copied()
             .iter_into_par()
-            .map(|t| -> QueryResult<(Timestamp, ExprResult)> {
-                // Best-effort per-step timeout check.
-                if deadline > 0 && current_time_millis() > deadline {
-                    return Err(QueryError::Timeout);
-                }
-
-                let ctx = crate::promql::EvalContext {
-                    query_start: start_ms,
-                    query_end: end_ms,
-                    evaluation_ts: t,
-                    lookback_delta_ms: lookback_delta.as_millis() as i64,
-                    step_ms: step.as_millis() as i64,
-                };
-
-                let result = evaluator
-                    .evaluate_with_context(&stmt.expr, ctx)
-                    .map_err(QueryError::from)?;
-                Ok((t, result))
-            })
+            .map(eval_step)
             .into_fallible_result()
             .collect()?;
 
-    // Merge per-step results into the series map. orx-parallel's `collect`
-    // preserves input order, so `step_results` is in ascending step-timestamp
-    // order and the per-series sample vectors built here are chronologically
-    // sorted without an extra sort.
-    let mut series_map = SeriesMap::default();
-
-    for (current_time, result) in step_results {
-        match result {
-            ExprResult::InstantVector(samples) => {
-                merge_step_into_series_map(&mut series_map, current_time, samples);
-            }
-            ExprResult::Scalar(value) => {
-                series_map
-                    .entry(EvalLabels::empty())
-                    .or_default()
-                    .push(Sample::new(current_time, value));
-            }
-            ExprResult::RangeVector(_) => {
-                return Err(QueryError::Execution(
-                    "range vectors not supported in range query evaluation".to_string(),
-                ));
-            }
-            ExprResult::String(_) => {
-                return Err(QueryError::Execution(
-                    "string expressions not supported in range query evaluation".to_string(),
-                ));
+        for (current_time, result) in chunk_results {
+            match result {
+                ExprResult::InstantVector(samples) => {
+                    merge_step_into_series_map(&mut series_map, current_time, samples);
+                }
+                ExprResult::Scalar(value) => {
+                    series_map
+                        .entry(EvalLabels::empty())
+                        .or_default()
+                        .push(Sample::new(current_time, value));
+                }
+                ExprResult::RangeVector(_) => {
+                    return Err(QueryError::Execution(
+                        "range vectors not supported in range query evaluation".to_string(),
+                    ));
+                }
+                ExprResult::String(_) => {
+                    return Err(QueryError::Execution(
+                        "string expressions not supported in range query evaluation".to_string(),
+                    ));
+                }
             }
         }
     }
