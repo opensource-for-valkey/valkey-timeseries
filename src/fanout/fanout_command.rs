@@ -27,7 +27,7 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// The request type.
     type Request: Serializable + Send + 'static;
     /// The response type.
-    type Response: Serializable + Default + Send;
+    type Response: Serializable + Send;
 
     /// Return the name of the fanout operation.
     fn name() -> &'static str;
@@ -65,13 +65,6 @@ pub trait FanoutCommand: Default + Send + 'static {
         exec_command(ctx, self, targets, timeout, f)
     }
 
-    /// Execute the fanout operation across nodes and wait synchronously for the response.
-    fn exec_sync(self, ctx: &Context) -> FanoutResult<Self::Response> {
-        let timeout = self.get_timeout();
-        let targets = self.get_targets(ctx);
-        exec_command_sync(ctx, self, targets, timeout)
-    }
-
     /// Generate the request to be sent to each target node.
     fn generate_request(&self) -> Self::Request;
 
@@ -97,12 +90,6 @@ pub trait FanoutCommand: Default + Send + 'static {
         Self::Response::default()
     }
 
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
-    }
-
     fn generate_error_reply(&self) -> FanoutError {
         FanoutError::custom(format!(
             "Internal error in fanout operation '{}'",
@@ -112,6 +99,7 @@ pub trait FanoutCommand: Default + Send + 'static {
 }
 
 /// Execute the fanout operation across cluster nodes.
+/// todo: pass in nodes to target instead of letting the command decide, for better separation of concerns.
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
@@ -122,11 +110,6 @@ pub fn exec_command<OP: FanoutCommand, F>(
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
-    // Validate up front (cluster mode enabled, not in MULTI/Lua) so we fail early
-    // with a clear error before setting up any fanout machinery or dispatching
-    // local/remote requests.
-    validate_cluster_exec(ctx)?;
-
     let op = command;
     let started = Instant::now();
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
