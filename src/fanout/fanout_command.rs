@@ -1,11 +1,10 @@
 use super::acl::{get_fanout_user, with_fanout_user};
-use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc, validate_cluster_exec};
+use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
 use crate::fanout::serialization::{Deserialized, Serializable};
 use crate::fanout::{FanoutResult, FanoutTargetMode, FanoutTargets, NodeInfo, get_fanout_targets};
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT, ValkeyResult};
@@ -21,7 +20,7 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// The request type.
     type Request: Serializable + Send + 'static;
     /// The response type.
-    type Response: Serializable + Default + Send;
+    type Response: Serializable + Send;
 
     /// Return the name of the fanout operation.
     fn name() -> &'static str;
@@ -50,13 +49,6 @@ pub trait FanoutCommand: Default + Send + 'static {
         let timeout = self.get_timeout();
         let targets = self.get_targets(ctx);
         exec_command(ctx, self, targets, timeout, f)
-    }
-
-    /// Execute the fanout operation across nodes and wait synchronously for the response.
-    fn exec_sync(self, ctx: &Context) -> FanoutResult<Self::Response> {
-        let timeout = self.get_timeout();
-        let targets = self.get_targets(ctx);
-        exec_command_sync(ctx, self, targets, timeout)
     }
 
     /// Generate the request to be sent to each target node.
@@ -90,12 +82,6 @@ pub trait FanoutCommand: Default + Send + 'static {
         false
     }
 
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
-    }
-
     fn generate_error_reply(&self) -> FanoutError {
         FanoutError::custom(format!(
             "Internal error in fanout operation '{}'",
@@ -105,6 +91,7 @@ pub trait FanoutCommand: Default + Send + 'static {
 }
 
 /// Execute the fanout operation across cluster nodes.
+/// todo: pass in nodes to target instead of letting the command decide, for better separation of concerns.
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
@@ -115,11 +102,6 @@ pub fn exec_command<OP: FanoutCommand, F>(
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
-    // Validate up front (cluster mode enabled, not in MULTI/Lua) so we fail early
-    // with a clear error before setting up any fanout machinery or dispatching
-    // local/remote requests.
-    validate_cluster_exec(ctx)?;
-
     let op = command;
 
     let FanoutTargets {
@@ -187,38 +169,6 @@ enum FanoutLifecycleState {
     Active,
     /// Completion callback already ran (or was explicitly finalized).
     Completed,
-}
-
-/// Execute the fanout operation across cluster nodes and wait synchronously for the response.
-pub fn exec_command_sync<OP: FanoutCommand>(
-    ctx: &Context,
-    command: OP,
-    targets: Arc<HashSet<NodeInfo>>,
-    timeout: Duration,
-) -> FanoutResult<OP::Response> {
-    use std::sync::Condvar;
-
-    let pair = Arc::new((Mutex::new(None), Condvar::new()));
-    let pair_clone = pair.clone();
-
-    let callback = move |op: OP, result: FanoutCommandResult| {
-        let (lock, cvar) = &*pair_clone;
-        let mut completed = lock.lock().expect(MUTEX_POISONED_MSG);
-        *completed = Some((op, result));
-        cvar.notify_one();
-    };
-
-    exec_command(ctx, command, targets, timeout, callback)?;
-
-    let (lock, cvar) = &*pair;
-    let mut completed = lock.lock().expect(MUTEX_POISONED_MSG);
-    while completed.is_none() {
-        completed = cvar.wait(completed).expect(MUTEX_POISONED_MSG);
-    }
-
-    let (op, result) = completed.take().unwrap();
-    result.map(|_| op.get_response())
-}
 }
 
 /// Internal structure to manage the state of an ongoing fanout operation.
@@ -438,7 +388,7 @@ fn spawn_local_request<OP, F>(
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     spawn(move || {
-        // Minimize the scope of GIL locking, avoiding re-entering the `GIL` which is non-reentrant.
+        // Minimize the scope of GIL locking, avoiding re-entering the GIL which is non-reentrant.
         let result = {
             let ctx = MODULE_CONTEXT.lock();
             with_fanout_user(&ctx, user.as_deref(), |ctx| {

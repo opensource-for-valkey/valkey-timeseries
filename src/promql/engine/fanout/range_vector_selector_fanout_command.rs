@@ -63,6 +63,13 @@ impl RangeVectorSelectorFanoutCommand {
             seen: Default::default(),
         }
     }
+
+    /// Consume the accumulated selector results into the final response.
+    pub fn get_response(self) -> RangeQueryResponse {
+        RangeQueryResponse {
+            series: self.series,
+        }
+    }
 }
 
 impl FanoutCommand for RangeVectorSelectorFanoutCommand {
@@ -123,11 +130,5 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
         }
         self.series.extend(resp.series);
         Ok(())
-    }
-
-    fn get_response(self) -> Self::Response {
-        RangeQueryResponse {
-            series: self.series,
-        }
     }
 }

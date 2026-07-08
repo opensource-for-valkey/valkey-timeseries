@@ -14,7 +14,7 @@ pub type FanoutContext = ReplyContext;
 /// This is a higher-level abstraction over `FanoutCommand` that includes client response handling logic.
 pub trait FanoutClientCommand: Default + Send + 'static {
     type Request: Serializable + Send + 'static;
-    type Response: Serializable + Default + Send;
+    type Response: Serializable + Send;
 
     fn name() -> &'static str;
 
@@ -31,12 +31,6 @@ pub trait FanoutClientCommand: Default + Send + 'static {
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 
-    /// Return the final response after the fanout operation is complete.
-    /// By default, it returns a default instance of the response type.
-    fn get_response(self) -> Self::Response {
-        Self::Response::default()
-    }
-
     /// NOTE: Use the provided `FanoutContext` reply helpers. This is already
     /// running on the main thread and does not require locking.
     fn reply(&mut self, ctx: &FanoutContext) -> Status;
@@ -47,9 +41,8 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     where
         Self: FanoutCommand,
     {
-        let blocked_client: Arc<Mutex<FanoutBlockedClient<Self>>> =
-            Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx)));
-        let bc_for_closure: Arc<Mutex<FanoutBlockedClient<Self>>> = Arc::clone(&blocked_client);
+        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx)));
+        let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
             // Runs on a background thread once all shard responses arrive.
@@ -64,7 +57,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
             Err(err) => {
                 // Set an error payload so the reply_callback sends back the
                 // proper error message instead of "No reply data".
-                let op: Self = Self::default();
+                let op = Self::default();
                 let fanout_result: FanoutResult = Err(err);
                 if let Ok(mut bc) = blocked_client.lock() {
                     bc.set_private_data(op, fanout_result);
@@ -80,10 +73,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
 }
 
 // ── Blanket impl of FanoutCommand ────────────────────────────────────────────
-impl<T: FanoutClientCommand> FanoutCommand for T
-where
-    <T as FanoutClientCommand>::Response: std::default::Default,
-{
+impl<T: FanoutClientCommand> FanoutCommand for T {
     type Request = T::Request;
     type Response = T::Response;
 
@@ -109,9 +99,5 @@ where
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
         FanoutClientCommand::on_response(self, resp, target)
-    }
-
-    fn get_response(self) -> Self::Response {
-        FanoutClientCommand::get_response(self)
     }
 }

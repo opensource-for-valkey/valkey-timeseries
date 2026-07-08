@@ -66,6 +66,13 @@ impl InstantVectorSelectorFanoutCommand {
             seen: FingerprintHashSet::default(),
         }
     }
+
+    /// Consume the accumulated selector results into the final response.
+    pub fn get_response(self) -> InstantQueryResponse {
+        InstantQueryResponse {
+            samples: self.results,
+        }
+    }
 }
 
 impl FanoutCommand for InstantVectorSelectorFanoutCommand {
@@ -126,11 +133,5 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         }
         self.results.append(&mut resp.samples);
         Ok(())
-    }
-
-    fn get_response(self) -> Self::Response {
-        InstantQueryResponse {
-            samples: self.results,
-        }
     }
 }
