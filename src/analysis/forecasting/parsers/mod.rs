@@ -7,7 +7,7 @@ mod utils;
 
 pub use model_parser::*;
 pub use spec_parser::*;
-pub use transform_parser::*;
+// pub use transform_parser::*;
 pub use utils::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, strum::EnumString, strum::Display)]
