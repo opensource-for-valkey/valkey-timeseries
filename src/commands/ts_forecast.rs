@@ -36,7 +36,7 @@ struct ForecastOptions {
 
 /// Forecasts future values of a time series using a specified model.
 ///
-/// ```
+/// ```text
 ///  TS.FORECAST key start_timestamp end_timestamp
 ///   MODELS model spec, ..
 ///   HORIZON horizon
@@ -55,7 +55,7 @@ struct ForecastOptions {
 ///   ]
 /// ```
 ///
-pub(crate) fn ts_forecast_command(ctx: &mut Context, args: Vec<ValkeyString>) -> ValkeyResult {
+pub(crate) fn ts_forecast_command(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 8 {
         return Err(ValkeyError::WrongArity);
     }
@@ -181,20 +181,21 @@ fn store_forecast_if_necessary(
 
 fn process_models(
     series: &ForecastTimeSeries,
-    models: Vec<BoxedForecaster>,
+    models: Vec<(BoxedForecaster, String)>,
     options: &ForecastOptions,
 ) -> ValkeyResult<Vec<ForecastOutput>> {
     let mut results = Vec::new();
-    let mut models: Vec<DynForecaster> = models.into_iter().map(DynForecaster::from).collect();
-    for model in models.iter_mut() {
-        let output = run_forecast(
+    for (model, spec_name) in models {
+        let mut model: DynForecaster = DynForecaster::from(model);
+        let mut output = run_forecast(
             series,
-            model,
+            &mut model,
             options.horizon,
             options.level,
             options.include_metrics,
             None, // seasonal_period can be added as an option if needed
         )?;
+        output.model_name = spec_name;
         results.push(output);
     }
     Ok(results)

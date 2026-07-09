@@ -63,6 +63,7 @@ pub use ts_decompose::*;
 pub use ts_features::*;
 pub use ts_fillgaps_cmd::*;
 pub use ts_fillgaps::*;
+pub(crate) use ts_forecast::*;
 pub use ts_mget::*;
 pub use ts_periods::*;
 pub use ts_sanitize::*;
