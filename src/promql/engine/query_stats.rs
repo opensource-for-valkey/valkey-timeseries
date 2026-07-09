@@ -188,7 +188,7 @@ impl QueryStatsTracker {
                 count,
             })
         }
-        a.sort_by(|a, b| a.count.cmp(&b.count));
+        a.sort_by_key(|a| a.count);
         if a.len() > top_n {
             a.resize(top_n, QueryStatByCount::default());
         }
@@ -235,7 +235,7 @@ impl QueryStatsTracker {
                 count: ks.count as u64,
             })
         }
-        a.sort_by(|a, b| a.duration.cmp(&b.duration));
+        a.sort_by_key(|a| a.duration);
 
         if a.len() > top_n {
             a.resize(top_n, QueryStatByDuration::default());
@@ -279,7 +279,7 @@ impl QueryStatsTracker {
                 count: kd.count as u64,
             })
         }
-        a.sort_by(|a, b| a.duration.cmp(&b.duration));
+        a.sort_by_key(|a| a.duration);
         if a.len() > top_n {
             a.resize(top_n, QueryStatByDuration::default());
         }
