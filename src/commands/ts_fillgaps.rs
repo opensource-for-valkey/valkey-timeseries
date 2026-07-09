@@ -39,7 +39,10 @@ use valkey_module::{
 /// a custom reference, or `ALIGN start` (or `-`) to align to startTimestamp.
 /// Only timestamps within [startTimestamp, endTimestamp] are filled.
 ///
-/// Returns the number of gaps filled.
+/// The source series itself is never modified. Without STORE, the filled gap
+/// samples are returned as an array of [timestamp, value] pairs and are not
+/// persisted anywhere. With STORE, the filled gap samples are written to the
+/// destination key and the number of samples written is returned.
 pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
@@ -144,6 +147,8 @@ pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Ok(ValkeyValue::from(written));
     }
 
+    // No STORE clause: the filled gaps are returned to the caller only; the
+    // source series is left untouched.
     reply_with_samples(ctx, gap_samples.iter().cloned());
 
     Ok(ValkeyValue::NoReply)

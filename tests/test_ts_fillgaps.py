@@ -80,7 +80,7 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         assert info['totalSamples'] == 5
 
     def test_fillgaps_basic_with_gaps(self):
-        """Fill gaps in a series with missing timestamps."""
+        """Fill gaps in a series with missing timestamps; source is untouched."""
         self.client.execute_command('TS.CREATE', 'ts2')
         # Add samples at 1000, 3000, 5000 (missing 2000 and 4000)
         self.client.execute_command('TS.ADD', 'ts2', 1000, 10)
@@ -91,16 +91,16 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts2', 1000, 5000, 'FREQUENCY', 1000
         )
         assert len(filled) == 2  # timestamps 2000 and 4000
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
+        assert parsed[1][0] == 4000
 
-        # Verify all 5 samples exist
+        # Source series is unchanged; without STORE, gaps are never written back
         result = self._get_values('ts2')
-        assert len(result) == 5
-        assert result[0] == (1000, 10.0)
-        assert result[2] == (3000, 30.0)
-        assert result[4] == (5000, 50.0)
+        assert result == [(1000, 10.0), (3000, 30.0), (5000, 50.0)]
 
     def test_fillgaps_default_nan_value(self):
-        """Fill gaps with default NaN fill value."""
+        """Fill gaps with default NaN fill value; result is returned, not stored."""
         self.client.execute_command('TS.CREATE', 'ts3')
         self.client.execute_command('TS.ADD', 'ts3', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts3', 3000, 30)
@@ -109,14 +109,15 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts3', 1000, 3000, 'FREQUENCY', 1000
         )
         assert len(filled) == 1  # timestamp 2000 filled with NaN
+        assert filled[0][0] == 2000
+        assert math.isnan(float(filled[0][1])), f"Expected NaN, got {filled[0][1]}"
 
-        result = self.client.execute_command('TS.RANGE', 'ts3', '-', '+')
-        assert len(result) == 3
-        # Check the gap value is NaN
-        assert math.isnan(float(result[1][1])), f"Expected NaN, got {result[1][1]}"
+        # Source series is unchanged
+        result = self._get_values('ts3')
+        assert result == [(1000, 10.0), (3000, 30.0)]
 
     def test_fillgaps_custom_value(self):
-        """Fill gaps with a custom VALUE."""
+        """Fill gaps with a custom VALUE; result is returned, not stored."""
         self.client.execute_command('TS.CREATE', 'ts4')
         self.client.execute_command('TS.ADD', 'ts4', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts4', 3000, 30)
@@ -126,13 +127,15 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'VALUE', 0.0
         )
         assert len(filled) == 1
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0] == (2000, 0.0)
 
+        # Source series is unchanged
         result = self._get_values('ts4')
-        assert len(result) == 3
-        assert result[1] == (2000, 0.0)  # filled with custom value
+        assert result == [(1000, 10.0), (3000, 30.0)]
 
     def test_fillgaps_custom_negative_value(self):
-        """Fill gaps with a negative VALUE."""
+        """Fill gaps with a negative VALUE; result is returned, not stored."""
         self.client.execute_command('TS.CREATE', 'ts_neg')
         self.client.execute_command('TS.ADD', 'ts_neg', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_neg', 3000, 30)
@@ -142,9 +145,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'VALUE', -1.5
         )
         assert len(filled) == 1
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0] == (2000, -1.5)
 
+        # Source series is unchanged
         result = self._get_values('ts_neg')
-        assert result[1] == (2000, -1.5)
+        assert result == [(1000, 10.0), (3000, 30.0)]
 
     # ------------------------------------------------------------------
     # Frequency inference tests
@@ -169,9 +175,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts_infer', 1000, 3500
         )
         assert len(filled) == 2  # 1500 and 2500
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [1500, 2500]
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_infer')
-        assert timestamps == [1000, 1500, 2000, 2500, 3000, 3500]
+        assert timestamps == [1000, 2000, 3000, 3500]
 
     def test_fillgaps_inferred_frequency_large_step(self):
         """GCD-based inference recovers the original frequency after deletions.
@@ -194,9 +203,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # Grid with 10000ms: 0, 10000, 20000, 30000, 40000, 50000
         # Gaps at 10000 and 30000
         assert len(filled) == 2
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [10000, 30000]
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_gcd')
-        assert timestamps == [0, 10000, 20000, 30000, 40000, 50000]
+        assert timestamps == [0, 20000, 40000, 50000]
 
     # ------------------------------------------------------------------
     # ALIGN tests
@@ -233,11 +245,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'ALIGN', 0
         )
         assert len(filled) == 1  # 2000 only; 1000 is before start_ts
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_align2')
-        assert 1100 in timestamps
-        assert 2000 in timestamps
-        assert 2100 in timestamps
+        assert timestamps == [1100, 2100]
 
     def test_fillgaps_align_already_on_grid(self):
         """ALIGN when startTimestamp is already on the frequency grid relative to align timestamp."""
@@ -251,9 +264,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'ALIGN', 0
         )
         assert len(filled) == 1  # 2000 is the gap
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_grid')
-        assert timestamps == [1000, 2000, 3000]
+        assert timestamps == [1000, 3000]
 
     def test_fillgaps_align_with_frequency(self):
         """ALIGN combined with explicit frequency and align timestamp.
@@ -276,11 +292,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'ALIGN', 0
         )
         assert len(filled) == 3
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [2000, 3000, 4000]
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_align_freq')
-        assert 2000 in timestamps
-        assert 3000 in timestamps
-        assert 4000 in timestamps
+        assert timestamps == [1100, 3100, 4100]
 
     def test_fillgaps_align_with_non_zero_reference(self):
         """ALIGN with a non-zero align timestamp shifts the grid accordingly."""
@@ -313,14 +330,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'ALIGN', 500
         )
         assert len(filled) == 2  # 1500 and 2500
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [1500, 2500]
 
+        # Source series is unchanged (no STORE): only original samples remain
         timestamps = self._get_timestamps('ts_align_diff')
-        # Original samples preserved: 1000, 3000
-        # Filled gaps: 1500, 2500
-        assert 1000 in timestamps
-        assert 1500 in timestamps
-        assert 2500 in timestamps
-        assert 3000 in timestamps
+        assert timestamps == [1000, 3000]
 
     def test_fillgaps_align_reference_before_range(self):
         """ALIGN with reference timestamp before the data range."""
@@ -383,9 +398,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 100, 'ALIGN', 100
         )
         assert len(filled) == 1
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 200
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_align_match')
-        assert timestamps == [0, 100, 200, 300, 400]
+        assert timestamps == [0, 100, 300, 400]
 
     # ------------------------------------------------------------------
     # Range boundary and partial overlap tests
@@ -400,9 +418,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts_before', 1000, 4000, 'FREQUENCY', 1000
         )
         assert len(filled) == 4  # 1000, 2000, 3000, 4000
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [1000, 2000, 3000, 4000]
 
+        # Source series is unchanged (no STORE)
         result = self._get_values('ts_before')
-        assert len(result) == 7  # 4 filled + 3 existing
+        assert len(result) == 3
 
     def test_fillgaps_range_after_data(self):
         """Fill gaps in a range entirely after existing data."""
@@ -413,9 +434,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts_after', 4000, 7000, 'FREQUENCY', 1000
         )
         assert len(filled) == 4  # 4000, 5000, 6000, 7000
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [4000, 5000, 6000, 7000]
 
+        # Source series is unchanged (no STORE)
         result = self._get_values('ts_after')
-        assert len(result) == 7  # 3 existing + 4 filled
+        assert len(result) == 3
 
     def test_fillgaps_range_sparse_data(self):
         """Fill gaps where existing data is sparse relative to the range."""
@@ -428,11 +452,9 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled) == 8  # 2000..9000 and already have 1000 & 10000
 
+        # Source series is unchanged (no STORE)
         result = self._get_values('ts_sparse')
-        assert len(result) == 10
-        # original values should be at their positions
-        assert result[0] == (1000, 10.0)
-        assert result[9] == (10000, 100.0)
+        assert result == [(1000, 10.0), (10000, 100.0)]
 
     def test_fillgaps_exact_boundaries(self):
         """Fill gaps with start and end exactly matching existing timestamps."""
@@ -444,9 +466,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts_exact', 1000, 5000, 'FREQUENCY', 1000
         )
         assert len(filled) == 3  # 2000, 3000, 4000; 1000&5000 already exist
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [2000, 3000, 4000]
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_exact')
-        assert timestamps == [1000, 2000, 3000, 4000, 5000]
+        assert timestamps == [1000, 5000]
 
     # ------------------------------------------------------------------
     # Existing samples are preserved
@@ -482,21 +507,19 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'VALUE', -999.0
         )
         assert len(filled) == 2  # 2000, 4000
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed == [(2000, -999.0), (4000, -999.0)]
 
+        # Source series is unchanged (no STORE); original values untouched
         result = self._get_values('ts_mixed')
-        assert len(result) == 5
-        assert result[0] == (1000, 10.0)    # original
-        assert result[1] == (2000, -999.0)  # filled
-        assert result[2] == (3000, 30.0)    # original
-        assert result[3] == (4000, -999.0)  # filled
-        assert result[4] == (5000, 50.0)    # original
+        assert result == [(1000, 10.0), (3000, 30.0), (5000, 50.0)]
 
     # ------------------------------------------------------------------
     # totalSamples / INFO verification
     # ------------------------------------------------------------------
 
-    def test_fillgaps_updates_total_samples(self):
-        """Verify totalSamples increases by the number of gaps filled."""
+    def test_fillgaps_leaves_total_samples_unchanged(self):
+        """Verify totalSamples is unaffected by FILLGAPS without STORE."""
         self._create_series_with_uniform_data('ts_info', 1000, 1000, 3)
         # 3 samples
 
@@ -512,7 +535,7 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         assert len(filled) == 1
 
         info_after = self.ts_info('ts_info')
-        assert info_after['totalSamples'] == 3
+        assert info_after['totalSamples'] == 2
 
     # ------------------------------------------------------------------
     # Large dataset tests
@@ -529,8 +552,9 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled) == 99  # 1000, 2000, ..., 99000 (99 gaps, 0 and 100000 already exist)
 
+        # Source series is unchanged (no STORE)
         info = self.ts_info('ts_large_gaps')
-        assert info['totalSamples'] == 101  # 2 original + 99 filled
+        assert info['totalSamples'] == 2
 
     def test_fillgaps_with_many_existing_samples(self):
         """Fill gaps in a series that already has many regular samples."""
@@ -546,8 +570,9 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled) == 50
 
+        # Source series is unchanged (no STORE)
         info = self.ts_info('ts_dense')
-        assert info['totalSamples'] == 100
+        assert info['totalSamples'] == 50
 
     # ------------------------------------------------------------------
     # Error cases
@@ -698,10 +723,14 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled) == 1
 
+        # The filled gap at 2000 should be NaN (default), returned but not stored
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
+        assert math.isnan(parsed[0][1])
+
+        # Source series is unchanged (no STORE)
         result = self._get_values('ts_single_ts')
-        # The filled gap at 2000 should be NaN (default)
-        nan_filled = any(t == 2000 and math.isnan(v) for t, v in result)
-        assert nan_filled, f"Expected NaN at timestamp 2000, got: {result}"
+        assert result == [(1000, 10.0)]
 
     def test_fillgaps_with_nan_as_custom_value(self):
         """Explicitly set VALUE to NaN (same as default but explicit)."""
@@ -714,9 +743,13 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'VALUE', 'nan'
         )
         assert len(filled) == 1
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
+        assert math.isnan(parsed[0][1])
 
+        # Source series is unchanged (no STORE)
         result = self.client.execute_command('TS.RANGE', 'ts_nan_val', '-', '+')
-        assert math.isnan(float(result[1][1]))
+        assert len(result) == 2
 
     def test_fillgaps_frequency_as_duration_string(self):
         """Use duration strings (e.g., '1s', '500ms') for FREQUENCY."""
@@ -730,9 +763,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'TS.FILLGAPS', 'ts_duration', 1000, 3000, 'FREQUENCY', "1s"
         )
         assert len(filled) == 1  # 2000
+        parsed = self._parse_fillgaps_result(filled)
+        assert parsed[0][0] == 2000
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_duration')
-        assert timestamps == [1000, 2000, 3000]
+        assert timestamps == [1000, 3000]
 
     def test_fillgaps_align_with_large_offset(self):
         """ALIGN with off-grid existing samples snaps them to the aligned grid.
@@ -752,12 +788,12 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
             'FREQUENCY', 1000, 'ALIGN', 0
         )
         assert len(filled) == 4  # 1000, 2000, 3000, 4000
+        parsed = self._parse_fillgaps_result(filled)
+        assert [ts for ts, _ in parsed] == [1000, 2000, 3000, 4000]
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_align_offset')
-        assert 1000 in timestamps
-        assert 2000 in timestamps
-        assert 3000 in timestamps
-        assert 4000 in timestamps
+        assert timestamps == [1500, 3500]
 
     def test_fillgaps_end_before_start(self):
         """Error when endTimestamp is before startTimestamp."""
@@ -791,10 +827,16 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         # 2000, 2100, 2200, 2300, 2400, 2500 = 6 gaps
         assert len(filled) > 0
 
-        # Verify all timestamps from 1000 to 5900 step 100 exist
+        # Verify the computed gap-fill samples cover the deleted range
+        parsed = self._parse_fillgaps_result(filled)
+        filled_timestamps = {ts for ts, _ in parsed}
+        for ts in range(2000, 2600, 100):
+            assert ts in filled_timestamps, f"Timestamp {ts} missing from fill result"
+
+        # Source series is unchanged (no STORE): deleted timestamps remain gaps
         timestamps = self._get_timestamps('ts_chunks')
-        for ts in range(1000, 6000, 100):
-            assert ts in timestamps, f"Timestamp {ts} missing after fill"
+        for ts in range(2000, 2600, 100):
+            assert ts not in timestamps, f"Timestamp {ts} should not have been written back"
 
     # ------------------------------------------------------------------
     # Return value verification
@@ -831,7 +873,8 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
     # ------------------------------------------------------------------
 
     def test_fillgaps_idempotent(self):
-        """Running FILLGAPS twice on the same range produces empty array on second call."""
+        """Without STORE, repeated calls on the same range are pure and
+        produce identical results each time, since nothing is persisted."""
         self.client.execute_command('TS.CREATE', 'ts_idempotent')
         self.client.execute_command('TS.ADD', 'ts_idempotent', 1000, 10)
         self.client.execute_command('TS.ADD', 'ts_idempotent', 3000, 30)
@@ -842,18 +885,22 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled1) == 1
 
-        # Second fill on same range
+        # Second fill on same range produces the same gap, since nothing was stored
         filled2 = self.client.execute_command(
             'TS.FILLGAPS', 'ts_idempotent', 1000, 3000, 'FREQUENCY', 1000
         )
-        assert filled2 == []
+        assert len(filled2) == 1
+        parsed1 = self._parse_fillgaps_result(filled1)
+        parsed2 = self._parse_fillgaps_result(filled2)
+        assert parsed1[0][0] == parsed2[0][0] == 2000
+        assert math.isnan(parsed1[0][1]) and math.isnan(parsed2[0][1])
 
-        # Verify totalSamples didn't double-count
+        # Verify totalSamples never changed
         info = self.ts_info('ts_idempotent')
-        assert info['totalSamples'] == 3
+        assert info['totalSamples'] == 2
 
     def test_fillgaps_multiple_ranges(self):
-        """Fill gaps in multiple non-overlapping ranges."""
+        """Fill gaps in multiple non-overlapping ranges; source stays unchanged."""
         self.client.execute_command('TS.CREATE', 'ts_multi')
         self.client.execute_command('TS.ADD', 'ts_multi', 0, 0)
         self.client.execute_command('TS.ADD', 'ts_multi', 5000, 50)
@@ -871,8 +918,9 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         )
         assert len(filled2) == 4  # 6000, 7000, 8000, 9000; 5000&10000 already exist
 
+        # Source series is unchanged (no STORE)
         timestamps = self._get_timestamps('ts_multi')
-        assert timestamps == [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+        assert timestamps == [0, 5000, 10000]
 
     # ------------------------------------------------------------------
     # STORE clause
@@ -896,7 +944,8 @@ class TestTimeSeriesFillgaps(ValkeyTimeSeriesTestCaseBase):
         assert self.client.execute_command('EXISTS', 'dest_store1') == 1
         stored = self._get_values('dest_store1')
         assert len(stored) == 2
-        assert stored == [(2000, float('nan')), (4000, float('nan'))]
+        assert stored[0][0] == 2000
+        assert stored[1][0] == 4000
         assert math.isnan(stored[0][1])
         assert math.isnan(stored[1][1])
 
