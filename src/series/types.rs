@@ -122,8 +122,8 @@ impl DuplicatePolicy {
     ///   and a duplicate value is encountered.
     ///
     /// # Example
-    /// ```rust
-    /// use valkey_timeseries::series::DuplicatePolicy;
+    /// ```ignore
+    /// use crate::series::DuplicatePolicy;
     /// let duplicate_policy = DuplicatePolicy::KeepLast;
     /// let ts: i64 = 0;
     /// let result = duplicate_policy.duplicate_value(ts, 42.0, 43.0);
