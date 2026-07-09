@@ -1,12 +1,12 @@
+use super::ForecastTransformKind;
 use super::SpecValue;
 use super::transform_spec_parser::{TransformSpec, TransformSpecError, parse_transform_specs};
-use super::ForecastTransformKind;
 use crate::analysis::forecasting::DynTransform;
-use anofox_forecast::transform::{Pipeline, Transform};
 use anofox_forecast::transform::transforms::{
     BoxCoxTransform, DifferenceTransform, LogTransform, ScaleMethod, ScaleTransform,
     SeasonalDifferenceTransform, YeoJohnsonTransform,
 };
+use anofox_forecast::transform::{Pipeline, Transform};
 
 pub fn build_transforms_from_specs(
     input: &str,
@@ -31,7 +31,9 @@ pub fn build_transform_pipeline(input: &str) -> Result<Pipeline, TransformSpecEr
     Ok(pipeline)
 }
 
-pub fn build_single_transform(mut spec: TransformSpec) -> Result<Box<dyn Transform>, TransformSpecError> {
+pub fn build_single_transform(
+    mut spec: TransformSpec,
+) -> Result<Box<dyn Transform>, TransformSpecError> {
     match spec.transform_type {
         ForecastTransformKind::Difference => {
             spec.ensure_arity(1)?;
@@ -125,7 +127,10 @@ fn remove_kwarg(spec: &mut TransformSpec, key: &str) -> Option<SpecValue> {
     }
 }
 
-fn parse_scale_method(value: &SpecValue, transform_name: &str) -> Result<ScaleMethod, TransformSpecError> {
+fn parse_scale_method(
+    value: &SpecValue,
+    transform_name: &str,
+) -> Result<ScaleMethod, TransformSpecError> {
     let ident = value.as_ident().ok_or_else(|| {
         TransformSpecError::new(format!(
             "Transform {transform_name} expects scale method as identifier or string"
@@ -168,8 +173,9 @@ mod tests {
     #[test]
     fn rejects_boxcox_duplicate_lambda_sources() {
         let err = build_transforms_from_specs("BoxCox(0.25, lambda=0.5)").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("received lambda both positionally and as keyword"));
+        assert!(
+            err.to_string()
+                .contains("received lambda both positionally and as keyword")
+        );
     }
 }

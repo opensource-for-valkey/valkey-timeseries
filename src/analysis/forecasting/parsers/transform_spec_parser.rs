@@ -23,7 +23,6 @@ impl TransformSpec {
             )))
         }
     }
-
 }
 
 pub fn parse_transform_specs(input: &str) -> Result<Vec<TransformSpec>, TransformSpecError> {
@@ -31,10 +30,7 @@ pub fn parse_transform_specs(input: &str) -> Result<Vec<TransformSpec>, Transfor
         .into_iter()
         .map(|spec| {
             let transform_type = spec.name.parse().map_err(|_| {
-                TransformSpecError::new(format!(
-                    "Unsupported transform name {}",
-                    spec.name
-                ))
+                TransformSpecError::new(format!("Unsupported transform name {}", spec.name))
             })?;
             Ok(TransformSpec {
                 transform_name: spec.name,

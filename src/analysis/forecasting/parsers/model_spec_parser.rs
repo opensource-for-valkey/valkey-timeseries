@@ -150,10 +150,9 @@ pub fn parse_model_specs(input: &str) -> Result<Vec<ModelSpec>, ModelSpecError> 
     parse_specs(input)?
         .into_iter()
         .map(|spec| {
-            let model_type: ForecastModelKind = spec
-                .name
-                .parse()
-                .map_err(|_| ModelSpecError::new(format!("Unsupported model name {}", spec.name)))?;
+            let model_type: ForecastModelKind = spec.name.parse().map_err(|_| {
+                ModelSpecError::new(format!("Unsupported model name {}", spec.name))
+            })?;
             Ok(ModelSpec {
                 model_name: spec.name,
                 model_type,
@@ -246,7 +245,6 @@ fn as_usize(value: &SpecValue) -> Result<usize, ModelSpecError> {
         )),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

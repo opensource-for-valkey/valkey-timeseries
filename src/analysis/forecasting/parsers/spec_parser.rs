@@ -93,7 +93,10 @@ impl SpecValue {
 
     pub fn as_usize_list(&self) -> Result<Vec<usize>, SpecError> {
         if let SpecValue::List(items) = self {
-            items.iter().map(|x| x.as_usize()).collect::<Result<Vec<_>, _>>()
+            items
+                .iter()
+                .map(|x| x.as_usize())
+                .collect::<Result<Vec<_>, _>>()
         } else {
             Err(SpecError::new("Expected a list value"))
         }
@@ -101,7 +104,10 @@ impl SpecValue {
 
     pub fn as_float_list(&self) -> Result<Vec<f64>, SpecError> {
         if let SpecValue::List(items) = self {
-            items.iter().map(|x| x.as_float()).collect::<Result<Vec<_>, _>>()
+            items
+                .iter()
+                .map(|x| x.as_float())
+                .collect::<Result<Vec<_>, _>>()
         } else {
             Err(SpecError::new("Expected a list value"))
         }
@@ -218,7 +224,10 @@ impl Parser {
         let specs = self.parse_spec_sequence(has_brackets)?;
 
         if has_brackets {
-            self.expect(&Token::RBracket, "Expected ']' after model specification list")?;
+            self.expect(
+                &Token::RBracket,
+                "Expected ']' after model specification list",
+            )?;
         }
 
         if !self.is_eof() {
@@ -292,7 +301,10 @@ impl Parser {
                 };
                 self.expect(&Token::Eq, "Expected '=' after keyword")?;
                 if !seen_keys.insert(key.clone()) {
-                    return Err(SpecError::new(format!("Duplicate keyword argument {}", key)));
+                    return Err(SpecError::new(format!(
+                        "Duplicate keyword argument {}",
+                        key
+                    )));
                 }
                 let value = self.parse_value()?;
                 keyword.push((key, value));

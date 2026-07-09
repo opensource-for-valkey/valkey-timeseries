@@ -1,21 +1,21 @@
-use crate::analysis::forecasting::build_models_from_specs;
 use crate::analysis::forecasting::DynForecaster;
+use crate::analysis::forecasting::build_models_from_specs;
+use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::{
     parse_forecast_confidence_level, parse_forecast_horizon_value,
 };
 use crate::commands::forecast_utils::{
-    handle_forecast_key_pos_request, parse_timeseries_for_forecast, reply_with_forecast_output,
-    run_forecast, ForecastOutput,
+    ForecastOutput, handle_forecast_key_pos_request, parse_timeseries_for_forecast,
+    reply_with_forecast_output, run_forecast,
 };
 use crate::commands::parse_store_clause;
-use crate::commands::CommandArgIterator;
-use crate::common::replies::{block_client, reply_with_array, ThreadSafeReplyContext};
-use crate::common::time::compute_median_step_ms;
 use crate::common::Sample;
-use crate::series::create_or_update_series_with_samples;
+use crate::common::replies::{ThreadSafeReplyContext, block_client, reply_with_array};
+use crate::common::time::compute_median_step_ms;
 use crate::series::DestinationWriteMode;
 use crate::series::TimeSeriesOptions;
 use crate::series::TimestampRange;
+use crate::series::create_or_update_series_with_samples;
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::models::BoxedForecaster;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -31,7 +31,7 @@ struct ForecastOptions {
     level: Option<f64>,
     destination_key: Option<Vec<u8>>,
     series_options: Option<TimeSeriesOptions>,
-    write_mode: DestinationWriteMode
+    write_mode: DestinationWriteMode,
 }
 
 /// Forecasts future values of a time series using a specified model.
@@ -153,10 +153,7 @@ fn store_forecast_if_necessary(
         let predicted = output.forecast.primary();
         let offset = samples.len() as i64;
         for (i, &value) in predicted.iter().enumerate() {
-            samples.push(Sample::new(
-                last_ts + step * (offset + i as i64 + 1),
-                value,
-            ));
+            samples.push(Sample::new(last_ts + step * (offset + i as i64 + 1), value));
         }
     }
 
@@ -174,10 +171,7 @@ fn store_forecast_if_necessary(
             let _ = ctx.reply(Ok(ValkeyValue::Integer(written as i64)));
         }
         Err(e) => {
-            let msg = format!(
-                "TSDB: failed to store forecast in key '{}': {}",
-                key, e
-            );
+            let msg = format!("TSDB: failed to store forecast in key '{}': {}", key, e);
             ctx.log_warning(&msg);
             let _ = ctx.reply(Err(ValkeyError::String(msg)));
         }
@@ -256,9 +250,7 @@ fn parse_forecast_args(args: &mut CommandArgIterator) -> ValkeyResult<ForecastOp
 
     if options.destination_key.is_some() {
         let model_count = build_models_from_specs(&options.models_spec)
-            .map_err(|e| {
-                ValkeyError::String(format!("TSDB: error parsing MODELS: {:?}", e))
-            })?
+            .map_err(|e| ValkeyError::String(format!("TSDB: error parsing MODELS: {:?}", e)))?
             .len();
         if model_count > 1 {
             return Err(ValkeyError::Str(

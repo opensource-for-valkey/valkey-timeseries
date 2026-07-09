@@ -4,7 +4,6 @@ use anofox_forecast::transform::{InverseMode, Transform};
 // for some reason, Forecaster is not implemented for Box<dyn Forecaster> in the anofox_forecast crate, so we need to re-export it here
 use anofox_forecast::Result as ForecastResult;
 
-
 pub struct DynForecaster(BoxedForecaster);
 
 impl DynForecaster {
@@ -52,11 +51,19 @@ impl Forecaster for DynForecaster {
         self.0.predict(horizon)
     }
 
-    fn predict_with_intervals(&self, horizon: usize, level: f64) -> anofox_forecast::Result<Forecast> {
+    fn predict_with_intervals(
+        &self,
+        horizon: usize,
+        level: f64,
+    ) -> anofox_forecast::Result<Forecast> {
         self.0.predict_with_intervals(horizon, level)
     }
 
-    fn fit_predict(&mut self, series: &TimeSeries, horizon: usize) -> anofox_forecast::Result<Forecast> {
+    fn fit_predict(
+        &mut self,
+        series: &TimeSeries,
+        horizon: usize,
+    ) -> anofox_forecast::Result<Forecast> {
         self.0.fit_predict(series, horizon)
     }
 

@@ -4,9 +4,9 @@ pub mod imputation;
 pub mod stats;
 
 mod parsers;
-mod utils;
 mod traits;
+mod utils;
 
 pub use parsers::*;
-pub use utils::*;
 pub use traits::*;
+pub use utils::*;

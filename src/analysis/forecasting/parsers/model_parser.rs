@@ -7,7 +7,9 @@ use crate::analysis::forecasting::parsers::{
     ForecastModelKind, parse_seasonal_forecast_method, parse_trend_forecast_method,
 };
 use anofox_forecast::models::arima::{ARIMA, AutoARIMA, SARIMA};
-use anofox_forecast::models::baseline::{Naive, RandomWalkWithDrift, SeasonalNaive, SimpleMovingAverage};
+use anofox_forecast::models::baseline::{
+    Naive, RandomWalkWithDrift, SeasonalNaive, SimpleMovingAverage,
+};
 use anofox_forecast::models::exponential::{
     AutoETS, ETS, ETSSpec, HoltLinearTrend, HoltWinters, SeasonalES, SeasonalType,
     SimpleExponentialSmoothing,
@@ -229,9 +231,7 @@ fn handle_naive(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError>
     Ok(Box::new(Naive::new()))
 }
 
-fn handle_random_walk_with_drift(
-    spec: &mut ModelSpec,
-) -> Result<BoxedForecaster, ModelSpecError> {
+fn handle_random_walk_with_drift(spec: &mut ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     let nums = spec.get_positionals_as_usize()?;
 
     let positional_changepoint = nums.first().copied();
