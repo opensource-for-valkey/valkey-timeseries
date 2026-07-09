@@ -53,8 +53,14 @@ pub fn seasonally_adjust(
         let required = 2 * max_period;
         validate_insufficient_data::<Vec<f64>>(required, n)?;
 
+        // MSTL alternates between fitting the trend and each seasonal component; its
+        // default of 2 outer iterations often hasn't converged by the time it stops,
+        // which can leave point-anomalies partially absorbed into trend/seasonal
+        // rather than showing up in the remainder. A few extra iterations noticeably
+        // stabilizes convergence at negligible extra cost.
         MSTL::new(periods.to_vec())
             .robust()
+            .with_iterations(5)
             .decompose(ts)
             .map(|res| res.remainder)
             .ok_or_else(|| {
