@@ -154,13 +154,11 @@ fn get_single_scalar_arg(fe: &Call) -> Option<f64> {
         match &*fe.args.args[0] {
             Expr::NumberLiteral(n) => return Some(n.val),
             Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
-            Expr::Call(fe) => {
-                if fe.func.name == "vector" && fe.args.len() == 1 {
-                    match &*fe.args.args[0] {
-                        Expr::NumberLiteral(n) => return Some(n.val),
-                        Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
-                        _ => {}
-                    }
+            Expr::Call(fe) if fe.func.name == "vector" && fe.args.len() == 1 => {
+                match &*fe.args.args[0] {
+                    Expr::NumberLiteral(n) => return Some(n.val),
+                    Expr::StringLiteral(s) => return parse_number(&s.val).ok(),
+                    _ => {}
                 }
             }
             _ => {}

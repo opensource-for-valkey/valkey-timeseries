@@ -78,10 +78,8 @@ mod tests {
             .collect();
         expected_sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
-        for (i, (actual_sample, (expected_value, expected_labels))) in actual_sorted
-            .into_iter()
-            .zip(expected_sorted.into_iter())
-            .enumerate()
+        for (i, (actual_sample, (expected_value, expected_labels))) in
+            actual_sorted.into_iter().zip(expected_sorted).enumerate()
         {
             assert!(
                 approx_eq(actual_sample.value, expected_value),
