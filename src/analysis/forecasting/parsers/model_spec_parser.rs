@@ -125,12 +125,44 @@ impl ModelSpec {
     }
 }
 
+impl ModelSpec {
+    /// Returns the canonical display name matching `Forecaster::name()` output.
+    pub fn canonical_model_name(&self) -> &str {
+        use super::ForecastModelKind::*;
+        match self.model_type {
+            Adida => "ADIDA",
+            Arima => "ARIMA",
+            AutoArima => "AutoARIMA",
+            Croston => "Croston",
+            Garch => "GARCH",
+            Holt => "Holt",
+            Imapa => "IMAPA",
+            Sarima => "SARIMA",
+            SeasonalEs => "SeasonalES",
+            SeasonalNaive => "SeasonalNaive",
+            Ses => "SES",
+            Sma => "SMA",
+            Tbats => "TBATS",
+            AutoTbats => "AutoTBATS",
+            Theta => "Theta",
+            Tsb => "TSB",
+            Mstl => "MSTL",
+            Mfles => "MFLES",
+            Naive => "Naive",
+            Ets => "ETS",
+            AutoEts => "AutoETS",
+            HoltWinters => "HoltWinters",
+            RandomWalkWithDrift => "RandomWalkWithDrift",
+        }
+    }
+}
+
 impl Display for ModelSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}(", self.model_name)?;
+        write!(f, "{}(", self.canonical_model_name())?;
         for (i, arg) in self.positional_args.iter().enumerate() {
             if i > 0 {
-                write!(f, ", ")?;
+                write!(f, ",")?;
             }
             write!(f, "{}", arg)?;
         }
@@ -138,7 +170,7 @@ impl Display for ModelSpec {
             if i == 0 && self.positional_args.is_empty() {
                 write!(f, "{}={}", k, v)?;
             } else {
-                write!(f, ", {}={}", k, v)?;
+                write!(f, ",{}={}", k, v)?;
             }
         }
         write!(f, ")")?;

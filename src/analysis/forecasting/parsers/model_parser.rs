@@ -21,10 +21,15 @@ use anofox_forecast::models::{
     TrendForecastMethod,
 };
 
-pub fn build_models_from_specs(input: &str) -> Result<Vec<BoxedForecaster>, ModelSpecError> {
+pub fn build_models_from_specs(
+    input: &str,
+) -> Result<Vec<(BoxedForecaster, String)>, ModelSpecError> {
     parse_model_specs(input)?
         .into_iter()
-        .map(build_single_model)
+        .map(|spec| {
+            let display_name = spec.to_string();
+            build_single_model(spec).map(|model| (model, display_name))
+        })
         .collect()
 }
 
@@ -787,29 +792,48 @@ mod tests {
 
     #[test]
     fn constructs_all_supported_models_from_canonical_specs() {
-        let models = build_models_from_specs(
+        let models: Vec<_> = build_models_from_specs(
             "ADIDA(), ARIMA(1,1,1), AutoARIMA(), Croston(), GARCH(), Holt(), IMAPA(), SARIMA(1,1,1,1,1,1,12), SeasonalES(12), SeasonalNaive(), SMA(), TBATS(12), AutoTBATS(12), Theta(), TSB(), MSTL(12), MFLES(12), ETS(), AutoETS(), HoltWinters(12), SES(), RandomWalkWithDrift()",
         )
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(models.len(), 22);
     }
 
     #[test]
     fn constructs_ets_from_notation() {
         // ETS with notation only (no seasonal period, defaults to 1)
-        let models = build_models_from_specs("ETS(ANN)").unwrap();
+        let models: Vec<_> = build_models_from_specs("ETS(ANN)")
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(models.len(), 1);
 
         // ETS with notation and seasonal period
-        let models = build_models_from_specs("ETS(ANM, 12)").unwrap();
+        let models: Vec<_> = build_models_from_specs("ETS(ANM, 12)")
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(models.len(), 1);
 
         // ETS with additive trend and multiplicative seasonal
-        let models = build_models_from_specs("ETS(AAM, 4)").unwrap();
+        let models: Vec<_> = build_models_from_specs("ETS(AAM, 4)")
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(models.len(), 1);
 
         // ETS with damped trend notation
-        let models = build_models_from_specs("ETS(AAdN, 1)").unwrap();
+        let models: Vec<_> = build_models_from_specs("ETS(AAdN, 1)")
+            .unwrap()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
         assert_eq!(models.len(), 1);
     }
 
