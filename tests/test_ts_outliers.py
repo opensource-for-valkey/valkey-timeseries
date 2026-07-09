@@ -619,9 +619,12 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         """Test detection with both daily and weekly seasonality patterns (OUTPUT full)."""
         key = 'test:seasonality:multiple:daily:weekly'
 
-        # Build data with daily + weekly cycles
+        # Build data with daily + weekly cycles. Weekly (period=168) MSTL
+        # decomposition needs enough cycles to reliably isolate point anomalies
+        # from the seasonal/trend fit rather than absorbing them, so use 30
+        # weeks rather than the bare minimum.
         data = []
-        for week in range(6):
+        for week in range(30):
             for day in range(7):
                 weekly_factor = 1.3 if day < 5 else 0.6
                 for hour in range(24):
@@ -682,9 +685,13 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         """Test detection with multiple seasonalities and an underlying trend."""
         key = 'test:seasonality:multiple:trend'
 
-        # Create a pattern with daily, weekly cycles, and upward trend
+        # Create a pattern with daily, weekly cycles, and upward trend.
+        # Weekly (period=168) MSTL decomposition needs enough cycles to
+        # reliably isolate point anomalies rather than absorbing them into
+        # the trend/seasonal fit, so use 30 weeks rather than the bare
+        # minimum.
         data = []
-        for week in range(8):
+        for week in range(30):
             for day in range(7):
                 # Weekly component
                 weekly_component = 20.0 * math.sin(day * math.pi / 3.5)
