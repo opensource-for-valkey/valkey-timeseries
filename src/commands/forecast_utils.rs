@@ -79,6 +79,14 @@ pub(super) fn run_forecast<T: Forecaster>(
         } else {
             actual
         };
+
+        // Some models (e.g. ARIMA) report NaN for a leading warm-up period
+        // where insufficient lagged terms are available to produce a fitted
+        // value. Trim that warm-up prefix from both series before scoring so
+        // metrics reflect only the values the model actually fitted.
+        let warmup = fitted.iter().take_while(|v| !v.is_finite()).count();
+        let (actual, fitted) = (&actual[warmup..], &fitted[warmup..]);
+
         match calculate_metrics(actual, fitted, seasonal_period) {
             Ok(m) => Some(m),
             Err(e) => {
