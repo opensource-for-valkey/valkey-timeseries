@@ -38,7 +38,7 @@ def parse_trend_response(response: List[Any]) -> Dict[str, Any]:
     """Parse the flat key-value list response from TS.TREND into a dict.
 
     The response is a flat list of alternating key-value pairs:
-    [key, "t", selected_series, "Linear", criterion, "AICc",
+    [model, "Linear", criterion, "AICc",
      fitted_trend, [...], scores, [[name, score], ...], n_params, 2, ...]
 
     All values are decoded to their native Python types:
@@ -46,8 +46,8 @@ def parse_trend_response(response: List[Any]) -> Dict[str, Any]:
     - scores → list of (str, float) tuples
     - n_params → int
     - features → dict of {str: float}
-    - metrics → dict of {str: float|None}
-    - key, selected_series, criterion, model → str
+    - accuracy_metrics → dict of {str: float|None}
+    - model, criterion → str
     """
     if not response:
         return {}
@@ -80,8 +80,8 @@ def parse_trend_response(response: List[Any]) -> Dict[str, Any]:
                 f_val = next(f_it)
                 features_dict[f_key_str] = float(f_val)
             result[key_str] = features_dict
-        elif key_str == "metrics":
-            # metrics is a flat list of key-value pairs: [name1, val1, name2, val2, ...]
+        elif key_str == "accuracy_metrics":
+            # accuracy_metrics is a flat list of key-value pairs: [name1, val1, name2, val2, ...]
             metrics_dict = {}
             m_it = iter(value)
             for m_key in m_it:
@@ -118,7 +118,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        selected = parsed["selected_series"]
+        selected = parsed["model"]
         # Linear or TheilSen should be top (both fit perfectly)
         assert selected in ("Linear", "TheilSen"), \
             f"expected Linear or TheilSen, got {selected}"
@@ -159,7 +159,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        selected = parsed["selected_series"]
+        selected = parsed["model"]
         scores = parsed["scores"]
         assert selected == "Exponential", \
             f"expected Exponential, got {selected}, scores: {scores}"
@@ -177,7 +177,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        selected = parsed["selected_series"]
+        selected = parsed["model"]
         scores = parsed["scores"]
         assert selected == "Quadratic", \
             f"expected Quadratic, got {selected}, scores: {scores}"
@@ -336,14 +336,12 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         values = [2.0 * i + 1.0 for i in range(100)]
         _add(self.client, key, 1000, values)
 
-        result = self.client.execute_command(
+        count = self.client.execute_command(
             "TS.TREND", key, "-", "+",
             "RECENCY", "FULL", "STORE", store_key
         )
-
-        parsed = parse_trend_response(result)
-        fitted = parsed["fitted_trend"]
-        assert len(fitted) == 100
+        # STORE returns the number of samples written, not the response map
+        assert count == 100, f"Expected 100 samples written, got {count}"
 
         # Verify the stored key exists
         assert self.client.execute_command("EXISTS", store_key) == 1, \
@@ -354,10 +352,10 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         assert len(stored) == 100, \
             f"Expected 100 stored samples, got {len(stored)}"
 
-        # Verify stored values match the fitted trend
-        for (ts, val), expected in zip(stored, fitted):
+        # Verify stored values match the (near-perfectly linear) input data
+        for (ts, val), expected in zip(stored, values):
             assert abs(float(val) - expected) < 0.2, \
-                f"Stored fitted value {val} differs from fitted {expected}"
+                f"Stored fitted value {val} differs from expected {expected}"
 
     def test_store_fitted_timestamps_match_input(self):
         """STORE preserves the original timestamps from the input series."""
@@ -394,16 +392,13 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         values = [2.0 * i + 1.0 for i in range(100)]
         _add(self.client, key, 1000, values)
 
-        result = self.client.execute_command(
+        count = self.client.execute_command(
             "TS.TREND", key, "-", "+",
             "RECENCY", "FULL", "PREDICT", "5", "STORE", store_key
         )
-
-        parsed = parse_trend_response(result)
-        fitted = parsed["fitted_trend"]
-        predicted = parsed["predicted_trend"]
-        assert len(fitted) == 100
-        assert len(predicted) == 5
+        # STORE returns the number of samples written (100 fitted + 5 predicted)
+        assert count == 105, \
+            f"Expected 105 samples written (100 fitted + 5 predicted), got {count}"
 
         # Verify stored key exists
         assert self.client.execute_command("EXISTS", store_key) == 1
@@ -413,15 +408,17 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         assert len(stored) == 105, \
             f"Expected 105 stored samples (100 fitted + 5 predicted), got {len(stored)}"
 
-        # First 100 stored values should match fitted trend
-        for (ts, val), expected in zip(stored[:100], fitted):
+        # First 100 stored values should match the (near-perfectly linear) input data
+        for (ts, val), expected in zip(stored[:100], values):
             assert abs(float(val) - expected) < 0.2, \
-                f"Stored fitted value {val} differs from fitted {expected}"
+                f"Stored fitted value {val} differs from expected {expected}"
 
-        # Last 5 stored values should match predicted trend
-        for (ts, val), expected in zip(stored[100:], predicted):
-            assert abs(float(val) - expected) < 0.2, \
-                f"Stored predicted value {val} differs from predicted {expected}"
+        # Last 5 stored values should extrapolate the linear trend
+        last_value = values[-1]
+        for i, (ts, val) in enumerate(stored[100:]):
+            expected = last_value + 2.0 * (i + 1)
+            assert abs(float(val) - expected) < 1.0, \
+                f"Stored predicted value {val} differs from expected {expected}"
 
     def test_store_predicted_timestamps_are_sequential(self):
         """STORE predicted timestamps extend beyond the last fitted timestamp."""
@@ -468,7 +465,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
 
         self.client.execute_command(
             "TS.TREND", key, "-", "+",
-            "RECENCY", "FULL", "STORE", store_key
+            "RECENCY", "FULL", "STORE", store_key, "MERGE"
         )
 
         # Stored key should now have existing + fitted samples
@@ -533,10 +530,10 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        assert "metrics" in parsed, \
-            f"Expected metrics in response, got keys: {list(parsed.keys())}"
+        assert "accuracy_metrics" in parsed, \
+            f"Expected accuracy_metrics in response, got keys: {list(parsed.keys())}"
 
-        metrics = parsed["metrics"]
+        metrics = parsed["accuracy_metrics"]
         required = ["mae", "mse", "rmse", "mape", "smape", "mase", "r_squared"]
         for field in required:
             assert field in metrics, \
@@ -548,7 +545,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         assert metrics["smape"] >= 0.0
 
     def test_metrics_without_metrics_omits_field(self):
-        """Without METRICS, metrics should be absent from response."""
+        """Without METRICS, accuracy_metrics should be absent from response."""
         key = "test:trend:metrics:absent"
         create_linear_series(self.client, key, count=100)
 
@@ -557,8 +554,8 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        assert "metrics" not in parsed, \
-            f"metrics should be absent without METRICS option"
+        assert "accuracy_metrics" not in parsed, \
+            f"accuracy_metrics should be absent without METRICS option"
 
     def test_metrics_with_specific_model(self):
         """METRICS also works for specific-model mode."""
@@ -573,8 +570,8 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
 
         parsed = parse_trend_response(result)
         assert parsed["model"] == "TheilSen"
-        assert "metrics" in parsed
-        assert "r_squared" in parsed["metrics"]
+        assert "accuracy_metrics" in parsed
+        assert "r_squared" in parsed["accuracy_metrics"]
 
     # ═══════════════════════════════════════════════════════════════════════
     # Recency options
@@ -675,7 +672,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
             f"Expected even-length flat map, got {len(result)} elements"
 
     def test_response_required_fields(self):
-        """Response must contain selected_series, criterion, fitted_trend,
+        """Response must contain model, criterion, fitted_trend,
         scores, and n_params."""
         key = "test:trend:format:required"
         create_linear_series(self.client, key, count=100)
@@ -685,14 +682,14 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        required = ["selected_series", "criterion", "fitted_trend",
+        required = ["model", "criterion", "fitted_trend",
                      "scores", "n_params"]
         for field in required:
             assert field in parsed, \
                 f"Missing required field '{field}' in response: {list(parsed.keys())}"
 
-    def test_response_selected_series_is_string(self):
-        """selected_series should be a non-empty string."""
+    def test_response_model_is_string(self):
+        """model should be a non-empty string."""
         key = "test:trend:format:selected_str"
         create_linear_series(self.client, key, count=100)
 
@@ -701,9 +698,9 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        selected = parsed["selected_series"]
+        selected = parsed["model"]
         assert isinstance(selected, str) and len(selected) > 0, \
-            f"selected_series should be non-empty string, got {selected!r}"
+            f"model should be non-empty string, got {selected!r}"
 
     def test_response_with_predict_features_and_metrics(self):
         """When PREDICT, FEATURES, and METRICS are specified, all optional fields appear."""
@@ -723,9 +720,9 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         assert "features" in parsed, \
             f"Missing features when FEATURES specified"
         assert len(parsed["features"]) > 0
-        assert "metrics" in parsed, \
-            f"Missing metrics when METRICS specified"
-        assert "mae" in parsed["metrics"]
+        assert "accuracy_metrics" in parsed, \
+            f"Missing accuracy_metrics when METRICS specified"
+        assert "mae" in parsed["accuracy_metrics"]
 
     # ═══════════════════════════════════════════════════════════════════════
     # Error handling
@@ -838,7 +835,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         key = "test:trend:err:store_missing"
         create_linear_series(self.client, key, count=100)
 
-        with pytest.raises(ResponseError, match="Missing value for STORE"):
+        with pytest.raises(ResponseError, match="missing key"):
             self.client.execute_command(
                 "TS.TREND", key, "-", "+",
                 "RECENCY", "FULL", "STORE"
@@ -959,7 +956,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
     # ═══════════════════════════════════════════════════════════════════════
 
     def test_model_auto_explicit(self):
-        """MODEL Auto (explicit) behaves like the default and includes selected_series."""
+        """MODEL Auto (explicit) behaves like the default and includes model."""
         key = "test:trend:model:auto_explicit"
         create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
@@ -970,8 +967,8 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        assert "selected_series" in parsed, \
-            f"Expected selected_series in Auto mode, got keys: {list(parsed.keys())}"
+        assert "model" in parsed, \
+            f"Expected model in Auto mode, got keys: {list(parsed.keys())}"
         assert "criterion" in parsed
         assert "scores" in parsed
         assert len(parsed["scores"]) >= 1, \
@@ -1022,9 +1019,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
             f"Expected model Exponential, got {parsed['model']}"
         assert len(parsed["fitted_trend"]) == 100
         assert "n_params" in parsed
-        # Specific model mode should NOT have selected_series, criterion, or scores
-        assert "selected_series" not in parsed, \
-            "selected_series should not be present in specific model mode"
+        # Specific model mode should NOT have criterion or scores
         assert "criterion" not in parsed, \
             "criterion should not be present in specific model mode"
         assert "scores" not in parsed, \
@@ -1131,13 +1126,12 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         create_linear_series(self.client, key, count=50,
                               slope=2.0, intercept=1.0)
 
-        result = self.client.execute_command(
+        count = self.client.execute_command(
             "TS.TREND", key, "-", "+",
             "MODEL", "Polynomial", "RECENCY", "FULL", "STORE", store_key
         )
-
-        parsed = parse_trend_response(result)
-        assert len(parsed["fitted_trend"]) == 50
+        # STORE returns the number of samples written, not the response map
+        assert count == 50, f"Expected 50 samples written, got {count}"
 
         # Verify stored key
         assert self.client.execute_command("EXISTS", store_key) == 1
@@ -1145,7 +1139,7 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         assert len(stored) == 50
 
     def test_model_default_is_auto(self):
-        """When no MODEL is specified, Auto is assumed (selected_series present)."""
+        """When no MODEL is specified, Auto is assumed (model present)."""
         key = "test:trend:model:default_auto"
         create_linear_series(self.client, key, count=100,
                               slope=2.0, intercept=1.0)
@@ -1155,8 +1149,8 @@ class TestTrend(ValkeyTimeSeriesTestCaseBase):
         )
 
         parsed = parse_trend_response(result)
-        assert "selected_series" in parsed, \
-            f"Default mode should have selected_series, got keys: {list(parsed.keys())}"
+        assert "model" in parsed, \
+            f"Default mode should have model, got keys: {list(parsed.keys())}"
         assert "criterion" in parsed
 
     # ═══════════════════════════════════════════════════════════════════════

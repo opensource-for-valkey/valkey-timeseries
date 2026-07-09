@@ -65,8 +65,8 @@ Trend model to fit. If omitted, `Auto` is assumed.
 * `Polynomial` — Fit a quadratic polynomial trend (degree 2).
 * `TheilSen` — Fit a robust linear trend using the Theil-Sen estimator (median of pairwise slopes).
 
-When `MODEL` is `Auto`, the response includes `selected_series`, `criterion`, and `scores`.
-When a specific model is given, the response includes `model` instead.
+When `MODEL` is `Auto`, the response includes `model`, `criterion`, and `scores`.
+When a specific model is given, the response includes `model` but omits `criterion` and `scores`.
 
 </details>
 
@@ -135,7 +135,8 @@ Persist the fitted trend values into a time series key. The fitted values are st
 original timestamps from the input series.
 
 - If the destination key does not exist, a new time series is created.
-- If the destination key already exists, the fitted samples are merged into it.
+- If the destination key already exists, it is overwritten by default. Pass `MERGE` to merge
+  the fitted (and optionally predicted) samples into the existing series instead.
 
 When `STORE` is combined with `PREDICT`, the predicted trend values are appended after the fitted
 values with timestamps continuing from the last observed timestamp using the series' median
