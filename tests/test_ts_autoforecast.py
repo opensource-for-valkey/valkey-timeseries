@@ -397,7 +397,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
         assert len(stored) == 4
 
     def test_store_on_existing_key(self):
-        """Test STORE on an existing key (should overwrite/update)."""
+        """Test STORE with MERGE on an existing key combines existing and forecast samples."""
         key = "test:autoforecast:store:exist:src"
         store_key = "test:autoforecast:store:exist:dst"
         create_linear_series(self.client, key, count=150)
@@ -408,7 +408,7 @@ class TestAutoForecast(ValkeyTimeSeriesTestCaseBase):
 
         result = self.client.execute_command(
             "TS.AUTOFORECAST", key, "-", "+",
-            "HORIZON", "3", "STORE", store_key
+            "HORIZON", "3", "STORE", store_key, "MERGE"
         )
 
         parsed = parse_forecast_response(result)
