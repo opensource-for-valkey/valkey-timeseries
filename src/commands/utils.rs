@@ -1,11 +1,11 @@
 use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSample};
 use crate::commands::fanout_codec::MGetValue;
 use crate::common::context::ClientReplyContext;
+use crate::common::replies::reply_with_multi_samples;
 use crate::common::replies::{
     IntoRawCtx, reply_label_ex, reply_with_array, reply_with_bulk_string, reply_with_labels,
     reply_with_sample_ex, reply_with_samples,
 };
-use crate::common::replies::reply_with_multi_samples;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::series::request_types::{MRangeSeriesResult, SeriesResultData};

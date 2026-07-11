@@ -26,8 +26,8 @@ use crate::series::request_types::{
 use crate::series::types::{DuplicatePolicy, ValueFilter};
 use crate::series::{TimestampRange, TimestampValue};
 use ahash::AHashMap;
-use smallvec::SmallVec;
 use promql_parser::parser::{EvalStmt, Expr};
+use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::iter::{Peekable, Skip};
