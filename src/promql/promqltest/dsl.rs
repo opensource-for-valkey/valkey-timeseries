@@ -72,8 +72,10 @@ pub struct SeriesLoad {
 // ============================================================================
 
 static PAT_EVAL_RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^eval(?:_(?:fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$")
-        .unwrap()
+    Regex::new(
+        r"^eval(?:_(?:fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$",
+    )
+    .unwrap()
 });
 
 struct Parser;
