@@ -889,6 +889,12 @@ impl From<Vec<LabelFilter>> for FilterList {
     }
 }
 
+impl From<SmallVec<[LabelFilter; 3]>> for FilterList {
+    fn from(value: SmallVec<[LabelFilter; 3]>) -> Self {
+        Self(value)
+    }
+}
+
 /// OrFiltersList is a small vector of FilterList, used for OR combinations of AND filters.
 pub type OrFiltersList = SmallVec<[FilterList; 2]>;
 

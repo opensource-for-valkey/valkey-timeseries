@@ -2,10 +2,10 @@ use crate::common::Sample;
 use crate::labels::{Label, Labels};
 use crate::parser::number::parse_number;
 use crate::promql::{InstantSample, QueryValue, RangeSample};
-use lazy_static::lazy_static;
 use promql_parser::util::unquote_string;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ============================================================================
 // Command Types
@@ -71,12 +71,10 @@ pub struct SeriesLoad {
 // Parser
 // ============================================================================
 
-lazy_static! {
-    static ref PAT_EVAL_RANGE: Regex = Regex::new(
-        r"^eval(?:_(?:fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$"
-    )
-    .unwrap();
-}
+static PAT_EVAL_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^eval(?:_(?:fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$")
+        .unwrap()
+});
 
 struct Parser;
 

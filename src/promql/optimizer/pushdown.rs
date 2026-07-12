@@ -482,7 +482,7 @@ fn drop_label_filters_for_label_names<'a>(
     if lfs.is_empty() {
         return vec![];
     }
-    let mut names_set: SmallVec<&str, 4> = SmallVec::new();
+    let mut names_set: SmallVec<[&str; 4]> = SmallVec::new();
     for label_name in label_names {
         if let Some(v) = get_expr_as_string(label_name) {
             names_set.push(v);
@@ -505,7 +505,7 @@ fn drop_label_filters_for_label_name(lfs: &[Matcher], label_name: &Expr) -> Vec<
 
 fn filter_label_filters_on(lfs: &mut Vec<Matcher>, args: &[String]) {
     if !args.is_empty() {
-        let m: SmallVec<&String, 8> = args.iter().collect();
+        let m: SmallVec<[&String; 8]> = args.iter().collect();
         lfs.retain(|x| m.contains(&&x.name))
     } else {
         lfs.clear()
@@ -514,7 +514,7 @@ fn filter_label_filters_on(lfs: &mut Vec<Matcher>, args: &[String]) {
 
 fn filter_label_filters_ignoring(lfs: &mut Vec<Matcher>, args: &[String]) {
     if !args.is_empty() {
-        let m: SmallVec<&String, 8> = args.iter().collect();
+        let m: SmallVec<[&String; 8]> = args.iter().collect();
         lfs.retain(|x| !m.contains(&&x.name));
     }
 }
