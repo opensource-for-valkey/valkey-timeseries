@@ -117,8 +117,10 @@ static PAT_EVAL_INSTANT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^eval(?:_(fail|warn|ordered|info))?\s+instant\s+(?:at\s+(.+?))?\s+(.+)$").unwrap()
 });
 static PAT_EVAL_RANGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^eval(?:_(fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$")
-        .unwrap()
+    Regex::new(
+        r"^eval(?:_(fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$",
+    )
+    .unwrap()
 });
 static PAT_EXPECT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^expect\s+(ordered|fail|warn|no_warn|info|no_info)(?:\s+(regex|msg):(.+))?$")
