@@ -18,11 +18,11 @@ use crate::common::time::system_time_to_millis;
 use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::promqltest::dsl::parse_duration;
 use crate::promql::{QueryValue, RangeSample};
-use lazy_static::lazy_static;
 use prometheus_stubs::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,23 +110,24 @@ mod prometheus_stubs {
 // Actual translation of promqltest.go
 // ============================================================================
 
-lazy_static! {
-    static ref PAT_SPACE: Regex = Regex::new(r"[\t ]+").unwrap();
-    static ref PAT_LOAD: Regex = Regex::new(r"^load(?:_(with_nhcb))?\s+(.+?)$").unwrap();
-    static ref PAT_EVAL_INSTANT: Regex =
-        Regex::new(r"^eval(?:_(fail|warn|ordered|info))?\s+instant\s+(?:at\s+(.+?))?\s+(.+)$")
-            .unwrap();
-    static ref PAT_EVAL_RANGE: Regex = Regex::new(
-        r"^eval(?:_(fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$"
-    )
-    .unwrap();
-    static ref PAT_EXPECT: Regex =
-        Regex::new(r"^expect\s+(ordered|fail|warn|no_warn|info|no_info)(?:\s+(regex|msg):(.+))?$")
-            .unwrap();
-    static ref PAT_MATCH_ANY: Regex = Regex::new(r"^.*$").unwrap();
-    static ref PAT_EXPECT_RANGE: Regex =
-        Regex::new(r"^expect range vector\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+)$").unwrap();
-}
+static PAT_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\t ]+").unwrap());
+static PAT_LOAD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^load(?:_(with_nhcb))?\s+(.+?)$").unwrap());
+static PAT_EVAL_INSTANT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^eval(?:_(fail|warn|ordered|info))?\s+instant\s+(?:at\s+(.+?))?\s+(.+)$").unwrap()
+});
+static PAT_EVAL_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^eval(?:_(fail|warn|info))?\s+range\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+?)\s+(.+)$")
+        .unwrap()
+});
+static PAT_EXPECT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^expect\s+(ordered|fail|warn|no_warn|info|no_info)(?:\s+(regex|msg):(.+))?$")
+        .unwrap()
+});
+static PAT_MATCH_ANY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^.*$").unwrap());
+static PAT_EXPECT_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^expect range vector\s+from\s+(.+)\s+to\s+(.+)\s+step\s+(.+)$").unwrap()
+});
 
 const DEFAULT_EPSILON: f64 = 0.000001;
 const DEFAULT_MAX_SAMPLES_PER_QUERY: usize = 10000;

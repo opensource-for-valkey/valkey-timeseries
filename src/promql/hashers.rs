@@ -74,7 +74,7 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(
     hasher: &mut xxhash3_128::Hasher,
 ) {
     fn update_list(list: &Vec<Matcher>, hasher: &mut xxhash3_128::Hasher) {
-        let mut keys: SmallVec<&Matcher, 6> = smallvec![];
+        let mut keys: SmallVec<[&Matcher; 6]> = smallvec![];
         for m in list {
             keys.push(m);
         }
@@ -93,7 +93,7 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(
     update_list(&vs.matchers.matchers, hasher);
 
     // Sort or_matchers lists to ensure order-independent hashing
-    let mut sorted_or_matchers: SmallVec<&Vec<Matcher>, 8> = smallvec![];
+    let mut sorted_or_matchers: SmallVec<[&Vec<Matcher>; 8]> = smallvec![];
     for m in &vs.matchers.or_matchers {
         sorted_or_matchers.push(m);
     }

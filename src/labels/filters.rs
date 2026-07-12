@@ -890,8 +890,8 @@ impl From<Vec<LabelFilter>> for FilterList {
     }
 }
 
-impl From<SmallVec<LabelFilter, 3>> for FilterList {
-    fn from(value: SmallVec<LabelFilter, 3>) -> Self {
+impl From<SmallVec<[LabelFilter; 3]>> for FilterList {
+    fn from(value: SmallVec<[LabelFilter; 3]>) -> Self {
         Self(value)
     }
 }

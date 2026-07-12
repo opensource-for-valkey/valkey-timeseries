@@ -2,6 +2,7 @@ use super::ts_debug_configs::list_configs_cmd;
 use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::context::replies::*;
+use crate::common::replies::reply_with_valkey_string;
 use crate::common::string_interner::{BucketStats, InternedString, TopKEntry};
 use crate::config::is_debug_mode_enabled;
 use crate::error_consts;
