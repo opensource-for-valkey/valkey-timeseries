@@ -1,6 +1,6 @@
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
-use crate::fanout::{calculate_hash_slot, key_hash_slot};
+use crate::fanout::calculate_hash_slot;
 use ahash::{AHashMap, HashSet, HashSetExt};
 use rand::{Rng, RngExt, rng};
 use range_set_blaze::{RangeMapBlaze, RangeSetBlaze, RangesIter};
@@ -476,7 +476,7 @@ impl ShardInfo {
     }
 
     pub fn i_own_key(&self, key: &[u8]) -> bool {
-        let slot = key_hash_slot(key);
+        let slot = calculate_hash_slot(key);
         self.i_own_slot(slot)
     }
 }
