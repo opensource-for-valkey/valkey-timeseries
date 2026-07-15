@@ -33,6 +33,36 @@ pub fn build_models_from_specs(
         .collect()
 }
 
+/// A model specification for repeated (re-)construction, for use cases such as walk-forward
+/// backtesting where every fold must train its own untrained model instance from scratch.
+/// `ModelSpec` itself stays private to this module; callers only get an opaque handle whose
+/// `build` method produces a fresh [`BoxedForecaster`] on every call.
+pub struct BacktestModelSpec {
+    display_name: String,
+    spec: ModelSpec,
+}
+
+impl BacktestModelSpec {
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    /// Constructs a fresh, untrained forecaster instance from this specification.
+    pub fn build(&self) -> Result<BoxedForecaster, ModelSpecError> {
+        build_single_model(self.spec.clone())
+    }
+}
+
+pub fn parse_backtest_model_specs(input: &str) -> Result<Vec<BacktestModelSpec>, ModelSpecError> {
+    Ok(parse_model_specs(input)?
+        .into_iter()
+        .map(|spec| BacktestModelSpec {
+            display_name: spec.to_string(),
+            spec,
+        })
+        .collect())
+}
+
 pub fn build_single_model(mut spec: ModelSpec) -> Result<BoxedForecaster, ModelSpecError> {
     match spec.model_type {
         ForecastModelKind::Arima => {
@@ -788,7 +818,26 @@ fn get_seasonal_forecast_method(
 
 #[cfg(test)]
 mod tests {
-    use super::build_models_from_specs;
+    use super::{build_models_from_specs, parse_backtest_model_specs};
+
+    #[test]
+    fn backtest_specs_rebuild_a_fresh_model_on_each_call() {
+        let specs = parse_backtest_model_specs("ARIMA(1,1,1), Naive()").unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].display_name(), "ARIMA(1,1,1)");
+        assert_eq!(specs[1].display_name(), "Naive()");
+
+        // `build` must succeed repeatedly (each fold in a backtest needs its own instance).
+        for spec in &specs {
+            assert!(spec.build().is_ok());
+            assert!(spec.build().is_ok());
+        }
+    }
+
+    #[test]
+    fn backtest_specs_reject_invalid_model_names() {
+        assert!(parse_backtest_model_specs("NotAModel()").is_err());
+    }
 
     #[test]
     fn constructs_all_supported_models_from_canonical_specs() {
