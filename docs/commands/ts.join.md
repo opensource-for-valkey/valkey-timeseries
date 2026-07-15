@@ -206,4 +206,4 @@ Next, run the join.
 
 ## See also
 
-`TS.RANGE`
+`TS.RANGE` | `TS.XCORR`
