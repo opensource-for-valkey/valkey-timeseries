@@ -1,0 +1,66 @@
+# RedisTimeSeries compatibility harness — reference (and optional subject) servers.
+# See docs/rts-compatibility-test-plan.md §3 (reference environment) and tests/compat/README.md.
+#
+# The reference image is pinned by digest. Bumping the digest is a reviewed change and
+# must be accompanied by a changelog scan of the corresponding RedisTimeSeries release
+# notes (plan §11, "Reference drift").
+#
+# Licensing note: the redis:8.6 image is used strictly as a black-box test target.
+# Nothing from the RedisTimeSeries source repository may be vendored, copied, ported,
+# or fetched at CI time (plan §3, licensing boundary).
+
+services:
+  reference:
+    # redis:8.6 multi-arch index digest, resolved 2026-07-15.
+    image: redis:8.6@sha256:a051e4f48a5d0ceda6554974f3ad0f5369f4479197f36829332c1325cecad2b7
+    command:
+      - redis-server
+      - --enable-debug-command
+      - "yes"
+      - --notify-keyspace-events
+      - KEA
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "${COMPAT_REFERENCE_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # Optional: run the subject (valkey-server + this module) in Docker as well.
+  # Requires a Linux build of the module matching the container architecture
+  # (target/release/libvalkey_timeseries.so). The pytest harness launches the subject
+  # as a local process by default, so this service is opt-in:
+  #   docker compose -f docker-compose.compat.yml --profile subject-docker up -d
+  subject:
+    image: valkey/valkey:8.1
+    profiles: ["subject-docker"]
+    volumes:
+      - ./target/release/libvalkey_timeseries.so:/opt/module/libvalkey_timeseries.so:ro
+    command:
+      - valkey-server
+      - --loadmodule
+      - /opt/module/libvalkey_timeseries.so
+      - --enable-debug-command
+      - "yes"
+      - --notify-keyspace-events
+      - KEA
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    ports:
+      - "${COMPAT_SUBJECT_PORT:-16380}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "6379", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
