@@ -18,6 +18,9 @@ well as provide a superset of the _RedisTimeSeries_ API.
 - Forecasting using methods such as ARIMA and Exponential Smoothing.
 - Compatibility with the [RedisTimeSeries](https://oss.redislabs.com/redistimeseries/) API.
 
+## Guides
+- [Time-Series EDA with Valkey-TimeSeries and Python](docs/eda-with-python.md) — an end-to-end exploratory data analysis walkthrough (profiling, imputation, feature extraction, autocorrelation, seasonality/decomposition, trends, stationarity, anomaly detection, and forecasting) using the `valkey-py` client.
+
 ## Scaling
 
 **valkey-timeseries** offers two deployment modes: 
@@ -86,6 +89,7 @@ TS.SANITIZE
 TS.STATIONARITY
 TS.STATS
 TS.REVRANGE
+TS.XCORR
 TS._DEBUG
 ```
 

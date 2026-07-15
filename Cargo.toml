@@ -10,8 +10,8 @@ description = "A Timeseries data type for Valkey"
 
 [dependencies]
 ahash = { version = "0.8", features = ["std"] }
-arc-swap = "1.9"
-anofox-forecast = { version = "0.15.3", features = ["parallel", "seasonal-detection", "distributional", "postprocess", "anomaly"] }
+arc-swap = "1.9.2"
+anofox-forecast = { version = "0.15.8", features = ["parallel", "seasonal-detection", "distributional", "postprocess", "anomaly"] }
 blart = "0.5"
 bon = "3.9"
 byte-pool = "0.2.4"

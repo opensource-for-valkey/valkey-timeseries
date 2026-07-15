@@ -3,6 +3,7 @@
 - [`TS.ADD`](commands/ts.add.md)
 - [`TS.AUTOCORRELATION`](commands/ts.autocorrelation.md)
 - [`TS.AUTOFORECAST`](commands/ts.autoforcast.md)
+- [`TS.BACKTEST`](commands/ts.backtest.md)
 - [`TS.TREND`](commands/ts.trend.md)
 - [`TS.ADDBULK`](commands/ts.addbulk.md)
 - [`TS.ALTER`](commands/ts.alter.md)
@@ -34,4 +35,5 @@
 - [`TS.RANGE`](commands/ts.range.md)
 - [`TS.STATIONARITY`](commands/ts.stationarity.md)
 - [`TS.REVRANGE`](commands/ts.revrange.md)
+- [`TS.XCORR`](commands/ts.xcorr.md)
 - [`TS._DEBUG`](commands/ts._debug.md)

@@ -47,6 +47,7 @@ mod ts_sanitize;
 mod ts_stationarity;
 mod ts_stats;
 mod ts_trend;
+mod ts_xcorr;
 mod utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
@@ -72,6 +73,7 @@ pub use ts_sanitize::*;
 pub use ts_stationarity::*;
 pub use ts_stats::*;
 pub use ts_trend::*;
+pub use ts_xcorr::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;
