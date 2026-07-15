@@ -1,0 +1,33 @@
+# Frozen RedisTimeSeries 8.6 TS.INFO baseline (test plan §5.1 rule 3).
+#
+# Derived clean-room from the public TS.INFO command documentation and validated
+# against the live pinned reference image by
+# tests/compat/test_compat_smoke.py::TestInfoBaseline. If that test fails after a
+# reference digest bump, the RTS field set changed: update this file in the same
+# reviewed change (plan §11, "Reference drift").
+#
+# Comparison policy:
+#   - a field listed here that is MISSING from a subject TS.INFO reply fails;
+#   - extra subject fields are 'reply-superset' deltas (see divergences.yml);
+#   - `type_only` fields compare by presence and python type, not value
+#     (nondeterministic across implementations — enumerated, never pattern-based).
+
+fields:
+  - totalSamples
+  - memoryUsage
+  - firstTimestamp
+  - lastTimestamp
+  - retentionTime
+  - chunkCount
+  - chunkSize
+  - chunkType
+  - duplicatePolicy
+  - labels
+  - sourceKey
+  - rules
+  - ignoreMaxTimeDiff
+  - ignoreMaxValDiff
+
+type_only:
+  - memoryUsage
+  - chunkCount
