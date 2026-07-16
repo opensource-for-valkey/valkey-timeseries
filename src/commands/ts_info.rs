@@ -123,14 +123,20 @@ fn get_ts_info(
         map.insert("labels".into(), ValkeyValue::from(labels_value));
     }
 
-    if let Some(src_id) = ts.src_series {
-        if let Some(key) = get_key_by_id(ctx, src_id) {
-            map.insert("sourceKey".into(), ValkeyValue::from(key));
-        } else {
+    // Always present: nil when the series is not a compaction target
+    // (RedisTimeSeries parity), or when the source id cannot be resolved.
+    let source_key = ts.src_series.and_then(|src_id| {
+        let key = get_key_by_id(ctx, src_id);
+        if key.is_none() {
             let msg = format!("Source series with id {src_id} not found");
             ctx.log_warning(&msg);
         }
-    }
+        key
+    });
+    map.insert(
+        "sourceKey".into(),
+        source_key.map_or(ValkeyValue::Null, ValkeyValue::from),
+    );
     map.insert(
         ValkeyValueKey::String("rules".to_string()),
         get_rules_info(ctx, ts),

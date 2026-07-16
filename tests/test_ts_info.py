@@ -128,7 +128,8 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         source_info = self.ts_info(source_key, True)
         dest_info = self.ts_info(dest_key, True)
         assert 'rules' not in source_info or len(source_info['rules']) == 0
-        assert 'sourceKey' not in dest_info
+        # sourceKey is always present, nil for a non-compaction series
+        assert dest_info['sourceKey'] is None
 
         # Create a compaction rule
         self.client.execute_command(
@@ -226,5 +227,6 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         assert 'rules' not in source_info or len(source_info['rules']) == 0
 
         # Verify source reference is removed from destination
+        # (sourceKey is always present, nil once the series is no longer a compaction)
         dest_info = self.ts_info(dest_key, True)
-        assert 'sourceKey' not in dest_info
+        assert dest_info['sourceKey'] is None

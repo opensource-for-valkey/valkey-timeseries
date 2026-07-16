@@ -1,6 +1,6 @@
 use crate::commands::parse_mrange_options;
 use crate::commands::ts_mrange_fanout_command::MRangeFanoutCommand;
-use crate::commands::utils::reply_with_mrange_series_results;
+use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::mrange::process_mrange_query;
@@ -58,6 +58,7 @@ fn mrange_internal(ctx: &Context, args: Vec<ValkeyString>, reverse: bool) -> Val
         return operation.exec(ctx);
     }
 
+    let shape = MRangeReplyShape::from_options(&options);
     let result_rows = process_mrange_query(ctx, options, false, None)?;
-    reply_with_mrange_series_results(ctx, &result_rows)
+    reply_with_mrange_series_results(ctx, &result_rows, &shape)
 }

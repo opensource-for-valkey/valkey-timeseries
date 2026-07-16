@@ -144,10 +144,27 @@ pub fn process_mget_request(
         } else {
             series.last_sample
         };
-        let labels = get_series_labels(series, with_labels, selected_labels)
-            .into_iter()
-            .map(|label| label.map(|x| Label::new(x.name, x.value)))
-            .collect();
+        // SELECTED_LABELS entries are positionally aligned with the request:
+        // a label missing from the series keeps its requested name with an
+        // empty value, so the reply can render [name, nil] like the reference.
+        let series_labels = get_series_labels(series, with_labels, selected_labels);
+        let labels = if selected_labels.is_empty() {
+            series_labels
+                .into_iter()
+                .map(|label| label.map(|x| Label::new(x.name, x.value)))
+                .collect()
+        } else {
+            series_labels
+                .into_iter()
+                .zip(selected_labels.iter())
+                .map(|(label, requested)| {
+                    Some(label.map_or_else(
+                        || Label::new(requested.as_str(), ""),
+                        |x| Label::new(x.name, x.value),
+                    ))
+                })
+                .collect()
+        };
 
         acc.push(MGetSeriesData {
             sample,

@@ -216,6 +216,7 @@ impl TryFrom<SeriesRangeResponse> for MRangeSeriesResult {
             key,
             group_label_value,
             labels,
+            sources: Vec::new(),
             data,
         })
     }
@@ -231,6 +232,7 @@ mod tests {
             key: key.into(),
             group_label_value: Some("g".into()),
             labels: Vec::new(),
+            sources: Vec::new(),
             data: SeriesResultData::Rows(rows),
         }
     }
@@ -366,6 +368,7 @@ mod tests {
             key: "a".into(),
             group_label_value: Some("g".into()),
             labels: Vec::new(),
+            sources: Vec::new(),
             data: SeriesResultData::Chunk(chunk),
         };
         match roundtrip(result) {

@@ -3,9 +3,18 @@ use crate::labels::Label;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_long};
 use valkey_module::{
-    Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyModule_ReplySetArrayLength,
-    ValkeyModuleCtx, ValkeyResult, ValkeyString, raw,
+    Context, ContextFlags, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN,
+    ValkeyModule_ReplySetArrayLength, ValkeyModuleCtx, ValkeyResult, ValkeyString, raw,
 };
+
+/// True when the client this reply targets negotiated RESP3 (HELLO 3).
+/// Commands whose RESP3 reply is structurally different from the RESP2 one
+/// (e.g. TS.MRANGE's map-of-series form) branch on this.
+pub fn is_resp3_client<C: IntoRawCtx>(ctx: C) -> bool {
+    Context::new(ctx.into_raw())
+        .get_flags()
+        .contains(ContextFlags::FLAGS_RESP3)
+}
 
 /// A small trait that allows reply helpers to accept either a raw
 /// `*mut raw::RedisModuleCtx` or a `&Context` and get the underlying raw
@@ -88,6 +97,24 @@ pub fn reply_with_labels<C: IntoRawCtx>(ctx: C, labels: &[Label]) {
     reply_with_array(raw_ctx, labels.len());
     for label in labels {
         reply_label(raw_ctx, &label.name, &label.value);
+    }
+}
+
+/// RESP3 form of a label set: a map of name -> value, with a null value for a
+/// label that exists in the request but not on the series (SELECTED_LABELS).
+pub fn reply_with_labels_map<'a, C: IntoRawCtx>(
+    ctx: C,
+    labels: impl ExactSizeIterator<Item = &'a Label>,
+) {
+    let raw_ctx = ctx.into_raw();
+    reply_with_map(raw_ctx, labels.len());
+    for label in labels {
+        reply_with_bulk_string(raw_ctx, &label.name);
+        if label.value.is_empty() {
+            raw::reply_with_null(raw_ctx);
+        } else {
+            reply_with_bulk_string(raw_ctx, &label.value);
+        }
     }
 }
 
