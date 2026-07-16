@@ -1,6 +1,7 @@
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::commands::ts_create::parse_series_options;
 use crate::common::{Sample, Timestamp};
+use crate::error_consts;
 use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, get_timeseries_mut};
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -41,8 +42,17 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let value = parse_value_arg(&args[3])?;
 
-    if let Some(mut guard) = get_timeseries_mut(ctx, &args[1], false, Some(AclPermissions::UPDATE))?
-    {
+    // RTS replies "TSDB: the key is not a TSDB key" for the auto-create write
+    // commands (TS.ADD/TS.MADD) but keeps the standard WRONGTYPE error for the
+    // read/modify commands — match that split (compat finding #7).
+    let guard = get_timeseries_mut(ctx, &args[1], false, Some(AclPermissions::UPDATE)).map_err(
+        |e| match e {
+            ValkeyError::WrongType => ValkeyError::Str(error_consts::INVALID_TIMESERIES_KEY),
+            e => e,
+        },
+    )?;
+
+    if let Some(mut guard) = guard {
         // args.done()?;
         return handle_add(ctx, &mut guard, args, timestamp, timestamp_str, value);
     }
