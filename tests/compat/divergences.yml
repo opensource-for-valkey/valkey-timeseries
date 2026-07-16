@@ -41,6 +41,7 @@
 # decision: keep the valkey-native ValkeyValue::Float path. One entry per
 # one entry per sample-returning command because registry matching is per-command; delete the 
 # batch together if the decision is ever reversed.
+- id: DIV-0002
   command: TS.RANGE
   kind: float-format
   description: >
