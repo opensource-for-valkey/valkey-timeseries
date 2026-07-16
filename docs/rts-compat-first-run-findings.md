@@ -86,8 +86,34 @@ behavioral deltas were found and fixed:
   rules was never replicated (replica drift) and emitted no `ts.add`. The
   branch now falls through like every other successful add.
 
+## §7.4 persistence interop (2026-07-16)
+
+Owner decision recorded: **RTS→valkey RDB migration is not a roadmap item** —
+the formats are incompatible and no conversion tooling is planned. Registered
+as **DIV-0010** (`unsupported`); migration recipes (export/re-ingest, live
+dual-write) documented in COMPATIBILITY.md. The defined-failure surface is
+pinned by `tests/compat/test_compat_persistence.py`:
+
+- **RESTORE of an RTS DUMP into us**: clean error, no key, server healthy.
+  Today the *server's* RDB-version footer rejects Redis 8.6 payloads (v13 >
+  valkey 8.0's max) before the module is reached — incidental protection.
+- **The durable guard (new)**: `rdb_load_series` previously never checked
+  `enc_ver` — an RTS payload admitted past the envelope (e.g. an RDB written
+  by RTS on Redis 7, whose RDB version valkey accepts) would have been
+  *parsed as ours*: the §11 silent-misparse data-integrity scenario. The
+  loader (and the index `aux_load`) now reject any encver other than ours
+  with a clear warning; RTS 8.6 writes encver 9 under the same `TSDB-TYPE`
+  name (decoded from the payload's module-type id). Verified end-to-end with
+  a crafted encver-9 payload (valid CRC): clean `Bad data format`, no key.
+- **RTS RDB file at startup**: refused with `Can't handle RDB format version
+  13` and a clean exit; fixture `test-data/rts-8.6-timeseries.rdb` (generated
+  output of the pinned reference image) keeps this pinned.
+- **Reverse (our DUMP into RTS 8.6)**: observed clean `Bad data format`
+  rejection, no key, reference healthy — pinned as documentation (we don't
+  control that direction).
+
 Not yet exercised (Phase 2/3 scope): COMMAND INFO metadata (§7.2),
-persistence interop (§7.4), compaction deep-dive, fuzzing.
+compaction deep-dive, fuzzing.
 
 ## Gate status
 

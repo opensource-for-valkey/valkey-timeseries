@@ -19,7 +19,13 @@ use valkey_module::server_events::FlushSubevent;
 use valkey_module_macros::flush_event_handler;
 
 /// TimeSeries Module data type RDB encoding version.
-const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
+///
+/// We register the same module type name as RedisTimeSeries (`TSDB-TYPE`)
+/// with an incompatible payload format; RTS 8.6 uses encver 9. The loaders
+/// reject any encver other than this one (see `rdb_load_series`) so a
+/// foreign payload fails cleanly instead of being misparsed — RTS→valkey
+/// RDB/DUMP migration is explicitly not supported (compat plan §7.4).
+pub(crate) const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
 
 pub static VK_TIME_SERIES_TYPE: ValkeyType = ValkeyType::new(
     "TSDB-TYPE",
@@ -94,7 +100,10 @@ unsafe extern "C" fn rdb_load(rdb: *mut RedisModuleIO, enc_ver: c_int) -> *mut c
     match rdb_load_series(rdb, enc_ver) {
         Ok(series) => Box::into_raw(Box::new(series)) as *mut std::ffi::c_void,
         Err(e) => {
-            logging::log_notice(format!("Failed to load series from RDB. {e:?}"));
+            // Warning level: this aborts the RESTORE / RDB load, and the
+            // message is the operator's only clue (e.g. a RedisTimeSeries
+            // payload rejected by the encoding-version guard).
+            logging::log_warning(format!("Failed to load series from RDB. {e:?}"));
             std::ptr::null_mut()
         }
     }
@@ -113,9 +122,19 @@ unsafe extern "C" fn aux_save(rdb: *mut RedisModuleIO, when: c_int) {
 
 /// Preloads the postings index from the RDB aux field. With `AUX_BEFORE_RDB` this runs before any
 /// key loads; the per-key `loaded` path then reduces to a `has_id` check per series.
-unsafe extern "C" fn aux_load(rdb: *mut RedisModuleIO, _encver: c_int, when: c_int) -> c_int {
+unsafe extern "C" fn aux_load(rdb: *mut RedisModuleIO, encver: c_int, when: c_int) -> c_int {
     if when != REDISMODULE_AUX_BEFORE_RDB as c_int {
         return raw::Status::Ok as c_int;
+    }
+    // Same guard as `rdb_load`: an aux field written by a foreign TSDB-TYPE
+    // (or a future encoding) cannot be consumed positionally — fail the load
+    // cleanly rather than misparse the stream.
+    if encver != TIMESERIES_TYPE_ENCODING_VERSION {
+        logging::log_warning(format!(
+            "Refusing TSDB-TYPE aux RDB payload with encoding version {encver} \
+             (this module writes version {TIMESERIES_TYPE_ENCODING_VERSION})"
+        ));
+        return raw::Status::Err as c_int;
     }
     load_index_from_rdb(rdb)
 }

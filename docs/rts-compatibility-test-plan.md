@@ -249,10 +249,13 @@ uses higher encoding versions. Consequences must be pinned by tests, not discove
   in `test-data/` (generated output data, not upstream source — no licensing concern).
 - The reverse direction (our DUMP into Redis 8.6): document observed behavior; we can't control
   it, but the compatibility page must state it.
-- **Decision point (owner call):** is RTS→valkey RDB migration a roadmap item? If yes, this
-  section grows into a migration test suite; if no, the divergence registry gets an `unsupported`
-  entry and the docs get a migration-path recipe (`TS.RANGE` export → `TS.MADD` import, or
-  live dual-write).
+- **Decision (owner, 2026-07-16): RTS→valkey RDB migration is NOT a roadmap item.** The data
+  formats are incompatible and there is no plan for conversion tooling. Registered as
+  **DIV-0010** (`unsupported`); the migration-path recipe (`TS.RANGE` export → `TS.MADD`
+  import, or live dual-write) lives in COMPATIBILITY.md §"Persistence and on-disk format".
+  The defined-failure surface above is pinned by `tests/compat/test_compat_persistence.py`,
+  backed by a module-level encoding-version guard (`rdb_load_series` rejects any encver other
+  than ours — RTS 8.6 writes encver 9 under the same `TSDB-TYPE` name).
 
 ### 7.5 Replication & persistence self-consistency (subject-only, reference-checked semantics)
 Existing `tests/test_ts_replication.py` / `test_ts_aofrewrite.py` cover our own stack. Add

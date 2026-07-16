@@ -122,3 +122,22 @@
     deliberate default for this engine and the config remains settable at
     startup for anyone wanting RTS's value
   since: 0.1.0
+
+- id: DIV-0010
+  command: RESTORE
+  kind: unsupported
+  description: >
+    RTS-produced RDB files and DUMP payloads cannot be loaded (and ours
+    cannot be loaded by RTS). Both modules register the module type name
+    TSDB-TYPE with incompatible payload formats (ours encver 1, RTS 8.6
+    encver 9); every load path fails cleanly by design — RESTORE errors
+    without creating a key, an RTS RDB file is refused at startup with a
+    clear log message, and the module's encoding-version guard rejects any
+    foreign TSDB-TYPE payload that passes the server's RDB-version check.
+  rationale: owner decision 2026-07-16 — RTS->valkey RDB migration is
+    explicitly not a roadmap item; the formats are incompatible and no
+    conversion tooling is planned. Migration is by re-ingest (TS.RANGE
+    export -> TS.MADD, or live dual-write); see COMPATIBILITY.md
+    "Persistence and on-disk format". Defined-failure behavior pinned by
+    tests/compat/test_compat_persistence.py
+  since: 0.1.0
