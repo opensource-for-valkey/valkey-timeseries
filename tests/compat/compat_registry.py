@@ -14,6 +14,11 @@ Registry entry kinds and the comparator delta kinds they may cover:
   config-name     -> config parameter naming differences (§7.1 tests)
   unsupported     -> whole surfaces intentionally not supported
 
+An entry marked `documentation_only: true` is never matched — it documents a
+divergence that a test pins with explicit per-engine assertions instead. Use it
+for anything a matcher could only catch with an over-broad rule (see
+DivergenceEntry.documentation_only).
+
 A "reference errors, subject succeeds" error-condition mismatch is NEVER registrable:
 that is an accepted-input superset, which silently breaks scripts ported back to
 Redis (plan §5.2). The harness hard-fails those regardless of registry contents.
@@ -61,8 +66,21 @@ class DivergenceEntry:
     # Optional regex applied to the delta detail string, to scope an entry to a
     # specific field/path instead of the whole command.
     details_regex: str = ""
+    # True for entries the harness must never match: the divergence is pinned by
+    # explicit per-engine assertions in a test, and this entry exists only so the
+    # compatibility page documents it.
+    #
+    # Without this, such an entry silently swallows unrelated mismatches. A
+    # `behavior` entry is matched on command+kind, and 'behavior' covers the
+    # value/shape/error-condition deltas — i.e. nearly every real bug on that
+    # command. That is not hypothetical: DIV-0013 (documenting an accepted-input
+    # superset in TS.RANGE's bound grammar) absorbed a genuine out-of-order
+    # compaction bug on TS.RANGE before this flag existed.
+    documentation_only: bool = False
 
     def covers(self, command: str, delta_kind: str, detail: str) -> bool:
+        if self.documentation_only:
+            return False
         if self.kind != DELTA_TO_REGISTRY_KIND.get(delta_kind):
             return False
         if self.command.upper() != command.upper():
@@ -100,6 +118,7 @@ def load_registry(path: str = REGISTRY_PATH) -> Registry:
             rationale=str(item.get("rationale", "")).strip(),
             since=str(item.get("since", "")),
             details_regex=str(item.get("details_regex", "")),
+            documentation_only=bool(item.get("documentation_only", False)),
         )
         if entry.kind not in VALID_KINDS:
             raise ValueError(f"{path}: entry {entry.id} has invalid kind {entry.kind!r}")

@@ -86,41 +86,63 @@ impl Hash for FirstAggregator {
 // -- Last ----------------------------------------------------------------
 
 #[derive(Copy, Clone, Default, Debug, PartialEq, GetSize)]
-pub struct LastAggregator(Option<f64>);
+pub struct LastAggregator {
+    current: Option<f64>,
+    /// The most recent value this aggregator ever saw, kept across `reset`.
+    ///
+    /// `last` is the one aggregator whose EMPTY fill is not a constant: RTS
+    /// reports the carried-forward previous value for a gap bucket (a gap means
+    /// "no new reading", so the last reading still stands), where every other
+    /// aggregator fills with NaN or 0. Query-time only — deliberately not part
+    /// of the RDB payload below, which stays the plain `Option<f64>` a
+    /// compaction rule has always persisted.
+    carried: Option<f64>,
+}
 
 impl AggregationHandler for LastAggregator {
     fn update(&mut self, _timestamp: i64, value: f64) -> bool {
         if value.is_nan() {
             return false;
         }
-        self.0 = Some(value);
+        self.current = Some(value);
         true
     }
 
     fn reset(&mut self) {
-        self.0 = None;
+        if self.current.is_some() {
+            self.carried = self.current;
+        }
+        self.current = None;
     }
 
     fn current(&self) -> Option<Value> {
-        self.0
+        self.current
+    }
+
+    fn empty_value(&self) -> Value {
+        self.carried.unwrap_or(f64::NAN)
     }
 }
 
 impl RdbSerializable for LastAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
-        rdb_save_optional_f64(rdb, self.0);
+        rdb_save_optional_f64(rdb, self.current);
     }
     fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self>
     where
         Self: Sized,
     {
-        rdb_load_optional_f64(rdb).map(Self)
+        rdb_load_optional_f64(rdb).map(|current| Self {
+            current,
+            carried: None,
+        })
     }
 }
 
 impl Hash for LastAggregator {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        hash_f64(self.0.unwrap_or(f64::NAN), state);
+        // `carried` is query-time EMPTY-fill state, not part of the identity.
+        hash_f64(self.current.unwrap_or(f64::NAN), state);
     }
 }
 

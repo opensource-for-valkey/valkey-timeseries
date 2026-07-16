@@ -1115,10 +1115,11 @@ mod tests {
         // Call trim and check the results
         let deleted_count = time_series.trim().expect("Trim should succeed");
 
-        // Verify that the first chunk is removed and the second chunk is trimmed
-        assert_eq!(deleted_count, chunk1_len + 2); // all from chunk1 and 2 from chunk2
+        // min_timestamp = last(30) - retention(15) = 15. Retention keeps samples
+        // with timestamp >= 15, so only 14 is dropped from chunk2 (15 is kept).
+        assert_eq!(deleted_count, chunk1_len + 1); // all from chunk1 and just 14 from chunk2
         assert_eq!(time_series.chunks.len(), 2); // Only chunk2 and chunk3 should remain
-        assert_eq!(time_series.chunks[0].first_timestamp(), 16); // chunk2 should be trimmed
+        assert_eq!(time_series.chunks[0].first_timestamp(), 15); // chunk2 trimmed to the window edge
         assert_eq!(time_series.chunks[1].first_timestamp(), 20); // chunk3 remains unchanged
     }
 

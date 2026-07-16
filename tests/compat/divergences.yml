@@ -12,7 +12,13 @@
 #
 # Fields: id, command, kind, description, rationale, since, details_regex (optional —
 # scopes the entry to deltas whose detail string matches; without it the entry covers
-# every delta of the given kind on the given command).
+# every delta of the given kind on the given command), documentation_only (optional —
+# the harness never matches the entry; it documents a divergence that a test pins with
+# explicit per-engine assertions).
+#
+# ⚠️ An unscoped `behavior` entry covers every value/shape/error-condition delta on its
+# command — i.e. nearly every real bug on that command. Always add a details_regex, or
+# documentation_only, so an entry can not silently absorb an unrelated mismatch.
 #
 # Kinds: reply-superset | error-text | float-format | behavior | config-name | unsupported
 #
@@ -140,4 +146,187 @@
     export -> TS.MADD, or live dual-write); see COMPATIBILITY.md
     "Persistence and on-disk format". Defined-failure behavior pinned by
     tests/compat/test_compat_persistence.py
+  since: 0.1.0
+
+- id: DIV-0012
+  command: TS.RANGE
+  kind: unsupported
+  description: >
+    The `twa` (time-weighted average) aggregator is not implemented. RTS 8.6
+    computes a time-weighted average over the bucket; we reject the aggregator
+    name with "TSDB: unknown aggregation type" on every command that takes an
+    AGGREGATION token (TS.RANGE/TS.REVRANGE/TS.MRANGE/TS.MREVRANGE and
+    TS.CREATERULE), and `twa` compaction policies are likewise unavailable.
+  rationale: >
+    owner decision 2026-07-16 (Phase 2 triage) — a feature gap rather than a
+    deliberate divergence, deferred to its own task because matching RTS's
+    bucket-edge interpolation semantics needs a design pass and its own
+    black-box probing. Rejecting cleanly is the safe interim behavior — a
+    client gets a detectable error instead of a differently-computed number.
+    Pinned by TestAggregation::test_unsupported_aggregator_is_rejected_not_wrong;
+    delete this entry and tests/compat/compat_helpers.py's
+    UNSUPPORTED_AGGREGATORS when twa lands.
+  since: 0.1.0
+
+# DIV-0013..DIV-0016 are Phase 2 read-path findings. All four are pinned by
+# per-engine assertions in tests/compat/test_compat_range.py rather than by
+# registry matching: an accepted-input superset is non-registrable by design
+# (§5.2), and the over-strict/behavior cases can only be matched by a regex
+# broad enough to mask real regressions in the same delta class. They are
+# recorded here because this file is what the public compatibility page renders.
+#
+# ⚠️ All four are `behavior`-kind and therefore need owner sign-off in the PR
+# that introduces them (§5.3).
+
+- id: DIV-0013
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    The range-bound grammar accepts two forms RTS 8.6 rejects with
+    "wrong fromTimestamp": `*` (the current time) and unit-suffixed relative
+    offsets (`-1h`, `-30m`, `-2d`). This is an accepted-input superset — a
+    query valid here errors on RedisTimeSeries. A *bare* negative integer is
+    NOT part of the extension: it is an absolute timestamp and is rejected the
+    same way RTS rejects it (previously it was silently read as an offset).
+  rationale: >
+    owner decision pending — deliberate ergonomic extension to the bound
+    grammar, kept because it is additive and unambiguous once bare negatives
+    are excluded. Pinned by
+    TestOptionParsing::test_relative_and_now_bounds_are_an_accepted_input_superset.
+  since: 0.1.0
+
+- id: DIV-0014
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A repeated option (e.g. `COUNT 5 COUNT 2`) is accepted by both engines but
+    resolved differently: RTS 8.6 keeps the first occurrence, we keep the last.
+    Neither errors.
+  rationale: >
+    owner decision pending — both behaviors are silent and arbitrary; matching
+    RTS means tracking seen tokens in the range parser while still consuming
+    the duplicate's operands. Pinned by
+    TestOptionParsing::test_duplicated_option.
+  since: 0.1.0
+
+- id: DIV-0015
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    We reject unknown or inapplicable trailing tokens; RTS 8.6 silently ignores
+    them. `TS.RANGE k - + GARBAGE` returns samples on RTS and errors here, as do
+    `WITHLABELS` (not a TS.RANGE option) and `EMPTY`/`BUCKETTIMESTAMP` without
+    an accompanying AGGREGATION. ALIGN without AGGREGATION is the exception RTS
+    does validate, and both engines reject it.
+  rationale: >
+    owner decision pending — deliberately NOT matching the reference here.
+    Matching would mean accepting arbitrary garbage in the option list and
+    silently ignoring a mistyped option, which turns a user's typo into a
+    wrong answer instead of an error. Strictness is the safer divergence.
+    Pinned by TestOptionParsing::test_unknown_or_inapplicable_option_rejected.
+  since: 0.1.0
+
+- id: DIV-0016
+  command: TS.REVRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    Under `AGGREGATION first|last ... EMPTY`, a gap bucket's carried-forward
+    fill follows the wrong direction on TS.REVRANGE. RTS fills a gap with the
+    previously *emitted* bucket's value, so its reverse scan carries the
+    chronologically newer neighbour (`last` fills with the newer value,
+    `first` fills NaN); we aggregate forward and reverse the finished buckets,
+    so our carry stays chronological and the two come out swapped. Bucket
+    timestamps and counts match; only the gap fill differs. TS.RANGE (forward)
+    is byte-identical, as are non-EMPTY reverse queries — `first`/`last`
+    themselves were aligned to RTS's scan-order semantics
+    (AggregationOptions::for_scan_order).
+  rationale: >
+    owner decision pending — matching would require either feeding the
+    aggregator reverse-ordered samples (buffering every sample in range rather
+    than one value per bucket, the memory trade the forward design exists to
+    avoid) or a fill pass over the reversed output. Narrow cell: reverse +
+    EMPTY + first/last only. Pinned by
+    TestEmpty::test_empty_carry_forward_is_chronological_not_scan_order.
+  since: 0.1.0
+
+- id: DIV-0017
+  command: TS.CREATERULE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A compaction destination may itself be the source of another rule. RTS 8.6
+    refuses ("TSDB: the source key already has a source rule"), making a
+    destination a leaf; we accept the chain, so a downstream series can compact
+    into a third. Accepted-input superset — a TS.CREATERULE valid here errors on
+    RedisTimeSeries.
+  rationale: >
+    owner decision pending — chaining is a coherent extension (cascading
+    rollups), but it is a real behavioral superset and the circular-dependency
+    guard (check_new_rule_circular_dependency) is what keeps it safe. Confirm
+    the intent, or reject chains to match. Pinned by
+    TestRuleLifecycle::test_rule_on_rule_is_an_accepted_input_superset.
+  since: 0.1.0
+
+- id: DIV-0018
+  command: CONFIG
+  kind: behavior
+  documentation_only: true
+  description: >
+    `ts-encoding` is a one-way latch on RTS 8.6: CONFIG SET can move it away
+    from the default `compressed` (e.g. to `uncompressed`) but never back —
+    the set returns OK yet the value stays put. Ours is fully reversible. The
+    default (compressed) matches; only runtime mutability diverges. Because the
+    latch is irreversible and the reference container is shared, no fixture can
+    restore it, so the value-validation test exercises the encoding grammar on
+    the subject and leaves the reference pristine, and the defaults test
+    tolerates a latched reference value.
+  rationale: >
+    owner decision pending — observed RTS behavior, not something we chose;
+    matching it would mean making ts-encoding immutable-after-change, which is
+    strictly less useful. Pinned by
+    TestValueValidation::test_encoding_is_a_one_way_latch_on_reference.
+  since: 0.1.0
+
+# DIV-0019/DIV-0020 are the Prometheus-style FILTER extensions: our label-filter
+# grammar is a superset of RTS's, so a few filters valid here are rejected by
+# RTS. Both are accepted-input supersets (§5.2, non-registrable) pinned by
+# per-engine assertions in test_compat_mrange.py; they apply equally to
+# TS.MGET and TS.QUERYINDEX. behavior-kind → owner sign-off required.
+
+- id: DIV-0019
+  command: TS.MRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A FILTER with no positive (intersecting) matcher — only negations
+    (`metric!=cpu`) or absence matchers (`region=`) — selects the complement.
+    RTS requires at least one equality matcher and rejects such a filter with
+    "please provide at least one matcher" (which is our MISSING_FILTER text, so
+    parity is enforceable if desired). Applies to TS.MRANGE/MGET/QUERYINDEX.
+  rationale: >
+    owner decision pending — our FILTER language is deliberately Prometheus-
+    style (the shared parser also backs the TS.MDEL/TS.CARD extensions), so a
+    complement query is a feature here. Restricting it to the in-scope commands
+    for RTS parity is a scoped change to the command parse layer, not the
+    shared selector parser. Pinned by
+    TestFilterLanguage::test_negative_only_matcher_is_a_superset.
+  since: 0.1.0
+
+- id: DIV-0020
+  command: TS.MRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A bare token with no operator (`not-a-matcher`) is accepted as a Prometheus
+    metric-name selector (matching nothing when no such metric exists); RTS
+    rejects it with "failed parsing labels". Same extended-grammar root as
+    DIV-0019; applies to TS.MRANGE/MGET/QUERYINDEX.
+  rationale: >
+    owner decision pending — bare metric-name selectors are valid PromQL and a
+    deliberate extension. Pinned by
+    TestFilterLanguage::test_bare_metric_name_matcher_is_a_superset.
   since: 0.1.0

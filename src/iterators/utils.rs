@@ -226,7 +226,8 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     match (&options.aggregation, grouping) {
         (Some(agg), Some(grp)) => {
-            let aggr_iter = create_aggregate_iterator(filtered, options, agg);
+            let agg = agg.for_scan_order(is_reverse);
+            let aggr_iter = create_aggregate_iterator(filtered, options, &agg);
             let aggregator = grp.aggregation.create_aggregator();
             let reducer = ReduceIterator::new(aggr_iter, aggregator);
             finalize(reducer, is_reverse, count)
@@ -237,7 +238,8 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
             finalize(reducer, is_reverse, count)
         }
         (Some(agg), None) => {
-            let aggr_iter = create_aggregate_iterator(filtered, options, agg);
+            let agg = agg.for_scan_order(is_reverse);
+            let aggr_iter = create_aggregate_iterator(filtered, options, &agg);
             finalize(aggr_iter, is_reverse, count)
         }
         (None, None) => finalize(filtered, is_reverse, count),

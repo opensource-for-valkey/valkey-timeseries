@@ -238,7 +238,7 @@ class TestTsLabelNames(ValkeyTimeSeriesTestCaseBase):
 
         # Invalid time format
         self.verify_error_response(self.client, 'TS.LABELNAMES FILTER_BY_RANGE invalid_time',
-                                   "TSDB: invalid start timestamp.")
+                                   "TSDB: wrong fromTimestamp")
 
         # Invalid limit format
         self.verify_error_response(self.client, 'TS.LABELNAMES LIMIT invalid_limit',

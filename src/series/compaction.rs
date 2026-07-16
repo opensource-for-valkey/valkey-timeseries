@@ -164,8 +164,15 @@ pub fn apply_compaction(
     process_series_with_compaction(ctx, series, op)
 }
 
-fn null_ts_filter(ts: Timestamp) -> bool {
-    ts != 0
+/// The "no filtering" filter for bucket recalculation: every stored sample counts.
+///
+/// Timestamp 0 is a valid sample timestamp and must be included — a previous
+/// version excluded it (`ts != 0`), which made any recalculation of a bucket
+/// containing a ts=0 sample drop that sample: an out-of-order write into a
+/// finalized first bucket produced the wrong downstream value, and overwriting a
+/// lone ts=0 sample deleted the downstream bucket entirely.
+fn null_ts_filter(_ts: Timestamp) -> bool {
+    true
 }
 
 fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> TsdbResult<()> {

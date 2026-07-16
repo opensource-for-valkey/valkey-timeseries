@@ -1,6 +1,8 @@
 use crate::aggregators::{AggregationType, Aggregator};
-use crate::commands::command_parser::{parse_inline_condition, split_aggregator_condition};
-use crate::commands::{CommandArgIterator, parse_duration};
+use crate::commands::command_parser::{
+    parse_bucket_duration_str, parse_inline_condition, split_aggregator_condition,
+};
+use crate::commands::CommandArgIterator;
 use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
@@ -119,8 +121,7 @@ fn parse_args(args: &mut CommandArgIterator, dest_id: SeriesRef) -> ValkeyResult
     let duration_str = args
         .next_str()
         .map_err(|_| ValkeyError::Str("TSDB: missing bucket duration"))?;
-    let duration = parse_duration(duration_str)
-        .map_err(|_| ValkeyError::Str("TSDB: invalid bucket duration"))?;
+    let duration = parse_bucket_duration_str(duration_str)?;
 
     // possible align timestamp
     let align_timestamp = if let Ok(align_str) = args.next_str() {

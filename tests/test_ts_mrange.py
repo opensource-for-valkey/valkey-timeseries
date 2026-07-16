@@ -334,17 +334,18 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
             assert labels_dict['__reducer__'] == 'max'
 
     def test_mrange_count_zero(self):
-        """Test TS.MRANGE with COUNT 0 (should return empty results)"""
+        """Test TS.MRANGE with COUNT 0 (rejected: COUNT must be >= 1)
+
+        COUNT 0 used to return every series with an empty sample list. It is now
+        an error, matching RedisTimeSeries — a zero here is a typo, not a request
+        for no data, and silently returning nothing hid it (see tests/compat).
+        """
         self.setup_data()
 
-        result = self.client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                             'COUNT', 0,
-                                             'FILTER', 'sensor=temp')
-
-        assert len(result) == 2  # Series are returned
-        for series in result:
-            # But no data points
-            assert len(series[2]) == 0
+        with pytest.raises(ResponseError, match="Invalid COUNT value"):
+            self.client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                        'COUNT', 0,
+                                        'FILTER', 'sensor=temp')
 
     def test_mrange_count_with_filter_by_value(self):
         """Test TS.MRANGE COUNT combined with FILTER_BY_VALUE"""

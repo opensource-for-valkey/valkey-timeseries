@@ -210,6 +210,50 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.INFO` | field-by-field vs frozen 8.6 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
 | `TS.QUERYINDEX` | filter matrix; result ordering (normalize); no-match empty array; requires-non-empty-matcher error |
 
+> **Phase 2 status (2026-07-16):** `TS.RANGE`/`TS.REVRANGE` (`tests/compat/test_compat_range.py`),
+> `TS.MRANGE`/`TS.MREVRANGE` (`tests/compat/test_compat_mrange.py`), `TS.GET`/`TS.MGET`
+> (`tests/compat/test_compat_get.py`), `TS.QUERYINDEX` (`tests/compat/test_compat_queryindex.py`),
+> and the compaction deep-dive (`tests/compat/test_compat_compaction.py`) are landed and fully
+> green — **the §6 read-path matrix is complete.** TS.QUERYINDEX needed no subject change: it
+> mirrors the MGET filter behavior (including the DIV-0019/0020 Prometheus supersets) and its
+> detailed parser diagnostics are a deliberate feature. The GET matrix found and fixed one subject
+> bug: TS.GET reported
+> valkey-module-rs's raw "Existing key has wrong Valkey type" on a WRONGTYPE key where RTS (and our
+> own TS.RANGE/TS.INFO) report the standard WRONGTYPE — `with_timeseries` now maps it, and a missing
+> key still reports KEY_NOT_FOUND. The MRANGE matrix found and fixed four subject bugs — REDUCE restricted to
+> RTS's reducer set (`first`/`last` were wrongly accepted), SELECTED_LABELS with no labels now
+> rejected, the ALIGN-`start`/`end`-needs-explicit-bound guard extended from RANGE to the MRANGE
+> family, and a stray `REDUCE` without `GROUPBY` now rejected instead of silently ignored — and
+> registered two Prometheus-superset FILTER divergences (DIV-0019 negative-only matcher, DIV-0020
+> bare metric-name matcher) plus documented the arity-vs-TSDB error-message differences. The phase found and fixed one crash
+> (`AGGREGATION <agg> 0` panicked the server; a zero-duration rule also persisted into the RDB and
+> crashed the source's next write), one silent correctness bug (`TS.INCRBY`/`TS.DECRBY` never drove
+> compaction rules), three accepted-input supersets, two over-strict rejections, and aligned ~10
+> error texts.
+>
+> **Fixed since:** *out-of-order compaction upsert.* A late sample into an already-finalized
+> bucket did not update the downstream value (RTS 100, ours 99 for `1 + 99` into a closed bucket),
+> and overwriting a lone ts=0 sample deleted the downstream bucket outright. Root cause: the
+> bucket-recalculation filter `null_ts_filter` excluded timestamp 0 (`ts != 0`). Now `true` —
+> every stored sample counts. Verified byte-identical to RTS.
+>
+> **Fixed since (retention accounting):** *TS.INFO under retention.* `totalSamples` /
+> `firstTimestamp` reported physically-buffered samples where RTS reports the retained window
+> (`TS.RANGE` already agreed). Root cause: retention was applied lazily — only by the async
+> background trim task and on chunk split — and `trim()` had an off-by-one boundary
+> (removed `<= min`, dropping the sample at exactly `lastTimestamp - retention`, which RTS keeps).
+> Now every write trims the series synchronously (`TimeSeries::add` / `merge_samples`), with the
+> boundary aligned to the read path and RTS (keep `>= min`). Verified byte-identical, including a
+> `DEBUG RELOAD` round-trip. The full compat suite is green.
+>
+> Divergences DIV-0012..DIV-0020 are registered but still need the §5.3 owner sign-off.
+>
+> **Registry hazard found while doing this (fixed):** an unscoped `behavior` entry matches every
+> `value`/`shape`/`error-condition` delta on its command — nearly every real bug on that command.
+> DIV-0013 silently absorbed finding (1) above until it was caught. `divergences.yml` entries now
+> carry either a `details_regex` or `documentation_only: true`, and the loader enforces the
+> distinction. Any future `behavior` entry needs the same scrutiny.
+
 **Compaction deep-dive scenarios** (highest historical-divergence area, gets its own module):
 bucket finalization timing (when does a sample land in the downstream series), out-of-order writes
 into already-finalized buckets, `TS.DEL` on source ranges covered by finalized buckets, retention

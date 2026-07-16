@@ -11,6 +11,7 @@ use crate::series::chunks::TimeSeriesChunk;
 use crate::series::{DateRange, TimestampRange, ValueFilter};
 use get_size2::GetSize;
 use smallvec::{SmallVec, smallvec};
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::hash::Hash;
 use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, ValkeyString};
@@ -98,6 +99,20 @@ impl AggregatorConfig {
         self.aggregation
     }
 
+    /// `first`/`last` with the two swapped, or `self` for every other aggregator.
+    /// See [`AggregationOptions::for_scan_order`].
+    fn with_first_last_swapped(&self) -> Self {
+        let aggregation = match self.aggregation {
+            AggregationType::First => AggregationType::Last,
+            AggregationType::Last => AggregationType::First,
+            other => other,
+        };
+        Self {
+            aggregation,
+            value_filter: self.value_filter,
+        }
+    }
+
     pub fn aggregation_name(&self) -> &'static str {
         self.aggregation.name()
     }
@@ -166,6 +181,39 @@ pub struct AggregationOptions {
     pub timestamp_output: BucketTimestamp,
     pub alignment: BucketAlignment,
     pub report_empty: bool,
+}
+
+impl AggregationOptions {
+    /// The aggregation as it must behave for a query scanned in `is_reverse` order.
+    ///
+    /// `first`/`last` are the only scan-order-dependent aggregators, and
+    /// RedisTimeSeries defines them against the scan: `TS.REVRANGE ... AGGREGATION
+    /// first` reports each bucket's *newest* sample. We always aggregate forward
+    /// and reverse the finished buckets (buffering bucket count rather than sample
+    /// count), so the two aggregators are swapped here to land on the same answer.
+    ///
+    /// Borrows unchanged for forward queries and for aggregations without
+    /// first/last, so the common path allocates nothing.
+    pub fn for_scan_order(&self, is_reverse: bool) -> Cow<'_, Self> {
+        let needs_swap = is_reverse
+            && self.aggregations.iter().any(|a| {
+                matches!(
+                    a.aggregation_type(),
+                    AggregationType::First | AggregationType::Last
+                )
+            });
+        if !needs_swap {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Self {
+            aggregations: self
+                .aggregations
+                .iter()
+                .map(AggregatorConfig::with_first_last_swapped)
+                .collect(),
+            ..self.clone()
+        })
+    }
 }
 
 /// A filter that can be either inclusive or exclusive over a date range.
