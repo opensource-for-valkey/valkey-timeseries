@@ -515,6 +515,15 @@ fn process_series_with_compaction(
     series: &mut TimeSeries,
     op: CompactionOp,
 ) -> TsdbResult<()> {
+    // `ts.add:dest` fires only when compaction appends new bucket data to a
+    // downstream series (a bucket close). Reference-observed (§7.3): an
+    // upsert into an already-closed bucket recomputes the destination
+    // silently, and a TS.DEL propagated into destinations emits only the
+    // source's `ts.del`.
+    let notify_destinations = matches!(
+        op,
+        CompactionOp::AddNew(_) | CompactionOp::AddBatch { .. }
+    );
     let mut notified: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
     let mut visited: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
     visited.push(series.id);
@@ -610,7 +619,7 @@ fn process_series_with_compaction(
         }
     }
 
-    if !notified.is_empty() {
+    if notify_destinations && !notified.is_empty() {
         notify_compaction(ctx, &notified);
     }
 

@@ -50,7 +50,9 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return process_series(ctx, &mut guard, samples);
     }
 
-    let mut series = create_and_store_series(ctx, &key, options, true, true)?;
+    // notify=false: auto-create emits no ts.create event, consistent with the
+    // TS.ADD family (and RTS's behavior for auto-creating writes).
+    let mut series = create_and_store_series(ctx, &key, options, false, true)?;
     process_series(ctx, &mut series, samples)
 }
 

@@ -133,6 +133,7 @@ pub fn create_and_store_internal(
     ctx: &Context,
     key: &ValkeyString,
     options: TimeSeriesOptions,
+    replicate: bool,
     notify: bool,
 ) -> ValkeyResult<()> {
     let _key = ValkeyKeyWritable::open(ctx.ctx, key);
@@ -144,8 +145,13 @@ pub fn create_and_store_internal(
     let ts = create_series(key, options, ctx)?;
     _key.set_value(&VK_TIME_SERIES_TYPE, ts)?;
 
-    if notify {
+    if replicate {
         ctx.replicate_verbatim();
+    }
+    // Only an explicit TS.CREATE emits `ts.create`; auto-creating write
+    // commands (TS.ADD/TS.MADD/TS.INCRBY/...) emit just their own write
+    // event, matching RedisTimeSeries (compat plan §7.3).
+    if notify {
         ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.create", key);
         ctx.log_verbose("series created");
     }
@@ -160,7 +166,7 @@ pub fn create_and_store_series<'a>(
     notify: bool,
     add_compactions: bool,
 ) -> ValkeyResult<SeriesGuardMut<'a>> {
-    create_and_store_internal(ctx, key, options, notify)?;
+    create_and_store_internal(ctx, key, options, true, notify)?;
 
     let Some(mut series) = get_timeseries_mut(ctx, key, true, Some(AclPermissions::INSERT))? else {
         return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND));
