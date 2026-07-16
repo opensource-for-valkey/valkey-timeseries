@@ -365,6 +365,10 @@ pub(crate) struct MRangeSeriesResult {
     pub key: String,
     pub group_label_value: Option<String>,
     pub labels: Vec<Label>,
+    /// Source series keys backing a GROUPBY group (sorted). Empty for
+    /// non-grouped results. RESP3 replies report these in the per-group
+    /// `sources` metadata map regardless of WITHLABELS.
+    pub sources: Vec<String>,
     pub data: SeriesResultData,
 }
 

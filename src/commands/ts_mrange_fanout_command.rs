@@ -4,7 +4,7 @@ use super::fanout_codec::generated::{
 };
 use crate::aggregators::MultiAggregateIterator;
 use crate::aggregators::{PartialReducer, PartialState};
-use crate::commands::utils::reply_with_mrange_series_results;
+use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
 use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -188,10 +188,14 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         let series = std::mem::take(&mut self.series);
         let group_partials = std::mem::take(&mut self.group_partials);
 
+        // Captured before process_responses, which clears aggregation options
+        // under push-down (the RESP3 reply still reports the aggregator names).
+        let shape = MRangeReplyShape::from_options(&self.options);
+
         match self.process_responses(series, group_partials) {
             Ok(mut series) => {
                 sort_mrange_results(&mut series, is_grouped);
-                let _ = reply_with_mrange_series_results(ctx, &series);
+                let _ = reply_with_mrange_series_results(ctx, &series, &shape);
                 Status::Ok
             }
             Err(e) => {
@@ -567,6 +571,7 @@ fn handle_group_partials(
                 key: format!("{}={}", group_options.group_label, label),
                 group_label_value: Some(label),
                 labels,
+                sources,
                 data,
             }
         })
@@ -692,6 +697,7 @@ fn process_group(
         key: format!("{}={}", group_options.group_label, label),
         group_label_value: Some(label),
         labels,
+        sources: data.keys.to_vec(),
         data: result_data,
     }
 }
@@ -787,6 +793,7 @@ mod tests {
             key: key.into(),
             group_label_value: group.map(String::from),
             labels: Vec::new(),
+            sources: Vec::new(),
             data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
                 UncompressedChunk::from_vec(data),
             )),
@@ -1482,6 +1489,7 @@ mod tests {
             key: key.into(),
             group_label_value: group.map(String::from),
             labels: Vec::new(),
+            sources: Vec::new(),
             data: SeriesResultData::Rows(rows),
         })
     }

@@ -357,6 +357,7 @@ fn handle_non_grouped(
                 group_label_value: meta.group_label_value,
                 key: meta.source_key,
                 labels,
+                sources: Vec::new(),
                 data,
             }
         })
@@ -416,6 +417,7 @@ fn handle_grouping(
                 key,
                 group_label_value: Some(label_value),
                 labels,
+                sources: group_data.source_keys,
                 data,
             }
         })
@@ -588,6 +590,7 @@ fn collect_group_label_values(metas: &mut Vec<MRangeSeriesMeta>, grouping: &Rang
 struct GroupedSeriesData<'a> {
     series: Vec<MRangeSeriesMeta<'a>>,
     labels: Vec<Label>,
+    source_keys: Vec<String>,
 }
 
 fn group_series_by_label<'a>(
@@ -606,26 +609,21 @@ fn group_series_by_label<'a>(
                 .or_insert_with(|| GroupedSeriesData {
                     series: Vec::new(),
                     labels: Vec::new(),
+                    source_keys: Vec::new(),
                 });
+            entry.source_keys.push(meta.source_key.clone());
             entry.series.push(meta);
         }
     }
 
-    if with_labels {
-        for (label_value_str, group_data) in grouped.iter_mut() {
-            let mut source_keys: Vec<String> = group_data
-                .series
-                .iter()
-                .map(|m| m.source_key.clone())
-                .collect();
-
-            source_keys.sort();
-
+    for (label_value_str, group_data) in grouped.iter_mut() {
+        group_data.source_keys.sort();
+        if with_labels {
             group_data.labels = build_mrange_grouped_labels(
                 group_by_label_name,
                 label_value_str,
                 reducer_name,
-                &source_keys,
+                &group_data.source_keys,
             );
         }
     }
