@@ -5,7 +5,9 @@ pub const CHUNK_COMPRESSION: &str = "TSDB: cannot compress chunk";
 pub const CHUNK_DECOMPRESSION: &str = "TSDB: cannot decompress chunk";
 pub const DUPLICATE_LABEL: &str = "TSDB: duplicate label";
 pub const DUPLICATE_LABELS: &str = "TSDB: duplicate labels";
-pub const DUPLICATE_SAMPLE: &str = "TSDB: duplicate sample";
+// Exact RTS text (compat finding #8): emitted for every duplicate-blocked
+// upsert (TS.ADD and per-item TS.MADD), regardless of which clause applies.
+pub const DUPLICATE_SAMPLE: &str = "TSDB: Error at upsert, update is not supported when DUPLICATE_POLICY is set to BLOCK mode, or either current or new value is NaN and DUPLICATE_POLICY is MAX/MIN/SUM";
 pub const DUPLICATE_UPSERT_SAMPLE: &str = "TSDB: duplicate sample at upsert";
 pub const SAMPLE_TOO_CLOSE: &str = "TSDB: sample too close to previous in value or timestamp";
 pub const DUPLICATE_SERIES: &str = "TSDB: duplicate series";

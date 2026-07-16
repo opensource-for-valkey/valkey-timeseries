@@ -324,9 +324,9 @@ impl From<SampleAddResult> for ValkeyValue {
         match res {
             SampleAddResult::Ok(ts) => ValkeyValue::Integer(ts.timestamp),
             SampleAddResult::Ignored(ts) => ValkeyValue::Integer(ts),
-            SampleAddResult::Duplicate => {
-                ValkeyValue::SimpleStringStatic(error_consts::DUPLICATE_SAMPLE)
-            }
+            // Per-item failures must be real RESP error replies inside the
+            // TS.MADD array (clients type-check the elements), matching RTS.
+            SampleAddResult::Duplicate => ValkeyValue::StaticError(error_consts::DUPLICATE_SAMPLE),
             SampleAddResult::TooOld => ValkeyValue::StaticError(error_consts::SAMPLE_TOO_OLD),
             SampleAddResult::Error(e) => ValkeyValue::StaticError(e),
         }
