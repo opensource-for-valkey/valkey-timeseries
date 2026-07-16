@@ -22,7 +22,7 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
 
     def reset_defaults(self):
         # Reset the configs we touched back to sane defaults
-        self.set_config("ts-chunk-size", DEFAULT_CHUNK_SIZE)
+        self.set_config("ts-chunk-size-bytes", DEFAULT_CHUNK_SIZE)
         self.set_config("ts-duplicate-policy", DEFAULT_DUPLICATE_POLICY)
         self.set_config("ts-retention-policy", DEFAULT_RETENTION)
 
@@ -30,7 +30,7 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
         key = "ts_cfg_chunksize"
         new_chunk_size = 8192
         try:
-            self.set_config("ts-chunk-size", new_chunk_size)
+            self.set_config("ts-chunk-size-bytes", new_chunk_size)
             self.client.execute_command("TS.CREATE", key)
             info = self.ts_info(key, True)
             assert info["chunkSize"] == new_chunk_size
@@ -71,7 +71,7 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command("TS.CREATE", key_old)
 
             # Change configs
-            self.set_config("ts-chunk-size", new_chunk_size)
+            self.set_config("ts-chunk-size-bytes", new_chunk_size)
             self.set_config("ts-duplicate-policy", new_policy)
             self.set_config("ts-retention-policy", new_retention)
 

@@ -212,15 +212,15 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 
 | Parameter                      | Type     | Default         | Description                                                                             |
 |--------------------------------|----------|-----------------|-----------------------------------------------------------------------------------------|
-| `ts-chunk-size`                | integer  | 4096            | Maximum memory per time series chunk, in bytes                                          |
-| `ts-encoding`                  | enum     | `CHIMP`         | Default chunk encoding: `CHIMP`, `GORILLA` or `UNCOMPRESSED`                            |
+| `ts-chunk-size-bytes`          | integer  | 4096            | Maximum memory per time series chunk, in bytes                                          |
+| `ts-encoding`                  | enum     | `COMPRESSED`    | Default chunk encoding: `CHIMP`, `GORILLA` or `UNCOMPRESSED`                            |
 | `ts-duplicate-policy`          | enum     | `BLOCK`         | Policy for handling duplicate timestamps: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, `SUM` |
 | `ts-retention-policy`          | duration | `0` (no expiry) | Default retention period (milliseconds)                                                 |
 | `ts-compaction-policy`         | string   | `None`          | Default compaction rules applied to all new time series                                 |
 | `ts-decimal-digits`            | integer  | `none`          | Round sample values to N decimal places; `none` disables rounding                       |
 | `ts-significant-digits`        | integer  | `none`          | Round sample values to N significant digits; `none` disables rounding                   |
 | `ts-ignore-max-time-diff`      | duration | `0ms`           | Max time delta (ms) for which a duplicate sample is silently ignored                    |
-| `ts-ignore-max-value-diff`     | float    | 0.0             | Max value delta for which a duplicate sample is silently ignored                        |
+| `ts-ignore-max-val-diff`     | float    | 0.0             | Max value delta for which a duplicate sample is silently ignored                        |
 | `ts-num-threads`               | integer  | 8               | Number of worker threads for parallel query processing                                  |
 | `ts-fanout-command-timeout`    | duration | —               | Timeout (ms) for fanout (cluster scatter/gather) commands                               |
 | `ts-cluster-map-expiration-ms` | duration | —               | How long (ms) cluster slot-map entries are cached; `0` disables caching                 |
@@ -235,7 +235,7 @@ TS._DEBUG LIST_CONFIGS
 ```
 
 ```valkey-cli
-1) "ts-chunk-size"
+1) "ts-chunk-size-bytes"
 2) "ts-encoding"
 3) "ts-duplicate-policy" ...
 ```

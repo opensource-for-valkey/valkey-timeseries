@@ -87,7 +87,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
 
         # Check for expected config names
         config_names = [name.decode() if isinstance(name, bytes) else name for name in result]
-        assert 'ts-chunk-size' in config_names
+        assert 'ts-chunk-size-bytes' in config_names
         assert 'ts-encoding' in config_names
         assert 'ts-duplicate-policy' in config_names
         assert 'ts-retention-policy' in config_names
@@ -159,7 +159,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             config_names.append(name)
 
         expected_configs = [
-            'ts-chunk-size',
+            'ts-chunk-size-bytes',
             'ts-encoding',
             'ts-duplicate-policy',
             'ts-retention-policy',
@@ -167,7 +167,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-decimal-digits',
             'ts-significant-digits',
             'ts-ignore-max-time-diff',
-            'ts-ignore-max-value-diff',
+            'ts-ignore-max-val-diff',
             'ts-num-threads',
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
@@ -304,30 +304,30 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         self.set_debug_mode()
 
         before = self._verbose_configs()
-        assert before['ts-chunk-size']['value'] == 4096
+        assert before['ts-chunk-size-bytes']['value'] == 4096
         assert before['ts-index-persist']['value'] == 'yes'
         assert before['ts-compaction-policy']['value'] == ''
         assert before['ts-decimal-digits']['value'] == 'none'
 
         # ts-num-threads cannot be changed after startup; everything else can
         assert before['ts-num-threads']['mutable'] == 'no'
-        assert before['ts-chunk-size']['mutable'] == 'yes'
+        assert before['ts-chunk-size-bytes']['mutable'] == 'yes'
 
-        self.client.config_set('ts.ts-chunk-size', 8192)
+        self.client.config_set('ts.ts-chunk-size-bytes', 8192)
         self.client.config_set('ts.ts-index-persist', 'no')
         self.client.config_set('ts.ts-compaction-policy', 'max:1m:1h')
         self.client.config_set('ts.ts-decimal-digits', '3')
         self.client.config_set('ts.ts-retention-policy', '5000')
 
         after = self._verbose_configs()
-        assert after['ts-chunk-size']['value'] == 8192
+        assert after['ts-chunk-size-bytes']['value'] == 8192
         assert after['ts-index-persist']['value'] == 'no'
         assert after['ts-compaction-policy']['value'] == 'max:1m:1h'
         assert after['ts-decimal-digits']['value'] == 3
         assert after['ts-retention-policy']['value'] == '5s'
 
         # Defaults are fixed metadata and must not follow the live value
-        assert after['ts-chunk-size']['default'] == 4096
+        assert after['ts-chunk-size-bytes']['default'] == 4096
         assert after['ts-retention-policy']['default'] == '0ms'
 
         # Clearing the compaction policy must clear what is reported
