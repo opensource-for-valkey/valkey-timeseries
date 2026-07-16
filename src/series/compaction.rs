@@ -307,8 +307,12 @@ fn handle_compaction_upsert(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
         return Ok(());
     }
 
-    // This is a historical upsert - need to recalculate the affected bucket
-    recalculate_bucket(ctx, bucket_start, bucket_end, null_ts_filter)
+    // This is a historical upsert — recalculate the affected (closed) bucket.
+    // The recompute range must be that bucket's own span; `bucket_end` above
+    // belongs to the *current* open bucket, and using it here would fold every
+    // sample between the historical bucket and the open one into the recompute.
+    let historical_bucket_end = bucket_start.saturating_add_unsigned(duration);
+    recalculate_bucket(ctx, bucket_start, historical_bucket_end, null_ts_filter)
 }
 
 /// Recalculate the current ongoing aggregation bucket

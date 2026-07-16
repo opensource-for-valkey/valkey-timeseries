@@ -174,7 +174,9 @@ fn parse_args<'a>(
                         SampleAddResult::Ok(Sample::default())
                     }
                     Ok(None) => {
-                        // notify=false: auto-create emits no ts.create event, matching RTS.
+                        // Auto-create: no ts.create event (RTS parity) and no
+                        // replication from the create helper — MADD replicates its
+                        // successful triples itself.
                         let guard =
                             create_and_store_series(ctx, key, options.clone(), false, true)?;
                         series_samples.series = Some(guard);

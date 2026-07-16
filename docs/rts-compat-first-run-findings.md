@@ -112,6 +112,37 @@ pinned by `tests/compat/test_compat_persistence.py`:
   rejection, no key, reference healthy — pinned as documentation (we don't
   control that direction).
 
+## §7.5 replication & persistence self-consistency (2026-07-16)
+
+Covered by `tests/compat/test_compat_replication.py`: primary→replica pairs on
+*both* engines (a second pinned-image container replicating the harness
+reference; a local valkey+module process replicating the session subject),
+plus a cross-engine post-`DEBUG RELOAD` diff of `TS.INFO` + `TS.RANGE`.
+Findings:
+
+- **Plan premise corrected**: RTS 8.6 does *not* replicate auto-timestamp
+  `TS.INCRBY` deterministically — it propagates the command verbatim and the
+  replica stamps its own clock (30/30 divergent when probed). We behave the
+  same (parity); explicit-`TIMESTAMP` increments and `*`-timestamp `TS.ADD`
+  (resolved before propagation) replicate exactly on both engines. Pinned
+  accordingly; the plan §7.5 text carries the correction.
+- **Fixed: double propagation on auto-create (replica corruption)**: the
+  create helper `alsoPropagate`d a verbatim copy of the auto-creating write
+  *and* the command replicated itself, so replicas applied such writes twice
+  — doubling `TS.INCRBY` values (observed `10` vs primary `5`) and, for
+  `*` timestamps, materializing spurious samples. Auto-create sites no longer
+  replicate from the create helper (`explicit_create` seam in
+  `create_and_store_series`); only `TS.CREATE` itself replicates there.
+- **Fixed: historical-upsert compaction recompute over-reach (L2)**: caught
+  by the reload diff — upserting into a closed bucket recalculated it using
+  the *current open* bucket's end boundary, folding every sample between the
+  historical bucket and the open one into the recompute (`sum` bucket of
+  `4+6+4.5` came out as `22.5` because the next bucket's `8` was included;
+  reference: `14.5`). The recompute now uses the historical bucket's own
+  span. Two integration tests in `test_compactions_add.py` had encoded the
+  buggy values (`25.0`, `75.0`); both corrected to the reference-verified
+  values (`70/3`, `45.0`).
+
 Not yet exercised (Phase 2/3 scope): COMMAND INFO metadata (§7.2),
 compaction deep-dive, fuzzing.
 

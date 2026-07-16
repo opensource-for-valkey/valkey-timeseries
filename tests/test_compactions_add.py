@@ -246,9 +246,12 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         dest_samples_after = self.client.execute_command("TS.RANGE", dest_key, "-", "+")
         assert len(dest_samples_after) >= initial_count
 
-        # Value should have changed due to upsert: (10 + 40 + 20 + 30) / 4 = 25
+        # Value should have changed due to upsert. The recomputed bucket
+        # [1000, 11000) holds (10 + 40 + 20) / 3; the sample at 16000 belongs
+        # to the next bucket and must NOT be folded into the recompute
+        # (reference-verified: RedisTimeSeries returns the same value).
         new_value = float(dest_samples_after[0][1])
-        assert new_value == 25.0
+        assert new_value == pytest.approx(70 / 3)
 
     def test_compaction_across_multiple_destination_series(self):
         """Test that one source can compact to multiple destinations with different rules"""
@@ -429,11 +432,12 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         assert len(dest_samples) >= 2  # At least two completed buckets
 
         # Verify compaction calculations are correct
-        # First bucket: 10 + 15 + 20 + 30 = 75 (with upsert)
-        # Second bucket: 30 + 35 = 65
+        # (reference-verified: RedisTimeSeries returns the same values)
+        # First bucket [100000, 105000): 10 + 20 + 15 (upsert) = 45
+        # Second bucket [105000, 110000): 30 + 35 = 65
         assert len(dest_samples) >= 2
 
-        assert float(dest_samples[0][1]) == 75.0
+        assert float(dest_samples[0][1]) == 45.0
         assert float(dest_samples[1][1]) == 65.0
 
     def test_chained_avg_aggregates_over_intermediate_series_not_raw_source(self):
