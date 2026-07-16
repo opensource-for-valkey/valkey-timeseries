@@ -146,8 +146,9 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         """Test error conditions with TS.QUERYINDEX"""
         self.setup_test_data(self.client)
 
-        # Empty query should return error
-        with pytest.raises(ResponseError, match="wrong number of arguments for 'TS.QUERYINDEX' command"):
+        # Empty query should return error. Commands are registered in lowercase
+        # (matching RedisTimeSeries), so the arity error echoes the lowercase name.
+        with pytest.raises(ResponseError, match="wrong number of arguments for 'ts.queryindex' command"):
             self.client.execute_command('TS.QUERYINDEX')
 
         # Invalid filter format

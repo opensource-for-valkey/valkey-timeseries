@@ -329,7 +329,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         self.create_test_series(source_key)
         self.create_test_series(dest_key)
 
-        with pytest.raises(ResponseError, match="wrong number of arguments for 'TS.CREATERULE' command"):
+        with pytest.raises(ResponseError, match="wrong number of arguments for 'ts.createrule' command"):
             self.client.execute_command(
                 "TS.CREATERULE", source_key, dest_key,
                 "AGGREGATION", "avg"

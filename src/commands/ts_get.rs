@@ -4,7 +4,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 
 /// TS.GET key [LATEST]
 #[valkey_module_macros::command({
-    name: "TS.GET",
+    name: "ts.get",
     flags: [ReadOnly, Fast],
     summary: "Get the last sample of a time series.",
     complexity: "O(1)",

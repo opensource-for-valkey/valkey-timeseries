@@ -9,7 +9,7 @@ use valkey_module::{
 /// TS.DEL key fromTimestamp toTimestamp
 ///
 #[valkey_module_macros::command({
-    name: "TS.DEL",
+    name: "ts.del",
     flags: [Write, DenyOOM],
     summary: "Delete samples of a time series within a timestamp range.",
     complexity: "O(N) where N is the number of samples removed.",

@@ -17,7 +17,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 /// 2. Series deletion: TS.MDEL FILTER label=value
 ///    - Removes entire time series matching the filter
 #[valkey_module_macros::command({
-    name: "TS.MDEL",
+    name: "ts.mdel",
     flags: [Write, DenyOOM],
     summary: "Delete samples or entire time series matching a filter.",
     complexity: "O(N*M) where N is the number of matching series and M the number of samples removed per series.",

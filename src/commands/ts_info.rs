@@ -1,4 +1,5 @@
 use crate::common::constants::META_KEY_LABEL;
+use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
 use crate::series::index::get_timeseries_index;
 use crate::series::{
@@ -13,7 +14,7 @@ use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{AclPermissions, Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
 
 #[valkey_module_macros::command({
-    name: "TS.INFO",
+    name: "ts.info",
     flags: [ReadOnly],
     summary: "Return information and statistics for a time series.",
     complexity: "O(1)",
@@ -48,6 +49,10 @@ fn get_ts_info(
     debug: bool,
     key: Option<&ValkeyString>,
 ) -> ValkeyValue {
+    // RESP3 clients receive `labels` and `rules` as native maps; RESP2 clients
+    // receive the array-of-pairs / array-of-arrays forms. Everything else is
+    // protocol-agnostic.
+    let is_resp3 = is_resp3_client(ctx);
     let mut map: HashMap<ValkeyValueKey, ValkeyValue> = HashMap::with_capacity(ts.labels.len() + 1);
     let metric = ts.prometheus_metric_name();
     map.insert("metric".into(), metric.into());
@@ -109,19 +114,7 @@ fn get_ts_info(
         );
     }
 
-    if ts.labels.is_empty() {
-        map.insert("labels".into(), ValkeyValue::Null);
-    } else {
-        let mut labels = ts.labels.to_label_vec();
-        labels.sort();
-
-        let labels_value = labels
-            .into_iter()
-            .map(|label| label.into())
-            .collect::<Vec<ValkeyValue>>();
-
-        map.insert("labels".into(), ValkeyValue::from(labels_value));
-    }
+    map.insert("labels".into(), get_labels_info(ts, is_resp3));
 
     // Always present: nil when the series is not a compaction target
     // (RedisTimeSeries parity), or when the source id cannot be resolved.
@@ -139,7 +132,7 @@ fn get_ts_info(
     );
     map.insert(
         ValkeyValueKey::String("rules".to_string()),
-        get_rules_info(ctx, ts),
+        get_rules_info(ctx, ts, is_resp3),
     );
 
     map.insert(
@@ -201,36 +194,101 @@ fn get_one_chunk_info(chunk: &TimeSeriesChunk) -> ValkeyValue {
     ValkeyValue::Map(map)
 }
 
-fn get_rules_info(ctx: &Context, series: &TimeSeries) -> ValkeyValue {
-    if series.rules.is_empty() {
-        return ValkeyValue::Array(vec![]);
+/// Series labels for TS.INFO.
+///
+/// RESP3: a map of `name -> value`. RESP2: an array of `[name, value]` pairs.
+/// A label-less series yields an empty map / empty array respectively. Both
+/// forms are empty (not nil) — see [`From<Label>`] for the RESP2 pair encoding.
+fn get_labels_info(ts: &TimeSeries, is_resp3: bool) -> ValkeyValue {
+    let mut labels = ts.labels.to_label_vec();
+    labels.sort();
+
+    if is_resp3 {
+        let map: HashMap<ValkeyValueKey, ValkeyValue> = labels
+            .into_iter()
+            .map(|label| {
+                let value = if label.value.is_empty() {
+                    ValkeyValue::Null
+                } else {
+                    ValkeyValue::from(label.value)
+                };
+                (ValkeyValueKey::String(label.name), value)
+            })
+            .collect();
+        return ValkeyValue::Map(map);
     }
 
+    let labels_value = labels
+        .into_iter()
+        .map(|label| label.into())
+        .collect::<Vec<ValkeyValue>>();
+    ValkeyValue::from(labels_value)
+}
+
+/// Aggregator name as reported inside a TS.INFO `rules` entry: uppercase
+/// (`AVG`, `STD.P`, …), matching RedisTimeSeries. Note this is TS.INFO-specific;
+/// the aggregator/reducer names in TS.MRANGE metadata are lowercase and are
+/// produced elsewhere.
+fn rule_aggregator_name(rule: &crate::series::CompactionRule) -> String {
+    rule.aggregator.aggregation_type().to_string().to_uppercase()
+}
+
+/// Compaction rules for TS.INFO.
+///
+/// RESP3: a map of `destKey -> [bucketDuration, aggregator, alignTimestamp]`.
+/// RESP2: an array of `[destKey, bucketDuration, aggregator, alignTimestamp]`.
+/// A rule whose destination key can no longer be resolved is dropped from the
+/// reply (and logged), in both protocols.
+fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyValue {
     let series_ids: SmallVec<[_; 16]> = series.rules.iter().map(|rule| rule.dest_id).collect();
     let keys_map = get_keys_by_id(ctx, &series_ids);
 
-    let rules_value = series
+    // Resolve destination keys once; a rule with a dangling destination id is
+    // logged and skipped so it appears in neither protocol's reply.
+    let resolved = series
         .rules
         .iter()
-        .flat_map(|x| {
-            let Some(dest_key) = keys_map.get(&x.dest_id) else {
+        .filter_map(|x| match keys_map.get(&x.dest_id) {
+            Some(dest_key) => Some((dest_key, x)),
+            None => {
                 let msg = format!(
                     "Compaction rule has invalid destination id {}. Removing rule.",
                     x.dest_id
                 );
                 ctx.log_warning(&msg);
-                return None;
-            };
-
-            Some(ValkeyValue::Array(vec![
-                ValkeyValue::BulkString(dest_key.clone()),
-                ValkeyValue::Integer(x.bucket_duration as i64),
-                ValkeyValue::SimpleString(x.aggregator.aggregation_type().to_string()),
-                ValkeyValue::Integer(x.align_timestamp),
-            ]))
+                None
+            }
         })
         .collect::<Vec<_>>();
 
+    if is_resp3 {
+        let rules_map: HashMap<ValkeyValueKey, ValkeyValue> = resolved
+            .into_iter()
+            .map(|(dest_key, x)| {
+                (
+                    ValkeyValueKey::String(dest_key.clone()),
+                    ValkeyValue::Array(vec![
+                        ValkeyValue::Integer(x.bucket_duration as i64),
+                        ValkeyValue::SimpleString(rule_aggregator_name(x)),
+                        ValkeyValue::Integer(x.align_timestamp),
+                    ]),
+                )
+            })
+            .collect();
+        return ValkeyValue::Map(rules_map);
+    }
+
+    let rules_value = resolved
+        .into_iter()
+        .map(|(dest_key, x)| {
+            ValkeyValue::Array(vec![
+                ValkeyValue::BulkString(dest_key.clone()),
+                ValkeyValue::Integer(x.bucket_duration as i64),
+                ValkeyValue::SimpleString(rule_aggregator_name(x)),
+                ValkeyValue::Integer(x.align_timestamp),
+            ])
+        })
+        .collect::<Vec<_>>();
     ValkeyValue::Array(rules_value)
 }
 

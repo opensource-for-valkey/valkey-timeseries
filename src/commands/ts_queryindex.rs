@@ -7,7 +7,7 @@ use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
 #[valkey_module_macros::command({
-    name: "TS.QUERYINDEX",
+    name: "ts.queryindex",
     flags: [ReadOnly],
     summary: "Return the keys of time series matching a filter.",
     complexity: "O(N) where N is the number of time series that match the filters.",

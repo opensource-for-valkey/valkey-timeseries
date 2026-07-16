@@ -15,7 +15,7 @@ use valkey_module::{Context, ValkeyResult, ValkeyString};
 /// [LIMIT limit]
 /// [FILTER seriesMatcher...]
 #[valkey_module_macros::command({
-    name: "TS.LABELNAMES",
+    name: "ts.labelnames",
     flags: [ReadOnly],
     summary: "Return label names across time series, optionally filtered.",
     complexity: "O(N) where N is the number of label names in the index.",

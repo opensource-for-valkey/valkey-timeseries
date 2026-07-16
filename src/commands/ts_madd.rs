@@ -40,7 +40,7 @@ struct SeriesSamples<'a> {
 /// Because of that there is extra bookkeeping to do, including mapping results back to the
 /// original input and returning results in input order.
 #[valkey_module_macros::command({
-    name: "TS.MADD",
+    name: "ts.madd",
     flags: [Write, DenyOOM],
     summary: "Append new samples to one or more time series.",
     complexity: "O(N) where N is the number of samples added.",
