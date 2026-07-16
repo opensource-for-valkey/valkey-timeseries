@@ -277,6 +277,32 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         assert dst_info[b'rules'] == {}
         assert dst_info[b'sourceKey'] == src.encode()
 
+    def test_info_debug_bytes_per_sample_is_double(self):
+        """Per-chunk `bytesPerSample` is replied as a double, matching
+        RedisTimeSeries (ReplyWithDouble): native double on RESP3, numeric
+        bulk string on RESP2."""
+        key = 'ts_dbg_bps'
+        self.client.execute_command('TS.CREATE', key)
+        self.client.execute_command('TS.ADD', key, 100, 1.5)
+
+        # RESP2: a bulk string carrying a numeric value
+        raw = self.client.execute_command('TS.INFO', key, 'DEBUG')
+        d = dict(zip(raw[::2], raw[1::2]))
+        chunk = d[b'Chunks'][0]
+        c = dict(zip(chunk[::2], chunk[1::2]))
+        bps = c[b'bytesPerSample']
+        assert isinstance(bps, bytes), f"RESP2 bytesPerSample should be a bulk string, got {bps!r}"
+        assert float(bps) > 0
+
+        # RESP3: a native double
+        c3 = self._resp3_client()
+        info3 = c3.execute_command('TS.INFO', key, 'DEBUG')
+        chunk3 = info3[b'Chunks'][0]
+        assert isinstance(chunk3, dict)
+        bps3 = chunk3[b'bytesPerSample']
+        assert isinstance(bps3, float), f"RESP3 bytesPerSample should be a double, got {bps3!r}"
+        assert bps3 > 0
+
     def test_info_resp2_labels_and_rules_stay_arrays(self):
         """RESP2 keeps the array shapes for `labels` and `rules` (unchanged)."""
         src = 'ts_resp2_src'

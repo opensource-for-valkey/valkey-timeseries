@@ -187,9 +187,11 @@ fn get_one_chunk_info(chunk: &TimeSeriesChunk) -> ValkeyValue {
     );
     map.insert("samples".into(), ValkeyValue::Integer(chunk.len() as i64));
     map.insert("size".into(), ValkeyValue::Integer(chunk.size() as i64));
+    // RTS replies bytesPerSample via ReplyWithDouble: native double on RESP3,
+    // bulk string on RESP2 (compat finding #12) — Float reproduces both.
     map.insert(
         "bytesPerSample".into(),
-        ValkeyValue::BulkString(chunk.bytes_per_sample().to_string()),
+        ValkeyValue::Float(chunk.bytes_per_sample() as f64),
     );
     ValkeyValue::Map(map)
 }
