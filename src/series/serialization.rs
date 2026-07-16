@@ -3,8 +3,9 @@ use crate::common::rdb::*;
 use crate::labels::MetricName;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use crate::series::compaction::CompactionRule;
+use crate::series::series_data_type::TIMESERIES_TYPE_ENCODING_VERSION;
 use crate::series::{SampleDuplicatePolicy, TimeSeries, TimeseriesId};
-use valkey_module::{ValkeyResult, raw};
+use valkey_module::{ValkeyError, ValkeyResult, raw};
 
 pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
     raw::save_unsigned(rdb, series.id);
@@ -34,6 +35,19 @@ pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
 }
 
 pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResult<TimeSeries> {
+    // Refuse foreign/unknown payload versions before touching the stream.
+    // RedisTimeSeries registers the same `TSDB-TYPE` name with an
+    // incompatible layout (encver 9 as of RTS 8.6); parsing it here would
+    // silently misread data. Migration is via export/re-ingest, not RDB —
+    // see COMPATIBILITY.md.
+    if enc_ver != TIMESERIES_TYPE_ENCODING_VERSION {
+        return Err(ValkeyError::String(format!(
+            "TSDB: cannot load TSDB-TYPE RDB payload with encoding version {enc_ver} \
+             (this module writes version {TIMESERIES_TYPE_ENCODING_VERSION}). \
+             RedisTimeSeries RDB/DUMP payloads are incompatible and cannot be imported; \
+             re-ingest via TS.RANGE export -> TS.MADD (see COMPATIBILITY.md)"
+        )));
+    }
     let id = raw::load_unsigned(rdb)? as TimeseriesId;
     let labels = MetricName::from_rdb(rdb)?;
 

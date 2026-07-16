@@ -86,7 +86,12 @@ This section describes areas where Valkey TimeSeries intentionally diverges from
 
 **Why.** The on-disk format is an internal implementation detail and is not part of the compatibility contract. Fixing it would constrain Valkey TimeSeries's ability to evolve its storage, chunk-encoding, and recovery strategies independently of RedisTimeSeries.
 
-**Migration impact.** RedisTimeSeries RDB files cannot be loaded directly by Valkey TimeSeries, and vice versa. Migrations between the two must rebuild series from the underlying data — for example by re-ingesting samples via `TS.ADD` / `TS.MADD` — not by copying persisted data.
+**Migration impact.** RedisTimeSeries RDB files cannot be loaded directly by Valkey TimeSeries, and vice versa. RDB/DUMP migration is explicitly not on the roadmap: the formats are incompatible and no conversion tooling is planned. Migrations between the two must rebuild series from the underlying data, not by copying persisted data. Two working recipes:
+
+- **Export / re-ingest:** for each series, read the samples with `TS.RANGE key - +` (and the metadata with `TS.INFO`), recreate the series on the target with `TS.CREATE` (labels, retention, duplicate policy, chunk settings) plus its `TS.CREATERULE` rules, then bulk-load the samples with `TS.MADD`.
+- **Live dual-write:** during a cutover window, write new samples to both deployments while backfilling history with the export/re-ingest recipe, then switch reads.
+
+The failure modes are deliberately defined and tested rather than left to chance (both modules register the same `TSDB-TYPE` type name, so a payload can *reach* the wrong module): `RESTORE` of a RedisTimeSeries `DUMP` payload into Valkey TimeSeries fails with a clean error and creates no key; starting Valkey TimeSeries on a RedisTimeSeries RDB file is refused with a clear log message; and the module's own encoding-version guard rejects any foreign `TSDB-TYPE` payload even when the server-level RDB version check would admit it (for example, an RDB produced by RedisTimeSeries on an older Redis). The reverse direction is outside this project's control; as observed against RedisTimeSeries 8.6, a Valkey TimeSeries payload is rejected there with `Bad data format`.
 
 ### Log messages
 
