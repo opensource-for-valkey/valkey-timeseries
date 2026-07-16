@@ -34,9 +34,33 @@ against the live reference: the RTS 8.6 field set matches exactly.
 | 12 | L1 | `TS.INFO DEBUG` `bytesPerSample` type | In the per-chunk `Chunks` list, RTS types `bytesPerSample` as a **double** (`4096.0`) in RESP3 and a bulk string (`b'4096'`) in RESP2; we emit a bulk string on both. Observed while probing #11; DEBUG-only, out of #11 scope | **FIXED 2026-07-15** — the per-chunk `bytesPerSample` is now replied as `ValkeyValue::Float` (`RedisModule_ReplyWithDouble`), which reproduces RTS's `ReplyWithDouble` typing exactly: native double on RESP3, numeric bulk string on RESP2. Byte *values* remain per-engine and uncompared (§6). RESP2/RESP3 type regression test in `test_ts_info.py` |
 | 13 | L1 | Sample value text in RESP2 (`TS.RANGE` et al.) | RTS renders some doubles in scientific notation (`0.5` → `5E-1`) in RESP2 bulk strings; we render plain decimal (`0.5`). Identical parsed values — the harness tags it `float-format`. Unmasked in `test_madd_partial_failure[resp2]` once the #3/#8 error deltas were fixed (the scenario now reaches its `TS.RANGE` verification step); RESP3 is unaffected (native doubles) | **REGISTERED 2026-07-15 (DIV-0002…DIV-0007)** — reviewed decision: keep replying sample values via `ValkeyValue::Float`/`RedisModule_ReplyWithDouble` (already the case module-wide), so the RESP2 text is valkey-core's own fpconv formatting. RTS instead formats with its own method; matching it byte-for-byte would be impractical. Values are numerically identical and RESP3 compares parsed doubles, so this is registered as a `float-format` divergence for each sample-returning command (RANGE/REVRANGE/GET/MGET/MRANGE/MREVRANGE — one shared root cause) |
 
-Not yet exercised by the smoke subset (Phase 1/2 scope): config parity (§7.1 — the
-`ts-chunk-size` vs `ts-chunk-size-bytes` naming suspects), keyspace notifications,
-COMMAND INFO metadata, persistence interop (§7.4), compaction deep-dive, fuzzing.
+| 14 | L2 | `twa` aggregator missing | RTS 8.6 supports 13 compaction/range aggregators including `twa` (time-weighted average); our `AggregationType` has no `twa` variant, so `TS.CREATERULE ... AGGREGATION twa`, `AGGREGATION twa` in range queries, and `twa:...` compaction-policy entries are all rejected. Found 2026-07-16 during §7.1 config parity (the policy-grammar case `twa:1h:0` failed on "unknown aggregation type", not on the grammar) | **Open** — implement TWA (Phase 2 compaction deep-dive scope; needs time-weighted bucket semantics incl. the single-sample and bucket-edge cases from plan §6) or register `unsupported` (owner call). Tracked by a strict xfail in `test_compat_config.py::test_compaction_policy_twa` that flips when TWA lands |
+
+## §7.1 config parity (2026-07-16)
+
+Covered by `tests/compat/test_compat_config.py` (names, defaults, mutability,
+value validation, COMPACTION_POLICY grammar): 23 passed, 1 xfail (#14 `twa`).
+Resolution of the day-one suspects and everything else the diff surfaced:
+
+- **Names**: `ts-chunk-size` → `ts-chunk-size-bytes`, `ts-ignore-max-value-diff`
+  → `ts-ignore-max-val-diff` (renamed to the RTS names, no aliases kept). The
+  module-name prefix valkey 8.0 forces on every module config
+  (`ts.ts-chunk-size-bytes`) is registered as **DIV-0008** (`config-name`);
+  the suffix — the part we control — matches RTS exactly.
+- **Defaults**: `ts-encoding` now reports `compressed` (an existing alias of
+  the default compressed encoding — behavior unchanged), matching the
+  reference. `ts-num-threads` deliberately stays at 4 vs RTS's 3 — registered
+  as **DIV-0009** (`behavior`) and asserted by the parity test. All other
+  defaults already matched.
+- **Validation**: the `ts-chunk-size-bytes` config bound was 64 but RTS (and
+  our own `TS.CREATE`) accept 48 — lowered to 48. The COMPACTION_POLICY parser
+  rejected two RTS-valid grammar forms: an alignTimestamp larger than the
+  bucket duration (valid — bucket assignment is modular) and redis-style
+  duration suffixes in the 4th field (it used a different parser than fields
+  2–3). Both fixed, with RTS-grammar unit tests in `compaction_policy.rs`.
+
+Not yet exercised (Phase 2/3 scope): keyspace notifications, COMMAND INFO
+metadata, persistence interop (§7.4), compaction deep-dive, fuzzing.
 
 ## Gate status
 

@@ -16,11 +16,12 @@
 #
 # Kinds: reply-superset | error-text | float-format | behavior | config-name | unsupported
 #
-# Phase-1 triage suspects (NOT yet registered; each becomes a fix or an entry once
-# confirmed against the live reference — see plan §7.1):
-#   - config naming: ts-chunk-size vs ts-chunk-size-bytes,
-#     ts-ignore-max-value-diff vs ts-ignore-max-val-diff
-#   - TS.INFO labels: nil vs empty-array for a series without labels
+# Phase-1 triage suspects: all resolved.
+#   - config naming (ts-chunk-size, ts-ignore-max-value-diff): fixed 2026-07-16 —
+#     renamed to the RTS names (ts-chunk-size-bytes, ts-ignore-max-val-diff);
+#     the module-name prefix that valkey 8.0 forces on every module config is
+#     DIV-0008 below. Full parity coverage in tests/compat/test_compat_config.py.
+#   - TS.INFO labels nil vs empty-array: fixed (findings doc #5).
 
 - id: DIV-0001
   command: TS.INFO
@@ -95,4 +96,29 @@
     RESP2 sample-value text uses valkey-core's double formatting instead of
     RTS's notation; values parse identically (same cause as DIV-0002).
   rationale: same root cause as DIV-0002
+  since: 0.1.0
+
+- id: DIV-0008
+  command: CONFIG
+  kind: config-name
+  description: >
+    Every module config is reachable only under the module-name namespace:
+    RTS `ts-chunk-size-bytes` is our `ts.ts-chunk-size-bytes`, and likewise
+    for the whole ts-* surface. The unprefixed suffix matches RTS exactly.
+  rationale: valkey 8.0's module-config API always registers configs as
+    "<module>.<name>" and offers no unprefixed registration (the RTS names are
+    possible on Redis 8 only via its CONFIG_UNPREFIXED module flag); revisit
+    when the minimum supported valkey version gains unprefixed module configs
+  since: 0.1.0
+
+- id: DIV-0009
+  command: CONFIG
+  kind: behavior
+  description: >
+    `ts-num-threads` defaults to 4; RTS 8.6 defaults to 3. Name, range,
+    immutability, and semantics (query worker pool size) are unchanged —
+    only the out-of-the-box value differs.
+  rationale: sizes our rayon pool for parallel query processing; 4 is the
+    deliberate default for this engine and the config remains settable at
+    startup for anyone wanting RTS's value
   since: 0.1.0

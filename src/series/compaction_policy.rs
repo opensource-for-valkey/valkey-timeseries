@@ -305,9 +305,13 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
             "TSDB: invalid retention in compaction policy",
         ));
     };
+    // Same redis-style duration grammar as the other fields ('m' = ms,
+    // 'M' = minutes). Any alignment value is valid — bucket assignment is
+    // modular, so an alignment larger than the bucket duration is simply
+    // congruent to `align % bucket_duration` (RTS accepts these too).
     let bucket_alignment = if args.len() == 4 {
-        match parse_positive_duration_value(args[3]) {
-            Ok(ts) => ts,
+        match parse_duration(args[3]) {
+            Ok(ts) => ts as i64,
             _ => {
                 return Err(ValkeyError::String(
                     "TSDB: invalid align timestamp in compaction policy".to_string(),
@@ -317,11 +321,6 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
     } else {
         0 // Default align timestamp
     };
-    if bucket_alignment >= bucket_duration_ms as i64 {
-        return Err(ValkeyError::Str(
-            "TSDB: bucket_alignment must be less than than bucket duration",
-        ));
-    }
 
     Ok(CompactionPolicy {
         aggregator,
@@ -880,5 +879,41 @@ mod tests {
         let rules3 = config.create_compaction_rules("test").unwrap();
         assert_eq!(rules3.len(), 1); // Should only have the new one
         assert!(rules3.contains_key("test_MAX_45000"));
+    }
+}
+
+#[cfg(test)]
+mod rts_grammar_parity {
+    use super::*;
+
+    /// RTS 8.6 accepts every one of these policy strings (verified black-box
+    /// against the pinned reference image; compat plan §7.1). `twa` variants
+    /// are excluded — the TWA aggregator itself is not implemented yet.
+    #[test]
+    fn accepts_rts_grammar() {
+        for s in [
+            "max:1M:1h",
+            "avg:2h:10d",
+            "avg:2h:10d:2d", // alignment larger than the bucket (modular)
+            "std.p:1m:1h",
+            "avg:1h:0",      // zero retention
+            "max:1M:1h;min:10s:5d",
+            "max:1M:1h;min:10s:5d:5m",
+        ] {
+            assert!(
+                parse_compaction_policies(s).is_ok(),
+                "RTS accepts {s:?}; our parser rejected it"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_grammar() {
+        for s in ["max:1M", "max", "bogus:x:y"] {
+            assert!(
+                parse_compaction_policies(s).is_err(),
+                "RTS rejects {s:?}; our parser accepted it"
+            );
+        }
     }
 }
