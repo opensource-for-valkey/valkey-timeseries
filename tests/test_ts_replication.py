@@ -4,7 +4,7 @@ from typing import List
 
 import pytest
 
-from common import SERVER_PATH, parse_info_response
+from common import SERVER_PATH, get_module_path, parse_info_response
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.valkey_test_case import ReplicationTestCase
 
@@ -46,7 +46,7 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             self.num_replicas = 1
             self.wait_for_primary_link_up_all_replicas()
         else:
-            self.args = {"enable-debug-command": "yes", 'loadmodule': os.getenv('MODULE_PATH')}
+            self.args = {"enable-debug-command": "yes", 'loadmodule': get_module_path()}
             self.server, self.client = self.create_server(testdir=self.testdir, server_path=SERVER_PATH, args=self.args)
             self.setup_replication(num_replicas=1)
 
@@ -58,7 +58,7 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             "repl-diskless-sync-delay 0",
             "cluster-enabled yes",
             f"cluster-config-file nodes_{port}.conf",
-            f"loadmodule {os.getenv('MODULE_PATH')}",
+            f"loadmodule {get_module_path()}",
         ]
 
     # Wait for replication to propagate
@@ -190,7 +190,8 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         rule = info_dict["rules"][0]
         assert rule.dest_key == dest_key
         assert rule.bucket_duration == 60000
-        assert rule.aggregation == "avg"
+        # TS.INFO reports the rule aggregator uppercase, matching RedisTimeSeries.
+        assert rule.aggregation == "AVG"
 
     def test_replication_ts_del(self):
         """Test that deletions replicate correctly"""
