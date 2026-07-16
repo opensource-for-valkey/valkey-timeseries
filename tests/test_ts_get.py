@@ -171,7 +171,7 @@ class TestTsGet(ValkeyTimeSeriesTestCaseBase):
         """Test TS.GET with no arguments"""
         # Test missing key argument
         self.verify_error_response(self.client, 'TS.GET',
-                                   "wrong number of arguments for 'TS.GET' command")
+                                   "wrong number of arguments for 'ts.get' command")
 
     def test_get_too_many_args(self):
         """Test TS.GET with too many arguments"""
@@ -180,7 +180,7 @@ class TestTsGet(ValkeyTimeSeriesTestCaseBase):
 
         # Test with extra arguments
         self.verify_error_response(self.client, 'TS.GET ts_extra latest other',
-                                   "wrong number of arguments for 'TS.GET' command")
+                                   "wrong number of arguments for 'ts.get' command")
 
     def test_get_with_nan_value(self):
         """Test TS.GET with a NaN value in the time series"""

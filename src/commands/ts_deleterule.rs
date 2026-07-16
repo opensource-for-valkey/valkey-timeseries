@@ -13,7 +13,7 @@ use valkey_module::{
 /// the destination series is not deleted.
 ///
 #[valkey_module_macros::command({
-    name: "TS.DELETERULE",
+    name: "ts.deleterule",
     flags: [Write, DenyOOM],
     summary: "Delete a compaction rule between a source and destination time series.",
     complexity: "O(1)",

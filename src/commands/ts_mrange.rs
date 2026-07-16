@@ -16,7 +16,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 //   FILTER filterExpr...
 //   [GROUPBY label REDUCE reducer]
 #[valkey_module_macros::command({
-    name: "TS.MRANGE",
+    name: "ts.mrange",
     flags: [ReadOnly],
     summary: "Query a range across multiple time series selected by a filter, in forward order.",
     complexity: "O(N*M) where N is the number of matching series and M the number of samples in the range.",
@@ -29,7 +29,7 @@ pub fn ts_mrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 }
 
 #[valkey_module_macros::command({
-    name: "TS.MREVRANGE",
+    name: "ts.mrevrange",
     flags: [ReadOnly],
     summary: "Query a range across multiple time series selected by a filter, in reverse order.",
     complexity: "O(N*M) where N is the number of matching series and M the number of samples in the range.",

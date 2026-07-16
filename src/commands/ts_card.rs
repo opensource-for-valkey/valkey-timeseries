@@ -9,7 +9,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 ///
 /// returns the number of unique time series that match a certain label set.
 #[valkey_module_macros::command({
-    name: "TS.CARD",
+    name: "ts.card",
     flags: [ReadOnly],
     summary: "Count the time series matching a filter.",
     complexity: "O(N) where N is the number of time series that match the filters.",

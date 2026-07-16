@@ -7,7 +7,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 
 /// https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
 #[valkey_module_macros::command({
-    name: "TS.LABELSTATS",
+    name: "ts.labelstats",
     flags: [ReadOnly],
     summary: "Return cardinality statistics about labels and metric names.",
     complexity: "O(N) where N is the number of indexed label-value pairs.",

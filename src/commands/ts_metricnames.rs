@@ -13,7 +13,7 @@ use valkey_module::{Context, ValkeyResult, ValkeyString};
 /// [LIMIT limit]
 /// [FILTER seriesMatcher...]
 #[valkey_module_macros::command({
-    name: "TS.METRICNAMES",
+    name: "ts.metricnames",
     flags: [ReadOnly],
     summary: "Return metric names across time series, optionally filtered.",
     complexity: "O(N) where N is the number of metric names in the index.",

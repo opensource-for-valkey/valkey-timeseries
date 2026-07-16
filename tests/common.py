@@ -179,7 +179,10 @@ class CompactionRule:
             self.alignment = int(alignment)
 
     def __key(self):
-        return self.dest_key, self.bucket_duration, self.aggregation, self.alignment
+        # Aggregator identity is case-insensitive: `avg` and `AVG` denote the
+        # same aggregator. TS.INFO reports it uppercase (matching
+        # RedisTimeSeries); rule equality here should not depend on that case.
+        return self.dest_key, self.bucket_duration, self.aggregation.lower(), self.alignment
 
     def __hash__(self):
         return hash(self.__key())
@@ -198,7 +201,7 @@ class CompactionRule:
             return False
         return (self.dest_key == other.dest_key and
                 self.bucket_duration == other.bucket_duration and
-                self.aggregation == other.aggregation and
+                self.aggregation.lower() == other.aggregation.lower() and
                 self.alignment == other.alignment)
     def __repr__(self):
         return f"CompactionRule(dest_key={self.dest_key}, bucket_duration={self.bucket_duration}, " \

@@ -17,7 +17,7 @@ use valkey_module::{
 ///   [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
 ///   [LABELS label1=value1 label2=value2 ...]
 #[valkey_module_macros::command({
-    name: "TS.ALTER",
+    name: "ts.alter",
     flags: [Write, DenyOOM],
     summary: "Update the configuration of an existing time series.",
     complexity: "O(1)",

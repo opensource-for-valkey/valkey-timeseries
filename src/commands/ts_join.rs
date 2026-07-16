@@ -16,7 +16,7 @@ use valkey_module::{
 ///   [REDUCE op]
 ///   [AGGREGATION aggregator bucket_duration [ALIGN align] [BUCKETTIMESTAMP timestamp] [EMPTY]]
 #[valkey_module_macros::command({
-    name: "TS.JOIN",
+    name: "ts.join",
     flags: [ReadOnly],
     summary: "Join the samples of two time series over a timestamp range.",
     complexity: "O(N+M) where N and M are the number of samples in each series within the range.",

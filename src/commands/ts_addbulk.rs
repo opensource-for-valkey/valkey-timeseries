@@ -18,7 +18,7 @@ use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString, ValkeyV
 ///     [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
 ///
 #[valkey_module_macros::command({
-    name: "TS.ADDBULK",
+    name: "ts.addbulk",
     flags: [Write, DenyOOM],
     summary: "Append multiple samples supplied as a JSON payload to a time series.",
     complexity: "O(N) where N is the number of samples in the payload.",

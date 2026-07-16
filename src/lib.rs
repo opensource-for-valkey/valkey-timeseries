@@ -117,32 +117,32 @@ fn preload(ctx: &Context, args: &[ValkeyString]) -> Status {
 /// annotations in `src/commands/*`.
 #[cfg(feature = "min-valkey-compatibility-version-8-0")]
 const COMMAND_ACL_CATEGORIES: &[(&str, &str)] = &[
-    ("TS.CREATE", "write fast timeseries"),
-    ("TS.ALTER", "write timeseries"),
-    ("TS.ADD", "write timeseries"),
-    ("TS.ADDBULK", "write timeseries"),
-    ("TS.GET", "fast read timeseries"),
-    ("TS.MGET", "fast read timeseries"),
-    ("TS.MADD", "fast write timeseries"),
-    ("TS.DEL", "write timeseries"),
-    ("TS.DECRBY", "write timeseries"),
-    ("TS.INCRBY", "write timeseries"),
-    ("TS.JOIN", "read timeseries"),
-    ("TS.MDEL", "write timeseries"),
-    ("TS.MRANGE", "read timeseries"),
-    ("TS.MREVRANGE", "read timeseries"),
-    ("TS.RANGE", "read timeseries"),
-    ("TS.REVRANGE", "read timeseries"),
-    ("TS.INFO", "read fast timeseries"),
-    ("TS.QUERYINDEX", "read timeseries"),
-    ("TS.CARD", "read timeseries"),
-    ("TS.LABELNAMES", "read timeseries"),
-    ("TS.LABELVALUES", "read timeseries"),
-    ("TS.METRICNAMES", "read timeseries"),
-    ("TS.LABELSTATS", "read timeseries"),
-    ("TS.CREATERULE", "write timeseries"),
-    ("TS.DELETERULE", "write timeseries"),
-    ("TS.OUTLIERS", "fast read timeseries"),
+    ("ts.create", "write fast timeseries"),
+    ("ts.alter", "write timeseries"),
+    ("ts.add", "write timeseries"),
+    ("ts.addbulk", "write timeseries"),
+    ("ts.get", "fast read timeseries"),
+    ("ts.mget", "fast read timeseries"),
+    ("ts.madd", "fast write timeseries"),
+    ("ts.del", "write timeseries"),
+    ("ts.decrby", "write timeseries"),
+    ("ts.incrby", "write timeseries"),
+    ("ts.join", "read timeseries"),
+    ("ts.mdel", "write timeseries"),
+    ("ts.mrange", "read timeseries"),
+    ("ts.mrevrange", "read timeseries"),
+    ("ts.range", "read timeseries"),
+    ("ts.revrange", "read timeseries"),
+    ("ts.info", "read fast timeseries"),
+    ("ts.queryindex", "read timeseries"),
+    ("ts.card", "read timeseries"),
+    ("ts.labelnames", "read timeseries"),
+    ("ts.labelvalues", "read timeseries"),
+    ("ts.metricnames", "read timeseries"),
+    ("ts.labelstats", "read timeseries"),
+    ("ts.createrule", "write timeseries"),
+    ("ts.deleterule", "write timeseries"),
+    ("ts.outliers", "fast read timeseries"),
 ];
 
 /// Assign ACL categories to the commands registered via the command-info path. The
@@ -240,6 +240,11 @@ valkey_module! {
     acl_categories: [
         "timeseries",
     ]
+    // Command names are registered in lowercase to match RedisTimeSeries, both here and in
+    // the `#[command]` annotations in `src/commands/*`. The registered name is what Valkey
+    // echoes back in COMMAND INFO/DOCS and in the "wrong number of arguments for '<name>'
+    // command" arity error; RedisTimeSeries uses lowercase there. Command dispatch is
+    // case-insensitive, so clients may still invoke `TS.CREATE`, `ts.create`, etc.
     commands: [
         // User-facing commands are registered with full command info (summary, complexity,
         // arity, and key specs) through the `#[valkey_module_macros::command]` attribute on
@@ -247,8 +252,8 @@ valkey_module! {
         // `register_commands`. Only internal/admin commands remain in this positional table.
         // ACL categories for the annotated commands are (re-)applied by
         // `assign_command_acl_categories`, since the command-info path does not set them.
-        ["TS._DEBUG", commands::ts_debug_cmd, "readonly", 0, 0, 0, "read timeseries admin"],
-        ["TS._RESTORE", commands::ts_asm_restore_cmd, "write deny-oom", 1, 1, 1, "write timeseries admin"],
+        ["ts._debug", commands::ts_debug_cmd, "readonly", 0, 0, 0, "read timeseries admin"],
+        ["ts._restore", commands::ts_asm_restore_cmd, "write deny-oom", 1, 1, 1, "write timeseries admin"],
     ]
     event_handlers: [
         [@GENERIC @LOADED @TRIMMED: generic_key_events_handler]

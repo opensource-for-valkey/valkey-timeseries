@@ -192,7 +192,7 @@ class TestTsMadd(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError) as execInfo:
             self.client.execute_command("TS.MADD", "ts1", "1000")
 
-        assert "wrong number of arguments for 'TS.MADD' command" in str(execInfo.value)
+        assert "wrong number of arguments for 'ts.madd' command" in str(execInfo.value)
 
     def test_madd_with_millisecond_values(self):
         """Test TS.MADD with millisecond timestamp values"""

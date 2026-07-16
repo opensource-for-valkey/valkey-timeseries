@@ -162,7 +162,7 @@ class TestTimeSeriesMget(ValkeyTimeSeriesTestCaseBase):
         self.setup_test_data(self.client)
 
         # Missing FILTER
-        with pytest.raises(ResponseError, match="wrong number of arguments for 'TS.MGET' command"):
+        with pytest.raises(ResponseError, match="wrong number of arguments for 'ts.mget' command"):
             self.client.execute_command('TS.MGET')
 
         # Unknown option

@@ -16,7 +16,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 ///   [WITHLABELS | SELECTED_LABELS label...]
 ///   [FILTER filterExpr...]
 #[valkey_module_macros::command({
-    name: "TS.MGET",
+    name: "ts.mget",
     flags: [ReadOnly, Fast],
     summary: "Get the last sample of each time series matching a filter.",
     complexity: "O(N) where N is the number of time series that match the filters.",

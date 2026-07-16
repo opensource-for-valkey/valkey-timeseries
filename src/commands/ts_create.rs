@@ -20,7 +20,7 @@ use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, Valk
 ///   [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
 ///   [LABELS label1=value1 label2=value2 ...]
 #[valkey_module_macros::command({
-    name: "TS.CREATE",
+    name: "ts.create",
     flags: [Write, DenyOOM],
     summary: "Create a new time series.",
     complexity: "O(1)",

@@ -9,7 +9,7 @@ use valkey_module::{
 };
 
 #[valkey_module_macros::command({
-    name: "TS.INCRBY",
+    name: "ts.incrby",
     flags: [Write, DenyOOM],
     summary: "Increase the value of the last sample, creating the series if needed.",
     complexity: "O(1)",
@@ -26,7 +26,7 @@ pub fn ts_incrby_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 }
 
 #[valkey_module_macros::command({
-    name: "TS.DECRBY",
+    name: "ts.decrby",
     flags: [Write, DenyOOM],
     summary: "Decrease the value of the last sample, creating the series if needed.",
     complexity: "O(1)",

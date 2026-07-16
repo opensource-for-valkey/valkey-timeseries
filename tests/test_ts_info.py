@@ -1,4 +1,5 @@
 import pytest
+import valkey
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
@@ -145,7 +146,8 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         rule = source_info['rules'][0]
         assert rule.dest_key == dest_key  # destination key
         assert rule.bucket_duration == 60000  # bucket duration
-        assert rule.aggregation == 'avg'  # aggregation type
+        # TS.INFO reports the rule aggregator uppercase, matching RedisTimeSeries.
+        assert rule.aggregation == 'AVG'  # aggregation type
 
         # Verify destination shows source key
         dest_info = self.ts_info(dest_key, True)
@@ -190,7 +192,9 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         print(rules)
 
         for rule in rules:
-            aggr = list(filter(lambda item: item[0] == rule.aggregation, aggregations))
+            # TS.INFO reports the aggregator uppercase (matching RedisTimeSeries),
+            # while `aggregations` lists them lowercase; compare case-insensitively.
+            aggr = list(filter(lambda item: item[0].lower() == rule.aggregation.lower(), aggregations))
             assert len(aggr) == 1
             dest_key = aggr[0][1]
             assert rule.dest_key == dest_key
@@ -230,3 +234,64 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         # (sourceKey is always present, nil once the series is no longer a compaction)
         dest_info = self.ts_info(dest_key, True)
         assert dest_info['sourceKey'] is None
+
+    def _resp3_client(self):
+        """A RESP3 (HELLO 3) client against the same server as self.client."""
+        return valkey.Valkey(
+            host=self.server.bind_ip, port=self.server.port, protocol=3
+        )
+
+    def test_info_resp3_labels_and_rules_are_maps(self):
+        """RESP3 renders `labels` and `rules` as native maps, matching RedisTimeSeries.
+
+        In RESP2 both are arrays (labels: [[name, value], ...]; rules:
+        [[destKey, bucket, agg, align], ...]). In RESP3 they are maps
+        (labels: {name: value}; rules: {destKey: [bucket, agg, align]}).
+        """
+        c3 = self._resp3_client()
+
+        src = 'ts_resp3_src'
+        dst = 'ts_resp3_dst'
+        c3.execute_command('TS.CREATE', src, 'LABELS', 'sensor', 's1', 'area', 'us-east')
+        c3.execute_command('TS.CREATE', dst)
+        c3.execute_command('TS.CREATERULE', src, dst, 'AGGREGATION', 'avg', 1000)
+
+        src_info = c3.execute_command('TS.INFO', src)
+        assert isinstance(src_info, dict), f"RESP3 TS.INFO should be a map, got {type(src_info)}"
+
+        labels = src_info[b'labels']
+        assert isinstance(labels, dict), f"RESP3 labels should be a map, got {labels!r}"
+        assert labels == {b'sensor': b's1', b'area': b'us-east'}
+
+        rules = src_info[b'rules']
+        assert isinstance(rules, dict), f"RESP3 rules should be a map, got {rules!r}"
+        assert list(rules.keys()) == [dst.encode()]
+        bucket, agg, align = rules[dst.encode()]
+        assert bucket == 1000
+        assert agg == b'AVG'  # aggregator reported uppercase, matching RedisTimeSeries
+        assert align == 0
+
+        # A label-less / rule-less series yields empty maps, not nil.
+        dst_info = c3.execute_command('TS.INFO', dst)
+        assert dst_info[b'labels'] == {}
+        assert dst_info[b'rules'] == {}
+        assert dst_info[b'sourceKey'] == src.encode()
+
+    def test_info_resp2_labels_and_rules_stay_arrays(self):
+        """RESP2 keeps the array shapes for `labels` and `rules` (unchanged)."""
+        src = 'ts_resp2_src'
+        dst = 'ts_resp2_dst'
+        self.client.execute_command('TS.CREATE', src, 'LABELS', 'sensor', 's1')
+        self.client.execute_command('TS.CREATE', dst)
+        self.client.execute_command('TS.CREATERULE', src, dst, 'AGGREGATION', 'avg', 1000)
+
+        src_info = self.client.execute_command('TS.INFO', src)
+        d = dict(zip(src_info[::2], src_info[1::2]))
+        assert d[b'labels'] == [[b'sensor', b's1']]
+        # Aggregator reported uppercase, matching RedisTimeSeries.
+        assert d[b'rules'] == [[dst.encode(), 1000, b'AVG', 0]]
+
+        dst_info = self.client.execute_command('TS.INFO', dst)
+        d = dict(zip(dst_info[::2], dst_info[1::2]))
+        assert d[b'labels'] == []
+        assert d[b'rules'] == []

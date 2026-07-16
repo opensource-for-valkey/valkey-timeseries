@@ -162,7 +162,7 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         # Test with a missing key
         self.verify_error_response(
             self.client, 'TS.INCRBY',
-            "wrong number of arguments for 'TS.INCRBY' command"
+            "wrong number of arguments for 'ts.incrby' command"
         )
 
         # Test with invalid increment

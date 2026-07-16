@@ -48,7 +48,7 @@ enum ZScoreType {
 ///     [DIRECTION <positive|negative|both>]
 ///     [SEASONALITY <period1> [period2] ...]
 #[valkey_module_macros::command({
-    name: "TS.OUTLIERS",
+    name: "ts.outliers",
     flags: [ReadOnly, DenyOOM],
     summary: "Detect outlier samples in a time series over a timestamp range.",
     complexity: "O(N) where N is the number of samples in the requested range.",

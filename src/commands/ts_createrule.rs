@@ -19,7 +19,7 @@ use valkey_module::{
 /// sourceKey must be different from destKey, and the user must be authorized to read from sourceKey and write to destKey.
 ///
 #[valkey_module_macros::command({
-    name: "TS.CREATERULE",
+    name: "ts.createrule",
     flags: [Write, DenyOOM],
     summary: "Create a compaction rule from a source time series to a destination series.",
     complexity: "O(1)",

@@ -19,7 +19,7 @@ use valkey_module::{
 ///     [LABELS label1=value1 label2=value2 ...]
 ///
 #[valkey_module_macros::command({
-    name: "TS.ADD",
+    name: "ts.add",
     flags: [Write, DenyOOM],
     summary: "Append a sample to a time series, creating it if it does not exist.",
     complexity: "O(1)",

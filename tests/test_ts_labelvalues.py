@@ -187,7 +187,7 @@ class TestTimeSeriesLabelValues(ValkeyTimeSeriesTestCaseBase):
         # Missing label argument
         self.verify_error_response(
             self.client, 'TS.LABELVALUES',
-            "wrong number of arguments for 'TS.LABELVALUES' command"
+            "wrong number of arguments for 'ts.labelvalues' command"
         )
 
         # Invalid filter format

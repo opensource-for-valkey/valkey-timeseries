@@ -13,7 +13,7 @@ use valkey_module::{
 //   [COUNT count]
 //   [[ALIGN align] AGGREGATION aggregator bucketDuration [CONDITION op value] [BUCKETTIMESTAMP bt] [EMPTY]]
 #[valkey_module_macros::command({
-    name: "TS.RANGE",
+    name: "ts.range",
     flags: [ReadOnly],
     summary: "Query a range of samples from a time series in forward order.",
     complexity: "O(N) where N is the number of samples in the requested range.",
@@ -36,7 +36,7 @@ pub fn ts_range_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 //   [COUNT count]
 //   [[ALIGN align] AGGREGATION aggregator bucket_duration [CONDITION op value] [BUCKETTIMESTAMP bt] [EMPTY]]
 #[valkey_module_macros::command({
-    name: "TS.REVRANGE",
+    name: "ts.revrange",
     flags: [ReadOnly],
     summary: "Query a range of samples from a time series in reverse order.",
     complexity: "O(N) where N is the number of samples in the requested range.",
