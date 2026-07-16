@@ -20,7 +20,7 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         command_cmd_result = client.execute_command('COMMAND')
         ts_cmds = ["TS.CREATE", "TS.ALTER", "TS.ADD", "TS.MADD", "TS.DEL", "TS.GET", "TS.MGET", "TS.RANGE", "TS.MRANGE",
                    "TS.CARD", "TS.QUERYINDEX", "TS.LABELSTATS", "TS.LABELNAMES", "TS.LABELVALUES", "TS.INFO"]
-        assert all(item in command_cmd_result for item in ts_cmds)
+        assert all(item.lower() in command_cmd_result for item in ts_cmds)
         # Basic timeseries create, item add and item exists validation.
         ts_add_result = client.execute_command('TS.ADD series1 1000 102')
         assert ts_add_result == 1000

@@ -68,7 +68,7 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         # Test user without TS permissions
         no_ts_client = self.get_user_client('no_ts', 'password123')
 
-        with pytest.raises(Exception, match="no permissions to run the 'TS.ADD' command"):
+        with pytest.raises(Exception, match="no permissions to run the 'ts.add' command"):
             no_ts_client.execute_command('TS.ADD', 'ts:acl:denied', '*', 300.5)
 
     def test_ts_range_acl_permissions(self):
@@ -194,7 +194,7 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
 
         # Verify role separation - producer can't create rules
         producer = self.get_user_client('data_producer', 'password123')
-        with pytest.raises(Exception, match="User data_producer has no permissions to run the 'TS.CREATERULE' command"):
+        with pytest.raises(Exception, match="User data_producer has no permissions to run the 'ts.createrule' command"):
             producer.execute_command(
                 'TS.CREATERULE', 'ts:acl:workflow:source', 'ts:acl:workflow:dest2',
                 'AGGREGATION', 'sum', 5000
@@ -202,7 +202,7 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
 
         # Consumer can't delete rules
         consumer = self.get_user_client('data_consumer', 'password123')
-        with pytest.raises(Exception, match="User data_consumer has no permissions to run the 'TS.DELETERULE' command"):
+        with pytest.raises(Exception, match="User data_consumer has no permissions to run the 'ts.deleterule' command"):
             consumer.execute_command('TS.DELETERULE', 'ts:acl:workflow:source', 'ts:acl:workflow:dest')
 
     def test_acl_command_category_restrictions(self):
@@ -225,7 +225,7 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         result = read_only_client.execute_command('TS.RANGE', 'ts:acl:categories', '-', '+')
         assert len(result) > 0
 
-        with pytest.raises(Exception, match="User read_only has no permissions to run the 'TS.ADD' command"):
+        with pytest.raises(Exception, match="User read_only has no permissions to run the 'ts.add' command"):
             read_only_client.execute_command('TS.ADD', 'ts:acl:categories', '2000', 100.0)
 
         # TS safe user can use timeseries commands

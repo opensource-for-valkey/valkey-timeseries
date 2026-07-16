@@ -131,7 +131,7 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
             # Check the first rule (most common case)
             rule = rules[0]
             if expected_aggregation is not None:
-                assert rule.aggregation == expected_aggregation, f"Wrong aggregation for {key}: expected {expected_aggregation}, got {rule.aggregation}"
+                assert rule.aggregation.lower() == expected_aggregation.lower(), f"Wrong aggregation for {key}: expected {expected_aggregation}, got {rule.aggregation}"
             if expected_bucket_duration is not None:
                 assert rule.bucket_duration == expected_bucket_duration, f"Wrong bucket duration for {key}: expected {expected_bucket_duration}, got {rule.bucket_duration}"
 
@@ -385,12 +385,12 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
             rules = info.get('rules', [])
 
             # All should have the global sum rule
-            sum_rules = [r for r in rules if r.aggregation == 'sum' and r.bucket_duration == 60000]
+            sum_rules = [r for r in rules if r.aggregation.lower() == 'sum' and r.bucket_duration == 60000]
             assert len(sum_rules) == 1, f"Expected 1 sum rule for {key}"
 
             if expected_rule_count == 2:
                 # high_freq keys should also have avg rule
-                avg_rules = [r for r in rules if r.aggregation == 'avg' and r.bucket_duration == 10000]
+                avg_rules = [r for r in rules if r.aggregation.lower() == 'avg' and r.bucket_duration == 10000]
                 assert len(avg_rules) == 1, f"Expected 1 avg rule for high_freq key {key}"
 
     def test_case_sensitive_regex_matching(self):

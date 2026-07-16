@@ -230,7 +230,10 @@ fn get_labels_info(ts: &TimeSeries, is_resp3: bool) -> ValkeyValue {
 /// the aggregator/reducer names in TS.MRANGE metadata are lowercase and are
 /// produced elsewhere.
 fn rule_aggregator_name(rule: &crate::series::CompactionRule) -> String {
-    rule.aggregator.aggregation_type().to_string().to_uppercase()
+    rule.aggregator
+        .aggregation_type()
+        .to_string()
+        .to_uppercase()
 }
 
 /// Compaction rules for TS.INFO.
