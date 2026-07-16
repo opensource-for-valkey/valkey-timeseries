@@ -281,7 +281,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         self.create_test_series(source_key)
         self.create_test_series(dest_key)
 
-        with pytest.raises(ResponseError, match="unknown aggregation type"):
+        with pytest.raises(ResponseError, match="Unknown aggregation type"):
             self.client.execute_command(
                 "TS.CREATERULE", source_key, dest_key,
                 "AGGREGATION", "invalid_agg", "60000"
@@ -295,17 +295,21 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         self.create_test_series(source_key)
         self.create_test_series(dest_key)
 
-        with pytest.raises(ResponseError, match="invalid bucket duration"):
+        with pytest.raises(ResponseError, match="Couldn't parse AGGREGATION"):
             self.client.execute_command(
                 "TS.CREATERULE", source_key, dest_key,
                 "AGGREGATION", "avg", "invalid"
             )
 
-        with pytest.raises(ResponseError, match="invalid bucket duration"):
-            self.client.execute_command(
-                "TS.CREATERULE", source_key, dest_key,
-                "AGGREGATION", "avg", "-1000"
-            )
+        # A non-positive bucket duration is its own error: zero would reach the
+        # bucket-boundary modulo in the aggregation iterator, and a rule carries
+        # its duration into the RDB.
+        for duration in ("-1000", "0"):
+            with pytest.raises(ResponseError, match="bucketDuration must be greater than zero"):
+                self.client.execute_command(
+                    "TS.CREATERULE", source_key, dest_key,
+                    "AGGREGATION", "avg", duration
+                )
 
     def test_create_rule_invalid_align_timestamp(self):
         """Test error with invalid alignment timestamp"""

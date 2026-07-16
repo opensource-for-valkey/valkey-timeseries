@@ -1433,12 +1433,17 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match="wrong number of arguments"):
             self.client.execute_command('TS.RANGE', 'ts1', '-')
 
-        # Invalid start/end timestamp
-        with pytest.raises(ResponseError, match="invalid start timestamp"):
+        # Invalid start/end timestamp (RTS wording; see tests/compat)
+        with pytest.raises(ResponseError, match="wrong fromTimestamp"):
             self.client.execute_command('TS.RANGE', 'ts1', 'invalid', '+')
 
-        with pytest.raises(ResponseError, match="invalid end timestamp"):
+        with pytest.raises(ResponseError, match="wrong toTimestamp"):
             self.client.execute_command('TS.RANGE', 'ts1', '-', 'invalid')
+
+        # A bare negative integer is an absolute timestamp, not a relative
+        # offset, and is rejected as one.
+        with pytest.raises(ResponseError, match="wrong fromTimestamp"):
+            self.client.execute_command('TS.RANGE', 'ts1', -1000, 1000)
 
         # Invalid filter values
         with pytest.raises(ResponseError, match="TSDB: Couldn't parse MIN"):

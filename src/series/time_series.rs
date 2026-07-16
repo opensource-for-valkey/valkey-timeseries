@@ -189,7 +189,7 @@ impl TimeSeries {
     ) -> SampleAddResult {
         let sample = self.make_sample(ts, value);
 
-        if let Some(last) = self.last_sample {
+        let result = if let Some(last) = self.last_sample {
             let last_ts = last.timestamp;
 
             // - ts < last_ts: upsert (no validation)
@@ -199,11 +199,26 @@ impl TimeSeries {
                 return SampleAddResult::Ignored(last_ts);
             }
             if ts <= last_ts {
-                return self.upsert_sample(sample, dp_override);
+                self.upsert_sample(sample, dp_override)
+            } else {
+                self.add_sample_internal(sample)
+            }
+        } else {
+            self.add_sample_internal(sample)
+        };
+
+        // Apply retention eagerly, matching RedisTimeSeries: a new max sample
+        // advances the window, so samples that just fell outside it are dropped
+        // now rather than waiting for the background trim task. This keeps
+        // total_samples / first_timestamp (TS.INFO) consistent with what a range
+        // query returns. trim() is a cheap no-op when nothing expired.
+        if result.is_ok() && !self.retention.is_zero() {
+            if let Err(e) = self.trim() {
+                logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
             }
         }
 
-        self.add_sample_internal(sample)
+        result
     }
 
     pub(crate) fn validate_sample(
@@ -452,7 +467,14 @@ impl TimeSeries {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        merge_samples(self, samples, policy_override)
+        let results = merge_samples(self, samples, policy_override)?;
+        // Eager retention trim, as in `add` — a batch can advance the window too.
+        if !self.retention.is_zero() {
+            if let Err(e) = self.trim() {
+                logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
+            }
+        }
+        Ok(results)
     }
 
     /// Get the time series between given start and end time (both inclusive).
@@ -589,11 +611,16 @@ impl TimeSeries {
         timestamp < min_ts
     }
 
+    /// Remove chunks that lie *entirely* outside the retention window, i.e. whose
+    /// newest sample is older than `min_timestamp`. The boundary is strict: a
+    /// sample at exactly `min_timestamp` is retained (a series with retention R
+    /// keeps `timestamp >= lastTimestamp - R`), so a chunk whose last sample is
+    /// `min_timestamp` is kept and trimmed partially by the caller.
     pub(super) fn remove_expired_chunks(&mut self, min_timestamp: Timestamp) -> usize {
         let mut deleted_count = 0;
         self.chunks.retain(|chunk| {
             let last_ts = chunk.last_timestamp();
-            if last_ts <= min_timestamp {
+            if last_ts < min_timestamp {
                 deleted_count += chunk.len();
                 false
             } else {
@@ -605,17 +632,19 @@ impl TimeSeries {
 
     pub(super) fn trim(&mut self) -> TsdbResult<usize> {
         let min_timestamp = self.get_min_timestamp();
-        if self.first_timestamp == min_timestamp {
+        if self.first_timestamp >= min_timestamp {
             return Ok(0);
         }
 
         let mut deleted_count = self.remove_expired_chunks(min_timestamp);
 
-        // Handle partial chunk
+        // Handle the boundary chunk: drop only samples strictly older than the
+        // retention window. `remove_range` is inclusive, so the upper bound is
+        // `min_timestamp - 1` — the sample at `min_timestamp` itself is retained.
         if let Some(chunk) = self.chunks.first_mut()
             && chunk.first_timestamp() < min_timestamp
         {
-            if let Ok(count) = chunk.remove_range(0, min_timestamp) {
+            if let Ok(count) = chunk.remove_range(0, min_timestamp - 1) {
                 deleted_count += count;
             } else {
                 return Err(TsdbError::RemoveRangeError);

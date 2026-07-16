@@ -410,10 +410,10 @@ pub struct ValueFilter {
 }
 
 impl ValueFilter {
+    /// An inverted filter (min > max) matches nothing — see [`Self::is_match`] —
+    /// rather than being rejected: RedisTimeSeries answers `FILTER_BY_VALUE 100 1`
+    /// with an empty result, and erroring here would make us stricter than it.
     pub(crate) fn new(min: f64, max: f64) -> ValkeyResult<Self> {
-        if min > max {
-            return Err(ValkeyError::Str("ERR invalid range"));
-        }
         Ok(Self { min, max })
     }
 

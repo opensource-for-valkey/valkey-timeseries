@@ -14,7 +14,13 @@ pub const DUPLICATE_SERIES: &str = "TSDB: duplicate series";
 pub const SAMPLE_MERGE_ERROR: &str = "TSDB: error merging samples";
 pub const ERROR_FETCHING_SAMPLE: &str = "TSDB: fetching sample";
 pub const INTERNAL_ERROR: &str = "TSDB: internal error";
-pub const INVALID_ALIGN: &str = "TSDB: invalid ALIGN argument";
+pub const INVALID_ALIGN: &str = "TSDB: unknown ALIGN parameter";
+pub const ALIGN_REQUIRES_AGGREGATION: &str =
+    "TSDB: ALIGN parameter can only be used with AGGREGATION";
+pub const START_ALIGN_NEEDS_EXPLICIT_START: &str =
+    "TSDB: start alignment can only be used with explicit start timestamp";
+pub const END_ALIGN_NEEDS_EXPLICIT_END: &str =
+    "TSDB: end alignment can only be used with explicit end timestamp";
 pub const INVALID_ARGUMENT: &str = "TSDB: invalid argument";
 pub const INVALID_VALUE: &str = "TSDB: invalid value";
 pub const CANNOT_INCREMENT_DECREMENT_NAN: &str = "TSDB: cannot increment/decrement a NaN value";
@@ -45,18 +51,19 @@ pub const UNBOUNDED_SERIES_FILTERS: &str =
     "TSDB: filters must contain at least one matcher that does not match the empty string";
 pub const INVALID_STEP_DURATION: &str = "TSDB: invalid step duration";
 pub const INVALID_TIMESTAMP: &str = "TSDB: invalid timestamp.";
-pub const UNKNOWN_AGGREGATION_TYPE: &str = "TSDB: unknown aggregation type";
+pub const UNKNOWN_AGGREGATION_TYPE: &str = "TSDB: Unknown aggregation type";
 pub const DUPLICATE_AGGREGATION: &str = "TSDB: duplicate aggregation";
 pub const TOO_MANY_AGGREGATIONS: &str = "TSDB: too many aggregations (max 16)";
 pub const INVALID_AGGREGATION_LIST: &str = "TSDB: invalid aggregation list";
+pub const INVALID_REDUCER_TYPE: &str = "TSDB: Invalid reducer type";
 pub const INVALID_AGGREGATION_CONDITION: &str = "TSDB: invalid aggregation condition";
 pub const MULTI_AGGREGATION_UNSUPPORTED: &str =
     "TSDB: multiple aggregations are not supported for TS.JOIN";
-pub const INVALID_START_TIMESTAMP: &str = "TSDB: invalid start timestamp.";
-pub const INVALID_END_TIMESTAMP: &str = "TSDB: invalid end timestamp.";
+pub const INVALID_START_TIMESTAMP: &str = "TSDB: wrong fromTimestamp";
+pub const INVALID_END_TIMESTAMP: &str = "TSDB: wrong toTimestamp";
 pub const NEGATIVE_TIMESTAMP: &str = "TSDB: timestamps cannot be negative.";
 pub const ERROR_ADDING_SAMPLE: &str = "TSDB: error at add";
-pub const MISSING_TIMESTAMP_FILTER_VALUE: &str = "TSDB: missing timestamp filter values";
+pub const MISSING_TIMESTAMP_FILTER_VALUE: &str = "TSDB: FILTER_BY_TS one or more arguments are missing";
 pub const TOO_MANY_TIMESTAMP_FILTER_VALUES: &str = "TSDB: too many timestamp filter values";
 pub const KEY_NOT_FOUND: &str = "TSDB: the key does not exist";
 pub const INVALID_TIMESERIES_KEY: &str = "TSDB: the key is not a TSDB key";
@@ -78,6 +85,9 @@ pub const NEGATIVE_IGNORE_VALUES: &str = "TSDB: IGNORE values cannot be negative
 pub const CANNOT_PARSE_LABELS: &str = "TSDB: Couldn't parse LABELS";
 pub const CANNOT_PARSE_RETENTION: &str = "TSDB: Couldn't parse RETENTION";
 pub const CANNOT_PARSE_AGGREGATION: &str = "TSDB: Couldn't parse AGGREGATION";
+pub const BUCKET_DURATION_TOO_SMALL: &str = "TSDB: bucketDuration must be greater than zero";
+pub const FILTER_BY_VALUE_MISSING_ARGS: &str =
+    "TSDB: FILTER_BY_VALUE one or more arguments are missing";
 pub const CANNOT_PARSE_MIN: &str = "TSDB: Couldn't parse MIN";
 pub const CANNOT_PARSE_MAX: &str = "TSDB: Couldn't parse MAX";
 
@@ -92,9 +102,9 @@ pub const TOO_MANY_LABELS: &str = "TSDB: too many labels";
 pub const MISSING_LABEL_VALUE: &str = "TSDB: empty or missing label value";
 pub const MISSING_LIMIT_VALUE: &str = "TSDB: missing LIMIT value";
 pub const INVALID_LIMIT_VALUE: &str = "TSDB: invalid LIMIT value";
-pub const MISSING_COUNT_VALUE: &str = "TSDB: missing COUNT value";
-pub const INVALID_COUNT_VALUE: &str = "TSDB: invalid COUNT value";
-pub const NEGATIVE_COUNT: &str = "TSDB: COUNT should be a positive number";
+pub const MISSING_COUNT_VALUE: &str = "TSDB: COUNT argument is missing";
+pub const INVALID_COUNT_VALUE: &str = "TSDB: Invalid COUNT value";
+pub const CANNOT_PARSE_COUNT: &str = "TSDB: Couldn't parse COUNT";
 pub const ROUNDING_ALREADY_SET: &str = "TSDB: rounding already set";
 pub const DUPLICATE_SAMPLE_BLOCKED: &str = "TSDB: Error at upsert, duplicate sample blocked";
 pub const PERMISSION_DENIED: &str = "TSDB: current user doesn't have read permission to one or more keys that match the specified filter";
@@ -104,6 +114,7 @@ pub const CLUSTER_MODE_ERROR: &str = "TSDB: cluster mode not supported";
 pub const NO_CLUSTER_NODES_AVAILABLE: &str = "TSDB: no cluster nodes available";
 pub const WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED: &str =
     "TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
+pub const EMPTY_SELECTED_LABELS: &str = "TSDB: SELECT_LABELS should have at least 1 parameter";
 pub const COMPACTION_CIRCULAR_DEPENDENCY: &str = "TSDB: circular dependency in compaction rules";
 pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exist";
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";

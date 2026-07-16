@@ -23,13 +23,19 @@ pub fn with_timeseries<R>(
     f: impl FnOnce(&TimeSeries) -> ValkeyResult<R>,
 ) -> ValkeyResult<R> {
     let redis_key = ctx.open_key(key);
-    if let Some(series) = redis_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE)? {
-        if check_acl {
-            check_key_permissions(ctx, key, &AclPermissions::ACCESS)?;
+    // A key holding a non-TSDB value must surface the standard WRONGTYPE error,
+    // not valkey-module-rs's raw "Existing key has wrong Valkey type" — the `?`
+    // shortcut leaked the latter, diverging from RTS (and from TS.RANGE/TS.INFO,
+    // which report WRONGTYPE). A missing key is KEY_NOT_FOUND.
+    match redis_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
+        Ok(Some(series)) => {
+            if check_acl {
+                check_key_permissions(ctx, key, &AclPermissions::ACCESS)?;
+            }
+            f(series)
         }
-        f(series)
-    } else {
-        Err(invalid_series_key_error())
+        Ok(None) => Err(invalid_series_key_error()),
+        Err(_) => Err(ValkeyError::WrongType),
     }
 }
 

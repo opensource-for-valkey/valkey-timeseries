@@ -90,8 +90,34 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `compat_registry.py` | known-divergence registry loader (plan §5.3) |
 | `divergences.yml` | the registry — single source of truth for intentional divergences |
 | `info-fields-8.6.yml` | frozen RTS 8.6 `TS.INFO` field baseline (plan §5.1 rule 3) |
+| `compat_helpers.py` | shared scenario helpers (pinned `TS.CREATE`, aggregator lists, label universe) |
 | `test_compat_smoke.py` | fixed smoke subset — the CI PR gate (plan §8) |
+| `test_compat_range.py` | Phase 2: `TS.RANGE`/`TS.REVRANGE` matrix (plan §6) |
+| `test_compat_mrange.py` | Phase 2: `TS.MRANGE`/`TS.MREVRANGE` matrix (plan §6) |
+| `test_compat_get.py` | Phase 2: `TS.GET`/`TS.MGET` matrix (plan §6) |
+| `test_compat_queryindex.py` | Phase 2: `TS.QUERYINDEX` matrix (plan §6) |
+| `test_compat_compaction.py` | Phase 2: compaction deep-dive (plan §6) |
+| `test_compat_config.py` | §7.1 configuration parity |
+| `test_compat_notifications.py` | §7.3 keyspace notifications |
+| `test_compat_persistence.py` | §7.4 persistence interop (defined-failure surface) |
+| `test_compat_replication.py` | §7.5 replication parity |
 
-Planned (later phases): per-command matrix modules (`test_compat_range.py`, …,
-plan §6), operational parity (§7), the Hypothesis differential fuzzer and its
-regression corpus under `corpus/` (§4.3), and client-library conformance (§4.2).
+The §6 read-path matrix is complete. Planned (later phases): the Hypothesis
+differential fuzzer and its regression corpus under `corpus/` (§4.3), and
+client-library conformance (§4.2).
+
+## Divergences the registry can not express
+
+Two classes are pinned by explicit per-engine assertions
+(`diff.reference` / `diff.subject`) instead of by routing the command through
+`diff`, and are documented in `divergences.yml` only so the compatibility page
+renders them:
+
+- **Accepted-input supersets** (we accept what RTS rejects) are non-registrable
+  by design — plan §5.2 hard-fails them through `DiffClient`.
+- **Over-strict rejections and one-sided gaps**, where the only registry entry
+  that would match is a regex broad enough to mask real regressions in the same
+  delta class.
+
+A test in this style must say in its docstring *why* it is not a plain `diff`
+call, and name the `DIV-` id it pins.

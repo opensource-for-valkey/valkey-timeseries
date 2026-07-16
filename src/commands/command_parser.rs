@@ -207,6 +207,39 @@ pub fn parse_duration_arg(arg: &ValkeyString) -> ValkeyResult<Duration> {
     parse_duration(&value_str)
 }
 
+/// Parse a bucket duration (the `AGGREGATION <aggregator> <bucketDuration>` operand,
+/// shared by the range family and TS.CREATERULE).
+///
+/// A zero duration reaches the bucket-boundary modulo in the aggregation iterator,
+/// so it must be rejected here rather than deeper: `bucket_duration` is also
+/// persisted with a compaction rule, where a zero would survive a reload.
+pub fn parse_bucket_duration_arg(arg: &ValkeyString) -> ValkeyResult<Duration> {
+    if let Ok(value) = arg.parse_integer() {
+        return bucket_duration_from_millis(value);
+    }
+    parse_bucket_duration_str(&arg.to_string_lossy())
+}
+
+/// String form of [`parse_bucket_duration_arg`], for callers holding a `&str`.
+pub fn parse_bucket_duration_str(arg: &str) -> ValkeyResult<Duration> {
+    if let Ok(value) = arg.parse::<i64>() {
+        return bucket_duration_from_millis(value);
+    }
+    let duration = parse_duration(arg)
+        .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
+    if duration.is_zero() {
+        return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
+    }
+    Ok(duration)
+}
+
+fn bucket_duration_from_millis(value: i64) -> ValkeyResult<Duration> {
+    if value <= 0 {
+        return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
+    }
+    Ok(Duration::from_millis(value as u64))
+}
+
 pub fn parse_duration(arg: &str) -> ValkeyResult<Duration> {
     parse_duration_ms(arg).map(|d| Duration::from_millis(d as u64))
 }
@@ -326,8 +359,10 @@ pub fn parse_timestamp_filter(
             .next_str()
             .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP_FILTER))?;
 
-        let timestamp =
-            parse_timestamp(arg).map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP))?;
+        // An unparseable entry is reported as a FILTER_BY_TS argument problem
+        // rather than a bare "invalid timestamp": the list is the operand.
+        let timestamp = parse_timestamp(arg)
+            .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP_FILTER))?;
 
         values.push(timestamp);
 
@@ -348,9 +383,15 @@ pub fn parse_timestamp_filter(
 }
 
 pub fn parse_value_filter(args: &mut CommandArgIterator) -> ValkeyResult<ValueFilter> {
-    let min = parse_number_with_unit(args.next_str()?)
+    let min_arg = args
+        .next_str()
+        .map_err(|_| ValkeyError::Str(error_consts::FILTER_BY_VALUE_MISSING_ARGS))?;
+    let min = parse_number_with_unit(min_arg)
         .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MIN))?;
-    let max = parse_number_with_unit(args.next_str()?)
+    let max_arg = args
+        .next_str()
+        .map_err(|_| ValkeyError::Str(error_consts::FILTER_BY_VALUE_MISSING_ARGS))?;
+    let max = parse_number_with_unit(max_arg)
         .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_MAX))?;
     if min.is_nan() {
         return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_MIN));
@@ -358,20 +399,24 @@ pub fn parse_value_filter(args: &mut CommandArgIterator) -> ValkeyResult<ValueFi
     if max.is_nan() {
         return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_MAX));
     }
-    if max < min {
-        return Err(ValkeyError::Str(
-            "TSDB filter min parameter is greater than max",
-        ));
-    }
+    // min > max is deliberately not rejected: it matches no sample, which is
+    // what RTS replies for the same input.
     ValueFilter::new(min, max)
 }
 
+/// Parse a COUNT operand. The value must be >= 1: zero is rejected rather than
+/// treated as "return no samples", so that a caller can not silently receive an
+/// empty reply from a typo.
 pub fn parse_count_arg(args: &mut CommandArgIterator) -> ValkeyResult<usize> {
     let next = args
         .next_arg()
         .map_err(|_| ValkeyError::Str(error_consts::MISSING_COUNT_VALUE))?;
-    let count = parse_integer_arg(&next, CMD_ARG_COUNT, false)
-        .map_err(|_| ValkeyError::Str(error_consts::NEGATIVE_COUNT))?;
+    let count = next
+        .parse_integer()
+        .map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_COUNT))?;
+    if count < 1 {
+        return Err(ValkeyError::Str(error_consts::INVALID_COUNT_VALUE));
+    }
     Ok(count as usize)
 }
 
@@ -627,13 +672,17 @@ fn parse_aggregation_list(agg_str: &str) -> ValkeyResult<SmallVec<[AggregationLi
 pub fn parse_aggregation_options(
     args: &mut CommandArgIterator,
 ) -> ValkeyResult<AggregationOptions> {
-    // AGGREGATION token already seen
+    // AGGREGATION token already seen. A missing operand is a parse failure
+    // ("Couldn't parse AGGREGATION"); a present but unrecognized aggregator name
+    // is the distinct "Unknown aggregation type" reported by parse_aggregation_list.
     let agg_str = args
         .next_str()
-        .map_err(|_e| ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE))?;
+        .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
     let aggregators = parse_aggregation_list(agg_str)?;
-    let bucket_duration = parse_duration_arg(&args.next_arg()?)
-        .map_err(|_e| ValkeyError::Str("TSDB: Couldn't parse bucket duration"))?;
+    let bucket_duration_arg = args
+        .next_arg()
+        .map_err(|_e| ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION))?;
+    let bucket_duration = parse_bucket_duration_arg(&bucket_duration_arg)?;
 
     let mut aggr: AggregationOptions = AggregationOptions {
         bucket_duration: bucket_duration.as_millis() as u64,
@@ -685,6 +734,45 @@ fn build_aggregator_configs(
         .collect()
 }
 
+/// ALIGN `start`/`end` need an explicit range bound: aligning to `start` is
+/// meaningless when the start is `-` (earliest), and likewise `end` with `+`.
+/// Shared by TS.RANGE and the TS.MRANGE family so both reject it identically.
+fn validate_align_against_bounds(
+    date_range: &TimestampRange,
+    aggregation: Option<&AggregationOptions>,
+) -> ValkeyResult<()> {
+    let Some(aggregation) = aggregation else {
+        return Ok(());
+    };
+    if date_range.start == TimestampValue::Earliest
+        && aggregation.alignment == BucketAlignment::Start
+    {
+        return Err(ValkeyError::Str(
+            error_consts::START_ALIGN_NEEDS_EXPLICIT_START,
+        ));
+    }
+    if date_range.end == TimestampValue::Latest
+        && aggregation.alignment == BucketAlignment::End
+    {
+        return Err(ValkeyError::Str(error_consts::END_ALIGN_NEEDS_EXPLICIT_END));
+    }
+    Ok(())
+}
+
+/// Whether an aggregator may be used as a `GROUPBY ... REDUCE` reducer.
+///
+/// Rejects the scan-order-dependent aggregators (`first`/`last`) and `Rate` (it
+/// needs a time window), matching RedisTimeSeries, which reports "Invalid
+/// reducer type" for them. Everything else `AggregationType` recognizes stays
+/// valid — including this engine's filtered-reducer extensions (`countif`,
+/// `sumif`, …), which RTS lacks but which are out of scope for parity and must
+/// keep working (tests/test_ts_mrange.py). Unknown names never reach here: they
+/// fail `AggregationType::try_from` and are rejected on the same path.
+fn is_valid_reducer(agg: &AggregationType) -> bool {
+    use AggregationType::*;
+    !matches!(agg, First | Last | Rate)
+}
+
 pub(super) fn parse_grouping_params(
     args: &mut CommandArgIterator,
 ) -> ValkeyResult<RangeGroupingOptions> {
@@ -700,16 +788,14 @@ pub(super) fn parse_grouping_params(
 
     let (name, cond_str) = split_aggregator_condition(agg_str)?;
 
-    let aggregator = AggregationType::try_from(name).map_err(|_| {
-        let msg = format!("TSDB: invalid grouping aggregator \"{name}\"");
-        ValkeyError::String(msg)
-    })?;
-
-    // Rate requires a time range, so it is not valid for grouping.
-    if aggregator == AggregationType::Rate {
-        let msg = "TSDB: aggregator not supported for GROUPBY reducer";
-        return Err(ValkeyError::Str(msg));
-    }
+    // GROUPBY ... REDUCE accepts a strict subset of the aggregators, matching
+    // RedisTimeSeries: the scan-order-dependent (first/last) and time-weighted
+    // (twa) aggregators are not reducers, and neither is any unknown name — all
+    // are rejected with the same "Invalid reducer type" as the reference.
+    let aggregator = AggregationType::try_from(name)
+        .ok()
+        .filter(is_valid_reducer)
+        .ok_or(ValkeyError::Str(error_consts::INVALID_REDUCER_TYPE))?;
 
     let value_filter = cond_str.map(parse_inline_condition).transpose()?;
     let aggregation = AggregatorConfig::new(aggregator, value_filter)?;
@@ -814,7 +900,7 @@ fn parse_align_for_aggregation(args: &mut CommandArgIterator) -> ValkeyResult<Ag
     let alignment_str = args.next_str()?;
 
     expect_next_token(args, CommandArgToken::Aggregation)
-        .map_err(|_| ValkeyError::Str("TSDB: missing AGGREGATION"))?;
+        .map_err(|_| ValkeyError::Str(error_consts::ALIGN_REQUIRES_AGGREGATION))?;
 
     let mut aggregation = parse_aggregation_options(args)?;
     aggregation.alignment = BucketAlignment::try_from(alignment_str)?;
@@ -871,23 +957,7 @@ pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeO
         }
     }
 
-    // according to docs, align cannot be Start if start time is Earliest, or End if end time is Latest
-    if let Some(aggregation) = &options.aggregation {
-        if options.date_range.start == TimestampValue::Earliest
-            && aggregation.alignment == BucketAlignment::Start
-        {
-            return Err(ValkeyError::Str(
-                "TSDB: cannot use 'start' align with '-' range start timestamp",
-            ));
-        }
-        if options.date_range.end == TimestampValue::Latest
-            && aggregation.alignment == BucketAlignment::End
-        {
-            return Err(ValkeyError::Str(
-                "TSDB: cannot use 'end' align with '+' range end timestamp",
-            ));
-        }
-    }
+    validate_align_against_bounds(&options.date_range, options.aggregation.as_ref())?;
 
     // filter out timestamp filters that are outside the range
     if let Some(ts_filter) = options.timestamp_filter.as_mut() {
@@ -968,11 +1038,20 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
             CommandArgToken::GroupBy => {
                 options.grouping = Some(parse_grouping_params(args)?);
             }
+            CommandArgToken::Reduce => {
+                // REDUCE is consumed inside GROUPBY parsing; reaching it here
+                // means it appeared without a preceding GROUPBY. RTS rejects the
+                // same input (it parses REDUCE as a stray filter token).
+                return Err(ValkeyError::Str("TSDB: REDUCE without GROUPBY"));
+            }
             CommandArgToken::Latest => {
                 options.range.latest = true;
             }
             CommandArgToken::SelectedLabels => {
                 options.selected_labels = parse_label_list(args, &RANGE_OPTION_ARGS)?;
+                if options.selected_labels.is_empty() {
+                    return Err(ValkeyError::Str(error_consts::EMPTY_SELECTED_LABELS));
+                }
             }
             CommandArgToken::WithLabels => {
                 options.with_labels = true;
@@ -984,6 +1063,8 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
     if options.filters.is_empty() {
         return Err(ValkeyError::Str("TSDB: no FILTER given"));
     }
+
+    validate_align_against_bounds(&options.range.date_range, options.range.aggregation.as_ref())?;
 
     // filter out timestamp filters that are outside the range
     if let Some(ts_filter) = options.range.timestamp_filter.as_mut() {
@@ -1229,6 +1310,10 @@ pub(super) fn parse_query_index_command_args(
 
     let mut matchers = Vec::with_capacity(4);
     while let Ok(arg) = args.next_str() {
+        // The `?` surfaces the parser's detailed diagnostic (e.g. `parse error:
+        // unexpected token "["`), a deliberate feature — see
+        // tests/test_queryindex_prometheus.py. It differs in wording from RTS's
+        // "failed parsing labels"; the compat suite pins that per-engine.
         let selector = parse_series_selector(arg)?;
         matchers.push(selector);
     }
