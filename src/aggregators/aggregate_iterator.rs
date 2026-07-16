@@ -69,9 +69,7 @@ impl AggregationHelper {
         for bucket_start in
             (start_bucket..end_bucket_exclusive).step_by(self.bucket_duration as usize)
         {
-            samples.push_back(
-                self.empty_row(self.bucket_ts.calculate(bucket_start, self.bucket_duration)),
-            );
+            samples.push_back(self.empty_row(self.render_timestamp(bucket_start)));
         }
     }
 
@@ -87,8 +85,7 @@ impl AggregationHelper {
     }
 
     fn output_timestamp(&self) -> Timestamp {
-        self.bucket_ts
-            .calculate(self.bucket_range_start, self.bucket_duration)
+        self.render_timestamp(self.bucket_range_start)
     }
 
     fn complete_bucket(
@@ -154,10 +151,22 @@ impl AggregationHelper {
             .saturating_add_unsigned(self.bucket_duration);
     }
 
+    /// True (unclamped) bucket start: may be negative when the alignment offset
+    /// places the first bucket before 0. Bucket membership must use this value;
+    /// only the *reported* timestamp is clamped (see [`Self::render_timestamp`]),
+    /// matching RTS `CalcBucketStart`/`BucketStartNormalize`.
     fn calc_bucket_start(&self, ts: Timestamp) -> Timestamp {
         let diff = ts - self.align_timestamp;
         let delta = self.bucket_duration as i64;
-        (ts - ((diff % delta + delta) % delta)).max(0)
+        ts - ((diff % delta + delta) % delta)
+    }
+
+    /// Reply timestamp for a bucket: clamp the start to 0 first, then apply the
+    /// BUCKETTIMESTAMP adjustment (RTS normalizes before, not after: the mid of
+    /// a `[-750, 250)` bucket reports 500, not 0).
+    fn render_timestamp(&self, bucket_start: Timestamp) -> Timestamp {
+        self.bucket_ts
+            .calculate(bucket_start.max(0), self.bucket_duration)
     }
 }
 
@@ -448,6 +457,77 @@ mod tests {
         assert_eq!(result[4].value, 6.0);
         assert_eq!(result[5].timestamp, 60);
         assert_eq!(result[5].value, 7.0);
+    }
+
+    // Reference-verified ALIGN semantics (RTS 8.6, compat finding #2): with
+    // ALIGN 250 and bucketDuration 1000 the buckets are [-750,250), [250,1250),
+    // [1250,2250), [2250,3250); membership uses the true (possibly negative)
+    // bucket start, and only the reported timestamp clamps the start to 0.
+    fn align_250_options(bucket_ts: BucketTimestamp, report_empty: bool) -> AggregationOptions {
+        AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration: 1000,
+            timestamp_output: bucket_ts,
+            alignment: BucketAlignment::Timestamp(250),
+            report_empty,
+        }
+    }
+
+    fn align_250_samples() -> Vec<Sample> {
+        vec![
+            Sample::new(0, 1.0),
+            Sample::new(500, 2.0),
+            Sample::new(1000, 3.0),
+            Sample::new(1500, 4.0),
+            Sample::new(2500, 10.5),
+        ]
+    }
+
+    #[test]
+    fn test_align_offset_bucket_membership_matches_reference() {
+        let options = align_250_options(BucketTimestamp::Start, false);
+        let result: Vec<Sample> =
+            AggregateIterator::new(align_250_samples().into_iter(), &options, 250).collect();
+
+        // ts 0 is alone in [-750,250) (reported clamped to 0); 500 and 1000
+        // share [250,1250) — the old clamped-start logic wrongly grouped 0
+        // with 500 and produced overlapping buckets.
+        let expected = [(0, 1.0), (250, 5.0), (1250, 4.0), (2250, 10.5)];
+        let actual: Vec<(Timestamp, f64)> =
+            result.iter().map(|s| (s.timestamp, s.value)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_align_offset_bucket_timestamp_clamps_start_before_adjustment() {
+        // RTS clamps the bucket start to 0 *before* applying BUCKETTIMESTAMP:
+        // the mid of [-750,250) reports 0 + 500 = 500, not max(0, -250).
+        let options = align_250_options(BucketTimestamp::Mid, false);
+        let result: Vec<Sample> =
+            AggregateIterator::new(align_250_samples().into_iter(), &options, 250).collect();
+        let mids: Vec<Timestamp> = result.iter().map(|s| s.timestamp).collect();
+        assert_eq!(mids, vec![500, 750, 1750, 2750]);
+
+        let options = align_250_options(BucketTimestamp::End, false);
+        let result: Vec<Sample> =
+            AggregateIterator::new(align_250_samples().into_iter(), &options, 250).collect();
+        let ends: Vec<Timestamp> = result.iter().map(|s| s.timestamp).collect();
+        assert_eq!(ends, vec![1000, 1250, 2250, 3250]);
+    }
+
+    #[test]
+    fn test_align_offset_empty_buckets_match_reference() {
+        let options = align_250_options(BucketTimestamp::Start, true);
+        let samples = vec![Sample::new(0, 1.0), Sample::new(2900, 5.0)];
+        let result: Vec<Sample> =
+            AggregateIterator::with_range(samples.into_iter(), &options, 250, 0, 3000).collect();
+
+        let actual: Vec<(Timestamp, f64)> =
+            result.iter().map(|s| (s.timestamp, s.value)).collect();
+        assert_eq!(
+            actual,
+            [(0, 1.0), (250, 0.0), (1250, 0.0), (2250, 5.0)]
+        );
     }
 
     #[test]
