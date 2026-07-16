@@ -183,7 +183,7 @@ class TestTimeseriesAdd(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command(
                 "TS.ADD", "ts_dup_block", timestamp, 20.0
             )
-        assert "duplicate" in str(exception_info.value)
+        assert "DUPLICATE_POLICY is set to BLOCK" in str(exception_info.value)
 
     def test_add_with_labels_creation(self):
         """Test TS.ADD with labels when creating a new timeseries"""
