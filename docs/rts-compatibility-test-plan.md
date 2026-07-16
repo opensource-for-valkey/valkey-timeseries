@@ -264,6 +264,14 @@ with `*` timestamp (replica must store the primary's timestamp), `TS.INCRBY` rep
 deterministic effect, and post-`DEBUG RELOAD` equivalence of `TS.INFO` + full `TS.RANGE` on both
 engines independently (each engine must round-trip itself; the *diff* is on post-reload replies).
 
+> **Observed correction (2026-07-16, `tests/compat/test_compat_replication.py`):** RTS 8.6 does
+> *not* replicate auto-timestamp `TS.INCRBY` as a deterministic effect — it propagates the command
+> verbatim and the replica stamps its own clock (30/30 divergent timestamps when probed). Only the
+> explicit-`TIMESTAMP` form is deterministic. Both engines share the verbatim behavior, so the
+> pinned semantics are: `*`-timestamp `TS.ADD` resolves before propagation (replica stores the
+> primary's timestamp); explicit-`TIMESTAMP` `TS.INCRBY`/`TS.DECRBY` replicate exactly;
+> auto-timestamp `TS.INCRBY` replicates the value but not the clock.
+
 ## 8. CI integration
 
 - **PR gate (`compat-smoke`, ~5 min):** Tier A golden tests for commands touched by the diff plus

@@ -159,14 +159,25 @@ pub fn create_and_store_internal(
     Ok(())
 }
 
+/// `explicit_create` distinguishes a client-issued `TS.CREATE` from the
+/// auto-create performed by write commands (TS.ADD/TS.MADD/TS.INCRBY/...):
+///
+/// - explicit: this call replicates verbatim and emits `ts.create`.
+/// - auto-create: neither — the calling command replicates *itself*, and the
+///   replica re-creates the series by re-running that command. Replicating
+///   here as well would propagate the write twice (`alsoPropagate` queues
+///   every call), which doubles non-idempotent effects like TS.INCRBY on
+///   replicas. (Corner case accepted: if the command errors *after* the
+///   auto-create, nothing propagates and the primary keeps an empty series
+///   the replica never sees.)
 pub fn create_and_store_series<'a>(
     ctx: &'a Context,
     key: &ValkeyString,
     options: TimeSeriesOptions,
-    notify: bool,
+    explicit_create: bool,
     add_compactions: bool,
 ) -> ValkeyResult<SeriesGuardMut<'a>> {
-    create_and_store_internal(ctx, key, options, true, notify)?;
+    create_and_store_internal(ctx, key, options, explicit_create, explicit_create)?;
 
     let Some(mut series) = get_timeseries_mut(ctx, key, true, Some(AclPermissions::INSERT))? else {
         return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND));

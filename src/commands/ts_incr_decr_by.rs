@@ -75,7 +75,9 @@ fn create_series_and_update(
     const INVALID_ARGS: &[CommandArgToken] = &[CommandArgToken::OnDuplicate];
 
     let options = parse_series_options(args, 2, INVALID_ARGS)?;
-    // notify=false: auto-create emits no ts.create event, matching RTS.
+    // Auto-create: no ts.create event (RTS parity) and no replication from
+    // the create helper — this command replicates itself (a second
+    // propagation would double the increment on replicas).
     let mut series = create_and_store_series(ctx, &key_name, options, false, true)?;
 
     handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)
