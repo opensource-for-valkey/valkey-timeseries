@@ -174,7 +174,9 @@ fn parse_args<'a>(
                         SampleAddResult::Ok(Sample::default())
                     }
                     Ok(None) => {
-                        let guard = create_and_store_series(ctx, key, options.clone(), true, true)?;
+                        // notify=false: auto-create emits no ts.create event, matching RTS.
+                        let guard =
+                            create_and_store_series(ctx, key, options.clone(), false, true)?;
                         series_samples.series = Some(guard);
                         SampleAddResult::Ok(Sample::default())
                     }

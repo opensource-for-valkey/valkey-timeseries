@@ -59,8 +59,35 @@ Resolution of the day-one suspects and everything else the diff surfaced:
   duration suffixes in the 4th field (it used a different parser than fields
   2–3). Both fixed, with RTS-grammar unit tests in `compaction_policy.rs`.
 
-Not yet exercised (Phase 2/3 scope): keyspace notifications, COMMAND INFO
-metadata, persistence interop (§7.4), compaction deep-dive, fuzzing.
+## §7.3 keyspace notifications (2026-07-16)
+
+Covered by `tests/compat/test_compat_notifications.py`: both engines run with
+`notify-keyspace-events KEA`; a canonical mutation script over the shared
+write surface is executed on each and the per-command `(event, key)` sequences
+are compared, plus an expiry-event case. Event names already matched
+(`ts.create`, `ts.add`, `ts.add:dest`, `ts.incrby`/`ts.decrby`, `ts.alter`,
+`ts.createrule:src`/`:dest`, `ts.del`, `ts.deleterule:src`/`:dest`). Three
+behavioral deltas were found and fixed:
+
+- **Auto-create emitted `ts.create`**: TS.ADD/TS.MADD/TS.INCRBY/TS.DECRBY on a
+  missing key fired `ts.create` + the write event; the reference fires only
+  the write event. The create helper's coupled replicate/notify flag was
+  split, and the auto-creating call sites now suppress just the event (their
+  replication is unchanged). `TS.ADDBULK` (extension) made consistent.
+- **TS.DEL / upsert fired `ts.add:dest`**: compaction propagation notified
+  destinations for every op; the reference emits `ts.add:dest` only on a
+  bucket close (new data appended downstream) — a propagated `TS.DEL` emits
+  only `ts.del`, and an upsert into a closed bucket recomputes the
+  destination silently. The notification is now gated to the add-flavored
+  compaction ops.
+- **Latent replication bug (found by the missing `ts.add`)**: TS.ADD's
+  upsert-with-rules branch early-returned after `upsert_compaction`, skipping
+  `replicate_and_notify` entirely — an upsert into a series with compaction
+  rules was never replicated (replica drift) and emitted no `ts.add`. The
+  branch now falls through like every other successful add.
+
+Not yet exercised (Phase 2/3 scope): COMMAND INFO metadata (§7.2),
+persistence interop (§7.4), compaction deep-dive, fuzzing.
 
 ## Gate status
 

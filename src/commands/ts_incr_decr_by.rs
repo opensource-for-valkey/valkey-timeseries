@@ -75,7 +75,8 @@ fn create_series_and_update(
     const INVALID_ARGS: &[CommandArgToken] = &[CommandArgToken::OnDuplicate];
 
     let options = parse_series_options(args, 2, INVALID_ARGS)?;
-    let mut series = create_and_store_series(ctx, &key_name, options, true, true)?;
+    // notify=false: auto-create emits no ts.create event, matching RTS.
+    let mut series = create_and_store_series(ctx, &key_name, options, false, true)?;
 
     handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)
 }

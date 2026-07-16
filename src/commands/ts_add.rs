@@ -63,7 +63,8 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let options = parse_series_options(args, 4, &[])?;
 
     let key = &original_args[1];
-    let mut series = create_and_store_series(ctx, key, options, true, true)?;
+    // notify=false: auto-create emits no ts.create event, matching RTS.
+    let mut series = create_and_store_series(ctx, key, options, false, true)?;
 
     handle_add(
         ctx,
@@ -130,8 +131,10 @@ fn handle_add(
                 );
                 return Err(ValkeyError::String(msg));
             }
-            // run compaction_upsert
-            return Ok(ValkeyValue::Integer(ts));
+            // Fall through to replicate_and_notify: an upsert is still a
+            // successful TS.ADD — it must replicate and emit `ts.add` like
+            // any other add (the early return here previously skipped both,
+            // leaving replicas without the sample).
         } else {
             let sample = series.last_sample.unwrap_or(Sample::new(ts, value));
             // If the sample is not an upsert, we run compaction
