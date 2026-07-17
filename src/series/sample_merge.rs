@@ -156,7 +156,20 @@ fn add_samples_internal(
         return Ok(smallvec![(index, result)]);
     }
 
-    input.sort_by_timestamp();
+    // In-batch duplicate timestamps: RTS applies each MADD item as an independent, sequential
+    // upsert under the series' duplicate policy (SUM accumulates, LAST wins, FIRST/MIN/MAX fold,
+    // BLOCK errors on the duplicate), so they must NOT be collapsed. The parallel bulk merge
+    // assumes unique timestamps per batch, so fall back to sequential single-sample add() in
+    // input order, which reproduces RTS exactly.
+    if has_in_batch_duplicate(&input.samples) {
+        return Ok(add_group_sequentially(input));
+    }
+
+    // Keep the samples in INPUT order: `normalize_batch`'s retention gate is input-order
+    // sensitive (it mirrors sequential TS.MADD — an item is TooOld only if it is older than the
+    // floor established by items at or before it). `merge_samples` returns results in the same
+    // order as the samples slice, and normalizes/sorts internally for grouping, so unsorted input
+    // is fully supported here.
     let samples: SmallVec<[Sample; 8]> = input
         .samples
         .iter()
@@ -168,9 +181,8 @@ fn add_samples_internal(
         .merge_samples(&samples, None)
         .map_err(|e| ValkeyError::String(format!("{e}")))?;
 
-    // `add_results` follow the sorted input order, so the accepted samples are ascending —
-    // exactly what batch compaction requires.
-    input.added = add_results
+    // Accepted samples feed batch compaction, which requires them ascending by timestamp.
+    let mut added: SmallVec<[Sample; 8]> = add_results
         .iter()
         .filter_map(|res| {
             if let SampleAddResult::Ok(s) = res {
@@ -180,6 +192,8 @@ fn add_samples_internal(
             }
         })
         .collect();
+    added.sort_unstable_by_key(|s| s.timestamp);
+    input.added = added;
 
     let mut result: SmallVec<[(usize, SampleAddResult); 8]> = SmallVec::new();
     for item in add_results
@@ -191,6 +205,50 @@ fn add_samples_internal(
     }
 
     Ok(result)
+}
+
+/// True if two samples in the group share a timestamp (checked over a sorted copy of the
+/// timestamps; groups are small, so the O(n log n) copy is cheap and only paid for MADD).
+fn has_in_batch_duplicate(samples: &[IndexedSample]) -> bool {
+    let mut timestamps: SmallVec<[Timestamp; 8]> = samples.iter().map(|s| s.timestamp).collect();
+    timestamps.sort_unstable();
+    timestamps.windows(2).any(|w| w[0] == w[1])
+}
+
+/// Apply a group with in-batch duplicate timestamps as sequential single-sample adds, in input
+/// order, so each item folds under the duplicate policy exactly as a standalone TS.ADD would.
+///
+/// Compaction is fed the *distinct* final stored samples (read back per affected timestamp): the
+/// append path streams samples into the open bucket one-by-one, so a duplicate timestamp appearing
+/// twice would otherwise be counted twice. Reading the committed value back also yields the
+/// policy-folded result (e.g. the summed value for `SUM`) rather than the raw inputs.
+fn add_group_sequentially(
+    input: &mut PerSeriesSamples,
+) -> SmallVec<[(usize, SampleAddResult); 8]> {
+    let mut result: SmallVec<[(usize, SampleAddResult); 8]> = SmallVec::new();
+    let mut touched: SmallVec<[Timestamp; 8]> = SmallVec::new();
+
+    // `input.samples` is in original MADD argument order (never sorted on the merge path).
+    let items: SmallVec<[IndexedSample; 6]> = std::mem::take(&mut input.samples);
+    for item in &items {
+        let res = input.series.add(item.timestamp, item.value, None);
+        if res.is_ok() {
+            touched.push(item.timestamp);
+        }
+        result.push((item.index, res));
+    }
+
+    touched.sort_unstable();
+    touched.dedup();
+    let mut added: SmallVec<[Sample; 8]> = SmallVec::new();
+    for ts in touched {
+        if let Ok(Some(sample)) = input.series.get_sample(ts) {
+            added.push(sample);
+        }
+    }
+    input.added = added;
+
+    result
 }
 
 /// Propagate each group's merged batch to its compaction destinations, one batch per series

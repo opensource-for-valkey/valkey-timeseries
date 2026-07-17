@@ -558,6 +558,34 @@ mod tests {
     }
 
     #[test]
+    fn normalize_retention_gate_is_input_order_sensitive() {
+        // On an empty series with retention, an item is TooOld only if it is older than the floor
+        // induced by items at or before it in INPUT order — matching sequential TS.MADD. A later
+        // item raising the floor does not retroactively reject an earlier accepted one.
+        let mk = || {
+            let mut series = TimeSeries::default();
+            series.retention = Duration::from_millis(1_000);
+            series
+        };
+
+        // Newer-first: the older item is below the floor the newer item established -> TooOld.
+        let series = mk();
+        let batch = normalize_batch(&series, &[s(1001, 0.0), s(0, 0.0)], None);
+        assert!(matches!(batch.results[1], SampleAddResult::TooOld));
+        let kept: Vec<i64> = batch.to_insert.iter().map(|x| x.timestamp).collect();
+        assert_eq!(kept, vec![1001]);
+
+        // Older-first: both accepted (the older one is later removed by the post-merge trim, but is
+        // still reported as accepted, not TooOld).
+        let series = mk();
+        let batch = normalize_batch(&series, &[s(0, 0.0), s(1001, 0.0)], None);
+        assert!(!matches!(batch.results[0], SampleAddResult::TooOld));
+        let mut kept: Vec<i64> = batch.to_insert.iter().map(|x| x.timestamp).collect();
+        kept.sort();
+        assert_eq!(kept, vec![0, 1001]);
+    }
+
+    #[test]
     fn group_splits_samples_across_chunks_when_ranges_differ() {
         let ctx = Context::dummy();
         let mut series = TimeSeries::default();

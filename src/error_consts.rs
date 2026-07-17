@@ -92,7 +92,7 @@ pub const CANNOT_PARSE_MIN: &str = "TSDB: Couldn't parse MIN";
 pub const CANNOT_PARSE_MAX: &str = "TSDB: Couldn't parse MAX";
 
 pub const NO_SERIES_FOUND: &str = "TSDB: no series found";
-pub const SAMPLE_TOO_OLD: &str = "TSDB: sample timestamp exceeds retention period";
+pub const SAMPLE_TOO_OLD: &str = "TSDB: Timestamp is older than retention";
 pub const SERIES_NOT_FOUND: &str = "TSDB: series not found";
 pub const GROUP_NOT_FOUND: &str = "TSDB: group not found";
 pub const LABELS_ALREADY_SET: &str = "TSDB: labels already set";
