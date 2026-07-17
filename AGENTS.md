@@ -165,7 +165,8 @@ Testing & debugging notes
   `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
   `docker compose -f docker-compose.compat.yml up -d reference` plus
   `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
-  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1`. Full env var table in `tests/compat/README.md`.
+  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1` (see "Fuzzing" below). Full env var table in
+  `tests/compat/README.md`.
 - pytest markers: `rts_compat` (needs a live reference server), `skip_for_asan`.
 - Leak detection: when `ASAN_BUILD` is set, the build script scans pytest output for LeakSanitizer output and fails if
   leaks are detected.
@@ -255,6 +256,43 @@ Benchmarks
   is always kept, since it is the baseline every delta is measured against), `--iterations`/`--warmup`, `--seed`,
   `--out-csv`/`--out-md`, `--quiet`. Wall-clock again, so no baseline gate — compare rows within one run.
 - `build.sh` does not run benches or any of the three report tools; they are manual.
+
+Fuzzing (Tier C differential fuzzer, plan §4.3)
+
+- There is no `cargo-fuzz`/libFuzzer target. The only fuzzer is `tests/compat/test_compat_fuzz.py`: Hypothesis
+  generates valid-by-construction command sequences (`tests/compat/fuzz_strategies.py`) over a small key/label
+  universe and replays each through the same `diff` client the rest of `tests/compat` uses, so every reply is
+  checked against the pinned `redis:8.6` reference. It therefore needs a reference server just like the other
+  compat tests, plus `hypothesis` installed (`requirements.txt` / `uv sync`).
+- It is opt-in and not part of the PR gate — a time-budgeted nightly-style job. It is currently not wired into
+  `.github/workflows/ci.yml`; run it by hand:
+
+  ```sh
+  # harness manages the reference container (needs Docker)
+  RTS_COMPAT=1 COMPAT_FUZZ=1 python3 -m pytest tests/compat/test_compat_fuzz.py -q
+
+  # or against an already-running reference
+  docker compose -f docker-compose.compat.yml up -d reference
+  COMPAT_FUZZ=1 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 \
+    python3 -m pytest tests/compat/test_compat_fuzz.py -q
+  ```
+
+- Fuzzer knobs (on top of the usual `COMPAT_*` vars): `COMPAT_FUZZ=1` enables it at all (without it the module
+  skips), `COMPAT_FUZZ_MAX_EXAMPLES=N` sets examples per protocol (default 150 — raise it for a longer soak),
+  `COMPAT_FUZZ_DERANDOMIZE=1` pins a fixed seed for reproducible debugging.
+- Build the module and `valkey-server` first (`SERVER_VERSION=unstable ./build.sh`), or point `COMPAT_SUBJECT_URL`
+  at a running instance — the fuzzer does not build anything itself.
+- When it finds a divergence, Hypothesis shrinks it to a minimal reproducer. Promote that command list into
+  `tests/compat/corpus/<slug>.json` (schema in `tests/compat/corpus/README.md`) so it becomes a deterministic
+  golden test; `test_compat_corpus.py` replays the whole corpus under RESP2 and RESP3 and runs as part of the
+  normal (non-opt-in) compat suite. Fixing the bug and adding the corpus case go in the same change.
+- Verify a promoted case with
+  `COMPAT_REFERENCE_URL=... python3 -m pytest tests/compat/test_compat_corpus.py -k <slug>`.
+- The generators deliberately stay inside the input space both engines accept, so a failure means a *reply*
+  divergence, not an input-rejection-boundary difference (that boundary is the §6 matrix's job). If a fuzzer
+  finding is an intentional divergence, register it in `divergences.yml` rather than weakening the generator.
+- Writing new strategies is clean-room work: derive them from public RTS documentation and black-box observation
+  only — never from RedisTimeSeries source or test code.
 
 Where to look first (key files & directories)
 
