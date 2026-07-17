@@ -155,31 +155,43 @@ class TestTsDelCompaction(ValkeyTimeSeriesTestCaseBase):
                 pass
 
     def test_del_current_bucket_adjustment(self):
-        """Test deletion affecting the current (incomplete) bucket"""
+        """Deleting from the current (incomplete) bucket adjusts its pending aggregation.
+
+        An open bucket must not reach the destination until something closes it (verified
+        against RedisTimeSeries), so the delete and the follow-up sample only change the
+        pending state. Once a later sample does close the bucket, the value it publishes must
+        exclude the deleted sample.
+        """
         source_key = 'source:current'
         dest_key = 'dest:current'
 
         self.setup_source_and_dest_series(source_key, dest_key)
         self.add_compaction_rule(source_key, dest_key, 'sum', 1000)
 
-        # Add samples to complete one bucket and start another
-        self.add_samples_to_source(source_key, 1000, 3, 100, 10.0)  # Complete bucket
-        self.add_samples_to_source(source_key, 2000, 2, 100, 20.0)  # Incomplete bucket
+        # Bucket [1000, 2000) gets 10.0 + 11.0 + 12.0 and is closed by the next bucket's
+        # samples; bucket [2000, 3000) gets 20.0 + 21.0 and stays open.
+        self.add_samples_to_source(source_key, 1000, 3, 100, 10.0)
+        self.add_samples_to_source(source_key, 2000, 2, 100, 20.0)
 
-        # Should have 1 complete compacted bucket
+        # Only the closed bucket is published.
         initial = self.get_compacted_samples(dest_key)
-        assert len(initial) == 1
+        assert initial == [[1000, b'33']]
 
-        # Delete from the incomplete bucket
+        # Delete the 20.0 sample out of the still-open bucket.
         deleted = self.client.execute_command('TS.DEL', source_key, 2000, 2050)
         assert deleted == 1
 
-        # Add more samples to complete the bucket
+        # Another sample lands in the same bucket, so it stays open: nothing new is published.
         self.client.execute_command('TS.ADD', source_key, 2200, 22.0)
+        assert self.get_compacted_samples(dest_key) == [[1000, b'33']]
 
-        # The incomplete bucket should be properly adjusted
+        # A sample in a later bucket finally closes it. The published value must be
+        # 21.0 + 22.0, i.e. the deleted 20.0 is excluded (it would be 63.0 otherwise).
+        self.client.execute_command('TS.ADD', source_key, 4000, 1.0)
         final = self.get_compacted_samples(dest_key)
         assert len(final) == 2
+        assert final[1][0] == 2000
+        assert float(final[1][1]) == 43.0
 
     def _test_del_with_retention_policy(self):
         """Test deletion with retention policy constraints"""
