@@ -190,10 +190,17 @@
     NOT part of the extension: it is an absolute timestamp and is rejected the
     same way RTS rejects it (previously it was silently read as an offset).
   rationale: >
-    owner decision pending — deliberate ergonomic extension to the bound
-    grammar, kept because it is additive and unambiguous once bare negatives
-    are excluded. Pinned by
+    Accepted (owner sign-off 2026-07-17, §5.3): a deliberate extension for
+    developer ergonomics — `*` and unit-suffixed relative offsets make ad-hoc
+    queries far easier to write by hand. Kept because it is purely additive and
+    unambiguous once bare negatives are excluded: every query RTS accepts still
+    means the same thing here, so the extension only widens the accepted input.
+    Being a superset, it can not be matched by the registry (§5.2 hard-fails
+    "reference errors, subject succeeds") and is pinned per-engine by
     TestOptionParsing::test_relative_and_now_bounds_are_an_accepted_input_superset.
+    Note the direction of risk: code written against this extension will not run
+    on RedisTimeSeries, so it is a portability caveat for users, not a
+    compatibility break for clients arriving from RTS.
   since: 0.1.0
 
 - id: DIV-0014
@@ -205,9 +212,11 @@
     resolved differently: RTS 8.6 keeps the first occurrence, we keep the last.
     Neither errors.
   rationale: >
-    owner decision pending — both behaviors are silent and arbitrary; matching
-    RTS means tracking seen tokens in the range parser while still consuming
-    the duplicate's operands. Pinned by
+    Accepted (owner sign-off 2026-07-17, §5.3): keep our last-occurrence-wins
+    resolution. Both engines accept the input and neither errors, so the only
+    difference is which arbitrary silent resolution applies; matching RTS would
+    mean tracking seen tokens in the range parser while still consuming the
+    duplicate's operands, for no observable benefit. Pinned by
     TestOptionParsing::test_duplicated_option.
   since: 0.1.0
 
@@ -222,11 +231,14 @@
     an accompanying AGGREGATION. ALIGN without AGGREGATION is the exception RTS
     does validate, and both engines reject it.
   rationale: >
-    owner decision pending — deliberately NOT matching the reference here.
-    Matching would mean accepting arbitrary garbage in the option list and
-    silently ignoring a mistyped option, which turns a user's typo into a
-    wrong answer instead of an error. Strictness is the safer divergence.
-    Pinned by TestOptionParsing::test_unknown_or_inapplicable_option_rejected.
+    Accepted (owner sign-off 2026-07-17, §5.3): deliberately stricter than the
+    reference. Matching would mean accepting arbitrary garbage in the option list
+    and silently ignoring a mistyped option, turning a user's typo into a wrong
+    answer instead of an error. Strictness is the safer divergence, and it is the
+    one direction that cannot corrupt a result: the cost is that a client relying
+    on RTS ignoring a stray token sees an error here, which is a visible, fixable
+    failure rather than silently wrong data. Pinned by
+    TestOptionParsing::test_unknown_or_inapplicable_option_rejected.
   since: 0.1.0
 
 - id: DIV-0016
@@ -383,10 +395,18 @@
     1e150 (square 1e300, finite) agrees on both engines; 1e200 (square overflows) diverges.
     Only this aggregator family is affected — avg/sum/min/max agree at DBL_MAX.
   rationale: >
-    owner decision pending — matching RTS here means deliberately adopting a numerically
-    unstable algorithm to reproduce a floating-point overflow artifact, degrading a
-    correct result (0) into NaN. Our stable accumulation is the intended behavior. Pinned
-    by TestAggregationOverflow::test_variance_family_overflows_on_rts.
+    Accepted (owner sign-off 2026-07-17, §5.3): our implementation is correct and stands.
+    Matching RTS would mean adopting a numerically unstable accumulation purely to
+    reproduce a floating-point overflow artifact, degrading a correct result (a single
+    sample has zero variance) into NaN. This divergence can only ever turn an RTS NaN into
+    a usable number, never the reverse, so no client is broken by it.
+    Pinned by TestAggregationOverflow::test_variance_family_overflows_on_rts, whose
+    companion test_below_the_overflow_boundary_agrees keeps the sub-boundary values (where
+    both engines must agree exactly) from being masked by this entry.
+    Consequence for Tier C: the fuzzer caps generated magnitudes below the overflow
+    boundary (fuzz_strategies.VALUES) so the variance aggregators stay fuzzable; that cap
+    is now permanent rather than provisional, and DBL_MAX itself stays covered by the
+    pinning test and corpus/float_formatting_high_precision.json.
   since: 0.1.0
 
 # DIV-0023 is a Tier C (differential fuzzer) finding, pinned per-engine in
