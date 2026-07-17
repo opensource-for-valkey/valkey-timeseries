@@ -437,6 +437,14 @@ fn remove_or_recalculate_bucket(
     start: Timestamp,
     end: Timestamp,
 ) -> TsdbResult<()> {
+    // The rule's still-open bucket has no destination entry yet and must not gain one: a bucket
+    // only reaches the destination when it closes. Recalculating it here would publish a bucket
+    // that is still accepting samples (RTS reports nothing for it). Its aggregator is repaired
+    // by `adjust_current_bucket_after_removal`, which runs after this, so leave it untouched.
+    if ctx.rule.bucket_start == Some(bucket_start) {
+        return Ok(());
+    }
+
     let bucket_end = bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
 
     if start <= bucket_start && end >= bucket_end {
