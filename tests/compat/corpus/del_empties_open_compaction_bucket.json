@@ -1,0 +1,32 @@
+{
+  "description": "TS.DEL that empties a rule's open bucket must drop the aggregation state: a later sample landing in an earlier bucket then opens a fresh bucket instead of being back-filled and materialized downstream while still open.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:dk1"],
+    ["TS.CREATE", "fz:dr1"],
+    ["TS.CREATERULE", "fz:dk1", "fz:dr1", "AGGREGATION", "avg", "500"],
+    ["TS.MADD", "fz:dk1", "500", "0"],
+    ["TS.DEL", "fz:dk1", "0", "500"],
+    ["TS.MADD", "fz:dk1", "0", "0"],
+    ["TS.RANGE", "fz:dr1", "-", "+"],
+    ["TS.GET", "fz:dr1"],
+    ["TS.GET", "fz:dr1", "LATEST"],
+    ["TS.CREATE", "fz:dk2"],
+    ["TS.CREATE", "fz:dr2"],
+    ["TS.CREATERULE", "fz:dk2", "fz:dr2", "AGGREGATION", "sum", "500"],
+    ["TS.ADD", "fz:dk2", "500", "10"],
+    ["TS.ADD", "fz:dk2", "600", "20"],
+    ["TS.DEL", "fz:dk2", "500", "550"],
+    ["TS.ADD", "fz:dk2", "1200", "5"],
+    ["TS.RANGE", "fz:dr2", "-", "+"],
+    ["TS.CREATE", "fz:dk3"],
+    ["TS.CREATE", "fz:dr3"],
+    ["TS.CREATERULE", "fz:dk3", "fz:dr3", "AGGREGATION", "sum", "500"],
+    ["TS.ADD", "fz:dk3", "600", "7"],
+    ["TS.DEL", "fz:dk3", "600", "600"],
+    ["TS.ADD", "fz:dk3", "700", "3"],
+    ["TS.ADD", "fz:dk3", "1600", "1"],
+    ["TS.RANGE", "fz:dr3", "-", "+"]
+  ]
+}

@@ -343,7 +343,13 @@ impl ChunkOps for UncompressedChunk {
             }
         }
 
-        Ok(self.len() - count)
+        // The chunk's *new* sample count, not the delta: callers derive the delta themselves by
+        // subtracting the length they observed beforehand (see `Chunk::upsert_sample`, and
+        // `TimeSeries::upsert_sample` which does `size - old_size`). Returning the delta here
+        // made that subtraction yield 0, so an out-of-order insert into an UNCOMPRESSED series
+        // never incremented `total_samples` — the series eventually reported itself empty while
+        // still holding samples, and TS.DEL then silently skipped them.
+        Ok(self.len())
     }
 
     fn merge_samples(
@@ -805,6 +811,8 @@ mod tests {
         ];
         let mut chunk = UncompressedChunk::new(1000, &samples);
 
+        // `upsert_sample` returns the chunk's sample count *after* the upsert (see the
+        // `Chunk` trait), so a duplicate leaves it unchanged rather than reporting 0.
         // Test 1: Upsert a new sample at the end
         let result = chunk
             .upsert_sample(
@@ -815,7 +823,7 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 1);
+        assert_eq!(result, 4);
         assert_eq!(
             chunk.samples,
             vec![
@@ -848,7 +856,7 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 1);
+        assert_eq!(result, 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -885,7 +893,7 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 0);
+        assert_eq!(result, 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -922,7 +930,7 @@ mod tests {
                 DuplicatePolicy::KeepFirst,
             )
             .unwrap();
-        assert_eq!(result, 0);
+        assert_eq!(result, 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -959,7 +967,7 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 1);
+        assert_eq!(result, 6);
         assert_eq!(
             chunk.samples,
             vec![

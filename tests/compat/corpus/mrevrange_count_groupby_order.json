@@ -1,0 +1,23 @@
+{
+  "description": "TS.MREVRANGE COUNT with GROUPBY must take the newest N buckets: COUNT limits rows in the requested order, so a reverse query reverses before truncating (previously it kept the oldest N and merely reversed those).",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:g0", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.ADD", "fz:g0", "0", "10"],
+    ["TS.ADD", "fz:g0", "1", "20"],
+    ["TS.ADD", "fz:g0", "2", "30"],
+    ["TS.CREATE", "fz:g1", "LABELS", "metric", "cpu", "host", "h2"],
+    ["TS.ADD", "fz:g1", "0", "1"],
+    ["TS.ADD", "fz:g1", "2", "5"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "1", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "2", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "3", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "2", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "max"],
+    ["TS.MREVRANGE", "0", "2", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MRANGE", "0", "2", "COUNT", "1", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MRANGE", "0", "2", "COUNT", "2", "FILTER", "metric=cpu", "GROUPBY", "metric", "REDUCE", "sum"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "2", "FILTER", "metric=cpu"],
+    ["TS.MREVRANGE", "0", "2", "COUNT", "1", "WITHLABELS", "FILTER", "metric=cpu", "GROUPBY", "host", "REDUCE", "max"]
+  ]
+}

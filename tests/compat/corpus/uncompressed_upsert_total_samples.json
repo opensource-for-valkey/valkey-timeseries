@@ -1,0 +1,22 @@
+{
+  "description": "Out-of-order upsert into an UNCOMPRESSED chunk must increment totalSamples: the chunk's upsert returns its new length (not the delta), so the series does not drift toward reporting itself empty while still holding samples (which made TS.DEL silently skip them).",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:u0", "RETENTION", "0", "ENCODING", "UNCOMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.MADD", "fz:u0", "1", "0"],
+    ["TS.ADD", "fz:u0", "0", "0"],
+    ["TS.INFO", "fz:u0"],
+    ["TS.RANGE", "fz:u0", "-", "+"],
+    ["TS.DEL", "fz:u0", "0", "0"],
+    ["TS.INFO", "fz:u0"],
+    ["TS.DEL", "fz:u0", "0", "1"],
+    ["TS.RANGE", "fz:u0", "-", "+"],
+    ["TS.CREATE", "fz:u1", "ENCODING", "UNCOMPRESSED", "CHUNK_SIZE", "4096", "DUPLICATE_POLICY", "LAST"],
+    ["TS.ADD", "fz:u1", "0", "1"],
+    ["TS.ADD", "fz:u1", "5", "1"],
+    ["TS.ADD", "fz:u1", "0", "99"],
+    ["TS.INFO", "fz:u1"],
+    ["TS.RANGE", "fz:u1", "-", "+"]
+  ]
+}

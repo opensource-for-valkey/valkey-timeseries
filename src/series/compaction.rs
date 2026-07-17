@@ -398,33 +398,56 @@ fn handle_compaction_range_removal(
     start: Timestamp,
     end: Timestamp,
 ) -> TsdbResult<()> {
-    // Update destination series buckets that overlap with [start, end]
+    // Update destination series buckets that overlap with [start, end].
+    //
+    // Only the first and last bucket can be partially covered; every bucket strictly between
+    // them is fully covered by definition (the removal spans them end to end), so they are
+    // dropped from the destination with a single range removal. Walking bucket by bucket
+    // instead made the cost scale with the *number of buckets in the range* rather than with
+    // the data actually stored: `TS.DEL key 0 <huge>` on a rule with a small bucketDuration
+    // spins for billions of iterations and blocks the server (a 1e10-bucket range took ~13s
+    // against RTS's 0.02s for the same two samples).
     let first_bucket_start = ctx.rule.calc_bucket_start(start);
     let last_bucket_start = ctx.rule.calc_bucket_start(end);
 
-    let mut current_bucket_start = first_bucket_start;
-    while current_bucket_start <= last_bucket_start {
-        let bucket_end = current_bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+    remove_or_recalculate_bucket(ctx, first_bucket_start, start, end)?;
 
-        let fully_covered = start <= current_bucket_start && end >= bucket_end;
-        if fully_covered {
-            if !ctx.dest.is_empty() {
-                ctx.dest
-                    .remove_range(current_bucket_start, bucket_end - 1)?;
-            }
-        } else {
-            // Recalculate this bucket excluding removed timestamps.
-            // If destination has no flushed buckets yet, this still correctly maintains the aggregator state.
-            recalculate_bucket(ctx, current_bucket_start, bucket_end, |ts| {
-                ts < start || ts > end
-            })?;
+    if last_bucket_start != first_bucket_start {
+        let middle_start = first_bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+        if middle_start < last_bucket_start && !ctx.dest.is_empty() {
+            // Buckets tile the range, so the fully covered middle is exactly
+            // [middle_start, last_bucket_start).
+            ctx.dest.remove_range(middle_start, last_bucket_start - 1)?;
         }
-
-        current_bucket_start = bucket_end;
+        remove_or_recalculate_bucket(ctx, last_bucket_start, start, end)?;
     }
 
     // Adjust current in-memory aggregation (ongoing bucket), if affected
     adjust_current_bucket_after_removal(ctx, start, end);
+
+    Ok(())
+}
+
+/// Apply a removal of `[start, end]` to the single destination bucket starting at `bucket_start`:
+/// drop it outright when the removal covers it entirely, otherwise recalculate it from the
+/// surviving source samples.
+fn remove_or_recalculate_bucket(
+    ctx: &mut CompactionContext,
+    bucket_start: Timestamp,
+    start: Timestamp,
+    end: Timestamp,
+) -> TsdbResult<()> {
+    let bucket_end = bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+
+    if start <= bucket_start && end >= bucket_end {
+        if !ctx.dest.is_empty() {
+            ctx.dest.remove_range(bucket_start, bucket_end - 1)?;
+        }
+    } else {
+        // Recalculate this bucket excluding removed timestamps.
+        // If destination has no flushed buckets yet, this still correctly maintains the aggregator state.
+        recalculate_bucket(ctx, bucket_start, bucket_end, |ts| ts < start || ts > end)?;
+    }
 
     Ok(())
 }
@@ -441,8 +464,10 @@ fn adjust_current_bucket_after_removal(
 
     let current_bucket_end = current_bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
 
-    // Check if the removal affects the current aggregation bucket
-    if removal_start < current_bucket_end && removal_end > current_bucket_start {
+    // Check if the removal affects the current aggregation bucket. The removal range is
+    // inclusive on both ends while the bucket is [start, end), so a removal ending exactly at
+    // `current_bucket_start` still deletes that bucket's first sample: the bound is `>=`.
+    if removal_start < current_bucket_end && removal_end >= current_bucket_start {
         let mut new_aggregator = ctx.rule.aggregator.clone();
         AggregationHandler::reset(&mut new_aggregator);
 
@@ -461,6 +486,16 @@ fn adjust_current_bucket_after_removal(
 
         ctx.rule.aggregator = new_aggregator;
         ctx.rule.has_samples = has_samples;
+
+        if !has_samples {
+            // The open bucket lost every sample, so there is no aggregation in progress any
+            // more. Drop `bucket_start` as well: leaving it set makes the next write compare
+            // against a bucket that no longer holds anything, so a sample landing *earlier*
+            // than it (possible once the deletion removed the series' last samples) takes the
+            // back-fill branch in `handle_sample_compaction` and materializes a bucket that is
+            // still open. Clearing it lets that sample simply open a fresh bucket.
+            ctx.rule.bucket_start = None;
+        }
     }
 }
 

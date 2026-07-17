@@ -511,19 +511,27 @@ pub(crate) fn collect_rows<I: Iterator<Item = MultiSample>>(
     rows
 }
 
+/// Apply reversal and COUNT to reduced samples. Like [`collect_rows`], COUNT limits samples in
+/// the *requested* order, so a reverse query must reverse before truncating: taking from the
+/// (ascending) iterator first would keep the oldest N and then merely reverse those, returning
+/// the wrong window entirely rather than just the wrong order.
 pub(crate) fn collect_samples<I: Iterator<Item = Sample>>(
     iter: I,
     is_reverse: bool,
     count: Option<usize>,
 ) -> Vec<Sample> {
-    let mut samples = if let Some(count) = count {
-        iter.take(count).collect::<Vec<_>>()
-    } else {
-        iter.collect::<Vec<_>>()
-    };
+    if !is_reverse {
+        // Ascending: the requested order matches the iterator, so COUNT can stop it early.
+        return match count {
+            Some(count) => iter.take(count).collect(),
+            None => iter.collect(),
+        };
+    }
 
-    if is_reverse {
-        samples.reverse();
+    let mut samples: Vec<Sample> = iter.collect();
+    samples.reverse();
+    if let Some(count) = count {
+        samples.truncate(count);
     }
     samples
 }
