@@ -110,13 +110,18 @@ fn handle_update(
 ) -> ValkeyResult {
     let delta = if !is_increment { -delta } else { delta };
 
+    // Captured before the write: an increment at exactly the last timestamp updates the
+    // existing sample in place, which compaction must treat as an upsert rather than a
+    // fresh append (see `run_compaction_for_increment`).
+    let prev_last_ts = series.last_sample.map(|s| s.timestamp);
+
     let result = series.increment_sample_value(timestamp, delta)?;
     match result {
         SampleAddResult::Ok(added) => {
             // An increment is a write like any other and must drive the series'
             // compaction rules; without this a counter maintained by
             // TS.INCRBY/TS.DECRBY never reaches its downstream series.
-            run_compaction_for_increment(ctx, series, key_name, added)?;
+            run_compaction_for_increment(ctx, series, key_name, added, prev_last_ts)?;
             replicate_and_notify(ctx, key_name, is_increment, added.timestamp)
         }
         SampleAddResult::Ignored(_ts) => {
@@ -133,20 +138,30 @@ fn handle_update(
 
 /// Drive the series' compaction rules after a successful increment.
 ///
-/// Always the non-upsert path: TS.INCRBY/TS.DECRBY reject a timestamp older than
-/// the last sample, so an increment can not land inside an already-finalized
-/// bucket the way an out-of-order TS.ADD can.
+/// TS.INCRBY/TS.DECRBY reject a timestamp *older* than the last sample, but not one equal
+/// to it: `TS.INCRBY key <d> TIMESTAMP <last_ts>` updates the existing sample in place. That
+/// is an upsert, so the affected bucket must be recalculated from the source instead of the
+/// new value being streamed into the open bucket as an additional sample — otherwise the old
+/// and new values are both aggregated (e.g. `TS.ADD k 0 0` then `TS.INCRBY k 1 TIMESTAMP 0`
+/// gave an `avg` rollup of 0.5 instead of 1). Mirrors the is_upsert split in TS.ADD.
 fn run_compaction_for_increment(
     ctx: &Context,
     series: &mut TimeSeries,
     key_name: &ValkeyString,
     added: Sample,
+    prev_last_ts: Option<Timestamp>,
 ) -> ValkeyResult<()> {
     if series.rules.is_empty() {
         return Ok(());
     }
-    let sample = series.last_sample.unwrap_or(added);
-    series.run_compaction(ctx, sample).map_err(|err| {
+    let is_upsert = prev_last_ts.is_some_and(|last_ts| added.timestamp <= last_ts);
+    let result = if is_upsert {
+        series.upsert_compaction(ctx, added)
+    } else {
+        let sample = series.last_sample.unwrap_or(added);
+        series.run_compaction(ctx, sample)
+    };
+    result.map_err(|err| {
         ValkeyError::String(format!(
             "TSDB: error running compaction for key '{key_name}': {err}"
         ))

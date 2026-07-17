@@ -29,9 +29,36 @@ pub(super) fn get_min_allowed_timestamp(series: &TimeSeries) -> Timestamp {
     }
 }
 
+/// Per-input-index mask of samples to reject as `TooOld`, evaluated in input order.
+///
+/// Mirrors sequential per-item `TS.ADD`: a running max timestamp (seeded from the series' current
+/// max, or the first batch item if the series is empty) advances as accepted items are seen, and
+/// each item is rejected only when it is older than `running_max - retention` *at that point*.
+/// Retention `0` never rejects.
+fn retention_gate(series: &TimeSeries, samples: &[Sample]) -> Vec<bool> {
+    let mut too_old = vec![false; samples.len()];
+    if series.retention.is_zero() {
+        return too_old;
+    }
+    let retention_ms = series.retention.as_millis() as i64;
+    let mut running_max: Option<Timestamp> = if series.is_empty() {
+        None
+    } else {
+        Some(series.last_timestamp())
+    };
+    for (i, sample) in samples.iter().enumerate() {
+        match running_max {
+            Some(max) if sample.timestamp < max.saturating_sub(retention_ms) => too_old[i] = true,
+            Some(max) => running_max = Some(max.max(sample.timestamp)),
+            None => running_max = Some(sample.timestamp),
+        }
+    }
+    too_old
+}
+
 /// Normalizes a batch of samples the same way single-sample [`TimeSeries::add`] does, so the
 /// bulk path stays behaviorally consistent with it:
-/// - drops samples older than the retention window, reporting them as `TooOld`;
+/// - reports samples older than the retention window as `TooOld` (see below);
 /// - applies the series' value rounding (`SIGNIFICANT_DIGITS`/`DECIMAL_DIGITS`);
 /// - applies the IGNORE filter (`max_time_delta`/`max_value_delta`) to in-order samples, reporting
 ///   ignored samples as `Ignored`.
@@ -39,12 +66,20 @@ pub(super) fn get_min_allowed_timestamp(series: &TimeSeries) -> Timestamp {
 /// The batch is processed in ascending timestamp order; unsorted input pays for one extra
 /// index sort (stable, so the *first* of two equal timestamps in input order wins). Results
 /// are always reported at the sample's original input index.
+///
+/// The retention gate is the one decision evaluated in **input order** rather than sorted order,
+/// because RedisTimeSeries processes `TS.MADD` items sequentially: an item is `TooOld` only if it
+/// falls below the retention floor induced by the max timestamp of the items at or before it (and
+/// any pre-existing samples). A *later* item that raises the floor does not retroactively reject an
+/// earlier accepted item — that earlier sample is inserted and then removed by the post-merge
+/// retention trim, so it is still reported as accepted. Only the per-item result differs between
+/// the two orderings; the stored end-state is identical either way.
 pub(super) fn normalize_batch(
     series: &TimeSeries,
     samples: &[Sample],
     policy_override: Option<DuplicatePolicy>,
 ) -> NormalizedBatch {
-    let min_allowed_ts = get_min_allowed_timestamp(series);
+    let too_old = retention_gate(series, samples);
     let dup_policy = series.sample_duplicates;
 
     // Process in ascending timestamp order even if the caller's batch isn't sorted.
@@ -77,7 +112,7 @@ pub(super) fn normalize_batch(
         }
         prev_ts = Some(sample.timestamp);
 
-        if sample.timestamp < min_allowed_ts {
+        if too_old[index] {
             results[index] = SampleAddResult::TooOld;
             continue;
         }

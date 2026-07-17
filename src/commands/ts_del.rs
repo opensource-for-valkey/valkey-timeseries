@@ -29,12 +29,9 @@ pub fn ts_del_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let count = with_timeseries_mut(ctx, &key, Some(AclPermissions::DELETE), |series| {
         let (start_ts, end_ts) = date_range.get_series_range(series, None, false);
 
-        if series.is_older_than_retention(start_ts) {
-            return Err(ValkeyError::String(
-                "TSDB: cannot delete samples older than retention".to_string(),
-            ));
-        }
-
+        // A range below the retention window is not an error: RedisTimeSeries deletes whatever
+        // the range intersects and reports the count (0 when it covers only already-expired
+        // time). Rejecting it here was an over-strict divergence found by the differential fuzzer.
         series
             .remove_range_with_compaction(ctx, start_ts, end_ts)
             .map_err(|_e| ValkeyError::String("TSDB: error deleting range".to_string()))

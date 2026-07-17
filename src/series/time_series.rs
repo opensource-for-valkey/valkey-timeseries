@@ -308,8 +308,23 @@ impl TimeSeries {
             }
             0
         } else {
-            let (pos, _found) = get_chunk_index(&self.chunks, sample.timestamp);
-            pos
+            let (pos, found) = get_chunk_index(&self.chunks, sample.timestamp);
+            if found {
+                pos
+            } else {
+                // The timestamp falls in a *gap* between chunks — chunks need not be
+                // contiguous (a split leaves one). `get_chunk_index` reports a miss as
+                // `chunks.len()`, which is not a usable index, so resolve it here: route the
+                // sample into the chunk starting after the gap, the same rule the bulk path
+                // uses (`group_samples_by_chunk`), which keeps chunks non-overlapping.
+                // `upsert_sample` is only reached for `timestamp <= last_timestamp`, so a
+                // chunk starting after the gap always exists; the last chunk is a defensive
+                // fallback.
+                self.chunks
+                    .iter()
+                    .position(|c| c.first_timestamp() > sample.timestamp)
+                    .unwrap_or(chunks_len - 1)
+            }
         };
 
         let is_last = target_idx + 1 == chunks_len;
@@ -336,10 +351,36 @@ impl TimeSeries {
             return res;
         }
 
-        // otherwise split the chunk and upsert into the new chunk
+        // Otherwise split the chunk and upsert into whichever half now owns the sample's
+        // timestamp. `split()` keeps the lower half in `chunk` and hands back the upper half,
+        // so upserting blindly into the new chunk would miss an existing sample left behind in
+        // the lower half: the duplicate policy would not fire and the timestamp would end up
+        // stored in both chunks, breaking the ascending-timestamp invariant.
         match chunk.split() {
             Ok(mut new_chunk) => {
-                let (size, res) = new_chunk.upsert(sample, duplicate_policy);
+                // An empty upper half (splitting a single-sample chunk) owns nothing.
+                let into_new = new_chunk.len() > 0 && sample.timestamp >= new_chunk.first_timestamp();
+                let (added, res) = if into_new {
+                    let old_size = new_chunk.len();
+                    let (size, res) = new_chunk.upsert(sample, duplicate_policy);
+                    (size.saturating_sub(old_size), res)
+                } else {
+                    let old_size = chunk.len();
+                    let (size, res) = chunk.upsert(sample, duplicate_policy);
+                    (size.saturating_sub(old_size), res)
+                };
+                // `chunk`'s borrow ends here; `self` is usable again below.
+
+                // Re-insert the upper half even when the upsert failed: `split()` already moved
+                // those samples out of `chunk`, so dropping it here would lose them. The split
+                // itself only redistributes samples, so it leaves `total_samples` unchanged.
+                if new_chunk.len() > 0 {
+                    let insert_at = self
+                        .chunks
+                        .partition_point(|c| c.first_timestamp() <= new_chunk.first_timestamp());
+                    self.chunks.insert(insert_at, new_chunk);
+                }
+
                 if !res.is_ok() {
                     return res;
                 }
@@ -349,17 +390,10 @@ impl TimeSeries {
                     logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
                 }
 
-                // insert the new chunk in order
-                let insert_at = self
-                    .chunks
-                    .partition_point(|c| c.first_timestamp() <= new_chunk.first_timestamp());
-                self.chunks.insert(insert_at, new_chunk);
-
-                self.total_samples += size;
-                if is_last {
-                    self.update_last_sample();
-                }
-                self.first_timestamp = sample.timestamp.min(self.first_timestamp);
+                self.total_samples += added;
+                // The insert above shifts chunk positions, so recompute both ends rather than
+                // relying on the pre-split `is_last`.
+                self.update_first_last_timestamps();
 
                 SampleAddResult::Ok(sample)
             }
