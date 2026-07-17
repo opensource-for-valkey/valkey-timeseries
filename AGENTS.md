@@ -4,9 +4,22 @@ Purpose
 
 - Short, focused instructions to help an AI model become productive in this codebase quickly.
 
+## ⚠️ Clean-room rule (read before touching compatibility work)
+
+This repo is Apache-2.0. RedisTimeSeries — **including its test suite** — is RSALv2/SSPLv1/AGPLv3,
+which is incompatible with that license.
+
+**Do not consult, fetch, vendor, copy, or port RedisTimeSeries source or test code**, and do not
+reproduce it from memory. Compatibility behavior must be derived only from public command
+documentation and black-box observation of a running reference server. Running the pinned
+`redis:8.6` image as a test target is fine; its source is off-limits. See
+[tests/compat/README.md](tests/compat/README.md).
+
 Quick start (commands you can run)
 
-- Build + checks:
+- Prerequisite: `protoc` (protobuf compiler) must be installed — the build compiles
+  `src/commands/fanout.*.proto` via `build.rs`. (`brew install protobuf` / `apt-get install protobuf-compiler`.)
+- Build + checks (mirrors CI):
   `cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release`
 - Local dev script (recommended):
     - `SERVER_VERSION=unstable ./build.sh`  # builds module, builds valkey-server, runs unit & integration tests
@@ -26,7 +39,7 @@ Key ENV and behavior (from `./build.sh`)
 
 Setup & Environment Notes
 
-- Rust version: The project requires a minimum Rust version of `1.92`.
+- Rust: edition 2024, minimum supported version `1.92`.
 - Python tests: Integration tests use Python. Dependencies are in `requirements.txt` (or via `uv sync`). The `build.sh`
   script handles this, but if running `pytest` manually, ensure packages are installed.
 - Running manually: To manually start a server with the module loaded, run
@@ -39,8 +52,9 @@ High-level architecture (big picture)
 - Command implementations live in `src/commands/*` and are registered in `src/lib.rs` with a one-to-one mapping to
   Valkey commands. Example:
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
-- Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
-  `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
+- Time-series core lives under `src/series` (storage, chunk encodings, compaction, background tasks, indexes,
+  serialization). Init helpers invoked from `src/lib.rs`: `init_croaring_allocator()`, `init_thread_pool()`,
+  `init_background_tasks()`, and `init_fanout()` when clustered.
   - `src/series/chunks/` implements three encoding formats: **Chimp** (ELF-on-Chimp, default),
     **Gorilla**, **Uncompressed**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
     Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
@@ -49,6 +63,10 @@ High-level architecture (big picture)
 - Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use the protobuf wire
   contract in `proto/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
   cluster-wide queries.
+- Beyond the RedisTimeSeries surface, the module ships extensions: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` and the
+  statistical machinery behind it (`src/analysis/` — outliers, seasonality, quantile estimators; see
+  `src/analysis/README.md`), `TS.ADDBULK`, `TS.LABELSTATS`, `TS.METRICNAMES`, `TS.MDEL`, and Prometheus-style
+  selector syntax (`src/parser/`, `docs/topics/filter-syntax.md`).
 - Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score, RCF
   variants) exposed via the `TS.OUTLIERS` command.
 - Aggregation: `src/aggregators/` — aggregation handlers and iterators used by range queries.
@@ -110,6 +128,21 @@ Cargo features
   library build too, so the `.so`/`.dylib` produced by `build.sh` contains the (unreachable) fixture code; a plain
   `cargo build --release` does not.
 
+Compatibility with RedisTimeSeries
+
+- [COMPATIBILITY.md](COMPATIBILITY.md) is the contract: what is expected to match RTS 8.6, what is an intentional
+  divergence, and what is explicitly a non-goal (RDB/AOF/replication byte formats, error message text, performance,
+  internals). Read it before "fixing" a behavior difference — some are deliberate.
+- [docs/rts-compatibility-test-plan.md](docs/rts-compatibility-test-plan.md) is the plan the harness implements;
+  its section numbers (§5.1 normalization, §5.2 error policy, §5.3 registry, §6 matrix, §7 operational parity)
+  are referenced throughout the test code.
+- `tests/compat/` is the differential harness. Each test uses a `diff` fixture that sends every command to both the
+  subject (valkey-server + this module) and the reference (pinned `redis:8.6`), normalizes both replies, and asserts
+  equality — automatically parametrized over RESP2 and RESP3.
+- Intentional mismatches go in `tests/compat/divergences.yml` and report as XFAIL-DIVERGENT rather than failing.
+  "Reference errors, subject succeeds" always hard-fails and cannot be registered away. Stale entries hide
+  regressions — remove entries that stop firing.
+
 Testing & debugging notes
 
 - Unit tests: `cargo test --features enable-system-alloc`.
@@ -124,12 +157,22 @@ Testing & debugging notes
   all of them ignore the range — see `is_workload()`). `TimestampModel` controls spacing
   (`Regular`, `Jitter`, `Irregular`). `DataGenerator::dataset(workload, model, samples, seed)` is the one-line form used
   by the benchmark matrix.
-- Integration tests: Python pytest under `tests/` and rely on a built `valkey-server` and `tests/valkeytestframework`
-  helper files (populated by `./build.sh`).
+- Integration tests: Python pytest under `tests/` (`test_ts_*.py` per command; `*_cme.py` are cluster-mode-enabled
+  variants) relying on a built `valkey-server` and the `tests/valkeytestframework` helpers (populated by `./build.sh`).
 - To reproduce integration runs locally: run `SERVER_VERSION=unstable ./build.sh` — this will clone/build Valkey and
   copy the server binary to `tests/build/binaries/`.
+- Compat tests are skipped unless a reference server is available:
+  `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
+  `docker compose -f docker-compose.compat.yml up -d reference` plus
+  `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
+  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1`. Full env var table in `tests/compat/README.md`.
+- pytest markers: `rts_compat` (needs a live reference server), `skip_for_asan`.
 - Leak detection: when `ASAN_BUILD` is set, the build script scans pytest output for LeakSanitizer output and fails if
   leaks are detected.
+- CI (`.github/workflows/ci.yml`): ubuntu + macos build/lint/unit, ubuntu integration tests across
+  `unstable`/`8.1`, an ASAN leak job, and a `compat-smoke` job that diffs the smoke subset against the pinned
+  reference (RESP3 only). `compat-smoke` is currently `continue-on-error: true` — non-blocking until the first-run
+  divergences are triaged.
 
 Benchmarks
 
@@ -215,15 +258,15 @@ Benchmarks
 
 Where to look first (key files & directories)
 
-- `src/lib.rs` — module entrypoint, command registration, lifecycle (preload/init/deinit).
+- `src/lib.rs` — module entrypoint, command registration, lifecycle (preload/init/deinit), config.
 - `src/commands/` — implementations and command parsing utilities (`command_parser.rs`).
-- `src/series/` — core storage, encodings, indexes, background tasks.
-- `src/fanout/` — cluster communication primitives.
+- `src/series/` — core storage, chunk encodings, compaction, indexes, background tasks, serialization.
+- `src/fanout/` — cluster communication primitives (cluster map, RPC, blocked clients, migrations).
 - `src/analysis/` — outlier detection algorithms (`src/analysis/outliers/`).
 - `src/aggregators/` — aggregation handlers for range queries.
 - `src/common/` — shared utilities (encoding, logging, thread pool, RDB, string interning).
 - `src/labels/` — label types and filter evaluation.
-- `src/parser/` — filter syntax, metric name, timestamp, and duration parsers.
+- `src/parser/` — selector/duration/timestamp parsing for the filter syntax.
 - `src/iterators/` — sample and row iterators.
 - `src/join/` — ASOF join for TS.JOIN.
 - `src/tests/` — shared test/bench support, compiled under `cfg(test)` or the `test-utils` feature:
@@ -242,6 +285,7 @@ Where to look first (key files & directories)
 - `build.sh` — canonical developer flow for formatting, linting, building, and running tests.
 - `README.md` and `docs/commands/` — human-facing command descriptions and examples.
 - `docs/topics/` — deep-dive topics: `filter-syntax.md`, `label-discovery.md`, `filter-dos-audit.md`.
+- `COMPATIBILITY.md`, `tests/compat/` — the RTS compatibility contract and its harness.
 
 Quick tips for code changes
 
@@ -258,11 +302,14 @@ Quick tips for code changes
   `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file; a normal build fails with instructions if the
   two disagree, so drift cannot land silently. Local↔wire conversions live beside it in `src/commands/fanout_codec/`
   (named `fanout_codec` rather than `fanout` so it does not collide with the `src/fanout/` transport layer).
+- Behavior changes on the shared RTS surface should be checked against `tests/compat` and, if the difference is
+  deliberate, recorded in `COMPATIBILITY.md` and/or `divergences.yml` (`behavior`-kind entries need explicit
+  sign-off in the PR that introduces them).
 
 Limitations of this document
 
 - Focused on discoverable, executable patterns. It does not cover domain rationale beyond what is visible in
-  source/docs.
+  source/docs. `docs/` also carries in-flight design and investigation notes that may run ahead of the code.
 
 If you need more context, inspect:
 
