@@ -330,3 +330,88 @@
     deliberate extension. Pinned by
     TestFilterLanguage::test_bare_metric_name_matcher_is_a_superset.
   since: 0.1.0
+
+# DIV-0021 is a Tier C (differential fuzzer) finding. Like DIV-0013..DIV-0020 it is
+# `documentation_only` and pinned by explicit per-engine assertions
+# (tests/compat/test_compat_del.py): the only registry regex that could match it
+# ("reference=<n> subject=0" on TS.DEL) would also absorb a genuine "TS.DEL deletes
+# nothing" regression — the exact hazard §5.3 warns about.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0021
+  command: TS.DEL
+  kind: behavior
+  documentation_only: true
+  description: >
+    TS.DEL over a range covering only already-expired samples reports 0 where RTS
+    reports the number of expired-but-still-stored samples it removed. Root cause is
+    a retention-model difference, not a TS.DEL bug: RTS trims lazily (an out-of-window
+    sample stays physically stored until its chunk expires) and filters it out of every
+    read path, so TS.DEL can still find and count it; we trim eagerly on write, so the
+    sample is already gone. Every read path agrees on both engines — TS.RANGE hides the
+    sample and TS.INFO reports totalSamples/firstTimestamp over the retained window —
+    so the divergence is confined to the TS.DEL return value for samples a client can
+    not observe anyway.
+  rationale: >
+    owner decision pending — matching RTS exactly means adopting its lazy-trim model
+    (physical retention deferred, every read path filtering logically), which is the
+    architecture the eager trim deliberately replaced to make TS.INFO's totalSamples /
+    firstTimestamp agree with TS.RANGE (see the plan's "retention accounting" fix).
+    Reverting that is a much larger change than the observable delta justifies, so the
+    divergence is documented rather than chased. Pinned by
+    TestDelRetention::test_del_of_expired_range_counts_differently.
+  since: 0.1.0
+
+# DIV-0022 is a Tier C (differential fuzzer) finding, pinned per-engine in
+# tests/compat/test_compat_range.py rather than matched by regex: the only regex that
+# could match it ("reference='NaN' subject=<n>") would absorb any real aggregation bug
+# that returns a number where RTS returns NaN.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0022
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    The variance/stddev aggregators (std.p, std.s, var.p, var.s) return NaN on RTS when
+    any sample magnitude exceeds sqrt(DBL_MAX) (~1.34e154); we return the mathematically
+    correct value. RTS accumulates the naive sum of squares, so x^2 overflows to +Inf and
+    the Inf - Inf term yields NaN — e.g. std.p over the single sample 1.7976931348623157e308
+    is NaN on RTS and 0 for us (a single sample has zero variance). The boundary is exact:
+    1e150 (square 1e300, finite) agrees on both engines; 1e200 (square overflows) diverges.
+    Only this aggregator family is affected — avg/sum/min/max agree at DBL_MAX.
+  rationale: >
+    owner decision pending — matching RTS here means deliberately adopting a numerically
+    unstable algorithm to reproduce a floating-point overflow artifact, degrading a
+    correct result (0) into NaN. Our stable accumulation is the intended behavior. Pinned
+    by TestAggregationOverflow::test_variance_family_overflows_on_rts.
+  since: 0.1.0
+
+# DIV-0023 is a Tier C (differential fuzzer) finding, pinned per-engine in
+# tests/compat/test_compat_compaction.py. Not registry-matchable: the regex would have to
+# cover "reference=<ts> subject=<ts>" on TS.GET/TS.MGET, absorbing any real last-sample bug.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0023
+  command: TS.GET
+  kind: behavior
+  documentation_only: true
+  description: >
+    After an out-of-order write back-fills a compaction bucket *older* than the currently
+    open one, TS.GET / TS.MGET without LATEST report the newly materialized downstream
+    bucket for us, but the previous (stale) bucket on RTS. Both engines store identical
+    downstream data — TS.RANGE returns the same samples on each, and TS.GET ... LATEST
+    agrees too — so RTS's reply contradicts its own TS.RANGE: it does not advance the
+    destination's cached last-sample when an older bucket is filled in. Reproducer: rule
+    `AGGREGATION avg 500` on src; `TS.ADD src 0 0`, `TS.ADD src 1000 0` (closes bucket 0),
+    then `TS.ADD src 500 0` — RANGE is `[[0,0],[500,0]]` on both, but TS.GET is `[500,0]`
+    for us and `[0,0]` on RTS.
+  rationale: >
+    owner decision pending — matching RTS means reproducing an inconsistency between its
+    own TS.GET and TS.RANGE by caching a destination last-sample that back-fill does not
+    refresh. Our reply is the last sample the series actually holds. Pinned by
+    TestOutOfOrderBackfill::test_get_after_backfilling_an_older_bucket.
+  since: 0.1.0

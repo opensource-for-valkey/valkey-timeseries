@@ -1,0 +1,22 @@
+{
+  "description": "In-batch duplicate timestamps in one TS.MADD fold per duplicate policy (SUM accumulates, LAST wins, BLOCK errors per duplicate), applied sequentially like standalone TS.ADD; compaction must not double-count.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:sum", "DUPLICATE_POLICY", "SUM"],
+    ["TS.MADD", "fz:sum", "0", "10", "fz:sum", "0", "20", "fz:sum", "0", "30"],
+    ["TS.RANGE", "fz:sum", "-", "+"],
+    ["TS.CREATE", "fz:last", "DUPLICATE_POLICY", "LAST"],
+    ["TS.MADD", "fz:last", "0", "10", "fz:last", "0", "20", "fz:last", "0", "30"],
+    ["TS.RANGE", "fz:last", "-", "+"],
+    ["TS.CREATE", "fz:block", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.MADD", "fz:block", "0", "10", "fz:block", "0", "20", "fz:block", "0", "30"],
+    ["TS.RANGE", "fz:block", "-", "+"],
+    ["TS.CREATE", "fz:isrc", "DUPLICATE_POLICY", "SUM"],
+    ["TS.CREATE", "fz:idst"],
+    ["TS.CREATERULE", "fz:isrc", "fz:idst", "AGGREGATION", "count", "1000"],
+    ["TS.MADD", "fz:isrc", "0", "5", "fz:isrc", "0", "7", "fz:isrc", "100", "3", "fz:isrc", "1500", "1"],
+    ["TS.RANGE", "fz:isrc", "-", "+"],
+    ["TS.RANGE", "fz:idst", "-", "+"]
+  ]
+}

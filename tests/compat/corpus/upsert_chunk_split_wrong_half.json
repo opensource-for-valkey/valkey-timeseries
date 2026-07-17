@@ -1,0 +1,25 @@
+{
+  "description": "Out-of-order upsert that triggers a chunk split must go into the half owning its timestamp: the lower half stays in place, so the duplicate policy has to fire there (BLOCK) instead of silently storing the timestamp twice out of order.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:sp", "RETENTION", "0", "CHUNK_SIZE", "128", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:sp", "0", "3.14"],
+    ["TS.MADD", "fz:sp", "1", "-0.0"],
+    ["TS.MADD", "fz:sp", "3000", "0"],
+    ["TS.MADD", "fz:sp", "1099511627776", "0"],
+    ["TS.ADD", "fz:sp", "2147483648", "-0.0"],
+    ["TS.ADD", "fz:sp", "0", "0"],
+    ["TS.RANGE", "fz:sp", "-", "+"],
+    ["TS.INFO", "fz:sp"],
+    ["TS.CREATE", "fz:sp2", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "LAST"],
+    ["TS.ADD", "fz:sp2", "0", "1"],
+    ["TS.ADD", "fz:sp2", "1", "1"],
+    ["TS.ADD", "fz:sp2", "3000", "1"],
+    ["TS.ADD", "fz:sp2", "1099511627776", "1"],
+    ["TS.ADD", "fz:sp2", "2147483648", "1"],
+    ["TS.ADD", "fz:sp2", "0", "99"],
+    ["TS.RANGE", "fz:sp2", "-", "+"],
+    ["TS.INFO", "fz:sp2"]
+  ]
+}

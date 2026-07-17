@@ -101,10 +101,34 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `test_compat_notifications.py` | §7.3 keyspace notifications |
 | `test_compat_persistence.py` | §7.4 persistence interop (defined-failure surface) |
 | `test_compat_replication.py` | §7.5 replication parity |
+| `fuzz_strategies.py` | §4.3 Hypothesis generators for valid-by-construction command sequences |
+| `test_compat_fuzz.py` | §4.3 property-based differential fuzzer (opt-in: `COMPAT_FUZZ=1`) |
+| `test_compat_corpus.py` | §4.3 regression corpus loader (replays `corpus/*.json` through `diff`) |
+| `corpus/` | checked-in minimal reproducers (fuzzer shrinks + hand-written), see `corpus/README.md` |
 
-The §6 read-path matrix is complete. Planned (later phases): the Hypothesis
-differential fuzzer and its regression corpus under `corpus/` (§4.3), and
-client-library conformance (§4.2).
+The §6 read-path matrix is complete, and the Tier C fuzzer (§4.3) is in place.
+Planned (later phases): client-library conformance (§4.2).
+
+## Differential fuzzer (Tier C, §4.3)
+
+`test_compat_fuzz.py` uses Hypothesis to generate random but valid-by-construction
+command sequences (create/write/read over a small key/label universe) and replays
+each through the `diff` client, so every reply is checked against the reference.
+It is **opt-in** — a time-budgeted nightly job, not part of the PR gate:
+
+```sh
+# needs a reference server, same as the rest of the suite
+COMPAT_FUZZ=1 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 \
+  python3 -m pytest tests/compat/test_compat_fuzz.py -q
+```
+
+Knobs: `COMPAT_FUZZ_MAX_EXAMPLES` (default 150 per protocol) and
+`COMPAT_FUZZ_DERANDOMIZE=1` (fixed seed, for reproducible debugging). When the
+fuzzer finds a divergence, Hypothesis shrinks it to a minimal reproducer; promote
+that into `corpus/` as a golden regression test (see `corpus/README.md`). The
+generator deliberately stays inside the input space both engines accept, so a
+failure is a *reply* divergence rather than an input-rejection-boundary difference
+(that boundary is already covered by the §6 matrix and its registered divergences).
 
 ## Divergences the registry can not express
 

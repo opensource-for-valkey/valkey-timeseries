@@ -1,0 +1,19 @@
+{
+  "description": "Out-of-order upsert into an already-finalized compaction bucket (including ts=0) defers to RTS.",
+  "origin": "manual reproducer",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:src", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "LAST"],
+    ["TS.CREATE", "fz:dst", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.CREATERULE", "fz:src", "fz:dst", "AGGREGATION", "sum", "1000"],
+    ["TS.ADD", "fz:src", "0", "1"],
+    ["TS.ADD", "fz:src", "500", "2"],
+    ["TS.ADD", "fz:src", "1000", "4"],
+    ["TS.ADD", "fz:src", "1500", "8"],
+    ["TS.ADD", "fz:src", "2500", "16"],
+    ["TS.ADD", "fz:src", "0", "100"],
+    ["TS.RANGE", "fz:dst", "-", "+"],
+    ["TS.GET", "fz:dst"],
+    ["TS.GET", "fz:dst", "LATEST"]
+  ]
+}

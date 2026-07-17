@@ -362,3 +362,57 @@ class TestReloadPartialBucket:
         self._reload(diff)
         diff("TS.ADD", "c:relo:src", 2000, 4.0)
         _probe(diff, "c:relo:src", "c:relo:dst")
+
+
+class TestOutOfOrderBackfill:
+    """DIV-0023: TS.GET on a destination whose *older* bucket was back-filled.
+
+    Pinned per-engine rather than via `diff`: the only registry regex able to match it
+    would cover "reference=<ts> subject=<ts>" on TS.GET/TS.MGET and absorb any real
+    last-sample bug (plan §5.3).
+    """
+
+    @staticmethod
+    def _backfill(client):
+        client.execute_command("TS.CREATE", "c:bsrc", "LABELS", "grp", "bf")
+        client.execute_command("TS.CREATE", "c:bdst", "LABELS", "grp", "bf")
+        client.execute_command(
+            "TS.CREATERULE", "c:bsrc", "c:bdst", "AGGREGATION", "avg", 500
+        )
+        client.execute_command("TS.ADD", "c:bsrc", 0, 0)      # opens bucket [0,500)
+        client.execute_command("TS.ADD", "c:bsrc", 1000, 0)   # closes it, opens [1000,1500)
+        client.execute_command("TS.ADD", "c:bsrc", 500, 0)    # back-fills [500,1000)
+
+    def test_backfilled_bucket_is_stored_identically(self, diff):
+        """The stored downstream data agrees — the divergence is only in TS.GET."""
+        diff("TS.CREATE", "c:b2src")
+        diff("TS.CREATE", "c:b2dst")
+        diff("TS.CREATERULE", "c:b2src", "c:b2dst", "AGGREGATION", "avg", 500)
+        diff("TS.ADD", "c:b2src", 0, 0)
+        diff("TS.ADD", "c:b2src", 1000, 0)
+        diff("TS.ADD", "c:b2src", 500, 0)
+        diff("TS.RANGE", "c:b2dst", "-", "+")
+        diff("TS.GET", "c:b2dst", "LATEST")
+
+    def test_get_after_backfilling_an_older_bucket(self, diff):
+        """RTS keeps reporting the stale bucket; we report the last sample actually
+        stored (which its own TS.RANGE agrees on). Pins DIV-0023."""
+        self._backfill(diff.reference)
+        self._backfill(diff.subject)
+
+        # Identical stored data on both engines.
+        assert (
+            diff.reference.execute_command("TS.RANGE", "c:bdst", "-", "+")
+            == diff.subject.execute_command("TS.RANGE", "c:bdst", "-", "+")
+        )
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:bdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
+        assert ref_get[0] == 0, f"expected RTS to report the stale bucket, got {ref_get!r}"
+        assert sub_get[0] == 500, f"expected the last stored bucket, got {sub_get!r}"
+
+        # LATEST (the open bucket) agrees on both.
+        assert (
+            diff.reference.execute_command("TS.GET", "c:bdst", "LATEST")
+            == diff.subject.execute_command("TS.GET", "c:bdst", "LATEST")
+        )

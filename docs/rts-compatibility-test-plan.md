@@ -253,6 +253,21 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 > DIV-0013 silently absorbed finding (1) above until it was caught. `divergences.yml` entries now
 > carry either a `details_regex` or `documentation_only: true`, and the loader enforces the
 > distinction. Any future `behavior` entry needs the same scrutiny.
+>
+> **Tier C status (2026-07-16):** the property-based differential fuzzer (§4.3) is landed —
+> `tests/compat/fuzz_strategies.py` (valid-by-construction command-sequence generators),
+> `tests/compat/test_compat_fuzz.py` (opt-in via `COMPAT_FUZZ=1`), and a checked-in regression
+> corpus (`tests/compat/corpus/`, replayed by `test_compat_corpus.py`). On its first runs against
+> the reference it found and fixed two `TS.MADD` subject bugs, both now pinned in the corpus:
+> (1) the batch retention gate used the pre-batch series max instead of an input-order running
+> max, so an item below the floor a *preceding* item established was silently accepted-then-trimmed
+> instead of reported `TooOld` — the gate is now input-order sensitive (mirroring sequential
+> per-item `TS.ADD`), and the too-old error text was aligned to RTS ("Timestamp is older than
+> retention"); (2) in-batch duplicate timestamps in one `TS.MADD` were rejected outright instead of
+> folding per duplicate policy (`SUM` accumulates, `LAST` wins, `BLOCK` errors per duplicate),
+> giving wrong stored values — such groups now fall back to sequential single-sample add, with
+> compaction fed the distinct post-fold samples so rollups do not double-count. Verified
+> byte-identical to RTS across all six duplicate policies and under an active compaction rule.
 
 **Compaction deep-dive scenarios** (highest historical-divergence area, gets its own module):
 bucket finalization timing (when does a sample land in the downstream series), out-of-order writes

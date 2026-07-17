@@ -568,3 +568,46 @@ class TestValueFormatting:
     def test_aggregation_produces_repeating_decimals(self, diff, range_cmd):
         mk_populated(diff, "r:repeating", [(0, 1.0), (1, 1.0), (2, 2.0)])
         diff(range_cmd, "r:repeating", "-", "+", "AGGREGATION", "avg", 1000)
+
+
+class TestAggregationOverflow:
+    """DIV-0022: the variance/stddev family overflows to NaN on RTS for huge magnitudes.
+
+    Pinned per-engine instead of via `diff`, because the only registry regex that could
+    cover it ("reference='NaN' subject=<n>") would also absorb a real aggregation bug
+    returning a number where RTS returns NaN (plan §5.3; see tests/compat/README.md
+    "Divergences the registry can not express").
+    """
+
+    # sqrt(DBL_MAX) ~= 1.34e154: above this, RTS's naive sum-of-squares overflows to
+    # +Inf and the Inf - Inf term yields NaN.
+    VARIANCE_AGGREGATORS = ("std.p", "std.s", "var.p", "var.s")
+
+    @pytest.mark.parametrize("agg", ("std.p", "var.p"))
+    def test_variance_family_overflows_on_rts(self, diff, agg):
+        """A single sample has zero variance; RTS reports NaN once x**2 overflows."""
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", "r:ovf")
+            client.execute_command("TS.ADD", "r:ovf", 0, "1.7976931348623157e308")
+
+        ref = diff.reference.execute_command(
+            "TS.RANGE", "r:ovf", "-", "+", "AGGREGATION", agg, 500
+        )
+        sub = diff.subject.execute_command(
+            "TS.RANGE", "r:ovf", "-", "+", "AGGREGATION", agg, 500
+        )
+        assert float(ref[0][1]) != float(ref[0][1]), f"expected RTS NaN, got {ref!r}"
+        assert float(sub[0][1]) == 0.0, f"expected a correct 0.0, got {sub!r}"
+
+    @pytest.mark.parametrize("agg", ("std.p", "var.p"))
+    def test_below_the_overflow_boundary_agrees(self, diff, agg):
+        """1e150 squares to 1e300 (finite), so both engines agree — this is the delta
+        class DIV-0022 must not be allowed to mask."""
+        mk_populated(diff, "r:safe", [(0, 1e150)])
+        diff("TS.RANGE", "r:safe", "-", "+", "AGGREGATION", agg, 500)
+
+    def test_non_variance_aggregators_agree_at_dbl_max(self, diff):
+        """avg/sum/min/max do not accumulate squares, so DBL_MAX is fine on both."""
+        mk_populated(diff, "r:big", [(0, 1.7976931348623157e308)])
+        for agg in ("avg", "sum", "min", "max", "count", "first", "last"):
+            diff("TS.RANGE", "r:big", "-", "+", "AGGREGATION", agg, 500)

@@ -1,0 +1,18 @@
+{
+  "description": "TS.REVRANGE first/last aggregation must reflect reverse scan order per bucket.",
+  "origin": "manual reproducer",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:s", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:s", "0", "1"],
+    ["TS.ADD", "fz:s", "250", "2"],
+    ["TS.ADD", "fz:s", "500", "3"],
+    ["TS.ADD", "fz:s", "1000", "4"],
+    ["TS.ADD", "fz:s", "1250", "5"],
+    ["TS.ADD", "fz:s", "1500", "6"],
+    ["TS.REVRANGE", "fz:s", "-", "+", "AGGREGATION", "first", "1000"],
+    ["TS.REVRANGE", "fz:s", "-", "+", "AGGREGATION", "last", "1000"],
+    ["TS.RANGE", "fz:s", "-", "+", "AGGREGATION", "first", "1000"],
+    ["TS.RANGE", "fz:s", "-", "+", "AGGREGATION", "last", "1000"]
+  ]
+}

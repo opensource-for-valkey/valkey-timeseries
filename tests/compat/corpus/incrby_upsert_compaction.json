@@ -1,0 +1,22 @@
+{
+  "description": "TS.INCRBY at the existing last timestamp updates the sample in place, so compaction must recalculate the bucket (avg=1) instead of aggregating both the old and new values (avg=0.5).",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:isrc2"],
+    ["TS.CREATE", "fz:idst2"],
+    ["TS.CREATERULE", "fz:isrc2", "fz:idst2", "AGGREGATION", "avg", "500"],
+    ["TS.ADD", "fz:isrc2", "0", "0"],
+    ["TS.INCRBY", "fz:isrc2", "1", "TIMESTAMP", "0"],
+    ["TS.GET", "fz:idst2", "LATEST"],
+    ["TS.RANGE", "fz:isrc2", "-", "+"],
+    ["TS.CREATE", "fz:isrc3"],
+    ["TS.CREATE", "fz:idst3"],
+    ["TS.CREATERULE", "fz:isrc3", "fz:idst3", "AGGREGATION", "sum", "500"],
+    ["TS.INCRBY", "fz:isrc3", "1", "TIMESTAMP", "0"],
+    ["TS.INCRBY", "fz:isrc3", "2", "TIMESTAMP", "100"],
+    ["TS.INCRBY", "fz:isrc3", "3", "TIMESTAMP", "600"],
+    ["TS.RANGE", "fz:isrc3", "-", "+"],
+    ["TS.RANGE", "fz:idst3", "-", "+"]
+  ]
+}
