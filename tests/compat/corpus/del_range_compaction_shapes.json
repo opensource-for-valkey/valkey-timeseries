@@ -1,0 +1,30 @@
+{
+  "description": "TS.DEL removal shapes against a compaction rule (aligned/partial/multi-bucket/whole-series), plus a range spanning billions of buckets which must stay O(data) rather than walking every bucket.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:ds"],
+    ["TS.CREATE", "fz:dd"],
+    ["TS.CREATERULE", "fz:ds", "fz:dd", "AGGREGATION", "sum", "500"],
+    ["TS.ADD", "fz:ds", "0", "1"],
+    ["TS.ADD", "fz:ds", "100", "2"],
+    ["TS.ADD", "fz:ds", "400", "5"],
+    ["TS.ADD", "fz:ds", "500", "6"],
+    ["TS.ADD", "fz:ds", "600", "7"],
+    ["TS.ADD", "fz:ds", "900", "10"],
+    ["TS.ADD", "fz:ds", "1000", "11"],
+    ["TS.ADD", "fz:ds", "1500", "16"],
+    ["TS.ADD", "fz:ds", "2000", "21"],
+    ["TS.DEL", "fz:ds", "250", "1750"],
+    ["TS.RANGE", "fz:ds", "-", "+"],
+    ["TS.RANGE", "fz:dd", "-", "+"],
+    ["TS.CREATE", "fz:ws"],
+    ["TS.CREATE", "fz:wd"],
+    ["TS.CREATERULE", "fz:ws", "fz:wd", "AGGREGATION", "sum", "1"],
+    ["TS.ADD", "fz:ws", "0", "1"],
+    ["TS.ADD", "fz:ws", "1099511627776", "1"],
+    ["TS.DEL", "fz:ws", "0", "1099511627776"],
+    ["TS.RANGE", "fz:ws", "-", "+"],
+    ["TS.RANGE", "fz:wd", "-", "+"]
+  ]
+}
