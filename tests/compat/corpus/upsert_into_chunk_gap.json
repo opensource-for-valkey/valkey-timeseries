@@ -1,0 +1,16 @@
+{
+  "description": "Upsert of a timestamp landing in the gap between two non-contiguous chunks (left by a split) must route into the chunk after the gap, not error out.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:gap", "CHUNK_SIZE", "128", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:gap", "0", "3.14"],
+    ["TS.MADD", "fz:gap", "501", "1", "fz:gap", "0", "0", "fz:gap", "2147483648", "0"],
+    ["TS.ADD", "fz:gap", "1", "0"],
+    ["TS.ADD", "fz:gap", "2", "1"],
+    ["TS.ADD", "fz:gap", "500", "0"],
+    ["TS.MADD", "fz:gap", "499", "0"],
+    ["TS.RANGE", "fz:gap", "-", "+"],
+    ["TS.INFO", "fz:gap"]
+  ]
+}

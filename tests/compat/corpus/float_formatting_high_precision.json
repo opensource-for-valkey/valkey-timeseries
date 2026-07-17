@@ -1,0 +1,17 @@
+{
+  "description": "High-precision, subnormal, huge and signed-zero values must read back with identical float formatting.",
+  "origin": "manual reproducer",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:f", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:f", "100", "3.141592653589793"],
+    ["TS.ADD", "fz:f", "200", "1e308"],
+    ["TS.ADD", "fz:f", "300", "5e-324"],
+    ["TS.ADD", "fz:f", "400", "-0.0"],
+    ["TS.ADD", "fz:f", "500", "123456789.123456789"],
+    ["TS.ADD", "fz:f", "600", "0.1"],
+    ["TS.RANGE", "fz:f", "-", "+"],
+    ["TS.GET", "fz:f"],
+    ["TS.RANGE", "fz:f", "-", "+", "AGGREGATION", "avg", "100"]
+  ]
+}

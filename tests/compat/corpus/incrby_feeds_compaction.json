@@ -1,0 +1,19 @@
+{
+  "description": "TS.INCRBY/DECRBY must feed downstream compaction rules the same way TS.ADD does.",
+  "origin": "manual reproducer",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:src", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.CREATE", "fz:dst", "RETENTION", "0", "CHUNK_SIZE", "4096", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.CREATERULE", "fz:src", "fz:dst", "AGGREGATION", "count", "1000"],
+    ["TS.INCRBY", "fz:src", "1", "TIMESTAMP", "100"],
+    ["TS.INCRBY", "fz:src", "2", "TIMESTAMP", "500"],
+    ["TS.INCRBY", "fz:src", "3", "TIMESTAMP", "1200"],
+    ["TS.INCRBY", "fz:src", "4", "TIMESTAMP", "1800"],
+    ["TS.INCRBY", "fz:src", "5", "TIMESTAMP", "2500"],
+    ["TS.RANGE", "fz:src", "-", "+"],
+    ["TS.RANGE", "fz:dst", "-", "+"],
+    ["TS.GET", "fz:dst"],
+    ["TS.GET", "fz:dst", "LATEST"]
+  ]
+}

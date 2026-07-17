@@ -1,0 +1,17 @@
+{
+  "description": "TS.MADD retention gate is input-order sensitive: an item below the floor a preceding item established is TooOld; reordering makes it accepted-then-trimmed.",
+  "origin": "fuzzer shrink 2026-07-16",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:k2", "RETENTION", "1000", "CHUNK_SIZE", "128", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.MADD", "fz:k2", "1001", "0", "fz:k2", "0", "0"],
+    ["TS.RANGE", "fz:k2", "-", "+"],
+    ["TS.CREATE", "fz:k3", "RETENTION", "1000", "CHUNK_SIZE", "128", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.MADD", "fz:k3", "0", "0", "fz:k3", "1001", "0"],
+    ["TS.RANGE", "fz:k3", "-", "+"],
+    ["TS.CREATE", "fz:k4", "RETENTION", "1000", "CHUNK_SIZE", "128", "ENCODING", "COMPRESSED", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:k4", "5000", "1"],
+    ["TS.MADD", "fz:k4", "4000", "1", "fz:k4", "3999", "1"],
+    ["TS.RANGE", "fz:k4", "-", "+"]
+  ]
+}

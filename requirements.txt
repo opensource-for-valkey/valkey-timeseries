@@ -1,3 +1,7 @@
 valkey
 pytest==7.4.3
 PyYAML
+# Compat suite only: PyYAML powers the divergence registry (tests/compat), and
+# hypothesis drives the opt-in differential fuzzer (tests/compat/test_compat_fuzz.py,
+# COMPAT_FUZZ=1). Both are skipped gracefully when absent.
+hypothesis
