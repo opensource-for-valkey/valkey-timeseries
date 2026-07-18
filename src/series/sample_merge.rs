@@ -137,6 +137,16 @@ pub fn multi_series_merge_samples(
         run_group_compactions(ctx, &mut groups);
     }
 
+    // Retention is applied only now, after compaction. The merge above deliberately
+    // skipped the eager trim: RedisTimeSeries folds a sample into its downstream
+    // bucket at write time, so trimming first would let a batch that both writes an
+    // out-of-order sample and advances the retention window drop that sample before
+    // the bucket recalculation reads it back — publishing a downstream value computed
+    // from fewer samples than RTS uses.
+    for group in groups.iter_mut() {
+        group.series.apply_retention();
+    }
+
     Ok(res)
 }
 
@@ -148,7 +158,9 @@ fn add_samples_internal(
     if input.samples.len() == 1 {
         let sample = input.samples.pop().unwrap();
         let index = sample.index;
-        let result = input.series.add(sample.timestamp, sample.value, None);
+        let result = input
+            .series
+            .add_deferring_retention(sample.timestamp, sample.value, None);
         if let SampleAddResult::Ok(added) = result {
             input.added.push(added);
         }
@@ -178,7 +190,7 @@ fn add_samples_internal(
 
     let add_results = input
         .series
-        .merge_samples(&samples, None)
+        .merge_samples_deferring_retention(&samples, None)
         .map_err(|e| ValkeyError::String(format!("{e}")))?;
 
     // Accepted samples feed batch compaction, which requires them ascending by timestamp.
@@ -222,6 +234,9 @@ fn has_in_batch_duplicate(samples: &[IndexedSample]) -> bool {
 /// append path streams samples into the open bucket one-by-one, so a duplicate timestamp appearing
 /// twice would otherwise be counted twice. Reading the committed value back also yields the
 /// policy-folded result (e.g. the summed value for `SUM`) rather than the raw inputs.
+///
+/// The adds here defer the retention trim (the caller applies it once, after compaction), so the
+/// read-back still sees a sample that a later item in the same batch pushed outside the window.
 fn add_group_sequentially(
     input: &mut PerSeriesSamples,
 ) -> SmallVec<[(usize, SampleAddResult); 8]> {
@@ -231,7 +246,9 @@ fn add_group_sequentially(
     // `input.samples` is in original MADD argument order (never sorted on the merge path).
     let items: SmallVec<[IndexedSample; 6]> = std::mem::take(&mut input.samples);
     for item in &items {
-        let res = input.series.add(item.timestamp, item.value, None);
+        let res = input
+            .series
+            .add_deferring_retention(item.timestamp, item.value, None);
         if res.is_ok() {
             touched.push(item.timestamp);
         }

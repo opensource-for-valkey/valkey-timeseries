@@ -1,0 +1,16 @@
+{
+  "description": "TS.MADD that writes an out-of-order sample and also advances the retention window past it must still count that sample in the downstream bucket: the trim runs after compaction, and bucket recalculation reads stored samples rather than the retention-clamped range.",
+  "origin": "fuzzer shrink 2026-07-18",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:k0", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.CREATE", "fz:rollup"],
+    ["TS.CREATERULE", "fz:k0", "fz:rollup", "AGGREGATION", "count", "500"],
+    ["TS.INCRBY", "fz:k0", "1", "TIMESTAMP", "1"],
+    ["TS.MADD", "fz:k0", "0", "0", "fz:k0", "1001", "0"],
+    ["TS.GET", "fz:rollup"],
+    ["TS.RANGE", "fz:rollup", "-", "+"],
+    ["TS.RANGE", "fz:k0", "-", "+"],
+    ["TS.INFO", "fz:k0"]
+  ]
+}

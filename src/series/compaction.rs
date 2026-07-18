@@ -832,8 +832,11 @@ where
 {
     let mut has_samples = false;
     aggregator.reset();
+    // `stored_range_iter`, not `range_iter`: bucket aggregation must count every
+    // sample physically present, including one the batch just wrote that the
+    // not-yet-applied retention window would hide (see `TimeSeries::apply_retention`).
     for sample in series
-        .range_iter(start, end)
+        .stored_range_iter(start, end)
         .filter(|sample| filter(sample.timestamp))
     {
         if aggregator.update(sample.timestamp, sample.value) {
