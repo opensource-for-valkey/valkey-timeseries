@@ -187,9 +187,26 @@ impl TimeSeries {
         value: f64,
         dp_override: Option<DuplicatePolicy>,
     ) -> SampleAddResult {
+        let result = self.add_deferring_retention(ts, value, dp_override);
+        if result.is_ok() {
+            self.apply_retention();
+        }
+        result
+    }
+
+    /// [`Self::add`] without the eager retention trim.
+    ///
+    /// Batch writers use this so that compaction can observe the series as it was
+    /// *before* this batch's trim — see [`Self::apply_retention`].
+    pub(super) fn add_deferring_retention(
+        &mut self,
+        ts: Timestamp,
+        value: f64,
+        dp_override: Option<DuplicatePolicy>,
+    ) -> SampleAddResult {
         let sample = self.make_sample(ts, value);
 
-        let result = if let Some(last) = self.last_sample {
+        if let Some(last) = self.last_sample {
             let last_ts = last.timestamp;
 
             // - ts < last_ts: upsert (no validation)
@@ -205,20 +222,28 @@ impl TimeSeries {
             }
         } else {
             self.add_sample_internal(sample)
-        };
-
-        // Apply retention eagerly, matching RedisTimeSeries: a new max sample
-        // advances the window, so samples that just fell outside it are dropped
-        // now rather than waiting for the background trim task. This keeps
-        // total_samples / first_timestamp (TS.INFO) consistent with what a range
-        // query returns. trim() is a cheap no-op when nothing expired.
-        if result.is_ok() && !self.retention.is_zero() {
-            if let Err(e) = self.trim() {
-                logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
-            }
         }
+    }
 
-        result
+    /// Apply the retention window now.
+    ///
+    /// Retention is applied eagerly, matching RedisTimeSeries: a new max sample
+    /// advances the window, so samples that just fell outside it are dropped now
+    /// rather than waiting for the background trim task. This keeps
+    /// total_samples / first_timestamp (TS.INFO) consistent with what a range
+    /// query returns. `trim()` is a cheap no-op when nothing expired.
+    ///
+    /// Callers that write a batch and then compact must defer this until after
+    /// compaction: RedisTimeSeries folds a sample into its downstream bucket at
+    /// write time, so trimming the source first would drop that contribution from
+    /// a bucket recalculation and diverge (see `sample_merge`).
+    pub(super) fn apply_retention(&mut self) {
+        if self.retention.is_zero() {
+            return;
+        }
+        if let Err(e) = self.trim() {
+            logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
+        }
     }
 
     pub(crate) fn validate_sample(
@@ -498,17 +523,24 @@ impl TimeSeries {
         samples: &[Sample],
         policy_override: Option<DuplicatePolicy>,
     ) -> TsdbResult<Vec<SampleAddResult>> {
+        let results = self.merge_samples_deferring_retention(samples, policy_override)?;
+        // Eager retention trim, as in `add` — a batch can advance the window too.
+        self.apply_retention();
+        Ok(results)
+    }
+
+    /// [`Self::merge_samples`] without the eager retention trim, for callers that
+    /// compact afterwards and must do so against the pre-trim series (see
+    /// [`Self::apply_retention`]).
+    pub(super) fn merge_samples_deferring_retention(
+        &mut self,
+        samples: &[Sample],
+        policy_override: Option<DuplicatePolicy>,
+    ) -> TsdbResult<Vec<SampleAddResult>> {
         if samples.is_empty() {
             return Ok(Vec::new());
         }
-        let results = merge_samples(self, samples, policy_override)?;
-        // Eager retention trim, as in `add` — a batch can advance the window too.
-        if !self.retention.is_zero() {
-            if let Err(e) = self.trim() {
-                logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
-            }
-        }
-        Ok(results)
+        merge_samples(self, samples, policy_override)
     }
 
     /// Get the time series between given start and end time (both inclusive).
@@ -630,6 +662,23 @@ impl TimeSeries {
 
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
         let start = start.max(self.get_min_timestamp());
+        SeriesSampleIterator::new(self, start, end, false)
+    }
+
+    /// Iterate the samples physically stored in `[start, end]`, **without** clamping
+    /// `start` to the retention window the way [`Self::range_iter`] does.
+    ///
+    /// Compaction recalculation needs this: a batch can both write an out-of-order
+    /// sample and advance the retention window past it, and the trim runs only after
+    /// compaction (see [`Self::apply_retention`]). Clamping there would aggregate the
+    /// bucket without the sample the batch just accepted, publishing a downstream
+    /// value computed from fewer samples than RedisTimeSeries uses. Query paths keep
+    /// the clamp — an untrimmed but expired sample must stay invisible to reads.
+    pub(super) fn stored_range_iter(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> SeriesSampleIterator<'_> {
         SeriesSampleIterator::new(self, start, end, false)
     }
 
