@@ -115,7 +115,10 @@ required-features = ["enable-system-alloc"]
 [[bench]]
 name = "fast_path"
 harness = false
-required-features = ["bench"]
+# `bench` exposes the bench_eval_* helpers; `enable-system-alloc` swaps the Valkey
+# allocator for the system one, without which a standalone bench binary aborts on
+# its first allocation (RedisModule_Alloc is only populated inside a Valkey server).
+required-features = ["bench", "enable-system-alloc"]
 
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
