@@ -112,6 +112,11 @@ name = "promql_engine"
 harness = false
 required-features = ["enable-system-alloc"]
 
+[[bench]]
+name = "fast_path"
+harness = false
+required-features = ["bench"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
 bench = []

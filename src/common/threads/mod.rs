@@ -4,8 +4,8 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::is_main_thread;
 #[allow(unused_imports)]
 pub(crate) use batch_worker::{
-    BatchRequest, BatchWorker, global_valkey_task_worker, submit_task_no_wait,
-    submit_task_with_payload,
+    BatchRequest, BatchWorker, exec_with_payload, global_valkey_task_worker, send_with_payload,
+    submit_valkey_task, submit_valkey_task_and_forget,
 };
 use rayon_core::{Scope, ThreadPoolBuilder};
 use std::os::raw::c_void;

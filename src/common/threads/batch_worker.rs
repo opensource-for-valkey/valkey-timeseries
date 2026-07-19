@@ -115,7 +115,7 @@ where
                     Err(_) => break, // channel closed, exit thread
                 };
 
-                let mut batch: SmallVec<BatchRequest<ITEM, OUTPUT, ERROR>, 6> = SmallVec::new();
+                let mut batch: SmallVec<[BatchRequest<ITEM, OUTPUT, ERROR>; 6]> = SmallVec::new();
                 batch.push(first);
 
                 let mut count = 1;
