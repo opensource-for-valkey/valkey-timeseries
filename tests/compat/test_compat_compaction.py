@@ -364,6 +364,28 @@ class TestReloadPartialBucket:
         _probe(diff, "c:relo:src", "c:relo:dst")
 
 
+@pytest.fixture
+def strict_subject(diff):
+    """Run one test with the subject in `ts-compatibility-mode strict`.
+
+    Yields the same `diff` client. The subject server is session-scoped, so the
+    previous value is always restored — a leak here would silently change what
+    every later test expects. Module configs are namespaced by the module name
+    (DIV-0008), hence the `ts.` prefix.
+    """
+    param = "ts.ts-compatibility-mode"
+    current = diff.subject.execute_command("CONFIG", "GET", param)
+    # valkey-py parses CONFIG GET into a dict; older/raw paths give a flat list.
+    previous = (
+        next(iter(current.values())) if isinstance(current, dict) else current[1]
+    )
+    diff.subject.execute_command("CONFIG", "SET", param, "strict")
+    try:
+        yield diff
+    finally:
+        diff.subject.execute_command("CONFIG", "SET", param, previous)
+
+
 class TestOutOfOrderBackfill:
     """DIV-0023: TS.GET on a destination whose *older* bucket was back-filled.
 
@@ -416,3 +438,53 @@ class TestOutOfOrderBackfill:
             diff.reference.execute_command("TS.GET", "c:bdst", "LATEST")
             == diff.subject.execute_command("TS.GET", "c:bdst", "LATEST")
         )
+
+    def test_strict_mode_reports_the_stale_bucket_like_rts(self, strict_subject):
+        """DIV-0023 gated: in `ts-compatibility-mode strict` TS.GET/TS.MGET report
+        RTS's cached destination last-sample instead of the last stored bucket.
+
+        Per-engine assertions for the same reason as the sibling test above.
+        """
+        diff = strict_subject
+        self._backfill(diff.reference)
+        self._backfill(diff.subject)
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:bdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
+        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
+        assert sub_get[0] == 0, f"expected the stale bucket under strict, got {sub_get!r}"
+
+        # TS.MGET rides on the same accessor. Cross-series order is undefined
+        # (COMPATIBILITY.md), so normalize it — `diff` would, this raw compare must too.
+        def by_key(reply):
+            return reply if isinstance(reply, dict) else sorted(reply, key=lambda e: e[0])
+
+        assert by_key(diff.reference.execute_command("TS.MGET", "FILTER", "grp=bf")) == by_key(
+            diff.subject.execute_command("TS.MGET", "FILTER", "grp=bf")
+        )
+
+        # The gate touches neither LATEST nor the stored data.
+        assert (
+            diff.reference.execute_command("TS.GET", "c:bdst", "LATEST")
+            == diff.subject.execute_command("TS.GET", "c:bdst", "LATEST")
+        )
+        assert (
+            diff.reference.execute_command("TS.RANGE", "c:bdst", "-", "+")
+            == diff.subject.execute_command("TS.RANGE", "c:bdst", "-", "+")
+        )
+
+    def test_strict_mode_advances_on_the_next_forward_close(self, strict_subject):
+        """The cached last-sample is stale only until forward progress closes the
+        next bucket — at which point strict tracks RTS again."""
+        diff = strict_subject
+        self._backfill(diff.reference)
+        self._backfill(diff.subject)
+
+        # Closes [1000,1500), which both engines publish downstream.
+        diff.reference.execute_command("TS.ADD", "c:bsrc", 2000, 0)
+        diff.subject.execute_command("TS.ADD", "c:bsrc", 2000, 0)
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:bdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
+        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
+        assert ref_get[0] == 1000, f"expected the newly closed bucket, got {ref_get!r}"

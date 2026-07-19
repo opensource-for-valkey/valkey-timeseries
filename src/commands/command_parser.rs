@@ -5,6 +5,7 @@ use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
 };
 use crate::common::time::current_time_millis;
+use crate::config::is_strict_rts_compat;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::join::join_reducer::JoinReducer;
@@ -907,6 +908,42 @@ fn parse_align_for_aggregation(args: &mut CommandArgIterator) -> ValkeyResult<Ag
     Ok(aggregation)
 }
 
+/// Resolves a *repeated* option the way RedisTimeSeries resolves it (DIV-0014).
+///
+/// Given `TS.RANGE k - + COUNT 5 COUNT 2`, RTS 8.6 keeps the first occurrence
+/// and we keep the last. Both engines accept the input and neither errors, so
+/// the divergence is a silently different answer to a query both engines call
+/// valid — exactly the case `ts-compatibility-mode strict` exists to close. A
+/// query builder that appends an option twice is the realistic way to hit it.
+///
+/// The duplicate's operands are always parsed regardless of mode: they have to
+/// be consumed from the argument stream either way, and a malformed operand is
+/// still an error. This only decides whether the parsed value is *stored*.
+#[derive(Default)]
+struct RepeatedOptions {
+    strict: bool,
+    seen: SmallVec<[CommandArgToken; 8]>,
+}
+
+impl RepeatedOptions {
+    fn new() -> Self {
+        Self {
+            strict: is_strict_rts_compat(),
+            seen: SmallVec::new(),
+        }
+    }
+
+    /// Record `token` and report whether its parsed value should be stored:
+    /// always in `extended` mode, only on first occurrence in `strict`.
+    fn accept(&mut self, token: CommandArgToken) -> bool {
+        let first = !self.seen.contains(&token);
+        if first {
+            self.seen.push(token);
+        }
+        first || !self.strict
+    }
+}
+
 pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeOptions> {
     const RANGE_OPTION_ARGS: [CommandArgToken; 7] = [
         CommandArgToken::Align,
@@ -925,25 +962,48 @@ pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeO
         ..Default::default()
     };
 
+    let mut repeated = RepeatedOptions::new();
+
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         match token {
             CommandArgToken::Align => {
-                options.aggregation = Some(parse_align_for_aggregation(args)?);
+                let value = parse_align_for_aggregation(args)?;
+                // ALIGN consumes the AGGREGATION that must follow it, so it fills
+                // both option slots. Non-short-circuiting `&` so each is recorded
+                // whichever one has already been seen.
+                if repeated.accept(CommandArgToken::Align)
+                    & repeated.accept(CommandArgToken::Aggregation)
+                {
+                    options.aggregation = Some(value);
+                }
             }
             CommandArgToken::Aggregation => {
-                options.aggregation = Some(parse_aggregation_options(args)?);
+                let value = parse_aggregation_options(args)?;
+                if repeated.accept(token) {
+                    options.aggregation = Some(value);
+                }
             }
             CommandArgToken::Count => {
-                options.count = Some(parse_count_arg(args)?);
+                let value = parse_count_arg(args)?;
+                if repeated.accept(token) {
+                    options.count = Some(value);
+                }
             }
             CommandArgToken::FilterByValue => {
-                options.value_filter = Some(parse_value_filter(args)?);
+                let value = parse_value_filter(args)?;
+                if repeated.accept(token) {
+                    options.value_filter = Some(value);
+                }
             }
             CommandArgToken::FilterByTs => {
-                options.timestamp_filter = Some(parse_timestamp_filter(args, &RANGE_OPTION_ARGS)?);
+                let value = parse_timestamp_filter(args, &RANGE_OPTION_ARGS)?;
+                if repeated.accept(token) {
+                    options.timestamp_filter = Some(value);
+                }
             }
             CommandArgToken::Latest => {
+                // Idempotent: a repeat sets the same flag, so no resolution needed.
                 options.latest = true;
             }
             _ => {
@@ -1013,30 +1073,55 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         ..Default::default()
     };
 
+    let mut repeated = RepeatedOptions::new();
+
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         match token {
             CommandArgToken::Align => {
-                options.range.aggregation = Some(parse_align_for_aggregation(args)?);
+                let value = parse_align_for_aggregation(args)?;
+                // See parse_range_options: ALIGN fills the AGGREGATION slot too.
+                if repeated.accept(CommandArgToken::Align)
+                    & repeated.accept(CommandArgToken::Aggregation)
+                {
+                    options.range.aggregation = Some(value);
+                }
             }
             CommandArgToken::Aggregation => {
-                options.range.aggregation = Some(parse_aggregation_options(args)?);
+                let value = parse_aggregation_options(args)?;
+                if repeated.accept(token) {
+                    options.range.aggregation = Some(value);
+                }
             }
             CommandArgToken::Count => {
-                options.range.count = Some(parse_count_arg(args)?);
+                let value = parse_count_arg(args)?;
+                if repeated.accept(token) {
+                    options.range.count = Some(value);
+                }
             }
             CommandArgToken::Filter => {
-                options.filters = parse_series_selector_list(args, &RANGE_OPTION_ARGS)?;
+                let value = parse_series_selector_list(args, &RANGE_OPTION_ARGS)?;
+                if repeated.accept(token) {
+                    options.filters = value;
+                }
             }
             CommandArgToken::FilterByValue => {
-                options.range.value_filter = Some(parse_value_filter(args)?);
+                let value = parse_value_filter(args)?;
+                if repeated.accept(token) {
+                    options.range.value_filter = Some(value);
+                }
             }
             CommandArgToken::FilterByTs => {
-                options.range.timestamp_filter =
-                    Some(parse_timestamp_filter(args, &RANGE_OPTION_ARGS)?);
+                let value = parse_timestamp_filter(args, &RANGE_OPTION_ARGS)?;
+                if repeated.accept(token) {
+                    options.range.timestamp_filter = Some(value);
+                }
             }
             CommandArgToken::GroupBy => {
-                options.grouping = Some(parse_grouping_params(args)?);
+                let value = parse_grouping_params(args)?;
+                if repeated.accept(token) {
+                    options.grouping = Some(value);
+                }
             }
             CommandArgToken::Reduce => {
                 // REDUCE is consumed inside GROUPBY parsing; reaching it here
@@ -1048,9 +1133,12 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 options.range.latest = true;
             }
             CommandArgToken::SelectedLabels => {
-                options.selected_labels = parse_label_list(args, &RANGE_OPTION_ARGS)?;
-                if options.selected_labels.is_empty() {
+                let value = parse_label_list(args, &RANGE_OPTION_ARGS)?;
+                if value.is_empty() {
                     return Err(ValkeyError::Str(error_consts::EMPTY_SELECTED_LABELS));
+                }
+                if repeated.accept(token) {
+                    options.selected_labels = value;
                 }
             }
             CommandArgToken::WithLabels => {
@@ -1396,6 +1484,64 @@ pub(super) fn find_last_token_instance(
 mod tests {
     use super::*;
     use strum::IntoEnumIterator;
+
+    /// DIV-0014. Built directly rather than through `RepeatedOptions::new()` so
+    /// the two modes are exercised without touching the process-wide config,
+    /// which the rest of the suite runs against in parallel.
+    #[test]
+    fn test_repeated_option_resolution() {
+        let count = CommandArgToken::Count;
+        let agg = CommandArgToken::Aggregation;
+
+        // extended: every occurrence is stored, so the last one wins.
+        let mut extended = RepeatedOptions {
+            strict: false,
+            seen: SmallVec::new(),
+        };
+        assert!(extended.accept(count));
+        assert!(extended.accept(count));
+        assert!(extended.accept(count));
+
+        // strict: only the first occurrence is stored, per token.
+        let mut strict = RepeatedOptions {
+            strict: true,
+            seen: SmallVec::new(),
+        };
+        assert!(strict.accept(count));
+        assert!(!strict.accept(count));
+        // A different option is unaffected by another's repeat.
+        assert!(strict.accept(agg));
+        assert!(!strict.accept(agg));
+        assert!(!strict.accept(count));
+    }
+
+    /// ALIGN consumes the AGGREGATION that follows it, so it occupies both slots
+    /// — a later bare AGGREGATION must not override it in strict mode. The `&`
+    /// at the call site must not short-circuit, or the second slot goes
+    /// unrecorded whenever the first already matched.
+    #[test]
+    fn test_align_occupies_the_aggregation_slot() {
+        let align = CommandArgToken::Align;
+        let agg = CommandArgToken::Aggregation;
+
+        let mut strict = RepeatedOptions {
+            strict: true,
+            seen: SmallVec::new(),
+        };
+        assert!(strict.accept(align) & strict.accept(agg));
+        assert!(
+            !strict.accept(agg),
+            "bare AGGREGATION after ALIGN is a repeat"
+        );
+
+        // Reverse order: a bare AGGREGATION first makes the later ALIGN a repeat.
+        let mut reversed = RepeatedOptions {
+            strict: true,
+            seen: SmallVec::new(),
+        };
+        assert!(reversed.accept(agg));
+        assert!(!(reversed.accept(align) & reversed.accept(agg)));
+    }
 
     #[test]
     fn test_aggregation_list_single_and_order() {

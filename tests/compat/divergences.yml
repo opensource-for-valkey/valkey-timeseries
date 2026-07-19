@@ -213,11 +213,17 @@
     Neither errors.
   rationale: >
     Accepted (owner sign-off 2026-07-17, §5.3): keep our last-occurrence-wins
-    resolution. Both engines accept the input and neither errors, so the only
-    difference is which arbitrary silent resolution applies; matching RTS would
-    mean tracking seen tokens in the range parser while still consuming the
-    duplicate's operands, for no observable benefit. Pinned by
-    TestOptionParsing::test_duplicated_option.
+    resolution as the default. Pinned by TestOptionParsing::test_duplicated_option.
+    Gated (2026-07-18): this is the archetype of the class `ts-compatibility-mode`
+    exists for — both engines accept the input, neither errors, and the answers
+    differ silently — so `strict` now resolves first-occurrence-wins the way RTS
+    does, on TS.RANGE/REVRANGE/MRANGE/MREVRANGE. The earlier "for no observable
+    benefit" reading undervalued that: a client migrating from RTS with a
+    duplicated option (a query builder appending twice) gets different data with
+    no error to alert it. The cost estimate was accurate — the implementation is
+    the seen-token tracking described here (RepeatedOptions in command_parser.rs),
+    which still parses the duplicate's operands so a malformed operand errors in
+    both modes. The default is unchanged; only the opt-in is new.
   since: 0.1.0
 
 - id: DIV-0015
@@ -430,8 +436,20 @@
     then `TS.ADD src 500 0` — RANGE is `[[0,0],[500,0]]` on both, but TS.GET is `[500,0]`
     for us and `[0,0]` on RTS.
   rationale: >
-    owner decision pending — matching RTS means reproducing an inconsistency between its
-    own TS.GET and TS.RANGE by caching a destination last-sample that back-fill does not
-    refresh. Our reply is the last sample the series actually holds. Pinned by
-    TestOutOfOrderBackfill::test_get_after_backfilling_an_older_bucket.
+    Default unchanged: `extended` reports the last sample the series actually holds,
+    rather than reproducing an inconsistency between RTS's own TS.GET and TS.RANGE.
+    Gated (2026-07-18): both engines accept the input and neither errors, so this is
+    the class `ts-compatibility-mode` exists for — `strict` now reports RTS's cached
+    destination last-sample from TS.GET/TS.MGET. The state is a runtime-only marker
+    (TimeSeries::last_forward_close) recorded when forward progress closes a bucket;
+    back-filling an older bucket deliberately leaves it alone. LATEST and the stored
+    downstream data are untouched in either mode.
+    Known limitation of the gate: the marker is not persisted, so after a reload or
+    restart a destination with a pending back-fill reports its true last sample again
+    until the next forward close. Matching RTS there would mean persisting a value
+    that contradicts the series' own chunk data, which needs an RDB encoding-version
+    bump (loader refuses any encver but 1); deliberately out of scope for the gate.
+    Pinned by TestOutOfOrderBackfill::test_get_after_backfilling_an_older_bucket
+    (extended) and ::test_strict_mode_reports_the_stale_bucket_like_rts plus
+    ::test_strict_mode_advances_on_the_next_forward_close (strict).
   since: 0.1.0

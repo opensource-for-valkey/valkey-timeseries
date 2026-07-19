@@ -281,7 +281,14 @@ fn finalize_current_bucket(
             "finalize_current_bucket should be called when current bucket start is already set",
         );
 
-        add_dest_bucket(ctx, current_bucket_start, aggregated_value)?;
+        if let Some(published) = add_dest_bucket(ctx, current_bucket_start, aggregated_value)? {
+            // DIV-0023: this is the only write that advances the destination
+            // last-sample `ts-compatibility-mode strict` reports from TS.GET/TS.MGET.
+            // Back-filling an older bucket (`recalculate_bucket`) materializes a
+            // downstream sample but deliberately leaves this untouched, mirroring
+            // RedisTimeSeries's cached last-sample.
+            ctx.dest.last_forward_close = Some(published);
+        }
     }
     ctx.rule.reset();
 
@@ -795,7 +802,16 @@ fn notify_compaction(ctx: &Context, ids: &[SeriesRef]) {
     });
 }
 
-fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> TsdbResult<()> {
+/// Write one aggregated bucket to the destination.
+///
+/// Returns the stored sample when the write actually landed, so a caller can tell a
+/// real publish from one the destination ignored (see DIV-0023 in
+/// `finalize_current_bucket`).
+fn add_dest_bucket(
+    ctx: &mut CompactionContext,
+    ts: Timestamp,
+    value: f64,
+) -> TsdbResult<Option<Sample>> {
     let bucket_start = ctx.rule.calc_bucket_start(ts);
     // Add the sample to the destination series
     // todo: specify to ignore whatever adjustments
@@ -805,12 +821,12 @@ fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> Ts
     {
         SampleAddResult::Ok(sample) => {
             ctx.written.push(sample);
-            Ok(())
+            Ok(Some(sample))
         }
-        SampleAddResult::Ignored(_) => Ok(()), // duplicate sample, (ignored)
+        SampleAddResult::Ignored(_) => Ok(None), // duplicate sample, (ignored)
         SampleAddResult::TooOld => {
             // bucket start is too old, we cannot add it
-            Ok(())
+            Ok(None)
         }
         x => {
             let base_msg = format!("TSDB: failed to add sample @{ts} to destination bucket: {x}",);

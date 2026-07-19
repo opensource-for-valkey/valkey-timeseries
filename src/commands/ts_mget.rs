@@ -142,7 +142,7 @@ pub fn process_mget_request(
         let sample = if options.latest {
             get_latest_compaction_sample(ctx, series).or(series.last_sample)
         } else {
-            series.last_sample
+            series.reported_last_sample()
         };
         // SELECTED_LABELS entries are positionally aligned with the request:
         // a label missing from the series keeps its requested name with an
