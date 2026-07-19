@@ -101,6 +101,10 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
         first_timestamp,
         last_sample,
         _db: None,
+        // Runtime-only strict-mode marker (DIV-0023); never serialized, so a
+        // reloaded destination reports its true last sample until the next
+        // forward bucket close.
+        last_forward_close: None,
         src_series,
         rules,
     };

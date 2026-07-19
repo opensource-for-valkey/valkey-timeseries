@@ -80,6 +80,62 @@ pub const CLUSTER_MAP_EXPIRATION_MS_DEFAULT: u64 = 750; // default: 0.75 seconds
 pub(crate) const CLUSTER_MAP_EXPIRATION_MIN_MS: i64 = 0; // min: 0 (no cache)
 pub(crate) const CLUSTER_MAP_EXPIRATION_MAX_MS: i64 = 3_600_000; // max: 1 hour
 
+pub(crate) const COMPATIBILITY_MODE_DEFAULT_STRING: &str = "extended";
+
+/// Which side of a *value* divergence from RedisTimeSeries the module takes
+/// (`ts-compatibility-mode`).
+///
+/// Scope is deliberately narrow: this governs only the cases where **both
+/// engines accept the command and both return a result, but the results
+/// differ**. That is the one class a migrating application cannot detect for
+/// itself — there is no error to catch, just different data.
+///
+/// It explicitly does *not* restrict the additive surface. Where RTS rejects an
+/// input we accept (relative range bounds, cascading compaction rules,
+/// complement filters, bare metric-name selectors, and the
+/// Valkey-TimeSeries-only commands), no RTS-compatible application can be
+/// depending on it, so there is nothing to protect and gating it would only
+/// remove function. Nor does it relax the places we are *stricter* than RTS: a
+/// visible error already beats silently wrong data.
+///
+/// See COMPATIBILITY.md for the gated set and for the divergences that qualify
+/// but are not yet switchable. Orthogonal to `ts-emulate-release`, which selects
+/// behavior by *release* to keep SemVer promises across a compatibility-bug fix;
+/// this selects between two behaviors that are both intended.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CompatibilityMode {
+    /// Valkey TimeSeries semantics. The default.
+    #[default]
+    Extended,
+    /// On a gated value divergence, resolve the command the way RedisTimeSeries
+    /// 8.6 resolves it, so a client written against RTS is not handed a
+    /// silently different answer.
+    Strict,
+}
+
+impl CompatibilityMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompatibilityMode::Extended => "extended",
+            CompatibilityMode::Strict => "strict",
+        }
+    }
+}
+
+impl TryFrom<&str> for CompatibilityMode {
+    type Error = ValkeyError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.eq_ignore_ascii_case("extended") {
+            Ok(CompatibilityMode::Extended)
+        } else if value.eq_ignore_ascii_case("strict") {
+            Ok(CompatibilityMode::Strict)
+        } else {
+            Err(ValkeyError::Str(error_consts::INVALID_COMPATIBILITY_MODE))
+        }
+    }
+}
+
 /// The type of value a configuration parameter holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigType {
@@ -350,6 +406,33 @@ static RETENTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-retention-policy"));
 static COMPACTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-compaction-policy"));
+static COMPATIBILITY_MODE_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-compatibility-mode"));
+
+/// Mirrors `ts-compatibility-mode` as a plain flag because it is read on the
+/// parse path of every range and filter command; the enum itself only ever has
+/// two states, so a lock here would buy nothing.
+static STRICT_RTS_COMPAT: AtomicBool = AtomicBool::new(false);
+
+/// True when `ts-compatibility-mode` is `strict`, i.e. a gated *value*
+/// divergence should resolve the way RedisTimeSeries 8.6 resolves it.
+///
+/// Before adding a call site, check it against the criterion in
+/// [`CompatibilityMode`]: both engines must accept the command and return
+/// differing results. If RTS errors on the input, it is an additive extension
+/// and must stay available in both modes.
+#[inline]
+pub fn is_strict_rts_compat() -> bool {
+    STRICT_RTS_COMPAT.load(Ordering::Relaxed)
+}
+
+pub fn compatibility_mode() -> CompatibilityMode {
+    if is_strict_rts_compat() {
+        CompatibilityMode::Strict
+    } else {
+        CompatibilityMode::Extended
+    }
+}
 static IGNORE_MAX_TIME_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-ignore-max-time-diff"));
 static IGNORE_MAX_VALUE_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
@@ -468,6 +551,12 @@ fn update_chunk_encoding(val: &str) -> ValkeyResult<()> {
     let encoding = ChunkEncoding::try_from(val)
         .map_err(|_| ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING))?;
     CHUNK_ENCODING.store(encoding as u8, Ordering::SeqCst);
+    Ok(())
+}
+
+fn update_compatibility_mode(val: &str) -> ValkeyResult<()> {
+    let mode = CompatibilityMode::try_from(val)?;
+    STRICT_RTS_COMPAT.store(mode == CompatibilityMode::Strict, Ordering::SeqCst);
     Ok(())
 }
 
@@ -673,6 +762,10 @@ fn read_compaction_policy() -> ConfigValue {
     ConfigValue::String(Cow::Owned(lock(&COMPACTION_POLICY).clone()))
 }
 
+fn read_compatibility_mode() -> ConfigValue {
+    ConfigValue::str(compatibility_mode().as_str())
+}
+
 fn read_decimal_digits() -> ConfigValue {
     match rounding_strategy() {
         Some(RoundingStrategy::DecimalDigits(digits)) => ConfigValue::Integer(digits as i64),
@@ -835,6 +928,20 @@ pub static CONFIGS: &[ConfigDesc] = &[
         storage: ConfigStorage::Str {
             cell: || &COMPACTION_POLICY_STRING,
             apply: update_compaction_policy,
+        },
+    },
+    ConfigDesc {
+        name: "ts-compatibility-mode",
+        read: read_compatibility_mode,
+        kind: ConfigType::Enum,
+        default: ConfigValue::str(COMPATIBILITY_MODE_DEFAULT_STRING),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Which side of a value divergence from RedisTimeSeries to take: EXTENDED or STRICT",
+        storage: ConfigStorage::Str {
+            cell: || &COMPATIBILITY_MODE_STRING,
+            apply: update_compatibility_mode,
         },
     },
     ConfigDesc {
@@ -1188,6 +1295,7 @@ mod tests {
         ("ts-duplicate-policy", "block"),
         ("ts-retention-policy", "0"),
         ("ts-compaction-policy", ""),
+        ("ts-compatibility-mode", "extended"),
         ("ts-decimal-digits", "none"),
         ("ts-significant-digits", "none"),
         ("ts-ignore-max-time-diff", "0"),
@@ -1443,11 +1551,16 @@ mod tests {
                 )
             });
 
-            // The parameter must now report the value it was just set to. Retention is the one
-            // exception: zero means "no expiry", which reports as the "none" sentinel.
+            // The parameter must now report the value it was just set to, with two exceptions:
+            // retention, where zero means "no expiry" and reports as the "none" sentinel; and
+            // `ts-encoding`, whose default is the RTS-facing alias "compressed" while `read`
+            // reports the canonical name of the encoding it selects ("gorilla").
             let value = (desc.read)();
+            let alias_default = desc.name == "ts-encoding"
+                && desc.default.as_registration_str() == "compressed"
+                && value == ConfigValue::str(DEFAULT_CHUNK_ENCODING.name());
             assert!(
-                value == desc.default || value == ConfigValue::none(),
+                value == desc.default || value == ConfigValue::none() || alias_default,
                 "{}: default {:?} applied but reads back as {value:?}",
                 desc.name,
                 desc.default
@@ -1579,5 +1692,35 @@ mod tests {
                 desc.name
             );
         }
+    }
+
+    #[test]
+    fn test_compatibility_mode_parsing() {
+        assert_eq!(
+            CompatibilityMode::try_from("extended").unwrap(),
+            CompatibilityMode::Extended
+        );
+        assert_eq!(
+            CompatibilityMode::try_from("strict").unwrap(),
+            CompatibilityMode::Strict
+        );
+        // CONFIG SET values arrive as-typed, so accept any casing.
+        assert_eq!(
+            CompatibilityMode::try_from("STRICT").unwrap(),
+            CompatibilityMode::Strict
+        );
+        assert!(CompatibilityMode::try_from("").is_err());
+        assert!(CompatibilityMode::try_from("rts").is_err());
+
+        // The registered default must round-trip, or CONFIG GET would report a
+        // value the set-callback rejects.
+        assert_eq!(
+            CompatibilityMode::try_from(COMPATIBILITY_MODE_DEFAULT_STRING).unwrap(),
+            CompatibilityMode::default()
+        );
+        assert_eq!(
+            CompatibilityMode::default().as_str(),
+            COMPATIBILITY_MODE_DEFAULT_STRING
+        );
     }
 }

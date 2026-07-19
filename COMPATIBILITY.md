@@ -113,6 +113,59 @@ In both forms, an extension is not considered an incompatibility: applications w
 
 Extensions are documented alongside the features they extend rather than centralized here. When an extension modifies the behavior of an existing RedisTimeSeries surface in a non-additive way, that change is tracked as an intentional incompatibility in the section above, not as an extension.
 
+## Strict compatibility mode
+
+A small number of divergences share a specific and uniquely dangerous shape: **both engines accept the command as valid, and both return a result, but the results differ.** An application migrating from RedisTimeSeries gets no error on such a command — it gets a different answer, silently. The `ts-compatibility-mode` configurable lets a deployment close that class.
+
+| Value | Behavior |
+| ----- | -------- |
+| `extended` (default) | Valkey TimeSeries semantics. |
+| `strict` | On the divergences listed below, resolve the command the way RedisTimeSeries 8.6 resolves it. |
+
+```
+CONFIG SET ts-compatibility-mode strict
+CONFIG GET ts-compatibility-mode
+```
+
+It is settable at runtime and at startup (`valkey.conf` or `MODULE LOAD` arguments), and is fully reversible. It takes effect on subsequent commands only — it does not rewrite series, rules, or any stored state, so switching modes is safe in both directions.
+
+### Scope: value divergences only
+
+`ts-compatibility-mode` governs **only** cases where the two engines disagree about the *value* returned for a command both consider valid. In particular, it deliberately does **not** restrict Valkey TimeSeries's additive surface.
+
+Where RedisTimeSeries rejects an input that Valkey TimeSeries accepts, no RedisTimeSeries-compatible application can be depending on that input — it would have been an error there. Such an accepted-input superset cannot silently change the behavior of a migrating application, so there is nothing for `strict` to protect against, and disabling it would only remove function. The relative range bounds (`-1h`, `*`), cascading compaction rules, complement filters, and Prometheus-style bare metric-name selectors all fall in this category and **remain available in both modes**, as do the Valkey-TimeSeries-only commands.
+
+The same reasoning excludes the reverse direction. Where Valkey TimeSeries is *stricter* than RedisTimeSeries — rejecting unknown trailing arguments, for example — a migrating application gets a visible, fixable error rather than wrong data. That is already the safe outcome, so `strict` does not relax it into RedisTimeSeries's silent-ignore behavior.
+
+### What `strict` gates
+
+| Divergence | `extended` (default) | `strict` |
+| ---------- | -------------------- | -------- |
+| A repeated option on the range family — `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE` (e.g. `COUNT 5 COUNT 2`, or a duplicated `AGGREGATION` / `FILTER` / `FILTER_BY_TS` / `FILTER_BY_VALUE` / `GROUPBY` / `SELECTED_LABELS`) | The **last** occurrence wins. | The **first** occurrence wins, as in RedisTimeSeries. |
+| `TS.GET` / `TS.MGET` (without `LATEST`) on a compaction destination whose *older* bucket was back-filled (DIV-0023) | The last sample the destination actually holds. | RedisTimeSeries's cached destination last-sample, which back-filling does not refresh. |
+
+Both engines accept a duplicated option and neither errors, so the only difference is which silent resolution applies — the defining shape of this class. A query builder that appends an option twice is the realistic way to reach it. The duplicate's operands are still parsed in both modes, so a malformed operand remains an error either way.
+
+The back-fill case has the same shape: both engines store identical downstream data — `TS.RANGE` and `TS.GET ... LATEST` agree in either mode — and differ only in which stored sample `TS.GET` names, with no error to signal it. RedisTimeSeries reports a cached last-sample that a back-filled older bucket does not advance, so its own `TS.GET` and `TS.RANGE` disagree; `strict` reproduces that, and `extended` reports the sample the series actually holds.
+
+One limitation is specific to this gate: the marker it reads is runtime-only, so after a reload or restart a destination with a pending back-fill reports its true last sample again until the next forward bucket close. Matching RedisTimeSeries across a reload would mean persisting a value that contradicts the series' own chunk data, which is deliberately out of scope.
+
+### Divergences that qualify but are not yet gated
+
+These meet the criterion — both engines accept, values differ — but are not currently switchable, because reproducing RedisTimeSeries's result is not a local decision. Each remains a permanent, documented divergence; see `tests/compat/divergences.yml` for the full rationale.
+
+| Divergence | Why it is not gated |
+| ---------- | ------------------- |
+| `TS.REVRANGE ... AGGREGATION first\|last ... EMPTY` gap fill (DIV-0016) | Matching requires either buffering every sample in range or a second pass over the reversed output — the memory trade the forward-aggregation design exists to avoid. |
+| `TS.DEL` count over an already-expired range (DIV-0021) | Matching requires adopting RedisTimeSeries's lazy-trim retention model, which the eager trim deliberately replaced so that `TS.INFO` agrees with `TS.RANGE`. |
+| `std.p` / `std.s` / `var.p` / `var.s` above ~1.34e154 (DIV-0022) | RedisTimeSeries returns `NaN` from an overflow in its naive sum-of-squares; matching means adopting a numerically unstable accumulation to reproduce a floating-point artifact. It can only turn a `NaN` into a usable number, never the reverse. |
+
+### What `strict` never affects
+
+The intentional incompatibilities listed above — configuration surface, `INFO` / `TS.INFO` metrics, cluster fan-out, persistence format, and log messages — are unchanged in either mode, as is error message *text*, which is not part of the compatibility contract. RESP2 floating-point *formatting* (DIV-0002…DIV-0007) is likewise out of scope: the parsed values are bit-identical, so it is a formatting difference rather than a value divergence.
+
+`ts-compatibility-mode` is orthogonal to `ts-emulate-release` below: this setting selects between two behaviors that are *both intended*, while `ts-emulate-release` preserves a behavior that was *wrong* so that fixing it does not break SemVer.
+
 ## Migration Guide
 
 This section describes the steps an application team should work through when migrating an existing RedisTimeSeries-based application to Valkey TimeSeries. The steps are ordered so that earlier steps surface blocking issues before later steps require code changes.
