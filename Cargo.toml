@@ -19,6 +19,7 @@ croaring = "2.6"
 enquote = "1.1.0"
 enum_dispatch = "0.3.13"
 get-size2 = { version = "0.10.2", features = ["derive"] }
+halfbrown = { version = "0.4", features = ["arraybackend"] }
 hashify = { version = "0.2" }
 itertools = "0.14"
 linkme = "0.3"
@@ -29,6 +30,7 @@ num-traits = "0.2"
 joinkit = "0.2.0"
 krcf = "0.4"
 papaya = "0.2"
+promql-parser = "0.10"
 prost = "0.14"
 rand = { version = "0.10" }
 rand_distr = "0.6"
@@ -39,6 +41,7 @@ topo_sort = "0.4.0"
 valkey-module = "0.1.11"
 valkey-module-macros = "0.1.11"
 range-set-blaze = "0.6.1"
+rayon = "1"
 rayon-core = "1.13"
 regex = "1"
 strum = { version = "0.28", features = ["derive"] }
@@ -48,6 +51,10 @@ log = "0.4"
 statrs = "0.18"
 welch-sde = "0.1.0"
 regex-syntax = "0.8.10"
+serde = "1.0.228"
+twox-hash = { version = "2.1.2", features = ["xxhash3_64"] }
+chrono = "0.4.45"
+tracing = "0.1.44"
 crc16 = "0.4.0"
 
 [dev-dependencies]
@@ -57,6 +64,7 @@ valkey-timeseries = { path = ".", features = ["test-utils"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.10"
 rand_distr = "0.6"
+rstest = "0.26"
 test-case = "3.3"
 serial_test = { version = "3.5", default-features = false }
 proptest = "1"
@@ -99,10 +107,17 @@ name = "wire_report"
 path = "tools/wire_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
+[[bench]]
+name = "promql_engine"
+harness = false
+required-features = ["enable-system-alloc"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
+bench = []
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
 min-valkey-compatibility-version-8-0 = ["valkey-module/min-valkey-compatibility-version-8-0"]
+valkey_8_0 = []
 use-redismodule-api = [] # We don't support this feature flag which is why it is empty.
 # Exposes src/tests (data generators, chunk helpers) to benchmarks and tools.
 # Enabled automatically for dev targets via the self dev-dependency above.
