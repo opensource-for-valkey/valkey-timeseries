@@ -9,7 +9,6 @@
 use crate::common::Sample;
 use anofox_forecast::ForecastError;
 use anofox_forecast::core::{CalendarAnnotations, Frequency, MissingValuePolicy};
-use anofox_forecast::detection::{OutlierConfig, detect_outliers};
 use anofox_forecast::seasonality::STL;
 use anofox_forecast::utils::stats::{nan_mean, nan_median};
 use chrono::{DateTime, Datelike, Duration, Utc};
@@ -148,6 +147,91 @@ impl TimeSeriesFiller {
         self.values.iter().filter(|v| v.is_finite()).count()
     }
 
+    /// Return a copy with missing regressor values imputed under `policy`.
+    ///
+    /// Regressors live on the calendar annotations; series without a calendar
+    /// are returned unchanged. `Drop` and `Error` are rejected because dropping
+    /// a regressor row would desynchronize it from the series it annotates.
+    pub fn with_imputed_regressors(
+        &self,
+        policy: MissingValuePolicy,
+    ) -> Result<TimeSeriesFiller, ForecastError> {
+        match policy {
+            MissingValuePolicy::Drop | MissingValuePolicy::Error => {
+                return Err(ForecastError::InvalidParameter(
+                    "Drop and Error policies are not supported for regressor imputation"
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+
+        let mut result = self.clone();
+        if let Some(ref mut cal) = result.calendar {
+            let mut imputed_regressors = HashMap::new();
+            for (name, values) in cal.regressors() {
+                let imputed = match policy {
+                    MissingValuePolicy::Fill(fill_value) => values
+                        .iter()
+                        .map(|&v| if !v.is_finite() { fill_value } else { v })
+                        .collect(),
+                    MissingValuePolicy::ForwardFill => {
+                        let mut res = Vec::with_capacity(values.len());
+                        let mut last_valid = None;
+                        for &v in values {
+                            if !v.is_finite() {
+                                res.push(last_valid.unwrap_or(v));
+                            } else {
+                                last_valid = Some(v);
+                                res.push(v);
+                            }
+                        }
+                        res
+                    }
+                    MissingValuePolicy::BackwardFill => {
+                        let mut res = values.to_vec();
+                        let mut next_valid = None;
+                        for i in (0..res.len()).rev() {
+                            if !res[i].is_finite() {
+                                if let Some(v) = next_valid {
+                                    res[i] = v;
+                                }
+                            } else {
+                                next_valid = Some(res[i]);
+                            }
+                        }
+                        res
+                    }
+                    MissingValuePolicy::FillMean => {
+                        let m = nan_mean(values);
+                        values
+                            .iter()
+                            .map(|&v| if !v.is_finite() { m } else { v })
+                            .collect()
+                    }
+                    MissingValuePolicy::FillMedian => {
+                        let med = nan_median(values);
+                        values
+                            .iter()
+                            .map(|&v| if !v.is_finite() { med } else { v })
+                            .collect()
+                    }
+                    MissingValuePolicy::Interpolate => interpolate_series(values, true),
+                    MissingValuePolicy::Drop | MissingValuePolicy::Error => {
+                        unreachable!()
+                    }
+                };
+                imputed_regressors.insert(name.clone(), imputed);
+            }
+            // Replace regressors in calendar
+            let mut new_cal = CalendarAnnotations::new().with_holidays(cal.holidays().to_vec());
+            for (name, values) in imputed_regressors {
+                new_cal = new_cal.with_regressor(name, values);
+            }
+            result.calendar = Some(new_cal);
+        }
+        Ok(result)
+    }
 
     /// Infer frequency from timestamps.
     pub fn infer_frequency(&self, tolerance: f64) -> Result<Duration, ForecastError> {
@@ -193,6 +277,69 @@ impl TimeSeriesFiller {
         Ok(Duration::seconds(modal_diff))
     }
 
+    /// Infer frequency from timestamps, ignoring non-business days.
+    ///
+    /// When a calendar is present, weekends and holidays are excluded before
+    /// measuring spacing, so daily business-day series infer a 1-day frequency
+    /// instead of being confused by weekend gaps. Without a calendar this
+    /// behaves like [`Self::infer_frequency`].
+    pub fn infer_frequency_calendar(&self, tolerance: f64) -> Result<Duration, ForecastError> {
+        if self.len() < 2 {
+            return Err(ForecastError::InsufficientData {
+                needed: 2,
+                got: self.len(),
+                hint: None,
+            });
+        }
+
+        // Filter to business days only if calendar is present
+        let business_timestamps: Vec<&DateTime<Utc>> = if self.calendar.is_some() {
+            self.timestamps
+                .iter()
+                .filter(|t| self.is_business_day(t))
+                .collect()
+        } else {
+            self.timestamps.iter().collect()
+        };
+
+        if business_timestamps.len() < 2 {
+            return Err(ForecastError::InsufficientData {
+                needed: 2,
+                got: business_timestamps.len(),
+                hint: None,
+            });
+        }
+
+        // Calculate differences between consecutive business days
+        let diffs: Vec<i64> = business_timestamps
+            .windows(2)
+            .map(|w| (*w[1] - *w[0]).num_seconds())
+            .collect();
+
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for &diff in &diffs {
+            *counts.entry(diff).or_insert(0) += 1;
+        }
+
+        let (modal_diff, modal_count) = counts
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(&diff, &count)| (diff, count))
+            .ok_or(ForecastError::FrequencyInference(
+                "empty spacing data".to_string(),
+            ))?;
+
+        let total_count: usize = counts.values().sum();
+        let modal_ratio = modal_count as f64 / total_count as f64;
+
+        if modal_ratio < tolerance {
+            return Err(ForecastError::FrequencyInference(
+                "no unique modal spacing found".to_string(),
+            ));
+        }
+
+        Ok(Duration::seconds(modal_diff))
+    }
 
     /// Generate future timestamps for a forecast horizon.
     ///

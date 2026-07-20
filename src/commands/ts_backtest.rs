@@ -12,7 +12,9 @@ use crate::common::replies::{
 use anofox_forecast::core::TimeSeries as ForecastTimeSeries;
 use anofox_forecast::models::Forecaster;
 use anofox_forecast::prelude::{AccuracyMetrics, calculate_metrics};
-use anofox_forecast::utils::cross_validation::{ConstraintViolation, CVStrategy, CvFoldGenerator, Fold};
+use anofox_forecast::utils::cross_validation::{
+    CVStrategy, ConstraintViolation, CvFoldGenerator, Fold,
+};
 use orx_parallel::{ParIter, ParIterResult, Parallelizable};
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -219,7 +221,11 @@ fn parse_backtest_args(args: &mut CommandArgIterator) -> ValkeyResult<BacktestOp
     Ok(options)
 }
 
-fn process_backtest(ctx: ThreadSafeReplyContext, series: ForecastTimeSeries, options: BacktestOptions) {
+fn process_backtest(
+    ctx: ThreadSafeReplyContext,
+    series: ForecastTimeSeries,
+    options: BacktestOptions,
+) {
     let specs = match parse_backtest_model_specs(&options.models_spec) {
         Ok(s) => s,
         Err(e) => {
