@@ -7,12 +7,12 @@
 #   docker compose down -v            # stop and remove volumes
 
 services:
-  valkey-timeseries:
+  valkey-timeseries-promql:
     image: valkey-timeseries:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: valkey-timeseries
+    container_name: valkey-timeseries-promql
     ports:
       - "6379:6379"
     volumes:
