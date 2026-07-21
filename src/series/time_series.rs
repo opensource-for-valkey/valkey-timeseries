@@ -398,7 +398,8 @@ impl TimeSeries {
         match chunk.split() {
             Ok(mut new_chunk) => {
                 // An empty upper half (splitting a single-sample chunk) owns nothing.
-                let into_new = new_chunk.len() > 0 && sample.timestamp >= new_chunk.first_timestamp();
+                let into_new =
+                    new_chunk.len() > 0 && sample.timestamp >= new_chunk.first_timestamp();
                 let (added, res) = if into_new {
                     let old_size = new_chunk.len();
                     let (size, res) = new_chunk.upsert(sample, duplicate_policy);

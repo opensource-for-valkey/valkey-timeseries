@@ -66,7 +66,8 @@ pub const INVALID_START_TIMESTAMP: &str = "TSDB: wrong fromTimestamp";
 pub const INVALID_END_TIMESTAMP: &str = "TSDB: wrong toTimestamp";
 pub const NEGATIVE_TIMESTAMP: &str = "TSDB: timestamps cannot be negative.";
 pub const ERROR_ADDING_SAMPLE: &str = "TSDB: error at add";
-pub const MISSING_TIMESTAMP_FILTER_VALUE: &str = "TSDB: FILTER_BY_TS one or more arguments are missing";
+pub const MISSING_TIMESTAMP_FILTER_VALUE: &str =
+    "TSDB: FILTER_BY_TS one or more arguments are missing";
 pub const TOO_MANY_TIMESTAMP_FILTER_VALUES: &str = "TSDB: too many timestamp filter values";
 pub const KEY_NOT_FOUND: &str = "TSDB: the key does not exist";
 pub const INVALID_TIMESERIES_KEY: &str = "TSDB: the key is not a TSDB key";

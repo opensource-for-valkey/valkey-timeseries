@@ -822,7 +822,10 @@ mod tests {
         assert!(!range.is_inverted());
 
         let equal = TimestampRange::from_timestamps(1000, 1000).unwrap();
-        assert!(!equal.is_inverted(), "a single-point window is not inverted");
+        assert!(
+            !equal.is_inverted(),
+            "a single-point window is not inverted"
+        );
     }
 
     #[test]
