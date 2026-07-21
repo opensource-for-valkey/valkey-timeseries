@@ -16,6 +16,15 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 ///     [END rfc3339 | unix_timestamp | + | - | * ]
 ///     [LOOKBACK_DELTA lookback]
 ///
+#[valkey_module_macros::command({
+    name: "TS.QUERYRANGE",
+    flags: [ReadOnly],
+    summary: "Evaluate a PromQL query over a range of time at a fixed step interval.",
+    complexity: "O(N*M*S) where N is the number of matching series, M the samples examined and S the number of steps.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: []
+})]
 pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let mut args = args.into_iter().skip(1).peekable();
     let config_guard = PROMQL_CONFIG
