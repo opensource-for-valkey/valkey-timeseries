@@ -7,12 +7,22 @@ use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_QUERY, "ts.query", "read timeseries");
 ///
 /// TS.QUERY <query>
 ///         [TIME rfc3339 | unix_timestamp | * | + ]
 ///         [LOOKBACK_DELTA lookback]
 ///         [TIMEOUT duration]
 ///
+#[valkey_module_macros::command({
+    name: "TS.QUERY",
+    flags: [ReadOnly],
+    summary: "Evaluate a PromQL query at a single point in time.",
+    complexity: "O(N*M) where N is the number of matching series and M the number of samples examined.",
+    since: "1.0.0",
+    arity: -2,
+    key_spec: []
+})]
 pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let config_guard = PROMQL_CONFIG.read()?;
     let mut args = args.into_iter().skip(1).peekable();
