@@ -67,6 +67,27 @@ impl Default for AutoForecastOptions {
 ///```
 /// `TS.AUTOFORECAST` fits all enabled auto models (AutoARIMA, AutoETS, AutoTheta)
 /// and selects the best one based on cross-validation error.
+#[valkey_module_macros::command({
+    name: "TS.AUTOFORECAST",
+    flags: [Write, DenyOOM],
+    summary: "Forecast a time series, automatically selecting the best-fitting model.",
+    complexity: "O(N*M) where N is the number of samples in the range and M is the number of candidate models.",
+    since: "1.0.0",
+    arity: -5,
+    key_spec: [
+        {
+            flags: [ReadOnly, Access],
+            begin_search: Index({ index: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        },
+        {
+            notes: "Optional destination series written by the STORE clause.",
+            flags: [ReadWrite, Update],
+            begin_search: Keyword({ keyword: "STORE", startfrom: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        }
+    ]
+})]
 pub(crate) fn ts_autoforecast_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 5 {
         return Err(ValkeyError::WrongArity);

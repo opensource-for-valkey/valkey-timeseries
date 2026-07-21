@@ -37,6 +37,19 @@ use valkey_module::{
 /// with duplicates removed.
 ///
 /// Returns a map of `{feature_name: value}`.
+#[valkey_module_macros::command({
+    name: "TS.FEATURES",
+    flags: [ReadOnly, DenyOOM],
+    summary: "Compute statistical features for a time series.",
+    complexity: "O(N*F) where N is the number of samples in the range and F is the number of requested features.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [{
+        flags: [ReadOnly, Access],
+        begin_search: Index({ index: 1 }),
+        find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+    }]
+})]
 pub fn ts_features_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);

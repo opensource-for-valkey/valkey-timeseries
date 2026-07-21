@@ -57,21 +57,8 @@ mod utils;
 // Only modules whose items are consumed through `crate::commands::*` are re-exported below.
 pub use command_parser::*;
 pub use ts_asm_restore::*;
-pub use ts_autocorrelation::*;
-pub(crate) use ts_autoforecast::*;
-pub(crate) use ts_backtest::*;
 pub use ts_debug::*;
-pub use ts_decompose::*;
-pub use ts_features::*;
-pub use ts_fillgaps::*;
-pub(crate) use ts_forecast::*;
 pub use ts_mget::*;
-pub use ts_periods::*;
-pub use ts_sanitize::*;
-pub use ts_stationarity::*;
-pub use ts_stats::*;
-pub use ts_trend::*;
-pub use ts_xcorr::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;

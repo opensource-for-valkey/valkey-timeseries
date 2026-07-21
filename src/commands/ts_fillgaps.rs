@@ -43,6 +43,27 @@ use valkey_module::{
 /// samples are returned as an array of [timestamp, value] pairs and are not
 /// persisted anywhere. With STORE, the filled gap samples are written to the
 /// destination key and the number of samples written is returned.
+#[valkey_module_macros::command({
+    name: "TS.FILLGAPS",
+    flags: [Write, DenyOOM],
+    summary: "Fill missing timestamps in a time series over a range.",
+    complexity: "O(N) where N is the number of timestamps in the range.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [
+        {
+            flags: [ReadOnly, Access],
+            begin_search: Index({ index: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        },
+        {
+            notes: "Optional destination series written by the STORE clause.",
+            flags: [ReadWrite, Update],
+            begin_search: Keyword({ keyword: "STORE", startfrom: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        }
+    ]
+})]
 pub fn ts_fillgaps_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);

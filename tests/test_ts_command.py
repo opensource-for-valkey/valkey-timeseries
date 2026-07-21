@@ -50,6 +50,35 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.CREATERULE":  (-6, 1,  2, 1, [b"write", b"denyoom", b"module"]),
         "TS.DELETERULE":   (3, 1,  2, 1, [b"write", b"denyoom", b"module"]),
         "TS.OUTLIERS":    (-6, 1,  1, 1, [b"readonly", b"denyoom", b"module"]),
+        # Analysis/forecasting commands. Those accepting a STORE clause declare a second,
+        # keyword-based key spec for the destination series, which the server reports as
+        # `movablekeys`; their legacy key range still covers only the source key at
+        # position 1. TS.SANITIZE writes the sanitized samples back to the source series,
+        # so its source key spec is RW rather than RO.
+        "TS.XCORR":          (-6, 1, 2, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.BACKTEST":       (-8, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.DECOMPOSE":      (-4, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.PERIODS":        (-4, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.AUTOCORRELATION":(-5, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.STATS":          (-2, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.FEATURES":       (-4, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.STATIONARITY":   (-4, 1, 1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.TREND":          (-4, 1, 1, 1, [b"write", b"denyoom", b"module", b"movablekeys"]),
+        "TS.FORECAST":       (-8, 1, 1, 1, [b"write", b"denyoom", b"module", b"movablekeys"]),
+        "TS.AUTOFORECAST":   (-5, 1, 1, 1, [b"write", b"denyoom", b"module", b"movablekeys"]),
+        "TS.FILLGAPS":       (-4, 1, 1, 1, [b"write", b"denyoom", b"module", b"movablekeys"]),
+        "TS.SANITIZE":       (-4, 1, 1, 1, [b"write", b"denyoom", b"module", b"movablekeys"]),
+    }
+
+    # Commands whose optional STORE clause names a destination series, and the argument
+    # prefix needed to reach that clause. COMMAND GETKEYS must report the destination in
+    # addition to the source key so the server can route and ACL-check it.
+    STORE_COMMANDS = {
+        "TS.FILLGAPS": ["src", "0", "100"],
+        "TS.SANITIZE": ["src", "0", "100"],
+        "TS.TREND": ["src", "0", "100"],
+        "TS.FORECAST": ["src", "0", "100", "MODELS", "AutoARIMA", "HORIZON", "5"],
+        "TS.AUTOFORECAST": ["src", "0", "100", "HORIZON", "5"],
     }
 
     def command_info(self, command):
@@ -59,6 +88,13 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         info = self.client.execute_command(f"COMMAND INFO {command}")
         assert info and info[0] is not None, f"Command {command} is not registered"
         return info[0]
+
+    def getkeys(self, command, *args):
+        # As with command_info, the single-string form avoids the client's COMMAND
+        # response callback, which would otherwise try to reshape the key list.
+        argv = " ".join(str(a) for a in args)
+        keys = self.client.execute_command(f"COMMAND GETKEYS {command} {argv}")
+        return [k.decode() if isinstance(k, bytes) else k for k in keys]
 
     def test_command_arity(self):
         for command, expected in self.COMMAND_INFO.items():
@@ -81,4 +117,26 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
             assert (first, last, step) == (expected[1], expected[2], expected[3]), (
                 f"Key range mismatch for '{command}': expected "
                 f"{(expected[1], expected[2], expected[3])}, got {(first, last, step)}"
+            )
+
+    def test_getkeys_reports_store_destination(self):
+        """The STORE destination must be discoverable via COMMAND GETKEYS.
+
+        The keyword-based key spec is what lets the server route and ACL-check the
+        destination series; without it only the source key would be reported.
+        """
+        for command, prefix in self.STORE_COMMANDS.items():
+            keys = self.getkeys(command, *prefix, "STORE", "dest")
+            assert keys == ["src", "dest"], (
+                f"GETKEYS mismatch for '{command}' with STORE: expected "
+                f"['src', 'dest'], got {keys}"
+            )
+
+    def test_getkeys_without_store(self):
+        """Without a STORE clause only the source key is reported."""
+        for command, prefix in self.STORE_COMMANDS.items():
+            keys = self.getkeys(command, *prefix)
+            assert keys == ["src"], (
+                f"GETKEYS mismatch for '{command}' without STORE: expected "
+                f"['src'], got {keys}"
             )

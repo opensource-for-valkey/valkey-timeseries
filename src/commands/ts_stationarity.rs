@@ -27,6 +27,19 @@ const MIN_SAMPLES: usize = 10;
 ///   If omitted, a sensible default is used automatically.
 ///
 /// Returns a map with test statistics, p-values, critical values, and a conclusion.
+#[valkey_module_macros::command({
+    name: "TS.STATIONARITY",
+    flags: [ReadOnly, DenyOOM],
+    summary: "Test whether a time series is stationary.",
+    complexity: "O(N*L) where N is the number of samples in the range and L is the number of lags used by the test.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [{
+        flags: [ReadOnly, Access],
+        begin_search: Index({ index: 1 }),
+        find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+    }]
+})]
 pub fn ts_stationarity_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);

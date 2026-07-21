@@ -144,6 +144,19 @@ const COMMAND_ACL_CATEGORIES: &[(&str, &str)] = &[
     ("TS.CREATERULE", "write timeseries"),
     ("TS.DELETERULE", "write timeseries"),
     ("TS.OUTLIERS", "fast read timeseries"),
+    ("TS.XCORR", "read timeseries"),
+    ("TS.FORECAST", "write timeseries"),
+    ("TS.AUTOFORECAST", "read write timeseries"),
+    ("TS.BACKTEST", "read timeseries"),
+    ("TS.DECOMPOSE", "read timeseries"),
+    ("TS.PERIODS", "read timeseries"),
+    ("TS.AUTOCORRELATION", "read timeseries"),
+    ("TS.TREND", "read write timeseries"),
+    ("TS.FILLGAPS", "fast write timeseries"),
+    ("TS.SANITIZE", "write timeseries"),
+    ("TS.STATS", "fast read timeseries"),
+    ("TS.FEATURES", "read timeseries"),
+    ("TS.STATIONARITY", "fast read timeseries"),
 ];
 
 /// Assign ACL categories to the commands registered via the command-info path. The
@@ -250,19 +263,6 @@ valkey_module! {
         // `register_commands`. Only internal/admin commands remain in this positional table.
         // ACL categories for the annotated commands are (re-)applied by
         // `assign_command_acl_categories`, since the command-info path does not set them.
-        ["TS.XCORR", commands::ts_xcorr_cmd, "readonly deny-oom", 1, 2, 1, "read timeseries"],
-        ["TS.FORECAST", commands::ts_forecast_command, "write deny-oom", 1, 1, 1, "write timeseries"],
-        ["TS.AUTOFORECAST", commands::ts_autoforecast_cmd, "write deny-oom", 1, 1, 1, "read write timeseries"],
-        ["TS.BACKTEST", commands::ts_backtest_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.DECOMPOSE", commands::ts_decompose_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.PERIODS", commands::ts_periods_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.AUTOCORRELATION", commands::ts_autocorrelation_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.TREND", commands::ts_trend_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.FILLGAPS", commands::ts_fillgaps_cmd, "write deny-oom", 1, 1, 1, "fast write timeseries"],
-        ["TS.SANITIZE", commands::ts_sanitize_cmd, "write deny-oom", 1, 1, 1, "write timeseries"],
-        ["TS.STATS", commands::ts_stats_cmd, "readonly deny-oom", 1, 1, 1, "fast read timeseries"],
-        ["TS.FEATURES", commands::ts_features_cmd, "readonly deny-oom", 1, 1, 1, "read timeseries"],
-        ["TS.STATIONARITY", commands::ts_stationarity_cmd, "readonly deny-oom", 1, 1, 1, "fast read timeseries"],
         ["TS._DEBUG", commands::ts_debug_cmd, "readonly", 0, 0, 0, "read timeseries admin"],
         ["TS._RESTORE", commands::ts_asm_restore_cmd, "write deny-oom", 1, 1, 1, "write timeseries admin"],
     ]

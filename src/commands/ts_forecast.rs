@@ -55,6 +55,27 @@ struct ForecastOptions {
 ///   ]
 /// ```
 ///
+#[valkey_module_macros::command({
+    name: "TS.FORECAST",
+    flags: [Write, DenyOOM],
+    summary: "Forecast future values of a time series using one or more explicit models.",
+    complexity: "O(N*M) where N is the number of samples in the range and M is the number of models.",
+    since: "1.0.0",
+    arity: -8,
+    key_spec: [
+        {
+            flags: [ReadOnly, Access],
+            begin_search: Index({ index: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        },
+        {
+            notes: "Optional destination series written by the STORE clause.",
+            flags: [ReadWrite, Update],
+            begin_search: Keyword({ keyword: "STORE", startfrom: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        }
+    ]
+})]
 pub(crate) fn ts_forecast_command(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 8 {
         return Err(ValkeyError::WrongArity);

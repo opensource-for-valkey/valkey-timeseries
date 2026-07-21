@@ -16,6 +16,19 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, V
 /// - `TRA`: Returns the time reversal asymmetry statistic at the specified lag.
 /// - `AGGREGATED <mean|var|std|median>`: Returns aggregated autocorrelation across lags
 ///   1..=lag, using the specified aggregation function.
+#[valkey_module_macros::command({
+    name: "TS.AUTOCORRELATION",
+    flags: [ReadOnly, DenyOOM],
+    summary: "Compute autocorrelation statistics for a time series at a given lag.",
+    complexity: "O(N*L) where N is the number of samples in the range and L is the lag.",
+    since: "1.0.0",
+    arity: -5,
+    key_spec: [{
+        flags: [ReadOnly, Access],
+        begin_search: Index({ index: 1 }),
+        find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+    }]
+})]
 pub fn ts_autocorrelation_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 5 {
         return Err(ValkeyError::WrongArity);

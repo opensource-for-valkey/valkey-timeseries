@@ -23,6 +23,19 @@ const MAX_SEASONALITY_PERIODS: usize = 4;
 ///
 /// If a single period is specified, STL decomposition is used.
 /// If multiple periods are specified, MSTL decomposition is used.
+#[valkey_module_macros::command({
+    name: "TS.DECOMPOSE",
+    flags: [ReadOnly, DenyOOM],
+    summary: "Decompose a time series into trend, seasonal and residual components.",
+    complexity: "O(N*P) where N is the number of samples in the range and P is the number of seasonal periods.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [{
+        flags: [ReadOnly, Access],
+        begin_search: Index({ index: 1 }),
+        find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+    }]
+})]
 pub fn ts_decompose_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);

@@ -76,6 +76,30 @@ impl Default for TrendModel {
 /// - `predicted_trend`: predicted trend values (when PREDICT is specified)
 /// - `features`: map of named features from the fitted component (when FEATURES is specified)
 /// - `metrics`: accuracy metrics between observed and fitted values (when METRICS is specified)
+#[valkey_module_macros::command({
+    name: "TS.TREND",
+    // Declared `Write` rather than `ReadOnly`: the STORE clause creates/updates the
+    // destination series and replicates, so the command must not be routed to replicas
+    // or treated as read-only, even though it is a pure read when STORE is omitted.
+    flags: [Write, DenyOOM],
+    summary: "Fit trend components to a time series, optionally selecting the best model.",
+    complexity: "O(N*M) where N is the number of samples in the range and M is the number of candidate trend models.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [
+        {
+            flags: [ReadOnly, Access],
+            begin_search: Index({ index: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        },
+        {
+            notes: "Optional destination series written by the STORE clause.",
+            flags: [ReadWrite, Update],
+            begin_search: Keyword({ keyword: "STORE", startfrom: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        }
+    ]
+})]
 pub fn ts_trend_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);

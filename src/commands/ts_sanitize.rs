@@ -47,6 +47,28 @@ use valkey_module::{
 /// cleared first. Returns the number of samples written.
 ///
 /// Without STORE, returns the number of samples that were sanitized (imputed or dropped).
+#[valkey_module_macros::command({
+    name: "TS.SANITIZE",
+    flags: [Write, DenyOOM],
+    summary: "Replace or drop missing values in a time series.",
+    complexity: "O(N) where N is the number of samples in the range.",
+    since: "1.0.0",
+    arity: -4,
+    key_spec: [
+        {
+            notes: "The sanitized samples are written back to the source series.",
+            flags: [ReadWrite, Update],
+            begin_search: Index({ index: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        },
+        {
+            notes: "Optional destination series written by the STORE clause.",
+            flags: [ReadWrite, Update],
+            begin_search: Keyword({ keyword: "STORE", startfrom: 1 }),
+            find_keys: Range({ last_key: 0, steps: 1, limit: 0 })
+        }
+    ]
+})]
 pub fn ts_sanitize_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 4 {
         return Err(ValkeyError::WrongArity);
