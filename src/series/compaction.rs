@@ -581,10 +581,7 @@ fn process_series_with_compaction(
     // upsert into an already-closed bucket recomputes the destination
     // silently, and a TS.DEL propagated into destinations emits only the
     // source's `ts.del`.
-    let notify_destinations = matches!(
-        op,
-        CompactionOp::AddNew(_) | CompactionOp::AddBatch { .. }
-    );
+    let notify_destinations = matches!(op, CompactionOp::AddNew(_) | CompactionOp::AddBatch { .. });
     let mut notified: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
     let mut visited: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
     visited.push(series.id);

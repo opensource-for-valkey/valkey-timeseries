@@ -237,9 +237,7 @@ fn has_in_batch_duplicate(samples: &[IndexedSample]) -> bool {
 ///
 /// The adds here defer the retention trim (the caller applies it once, after compaction), so the
 /// read-back still sees a sample that a later item in the same batch pushed outside the window.
-fn add_group_sequentially(
-    input: &mut PerSeriesSamples,
-) -> SmallVec<[(usize, SampleAddResult); 8]> {
+fn add_group_sequentially(input: &mut PerSeriesSamples) -> SmallVec<[(usize, SampleAddResult); 8]> {
     let mut result: SmallVec<[(usize, SampleAddResult); 8]> = SmallVec::new();
     let mut touched: SmallVec<[Timestamp; 8]> = SmallVec::new();
 

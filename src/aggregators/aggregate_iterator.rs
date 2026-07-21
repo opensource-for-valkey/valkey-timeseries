@@ -493,8 +493,7 @@ mod tests {
         // share [250,1250) — the old clamped-start logic wrongly grouped 0
         // with 500 and produced overlapping buckets.
         let expected = [(0, 1.0), (250, 5.0), (1250, 4.0), (2250, 10.5)];
-        let actual: Vec<(Timestamp, f64)> =
-            result.iter().map(|s| (s.timestamp, s.value)).collect();
+        let actual: Vec<(Timestamp, f64)> = result.iter().map(|s| (s.timestamp, s.value)).collect();
         assert_eq!(actual, expected);
     }
 
@@ -522,12 +521,8 @@ mod tests {
         let result: Vec<Sample> =
             AggregateIterator::with_range(samples.into_iter(), &options, 250, 0, 3000).collect();
 
-        let actual: Vec<(Timestamp, f64)> =
-            result.iter().map(|s| (s.timestamp, s.value)).collect();
-        assert_eq!(
-            actual,
-            [(0, 1.0), (250, 0.0), (1250, 0.0), (2250, 5.0)]
-        );
+        let actual: Vec<(Timestamp, f64)> = result.iter().map(|s| (s.timestamp, s.value)).collect();
+        assert_eq!(actual, [(0, 1.0), (250, 0.0), (1250, 0.0), (2250, 5.0)]);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use crate::aggregators::{AggregationType, Aggregator};
+use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::{
     parse_bucket_duration_str, parse_inline_condition, split_aggregator_condition,
 };
-use crate::commands::CommandArgIterator;
 use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;

@@ -752,9 +752,7 @@ fn validate_align_against_bounds(
             error_consts::START_ALIGN_NEEDS_EXPLICIT_START,
         ));
     }
-    if date_range.end == TimestampValue::Latest
-        && aggregation.alignment == BucketAlignment::End
-    {
+    if date_range.end == TimestampValue::Latest && aggregation.alignment == BucketAlignment::End {
         return Err(ValkeyError::Str(error_consts::END_ALIGN_NEEDS_EXPLICIT_END));
     }
     Ok(())
@@ -1152,7 +1150,10 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         return Err(ValkeyError::Str("TSDB: no FILTER given"));
     }
 
-    validate_align_against_bounds(&options.range.date_range, options.range.aggregation.as_ref())?;
+    validate_align_against_bounds(
+        &options.range.date_range,
+        options.range.aggregation.as_ref(),
+    )?;
 
     // filter out timestamp filters that are outside the range
     if let Some(ts_filter) = options.range.timestamp_filter.as_mut() {

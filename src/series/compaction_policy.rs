@@ -896,7 +896,7 @@ mod rts_grammar_parity {
             "avg:2h:10d",
             "avg:2h:10d:2d", // alignment larger than the bucket (modular)
             "std.p:1m:1h",
-            "avg:1h:0",      // zero retention
+            "avg:1h:0", // zero retention
             "max:1M:1h;min:10s:5d",
             "max:1M:1h;min:10s:5d:5m",
         ] {

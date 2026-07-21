@@ -562,10 +562,9 @@ mod tests {
         // On an empty series with retention, an item is TooOld only if it is older than the floor
         // induced by items at or before it in INPUT order — matching sequential TS.MADD. A later
         // item raising the floor does not retroactively reject an earlier accepted one.
-        let mk = || {
-            let mut series = TimeSeries::default();
-            series.retention = Duration::from_millis(1_000);
-            series
+        let mk = || TimeSeries {
+            retention: Duration::from_millis(1_000),
+            ..Default::default()
         };
 
         // Newer-first: the older item is below the floor the newer item established -> TooOld.
