@@ -19,6 +19,7 @@ pub use row_reducer::RowReducer;
 pub use sample_iter::*;
 pub use sample_merge_iterator::*;
 pub use sample_reducer::SampleReducer;
+pub(crate) use timeseries_range_iterator::get_range_latest_sample;
 pub use timeseries_range_iterator::{TimeSeriesRangeIterator, TimeSeriesRangeRowIterator};
 pub use timestamp_filter_iterator::TimestampFilterIterator;
 pub use utils::*;
