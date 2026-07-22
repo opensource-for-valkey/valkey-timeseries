@@ -10,16 +10,17 @@ use std::collections::VecDeque;
 #[derive(Debug)]
 struct AggregationHelper {
     aggregators: SmallVec<[Aggregator; 2]>,
+    /// Per-aggregator: did it accept at least one sample from the current bucket? Parallel
+    /// to `aggregators`. Drives whether the bucket is emitted — see `complete_bucket`.
+    accepted: SmallVec<[bool; 2]>,
     bucket_duration: u64,
     bucket_ts: BucketTimestamp,
     bucket_range_start: Timestamp,
     bucket_range_end: Timestamp,
     align_timestamp: Timestamp,
-    has_samples: bool,
-    /// Whether the current bucket received any sample at all, NaN or not. Distinct from
-    /// `has_samples`, which means "received a sample that counts": an all-NaN bucket is empty
-    /// (so it is omitted, or takes the EMPTY fill), but it is still a bucket that was started,
-    /// and the trailing one must not be dropped by `finalize_last_bucket_if_any`.
+    /// Whether the current bucket received any sample at all, NaN or not. A bucket every
+    /// aggregator ignored still counts as started, and the trailing one must not be dropped
+    /// by `finalize_last_bucket_if_any`.
     saw_sample: bool,
     report_empty: bool,
 }
@@ -34,13 +35,13 @@ impl AggregationHelper {
         }
 
         Self {
+            accepted: smallvec::smallvec![false; aggregators.len()],
             aggregators,
             bucket_duration: options.bucket_duration,
             bucket_ts: options.timestamp_output,
             bucket_range_start: 0,
             bucket_range_end: 0,
             align_timestamp,
-            has_samples: false,
             saw_sample: false,
             report_empty: options.report_empty,
         }
@@ -97,12 +98,25 @@ impl AggregationHelper {
         last_ts: Option<Timestamp>,
         empty_buckets: &mut VecDeque<MultiSample>,
     ) -> Option<MultiSample> {
-        // `has_samples`, not a raw sample count: a bucket holding only NaNs is empty as far
-        // as RedisTimeSeries is concerned — without EMPTY it is omitted, with EMPTY it takes
-        // the same fill as a bucket that held no samples at all. Counting raw samples emitted
-        // it as a real bucket instead (reference-checked: `TS.RANGE` over a bucket of NaNs
-        // returns nothing).
-        let bucket = if self.has_samples {
+        // Emission is a property of the aggregator, not of the bucket: RTS returns a bucket
+        // iff *this* aggregation took something from it. So a bucket holding only NaNs is
+        // returned for COUNTALL/COUNTNAN, which count NaNs, and omitted for the NaN-ignoring
+        // ones; conversely COUNTNAN over a bucket of ordinary readings is omitted. Both
+        // directions reference-checked. Under EMPTY the bucket is emitted either way, but an
+        // aggregator that did take samples reports its real value rather than the fill — an
+        // all-NaN bucket gives COUNTALL its count, not 0.
+        //
+        // The test is "accepted a sample" (`update`'s return), not "has a value": an
+        // aggregator can accept input and still have nothing to report — IRATE over a
+        // counter reset, SUMIF whose condition matched nothing — and those buckets are real,
+        // reporting NaN and 0 respectively. Only a bucket an aggregator took nothing from is
+        // absent for it.
+        //
+        // With several aggregations (an extension; RTS permits one) a row is all-or-nothing,
+        // so it is emitted once any aggregator accepted a sample and the rest take their fill.
+        let any_accepted = self.accepted.iter().any(|&accepted| accepted);
+
+        let bucket = if any_accepted {
             Some(MultiSample::new(
                 self.output_timestamp(),
                 self.aggregators
@@ -125,6 +139,7 @@ impl AggregationHelper {
         for aggregator in self.aggregators.iter_mut() {
             AggregationHandler::reset(aggregator);
         }
+        self.accepted.fill(false);
 
         if self.report_empty
             && let Some(last_ts) = last_ts
@@ -134,21 +149,13 @@ impl AggregationHelper {
             self.add_empty_buckets_between_timestamps(empty_buckets, start, last_ts);
         }
 
-        self.has_samples = false;
         self.saw_sample = false;
         bucket
     }
 
     fn update(&mut self, sample: Sample) {
-        for aggregator in self.aggregators.iter_mut() {
-            aggregator.update(sample.timestamp, sample.value);
-        }
-        // Emptiness is a property of the bucket's samples, not of the aggregators running over
-        // it: deriving it from whether some aggregator accepted the update would make the same
-        // bucket present in a multi-aggregation reply and absent in the single-aggregation one
-        // (`count_nan` accepts only NaNs, so a bucket of ordinary readings would vanish).
-        if !sample.value.is_nan() {
-            self.has_samples = true;
+        for (aggregator, accepted) in self.aggregators.iter_mut().zip(self.accepted.iter_mut()) {
+            *accepted |= aggregator.update(sample.timestamp, sample.value);
         }
         self.saw_sample = true;
     }
@@ -317,8 +324,8 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
             if bucket.is_some() {
                 return bucket;
             }
-            // All-NaN bucket was skipped; continue processing the next samples
-            // in the newly started bucket.
+            // No aggregator accepted a sample from that bucket, so it was skipped; continue
+            // processing the next samples in the newly started bucket.
         }
 
         None
@@ -839,11 +846,15 @@ mod tests {
         assert_eq!(result[2].value, 4.0);
     }
 
-    /// Cornerstone multi-aggregation invariant: for every aggregation type
-    /// and option combination, column i of the multi iterator over
-    /// [a1, ..., aN] is identical to running the single-aggregator iterator
-    /// with ai alone. Bucket boundaries and EMPTY logic depend only on shared
-    /// options, never on aggregator state, so this must hold structurally.
+    /// Cornerstone multi-aggregation invariant: for every aggregation type and option
+    /// combination, column i of the multi iterator over [a1, ..., aN] agrees with running
+    /// the single-aggregator iterator with ai alone, at every bucket the single one emits.
+    ///
+    /// Row *counts* need not agree. Emission is per-aggregator — a bucket is returned iff
+    /// that aggregation accepted a sample from it — so over NaN-bearing input a bucket can
+    /// be real for COUNTALL and absent for AVG. A multi row is all-or-nothing, so the multi
+    /// timestamps are the union of the single ones. Under EMPTY every bucket is emitted on
+    /// both sides and the union is exact.
     #[test]
     fn test_multi_single_column_equivalence() {
         use crate::series::request_types::AggregatorConfig;
@@ -918,9 +929,29 @@ mod tests {
                             "type={ty:?} empty={report_empty} ts_out={timestamp_output:?} input_len={}",
                             input.len()
                         );
-                        assert_eq!(rows.len(), singles.len(), "row count mismatch: {context}");
-                        for (row, single) in rows.iter().zip(singles.iter()) {
-                            assert_eq!(row.timestamp, single.timestamp, "{context}");
+                        if report_empty {
+                            assert_eq!(rows.len(), singles.len(), "row count mismatch: {context}");
+                        } else {
+                            assert!(
+                                rows.len() >= singles.len(),
+                                "multi dropped a bucket the single iterator emitted: \
+                                 multi={} single={} ({context})",
+                                rows.len(),
+                                singles.len(),
+                            );
+                        }
+
+                        for single in singles.iter() {
+                            let row = rows
+                                .iter()
+                                .find(|r| r.timestamp == single.timestamp)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "multi is missing bucket {} emitted by the single \
+                                         iterator ({context})",
+                                        single.timestamp
+                                    )
+                                });
                             let multi_value = row.values[column];
                             assert!(
                                 (multi_value.is_nan() && single.value.is_nan())

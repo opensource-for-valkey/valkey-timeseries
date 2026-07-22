@@ -127,6 +127,36 @@ class TestAggregation:
         mk_populated(diff, "r:agg_one", BASE_SAMPLES)
         diff(range_cmd, "r:agg_one", "-", "+", "AGGREGATION", agg, 100000)
 
+    # NaN-only buckets. Bucket emission is per-aggregator — the bucket is returned iff that
+    # aggregation accepted a sample from it — so an all-NaN bucket is real for the counters
+    # that accept NaNs and absent for everything else. Nothing exercised NaN samples here
+    # before, which is why a per-bucket emission rule diverged unnoticed.
+    NAN_AGGREGATORS = AGGREGATORS + ("countall", "countnan")
+
+    @pytest.mark.parametrize("agg", NAN_AGGREGATORS)
+    def test_aggregator_over_all_nan_bucket(self, diff, range_cmd, agg):
+        mk_populated(diff, "r:nan", [(1000, "nan"), (2000, "nan"), (3000, "nan")])
+        diff(range_cmd, "r:nan", "-", "+", "AGGREGATION", agg, 4000)
+
+    @pytest.mark.parametrize("agg", NAN_AGGREGATORS)
+    def test_aggregator_over_all_nan_bucket_with_empty(self, diff, range_cmd, agg):
+        """With EMPTY the bucket is emitted either way — but an aggregator that did accept
+        the NaNs must report its real count, not the fill."""
+        mk_populated(diff, "r:nanE", [(1000, "nan"), (3000, "nan"), (5000, "nan")])
+        diff(range_cmd, "r:nanE", 0, 6000, "ALIGN", 0, "AGGREGATION", agg, 2000, "EMPTY")
+
+    @pytest.mark.parametrize("agg", NAN_AGGREGATORS)
+    def test_aggregator_over_mixed_nan_bucket(self, diff, range_cmd, agg):
+        mk_populated(diff, "r:nanMix", [(1000, 1.0), (2000, "nan"), (3000, 3.0)])
+        diff(range_cmd, "r:nanMix", "-", "+", "AGGREGATION", agg, 4000)
+
+    @pytest.mark.parametrize("agg", NAN_AGGREGATORS)
+    def test_aggregator_over_ordinary_bucket(self, diff, range_cmd, agg):
+        """The converse direction: countnan accepts only NaNs, so a bucket of ordinary
+        readings is absent for it while every other aggregator reports it."""
+        mk_populated(diff, "r:nanOrd", [(1000, 1.0), (2000, 2.0)])
+        diff(range_cmd, "r:nanOrd", "-", "+", "AGGREGATION", agg, 4000)
+
     def test_bucket_boundary_assignment(self, diff, range_cmd):
         """Samples exactly on, ±1 around, a bucket boundary."""
         mk_populated(
