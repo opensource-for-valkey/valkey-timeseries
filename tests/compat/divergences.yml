@@ -397,9 +397,20 @@
     any sample magnitude exceeds sqrt(DBL_MAX) (~1.34e154); we return the mathematically
     correct value. RTS accumulates the naive sum of squares, so x^2 overflows to +Inf and
     the Inf - Inf term yields NaN — e.g. std.p over the single sample 1.7976931348623157e308
-    is NaN on RTS and 0 for us (a single sample has zero variance). The boundary is exact:
-    1e150 (square 1e300, finite) agrees on both engines; 1e200 (square overflows) diverges.
-    Only this aggregator family is affected — avg/sum/min/max agree at DBL_MAX.
+    is NaN on RTS and 0 for us (a single sample has zero variance). The overflow boundary
+    itself is exact: 1e150 (square 1e300, finite) agrees on both engines; 1e200 (square
+    overflows) diverges. Only this aggregator family is affected — avg/sum/min/max agree
+    at DBL_MAX.
+
+    CORRECTION (2026-07-22, Tier C): overflow is not the only failure mode of that naive
+    identity, and staying under the boundary is *not* sufficient for agreement. The same
+    E[x^2]-E[x]^2 form also cancels catastrophically whenever a bucket's samples are close
+    relative to their magnitude, losing about (mean/sd)^2 * DBL_EPSILON of relative
+    accuracy at any magnitude. Measured against the reference: {100, 100.1} disagrees at
+    ~1e-10 relative (past the §5.1 1e-12 tolerance), {100, 100.0001} at 2.2e-4, and
+    {12345.6789, 12345.679} returns NaN — nine orders of magnitude below the overflow
+    boundary. Where the cancellation is total, RTS returns exactly 0 for a non-zero
+    deviation; that end of the range is registered separately as DIV-0024..0029.
   rationale: >
     Accepted (owner sign-off 2026-07-17, §5.3): our implementation is correct and stands.
     Matching RTS would mean adopting a numerically unstable accumulation purely to
@@ -409,10 +420,17 @@
     Pinned by TestAggregationOverflow::test_variance_family_overflows_on_rts, whose
     companion test_below_the_overflow_boundary_agrees keeps the sub-boundary values (where
     both engines must agree exactly) from being masked by this entry.
-    Consequence for Tier C: the fuzzer caps generated magnitudes below the overflow
-    boundary (fuzz_strategies.VALUES) so the variance aggregators stay fuzzable; that cap
-    is now permanent rather than provisional, and DBL_MAX itself stays covered by the
-    pinning test and corpus/float_formatting_high_precision.json.
+    Consequence for Tier C, CORRECTED (2026-07-22): the magnitude cap
+    (fuzz_strategies.VALUES) keeps the *overflow* mode out of the fuzzer, but — per the
+    correction above — it is not enough to keep the variance family fuzzable, because
+    cancellation strikes well inside the capped range. A program may now either use a
+    variance aggregator, in which case its writes are drawn from
+    fuzz_strategies.WELL_CONDITIONED_VALUES/DELTAS (small magnitudes, spreads >= 1, which
+    hold the naive form's error under the §5.1 tolerance), or use the full adversarial
+    value set with the variance family excluded — never both. Deltas are constrained too,
+    not just values: the case that exposed this built {100, 100.1} via TS.INCRBY. DBL_MAX
+    itself stays covered by the pinning test and
+    corpus/float_formatting_high_precision.json.
   since: 0.1.0
 
 # DIV-0023 is a Tier C (differential fuzzer) finding, pinned per-engine in
@@ -453,3 +471,149 @@
     (extended) and ::test_strict_mode_reports_the_stale_bucket_like_rts plus
     ::test_strict_mode_advances_on_the_next_forward_close (strict).
   since: 0.1.0
+
+# DIV-0024..DIV-0029 share one root cause (Tier C fuzzer, 2026-07-22): the variance
+# family. RedisTimeSeries evaluates variance with the textbook sum-of-squares identity
+# (E[x^2] - E[x]^2). When |x| is large and the spread is small, the two terms agree to
+# within f64 precision and the subtraction cancels catastrophically, so RTS returns
+# exactly 0 for a sample set whose true deviation is not 0. We accumulate in a
+# numerically stable form and return the correct value.
+#
+#   TS.ADD s 0 123456789.123456789 ; TS.ADD s 1 123456789.123456789+1
+#   TS.RANGE s - + AGGREGATION std.p 500  ->  ours 0.5, RTS 0
+#
+# Observed on std.p / std.s / var.p / var.s, at magnitudes from ~1.2e8 upward (also
+# reproduced at 1e15). avg and sum agree at the same magnitudes, and all four agree on
+# small-magnitude inputs, which is what identifies this as cancellation rather than a
+# formatting or accumulation-order difference. It reaches every sample-returning command
+# two ways: AGGREGATION std|var on the read path, and reading a series fed by a
+# std|var compaction rule.
+#
+# Reviewed decision: do NOT match. Reproducing it means deliberately implementing an
+# unstable variance so that a mathematically wrong answer can be returned — the same
+# reasoning as DIV-0023, where we declined to reproduce RTS contradicting its own
+# TS.RANGE. Registered per command because registry matching is per-command; delete the
+# batch together if the decision is ever reversed.
+#
+# ⚠️ Scoping: each entry requires the *reference* side to be exactly 0 (`reference='0'`
+# in RESP2, `reference=0.0` in RESP3) at a sample-value position. That is much tighter
+# than a bare path regex — it can not absorb a general value delta — but it does still
+# cover any hypothetical bug in which RTS legitimately returns 0 for a sample value and
+# we return non-zero. The registry sees only (command, delta kind, "path: reference=X
+# subject=Y"); it can not see the aggregator, so std/var can not be named directly.
+# A per-engine pinning test would close that gap.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0024
+  command: TS.RANGE
+  kind: behavior
+  description: >
+    AGGREGATION std.p/std.s/var.p/var.s over large-magnitude, small-spread samples:
+    RTS cancels to 0, we return the mathematically correct deviation.
+  rationale: RTS uses the unstable E[x^2]-E[x]^2 identity; matching it would mean
+    returning a knowingly wrong value
+  since: 0.1.0
+  details_regex: '^\$\[\d+\]\[1\]: reference=(?:''0''|0\.0) subject='
+
+- id: DIV-0025
+  command: TS.REVRANGE
+  kind: behavior
+  description: >
+    AGGREGATION std.p/std.s/var.p/var.s over large-magnitude, small-spread samples:
+    RTS cancels to 0, we return the mathematically correct deviation.
+  rationale: see DIV-0024
+  since: 0.1.0
+  details_regex: '^\$\[\d+\]\[1\]: reference=(?:''0''|0\.0) subject='
+
+- id: DIV-0026
+  command: TS.MRANGE
+  kind: behavior
+  description: >
+    AGGREGATION std.p/std.s/var.p/var.s over large-magnitude, small-spread samples:
+    RTS cancels to 0, we return the mathematically correct deviation.
+  rationale: see DIV-0024
+  since: 0.1.0
+  details_regex: '^\$(?:\[\d+\]|\.[^\[]+)\[2\]\[\d+\]\[1\]: reference=(?:''0''|0\.0) subject='
+
+- id: DIV-0027
+  command: TS.MREVRANGE
+  kind: behavior
+  description: >
+    AGGREGATION std.p/std.s/var.p/var.s over large-magnitude, small-spread samples:
+    RTS cancels to 0, we return the mathematically correct deviation.
+  rationale: see DIV-0024
+  since: 0.1.0
+  details_regex: '^\$(?:\[\d+\]|\.[^\[]+)\[2\]\[\d+\]\[1\]: reference=(?:''0''|0\.0) subject='
+
+- id: DIV-0028
+  command: TS.GET
+  kind: behavior
+  description: >
+    Reading a destination fed by a std|var compaction rule: the bucket value RTS
+    cancelled to 0 where the true deviation is non-zero.
+  rationale: see DIV-0024
+  since: 0.1.0
+  details_regex: '^\$\[1\]: reference=(?:''0''|0\.0) subject='
+
+- id: DIV-0029
+  command: TS.MGET
+  kind: behavior
+  description: >
+    Reading a destination fed by a std|var compaction rule: the bucket value RTS
+    cancelled to 0 where the true deviation is non-zero.
+  rationale: see DIV-0024
+  since: 0.1.0
+  details_regex: '^\$(?:\[\d+\]\[2\]|\.[^\[]+\[1\])\[1\]: reference=(?:''0''|0\.0) subject='
+
+# DIV-0030..DIV-0031 (Tier C fuzzer, 2026-07-22): reverse + LATEST + AGGREGATION reading a
+# compaction destination, where the range end falls before the destination's open bucket.
+#
+# `LATEST` appends the rule's still-open bucket to the destination's data. Reading backwards
+# with a re-aggregation, RTS appears to start from that appended bucket, find it past the
+# range end, and stop — returning nothing and dropping the closed bucket that *is* in range.
+#
+#   TS.CREATERULE k0 rollup AGGREGATION avg 500 ; TS.ADD k0 0 0 ; TS.MADD k0 500 0
+#   TS.REVRANGE rollup - 1 LATEST AGGREGATION avg 500   ->  ours [[0,0]], RTS []
+#
+# All five conditions are required, and dropping any one makes the engines agree: the series
+# must be a compaction destination (a plain series holding the same two samples agrees), the
+# direction reverse (forward TS.MRANGE agrees), plus LATEST, plus AGGREGATION, plus an end
+# bound below the open bucket's start (`- 500` and `- +` agree).
+#
+# Reviewed decision: do NOT match. Our reply is the same set the forward query returns and
+# the same the non-LATEST reverse returns; RTS's contradicts both of its own — the DIV-0023
+# pattern, where we decline to reproduce an engine disagreeing with itself. Registered per
+# command because registry matching is per-command.
+#
+# ⚠️ Scoping: each entry requires the *reference* side to be an empty row set
+# (`reference=[] subject=...`, a `shape` delta). The dangerous direction — subject returns
+# nothing where the reference returned data — is NOT matched, and neither is any value
+# delta. It does still cover other "we return rows where RTS returns none" cases on these
+# two commands, which is an accepted-input-superset class §5.2 would normally hard-fail;
+# the pinning test below is what keeps that from going unnoticed.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0030
+  command: TS.REVRANGE
+  kind: behavior
+  description: >
+    Reverse + LATEST + AGGREGATION on a compaction destination, with the range ending
+    before the open bucket: RTS returns an empty reply, dropping the closed bucket inside
+    the range; we return it, matching our own forward reply.
+  rationale: RTS contradicts its own forward and non-LATEST replies; matching it would mean
+    dropping in-range data (see DIV-0023 for the same reasoning)
+  since: 0.1.0
+  details_regex: '^\$: reference=\[\] subject=\[\[.*\(length 0 vs \d+\)$'
+
+- id: DIV-0031
+  command: TS.MREVRANGE
+  kind: behavior
+  description: >
+    Reverse + LATEST + AGGREGATION on a compaction destination, with the range ending
+    before the open bucket: RTS returns an empty sample list for that series, dropping the
+    closed bucket inside the range; we return it, matching our own forward reply.
+  rationale: see DIV-0030
+  since: 0.1.0
+  details_regex: '^\$(?:\[\d+\]\[2\]|\.[^\[]+\[2\]): reference=\[\] subject=\[\[.*\(length 0 vs \d+\)$'

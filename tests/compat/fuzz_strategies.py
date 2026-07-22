@@ -20,6 +20,8 @@ drown the fuzz signal. Concretely the generator never emits:
   - `TS.RANGE` bounds with from > to (inverted-range superset, DIV-0013);
   - `TS.DEL` against a series with a retention window (DIV-0021, an owner-pending
     retention-model divergence pinned by test_compat_del.py);
+  - `FILTER_BY_VALUE` on a read that can reach a std/var compaction target
+    (DIV-0024..0029 — see VARIANCE_AGGREGATORS below);
   - `EMPTY` over an unbounded span (see MAX_EMPTY_BUCKETS — it OOM-kills either engine).
 
 Everything a command emits is a `str`, so a shrunk failing example round-trips
@@ -77,6 +79,23 @@ VALUES = [
 # belong on the value axis, not the accumulation axis).
 DELTAS = ["1", "0.5", "2.5", "100", "0.1", "1000", "42"]
 
+# Values/deltas used when a program may reach a variance aggregator.
+#
+# RTS's naive E[x^2]-E[x]^2 loses roughly `(mean/sd)^2 * DBL_EPSILON` of relative accuracy,
+# so it disagrees with a stable algorithm whenever a bucket's samples are close *relative to
+# their magnitude* — long before the DIV-0022 overflow boundary. Observed on the reference:
+# {100, 100.1} is wrong in the 10th digit, {100, 100.0001} by 2.2e-4, and {12345.6789,
+# 12345.679} comes back NaN. None of that is a subject bug (we are exact or near-exact),
+# but it swamps the fuzz signal, and it cannot be registered — the registry sees only
+# "path: reference=X subject=Y" and cannot tell which aggregator produced a value.
+#
+# Keeping magnitudes small and spreads >= 1 holds (mean/sd)^2 * eps well under the harness's
+# 1e-12 relative tolerance. Deltas are constrained too, not just values: the case that found
+# this built 100 and 100.1 by `TS.INCRBY`, so a small delta on a large value reintroduces
+# exactly the ill-conditioning the value set avoids.
+WELL_CONDITIONED_VALUES = ["0", "1", "-1", "2", "-2", "5", "-5", "10", "-10"]
+WELL_CONDITIONED_DELTAS = ["1", "2", "5", "10"]
+
 ENCODINGS = ["COMPRESSED", "UNCOMPRESSED"]
 DUPLICATE_POLICIES = ["BLOCK", "FIRST", "LAST", "MIN", "MAX", "SUM"]
 RETENTIONS = ["0", "1000", "5000"]
@@ -104,6 +123,28 @@ LABEL_NAMES = ["metric", "host", "region"]
 
 # Valid GROUPBY reducers (RTS 8.6). `first`/`last`/`twa` are not reducers.
 GROUP_REDUCERS = ["sum", "min", "max", "avg", "range", "count", "std.p", "std.s", "var.p", "var.s"]
+
+# The variance family. RTS evaluates it with the naive E[x^2]-E[x]^2 identity, which
+# cancels to exactly 0 for large-magnitude, small-spread buckets where the true deviation
+# is not 0 (DIV-0024..0029; the same naive formula also overflows — DIV-0022).
+#
+# As a *value* delta that is registered and rides through the fuzzer as XFAIL-DIVERGENT.
+# But when such a value is compared against a predicate, the divergence changes shape: RTS's
+# 0 passes `FILTER_BY_VALUE 0 0` and our correct 0.5 is filtered out, so the reply differs by
+# a whole row (`length 1 vs 0`) rather than by a value. No registry entry can cover that
+# safely — the only matching regex would also absorb "subject returned nothing where the
+# reference returned data", the regression class most worth keeping.
+#
+# The filter is therefore withheld from reads that can reach a std/var *compaction target*,
+# whose stored values are aggregator output. In-query `AGGREGATION std.p` / `GROUPBY REDUCE
+# std.p` need no such guard: FILTER_BY_VALUE is applied to raw samples *before* aggregation
+# (verified black-box on both engines), so it never sees the cancelled value.
+VARIANCE_AGGREGATORS = frozenset({"std.p", "std.s", "var.p", "var.s"})
+
+# Aggregator/reducer pools for programs that opt out of the variance family, so those
+# programs can use the full adversarial value set (see WELL_CONDITIONED_VALUES).
+NON_VARIANCE_AGGREGATORS = [a for a in AGGREGATORS if a not in VARIANCE_AGGREGATORS]
+NON_VARIANCE_REDUCERS = [r for r in GROUP_REDUCERS if r not in VARIANCE_AGGREGATORS]
 
 
 # -- sub-strategies ---------------------------------------------------------
@@ -143,15 +184,24 @@ def _empty_is_safe(bounds: Tuple[str, str], bucket: str) -> bool:
 
 
 @st.composite
-def _range_options(draw, bounds: Tuple[str, str], aggregation_allowed: bool = True) -> List[str]:
+def _range_options(
+    draw,
+    bounds: Tuple[str, str],
+    aggregation_allowed: bool = True,
+    value_filter_allowed: bool = True,
+    aggregators: List[str] = list(AGGREGATORS),
+) -> List[str]:
     """Options common to TS.RANGE/REVRANGE (emitted in RTS syntax order).
 
     `bounds` is the already-drawn (from, to) pair; it gates `EMPTY` (see `_empty_is_safe`).
+    `value_filter_allowed` is False when the read can reach a std/var compaction target,
+    where a value predicate turns DIV-0024..0029 into an unregistrable shape delta (see
+    VARIANCE_AGGREGATORS).
     """
     opts: List[str] = []
     if draw(st.booleans()):
         opts.append("LATEST")
-    if draw(st.booleans()):
+    if value_filter_allowed and draw(st.booleans()):
         lo, hi = sorted(draw(st.sampled_from(VALUES)) for _ in range(2))
         opts += ["FILTER_BY_VALUE", lo, hi]
     if draw(st.booleans()):
@@ -160,7 +210,7 @@ def _range_options(draw, bounds: Tuple[str, str], aggregation_allowed: bool = Tr
         if draw(st.booleans()):
             opts += ["ALIGN", draw(st.sampled_from(["start", "end", "0", "1000"]))]
         bucket = draw(st.sampled_from(BUCKETS))
-        opts += ["AGGREGATION", draw(st.sampled_from(AGGREGATORS)), bucket]
+        opts += ["AGGREGATION", draw(st.sampled_from(aggregators)), bucket]
         if draw(st.booleans()):
             opts += ["BUCKETTIMESTAMP", draw(st.sampled_from(BUCKET_TIMESTAMPS))]
         if _empty_is_safe(bounds, bucket) and draw(st.booleans()):
@@ -189,10 +239,16 @@ def _filter(draw) -> List[str]:
 
 
 @st.composite
-def _write_op(draw, writable: List[str], deletable: List[str]) -> Command:
+def _write_op(
+    draw,
+    writable: List[str],
+    deletable: List[str],
+    values: List[str] = VALUES,
+    deltas: List[str] = DELTAS,
+) -> Command:
     key = draw(st.sampled_from(writable))
     ts = str(draw(st.sampled_from(TIMESTAMPS)))
-    val = draw(st.sampled_from(VALUES))
+    val = draw(st.sampled_from(values))
     kinds = ["ADD", "MADD", "INCRBY", "DECRBY"]
     if deletable:
         kinds.append("DEL")
@@ -204,25 +260,39 @@ def _write_op(draw, writable: List[str], deletable: List[str]) -> Command:
         for _ in range(draw(st.integers(min_value=1, max_value=3))):
             triples += [draw(st.sampled_from(writable)),
                         str(draw(st.sampled_from(TIMESTAMPS))),
-                        draw(st.sampled_from(VALUES))]
+                        draw(st.sampled_from(values))]
         return ("TS.MADD", *triples)
     if kind in ("INCRBY", "DECRBY"):
         # Explicit TIMESTAMP: never the server clock (which differs per engine).
-        return (f"TS.{kind}", key, draw(st.sampled_from(DELTAS)), "TIMESTAMP", ts)
+        return (f"TS.{kind}", key, draw(st.sampled_from(deltas)), "TIMESTAMP", ts)
     # DEL over an ordered range, on a retention-0 series only (see `deletable`).
     lo, hi = sorted(draw(st.sampled_from(TIMESTAMPS)) for _ in range(2))
     return ("TS.DEL", draw(st.sampled_from(deletable)), str(lo), str(hi))
 
 
 @st.composite
-def _read_op(draw, keys: List[str]) -> Command:
+def _read_op(
+    draw,
+    keys: List[str],
+    variance_rollup: bool = False,
+    aggregators: List[str] = list(AGGREGATORS),
+    reducers: List[str] = GROUP_REDUCERS,
+) -> Command:
+    """One read command. `variance_rollup` is True when the program created a std/var
+    compaction rule, which withholds FILTER_BY_VALUE from reads that can reach the
+    rollup — directly by key, or via a matcher (its labels are in the MATCHERS set).
+    `aggregators`/`reducers` are narrowed to exclude the variance family for programs
+    written with the full adversarial value set."""
     kind = draw(st.sampled_from(
         ["RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "MGET", "QUERYINDEX"]
     ))
     if kind in ("RANGE", "REVRANGE"):
         key = draw(st.sampled_from(keys))
         frm, to = draw(_bounds())
-        return (f"TS.{kind}", key, frm, to, *draw(_range_options((frm, to))))
+        value_filter_allowed = not (variance_rollup and key == ROLLUP_KEY)
+        return (f"TS.{kind}", key, frm, to,
+                *draw(_range_options((frm, to), value_filter_allowed=value_filter_allowed,
+                                    aggregators=aggregators)))
     if kind == "GET":
         key = draw(st.sampled_from(keys))
         opt = ["LATEST"] if draw(st.booleans()) else []
@@ -232,12 +302,14 @@ def _read_op(draw, keys: List[str]) -> Command:
         opts: List[str] = []
         if draw(st.booleans()):
             opts.append("WITHLABELS")
-        opts += draw(_range_options((frm, to)))
+        # A matcher can select the rollup, so the guard applies to the whole command.
+        opts += draw(_range_options((frm, to), value_filter_allowed=not variance_rollup,
+                                    aggregators=aggregators))
         # GROUPBY...REDUCE is the trailing clause, AFTER FILTER (RTS syntax order).
         groupby: List[str] = []
         if draw(st.booleans()):
             groupby = ["GROUPBY", draw(st.sampled_from(LABEL_NAMES)),
-                       "REDUCE", draw(st.sampled_from(GROUP_REDUCERS))]
+                       "REDUCE", draw(st.sampled_from(reducers))]
         return (f"TS.{kind}", frm, to, *opts, "FILTER", *draw(_filter()), *groupby)
     if kind == "MGET":
         opts = ["WITHLABELS"] if draw(st.booleans()) else []
@@ -254,6 +326,16 @@ def programs(draw) -> List[Command]:
     n_series = draw(st.integers(min_value=1, max_value=len(BASE_KEYS)))
     keys = BASE_KEYS[:n_series]
 
+    # Decided up front, because the write phase is generated before the reads that would
+    # choose an aggregator: either this program may use the variance family and writes
+    # well-conditioned values, or it uses the full adversarial value set and no variance
+    # aggregator. Splitting it this way keeps both axes covered instead of trading one away.
+    variance_ok = draw(st.booleans())
+    values = WELL_CONDITIONED_VALUES if variance_ok else VALUES
+    deltas = WELL_CONDITIONED_DELTAS if variance_ok else DELTAS
+    aggregators = list(AGGREGATORS) if variance_ok else NON_VARIANCE_AGGREGATORS
+    reducers = GROUP_REDUCERS if variance_ok else NON_VARIANCE_REDUCERS
+
     commands: List[Command] = []
     # TS.DEL is restricted to retention-0 series: deleting a range that covers only
     # already-expired samples is DIV-0021 (RTS trims lazily and still counts the sample;
@@ -269,17 +351,20 @@ def programs(draw) -> List[Command]:
         commands.append(("TS.CREATE", key, *opts, "LABELS", *draw(_labels())))
 
     read_keys = list(keys)
+    variance_rollup = False
     if draw(st.booleans()):
         src = draw(st.sampled_from(keys))
+        rollup_agg = draw(st.sampled_from(aggregators))
+        variance_rollup = rollup_agg in VARIANCE_AGGREGATORS
         commands.append(("TS.CREATE", ROLLUP_KEY, "LABELS", "metric", "cpu", "host", "h1"))
         commands.append(("TS.CREATERULE", src, ROLLUP_KEY, "AGGREGATION",
-                         draw(st.sampled_from(AGGREGATORS)), draw(st.sampled_from(BUCKETS))))
+                         rollup_agg, draw(st.sampled_from(BUCKETS))))
         read_keys = list(keys) + [ROLLUP_KEY]  # rollup is readable, not writable
 
     for _ in range(draw(st.integers(min_value=0, max_value=14))):
-        commands.append(draw(_write_op(keys, deletable)))
+        commands.append(draw(_write_op(keys, deletable, values, deltas)))
 
     for _ in range(draw(st.integers(min_value=1, max_value=8))):
-        commands.append(draw(_read_op(read_keys)))
+        commands.append(draw(_read_op(read_keys, variance_rollup, aggregators, reducers)))
 
     return commands
