@@ -320,7 +320,11 @@ mod tests {
         // drained {0,1,2,10} from the heap before ever reading `3`. Found via
         // out-of-order TS.MRANGE GROUPBY REDUCE replies (Tier C fuzzer).
         let a = vec![make_sample(0, 0.0), make_sample(10, 10.0)];
-        let b = vec![make_sample(1, 1.0), make_sample(2, 2.0), make_sample(3, 3.0)];
+        let b = vec![
+            make_sample(1, 1.0),
+            make_sample(2, 2.0),
+            make_sample(3, 3.0),
+        ];
 
         let iter = MultiSeriesSampleIter::new(vec![a.into_iter(), b.into_iter()]);
         let timestamps: Vec<i64> = iter.map(|s| s.timestamp).collect();
@@ -358,7 +362,10 @@ mod tests {
         expected.sort_unstable();
 
         let iter = MultiSeriesSampleIter::new(
-            series.into_iter().map(|s| s.into_iter()).collect::<Vec<_>>(),
+            series
+                .into_iter()
+                .map(|s| s.into_iter())
+                .collect::<Vec<_>>(),
         );
         let timestamps: Vec<i64> = iter.map(|s| s.timestamp).collect();
         assert_eq!(timestamps, expected);
