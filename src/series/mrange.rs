@@ -5,16 +5,16 @@ use crate::error_consts;
 use crate::iterators::create_sample_iterator_adapter;
 use crate::iterators::{
     MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer, TailIter,
-    create_range_iterator, create_row_iterator,
+    create_range_iterator, create_row_iterator, get_range_latest_sample,
 };
 use crate::labels::Label;
+use crate::series::TimeSeries;
 use crate::series::acl::check_metadata_permissions;
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use crate::series::index::series_by_selectors;
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
 };
-use crate::series::{TimeSeries, get_latest_compaction_sample};
 use ahash::AHashMap;
 use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
 use valkey_module::{Context, ValkeyError, ValkeyResult};
@@ -252,32 +252,18 @@ fn process_mrange(
     Ok(items)
 }
 
+/// The destination's still-open bucket, when `LATEST` asks for it.
+///
+/// Delegates to the single-key helper rather than re-deriving the rule. A local copy here
+/// checked only that the bucket's timestamp fell inside the requested range, and so was
+/// missing two conditions the shared version carries: the retention clamp, and the
+/// `end_ts > last_timestamp()` guard that keeps an open bucket hidden unless the query
+/// reaches past the last *stored* sample. Without them TS.MRANGE reported an open bucket
+/// that TS.RANGE — and the reference — both omit, so the engine disagreed with itself
+/// (found by the Tier C fuzzer). Keeping one implementation is what stops that recurring.
 fn get_latest(options: &RangeOptions, ctx: &Context, series: &TimeSeries) -> Option<Sample> {
-    if !options.latest || !series.is_compaction() {
-        return None;
-    }
-    get_latest_compaction_sample(ctx, series).filter(|s| {
-        let (start_ts, end_ts) = options.get_timestamp_range();
-        let ts = s.timestamp;
-
-        if ts < start_ts || ts > end_ts {
-            return false;
-        }
-
-        if !options.value_filter.is_none_or(|vf| vf.is_match(s.value)) {
-            return false;
-        }
-
-        if !options
-            .timestamp_filter
-            .as_ref()
-            .is_none_or(|ts_vec| ts_vec.contains(&ts))
-        {
-            return false;
-        }
-
-        true
-    })
+    get_range_latest_sample(Some(ctx), series, options)
+        .filter(|s| options.value_filter.is_none_or(|vf| vf.is_match(s.value)))
 }
 
 fn create_iter<'a>(
@@ -443,17 +429,14 @@ fn get_grouped_samples(
     //
     // Per-series iterators must not apply the group reducer: reduction happens once,
     // across series, in the SampleReducer below.
+    //
+    // They also run ascending (`false`), like `get_grouped_rows` and the shard-side path:
+    // the k-way merge below yields its sources' order, and `collect_samples` reverses the
+    // *reduced* stream. Feeding it descending sources made the merge's output order depend
+    // on it buffering every iterator, which stopped holding once the merge was corrected.
     let iterators = series_metas
         .iter()
-        .map(|meta| {
-            create_range_iterator(
-                meta.series,
-                &options.range,
-                &None,
-                meta.latest,
-                options.is_reverse,
-            )
-        })
+        .map(|meta| create_range_iterator(meta.series, &options.range, &None, meta.latest, false))
         .collect::<Vec<_>>();
 
     let multi_iter = MultiSeriesSampleIter::new(iterators);

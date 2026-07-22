@@ -5,8 +5,9 @@ use crate::series::{TimeSeries, get_latest_compaction_sample};
 use valkey_module::Context;
 
 /// Determines and retrieves the latest compaction sample if needed
-/// (aggregation-agnostic; shared by the sample and row range iterators).
-fn get_range_latest_sample(
+/// (aggregation-agnostic; shared by the sample and row range iterators, and by the
+/// multi-key path in `series::mrange` — see the note there).
+pub(crate) fn get_range_latest_sample(
     ctx: Option<&Context>,
     series: &TimeSeries,
     options: &RangeOptions,
