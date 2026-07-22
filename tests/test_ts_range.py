@@ -1301,10 +1301,14 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
     @pytest.mark.parametrize(
         "agg_type, expected",
         [
+            # Aggregators that count NaNs take the samples, so the bucket is real and
+            # reports the true count.
             ("COUNTALL", 3.0),
             ("COUNTNAN", 3.0),
-            ("COUNT", 0.0),
-            ("SUM", 0.0),
+            # Every NaN-ignoring aggregator took nothing from this bucket, so without
+            # EMPTY there is no bucket to report. `None` means "omitted", not "NaN".
+            ("COUNT", None),
+            ("SUM", None),
             ("AVG", None),
             ("MIN", None),
             ("MAX", None),
@@ -1321,9 +1325,12 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
     )
     def test_all_nan_values(self, agg_type, expected):
         """
-        Verify aggregations' behavior when all samples in the bucket are NaN.
-        Numeric aggregations that ignore NaNs should emit NaN when no non-NaN samples exist.
-        COUNTALL/COUNTNAN count NaNs appropriately; COUNT counts non-NaN values.
+        Aggregation over a bucket holding only NaN samples, without EMPTY.
+
+        Bucket emission is per-aggregator: the bucket is returned iff that aggregation
+        accepted a sample from it. COUNTALL/COUNTNAN accept NaNs and report the count;
+        every other aggregator ignores them and the bucket is omitted entirely.
+        Reference-checked against RedisTimeSeries 8.6.
         """
         self.client.execute_command('TS.CREATE', 'ts_all_nan')
 
@@ -1339,14 +1346,37 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             'BUCKETTIMESTAMP', 'START'
         )
 
+        if expected is None:
+            assert result == [], f"Expected {agg_type} to omit the all-NaN bucket, got {result}"
+            return
+
         assert len(result) == 1
         assert result[0][0] == 0
         actual = float(result[0][1])
+        assert actual == pytest.approx(expected), f"Unexpected value for {agg_type}"
 
-        if expected is None:
-            assert math.isnan(actual), f"Expected NaN for {agg_type}, got {actual}"
+    @pytest.mark.parametrize("agg_type", ["COUNTNAN", "AVG", "COUNTALL"])
+    def test_ordinary_bucket_omitted_for_countnan(self, agg_type):
+        """
+        The converse of test_all_nan_values: a bucket of ordinary readings is omitted for
+        COUNTNAN, which accepts only NaNs, while the others report it. Emission tracks the
+        aggregator, not the bucket, in both directions. Reference-checked.
+        """
+        self.client.execute_command('TS.CREATE', 'ts_ordinary')
+        self.client.execute_command('TS.ADD', 'ts_ordinary', 1000, 1.0)
+        self.client.execute_command('TS.ADD', 'ts_ordinary', 2000, 2.0)
+
+        result = self.client.execute_command(
+            'TS.RANGE', 'ts_ordinary', 0, 4000,
+            'ALIGN', 0,
+            'AGGREGATION', agg_type, 4000,
+            'BUCKETTIMESTAMP', 'START'
+        )
+
+        if agg_type == "COUNTNAN":
+            assert result == [], f"Expected COUNTNAN to omit an all-ordinary bucket, got {result}"
         else:
-            assert actual == pytest.approx(expected), f"Unexpected value for {agg_type}"
+            assert len(result) == 1, f"Expected {agg_type} to report the bucket, got {result}"
 
     @pytest.mark.parametrize(
         "agg_type, expect_value",
