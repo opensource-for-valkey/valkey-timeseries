@@ -694,15 +694,15 @@ impl TimeSeries {
         SeriesSampleIterator::new(self, start, end, false)
     }
 
-    /// Iterate the samples physically stored in `[start, end]`, **without** clamping
-    /// `start` to the retention window the way [`Self::range_iter`] does.
+    /// Iterate the samples physically stored in `[start, end]`, **without** clamping `start`
+    /// to the current retention window the way [`Self::range_iter`] does.
     ///
-    /// Compaction recalculation needs this: a batch can both write an out-of-order
-    /// sample and advance the retention window past it, and the trim runs only after
-    /// compaction (see [`Self::apply_retention`]). Clamping there would aggregate the
-    /// bucket without the sample the batch just accepted, publishing a downstream
-    /// value computed from fewer samples than RedisTimeSeries uses. Query paths keep
-    /// the clamp — an untrimmed but expired sample must stay invisible to reads.
+    /// Compaction recalculation needs the clamp to be explicit rather than implicit. Both batch
+    /// ingest paths run the retention trim only after compaction, and a batch is applied as one
+    /// sorted run, so this series' *current* window is not the one that was in force when a
+    /// given item would have been applied sequentially. `handle_batch_compaction` therefore
+    /// reconstructs the floor per back-filled item and clamps `start` itself. Query paths keep
+    /// [`Self::range_iter`] — an untrimmed but expired sample must stay invisible to reads.
     pub(super) fn stored_range_iter(
         &self,
         start: Timestamp,

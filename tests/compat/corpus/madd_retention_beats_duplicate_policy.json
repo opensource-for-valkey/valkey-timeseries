@@ -1,0 +1,33 @@
+{
+  "description": "An in-batch TS.MADD item that an earlier item in the same batch pushed below the retention floor must report 'Timestamp is older than retention', not a DUPLICATE_POLICY violation: retention is decided before the duplicate policy, even though the deferred trim means the pre-trim sample is still physically present at that timestamp.",
+  "origin": "fuzzer shrink 2026-07-22",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:rp0", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:rp0", "0", "0"],
+    ["TS.MADD", "fz:rp0", "1", "0", "fz:rp0", "1500", "0", "fz:rp0", "1", "0"],
+    ["TS.RANGE", "fz:rp0", "-", "+"],
+    ["TS.INFO", "fz:rp0"],
+
+    ["TS.CREATE", "fz:rp1", "RETENTION", "1000", "DUPLICATE_POLICY", "LAST"],
+    ["TS.ADD", "fz:rp1", "0", "0"],
+    ["TS.MADD", "fz:rp1", "1", "0", "fz:rp1", "1500", "0", "fz:rp1", "1", "9"],
+    ["TS.RANGE", "fz:rp1", "-", "+"],
+
+    ["TS.CREATE", "fz:rp2", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:rp2", "1400", "0"],
+    ["TS.MADD", "fz:rp2", "1500", "0", "fz:rp2", "1400", "0"],
+    ["TS.RANGE", "fz:rp2", "-", "+"],
+
+    ["TS.CREATE", "fz:rp3", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:rp3", "0", "0"],
+    ["TS.MADD", "fz:rp3", "1500", "0", "fz:rp3", "1", "0"],
+    ["TS.RANGE", "fz:rp3", "-", "+"],
+
+    ["TS.CREATE", "fz:rp4", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.ADD", "fz:rp4", "1", "0"],
+    ["TS.ADD", "fz:rp4", "1500", "0"],
+    ["TS.ADD", "fz:rp4", "1", "0"],
+    ["TS.RANGE", "fz:rp4", "-", "+"]
+  ]
+}

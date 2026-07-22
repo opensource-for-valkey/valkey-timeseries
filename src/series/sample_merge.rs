@@ -21,6 +21,10 @@ pub struct PerSeriesSamples<'a> {
     /// Samples accepted by the merge, ascending by timestamp; consumed by the post-merge
     /// compaction pass.
     added: SmallVec<[Sample; 8]>,
+    /// The accepted timestamps in the order the caller supplied them (MADD argument order),
+    /// which `added` discards by sorting. Only the DIV-0023 forward-close marker needs it —
+    /// see `last_forward_close_in_input_order`.
+    added_order: SmallVec<[Timestamp; 8]>,
     /// The series' last timestamp before the merge: batch compaction uses it to tell
     /// guaranteed-fresh appends apart from samples that may have replaced existing values.
     prev_last: Option<Timestamp>,
@@ -33,6 +37,7 @@ impl<'a> PerSeriesSamples<'a> {
             series,
             samples: SmallVec::new(),
             added: SmallVec::new(),
+            added_order: SmallVec::new(),
             prev_last: None,
         }
     }
@@ -137,12 +142,14 @@ pub fn multi_series_merge_samples(
         run_group_compactions(ctx, &mut groups);
     }
 
-    // Retention is applied only now, after compaction. The merge above deliberately
-    // skipped the eager trim: RedisTimeSeries folds a sample into its downstream
-    // bucket at write time, so trimming first would let a batch that both writes an
-    // out-of-order sample and advances the retention window drop that sample before
-    // the bucket recalculation reads it back — publishing a downstream value computed
-    // from fewer samples than RTS uses.
+    // Retention is applied only now. The merge above deliberately skipped the eager trim so
+    // that `add_group_sequentially`'s read-back still sees a sample which a later item in the
+    // same batch pushed outside the window — that is what lets retention be decided ahead of
+    // the duplicate policy (corpus: madd_retention_beats_duplicate_policy).
+    //
+    // Deferring it does *not* leak expired samples into the destination buckets: compaction
+    // aggregates through the retention-clamped `range_iter`, so a sample this trim is about to
+    // evict is already invisible to the bucket recalculation.
     for group in groups.iter_mut() {
         group.series.apply_retention();
     }
@@ -163,6 +170,7 @@ fn add_samples_internal(
             .add_deferring_retention(sample.timestamp, sample.value, None);
         if let SampleAddResult::Ok(added) = result {
             input.added.push(added);
+            input.added_order.push(added.timestamp);
         }
 
         return Ok(smallvec![(index, result)]);
@@ -194,6 +202,8 @@ fn add_samples_internal(
         .map_err(|e| ValkeyError::String(format!("{e}")))?;
 
     // Accepted samples feed batch compaction, which requires them ascending by timestamp.
+    // `add_results` is parallel to `samples`, i.e. still in input order, so the order is
+    // captured before sorting (the DIV-0023 forward-close marker depends on it).
     let mut added: SmallVec<[Sample; 8]> = add_results
         .iter()
         .filter_map(|res| {
@@ -204,6 +214,7 @@ fn add_samples_internal(
             }
         })
         .collect();
+    input.added_order = added.iter().map(|s| s.timestamp).collect();
     added.sort_unstable_by_key(|s| s.timestamp);
     input.added = added;
 
@@ -249,6 +260,9 @@ fn add_group_sequentially(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sam
             .add_deferring_retention(item.timestamp, item.value, None);
         if res.is_ok() {
             touched.push(item.timestamp);
+            // Input order, duplicates included: a repeated timestamp does not advance the
+            // running max, so it reads as a back-fill exactly as RTS applies it.
+            input.added_order.push(item.timestamp);
         }
         result.push((item.index, res));
     }
@@ -275,9 +289,10 @@ fn run_group_compactions(ctx: &Context, groups: &mut [PerSeriesSamples]) {
             continue;
         }
 
-        if let Err(e) = group
-            .series
-            .batch_compaction(ctx, &group.added, group.prev_last)
+        if let Err(e) =
+            group
+                .series
+                .batch_compaction(ctx, &group.added, group.prev_last, &group.added_order)
         {
             let key = get_series_key_by_id(ctx, group.series.id)
                 .unwrap_or_else(|| ctx.create_string("Unknown"));

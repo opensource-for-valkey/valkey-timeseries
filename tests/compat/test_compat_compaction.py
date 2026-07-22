@@ -90,6 +90,36 @@ class TestBucketFinalization:
         diff("TS.GET", "c:open:dst")
         diff("TS.GET", "c:open:dst", "LATEST")
 
+    def test_latest_open_bucket_under_a_bounded_range(self, diff):
+        """LATEST must hide the open bucket unless the query reaches past the last
+        *stored* sample — and single-key and multi-key must agree on that.
+
+        With no bucket closed yet the destination has no stored samples, so a query
+        ending at the open bucket's own start reaches nothing: both engines report
+        empty. TS.MRANGE used to re-derive this rule locally and checked only that the
+        bucket's timestamp fell in range, so it reported a bucket TS.RANGE omitted —
+        the engine contradicting itself. Found by the Tier C fuzzer.
+        """
+        _rule(diff, "c:lob:src", "c:lob:dst", "avg", 500)
+        diff("TS.ALTER", "c:lob:dst", "LABELS", "grp", "lob")
+        diff("TS.ADD", "c:lob:src", 0, 0)  # opens [0,500); nothing closed
+
+        # Bounded ranges, single-key and multi-key, must agree with each other.
+        for end in (0, 1, 250, 499, 500, 1000):
+            diff("TS.RANGE", "c:lob:dst", 0, end, "LATEST")
+            diff("TS.REVRANGE", "c:lob:dst", 0, end, "LATEST")
+            diff("TS.MRANGE", 0, end, "LATEST", "FILTER", "grp=lob")
+            diff("TS.MREVRANGE", 0, end, "LATEST", "FILTER", "grp=lob")
+        diff("TS.RANGE", "c:lob:dst", "-", "+", "LATEST")
+        diff("TS.MRANGE", "-", "+", "LATEST", "FILTER", "grp=lob")
+
+        # Once a bucket closes, the stored sample is visible and LATEST adds the new
+        # open one on top — the same on both paths.
+        diff("TS.ADD", "c:lob:src", 500, 0)
+        for end in (0, 499, 500, 999, 1000):
+            diff("TS.RANGE", "c:lob:dst", 0, end, "LATEST")
+            diff("TS.MRANGE", 0, end, "LATEST", "FILTER", "grp=lob")
+
     @pytest.mark.parametrize("agg", AGGREGATORS)
     def test_each_aggregator_finalizes_the_same_bucket(self, diff, agg):
         _rule(diff, f"c:agg:src:{agg}", f"c:agg:dst:{agg}", agg)
@@ -473,6 +503,130 @@ class TestOutOfOrderBackfill:
             == diff.subject.execute_command("TS.RANGE", "c:bdst", "-", "+")
         )
 
+    @staticmethod
+    def _backfill_one_madd(client):
+        """The same three writes as `_backfill`, but as ONE out-of-order TS.MADD."""
+        client.execute_command("TS.CREATE", "c:msrc", "LABELS", "grp", "mbf")
+        client.execute_command("TS.CREATE", "c:mdst", "LABELS", "grp", "mbf")
+        client.execute_command(
+            "TS.CREATERULE", "c:msrc", "c:mdst", "AGGREGATION", "avg", 500
+        )
+        # Argument order matters: 1000 closes [0,500) by forward progress, then 500
+        # back-fills the skipped [500,1000).
+        client.execute_command(
+            "TS.MADD", "c:msrc", 0, 0, "c:msrc", 1000, 0, "c:msrc", 500, 0
+        )
+
+    def test_strict_mode_honors_madd_argument_order(self, strict_subject):
+        """A single TS.MADD carrying both the closing sample and the back-fill must
+        land on the same cached last-sample as the equivalent TS.ADD sequence.
+
+        We merge a MADD as one sorted run, which is right for the stored data but
+        erases which closes were forward — sorted, this looks like two forward closes
+        and the marker would advance to 500 where RTS reports 0. Regression test for
+        the input-order fix in `last_forward_close_in_input_order`; found by the
+        Tier C fuzzer. Per-engine assertions for the same reason as the siblings above.
+        """
+        diff = strict_subject
+        self._backfill_one_madd(diff.reference)
+        self._backfill_one_madd(diff.subject)
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:mdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:mdst")
+        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
+        assert sub_get[0] == 0, f"expected the forward-closed bucket, got {sub_get!r}"
+
+        # TS.INFO reads the same accessor and must not disagree with TS.GET.
+        def last_ts(client):
+            reply = client.execute_command("TS.INFO", "c:mdst")
+            items = reply.items() if isinstance(reply, dict) else zip(reply[::2], reply[1::2])
+            fields = {
+                (k.decode() if isinstance(k, bytes) else k): v for k, v in items
+            }
+            return fields["lastTimestamp"]
+
+        assert last_ts(diff.subject) == last_ts(diff.reference)
+
+        # Stored data is unaffected by the marker.
+        assert (
+            diff.reference.execute_command("TS.RANGE", "c:mdst", "-", "+")
+            == diff.subject.execute_command("TS.RANGE", "c:mdst", "-", "+")
+        )
+
+    @staticmethod
+    def _delete_then_recreate(client):
+        """Forward-close a bucket, delete it, then write past it and re-create it."""
+        client.execute_command("TS.CREATE", "c:rsrc", "LABELS", "grp", "res")
+        client.execute_command("TS.CREATE", "c:rdst", "LABELS", "grp", "res")
+        client.execute_command(
+            "TS.CREATERULE", "c:rsrc", "c:rdst", "AGGREGATION", "avg", 500
+        )
+        client.execute_command("TS.ADD", "c:rsrc", 0, 0)
+        client.execute_command("TS.MADD", "c:rsrc", 1000, 0)  # closes [0,500) -> dst(0)
+        client.execute_command("TS.DEL", "c:rsrc", 0, 0)      # dst(0) recalculated away
+        client.execute_command("TS.ADD", "c:rsrc", 500, 0)    # back-fills dst(500)
+        client.execute_command("TS.ADD", "c:rsrc", 0, 0)      # re-creates dst(0)
+
+    def test_strict_mode_does_not_resurrect_a_deleted_marker(self, strict_subject):
+        """A cached last-sample whose bucket was deleted must stay dead.
+
+        Leaving it set lets a later write that re-creates the same timestamp make it
+        readable again, dragging the reported last-sample backwards to a bucket the
+        reference stopped reporting once it was removed. Regression test for the
+        marker-liveness check in `add_dest_bucket`; found by the Tier C fuzzer.
+        """
+        diff = strict_subject
+        self._delete_then_recreate(diff.reference)
+        self._delete_then_recreate(diff.subject)
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:rdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:rdst")
+        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
+        assert sub_get[0] == 500, f"expected the bucket written after the delete, got {sub_get!r}"
+
+        assert (
+            diff.reference.execute_command("TS.RANGE", "c:rdst", "-", "+")
+            == diff.subject.execute_command("TS.RANGE", "c:rdst", "-", "+")
+        )
+
+    @staticmethod
+    def _backfill_then_delete_then_recreate(client):
+        """Like `_delete_then_recreate`, but the back-fill lands BEFORE the delete, so a
+        newer bucket survives it."""
+        client.execute_command("TS.CREATE", "c:vsrc", "LABELS", "grp", "surv")
+        client.execute_command("TS.CREATE", "c:vdst", "LABELS", "grp", "surv")
+        client.execute_command(
+            "TS.CREATERULE", "c:vsrc", "c:vdst", "AGGREGATION", "avg", 500
+        )
+        client.execute_command("TS.ADD", "c:vsrc", 0, 0)
+        client.execute_command("TS.MADD", "c:vsrc", 1000, 0)  # closes [0,500) -> dst(0)
+        client.execute_command("TS.ADD", "c:vsrc", 500, 0)    # back-fills dst(500)
+        client.execute_command("TS.DEL", "c:vsrc", 0, 0)      # removes dst(0); dst(500) lives
+        client.execute_command("TS.ADD", "c:vsrc", 0, 0)      # re-creates dst(0)
+
+    def test_strict_mode_falls_back_to_the_surviving_bucket(self, strict_subject):
+        """When the marker's bucket is removed, the cache falls to what the destination
+        still holds — not to whatever is written next.
+
+        The sibling test above leaves the destination empty, so "next write" and
+        "surviving last sample" coincide and cannot tell the two rules apart. Here a newer
+        bucket survives the delete, so claiming the marker for the next write (which
+        re-creates the *older* timestamp) would report it and diverge.
+        """
+        diff = strict_subject
+        self._backfill_then_delete_then_recreate(diff.reference)
+        self._backfill_then_delete_then_recreate(diff.subject)
+
+        ref_get = diff.reference.execute_command("TS.GET", "c:vdst")
+        sub_get = diff.subject.execute_command("TS.GET", "c:vdst")
+        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
+        assert sub_get[0] == 500, f"expected the surviving bucket, got {sub_get!r}"
+
+        assert (
+            diff.reference.execute_command("TS.RANGE", "c:vdst", "-", "+")
+            == diff.subject.execute_command("TS.RANGE", "c:vdst", "-", "+")
+        )
+
     def test_strict_mode_advances_on_the_next_forward_close(self, strict_subject):
         """The cached last-sample is stale only until forward progress closes the
         next bucket — at which point strict tracks RTS again."""
@@ -488,3 +642,92 @@ class TestOutOfOrderBackfill:
         sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
         assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
         assert ref_get[0] == 1000, f"expected the newly closed bucket, got {ref_get!r}"
+
+
+class TestReverseLatestAggregationOnDestination:
+    """DIV-0030/0031: reverse + LATEST + AGGREGATION on a compaction destination, with the
+    range ending before the destination's open bucket.
+
+    `LATEST` appends the rule's still-open bucket to the destination's data. Reading
+    backwards with a re-aggregation, RTS appears to start from that appended bucket, find it
+    past the range end, and stop — returning nothing and dropping the closed bucket that is
+    inside the range. We return it, which is what our own forward query and our own
+    non-LATEST reverse query both return.
+
+    Per-engine assertions rather than `diff`: the registry entries are scoped to
+    "reference=[] subject=[[...]]", so routing the diverging call through `diff` would
+    exercise the entry rather than the behavior. The boundary tests below are what keep the
+    entry honest — they pin that dropping any single condition makes the engines agree, so a
+    regression that widened the divergence would fail here instead of being absorbed.
+    """
+
+    @staticmethod
+    def _rule_with_open_bucket(client):
+        client.execute_command("TS.CREATE", "c:lsrc", "LABELS", "grp", "lat")
+        client.execute_command("TS.CREATE", "c:ldst", "LABELS", "grp", "lat")
+        client.execute_command(
+            "TS.CREATERULE", "c:lsrc", "c:ldst", "AGGREGATION", "avg", 500
+        )
+        client.execute_command("TS.ADD", "c:lsrc", 0, 0)      # opens [0,500)
+        client.execute_command("TS.MADD", "c:lsrc", 500, 0)   # closes it, opens [500,1000)
+
+    def test_reverse_latest_aggregation_drops_the_in_range_bucket_on_rts(self, diff):
+        self._rule_with_open_bucket(diff.reference)
+        self._rule_with_open_bucket(diff.subject)
+
+        args = ("TS.REVRANGE", "c:ldst", "-", 1, "LATEST", "AGGREGATION", "avg", 500)
+        ref = diff.reference.execute_command(*args)
+        sub = diff.subject.execute_command(*args)
+
+        assert ref == [], f"expected RTS to drop the in-range bucket, got {ref!r}"
+        assert [s[0] for s in sub] == [0], f"expected the closed bucket at 0, got {sub!r}"
+
+        # The multi-key form behaves the same (DIV-0031).
+        margs = ("TS.MREVRANGE", "-", 1, "LATEST", "AGGREGATION", "avg", 500,
+                 "FILTER", "grp=lat")
+
+        def samples_by_key(reply):
+            """RESP2 gives [key, labels, samples] rows; RESP3 a map whose value list
+            carries extra metadata entries. Samples are last in both."""
+            items = reply.items() if isinstance(reply, dict) else ((r[0], r) for r in reply)
+            return {k: v[-1] for k, v in items}
+
+        mref = samples_by_key(diff.reference.execute_command(*margs))
+        msub = samples_by_key(diff.subject.execute_command(*margs))
+        assert mref[b"c:ldst"] == []
+        assert [s[0] for s in msub[b"c:ldst"]] == [0]
+
+    def test_our_reverse_agrees_with_our_own_forward(self, diff):
+        """The reason we do not match RTS here: its reply contradicts itself."""
+        self._rule_with_open_bucket(diff.subject)
+
+        fwd = diff.subject.execute_command(
+            "TS.RANGE", "c:ldst", "-", 1, "LATEST", "AGGREGATION", "avg", 500
+        )
+        rev = diff.subject.execute_command(
+            "TS.REVRANGE", "c:ldst", "-", 1, "LATEST", "AGGREGATION", "avg", 500
+        )
+        assert [s[0] for s in fwd] == [s[0] for s in rev] == [0]
+
+    def test_dropping_any_single_condition_agrees(self, diff):
+        """All five conditions are required; each of these must diff clean, so the
+        registry entries can not quietly widen."""
+        self._rule_with_open_bucket(diff.reference)
+        self._rule_with_open_bucket(diff.subject)
+
+        # no LATEST
+        diff("TS.REVRANGE", "c:ldst", "-", 1, "AGGREGATION", "avg", 500)
+        # no AGGREGATION
+        diff("TS.REVRANGE", "c:ldst", "-", 1, "LATEST")
+        # forward instead of reverse
+        diff("TS.RANGE", "c:ldst", "-", 1, "LATEST", "AGGREGATION", "avg", 500)
+        # range end at/after the open bucket
+        diff("TS.REVRANGE", "c:ldst", "-", 500, "LATEST", "AGGREGATION", "avg", 500)
+        diff("TS.REVRANGE", "c:ldst", "-", "+", "LATEST", "AGGREGATION", "avg", 500)
+
+    def test_plain_series_with_the_same_samples_agrees(self, diff):
+        """Not a general reverse/LATEST bug: it needs a compaction destination."""
+        diff("TS.CREATE", "c:lplain", "LABELS", "grp", "lat2")
+        diff("TS.ADD", "c:lplain", 0, 0)
+        diff("TS.ADD", "c:lplain", 500, 0)
+        diff("TS.REVRANGE", "c:lplain", "-", 1, "LATEST", "AGGREGATION", "avg", 500)
