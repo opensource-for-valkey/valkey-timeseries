@@ -1,10 +1,57 @@
 use crate::common::Sample;
 use min_max_heap::MinMaxHeap;
+use std::cmp::Ordering;
 
-/// Iterate over multiple Sample iterators, returning the samples in timestamp order
+/// A pending sample tagged with the iterator it came from, so the merge can refill exactly
+/// that iterator once the sample is emitted.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    sample: Sample,
+    source: usize,
+}
+
+impl PartialEq for Entry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Entry {}
+
+impl PartialOrd for Entry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Entry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Timestamp first. `source` only breaks ties, so equal timestamps come out in
+        // series order rather than in whatever order the heap happens to hold them —
+        // and values (which may be NaN) never take part in the comparison.
+        self.sample
+            .timestamp
+            .cmp(&other.sample.timestamp)
+            .then(self.source.cmp(&other.source))
+    }
+}
+
+/// Iterate over multiple sorted `Sample` iterators, yielding samples in timestamp order.
+///
+/// A textbook k-way merge: the heap holds the next unread sample of **every** live iterator,
+/// and emitting one refills from that same iterator. Holding that invariant is the whole
+/// correctness argument — `pop_min` is only the global minimum if every iterator is
+/// represented.
+///
+/// An earlier version pushed a bounded *prefix* of each iterator and drained the heap
+/// completely before reloading, which broke the invariant: with `{0,10}` and `{1,2,3}` it
+/// loaded `{0,1,2,10}`, emitted all four, and only then read `3` — yielding
+/// `0,1,2,10,3`. That surfaced as out-of-order `TS.MRANGE ... GROUPBY ... REDUCE` replies
+/// (found by the Tier C differential fuzzer).
 pub struct MultiSeriesSampleIter<T: Iterator<Item = Sample>> {
-    heap: MinMaxHeap<Sample>,
+    heap: MinMaxHeap<Entry>,
     inner: Vec<T>,
+    primed: bool,
 }
 
 impl<T: Iterator<Item = Sample>> MultiSeriesSampleIter<T> {
@@ -13,52 +60,18 @@ impl<T: Iterator<Item = Sample>> MultiSeriesSampleIter<T> {
         Self {
             inner: list,
             heap: MinMaxHeap::with_capacity(len),
+            primed: false,
         }
     }
 
-    /// Push one sample from each iterator to the heap.
-    /// Returns `true` if at least one sample was added.
-    fn push_samples_to_heap(&mut self) -> bool {
-        let initial_len = self.heap.len();
-        for iter in &mut self.inner {
-            if let Some(sample) = iter.next() {
-                self.heap.push(sample);
+    /// Seed the heap with the first sample of every iterator.
+    fn prime(&mut self) {
+        for source in 0..self.inner.len() {
+            if let Some(sample) = self.inner[source].next() {
+                self.heap.push(Entry { sample, source });
             }
         }
-        self.heap.len() > initial_len
-    }
-
-    /// Load samples to the heap, trying to ensure that the iterators are roughly at the same timestamp.
-    /// Removes exhausted iterators from `self.inner`.
-    fn load_heap(&mut self) -> bool {
-        if !self.push_samples_to_heap() {
-            return false;
-        }
-
-        let Some(upper_bound_timestamp) = self.heap.peek_max().map(|s| s.timestamp) else {
-            return false;
-        };
-
-        // Remove exhausted iterators in a single pass.
-        self.inner.retain_mut(|sample_iter| {
-            let mut produced_any = false;
-
-            for sample in sample_iter.by_ref() {
-                produced_any = true;
-
-                let is_beyond_upper_bound = sample.timestamp > upper_bound_timestamp;
-                self.heap.push(sample);
-
-                // Stop once we have crossed the boundary; leave remaining items for later.
-                if is_beyond_upper_bound {
-                    break;
-                }
-            }
-
-            produced_any
-        });
-
-        true
+        self.primed = true;
     }
 }
 
@@ -66,10 +79,20 @@ impl<T: Iterator<Item = Sample>> Iterator for MultiSeriesSampleIter<T> {
     type Item = Sample;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.heap.is_empty() && !self.load_heap() {
-            return None;
+        if !self.primed {
+            self.prime();
         }
-        self.heap.pop_min()
+
+        let entry = self.heap.pop_min()?;
+        // Refill from the iterator just consumed, keeping every live iterator represented.
+        // An exhausted one simply stops contributing.
+        if let Some(sample) = self.inner[entry.source].next() {
+            self.heap.push(Entry {
+                sample,
+                source: entry.source,
+            });
+        }
+        Some(entry.sample)
     }
 }
 
@@ -289,6 +312,56 @@ mod tests {
 
         let timestamps: Vec<i64> = iter.by_ref().map(|s| s.timestamp).collect();
         assert_eq!(timestamps, vec![1, 2, 999999, 1000000]);
+    }
+
+    #[test]
+    fn refills_the_consumed_iterator_before_emitting() {
+        // Regression: the old prefix-loading merge emitted 0,1,2,10,3 here, because it
+        // drained {0,1,2,10} from the heap before ever reading `3`. Found via
+        // out-of-order TS.MRANGE GROUPBY REDUCE replies (Tier C fuzzer).
+        let a = vec![make_sample(0, 0.0), make_sample(10, 10.0)];
+        let b = vec![make_sample(1, 1.0), make_sample(2, 2.0), make_sample(3, 3.0)];
+
+        let iter = MultiSeriesSampleIter::new(vec![a.into_iter(), b.into_iter()]);
+        let timestamps: Vec<i64> = iter.map(|s| s.timestamp).collect();
+        assert_eq!(timestamps, vec![0, 1, 2, 3, 10]);
+    }
+
+    #[test]
+    fn one_iterator_outruns_the_others_by_many_samples() {
+        // The gap between the short series' samples spans an arbitrary run of the long one.
+        let a = vec![make_sample(0, 0.0), make_sample(100, 100.0)];
+        let b: Vec<Sample> = (1..=20).map(|i| make_sample(i, i as f64)).collect();
+
+        let iter = MultiSeriesSampleIter::new(vec![a.into_iter(), b.into_iter()]);
+        let timestamps: Vec<i64> = iter.map(|s| s.timestamp).collect();
+
+        let mut expected: Vec<i64> = (0..=20).collect();
+        expected.push(100);
+        assert_eq!(timestamps, expected);
+    }
+
+    #[test]
+    fn output_is_sorted_for_many_ragged_series() {
+        // Ragged lengths and offsets across more series than the heap's initial capacity.
+        let series: Vec<Vec<Sample>> = (0..7)
+            .map(|s| {
+                (0..(s * 3 + 1))
+                    .map(|i| make_sample((i * 7 + s * 2) as i64, 1.0))
+                    .collect()
+            })
+            .collect();
+        let mut expected: Vec<i64> = series
+            .iter()
+            .flat_map(|s| s.iter().map(|x| x.timestamp))
+            .collect();
+        expected.sort_unstable();
+
+        let iter = MultiSeriesSampleIter::new(
+            series.into_iter().map(|s| s.into_iter()).collect::<Vec<_>>(),
+        );
+        let timestamps: Vec<i64> = iter.map(|s| s.timestamp).collect();
+        assert_eq!(timestamps, expected);
     }
 
     #[test]
