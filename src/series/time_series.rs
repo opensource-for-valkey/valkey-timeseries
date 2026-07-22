@@ -220,6 +220,20 @@ impl TimeSeries {
     ) -> SampleAddResult {
         let sample = self.make_sample(ts, value);
 
+        // Retention is decided before the duplicate policy, matching RedisTimeSeries: an item
+        // below the window is `TooOld` even when a sample already sits at its timestamp.
+        //
+        // `upsert_sample` also tests this, but only on the `ts <= first_timestamp` branch —
+        // a proxy that holds solely once the trim has run. Callers that defer the trim (the
+        // TS.MADD fallback for in-batch duplicates) still hold the pre-trim samples, so
+        // `first_timestamp` is stale, the branch is skipped, and the stale sample answers as a
+        // DUPLICATE_POLICY violation instead. `is_older_than_retention` reads the floor from
+        // the last timestamp rather than the first, so it is correct either way. For an
+        // append (`ts > last_ts`) it can never fire.
+        if self.is_older_than_retention(ts) {
+            return SampleAddResult::TooOld;
+        }
+
         if let Some(last) = self.last_sample {
             let last_ts = last.timestamp;
 
