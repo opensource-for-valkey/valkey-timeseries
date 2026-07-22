@@ -1,0 +1,50 @@
+{
+  "description": "A TS.MADD item that back-fills an already-closed bucket recalculates that bucket from the source as it stood when the item would have been applied sequentially: RTS applies items one at a time in argument order, each item above the running maximum appending and each item at or below it back-filling, with the retention trim running between items. So the recalculation sees the window implied by the running maximum at that item's position -- which drops a sample an earlier item in the same batch pushed out of retention. Appends are unaffected: a bucket closed by an append still publishes the value it accumulated, including a sample the trim evicts immediately afterwards. Merging the batch as one sorted run against the pre-batch last timestamp erases both halves -- on a series the batch itself populates every item outranks `prev_last`, so nothing is recognised as a back-fill and the expired sample stays folded into the bucket (sum reports 6 where RTS reports 1).",
+  "origin": "fuzzer shrink 2026-07-22",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:bf0", "RETENTION", "1000", "DUPLICATE_POLICY", "BLOCK"],
+    ["TS.CREATE", "fz:bf0r"],
+    ["TS.CREATERULE", "fz:bf0", "fz:bf0r", "AGGREGATION", "avg", "2000"],
+    ["TS.MADD", "fz:bf0", "0", "0", "fz:bf0", "2000", "0", "fz:bf0", "1000", "1"],
+    ["TS.RANGE", "fz:bf0r", "-", "+"],
+    ["TS.RANGE", "fz:bf0", "-", "+"],
+    ["TS.GET", "fz:bf0r"],
+
+    ["TS.CREATE", "fz:bf1", "RETENTION", "1000"],
+    ["TS.CREATE", "fz:bf1r"],
+    ["TS.CREATERULE", "fz:bf1", "fz:bf1r", "AGGREGATION", "sum", "2000"],
+    ["TS.MADD", "fz:bf1", "0", "5", "fz:bf1", "2000", "0", "fz:bf1", "1000", "1"],
+    ["TS.RANGE", "fz:bf1r", "-", "+"],
+
+    ["TS.CREATE", "fz:bf2", "RETENTION", "1000"],
+    ["TS.CREATE", "fz:bf2r"],
+    ["TS.CREATERULE", "fz:bf2", "fz:bf2r", "AGGREGATION", "avg", "2000"],
+    ["TS.MADD", "fz:bf2", "0", "0", "fz:bf2", "2000", "0"],
+    ["TS.RANGE", "fz:bf2r", "-", "+"],
+    ["TS.RANGE", "fz:bf2", "-", "+"],
+
+    ["TS.CREATE", "fz:bf3", "RETENTION", "1000"],
+    ["TS.CREATE", "fz:bf3r"],
+    ["TS.CREATERULE", "fz:bf3", "fz:bf3r", "AGGREGATION", "count", "500"],
+    ["TS.INCRBY", "fz:bf3", "1", "TIMESTAMP", "1"],
+    ["TS.MADD", "fz:bf3", "1001", "0", "fz:bf3", "0", "0"],
+    ["TS.RANGE", "fz:bf3r", "-", "+"],
+    ["TS.GET", "fz:bf3r"],
+
+    ["TS.CREATE", "fz:bf4", "RETENTION", "500"],
+    ["TS.CREATE", "fz:bf4r"],
+    ["TS.CREATERULE", "fz:bf4", "fz:bf4r", "AGGREGATION", "avg", "2000"],
+    ["TS.MADD", "fz:bf4", "0", "0", "fz:bf4", "2000", "0", "fz:bf4", "1000", "1", "fz:bf4", "1600", "4"],
+    ["TS.RANGE", "fz:bf4r", "-", "+"],
+    ["TS.RANGE", "fz:bf4", "-", "+"],
+
+    ["TS.CREATE", "fz:bf5", "RETENTION", "1000"],
+    ["TS.CREATE", "fz:bf5r"],
+    ["TS.CREATERULE", "fz:bf5", "fz:bf5r", "AGGREGATION", "count", "500"],
+    ["TS.INCRBY", "fz:bf5", "1", "TIMESTAMP", "1"],
+    ["TS.MADD", "fz:bf5", "0", "0", "fz:bf5", "1100", "0"],
+    ["TS.RANGE", "fz:bf5r", "-", "+"],
+    ["TS.RANGE", "fz:bf5", "-", "+"]
+  ]
+}

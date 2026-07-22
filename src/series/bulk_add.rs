@@ -3,7 +3,7 @@
 //! This module provides bulk insertion of samples into a time series, with support for duplicate
 //! policies and automatic compaction handling. It is optimized for high-throughput data ingestion
 //! scenarios by leveraging parallel processing and efficient sample merging.
-use crate::common::Sample;
+use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::index::with_timeseries_postings;
@@ -452,11 +452,14 @@ pub fn bulk_insert_samples(
 
         // `results` follow the caller's input order; batch compaction needs ascending
         // timestamps. TS.ADDBULK pre-sorts its input, so this is normally a no-op check.
+        // The pre-sort order is kept separately: the DIV-0023 forward-close marker is
+        // input-order sensitive (see `last_forward_close_in_input_order`).
+        let input_order: Vec<Timestamp> = added.iter().map(|s| s.timestamp).collect();
         if !added.is_sorted_by_key(|s| s.timestamp) {
             added.sort_unstable_by_key(|s| s.timestamp);
         }
 
-        if let Err(e) = series.batch_compaction(ctx, &added, prev_last) {
+        if let Err(e) = series.batch_compaction(ctx, &added, prev_last, &input_order) {
             ctx.log_warning(&format!(
                 "Failed to run compactions after bulk insert samples: {e:?}"
             ))
