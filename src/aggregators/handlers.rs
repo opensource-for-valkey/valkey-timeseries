@@ -88,15 +88,6 @@ impl Hash for FirstAggregator {
 #[derive(Copy, Clone, Default, Debug, PartialEq, GetSize)]
 pub struct LastAggregator {
     current: Option<f64>,
-    /// The most recent value this aggregator ever saw, kept across `reset`.
-    ///
-    /// `last` is the one aggregator whose EMPTY fill is not a constant: RTS
-    /// reports the carried-forward previous value for a gap bucket (a gap means
-    /// "no new reading", so the last reading still stands), where every other
-    /// aggregator fills with NaN or 0. Query-time only — deliberately not part
-    /// of the RDB payload below, which stays the plain `Option<f64>` a
-    /// compaction rule has always persisted.
-    carried: Option<f64>,
 }
 
 impl AggregationHandler for LastAggregator {
@@ -109,9 +100,6 @@ impl AggregationHandler for LastAggregator {
     }
 
     fn reset(&mut self) {
-        if self.current.is_some() {
-            self.carried = self.current;
-        }
         self.current = None;
     }
 
@@ -119,8 +107,17 @@ impl AggregationHandler for LastAggregator {
         self.current
     }
 
+    /// NaN, like every other non-counting aggregator.
+    ///
+    /// `last` is the one aggregator whose EMPTY fill is not a constant — RTS reports the
+    /// previous value for a gap bucket, a gap meaning "no new reading, so the last reading
+    /// still stands". That carry cannot be done here: it runs in **output** order, and a
+    /// reverse query aggregates forward and reverses the finished buckets, so the value a
+    /// gap must inherit is one this aggregator has not seen yet. `carry_last_empty_buckets`
+    /// applies it after the reversal instead, which lands on RTS in both directions
+    /// (forward `7,7,7,9`; reverse `9,9,9,7`).
     fn empty_value(&self) -> Value {
-        self.carried.unwrap_or(f64::NAN)
+        f64::NAN
     }
 }
 
@@ -132,16 +129,12 @@ impl RdbSerializable for LastAggregator {
     where
         Self: Sized,
     {
-        rdb_load_optional_f64(rdb).map(|current| Self {
-            current,
-            carried: None,
-        })
+        rdb_load_optional_f64(rdb).map(|current| Self { current })
     }
 }
 
 impl Hash for LastAggregator {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // `carried` is query-time EMPTY-fill state, not part of the identity.
         hash_f64(self.current.unwrap_or(f64::NAN), state);
     }
 }

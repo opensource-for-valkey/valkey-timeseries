@@ -1,4 +1,4 @@
-use crate::aggregators::{AggregateIterator, MultiAggregateIterator};
+use crate::aggregators::{AggregateIterator, AggregationType, MultiAggregateIterator};
 use crate::common::hash::IntSet;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::iterators::{ReduceIterator, TimestampFilterIterator};
@@ -156,23 +156,37 @@ pub fn create_row_iterator<'a>(
     let aligned_timestamp = aggregation
         .alignment
         .get_aligned_timestamp(start_ts, end_ts);
-    let aggr_iter = MultiAggregateIterator::new(filtered, aggregation, aligned_timestamp);
+    // Same scan-order swap the sample path applies: this stream is aggregated forward and
+    // reversed at the end too, so `first`/`last` have to be exchanged for a reverse query.
+    let carry = last_carry_mask(aggregation);
+    let scan_aggregation = aggregation.for_scan_order(is_reverse);
+    let aggr_iter = MultiAggregateIterator::new(filtered, &scan_aggregation, aligned_timestamp);
 
-    finalize_row_iterator(aggr_iter, is_reverse, options.count)
+    finalize_row_iterator(aggr_iter, is_reverse, options.count, carry)
 }
 
-/// Apply reversal and COUNT to a row stream (COUNT limits output buckets,
-/// exactly like the sample path).
+/// Apply reversal, the `last` EMPTY carry and COUNT to a row stream (COUNT limits output
+/// buckets, exactly like the sample path).
 pub(crate) fn finalize_row_iterator<'a, I: Iterator<Item = MultiSample> + 'a>(
     iter: I,
     is_reverse: bool,
     count: Option<usize>,
+    carry: Option<SmallVec<[bool; 2]>>,
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
-    if is_reverse {
-        let rev = ReverseIter::new(iter);
-        apply_iter_limit!(rev, count)
-    } else {
-        apply_iter_limit!(iter, count)
+    match (is_reverse, carry) {
+        (true, Some(mask)) => {
+            let filled = CarryLastEmpty::new(ReverseIter::new(iter), mask);
+            apply_iter_limit!(filled, count)
+        }
+        (true, None) => {
+            let rev = ReverseIter::new(iter);
+            apply_iter_limit!(rev, count)
+        }
+        (false, Some(mask)) => {
+            let filled = CarryLastEmpty::new(iter, mask);
+            apply_iter_limit!(filled, count)
+        }
+        (false, None) => apply_iter_limit!(iter, count),
     }
 }
 
@@ -209,41 +223,141 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     let count = options.count;
 
-    // Helper to apply reversal and limits, then box.
+    // Helper to apply reversal, the EMPTY carry and limits, then box.
     // This ensures we only box once at the very end of the chain.
+    //
+    // Order matters: the carry runs on the reversed stream (output order) but before COUNT,
+    // so a truncated reply still carries from the buckets that precede it.
     fn finalize<'a, I: Iterator<Item = Sample> + 'a>(
         iter: I,
         is_reverse: bool,
         count: Option<usize>,
+        carry: Option<SmallVec<[bool; 2]>>,
     ) -> Box<dyn Iterator<Item = Sample> + 'a> {
-        if is_reverse {
-            let rev = ReverseIter::new(iter);
-            apply_iter_limit!(rev, count)
-        } else {
-            apply_iter_limit!(iter, count)
+        match (is_reverse, carry) {
+            (true, Some(mask)) => {
+                let filled = CarryLastEmpty::new(ReverseIter::new(iter), mask);
+                apply_iter_limit!(filled, count)
+            }
+            (true, None) => {
+                let rev = ReverseIter::new(iter);
+                apply_iter_limit!(rev, count)
+            }
+            (false, Some(mask)) => {
+                let filled = CarryLastEmpty::new(iter, mask);
+                apply_iter_limit!(filled, count)
+            }
+            (false, None) => apply_iter_limit!(iter, count),
         }
     }
 
     match (&options.aggregation, grouping) {
         (Some(agg), Some(grp)) => {
-            let agg = agg.for_scan_order(is_reverse);
-            let aggr_iter = create_aggregate_iterator(filtered, options, &agg);
+            // No carry here: the group reducer combines across series, so a gap in one
+            // series is not a gap in the reduced bucket.
+            let scan_agg = agg.for_scan_order(is_reverse);
+            let aggr_iter = create_aggregate_iterator(filtered, options, &scan_agg);
             let aggregator = grp.aggregation.create_aggregator();
             let reducer = ReduceIterator::new(aggr_iter, aggregator);
-            finalize(reducer, is_reverse, count)
+            finalize(reducer, is_reverse, count, None)
         }
         (None, Some(grp)) => {
             let aggregator = grp.aggregation.create_aggregator();
             let reducer = ReduceIterator::new(filtered, aggregator);
-            finalize(reducer, is_reverse, count)
+            finalize(reducer, is_reverse, count, None)
         }
         (Some(agg), None) => {
-            let agg = agg.for_scan_order(is_reverse);
-            let aggr_iter = create_aggregate_iterator(filtered, options, &agg);
-            finalize(aggr_iter, is_reverse, count)
+            let carry = last_carry_mask(agg);
+            let scan_agg = agg.for_scan_order(is_reverse);
+            let aggr_iter = create_aggregate_iterator(filtered, options, &scan_agg);
+            finalize(aggr_iter, is_reverse, count, carry)
         }
-        (None, None) => finalize(filtered, is_reverse, count),
+        (None, None) => finalize(filtered, is_reverse, count, None),
     }
+}
+
+/// One value slot of an emitted bucket, so the EMPTY carry can be applied to the sample
+/// stream and the multi-aggregation row stream through the same adapter.
+pub(crate) trait BucketValues {
+    fn values_mut(&mut self) -> &mut [f64];
+}
+
+impl BucketValues for Sample {
+    fn values_mut(&mut self) -> &mut [f64] {
+        std::slice::from_mut(&mut self.value)
+    }
+}
+
+impl BucketValues for MultiSample {
+    fn values_mut(&mut self) -> &mut [f64] {
+        &mut self.values
+    }
+}
+
+/// Fills each `last` column's gap buckets with the previously *emitted* value.
+///
+/// RTS's EMPTY fill for `last` is "the value already reported for the preceding bucket",
+/// which is a statement about output order, not about time: forward over `7 _ _ _ 9` it
+/// reports `7,7,7,9`, and in reverse it reports `9,9,9,7`. Running in output order — after
+/// `ReverseIter` — is what makes one rule cover both, and it is also why the aggregator
+/// itself cannot do the carry (see `LastAggregator::empty_value`).
+///
+/// `carry[i]` marks the columns whose *requested* aggregator is `last`. It must be built
+/// from the request rather than from the aggregators actually running, because a reverse
+/// query swaps `first`/`last` to compensate for scanning forward (`for_scan_order`) — the
+/// fill rule follows the name the caller asked for, while the swap only decides which
+/// sample of a non-empty bucket wins.
+pub(crate) struct CarryLastEmpty<I: Iterator> {
+    inner: I,
+    carry: SmallVec<[bool; 2]>,
+    prev: SmallVec<[f64; 2]>,
+}
+
+impl<I: Iterator> CarryLastEmpty<I> {
+    pub fn new(inner: I, carry: SmallVec<[bool; 2]>) -> Self {
+        let prev = smallvec::smallvec![f64::NAN; carry.len()];
+        Self { inner, carry, prev }
+    }
+}
+
+impl<I: Iterator> Iterator for CarryLastEmpty<I>
+where
+    I::Item: BucketValues,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut item = self.inner.next()?;
+        for (idx, value) in item.values_mut().iter_mut().enumerate() {
+            if self.carry.get(idx).copied() != Some(true) {
+                continue;
+            }
+            if value.is_nan() {
+                *value = self.prev[idx];
+            } else {
+                self.prev[idx] = *value;
+            }
+        }
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// Which output columns need the `last` EMPTY carry, or `None` when none do (the common
+/// case, so the adapter is skipped entirely).
+pub(crate) fn last_carry_mask(options: &AggregationOptions) -> Option<SmallVec<[bool; 2]>> {
+    if !options.report_empty {
+        return None;
+    }
+    let mask: SmallVec<[bool; 2]> = options
+        .aggregations
+        .iter()
+        .map(|a| matches!(a.aggregation_type(), AggregationType::Last))
+        .collect();
+    mask.iter().any(|c| *c).then_some(mask)
 }
 
 /// Buffers the inner iterator and yields its items in reverse order.
