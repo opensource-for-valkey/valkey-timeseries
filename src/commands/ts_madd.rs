@@ -197,6 +197,10 @@ fn parse_args<'a>(
         } else {
             let ts = match parse_timestamp(timestamp_str) {
                 Ok(ts) => ts,
+                Err(ValkeyError::Str(msg)) => {
+                    res = SampleAddResult::Error(msg);
+                    0
+                }
                 Err(_) => {
                     res = SampleAddResult::Error(error_consts::INVALID_TIMESTAMP);
                     0

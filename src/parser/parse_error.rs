@@ -16,6 +16,11 @@ pub enum ParseError {
     InvalidDuration(String),
     #[error("Expected positive unix millis or rfc3339 timestamp: found `{0}`")]
     InvalidTimestamp(String),
+    /// Parsed cleanly as a number but is negative. Kept distinct from
+    /// `InvalidTimestamp` so the write path can report RedisTimeSeries'
+    /// separate "must be a nonnegative integer" message.
+    #[error("Expected a nonnegative timestamp: found `{0}`")]
+    NegativeTimestamp(String),
     #[error("Expected number: found `{0}`")]
     InvalidNumber(String),
     #[error("Syntax Error: `{0}`")]

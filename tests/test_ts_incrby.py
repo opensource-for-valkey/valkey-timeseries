@@ -174,7 +174,7 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         # Test with invalid timestamp
         self.verify_error_response(
             self.client, 'TS.INCRBY ts_err 5 TIMESTAMP invalid',
-            "TSDB: invalid timestamp."
+            "TSDB: invalid timestamp"
         )
 
         # Test with invalid option (ON_DUPLICATE is not a valid option)

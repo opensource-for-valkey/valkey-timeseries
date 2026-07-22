@@ -88,6 +88,19 @@ class TestAddRange:
         diff("TS.DECRBY", "smoke:ctr", 3, "TIMESTAMP", 300)
         diff("TS.RANGE", "smoke:ctr", "-", "+")
 
+    @pytest.mark.parametrize("command", ["TS.INCRBY", "TS.DECRBY"])
+    def test_negative_timestamp_is_rejected(self, diff, command):
+        """DIV-0032/DIV-0033: we validate where RTS does not.
+
+        The reference accepts this and stores a sample at the negative timestamp, so the
+        key is used once and never read back — the two engines hold different state
+        afterwards by design. Going through `diff` (rather than asserting on the subject
+        alone) is what records the divergence and keeps the registry entries live.
+        """
+        key = f"smoke:negts:{command}"
+        with pytest.raises(ResponseError, match="must be a nonnegative integer"):
+            diff(command, key, 1, "TIMESTAMP", -1000)
+
     def test_del_boundary_inclusivity(self, diff):
         _mk(diff, "smoke:del")
         for ts in (100, 200, 300, 400, 500):

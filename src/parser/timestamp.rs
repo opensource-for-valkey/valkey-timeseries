@@ -1,5 +1,19 @@
+use crate::error_consts;
 use crate::parser::parse_error::{ParseError, ParseResult};
 use speedate::DateTime;
+
+/// Maps a timestamp parse failure to the client-facing message.
+///
+/// RedisTimeSeries reports a well-formed but negative timestamp differently from one it
+/// could not parse at all, so the two cases must not collapse into a single message.
+/// The range family deliberately ignores this and reports a bad bound positionally
+/// (`wrong fromTimestamp` / `wrong toTimestamp`) whatever the underlying cause.
+pub fn timestamp_error(err: &ParseError) -> &'static str {
+    match err {
+        ParseError::NegativeTimestamp(_) => error_consts::NEGATIVE_TIMESTAMP,
+        _ => error_consts::INVALID_TIMESTAMP,
+    }
+}
 
 /// Parses a string into a unix timestamp (milliseconds). Accepts a positive integer or an RFC3339 timestamp.
 /// Included here only to avoid having to include chrono in the public API
@@ -12,7 +26,7 @@ pub fn parse_timestamp(s: &str, auto_scale: bool) -> ParseResult<i64> {
         value.timestamp_ms()
     };
     if value < 0 {
-        return Err(ParseError::InvalidTimestamp(s.to_string()));
+        return Err(ParseError::NegativeTimestamp(s.to_string()));
     }
     Ok(value)
 }
