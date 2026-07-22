@@ -7,8 +7,8 @@ common dimensions: missing key, WRONGTYPE, arg parsing, RESP2/RESP3.
 
 TS.MGET shares the filter grammar with TS.MRANGE, so the deep filter-language
 coverage lives in test_compat_mrange.py; here it is exercised enough to confirm
-MGET wires the same parser (including the Prometheus-superset divergences
-DIV-0019/DIV-0020).
+MGET wires the same parser (including the Prometheus-superset divergence
+DIV-0020 and the boundedness rule that retired DIV-0019).
 
 Cross-series replies are order-normalized (sort by key); within a series the
 single sample must match exactly (compat_normalize._normalize_multi_series).
@@ -179,15 +179,15 @@ class TestMgetArgParsing:
 
 
 class TestMgetFilterSupersets:
-    """The Prometheus-superset FILTER divergences (DIV-0019/DIV-0020) apply to
-    TS.MGET too, since it shares the selector parser. Pinned per-engine because
-    an accepted-input superset is non-registrable (plan §5.2)."""
+    """The Prometheus-superset FILTER divergence (DIV-0020) applies to TS.MGET too,
+    since it shares the selector parser, and is pinned per-engine because an
+    accepted-input superset is non-registrable (plan §5.2). The negative-only case
+    below is no longer a superset — both engines reject it — so it goes through `diff`."""
 
-    def test_negative_only_matcher_is_a_superset(self, diff):
+    def test_negative_only_matcher_rejected(self, diff):
         mk_label_universe(diff)
-        with pytest.raises(ResponseError):
-            diff.reference.execute_command("TS.MGET", "FILTER", "metric!=cpu")
-        diff.subject.execute_command("TS.MGET", "FILTER", "metric!=cpu")
+        with pytest.raises(ResponseError, match="please provide at least one matcher"):
+            diff("TS.MGET", "FILTER", "metric!=cpu")
 
     def test_bare_metric_name_matcher_is_a_superset(self, diff):
         mk_label_universe(diff)

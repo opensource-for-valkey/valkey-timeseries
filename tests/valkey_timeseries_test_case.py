@@ -244,7 +244,10 @@ class ValkeyTimeSeriesTestCaseCommon(ValkeyTestCase):
     # label, so that a query never degenerates into a full keyspace scan. Filters are
     # conjunctive, so the requirement applies to the list as a whole: one bounded filter
     # licenses any number of negative or empty-matching ones alongside it.
-    UNBOUNDED_FILTER_ERROR = "at least one matcher that does not match the empty string"
+    #
+    # The message is RedisTimeSeries' own text for the same condition — deliberately not a
+    # more descriptive one, so a client migrating from RTS sees the wording it expects.
+    UNBOUNDED_FILTER_ERROR = "please provide at least one matcher"
 
     def assert_filters_rejected(self, *args, client=None):
         """Assert a command is rejected because its filter list lacks a bounded matcher."""

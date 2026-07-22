@@ -215,7 +215,7 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 > (`tests/compat/test_compat_get.py`), `TS.QUERYINDEX` (`tests/compat/test_compat_queryindex.py`),
 > and the compaction deep-dive (`tests/compat/test_compat_compaction.py`) are landed and fully
 > green — **the §6 read-path matrix is complete.** TS.QUERYINDEX needed no subject change: it
-> mirrors the MGET filter behavior (including the DIV-0019/0020 Prometheus supersets) and its
+> mirrors the MGET filter behavior (including the DIV-0020 Prometheus superset) and its
 > detailed parser diagnostics are a deliberate feature. The GET matrix found and fixed one subject
 > bug: TS.GET reported
 > valkey-module-rs's raw "Existing key has wrong Valkey type" on a WRONGTYPE key where RTS (and our

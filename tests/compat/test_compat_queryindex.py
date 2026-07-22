@@ -6,10 +6,11 @@ requires-non-empty-matcher error. Runs under RESP2 and RESP3 (the reply is a
 flat key list, a set in RESP3, both order-normalized by
 compat_normalize._normalize_queryindex).
 
-TS.QUERYINDEX shares the label-filter grammar with TS.MRANGE/TS.MGET, so the two
-Prometheus-superset divergences carry over here (DIV-0019 negative-only matcher,
-DIV-0020 bare metric-name matcher); they are pinned per-engine because an
-accepted-input superset is non-registrable (plan §5.2).
+TS.QUERYINDEX shares the label-filter grammar with TS.MRANGE/TS.MGET, so the
+Prometheus-superset divergence carries over here (DIV-0020, bare metric-name
+matcher); it is pinned per-engine because an accepted-input superset is
+non-registrable (plan §5.2). The negative-only matcher that was DIV-0019 is
+rejected by both engines and is diffed normally.
 
 Written clean-room from public RedisTimeSeries documentation and black-box
 observation of the reference server. Do NOT consult RedisTimeSeries source or
@@ -100,13 +101,13 @@ class TestErrors:
 
 
 class TestFilterSupersets:
-    """DIV-0019/DIV-0020 carry over to TS.QUERYINDEX (shared selector parser)."""
+    """DIV-0020 carries over to TS.QUERYINDEX (shared selector parser), as does the
+    boundedness rule that retired DIV-0019."""
 
-    def test_negative_only_matcher_is_a_superset(self, diff):
+    def test_negative_only_matcher_rejected(self, diff):
         mk_label_universe(diff)
-        with pytest.raises(ResponseError):
-            diff.reference.execute_command("TS.QUERYINDEX", "metric!=cpu")
-        diff.subject.execute_command("TS.QUERYINDEX", "metric!=cpu")
+        with pytest.raises(ResponseError, match="please provide at least one matcher"):
+            diff("TS.QUERYINDEX", "metric!=cpu")
 
     def test_bare_metric_name_matcher_is_a_superset(self, diff):
         mk_label_universe(diff)
