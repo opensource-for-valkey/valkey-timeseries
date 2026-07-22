@@ -16,7 +16,11 @@ struct AggregationHelper {
     bucket_range_end: Timestamp,
     align_timestamp: Timestamp,
     has_samples: bool,
-    count: usize,
+    /// Whether the current bucket received any sample at all, NaN or not. Distinct from
+    /// `has_samples`, which means "received a sample that counts": an all-NaN bucket is empty
+    /// (so it is omitted, or takes the EMPTY fill), but it is still a bucket that was started,
+    /// and the trailing one must not be dropped by `finalize_last_bucket_if_any`.
+    saw_sample: bool,
     report_empty: bool,
 }
 
@@ -37,7 +41,7 @@ impl AggregationHelper {
             bucket_range_end: 0,
             align_timestamp,
             has_samples: false,
-            count: 0,
+            saw_sample: false,
             report_empty: options.report_empty,
         }
     }
@@ -93,7 +97,12 @@ impl AggregationHelper {
         last_ts: Option<Timestamp>,
         empty_buckets: &mut VecDeque<MultiSample>,
     ) -> Option<MultiSample> {
-        let bucket = if self.count > 0 {
+        // `has_samples`, not a raw sample count: a bucket holding only NaNs is empty as far
+        // as RedisTimeSeries is concerned — without EMPTY it is omitted, with EMPTY it takes
+        // the same fill as a bucket that held no samples at all. Counting raw samples emitted
+        // it as a real bucket instead (reference-checked: `TS.RANGE` over a bucket of NaNs
+        // returns nothing).
+        let bucket = if self.has_samples {
             Some(MultiSample::new(
                 self.output_timestamp(),
                 self.aggregators
@@ -126,17 +135,22 @@ impl AggregationHelper {
         }
 
         self.has_samples = false;
-        self.count = 0;
+        self.saw_sample = false;
         bucket
     }
 
     fn update(&mut self, sample: Sample) {
         for aggregator in self.aggregators.iter_mut() {
-            if aggregator.update(sample.timestamp, sample.value) {
-                self.has_samples = true;
-            }
+            aggregator.update(sample.timestamp, sample.value);
         }
-        self.count += 1;
+        // Emptiness is a property of the bucket's samples, not of the aggregators running over
+        // it: deriving it from whether some aggregator accepted the update would make the same
+        // bucket present in a multi-aggregation reply and absent in the single-aggregation one
+        // (`count_nan` accepts only NaNs, so a bucket of ordinary readings would vanish).
+        if !sample.value.is_nan() {
+            self.has_samples = true;
+        }
+        self.saw_sample = true;
     }
 
     #[inline]
@@ -311,7 +325,7 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     }
 
     fn finalize_last_bucket_if_any(&mut self) -> Option<MultiSample> {
-        if self.aggregator.count == 0 {
+        if !self.aggregator.saw_sample {
             return None;
         }
 
@@ -561,12 +575,9 @@ mod tests {
         let iterator = AggregateIterator::new(samples.into_iter(), &options, 0);
         let result: Vec<Sample> = iterator.collect();
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].timestamp, 10);
-        // All NaNs should be ignored, sum = 0.0
-        assert_eq!(result[0].value, 0.0);
-        assert_eq!(result[1].timestamp, 20);
-        assert_eq!(result[1].value, 0.0);
+        // Every bucket holds only NaNs, so every bucket is empty and omitted. With EMPTY
+        // they would come back as 0.0 -- see `test_sum_all_nans_report_empty`.
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -663,13 +674,12 @@ mod tests {
         let iterator = AggregateIterator::new(samples.into_iter(), &options, 0);
         let result: Vec<Sample> = iterator.collect();
 
-        assert_eq!(result.len(), 3);
+        // The trailing [30, 40) bucket holds only NaNs, so it is empty and omitted.
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0].timestamp, 10);
         assert_eq!(result[0].value, 1.0); // only the non-NaN sample is counted
         assert_eq!(result[1].timestamp, 20);
         assert_eq!(result[1].value, 1.0); // NaN is ignored, valid sample still counts
-        assert_eq!(result[2].timestamp, 30);
-        assert_eq!(result[2].value, 0.0); // all-NaN bucket yields an empty count
     }
 
     #[test]
@@ -685,11 +695,9 @@ mod tests {
         let iterator = AggregateIterator::new(samples.into_iter(), &options, 0);
         let result: Vec<Sample> = iterator.collect();
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].timestamp, 10);
-        assert_eq!(result[0].value, 0.0);
-        assert_eq!(result[1].timestamp, 20);
-        assert_eq!(result[1].value, 0.0);
+        // A bucket holding only NaNs is empty, so without EMPTY it is omitted rather than
+        // reported as a zero count (reference-checked against RedisTimeSeries 8.6).
+        assert!(result.is_empty());
     }
 
     #[test]

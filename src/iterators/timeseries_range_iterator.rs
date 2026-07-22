@@ -482,12 +482,15 @@ mod tests {
         let samples: Vec<Sample> =
             TimeSeriesRangeIterator::new(None, &series, &options, true).collect();
 
-        // Reverse order: bucket [2000, 4000) first, then [0, 2000)
+        // RedisTimeSeries defines first/last against the *scan*, not against time: under
+        // TS.REVRANGE, `last` is the bucket's OLDEST non-NaN sample. Buckets come back newest
+        // first, so [2000, 4000) yields 5.0 (at t=2000) and [0, 2000) yields 1.0 (at t=0).
+        // Reference-checked against RedisTimeSeries 8.6.
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].timestamp, 2000);
-        assert_eq!(samples[0].value, 7.0);
+        assert_eq!(samples[0].value, 5.0);
         assert_eq!(samples[1].timestamp, 0);
-        assert_eq!(samples[1].value, 3.0);
+        assert_eq!(samples[1].value, 1.0);
     }
 
     #[test]
@@ -520,13 +523,12 @@ mod tests {
         let samples: Vec<Sample> =
             TimeSeriesRangeIterator::new(None, &series, &options, false).collect();
 
-        // Bucket [0, 2000) has only NaNs — result should be NaN
-        // Bucket [2000, 4000) last non-NaN is 7.0
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].timestamp, 0);
-        assert!(samples[0].value.is_nan());
-        assert_eq!(samples[1].timestamp, 2000);
-        assert_eq!(samples[1].value, 7.0);
+        // Bucket [0, 2000) holds only NaNs, so it is empty and — without EMPTY — omitted
+        // entirely rather than reported as NaN (reference-checked).
+        // Bucket [2000, 4000) last non-NaN is 7.0.
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].timestamp, 2000);
+        assert_eq!(samples[0].value, 7.0);
     }
 
     #[test]
