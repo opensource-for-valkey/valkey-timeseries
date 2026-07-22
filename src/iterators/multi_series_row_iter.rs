@@ -2,14 +2,17 @@ use crate::common::MultiSample;
 use min_max_heap::MinMaxHeap;
 use std::cmp::Ordering;
 
-/// Heap entry ordering rows by bucket timestamp only. Rows with equal
-/// timestamps compare equal — the downstream reducer groups by timestamp, so
-/// their relative order does not matter.
-struct RowEntry(MultiSample);
+/// Heap entry ordering rows by bucket timestamp, with the source iterator index breaking
+/// ties so equal timestamps come out in series order. `source` also lets the merge refill
+/// exactly the iterator a row was taken from.
+struct RowEntry {
+    row: MultiSample,
+    source: usize,
+}
 
 impl PartialEq for RowEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.0.timestamp == other.0.timestamp
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -23,15 +26,22 @@ impl PartialOrd for RowEntry {
 
 impl Ord for RowEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.timestamp.cmp(&other.0.timestamp)
+        self.row
+            .timestamp
+            .cmp(&other.row.timestamp)
+            .then(self.source.cmp(&other.source))
     }
 }
 
-/// Iterate over multiple multi-aggregation row iterators, returning the rows
-/// in timestamp order. Structural clone of `MultiSeriesSampleIter`.
+/// Iterate over multiple multi-aggregation row iterators, returning the rows in timestamp
+/// order. Structural clone of `MultiSeriesSampleIter` — including its correctness argument:
+/// the heap holds the next unread row of **every** live iterator, and emitting one refills
+/// from that same iterator, so `pop_min` really is the global minimum. See the sibling for
+/// the out-of-order bug that arose from loading prefixes instead.
 pub struct MultiSeriesRowIter<T: Iterator<Item = MultiSample>> {
     heap: MinMaxHeap<RowEntry>,
     inner: Vec<T>,
+    primed: bool,
 }
 
 impl<T: Iterator<Item = MultiSample>> MultiSeriesRowIter<T> {
@@ -40,52 +50,18 @@ impl<T: Iterator<Item = MultiSample>> MultiSeriesRowIter<T> {
         Self {
             inner: list,
             heap: MinMaxHeap::with_capacity(len),
+            primed: false,
         }
     }
 
-    /// Push one row from each iterator to the heap.
-    /// Returns `true` if at least one row was added.
-    fn push_rows_to_heap(&mut self) -> bool {
-        let initial_len = self.heap.len();
-        for iter in &mut self.inner {
-            if let Some(row) = iter.next() {
-                self.heap.push(RowEntry(row));
+    /// Seed the heap with the first row of every iterator.
+    fn prime(&mut self) {
+        for source in 0..self.inner.len() {
+            if let Some(row) = self.inner[source].next() {
+                self.heap.push(RowEntry { row, source });
             }
         }
-        self.heap.len() > initial_len
-    }
-
-    /// Load rows to the heap, trying to ensure that the iterators are roughly
-    /// at the same timestamp. Removes exhausted iterators from `self.inner`.
-    fn load_heap(&mut self) -> bool {
-        if !self.push_rows_to_heap() {
-            return false;
-        }
-
-        let Some(upper_bound_timestamp) = self.heap.peek_max().map(|e| e.0.timestamp) else {
-            return false;
-        };
-
-        // Remove exhausted iterators in a single pass.
-        self.inner.retain_mut(|row_iter| {
-            let mut produced_any = false;
-
-            for row in row_iter.by_ref() {
-                produced_any = true;
-
-                let is_beyond_upper_bound = row.timestamp > upper_bound_timestamp;
-                self.heap.push(RowEntry(row));
-
-                // Stop once we have crossed the boundary; leave remaining items for later.
-                if is_beyond_upper_bound {
-                    break;
-                }
-            }
-
-            produced_any
-        });
-
-        true
+        self.primed = true;
     }
 }
 
@@ -93,10 +69,18 @@ impl<T: Iterator<Item = MultiSample>> Iterator for MultiSeriesRowIter<T> {
     type Item = MultiSample;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.heap.is_empty() && !self.load_heap() {
-            return None;
+        if !self.primed {
+            self.prime();
         }
-        self.heap.pop_min().map(|e| e.0)
+
+        let entry = self.heap.pop_min()?;
+        if let Some(row) = self.inner[entry.source].next() {
+            self.heap.push(RowEntry {
+                row,
+                source: entry.source,
+            });
+        }
+        Some(entry.row)
     }
 }
 
