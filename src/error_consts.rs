@@ -53,7 +53,7 @@ pub const UNBOUNDED_SERIES_FILTERS: &str =
 pub const INVALID_COMPATIBILITY_MODE: &str =
     "TSDB: invalid compatibility mode, expected one of: extended, strict";
 pub const INVALID_STEP_DURATION: &str = "TSDB: invalid step duration";
-pub const INVALID_TIMESTAMP: &str = "TSDB: invalid timestamp.";
+pub const INVALID_TIMESTAMP: &str = "TSDB: invalid timestamp";
 pub const UNKNOWN_AGGREGATION_TYPE: &str = "TSDB: Unknown aggregation type";
 pub const DUPLICATE_AGGREGATION: &str = "TSDB: duplicate aggregation";
 pub const TOO_MANY_AGGREGATIONS: &str = "TSDB: too many aggregations (max 16)";
@@ -64,7 +64,11 @@ pub const MULTI_AGGREGATION_UNSUPPORTED: &str =
     "TSDB: multiple aggregations are not supported for TS.JOIN";
 pub const INVALID_START_TIMESTAMP: &str = "TSDB: wrong fromTimestamp";
 pub const INVALID_END_TIMESTAMP: &str = "TSDB: wrong toTimestamp";
-pub const NEGATIVE_TIMESTAMP: &str = "TSDB: timestamps cannot be negative.";
+// Write-path rejection of a negative absolute timestamp. The range family does not use
+// this: it reports a bad bound positionally as INVALID_START/END_TIMESTAMP regardless of
+// why the bound failed to parse. Wording (including the unhyphenated "nonnegative") is
+// verbatim RedisTimeSeries 8.6.2, confirmed by probing the reference container.
+pub const NEGATIVE_TIMESTAMP: &str = "TSDB: invalid timestamp, must be a nonnegative integer";
 pub const ERROR_ADDING_SAMPLE: &str = "TSDB: error at add";
 pub const MISSING_TIMESTAMP_FILTER_VALUE: &str =
     "TSDB: FILTER_BY_TS one or more arguments are missing";

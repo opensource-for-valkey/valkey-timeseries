@@ -617,3 +617,44 @@
   rationale: see DIV-0030
   since: 0.1.0
   details_regex: '^\$(?:\[\d+\]\[2\]|\.[^\[]+\[2\]): reference=\[\] subject=\[\[.*\(length 0 vs \d+\)$'
+
+# DIV-0032..DIV-0033 (2026-07-22): the counter commands are the one place RTS forgets to
+# validate the timestamp. Unlike the DIV-0013 read-path extension, this is the *stricter*
+# direction — we reject input RTS accepts — so it is registrable (§5.2 only hard-fails the
+# accepted-input-superset direction, "reference errors, subject succeeds").
+#
+# Both entries are scoped by details_regex to the nonnegative-timestamp message, so they
+# cover only this rejection and can not absorb another error-condition bug on these
+# commands. One entry per command because registry matching is per-command.
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-07-22 — stricter validation is preferred here.
+
+- id: DIV-0032
+  command: TS.INCRBY
+  kind: behavior
+  description: >
+    TS.INCRBY with a negative TIMESTAMP is rejected ("must be a nonnegative integer");
+    RTS 8.6.2 accepts it and stores a sample at that negative timestamp. TS.ADD and
+    TS.MADD reject it on both engines — the gap is specific to the counter commands.
+  rationale: >
+    Accepted (owner sign-off 2026-07-22, §5.3): an RTS validation gap, not intended
+    semantics. The sample RTS stores is unreachable — TS.RANGE key 0 + skips it and
+    TS.RANGE key -1000 + is itself rejected with "wrong fromTimestamp" — so it is
+    write-only, is reported by TS.INFO as firstTimestamp, and drags the series' reported
+    start before an unqueryable boundary. It also bypasses the out-of-order rejection the
+    same command applies to nonnegative timestamps. Matching RTS would mean reproducing a
+    bug that corrupts the retrievable range of a series, so we validate instead. Direction
+    of risk is the safe one: input we reject, RTS accepts, so nothing written against RTS
+    silently changes meaning here — it errors loudly.
+  since: 0.1.0
+  details_regex: 'must be a nonnegative integer'
+
+- id: DIV-0033
+  command: TS.DECRBY
+  kind: behavior
+  description: >
+    TS.DECRBY with a negative TIMESTAMP is rejected; RTS 8.6.2 accepts it. Same gap as
+    DIV-0032.
+  rationale: see DIV-0032
+  since: 0.1.0
+  details_regex: 'must be a nonnegative integer'

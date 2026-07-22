@@ -16,6 +16,7 @@ use crate::parser::number::parse_number;
 use crate::parser::{
     metric_name::parse_metric_name as parse_metric, number::parse_number as parse_number_internal,
     parse_positive_duration_value, timestamp::parse_timestamp as parse_timestamp_internal,
+    timestamp::timestamp_error,
 };
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
@@ -180,8 +181,7 @@ pub fn parse_timestamp(arg: &str) -> ValkeyResult<Timestamp> {
     if arg == "*" {
         return Ok(current_time_millis());
     }
-    parse_timestamp_internal(arg, false)
-        .map_err(|_| ValkeyError::Str(error_consts::INVALID_TIMESTAMP))
+    parse_timestamp_internal(arg, false).map_err(|e| ValkeyError::Str(timestamp_error(&e)))
 }
 
 pub fn parse_timestamp_arg(arg: &str, name: &str) -> Result<TimestampValue, ValkeyError> {
