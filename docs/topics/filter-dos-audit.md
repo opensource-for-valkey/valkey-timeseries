@@ -634,8 +634,8 @@ shipping) anything. What can be said today:
 every series; `TS.MRANGE - + FILTER host!=__nonexistent__` is the read form,
 `TS.MDEL ... FILTER host!=__nonexistent__` the destructive one.
 
-**F1, after the fix (this branch)** — the same input now returns a parse error ("selector must
-contain at least one matcher that does not match the empty string") before any index lookup
+**F1, after the fix (this branch)** — the same input now returns a parse error ("please provide at
+least one matcher", RedisTimeSeries' own wording for the same condition) before any index lookup
 happens. This is covered by unit tests in
 [`series_selector_tests.rs`](../../src/parser/series_selector_tests.rs) (e.g.
 `test_parse_series_selector_with_negated_label_matchers`,

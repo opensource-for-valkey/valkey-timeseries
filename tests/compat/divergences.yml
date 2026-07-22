@@ -309,30 +309,18 @@
     TestValueValidation::test_encoding_is_a_one_way_latch_on_reference.
   since: 0.1.0
 
-# DIV-0019/DIV-0020 are the Prometheus-style FILTER extensions: our label-filter
-# grammar is a superset of RTS's, so a few filters valid here are rejected by
-# RTS. Both are accepted-input supersets (§5.2, non-registrable) pinned by
-# per-engine assertions in test_compat_mrange.py; they apply equally to
-# TS.MGET and TS.QUERYINDEX. behavior-kind → owner sign-off required.
-
-- id: DIV-0019
-  command: TS.MRANGE
-  kind: behavior
-  documentation_only: true
-  description: >
-    A FILTER with no positive (intersecting) matcher — only negations
-    (`metric!=cpu`) or absence matchers (`region=`) — selects the complement.
-    RTS requires at least one equality matcher and rejects such a filter with
-    "please provide at least one matcher" (which is our MISSING_FILTER text, so
-    parity is enforceable if desired). Applies to TS.MRANGE/MGET/QUERYINDEX.
-  rationale: >
-    owner decision pending — our FILTER language is deliberately Prometheus-
-    style (the shared parser also backs the TS.MDEL/TS.CARD extensions), so a
-    complement query is a feature here. Restricting it to the in-scope commands
-    for RTS parity is a scoped change to the command parse layer, not the
-    shared selector parser. Pinned by
-    TestFilterLanguage::test_negative_only_matcher_is_a_superset.
-  since: 0.1.0
+# DIV-0020 is the surviving Prometheus-style FILTER extension: our label-filter grammar
+# is a superset of RTS's, so a bare metric-name token valid here is rejected by RTS. It is
+# an accepted-input superset (§5.2, non-registrable) pinned by per-engine assertions in
+# test_compat_mrange.py, and applies equally to TS.MGET and TS.QUERYINDEX.
+# behavior-kind → owner sign-off required.
+#
+# DIV-0019 covered the other half — a FILTER with no positive matcher (`metric!=cpu`,
+# `region=`) selecting the complement — and was removed 2026-07-22 when the boundedness
+# check made both engines reject it with the same text (owner decision: parity). Per the
+# "remove entries that stop firing" rule, the divergence is gone rather than registered.
+# Parity is now pinned by TestFilterLanguage::test_negative_only_matcher_rejected, with
+# the list-level rule that one bounded selector anywhere suffices covered alongside it.
 
 - id: DIV-0020
   command: TS.MRANGE
@@ -341,8 +329,7 @@
   description: >
     A bare token with no operator (`not-a-matcher`) is accepted as a Prometheus
     metric-name selector (matching nothing when no such metric exists); RTS
-    rejects it with "failed parsing labels". Same extended-grammar root as
-    DIV-0019; applies to TS.MRANGE/MGET/QUERYINDEX.
+    rejects it with "failed parsing labels". Applies to TS.MRANGE/MGET/QUERYINDEX.
   rationale: >
     owner decision pending — bare metric-name selectors are valid PromQL and a
     deliberate extension. Pinned by

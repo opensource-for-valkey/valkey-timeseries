@@ -112,9 +112,11 @@ BUCKET_TIMESTAMPS = ["-", "+", "~"]
 # extent, which the generator does not know here.
 MAX_EMPTY_BUCKETS = 5_000
 
-# Positive-anchored matchers over the labels the create phase emits. Every entry
-# has at least one `label=value` term, so none is a negative-only / bare-name
-# superset (DIV-0019/DIV-0020).
+# Positive-anchored matchers over the labels the create phase emits. Every entry has at
+# least one `label=value` term, so no generated filter list is a bare-name superset
+# (DIV-0020) or unbounded. Unbounded lists are no longer a divergence — both engines now
+# reject them identically — but generating one would only ever exercise that rejection,
+# so the soak stays on filters that actually select series.
 MATCHERS = [
     "metric=cpu", "metric=mem", "host=h1", "host=h2",
     "metric=(cpu,mem)", "host=(h1,h2)", "region=us",
@@ -342,7 +344,7 @@ def programs(draw) -> List[Command]:
     # we trim eagerly, so it is already gone), an owner-pending divergence pinned by
     # tests/compat/test_compat_del.py. Generating it here would trip the fuzzer on a
     # known divergence forever and drown the signal — the same reason twa (DIV-0012) and
-    # the FILTER supersets (DIV-0019/0020) are excluded above.
+    # the bare-name FILTER superset (DIV-0020) are excluded above.
     deletable: List[str] = []
     for key in keys:
         opts = draw(_create_options())

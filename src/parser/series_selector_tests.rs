@@ -16,7 +16,7 @@ mod tests {
             .expect_err("selector has no positive matcher");
         assert_eq!(
             err.to_string(),
-            error_consts::UNBOUNDED_SERIES_FILTERS,
+            error_consts::MISSING_FILTER,
             "unexpected error for {selector}"
         );
         parsed

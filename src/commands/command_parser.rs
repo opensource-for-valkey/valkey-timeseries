@@ -856,11 +856,16 @@ pub(crate) fn parse_ignore_options(args: &mut CommandArgIterator) -> ValkeyResul
 ///
 /// Must be called by every command that assembles a complete filter set — validating a single
 /// selector as it is parsed would reject legitimate multi-argument queries.
+///
+/// Reports `MISSING_FILTER`, the same text RTS uses, rather than naming the boundedness rule:
+/// the condition is identical on both engines (verified across single- and multi-selector
+/// lists), so a more descriptive message would be a gratuitous error-text divergence for a
+/// client migrating from RedisTimeSeries. It is also what the empty-list check below reports.
 pub fn validate_selector_list(selectors: &[SeriesSelector]) -> ValkeyResult<()> {
     if selectors.iter().any(SeriesSelector::is_bounded) {
         Ok(())
     } else {
-        Err(ValkeyError::Str(error_consts::UNBOUNDED_SERIES_FILTERS))
+        Err(ValkeyError::Str(error_consts::MISSING_FILTER))
     }
 }
 

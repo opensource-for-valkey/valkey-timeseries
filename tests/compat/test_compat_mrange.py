@@ -67,8 +67,8 @@ def _ref_rejects_subject_accepts(diff, *args):
     """Assert the reference rejects `args` while the subject accepts them.
 
     An accepted-input superset (plan §5.2) that is non-registrable and can not
-    be routed through `diff`. Used for the Prometheus-style FILTER extensions
-    (DIV-0019, DIV-0020) our engine supports beyond RTS.
+    be routed through `diff`. Used for the Prometheus-style FILTER extension
+    (DIV-0020) our engine supports beyond RTS.
     """
     with pytest.raises(ResponseError):
         diff.reference.execute_command(*args)
@@ -116,19 +116,26 @@ class TestFilterLanguage:
         diff(mrange_cmd, "-", "+", "FILTER", "metric=nope")
         diff(mrange_cmd, "-", "+", "FILTER", "metric=cpu", "host=nope")
 
-    def test_negative_only_matcher_is_a_superset(self, diff, mrange_cmd):
-        """DIV-0019: a filter with no positive matcher.
+    @pytest.mark.parametrize("matcher", ["metric!=cpu", "region=", "metric!="])
+    def test_negative_only_matcher_rejected(self, diff, mrange_cmd, matcher):
+        """A filter list with no bounded (intersecting) matcher is rejected by both.
 
-        RTS requires at least one intersecting (equality) matcher and rejects a
-        purely negative/absence filter with "please provide at least one
-        matcher". Our FILTER language is Prometheus-style, so `metric!=cpu` or
-        `region=` (absence) alone select the complement — an accepted-input
-        superset. The reference's rejection text already matches our
-        MISSING_FILTER, so this is enforceable if the owner chooses parity.
+        Purely negative or absence-only matchers have nothing to intersect against but
+        the whole keyspace. This was DIV-0019, an accepted-input superset, until the
+        boundedness check landed; both engines now reject and agree on the wording, so
+        it goes through `diff` — which compares the two errors and fails on any drift.
         """
         mk_label_universe(diff)
-        _ref_rejects_subject_accepts(diff, mrange_cmd, "-", "+", "FILTER", "metric!=cpu")
-        _ref_rejects_subject_accepts(diff, mrange_cmd, "-", "+", "FILTER", "region=")
+        with pytest.raises(ResponseError, match="please provide at least one matcher"):
+            diff(mrange_cmd, "-", "+", "FILTER", matcher)
+
+    def test_bounded_sibling_rescues_an_unbounded_matcher(self, diff, mrange_cmd):
+        """Boundedness is a property of the list: one bounded selector anywhere suffices,
+        in either order. Reference-checked — this is what keeps the rule above from
+        rejecting legitimate multi-matcher queries."""
+        mk_label_universe(diff)
+        diff(mrange_cmd, "-", "+", "FILTER", "metric=cpu", "host!=h2")
+        diff(mrange_cmd, "-", "+", "FILTER", "host!=h2", "metric=cpu")
 
     def test_bare_metric_name_matcher_is_a_superset(self, diff, mrange_cmd):
         """DIV-0020: a bare token with no operator.
