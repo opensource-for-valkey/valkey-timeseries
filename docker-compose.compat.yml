@@ -39,7 +39,7 @@ services:
   # as a local process by default, so this service is opt-in:
   #   docker compose -f docker-compose.compat.yml --profile subject-docker up -d
   subject:
-    image: valkey/valkey:8.1
+    image: valkey/valkey:9.1
     profiles: ["subject-docker"]
     volumes:
       - ./target/release/libvalkey_timeseries.so:/opt/module/libvalkey_timeseries.so:ro
