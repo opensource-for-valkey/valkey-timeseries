@@ -573,7 +573,7 @@ impl<'a> BatchIterator<'a> {
     fn adjusted_cardinality(inner: &Postings, bitmap: &PostingsBitmap, has_stale_ids: bool) -> u64 {
         let mut count = bitmap.cardinality();
         if has_stale_ids {
-            let stale_count = inner.stale_ids.and_cardinality(bitmap);
+            let stale_count = inner.stale_ids.stale_count_in(bitmap);
             if stale_count > 0 {
                 count = count.saturating_sub(stale_count);
             }

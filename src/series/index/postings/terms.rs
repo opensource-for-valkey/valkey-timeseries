@@ -15,8 +15,7 @@ impl Postings {
     /// If stale_ids is non-empty, this returns Owned.
     fn postings_for_key(&'_ self, key: &[u8]) -> Cow<'_, PostingsBitmap> {
         match self.label_index.get(key) {
-            Some(bmp) if self.stale_ids.is_empty() => Cow::Borrowed(bmp),
-            Some(bmp) => Cow::Owned(bmp.andnot(&self.stale_ids)),
+            Some(bmp) => self.stale_ids.mask_cow(Cow::Borrowed(bmp)),
             None => Cow::Borrowed(&*EMPTY_BITMAP),
         }
     }
@@ -24,7 +23,7 @@ impl Postings {
     /// Clone postings for a key (or empty), then remove stale IDs in-place.
     fn postings_for_key_owned(&self, key: &[u8]) -> PostingsBitmap {
         let mut out = self.label_index.get(key).cloned().unwrap_or_default();
-        self.remove_stale_if_needed(&mut out);
+        self.stale_ids.mask(&mut out);
         out
     }
 
@@ -72,7 +71,7 @@ impl Postings {
         for (_, map) in self.label_index.prefix(prefix.as_bytes()) {
             result |= map;
         }
-        self.remove_stale_if_needed(&mut result);
+        self.stale_ids.mask(&mut result);
         result
     }
 
@@ -97,7 +96,7 @@ impl Postings {
             }
         }
 
-        self.remove_stale_if_needed(&mut result);
+        self.stale_ids.mask(&mut result);
         result
     }
 
@@ -124,7 +123,7 @@ impl Postings {
             }
         }
 
-        self.remove_stale_if_needed(&mut result);
+        self.stale_ids.mask(&mut result);
         result
     }
 
@@ -147,7 +146,7 @@ impl Postings {
                 }
             }
         }
-        self.remove_stale_if_needed(&mut acc);
+        self.stale_ids.mask(&mut acc);
 
         acc
     }
@@ -172,7 +171,7 @@ impl Postings {
         for (_key, map) in self.label_index.prefix(&search_prefix) {
             result |= map;
         }
-        self.remove_stale_if_needed(&mut result);
+        self.stale_ids.mask(&mut result);
         result
     }
 
@@ -195,7 +194,7 @@ impl Postings {
                 result |= map;
             }
         }
-        self.remove_stale_if_needed(&mut result);
+        self.stale_ids.mask(&mut result);
 
         result
     }
@@ -219,7 +218,7 @@ impl Postings {
             }
         }
 
-        self.remove_stale_if_needed(&mut acc);
+        self.stale_ids.mask(&mut acc);
 
         (acc.cardinality() == 1)
             .then(|| acc.iter().next())

@@ -3,7 +3,7 @@
 //! This module owns the index state ([`Postings`]); each submodule implements one concern
 //! against it:
 //!
-//! * [`writer`] — mutation: indexing and un-indexing series, one at a time or in bulk.
+//! * [`mutation`] — indexing and un-indexing series, one at a time or in bulk.
 //! * [`directory`] — the `SeriesRef -> key` forward map.
 //! * [`terms`] — term-dictionary lookups: label key/prefix scans down to posting bitmaps.
 //! * [`predicate`] — translating a single `LabelFilter` into a bitmap.
@@ -17,16 +17,17 @@
 
 mod directory;
 mod maintenance;
+mod mutation;
 mod planner;
 mod predicate;
 mod stale;
 mod terms;
-mod mutation;
 
 #[cfg(test)]
 mod test_support;
 
 pub(crate) use mutation::BulkIndexEntry;
+pub(in crate::series::index) use stale::StaleSet;
 
 use super::index_key::IndexKey;
 use crate::series::SeriesRef;
@@ -56,7 +57,7 @@ pub struct Postings {
     /// Set of timeseries ids of series that should be removed from the index. This really only
     /// happens when the index is inconsistent (value does not exist in the db but exists in the index)
     /// Keep track and cleanup from the index during a gc pass.
-    pub(super) stale_ids: PostingsBitmap,
+    pub(super) stale_ids: StaleSet,
     /// Set of all timeseries ids in the index. This is used to optimize queries that are subtractive.
     ///
     /// Invariant: this set never contains stale ids — [`Postings::mark_ids_as_stale`] removes them
@@ -69,7 +70,7 @@ impl Default for Postings {
         Postings {
             label_index: PostingsIndex::new(),
             id_to_key: BTreeMap::new(),
-            stale_ids: PostingsBitmap::default(),
+            stale_ids: StaleSet::default(),
             all_postings: PostingsBitmap::default(),
         }
     }

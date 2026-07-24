@@ -86,7 +86,7 @@ impl Postings {
         // `index_timeseries`.
         if !self.stale_ids.is_empty() {
             for entry in &entries {
-                self.stale_ids.remove(entry.id);
+                self.stale_ids.revoke(entry.id);
             }
         }
 
@@ -144,7 +144,7 @@ impl Postings {
         // GC drain would strip the id from the very label bitmaps being filled here (e.g. the
         // post-load repair scan re-indexing an id the reconciliation sweep just marked stale).
         if !self.stale_ids.is_empty() {
-            self.stale_ids.remove(id);
+            self.stale_ids.revoke(id);
         }
 
         for InternedLabel { name, value } in ts.labels.iter() {

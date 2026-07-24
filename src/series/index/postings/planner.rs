@@ -221,12 +221,7 @@ impl Postings {
             [] => Ok(Cow::Borrowed(&*EMPTY_BITMAP)),
             [selector] => {
                 let result = self.postings_for_selector(selector)?;
-                if !self.stale_ids.is_empty() {
-                    let mut result = result.into_owned();
-                    result.andnot_inplace(&self.stale_ids);
-                    return Ok(Cow::Owned(result));
-                }
-                Ok(result)
+                Ok(self.stale_ids.mask_cow(result))
             }
             _ => {
                 let first = self.postings_for_selector(&selectors[0])?;
@@ -237,9 +232,7 @@ impl Postings {
                     result.and_inplace(&bitmap);
                 }
 
-                if !self.stale_ids.is_empty() {
-                    result.andnot_inplace(&self.stale_ids);
-                }
+                self.stale_ids.mask(&mut result);
 
                 Ok(Cow::Owned(result))
             }

@@ -5,22 +5,89 @@
 //! needed to find its posting lists is gone. Instead the id is recorded here, masked out of every
 //! read, and physically drained from the posting lists later by a background pass.
 //!
-//! Every read path that returns ids sourced from `label_index` must therefore run its result
-//! through [`Postings::remove_stale_if_needed`]. Reads sourced from `all_postings` need not:
-//! [`Postings::mark_ids_as_stale`] evicts from that set eagerly.
+//! [`StaleSet`] exists so that masking cannot be forgotten. The raw bitmap is private to this
+//! module; every consumer must go through [`StaleSet::mask`] or [`StaleSet::mask_cow`], both of
+//! which are free when nothing is marked. Reads sourced from `all_postings` need no masking at
+//! all — [`Postings::mark_ids_as_stale`] evicts from that set eagerly.
 
 use super::{IndexKey, Postings, PostingsBitmap};
 use crate::series::SeriesRef;
+use std::borrow::Cow;
 use std::ops::Bound;
 
-impl Postings {
+/// The set of series ids that are marked for removal but still present in the label bitmaps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(in crate::series::index) struct StaleSet {
+    ids: PostingsBitmap,
+}
+
+impl StaleSet {
     #[inline]
-    pub(super) fn remove_stale_if_needed(&self, postings: &mut PostingsBitmap) {
-        if !self.stale_ids.is_empty() {
-            postings.andnot_inplace(&self.stale_ids);
+    pub(in crate::series::index) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    #[inline]
+    pub(in crate::series::index) fn cardinality(&self) -> u64 {
+        self.ids.cardinality()
+    }
+
+    /// How many of `postings`' ids are stale. Cheaper than masking when only the count is wanted.
+    #[inline]
+    pub(in crate::series::index) fn stale_count_in(&self, postings: &PostingsBitmap) -> u64 {
+        self.ids.and_cardinality(postings)
+    }
+
+    /// Drops every stale id from `postings`. No-op when nothing is marked.
+    #[inline]
+    pub(super) fn mask(&self, postings: &mut PostingsBitmap) {
+        if !self.ids.is_empty() {
+            postings.andnot_inplace(&self.ids);
         }
     }
 
+    /// [`StaleSet::mask`] for a `Cow`: a borrowed input stays borrowed when nothing is marked,
+    /// and an owned one is filtered in place rather than copied.
+    #[inline]
+    pub(in crate::series::index) fn mask_cow<'a>(
+        &self,
+        postings: Cow<'a, PostingsBitmap>,
+    ) -> Cow<'a, PostingsBitmap> {
+        if self.ids.is_empty() {
+            return postings;
+        }
+        match postings {
+            Cow::Borrowed(bmp) => Cow::Owned(bmp.andnot(&self.ids)),
+            Cow::Owned(mut bmp) => {
+                bmp.andnot_inplace(&self.ids);
+                Cow::Owned(bmp)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::series::index) fn contains(&self, id: SeriesRef) -> bool {
+        self.ids.contains(id)
+    }
+
+    #[inline]
+    fn mark_many(&mut self, ids: &[SeriesRef]) {
+        self.ids.add_many(ids);
+    }
+
+    /// Un-marks an id, asserting it is alive again.
+    #[inline]
+    pub(super) fn revoke(&mut self, id: SeriesRef) {
+        self.ids.remove(id);
+    }
+
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.ids.clear();
+    }
+}
+
+impl Postings {
     pub(crate) fn mark_id_as_stale(&mut self, id: SeriesRef) {
         self.mark_ids_as_stale(&[id]);
     }
@@ -38,7 +105,7 @@ impl Postings {
         for id in ids {
             let _ = self.id_to_key.remove(id);
         }
-        self.stale_ids.add_many(ids);
+        self.stale_ids.mark_many(ids);
         self.all_postings.remove_many(ids);
     }
 
@@ -81,10 +148,11 @@ impl Postings {
             None => (Bound::Unbounded, Bound::Unbounded),
         };
 
+        let stale = &self.stale_ids;
         for (key, bitmap) in self.label_index.range_mut::<IndexKey, _>(range) {
             // Remove stale IDs from the bitmap
             let should_remove = if !bitmap.is_empty() {
-                bitmap.andnot_inplace(&self.stale_ids);
+                stale.mask(bitmap);
                 bitmap.is_empty()
             } else {
                 true
@@ -168,5 +236,30 @@ mod tests {
         // Odd (non-stale) ids remain.
         assert!(bmp.contains(1));
         assert!(bmp.contains(3));
+    }
+
+    #[test]
+    fn mask_cow_leaves_borrowed_untouched_when_nothing_is_marked() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "job", "web");
+        postings.add_posting_for_label_value(2, "job", "web");
+
+        let raw = postings
+            .label_index
+            .get::<IndexKey>(&IndexKey::for_label_value("job", "web"))
+            .expect("posting list should exist");
+
+        let out = postings.stale_ids.mask_cow(Cow::Borrowed(raw));
+        assert!(matches!(out, Cow::Borrowed(_)), "no marks: stays borrowed");
+
+        postings.mark_id_as_stale(1);
+        let raw = postings
+            .label_index
+            .get::<IndexKey>(&IndexKey::for_label_value("job", "web"))
+            .expect("posting list should exist");
+        let out = postings.stale_ids.mask_cow(Cow::Borrowed(raw));
+        assert!(matches!(out, Cow::Owned(_)), "marks present: must copy");
+        assert!(!out.contains(1));
+        assert!(out.contains(2));
     }
 }

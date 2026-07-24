@@ -11,7 +11,7 @@
 //! `try_read`; if any is contended we write nothing at all (`aux_save2` omits the aux field
 //! entirely) and the loader falls back to the rebuild path.
 
-use super::postings::{Postings, PostingsBitmap, PostingsIndex};
+use super::postings::{Postings, PostingsBitmap, PostingsIndex, StaleSet};
 use super::{TIMESERIES_INDEX, get_db_index, index_series_by_key};
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::encoding::{
@@ -161,11 +161,7 @@ fn serialize_postings_section(buf: &mut Vec<u8>, db: i32, postings: &Postings) {
         // The subtraction only costs anything when `stale_ids` is non-empty (rare: the cron GC
         // drains continuously); entries that become empty are dropped, so each group's count is
         // written only once its entries have been serialized.
-        let cleaned: Cow<PostingsBitmap> = if stale.is_empty() {
-            Cow::Borrowed(bitmap)
-        } else {
-            Cow::Owned(bitmap.andnot(stale))
-        };
+        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
         if cleaned.is_empty() {
             continue;
         }
@@ -270,7 +266,7 @@ fn deserialize_postings_section(buf: &mut &[u8]) -> PayloadResult<(i32, Postings
             label_index,
             id_to_key,
             // Stale ids were subtracted at save time; the loaded index starts clean.
-            stale_ids: PostingsBitmap::default(),
+            stale_ids: StaleSet::default(),
             all_postings,
         },
     ))
