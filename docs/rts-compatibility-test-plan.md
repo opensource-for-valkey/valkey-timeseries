@@ -1,7 +1,7 @@
-# RedisTimeSeries 8.6 Compatibility Test Plan
+# RedisTimeSeries 8.8 Compatibility Test Plan
 
 **Status:** Draft
-**Reference implementation:** the official Redis release of RedisTimeSeries as shipped in Redis Open Source 8.6 (`redis:8.6` Docker image, pinned by digest)
+**Reference implementation:** the official Redis release of RedisTimeSeries as shipped in Redis Open Source 8.8 (`redis:8.8` Docker image, pinned by digest)
 **Owner:** TBD
 
 valkey-timeseries advertises a *superset* of the RedisTimeSeries API. This plan defines what
@@ -13,7 +13,7 @@ today checks that behavior *against* RedisTimeSeries. This plan closes that gap.
 
 ## 1. Compatibility contract
 
-"Consistent with RedisTimeSeries 8.6" is decomposed into five testable layers, from strictest to
+"Consistent with RedisTimeSeries 8.8" is decomposed into five testable layers, from strictest to
 loosest:
 
 | Layer | Contract | Verification |
@@ -30,7 +30,7 @@ A compatibility claim in the README should reference the layer(s) we actually ga
 
 ### 2.1 In scope — the shared command surface
 
-The 17 commands RedisTimeSeries 8.6 exposes:
+The 17 commands RedisTimeSeries 8.8 exposes:
 
 `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.MADD`, `TS.INCRBY`, `TS.DECRBY`, `TS.DEL`,
 `TS.CREATERULE`, `TS.DELETERULE`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`,
@@ -62,7 +62,7 @@ Also out of scope: performance parity, memory-usage parity (`TS.INFO memoryUsage
 
 ## 3. Reference environment
 
-- **Reference:** the official Redis release — the `redis:8.6` Docker image (timeseries is bundled
+- **Reference:** the official Redis release — the `redis:8.8` Docker image (timeseries is bundled
   in Redis Open Source 8.x). Pin the exact digest in the compose file; bumping the digest is a
   reviewed change accompanied by a changelog scan of the corresponding RedisTimeSeries release
   notes.
@@ -150,8 +150,8 @@ Applied to both sides before comparison:
 2. **Maps:** RESP3 maps and RESP2 flattened name/value arrays (`TS.INFO`, `MRANGE` label sets)
    compare as unordered dicts.
 3. **TS.INFO superset:** extra fields we emit are allowed and reported (not failed); *missing* or
-   value-mismatched RTS 8.6 fields fail. RTS 8.6 baseline field list is frozen in
-   `tests/compat/info-fields-8.6.yml`.
+   value-mismatched RTS 8.8 fields fail. RTS 8.8 baseline field list is frozen in
+   `tests/compat/info-fields-8.8.yml`.
 4. **MRANGE/MGET ordering:** RTS makes no cross-series order guarantee; sort by key before
    comparison. *Within* a series, sample order must match exactly.
 5. **Nondeterministic values** (`memoryUsage`, `chunkSize`-dependent chunk counts under different
@@ -178,7 +178,7 @@ build renders into a public "Compatibility" page:
   command: TS.INFO
   kind: reply-superset          # reply-superset | error-text | behavior | config-name | unsupported
   description: >
-    TS.INFO returns additional fields (…) beyond the RTS 8.6 set.
+    TS.INFO returns additional fields (…) beyond the RTS 8.8 set.
   rationale: extension metadata
   since: 0.x.0
 ```
@@ -207,7 +207,7 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.MRANGE`/`TS.MREVRANGE` | full filter language matrix; WITHLABELS vs SELECTED_LABELS (missing label → nil); GROUPBY/REDUCE × all reducers, incl. empty groups and label-absent series; everything from RANGE applied per-series; reply nesting shape RESP2 vs RESP3 (this is where RESP3 differs most) |
 | `TS.GET` | empty series reply shape; LATEST semantics on compaction target with open bucket |
 | `TS.MGET` | filter matrix; WITHLABELS/SELECTED_LABELS; empty-series entries |
-| `TS.INFO` | field-by-field vs frozen 8.6 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
+| `TS.INFO` | field-by-field vs frozen 8.8 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
 | `TS.QUERYINDEX` | filter matrix; result ordering (normalize); no-match empty array; requires-non-empty-matcher error |
 
 > **Phase 2 status (2026-07-16):** `TS.RANGE`/`TS.REVRANGE` (`tests/compat/test_compat_range.py`),
@@ -298,7 +298,7 @@ name sequence (`ts.add`, `ts.incrby`, `ts.createrule`, `del`, expiry events, …
 
 ### 7.4 Persistence interop (defined-failure surface)
 We register the **same module type name** as RedisTimeSeries — `TSDB-TYPE`
-(`src/series/series_data_type.rs:25`) — with our own payload format and `encver=1`, while RTS 8.6
+(`src/series/series_data_type.rs:25`) — with our own payload format and `encver=1`, while RTS 8.8
 uses higher encoding versions. Consequences must be pinned by tests, not discovered by users:
 
 - `RESTORE` of an RTS-produced `DUMP` payload into valkey-timeseries: must fail **cleanly**
@@ -306,7 +306,7 @@ uses higher encoding versions. Consequences must be pinned by tests, not discove
 - Loading an RTS-produced RDB file: server must either refuse the file with a clear log message or
   skip/fail cleanly — never misparse. Fixture RDBs generated by running the reference server live
   in `test-data/` (generated output data, not upstream source — no licensing concern).
-- The reverse direction (our DUMP into Redis 8.6): document observed behavior; we can't control
+- The reverse direction (our DUMP into Redis 8.8): document observed behavior; we can't control
   it, but the compatibility page must state it.
 - **Decision (owner, 2026-07-16): RTS→valkey RDB migration is NOT a roadmap item.** The data
   formats are incompatible and there is no plan for conversion tooling. Registered as
@@ -314,7 +314,7 @@ uses higher encoding versions. Consequences must be pinned by tests, not discove
   import, or live dual-write) lives in COMPATIBILITY.md §"Persistence and on-disk format".
   The defined-failure surface above is pinned by `tests/compat/test_compat_persistence.py`,
   backed by a module-level encoding-version guard (`rdb_load_series` rejects any encver other
-  than ours — RTS 8.6 writes encver 9 under the same `TSDB-TYPE` name).
+  than ours — RTS 8.8 writes encver 9 under the same `TSDB-TYPE` name).
 
 ### 7.5 Replication & persistence self-consistency (subject-only, reference-checked semantics)
 Existing `tests/test_ts_replication.py` / `test_ts_aofrewrite.py` cover our own stack. Add
@@ -323,7 +323,8 @@ with `*` timestamp (replica must store the primary's timestamp), `TS.INCRBY` rep
 deterministic effect, and post-`DEBUG RELOAD` equivalence of `TS.INFO` + full `TS.RANGE` on both
 engines independently (each engine must round-trip itself; the *diff* is on post-reload replies).
 
-> **Observed correction (2026-07-16, `tests/compat/test_compat_replication.py`):** RTS 8.6 does
+> **Observed correction (2026-07-16 against the then-current 8.6 pin,
+> `tests/compat/test_compat_replication.py`; re-confirmed against 8.8 on 2026-07-23):** RTS does
 > *not* replicate auto-timestamp `TS.INCRBY` as a deterministic effect — it propagates the command
 > verbatim and the replica stamps its own clock (30/30 divergent timestamps when probed). Only the
 > explicit-`TIMESTAMP` form is deterministic. Both engines share the verbatim behavior, so the
@@ -364,8 +365,9 @@ Bring-up is done when:
 
 ## 11. Risks & open questions
 
-- **Reference drift:** Redis 8.6.x patch releases can change behavior; digest pinning + reviewed
-  bumps mitigate. Track RTS release notes on bump.
+- **Reference drift:** Redis 8.8.x patch releases can change behavior; digest pinning + reviewed
+  bumps mitigate. Track RTS release notes on bump, and record what moved in
+  `docs/rts-reference-bumps.md` (bump log, one section per pin change).
 - **Float formatting** is the most likely source of high-volume noise; the §5.1 policy decision
   (exact vs tolerance for sample values) should be made in Phase 0, deliberately, not under
   pressure of a red CI.

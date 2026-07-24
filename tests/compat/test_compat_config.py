@@ -1,4 +1,4 @@
-"""Configuration parity with RedisTimeSeries 8.6 (test plan §7.1).
+"""Configuration parity with RedisTimeSeries 8.8 (test plan §7.1).
 
 Diffs the `ts-*` config surface between the two engines: names, defaults,
 mutability (CONFIG SET accept/reject), and value validation — including the
@@ -26,7 +26,7 @@ import pytest
 import valkey
 from valkey.exceptions import ResponseError
 
-# The complete RTS 8.6 ts-* surface with its defaults, observed black-box
+# The complete RTS 8.8 ts-* surface with its defaults, observed black-box
 # against the pinned reference image (values as CONFIG GET reports them).
 RTS_CONFIG_DEFAULTS = {
     "ts-retention-policy": "0",
@@ -39,7 +39,28 @@ RTS_CONFIG_DEFAULTS = {
     "ts-chunk-size-bytes": "4096",
 }
 
-IMMUTABLE_CONFIGS = {"ts-num-threads"}
+# Mutability is per-engine as of the 8.8 reference bump: RTS made
+# `ts-num-threads` settable at runtime (it was immutable on the 8.6 pin, which
+# is what this module's registration still matches). Divergences are registered
+# in MUTABILITY_DIVERGENCES below.
+RTS_IMMUTABLE_CONFIGS: set[str] = set()
+SUBJECT_IMMUTABLE_CONFIGS = {"ts-num-threads"}
+
+# Names whose CONFIG SET outcome legitimately differs between engines, by
+# reviewed decision. Keyed by canonical name -> registry entry.
+MUTABILITY_DIVERGENCES = {
+    "ts-num-threads": "DIV-0035",
+}
+
+# RTS configs with no subject equivalent, by reviewed decision. Excluded from
+# both the frozen-baseline equality above and the "every RTS name must exist on
+# the subject" rule; every other RTS name still fails when missing. Keyed by
+# canonical name -> registry entry.
+REFERENCE_ONLY_CONFIGS = {
+    # Selects the wire protocol for libmr, the cluster fan-out layer RTS uses
+    # for TS.MRANGE/TS.MGET/TS.QUERYINDEX. New in the 8.8 reference bump.
+    "ts-libmr-protocol": "DIV-0034",
+}
 
 # Registered default-value divergences: subject default != reference default,
 # by reviewed decision. Keyed by canonical name -> (expected subject value,
@@ -56,9 +77,10 @@ class ConfigClient:
     """A client plus the engine's module-config name prefix; all names passed
     in and returned are the canonical (RTS) unprefixed names."""
 
-    def __init__(self, client, prefix: str):
+    def __init__(self, client, prefix: str, immutable: set):
         self.client = client
         self.prefix = prefix
+        self.immutable = immutable
 
     def get_all(self) -> dict:
         raw = self.client.config_get(f"{self.prefix}ts-*")
@@ -87,8 +109,12 @@ def _normalize(value: str):
 @pytest.fixture(scope="module")
 def clients(subject_url, reference_url):
     # Config replies are plain strings on both protocols; RESP2 suffices.
-    subject = ConfigClient(valkey.Valkey.from_url(subject_url), SUBJECT_PREFIX)
-    reference = ConfigClient(valkey.Valkey.from_url(reference_url), "")
+    subject = ConfigClient(
+        valkey.Valkey.from_url(subject_url), SUBJECT_PREFIX, SUBJECT_IMMUTABLE_CONFIGS
+    )
+    reference = ConfigClient(
+        valkey.Valkey.from_url(reference_url), "", RTS_IMMUTABLE_CONFIGS
+    )
     yield subject, reference
     subject.close()
     reference.close()
@@ -111,7 +137,7 @@ def restore_configs(clients):
     subject, reference = clients
     current = reference.get_all()
     for name, value in RTS_CONFIG_DEFAULTS.items():
-        if name in IMMUTABLE_CONFIGS or name == "ts-encoding":
+        if name in reference.immutable or name == "ts-encoding":
             continue
         if current.get(name) != value:
             reference.client.config_set(f"{reference.prefix}{name}", value)
@@ -121,7 +147,7 @@ def restore_configs(clients):
     for client, snapshot in snapshots:
         current = client.get_all()
         for name, value in snapshot.items():
-            if name not in IMMUTABLE_CONFIGS and current.get(name) != value:
+            if name not in client.immutable and current.get(name) != value:
                 client.client.config_set(f"{client.prefix}{name}", value)
 
 
@@ -138,14 +164,26 @@ class TestConfigSurface:
         # kept container reports `uncompressed` forever, which is expected, not
         # drift. It is still checked below as a name-present + divergence case.
         reference_baseline = {
-            k: v for k, v in reference_cfg.items() if k != "ts-encoding"
+            k: v
+            for k, v in reference_cfg.items()
+            if k != "ts-encoding" and k not in REFERENCE_ONLY_CONFIGS
         }
         expected_baseline = {
             k: v for k, v in RTS_CONFIG_DEFAULTS.items() if k != "ts-encoding"
         }
         assert reference_baseline == expected_baseline
 
-        missing = sorted(set(reference_cfg) - set(subject_cfg))
+        # Reference-only names must still be *present* on the reference: if one
+        # disappears, the registry entry is stale and should be deleted.
+        vanished = sorted(set(REFERENCE_ONLY_CONFIGS) - set(reference_cfg))
+        assert not vanished, (
+            f"reference-only config(s) no longer on the reference: {vanished}; "
+            "drop the REFERENCE_ONLY_CONFIGS entry and its divergence registration"
+        )
+
+        missing = sorted(
+            set(reference_cfg) - set(subject_cfg) - set(REFERENCE_ONLY_CONFIGS)
+        )
         assert not missing, f"subject is missing RTS config name(s): {missing}"
 
         # The subject's ts-encoding default must match RTS's *default*
@@ -159,6 +197,8 @@ class TestConfigSurface:
         for name, ref_value in reference_cfg.items():
             if name == "ts-encoding":
                 continue  # handled above; live reference value may be latched
+            if name in REFERENCE_ONLY_CONFIGS:
+                continue  # no subject counterpart to compare against
             if name in DEFAULT_DIVERGENCES:
                 expected, entry_id = DEFAULT_DIVERGENCES[name]
                 assert _normalize(subject_cfg[name]) == _normalize(expected), (
@@ -176,14 +216,26 @@ class TestConfigSurface:
             assert name.startswith("ts-")
 
     def test_mutability_parity(self, clients):
+        """CONFIG SET accept/reject must agree, except where a divergence is
+        registered — and there the two engines must actually still disagree, so
+        a stale entry surfaces instead of silently passing."""
         subject, reference = clients
         for name, default in RTS_CONFIG_DEFAULTS.items():
-            expected = "error" if name in IMMUTABLE_CONFIGS else "ok"
+            outcomes = {}
             # A self-assignment probes writability without changing state.
             for side in (reference, subject):
+                expected = "error" if name in side.immutable else "ok"
                 outcome = side.set_outcome(name, default)
+                outcomes[side.prefix] = outcome
                 assert outcome == expected, (
                     f"prefix={side.prefix!r}: CONFIG SET {name} => {outcome}, expected {expected}"
+                )
+
+            if name in MUTABILITY_DIVERGENCES:
+                assert outcomes[reference.prefix] != outcomes[SUBJECT_PREFIX], (
+                    f"{name}: engines now agree (both "
+                    f"{outcomes[reference.prefix]}), but {MUTABILITY_DIVERGENCES[name]} "
+                    "still registers a mutability divergence — delete the entry"
                 )
 
 

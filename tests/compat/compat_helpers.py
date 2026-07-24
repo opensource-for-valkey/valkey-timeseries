@@ -7,7 +7,7 @@ test code (see tests/compat/README.md).
 
 from __future__ import annotations
 
-# The 13 aggregators RedisTimeSeries 8.6 exposes (plan §6, TS.CREATERULE row).
+# The 13 aggregators RedisTimeSeries 8.8 exposes (plan §6, TS.CREATERULE row).
 ALL_RTS_AGGREGATORS = (
     "avg",
     "sum",

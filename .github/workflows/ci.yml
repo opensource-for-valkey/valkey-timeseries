@@ -81,7 +81,7 @@ jobs:
         run: python3 -m pytest --cache-clear -v "tests/"
 
   # RedisTimeSeries compatibility smoke gate (docs/rts-compatibility-test-plan.md §8):
-  # Tier A smoke subset diffed against the pinned redis:8.6 reference image,
+  # Tier A smoke subset diffed against the pinned redis:8.8 reference image,
   # RESP3 only, single subject server version.
   compat-smoke:
     runs-on: ubuntu-latest
@@ -132,7 +132,7 @@ jobs:
       - name: Update module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_timeseries.so)" >> $GITHUB_ENV
 
-      - name: Start reference server (pinned redis:8.6)
+      - name: Start reference server (pinned redis:8.8)
         run: docker compose -f docker-compose.compat.yml up -d --wait reference
 
       - name: Run compatibility smoke tests

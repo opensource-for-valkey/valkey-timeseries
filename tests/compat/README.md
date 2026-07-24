@@ -1,6 +1,6 @@
 # RedisTimeSeries compatibility harness
 
-Differential tests that verify valkey-timeseries behaves like RedisTimeSeries 8.6
+Differential tests that verify valkey-timeseries behaves like RedisTimeSeries 8.8
 on the shared command surface. Implements Tier A of
 [docs/rts-compatibility-test-plan.md](../../docs/rts-compatibility-test-plan.md);
 the compatibility contract itself is described in
@@ -19,14 +19,18 @@ compatibility tests.** Everything in this directory must be derived from:
 - black-box observation of the reference server's behavior.
 
 Nothing from the RedisTimeSeries repository may be vendored, copied, ported, or
-fetched at CI time. Running the official `redis:8.6` binary image as a black-box
+fetched at CI time. Running the official `redis:8.8` binary image as a black-box
 test target is fine; its source and tests are off-limits.
+
+The pinned image is a reviewed choice: see
+[docs/rts-reference-bumps.md](../../docs/rts-reference-bumps.md) for what moved
+at each bump, and add a section there when changing the pin.
 
 ## How it works
 
 Each test gets a `diff` fixture: a `DiffClient` that sends every command to
 **both** engines — the *subject* (valkey-server + this module) and the
-*reference* (pinned `redis:8.6` Docker image) — normalizes both replies
+*reference* (pinned `redis:8.8` Docker image) — normalizes both replies
 (`compat_normalize.py`, plan §5.1), and asserts equality. Tests are just command
 sequences; they are automatically parametrized over RESP2 and RESP3.
 
@@ -89,7 +93,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `compat_normalize.py` | reply normalization and structural diffing (plan §5.1) |
 | `compat_registry.py` | known-divergence registry loader (plan §5.3) |
 | `divergences.yml` | the registry — single source of truth for intentional divergences |
-| `info-fields-8.6.yml` | frozen RTS 8.6 `TS.INFO` field baseline (plan §5.1 rule 3) |
+| `info-fields-8.8.yml` | frozen RTS 8.8 `TS.INFO` field baseline (plan §5.1 rule 3) |
 | `compat_helpers.py` | shared scenario helpers (pinned `TS.CREATE`, aggregator lists, label universe) |
 | `test_compat_smoke.py` | fixed smoke subset — the CI PR gate (plan §8) |
 | `test_compat_range.py` | Phase 2: `TS.RANGE`/`TS.REVRANGE` matrix (plan §6) |

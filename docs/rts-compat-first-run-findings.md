@@ -6,6 +6,13 @@
 **Result:** 27 passed / 21 failed of 48 smoke cases (24 scenarios × RESP2/RESP3)
 **Update 2026-07-15:** findings #1–#9, #11, and #12 fixed, #13 registered as DIV-0002…DIV-0007 (see below); **suite green at 48 passed / 0 failed**. Every finding is now resolved as a module fix or a reviewed registry entry; the Phase 1 exit action (flipping the `compat-smoke` CI job to blocking, plan §8) is unblocked
 
+> **Historical record — do not update version references.** This documents the
+> first run against the *then-current* `redis:8.6` pin. The harness moved to
+> `redis:8.8` on 2026-07-23; the 8.6 references below are preserved deliberately
+> so the record stays faithful to what was observed. For the current reference
+> see [docker-compose.compat.yml](../docker-compose.compat.yml) and
+> [tests/compat/README.md](../tests/compat/README.md).
+
 This is the raw triage input the test plan's Phase 1 calls for
 (docs/rts-compatibility-test-plan.md §10): each finding must be resolved as either a
 module fix or a reviewed entry in `tests/compat/divergences.yml`. Reproducers are in
