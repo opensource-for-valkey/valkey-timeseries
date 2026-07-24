@@ -151,11 +151,11 @@ impl Postings {
         let stale = &self.stale_ids;
         for (key, bitmap) in self.label_index.range_mut::<IndexKey, _>(range) {
             if keys_processed == count {
-                 // Save the first *unprocessed* key as the next starting point.
-                 next_key = Some(key.clone());
-                 break;
-             }
-            
+                // Save the first *unprocessed* key as the next starting point.
+                next_key = Some(key.clone());
+                break;
+            }
+
             // Remove stale IDs from the bitmap
             let should_remove = if !bitmap.is_empty() {
                 stale.mask(bitmap);
