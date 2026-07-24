@@ -2,7 +2,7 @@
 
 Each `corpus/*.json` file is a minimal command sequence — either a fuzzer shrink
 or a hand-written reproducer of a fixed bug — that must stay byte-identical to
-RedisTimeSeries 8.6. Every file is replayed through the `diff` fixture under both
+RedisTimeSeries 8.8. Every file is replayed through the `diff` fixture under both
 RESP versions, so a regression that reopens the bug fails here as a plain
 mismatch. A file whose only remaining delta is an intentional divergence is
 tolerated via the registry (its `expect_divergence` id documents which one).

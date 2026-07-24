@@ -1,4 +1,4 @@
-"""Keyspace-notification parity with RedisTimeSeries 8.6 (test plan §7.3).
+"""Keyspace-notification parity with RedisTimeSeries 8.8 (test plan §7.3).
 
 Subscribes `__keyevent@0__:*` on both engines (both run with
 `notify-keyspace-events KEA`, §3), executes a canonical mutation script, and

@@ -1,4 +1,7 @@
-# Frozen RedisTimeSeries 8.6 TS.INFO baseline (test plan §5.1 rule 3).
+# Frozen RedisTimeSeries 8.8 TS.INFO baseline (test plan §5.1 rule 3).
+#
+# Field set re-validated against redis:8.8 on 2026-07-23: unchanged from the
+# previous redis:8.6 pin (all 14 fields identical, same order).
 #
 # Derived clean-room from the public TS.INFO command documentation and validated
 # against the live pinned reference image by
