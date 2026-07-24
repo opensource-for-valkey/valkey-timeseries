@@ -2,26 +2,27 @@
 //!
 //! Each `PredicateMatch` variant gets a handler that picks the cheapest term-dictionary access for
 //! it — an exact key hit, a prefix scan, or a full scan of one label's values with a predicate.
-//! [`Postings::inverse_postings_for_filter`] serves the planner's negation path, where Prometheus
+//! [`Terms::inverse_postings_for_filter`] serves the planner's negation path, where Prometheus
 //! semantics require "matches the inverse" rather than "does not match".
 
-use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
+use super::terms::Terms;
+use super::{EMPTY_BITMAP, PostingsBitmap};
 use crate::error_consts::INTERNAL_ERROR;
 use crate::labels::filters::{LabelFilter, PredicateMatch, PredicateValue};
 use std::borrow::Cow;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-impl Postings {
+impl<'a> Terms<'a> {
     pub(super) fn postings_for_filter(
-        &'_ self,
+        self,
         filter: &LabelFilter,
-    ) -> ValkeyResult<Cow<'_, PostingsBitmap>> {
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         let result = match filter.matcher {
             PredicateMatch::Equal(ref value) => handle_equal_match(self, &filter.label, value),
             PredicateMatch::NotEqual(ref value) => {
                 handle_not_equal_match(self, &filter.label, value)
             }
-            PredicateMatch::MatchAll => Cow::Borrowed(&self.all_postings),
+            PredicateMatch::MatchAll => Cow::Borrowed(self.all()),
             PredicateMatch::MatchNone => Cow::Borrowed(&*EMPTY_BITMAP),
             PredicateMatch::RegexEqual(_) => handle_regex_equal_match(self, filter)?,
             PredicateMatch::RegexNotEqual(_) => handle_regex_not_equal_match(self, filter)?,
@@ -38,9 +39,9 @@ impl Postings {
     }
 
     pub(super) fn inverse_postings_for_filter(
-        &'_ self,
+        self,
         filter: &LabelFilter,
-    ) -> Cow<'_, PostingsBitmap> {
+    ) -> Cow<'a, PostingsBitmap> {
         match &filter.matcher {
             PredicateMatch::NotEqual(pv) => handle_equal_match(self, &filter.label, pv),
             // If the matcher being inverted is ="", we just want all the values.
@@ -48,7 +49,7 @@ impl Postings {
                 Cow::Owned(self.postings_for_all_label_values(&filter.label))
             }
             PredicateMatch::MatchAll => Cow::Borrowed(&*EMPTY_BITMAP),
-            PredicateMatch::MatchNone => Cow::Borrowed(&self.all_postings),
+            PredicateMatch::MatchNone => Cow::Borrowed(self.all()),
             // If the matcher being inverted is =~"", we just want all the values.
             PredicateMatch::RegexEqual(re) if matches!(re.regex.as_str(), "" | ".*") => {
                 Cow::Owned(self.postings_for_all_label_values(&filter.label))
@@ -83,7 +84,7 @@ impl Postings {
 }
 
 fn handle_equal_match<'a>(
-    ix: &'a Postings,
+    ix: Terms<'a>,
     label: &str,
     value: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
@@ -131,14 +132,14 @@ fn handle_equal_match<'a>(
 }
 
 // return postings for series which has the label `label
-fn with_label<'a>(ix: &'a Postings, label: &str) -> Cow<'a, PostingsBitmap> {
+fn with_label<'a>(ix: Terms<'a>, label: &str) -> Cow<'a, PostingsBitmap> {
     let mut state = ();
     let postings = ix.postings_for_label_matching(label, &mut state, |_value, _| true);
     Cow::Owned(postings)
 }
 
 fn handle_not_equal_match<'a>(
-    ix: &'a Postings,
+    ix: Terms<'a>,
     label: &str,
     value: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
@@ -148,7 +149,7 @@ fn handle_not_equal_match<'a>(
             if s.is_empty() {
                 return with_label(ix, label);
             }
-            let all = &ix.all_postings;
+            let all = ix.all();
             let postings = ix.postings_for_label_value(label, s);
             if postings.is_empty() {
                 Cow::Borrowed(all)
@@ -163,7 +164,7 @@ fn handle_not_equal_match<'a>(
                 _ => {
                     // get postings for label m.label without values in values
                     let to_remove = ix.postings_for_label_values(label, values);
-                    let all_postings = &ix.all_postings;
+                    let all_postings = ix.all();
                     if to_remove.is_empty() {
                         Cow::Borrowed(all_postings)
                     } else {
@@ -178,7 +179,7 @@ fn handle_not_equal_match<'a>(
 }
 
 fn handle_regex_equal_match<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     filter: &LabelFilter,
 ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
     if filter.matches_empty() {
@@ -201,7 +202,7 @@ fn handle_regex_equal_match<'a>(
 }
 
 fn handle_regex_not_equal_match<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     filter: &LabelFilter,
 ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
     if filter.matches_empty() {
@@ -223,7 +224,7 @@ fn handle_regex_not_equal_match<'a>(
 }
 
 fn handle_starts_with<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     label: &str,
     prefix: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
@@ -231,16 +232,16 @@ fn handle_starts_with<'a>(
 }
 
 fn handle_not_starts_with<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     label: &str,
     prefix: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
     let matching_prefix = postings_by_prefix_value(postings, label, prefix);
-    Cow::Owned(postings.all_postings.andnot(&matching_prefix))
+    Cow::Owned(postings.all().andnot(&matching_prefix))
 }
 
 fn postings_by_prefix_value(
-    postings: &Postings,
+    postings: Terms<'_>,
     label: &str,
     value: &PredicateValue,
 ) -> PostingsBitmap {
@@ -258,7 +259,7 @@ fn postings_by_prefix_value(
 }
 
 fn handle_contains<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     label: &str,
     value: &PredicateValue,
 ) -> Cow<'a, PostingsBitmap> {
@@ -270,7 +271,7 @@ fn handle_contains<'a>(
 }
 
 fn handle_not_contains<'a>(
-    postings: &'a Postings,
+    postings: Terms<'a>,
     filter: &LabelFilter,
 ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
     // The caller dispatches on this same enum (`postings_for_filter`), so this arm is only
@@ -284,7 +285,7 @@ fn handle_not_contains<'a>(
         postings.postings_for_label_matching(&filter.label, &mut state, |candidate, value| {
             value.matches_contains_any(candidate)
         });
-    let res = &postings.all_postings;
+    let res = postings.all();
     let value = res.andnot(&contains_matches);
     Ok(Cow::Owned(value))
 }
@@ -293,6 +294,7 @@ fn handle_not_contains<'a>(
 mod tests {
     use super::*;
     use crate::labels::filters::MatchOp;
+    use crate::series::index::postings::Postings;
 
     #[test]
     fn test_not_starts_with_filter_returns_non_matching_label_values() {
@@ -307,7 +309,7 @@ mod tests {
             matcher: PredicateMatch::NotStartsWith(PredicateValue::String("server".to_string())),
         };
 
-        let result = postings.postings_for_filter(&filter).unwrap();
+        let result = postings.terms().postings_for_filter(&filter).unwrap();
         // Prometheus-compatible negative matchers include series that do not have the label.
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(2));
@@ -346,7 +348,7 @@ mod tests {
             ])),
         };
 
-        let result = postings.postings_for_filter(&filter).unwrap();
+        let result = postings.terms().postings_for_filter(&filter).unwrap();
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(1));
         assert!(result.contains(2));
@@ -366,7 +368,7 @@ mod tests {
             matcher: PredicateMatch::Contains(PredicateValue::String("server".to_string())),
         };
 
-        let result = postings.postings_for_filter(&filter).unwrap();
+        let result = postings.terms().postings_for_filter(&filter).unwrap();
 
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(1));
@@ -390,7 +392,7 @@ mod tests {
             ])),
         };
 
-        let result = postings.postings_for_filter(&filter).unwrap();
+        let result = postings.terms().postings_for_filter(&filter).unwrap();
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(1));
         assert!(result.contains(2));

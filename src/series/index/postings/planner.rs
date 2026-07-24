@@ -5,6 +5,7 @@
 //! small and stable), and cheap matchers run before expensive ones. Degenerate regexes (`.*`,
 //! `.+`) are short-circuited before touching the index at all.
 
+use super::terms::Terms;
 use super::{EMPTY_BITMAP, Postings, PostingsBitmap};
 use crate::error_consts::MISSING_FILTER;
 use crate::labels::filters::{FilterList, LabelFilter, MatchOp, PredicateMatch, SeriesSelector};
@@ -13,21 +14,21 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-impl Postings {
+impl<'a> Terms<'a> {
     /// `postings_for_label_filters` assembles a single postings iterator against the index
     /// based on the given matchers.
     pub(super) fn postings_for_label_filters(
-        &'_ self,
+        self,
         filters: &[LabelFilter],
-    ) -> ValkeyResult<Cow<'_, PostingsBitmap>> {
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         if filters.is_empty() {
-            return Ok(Cow::Borrowed(&self.all_postings));
+            return Ok(Cow::Borrowed(self.all()));
         }
         if filters.len() == 1 {
             let filter = &filters[0];
             // follow Prometheus here: if we have an empty matcher and label, return all postings.
             if filter.label.is_empty() && filter.matcher.is_empty() {
-                return Ok(Cow::Borrowed(&self.all_postings));
+                return Ok(Cow::Borrowed(self.all()));
             }
             // shortcut the handling of simple equality matchers
             if !filter.is_negative_matcher() && !filter.matches_empty() {
@@ -64,7 +65,7 @@ impl Postings {
             // If there's nothing to subtract from, add in everything and remove the not_its later.
             // We prefer to get all_postings so that the base of subtraction (i.e., all_postings)
             // doesn't include series that may be added to the index reader during this function call.
-            its.push(Cow::Borrowed(&self.all_postings));
+            its.push(Cow::Borrowed(self.all()));
         };
 
         // Sort matchers to have the intersecting matchers first.
@@ -189,7 +190,7 @@ impl Postings {
         }
 
         let mut result = if its.is_empty() {
-            self.all_postings.clone()
+            self.all().clone()
         } else {
             // sort by cardinality first to reduce the amount of work
             its.sort_by_key(|a| a.cardinality());
@@ -203,25 +204,25 @@ impl Postings {
         Ok(Cow::Owned(result))
     }
 
-    pub fn postings_for_selector(
-        &'_ self,
+    pub(super) fn postings_for_selector(
+        self,
         selector: &SeriesSelector,
-    ) -> ValkeyResult<Cow<'_, PostingsBitmap>> {
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         match &selector {
             SeriesSelector::And(filters) => self.postings_for_label_filters(filters),
             SeriesSelector::Or(filters) => self.process_or_matchers(filters),
         }
     }
 
-    pub fn postings_for_selectors(
-        &'_ self,
+    pub(super) fn postings_for_selectors(
+        self,
         selectors: &[SeriesSelector],
-    ) -> ValkeyResult<Cow<'_, PostingsBitmap>> {
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         match selectors {
             [] => Ok(Cow::Borrowed(&*EMPTY_BITMAP)),
             [selector] => {
                 let result = self.postings_for_selector(selector)?;
-                Ok(self.stale_ids.mask_cow(result))
+                Ok(self.mask_cow(result))
             }
             _ => {
                 let first = self.postings_for_selector(&selectors[0])?;
@@ -232,19 +233,16 @@ impl Postings {
                     result.and_inplace(&bitmap);
                 }
 
-                self.stale_ids.mask(&mut result);
+                self.mask(&mut result);
 
                 Ok(Cow::Owned(result))
             }
         }
     }
 
-    fn process_or_matchers(
-        &'_ self,
-        filters: &[FilterList],
-    ) -> ValkeyResult<Cow<'_, PostingsBitmap>> {
+    fn process_or_matchers(self, filters: &[FilterList]) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
         match filters {
-            [] => Ok(Cow::Borrowed(&self.all_postings)),
+            [] => Ok(Cow::Borrowed(self.all())),
             [filters] => self.postings_for_label_filters(filters),
             _ => {
                 let mut result = PostingsBitmap::new();
@@ -256,6 +254,22 @@ impl Postings {
                 Ok(Cow::Owned(result))
             }
         }
+    }
+}
+
+impl Postings {
+    pub fn postings_for_selector<'a>(
+        &'a self,
+        selector: &SeriesSelector,
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
+        self.terms().postings_for_selector(selector)
+    }
+
+    pub fn postings_for_selectors<'a>(
+        &'a self,
+        selectors: &[SeriesSelector],
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
+        self.terms().postings_for_selectors(selectors)
     }
 }
 
@@ -308,7 +322,7 @@ mod tests {
             ])),
         };
 
-        let res = postings.postings_for_label_filters(&[lf]).unwrap();
+        let res = postings.terms().postings_for_label_filters(&[lf]).unwrap();
         let res = res.into_owned();
 
         // Both series 1 (has value x) and 2 (no label) should be present.
@@ -338,7 +352,7 @@ mod tests {
         };
 
         // Query using this filter
-        let result = postings.postings_for_label_filters(&[lf]).unwrap();
+        let result = postings.terms().postings_for_label_filters(&[lf]).unwrap();
         let result = result.into_owned();
 
         // Should match series 1, 2, and 4 (all with node1 or node2)
@@ -360,7 +374,10 @@ mod tests {
             matcher: PredicateMatch::MatchNone,
         };
 
-        let result = postings.postings_for_label_filters(&[filter]).unwrap();
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&[filter])
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -380,7 +397,10 @@ mod tests {
             ])),
         };
 
-        let result = postings.postings_for_label_filters(&[filter]).unwrap();
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&[filter])
+            .unwrap();
         let result = result.into_owned();
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(3));
@@ -403,7 +423,10 @@ mod tests {
             matcher: PredicateMatch::NotContains(PredicateValue::String("server".to_string())),
         };
 
-        let result = postings.postings_for_label_filters(&[filter]).unwrap();
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&[filter])
+            .unwrap();
         let result = result.into_owned();
 
         assert_eq!(result.cardinality(), 2);
@@ -429,7 +452,10 @@ mod tests {
             ])),
         };
 
-        let result = postings.postings_for_label_filters(&[filter]).unwrap();
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&[filter])
+            .unwrap();
         let result = result.into_owned();
         assert_eq!(result.cardinality(), 2);
         assert!(result.contains(3));
