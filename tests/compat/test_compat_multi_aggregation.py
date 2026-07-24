@@ -414,18 +414,18 @@ class TestNanColumns:
     `countnan`/`countall` accept NaN samples that every other aggregator skips,
     so a bucket holding only NaNs is real for those columns and empty for the
     rest. The reference emits such a bucket when *any* column accepted a sample
-    and fills the others (NaN for avg, 0 for count).
+    and fills the others (NaN for avg, 0 for count); the subject matches this.
 
-    These go through `diff`, not per-engine assertions, on purpose: unlike the
-    entries in TestDivergences this is not an intentional divergence but a
-    genuine subject bug, so it should keep failing until fixed. The all-NaN
-    case below currently diverges for the same reason the single-aggregator
-    tests in test_compat_range.py (TestAggregation::test_aggregator_over_all_nan_bucket)
-    already fail unregistered: the subject omits an all-NaN bucket that RTS
-    emits once a NaN-counting column keeps it alive. The row surface adds the
-    specific question those tests can't ask — whether the *whole row* is
-    dropped when one column (avg/count) rejected the NaNs but another
-    (countnan) accepted them — and the answer today is that it is.
+    These go through `diff` (not per-engine assertions) and pass: emission is
+    decided per aggregator, not per bucket, so an all-NaN bucket survives for a
+    NaN-counting column while its avg/count neighbours in the same row report
+    their fill. That per-aggregator emission rule was established for the
+    single-aggregator path in commit d442a184 ("Decide bucket emission per
+    aggregator, not per bucket"), covered by
+    test_compat_range.py::TestAggregation::test_aggregator_over_all_nan_bucket;
+    the cases here extend it to the multi-column surface — verifying the *whole
+    row* is kept when one column (avg/count) rejected the NaNs but another
+    (countnan/countall) accepted them.
     """
 
     def test_all_nan_bucket_with_a_counting_column(self, diff, range_cmd):
