@@ -204,15 +204,22 @@ impl<'a> Terms<'a> {
 
         for label in labels.iter() {
             let key = KeyBuffer::for_label_value(label.name(), label.value());
-            if let Some(bmp) = self.index.get(key.as_bytes()) {
-                if bmp.is_empty() {
+            let Some(bmp) = self.index.get(key.as_bytes()) else {
+                acc.clear();
+                break;
+            };
+            if bmp.is_empty() {
+                acc.clear();
+                break;
+            }
+
+            if first {
+                acc |= bmp;
+                first = false;
+            } else {
+                acc &= bmp;
+                if acc.is_empty() {
                     break;
-                }
-                if first {
-                    acc |= bmp;
-                    first = false;
-                } else {
-                    acc &= bmp;
                 }
             }
         }
