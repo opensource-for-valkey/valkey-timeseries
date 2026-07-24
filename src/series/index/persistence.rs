@@ -31,8 +31,12 @@ use valkey_module::{Context, KeysCursor, MODULE_CONTEXT, RedisModuleIO, ValkeySt
 /// Identifies the aux payload; guards against reading garbage from a foreign/corrupt field.
 const INDEX_AUX_MAGIC: &[u8; 4] = b"TSIX";
 
-/// Internal payload format version, independent of `TIMESERIES_TYPE_ENCODING_VERSION`.
-/// Any mismatch discards the payload and falls back to the per-key rebuild.
+/// Version of the *envelope* only — the magic, the section count, and the db number prefixing
+/// each section. The index body inside each section carries its own
+/// [`serialization::BODY_VERSION`], so a layout change there does not invalidate this framing and
+/// a framing change here does not invalidate bodies. Independent of
+/// `TIMESERIES_TYPE_ENCODING_VERSION`. Any mismatch discards the payload and falls back to the
+/// per-key rebuild.
 const INDEX_AUX_VERSION: u8 = 1;
 
 /// Databases whose index was preloaded from the aux payload during the current load.
@@ -108,7 +112,8 @@ type PayloadResult<T> = Result<T, String>;
 // ---------------------------------------------------------------------------
 //
 // The index body format lives in `postings::serialization`. This module owns only the container
-// around it: magic, version, section count, and the db number that prefixes each section.
+// around it: magic, envelope version, section count, and the db number that prefixes each
+// section. The body versions itself, so neither side's format is pinned to the other's.
 
 /// Appends one per-db section to `buf`: the db number, then the encoded index body.
 fn serialize_postings_section(buf: &mut Vec<u8>, db: i32, postings: &Postings) {
@@ -745,6 +750,9 @@ mod tests {
                     bitmap,
                 )
                 .unwrap();
+            // Every posted id must be in `all_postings`; the decoder rejects bodies where a
+            // label bitmap names an id the membership set does not.
+            postings.all_postings.add(i);
         }
 
         let payload = build_payload(&[(0, &postings)]);
@@ -771,6 +779,7 @@ mod tests {
                 .label_index
                 .try_insert(IndexKey::from(*key), bitmap)
                 .unwrap();
+            postings.all_postings.add(i as u64 + 1);
         }
 
         let payload = build_payload(&[(0, &postings)]);
