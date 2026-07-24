@@ -223,7 +223,7 @@ pub fn parse_number_with_unit(arg: &str) -> TsdbResult<f64> {
 pub fn parse_metric_name(arg: &str) -> ValkeyResult<Vec<Label>> {
     let labels =
         parse_metric(arg).map_err(|_e| ValkeyError::Str(error_consts::INVALID_METRIC_NAME))?;
-    if labels.len() == MAX_LABELS_PER_SERIES {
+    if labels.len() > MAX_LABELS_PER_SERIES {
         return Err(ValkeyError::Str(error_consts::TOO_MANY_LABELS));
     }
     Ok(labels)
