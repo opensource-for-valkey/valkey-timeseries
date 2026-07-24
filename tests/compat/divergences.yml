@@ -686,3 +686,90 @@
     which point this entry and SUBJECT_IMMUTABLE_CONFIGS both go away.
   since: 0.1.0
   details_regex: "can't set immutable config"
+
+# DIV-0036..DIV-0038 are the AGGREGATION aggregator-list surface that RTS 8.8
+# introduced (`AGGREGATION min,avg,max 1000`). All three are `documentation_only`
+# and pinned by explicit per-engine assertions in
+# tests/compat/test_compat_multi_aggregation.py: two are accepted-input supersets
+# (§5.2 hard-fails those through DiffClient by design) and one is an over-strict
+# rejection whose only matching regex would mask real regressions in the same
+# delta class.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0036
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A repeated aggregator inside an AGGREGATION list is rejected here and
+    accepted by RTS 8.8. RTS treats the list positionally, so
+    `AGGREGATION avg,avg 1000` returns two identical columns; we reject the
+    whole clause with "duplicate aggregation 'avg'". The check is
+    case-insensitive on the aggregator name (`avg,AVG` is a duplicate) and
+    applies to TS.RANGE/REVRANGE/MRANGE/MREVRANGE. A side effect is that the
+    16-element list cap is unreachable here through a repeat: only 15 distinct
+    aggregator names exist, so any 17-element list hits the duplicate check
+    first, where RTS reports "Too many aggregation types".
+  rationale: >
+    owner decision pending — a repeated column carries no information the
+    caller does not already have (it is a byte-for-byte copy of another column),
+    so rejecting it turns a probable query-builder bug into a visible error
+    rather than silently widening the row. Direction of risk is the safe one: we
+    reject input RTS accepts, so a client migrating from RTS sees an error
+    instead of wrong data. The cost is that a generated query that happens to
+    repeat an aggregator stops working and must be de-duplicated caller-side.
+    Pinned by
+    TestDivergences::test_duplicate_aggregator_in_a_list_is_rejected.
+  since: 0.1.0
+
+- id: DIV-0037
+  command: TS.MRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    GROUPBY/REDUCE combined with a multi-aggregator AGGREGATION list is rejected
+    by RTS 8.8 ("GROUPBY is not allowed when multiple aggregators are
+    specified") and supported here: we apply the reducer to each column
+    independently and return a grouped row of the same width. RTS enforces the
+    restriction on list *length*, so even a list of one repeated aggregator is
+    refused there. With a single aggregator, GROUPBY behaves identically on both
+    engines. Applies to TS.MRANGE and TS.MREVRANGE.
+  rationale: >
+    owner decision pending — an accepted-input superset. Column-wise reduction
+    is the natural reading of the two features composed (each column is an
+    independent series of bucket values, and the reducer is defined on exactly
+    that), and it is already implemented and covered by
+    tests/test_ts_multi_aggregation.py. Being a superset it can not be matched
+    by the registry (§5.2 hard-fails "reference errors, subject succeeds"), and
+    the direction of risk is the portability one: a query written against this
+    combination will not run on RedisTimeSeries, so it is a caveat for users
+    moving the other way rather than a compatibility break for clients arriving
+    from RTS. Pinned by
+    TestDivergences::test_groupby_with_a_multi_aggregator_list_is_a_superset,
+    with test_groupby_with_a_single_aggregator_still_agrees holding the boundary.
+  since: 0.1.0
+
+- id: DIV-0038
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    The list-element grammar accepts two forms RTS 8.8 has no vocabulary for,
+    both answered there with "Unknown aggregation type": aggregator names this
+    engine adds (`rate`, `countif`, `sumif`, …), and the inline per-element
+    condition `name(condition)` — e.g. `AGGREGATION countif(>15),avg 1000`,
+    which counts only the samples matching the condition in the first column
+    while the second aggregates normally. Each element carries its own
+    condition; an aggregator that requires one and is given none, or is given
+    one it does not accept, is rejected here.
+  rationale: >
+    owner decision pending — an accepted-input superset on the same clause as
+    DIV-0036/0037. The inline-condition syntax exists because the list grammar
+    gives each element its own slot, and it is the only way to express a
+    filtered aggregation without a second round trip. Purely additive: every
+    list RTS accepts still parses and means the same thing here. Non-registrable
+    for the usual §5.2 reason, and the risk direction is portability — code
+    written against these elements will not run on RedisTimeSeries. Pinned by
+    TestDivergences::test_extension_list_elements_are_a_superset.
+  since: 0.1.0
