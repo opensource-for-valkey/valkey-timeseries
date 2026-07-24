@@ -10,6 +10,7 @@
 //! * [`planner`] — boolean set algebra assembling filters and selectors into one bitmap.
 //! * [`stale`] — tombstoned ids: marking, masking them out of reads, incremental draining.
 //! * [`maintenance`] — incremental bitmap compaction.
+//! * [`serialization`] — the wire format for one index body, container-agnostic.
 //!
 //! Consumers above this layer go through `TimeSeriesIndex` (locking) or `querier`/`label_querier`
 //! (ACL, date ranges, ranking). Only the entry points those need are exported past this module;
@@ -20,6 +21,7 @@ mod maintenance;
 mod mutation;
 mod planner;
 mod predicate;
+pub(in crate::series::index) mod serialization;
 mod stale;
 mod terms;
 

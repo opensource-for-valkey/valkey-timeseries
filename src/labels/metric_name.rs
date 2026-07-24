@@ -14,6 +14,10 @@ use valkey_module::{ValkeyResult, ValkeyValue, raw};
 const VALUE_SEPARATOR: &str = "=";
 const EMPTY_LABEL: &str = "";
 
+// Real series never come close to this many labels; it only rejects a corrupt/hostile
+// count before it reaches `with_capacity`.
+pub const MAX_LABELS_PER_SERIES: usize = 128;
+
 pub struct InternedLabel<'a> {
     pub name: &'a str,
     pub value: &'a str,
@@ -168,9 +172,6 @@ impl MetricName {
     }
 
     pub fn from_rdb(rdb: *mut raw::RedisModuleIO) -> ValkeyResult<Self> {
-        // Real series never come close to this many labels; it only rejects a corrupt/hostile
-        // count before it reaches `with_capacity`.
-        const MAX_LABELS_PER_SERIES: usize = 5_000;
         let count = rdb_load_len(rdb, MAX_LABELS_PER_SERIES)?;
         let mut result = Self::with_capacity(count);
         for _ in 0..count {

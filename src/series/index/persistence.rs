@@ -11,22 +11,17 @@
 //! `try_read`; if any is contended we write nothing at all (`aux_save2` omits the aux field
 //! entirely) and the loader falls back to the rebuild path.
 
-use super::postings::{Postings, PostingsBitmap, PostingsIndex, StaleSet};
+use super::postings::Postings;
+use super::postings::serialization;
 use super::{TIMESERIES_INDEX, get_db_index, index_series_by_key};
 use crate::common::context::{get_current_db, set_current_db};
-use crate::common::encoding::{
-    try_read_byte_slice, try_read_u8, try_read_uvarint, write_byte_slice, write_u8, write_uvarint,
-};
+use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::sync::{read_lock, write_lock};
 use crate::config::is_index_persist_enabled;
-use crate::series::index::IndexKey;
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{SeriesRef, TimeSeries};
-use croaring::{Bitmap64, Portable};
-use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::os::raw::c_int;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,165 +106,22 @@ type PayloadResult<T> = Result<T, String>;
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
+//
+// The index body format lives in `postings::serialization`. This module owns only the container
+// around it: magic, version, section count, and the db number that prefixes each section.
 
-fn write_bitmap(buf: &mut Vec<u8>, bitmap: &PostingsBitmap) {
-    let size = bitmap.get_serialized_size_in_bytes::<Portable>();
-    write_uvarint(buf, size as u64);
-    buf.reserve(size);
-    let before = buf.len();
-    let _ = bitmap.serialize_into_vec::<Portable>(buf);
-    debug_assert_eq!(buf.len() - before, size);
-}
-
-fn read_bitmap(buf: &mut &[u8]) -> PayloadResult<PostingsBitmap> {
-    let blob = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-    Bitmap64::try_deserialize::<Portable>(blob)
-        .ok_or_else(|| "corrupt roaring bitmap blob".to_string())
-}
-
-/// Appends one per-db section to `buf`.
+/// Appends one per-db section to `buf`: the db number, then the encoded index body.
 fn serialize_postings_section(buf: &mut Vec<u8>, db: i32, postings: &Postings) {
     write_uvarint(buf, db as u64);
-
-    // label_index in tree iteration order (sorted): cache-friendly ART rebuild on load.
-    //
-    // Keys are written grouped by their shared `name=` prefix, which is emitted once per group
-    // rather than once per entry — the on-disk analogue of the prefix sharing the ART gives us
-    // in memory. Label *value* cardinality is what grows (hosts, instances); the set of label
-    // *names* is small and schema-bound, so a name with k values costs one copy of the name
-    // instead of k. Sorted iteration order is what makes this a single pass: a group's entries
-    // are necessarily contiguous, because every key in it shares the prefix up to and including
-    // the first `=`, and no other group's prefix can fall between them (a prefix never contains
-    // `=` except as its last byte, so no prefix is a prefix of another).
-    let stale = &postings.stale_ids;
-    // Group directory: (prefix, entry count) pairs, one per distinct label name.
-    let mut groups: Vec<u8> = Vec::new();
-    let mut group_count: u64 = 0;
-    let mut entries: Vec<u8> = Vec::new();
-    let mut open_group: Option<(&[u8], u64)> = None;
-    for (key, bitmap) in postings.label_index.iter() {
-        if bitmap.is_empty() {
-            continue;
-        }
-
-        // Stale ids are subtracted here rather than persisted: `mark_ids_as_stale` already cleans
-        // `id_to_key` and `all_postings` at mark time, so the label bitmaps are the only structures
-        // still carrying stale ids — persisting them would persist a cleanup obligation. Subtracting
-        // yields exactly the state a completed GC drain would produce. A stale id whose key is still
-        // in the RDB (a fork can land mid-ASM-export, before the engine's lazy delete) is
-        // resurrected by the post-load count-verification scan, matching the keyspace either way.
-        // The subtraction only costs anything when `stale_ids` is non-empty (rare: the cron GC
-        // drains continuously); entries that become empty are dropped, so each group's count is
-        // written only once its entries have been serialized.
-        let cleaned: Cow<PostingsBitmap> = stale.mask_cow(Cow::Borrowed(bitmap));
-        if cleaned.is_empty() {
-            continue;
-        }
-        // `as_str` strips the NUL sentinel; `IndexKey::from(&[u8])` re-appends it on load.
-        let full = key.as_str().as_bytes();
-        // Split *after* the first `=` so that `prefix + suffix` reproduces the key byte for
-        // byte, whatever it contains — a value with an `=` in it, or a key with none at all.
-        // Nothing here has to agree with `IndexKey::for_label_value` about where the name ends.
-        let split_at = full
-            .iter()
-            .position(|b| *b == b'=')
-            .map_or(full.len(), |i| i + 1);
-        let (prefix, suffix) = full.split_at(split_at);
-
-        match open_group {
-            Some((open, ref mut count)) if open == prefix => *count += 1,
-            _ => {
-                if let Some((open, count)) = open_group {
-                    write_byte_slice(&mut groups, open);
-                    write_uvarint(&mut groups, count);
-                    group_count += 1;
-                }
-                open_group = Some((prefix, 1));
-            }
-        }
-        write_byte_slice(&mut entries, suffix);
-        write_bitmap(&mut entries, &cleaned);
-    }
-    if let Some((open, count)) = open_group {
-        write_byte_slice(&mut groups, open);
-        write_uvarint(&mut groups, count);
-        group_count += 1;
-    }
-
-    write_uvarint(buf, group_count);
-    buf.extend_from_slice(&groups);
-    buf.extend_from_slice(&entries);
-
-    // id_to_key in ascending id order: ids share their high epoch bits and increment densely,
-    // so varint deltas stay small.
-    write_uvarint(buf, postings.id_to_key.len() as u64);
-    let mut prev_id: SeriesRef = 0;
-    for (id, key) in postings.id_to_key.iter() {
-        write_uvarint(buf, id - prev_id);
-        prev_id = *id;
-        write_byte_slice(buf, key.as_ref());
-    }
-
-    write_bitmap(buf, &postings.all_postings);
+    serialization::serialize(buf, postings);
 }
 
+/// Reads one per-db section, mirroring [`serialize_postings_section`].
 fn deserialize_postings_section(buf: &mut &[u8]) -> PayloadResult<(i32, Postings)> {
     let db = try_read_uvarint(buf).map_err(|e| e.to_string())?;
     let db = i32::try_from(db).map_err(|_| format!("invalid db number {db}"))?;
-
-    // Group directory first (see `serialize_postings_section`), then the entries for each group
-    // in the same order. `with_capacity` is clamped: the count comes from the payload, and a
-    // corrupt one must not turn into an unbounded allocation before the read that rejects it.
-    let group_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
-    let mut groups: Vec<(&[u8], usize)> = Vec::with_capacity(group_count.min(64));
-    for _ in 0..group_count {
-        let prefix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-        let count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
-        groups.push((prefix, count));
-    }
-
-    let mut label_index = PostingsIndex::new();
-    let mut key_bytes: Vec<u8> = Vec::new();
-    for (prefix, count) in groups {
-        for _ in 0..count {
-            let suffix = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-            let bitmap = read_bitmap(buf)?;
-            key_bytes.clear();
-            key_bytes.reserve(prefix.len() + suffix.len());
-            key_bytes.extend_from_slice(prefix);
-            key_bytes.extend_from_slice(suffix);
-            let key = IndexKey::from(key_bytes.as_slice());
-            label_index
-                .try_insert(key, bitmap)
-                .map_err(|e| format!("label index insert failed: {e}"))?;
-        }
-    }
-
-    let id_count = try_read_uvarint(buf).map_err(|e| e.to_string())? as usize;
-    let mut id_to_key = BTreeMap::new();
-    let mut prev_id: SeriesRef = 0;
-    for _ in 0..id_count {
-        let delta = try_read_uvarint(buf).map_err(|e| e.to_string())?;
-        let id = prev_id
-            .checked_add(delta)
-            .ok_or_else(|| "series id overflow".to_string())?;
-        prev_id = id;
-        let key = try_read_byte_slice(buf).map_err(|e| e.to_string())?;
-        id_to_key.insert(id, key.to_vec().into_boxed_slice());
-    }
-
-    let all_postings = read_bitmap(buf)?;
-
-    Ok((
-        db,
-        Postings {
-            label_index,
-            id_to_key,
-            // Stale ids were subtracted at save time; the loaded index starts clean.
-            stale_ids: StaleSet::default(),
-            all_postings,
-        },
-    ))
+    let postings = serialization::deserialize(buf)?;
+    Ok((db, postings))
 }
 
 /// Serializes every non-empty db index into a single payload buffer.
@@ -772,6 +624,8 @@ fn discard_preloaded_indexes() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::index::IndexKey;
+    use crate::series::index::postings::PostingsBitmap;
 
     fn sample_postings() -> Postings {
         let mut postings = Postings::default();
@@ -996,17 +850,6 @@ mod tests {
         let mut payload = build_payload(&[(0, &postings)]);
         payload.push(0xAB);
         assert!(parse_aux_payload(&payload).is_err());
-    }
-
-    #[test]
-    fn rejects_corrupt_bitmap_blob() {
-        // A blob whose declared length is intact but whose contents are not a valid portable
-        // bitmap: the leading u64 bucket count is absurd relative to the remaining bytes.
-        // (Bit flips that still decode as *some* valid bitmap are the RDB CRC's job to catch.)
-        let mut buf = Vec::new();
-        write_byte_slice(&mut buf, &[0xFF; 9]);
-        let mut slice = buf.as_slice();
-        assert!(read_bitmap(&mut slice).is_err());
     }
 
     /// The repair-scan scenario: the reconciliation sweep marks an id stale, then the keyspace
