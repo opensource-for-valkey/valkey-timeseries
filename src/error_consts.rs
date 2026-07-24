@@ -85,6 +85,7 @@ pub const GROUP_NOT_FOUND: &str = "TSDB: group not found";
 pub const LABELS_ALREADY_SET: &str = "TSDB: labels already set";
 pub const INVALID_LABEL_NAME: &str = "TSDB: invalid label name";
 pub const INVALID_LABEL_VALUE: &str = "TSDB: invalid label value";
+pub const TOO_MANY_LABELS: &str = "TSDB: too many labels";
 pub const MISSING_LABEL_VALUE: &str = "TSDB: empty or missing label value";
 pub const MISSING_LIMIT_VALUE: &str = "TSDB: missing LIMIT value";
 pub const INVALID_LIMIT_VALUE: &str = "TSDB: invalid LIMIT value";

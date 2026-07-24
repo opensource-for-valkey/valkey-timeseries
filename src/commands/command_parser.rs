@@ -8,7 +8,7 @@ use crate::error_consts;
 use crate::join::join_reducer::JoinReducer;
 use crate::join::{AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinType};
 use crate::labels::filters::SeriesSelector;
-use crate::labels::{Label, parse_series_selector};
+use crate::labels::{Label, MAX_LABELS_PER_SERIES, parse_series_selector};
 use crate::parser::number::parse_number;
 use crate::parser::{
     metric_name::parse_metric_name as parse_metric, number::parse_number as parse_number_internal,
@@ -221,7 +221,12 @@ pub fn parse_number_with_unit(arg: &str) -> TsdbResult<f64> {
 }
 
 pub fn parse_metric_name(arg: &str) -> ValkeyResult<Vec<Label>> {
-    parse_metric(arg).map_err(|_e| ValkeyError::Str(error_consts::INVALID_METRIC_NAME))
+    let labels =
+        parse_metric(arg).map_err(|_e| ValkeyError::Str(error_consts::INVALID_METRIC_NAME))?;
+    if labels.len() == MAX_LABELS_PER_SERIES {
+        return Err(ValkeyError::Str(error_consts::TOO_MANY_LABELS));
+    }
+    Ok(labels)
 }
 
 /// Parse a float value for use in a command argument, specifically ADD, MADD, and INCRBY/DECRBY.
@@ -488,6 +493,9 @@ pub fn parse_label_list(
     for_each_arg_until_stop(args, stop_tokens, |label| {
         if labels.contains(label) {
             return Err(ValkeyError::Str(error_consts::DUPLICATE_LABEL));
+        }
+        if labels.len() == MAX_LABELS_PER_SERIES {
+            return Err(ValkeyError::Str(error_consts::TOO_MANY_LABELS));
         }
         labels.insert(label.to_string());
         Ok(())
