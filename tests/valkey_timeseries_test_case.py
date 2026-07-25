@@ -642,7 +642,7 @@ def EnableDebugMode(config: List[str]):
 
 class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
     """
-    Same as ValkeySearchClusterTestCase, except that "debug-mode" is enabled.
+    Same as ValkeyTimeSeriesTestCase, except that "debug-mode" is enabled.
     """
 
     MODULE_ARGS = "debug-mode yes"
@@ -653,7 +653,7 @@ class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
 
 class ValkeyTimeSeriesClusterTestCaseDebugMode(ValkeyTimeSeriesClusterTestCase):
     """
-    Same as ValkeySearchClusterTestCase, except that "debug-mode" is enabled.
+    Same as ValkeyTimeSeriesClusterTestCase, except that "debug-mode" is enabled.
     """
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         return EnableDebugMode(
