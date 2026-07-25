@@ -1,5 +1,5 @@
 use crate::common::humanize::humanize_duration_ms;
-use crate::common::rounding::RoundingStrategy;
+use crate::common::rounding::{MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, RoundingStrategy};
 use crate::common::sync::lock;
 use crate::error_consts;
 use crate::parser::number::parse_number;
@@ -36,9 +36,13 @@ pub(crate) const FANOUT_COMMAND_TIMEOUT_MAX: i64 = 10000;
 pub const CHUNK_SIZE_MIN: i64 = 64;
 pub const CHUNK_SIZE_MAX: i64 = 1024 * 1024;
 pub const CHUNK_SIZE_DEFAULT: i64 = 4 * 1024;
-pub const DECIMAL_DIGITS_MAX: i64 = 18;
+// Rounding bounds come from the rounding module, which is what actually applies them: the
+// per-series `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` command arguments are validated against the
+// same constants. These previously read 18 here, so `CONFIG SET ts-decimal-digits 17` was
+// accepted and then silently clamped, while `TS.CREATE ... DECIMAL_DIGITS 17` was rejected.
+pub const DECIMAL_DIGITS_MAX: i64 = MAX_DECIMAL_DIGITS as i64;
 pub const DECIMAL_DIGITS_MIN: i64 = 0;
-pub const SIGNIFICANT_DIGITS_MAX: i64 = 18;
+pub const SIGNIFICANT_DIGITS_MAX: i64 = MAX_SIGNIFICANT_DIGITS as i64;
 pub const SIGNIFICANT_DIGITS_MIN: i64 = 0;
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = CHUNK_SIZE_DEFAULT as usize;
 pub const DEFAULT_CHUNK_ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
@@ -1334,6 +1338,23 @@ mod tests {
             ChunkEncoding::Xor2,
         ] {
             assert_eq!(ChunkEncoding::try_from(encoding as u8).ok(), Some(encoding));
+        }
+    }
+
+    /// The module-wide rounding defaults and the per-series `DECIMAL_DIGITS` /
+    /// `SIGNIFICANT_DIGITS` command arguments must accept the same range.
+    #[test]
+    fn rounding_bounds_match_the_per_series_command_bounds() {
+        assert_eq!(DECIMAL_DIGITS_MAX, MAX_DECIMAL_DIGITS as i64);
+        assert_eq!(SIGNIFICANT_DIGITS_MAX, MAX_SIGNIFICANT_DIGITS as i64);
+
+        // A digit count the config accepts must survive the packed representation.
+        for digits in DECIMAL_DIGITS_MIN..=DECIMAL_DIGITS_MAX {
+            let strategy = Some(RoundingStrategy::DecimalDigits(digits as u8));
+            assert_eq!(
+                decode_rounding_strategy(encode_rounding_strategy(strategy)),
+                strategy
+            );
         }
     }
 

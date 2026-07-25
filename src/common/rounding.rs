@@ -51,7 +51,10 @@ pub fn round_to_decimal_digits(value: f64, digits: u8) -> f64 {
 /// ### Parameters
 ///
 /// - `value`: The floating-point value to be rounded.
-/// - `digits`: The number of significant figures to round to. If `digits` is 0 or greater than or equal to 18, the function returns the original `value` unchanged.
+/// - `digits`: The number of significant figures to round to. If `digits` is 0 or greater than
+///   or equal to [`MAX_SIGNIFICANT_DIGITS`], the function returns the original `value`
+///   unchanged — at that point the request is at or beyond `f64`'s precision, so rounding
+///   would only introduce error.
 ///
 /// ### Returns
 ///
