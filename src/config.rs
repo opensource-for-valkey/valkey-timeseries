@@ -357,7 +357,7 @@ static FANOUT_COMMAND_TIMEOUT_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-fanout-command-timeout"));
 static CLUSTER_MAP_EXPIRATION_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-cluster-map-expiration-ms"));
-    
+
 /// Gate for the `TS._DEBUG` command surface (`debug-mode`, default off).
 ///
 /// `TS._DEBUG` exposes internal state (the string-interner pool, the node-local postings
