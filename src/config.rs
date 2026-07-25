@@ -983,7 +983,7 @@ pub static CONFIGS: &[ConfigDesc] = &[
         min: None,
         max: None,
         flags: ConfigurationFlags::DEFAULT,
-        description: "Enable debug logging and the TS._DEBUG command surface",
+        description: "Enable the TS._DEBUG command surface (disabled by default)",
         storage: ConfigStorage::Bool {
             cell: || &IS_DEBUG_MODE,
         },
@@ -1145,8 +1145,8 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
     // module itself rejects surfaces — for example `ts-decimal-digits` and
     // `ts-significant-digits` both set, which the mutual-exclusion check refuses.
     //
-    // A failure here leaves the offending parameter at its previous value and the rest applied;
-    // the module still loads, so report it rather than letting it pass silently.
+    // If applying the startup configuration fails, module initialization fails too (we return Err).
+    // Log a warning so operators can see why the module did not start.
     let status = unsafe { RedisModule_LoadConfigs.unwrap()(ctx.ctx) };
     if status != raw::REDISMODULE_OK as c_int {
         log_warning(
