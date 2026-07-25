@@ -217,6 +217,7 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | `ts-duplicate-policy`          | enum     | `BLOCK`         | Policy for handling duplicate timestamps: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, `SUM` |
 | `ts-retention-policy`          | duration | `0` (no expiry) | Default retention period (milliseconds)                                                 |
 | `ts-compaction-policy`         | string   | `None`          | Default compaction rules applied to all new time series                                 |
+| `ts-compatibility-mode`        | enum     | `EXTENDED`      | Which side of a value divergence from RedisTimeSeries to take: `EXTENDED` or `STRICT`   |
 | `ts-decimal-digits`            | integer  | `none`          | Round sample values to N decimal places; `none` disables rounding                       |
 | `ts-significant-digits`        | integer  | `none`          | Round sample values to N significant digits; `none` disables rounding                   |
 | `ts-ignore-max-time-diff`      | duration | `0ms`           | Max time delta (ms) for which a duplicate sample is silently ignored                    |
