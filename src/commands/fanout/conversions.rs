@@ -64,6 +64,7 @@ impl From<ChunkEncoding> for FanoutChunkEncoding {
             ChunkEncoding::TsXor => FanoutChunkEncoding::Tsxor,
             ChunkEncoding::Xor2 => FanoutChunkEncoding::Xor2,
             ChunkEncoding::Pco => FanoutChunkEncoding::Pco,
+            ChunkEncoding::DeXor => FanoutChunkEncoding::Dexor,
         }
     }
 }
@@ -76,6 +77,7 @@ impl From<FanoutChunkEncoding> for ChunkEncoding {
             FanoutChunkEncoding::Pco => ChunkEncoding::Pco,
             FanoutChunkEncoding::Tsxor => ChunkEncoding::TsXor,
             FanoutChunkEncoding::Xor2 => ChunkEncoding::Xor2,
+            FanoutChunkEncoding::Dexor => ChunkEncoding::DeXor,
         }
     }
 }

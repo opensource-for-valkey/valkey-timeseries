@@ -60,25 +60,76 @@
 //!   values that `Double.toString` renders in scientific notation. See
 //!   [`tools`].
 //!
-//! # Example
+//! # Layers
+//!
+//! [`DeXorValueEncoder`] / [`DeXorValueDecoder`] are the value codec proper.
+//! They borrow the bit stream rather than owning it, so a chunk can interleave
+//! timestamps between values:
 //!
 //! ```ignore
 //! let values = [21.5, 21.6, 21.7, 21.65];
-//! let bytes = DeXorEncoder::encode_slice(&values, DeXorConfig::default());
-//! let decoded = DeXorDecoder::decode_all(&bytes, values.len(), DeXorConfig::default())?;
+//! let bytes = encode_values(&values, DeXorConfig::default());
+//! let decoded = decode_values(&bytes, values.len(), DeXorConfig::default())?;
 //! assert_eq!(decoded, values);
 //! ```
+//!
+//! [`DeXorEncoder`] and [`DeXorChunk`] build the [`ChunkEncoding::DeXor`]
+//! storage format on top: DeXOR values interleaved with Gorilla's
+//! delta-of-delta varbit timestamps.
+//!
+//! [`ChunkEncoding::DeXor`]: crate::series::chunks::ChunkEncoding::DeXor
 
-mod dexor_decoder;
+mod dexor_chunk;
+#[cfg(test)]
+mod dexor_chunk_tests;
 mod dexor_encoder;
+mod dexor_iterator;
 mod exponent_coder;
 mod stream_io;
 #[cfg(test)]
 mod tests;
 mod tools;
+mod value_decoder;
+mod value_encoder;
 
-pub use dexor_decoder::DeXorDecoder;
+pub use dexor_chunk::{DeXorChunk, DeXorChunkIterator};
 pub use dexor_encoder::DeXorEncoder;
+pub use dexor_iterator::DeXorIterator;
+pub use value_decoder::DeXorValueDecoder;
+pub use value_encoder::DeXorValueEncoder;
+
+use crate::common::hash::hash_f64;
+use crate::series::chunks::stream::bitstream::BitStream;
+use crate::series::chunks::stream::bitstream_reader::BitStreamReader;
+use get_size2::GetSize;
+use std::hash::{Hash, Hasher};
+use std::io;
+
+/// Encode `values` into a standalone bit stream.
+///
+/// Useful for testing and for callers that only want the value codec; the
+/// chunk encoder interleaves timestamps instead.
+pub fn encode_values(values: &[f64], config: DeXorConfig) -> Vec<u8> {
+    let mut encoder = DeXorValueEncoder::new(config);
+    let mut out = BitStream::new();
+    for &value in values {
+        encoder.encode(&mut out, value);
+    }
+    out.into_bytes()
+}
+
+/// Decode exactly `count` values written by [`encode_values`].
+///
+/// The stream carries no length, so the count has to come from the caller.
+pub fn decode_values(bytes: &[u8], count: usize, config: DeXorConfig) -> io::Result<Vec<f64>> {
+    let mut decoder = DeXorValueDecoder::new(config);
+    let mut input = BitStreamReader::new(bytes);
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(decoder.decode(&mut input)?);
+    }
+    Ok(values)
+}
 
 /// Width of the leading control code.
 const CONTROL_BITS: u32 = 2;
@@ -106,7 +157,7 @@ const DELTA_BITS: u32 = 4;
 const MAX_DELTA: u32 = 1 << DELTA_BITS;
 
 /// How the encoder picks the value each sample is coded against.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, GetSize)]
 pub enum DeXorMode {
     /// Code every sample against its immediate predecessor.
     #[default]
@@ -133,7 +184,7 @@ pub enum DeXorMode {
 ///
 /// The encoder and decoder must be constructed with identical configuration;
 /// none of it is carried in the bit stream.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, GetSize)]
 pub struct DeXorConfig {
     pub mode: DeXorMode,
 
@@ -164,7 +215,7 @@ impl DeXorConfig {
 }
 
 /// The per-stream state that the encoder and decoder must keep in lockstep.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, GetSize)]
 struct SharedState {
     config: DeXorConfig,
     /// The value the next sample is coded against in the non-buffered modes.
@@ -225,4 +276,34 @@ impl SharedState {
             }
         }
     }
+}
+
+impl Hash for SharedState {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.config.hash(hasher);
+        hash_f64(self.previous_value, hasher);
+        self.previous_q.hash(hasher);
+        self.previous_delta.hash(hasher);
+        for &value in &self.window {
+            hash_f64(value, hasher);
+        }
+        self.window_next.hash(hasher);
+        self.exception_run.hash(hasher);
+        self.skipping.hash(hasher);
+    }
+}
+
+/// The predictor state a paused encoder must carry across persistence in order
+/// to keep appending to a stream it did not itself write.
+///
+/// Only [`DeXorMode::Native`] state is captured: the chunk encoder fixes the
+/// mode, so the dictionary and skip counters are always at their defaults.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct CodecSnapshot {
+    pub previous_value_bits: u64,
+    pub previous_q: i32,
+    pub previous_delta: u32,
+    pub previous_exp: u64,
+    pub exponent_len: u32,
+    pub contract_step: u32,
 }

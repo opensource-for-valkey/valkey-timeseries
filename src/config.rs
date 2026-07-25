@@ -1379,6 +1379,7 @@ mod tests {
             ChunkEncoding::TsXor,
             ChunkEncoding::Pco,
             ChunkEncoding::Xor2,
+            ChunkEncoding::DeXor,
         ] {
             assert_eq!(ChunkEncoding::try_from(encoding as u8).ok(), Some(encoding));
         }

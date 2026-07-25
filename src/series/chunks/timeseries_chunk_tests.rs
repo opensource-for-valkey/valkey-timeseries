@@ -19,12 +19,13 @@ mod tests {
         (f1 - f2).abs() < f64::EPSILON
     }
 
-    const CHUNK_TYPES: [ChunkEncoding; 5] = [
+    const CHUNK_TYPES: [ChunkEncoding; 6] = [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
         ChunkEncoding::Xor2,
         ChunkEncoding::TsXor,
         ChunkEncoding::Pco,
+        ChunkEncoding::DeXor,
     ];
 
     fn generate_random_samples(count: usize) -> Vec<Sample> {
@@ -2445,6 +2446,7 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::Pco,
+            ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);
             let samples = vec![
@@ -2528,6 +2530,7 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::Pco,
+            ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);
             let samples = vec![

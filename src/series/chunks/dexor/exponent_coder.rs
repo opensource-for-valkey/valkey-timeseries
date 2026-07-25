@@ -13,6 +13,7 @@
 use super::stream_io::{read_bits, write_bits};
 use crate::series::chunks::stream::bitstream::BitStream;
 use crate::series::chunks::stream::bitstream_reader::BitStreamReader;
+use get_size2::GetSize;
 use std::io;
 
 /// IEEE-754 exponent of `1.0`; the reference seeds its predictor with this.
@@ -25,7 +26,7 @@ const MAX_EXPONENT_LEN: u32 = 10;
 const EXPONENT_MASK: u64 = 0x7FF;
 const MANTISSA_MASK: u64 = (1u64 << 52) - 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, GetSize)]
 pub(super) struct ExponentCoder {
     previous_exp: u64,
     /// Current width, in bits, of the exponent-delta field.
@@ -43,6 +44,33 @@ impl ExponentCoder {
             contract_step: 0,
             rho,
         }
+    }
+
+    /// `(previous_exp, len, contract_step)` — everything a resumed encoder needs.
+    pub(super) fn snapshot(&self) -> (u64, u32, u32) {
+        (self.previous_exp, self.len, self.contract_step)
+    }
+
+    /// Rebuild from a snapshot, rejecting values that would make `bias()`
+    /// shift out of range. Persisted state is untrusted input.
+    pub(super) fn restore(
+        rho: u32,
+        previous_exp: u64,
+        len: u32,
+        contract_step: u32,
+    ) -> Option<Self> {
+        if previous_exp > EXPONENT_MASK
+            || !(1..=MAX_EXPONENT_LEN).contains(&len)
+            || contract_step > rho
+        {
+            return None;
+        }
+        Some(Self {
+            previous_exp,
+            len,
+            contract_step,
+            rho,
+        })
     }
 
     /// Largest magnitude a delta field of the current width can carry. The

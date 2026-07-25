@@ -18,6 +18,7 @@ enum CompressionType {
   PCO = 2;
   TSXOR = 3;
   XOR2 = 4;
+  DEXOR = 5;
 }
 
 message SampleData {

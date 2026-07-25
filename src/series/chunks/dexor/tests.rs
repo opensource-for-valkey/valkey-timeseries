@@ -19,8 +19,8 @@ fn configs() -> Vec<DeXorConfig> {
 #[track_caller]
 fn assert_roundtrip(values: &[f64]) {
     for config in configs() {
-        let bytes = DeXorEncoder::encode_slice(values, config);
-        let decoded = DeXorDecoder::decode_all(&bytes, values.len(), config)
+        let bytes = encode_values(values, config);
+        let decoded = decode_values(&bytes, values.len(), config)
             .unwrap_or_else(|e| panic!("decode failed for {config:?}: {e}"));
 
         assert_eq!(
@@ -40,16 +40,16 @@ fn assert_roundtrip(values: &[f64]) {
 
 /// Bits per sample under the default configuration.
 fn bits_per_sample(values: &[f64]) -> f64 {
-    let bytes = DeXorEncoder::encode_slice(values, DeXorConfig::default());
+    let bytes = encode_values(values, DeXorConfig::default());
     (bytes.len() * 8) as f64 / values.len() as f64
 }
 
 #[test]
 fn empty_stream() {
-    let bytes = DeXorEncoder::encode_slice(&[], DeXorConfig::default());
+    let bytes = encode_values(&[], DeXorConfig::default());
     assert!(bytes.is_empty());
     assert!(
-        DeXorDecoder::decode_all(&bytes, 0, DeXorConfig::default())
+        decode_values(&bytes, 0, DeXorConfig::default())
             .unwrap()
             .is_empty()
     );
@@ -110,8 +110,8 @@ fn non_finite_values() {
 
     // A signalling-style NaN payload must survive verbatim too.
     let payload = f64::from_bits(0x7FF0_0000_DEAD_BEEF);
-    let bytes = DeXorEncoder::encode_slice(&[payload], DeXorConfig::default());
-    let decoded = DeXorDecoder::decode_all(&bytes, 1, DeXorConfig::default()).unwrap();
+    let bytes = encode_values(&[payload], DeXorConfig::default());
+    let decoded = decode_values(&bytes, 1, DeXorConfig::default()).unwrap();
     assert_eq!(decoded[0].to_bits(), payload.to_bits());
 }
 
@@ -191,8 +191,8 @@ fn skippable_mode_gives_up_after_threshold() {
 
     assert_roundtrip(&values);
 
-    let native = DeXorEncoder::encode_slice(&values, DeXorConfig::default()).len();
-    let skippable = DeXorEncoder::encode_slice(
+    let native = encode_values(&values, DeXorConfig::default()).len();
+    let skippable = encode_values(
         &values,
         DeXorConfig {
             mode: DeXorMode::Skippable { after: 4 },
@@ -223,13 +223,12 @@ fn exception_run_recovers() {
 #[test]
 fn truncated_stream_errors_instead_of_panicking() {
     let values: Vec<f64> = (0..64).map(|i| 10.5 + i as f64 * 0.25).collect();
-    let bytes = DeXorEncoder::encode_slice(&values, DeXorConfig::default());
+    let bytes = encode_values(&values, DeXorConfig::default());
 
     for cut in 0..bytes.len() {
         // Asking for far more samples than the stream holds must surface an
         // error, never a panic.
-        let result =
-            DeXorDecoder::decode_all(&bytes[..cut], values.len() * 4, DeXorConfig::default());
+        let result = decode_values(&bytes[..cut], values.len() * 4, DeXorConfig::default());
         assert!(result.is_err(), "expected EOF error at cut {cut}");
     }
 }
@@ -247,7 +246,7 @@ fn arbitrary_bytes_do_not_panic() {
             .collect();
         for config in configs() {
             // Values may be nonsense; the contract is only that we terminate.
-            let _ = DeXorDecoder::decode_all(&bytes, 64, config);
+            let _ = decode_values(&bytes, 64, config);
         }
     }
 }
@@ -258,8 +257,8 @@ proptest! {
     #[test]
     fn roundtrip_arbitrary_doubles(values in prop::collection::vec(any::<f64>(), 1..64)) {
         for config in configs() {
-            let bytes = DeXorEncoder::encode_slice(&values, config);
-            let decoded = DeXorDecoder::decode_all(&bytes, values.len(), config).unwrap();
+            let bytes = encode_values(&values, config);
+            let decoded = decode_values(&bytes, values.len(), config).unwrap();
             for (expected, actual) in values.iter().zip(decoded.iter()) {
                 prop_assert_eq!(expected.to_bits(), actual.to_bits());
             }
@@ -274,8 +273,8 @@ proptest! {
         let divisor = 10f64.powi(scale);
         let values: Vec<f64> = raw.iter().map(|&v| v as f64 / divisor).collect();
         for config in configs() {
-            let bytes = DeXorEncoder::encode_slice(&values, config);
-            let decoded = DeXorDecoder::decode_all(&bytes, values.len(), config).unwrap();
+            let bytes = encode_values(&values, config);
+            let decoded = decode_values(&bytes, values.len(), config).unwrap();
             for (expected, actual) in values.iter().zip(decoded.iter()) {
                 prop_assert_eq!(expected.to_bits(), actual.to_bits());
             }

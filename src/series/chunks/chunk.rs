@@ -31,6 +31,7 @@ pub enum ChunkEncoding {
     TsXor = 3,
     Pco = 4,
     Xor2 = 5,
+    DeXor = 6,
 }
 
 impl ChunkEncoding {
@@ -41,6 +42,7 @@ impl ChunkEncoding {
             ChunkEncoding::TsXor => "tsxor",
             ChunkEncoding::Xor2 => "xor2",
             ChunkEncoding::Pco => "pco",
+            ChunkEncoding::DeXor => "dexor",
         }
     }
 
@@ -64,6 +66,7 @@ impl TryFrom<u8> for ChunkEncoding {
             3 => Ok(ChunkEncoding::TsXor),
             4 => Ok(ChunkEncoding::Pco),
             5 => Ok(ChunkEncoding::Xor2),
+            6 => Ok(ChunkEncoding::DeXor),
             _ => Err(ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING)),
         }
     }
@@ -95,6 +98,7 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
         "tsxor" => ChunkEncoding::TsXor,
         "xor2" => ChunkEncoding::Xor2,
         "pco" => ChunkEncoding::Pco,
+        "dexor" => ChunkEncoding::DeXor,
     }
 }
 
@@ -219,6 +223,7 @@ mod tests {
             ChunkEncoding::TsXor,
             ChunkEncoding::Pco,
             ChunkEncoding::Xor2,
+            ChunkEncoding::DeXor,
         ];
 
         for &enc in &encodings {
@@ -230,7 +235,7 @@ mod tests {
 
     #[test]
     fn chunk_encoding_invalid_u8_returns_err() {
-        // Pick a value outside the defined range (1..=5)
+        // Pick a value outside the defined range (1..=6)
         let invalid: u8 = 0u8;
         assert!(ChunkEncoding::try_from(invalid).is_err());
 

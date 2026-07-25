@@ -1,256 +1,323 @@
-//! DeXOR encoder.
+//! Sample-level DeXOR encoder.
 //!
-//! Port of `algorithms.DeXOR.encoder.DoubleDeXOREncoder`, with the three
-//! reference strategies (`Native`, `Skippable`, `Buffered`) collapsed into
-//! [`DeXorMode`] rather than a subclass hierarchy.
+//! Mirrors [`GorillaEncoder`](crate::series::chunks::GorillaEncoder): timestamps
+//! and values are interleaved in a single bit stream, one record per sample.
+//! Timestamps use the same delta-of-delta varbit scheme as Gorilla; only the
+//! value coder differs.
+//!
+//! | sample | timestamp                        | value              |
+//! |--------|----------------------------------|--------------------|
+//! | first  | zig-zag varint, absolute         | DeXOR              |
+//! | second | uvarint delta                    | DeXOR              |
+//! | nth    | varbit delta-of-delta            | DeXOR              |
+//!
+//! Unlike Gorilla, the first value is *not* stored as a raw `f64`: the DeXOR
+//! value coder starts from a predictor of `0.0` on both sides, so the first
+//! sample codes like any other and a leading integer costs a handful of bits
+//! rather than 64.
+//!
+//! The chunk fixes the value coder to [`DeXorMode::Native`] with the default
+//! `rho`. The `Skippable` and `Buffered` modes remain available through
+//! [`DeXorValueEncoder`] but are not persisted, since selecting them would need
+//! a per-series knob and extra state in every chunk header.
+//!
+//! [`DeXorMode::Native`]: super::DeXorMode::Native
 
-use super::exponent_coder::ExponentCoder;
-use super::stream_io::write_bits;
-use super::tools::{approx_zero, decimal_bits, last_digit_exponent, p10, truncate};
-use super::{
-    CONTROL_BITS, CONTROL_EXCEPTION, CONTROL_NEW_DELTA, CONTROL_NEW_Q, CONTROL_REPEAT, DELTA_BITS,
-    DeXorConfig, MAX_DELTA, Q_BIAS, Q_BITS, Q_MAX, Q_MIN, SharedState,
+use super::dexor_iterator::DeXorIterator;
+use super::{CodecSnapshot, DeXorConfig, DeXorValueEncoder};
+use crate::common::Sample;
+use crate::common::encoding::{try_read_f64_le, try_read_uvarint, write_f64_le, write_uvarint};
+use crate::common::hash::hash_f64;
+use crate::common::logging::log_warning;
+use crate::common::rdb::{
+    RdbSerializable, rdb_load_timestamp, rdb_load_usize, rdb_save_timestamp, rdb_save_usize,
 };
+use crate::error::{TsdbError, TsdbResult};
 use crate::series::chunks::stream::bitstream::BitStream;
+use crate::series::chunks::stream::varbit::write_varbit;
+use get_size2::GetSize;
+use std::ffi::c_longlong;
+use std::hash::Hash;
+use std::mem::size_of_val;
+use valkey_module::digest::Digest;
+use valkey_module::error::Error as ValkeyError;
+use valkey_module::raw;
 
-/// A decimal encoding the encoder has committed to for one sample.
-struct Plan {
-    q: i32,
-    delta: u32,
-    /// The shared decimal prefix, which the decoder recomputes rather than reads.
-    alpha: f64,
-    /// Magnitude of the residual, in units of `10^q`.
-    beta: u64,
-    /// Dictionary slot the prefix came from; always 0 outside `Buffered` mode.
-    slot: usize,
-}
+/// Configuration used by every persisted DeXOR chunk.
+///
+/// Fixed rather than per-series so a chunk header does not have to carry it and
+/// so the format stays stable across releases.
+pub(super) const CHUNK_CODEC_CONFIG: DeXorConfig = DeXorConfig {
+    mode: super::DeXorMode::Native,
+    rho: 8,
+};
 
 #[derive(Debug, Clone)]
 pub struct DeXorEncoder {
-    out: BitStream,
-    exceptions: ExponentCoder,
-    state: SharedState,
-    count: usize,
+    writer: BitStream,
+    values: DeXorValueEncoder,
+    timestamp_delta: i64,
+    pub num_samples: usize,
+    pub first_ts: i64,
+    pub last_ts: i64,
+    pub last_value: f64,
+}
+
+impl GetSize for DeXorEncoder {
+    fn get_size(&self) -> usize {
+        self.writer.get_size()
+            + self.values.get_size()
+            + size_of_val(&self.num_samples)
+            + size_of_val(&self.first_ts)
+            + size_of_val(&self.last_ts)
+            + size_of_val(&self.last_value)
+            + size_of_val(&self.timestamp_delta)
+    }
+}
+
+impl Hash for DeXorEncoder {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.writer.hash(state);
+        self.values.hash(state);
+        self.num_samples.hash(state);
+        self.first_ts.hash(state);
+        self.last_ts.hash(state);
+        self.timestamp_delta.hash(state);
+        hash_f64(self.last_value, state);
+    }
 }
 
 impl Default for DeXorEncoder {
     fn default() -> Self {
-        Self::new(DeXorConfig::default())
+        Self::new()
     }
 }
 
 impl DeXorEncoder {
-    pub fn new(config: DeXorConfig) -> Self {
-        Self {
-            out: BitStream::new(),
-            exceptions: ExponentCoder::new(config.rho),
-            state: SharedState::new(config),
-            count: 0,
+    pub fn new() -> DeXorEncoder {
+        DeXorEncoder {
+            writer: BitStream::new(),
+            values: DeXorValueEncoder::new(CHUNK_CODEC_CONFIG),
+            timestamp_delta: 0,
+            num_samples: 0,
+            first_ts: 0,
+            last_ts: 0,
+            last_value: 0.0,
         }
-    }
-
-    /// Encode a whole slice in one call.
-    pub fn encode_slice(values: &[f64], config: DeXorConfig) -> Vec<u8> {
-        let mut encoder = Self::new(config);
-        for &value in values {
-            encoder.push(value);
-        }
-        encoder.finish()
-    }
-
-    /// Number of samples written so far.
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// The bytes produced so far. The final byte may be partially filled; the
-    /// stream is not self-terminating, so a decoder needs the sample count.
-    pub fn bytes(&self) -> &[u8] {
-        self.out.bytes()
-    }
-
-    pub fn finish(self) -> Vec<u8> {
-        self.out.into_bytes()
     }
 
     pub fn clear(&mut self) {
-        let config = self.state.config;
-        self.out.clear();
-        self.exceptions = ExponentCoder::new(config.rho);
-        self.state = SharedState::new(config);
-        self.count = 0;
+        self.writer.clear();
+        self.values.reset();
+        self.timestamp_delta = 0;
+        self.num_samples = 0;
+        self.first_ts = 0;
+        self.last_ts = 0;
+        self.last_value = 0.0;
     }
 
-    /// Append one sample.
-    pub fn push(&mut self, value: f64) {
-        self.count += 1;
-
-        if self.state.skipping {
-            self.exceptions.encode(&mut self.out, value);
-            return;
-        }
-
-        match self.plan(value) {
-            Some(plan) => self.write_decimal(value, plan),
-            None => {
-                write_bits(&mut self.out, CONTROL_BITS, CONTROL_EXCEPTION);
-                self.exceptions.encode(&mut self.out, value);
-                self.state.reject();
-            }
+    pub fn add_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        match self.num_samples {
+            0 => self.write_first_sample(sample),
+            1 => self.write_second_sample(sample),
+            _ => self.write_nth_sample(sample),
         }
     }
 
-    /// Decide how `value` can be coded on the decimal path, or `None` if it
-    /// cannot be coded there at all.
-    ///
-    /// The final check is the important one: it replays the decoder's exact
-    /// floating-point arithmetic and rejects anything that would not come back
-    /// bit-identical. The reference instead accepts any reconstruction within
-    /// `10^q` of the input, which makes it lossy in the last decimal place.
-    fn plan(&self, value: f64) -> Option<Plan> {
-        if !value.is_finite() {
-            return None;
-        }
+    fn write_first_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.writer.write_varint(sample.timestamp)?;
+        self.values.encode(&mut self.writer, sample.value);
 
-        let q = last_digit_exponent(value, self.state.previous_q)?;
-        if !(Q_MIN..=Q_MAX).contains(&q) {
-            return None;
-        }
+        self.first_ts = sample.timestamp;
+        self.last_ts = sample.timestamp;
+        self.last_value = sample.value;
+        self.num_samples += 1;
+        Ok(())
+    }
 
-        let (delta, alpha, slot) = if self.state.window.is_empty() {
-            let (delta, alpha) = shared_prefix(value, self.state.previous_value, q)?;
-            (delta, alpha, 0)
-        } else {
-            self.search_window(value, q)?
+    fn write_second_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        let timestamp_delta = self.timestamp_delta(sample.timestamp)?;
+        self.writer.write_uvarint(timestamp_delta as u64)?;
+        self.values.encode(&mut self.writer, sample.value);
+
+        self.last_ts = sample.timestamp;
+        self.last_value = sample.value;
+        self.timestamp_delta = timestamp_delta;
+        self.num_samples += 1;
+        Ok(())
+    }
+
+    fn write_nth_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
+        let timestamp_delta = self.timestamp_delta(sample.timestamp)?;
+        let delta_of_delta = timestamp_delta - self.timestamp_delta;
+
+        write_varbit(&mut self.writer, delta_of_delta)?;
+        self.values.encode(&mut self.writer, sample.value);
+
+        self.last_ts = sample.timestamp;
+        self.last_value = sample.value;
+        self.timestamp_delta = timestamp_delta;
+        self.num_samples += 1;
+        Ok(())
+    }
+
+    fn timestamp_delta(&self, timestamp: i64) -> std::io::Result<i64> {
+        let delta = timestamp - self.last_ts;
+        if delta < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "samples aren't sorted by timestamp ascending",
+            ));
+        }
+        Ok(delta)
+    }
+
+    pub fn iter(&'_ self) -> DeXorIterator<'_> {
+        DeXorIterator::new(self)
+    }
+
+    pub(crate) fn buf(&self) -> &[u8] {
+        self.writer.get_ref()
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.writer.shrink_to_fit()
+    }
+
+    pub fn rdb_save(&self, rdb: *mut raw::RedisModuleIO) {
+        let snapshot = self.values.snapshot();
+        rdb_save_usize(rdb, self.num_samples);
+        rdb_save_timestamp(rdb, self.first_ts);
+        rdb_save_timestamp(rdb, self.last_ts);
+        raw::save_double(rdb, self.last_value);
+        raw::save_signed(rdb, self.timestamp_delta);
+        raw::save_unsigned(rdb, snapshot.previous_value_bits);
+        raw::save_signed(rdb, snapshot.previous_q as i64);
+        raw::save_unsigned(rdb, snapshot.previous_delta as u64);
+        raw::save_unsigned(rdb, snapshot.previous_exp);
+        raw::save_unsigned(rdb, snapshot.exponent_len as u64);
+        raw::save_unsigned(rdb, snapshot.contract_step as u64);
+        self.writer.rdb_save(rdb);
+    }
+
+    pub fn rdb_load(rdb: *mut raw::RedisModuleIO) -> Result<DeXorEncoder, ValkeyError> {
+        let num_samples = rdb_load_usize(rdb)?;
+        let first_ts = rdb_load_timestamp(rdb)?;
+        let last_ts = rdb_load_timestamp(rdb)?;
+        let last_value = raw::load_double(rdb)?;
+        let timestamp_delta = raw::load_signed(rdb)?;
+        let snapshot = CodecSnapshot {
+            previous_value_bits: raw::load_unsigned(rdb)?,
+            previous_q: raw::load_signed(rdb)? as i32,
+            previous_delta: raw::load_unsigned(rdb)? as u32,
+            previous_exp: raw::load_unsigned(rdb)?,
+            exponent_len: raw::load_unsigned(rdb)? as u32,
+            contract_step: raw::load_unsigned(rdb)? as u32,
         };
+        let writer = BitStream::rdb_load(rdb)?;
 
-        let pow_q = p10(q)?;
-        let scaled = (value - alpha) / pow_q;
-        if !scaled.is_finite() {
-            return None;
-        }
+        let values = DeXorValueEncoder::restore(CHUNK_CODEC_CONFIG, snapshot)
+            .ok_or_else(|| ValkeyError::generic("dexor: invalid codec state in RDB"))?;
 
-        let beta = scaled.round().abs();
-        // Keep the cast below well-defined; the field-width check that follows
-        // is the one that actually binds.
-        if beta >= u64::MAX as f64 {
-            return None;
-        }
-        let beta = beta as u64;
-
-        let width = decimal_bits(delta);
-        debug_assert!(width < 64, "delta < 16 bounds the residual to 50 bits");
-        if beta >> width != 0 {
-            return None;
-        }
-
-        // Replay the decoder.
-        let sign: i64 = if approx_zero(alpha) {
-            if value > 0.0 { 1 } else { -1 }
-        } else if alpha > 0.0 {
-            1
-        } else {
-            -1
-        };
-        let reconstructed = alpha + ((sign * beta as i64) as f64) * pow_q;
-        if reconstructed.to_bits() != value.to_bits() {
-            return None;
-        }
-
-        Some(Plan {
-            q,
-            delta,
-            alpha,
-            beta,
-            slot,
+        Ok(DeXorEncoder {
+            writer,
+            values,
+            timestamp_delta,
+            num_samples,
+            first_ts,
+            last_ts,
+            last_value,
         })
     }
 
-    /// [`DeXorMode::Buffered`] prefix search: start from the window's first
-    /// slot, then walk the rest looking for a slot that shares strictly more
-    /// decimal digits.
-    ///
-    /// [`DeXorMode::Buffered`]: super::DeXorMode::Buffered
-    fn search_window(&self, value: f64, q: i32) -> Option<(u32, f64, usize)> {
-        let window = &self.state.window;
+    pub fn serialize(&self, buf: &mut Vec<u8>) {
+        let snapshot = self.values.snapshot();
 
-        let (mut delta, mut alpha) = shared_prefix(value, window[0], q).unwrap_or((MAX_DELTA, 0.0));
-        let mut slot = 0usize;
+        write_uvarint(buf, self.num_samples as u64);
+        write_uvarint(buf, self.first_ts as u64);
+        write_uvarint(buf, self.last_ts as u64);
+        write_f64_le(buf, self.last_value);
 
-        let mut pow = p10(q + delta as i32 - 1)?;
-        let mut a = truncate(value / pow);
+        // Verified non-negative when adding samples.
+        write_uvarint(buf, self.timestamp_delta as u64);
 
-        for (index, &candidate) in window.iter().enumerate().skip(1) {
-            if delta == 0 {
-                break;
-            }
-            let mut b = truncate(candidate / pow);
-            while a == b {
-                alpha = a as f64 * pow;
-                slot = index;
-                delta -= 1;
-                if delta == 0 {
-                    break;
-                }
-                pow = p10(q + delta as i32 - 1)?;
-                a = truncate(value / pow);
-                b = truncate(candidate / pow);
-            }
-        }
+        write_uvarint(buf, snapshot.previous_value_bits);
+        // Biased so the varint stays small for the common negative exponents.
+        write_uvarint(buf, (snapshot.previous_q - super::Q_MIN) as u64);
+        write_uvarint(buf, snapshot.previous_delta as u64);
+        write_uvarint(buf, snapshot.previous_exp);
+        write_uvarint(buf, snapshot.exponent_len as u64);
+        write_uvarint(buf, snapshot.contract_step as u64);
 
-        (delta < MAX_DELTA).then_some((delta, alpha, slot))
+        self.writer.serialize(buf);
     }
 
-    fn write_decimal(&mut self, value: f64, plan: Plan) {
-        let same_q = plan.q == self.state.previous_q;
-        let repeat = same_q && plan.delta == self.state.previous_delta;
+    pub fn deserialize(buf: &[u8]) -> TsdbResult<DeXorEncoder> {
+        let mut buf = buf;
 
-        let control = if repeat {
-            CONTROL_REPEAT
-        } else if same_q {
-            CONTROL_NEW_DELTA
-        } else {
-            CONTROL_NEW_Q
+        let num_samples = read_uvarint(&mut buf)? as usize;
+        let first_ts = read_uvarint(&mut buf)? as i64;
+        let last_ts = read_uvarint(&mut buf)? as i64;
+        let last_value = try_read_f64_le(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
+        let timestamp_delta = read_uvarint(&mut buf)? as i64; // yes, this is intended
+
+        let snapshot = CodecSnapshot {
+            previous_value_bits: read_uvarint(&mut buf)?,
+            previous_q: read_uvarint(&mut buf)? as i32 + super::Q_MIN,
+            previous_delta: read_uvarint(&mut buf)? as u32,
+            previous_exp: read_uvarint(&mut buf)?,
+            exponent_len: read_uvarint(&mut buf)? as u32,
+            contract_step: read_uvarint(&mut buf)? as u32,
         };
-        write_bits(&mut self.out, CONTROL_BITS, control);
-        write_bits(
-            &mut self.out,
-            self.state.config.slot_bits(),
-            plan.slot as u64,
-        );
 
-        if !repeat {
-            if !same_q {
-                write_bits(&mut self.out, Q_BITS, (plan.q + Q_BIAS) as u64);
-                self.state.previous_q = plan.q;
-            }
-            write_bits(&mut self.out, DELTA_BITS, u64::from(plan.delta));
-            self.state.previous_delta = plan.delta;
-        }
+        let writer = BitStream::deserialize(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
 
-        // The prefix carries the sign unless it is zero.
-        if approx_zero(plan.alpha) {
-            self.out.write_bit(value > 0.0);
-        }
+        let values = DeXorValueEncoder::restore(CHUNK_CODEC_CONFIG, snapshot).ok_or_else(|| {
+            log_warning("dexor: invalid codec state in serialized chunk");
+            TsdbError::ChunkDecoding
+        })?;
 
-        write_bits(&mut self.out, decimal_bits(plan.delta), plan.beta);
-        self.state.accept(value);
+        Ok(DeXorEncoder {
+            writer,
+            values,
+            timestamp_delta,
+            num_samples,
+            first_ts,
+            last_ts,
+            last_value,
+        })
+    }
+
+    pub fn debug_digest(&self, dig: &mut Digest) {
+        let snapshot = self.values.snapshot();
+        self.writer.debug_digest(dig);
+        dig.add_long_long(self.num_samples as c_longlong);
+        dig.add_long_long(self.first_ts);
+        dig.add_long_long(self.last_ts);
+        dig.add_long_long(self.timestamp_delta);
+        dig.add_long_long(self.last_value.to_bits() as c_longlong);
+        dig.add_long_long(snapshot.previous_value_bits as c_longlong);
+        dig.add_long_long(snapshot.previous_q.into());
+        dig.add_long_long(snapshot.previous_delta.into());
+        dig.add_long_long(snapshot.previous_exp as c_longlong);
+        dig.add_long_long(snapshot.exponent_len.into());
+        dig.add_long_long(snapshot.contract_step.into());
     }
 }
 
-/// Shortest `delta` for which `value` and `reference` truncate to the same
-/// multiple of `10^(q + delta)`, together with that shared prefix.
-fn shared_prefix(value: f64, reference: f64, q: i32) -> Option<(u32, f64)> {
-    for delta in 0..MAX_DELTA {
-        let pow = p10(q + delta as i32)?;
-        let a = truncate(value / pow);
-        if a == truncate(reference / pow) {
-            return Some((delta, a as f64 * pow));
-        }
+impl PartialEq<Self> for DeXorEncoder {
+    fn eq(&self, other: &Self) -> bool {
+        self.num_samples == other.num_samples
+            && self.last_ts == other.last_ts
+            && self.last_value == other.last_value
+            && self.timestamp_delta == other.timestamp_delta
+            && self.values == other.values
+            && self.writer == other.writer
     }
-    None
+}
+
+impl Eq for DeXorEncoder {}
+
+fn read_uvarint(buf: &mut &[u8]) -> TsdbResult<u64> {
+    try_read_uvarint(buf).map_err(|_| TsdbError::ChunkDecoding)
 }

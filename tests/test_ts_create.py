@@ -72,6 +72,7 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
             ("PCO", "pco", "compressed"),
             ("tsxor", "tsxor", "compressed"),
             ("xor2", "xor2", "compressed"),
+            ("dexor", "dexor", "compressed"),
         ]
 
         for i, (encoding, expected_name, expected_chunk_type) in enumerate(cases):

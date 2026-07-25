@@ -40,8 +40,8 @@ High-level architecture (big picture)
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
 - Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
   `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
-  - `src/series/chunks/` implements five encoding formats: **Gorilla** (default), **PCO**, **TsXOR**, **Uncompressed**,
-    **XOR2**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
+  - `src/series/chunks/` implements six encoding formats: **Gorilla** (default), **PCO**, **TsXOR**, **Uncompressed**,
+    **XOR2**, **DeXOR**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
   - ACL filtering per series: `src/series/acl.rs`.
 - Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use protobuf (
   `src/commands/fanout.*.proto`) and explicit fanout registration (`register_fanout_operations`) to implement

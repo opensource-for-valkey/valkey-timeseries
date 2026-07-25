@@ -54,6 +54,7 @@ class TestTsEncodingIntegration(ValkeyTimeSeriesTestCaseBase):
             ("PCO", "pco", "compressed"),
             ("XOR2", "xor2", "compressed"),
             ("TSXOR", "tsxor", "compressed"),
+            ("DEXOR", "dexor", "compressed"),
         ]
 
         keys_by_encoding = {}
