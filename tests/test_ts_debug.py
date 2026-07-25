@@ -104,10 +104,10 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert isinstance(result, list)
         assert len(result) > 0
 
-        # Each config should have 12 elements (6 key-value pairs)
+        # Each config should have 16 elements (8 key-value pairs)
         for config_entry in result:
             assert isinstance(config_entry, list)
-            assert len(config_entry) == 12
+            assert len(config_entry) == 16
 
             # Convert to dict for easier assertion
             config_dict = {}
@@ -122,11 +122,20 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             assert 'default' in config_dict
             assert 'min' in config_dict
             assert 'max' in config_dict
+            assert 'value' in config_dict
+            assert 'description' in config_dict
+            assert 'mutable' in config_dict
+
+            # Every config documents itself
+            description = config_dict['description']
+            if isinstance(description, bytes):
+                description = description.decode()
+            assert description.strip()
 
             # Validate type values
             config_type = config_dict['type'].decode() if isinstance(config_dict['type'], bytes) else config_dict[
                 'type']
-            assert config_type in ['integer', 'float', 'string', 'duration', 'enum']
+            assert config_type in ['integer', 'float', 'boolean', 'string', 'duration', 'enum']
 
     def test_debug_list_configs_verbose_case_insensitive(self):
         """Test TS._DEBUG LIST_CONFIGS with case-insensitive VERBOSE keyword"""
@@ -162,10 +171,18 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-num-threads',
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
+            'ts-index-build-max-memory',
+            'ts-fanout-aggregation-pushdown',
+            'ts-index-persist',
+            'debug-mode',
         ]
 
         for expected in expected_configs:
             assert expected in config_names, f"Expected config '{expected}' not found"
+
+        # LIST_CONFIGS reports from the module's configuration registry, so it must cover every
+        # registered parameter and nothing else.
+        assert sorted(config_names) == sorted(expected_configs)
 
     def test_debug_unknown_subcommand(self):
         """Test TS._DEBUG with an unknown subcommand"""
@@ -237,8 +254,60 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
                 break
 
         assert dup_policy_config is not None
-        assert dup_policy_config['default'] == 'BLOCK'
+        # Lowercase: LIST_CONFIGS reports the default the module actually registers with the
+        # server, which is what CONFIG GET ts.ts-duplicate-policy returns.
+        assert dup_policy_config['default'] == 'block'
         assert dup_policy_config['type'] == 'enum'
+
+    def _verbose_configs(self) -> dict:
+        """LIST_CONFIGS VERBOSE as {name: {field: value}}, with bytes decoded."""
+        configs = {}
+        for entry in self.client.execute_command('TS._DEBUG', 'LIST_CONFIGS', 'VERBOSE'):
+            fields = {}
+            for i in range(0, len(entry), 2):
+                key = entry[i].decode() if isinstance(entry[i], bytes) else entry[i]
+                value = entry[i + 1]
+                fields[key] = value.decode() if isinstance(value, bytes) else value
+            configs[fields['name']] = fields
+        return configs
+
+    def test_debug_list_configs_reports_live_values(self):
+        """LIST_CONFIGS reports each parameter's current value, not its default."""
+        self.set_debug_mode()
+
+        before = self._verbose_configs()
+        assert before['ts-chunk-size']['value'] == 4096
+        assert before['ts-index-persist']['value'] == 'yes'
+        assert before['ts-compaction-policy']['value'] == ''
+        assert before['ts-decimal-digits']['value'] == 'none'
+
+        # ts-num-threads cannot be changed after startup; everything else can
+        assert before['ts-num-threads']['mutable'] == 'no'
+        assert before['ts-chunk-size']['mutable'] == 'yes'
+
+        self.client.config_set('ts.ts-chunk-size', 8192)
+        self.client.config_set('ts.ts-index-persist', 'no')
+        self.client.config_set('ts.ts-compaction-policy', 'max:1m:1h')
+        self.client.config_set('ts.ts-decimal-digits', '3')
+        self.client.config_set('ts.ts-retention-policy', '5000')
+
+        after = self._verbose_configs()
+        assert after['ts-chunk-size']['value'] == 8192
+        assert after['ts-index-persist']['value'] == 'no'
+        assert after['ts-compaction-policy']['value'] == 'max:1m:1h'
+        assert after['ts-decimal-digits']['value'] == 3
+        assert after['ts-retention-policy']['value'] == '5s'
+
+        # Defaults are fixed metadata and must not follow the live value
+        assert after['ts-chunk-size']['default'] == 4096
+        assert after['ts-retention-policy']['default'] == '0ms'
+
+        # Clearing the compaction policy must clear what is reported
+        self.client.config_set('ts.ts-compaction-policy', '')
+        assert self._verbose_configs()['ts-compaction-policy']['value'] == ''
+
+        # Rounding is mutually exclusive: setting decimal digits leaves significant unset
+        assert after['ts-significant-digits']['value'] == 'none'
 
 
 def _parse_top_k_entry(entry: list) -> dict:

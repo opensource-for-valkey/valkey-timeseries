@@ -82,12 +82,7 @@ impl TimeSeries {
         }
 
         res.chunk_encoding = options.chunk_encoding;
-        res.retention = options.retention.unwrap_or_else(|| {
-            let retention = config::RETENTION_PERIOD
-                .lock()
-                .expect("failed to lock RETENTION_PERIOD mutex");
-            *retention
-        });
+        res.retention = options.retention.unwrap_or_else(config::retention_period);
         res.rounding = options.rounding;
         res.sample_duplicates = options.sample_duplicate_policy.unwrap_or_default();
 

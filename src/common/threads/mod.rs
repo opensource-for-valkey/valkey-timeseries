@@ -9,6 +9,7 @@ pub(crate) use batch_worker::{
 };
 use rayon_core::{Scope, ThreadPoolBuilder};
 use std::os::raw::c_void;
+use valkey_module::logging::log_notice;
 use valkey_module::{Context, MODULE_CONTEXT, raw};
 
 /// Builds the module's global rayon thread pool, sized from `config::NUM_THREADS`
@@ -18,6 +19,7 @@ use valkey_module::{Context, MODULE_CONTEXT, raw};
 /// cannot be resized once built — there is no later point at which this needs to re-run.
 pub fn init_thread_pool() {
     let threads = crate::config::num_threads();
+    log_notice(format!("Setting number of threads to {threads}"));
     ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("valkey-timeseries-{index}"))

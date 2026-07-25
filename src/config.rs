@@ -1,17 +1,17 @@
 use crate::common::constants::MILLIS_PER_YEAR;
 use crate::common::humanize::humanize_duration_ms;
 use crate::common::rounding::RoundingStrategy;
-use crate::common::sync::{lock, read_lock, write_lock};
+use crate::common::sync::lock;
 use crate::error_consts;
 use crate::parser::number::parse_number;
 use crate::parser::parse_duration_value;
 use crate::series::chunks::{ChunkEncoding, validate_chunk_size};
 use crate::series::{
-    DuplicatePolicy, SampleDuplicatePolicy, add_compaction_policies_from_config,
-    clear_compaction_policy_config,
+    DuplicatePolicy, add_compaction_policies_from_config, clear_compaction_policy_config,
 };
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use valkey_module::configuration::{
     ConfigurationContext, ConfigurationFlags, get_bool_default_config_value,
@@ -23,7 +23,6 @@ use valkey_module::{
     ConfigurationValue, Context, RedisModule_LoadConfigs, ValkeyError, ValkeyGILGuard,
     ValkeyResult, ValkeyString,
 };
-use valkey_module_macros::config_changed_event_handler;
 
 /// Minimal Valkey version that supports the TimeSeries Module
 pub const TIMESERIES_MIN_SUPPORTED_VERSION: &[i64; 3] = &[8, 0, 0];
@@ -34,24 +33,20 @@ const ONE_YEAR_MS: i64 = 365 * ONE_DAY_MS;
 
 pub(crate) const FANOUT_COMMAND_TIMEOUT_MIN: i64 = 500;
 pub(crate) const FANOUT_COMMAND_TIMEOUT_MAX: i64 = 10000;
-pub(crate) const FANOUT_COMMAND_TIMEOUT_DEFAULT: &str = "5000";
 
 pub const CHUNK_SIZE_MIN: i64 = 64;
 pub const CHUNK_SIZE_MAX: i64 = 1024 * 1024;
 pub const CHUNK_SIZE_DEFAULT: i64 = 4 * 1024;
 pub const DECIMAL_DIGITS_MAX: i64 = 18;
 pub const DECIMAL_DIGITS_MIN: i64 = 0;
-pub const DECIMAL_DIGITS_DEFAULT: i64 = 18;
 pub const SIGNIFICANT_DIGITS_MAX: i64 = 18;
 pub const SIGNIFICANT_DIGITS_MIN: i64 = 0;
-pub const SIGNIFICANT_DIGITS_DEFAULT: i64 = 18;
-pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 * 1024;
+pub const DEFAULT_CHUNK_SIZE_BYTES: usize = CHUNK_SIZE_DEFAULT as usize;
 pub const DEFAULT_CHUNK_ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
 pub const DEFAULT_DUPLICATE_POLICY: DuplicatePolicy = DuplicatePolicy::Block;
-pub const DEFAULT_RETENTION_PERIOD: Duration = Duration::ZERO;
 pub const IGNORE_MAX_TIME_DIFF_DEFAULT: i64 = 0;
 pub const IGNORE_MAX_TIME_DIFF_MIN: i64 = 0;
-pub const IGNORE_MAX_TIME_DIFF_MAX: i64 = ONE_DAY_MS * 365 * 100; // 100 years
+pub const IGNORE_MAX_TIME_DIFF_MAX: i64 = ONE_YEAR_MS * 100; // 100 years
 pub const IGNORE_MAX_VALUE_DIFF_MIN: f64 = 0.0;
 pub const IGNORE_MAX_VALUE_DIFF_MAX: f64 = f64::MAX;
 
@@ -60,57 +55,151 @@ pub const MAX_THREADS: i64 = 16;
 pub const DEFAULT_THREADS: i64 = 4;
 
 pub const RETENTION_POLICY_MIN: i64 = 0;
-pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; //
+pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; // 10 years
 
-// Default values as strings for Valkey configuration registration
-const IGNORE_MAX_VALUE_DIFF_DEFAULT_STRING: &str = "0";
-const RETENTION_POLICY_DEFAULT_STRING: &str = "0";
-const IGNORE_MAX_TIME_DIFF_DEFAULT_STRING: &str = "0";
-
-pub(crate) const SIGNIFICANT_DIGITS_DEFAULT_STRING: &str = "none";
-pub(crate) const DECIMAL_DIGITS_DEFAULT_STRING: &str = "none";
-pub(crate) const COMPACTION_POLICY_DEFAULT_STRING: &str = "";
-pub(crate) const CHUNK_ENCODING_DEFAULT_STRING: &str = DEFAULT_CHUNK_ENCODING.name();
-pub(crate) const CHUNK_SIZE_DEFAULT_STRING: &str = "4096";
+/// The default compaction policy: no automatic downsampling rules.
 pub(crate) const DEFAULT_COMPACTION_POLICY: &str = "";
 
 pub const INDEX_BUILD_MAX_MEMORY_MIN: i64 = 0; // 0 = unlimited
 pub const INDEX_BUILD_MAX_MEMORY_MAX: i64 = i64::MAX;
 pub const INDEX_BUILD_MAX_MEMORY_DEFAULT: i64 = 256 * 1024 * 1024; // 256 MiB
 
-pub const CLUSTER_MAP_EXPIRATION_MS_DEFAULT: u64 = 750; // default: 0.25 second
+pub const CLUSTER_MAP_EXPIRATION_MS_DEFAULT: u64 = 750; // default: 0.75 seconds
 pub(crate) const CLUSTER_MAP_EXPIRATION_MIN_MS: i64 = 0; // min: 0 (no cache)
 pub(crate) const CLUSTER_MAP_EXPIRATION_MAX_MS: i64 = 3_600_000; // max: 1 hour
-pub const CLUSTER_MAP_EXPIRATION_DEFAULT_STRING: &str = "750";
 
-#[derive(Clone, Debug)]
-pub struct ConfigSettings {
-    pub retention_period: Option<Duration>,
-    pub chunk_encoding: ChunkEncoding,
-    pub chunk_size_bytes: usize,
-    pub rounding: Option<RoundingStrategy>,
-    pub duplicate_policy: SampleDuplicatePolicy,
-    pub compaction_policy: String,
-    pub fanout_command_timeout: Duration,
-    pub cluster_map_expiration: Duration,
-    pub is_debug_mode_enabled: bool,
-    pub num_threads: usize,
+/// The type of value a configuration parameter holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigType {
+    Integer,
+    Float,
+    Boolean,
+    String,
+    Duration,
+    Enum,
 }
 
-impl Default for ConfigSettings {
-    fn default() -> Self {
-        Self {
-            retention_period: None,
-            chunk_size_bytes: DEFAULT_CHUNK_SIZE_BYTES,
-            chunk_encoding: ChunkEncoding::Gorilla,
-            rounding: None,
-            duplicate_policy: SampleDuplicatePolicy::default(),
-            compaction_policy: String::new(),
-            fanout_command_timeout: Duration::from_millis(DEFAULT_FANOUT_COMMAND_TIMEOUT_MS),
-            cluster_map_expiration: Duration::from_millis(CLUSTER_MAP_EXPIRATION_MS_DEFAULT),
-            is_debug_mode_enabled: false,
-            num_threads: DEFAULT_THREADS as usize,
+impl ConfigType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfigType::Integer => "integer",
+            ConfigType::Float => "float",
+            ConfigType::Boolean => "boolean",
+            ConfigType::String => "string",
+            ConfigType::Duration => "duration",
+            ConfigType::Enum => "enum",
         }
+    }
+}
+
+/// A configuration value: a parameter's default, one end of its range, or its current value.
+///
+/// Every variant is `const`-constructible — `Cow::Borrowed` included — so that [`CONFIGS`] can
+/// be a `static` while the same type still carries values only known at runtime (an encoding
+/// name, the compaction policy). Defaults and bounds are therefore declared exactly once, in
+/// the registry, rather than once for registration and again for `TS._DEBUG LIST_CONFIGS`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigValue {
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+    String(Cow<'static, str>),
+    /// A duration, in milliseconds.
+    DurationMs(i64),
+}
+
+/// Reported as the value or default of a parameter that is unset or disabled.
+pub const CONFIG_VALUE_NONE: &str = "none";
+
+impl ConfigValue {
+    /// Convenience constructor for a borrowed string, usable in `const` position.
+    pub const fn str(value: &'static str) -> Self {
+        ConfigValue::String(Cow::Borrowed(value))
+    }
+
+    /// A value meaning "unset" or "disabled".
+    pub const fn none() -> Self {
+        ConfigValue::str(CONFIG_VALUE_NONE)
+    }
+
+    /// The literal text registered with the server as this parameter's default.
+    fn as_registration_str(&self) -> Cow<'static, str> {
+        match self {
+            ConfigValue::String(s) => s.clone(),
+            ConfigValue::Integer(v) => Cow::Owned(v.to_string()),
+            ConfigValue::DurationMs(ms) => Cow::Owned(ms.to_string()),
+            ConfigValue::Float(v) => Cow::Owned(v.to_string()),
+            ConfigValue::Boolean(b) => Cow::Borrowed(if *b { "yes" } else { "no" }),
+        }
+    }
+
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            ConfigValue::Integer(v) | ConfigValue::DurationMs(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            ConfigValue::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+}
+
+/// Where a parameter's value lives, and how a newly-set value is validated.
+///
+/// The store is reached through a `fn` pointer rather than a reference so that the registry
+/// stays `const`-constructible: the string stores are `LazyLock`s, which cannot be
+/// dereferenced in a `static` initializer.
+pub enum ConfigStorage {
+    /// A string-valued parameter. `apply` parses the raw text and commits the typed value to
+    /// the parameter's own store; it is the only place a string parameter is validated, and
+    /// the server rejects the `CONFIG SET` when it returns `Err`.
+    Str {
+        cell: fn() -> &'static ValkeyGILGuard<ValkeyString>,
+        apply: fn(&str) -> ValkeyResult<()>,
+    },
+    /// An integer parameter. The server enforces `min`/`max` from the descriptor before the
+    /// value reaches `cell`; `validate` covers constraints the server cannot express (for
+    /// example the chunk-size alignment rule).
+    I64 {
+        cell: fn() -> &'static AtomicI64,
+        validate: Option<fn(i64) -> ValkeyResult<()>>,
+    },
+    /// A boolean parameter. The server writes straight to `cell`; there is nothing to parse.
+    Bool { cell: fn() -> &'static AtomicBool },
+}
+
+/// Everything the module knows about one configuration parameter.
+///
+/// This is the single source of truth: [`register_config`] registers from it, the server's
+/// set-callback dispatches through [`ConfigStorage`] rather than matching on the name, and
+/// `TS._DEBUG LIST_CONFIGS` reports from it. Adding a parameter means adding one entry.
+pub struct ConfigDesc {
+    pub name: &'static str,
+    pub kind: ConfigType,
+    pub default: ConfigValue,
+    pub min: Option<ConfigValue>,
+    pub max: Option<ConfigValue>,
+    pub flags: ConfigurationFlags,
+    pub description: &'static str,
+    pub storage: ConfigStorage,
+    /// Reads the parameter's current value from its typed store, for reporting.
+    pub read: fn() -> ConfigValue,
+}
+
+impl ConfigDesc {
+    /// `ConfigurationFlags` is neither `Copy` nor `Clone`, so hand registration a fresh value
+    /// built from the same bits.
+    fn flags(&self) -> ConfigurationFlags {
+        ConfigurationFlags::from_bits_truncate(self.flags.bits())
+    }
+
+    /// Whether the parameter can be changed after startup.
+    pub fn is_mutable(&self) -> bool {
+        !self.flags.contains(ConfigurationFlags::IMMUTABLE)
     }
 }
 
@@ -135,75 +224,131 @@ pub fn num_threads() -> usize {
 
 pub const DEFAULT_FANOUT_COMMAND_TIMEOUT_MS: u64 = 5000;
 
-pub static ROUNDING_STRATEGY: LazyLock<Mutex<Option<RoundingStrategy>>> =
-    LazyLock::new(|| Mutex::new(None));
-pub static DECIMAL_DIGITS: LazyLock<AtomicI64> =
-    LazyLock::new(|| AtomicI64::new(DECIMAL_DIGITS_MAX));
-pub static SIGNIFICANT_DIGITS: LazyLock<AtomicI64> =
-    LazyLock::new(|| AtomicI64::new(SIGNIFICANT_DIGITS_MAX));
-pub static IGNORE_MAX_TIME_DIFF: LazyLock<AtomicI64> =
-    LazyLock::new(|| AtomicI64::new(IGNORE_MAX_TIME_DIFF_DEFAULT));
-pub static IGNORE_MAX_VALUE_DIFF: LazyLock<Mutex<f64>> = LazyLock::new(|| Mutex::new(0.0));
-pub static RETENTION_PERIOD: LazyLock<Mutex<Duration>> =
-    LazyLock::new(|| Mutex::new(DEFAULT_RETENTION_PERIOD));
-pub static CHUNK_ENCODING: LazyLock<Mutex<ChunkEncoding>> =
-    LazyLock::new(|| Mutex::new(DEFAULT_CHUNK_ENCODING));
-pub static FANOUT_COMMAND_TIMEOUT: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(DEFAULT_FANOUT_COMMAND_TIMEOUT_MS));
-pub static DUPLICATE_POLICY: LazyLock<Mutex<DuplicatePolicy>> =
-    LazyLock::new(|| Mutex::new(DEFAULT_DUPLICATE_POLICY));
-pub static CLUSTER_MAP_EXPIRATION_MS: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(CLUSTER_MAP_EXPIRATION_MS_DEFAULT));
-static CHUNK_SIZE_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
-    LazyLock::new(|| ValkeyGILGuard::new(ValkeyString::create(None, CHUNK_SIZE_DEFAULT_STRING)));
-static CHUNK_ENCODING_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(None, DEFAULT_CHUNK_ENCODING.name()))
-});
-static DUPLICATE_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(
-        None,
-        DEFAULT_DUPLICATE_POLICY.as_str(),
-    ))
-});
-static RETENTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(None, RETENTION_POLICY_DEFAULT_STRING))
-});
-static COMPACTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(None, COMPACTION_POLICY_DEFAULT_STRING))
-});
-static IGNORE_MAX_TIME_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(
-        None,
-        IGNORE_MAX_TIME_DIFF_DEFAULT_STRING,
-    ))
-});
-static IGNORE_MAX_VALUE_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(
-        None,
-        IGNORE_MAX_VALUE_DIFF_DEFAULT_STRING,
-    ))
-});
-static DECIMAL_DIGITS_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(None, DECIMAL_DIGITS_DEFAULT_STRING))
-});
-static SIGNIFICANT_DIGITS_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> = LazyLock::new(|| {
-    ValkeyGILGuard::new(ValkeyString::create(
-        None,
-        SIGNIFICANT_DIGITS_DEFAULT_STRING,
-    ))
-});
+/// Rounding applied to sample values (`ts-decimal-digits` / `ts-significant-digits`).
+///
+/// The two parameters are mutually exclusive, so a single store holds both: packing the kind
+/// and the digit count into one atomic makes "decimal and significant rounding both active"
+/// unrepresentable, where the previous three separate stores could disagree. Read through
+/// [`rounding_strategy`]; written through [`store_rounding_strategy`].
+static ROUNDING_STRATEGY: AtomicU16 = AtomicU16::new(ROUNDING_NONE);
+
+/// Packed encoding of `Option<RoundingStrategy>`: the high byte is the kind, the low byte the
+/// digit count. Digit counts are validated against `*_DIGITS_MAX` (<= 18) before being stored.
+const ROUNDING_NONE: u16 = 0;
+const ROUNDING_DECIMAL: u16 = 1 << 8;
+const ROUNDING_SIGNIFICANT: u16 = 2 << 8;
+
+fn encode_rounding_strategy(strategy: Option<RoundingStrategy>) -> u16 {
+    match strategy {
+        None => ROUNDING_NONE,
+        Some(RoundingStrategy::DecimalDigits(digits)) => ROUNDING_DECIMAL | digits as u16,
+        Some(RoundingStrategy::SignificantDigits(digits)) => ROUNDING_SIGNIFICANT | digits as u16,
+    }
+}
+
+fn decode_rounding_strategy(packed: u16) -> Option<RoundingStrategy> {
+    let digits = (packed & 0xFF) as u8;
+    match packed & 0xFF00 {
+        ROUNDING_DECIMAL => Some(RoundingStrategy::DecimalDigits(digits)),
+        ROUNDING_SIGNIFICANT => Some(RoundingStrategy::SignificantDigits(digits)),
+        _ => None,
+    }
+}
+
+/// The rounding applied to sample values, or `None` when rounding is disabled.
+pub fn rounding_strategy() -> Option<RoundingStrategy> {
+    decode_rounding_strategy(ROUNDING_STRATEGY.load(Ordering::Relaxed))
+}
+
+fn store_rounding_strategy(strategy: Option<RoundingStrategy>) {
+    ROUNDING_STRATEGY.store(encode_rounding_strategy(strategy), Ordering::SeqCst);
+}
+
+/// `ts-ignore-max-time-diff`, in milliseconds.
+static IGNORE_MAX_TIME_DIFF: AtomicI64 = AtomicI64::new(IGNORE_MAX_TIME_DIFF_DEFAULT);
+
+/// `ts-ignore-max-value-diff`, held as the `f64` bit pattern.
+static IGNORE_MAX_VALUE_DIFF: AtomicU64 = AtomicU64::new(0);
+
+pub fn ignore_max_value_diff() -> f64 {
+    f64::from_bits(IGNORE_MAX_VALUE_DIFF.load(Ordering::Relaxed))
+}
+
+/// `ts-retention-policy`, in milliseconds. Zero means "no expiry".
+static RETENTION_PERIOD_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn retention_period() -> Duration {
+    Duration::from_millis(RETENTION_PERIOD_MS.load(Ordering::Relaxed))
+}
+
+/// `ts-encoding`, held as the `#[repr(u8)]` discriminant of [`ChunkEncoding`].
+static CHUNK_ENCODING: AtomicU8 = AtomicU8::new(DEFAULT_CHUNK_ENCODING as u8);
+
+pub fn chunk_encoding() -> ChunkEncoding {
+    ChunkEncoding::try_from(CHUNK_ENCODING.load(Ordering::Relaxed))
+        .unwrap_or(DEFAULT_CHUNK_ENCODING)
+}
+
+/// `ts-duplicate-policy`, held as the `#[repr(u8)]` discriminant of [`DuplicatePolicy`].
+static DUPLICATE_POLICY: AtomicU8 = AtomicU8::new(DEFAULT_DUPLICATE_POLICY as u8);
+
+pub fn duplicate_policy() -> DuplicatePolicy {
+    DuplicatePolicy::from_u8(DUPLICATE_POLICY.load(Ordering::Relaxed))
+        .unwrap_or(DEFAULT_DUPLICATE_POLICY)
+}
+
+/// `ts-chunk-size`, in bytes.
+pub fn chunk_size_bytes() -> usize {
+    CHUNK_SIZE.load(Ordering::Relaxed) as usize
+}
+
+pub fn ignore_max_time_diff() -> u64 {
+    IGNORE_MAX_TIME_DIFF.load(Ordering::Relaxed) as u64
+}
+
+/// `ts-fanout-command-timeout`, in milliseconds.
+pub static FANOUT_COMMAND_TIMEOUT: AtomicU64 = AtomicU64::new(DEFAULT_FANOUT_COMMAND_TIMEOUT_MS);
+
+/// `ts-cluster-map-expiration-ms`. Read as raw milliseconds by the cluster-map backoff
+/// arithmetic in `fanout`, so it is not wrapped in a `Duration` accessor.
+pub static CLUSTER_MAP_EXPIRATION_MS: AtomicU64 = AtomicU64::new(CLUSTER_MAP_EXPIRATION_MS_DEFAULT);
+/// Typed store for `ts-compaction-policy`. The parsed rules live in the compaction module;
+/// this keeps the policy text so the parameter can be reported like any other.
+pub static COMPACTION_POLICY: LazyLock<Mutex<String>> =
+    LazyLock::new(|| Mutex::new(DEFAULT_COMPACTION_POLICY.to_string()));
+/// Builds a string parameter's storage cell, seeded with the default declared in [`CONFIGS`].
+///
+/// The seed is transient — registration passes the resolved default separately and
+/// `RedisModule_LoadConfigs` overwrites the cell as soon as registration finishes — but taking
+/// it from the registry means there is no second copy of the default to drift out of step.
+fn default_string_cell(name: &str) -> ValkeyGILGuard<ValkeyString> {
+    let default = find_config(name)
+        .map(|desc| desc.default.as_registration_str())
+        .unwrap_or(Cow::Borrowed(""));
+    ValkeyGILGuard::new(ValkeyString::create(None, default.as_ref()))
+}
+
+static CHUNK_ENCODING_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-encoding"));
+static DUPLICATE_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-duplicate-policy"));
+static RETENTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-retention-policy"));
+static COMPACTION_POLICY_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-compaction-policy"));
+static IGNORE_MAX_TIME_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-ignore-max-time-diff"));
+static IGNORE_MAX_VALUE_DIFF_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-ignore-max-value-diff"));
+static DECIMAL_DIGITS_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-decimal-digits"));
+static SIGNIFICANT_DIGITS_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
+    LazyLock::new(|| default_string_cell("ts-significant-digits"));
 static FANOUT_COMMAND_TIMEOUT_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
-    LazyLock::new(|| {
-        ValkeyGILGuard::new(ValkeyString::create(None, FANOUT_COMMAND_TIMEOUT_DEFAULT))
-    });
+    LazyLock::new(|| default_string_cell("ts-fanout-command-timeout"));
 static CLUSTER_MAP_EXPIRATION_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
-    LazyLock::new(|| {
-        ValkeyGILGuard::new(ValkeyString::create(
-            None,
-            CLUSTER_MAP_EXPIRATION_DEFAULT_STRING,
-        ))
-    });
-static IS_DEBUG_MODE: LazyLock<AtomicBool> = LazyLock::new(AtomicBool::default);
+    LazyLock::new(|| default_string_cell("ts-cluster-map-expiration-ms"));
+static IS_DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Runtime toggle for shard-side aggregation push-down in MRANGE fanout
 /// (`ts-fanout-aggregation-pushdown`, default on). Consulted by the
@@ -246,87 +391,6 @@ pub static INDEX_BUILD_MAX_MEMORY: AtomicI64 = AtomicI64::new(INDEX_BUILD_MAX_ME
 
 pub fn index_build_max_memory() -> i64 {
     INDEX_BUILD_MAX_MEMORY.load(Ordering::Relaxed)
-}
-
-static SETTINGS: LazyLock<RwLock<ConfigSettings>> =
-    LazyLock::new(|| RwLock::from(ConfigSettings::default()));
-
-pub fn get_config() -> ConfigSettings {
-    read_lock(&SETTINGS).clone()
-}
-
-#[config_changed_event_handler]
-fn config_changed_event_handler(_ctx: &Context, changed_configs: &[&str]) {
-    if changed_configs.is_empty() {
-        return;
-    }
-    let mut cfg: ConfigSettings = get_config();
-
-    let mut modified = false;
-    for &name in changed_configs {
-        hashify::fnc_map_ignore_case!(name.as_bytes(),
-            "ts-chunk-size" => {
-                cfg.chunk_size_bytes = CHUNK_SIZE.load(Ordering::Relaxed) as usize;
-                modified = true;
-            },
-            "ts-duplicate-policy" => {
-                cfg.duplicate_policy.policy = Some(*lock(&DUPLICATE_POLICY));
-                modified = true;
-            },
-            "ts-encoding" => {
-                cfg.chunk_encoding = *lock(&CHUNK_ENCODING);
-                modified = true;
-            },
-            "ts-num-threads" => {
-                // `ts-num-threads` is IMMUTABLE, so this only fires once at startup (if set via
-                // `valkey.conf`); keep the cached snapshot in sync with the value the thread
-                // pool was actually built with.
-                cfg.num_threads = num_threads();
-                modified = true;
-            },
-            "ts-retention-policy" => {
-                let period = *lock(&RETENTION_PERIOD);
-                cfg.retention_period = if period.is_zero() { None } else { Some(period) };
-                modified = true;
-            },
-            "ts-ignore-max-time-diff" => {
-                cfg.duplicate_policy.max_time_delta = IGNORE_MAX_TIME_DIFF.load(Ordering::Relaxed) as u64;
-                modified = true;
-            },
-            "ts-ignore-max-value-diff" => {
-                cfg.duplicate_policy.max_value_delta = *lock(&IGNORE_MAX_VALUE_DIFF);
-                modified = true;
-            },
-            "ts-decimal-digits" => {
-                cfg.rounding = *lock(&ROUNDING_STRATEGY);
-                modified = true;
-            },
-            "ts-significant-digits" => {
-                cfg.rounding = *lock(&ROUNDING_STRATEGY);
-                modified = true;
-            },
-            "ts-compaction-policy" => {
-            },
-            "ts-fanout-command-timeout" => {
-                cfg.fanout_command_timeout = Duration::from_millis(FANOUT_COMMAND_TIMEOUT.load(Ordering::Relaxed));
-                modified = true;
-            },
-            "debug-mode" => {
-                cfg.is_debug_mode_enabled = IS_DEBUG_MODE.load(Ordering::Relaxed);
-                modified = true;
-            },
-             "ts-cluster-map-expiration-ms" => {
-                cfg.cluster_map_expiration = Duration::from_millis(CLUSTER_MAP_EXPIRATION_MS.load(Ordering::Relaxed));
-                modified = true;
-            },
-            _ => {}
-        );
-    }
-    if modified {
-        log_notice(format!("Configuration updated: {cfg:?}"));
-        let mut guard = write_lock(&SETTINGS);
-        *guard = cfg;
-    }
 }
 
 fn parse_duration_in_range(name: &str, value: &str, min: i64, max: i64) -> ValkeyResult<i64> {
@@ -374,57 +438,31 @@ fn parse_number_in_range(name: &str, value: &str, min: f64, max: f64) -> ValkeyR
     Ok(number)
 }
 
-fn update_chunk_size(val: &str) -> ValkeyResult<()> {
-    let chunk_size = parse_number(val)? as usize;
-    validate_chunk_size(chunk_size)?;
-    CHUNK_SIZE.store(chunk_size as i64, Ordering::SeqCst);
-    Ok(())
-}
-
 fn update_duplicate_policy(val: &str) -> ValkeyResult<()> {
     let policy = DuplicatePolicy::try_from(val)
         .map_err(|_| ValkeyError::Str(error_consts::INVALID_DUPLICATE_POLICY))?;
-    *DUPLICATE_POLICY
-        .lock()
-        .expect("error unlocking duplicate policy") = policy;
+    DUPLICATE_POLICY.store(policy.as_u8(), Ordering::SeqCst);
     Ok(())
 }
 
 fn update_chunk_encoding(val: &str) -> ValkeyResult<()> {
     let encoding = ChunkEncoding::try_from(val)
         .map_err(|_| ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING))?;
-    *CHUNK_ENCODING
-        .lock()
-        .expect("error unlocking chunk encoding policy") = encoding;
+    CHUNK_ENCODING.store(encoding as u8, Ordering::SeqCst);
     Ok(())
 }
 
 fn update_compaction_policy(v: &str) -> ValkeyResult<()> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+    if v.is_empty() || v.eq_ignore_ascii_case(CONFIG_VALUE_NONE) {
         clear_compaction_policy_config();
+        // Clearing must also clear the stored text, or the parameter keeps reporting the
+        // policy that was just removed.
+        *lock(&COMPACTION_POLICY) = String::new();
         return Ok(());
     }
     add_compaction_policies_from_config(v, true)?;
+    *lock(&COMPACTION_POLICY) = v.to_string();
 
-    // HACK.. we need to update the global config struct, which would normally happen in config_changed_event_handler,
-    // but we have no access to the ConfigurationContext to be able to read from COMPACTION_POLICY_STRING. We directly update the global config struct here,
-    // but this is not ideal.
-    // mutable reference to the ValkeyGILGuard, which we don't have.
-
-    let mut guard = write_lock(&SETTINGS);
-    guard.compaction_policy = v.to_string();
-
-    Ok(())
-}
-
-fn update_num_threads(val: &str) -> ValkeyResult<()> {
-    let threads = parse_number_in_range(
-        "ts-num-threads",
-        val,
-        MIN_THREADS as f64,
-        MAX_THREADS as f64,
-    )? as i64;
-    NUM_THREADS.store(threads, Ordering::SeqCst);
     Ok(())
 }
 
@@ -435,14 +473,7 @@ fn update_retention_policy(val: &str) -> ValkeyResult<()> {
         RETENTION_POLICY_MIN,
         RETENTION_POLICY_MAX,
     )?;
-    let duration = if duration > 0 {
-        Duration::from_millis(duration as u64)
-    } else {
-        Duration::ZERO
-    };
-    *RETENTION_PERIOD
-        .lock()
-        .expect("retention period lock poisoned") = duration;
+    RETENTION_PERIOD_MS.store(duration.max(0) as u64, Ordering::SeqCst);
     Ok(())
 }
 
@@ -464,9 +495,7 @@ fn update_ignore_max_value_diff(val: &str) -> ValkeyResult<()> {
         IGNORE_MAX_VALUE_DIFF_MIN,
         IGNORE_MAX_VALUE_DIFF_MAX,
     )?;
-    *IGNORE_MAX_VALUE_DIFF
-        .lock()
-        .expect("ignore max value diff lock poisoned") = value;
+    IGNORE_MAX_VALUE_DIFF.store(value.to_bits(), Ordering::SeqCst);
     Ok(())
 }
 
@@ -492,158 +521,176 @@ fn update_cluster_map_expiration(val: &str) -> ValkeyResult<()> {
     Ok(())
 }
 
-fn on_config_set(
-    config_ctx: &ConfigurationContext,
-    name: &str,
-    val: &'static ValkeyGILGuard<ValkeyString>,
-) -> Result<(), ValkeyError> {
-    let v = val.get(config_ctx).to_string_lossy();
+/// Which of the two mutually exclusive rounding parameters a value belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RoundingKind {
+    Decimal,
+    Significant,
+}
 
-    hashify::fnc_map_ignore_case!(name.as_bytes(),
-        "ts-cluster-map-expiration-ms" => {
-            return update_cluster_map_expiration(&v)
-        },
-        "ts-chunk-size" => {
-           return update_chunk_size(&v)
-        },
-        "ts-duplicate-policy" => {
-            return update_duplicate_policy(&v)
-        },
-        "ts-encoding" => {
-            return update_chunk_encoding(&v)
-        },
-        "ts-compaction-policy" => {
-            return update_compaction_policy(&v)
-        },
-        "ts-num-threads" => {
-            return update_num_threads(&v)
-        },
-        "ts-ignore-max-value-diff" => {
-            return update_ignore_max_value_diff(&v)
-        },
-        "ts-decimal-digits" => {
-             return update_decimal_digits(&v)
-        },
-        "ts-significant-digits" => {
-             return update_significant_digits(&v)
-        },
-        "ts-retention-policy" => {
-            return update_retention_policy(&v)
-        },
-        "ts-ignore-max-time-diff" => {
-            return update_ignore_max_time_diff(&v)
-        },
-        "ts-fanout-command-timeout" => {
-            return update_fanout_command_timeout(&v)
-        },
-        _ => {
+impl RoundingKind {
+    fn of(strategy: &RoundingStrategy) -> Self {
+        match strategy {
+            RoundingStrategy::DecimalDigits(_) => RoundingKind::Decimal,
+            RoundingStrategy::SignificantDigits(_) => RoundingKind::Significant,
         }
-    );
-    Err(ValkeyError::Str("Unknown configuration parameter"))
+    }
+
+    fn build(self, digits: u8) -> RoundingStrategy {
+        match self {
+            RoundingKind::Decimal => RoundingStrategy::DecimalDigits(digits),
+            RoundingKind::Significant => RoundingStrategy::SignificantDigits(digits),
+        }
+    }
+}
+
+/// Applies `ts-decimal-digits` or `ts-significant-digits`.
+///
+/// The two are mutually exclusive and share one store, so each may only touch rounding of its
+/// own kind: `none` (or 0) disables *this* kind and leaves the other alone, and setting a
+/// digit count while the other kind is active is rejected. Previously the disable path cleared
+/// the store outright, so `CONFIG SET ts-decimal-digits none` silently switched off an active
+/// significant-digits rounding.
+///
+/// Read-modify-write is safe without a lock: config set callbacks run on the main thread with
+/// the module GIL held.
+fn update_rounding(
+    kind: RoundingKind,
+    name: &str,
+    val: &str,
+    min: i64,
+    max: i64,
+) -> ValkeyResult<()> {
+    let digits = if val.eq_ignore_ascii_case(CONFIG_VALUE_NONE) {
+        0
+    } else {
+        parse_number_in_range(name, val, min as f64, max as f64)? as i64
+    };
+
+    let current = rounding_strategy();
+    let active_kind = current.as_ref().map(RoundingKind::of);
+
+    if digits == 0 {
+        if active_kind == Some(kind) {
+            store_rounding_strategy(None);
+        }
+        return Ok(());
+    }
+
+    if let Some(active_kind) = active_kind
+        && active_kind != kind
+    {
+        return Err(ValkeyError::String(
+            "Cannot set both ts-decimal-digits and ts-significant-digits".to_string(),
+        ));
+    }
+
+    store_rounding_strategy(Some(kind.build(digits as u8)));
+    Ok(())
 }
 
 fn update_decimal_digits(val: &str) -> ValkeyResult<()> {
-    let digits = if val.eq_ignore_ascii_case("none") {
-        0
-    } else {
-        parse_number_in_range(
-            "ts-decimal-digits",
-            val,
-            DECIMAL_DIGITS_MIN as f64,
-            DECIMAL_DIGITS_MAX as f64,
-        )? as i64
-    };
-
-    if digits == 0 {
-        *ROUNDING_STRATEGY
-            .lock()
-            .expect("rounding strategy lock poisoned") = None;
-        DECIMAL_DIGITS.store(DECIMAL_DIGITS_MAX, Ordering::SeqCst);
-        return Ok(());
-    }
-    DECIMAL_DIGITS.store(digits, Ordering::SeqCst);
-    let mut strategy = ROUNDING_STRATEGY
-        .lock()
-        .expect("rounding strategy lock poisoned");
-    match *strategy {
-        Some(RoundingStrategy::DecimalDigits(_)) | None => {
-            *strategy = Some(RoundingStrategy::DecimalDigits(digits as u8));
-            Ok(())
-        }
-        Some(RoundingStrategy::SignificantDigits(_)) => Err(ValkeyError::String(
-            "Cannot set both ts-decimal-digits and ts-significant-digits".to_string(),
-        )),
-    }
+    update_rounding(
+        RoundingKind::Decimal,
+        "ts-decimal-digits",
+        val,
+        DECIMAL_DIGITS_MIN,
+        DECIMAL_DIGITS_MAX,
+    )
 }
 
 fn update_significant_digits(val: &str) -> ValkeyResult<()> {
-    let digits = if val.eq_ignore_ascii_case("none") {
-        0
+    update_rounding(
+        RoundingKind::Significant,
+        "ts-significant-digits",
+        val,
+        SIGNIFICANT_DIGITS_MIN,
+        SIGNIFICANT_DIGITS_MAX,
+    )
+}
+
+// Readers for the `read` hook of each registry entry. Each one reports from the parameter's
+// typed store, which is the value the module actually acts on.
+
+fn read_chunk_size() -> ConfigValue {
+    ConfigValue::Integer(chunk_size_bytes() as i64)
+}
+
+fn read_chunk_encoding() -> ConfigValue {
+    ConfigValue::str(chunk_encoding().name())
+}
+
+fn read_duplicate_policy() -> ConfigValue {
+    ConfigValue::str(duplicate_policy().as_str())
+}
+
+fn read_retention_policy() -> ConfigValue {
+    let period = retention_period();
+    if period.is_zero() {
+        ConfigValue::none()
     } else {
-        parse_number_in_range(
-            "ts-significant-digits",
-            val,
-            SIGNIFICANT_DIGITS_MIN as f64,
-            SIGNIFICANT_DIGITS_MAX as f64,
-        )? as i64
-    };
-
-    if digits == 0 {
-        *ROUNDING_STRATEGY
-            .lock()
-            .expect("rounding strategy lock poisoned") = None;
-        SIGNIFICANT_DIGITS.store(SIGNIFICANT_DIGITS_MAX, Ordering::SeqCst);
-        return Ok(());
-    }
-    SIGNIFICANT_DIGITS.store(digits, Ordering::SeqCst);
-    let mut strategy = ROUNDING_STRATEGY
-        .lock()
-        .expect("rounding strategy lock poisoned");
-    match *strategy {
-        Some(RoundingStrategy::SignificantDigits(_)) | None => {
-            *strategy = Some(RoundingStrategy::SignificantDigits(digits as u8));
-            Ok(())
-        }
-        Some(RoundingStrategy::DecimalDigits(_)) => Err(ValkeyError::String(
-            "Cannot set both ts-decimal-digits and ts-significant-digits".to_string(),
-        )),
+        ConfigValue::DurationMs(period.as_millis() as i64)
     }
 }
 
-fn on_thread_config_set(
-    _config_ctx: &ConfigurationContext,
-    _name: &str,
-    atomic: &'static AtomicI64,
-) -> Result<(), ValkeyError> {
-    let threads = atomic.load(Ordering::SeqCst);
-    log_notice(format!("Setting number of threads to {threads}"));
-    // `ts-num-threads` is IMMUTABLE (see its registration), so this only ever runs once at
-    // startup, before `init_thread_pool()` builds the global rayon pool from this same value.
-    // There is nothing to resize here: rayon's global pool has no runtime resize API.
-    Ok(())
+fn read_compaction_policy() -> ConfigValue {
+    ConfigValue::String(Cow::Owned(lock(&COMPACTION_POLICY).clone()))
 }
 
-fn on_chunk_size_config_set(
-    _config_ctx: &ConfigurationContext,
-    _name: &str,
-    atomic: &'static AtomicI64,
-) -> Result<(), ValkeyError> {
-    let chunk_size = atomic.load(Ordering::SeqCst) as usize;
-    validate_chunk_size(chunk_size)?;
-    Ok(())
-}
-
-fn on_bool_config_set(
-    config_ctx: &ConfigurationContext,
-    name: &str,
-    val: &'static AtomicBool,
-) -> Result<(), ValkeyError> {
-    let v = val.get(config_ctx);
-    if name.eq_ignore_ascii_case("debug-mode") {
-        log_notice(format!("Setting debug mode to {v}"));
-    } else {
-        log_notice(format!("Setting {name} to {v}"));
+fn read_decimal_digits() -> ConfigValue {
+    match rounding_strategy() {
+        Some(RoundingStrategy::DecimalDigits(digits)) => ConfigValue::Integer(digits as i64),
+        _ => ConfigValue::none(),
     }
+}
+
+fn read_significant_digits() -> ConfigValue {
+    match rounding_strategy() {
+        Some(RoundingStrategy::SignificantDigits(digits)) => ConfigValue::Integer(digits as i64),
+        _ => ConfigValue::none(),
+    }
+}
+
+fn read_ignore_max_time_diff() -> ConfigValue {
+    ConfigValue::DurationMs(ignore_max_time_diff() as i64)
+}
+
+fn read_ignore_max_value_diff() -> ConfigValue {
+    ConfigValue::Float(ignore_max_value_diff())
+}
+
+fn read_num_threads() -> ConfigValue {
+    ConfigValue::Integer(NUM_THREADS.load(Ordering::Relaxed))
+}
+
+fn read_fanout_command_timeout() -> ConfigValue {
+    ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT.load(Ordering::Relaxed) as i64)
+}
+
+fn read_cluster_map_expiration() -> ConfigValue {
+    ConfigValue::DurationMs(CLUSTER_MAP_EXPIRATION_MS.load(Ordering::Relaxed) as i64)
+}
+
+fn read_index_build_max_memory() -> ConfigValue {
+    ConfigValue::Integer(index_build_max_memory())
+}
+
+fn read_fanout_aggregation_pushdown() -> ConfigValue {
+    ConfigValue::Boolean(is_fanout_aggregation_pushdown_enabled())
+}
+
+fn read_index_persist() -> ConfigValue {
+    ConfigValue::Boolean(is_index_persist_enabled())
+}
+
+fn read_debug_mode() -> ConfigValue {
+    ConfigValue::Boolean(IS_DEBUG_MODE.load(Ordering::Relaxed))
+}
+
+/// Constraint on `ts-chunk-size` that the server's own numeric range check cannot express:
+/// the size must additionally be a multiple of 8.
+fn validate_chunk_size_config(chunk_size: i64) -> ValkeyResult<()> {
+    validate_chunk_size(chunk_size as usize)?;
     Ok(())
 }
 
@@ -673,193 +720,724 @@ fn get_i64_default(args: &[ValkeyString], name: &str, default: i64) -> ValkeyRes
     }
 }
 
-fn register_string_config(
+/// The registry of every configuration parameter the module exposes.
+///
+/// This is the single source of truth. `register_config` registers each entry with the
+/// server, the set-callback it installs dispatches straight to that entry's `apply`/`validate`
+/// hook (so there is no name-matching step that can fall through to an unhandled parameter),
+/// and `TS._DEBUG LIST_CONFIGS` reports name/type/default/bounds/description from here.
+pub static CONFIGS: &[ConfigDesc] = &[
+    ConfigDesc {
+        name: "ts-chunk-size",
+        read: read_chunk_size,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(CHUNK_SIZE_DEFAULT),
+        min: Some(ConfigValue::Integer(CHUNK_SIZE_MIN)),
+        max: Some(ConfigValue::Integer(CHUNK_SIZE_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Maximum memory used for each time series chunk in bytes",
+        storage: ConfigStorage::I64 {
+            cell: || &CHUNK_SIZE,
+            validate: Some(validate_chunk_size_config),
+        },
+    },
+    ConfigDesc {
+        name: "ts-encoding",
+        read: read_chunk_encoding,
+        kind: ConfigType::Enum,
+        default: ConfigValue::str(DEFAULT_CHUNK_ENCODING.name()),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Default chunk encoding: GORILLA or UNCOMPRESSED",
+        storage: ConfigStorage::Str {
+            cell: || &CHUNK_ENCODING_STRING,
+            apply: update_chunk_encoding,
+        },
+    },
+    ConfigDesc {
+        name: "ts-duplicate-policy",
+        read: read_duplicate_policy,
+        kind: ConfigType::Enum,
+        default: ConfigValue::str(DEFAULT_DUPLICATE_POLICY.as_str()),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Policy for handling duplicate samples: BLOCK, FIRST, LAST, MIN, MAX, SUM",
+        storage: ConfigStorage::Str {
+            cell: || &DUPLICATE_POLICY_STRING,
+            apply: update_duplicate_policy,
+        },
+    },
+    ConfigDesc {
+        name: "ts-retention-policy",
+        read: read_retention_policy,
+        kind: ConfigType::Duration,
+        default: ConfigValue::DurationMs(RETENTION_POLICY_MIN),
+        min: Some(ConfigValue::DurationMs(RETENTION_POLICY_MIN)),
+        max: Some(ConfigValue::DurationMs(RETENTION_POLICY_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Default retention period in milliseconds (0 = no expiry)",
+        storage: ConfigStorage::Str {
+            cell: || &RETENTION_POLICY_STRING,
+            apply: update_retention_policy,
+        },
+    },
+    ConfigDesc {
+        name: "ts-compaction-policy",
+        read: read_compaction_policy,
+        kind: ConfigType::String,
+        default: ConfigValue::str(DEFAULT_COMPACTION_POLICY),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Default compaction rules applied to all new time series",
+        storage: ConfigStorage::Str {
+            cell: || &COMPACTION_POLICY_STRING,
+            apply: update_compaction_policy,
+        },
+    },
+    ConfigDesc {
+        name: "ts-decimal-digits",
+        read: read_decimal_digits,
+        kind: ConfigType::Integer,
+        // The default is the "disabled" sentinel, not a digit count: rounding is off unless
+        // this or `ts-significant-digits` is set.
+        default: ConfigValue::none(),
+        min: Some(ConfigValue::Integer(DECIMAL_DIGITS_MIN)),
+        max: Some(ConfigValue::Integer(DECIMAL_DIGITS_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Round sample values to this many decimal places (none = disabled)",
+        storage: ConfigStorage::Str {
+            cell: || &DECIMAL_DIGITS_STRING,
+            apply: update_decimal_digits,
+        },
+    },
+    ConfigDesc {
+        name: "ts-significant-digits",
+        read: read_significant_digits,
+        kind: ConfigType::Integer,
+        default: ConfigValue::none(),
+        min: Some(ConfigValue::Integer(SIGNIFICANT_DIGITS_MIN)),
+        max: Some(ConfigValue::Integer(SIGNIFICANT_DIGITS_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Round sample values to this many significant digits (none = disabled)",
+        storage: ConfigStorage::Str {
+            cell: || &SIGNIFICANT_DIGITS_STRING,
+            apply: update_significant_digits,
+        },
+    },
+    ConfigDesc {
+        name: "ts-ignore-max-time-diff",
+        read: read_ignore_max_time_diff,
+        kind: ConfigType::Duration,
+        default: ConfigValue::DurationMs(IGNORE_MAX_TIME_DIFF_DEFAULT),
+        min: Some(ConfigValue::DurationMs(IGNORE_MAX_TIME_DIFF_MIN)),
+        max: Some(ConfigValue::DurationMs(IGNORE_MAX_TIME_DIFF_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Max time delta (ms) for which a duplicate sample is ignored",
+        storage: ConfigStorage::Str {
+            cell: || &IGNORE_MAX_TIME_DIFF_STRING,
+            apply: update_ignore_max_time_diff,
+        },
+    },
+    ConfigDesc {
+        name: "ts-ignore-max-value-diff",
+        read: read_ignore_max_value_diff,
+        kind: ConfigType::Float,
+        default: ConfigValue::Float(IGNORE_MAX_VALUE_DIFF_MIN),
+        min: Some(ConfigValue::Float(IGNORE_MAX_VALUE_DIFF_MIN)),
+        max: Some(ConfigValue::Float(IGNORE_MAX_VALUE_DIFF_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Max value delta for which a duplicate sample is ignored",
+        storage: ConfigStorage::Str {
+            cell: || &IGNORE_MAX_VALUE_DIFF_STRING,
+            apply: update_ignore_max_value_diff,
+        },
+    },
+    ConfigDesc {
+        name: "ts-num-threads",
+        read: read_num_threads,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(DEFAULT_THREADS),
+        min: Some(ConfigValue::Integer(MIN_THREADS)),
+        max: Some(ConfigValue::Integer(MAX_THREADS)),
+        // Rayon's global thread pool cannot be resized after `build_global()`, so this can
+        // only be set at startup; runtime `CONFIG SET` is rejected by the server itself.
+        flags: ConfigurationFlags::IMMUTABLE,
+        description: "Number of worker threads for parallel query processing",
+        storage: ConfigStorage::I64 {
+            cell: || &NUM_THREADS,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-fanout-command-timeout",
+        read: read_fanout_command_timeout,
+        kind: ConfigType::Duration,
+        default: ConfigValue::DurationMs(DEFAULT_FANOUT_COMMAND_TIMEOUT_MS as i64),
+        min: Some(ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT_MIN)),
+        max: Some(ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Timeout in milliseconds for fanout (cluster scatter/gather) commands",
+        storage: ConfigStorage::Str {
+            cell: || &FANOUT_COMMAND_TIMEOUT_STRING,
+            apply: update_fanout_command_timeout,
+        },
+    },
+    ConfigDesc {
+        name: "ts-cluster-map-expiration-ms",
+        read: read_cluster_map_expiration,
+        kind: ConfigType::Duration,
+        default: ConfigValue::DurationMs(CLUSTER_MAP_EXPIRATION_MS_DEFAULT as i64),
+        min: Some(ConfigValue::DurationMs(CLUSTER_MAP_EXPIRATION_MIN_MS)),
+        max: Some(ConfigValue::DurationMs(CLUSTER_MAP_EXPIRATION_MAX_MS)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "How long (ms) cluster slot-map entries are cached (0 = no cache)",
+        storage: ConfigStorage::Str {
+            cell: || &CLUSTER_MAP_EXPIRATION_STRING,
+            apply: update_cluster_map_expiration,
+        },
+    },
+    ConfigDesc {
+        name: "ts-index-build-max-memory",
+        read: read_index_build_max_memory,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_DEFAULT),
+        min: Some(ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_MIN)),
+        max: Some(ConfigValue::Integer(INDEX_BUILD_MAX_MEMORY_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Cap in bytes on the transient buffer used by the bulk index build during \
+                      RDB/replication load (0 = unlimited)",
+        storage: ConfigStorage::I64 {
+            cell: || &INDEX_BUILD_MAX_MEMORY,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-fanout-aggregation-pushdown",
+        read: read_fanout_aggregation_pushdown,
+        kind: ConfigType::Boolean,
+        default: ConfigValue::Boolean(true),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Push MRANGE aggregation down to shards during cluster fanout",
+        storage: ConfigStorage::Bool {
+            cell: || &FANOUT_AGGREGATION_PUSHDOWN,
+        },
+    },
+    ConfigDesc {
+        name: "ts-index-persist",
+        read: read_index_persist,
+        kind: ConfigType::Boolean,
+        default: ConfigValue::Boolean(true),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Persist the postings index as an RDB aux field instead of rebuilding it on load",
+        storage: ConfigStorage::Bool {
+            cell: || &INDEX_PERSIST,
+        },
+    },
+    ConfigDesc {
+        name: "debug-mode",
+        read: read_debug_mode,
+        kind: ConfigType::Boolean,
+        default: ConfigValue::Boolean(false),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Enable debug logging and the TS._DEBUG command surface",
+        storage: ConfigStorage::Bool {
+            cell: || &IS_DEBUG_MODE,
+        },
+    },
+];
+
+/// Looks up a parameter by name. Names are matched case-insensitively, as the server does.
+pub fn find_config(name: &str) -> Option<&'static ConfigDesc> {
+    CONFIGS
+        .iter()
+        .find(|desc| desc.name.eq_ignore_ascii_case(name))
+}
+
+fn registry_error(name: &str, what: &str) -> ValkeyError {
+    ValkeyError::String(format!(
+        "internal error: configuration \"{name}\" has no valid {what} in the registry"
+    ))
+}
+
+/// Resolves the i64 bound `bound` for parameter `name`, which the registry must supply.
+fn required_i64(bound: Option<&ConfigValue>, name: &str, what: &str) -> ValkeyResult<i64> {
+    bound
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| registry_error(name, what))
+}
+
+/// Records an accepted configuration change.
+///
+/// Every parameter logs the same way, which is what the removed `config_changed_event_handler`
+/// used to provide (it dumped the whole cached struct on any change).
+fn log_config_set(name: &str, value: &str) {
+    log_notice(format!("Setting {name} to {value}"));
+}
+
+fn register_string_param(
     ctx: &Context,
     args: &[ValkeyString],
-    name: &str,
-    storage: &'static ValkeyGILGuard<ValkeyString>,
-    default: &str,
+    desc: &'static ConfigDesc,
+    cell: fn() -> &'static ValkeyGILGuard<ValkeyString>,
+    apply: fn(&str) -> ValkeyResult<()>,
 ) -> ValkeyResult<()> {
-    let config_default = get_string_default(args, name, default)?;
+    let fallback = desc.default.as_registration_str();
+    let default = get_string_default(args, desc.name, &fallback)?;
+
+    // Applying the resolved default here would be redundant: `RedisModule_LoadConfigs` sets
+    // every parameter once registration completes, which runs `apply` with this same value.
     register_string_configuration::<ValkeyGILGuard<ValkeyString>>(
         ctx,
-        name,
-        storage,
-        config_default,
-        ConfigurationFlags::DEFAULT,
+        desc.name,
+        cell(),
+        default,
+        desc.flags(),
         None,
-        Some(Box::new(on_config_set)),
+        Some(Box::new(
+            move |config_ctx: &ConfigurationContext,
+                  name: &str,
+                  val: &'static ValkeyGILGuard<ValkeyString>| {
+                let raw = val.get(config_ctx).to_string_lossy();
+                apply(&raw)?;
+                log_config_set(name, &raw);
+                Ok(())
+            },
+        )),
+    );
+    Ok(())
+}
+
+fn register_i64_param(
+    ctx: &Context,
+    args: &[ValkeyString],
+    desc: &'static ConfigDesc,
+    cell: fn() -> &'static AtomicI64,
+    validate: Option<fn(i64) -> ValkeyResult<()>>,
+) -> ValkeyResult<()> {
+    let fallback = required_i64(Some(&desc.default), desc.name, "default")?;
+    let min = required_i64(desc.min.as_ref(), desc.name, "minimum")?;
+    let max = required_i64(desc.max.as_ref(), desc.name, "maximum")?;
+    let default = get_i64_default(args, desc.name, fallback)?;
+
+    // Surface a bad startup default as a warning rather than a failed module load, matching
+    // the behaviour operators already rely on: the server applies it regardless, and the
+    // parameter can still be corrected at runtime.
+    if let Some(validate) = validate
+        && let Err(e) = validate(default)
+    {
+        log_warning(format!(
+            "Error validating default value ({default}) for \"{}\": {e}. Please correct this configuration parameter.",
+            desc.name
+        ));
+    }
+
+    register_i64_configuration(
+        ctx,
+        desc.name,
+        cell(),
+        default,
+        min,
+        max,
+        desc.flags(),
+        None,
+        Some(Box::new(
+            move |_config_ctx: &ConfigurationContext, name: &str, atomic: &'static AtomicI64| {
+                let value = atomic.load(Ordering::SeqCst);
+                if let Some(validate) = validate {
+                    validate(value)?;
+                }
+                log_config_set(name, &value.to_string());
+                Ok(())
+            },
+        )),
+    );
+    Ok(())
+}
+
+fn register_bool_param(
+    ctx: &Context,
+    args: &[ValkeyString],
+    desc: &'static ConfigDesc,
+    cell: fn() -> &'static AtomicBool,
+) -> ValkeyResult<()> {
+    let fallback = desc
+        .default
+        .as_bool()
+        .ok_or_else(|| registry_error(desc.name, "default"))?;
+    let default = get_bool_default_config_value(args, desc.name, fallback)?;
+
+    register_bool_configuration(
+        ctx,
+        desc.name,
+        cell(),
+        default,
+        desc.flags(),
+        None,
+        Some(Box::new(
+            move |config_ctx: &ConfigurationContext, name: &str, val: &'static AtomicBool| {
+                log_config_set(name, if val.get(config_ctx) { "yes" } else { "no" });
+                Ok(())
+            },
+        )),
     );
     Ok(())
 }
 
 pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyResult<()> {
-    let chunk_size_default = get_i64_default(args, "ts-chunk-size", CHUNK_SIZE_DEFAULT)?;
-    // validate default chunk size
-    if let Err(e) = validate_chunk_size(chunk_size_default as usize) {
-        let msg = format!(
-            "Error validating default chunk size ({}): {}. Please correct the 'ts-chunk-size' configuration parameter.",
-            chunk_size_default,
-            e.to_string().as_str(),
-        );
-        log_warning(&msg);
+    for desc in CONFIGS {
+        match desc.storage {
+            ConfigStorage::Str { cell, apply } => {
+                register_string_param(ctx, args, desc, cell, apply)?
+            }
+            ConfigStorage::I64 { cell, validate } => {
+                register_i64_param(ctx, args, desc, cell, validate)?
+            }
+            ConfigStorage::Bool { cell } => register_bool_param(ctx, args, desc, cell)?,
+        }
     }
-    register_i64_configuration(
-        ctx,
-        "ts-chunk-size",
-        &CHUNK_SIZE,
-        chunk_size_default,
-        CHUNK_SIZE_MIN,
-        CHUNK_SIZE_MAX,
-        ConfigurationFlags::DEFAULT,
-        None,
-        Some(Box::new(on_chunk_size_config_set)),
-    );
-
-    let num_threads_default = get_i64_default(args, "ts-num-threads", DEFAULT_THREADS)?;
-    register_i64_configuration(
-        ctx,
-        "ts-num-threads",
-        &NUM_THREADS,
-        num_threads_default,
-        1,
-        MAX_THREADS,
-        // Rayon's global thread pool cannot be resized after `build_global()`, so this can
-        // only be set at startup; runtime `CONFIG SET` is rejected by the server itself.
-        ConfigurationFlags::IMMUTABLE,
-        None,
-        Some(Box::new(on_thread_config_set)),
-    );
-
-    register_string_config(
-        ctx,
-        args,
-        "ts-encoding",
-        &CHUNK_ENCODING_STRING,
-        CHUNK_ENCODING_DEFAULT_STRING,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-duplicate-policy",
-        &DUPLICATE_POLICY_STRING,
-        DEFAULT_DUPLICATE_POLICY.as_str(),
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-compaction-policy",
-        &COMPACTION_POLICY_STRING,
-        DEFAULT_COMPACTION_POLICY,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-decimal-digits",
-        &DECIMAL_DIGITS_STRING,
-        DECIMAL_DIGITS_DEFAULT_STRING,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-significant-digits",
-        &SIGNIFICANT_DIGITS_STRING,
-        SIGNIFICANT_DIGITS_DEFAULT_STRING,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-retention-policy",
-        &RETENTION_POLICY_STRING,
-        RETENTION_POLICY_DEFAULT_STRING,
-    )?;
-
-    register_string_config(
-        ctx,
-        args,
-        "ts-ignore-max-time-diff",
-        &IGNORE_MAX_TIME_DIFF_STRING,
-        IGNORE_MAX_TIME_DIFF_DEFAULT_STRING,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-ignore-max-value-diff",
-        &IGNORE_MAX_VALUE_DIFF_STRING,
-        IGNORE_MAX_VALUE_DIFF_DEFAULT_STRING,
-    )?;
-    register_string_config(
-        ctx,
-        args,
-        "ts-fanout-command-timeout",
-        &FANOUT_COMMAND_TIMEOUT_STRING,
-        FANOUT_COMMAND_TIMEOUT_DEFAULT,
-    )?;
-
-    register_string_config(
-        ctx,
-        args,
-        "ts-cluster-map-expiration-ms",
-        &CLUSTER_MAP_EXPIRATION_STRING,
-        CLUSTER_MAP_EXPIRATION_DEFAULT_STRING,
-    )?;
-
-    let debug_mode_default = get_bool_default_config_value(args, "debug-mode", false)?;
-
-    register_bool_configuration(
-        ctx,
-        "debug-mode",
-        &*IS_DEBUG_MODE,
-        debug_mode_default,
-        ConfigurationFlags::DEFAULT,
-        None,
-        Some(Box::new(on_bool_config_set)),
-    );
-
-    let fanout_pushdown_default =
-        get_bool_default_config_value(args, "ts-fanout-aggregation-pushdown", true)?;
-
-    register_bool_configuration(
-        ctx,
-        "ts-fanout-aggregation-pushdown",
-        &FANOUT_AGGREGATION_PUSHDOWN,
-        fanout_pushdown_default,
-        ConfigurationFlags::DEFAULT,
-        None,
-        Some(Box::new(on_bool_config_set)),
-    );
-
-    let index_persist_default = get_bool_default_config_value(args, "ts-index-persist", true)?;
-
-    register_bool_configuration(
-        ctx,
-        "ts-index-persist",
-        &INDEX_PERSIST,
-        index_persist_default,
-        ConfigurationFlags::DEFAULT,
-        None,
-        Some(Box::new(on_bool_config_set)),
-    );
-
-    let bulk_build_max_memory_default = get_i64_default(
-        args,
-        "ts-index-build-max-memory",
-        INDEX_BUILD_MAX_MEMORY_DEFAULT,
-    )?;
-    register_i64_configuration(
-        ctx,
-        "ts-index-build-max-memory",
-        &INDEX_BUILD_MAX_MEMORY,
-        bulk_build_max_memory_default,
-        INDEX_BUILD_MAX_MEMORY_MIN,
-        INDEX_BUILD_MAX_MEMORY_MAX,
-        ConfigurationFlags::DEFAULT,
-        None,
-        None,
-    );
 
     // Initialize config settings
     unsafe { RedisModule_LoadConfigs.unwrap()(ctx.ctx) };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact default string each parameter was registered with before the registry
+    /// existed. Registration defaults are user-visible (`CONFIG GET` reports them on a fresh
+    /// server), so the registry must reproduce them byte for byte.
+    const EXPECTED_REGISTRATION_DEFAULTS: &[(&str, &str)] = &[
+        ("ts-chunk-size", "4096"),
+        ("ts-encoding", "gorilla"),
+        // Lowercase: this is what the server registers and what `CONFIG GET` returns.
+        // `TS._DEBUG LIST_CONFIGS` reports the same value, having previously hardcoded "BLOCK".
+        ("ts-duplicate-policy", "block"),
+        ("ts-retention-policy", "0"),
+        ("ts-compaction-policy", ""),
+        ("ts-decimal-digits", "none"),
+        ("ts-significant-digits", "none"),
+        ("ts-ignore-max-time-diff", "0"),
+        ("ts-ignore-max-value-diff", "0"),
+        ("ts-num-threads", "4"),
+        ("ts-fanout-command-timeout", "5000"),
+        ("ts-cluster-map-expiration-ms", "750"),
+        ("ts-index-build-max-memory", "268435456"),
+        ("ts-fanout-aggregation-pushdown", "yes"),
+        ("ts-index-persist", "yes"),
+        ("debug-mode", "no"),
+    ];
+
+    #[test]
+    fn registration_defaults_are_unchanged() {
+        for (name, expected) in EXPECTED_REGISTRATION_DEFAULTS {
+            let desc = find_config(name).unwrap_or_else(|| panic!("{name} is not registered"));
+            assert_eq!(
+                desc.default.as_registration_str(),
+                *expected,
+                "registration default for {name} changed"
+            );
+        }
+        assert_eq!(
+            CONFIGS.len(),
+            EXPECTED_REGISTRATION_DEFAULTS.len(),
+            "a parameter was added or removed without updating this test"
+        );
+    }
+
+    #[test]
+    fn names_are_unique() {
+        for (i, desc) in CONFIGS.iter().enumerate() {
+            assert!(
+                CONFIGS[..i]
+                    .iter()
+                    .all(|prior| !prior.name.eq_ignore_ascii_case(desc.name)),
+                "duplicate configuration name: {}",
+                desc.name
+            );
+        }
+    }
+
+    /// Numeric parameters are registered directly with the server, which needs a concrete
+    /// default, min and max — a missing or wrongly-typed bound would fail module load.
+    #[test]
+    fn numeric_params_have_usable_bounds() {
+        for desc in CONFIGS {
+            let ConfigStorage::I64 { .. } = desc.storage else {
+                continue;
+            };
+            let default = required_i64(Some(&desc.default), desc.name, "default").unwrap();
+            let min = required_i64(desc.min.as_ref(), desc.name, "minimum").unwrap();
+            let max = required_i64(desc.max.as_ref(), desc.name, "maximum").unwrap();
+            assert!(min <= max, "{}: min exceeds max", desc.name);
+            assert!(
+                (min..=max).contains(&default),
+                "{}: default {default} is outside [{min}, {max}]",
+                desc.name
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_params_have_boolean_defaults() {
+        for desc in CONFIGS {
+            let ConfigStorage::Bool { .. } = desc.storage else {
+                continue;
+            };
+            assert!(
+                desc.default.as_bool().is_some(),
+                "{}: default is not a boolean",
+                desc.name
+            );
+            assert_eq!(desc.kind, ConfigType::Boolean, "{}: wrong kind", desc.name);
+        }
+    }
+
+    /// Every parameter must document itself; `TS._DEBUG LIST_CONFIGS` reports the description.
+    #[test]
+    fn descriptions_are_present() {
+        for desc in CONFIGS {
+            assert!(
+                !desc.description.trim().is_empty(),
+                "{}: missing description",
+                desc.name
+            );
+        }
+    }
+
+    /// Whether `value` is a variant the parameter's declared type allows. The "none" sentinel
+    /// is always allowed: it is how an unset or disabled parameter reports itself.
+    fn matches_kind(value: &ConfigValue, kind: ConfigType) -> bool {
+        if *value == ConfigValue::none() {
+            return true;
+        }
+        match kind {
+            ConfigType::Integer => matches!(value, ConfigValue::Integer(_)),
+            ConfigType::Float => matches!(value, ConfigValue::Float(_)),
+            ConfigType::Boolean => matches!(value, ConfigValue::Boolean(_)),
+            ConfigType::String | ConfigType::Enum => matches!(value, ConfigValue::String(_)),
+            ConfigType::Duration => matches!(value, ConfigValue::DurationMs(_)),
+        }
+    }
+
+    /// The reported value must agree with the declared type, or clients cannot rely on the
+    /// `type` field of `TS._DEBUG LIST_CONFIGS`.
+    #[test]
+    fn read_values_match_declared_kind() {
+        for desc in CONFIGS {
+            let value = (desc.read)();
+            assert!(
+                matches_kind(&value, desc.kind),
+                "{}: value {value:?} does not match declared type {:?}",
+                desc.name,
+                desc.kind
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_and_bounds_match_declared_kind() {
+        for desc in CONFIGS {
+            assert!(
+                matches_kind(&desc.default, desc.kind),
+                "{}: default {:?} does not match declared type {:?}",
+                desc.name,
+                desc.default,
+                desc.kind
+            );
+            for (label, bound) in [("min", &desc.min), ("max", &desc.max)] {
+                if let Some(bound) = bound {
+                    assert!(
+                        matches_kind(bound, desc.kind),
+                        "{}: {label} {bound:?} does not match declared type {:?}",
+                        desc.name,
+                        desc.kind
+                    );
+                }
+            }
+        }
+    }
+
+    /// The packed rounding representation must survive a round trip for every kind and every
+    /// digit count the parameters accept, or a `CONFIG SET` would silently change the value.
+    #[test]
+    fn rounding_strategy_encoding_round_trips() {
+        let max = DECIMAL_DIGITS_MAX.max(SIGNIFICANT_DIGITS_MAX) as u8;
+        let mut cases = vec![None];
+        for digits in 0..=max {
+            cases.push(Some(RoundingStrategy::DecimalDigits(digits)));
+            cases.push(Some(RoundingStrategy::SignificantDigits(digits)));
+        }
+
+        for strategy in cases {
+            let packed = encode_rounding_strategy(strategy);
+            assert_eq!(
+                decode_rounding_strategy(packed),
+                strategy,
+                "round trip failed for {strategy:?}"
+            );
+        }
+    }
+
+    /// The two kinds must never collide in the packed form: that is the invariant the single
+    /// store exists to enforce.
+    #[test]
+    fn rounding_kinds_encode_distinctly() {
+        for digits in 0..=18u8 {
+            assert_ne!(
+                encode_rounding_strategy(Some(RoundingStrategy::DecimalDigits(digits))),
+                encode_rounding_strategy(Some(RoundingStrategy::SignificantDigits(digits))),
+            );
+            assert_ne!(
+                encode_rounding_strategy(Some(RoundingStrategy::DecimalDigits(digits))),
+                encode_rounding_strategy(None),
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_policy_discriminants_round_trip() {
+        for policy in [
+            DuplicatePolicy::Block,
+            DuplicatePolicy::KeepFirst,
+            DuplicatePolicy::KeepLast,
+            DuplicatePolicy::Min,
+            DuplicatePolicy::Max,
+            DuplicatePolicy::Sum,
+        ] {
+            assert_eq!(DuplicatePolicy::from_u8(policy.as_u8()), Some(policy));
+        }
+        assert_eq!(DuplicatePolicy::from_u8(6), None);
+    }
+
+    #[test]
+    fn chunk_encoding_discriminants_round_trip() {
+        for encoding in [
+            ChunkEncoding::Uncompressed,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::TsXor,
+            ChunkEncoding::Pco,
+            ChunkEncoding::Xor2,
+        ] {
+            assert_eq!(ChunkEncoding::try_from(encoding as u8).ok(), Some(encoding));
+        }
+    }
+
+    /// Serializes the tests that mutate the module-level configuration stores, which are
+    /// process-wide and would otherwise interfere when tests run in parallel.
+    static CONFIG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        CONFIG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A parameter's declared default must be a value that parameter actually accepts.
+    ///
+    /// This is what ties the registry's metadata to its behaviour: the default is what the
+    /// server registers and what `RedisModule_LoadConfigs` feeds straight back into `apply`
+    /// at startup, so a default outside the parameter's own range, or a mistyped enum name,
+    /// would fail on every module load.
+    #[test]
+    fn declared_defaults_are_accepted_by_their_own_parser() {
+        let _guard = config_test_lock();
+        store_rounding_strategy(None);
+
+        for desc in CONFIGS {
+            let ConfigStorage::Str { apply, .. } = desc.storage else {
+                continue;
+            };
+            let default = desc.default.as_registration_str();
+
+            apply(&default).unwrap_or_else(|e| {
+                panic!(
+                    "{}: declared default {default:?} is rejected by its own parser: {e}",
+                    desc.name
+                )
+            });
+
+            // The parameter must now report the value it was just set to. Retention is the one
+            // exception: zero means "no expiry", which reports as the "none" sentinel.
+            let value = (desc.read)();
+            assert!(
+                value == desc.default || value == ConfigValue::none(),
+                "{}: default {:?} applied but reads back as {value:?}",
+                desc.name,
+                desc.default
+            );
+        }
+
+        store_rounding_strategy(None);
+    }
+
+    /// `ts-decimal-digits` and `ts-significant-digits` share one store. Each may only disable
+    /// its own kind, and neither may override the other while it is active.
+    #[test]
+    fn rounding_parameters_are_mutually_exclusive() {
+        let _guard = config_test_lock();
+        let restore = rounding_strategy();
+
+        store_rounding_strategy(None);
+        update_decimal_digits("3").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::DecimalDigits(3))
+        );
+
+        // The other kind cannot take over while this one is active.
+        assert!(update_significant_digits("5").is_err());
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::DecimalDigits(3))
+        );
+
+        // Disabling the inactive kind must leave the active one alone.
+        update_significant_digits("none").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::DecimalDigits(3))
+        );
+
+        // A parameter may always be re-set to a new value of its own kind.
+        update_decimal_digits("7").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::DecimalDigits(7))
+        );
+
+        // Disabling the active kind clears rounding and frees the other kind.
+        update_decimal_digits("none").unwrap();
+        assert_eq!(rounding_strategy(), None);
+        update_significant_digits("5").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::SignificantDigits(5))
+        );
+
+        store_rounding_strategy(restore);
+    }
+
+    /// `ts-num-threads` is the one parameter that cannot change after startup, because rayon's
+    /// global pool cannot be resized once built.
+    #[test]
+    fn only_num_threads_is_immutable() {
+        for desc in CONFIGS {
+            assert_eq!(
+                desc.is_mutable(),
+                desc.name != "ts-num-threads",
+                "{}: unexpected mutability",
+                desc.name
+            );
+        }
+    }
 }

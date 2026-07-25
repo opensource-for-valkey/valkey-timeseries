@@ -2,8 +2,8 @@ use crate::common::rdb::rdb_load_string;
 use crate::common::rounding::RoundingStrategy;
 use crate::common::{Sample, Timestamp};
 use crate::config::{
-    CHUNK_ENCODING, CHUNK_SIZE, CHUNK_SIZE_DEFAULT, ConfigSettings, DUPLICATE_POLICY,
-    IGNORE_MAX_TIME_DIFF, IGNORE_MAX_VALUE_DIFF, RETENTION_PERIOD, ROUNDING_STRATEGY,
+    CHUNK_SIZE_DEFAULT, chunk_encoding, chunk_size_bytes, duplicate_policy, ignore_max_time_diff,
+    ignore_max_value_diff, retention_period, rounding_strategy,
 };
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
@@ -19,20 +19,25 @@ use valkey_module::{ValkeyError, ValkeyResult, ValkeyValue, raw};
 
 #[derive(Debug, Default, PartialEq, Clone, Copy, GetSize, Hash)]
 /// The policy to use when a duplicate sample is encountered
+///
+/// The discriminants let the policy be held in an atomic (see `config::DUPLICATE_POLICY`).
+/// They are an in-memory detail only: RDB and the fanout protocol both carry the *name*, so
+/// the numbering can change without affecting persistence or the wire format.
+#[repr(u8)]
 pub enum DuplicatePolicy {
     /// Block the sample and return an error
     #[default]
-    Block,
+    Block = 0,
     /// Keep the first sample
-    KeepFirst,
+    KeepFirst = 1,
     /// Keep the last (current) sample
-    KeepLast,
+    KeepLast = 2,
     /// Keep the minimum value of the current and old sample
-    Min,
+    Min = 3,
     /// Keep the maximum value of the current and old sample
-    Max,
+    Max = 4,
     /// Sum the current and old sample
-    Sum,
+    Sum = 5,
 }
 
 impl Display for DuplicatePolicy {
@@ -50,6 +55,24 @@ impl DuplicatePolicy {
             DuplicatePolicy::Min => "min",
             DuplicatePolicy::Max => "max",
             DuplicatePolicy::Sum => "sum",
+        }
+    }
+
+    /// The discriminant, for storing the policy in an atomic.
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Inverse of [`Self::as_u8`]; `None` for a value that is not a discriminant.
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(DuplicatePolicy::Block),
+            1 => Some(DuplicatePolicy::KeepFirst),
+            2 => Some(DuplicatePolicy::KeepLast),
+            3 => Some(DuplicatePolicy::Min),
+            4 => Some(DuplicatePolicy::Max),
+            5 => Some(DuplicatePolicy::Sum),
+            _ => None,
         }
     }
 
@@ -236,11 +259,9 @@ impl SampleDuplicatePolicy {
     }
 
     pub fn resolve_policy(&self, override_policy: Option<DuplicatePolicy>) -> DuplicatePolicy {
-        override_policy.or(self.policy).unwrap_or_else(|| {
-            *DUPLICATE_POLICY
-                .lock()
-                .expect("error unlocking duplicate policy")
-        })
+        override_policy
+            .or(self.policy)
+            .unwrap_or_else(duplicate_policy)
     }
 
     pub(crate) fn rdb_save(&self, rdb: *mut raw::RedisModuleIO) {
@@ -343,41 +364,24 @@ impl TimeSeriesOptions {
         self.retention = Some(retention);
     }
 
+    /// Builds options from the module-level configuration. Every value is read from a
+    /// lock-free store, so this stays cheap on the create path of `TS.ADD`/`TS.MADD`.
     pub fn from_config() -> Self {
-        let policy = *DUPLICATE_POLICY
-            .lock()
-            .expect("error unlocking duplicate policy");
-        let rounding = *ROUNDING_STRATEGY
-            .lock()
-            .expect("error unlocking rounding strategy");
-        let chunk_size = CHUNK_SIZE.load(std::sync::atomic::Ordering::SeqCst) as usize;
-        let chunk_encoding = *CHUNK_ENCODING
-            .lock()
-            .expect("error unlocking chunk encoding");
-
-        let max_time_delta = IGNORE_MAX_TIME_DIFF.load(std::sync::atomic::Ordering::SeqCst) as u64;
-
-        let max_value_delta = *IGNORE_MAX_VALUE_DIFF
-            .lock()
-            .expect("error unlocking max value diff");
-
-        let retention_period = *RETENTION_PERIOD
-            .lock()
-            .expect("error unlocking retention period");
+        let retention = retention_period();
 
         TimeSeriesOptions {
-            retention: if retention_period.as_millis() > 0 {
-                Some(retention_period)
-            } else {
+            retention: if retention.is_zero() {
                 None
+            } else {
+                Some(retention)
             },
-            chunk_encoding,
-            chunk_size: Some(chunk_size),
-            rounding,
+            chunk_encoding: chunk_encoding(),
+            chunk_size: Some(chunk_size_bytes()),
+            rounding: rounding_strategy(),
             sample_duplicate_policy: Some(SampleDuplicatePolicy {
-                policy: Some(policy),
-                max_time_delta,
-                max_value_delta,
+                policy: Some(duplicate_policy()),
+                max_time_delta: ignore_max_time_diff(),
+                max_value_delta: ignore_max_value_diff(),
             }),
             ..Default::default()
         }
@@ -396,27 +400,6 @@ impl Default for TimeSeriesOptions {
             rounding: None,
             on_duplicate: None,
         }
-    }
-}
-
-impl From<&ConfigSettings> for TimeSeriesOptions {
-    fn from(settings: &ConfigSettings) -> Self {
-        Self {
-            src_id: None,
-            chunk_encoding: settings.chunk_encoding,
-            chunk_size: Some(settings.chunk_size_bytes),
-            retention: settings.retention_period,
-            sample_duplicate_policy: Some(settings.duplicate_policy),
-            labels: None,
-            rounding: settings.rounding,
-            on_duplicate: None,
-        }
-    }
-}
-
-impl From<ConfigSettings> for TimeSeriesOptions {
-    fn from(settings: ConfigSettings) -> Self {
-        Self::from(&settings)
     }
 }
 
