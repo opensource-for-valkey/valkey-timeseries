@@ -112,3 +112,27 @@ pub fn filled_prefix_len(data: &[Sample], encoding: ChunkEncoding, chunk_size: u
     }
     count
 }
+
+/// The number of bytes a chunk has actually written, for compression reporting.
+///
+/// [`ChunkOps::size`] is not comparable across encodings: gorilla, tsxor, dexor
+/// and pco return a `get_size()` heap footprint, which counts buffer *capacity*
+/// and therefore jumps to the next power of two as the buffer grows, while xor2
+/// and uncompressed return the bytes in use. A ratio built on `size()` compares
+/// allocator slack rather than compression — at a 64 KiB budget gorilla reports
+/// ~128 KiB of footprint against xor2's exact ~64 KiB.
+///
+/// This returns the used-byte count for every encoding, matching what each
+/// implementation's `is_full()` measures.
+pub fn encoded_size(chunk: &TimeSeriesChunk) -> usize {
+    match chunk {
+        // `samples.len() * size_of::<Sample>()` — already exact.
+        TimeSeriesChunk::Uncompressed(c) => c.size(),
+        TimeSeriesChunk::Gorilla(c) => c.encoder.buf().len(),
+        TimeSeriesChunk::TsXor(c) => c.buf().len(),
+        // `stream.len()` — already exact.
+        TimeSeriesChunk::Xor(c) => c.size(),
+        TimeSeriesChunk::Pco(c) => c.timestamps.len() + c.values.len(),
+        TimeSeriesChunk::DeXor(c) => c.encoder.buf().len(),
+    }
+}
