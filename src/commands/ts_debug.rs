@@ -3,6 +3,8 @@ use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
 use crate::common::string_interner::{BucketStats, InternedString, TopKEntry};
+use crate::config::is_debug_mode_enabled;
+use crate::error_consts;
 use crate::series::index::series_keys_by_selectors;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -157,7 +159,16 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 }
 
 /// Main entry point for TS._DEBUG command.
+///
+/// The whole command surface is gated on `debug-mode`, which is off by default: these
+/// subcommands expose module internals that are not part of the supported API. The gate is
+/// checked before the subcommand is parsed, so a disabled server reports that it is disabled
+/// rather than complaining about the arguments.
 pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult<()> {
+    if !is_debug_mode_enabled() {
+        return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
+    }
+
     // skip the command name and parse the subcommand keyword
     let mut itr = args.into_iter().skip(1).peekable();
 

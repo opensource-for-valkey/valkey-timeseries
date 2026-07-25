@@ -26,6 +26,7 @@ pub const CANNOT_PARSE_CHUNK_SIZE: &str = "TSDB: couldn't parse CHUNK_SIZE";
 pub const INVALID_CHUNK_SIZE: &str = "TSDB: invalid chunk size";
 pub const INVALID_DUPLICATE_POLICY: &str = "TSDB: invalid duplicate policy";
 pub const MISSING_DUPLICATE_POLICY: &str = "TSDB: missing duplicate policy value";
+pub const DEBUG_MODE_DISABLED: &str = "TSDB: TS._DEBUG is disabled. Set the 'ts.debug-mode' configuration parameter to yes to enable it";
 pub const INVALID_DURATION: &str = "TSDB: invalid duration";
 pub const INVALID_INTEGER: &str = "TSDB: invalid integer";
 pub const INVALID_JOIN_KEY: &str = "TSDB: invalid join key";

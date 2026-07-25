@@ -18,7 +18,7 @@ import pytest
 from valkey import Valkey, ValkeyCluster
 from valkeytestframework.util.waiters import wait_for_true, WaitTimeout
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
+from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,12 @@ def get_server_version(client: Valkey) -> tuple:
     return tuple(int(p.split("-")[0]) for p in parts[:3])
 
 
-class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCase):
-    """Test Atomic Slot Migration index consistency."""
+class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """Test Atomic Slot Migration index consistency.
+
+    Runs with debug-mode enabled: these tests use TS._DEBUG QUERYINDEX to inspect a single
+    node's local index, and that command surface is gated on debug-mode.
+    """
 
     # Use 3 shards with 1 replica each for comprehensive migration testing
     CLUSTER_SIZE = 3

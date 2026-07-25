@@ -259,6 +259,34 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert dup_policy_config['default'] == 'block'
         assert dup_policy_config['type'] == 'enum'
 
+    def test_debug_requires_debug_mode(self):
+        """TS._DEBUG is rejected unless ts.debug-mode is enabled."""
+        try:
+            self.set_debug_mode(False)
+
+            # Every subcommand is gated, including HELP and unknown ones: the gate is checked
+            # before the arguments are looked at.
+            for args in (
+                ('HELP',),
+                ('LIST_CONFIGS',),
+                ('LIST_CONFIGS', 'VERBOSE'),
+                ('STRINGPOOLSTATS',),
+                ('INVALID_SUBCOMMAND',),
+                (),
+            ):
+                with pytest.raises(ResponseError, match="disabled"):
+                    self.client.execute_command('TS._DEBUG', *args)
+        finally:
+            self.set_debug_mode(True)
+
+        # Re-enabling at runtime takes effect immediately.
+        assert self.client.execute_command('TS._DEBUG', 'LIST_CONFIGS')
+
+    def test_debug_mode_value_is_reported(self):
+        """The debug-mode parameter reports its live value like any other."""
+        self.set_debug_mode(True)
+        assert self._verbose_configs()['debug-mode']['value'] == 'yes'
+
     def _verbose_configs(self) -> dict:
         """LIST_CONFIGS VERBOSE as {name: {field: value}}, with bytes decoded."""
         configs = {}

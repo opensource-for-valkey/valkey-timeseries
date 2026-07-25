@@ -347,7 +347,16 @@ static FANOUT_COMMAND_TIMEOUT_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-fanout-command-timeout"));
 static CLUSTER_MAP_EXPIRATION_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-cluster-map-expiration-ms"));
+/// Gate for the `TS._DEBUG` command surface (`debug-mode`, default off).
+///
+/// `TS._DEBUG` exposes internal state (the string-interner pool, the node-local postings
+/// index, the configuration registry) that is useful for diagnostics but is not part of the
+/// module's supported API, so it stays off unless an operator turns it on.
 static IS_DEBUG_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_debug_mode_enabled() -> bool {
+    IS_DEBUG_MODE.load(Ordering::Relaxed)
+}
 
 /// Runtime toggle for shard-side aggregation push-down in MRANGE fanout
 /// (`ts-fanout-aggregation-pushdown`, default on). Consulted by the
@@ -678,7 +687,7 @@ fn read_index_persist() -> ConfigValue {
 }
 
 fn read_debug_mode() -> ConfigValue {
-    ConfigValue::Boolean(IS_DEBUG_MODE.load(Ordering::Relaxed))
+    ConfigValue::Boolean(is_debug_mode_enabled())
 }
 
 /// Constraint on `ts-chunk-size` that the server's own numeric range check cannot express:

@@ -5,6 +5,31 @@ Internal diagnostic and introspection tool for the valkey-timeseries module.
 > **Note:** `TS._DEBUG` is intended for operators and developers. Its subcommands, output formats, and behavior may
 > change between versions without notice. Do not rely on this command in production application logic.
 
+## Enabling
+
+`TS._DEBUG` is disabled by default. Every subcommand is rejected until the `debug-mode`
+configuration parameter is enabled:
+
+```
+TS._DEBUG HELP
+(error) TSDB: TS._DEBUG is disabled. Set the 'ts.debug-mode' configuration parameter to yes to enable it
+```
+
+Enable it at runtime:
+
+```
+CONFIG SET ts.debug-mode yes
+```
+
+or at startup, as a module load argument (unprefixed there — the `ts.` prefix applies only to
+`CONFIG GET`/`CONFIG SET`):
+
+```
+loadmodule /path/to/libvalkey_timeseries.so debug-mode yes
+```
+
+The setting takes effect immediately and can be turned back off with `CONFIG SET ts.debug-mode no`.
+
 ## Syntax
 
 ````aiignore

@@ -310,10 +310,16 @@ class ValkeyTimeSeriesTestCaseCommon(ValkeyTestCase):
 
 class ValkeyTimeSeriesTestCaseBase(ValkeyTimeSeriesTestCaseCommon):
 
+    # Extra module load arguments, as bare "name value" pairs appended to the loadmodule line.
+    # Module configs are addressed by their unprefixed name at load time (the "ts." prefix
+    # applies only to CONFIG GET/SET), e.g. "debug-mode yes".
+    MODULE_ARGS: str = ""
+
     @pytest.fixture(autouse=True)
     def setup_test(self, request):
         module_path = self.resolve_module_path()
-        args = {"enable-debug-command": "yes", 'loadmodule': module_path}
+        loadmodule = f"{module_path} {self.MODULE_ARGS}".strip()
+        args = {"enable-debug-command": "yes", 'loadmodule': loadmodule}
         server_path = VALKEY_SERVER_PATH
 
         self.server, self.client = self.create_server(testdir=self.testdir, server_path=server_path, args=args)
@@ -624,16 +630,22 @@ class ValkeyTimeSeriesClusterTestCase(ValkeyTimeSeriesTestCaseCommon):
 
 
 def EnableDebugMode(config: List[str]):
-    # turn "loadmodule xx.so" into "loadmodule xx.so --ts.debug-mode yes"
+    # turn "loadmodule xx.so" into "loadmodule xx.so debug-mode yes"
+    #
+    # The argument is the module config's bare name: module load arguments are matched
+    # verbatim against the registered name, so the "ts." prefix used by CONFIG GET/SET must
+    # not appear here.
     module_path = os.path.abspath(os.getenv('MODULE_PATH') or get_module_path() or DEFAULT_MODULE_PATH)
     load_module = f"loadmodule {module_path}"
-    return [x.replace(load_module, load_module + " --ts.debug-mode yes") for x in config]
+    return [x.replace(load_module, load_module + " debug-mode yes") for x in config]
 
 
 class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
     """
     Same as ValkeySearchClusterTestCase, except that "debug-mode" is enabled.
     """
+
+    MODULE_ARGS = "debug-mode yes"
 
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         return EnableDebugMode(super(ValkeyTimeSeriesTestCaseDebugMode, self).get_config_file_lines(test_dir, port))
