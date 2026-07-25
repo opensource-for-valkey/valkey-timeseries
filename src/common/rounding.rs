@@ -2,8 +2,28 @@ use get_size2::GetSize;
 use std::f64;
 use std::fmt::Display;
 
+/// Largest accepted `SIGNIFICANT_DIGITS` value.
+///
+/// Note this is a cap, not the largest *effective* value: [`round_to_sig_figs`] leaves values
+/// untouched at exactly this many digits, because it is at the edge of `f64`'s ~15-17
+/// significant decimal digits and rounding there would only introduce error. Requesting 16
+/// is therefore accepted but rounds nothing; 15 is the largest value that has an effect.
 pub const MAX_SIGNIFICANT_DIGITS: u8 = 16;
+
+/// Smallest accepted `SIGNIFICANT_DIGITS` value.
+///
+/// Zero is rejected rather than accepted-and-ignored: "no significant digits" is not a
+/// quantity, so unlike `DECIMAL_DIGITS 0` there is nothing it could sensibly mean. To turn
+/// rounding off, omit the argument (or set the config to `none`).
+pub const MIN_SIGNIFICANT_DIGITS: u8 = 1;
+
+/// Largest accepted `DECIMAL_DIGITS` value. Unlike [`MAX_SIGNIFICANT_DIGITS`], every value up
+/// to and including this one has an effect.
 pub const MAX_DECIMAL_DIGITS: u8 = 16;
+
+/// Smallest accepted `DECIMAL_DIGITS` value. Zero is meaningful here — it rounds to whole
+/// numbers — so it is accepted.
+pub const MIN_DECIMAL_DIGITS: u8 = 0;
 
 #[derive(Clone, Debug, Hash, PartialEq, Copy, GetSize)]
 pub enum RoundingStrategy {
@@ -31,17 +51,21 @@ impl Display for RoundingStrategy {
     }
 }
 
-/// Rounds f to the given number of decimal digits after the point.
+/// Rounds `value` to the given number of decimal digits after the point.
 ///
-/// See also round_to_sig_figs.
+/// `digits == 0` rounds to whole numbers — it does *not* mean "no rounding". Both the
+/// per-series `DECIMAL_DIGITS 0` argument and `ts-decimal-digits 0` mean this; rounding is
+/// switched off by omitting the argument, or by setting the config to `none`.
+///
+/// Values above [`MAX_DECIMAL_DIGITS`] are clamped rather than rejected; both callers validate
+/// the range first, so the clamp only guards direct use.
+///
+/// See also [`round_to_sig_figs`].
 pub fn round_to_decimal_digits(value: f64, digits: u8) -> f64 {
     if digits == 0 {
         return value.round();
     }
-    let digits = digits.clamp(0, MAX_DECIMAL_DIGITS);
-    if digits == 0 {
-        return value;
-    }
+    let digits = digits.clamp(1, MAX_DECIMAL_DIGITS);
     let factor = 10_f64.powi(digits as i32);
     (value * factor).round() / factor
 }

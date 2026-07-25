@@ -36,8 +36,15 @@ TS.ADD key timestamp value
 | `METRIC metric`                             | Metric name (alternative to `LABELS` for simple metric identification)                                                        | —                       |
 | `LABELS labelName labelValue ...`           | Key-value pairs for series labels (must have even number of arguments)                                                        | —                       |
 | `IGNORE ignoreMaxTimediff ignoreMaxValDiff` | Ignore samples within `ignoreMaxTimediff` (ms) and `ignoreMaxValDiff` threshold                                               | No filtering            |
-| `SIGNIFICANT_DIGITS significantDigits`      | Round values to N significant digits (0-20)                                                                                   | No rounding             |
-| `DECIMAL_DIGITS decimalDigits`              | Round values to N decimal places (0-20)                                                                                       | No rounding             |
+| `SIGNIFICANT_DIGITS significantDigits`      | Round values to N significant digits (1-16; see note below)                                                                   | No rounding             |
+| `DECIMAL_DIGITS decimalDigits`              | Round values to N decimal places (0-16; `0` rounds to whole numbers)                                                          | No rounding             |
+
+> **Rounding notes:** `SIGNIFICANT_DIGITS` and `DECIMAL_DIGITS` are mutually exclusive.
+> `DECIMAL_DIGITS 0` rounds to whole numbers — it does not mean "no rounding"; omit the
+> argument for that. `SIGNIFICANT_DIGITS` starts at 1, since "zero significant digits" is not a
+> quantity. `SIGNIFICANT_DIGITS 16` is accepted but rounds nothing: 16 significant decimal
+> digits is at the edge of a 64-bit float's precision, so rounding there would only introduce
+> error; 15 is the largest value with an effect.
 
 ## Return Value
 

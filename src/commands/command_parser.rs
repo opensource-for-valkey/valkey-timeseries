@@ -1,7 +1,9 @@
 use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
 use crate::common::Timestamp;
 use crate::common::binop::ComparisonOperator;
-use crate::common::rounding::{MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, RoundingStrategy};
+use crate::common::rounding::{
+    MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
+};
 use crate::common::time::current_time_millis;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
@@ -722,9 +724,12 @@ pub fn parse_significant_digit_rounding(
     args: &mut CommandArgIterator,
 ) -> ValkeyResult<RoundingStrategy> {
     let next = args.next_u64()?;
-    if next > MAX_SIGNIFICANT_DIGITS as u64 {
-        let msg =
-            format!("TSDB: SIGNIFICANT_DIGITS must be between 0 and {MAX_SIGNIFICANT_DIGITS}");
+    // Zero is rejected rather than accepted-and-ignored: "no significant digits" is not a
+    // quantity. Omit the argument to leave values unrounded.
+    if next < MIN_SIGNIFICANT_DIGITS as u64 || next > MAX_SIGNIFICANT_DIGITS as u64 {
+        let msg = format!(
+            "TSDB: SIGNIFICANT_DIGITS must be between {MIN_SIGNIFICANT_DIGITS} and {MAX_SIGNIFICANT_DIGITS}"
+        );
         return Err(ValkeyError::String(msg));
     }
     Ok(RoundingStrategy::SignificantDigits(next as u8))

@@ -105,8 +105,11 @@ Samples exceeding either threshold are dropped.
 
 Value precision control (mutually exclusive):
 
-- `SIGNIFICANT_DIGITS` - Number of significant digits (0-18)
-- `DECIMAL_DIGITS` - Number of decimal places
+- `SIGNIFICANT_DIGITS` - Number of significant digits (1-16). Zero is rejected — "zero
+  significant digits" is not a quantity. 16 is accepted but rounds nothing, being at the edge
+  of a 64-bit float's precision; 15 is the largest effective value.
+- `DECIMAL_DIGITS` - Number of decimal places (0-16). `0` rounds to whole numbers; omit the
+  argument for no rounding.
 
 </summary>
 

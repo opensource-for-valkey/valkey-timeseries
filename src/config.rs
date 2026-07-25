@@ -1,5 +1,8 @@
 use crate::common::humanize::humanize_duration_ms;
-use crate::common::rounding::{MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, RoundingStrategy};
+use crate::common::rounding::{
+    MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_DECIMAL_DIGITS, MIN_SIGNIFICANT_DIGITS,
+    RoundingStrategy,
+};
 use crate::common::sync::lock;
 use crate::error_consts;
 use crate::parser::number::parse_number;
@@ -9,6 +12,7 @@ use crate::series::{
     DuplicatePolicy, add_compaction_policies_from_config, clear_compaction_policy_config,
 };
 use std::borrow::Cow;
+use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -20,7 +24,7 @@ use valkey_module::configuration::{
 use valkey_module::logging::{log_notice, log_warning};
 use valkey_module::{
     ConfigurationValue, Context, RedisModule_LoadConfigs, ValkeyError, ValkeyGILGuard,
-    ValkeyResult, ValkeyString,
+    ValkeyResult, ValkeyString, raw,
 };
 
 /// Minimal Valkey version that supports the TimeSeries Module
@@ -38,12 +42,12 @@ pub const CHUNK_SIZE_MAX: i64 = 1024 * 1024;
 pub const CHUNK_SIZE_DEFAULT: i64 = 4 * 1024;
 // Rounding bounds come from the rounding module, which is what actually applies them: the
 // per-series `DECIMAL_DIGITS`/`SIGNIFICANT_DIGITS` command arguments are validated against the
-// same constants. These previously read 18 here, so `CONFIG SET ts-decimal-digits 17` was
-// accepted and then silently clamped, while `TS.CREATE ... DECIMAL_DIGITS 17` was rejected.
+// same constants. Note the two minima differ: `DECIMAL_DIGITS 0` rounds to whole numbers,
+// whereas "zero significant digits" is not a quantity and is rejected.
 pub const DECIMAL_DIGITS_MAX: i64 = MAX_DECIMAL_DIGITS as i64;
-pub const DECIMAL_DIGITS_MIN: i64 = 0;
+pub const DECIMAL_DIGITS_MIN: i64 = MIN_DECIMAL_DIGITS as i64;
 pub const SIGNIFICANT_DIGITS_MAX: i64 = MAX_SIGNIFICANT_DIGITS as i64;
-pub const SIGNIFICANT_DIGITS_MIN: i64 = 0;
+pub const SIGNIFICANT_DIGITS_MIN: i64 = MIN_SIGNIFICANT_DIGITS as i64;
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = CHUNK_SIZE_DEFAULT as usize;
 pub const DEFAULT_CHUNK_ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
 pub const DEFAULT_DUPLICATE_POLICY: DuplicatePolicy = DuplicatePolicy::Block;
@@ -315,10 +319,12 @@ pub static FANOUT_COMMAND_TIMEOUT: AtomicU64 = AtomicU64::new(DEFAULT_FANOUT_COM
 /// `ts-cluster-map-expiration-ms`. Read as raw milliseconds by the cluster-map backoff
 /// arithmetic in `fanout`, so it is not wrapped in a `Duration` accessor.
 pub static CLUSTER_MAP_EXPIRATION_MS: AtomicU64 = AtomicU64::new(CLUSTER_MAP_EXPIRATION_MS_DEFAULT);
+
 /// Typed store for `ts-compaction-policy`. The parsed rules live in the compaction module;
 /// this keeps the policy text so the parameter can be reported like any other.
 pub static COMPACTION_POLICY: LazyLock<Mutex<String>> =
     LazyLock::new(|| Mutex::new(DEFAULT_COMPACTION_POLICY.to_string()));
+
 /// Builds a string parameter's storage cell, seeded with the default declared in [`CONFIGS`].
 ///
 /// The seed is transient — registration passes the resolved default separately and
@@ -351,6 +357,7 @@ static FANOUT_COMMAND_TIMEOUT_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-fanout-command-timeout"));
 static CLUSTER_MAP_EXPIRATION_STRING: LazyLock<ValkeyGILGuard<ValkeyString>> =
     LazyLock::new(|| default_string_cell("ts-cluster-map-expiration-ms"));
+    
 /// Gate for the `TS._DEBUG` command surface (`debug-mode`, default off).
 ///
 /// `TS._DEBUG` exposes internal state (the string-interner pool, the node-local postings
@@ -528,6 +535,16 @@ fn update_cluster_map_expiration(val: &str) -> ValkeyResult<()> {
     Ok(())
 }
 
+/// What a rounding set-request asks for.
+///
+/// `none` and `0` are different requests: `0` is a real digit count, not a way to switch
+/// rounding off. Keeping them distinct is what lets `ts-decimal-digits 0` mean whole-number
+/// rounding, matching the per-series `DECIMAL_DIGITS 0` argument.
+enum RoundingRequest {
+    Disable,
+    Digits(u8),
+}
+
 /// Which of the two mutually exclusive rounding parameters a value belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RoundingKind {
@@ -557,7 +574,12 @@ impl RoundingKind {
 /// own kind: `none` (or 0) disables *this* kind and leaves the other alone, and setting a
 /// digit count while the other kind is active is rejected. Previously the disable path cleared
 /// the store outright, so `CONFIG SET ts-decimal-digits none` silently switched off an active
-/// significant-digits rounding.
+/// significant-digits rounding. To switch kinds, disable the active one and then set the other.
+///
+/// Only `none` disables rounding; `0` is a digit count like any other, so
+/// `ts-decimal-digits 0` rounds samples to whole numbers exactly as the per-series
+/// `DECIMAL_DIGITS 0` argument does. `ts-significant-digits` has no meaningful zero and
+/// rejects it — see [`MIN_SIGNIFICANT_DIGITS`].
 ///
 /// Read-modify-write is safe without a lock: config set callbacks run on the main thread with
 /// the module GIL held.
@@ -568,31 +590,33 @@ fn update_rounding(
     min: i64,
     max: i64,
 ) -> ValkeyResult<()> {
-    let digits = if val.eq_ignore_ascii_case(CONFIG_VALUE_NONE) {
-        0
+    let request = if val.eq_ignore_ascii_case(CONFIG_VALUE_NONE) {
+        RoundingRequest::Disable
     } else {
-        parse_number_in_range(name, val, min as f64, max as f64)? as i64
+        RoundingRequest::Digits(parse_number_in_range(name, val, min as f64, max as f64)? as u8)
     };
 
-    let current = rounding_strategy();
-    let active_kind = current.as_ref().map(RoundingKind::of);
+    let active_kind = rounding_strategy().as_ref().map(RoundingKind::of);
 
-    if digits == 0 {
-        if active_kind == Some(kind) {
-            store_rounding_strategy(None);
+    match request {
+        // Disabling only clears rounding of this kind; the other kind is left alone.
+        RoundingRequest::Disable => {
+            if active_kind == Some(kind) {
+                store_rounding_strategy(None);
+            }
         }
-        return Ok(());
+        RoundingRequest::Digits(digits) => {
+            if let Some(active_kind) = active_kind
+                && active_kind != kind
+            {
+                return Err(ValkeyError::String(
+                    "Cannot set both ts-decimal-digits and ts-significant-digits".to_string(),
+                ));
+            }
+            store_rounding_strategy(Some(kind.build(digits)));
+        }
     }
 
-    if let Some(active_kind) = active_kind
-        && active_kind != kind
-    {
-        return Err(ValkeyError::String(
-            "Cannot set both ts-decimal-digits and ts-significant-digits".to_string(),
-        ));
-    }
-
-    store_rounding_strategy(Some(kind.build(digits as u8)));
     Ok(())
 }
 
@@ -814,7 +838,9 @@ pub static CONFIGS: &[ConfigDesc] = &[
         min: Some(ConfigValue::Integer(DECIMAL_DIGITS_MIN)),
         max: Some(ConfigValue::Integer(DECIMAL_DIGITS_MAX)),
         flags: ConfigurationFlags::DEFAULT,
-        description: "Round sample values to this many decimal places (none = disabled)",
+        description: "Round sample values to this many decimal places (none = disabled, \
+                      0 = round to whole numbers; mutually exclusive with \
+                      ts-significant-digits)",
         storage: ConfigStorage::Str {
             cell: || &DECIMAL_DIGITS_STRING,
             apply: update_decimal_digits,
@@ -828,7 +854,9 @@ pub static CONFIGS: &[ConfigDesc] = &[
         min: Some(ConfigValue::Integer(SIGNIFICANT_DIGITS_MIN)),
         max: Some(ConfigValue::Integer(SIGNIFICANT_DIGITS_MAX)),
         flags: ConfigurationFlags::DEFAULT,
-        description: "Round sample values to this many significant digits (none = disabled)",
+        description: "Round sample values to this many significant digits (none = disabled; \
+                      16 is accepted but rounds nothing; mutually exclusive with \
+                      ts-decimal-digits)",
         storage: ConfigStorage::Str {
             cell: || &SIGNIFICANT_DIGITS_STRING,
             apply: update_significant_digits,
@@ -1112,8 +1140,23 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
         }
     }
 
-    // Initialize config settings
-    unsafe { RedisModule_LoadConfigs.unwrap()(ctx.ctx) };
+    // Apply the resolved values (from `valkey.conf` / `MODULE LOAD` args, or the registered
+    // defaults). This runs each parameter's set path, so it is where a startup value that the
+    // module itself rejects surfaces — for example `ts-decimal-digits` and
+    // `ts-significant-digits` both set, which the mutual-exclusion check refuses.
+    //
+    // A failure here leaves the offending parameter at its previous value and the rest applied;
+    // the module still loads, so report it rather than letting it pass silently.
+    let status = unsafe { RedisModule_LoadConfigs.unwrap()(ctx.ctx) };
+    if status != raw::REDISMODULE_OK as c_int {
+        log_warning(
+            "Failed to apply the startup configuration: one or more timeseries parameters were \
+             rejected (see the preceding errors). The module cannot start.",
+        );
+        return Err(ValkeyError::Str(
+            "TSDB: invalid startup configuration; see the preceding errors in the server log",
+        ));
+    }
 
     Ok(())
 }
@@ -1443,6 +1486,69 @@ mod tests {
         update_decimal_digits("none").unwrap();
         assert_eq!(rounding_strategy(), None);
         update_significant_digits("5").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::SignificantDigits(5))
+        );
+
+        store_rounding_strategy(restore);
+    }
+
+    /// Only `none` disables rounding. `0` is an ordinary digit count, so `ts-decimal-digits 0`
+    /// rounds to whole numbers exactly as the per-series `DECIMAL_DIGITS 0` argument does.
+    #[test]
+    fn zero_decimal_digits_rounds_to_whole_numbers() {
+        let _guard = config_test_lock();
+        let restore = rounding_strategy();
+        store_rounding_strategy(None);
+
+        update_decimal_digits("0").unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::DecimalDigits(0))
+        );
+        assert_eq!(rounding_strategy().unwrap().round(3.7), 4.0);
+        // It reports as a digit count, not as the "disabled" sentinel.
+        assert_eq!(read_decimal_digits(), ConfigValue::Integer(0));
+
+        update_decimal_digits(CONFIG_VALUE_NONE).unwrap();
+        assert_eq!(rounding_strategy(), None);
+        assert_eq!(read_decimal_digits(), ConfigValue::none());
+
+        store_rounding_strategy(restore);
+    }
+
+    /// Zero is rejected for significant digits rather than stored as a strategy that rounds
+    /// nothing: unlike decimal places, "zero significant digits" is not a quantity.
+    #[test]
+    fn zero_significant_digits_is_rejected() {
+        let _guard = config_test_lock();
+        let restore = rounding_strategy();
+        store_rounding_strategy(None);
+
+        assert!(update_significant_digits("0").is_err());
+        assert_eq!(rounding_strategy(), None);
+
+        update_significant_digits(&SIGNIFICANT_DIGITS_MIN.to_string()).unwrap();
+        assert_eq!(
+            rounding_strategy(),
+            Some(RoundingStrategy::SignificantDigits(
+                SIGNIFICANT_DIGITS_MIN as u8
+            ))
+        );
+
+        store_rounding_strategy(restore);
+    }
+
+    /// `ts-decimal-digits 0` now activates rounding, so it takes part in the mutual-exclusion
+    /// rule that it used to bypass by being a synonym for `none`.
+    #[test]
+    fn zero_decimal_digits_conflicts_with_active_significant_digits() {
+        let _guard = config_test_lock();
+        let restore = rounding_strategy();
+
+        store_rounding_strategy(Some(RoundingStrategy::SignificantDigits(5)));
+        assert!(update_decimal_digits("0").is_err());
         assert_eq!(
             rounding_strategy(),
             Some(RoundingStrategy::SignificantDigits(5))

@@ -2,6 +2,7 @@
 import time
 
 import pytest
+from valkey import ResponseError
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
@@ -438,3 +439,72 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
                 self.assert_compaction_rule(key, "avg", 10000)
             else:
                 self.assert_no_compaction_rules(key)
+
+
+class TestTimeseriesRoundingConfig(ValkeyTimeSeriesTestCaseBase):
+    """`none` disables rounding; `0` is an ordinary digit count.
+
+    The module-wide defaults and the per-series DECIMAL_DIGITS / SIGNIFICANT_DIGITS arguments
+    must agree on what each value means.
+    """
+
+    def set_config(self, name: str, value):
+        self.client.execute_command("CONFIG", "SET", f"ts.{name}", value)
+
+    def sample_value(self, key):
+        return float(self.client.execute_command("TS.GET", key)[1])
+
+    def setup_method(self, method):
+        # Each test starts from "rounding disabled".
+        pass
+
+    def test_config_zero_decimal_digits_rounds_to_whole_numbers(self):
+        self.set_config("ts-decimal-digits", "0")
+        try:
+            self.client.execute_command("TS.CREATE", "round_cfg_zero")
+            self.client.execute_command("TS.ADD", "round_cfg_zero", 1000, 3.7)
+            assert self.sample_value("round_cfg_zero") == 4.0
+        finally:
+            self.set_config("ts-decimal-digits", "none")
+
+    def test_config_none_disables_rounding(self):
+        self.set_config("ts-decimal-digits", "none")
+        self.client.execute_command("TS.CREATE", "round_cfg_none")
+        self.client.execute_command("TS.ADD", "round_cfg_none", 1000, 3.7)
+        assert self.sample_value("round_cfg_none") == 3.7
+
+    def test_config_and_per_series_zero_agree(self):
+        """The whole point: `0` means the same thing on both paths."""
+        self.set_config("ts-decimal-digits", "0")
+        try:
+            self.client.execute_command("TS.CREATE", "round_from_config")
+            self.client.execute_command("TS.ADD", "round_from_config", 1000, 3.7)
+        finally:
+            self.set_config("ts-decimal-digits", "none")
+
+        self.client.execute_command("TS.CREATE", "round_from_arg", "DECIMAL_DIGITS", 0)
+        self.client.execute_command("TS.ADD", "round_from_arg", 1000, 3.7)
+
+        assert self.sample_value("round_from_config") == self.sample_value("round_from_arg") == 4.0
+
+    def test_zero_significant_digits_rejected_on_both_paths(self):
+        """Zero significant digits is not a quantity, so neither path accepts it."""
+        with pytest.raises(ResponseError):
+            self.set_config("ts-significant-digits", "0")
+
+        with pytest.raises(ResponseError, match="SIGNIFICANT_DIGITS"):
+            self.client.execute_command("TS.CREATE", "sig_zero", "SIGNIFICANT_DIGITS", 0)
+
+        # 1 is the minimum and is accepted on both.
+        self.set_config("ts-significant-digits", "1")
+        self.set_config("ts-significant-digits", "none")
+        self.client.execute_command("TS.CREATE", "sig_one", "SIGNIFICANT_DIGITS", 1)
+
+    def test_zero_decimal_digits_conflicts_with_significant_digits(self):
+        """`0` now activates rounding, so it participates in the mutual-exclusion rule."""
+        self.set_config("ts-significant-digits", "5")
+        try:
+            with pytest.raises(ResponseError, match="Cannot set both"):
+                self.set_config("ts-decimal-digits", "0")
+        finally:
+            self.set_config("ts-significant-digits", "none")
