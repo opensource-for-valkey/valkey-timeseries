@@ -1,4 +1,3 @@
-use crate::common::constants::MILLIS_PER_YEAR;
 use crate::common::humanize::humanize_duration_ms;
 use crate::common::rounding::RoundingStrategy;
 use crate::common::sync::lock;
@@ -405,15 +404,10 @@ fn parse_duration_in_range(name: &str, value: &str, min: i64, max: i64) -> Valke
         )));
     }
     if duration < min || duration > max {
-        let upper_value = if duration > (50 * MILLIS_PER_YEAR) as i64 {
-            // ignore reporting upper value if it is too high
-            "+inf".to_string()
-        } else {
-            humanize_duration_ms(max)
-        };
         return Err(ValkeyError::String(format!(
-            "Invalid value ({duration}) for \"{name}\". Must be in the range [{}, {upper_value}]",
+            "Invalid value ({duration}) for \"{name}\". Must be in the range [{}, {}]",
             humanize_duration_ms(min),
+            humanize_duration_ms(max),
         )));
     }
     Ok(duration)
