@@ -28,6 +28,8 @@ Quick start (commands you can run)
 - Benchmarks: `cargo bench --features enable-system-alloc` (see Benchmarks below — the feature is mandatory).
 - Compression report: `tools/compression_report.sh` (add `--check` to fail on regressions against a saved baseline).
 - Latency report: `tools/latency_report.sh`. Wire-payload report: `tools/wire_report.sh` (see Benchmarks below).
+- Compatibility fuzzer: `./run-fuzz.sh` (installs deps, builds, starts both servers, runs the fuzzer;
+  `--help` for options — see Fuzzing below).
 
 Key ENV and behavior (from `./build.sh`)
 
@@ -165,8 +167,8 @@ Testing & debugging notes
   `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
   `docker compose -f docker-compose.compat.yml up -d reference` plus
   `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
-  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1` (see "Fuzzing" below). Full env var table in
-  `tests/compat/README.md`.
+  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1` and is easiest to run via `./run-fuzz.sh`
+  (see "Fuzzing" below). Full env var table in `tests/compat/README.md`.
 - pytest markers: `rts_compat` (needs a live reference server), `skip_for_asan`.
 - Leak detection: when `ASAN_BUILD` is set, the build script scans pytest output for LeakSanitizer output and fails if
   leaks are detected.
@@ -265,7 +267,31 @@ Fuzzing (Tier C differential fuzzer, plan §4.3)
   checked against the pinned `redis:8.8` reference. It therefore needs a reference server just like the other
   compat tests, plus `hypothesis` installed (`requirements.txt` / `uv sync`).
 - It is opt-in and not part of the PR gate — a time-budgeted nightly-style job. It is currently not wired into
-  `.github/workflows/ci.yml`; run it by hand:
+  `.github/workflows/ci.yml`; run it by hand.
+- **Preferred entry point: `./run-fuzz.sh`.** It installs the Python deps if missing, builds the module
+  and `valkey-server` if missing, starts the pinned reference container and a subject server, puts the subject in
+  `ts-compatibility-mode strict`, runs the fuzzer in rounds, and tears down whatever it started:
+
+  ```sh
+  ./run-fuzz.sh                                  # 150 examples/protocol
+  ./run-fuzz.sh --examples 20000 --duration 20m --stats   # soak
+  ./run-fuzz.sh --protocol resp3 --derandomize --seed 4 -v  # reproduce
+  ./run-fuzz.sh --suite corpus                   # replay the corpus only
+  ./run-fuzz.sh --reference-url redis://127.0.0.1:16379 \
+                --subject-url   redis://127.0.0.1:16390   # reuse servers
+  ./run-fuzz.sh --dry-run                        # print the plan, run nothing
+  ```
+
+  Other options: `--rounds`, `--filter` (extra pytest `-k`), `--compat-mode strict|extended|keep`,
+  `--reference-port`, `--keep-reference`, `--server-version`, `--skip-build`, `--rebuild`, `--skip-install`,
+  `--python`, `--report`; everything after `--` goes to pytest. Exit status is pytest's (0 clean, 1 divergence,
+  5 nothing collected). Full list: `--help`.
+- **Strict mode is not optional for a soak.** The subject defaults to `extended`, where we knowingly diverge, so
+  gated divergences (e.g. DIV-0023) fail the fuzzer as if they were new bugs and Hypothesis stops at the first
+  failure — a "soak" then dies in ~30s. `run-fuzz.sh` sets `CONFIG SET ts.ts-compatibility-mode strict` for you
+  (module configs carry the `ts.` prefix, DIV-0008); driving pytest directly means doing it yourself, as the
+  `strict_subject` fixture in `test_compat_compaction.py` does.
+- Running pytest directly (what the script wraps), when you need full control:
 
   ```sh
   # harness manages the reference container (needs Docker)
@@ -277,11 +303,18 @@ Fuzzing (Tier C differential fuzzer, plan §4.3)
     python3 -m pytest tests/compat/test_compat_fuzz.py -q
   ```
 
+  This path builds nothing: build the module and `valkey-server` first
+  (`SERVER_VERSION=unstable ./build.sh`) or point `COMPAT_SUBJECT_URL` at a running instance.
 - Fuzzer knobs (on top of the usual `COMPAT_*` vars): `COMPAT_FUZZ=1` enables it at all (without it the module
   skips), `COMPAT_FUZZ_MAX_EXAMPLES=N` sets examples per protocol (default 150 — raise it for a longer soak),
-  `COMPAT_FUZZ_DERANDOMIZE=1` pins a fixed seed for reproducible debugging.
-- Build the module and `valkey-server` first (`SERVER_VERSION=unstable ./build.sh`), or point `COMPAT_SUBJECT_URL`
-  at a running instance — the fuzzer does not build anything itself.
+  `COMPAT_FUZZ_DERANDOMIZE=1` pins a fixed seed for reproducible debugging. `run-fuzz.sh` exposes these as
+  `--examples` / `--derandomize`, and adds `--seed N` (Hypothesis's own `--hypothesis-seed`).
+- Throughput is roughly 55-60 examples/sec/protocol, so a 20-minute budget is ~70k examples — but a run ends at
+  the first unregistered divergence regardless of the cap, which is why `--duration` restarts rounds rather than
+  handing Hypothesis one enormous `max_examples`.
+- Triage a finding before treating it as a bug: grep the command in `tests/compat/divergences.yml` (it may
+  already be registered) and re-run the shrunk sequence under `--compat-mode strict` vs `extended` to see whether
+  it is gated, known behavior.
 - When it finds a divergence, Hypothesis shrinks it to a minimal reproducer. Promote that command list into
   `tests/compat/corpus/<slug>.json` (schema in `tests/compat/corpus/README.md`) so it becomes a deterministic
   golden test; `test_compat_corpus.py` replays the whole corpus under RESP2 and RESP3 and runs as part of the
