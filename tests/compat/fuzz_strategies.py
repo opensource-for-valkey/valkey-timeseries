@@ -22,6 +22,8 @@ drown the fuzz signal. Concretely the generator never emits:
     retention-model divergence pinned by test_compat_del.py);
   - `FILTER_BY_VALUE` on a read that can reach a std/var compaction target
     (DIV-0024..0029 — see VARIANCE_AGGREGATORS below);
+  - an ill-conditioned aggregator (the variance family, or sum/avg) together with the
+    adversarial value set — see ILL_CONDITIONED_AGGREGATORS;
   - `EMPTY` over an unbounded span (see MAX_EMPTY_BUCKETS — it OOM-kills either engine).
 
 Everything a command emits is a `str`, so a shrunk failing example round-trips
@@ -65,9 +67,14 @@ TIMESTAMPS = [
 # test_compat_range.py::TestAggregationOverflow. The cap must therefore leave headroom for
 # accumulation, not just for a single square: 1e150 squares to 1e300, so even ~20 samples
 # in one bucket stay finite, whereas sqrt(DBL_MAX) (~1.34e154) would overflow at the second
-# sample. The generator picks aggregators independently of the values written, so it can
-# not correlate the two — the cap is what keeps std.p/var.p/std.s/var.s in the fuzzable
-# set. DBL_MAX itself is still covered by that test and by corpus/float_formatting_*.
+# sample. DBL_MAX itself is still covered by that test and by corpus/float_formatting_*.
+#
+# The cap alone does NOT make an aggregator fuzzable against this set — it only rules out
+# the DIV-0022 overflow. Both remaining failure modes (variance cancellation, and the
+# sum/avg cross-magnitude cancellation of DIV-0039) strike well inside the capped range,
+# and this set is deliberately adversarial about magnitude mixing: 1e150 and 1e-308 are
+# both in it. Correlating values with aggregators, which `programs` does, is what keeps
+# those families fuzzable at all.
 VALUES = [
     "0", "0.0", "-0.0", "1", "-1", "42", "-42", "3.14",
     "3.141592653589793", "2.718281828459045", "0.1", "0.2", "0.3",
@@ -79,7 +86,8 @@ VALUES = [
 # belong on the value axis, not the accumulation axis).
 DELTAS = ["1", "0.5", "2.5", "100", "0.1", "1000", "42"]
 
-# Values/deltas used when a program may reach a variance aggregator.
+# Values/deltas used when a program may reach an ill-conditioned aggregator (see
+# ILL_CONDITIONED_AGGREGATORS — the variance family *and* sum/avg).
 #
 # RTS's naive E[x^2]-E[x]^2 loses roughly `(mean/sd)^2 * DBL_EPSILON` of relative accuracy,
 # so it disagrees with a stable algorithm whenever a bucket's samples are close *relative to
@@ -88,6 +96,11 @@ DELTAS = ["1", "0.5", "2.5", "100", "0.1", "1000", "42"]
 # 12345.679} comes back NaN. None of that is a subject bug (we are exact or near-exact),
 # but it swamps the fuzz signal, and it cannot be registered — the registry sees only
 # "path: reference=X subject=Y" and cannot tell which aggregator produced a value.
+#
+# sum/avg fail on the *opposite* input shape — a bucket that mixes magnitudes, where the
+# large terms cancel and the small ones decide the answer (DIV-0039). Keeping magnitudes
+# within a few orders of each other is what rules that out; the "spread >= 1" property
+# below is what rules out the variance regime. This value set satisfies both at once.
 #
 # Keeping magnitudes small and spreads >= 1 holds (mean/sd)^2 * eps well under the harness's
 # 1e-12 relative tolerance. Deltas are constrained too, not just values: the case that found
@@ -143,10 +156,37 @@ GROUP_REDUCERS = ["sum", "min", "max", "avg", "range", "count", "std.p", "std.s"
 # (verified black-box on both engines), so it never sees the cancelled value.
 VARIANCE_AGGREGATORS = frozenset({"std.p", "std.s", "var.p", "var.s"})
 
-# Aggregator/reducer pools for programs that opt out of the variance family, so those
-# programs can use the full adversarial value set (see WELL_CONDITIONED_VALUES).
-NON_VARIANCE_AGGREGATORS = [a for a in AGGREGATORS if a not in VARIANCE_AGGREGATORS]
-NON_VARIANCE_REDUCERS = [r for r in GROUP_REDUCERS if r not in VARIANCE_AGGREGATORS]
+# sum/avg (DIV-0039, Tier C 2026-07-25). We accumulate with compensated (Neumaier)
+# summation; RTS adds naively left to right. The two agree until a bucket mixes
+# magnitudes — then the naive running sum absorbs the small terms into the rounding of
+# the large ones, and once the large terms cancel, what remains is the absorption error
+# rather than the small terms themselves. Measured against the reference:
+#
+#   {1e150, 1, -1e150}  -> we 1,     RTS 0
+#   {1e16, 1, 1, -1e16} -> we 2,     RTS 0
+#   {1e6, 0.001, -1e6}  -> we 0.001, RTS 1.0000000474974513e-3
+#
+# The last one matters for the exclusion below: total cancellation (RTS exactly 0) is
+# what DIV-0024..0029's `reference='0'` regexes happen to absorb, but *partial*
+# cancellation leaves a non-zero wrong value that no entry matches, so the soak fails on
+# it. Neither shape is a subject bug, and neither is registrable for the same reason as
+# the variance family: the registry cannot see which aggregator produced a value.
+#
+# Note this needs no extreme magnitudes — 1e6 with a millisecond added is enough. The
+# VALUES cap does not help; only correlating values with aggregators does.
+COMPENSATED_AGGREGATORS = frozenset({"sum", "avg"})
+
+# Aggregators whose RTS implementation is numerically fragile, in either regime above.
+# A program may use these only if its writes are well-conditioned (see `programs`).
+ILL_CONDITIONED_AGGREGATORS = VARIANCE_AGGREGATORS | COMPENSATED_AGGREGATORS
+
+# Aggregator/reducer pools for programs that opt out of the ill-conditioned families, so
+# those programs can use the full adversarial value set (see WELL_CONDITIONED_VALUES).
+# What is left — min/max/range/count/first/last — passes values through without
+# accumulating, so it agrees with RTS on the whole adversarial set (verified per
+# aggregator against the reference, 2026-07-25).
+ROBUST_AGGREGATORS = [a for a in AGGREGATORS if a not in ILL_CONDITIONED_AGGREGATORS]
+ROBUST_REDUCERS = [r for r in GROUP_REDUCERS if r not in ILL_CONDITIONED_AGGREGATORS]
 
 
 # -- sub-strategies ---------------------------------------------------------
@@ -283,8 +323,9 @@ def _read_op(
     """One read command. `variance_rollup` is True when the program created a std/var
     compaction rule, which withholds FILTER_BY_VALUE from reads that can reach the
     rollup — directly by key, or via a matcher (its labels are in the MATCHERS set).
-    `aggregators`/`reducers` are narrowed to exclude the variance family for programs
-    written with the full adversarial value set."""
+    `aggregators`/`reducers` are narrowed to exclude the ill-conditioned families (the
+    variance family and sum/avg) for programs written with the full adversarial value
+    set — see ILL_CONDITIONED_AGGREGATORS."""
     kind = draw(st.sampled_from(
         ["RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "MGET", "QUERYINDEX"]
     ))
@@ -329,14 +370,15 @@ def programs(draw) -> List[Command]:
     keys = BASE_KEYS[:n_series]
 
     # Decided up front, because the write phase is generated before the reads that would
-    # choose an aggregator: either this program may use the variance family and writes
-    # well-conditioned values, or it uses the full adversarial value set and no variance
-    # aggregator. Splitting it this way keeps both axes covered instead of trading one away.
-    variance_ok = draw(st.booleans())
-    values = WELL_CONDITIONED_VALUES if variance_ok else VALUES
-    deltas = WELL_CONDITIONED_DELTAS if variance_ok else DELTAS
-    aggregators = list(AGGREGATORS) if variance_ok else NON_VARIANCE_AGGREGATORS
-    reducers = GROUP_REDUCERS if variance_ok else NON_VARIANCE_REDUCERS
+    # choose an aggregator: either this program may use the ill-conditioned aggregators
+    # (the variance family and sum/avg) and writes well-conditioned values, or it uses the
+    # full adversarial value set with those aggregators withheld. Splitting it this way
+    # keeps both axes covered instead of trading one away.
+    well_conditioned = draw(st.booleans())
+    values = WELL_CONDITIONED_VALUES if well_conditioned else VALUES
+    deltas = WELL_CONDITIONED_DELTAS if well_conditioned else DELTAS
+    aggregators = list(AGGREGATORS) if well_conditioned else ROBUST_AGGREGATORS
+    reducers = GROUP_REDUCERS if well_conditioned else ROBUST_REDUCERS
 
     commands: List[Command] = []
     # TS.DEL is restricted to retention-0 series: deleting a range that covers only
@@ -353,6 +395,10 @@ def programs(draw) -> List[Command]:
         commands.append(("TS.CREATE", key, *opts, "LABELS", *draw(_labels())))
 
     read_keys = list(keys)
+    # The FILTER_BY_VALUE guard below stays keyed on the variance family alone. A sum/avg
+    # rollup can cancel to the same unregistrable shape delta in principle, but not here:
+    # a program that may pick sum/avg at all is one that writes well-conditioned values,
+    # and one that writes adversarial values cannot draw sum/avg as `rollup_agg`.
     variance_rollup = False
     if draw(st.booleans()):
         src = draw(st.sampled_from(keys))

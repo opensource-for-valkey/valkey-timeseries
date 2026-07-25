@@ -17,6 +17,8 @@ observation of the reference server. Do NOT consult RedisTimeSeries source or
 test code (see tests/compat/README.md).
 """
 
+import itertools
+
 import pytest
 from valkey.exceptions import ResponseError
 
@@ -637,7 +639,122 @@ class TestAggregationOverflow:
         diff("TS.RANGE", "r:safe", "-", "+", "AGGREGATION", agg, 500)
 
     def test_non_variance_aggregators_agree_at_dbl_max(self, diff):
-        """avg/sum/min/max do not accumulate squares, so DBL_MAX is fine on both."""
+        """avg/sum/min/max do not accumulate squares, so a single DBL_MAX sample is fine
+        on both. Scoped to overflow: it does NOT mean sum/avg agree at these magnitudes
+        generally — a bucket that mixes them diverges (DIV-0039, TestSumAvgAccumulation)."""
         mk_populated(diff, "r:big", [(0, 1.7976931348623157e308)])
         for agg in ("avg", "sum", "min", "max", "count", "first", "last"):
             diff("TS.RANGE", "r:big", "-", "+", "AGGREGATION", agg, 500)
+
+
+def _samples(row):
+    """The sample list of a GROUPBY row, under either protocol.
+
+    RESP2 gives [label, labels, samples]; RESP3 a map whose value is
+    [labels, reducers, sources, samples]. Samples are last in both.
+    """
+    return row[-1]
+
+
+class TestSumAvgAccumulation:
+    """DIV-0039: sum/avg over a bucket that mixes magnitudes.
+
+    We accumulate with compensated (Neumaier) summation; RTS adds naively left to right,
+    absorbing the small terms into the rounding of the large ones. Once the large terms
+    cancel, RTS is left with the absorption error rather than the small terms.
+
+    Pinned per-engine instead of via `diff` because no registry regex can express it: the
+    total-cancellation shape ("reference='0' subject=<n>") is already claimed by
+    DIV-0024/DIV-0026 for the variance family, and the partial-cancellation shape
+    (reference non-zero but wrong) would need a rule loose enough to absorb any value
+    delta on the command (plan §5.3; see tests/compat/README.md "Divergences the registry
+    can not express").
+    """
+
+    # Same double in magnitude with opposite signs, plus a term far below both. The exact
+    # sum is 1; the naive running sum absorbs the 1 into 1e150's rounding, then cancels.
+    CANCELLING = ("-9.999999999999999e149", "1", "1e150")
+
+    def _fill(self, diff, key, values):
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", key)
+            for ts, value in enumerate(values):
+                client.execute_command("TS.ADD", key, ts, value)
+
+    @pytest.mark.parametrize("agg,expected", (("sum", 1.0), ("avg", 1.0 / 3.0)))
+    def test_total_cancellation_zeroes_the_bucket_on_rts(self, diff, agg, expected):
+        """RTS loses the surviving term entirely and reports exactly 0."""
+        self._fill(diff, f"r:cancel:{agg}", self.CANCELLING)
+        query = ("TS.RANGE", f"r:cancel:{agg}", "-", "+", "AGGREGATION", agg, 1000)
+        ref = diff.reference.execute_command(*query)
+        sub = diff.subject.execute_command(*query)
+        assert float(ref[0][1]) == 0.0, f"expected RTS 0, got {ref!r}"
+        assert float(sub[0][1]) == pytest.approx(expected), f"got {sub!r}"
+
+    def test_partial_cancellation_leaves_rts_a_non_zero_wrong_value(self, diff):
+        """The shape no registry entry covers, and the reason DIV-0039 is
+        documentation_only: RTS returns the absorption error, not 0, so a
+        `reference='0'` rule would not match it and a looser one would absorb
+        every value delta on TS.RANGE. Ordinary magnitudes are enough here —
+        a millisecond added to a 1e6 counter."""
+        self._fill(diff, "r:partial", ("1e6", "0.001", "-1e6"))
+        query = ("TS.RANGE", "r:partial", "-", "+", "AGGREGATION", "sum", 1000)
+        ref = float(diff.reference.execute_command(*query)[0][1])
+        sub = float(diff.subject.execute_command(*query)[0][1])
+        assert sub == 0.001, f"expected the exact surviving term, got {sub!r}"
+        assert ref != 0.0, "this case is the *partial* shape; 0 means it stopped being it"
+        assert ref != sub, f"expected RTS to differ, got {ref!r}"
+
+    def test_groupby_reduce_diverges_the_same_way(self, diff):
+        """The shrunk fuzzer reproducer: one series per value, grouped into one bucket."""
+        for client in (diff.reference, diff.subject):
+            for i, value in enumerate(self.CANCELLING):
+                client.execute_command("TS.CREATE", f"r:g{i}", "LABELS", "metric", "grp")
+                client.execute_command("TS.ADD", f"r:g{i}", 0, value)
+
+        query = ("TS.MRANGE", "-", "+", "FILTER", "metric=grp",
+                 "GROUPBY", "metric", "REDUCE", "sum")
+        ref = diff.reference.execute_command(*query)
+        sub = diff.subject.execute_command(*query)
+        ref_rows = list(ref.values()) if isinstance(ref, dict) else ref
+        sub_rows = list(sub.values()) if isinstance(sub, dict) else sub
+        assert float(_samples(ref_rows[0])[0][1]) == 0.0, f"expected RTS 0, got {ref!r}"
+        assert float(_samples(sub_rows[0])[0][1]) == 1.0, f"got {sub!r}"
+
+    def test_compaction_destination_diverges_the_same_way(self, diff):
+        """The second route into a reply: the rule's own accumulator, not the read path."""
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", "r:src")
+            client.execute_command("TS.CREATE", "r:dst")
+            client.execute_command("TS.CREATERULE", "r:src", "r:dst",
+                                   "AGGREGATION", "sum", 1000)
+            for ts, value in enumerate(self.CANCELLING):
+                client.execute_command("TS.ADD", "r:src", ts, value)
+            client.execute_command("TS.ADD", "r:src", 5000, 0)  # close the bucket
+
+        ref = diff.reference.execute_command("TS.RANGE", "r:dst", "-", "+")
+        sub = diff.subject.execute_command("TS.RANGE", "r:dst", "-", "+")
+        assert float(ref[0][1]) == 0.0, f"expected RTS 0, got {ref!r}"
+        assert float(sub[0][1]) == 1.0, f"got {sub!r}"
+
+    def test_our_result_does_not_depend_on_sample_order(self, diff):
+        """Compensation, not ordering, is the root cause: Neumaier gives 1 for every
+        permutation, while the naive sum gives 0 for four of the six and 1 for two. A
+        naive accumulator could not be 'matched' stably even if we wanted to."""
+        for i, perm in enumerate(itertools.permutations(self.CANCELLING)):
+            key = f"r:perm{i}"
+            diff.subject.execute_command("TS.CREATE", key)
+            for ts, value in enumerate(perm):
+                diff.subject.execute_command("TS.ADD", key, ts, value)
+            got = diff.subject.execute_command(
+                "TS.RANGE", key, "-", "+", "AGGREGATION", "sum", 1000
+            )
+            assert float(got[0][1]) == 1.0, f"permutation {perm} gave {got!r}"
+
+    @pytest.mark.parametrize("agg", ("sum", "avg"))
+    def test_well_conditioned_buckets_agree(self, diff, agg):
+        """The delta class DIV-0039 must not be allowed to mask: without a magnitude mix
+        there is nothing to absorb, and the engines must agree exactly. This is also the
+        property fuzz_strategies.WELL_CONDITIONED_VALUES relies on."""
+        mk_populated(diff, f"r:wc:{agg}", [(0, 10.0), (1, -5.0), (2, 2.0), (3, -1.0)])
+        diff("TS.RANGE", f"r:wc:{agg}", "-", "+", "AGGREGATION", agg, 1000)
