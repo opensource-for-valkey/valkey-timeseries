@@ -8,7 +8,7 @@ use get_size2::GetSize;
 use valkey_timeseries::series::chunks::{ChunkEncoding, ChunkOps};
 use valkey_timeseries::tests::chunk_utils::{
     CHUNK_SIZE_1K, CHUNK_SIZE_4K, CHUNK_SIZE_64K, build_chunk_until_full, chunk_size_id,
-    filled_prefix_len,
+    encoded_size, filled_prefix_len,
 };
 use valkey_timeseries::tests::generators::{
     DATASET_SAMPLES, DatasetKey, DatasetRegistry, TimestampModel, ValueWorkload,
@@ -63,12 +63,13 @@ fn encode_matrix_chunk_sizes(key: &DatasetKey) -> Vec<usize> {
     }
 }
 
-fn encodings() -> [ChunkEncoding; 4] {
+fn encodings() -> [ChunkEncoding; 5] {
     [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
         ChunkEncoding::TsXor,
         ChunkEncoding::Xor2,
+        ChunkEncoding::DeXor,
     ]
 }
 
@@ -462,8 +463,10 @@ fn main() {
                 let (chunk, _needed) = build_chunk_until_full(encoding, chunk_size, data);
 
                 let len = chunk.len();
-                let data_size = chunk.size();
-                // Prefer structural size via GetSize for footprint reporting
+                // Bytes the encoder actually wrote. `chunk.size()` is not
+                // comparable across encodings — see `encoded_size`.
+                let data_size = encoded_size(&chunk);
+                // Total heap footprint, including unused buffer capacity.
                 let footprint = chunk.get_size();
                 let bps = if len > 0 {
                     data_size as f64 / len as f64

@@ -14,10 +14,9 @@ use crate::common::rdb::{
 use crate::error::{TsdbError, TsdbResult};
 use crate::series::chunks::stream::bitstream::BitStream;
 use crate::series::chunks::stream::varbit::write_varbit;
-use get_size2::GetSize;
+use get_size2::{GetSize, GetSizeTracker};
 use std::ffi::c_longlong;
 use std::hash::Hash;
-use std::mem::size_of_val;
 use valkey_module::digest::Digest;
 use valkey_module::error::Error as ValkeyError;
 use valkey_module::raw;
@@ -35,15 +34,12 @@ pub struct GorillaEncoder {
 }
 
 impl GetSize for GorillaEncoder {
-    fn get_size(&self) -> usize {
-        self.writer.get_size()
-            + size_of_val(&self.num_samples)
-            + size_of_val(&self.first_ts)
-            + size_of_val(&self.last_ts)
-            + size_of_val(&self.last_value)
-            + size_of_val(&self.leading_bits)
-            + size_of_val(&self.trailing_bits)
-            + size_of_val(&self.timestamp_delta)
+    // `get_heap_size_with_tracker` is the extension point a containing type's
+    // derived impl calls; overriding only `get_size` would report zero heap
+    // whenever this encoder is nested inside another `GetSize` type.
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        // `writer` owns the only allocation; every other field is a scalar.
+        self.writer.get_heap_size_with_tracker(tracker)
     }
 }
 

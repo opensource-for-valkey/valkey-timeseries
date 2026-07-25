@@ -8,7 +8,7 @@ use crate::series::chunks::merge::merge_chunk_samples;
 use crate::series::chunks::{Chunk, ChunkOps, MAX_CHUNK_SIZE};
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use core::mem::size_of;
-use get_size2::GetSize;
+use get_size2::{GetSize, GetSizeTracker};
 use std::hash::Hash;
 use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyResult, raw};
@@ -36,10 +36,11 @@ impl Default for UncompressedChunk {
 }
 
 impl GetSize for UncompressedChunk {
-    fn get_size(&self) -> usize {
-        size_of::<usize>() +  // self.max_size
-        size_of::<usize>() +  // self.max_elements
-        self.samples.capacity() * size_of::<Sample>() // todo: add capacity
+    // See `GorillaEncoder`: containers call `get_heap_size_with_tracker`, so
+    // that is what a manual impl has to provide. `Vec`'s own impl accounts for
+    // reserved-but-unused capacity.
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        self.samples.get_heap_size_with_tracker(tracker)
     }
 }
 

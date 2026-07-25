@@ -35,10 +35,9 @@ use crate::common::rdb::{
 use crate::error::{TsdbError, TsdbResult};
 use crate::series::chunks::stream::bitstream::BitStream;
 use crate::series::chunks::stream::varbit::write_varbit;
-use get_size2::GetSize;
+use get_size2::{GetSize, GetSizeTracker};
 use std::ffi::c_longlong;
 use std::hash::Hash;
-use std::mem::size_of_val;
 use valkey_module::digest::Digest;
 use valkey_module::error::Error as ValkeyError;
 use valkey_module::raw;
@@ -64,14 +63,12 @@ pub struct DeXorEncoder {
 }
 
 impl GetSize for DeXorEncoder {
-    fn get_size(&self) -> usize {
-        self.writer.get_size()
-            + self.values.get_size()
-            + size_of_val(&self.num_samples)
-            + size_of_val(&self.first_ts)
-            + size_of_val(&self.last_ts)
-            + size_of_val(&self.last_value)
-            + size_of_val(&self.timestamp_delta)
+    // See `GorillaEncoder`: containers call `get_heap_size_with_tracker`, so
+    // that is what a manual impl has to provide.
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (writer, tracker) = self.writer.get_heap_size_with_tracker(tracker);
+        let (values, tracker) = self.values.get_heap_size_with_tracker(tracker);
+        (writer + values, tracker)
     }
 }
 
