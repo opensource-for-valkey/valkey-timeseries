@@ -164,6 +164,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-duplicate-policy',
             'ts-retention-policy',
             'ts-compaction-policy',
+            'ts-compatibility-mode',
             'ts-decimal-digits',
             'ts-significant-digits',
             'ts-ignore-max-time-diff',
