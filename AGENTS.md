@@ -140,11 +140,18 @@ Benchmarks
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (96 rows: encoding × workload × timestamp model × chunk size).
+  `target/bench-reports/compression.csv` and `.md` (120 rows: encoding × workload × timestamp model × chunk size —
+  24 rows for each of the 5 encodings listed in `encodings()`, which currently omits PCO).
+  The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
+  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and pco report a `get_size()`
+  heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio
+  built on it compares allocator slack instead of compression. The separate `size` column is the full heap footprint,
+  including unused capacity.
   Script flags: `--check` fails if any compression ratio drops more than 5% below the baseline, `--save-baseline`
   records the run just made as the baseline, `--baseline <path>` overrides the default
-  `benches/baselines/compression_baseline.csv`. That baseline is **not** checked in, so `--check` exits 2 until you
-  generate one with `--save-baseline`.
+  `benches/baselines/compression_baseline.csv`. `--check` exits 2 when that file is missing. Datasets are built from
+  fixed seeds, so a re-run reproduces the baseline exactly; regenerate it with `--save-baseline` after any intentional
+  encoder or dataset change, and review the diff rather than saving blind.
 - `--by-workload [metric]` additionally writes a pivoted view —
   `target/bench-reports/compression_by_workload_<metric>.{csv,md}` — with one table per chunk size, one row per
   workload/timestamp model, and one column per encoding. `metric` is `ratio` (default), `bytes-per-sample`, or
@@ -171,7 +178,7 @@ Where to look first (key files & directories)
     - `generators/workload.rs` — the shape functions (drift/periodic/noisy/bursty/counter/discrete) and `TimestampModel`.
     - `generators/generator.rs`, `generators/mackey_glass.rs` — the range-bounded iterator generators.
     - `generators/dataset.rs` — `DatasetKey`, `DatasetRegistry`, and the benchmark dataset matrix.
-    - `chunk_utils.rs` — `build_chunk`, `build_chunk_until_full`, `filled_prefix(_len)`, `CHUNK_SIZE_*`.
+    - `chunk_utils.rs` — `build_chunk`, `build_chunk_until_full`, `filled_prefix(_len)`, `encoded_size`, `CHUNK_SIZE_*`.
 - `benches/` — criterion benchmarks; `benches/support/mod.rs` just re-exports `src/tests/` so benches, unit tests and
   `compression_report` share one implementation.
 - `tools/compression_report.rs` — the `compression_report` binary; encoding size/ratio matrix with baseline checking.
