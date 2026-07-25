@@ -1,4 +1,5 @@
 mod chunk;
+mod dexor;
 mod gorilla;
 mod merge;
 mod pco;
@@ -17,6 +18,8 @@ mod xor2;
 pub(crate) use tsxor::*;
 
 pub use chunk::*;
+#[allow(unused_imports)]
+pub use dexor::*;
 pub use gorilla::*;
 pub use merge::*;
 pub use pco::*;
