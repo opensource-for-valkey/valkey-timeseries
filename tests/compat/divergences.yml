@@ -386,8 +386,14 @@
     the Inf - Inf term yields NaN — e.g. std.p over the single sample 1.7976931348623157e308
     is NaN on RTS and 0 for us (a single sample has zero variance). The overflow boundary
     itself is exact: 1e150 (square 1e300, finite) agrees on both engines; 1e200 (square
-    overflows) diverges. Only this aggregator family is affected — avg/sum/min/max agree
-    at DBL_MAX.
+    overflows) diverges. Only this aggregator family overflows — avg/sum/min/max do not
+    accumulate squares, so a single sample at DBL_MAX agrees on both.
+
+    CORRECTION (2026-07-25, Tier C): read that last sentence as scoped to overflow, which
+    is all it was measured against (a single DBL_MAX sample). It does not mean sum/avg
+    agree with RTS generally at those magnitudes — they diverge on any bucket that mixes
+    magnitudes, for an unrelated reason (naive vs compensated accumulation), which is
+    registered separately as DIV-0039. {DBL_MAX, 1, -DBL_MAX} sums to 1 here and 0 on RTS.
 
     CORRECTION (2026-07-22, Tier C): overflow is not the only failure mode of that naive
     identity, and staying under the boundary is *not* sufficient for agreement. The same
@@ -418,6 +424,11 @@
     not just values: the case that exposed this built {100, 100.1} via TS.INCRBY. DBL_MAX
     itself stays covered by the pinning test and
     corpus/float_formatting_high_precision.json.
+    WIDENED (2026-07-25): that same either/or now covers sum and avg, which fail on the
+    opposite input shape (a bucket mixing magnitudes) for an unrelated reason — DIV-0039.
+    The gate is keyed on fuzz_strategies.ILL_CONDITIONED_AGGREGATORS, the union of the two
+    families, so the adversarial value set is now paired only with the aggregators that do
+    not accumulate at all (min/max/range/count/first/last).
   since: 0.1.0
 
 # DIV-0023 is a Tier C (differential fuzzer) finding, pinned per-engine in
@@ -470,9 +481,21 @@
 #   TS.RANGE s - + AGGREGATION std.p 500  ->  ours 0.5, RTS 0
 #
 # Observed on std.p / std.s / var.p / var.s, at magnitudes from ~1.2e8 upward (also
-# reproduced at 1e15). avg and sum agree at the same magnitudes, and all four agree on
-# small-magnitude inputs, which is what identifies this as cancellation rather than a
-# formatting or accumulation-order difference. It reaches every sample-returning command
+# reproduced at 1e15). avg and sum agree at the same magnitudes *for these inputs*, and all
+# four agree on small-magnitude inputs, which is what identifies this as cancellation rather
+# than a formatting or accumulation-order difference.
+#
+# ⚠️ CORRECTION (2026-07-25): do not read that as "sum/avg agree with RTS at these
+# magnitudes" in general — it holds for the input shape measured here (large magnitude,
+# *small spread*), not across the board. sum/avg diverge on the opposite shape, a bucket
+# that mixes magnitudes, from an unrelated root cause (naive vs compensated accumulation):
+# at this very magnitude, {1e15, 0.01, -1e15} sums to 0.01 here and 0 on RTS. (The mix has
+# to exceed the running sum's precision to bite: {1e15, 1, -1e15} agrees, because 1e15 + 1
+# is exactly representable and nothing is absorbed.) That is DIV-0039, and the mitigation
+# this note was used to scope (pairing the adversarial value set with non-variance
+# aggregators) had to be widened to cover sum/avg as a result.
+#
+# It reaches every sample-returning command
 # two ways: AGGREGATION std|var on the read path, and reading a series fed by a
 # std|var compaction rule.
 #
@@ -485,10 +508,15 @@
 # ⚠️ Scoping: each entry requires the *reference* side to be exactly 0 (`reference='0'`
 # in RESP2, `reference=0.0` in RESP3) at a sample-value position. That is much tighter
 # than a bare path regex — it can not absorb a general value delta — but it does still
-# cover any hypothetical bug in which RTS legitimately returns 0 for a sample value and
-# we return non-zero. The registry sees only (command, delta kind, "path: reference=X
-# subject=Y"); it can not see the aggregator, so std/var can not be named directly.
-# A per-engine pinning test would close that gap.
+# cover any bug in which RTS legitimately returns 0 for a sample value and we return
+# non-zero. The registry sees only (command, delta kind, "path: reference=X subject=Y");
+# it can not see the aggregator, so std/var can not be named directly. A per-engine
+# pinning test would close that gap.
+#
+# ⚠️ That absorption is no longer hypothetical (2026-07-25): a sum|avg bucket whose
+# magnitudes cancel *totally* produces exactly this delta shape on exactly these commands,
+# so DIV-0024/DIV-0026 match it and file it under the variance family. Different root
+# cause — see DIV-0039, which is pinned by its own test for that reason.
 #
 # ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
 
@@ -772,4 +800,80 @@
     for the usual §5.2 reason, and the risk direction is portability — code
     written against these elements will not run on RedisTimeSeries. Pinned by
     TestDivergences::test_extension_list_elements_are_a_superset.
+  since: 0.1.0
+
+# DIV-0039 (Tier C fuzzer, 2026-07-25): sum/avg accumulation. We accumulate with
+# compensated (Neumaier) summation; RedisTimeSeries adds naively, left to right. The two
+# agree until a bucket mixes magnitudes: a naive running sum absorbs the small terms into
+# the rounding of the large ones, and once the large terms cancel, what is left is the
+# absorption error rather than the small terms. Shrunk reproducer — three series holding
+# -9.999999999999999e149, 1 and 1e150, grouped into one bucket:
+#
+#   TS.MRANGE - + FILTER metric=m GROUPBY metric REDUCE sum  ->  ours 1, RTS 0
+#
+# Neither engine is close to the exact sum for that input; it is catastrophically
+# ill-conditioned either way. But the effect does not need extreme magnitudes, and that is
+# the part that matters for migration:
+#
+#   {1e16, 1, 1, -1e16} -> ours 2,     RTS 0
+#   {1e6, 0.001, -1e6}  -> ours 0.001, RTS 1.0000000474974513e-3
+#
+# Compensation, not ordering, is what identifies it: Neumaier predicts our answer for every
+# permutation of the samples, while the naive sum's answer depends on the order (4 of the 6
+# permutations of the shrunk case give 0, two give 1). Protocol-independent — RESP2 and
+# RESP3 diverge identically. It reaches a reply by the same two routes as DIV-0024..0029:
+# AGGREGATION sum|avg (and GROUPBY ... REDUCE sum|avg) on the read path, and reading a
+# destination fed by a sum|avg compaction rule.
+#
+# Reviewed decision: do NOT match, for the DIV-0022/DIV-0024 reason — reproducing it means
+# adopting a knowingly lossy accumulation, and here it would not even be deterministic,
+# since the naive result depends on an accumulation order neither engine specifies.
+#
+# ⚠️ documentation_only, unlike DIV-0024..0029, which are matched by a `reference='0'`
+# regex. That regex shape cannot be reused here: total cancellation (RTS exactly 0) is only
+# one of the two shapes — partial cancellation leaves a non-zero wrong value, and a regex
+# loose enough to cover it would absorb any value delta on the command. Generation is
+# prevented instead (fuzz_strategies.ILL_CONDITIONED_AGGREGATORS) and the divergence is
+# pinned per-engine by TestSumAvgAccumulation.
+#
+# ⚠️ Correction to DIV-0024..0029's scoping note, which called it hypothetical that those
+# regexes could absorb a delta from an unrelated root cause: they do. A sum/avg bucket that
+# cancels *totally* produces exactly `reference='0' subject=<n>` on the same commands, so
+# DIV-0024 and DIV-0026 match it and report it as a variance-family divergence. That is now
+# harmless — the generator no longer produces it and the pinning test covers it directly —
+# but the entries are broader than their descriptions claim.
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-07-25 — compensated summation stands, and the
+# divergence is deliberately not gated under `strict`.
+
+- id: DIV-0039
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    AGGREGATION sum|avg (and GROUPBY ... REDUCE sum|avg, and reading a destination fed by
+    a sum|avg compaction rule) over a bucket that mixes magnitudes: we accumulate with
+    compensated summation and return the small terms that survive the cancellation, RTS
+    accumulates naively and returns the absorption error instead. `{1e150, 1, -1e150}`
+    sums to 1 here and 0 on RTS; `{1e6, 0.001, -1e6}` to 0.001 here and
+    1.0000000474974513e-3 on RTS. Both engines are far from the exact sum on inputs this
+    ill-conditioned; the divergence is that ours is reproducible and theirs depends on
+    accumulation order.
+  rationale: >
+    Accepted (owner sign-off 2026-07-25, §5.3): compensated summation stands. Matching RTS
+    would mean adopting an accumulation that is both lossier and order-dependent, so the
+    "matched" result would not be stable across a change in bucket iteration or GROUPBY
+    series order in either engine. Deliberately not gated by `ts-compatibility-mode strict`
+    either (same sign-off), on the same ground as DIV-0022/DIV-0024..0029: `strict`
+    reproduces RTS's resolution of genuinely ambiguous cases, not its arithmetic error
+    terms. This is a settled decision, not a deferral for want of a mechanism.
+    Consequence for Tier C: the DIV-0022 mitigation was scoped by the claim that "avg and
+    sum agree at the same magnitudes" as the variance family. That is true only in the
+    regime it was measured in (large magnitude, small spread, where sum/avg do agree) and
+    does not generalize — sum/avg fail on the opposite input shape, a bucket mixing
+    magnitudes. fuzz_strategies.WELL_CONDITIONED_VALUES/DELTAS therefore now gate sum/avg
+    as well as the variance family (ILL_CONDITIONED_AGGREGATORS); that value set was
+    verified to hold sum/avg to exact agreement over every 3-sample combination.
+    Pinned by TestSumAvgAccumulation in test_compat_range.py, whose companion
+    test_well_conditioned_buckets_agree keeps the agreeing case from being masked.
   since: 0.1.0
