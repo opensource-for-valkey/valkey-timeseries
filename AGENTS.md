@@ -98,8 +98,10 @@ Testing & debugging notes
   `crate::tests::generators::{DataGenerator, ValueWorkload, TimestampModel}`) rather than hand-rolling loops:
   `DataGenerator::builder().start(ts).samples(n).seed(s).algorithm(ValueWorkload::Drift).build().generate()`.
   `ValueWorkload` covers the four range-bounded random generators (`Uniform`, `StdNorm`, `MackeyGlass`, `Deriv`, which
-  honour `.values(range)`) plus eight absolute-valued shapes (`Constant`, `ConstantInt`, `Drift`, `Periodic`, `Noisy`,
-  `Bursty`, `Counter`, `Discrete`, which ignore the range — see `is_workload()`). `TimestampModel` controls spacing
+  honour `.values(range)`) plus twelve absolute-valued shapes (`Constant`, `ConstantInt`, `Drift`, `Periodic`, `Noisy`,
+  `Bursty`, `Counter`, `Discrete`, and the decimal-quantized variants `DriftQuantized`, `PeriodicQuantized`,
+  `NoisyQuantized`, `BurstyQuantized` — same seeded values rounded to two decimals, see `quantized()`/`is_quantized()`;
+  all of them ignore the range — see `is_workload()`). `TimestampModel` controls spacing
   (`Regular`, `Jitter`, `Irregular`). `DataGenerator::dataset(workload, model, samples, seed)` is the one-line form used
   by the benchmark matrix.
 - Integration tests: Python pytest under `tests/` and rely on a built `valkey-server` and `tests/valkeytestframework`
@@ -126,8 +128,8 @@ Benchmarks
   `encoding/workload/timestamp_model/chunk_size`.
 - Shared fixtures live in the crate itself (`src/tests/`, exposed to dev targets by the `test-utils` feature) and are
   re-exported through `benches/support/mod.rs`, so benches, unit tests and `compression_report` all generate data
-  through the same `DataGenerator`. `DatasetRegistry` builds 12 datasets of 64k samples from fixed seeds
-  (the 8 `ValueWorkload` shapes at regular timestamps, plus drift/noisy at jitter and irregular timestamps), so results
+  through the same `DataGenerator`. `DatasetRegistry` builds 16 datasets of 64k samples from fixed seeds
+  (the 12 `ValueWorkload` shapes at regular timestamps, plus drift/noisy at jitter and irregular timestamps), so results
   are comparable across runs, machines, and commits. The matrix is defined in `src/tests/generators/dataset.rs`
   (`benchmark_dataset_keys`, `DatasetKey`, `DATASET_SAMPLES`, `dataset_seed`); chunk sizes are 1k / 4k
   (`DEFAULT_CHUNK_SIZE_BYTES`) / 64k.
@@ -140,8 +142,8 @@ Benchmarks
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (120 rows: encoding × workload × timestamp model × chunk size —
-  24 rows for each of the 5 encodings listed in `encodings()`, which currently omits PCO).
+  `target/bench-reports/compression.csv` and `.md` (140 rows: encoding × workload × timestamp model × chunk size —
+  28 rows for each of the 5 encodings listed in `encodings()`, which currently omits PCO).
   The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
   actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and pco report a `get_size()`
   heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio
@@ -151,7 +153,9 @@ Benchmarks
   records the run just made as the baseline, `--baseline <path>` overrides the default
   `benches/baselines/compression_baseline.csv`. `--check` exits 2 when that file is missing. Datasets are built from
   fixed seeds, so a re-run reproduces the baseline exactly; regenerate it with `--save-baseline` after any intentional
-  encoder or dataset change, and review the diff rather than saving blind.
+  encoder or dataset change, and review the diff rather than saving blind. `dataset_seed` hashes the dataset key
+  (`workload/ts_model`) rather than its position in the matrix, so adding or reordering workloads leaves every other
+  dataset — and its baseline row — byte-for-byte identical.
 - `--by-workload [metric]` additionally writes a pivoted view —
   `target/bench-reports/compression_by_workload_<metric>.{csv,md}` — with one table per chunk size, one row per
   workload/timestamp model, and one column per encoding. `metric` is `ratio` (default), `bytes-per-sample`, or

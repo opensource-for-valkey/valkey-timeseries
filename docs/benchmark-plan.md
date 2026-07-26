@@ -67,6 +67,24 @@ Two supplementary distributions (cheap to add, high diagnostic value):
 | `counter` | Monotonic counter with occasional resets (`v += Poisson(λ=10)`, reset to 0 every ~50k) | The single most common Prometheus-style shape; integer deltas |
 | `discrete` | Values from a small set (e.g., 0.0/1.0 gauge, or {0, 0.25, 0.5, 1.0}) | Low-entropy non-constant; distinguishes dictionary-ish wins (Pco) from XOR wins |
 
+#### Decimal-quantized variants
+
+Real collection agents rarely emit full-precision f64: values arrive rounded to a
+fixed number of decimals, which zeroes the low mantissa bits and changes what
+every encoder has to carry. Each full-precision shape therefore has a `_q2`
+counterpart — the same seeded values rounded to **2 decimal places**
+(`QUANTIZED_DECIMALS` in `src/tests/generators/workload.rs`):
+
+| ID | Base | Why |
+|---|---|---|
+| `drift_q2` | `drift` | Quantized drift often collapses to *no* change between samples; separates real drift cost from mantissa noise |
+| `periodic_q2` | `periodic` | Predictable shape at realistic reporting precision |
+| `noisy_q2` | `noisy` | The XOR worst case with ~46 mantissa bits removed; the clearest read on how much of `noisy`'s cost is precision, not entropy |
+| `bursty_q2` | `bursty` | Regime switches without the mantissa noise inside each regime |
+
+`constant`, `constant_int`, `counter` and `discrete` have no quantized variant:
+their values are already exact at this precision.
+
 ### 3.2 Timestamp models
 
 Timestamp compression is half the story (Gorilla delta-of-delta, Pco separate

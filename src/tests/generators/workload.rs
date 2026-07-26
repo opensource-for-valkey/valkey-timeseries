@@ -7,8 +7,14 @@
 //! value range does not apply to these workloads.
 
 use crate::common::Timestamp;
+use crate::common::rounding::round_to_decimal_digits;
 use rand::prelude::{IndexedRandom, StdRng};
 use rand_distr::{Distribution, Exp, Normal, Poisson, Uniform};
+
+/// Decimal places kept by the `*_quantized` workloads. Two decimals is the
+/// precision most collection agents report at, and it clears the low mantissa
+/// bits that the XOR family and Pco would otherwise have to carry.
+pub const QUANTIZED_DECIMALS: u8 = 2;
 
 /// Spacing model applied to generated timestamps.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
@@ -170,4 +176,32 @@ pub fn discrete_values(count: usize, rng: &mut StdRng) -> Vec<f64> {
     (0..count)
         .map(|_| *choices.choose(rng).expect("choices non-empty"))
         .collect()
+}
+
+/// Round every value to [`QUANTIZED_DECIMALS`] decimal places.
+fn quantize(mut values: Vec<f64>) -> Vec<f64> {
+    for value in values.iter_mut() {
+        *value = round_to_decimal_digits(*value, QUANTIZED_DECIMALS);
+    }
+    values
+}
+
+/// [`drift_values`] reported at two decimal places.
+pub fn drift_quantized_values(count: usize, rng: &mut StdRng) -> Vec<f64> {
+    quantize(drift_values(count, rng))
+}
+
+/// [`periodic_values`] reported at two decimal places.
+pub fn periodic_quantized_values(count: usize, rng: &mut StdRng) -> Vec<f64> {
+    quantize(periodic_values(count, rng))
+}
+
+/// [`noisy_values`] reported at two decimal places.
+pub fn noisy_quantized_values(count: usize, rng: &mut StdRng) -> Vec<f64> {
+    quantize(noisy_values(count, rng))
+}
+
+/// [`bursty_values`] reported at two decimal places.
+pub fn bursty_quantized_values(count: usize, rng: &mut StdRng) -> Vec<f64> {
+    quantize(bursty_values(count, rng))
 }

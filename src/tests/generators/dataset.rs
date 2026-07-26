@@ -46,9 +46,22 @@ pub fn benchmark_dataset_keys() -> Vec<DatasetKey> {
     keys
 }
 
-/// Seed for the `index`th dataset of the matrix.
-pub fn dataset_seed(index: usize) -> u64 {
-    DEFAULT_SEED.wrapping_add(index as u64 * 0x9E37_79B9)
+/// Seed for a dataset, derived from its key rather than its position in the
+/// matrix, so adding, removing or reordering entries never reseeds the others
+/// (and never invalidates unrelated rows of the compression baseline).
+pub fn dataset_seed(key: DatasetKey) -> u64 {
+    // FNV-1a over the key id. Spelled out rather than using `DefaultHasher`,
+    // whose output is explicitly not stable across Rust releases — these seeds
+    // have to reproduce byte-for-byte on any toolchain.
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in key.id().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    DEFAULT_SEED ^ hash
 }
 
 pub fn generate_dataset(key: DatasetKey, sample_count: usize, seed: u64) -> Vec<Sample> {
@@ -68,8 +81,8 @@ impl DatasetRegistry {
 
     pub fn with_samples(sample_count: usize) -> Self {
         let mut datasets = HashMap::new();
-        for (idx, key) in benchmark_dataset_keys().into_iter().enumerate() {
-            datasets.insert(key, generate_dataset(key, sample_count, dataset_seed(idx)));
+        for key in benchmark_dataset_keys() {
+            datasets.insert(key, generate_dataset(key, sample_count, dataset_seed(key)));
         }
         Self { datasets }
     }

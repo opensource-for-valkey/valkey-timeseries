@@ -6,8 +6,10 @@ use crate::tests::generators::generator::{
     DerivativeGenerator, MackeyGlassGenerator, StdNormalGenerator, UniformGenerator,
 };
 use crate::tests::generators::workload::{
-    TimestampModel, bursty_values, constant_int_values, constant_values, counter_values,
-    discrete_values, drift_values, generate_timestamps_with_model, noisy_values, periodic_values,
+    TimestampModel, bursty_quantized_values, bursty_values, constant_int_values, constant_values,
+    counter_values, discrete_values, drift_quantized_values, drift_values,
+    generate_timestamps_with_model, noisy_quantized_values, noisy_values,
+    periodic_quantized_values, periodic_values,
 };
 use bon::bon;
 use rand::prelude::StdRng;
@@ -30,12 +32,20 @@ pub enum ValueWorkload {
     ConstantInt,
     /// Slow random walk within a narrow band.
     Drift,
+    /// [`Self::Drift`] rounded to two decimal places.
+    DriftQuantized,
     /// Alternating sine / sawtooth segments.
     Periodic,
+    /// [`Self::Periodic`] rounded to two decimal places.
+    PeriodicQuantized,
     /// Wide-spread gaussian noise.
     Noisy,
+    /// [`Self::Noisy`] rounded to two decimal places.
+    NoisyQuantized,
     /// Quiet stretches punctuated by bursts.
     Bursty,
+    /// [`Self::Bursty`] rounded to two decimal places.
+    BurstyQuantized,
     /// Monotonically increasing counter with resets.
     Counter,
     /// Values drawn from a small fixed set.
@@ -52,9 +62,13 @@ impl ValueWorkload {
             Self::Constant => "constant",
             Self::ConstantInt => "constant_int",
             Self::Drift => "drift",
+            Self::DriftQuantized => "drift_q2",
             Self::Periodic => "periodic",
+            Self::PeriodicQuantized => "periodic_q2",
             Self::Noisy => "noisy",
+            Self::NoisyQuantized => "noisy_q2",
             Self::Bursty => "bursty",
+            Self::BurstyQuantized => "bursty_q2",
             Self::Counter => "counter",
             Self::Discrete => "discrete",
         }
@@ -69,26 +83,59 @@ impl ValueWorkload {
             Self::Constant,
             Self::ConstantInt,
             Self::Drift,
+            Self::DriftQuantized,
             Self::Periodic,
+            Self::PeriodicQuantized,
             Self::Noisy,
+            Self::NoisyQuantized,
             Self::Bursty,
+            Self::BurstyQuantized,
             Self::Counter,
             Self::Discrete,
         ]
     }
 
-    /// The shape-oriented workloads, in declaration order.
+    /// The shape-oriented workloads, in declaration order. This order drives
+    /// report row ordering only; dataset seeds are derived from the key, not
+    /// from a position here.
     pub const fn workloads() -> &'static [ValueWorkload] {
         &[
             Self::Constant,
             Self::ConstantInt,
             Self::Drift,
+            Self::DriftQuantized,
             Self::Periodic,
+            Self::PeriodicQuantized,
             Self::Noisy,
+            Self::NoisyQuantized,
             Self::Bursty,
+            Self::BurstyQuantized,
             Self::Counter,
             Self::Discrete,
         ]
+    }
+
+    /// The decimal-quantized counterpart of a full-precision shape, if it has
+    /// one.
+    pub const fn quantized(self) -> Option<ValueWorkload> {
+        match self {
+            Self::Drift => Some(Self::DriftQuantized),
+            Self::Periodic => Some(Self::PeriodicQuantized),
+            Self::Noisy => Some(Self::NoisyQuantized),
+            Self::Bursty => Some(Self::BurstyQuantized),
+            _ => None,
+        }
+    }
+
+    /// Whether this workload rounds its values to a fixed decimal precision.
+    pub const fn is_quantized(self) -> bool {
+        matches!(
+            self,
+            Self::DriftQuantized
+                | Self::PeriodicQuantized
+                | Self::NoisyQuantized
+                | Self::BurstyQuantized
+        )
     }
 
     /// Shape-oriented workloads ignore the generator's value range and are
@@ -239,9 +286,13 @@ fn generate_values(options: &DataGenerator, rng: &mut StdRng) -> Vec<f64> {
         ValueWorkload::Constant => constant_values(options.samples),
         ValueWorkload::ConstantInt => constant_int_values(options.samples),
         ValueWorkload::Drift => drift_values(options.samples, rng),
+        ValueWorkload::DriftQuantized => drift_quantized_values(options.samples, rng),
         ValueWorkload::Periodic => periodic_values(options.samples, rng),
+        ValueWorkload::PeriodicQuantized => periodic_quantized_values(options.samples, rng),
         ValueWorkload::Noisy => noisy_values(options.samples, rng),
+        ValueWorkload::NoisyQuantized => noisy_quantized_values(options.samples, rng),
         ValueWorkload::Bursty => bursty_values(options.samples, rng),
+        ValueWorkload::BurstyQuantized => bursty_quantized_values(options.samples, rng),
         ValueWorkload::Counter => counter_values(options.samples, rng),
         ValueWorkload::Discrete => discrete_values(options.samples, rng),
         _ => get_generator_impl(options.typ, options.seed, &options.values)
@@ -308,6 +359,7 @@ pub fn generate_timestamps(count: usize, start: Timestamp, interval: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::generators::workload::QUANTIZED_DECIMALS;
 
     const SAMPLE_COUNT: usize = 2_048;
 
@@ -357,6 +409,48 @@ mod tests {
         let second =
             DataGenerator::dataset(ValueWorkload::Bursty, TimestampModel::Jitter, 1_000, 99);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_quantized_workloads_round_to_two_decimals() {
+        for workload in ValueWorkload::workloads()
+            .iter()
+            .filter(|w| w.is_quantized())
+        {
+            let samples =
+                DataGenerator::dataset(*workload, TimestampModel::Regular, SAMPLE_COUNT, 5);
+            for sample in &samples {
+                assert_eq!(
+                    sample.value,
+                    round_to_decimal_digits(sample.value, QUANTIZED_DECIMALS),
+                    "{} produced a value below the quantization step",
+                    workload.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_quantized_workloads_track_their_base_shape() {
+        for base in ValueWorkload::workloads() {
+            let Some(quantized) = base.quantized() else {
+                continue;
+            };
+            let plain = DataGenerator::dataset(*base, TimestampModel::Regular, SAMPLE_COUNT, 11);
+            let rounded =
+                DataGenerator::dataset(quantized, TimestampModel::Regular, SAMPLE_COUNT, 11);
+            assert_eq!(plain.len(), rounded.len());
+            for (p, q) in plain.iter().zip(rounded.iter()) {
+                assert_eq!(p.timestamp, q.timestamp);
+                assert_eq!(
+                    round_to_decimal_digits(p.value, QUANTIZED_DECIMALS),
+                    q.value,
+                    "{} must be {} rounded to {QUANTIZED_DECIMALS} decimals",
+                    quantized.id(),
+                    base.id()
+                );
+            }
+        }
     }
 
     #[test]
