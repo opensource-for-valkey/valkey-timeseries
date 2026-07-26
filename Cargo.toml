@@ -93,6 +93,11 @@ name = "latency_report"
 path = "tools/latency_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
+[[bin]]
+name = "wire_report"
+path = "tools/wire_report.rs"
+required-features = ["test-utils", "enable-system-alloc"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
