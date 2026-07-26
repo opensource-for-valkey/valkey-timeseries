@@ -9,7 +9,7 @@ use crate::iterators::{
 };
 use crate::labels::Label;
 use crate::series::acl::check_metadata_permissions;
-use crate::series::chunks::{ChunkOps, GorillaChunk, TimeSeriesChunk, UncompressedChunk};
+use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use crate::series::index::series_by_selectors;
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
@@ -339,15 +339,13 @@ fn handle_non_grouped(
                     Some(limit) => limit.apply(iter),
                     None => iter,
                 };
-                // if we're clustered, we use gorilla chunks to reduce network usage
+                let samples = iter.collect::<Vec<_>>();
+                // Only the clustered response crosses the network, so only it is
+                // worth compressing — and only once it holds enough samples to
+                // pay for the chunk header (see `samples_to_chunk`).
                 if clustered {
-                    let mut chunk = GorillaChunk::with_max_size(16 * 1024); // 16KB - todo: make configurable?
-                    for sample in iter {
-                        let _ = chunk.add_sample(&sample);
-                    }
-                    SeriesResultData::Chunk(TimeSeriesChunk::Gorilla(chunk))
+                    SeriesResultData::Chunk(samples_to_chunk_lossless(samples))
                 } else {
-                    let samples = iter.collect::<Vec<_>>();
                     let chunk = UncompressedChunk::from_vec(samples);
                     SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(chunk))
                 }
@@ -404,6 +402,10 @@ fn handle_grouping(
                 SeriesResultData::Rows(rows)
             } else {
                 let samples = get_grouped_samples(&group_data.series, &options, grouping, count);
+                // Grouping only runs on the node answering the client
+                // (`process_mrange` returns early when clustered), so these
+                // samples never cross the network and compressing them would
+                // only be undone by the reply serializer.
                 SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
                     samples,
                 )))
