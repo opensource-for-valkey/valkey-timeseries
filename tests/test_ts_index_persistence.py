@@ -11,7 +11,7 @@ from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true, TEST_MAX_WAIT_TIME_SECONDS
 from valkeytestframework.valkey_test_case import ReplicationTestCase
 
-from common import SERVER_PATH
+from common import SERVER_PATH, get_module_path
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
 
@@ -20,6 +20,25 @@ DISABLED_LOG = "ts-index-persist is disabled; discarding persisted postings inde
 DANGLING_LOG = "dangling ids marked stale"
 REPAIR_LOG = "scanning keyspace to repair"
 SKIP_SWEEP_LOG = "skipping reconciliation sweep"
+RECONCILE_LOG = "does not match the loaded set"
+
+
+def wait_for_log(server, needle, timeout=TEST_MAX_WAIT_TIME_SECONDS):
+    """The reconciliation sweep runs on the module thread pool after loading ends
+    (`reconcile_preloaded_indexes` -> `threads::spawn`), so its log lines can land after
+    `is_rdb_done_loading()` is already true. Poll rather than checking once."""
+    wait_for_true(lambda: server.verify_string_in_logfile(needle), timeout=timeout)
+
+
+def wait_for_sweep_decision(server, timeout=TEST_MAX_WAIT_TIME_SECONDS):
+    """Wait until the sweep has logged its per-db verdict — either the digest fast path or
+    the reconcile branch. Only meaningful for a db that actually preloaded; with no aux
+    payload the sweep never runs and nothing is logged."""
+    wait_for_true(
+        lambda: server.verify_string_in_logfile(SKIP_SWEEP_LOG)
+        or server.verify_string_in_logfile(RECONCILE_LOG),
+        timeout=timeout,
+    )
 
 
 class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
@@ -55,7 +74,7 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
         assert self.server.verify_string_in_logfile(PRELOADED_LOG)
         # On a clean load the per-(id, key_name) digests agree, so the O(N) keyspace-probing
         # sweep is skipped entirely and nothing needs repairing.
-        assert self.server.verify_string_in_logfile(SKIP_SWEEP_LOG)
+        wait_for_log(self.server, SKIP_SWEEP_LOG)
         assert not self.server.verify_string_in_logfile(DANGLING_LOG)
         assert not self.server.verify_string_in_logfile(REPAIR_LOG)
 
@@ -159,6 +178,7 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
         wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
 
         assert self.server.verify_string_in_logfile(PRELOADED_LOG)
+        wait_for_sweep_decision(self.server)
         assert not self.server.verify_string_in_logfile(REPAIR_LOG)
         assert client.execute_command("TS.CARD") == len(keys) - len(to_delete)
         for key in to_delete:
@@ -170,9 +190,10 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
 
 class TestIndexPersistenceDanglingRepair(ValkeyTimeSeriesTestCaseBase):
     """Exercises the case where the aux payload names an id whose key does not load
-    (RDB body corruption / a fork landing mid-write). The reconciliation sweep must
-    mark the id stale, and the count-verification scan must repair the index so the
-    renamed key becomes findable under its real name."""
+    (RDB body corruption / a fork landing mid-write). The digest must force a
+    reconciliation sweep, the dangling id must be dropped from the index, and the
+    count-verification scan must repair it so the renamed key becomes findable under its
+    real name."""
 
     @property
     def rdb_path(self):
@@ -223,11 +244,20 @@ class TestIndexPersistenceDanglingRepair(ValkeyTimeSeriesTestCaseBase):
         wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
 
         assert self.server.verify_string_in_logfile(PRELOADED_LOG)
+        # The sweep is asynchronous; wait for its output rather than sampling the log once.
+        wait_for_log(self.server, RECONCILE_LOG)
+        wait_for_log(self.server, REPAIR_LOG)
         # The renamed key leaves the cardinalities equal (7 loaded, 7 indexed), so a count-only
         # check would wave this through; the (id, key_name) digest is what forces the sweep.
         assert not self.server.verify_string_in_logfile(SKIP_SWEEP_LOG)
-        assert self.server.verify_string_in_logfile(DANGLING_LOG)
-        assert self.server.verify_string_in_logfile(REPAIR_LOG)
+        # Deliberately not asserting DANGLING_LOG: the retention-trim cron
+        # (`process_series_trim` -> `fetch_series_batch`) fires on the first cron tick after
+        # loading ends, opens every indexed key too, and marks the same id stale by the same
+        # mechanism. Both racers run on the module thread pool, so either can reach the
+        # dangling id first; when the cron wins, `reconcile_db` finds nothing dangling and
+        # logs only at debug level, while the index is already short one entry so the repair
+        # scan still fires. The sweep's own stale-marking is covered deterministically by the
+        # `reindex_revokes_stale_marking` unit test in src/series/index/persistence.rs.
 
         client = self.server.get_new_client()
         # Repair must converge to the correct final state regardless of GC timing.
@@ -386,7 +416,9 @@ class TestIndexPersistenceReplication(ReplicationTestCase):
 
     @pytest.fixture(autouse=True)
     def setup_test(self, setup):
-        self.args = {"enable-debug-command": "yes", "loadmodule": os.getenv("MODULE_PATH")}
+        # get_module_path() rather than os.getenv: with MODULE_PATH unset the raw getenv
+        # yields "--loadmodule None" and the server never comes up.
+        self.args = {"enable-debug-command": "yes", "loadmodule": get_module_path()}
         self.server, self.client = self.create_server(
             testdir=self.testdir, server_path=SERVER_PATH, args=self.args
         )
@@ -408,7 +440,7 @@ class TestIndexPersistenceReplication(ReplicationTestCase):
         self.setup_replication(num_replicas=1)
         replica = self.replicas[0]
 
-        assert replica.verify_string_in_logfile(PRELOADED_LOG)
+        wait_for_log(replica, PRELOADED_LOG)
 
         replica_card = replica.client.execute_command("TS.CARD", "FILTER", "service=api")
         assert replica_card == len(keys)
