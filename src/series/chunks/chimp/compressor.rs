@@ -17,6 +17,17 @@
 //! read (`ChimpDecompressor::new(bytes, count)`), so the trailing bit padding
 //! is never mistaken for another sample and no bit pattern — NaN included —
 //! has to be reserved as a sentinel.
+//!
+//! # Repeated values
+//!
+//! A value identical to its predecessor bypasses ELF entirely and is written as
+//! Elf case `0` plus Chimp's `xor == 0` flag — 3 bits, against the 4 a flat
+//! series used to pay by falling through to the raw `10` marker.
+//!
+//! That pairing is reserved for repeats, which is not free: a *distinct* value
+//! can erase onto the bit pattern Chimp already holds, and the encoder has to
+//! push those onto the raw path so they cannot be read back as a repeat. See
+//! `write_value`.
 
 use super::chimp_iterator::ChimpIterator;
 use super::encoder::{ChimpDec, ChimpEnc, ChimpEncState};
@@ -300,7 +311,21 @@ impl ChimpCompressor {
         dig.add_long_long(state.first as c_longlong);
     }
 
+    /// Encode a value identical to the one before it: Elf case `0` plus Chimp's
+    /// `xor == 0` flag, 3 bits.
+    ///
+    /// Comparison is on the bit pattern, so `-0.0` never counts as a repeat of
+    /// `0.0` and a NaN repeats only itself.
+    fn write_repeat(&mut self) -> io::Result<()> {
+        self.writer.write_bit(false);
+        self.chimp.add_repeat(&mut self.writer)
+    }
+
     fn write_value(&mut self, v: f64) -> io::Result<()> {
+        if self.count > 0 && v.to_bits() == self.last_value.to_bits() {
+            return self.write_repeat();
+        }
+
         let v_long = v.to_bits();
 
         if v == 0.0 || !v.is_finite() {
@@ -335,6 +360,16 @@ impl ChimpCompressor {
                             && try_recover(v_prime_long, beta_star) == Some(v)
                         {
                             if beta_star == self.last_beta_star {
+                                if v_prime_long == self.chimp.state().stored_val {
+                                    // Case `0` over an unchanged Chimp value is
+                                    // how a repeat is spelled, and this value is
+                                    // not one — a distinct `v` can erase onto the
+                                    // previous raw bit pattern. Store it raw so
+                                    // the decoder cannot misread it as a repeat.
+                                    self.writer.write_bits(2, 0b10)?;
+                                    self.chimp.add_value(&mut self.writer, v_long)?;
+                                    return Ok(());
+                                }
                                 self.writer.write_bit(false); // case `0`
                             } else {
                                 // case `11` + 4-bit beta_star
@@ -421,6 +456,8 @@ pub struct ChimpDecompressor<'a> {
     sample_count: u64,
     last_timestamp: Timestamp,
     last_delta: i64,
+    /// The previously decoded value, returned verbatim for a repeat.
+    last_value: f64,
 }
 
 impl<'a> ChimpDecompressor<'a> {
@@ -433,6 +470,7 @@ impl<'a> ChimpDecompressor<'a> {
             sample_count,
             last_timestamp: 0,
             last_delta: 0,
+            last_value: 0.0,
         }
     }
 
@@ -493,24 +531,31 @@ impl<'a> ChimpDecompressor<'a> {
     }
 
     fn read_value(&mut self) -> io::Result<f64> {
-        if !self.reader.read_bit()? {
-            // case `0`: reuse last beta_star
-            self.recover_v_by_beta_star()
+        let value = if !self.reader.read_bit()? {
+            // case `0`: a repeat, or a value sharing the previous beta_star.
+            let (bits, repeat) = self.chimp.read_value_flagged(&mut self.reader)?;
+            if repeat {
+                // Returning `last_value` verbatim rather than recovering it from
+                // the Chimp bits is what makes the 3-bit repeat legal after a raw
+                // (case `10`) value, whose stored bits are not an erased
+                // `v_prime` and would not survive `recover`.
+                return Ok(self.last_value);
+            }
+            recover(bits, self.last_beta_star)?
         } else if !self.reader.read_bit()? {
             // case `10`: raw value (zero, infinities, NaN, or anything ELF
             // could not erase reversibly)
             let bits = self.chimp.read_value(&mut self.reader)?;
-            Ok(f64::from_bits(bits))
+            f64::from_bits(bits)
         } else {
             // case `11`: new 4-bit beta_star
             self.last_beta_star = self.reader.read_bits(4)? as i32;
-            self.recover_v_by_beta_star()
-        }
-    }
+            let bits = self.chimp.read_value(&mut self.reader)?;
+            recover(bits, self.last_beta_star)?
+        };
 
-    fn recover_v_by_beta_star(&mut self) -> io::Result<f64> {
-        let v_prime_bits = self.chimp.read_value(&mut self.reader)?;
-        recover(v_prime_bits, self.last_beta_star)
+        self.last_value = value;
+        Ok(value)
     }
 
     /// Consume the rest of the stream into a `Vec<Sample>`.
@@ -721,6 +766,176 @@ mod tests {
             Sample::new(2, 42.0),
             Sample::new(3, f64::NEG_INFINITY),
         ]);
+    }
+
+    #[test]
+    fn repeated_values_round_trip() {
+        for run in [1usize, 2, 3, 4, 17, 500] {
+            let mut samples = vec![Sample::new(1000, 1.25)];
+            for i in 0..run {
+                samples.push(Sample::new(1010 + i as Timestamp * 10, 1.25));
+            }
+            samples.push(Sample::new(9_000_000, -3.5));
+            samples.push(Sample::new(9_000_010, -3.5));
+            round_trip(&samples);
+        }
+    }
+
+    #[test]
+    fn repeats_of_special_values_round_trip_bit_exactly() {
+        // `-0.0` must not count as a repeat of `0.0`, and a NaN repeats only
+        // the exact payload before it.
+        let values = [
+            0.0,
+            0.0,
+            0.0,
+            -0.0,
+            -0.0,
+            0.0,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+            f64::from_bits(0x7ff0_0000_0000_0002),
+            f64::from_bits(0x7ff0_0000_0000_0002),
+            f64::NAN,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let samples: Vec<Sample> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| Sample::new(1000 + i as Timestamp * 10, *v))
+            .collect();
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn a_long_flat_stretch_round_trips() {
+        let n = 8_192;
+        let mut samples: Vec<Sample> = (0..n).map(|i| Sample::new(1000 + i * 10, 8.75)).collect();
+        samples.push(Sample::new(1000 + n * 10, 8.76));
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn repeats_interleaved_with_distinct_values_round_trip() {
+        // Walks the state machine through None -> One -> Run and back out
+        // again at every position.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut samples = Vec::new();
+        let mut ts = 1_600_000_000_000i64;
+        let mut value = 100.0f64;
+        for _ in 0..5000 {
+            // Three samples in four repeat the one before them.
+            if next() % 4 == 0 {
+                value = (next() % 100_000) as f64 / 100.0;
+            }
+            ts += 1000;
+            samples.push(Sample::new(ts, value));
+        }
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn near_miss_values_do_not_masquerade_as_repeats() {
+        // A distinct value can erase onto the bit pattern the Chimp layer
+        // already holds; the encoder falls back to a raw write so the decoder
+        // cannot read the result as a repeat.
+        let mut samples = Vec::new();
+        let mut ts = 0;
+        for k in 1..2000u64 {
+            let nice = k as f64 / 100.0;
+            let bits = nice.to_bits();
+            for v in [
+                nice,
+                f64::from_bits(bits - 1),
+                f64::from_bits(bits + 1),
+                nice,
+            ] {
+                ts += 10;
+                samples.push(Sample::new(ts, v));
+            }
+        }
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn every_repeat_costs_four_bits() {
+        // Settle the timestamp delta first, so from here each sample's
+        // delta-of-delta is zero and costs exactly one bit. On top of that a
+        // repeat is Elf case `0` plus Chimp's zero-XOR flag.
+        let mut compressor = ChimpCompressor::new();
+        compressor.add_sample(1000, 12.5).unwrap();
+        compressor.add_sample(2000, 13.5).unwrap();
+        compressor.add_sample(3000, 14.5).unwrap();
+
+        let mut ts = 4000;
+        for _ in 0..8 {
+            let before = compressor.len_bits();
+            compressor.add_sample(ts, 14.5).unwrap();
+            assert_eq!(compressor.len_bits() - before, 1 + 3);
+            ts += 1000;
+        }
+    }
+
+    #[test]
+    fn a_flat_series_costs_half_a_byte_per_sample() {
+        let n = 4096;
+        let mut compressor = ChimpCompressor::new();
+        for i in 0..n {
+            compressor
+                .add_sample(1_700_000_000_000 + i * 1000, 19.5)
+                .unwrap();
+        }
+        let bits_per_sample = compressor.len_bits() as f64 / n as f64;
+        assert!(
+            bits_per_sample < 4.1,
+            "flat series cost {bits_per_sample} bits/sample"
+        );
+    }
+
+    #[test]
+    fn appending_after_serialization_still_detects_repeats() {
+        // Repeat detection reads `last_value`, so it has to survive a
+        // serialization round trip: split at every point and keep going.
+        let samples: Vec<Sample> = (0..24).map(|i| Sample::new(1000 + i * 10, 7.5)).collect();
+
+        for split in 1..samples.len() {
+            let mut compressor = ChimpCompressor::new();
+            for sample in &samples[..split] {
+                compressor.add(*sample).unwrap();
+            }
+
+            let mut buf = Vec::new();
+            compressor.serialize(&mut buf);
+            let mut restored = ChimpCompressor::deserialize(&buf).unwrap();
+            assert_eq!(restored, compressor, "split at {split}");
+
+            for sample in &samples[split..] {
+                restored.add(*sample).unwrap();
+            }
+
+            let count = restored.count();
+            let bytes = restored.into_bytes();
+            let decoded = ChimpDecompressor::new(&bytes, count).collect().unwrap();
+            assert_eq!(decoded.len(), samples.len(), "split at {split}");
+            for (actual, want) in decoded.iter().zip(&samples) {
+                assert_eq!(actual.timestamp, want.timestamp, "split at {split}");
+                assert_eq!(
+                    actual.value.to_bits(),
+                    want.value.to_bits(),
+                    "split at {split}"
+                );
+            }
+        }
     }
 
     #[test]

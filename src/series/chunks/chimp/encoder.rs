@@ -92,6 +92,19 @@ impl ChimpEnc {
         Ok(())
     }
 
+    /// Emit the `xor == 0` flag for a value the caller has already established
+    /// is unchanged.
+    ///
+    /// Equivalent to `add_value` with the stored value, but the Elf layer
+    /// recognises repeats before erasure, so it no longer knows which bit
+    /// pattern (raw or erased) was last fed in here.
+    pub fn add_repeat(&mut self, out: &mut BitStream) -> io::Result<()> {
+        debug_assert!(!self.first, "a repeat needs a preceding value");
+        out.write_bits(2, 0b00)?;
+        self.stored_lz = 65;
+        Ok(())
+    }
+
     fn compress_value(&mut self, out: &mut BitStream, value: u64) -> io::Result<()> {
         let xor = self.stored_val ^ value;
         if xor == 0 {
@@ -162,17 +175,26 @@ impl ChimpDec {
         Ok(self.stored_val)
     }
 
-    fn next(&mut self, inp: &mut BitStreamReader) -> io::Result<()> {
+    /// [`read_value`](Self::read_value), also reporting whether the value was
+    /// unchanged (the `xor == 0` case). The Elf layer needs that flag to tell a
+    /// repeat apart from a value that merely shares the previous `beta_star`.
+    pub fn read_value_flagged(&mut self, inp: &mut BitStreamReader) -> io::Result<(u64, bool)> {
+        let repeat = self.next(inp)?;
+        Ok((self.stored_val, repeat))
+    }
+
+    fn next(&mut self, inp: &mut BitStreamReader) -> io::Result<bool> {
         if self.first {
             self.first = false;
             self.stored_val = inp.read_bits(64)?;
+            Ok(false)
         } else {
-            self.next_value(inp)?;
+            self.next_value(inp)
         }
-        Ok(())
     }
 
-    fn next_value(&mut self, inp: &mut BitStreamReader) -> io::Result<()> {
+    /// Returns `true` when the encoded XOR was zero, i.e. the value repeats.
+    fn next_value(&mut self, inp: &mut BitStreamReader) -> io::Result<bool> {
         let flag = inp.read_bits(2)? as i32;
         match flag {
             3 => {
@@ -200,8 +222,9 @@ impl ChimpDec {
             }
             _ => {
                 // flag == 0: xor was zero, value unchanged.
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 }

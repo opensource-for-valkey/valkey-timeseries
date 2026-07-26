@@ -80,7 +80,9 @@ impl ChimpChunk {
         if self.len() == 0 {
             return 0;
         }
-        self.remaining_capacity() / self.bytes_per_sample()
+        // A flat series costs well under a byte per sample, at which point the
+        // integer ratio floors to zero.
+        self.remaining_capacity() / self.bytes_per_sample().max(1)
     }
 
     pub fn memory_usage(&self) -> usize {
