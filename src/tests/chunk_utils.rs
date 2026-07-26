@@ -134,5 +134,6 @@ pub fn encoded_size(chunk: &TimeSeriesChunk) -> usize {
         TimeSeriesChunk::Xor(c) => c.size(),
         TimeSeriesChunk::Pco(c) => c.timestamps.len() + c.values.len(),
         TimeSeriesChunk::DeXor(c) => c.encoder.buf().len(),
+        TimeSeriesChunk::Chimp(c) => c.encoder.bytes().len(),
     }
 }

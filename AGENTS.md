@@ -142,8 +142,8 @@ Benchmarks
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (140 rows: encoding × workload × timestamp model × chunk size —
-  28 rows for each of the 5 encodings listed in `encodings()`, which currently omits PCO).
+  `target/bench-reports/compression.csv` and `.md` (168 rows: encoding × workload × timestamp model × chunk size —
+  28 rows for each of the 6 encodings listed in `encodings()`, which currently omits PCO).
   The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
   actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and pco report a `get_size()`
   heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio

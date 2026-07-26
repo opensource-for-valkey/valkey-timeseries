@@ -1,4 +1,4 @@
-//! Property-based round-trip tests for the six chunk encodings.
+//! Property-based round-trip tests for the seven chunk encodings.
 //!
 //! For every encoding, a randomly generated run of samples that is written into a
 //! chunk must survive a `serialize` → `deserialize` round-trip unchanged: the
@@ -11,14 +11,15 @@ use crate::common::Sample;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use proptest::prelude::*;
 
-/// All six encodings under test.
-const CHUNK_TYPES: [ChunkEncoding; 6] = [
+/// All seven encodings under test.
+const CHUNK_TYPES: [ChunkEncoding; 7] = [
     ChunkEncoding::Uncompressed,
     ChunkEncoding::Gorilla,
     ChunkEncoding::TsXor,
     ChunkEncoding::Xor2,
     ChunkEncoding::Pco,
     ChunkEncoding::DeXor,
+    ChunkEncoding::Chimp,
 ];
 
 /// A chunk size comfortably larger than the sample runs we generate, so the

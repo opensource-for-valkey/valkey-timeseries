@@ -1,4 +1,5 @@
 mod chunk;
+mod elf64;
 mod dexor;
 mod gorilla;
 mod merge;
@@ -14,9 +15,12 @@ mod tsxor;
 mod uncompressed;
 pub(crate) mod utils;
 mod xor2;
+mod chimp;
 
 pub(crate) use tsxor::*;
+pub(in crate::series::chunks) use elf64::*;
 
+pub use chimp::*;
 pub use chunk::*;
 pub use dexor::*;
 pub use gorilla::*;

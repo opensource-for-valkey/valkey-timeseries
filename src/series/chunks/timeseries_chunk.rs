@@ -5,6 +5,7 @@ use crate::config::SPLIT_FACTOR;
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::iterators::{FilteredSampleIterator, SampleIter};
+use crate::series::chunks::chimp::ChimpChunk;
 use crate::series::chunks::dexor::DeXorChunk;
 use crate::series::chunks::tsxor::TsXorChunk;
 use crate::series::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
@@ -30,6 +31,7 @@ pub enum TimeSeriesChunk {
     Xor(Xor2Chunk),
     Pco(PcoChunk),
     DeXor(DeXorChunk),
+    Chimp(ChimpChunk),
 }
 
 impl TimeSeriesChunk {
@@ -54,6 +56,7 @@ impl TimeSeriesChunk {
             }
             ChunkEncoding::Pco => Pco(PcoChunk::with_max_size(chunk_size)),
             ChunkEncoding::DeXor => DeXor(DeXorChunk::with_max_size(chunk_size)),
+            ChunkEncoding::Chimp => Chimp(ChimpChunk::with_max_size(chunk_size)),
         }
     }
 
@@ -65,6 +68,7 @@ impl TimeSeriesChunk {
             TimeSeriesChunk::Xor(_) => ChunkEncoding::Xor2,
             TimeSeriesChunk::Pco(_) => ChunkEncoding::Pco,
             TimeSeriesChunk::DeXor(_) => ChunkEncoding::DeXor,
+            TimeSeriesChunk::Chimp(_) => ChunkEncoding::Chimp,
         }
     }
 
@@ -140,6 +144,7 @@ impl TimeSeriesChunk {
             Xor(chunk) => Box::new(chunk.iterator()),
             Pco(chunk) => Box::new(chunk.iter()),
             DeXor(chunk) => Box::new(chunk.iter()),
+            Chimp(chunk) => Box::new(chunk.iter()),
         }
     }
 
@@ -165,6 +170,7 @@ impl TimeSeriesChunk {
             },
             Pco(chunk) => chunk.range_iter(start, end),
             DeXor(chunk) => chunk.range_iter(start, end),
+            Chimp(chunk) => chunk.range_iter(start, end),
         }
     }
 
@@ -348,6 +354,7 @@ impl Chunk for TimeSeriesChunk {
             Xor(chunk) => Ok(Xor(chunk.split()?)),
             Pco(chunk) => Ok(Pco(chunk.split()?)),
             DeXor(chunk) => Ok(DeXor(chunk.split()?)),
+            Chimp(chunk) => Ok(Chimp(chunk.split()?)),
         }
     }
 
@@ -361,6 +368,7 @@ impl Chunk for TimeSeriesChunk {
             Xor(chunk) => chunk.save_rdb(rdb),
             Pco(chunk) => chunk.save_rdb(rdb),
             DeXor(chunk) => chunk.save_rdb(rdb),
+            Chimp(chunk) => chunk.save_rdb(rdb),
         }
     }
 
@@ -375,6 +383,7 @@ impl Chunk for TimeSeriesChunk {
             ChunkEncoding::Xor2 => Xor(Xor2Chunk::load_rdb(rdb, enc_ver)?),
             ChunkEncoding::Pco => Pco(PcoChunk::load_rdb(rdb, enc_ver)?),
             ChunkEncoding::DeXor => DeXor(DeXorChunk::load_rdb(rdb, enc_ver)?),
+            ChunkEncoding::Chimp => Chimp(ChimpChunk::load_rdb(rdb, enc_ver)?),
         };
         Ok(chunk)
     }
@@ -404,6 +413,10 @@ impl Chunk for TimeSeriesChunk {
             }
             DeXor(chunk) => {
                 dest.push(ChunkEncoding::DeXor as u8);
+                chunk.serialize(dest)
+            }
+            Chimp(chunk) => {
+                dest.push(ChunkEncoding::Chimp as u8);
                 chunk.serialize(dest)
             }
         }
@@ -443,6 +456,10 @@ impl Chunk for TimeSeriesChunk {
                 let chunk = DeXorChunk::deserialize(&buf[1..])?;
                 Ok(DeXor(chunk))
             }
+            ChunkEncoding::Chimp => {
+                let chunk = ChimpChunk::deserialize(&buf[1..])?;
+                Ok(Chimp(chunk))
+            }
         }
     }
 
@@ -455,6 +472,7 @@ impl Chunk for TimeSeriesChunk {
             Xor(chunk) => chunk.debug_digest(dig),
             Pco(chunk) => chunk.debug_digest(dig),
             DeXor(chunk) => chunk.debug_digest(dig),
+            Chimp(chunk) => chunk.debug_digest(dig),
         }
     }
 }
