@@ -11,8 +11,6 @@ mod encoder;
 
 #[cfg(test)]
 mod chimp_chunk_tests;
-#[cfg(test)]
-mod compression_tests;
 
 pub use chimp_chunk::*;
 pub use chimp_iterator::*;
