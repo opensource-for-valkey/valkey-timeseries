@@ -157,6 +157,17 @@ Benchmarks
   `capacity`; in the Markdown the best encoding per row is bold, with `uncompressed` excluded as the baseline. This is
   the layout to reach for when comparing encodings against each other; the flat `compression.csv` stays the source of
   truth for `--check`.
+- Latency report (also not a criterion bench): `tools/latency_report.sh` wraps the `latency_report` binary
+  (`tools/latency_report.rs`, same two required features). It answers "how fast" where the compression report answers
+  "how small": for each encoding it times `set_data`, per-sample `add_sample`, a full `iter()` scan, `get_range` over the
+  whole chunk, and a 10% mid-chunk `range_iter`, then writes `target/bench-reports/latency.{csv,md}` and prints the
+  table. Every cell is the median of `--iterations` runs (default 200, after `--warmup` 20) of the *whole* operation, in
+  µs. Parameterize with `--samples` (default 1000), `--encodings`/`--workloads`/`--ts-models` (comma lists or `all`),
+  `--chunk-size` (default 1 MiB so nothing fills up), `--seed`, `--out-csv`/`--out-md`, `--quiet`. There is no baseline
+  gate: these are wall-clock numbers, so compare rows within one run rather than across machines or commits. Note that
+  `set_data` bulk-loads past the chunk budget while `add_sample` stops at `is_full()`, so a small `--chunk-size` makes
+  the two encode columns cover different sample counts — the tool warns and records `append_len` in the CSV when that
+  happens.
 - `build.sh` does not run benches or the compression report; they are manual.
 
 Where to look first (key files & directories)

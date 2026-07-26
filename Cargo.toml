@@ -88,6 +88,11 @@ name = "compression_report"
 path = "tools/compression_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
+[[bin]]
+name = "latency_report"
+path = "tools/latency_report.rs"
+required-features = ["test-utils", "enable-system-alloc"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
 enable-system-alloc = ["valkey-module/enable-system-alloc"]

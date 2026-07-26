@@ -229,13 +229,30 @@ mod tools_tests {
     #[test]
     fn scan_matches_string_formulation() {
         let mut cases = vec![
-            0.0, -0.0, 1.0, -1.0, 100.0, -100.0, 1e23, 1e-23, 0.5, -0.125, 3.14161, 1234.5678,
-            f64::MIN_POSITIVE, f64::MAX, f64::MIN, 1e-300, 9.007_199_254_740_991e15,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            100.0,
+            -100.0,
+            1e23,
+            1e-23,
+            0.5,
+            -0.125,
+            3.14161,
+            1234.5678,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            1e-300,
+            9.007_199_254_740_991e15,
         ];
         // A cheap deterministic spread of bit patterns.
         let mut bits: u64 = 0x9E37_79B9_7F4A_7C15;
         for _ in 0..20_000 {
-            bits = bits.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            bits = bits
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let candidate = f64::from_bits(bits);
             if candidate.is_finite() {
                 cases.push(candidate);
