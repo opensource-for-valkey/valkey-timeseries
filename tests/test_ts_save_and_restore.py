@@ -353,11 +353,6 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
         client = self.server.get_new_client()
         self._roundtrip_encoding(client, 'CHIMP', 'chimp', 'compressed')
 
-    def test_save_restore_tsxor_encoding(self):
-        """RDB round-trip preserves data and encoding for TSXOR chunks."""
-        client = self.server.get_new_client()
-        self._roundtrip_encoding(client, 'TSXOR', 'tsxor', 'compressed')
-
     def test_save_restore_xor2_encoding(self):
         """RDB round-trip preserves data and encoding for XOR2 chunks."""
         client = self.server.get_new_client()
@@ -369,7 +364,7 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
         self._roundtrip_encoding(client, 'DEXOR', 'dexor', 'compressed')
 
     def test_save_restore_all_encodings_digest_match(self):
-        """All six chunk encodings produce identical per-key digests after a
+        """All five chunk encodings produce identical per-key digests after a
         single bgsave/restart cycle.  This catches any encoding-specific
         regression in a single test run.
         """
@@ -379,7 +374,6 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
             ('UNCOMPRESSED', 'uncompressed', 'uncompressed'),
             ('GORILLA',      'gorilla',      'compressed'),
             ('CHIMP',        'chimp',        'compressed'),
-            ('TSXOR',        'tsxor',        'compressed'),
             ('XOR2',         'xor2',         'compressed'),
             ('DEXOR',        'dexor',        'compressed'),
         ]

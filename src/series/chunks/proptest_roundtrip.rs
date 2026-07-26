@@ -11,11 +11,10 @@ use crate::common::Sample;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use proptest::prelude::*;
 
-/// All six encodings under test.
-const CHUNK_TYPES: [ChunkEncoding; 6] = [
+/// All five encodings under test.
+const CHUNK_TYPES: [ChunkEncoding; 5] = [
     ChunkEncoding::Uncompressed,
     ChunkEncoding::Gorilla,
-    ChunkEncoding::TsXor,
     ChunkEncoding::Xor2,
     ChunkEncoding::DeXor,
     ChunkEncoding::Chimp,

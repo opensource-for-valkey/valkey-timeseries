@@ -41,7 +41,7 @@ High-level architecture (big picture)
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
 - Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
   `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
-  - `src/series/chunks/` implements six encoding formats: **Gorilla** (default), **TsXOR**, **Uncompressed**,
+  - `src/series/chunks/` implements five encoding formats: **Gorilla** (default), **Uncompressed**,
     **XOR2**, **DeXOR**, **Chimp** (ELF-on-Chimp). The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
     Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
     see "Wire encoding policy" under conventions below.
@@ -157,10 +157,10 @@ Benchmarks
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (168 rows: encoding × workload × timestamp model × chunk size —
-  28 rows for each of the 6 encodings listed in `encodings()`).
+  `target/bench-reports/compression.csv` and `.md` (140 rows: encoding × workload × timestamp model × chunk size —
+  28 rows for each of the 5 encodings listed in `encodings()`).
   The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
-  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and chimp report a `get_size()`
+  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, dexor and chimp report a `get_size()`
   heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio
   built on it compares allocator slack instead of compression. The separate `size` column is the full heap footprint,
   including unused capacity.
@@ -200,8 +200,7 @@ Benchmarks
     - **A correctness gate runs before any measurement.** Every encoding is put through adversarial payloads (NaN,
       infinities, `-0.0`, subnormals, `f64::MIN/MAX`, timestamp extremes, duplicate timestamps) and must round-trip
       bit-exactly. This is not academic: the grouped/aggregated path back-fills empty buckets with NaN, so an encoding
-      that cannot carry one is unusable on the wire whatever it scores on size. `tsxor` currently **fails**
-      `timestamp_extremes` and is disqualified on that ground alone.
+      that cannot carry one is unusable on the wire whatever it scores on size.
     - **`break_even` is a link speed in Gbit/s**, not a ratio: the bandwidth below which the bytes an encoding saves take
       longer to transmit than the extra CPU takes to spend. Compare it against the interconnect — an encoding pays off on
       any link *slower* than its figure, and `--link-gbps` (default 10) sets what the threshold summary is judged

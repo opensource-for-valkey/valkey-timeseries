@@ -2,7 +2,7 @@
 
 **Status:** Plan only — not yet implemented.
 **Goal:** Characterize the relative strengths and weaknesses of each chunk encoding
-(`Uncompressed`, `Gorilla`, `TsXor`, `Xor2`, `DeXor`, `Chimp`) across realistic data
+(`Uncompressed`, `Gorilla`, `Xor2`, `DeXor`, `Chimp`) across realistic data
 distributions, and establish repeatable baselines so compression-ratio and latency
 regressions are caught before merge.
 
@@ -20,12 +20,12 @@ regressions are caught before merge.
 
 ## 2. System under test
 
-All six encodings are exercised through the public enum
+All five encodings are exercised through the public enum
 `TimeSeriesChunk` (`src/series/chunks/timeseries_chunk.rs`), constructed with
 `TimeSeriesChunk::new(encoding, chunk_size)`. This is deliberate:
 
-- `TsXorChunk` and `Xor2Chunk` are `pub(crate)` (`src/series/chunks/mod.rs`), so an
-  external bench crate cannot name them directly.
+- `Xor2Chunk` is `pub(crate)` (`src/series/chunks/mod.rs`), so an
+  external bench crate cannot name it directly.
 - The enum dispatch is the code path production queries actually take, so measuring
   through it includes the (small) match overhead uniformly for all encodings.
 
@@ -64,7 +64,7 @@ Two supplementary distributions (cheap to add, high diagnostic value):
 | ID | Workload | Why |
 |---|---|---|
 | `counter` | Monotonic counter with occasional resets (`v += Poisson(λ=10)`, reset to 0 every ~50k) | The single most common Prometheus-style shape; integer deltas |
-| `discrete` | Values from a small set (e.g., 0.0/1.0 gauge, or {0, 0.25, 0.5, 1.0}) | Low-entropy non-constant; distinguishes dictionary-ish wins (TsXor's value window) from XOR wins |
+| `discrete` | Values from a small set (e.g., 0.0/1.0 gauge, or {0, 0.25, 0.5, 1.0}) | Low-entropy non-constant; distinguishes dictionary-ish wins (a repeated-value window) from XOR wins |
 
 #### Decimal-quantized variants
 
@@ -211,7 +211,7 @@ samples/sec:
   expect and document a large gap between the two shapes — that gap is itself a
   key finding.
 
-Matrix: 6 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
+Matrix: 5 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
 cross for `drift`/`noisy`, plus chunk-size sweep (1 KiB/4 KiB/64 KiB) for
 `drift` and `noisy` only. ≈ 6 × (7 + 4 + 4) × 2 shapes ≈ 180 benchmark points —
 acceptable at criterion defaults (~each point 5s warmup + 5s measure ⇒ budget

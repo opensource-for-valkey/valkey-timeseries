@@ -1376,7 +1376,6 @@ mod tests {
         for encoding in [
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
-            ChunkEncoding::TsXor,
             ChunkEncoding::Xor2,
             ChunkEncoding::DeXor,
             ChunkEncoding::Chimp,
