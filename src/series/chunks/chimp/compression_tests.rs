@@ -13,9 +13,9 @@
 
 use super::compressor::{ChimpCompressor, ChimpDecompressor};
 use crate::common::Sample;
+use crate::series::chunks::timeseries_chunk::TimeSeriesChunk;
 use crate::series::chunks::{ChunkEncoding, ChunkOps};
 use crate::tests::chunk_utils::encoded_size;
-use crate::series::chunks::timeseries_chunk::TimeSeriesChunk;
 use crate::tests::generators::{
     DATASET_SAMPLES, DatasetKey, benchmark_dataset_keys, dataset_seed, generate_dataset,
 };

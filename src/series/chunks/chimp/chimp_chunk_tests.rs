@@ -320,7 +320,11 @@ fn test_append_after_serialize_roundtrip_mixed_cases() {
     assert_eq!(decoded.len(), samples.len());
     for (i, (expected, actual)) in samples.iter().zip(decoded.iter()).enumerate() {
         assert_eq!(expected.timestamp, actual.timestamp, "timestamp {i}");
-        assert_eq!(expected.value.to_bits(), actual.value.to_bits(), "value {i}");
+        assert_eq!(
+            expected.value.to_bits(),
+            actual.value.to_bits(),
+            "value {i}"
+        );
     }
     assert_eq!(restored, chunk);
 }

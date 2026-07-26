@@ -5,7 +5,9 @@
 //! ones where the reference would throw) are reported via `Err` so the caller
 //! can fall back to storing the raw value losslessly (Elf case `10`).
 
-const F: [i32; 21] = [0, 4, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40, 44, 47, 50, 54, 57, 60, 64, 67];
+const F: [i32; 21] = [
+    0, 4, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40, 44, 47, 50, 54, 57, 60, 64, 67,
+];
 
 const MAP_10IP: [f64; 21] = [
     1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
@@ -19,7 +21,9 @@ const MAP_10IN: [f64; 21] = [
 
 const MAP_SP_GREATER_1: [f64; 10] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9];
 
-const MAP_SP_LESS_1: [f64; 11] = [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10];
+const MAP_SP_LESS_1: [f64; 11] = [
+    1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10,
+];
 
 const LOG_2_10: f64 = std::f64::consts::LN_10 / std::f64::consts::LN_2;
 // Note: the reference computes `Math.log(10)/Math.log(2)`; LN_10/LN_2 is the
@@ -105,7 +109,11 @@ fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
     }
     let log10v = v.log10();
     let sp = log10v.floor() as i32;
-    let flag = if log10v == (log10v as i64) as f64 { 1 } else { 0 };
+    let flag = if log10v == (log10v as i64) as f64 {
+        1
+    } else {
+        0
+    };
     (sp, flag)
 }
 

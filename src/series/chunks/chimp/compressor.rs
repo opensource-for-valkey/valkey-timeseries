@@ -30,7 +30,9 @@ use crate::common::rdb::{
 };
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
-use crate::series::chunks::elf64::{get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up};
+use crate::series::chunks::elf64::{
+    get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up,
+};
 use crate::series::chunks::stream::bitstream::BitStream;
 use crate::series::chunks::stream::bitstream_reader::BitStreamReader;
 use get_size2::{GetSize, GetSizeTracker};
@@ -336,7 +338,7 @@ impl ChimpCompressor {
                                 self.writer.write_bit(false); // case `0`
                             } else {
                                 // case `11` + 4-bit beta_star
-                                self.writer.write_bits(6,(beta_star as u64) | 0x30)?;
+                                self.writer.write_bits(6, (beta_star as u64) | 0x30)?;
                                 self.last_beta_star = beta_star;
                             }
                             self.chimp.add_value(&mut self.writer, v_prime_long)?;
@@ -529,9 +531,13 @@ fn recover(v_prime_bits: u64, beta_star: i32) -> io::Result<f64> {
     let v = if beta_star == 0 {
         let idx = -(sp as i64) - 1;
         if idx < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery index"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid recovery index",
+            ));
         }
-        let mut r = get_10in(idx as i32).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery value"))?;
+        let mut r = get_10in(idx as i32)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery value"))?;
         if v_prime < 0.0 {
             r = -r;
         }
@@ -539,9 +545,13 @@ fn recover(v_prime_bits: u64, beta_star: i32) -> io::Result<f64> {
     } else {
         let alpha = (beta_star as i64) - (sp as i64) - 1;
         if alpha < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery alpha"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid recovery alpha",
+            ));
         }
-        round_up(v_prime, alpha as i32).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery value"))?
+        round_up(v_prime, alpha as i32)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid recovery value"))?
     };
     Ok(v)
 }
