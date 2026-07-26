@@ -8,6 +8,8 @@
 //! magnitudes; in this port a miss simply means "not representable on the
 //! decimal path", and the caller falls back to the raw exception coder.
 
+use std::fmt::{self, Write};
+
 /// Smallest exponent held in [`P10`].
 pub(super) const P10_MIN_EXP: i32 = -23;
 /// Largest exponent held in [`P10`].
@@ -117,13 +119,51 @@ fn is_last_digit_exponent(value: f64, exp: i32) -> bool {
 /// Rust's `Display` never uses scientific notation for `f64`, so reading the
 /// fraction length is both simpler and correct.
 fn last_digit_exponent_from_repr(value: f64) -> i32 {
-    let text = format!("{value}");
-    match text.split_once('.') {
-        Some((_, fraction)) => -(fraction.len() as i32),
-        None => {
-            let digits = text.trim_start_matches('-');
-            (digits.len() - digits.trim_end_matches('0').len()) as i32
+    let mut scan = DigitScan::default();
+    // `f64`'s `Display` is infallible, and `DigitScan` never reports an error.
+    let _ = write!(scan, "{value}");
+    scan.exponent()
+}
+
+/// Streaming sink that extracts the last-digit exponent from a `Display`ed
+/// `f64` without buffering the text.
+///
+/// The formatter can hand over the digits in any number of fragments, so the
+/// two quantities the exponent needs — the fraction length, and the run of
+/// trailing zeros in a fraction-less integer — are accumulated incrementally.
+#[derive(Default)]
+struct DigitScan {
+    /// Digits seen after the decimal point.
+    fraction_len: u32,
+    /// Length of the current run of trailing `0`s before the decimal point.
+    trailing_zeros: u32,
+    seen_point: bool,
+}
+
+impl DigitScan {
+    fn exponent(&self) -> i32 {
+        if self.seen_point {
+            -(self.fraction_len as i32)
+        } else {
+            self.trailing_zeros as i32
         }
+    }
+}
+
+impl fmt::Write for DigitScan {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            match byte {
+                b'.' => self.seen_point = true,
+                b'0' if self.seen_point => self.fraction_len += 1,
+                b'0' => self.trailing_zeros += 1,
+                b'1'..=b'9' if self.seen_point => self.fraction_len += 1,
+                b'1'..=b'9' => self.trailing_zeros = 0,
+                // The leading sign; nothing else can appear for a finite `f64`.
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -166,6 +206,49 @@ pub(super) fn last_digit_exponent(value: f64, hint: i32) -> Option<i32> {
             if is_int(value / p10(q)?, INTEGER_EPS) {
                 return Some(q);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tools_tests {
+    use super::*;
+
+    /// The allocating formulation `last_digit_exponent_from_repr` replaced.
+    fn exponent_via_string(value: f64) -> i32 {
+        let text = format!("{value}");
+        match text.split_once('.') {
+            Some((_, fraction)) => -(fraction.len() as i32),
+            None => {
+                let digits = text.trim_start_matches('-');
+                (digits.len() - digits.trim_end_matches('0').len()) as i32
+            }
+        }
+    }
+
+    #[test]
+    fn scan_matches_string_formulation() {
+        let mut cases = vec![
+            0.0, -0.0, 1.0, -1.0, 100.0, -100.0, 1e23, 1e-23, 0.5, -0.125, 3.14161, 1234.5678,
+            f64::MIN_POSITIVE, f64::MAX, f64::MIN, 1e-300, 9.007_199_254_740_991e15,
+        ];
+        // A cheap deterministic spread of bit patterns.
+        let mut bits: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            bits = bits.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let candidate = f64::from_bits(bits);
+            if candidate.is_finite() {
+                cases.push(candidate);
+            }
+            cases.push((bits % 1_000_000) as f64 / 10f64.powi((bits % 7) as i32));
+        }
+
+        for value in cases {
+            assert_eq!(
+                last_digit_exponent_from_repr(value),
+                exponent_via_string(value),
+                "mismatch for {value}"
+            );
         }
     }
 }
