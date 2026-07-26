@@ -13,7 +13,7 @@ use rand_distr::{Distribution, Exp, Normal, Poisson, Uniform};
 
 /// Decimal places kept by the `*_quantized` workloads. Two decimals is the
 /// precision most collection agents report at, and it clears the low mantissa
-/// bits that the XOR family and Pco would otherwise have to carry.
+/// bits that the XOR family would otherwise have to carry.
 pub const QUANTIZED_DECIMALS: u8 = 2;
 
 /// Spacing model applied to generated timestamps.

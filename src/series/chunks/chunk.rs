@@ -29,10 +29,9 @@ pub enum ChunkEncoding {
     #[default]
     Gorilla = 2,
     TsXor = 3,
-    Pco = 4,
-    Xor2 = 5,
-    DeXor = 6,
-    Chimp = 7,
+    Xor2 = 4,
+    DeXor = 5,
+    Chimp = 6,
 }
 
 impl ChunkEncoding {
@@ -42,7 +41,6 @@ impl ChunkEncoding {
             ChunkEncoding::Gorilla => "gorilla",
             ChunkEncoding::TsXor => "tsxor",
             ChunkEncoding::Xor2 => "xor2",
-            ChunkEncoding::Pco => "pco",
             ChunkEncoding::DeXor => "dexor",
             ChunkEncoding::Chimp => "chimp",
         }
@@ -66,10 +64,9 @@ impl TryFrom<u8> for ChunkEncoding {
             1 => Ok(ChunkEncoding::Uncompressed),
             2 => Ok(ChunkEncoding::Gorilla),
             3 => Ok(ChunkEncoding::TsXor),
-            4 => Ok(ChunkEncoding::Pco),
-            5 => Ok(ChunkEncoding::Xor2),
-            6 => Ok(ChunkEncoding::DeXor),
-            7 => Ok(ChunkEncoding::Chimp),
+            4 => Ok(ChunkEncoding::Xor2),
+            5 => Ok(ChunkEncoding::DeXor),
+            6 => Ok(ChunkEncoding::Chimp),
             _ => Err(ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING)),
         }
     }
@@ -100,7 +97,6 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
         "gorilla" => ChunkEncoding::Gorilla,
         "tsxor" => ChunkEncoding::TsXor,
         "xor2" => ChunkEncoding::Xor2,
-        "pco" => ChunkEncoding::Pco,
         "dexor" => ChunkEncoding::DeXor,
         "chimp" => ChunkEncoding::Chimp,
     }
@@ -225,7 +221,6 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::TsXor,
-            ChunkEncoding::Pco,
             ChunkEncoding::Xor2,
             ChunkEncoding::DeXor,
             ChunkEncoding::Chimp,

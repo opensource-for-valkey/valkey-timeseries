@@ -1377,7 +1377,6 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::TsXor,
-            ChunkEncoding::Pco,
             ChunkEncoding::Xor2,
             ChunkEncoding::DeXor,
             ChunkEncoding::Chimp,

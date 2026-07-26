@@ -21,43 +21,24 @@ pub fn chunk_size_id(chunk_size: usize) -> &'static str {
 /// Fill a chunk from `data`, stopping once it reports full.
 pub fn build_chunk(encoding: ChunkEncoding, chunk_size: usize, data: &[Sample]) -> TimeSeriesChunk {
     let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
-    if matches!(encoding, ChunkEncoding::Pco) {
-        // PcoChunk::add_sample decompresses+recompresses on every call (O(n²)
-        // allocations).  For constant/repeating workloads PCO compresses so well
-        // that is_full() never triggers, causing OOM on large datasets.
-        // set_data is bulk O(n) and avoids this.
-        chunk.set_data(data).expect("set_data should succeed");
-    } else {
-        for sample in data {
-            if chunk.is_full() {
-                break;
-            }
-            chunk
-                .add_sample(sample)
-                .expect("sample should append to benchmark chunk");
+    for sample in data {
+        if chunk.is_full() {
+            break;
         }
+        chunk
+            .add_sample(sample)
+            .expect("sample should append to benchmark chunk");
     }
     chunk
 }
 
-/// As [`build_chunk`], but also reports how many samples were consumed, and
-/// never exceeds `chunk_size` for PCO.
+/// As [`build_chunk`], but also reports how many samples were consumed.
 pub fn build_chunk_until_full(
     encoding: ChunkEncoding,
     chunk_size: usize,
     data: &[Sample],
 ) -> (TimeSeriesChunk, usize) {
     let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
-    if matches!(encoding, ChunkEncoding::Pco) {
-        // See build_chunk: appending one sample at a time into a PCO chunk is
-        // O(n²); find the fitting prefix and bulk-load it instead.
-        let count = filled_prefix_len(data, encoding, chunk_size);
-        chunk
-            .set_data(&data[..count])
-            .expect("set_data should succeed");
-        return (chunk, count);
-    }
-
     let mut count = 0;
     for sample in data {
         if chunk.is_full() {
@@ -79,26 +60,6 @@ pub fn filled_prefix(data: &[Sample], encoding: ChunkEncoding, chunk_size: usize
 /// Length of the longest prefix of `data` that fits in a chunk of `chunk_size`
 /// bytes.
 pub fn filled_prefix_len(data: &[Sample], encoding: ChunkEncoding, chunk_size: usize) -> usize {
-    if matches!(encoding, ChunkEncoding::Pco) {
-        // PcoChunk::add_sample is O(n²); use binary search + set_data
-        // to find the largest prefix that fits within chunk_size.
-        let mut lo = 0;
-        let mut hi = data.len();
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
-            chunk
-                .set_data(&data[..mid])
-                .expect("set_data should succeed");
-            if chunk.is_full() {
-                hi = mid - 1;
-            } else {
-                lo = mid;
-            }
-        }
-        return lo;
-    }
-
     let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
     let mut count = 0;
     for sample in data {
@@ -116,7 +77,7 @@ pub fn filled_prefix_len(data: &[Sample], encoding: ChunkEncoding, chunk_size: u
 /// The number of bytes a chunk has actually written, for compression reporting.
 ///
 /// [`ChunkOps::size`] is not comparable across encodings: gorilla, tsxor, dexor
-/// and pco return a `get_size()` heap footprint, which counts buffer *capacity*
+/// and chimp return a `get_size()` heap footprint, which counts buffer *capacity*
 /// and therefore jumps to the next power of two as the buffer grows, while xor2
 /// and uncompressed return the bytes in use. A ratio built on `size()` compares
 /// allocator slack rather than compression — at a 64 KiB budget gorilla reports
@@ -132,7 +93,6 @@ pub fn encoded_size(chunk: &TimeSeriesChunk) -> usize {
         TimeSeriesChunk::TsXor(c) => c.buf().len(),
         // `stream.len()` — already exact.
         TimeSeriesChunk::Xor(c) => c.size(),
-        TimeSeriesChunk::Pco(c) => c.timestamps.len() + c.values.len(),
         TimeSeriesChunk::DeXor(c) => c.encoder.buf().len(),
         TimeSeriesChunk::Chimp(c) => c.encoder.bytes().len(),
     }

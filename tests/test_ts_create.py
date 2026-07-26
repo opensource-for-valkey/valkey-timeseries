@@ -69,7 +69,7 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
             # COMPRESSED maps to the default compressed encoding (currently gorilla)
             ("COMPRESSED", "gorilla", "compressed"),
             ("GORILLA", "gorilla", "compressed"),
-            ("PCO", "pco", "compressed"),
+            ("CHIMP", "chimp", "compressed"),
             ("tsxor", "tsxor", "compressed"),
             ("xor2", "xor2", "compressed"),
             ("dexor", "dexor", "compressed"),

@@ -19,13 +19,12 @@ const SCAN_WORKLOADS: &[ValueWorkload] = &[
     ValueWorkload::Bursty,
 ];
 
-fn encodings() -> [ChunkEncoding; 5] {
+fn encodings() -> [ChunkEncoding; 4] {
     [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
         ChunkEncoding::TsXor,
         ChunkEncoding::Xor2,
-        ChunkEncoding::Pco,
     ]
 }
 

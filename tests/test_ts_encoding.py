@@ -51,7 +51,7 @@ class TestTsEncodingIntegration(ValkeyTimeSeriesTestCaseBase):
             ("UNCOMPRESSED", "uncompressed", "uncompressed"),
             ("COMPRESSED", "gorilla", "compressed"),
             ("GORILLA", "gorilla", "compressed"),
-            ("PCO", "pco", "compressed"),
+            ("CHIMP", "chimp", "compressed"),
             ("XOR2", "xor2", "compressed"),
             ("TSXOR", "tsxor", "compressed"),
             ("DEXOR", "dexor", "compressed"),

@@ -348,10 +348,10 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
         )
         assert post_info['chunkType'] == 'compressed'
 
-    def test_save_restore_pco_encoding(self):
-        """RDB round-trip preserves data and encoding for PCO chunks."""
+    def test_save_restore_chimp_encoding(self):
+        """RDB round-trip preserves data and encoding for CHIMP chunks."""
         client = self.server.get_new_client()
-        self._roundtrip_encoding(client, 'PCO', 'pco', 'compressed')
+        self._roundtrip_encoding(client, 'CHIMP', 'chimp', 'compressed')
 
     def test_save_restore_tsxor_encoding(self):
         """RDB round-trip preserves data and encoding for TSXOR chunks."""
@@ -378,7 +378,7 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
         encoding_cases = [
             ('UNCOMPRESSED', 'uncompressed', 'uncompressed'),
             ('GORILLA',      'gorilla',      'compressed'),
-            ('PCO',          'pco',          'compressed'),
+            ('CHIMP',        'chimp',        'compressed'),
             ('TSXOR',        'tsxor',        'compressed'),
             ('XOR2',         'xor2',         'compressed'),
             ('DEXOR',        'dexor',        'compressed'),

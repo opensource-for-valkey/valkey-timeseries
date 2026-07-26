@@ -40,8 +40,8 @@ High-level architecture (big picture)
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
 - Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
   `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
-  - `src/series/chunks/` implements six encoding formats: **Gorilla** (default), **PCO**, **TsXOR**, **Uncompressed**,
-    **XOR2**, **DeXOR**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
+  - `src/series/chunks/` implements six encoding formats: **Gorilla** (default), **TsXOR**, **Uncompressed**,
+    **XOR2**, **DeXOR**, **Chimp** (ELF-on-Chimp). The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
   - ACL filtering per series: `src/series/acl.rs`.
 - Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use protobuf (
   `src/commands/fanout.*.proto`) and explicit fanout registration (`register_fanout_operations`) to implement
@@ -133,19 +133,14 @@ Benchmarks
   are comparable across runs, machines, and commits. The matrix is defined in `src/tests/generators/dataset.rs`
   (`benchmark_dataset_keys`, `DatasetKey`, `DATASET_SAMPLES`, `dataset_seed`); chunk sizes are 1k / 4k
   (`DEFAULT_CHUNK_SIZE_BYTES`) / 64k.
-- PCO gotcha: `PcoChunk::add_sample` decompresses and recompresses the whole chunk on every call (O(n²) allocations), and
-  well-compressing workloads never trip `is_full()`. Use `set_data` for bulk loads; `build_chunk`, `filled_prefix` and
-  `build_chunk_until_full` in `src/tests/chunk_utils.rs` already special-case this.
-- Known breakage: `--bench encode` is OOM-killed (SIGKILL) at `encode_append/pco/constant/...`, because
-  `bench_encode_append` calls `add_sample` per sample for every encoding including PCO — the hazard above. `decode` and
-  `query_scan` all pass `-- --test`.
+- `encode`, `decode` and `query_scan` all pass `-- --test`.
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
   `target/bench-reports/compression.csv` and `.md` (168 rows: encoding × workload × timestamp model × chunk size —
-  28 rows for each of the 6 encodings listed in `encodings()`, which currently omits PCO).
+  28 rows for each of the 6 encodings listed in `encodings()`).
   The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
-  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and pco report a `get_size()`
+  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, tsxor, dexor and chimp report a `get_size()`
   heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio
   built on it compares allocator slack instead of compression. The separate `size` column is the full heap footprint,
   including unused capacity.

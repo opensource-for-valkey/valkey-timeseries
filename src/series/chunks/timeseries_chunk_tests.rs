@@ -20,12 +20,11 @@ mod tests {
         (f1 - f2).abs() < f64::EPSILON
     }
 
-    const CHUNK_TYPES: [ChunkEncoding; 7] = [
+    const CHUNK_TYPES: [ChunkEncoding; 6] = [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
         ChunkEncoding::Xor2,
         ChunkEncoding::TsXor,
-        ChunkEncoding::Pco,
         ChunkEncoding::DeXor,
         ChunkEncoding::Chimp,
     ];
@@ -2478,7 +2477,7 @@ mod tests {
         for encoding in [
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
-            ChunkEncoding::Pco,
+            ChunkEncoding::Chimp,
             ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);
@@ -2562,7 +2561,7 @@ mod tests {
         for encoding in [
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
-            ChunkEncoding::Pco,
+            ChunkEncoding::Chimp,
             ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);

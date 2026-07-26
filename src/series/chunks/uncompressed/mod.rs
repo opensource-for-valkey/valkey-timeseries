@@ -16,7 +16,6 @@ use valkey_module::{RedisModuleIO, ValkeyResult, raw};
 pub const MAX_UNCOMPRESSED_SAMPLES: usize = 256;
 const FLAG_SERIALIZE_UNCOMPRESSED: u8 = 0b00000001;
 const FLAG_SERIALIZE_GORILLA: u8 = 0b00000010;
-const FLAG_SERIALIZE_PCO: u8 = 0b00000100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UncompressedChunk {

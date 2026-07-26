@@ -3,7 +3,8 @@ mod elf64;
 mod dexor;
 mod gorilla;
 mod merge;
-mod pco;
+#[cfg(test)]
+mod encoding_latency_tests;
 #[cfg(test)]
 mod proptest_roundtrip;
 mod serialization;
@@ -17,15 +18,12 @@ pub(crate) mod utils;
 mod xor2;
 mod chimp;
 
-pub(crate) use tsxor::*;
-pub(in crate::series::chunks) use elf64::*;
-
+pub use tsxor::*;
 pub use chimp::*;
 pub use chunk::*;
 pub use dexor::*;
 pub use gorilla::*;
 pub use merge::*;
-pub use pco::*;
 // pub use serialization::*;
 pub use timeseries_chunk::*;
 pub use uncompressed::*;

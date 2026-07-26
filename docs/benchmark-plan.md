@@ -2,7 +2,7 @@
 
 **Status:** Plan only — not yet implemented.
 **Goal:** Characterize the relative strengths and weaknesses of each chunk encoding
-(`Uncompressed`, `Gorilla`, `TsXor`, `Xor2`, `Pco`) across realistic data
+(`Uncompressed`, `Gorilla`, `TsXor`, `Xor2`, `DeXor`, `Chimp`) across realistic data
 distributions, and establish repeatable baselines so compression-ratio and latency
 regressions are caught before merge.
 
@@ -20,7 +20,7 @@ regressions are caught before merge.
 
 ## 2. System under test
 
-All five encodings are exercised through the public enum
+All six encodings are exercised through the public enum
 `TimeSeriesChunk` (`src/series/chunks/timeseries_chunk.rs`), constructed with
 `TimeSeriesChunk::new(encoding, chunk_size)`. This is deliberate:
 
@@ -32,9 +32,8 @@ All five encodings are exercised through the public enum
 Relevant per-chunk API already available: `set_data(&[Sample])`, `add_sample`,
 `iter()`, `range_iter(start, end)`, `get_range(start, end)`, `len()`, `size()`,
 `data_size()` (per encoding), `bytes_per_sample()`, `memory_usage()` /
-`get_size()` (via `GetSize` derive). `PcoChunk` additionally exposes
-`timestamp_compression_ratio()` / `value_compression_ratio()` — worth reporting
-separately for Pco since it compresses the two streams independently.
+`get_size()` (via `GetSize` derive). Every encoding interleaves timestamps and
+values in a single stream, so one ratio per chunk is the whole story.
 
 **Out of scope:** `save_rdb`/`load_rdb` (requires a live module context),
 cross-chunk series operations, and the label index. `serialize`/`deserialize`
@@ -54,10 +53,10 @@ reproducible and baselines comparable across machines and commits.
 
 | ID | Workload | Generator spec | What it stresses |
 |---|---|---|---|
-| `constant` | Constant values | `v = 42.0` for all samples; variant `constant_int` with `v = 1000.0` (integer-valued float) | Best case for XOR family (all-zero XOR); Pco run-length modes |
-| `drift` | Slowly drifting | Random walk: `v += N(0, 0.01)`, start 100.0; bounded to ±5% of start | Small-mantissa XOR deltas; Pco delta encoding |
+| `constant` | Constant values | `v = 42.0` for all samples; variant `constant_int` with `v = 1000.0` (integer-valued float) | Best case for XOR family (all-zero XOR) |
+| `drift` | Slowly drifting | Random walk: `v += N(0, 0.01)`, start 100.0; bounded to ±5% of start | Small-mantissa XOR deltas; decimal-space deltas for DeXor |
 | `periodic` | Periodic data | `v = A·sin(2πt/P) + N(0, A/100)`, A=50, P=1h of samples; plus a sawtooth variant | Predictable but continuously-changing values; neither constant nor random |
-| `noisy` | High-cardinality noisy telemetry | `v = N(100, 25)` full-precision f64, effectively unique values | Worst case for XOR trailing/leading-zero tricks; Pco quantization |
+| `noisy` | High-cardinality noisy telemetry | `v = N(100, 25)` full-precision f64, effectively unique values | Worst case for XOR trailing/leading-zero tricks |
 | `bursty` | Bursty / change-heavy | Regime-switching: long quiet segments (constant or slow drift, ~80% of samples) interrupted by bursts (200–500 samples of `N(µ·10, σ·20)`), regime switches from seeded RNG | Adaptive behavior; encoders that amortize over a whole chunk vs. per-sample |
 
 Two supplementary distributions (cheap to add, high diagnostic value):
@@ -65,7 +64,7 @@ Two supplementary distributions (cheap to add, high diagnostic value):
 | ID | Workload | Why |
 |---|---|---|
 | `counter` | Monotonic counter with occasional resets (`v += Poisson(λ=10)`, reset to 0 every ~50k) | The single most common Prometheus-style shape; integer deltas |
-| `discrete` | Values from a small set (e.g., 0.0/1.0 gauge, or {0, 0.25, 0.5, 1.0}) | Low-entropy non-constant; distinguishes dictionary-ish wins (Pco) from XOR wins |
+| `discrete` | Values from a small set (e.g., 0.0/1.0 gauge, or {0, 0.25, 0.5, 1.0}) | Low-entropy non-constant; distinguishes dictionary-ish wins (TsXor's value window) from XOR wins |
 
 #### Decimal-quantized variants
 
@@ -87,8 +86,8 @@ their values are already exact at this precision.
 
 ### 3.2 Timestamp models
 
-Timestamp compression is half the story (Gorilla delta-of-delta, Pco separate
-timestamp stream). Cross the value distributions with:
+Timestamp compression is half the story (every encoding uses some flavour of
+delta-of-delta). Cross the value distributions with:
 
 | ID | Model |
 |---|---|
@@ -167,7 +166,7 @@ renames as breaking):
 ```
 <group>/<encoding>/<workload>[/<ts_model>][/<chunk_size>]
 e.g.  encode_bulk/gorilla/drift/ts_regular/4k
-      scan/pco/noisy/mid_10pct/64k
+      scan/dexor/noisy/mid_10pct/64k
 ```
 
 ## 5. Compression ratio measurement
@@ -180,8 +179,7 @@ buries the numbers in timing reports. Instead:
   (encoding × workload × ts-model × chunk size):
   1. fills a chunk via `set_data` until full,
   2. records `len()`, `data_size()`, `size()`, `bytes_per_sample()`,
-     ratio = `len()*16 / data_size()`, and for Pco the split
-     timestamp/value ratios,
+     ratio = `len()*16 / data_size()`,
   3. emits both a human-readable Markdown table and a machine-readable
      CSV/JSON at `target/bench-reports/compression.{md,csv}`.
 - **Regression gate:** check in a golden file
@@ -209,13 +207,13 @@ samples/sec:
   `BatchSize::SmallInput`. This is the compaction/merge path.
 - **Streaming (`encode_append`)**: setup creates empty chunk; routine loops
   `add_sample(&s)` over the slice until full or slice exhausted. This is the hot
-  `TS.ADD` path. For encoders that buffer-and-recompress (Pco recompresses on
-  append), expect and document a large gap between the two shapes — that gap is
-  itself a key finding.
+  `TS.ADD` path. For any encoder that buffers and recompresses on append,
+  expect and document a large gap between the two shapes — that gap is itself a
+  key finding.
 
-Matrix: 5 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
+Matrix: 6 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
 cross for `drift`/`noisy`, plus chunk-size sweep (1 KiB/4 KiB/64 KiB) for
-`drift` and `noisy` only. ≈ 5 × (7 + 4 + 4) × 2 shapes ≈ 150 benchmark points —
+`drift` and `noisy` only. ≈ 6 × (7 + 4 + 4) × 2 shapes ≈ 180 benchmark points —
 acceptable at criterion defaults (~each point 5s warmup + 5s measure ⇒ budget
 ~25 min; trim with `--sample-size`/`measurement_time` config in a shared
 `criterion_config()` helper, and provide `--quick` guidance in the README).
@@ -243,14 +241,14 @@ Setup: fill one 4 KiB and one 64 KiB chunk per (encoding × workload). Measure
 |---|---|
 | `full` | `[first_ts, last_ts]` |
 | `head_10pct` | first 10% of the time span |
-| `mid_10pct` | 10% window centered mid-chunk — stresses seek-to-offset; XOR-family must decode from the start, Pco may decompress whole pages |
+| `mid_10pct` | 10% window centered mid-chunk — stresses seek-to-offset; every encoding must decode from the start of the chunk |
 | `tail_10pct` | last 10% — common "recent data" dashboard query |
 | `point` | single-timestamp hit mid-chunk `[ts, ts]` |
 | `miss` | range before `first_timestamp` (early-out path) |
 
 Workloads here can be trimmed to the shape-relevant set: `constant`, `drift`,
-`noisy`, `bursty` (periodic/counter add little for scan behavior). ≈ 5 × 4 × 6 ×
-2 sizes = 240 points; use reduced `measurement_time` (2 s) since per-iteration
+`noisy`, `bursty` (periodic/counter add little for scan behavior). ≈ 6 × 4 × 6 ×
+2 sizes = 288 points; use reduced `measurement_time` (2 s) since per-iteration
 cost is tiny.
 
 Additionally one **filtered scan** case per encoding (`drift` workload only)
@@ -303,9 +301,9 @@ After the first full run, produce `docs/chunk-encoding-comparison.md`:
 
 - The §5 compression table and §6 throughput/latency tables.
 - A **decision matrix**: rows = workload shapes, columns = encodings, cells =
-  recommend / acceptable / avoid, with one-line justification (e.g. "Pco:
-  best ratio on noisy telemetry but recompress-on-append makes it wrong for
-  hot `TS.ADD` series; use for cold/compacted chunks").
+  recommend / acceptable / avoid, with one-line justification (e.g. "Chimp:
+  best ratio on decimal-quantized data and irregular timestamps, but loses to
+  gorilla on constant series").
 - Explicit callouts of asymmetries the single-number view hides:
   bulk-vs-streaming encode gap, mid-range seek cost, alloc count per append.
 - This document is the artifact that answers "which encoding should be the
@@ -331,9 +329,6 @@ separate PRs.
 
 - **Allocator linkage (§4)** — the one thing that can invalidate the whole
   approach; resolve in phase 0 before writing any benchmark code.
-- **Pco append semantics** — if `add_sample` recompresses the whole chunk,
-  `encode_append` for Pco at 64 KiB may be quadratic and blow the time budget;
-  cap append benches at 4 KiB chunks for Pco or lower `sample_size`.
 - **Dataset realism** — synthetic generators are proxies. If real telemetry
   extracts exist in `test-data/`, add a `replay` workload in a later phase; do
   not block the initial suite on it.

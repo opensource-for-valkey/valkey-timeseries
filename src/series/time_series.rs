@@ -45,7 +45,7 @@ pub struct TimeSeries {
     pub retention: Duration,
     /// Policy for handling duplicate samples
     pub sample_duplicates: SampleDuplicatePolicy,
-    /// The chunk encoding algorithm used (Uncompressed, Gorilla, xor2, tsxor, dexor, or Pco)
+    /// The chunk encoding algorithm used (Uncompressed, Gorilla, xor2, tsxor, dexor, or chimp)
     pub chunk_encoding: ChunkEncoding,
     /// Optional strategy for rounding values (either by significant or decimal digits)
     pub rounding: Option<RoundingStrategy>,

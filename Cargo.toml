@@ -29,7 +29,6 @@ num-traits = "0.2"
 joinkit = "0.2.0"
 krcf = "0.4"
 papaya = "0.2"
-pco = "1.0"
 prost = "0.14"
 rand = { version = "0.10" }
 rand_distr = "0.6"
