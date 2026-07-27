@@ -371,9 +371,9 @@ pub fn is_debug_mode_enabled() -> bool {
     IS_DEBUG_MODE.load(Ordering::Relaxed)
 }
 
-/// Runtime toggle for shard-side aggregation push-down in MRANGE fanout
-/// (`ts-fanout-aggregation-pushdown`, default on). Consulted by the
-/// coordinator only; shards obey the request flag.
+/// Runtime toggle for shard-side aggregation push-down in MRANGE fanout and in
+/// PromQL aggregation fanout (`ts-fanout-aggregation-pushdown`, default on).
+/// Consulted by the coordinator only; shards obey the request flag.
 ///
 /// This is NOT a mixed-version safety mechanism — the fanout compatibility
 /// handshake (self-describing responses + envelope feature gate, see

@@ -1,4 +1,4 @@
-use super::aggregations::eval_aggregation;
+use super::aggregations::{AggregationKind, apply_aggregation, eval_aggregation};
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
@@ -6,18 +6,23 @@ use crate::labels::Labels;
 use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
+use crate::promql::engine::query_reader::{
+    AggregationOutcome, AggregationParam, AggregationRequest,
+};
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
 };
-use crate::promql::exec::types::SeriesMap;
+use crate::promql::exec::types::{EvalLabels, SeriesMap};
 use crate::promql::exec::utils::{collect_vector_selectors, merge_step_into_series_map};
 use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
 use crate::promql::hashers::PreloadKey;
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
-use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, PreloadMap};
+use crate::promql::{
+    EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, InstantSample, PreloadMap,
+};
 use ahash::AHashSet;
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
@@ -29,6 +34,7 @@ use promql_parser::parser::{
     VectorSelector,
 };
 use std::sync::RwLock;
+use std::time::Duration;
 
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: &'reader R,
@@ -711,6 +717,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
+        // First ask the data source to evaluate the whole aggregation where the
+        // data lives (see `QueryReader::query_aggregation`): across a cluster
+        // that turns the input vector into one value per group per shard.
+        if let Some(result) =
+            self.evaluate_pushed_down_aggregate(aggregate, ctx, preload_eligible)?
+        {
+            return Ok(result);
+        }
+
         // Evaluate the inner expression to get all samples
         let result = self.evaluate_expr(&aggregate.expr, ctx, preload_eligible)?;
 
@@ -747,6 +762,118 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         eval_aggregation(aggregate, samples, param, timestamp_ms)
     }
+
+    /// Try to have the data source evaluate `aggregate` itself.
+    ///
+    /// Returns `None` when the aggregation stays here, which is the case unless
+    /// all of the following hold:
+    ///
+    /// * the operator has a decomposable form (everything but `quantile`);
+    /// * the operand is a bare vector selector — anything else has to be
+    ///   evaluated before the aggregation can see it;
+    /// * the selector was not preloaded, i.e. this is not a step of a range
+    ///   query whose samples were already fetched in one go;
+    /// * the operator parameter is a literal that can be shipped;
+    /// * and the source says it can do it (only a cluster can).
+    fn evaluate_pushed_down_aggregate(
+        &self,
+        aggregate: &AggregateExpr,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<Option<ExprResult>> {
+        let kind = AggregationKind::try_from(aggregate.op)?;
+        if kind.pushdown_strategy().is_none() {
+            return Ok(None);
+        }
+
+        let Expr::VectorSelector(selector) = strip_parens(&aggregate.expr) else {
+            return Ok(None);
+        };
+
+        if preload_eligible && self.is_preloaded(selector) {
+            return Ok(None);
+        }
+
+        let param = match &aggregate.param {
+            None => None,
+            Some(expr) => match self.evaluate_expr(expr, ctx, preload_eligible)? {
+                ExprResult::Scalar(value) => Some(AggregationParam::Scalar(value)),
+                ExprResult::String(label) => Some(AggregationParam::Label(label)),
+                _ => return Ok(None),
+            },
+        };
+
+        let request = AggregationRequest {
+            kind,
+            modifier: aggregate.modifier.clone(),
+            param,
+            // The output carries the query's evaluation timestamp even when the
+            // input is selected at a shifted one.
+            eval_timestamp: ctx.evaluation_ts,
+        };
+
+        // Selection timestamp and lookback, resolved exactly as
+        // `evaluate_vector_selector` resolves them for the same selector.
+        let adjusted_eval_ts = apply_time_modifiers_ms(
+            selector.at.as_ref(),
+            selector.offset.as_ref(),
+            ctx.query_start,
+            ctx.query_end,
+            ctx.evaluation_ts,
+        );
+        let mut options = self.options;
+        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+
+        let outcome =
+            self.reader
+                .query_aggregation(selector, adjusted_eval_ts, &request, options)?;
+
+        let samples = match outcome {
+            AggregationOutcome::Unsupported => return Ok(None),
+            AggregationOutcome::Aggregated(samples) => to_eval_samples(samples),
+            AggregationOutcome::Raw(samples) => {
+                // The source selected but did not aggregate; finish the job.
+                apply_aggregation(
+                    kind,
+                    request.modifier.as_ref(),
+                    request.param.as_ref().map(AggregationParam::to_expr_result),
+                    to_eval_samples(samples),
+                    ctx.evaluation_ts,
+                )?
+            }
+        };
+
+        Ok(Some(ExprResult::InstantVector(samples)))
+    }
+
+    /// Whether this selector's samples were already fetched by
+    /// [`Self::preload_for_range`].
+    fn is_preloaded(&self, selector: &VectorSelector) -> bool {
+        let key = PreloadKey::from_selector(selector);
+        self.preloaded_instant.read().unwrap().contains_key(&key)
+    }
+}
+
+/// Look through parentheses: `sum((metric))` aggregates a selector just as
+/// `sum(metric)` does.
+fn strip_parens(expr: &Expr) -> &Expr {
+    let mut current = expr;
+    while let Expr::Paren(paren) = current {
+        current = &paren.expr;
+    }
+    current
+}
+
+fn to_eval_samples(samples: Vec<InstantSample>) -> Vec<EvalSample> {
+    samples
+        .into_iter()
+        .map(|s| EvalSample {
+            timestamp_ms: s.timestamp_ms,
+            value: s.value,
+            labels: EvalLabels::from(s.labels),
+            drop_name: false,
+        })
+        .collect()
 }
 
 fn get_function_arg(call: &Call, idx: usize) -> EvalResult<(&Expr, ValueType)> {

@@ -16,10 +16,14 @@ mod tests {
     use crate::commands::parse_metric_name;
     use crate::common::time::system_time_to_millis;
     use crate::labels::{Label, Labels};
+    use crate::promql::engine::query_reader::{
+        AggregationOutcome, AggregationParam, AggregationRequest,
+    };
     use crate::promql::engine::test_utils::{
         MemorySeriesQuerier, MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder,
     };
     use crate::promql::engine::{QueryOptions, QueryReader};
+    use crate::promql::exec::aggregations::AggregationKind;
     use crate::tests::approx_eq;
     use promql_parser::parser::token::{T_SUB, TokenType};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3690,5 +3694,177 @@ mod tests {
                 (60.0, vec![("env", "prod"), ("instance", "i3")]),
             ],
         );
+    }
+
+    // ── Aggregation push-down hook ─────────────────────────────────────────
+    // `evaluate_pushed_down_aggregate` offers each aggregation to the data
+    // source before evaluating it here. These tests pin down which
+    // aggregations are offered, what the source is told, and that its answer
+    // is used verbatim.
+
+    /// What the source was told about one offered aggregation: the operator,
+    /// its parameter, the timestamp the input is selected at, and the timestamp
+    /// the output is stamped with.
+    type OfferedAggregation = (AggregationKind, Option<AggregationParam>, i64, i64);
+
+    /// A reader that reports every aggregation it is offered as already
+    /// evaluated, answering with a single sentinel sample. Records what it was
+    /// asked so the request itself can be asserted on.
+    struct PushdownReader {
+        inner: MemorySeriesQuerier,
+        offered: std::sync::Mutex<Vec<OfferedAggregation>>,
+    }
+
+    impl PushdownReader {
+        const SENTINEL: f64 = -12345.0;
+
+        fn new(inner: MemorySeriesQuerier) -> Self {
+            Self {
+                inner,
+                offered: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn offered(&self) -> Vec<OfferedAggregation> {
+            self.offered.lock().unwrap().clone()
+        }
+    }
+
+    impl QueryReader for PushdownReader {
+        fn query(
+            &self,
+            selector: &VectorSelector,
+            timestamp: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+            self.inner.query(selector, timestamp, options)
+        }
+
+        fn query_range(
+            &self,
+            selector: &VectorSelector,
+            start_ms: i64,
+            end_ms: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+            self.inner.query_range(selector, start_ms, end_ms, options)
+        }
+
+        fn query_aggregation(
+            &self,
+            _selector: &VectorSelector,
+            timestamp: i64,
+            aggregation: &AggregationRequest,
+            _options: QueryOptions,
+        ) -> crate::promql::PromqlResult<AggregationOutcome> {
+            self.offered.lock().unwrap().push((
+                aggregation.kind,
+                aggregation.param.clone(),
+                timestamp,
+                aggregation.eval_timestamp,
+            ));
+            Ok(AggregationOutcome::Aggregated(vec![
+                crate::promql::InstantSample {
+                    labels: Labels::from_pairs(&[("pushed", "down")]),
+                    timestamp_ms: aggregation.eval_timestamp,
+                    value: Self::SENTINEL,
+                },
+            ]))
+        }
+    }
+
+    fn pushdown_reader() -> (PushdownReader, SystemTime) {
+        let (inner, end_time) = setup_mock_reader(vec![
+            ("metric", vec![("job", "a")], 0, 1.0),
+            ("metric", vec![("job", "b")], 0, 2.0),
+        ]);
+        (PushdownReader::new(inner), end_time)
+    }
+
+    fn evaluate_with_pushdown(query: &str) -> (Vec<EvalSample>, Vec<OfferedAggregation>) {
+        let (reader, end_time) = pushdown_reader();
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+        let result = parse_and_evaluate(&evaluator, query, end_time, Duration::from_secs(300))
+            .expect("query should evaluate");
+        (result, reader.offered())
+    }
+
+    /// A decomposable aggregation over a bare selector is handed to the source,
+    /// and its answer is the result — the evaluator does not re-aggregate.
+    #[test]
+    fn should_use_source_evaluated_aggregation() {
+        for query in [
+            "sum by (job) (metric)",
+            "sum(metric)",
+            "avg without (job) (metric)",
+            "stddev(metric)",
+            "topk(1, metric)",
+            "count_values(\"v\", metric)",
+            // Parentheses around the operand do not change what is aggregated.
+            "sum((metric))",
+        ] {
+            let (result, offered) = evaluate_with_pushdown(query);
+            assert_eq!(offered.len(), 1, "{query}: offered once");
+            assert_eq!(result.len(), 1, "{query}: source answer used verbatim");
+            assert_eq!(result[0].value, PushdownReader::SENTINEL, "{query}");
+        }
+    }
+
+    /// The operator, its evaluated parameter, and both timestamps reach the
+    /// source. With an `offset`, the input is selected at the shifted
+    /// timestamp while the output is stamped at the evaluation timestamp.
+    #[test]
+    fn should_describe_the_aggregation_to_the_source() {
+        let (_, offered) = evaluate_with_pushdown("topk(3, metric)");
+        let (kind, param, select_ts, eval_ts) = offered[0].clone();
+        assert_eq!(kind, AggregationKind::Topk);
+        assert_eq!(param, Some(AggregationParam::Scalar(3.0)));
+        assert_eq!(select_ts, eval_ts, "no modifier: one timestamp");
+
+        let (_, offered) = evaluate_with_pushdown("count_values(\"le\", metric)");
+        let (kind, param, _, _) = offered[0].clone();
+        assert_eq!(kind, AggregationKind::CountValues);
+        assert_eq!(param, Some(AggregationParam::Label("le".to_string())));
+
+        let (_, offered) = evaluate_with_pushdown("sum(metric offset 30s)");
+        let (_, _, select_ts, eval_ts) = offered[0].clone();
+        assert_eq!(
+            select_ts,
+            eval_ts - 30_000,
+            "offset shifts selection, not the output stamp"
+        );
+    }
+
+    /// What is never offered: quantile (no decomposable form) and anything
+    /// whose operand is not a bare selector.
+    #[test]
+    fn should_not_push_down_ineligible_aggregations() {
+        for query in [
+            "quantile(0.5, metric)",
+            "sum(rate(metric[5m]))",
+            "sum(metric * 2)",
+            "sum(sum by (job) (metric))",
+        ] {
+            let (_, offered) = evaluate_with_pushdown(query);
+            assert!(
+                offered
+                    .iter()
+                    .all(|(kind, ..)| *kind != AggregationKind::Quantile),
+                "{query}: quantile must never be offered"
+            );
+            if query != "sum(sum by (job) (metric))" {
+                assert!(offered.is_empty(), "{query}: nothing to push down");
+            } else {
+                // The inner aggregation is a bare selector and is offered; the
+                // outer one aggregates its result and is not.
+                assert_eq!(offered.len(), 1, "{query}: only the inner aggregation");
+            }
+        }
     }
 }
