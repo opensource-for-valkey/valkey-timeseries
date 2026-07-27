@@ -169,6 +169,13 @@ depends on absence across the whole cluster, which no shard can observe), `predi
 the query's evaluation timestamp, which `@`/`offset` divorce from the window end a shard is told), and
 `double_exponential_smoothing` (two scalar parameters; the request carries one).
 
-The toggle defaults off pending cluster-level validation. Interaction with the aggregation toggle is none: they cover
-disjoint query shapes (an instant vector's aggregation vs a matrix selector's reduction), and each is consulted only
-by the coordinator evaluating that shape.
+A rollup directly under a reducing aggregation is fused into the same request: `sum by (job) (rate(m[5m]))` has the
+shard reduce each series' windows *and* accumulate them into per-`(group, step)` partials, so a job with a thousand
+pods ships one value per step rather than a thousand. The response carries a second handshake bit — a shard that
+predates fusion returns per-series values with `aggregated = false`, and the coordinator groups them itself. Only the
+reducing operators fuse; `topk` and `count_values` need the individual samples, so they keep the rollup push-down and
+select on the coordinator.
+
+The toggle still defaults off — it is new, and the conservative default costs only the optimization. Interaction with
+the aggregation toggle is none: they cover disjoint query shapes (an instant vector's aggregation vs a matrix
+selector's reduction), and each is consulted only by the coordinator evaluating that shape.

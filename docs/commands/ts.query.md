@@ -27,12 +27,21 @@ The PromQL query string to evaluate. This can include metric selectors, aggregat
 
 The evaluation timestamp for the instant query. Accepts:
 
-- Numeric timestamp in milliseconds
+- Numeric timestamp, unit detected from its magnitude: seconds, milliseconds,
+  microseconds or nanoseconds. Values below 2^32 are read as **seconds**, which
+  is what makes `TIME 1672531200` (the Prometheus HTTP API convention) and
+  `TIME 1672531200000` name the same instant.
+- Numeric timestamp with a decimal point or exponent — always **seconds**, with
+  the fraction kept (`1672531200.5`).
 - RFC3339 formatted date string
 - `*` for the current time (default)
 - `+` for the latest timestamp across all series
 - `-` for the earliest timestamp across all series
 - Duration spec (e.g., `-1h` for 1 hour ago)
+
+> **Note:** this differs from `START`/`END` on [TS.QUERYRANGE](ts.queryrange.md),
+> where a bare integer is *always* milliseconds. A value like `1672531200` means
+> 2023 here and 1970 there.
 
 </details>
 

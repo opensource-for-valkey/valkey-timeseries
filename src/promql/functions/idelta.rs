@@ -12,7 +12,10 @@ impl PromQLFunction for IDeltaFunction {
     }
 }
 
-/// `idelta` over one window: the difference across its first and last samples.
+/// `idelta` over one window: the difference between its **last two** samples,
+/// not across the whole window. `idelta` is the instant counterpart of `delta`
+/// — everything before the final pair is only there to establish that a pair
+/// exists.
 ///
 /// Named rather than inline so the pushed-down path reduces a window with the
 /// very same function the local path runs.
@@ -20,10 +23,10 @@ pub(in crate::promql) fn rollup_idelta(samples: &[Sample]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
-    let first = &samples[0];
+    let previous = &samples[samples.len() - 2];
     let last = &samples[samples.len() - 1];
-    if first.timestamp == last.timestamp {
+    if previous.timestamp == last.timestamp {
         return None;
     }
-    Some(last.value - first.value)
+    Some(last.value - previous.value)
 }

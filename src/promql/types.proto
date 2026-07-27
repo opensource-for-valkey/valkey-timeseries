@@ -273,6 +273,25 @@ message RollupQuery {
   /// Bound on the raw points examined per series, enforced shard-side. The
   /// coordinator separately bounds the rolled-up points it accepts back.
   uint64 max_points_per_series = 11;
+  /// An outer aggregation to fuse with the rollup: `sum by (job) (rate(m[5m]))`
+  /// asks the shard to group its rolled-up values as well as compute them, so
+  /// what crosses the wire is one partial per group per step rather than one
+  /// value per *series* per step. Absent when the rollup is not under a
+  /// decomposable aggregation.
+  ///
+  /// Only the reducing operators appear here; the selecting ones (topk and
+  /// friends) need the individual samples and are not fused.
+  optional AggregationKind agg_kind = 12;
+  optional AggregationGrouping agg_grouping = 13;
+}
+
+/// One `(group, step, shard)` partial for a fused rollup+aggregation: the
+/// group's label set as computed by the request's grouping modifier, the step it
+/// belongs to, and the shard's accumulated state for that pair.
+message RollupGroupPartial {
+  repeated Label labels = 1;
+  int64 step_ts = 2;
+  AggregationPartialState state = 3;
 }
 
 /// One series' rolled-up output: sparse `(window end, value)` pairs.
@@ -299,6 +318,18 @@ message RollupQueryResponse {
   /// false. Absent on a pre-handshake peer (proto3 decodes as false), which is
   /// exactly the right interpretation.
   bool applied = 3;
+  /// Set when `aggregated`: one mergeable partial per `(group, step)`.
+  repeated RollupGroupPartial partials = 4;
+  /// Second handshake bit, for the fused form: true when the shard applied the
+  /// outer aggregation as well as the rollup.
+  ///
+  /// It has to be separate from `applied`, because a shard that predates fusion
+  /// silently ignores the `agg_*` fields and answers `applied = true` with
+  /// per-series rollup values. Reading that as "aggregated" would drop the
+  /// grouping entirely; reading `aggregated == false` makes the coordinator
+  /// group those values itself, which is correct at the cost of the transfer
+  /// the fusion would have saved.
+  bool aggregated = 5;
 }
 
 message AggregationQueryResponse {

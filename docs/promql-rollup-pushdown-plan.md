@@ -1,9 +1,13 @@
 # PromQL Rollup Push-Down Plan (Revised)
 
-Status: PR 0 (semantics lock), PR 1 (protocol skeleton), PR 2 (range grid) and
-PR 3 (full function set) landed. Push-down is behind
-`ts-fanout-rollup-pushdown`, default off. Remaining: PR 4 (fusion with outer
-aggregation) and the cluster integration suite (§10.3).
+Status: PR 0 (semantics lock), PR 1 (protocol skeleton), PR 2 (range grid),
+PR 3 (full function set) and PR 4 (fusion with outer aggregation) landed, plus
+the cluster integration suite of §10.3. Push-down is behind
+`ts-fanout-rollup-pushdown`, default off.
+
+The feature work is complete and verified over a real 3-shard cluster. Flipping
+the default is now a judgement call about soak time rather than a matter of
+missing coverage.
 
 Goal: Push range-vector function evaluation to shards so cluster queries avoid
 step-by-step fanout and avoid shipping overlapping raw windows.
@@ -402,9 +406,51 @@ checks `func.experimental`, but `preload_rollups` runs before the step loop and
 bypassed it — the query would still have errored, after a wasted fan-out. §6.C's
 "shards execute only when coordinator-approved" now holds.
 
-### PR 4
+### PR 4 — DONE
 
-Phase-2 fusion with outer aggregation.
+Fusion with the outer aggregation: `sum by (job) (rate(m[5m]))` is one request.
+The shard reduces each series' windows, accumulates the results into partials
+keyed by `(group, step)`, and ships those; the coordinator merges per
+`(group, step)` and finalizes. A job with a thousand pods ships one value per
+step instead of a thousand.
+
+Notes on what the implementation settled:
+
+**A second handshake bit, not a wider first one.** `RollupQueryResponse` gains
+`aggregated` alongside `applied`. A shard that predates fusion silently ignores
+the `agg_*` request fields and answers `applied = true` with per-series values;
+reading that as "aggregated" would drop the grouping and return ungrouped series
+— a wrong answer, not a slow one. With `aggregated == false` the coordinator
+groups them itself. The two bits are independent, so a mixed cluster of
+current / rollup-only / no-push-down peers is compensated peer by peer, which
+`test_mixed_version_peers_are_compensated` pins.
+
+**One `PartialGroups` per step.** The merge algebra is per group and identical at
+every step — steps never interact — so `SteppedPartialGroups` keys the existing
+type by step rather than restating it. A `BTreeMap` keeps steps ordered, so
+finalizing emits each group's points chronologically without a sort.
+
+**Only the reducing operators fuse.** `topk` and `count_values` need the
+individual rolled-up samples to choose or count among, so fusing them would not
+shrink the response. They stay on the unfused path, where the inner rollup is
+still pushed down on its own and the selection happens on the coordinator.
+
+**The exactness policy has a boundary here.** §10.2 asks for exact value
+equality, and rollup push-down meets it: the same kernel reduces the same window
+either way. Fused aggregation does not, and cannot — merging per-shard partials
+sums in a different order than a single-node reduction, which
+`partial_aggregation` already documents. The fused parity tests therefore assert
+*shape* exactly (which `(group, step)` pairs exist, with which labels) and values
+to a relative 1e-12. Shape is the part that must never degrade.
+
+**A type-level ambiguity the tests found.** `RollupOutcome::Rolled` meant "fully
+applied" for a fused request and "per-series" otherwise, with nothing enforcing
+which. `RollupOutcome::Reduced` now names the middle state — reduced but not
+grouped — so a source that skips the grouping has to say so.
+
+Mutation checks: treating a `Reduced` answer as grouped, dropping the
+coordinator's compensation for an un-grouped peer, and losing the inner rollup's
+`__name__` drop through the group each fail the suite.
 
 ---
 
@@ -429,12 +475,63 @@ For rollup push-down parity:
 
 Do not use tolerance-only assertions as primary proof for this feature.
 
-### 10.3 Suggested test locations
+### 10.3 Suggested test locations — DONE
 
 - unit and round-trip tests near fanout command and evaluator push-down path
 - cluster integration in a new
   `tests/test_ts_query_rollup_pushdown_cme.py`
 - compatibility and fallback cases mirroring aggregation push-down tests
+
+`tests/test_ts_query_rollup_pushdown_cme.py` is 37 tests over a real 3-shard
+cluster: the six fixture series live on known primaries via `{hN}` hash tags and
+both jobs straddle shards, so nothing here can pass on a single node. It covers
+the whole pushable function set, the step grid, `@`/`offset`/`@ start()`/
+`@ end()`, sparse and NaN windows, `__name__` handling, the fused and unfused
+aggregation paths, the three coordinator-only functions, and on/off equivalence
+for 70 queries.
+
+Notes on what the suite settled:
+
+**The exactness policy needed one more boundary.** §10.2's `==` holds for every
+*value* a rollup produces, and the equivalence tests use it. It does not hold
+for hand-written constants: the running variance is a compensated accumulation
+(`stdvar_over_time` of `[7 7 8 8]` comes back as 0.2500000000000001, not 0.25)
+and `rate` is a chain of divisions (0.9999999999999999, not 1.0). Those two
+assertions carry a 1e-12 tolerance and say so; the exact proof for both is the
+on/off comparison, which does not go through a decimal literal.
+
+**Push-down engagement is provable, just not observable.** Nothing in INFO,
+COMMANDSTATS or the log distinguishes a pushed-down rollup from a
+coordinator-side one, so the suite cannot assert the request was made. But the
+equivalence tests compare the two paths against each other, so a defect anywhere
+in the shard-side reduction surfaces as a divergence — shifting the shard's
+window ends by 1ms fails 11 of the 37. Mixed-version behaviour stays out of
+reach from here (the config is consulted only by the coordinator, and shards
+obey the request, so no `CONFIG SET` makes a peer act like an older build); that
+remains the round-trip tests' job.
+
+**Two pre-existing divergences surfaced while building the fixture**, both
+unrelated to push-down and both hidden by the same mechanism — large regions of
+`promqltest/testdata/functions.test` sit inside `ignore` blocks because they are
+dense with native histograms, and the float-only cases are skipped along with
+them:
+
+- `idelta` computed `last - first` over the whole window instead of the
+  difference between the last two samples. Fixed, because push-down ships this
+  function to shards and PR 3 claimed conformance for it. The upstream float
+  cases now live in `rollup_range_steps.test`, outside any `ignore`.
+- `absent_over_time` returns `{}` where Prometheus copies the selector's
+  equality matchers (`{instance="nope"}`). Left alone: `absent_over_time` is
+  never pushed down, and the fix belongs with `absent` in a separate change.
+
+**One config does not survive `CONFIG SET`.**
+`ts-promql-enable-experimental-functions` is cached into `PROMQL_CONFIG` at
+startup and refreshed only by a config-changed event handler that never fires
+for module configs, so a runtime change is accepted and read back but never
+reaches a query. Every promql config read through that cached struct has the
+same problem. `ts-fanout-rollup-pushdown` does *not*: it is read straight from
+the atomic the config framework writes, which is why the equivalence tests
+work.
 
 ---
 

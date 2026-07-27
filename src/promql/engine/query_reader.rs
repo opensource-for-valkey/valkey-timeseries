@@ -66,9 +66,26 @@ pub enum AggregationOutcome {
 /// it is handed and never re-derives a modifier. Paired with the selector passed
 /// alongside it, this is the whole of a `sum_over_time(m[5m] offset 1h)` — which
 /// is what makes it something a source can evaluate close to the data.
+/// An outer aggregation fused onto a rollup: the `sum by (job)` of
+/// `sum by (job) (rate(m[5m]))`.
+///
+/// Only the reducing operators appear here. The selecting ones (`topk` and
+/// friends) need the individual rolled-up samples to choose among, so fusing
+/// them would not reduce what crosses the wire — see
+/// [`crate::promql::exec::aggregations::PushdownStrategy`].
+#[derive(Debug, Clone)]
+pub struct RollupAggregation {
+    pub kind: AggregationKind,
+    pub modifier: Option<LabelModifier>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RollupRequest {
     pub kind: RollupKind,
+    /// When set, the source groups its rolled-up values as well as computing
+    /// them, and returns one value per group per step instead of one per series
+    /// per step.
+    pub aggregation: Option<RollupAggregation>,
     /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
     pub range_ms: i64,
     pub lookback_delta_ms: i64,
@@ -96,12 +113,24 @@ impl RollupRequest {
 /// What a data source made of a [`RollupRequest`]. Every variant tells the
 /// caller what it still has to do.
 pub enum RollupOutcome {
-    /// The source evaluated the rollup. Each entry is one series' sparse
-    /// `(window end, value)` pairs — a window that held no samples is absent,
-    /// not NaN.
+    /// The source did everything the request asked: it reduced the windows and,
+    /// when the request carried an aggregation, grouped the result — so the
+    /// entries are groups rather than series. Each entry holds sparse
+    /// `(window end, value)` pairs; a window that held no samples is absent, not
+    /// NaN.
     Rolled(Vec<RangeSample>),
+    /// The source reduced the windows but did *not* apply the request's
+    /// aggregation: the entries are per-series values and the caller groups
+    /// them.
+    ///
+    /// Distinct from [`Self::Rolled`] because the two carry the same type and
+    /// mean different things. Without the distinction a source that skipped the
+    /// grouping would be taken to have done it, and the query would answer with
+    /// ungrouped series — a wrong answer rather than a slow one.
+    Reduced(Vec<RangeSample>),
     /// The source returned the raw windows instead of reducing them (nothing to
-    /// push down to, e.g. a single node): the caller reduces them.
+    /// push down to, e.g. a single node): the caller reduces them, and groups
+    /// them if the request asked for that.
     Raw(Vec<RangeSample>),
     /// The source cannot evaluate pushed-down rollups: the caller should select
     /// the matrix itself and reduce that.

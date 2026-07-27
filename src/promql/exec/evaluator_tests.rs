@@ -4083,8 +4083,11 @@ mod tests {
 
     #[derive(Clone, Copy, PartialEq)]
     enum RollupAnswer {
-        /// Reduce here, as a shard would.
+        /// Do everything the request asks — reduce, and group when it carries an
+        /// aggregation — as a current shard would.
         Rolled,
+        /// Reduce but do not group, as a peer that predates fusion does.
+        Reduced,
         /// Return the windows unreduced, as a single node does.
         Raw,
         /// Refuse, as a node without push-down does.
@@ -4153,25 +4156,37 @@ mod tests {
 
             // Reduce here, exactly as a shard does.
             let ends = rollup.window_ends();
-            Ok(RollupOutcome::Rolled(
-                windows
-                    .into_iter()
-                    .filter_map(|s| {
-                        let points = rollup.kind.eval_windows(
-                            &s.samples,
-                            rollup.range_ms,
-                            rollup.lookback_delta_ms,
-                            rollup.step_ms,
-                            ends.iter().copied(),
-                            rollup.param,
-                        );
-                        (!points.is_empty()).then_some(crate::promql::RangeSample {
-                            labels: s.labels,
-                            samples: points,
-                        })
+            let reduced: Vec<crate::promql::RangeSample> = windows
+                .into_iter()
+                .filter_map(|s| {
+                    let points = rollup.kind.eval_windows(
+                        &s.samples,
+                        rollup.range_ms,
+                        rollup.lookback_delta_ms,
+                        rollup.step_ms,
+                        ends.iter().copied(),
+                        rollup.param,
+                    );
+                    (!points.is_empty()).then_some(crate::promql::RangeSample {
+                        labels: s.labels,
+                        samples: points,
                     })
-                    .collect(),
-            ))
+                })
+                .collect();
+
+            if self.answer == RollupAnswer::Reduced {
+                return Ok(RollupOutcome::Reduced(reduced));
+            }
+
+            // …and group, when the request asks for it.
+            let Some(aggregation) = rollup.aggregation.as_ref() else {
+                return Ok(RollupOutcome::Rolled(reduced));
+            };
+            let mut partials = crate::promql::exec::partial_aggregation::SteppedPartialGroups::new(
+                aggregation.kind,
+            );
+            partials.accumulate(aggregation.modifier.as_ref(), reduced);
+            Ok(RollupOutcome::Rolled(partials.finalize()))
         }
     }
 
@@ -4353,6 +4368,7 @@ mod tests {
 
                     for answer in [
                         RollupAnswer::Rolled,
+                        RollupAnswer::Reduced,
                         RollupAnswer::Raw,
                         RollupAnswer::Unsupported,
                     ] {
@@ -4389,7 +4405,11 @@ mod tests {
                     assert_eq!(offered.len(), 1, "{dataset}/{query}: offered once");
                     let local = rendered_steps(local);
 
-                    for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+                    for answer in [
+                        RollupAnswer::Rolled,
+                        RollupAnswer::Reduced,
+                        RollupAnswer::Raw,
+                    ] {
                         let (pushed, _) = evaluate_range_with_pushdown_on(
                             reader(),
                             &query,
@@ -4445,7 +4465,11 @@ mod tests {
     /// rollup drops `__name__` exactly where a local one does.
     #[test]
     fn should_apply_the_label_rule_to_pushed_down_rollups() {
-        for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+        for answer in [
+            RollupAnswer::Rolled,
+            RollupAnswer::Reduced,
+            RollupAnswer::Raw,
+        ] {
             let (result, _) =
                 evaluate_rollup_pushdown("sum_over_time(metric[1m])", 120_000, answer);
             assert_eq!(result.len(), 1);
@@ -4595,6 +4619,38 @@ mod tests {
     /// A named dataset for the conformance suite, built fresh per case so the
     /// pushed-down and local runs cannot share mutated state.
     type RollupDataset = (&'static str, fn() -> MemorySeriesQuerier);
+
+    /// Compare two runs' `(step, labels, value)` triples, exactly on shape and
+    /// within a relative tolerance on value.
+    ///
+    /// Shape — which `(group, step)` pairs exist, and with which labels — is
+    /// exact and must stay so. Values are not: a fused aggregation merges
+    /// per-shard partials, so the summation order differs from a single-node
+    /// reduction and the last bits with it. `partial_aggregation` documents that
+    /// bit-exact parity is not achievable there; demanding it would be demanding
+    /// something false.
+    fn assert_steps_near(
+        local: Vec<(i64, String, String)>,
+        pushed: Vec<(i64, String, String)>,
+        what: &str,
+    ) {
+        let shape = |rows: &[(i64, String, String)]| -> Vec<(i64, String)> {
+            rows.iter().map(|(s, l, _)| (*s, l.clone())).collect()
+        };
+        assert_eq!(shape(&local), shape(&pushed), "{what}: shape");
+
+        for ((step, labels, want), (_, _, got)) in local.iter().zip(&pushed) {
+            let (want_f, got_f) = (want.parse::<f64>(), got.parse::<f64>());
+            match (want_f, got_f) {
+                (Ok(a), Ok(b)) => assert!(
+                    (a - b).abs() <= 1e-12 * a.abs().max(b.abs()).max(1.0),
+                    "{what}: step {step} {labels}: expected {want}, got {got}"
+                ),
+                // NaN and the infinities render as text; they must match exactly.
+                _ => assert_eq!(want, got, "{what}: step {step} {labels}"),
+            }
+        }
+    }
 
     /// The datasets the conformance suite runs against: a dense monotonic
     /// counter, and one with gaps and a counter reset so the reset-handling and
@@ -4839,5 +4895,209 @@ mod tests {
             offered.iter().all(|o| o.step_ms == 0),
             "subquery steps are single evaluations, got {offered:?}"
         );
+    }
+
+    // ── Fusion with an outer aggregation ────────────────────────────────
+    //
+    // `sum by (job) (rate(m[5m]))` is one request: the source reduces each
+    // series' windows and groups the result, so what comes back is one value per
+    // group per step rather than one per series.
+
+    /// A reader with several series per group, so fusion has something to fold.
+    fn grouped_rollup_reader() -> MemorySeriesQuerier {
+        let mut builder = MockQueryReaderBuilder::new();
+        for (job, instance, base) in [
+            ("api", "0", 0.0f64),
+            ("api", "1", 100.0),
+            ("db", "0", 1000.0),
+        ] {
+            let labels = create_labels("metric", vec![("job", job), ("instance", instance)]);
+            for i in 0..=30i64 {
+                builder.add_sample(&labels, Sample::new(i * 10_000, base + i as f64));
+            }
+        }
+        builder.build()
+    }
+
+    /// The fused form must equal the unfused one: same values, same groups, same
+    /// steps — whether the source grouped, only reduced, or did neither.
+    #[test]
+    fn should_match_local_evaluation_for_fused_aggregations() {
+        let aggregations = [
+            "sum", "avg", "min", "max", "count", "group", "stddev", "stdvar",
+        ];
+        for agg in aggregations {
+            for grouping in [
+                "",
+                " by (job)",
+                " by (job, instance)",
+                " without (instance)",
+            ] {
+                for inner in ["rate(metric[1m])", "sum_over_time(metric[1m])"] {
+                    let query = format!("{agg}{grouping} ({inner})");
+
+                    let (local, _) = evaluate_range_with_pushdown_on(
+                        grouped_rollup_reader(),
+                        &query,
+                        0,
+                        300_000,
+                        30_000,
+                        RollupAnswer::Unsupported,
+                    );
+                    let local = rendered_steps(local);
+
+                    for answer in [
+                        RollupAnswer::Rolled,
+                        RollupAnswer::Reduced,
+                        RollupAnswer::Raw,
+                    ] {
+                        let (pushed, _) = evaluate_range_with_pushdown_on(
+                            grouped_rollup_reader(),
+                            &query,
+                            0,
+                            300_000,
+                            30_000,
+                            answer,
+                        );
+                        assert_steps_near(
+                            local.clone(),
+                            rendered_steps(pushed),
+                            &format!("{query} (grid)"),
+                        );
+                    }
+
+                    // …and the same at an instant.
+                    let instant_local = eval_rollup(&grouped_rollup_reader(), &query, 120_000);
+                    for answer in [
+                        RollupAnswer::Rolled,
+                        RollupAnswer::Reduced,
+                        RollupAnswer::Raw,
+                    ] {
+                        let (pushed, _) = evaluate_rollup_pushdown_on(
+                            grouped_rollup_reader(),
+                            &query,
+                            120_000,
+                            answer,
+                        );
+                        assert_steps_near(
+                            rendered_samples(instant_local.clone())
+                                .into_iter()
+                                .map(|(l, t, v)| (t, l, v))
+                                .collect(),
+                            rendered_samples(pushed)
+                                .into_iter()
+                                .map(|(l, t, v)| (t, l, v))
+                                .collect(),
+                            &format!("{query} (instant)"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One request for the whole grid, fused — not one per step, and not a
+    /// separate one for the inner rollup.
+    #[test]
+    fn should_issue_one_fused_request_for_the_grid() {
+        let (steps, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            "sum by (job) (rate(metric[1m]))",
+            0,
+            300_000,
+            30_000,
+            RollupAnswer::Rolled,
+        );
+
+        assert_eq!(steps.len(), 11, "eleven steps evaluated");
+        assert_eq!(offered.len(), 1, "one fused request for all of them");
+        assert_eq!(offered[0].kind, RollupKind::Rate);
+        assert_eq!(offered[0].step_ms, 30_000);
+
+        // Two jobs, so two groups per step that has data.
+        for (step, samples) in &steps {
+            assert!(
+                samples.len() <= 2,
+                "step {step}: grouped to at most one value per job, got {}",
+                samples.len()
+            );
+        }
+    }
+
+    /// `__name__` handling has to survive fusion. The inner rollup's pending drop
+    /// is inherited by the group, and grouping *by* `__name__` still sees the
+    /// name that is about to disappear.
+    #[test]
+    fn should_carry_the_name_drop_through_fusion() {
+        for answer in [
+            RollupAnswer::Rolled,
+            RollupAnswer::Reduced,
+            RollupAnswer::Raw,
+        ] {
+            // `rate` drops the name, so the group has none.
+            let (pushed, _) = evaluate_rollup_pushdown_on(
+                grouped_rollup_reader(),
+                "sum by (job) (rate(metric[1m]))",
+                120_000,
+                answer,
+            );
+            assert!(!pushed.is_empty());
+            for sample in &pushed {
+                assert_eq!(sample.labels.get(METRIC_NAME), None, "name dropped");
+                assert!(sample.labels.get("job").is_some(), "job kept");
+            }
+
+            // `last_over_time` keeps it, so grouping by `__name__` keeps it too.
+            let (pushed, _) = evaluate_rollup_pushdown_on(
+                grouped_rollup_reader(),
+                "sum by (__name__) (last_over_time(metric[1m]))",
+                120_000,
+                answer,
+            );
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].labels.get(METRIC_NAME), Some("metric"));
+
+            // Grouping by `__name__` over a name-dropping rollup groups on the
+            // name and *then* drops it — Prometheus's delayed removal.
+            let (pushed, _) = evaluate_rollup_pushdown_on(
+                grouped_rollup_reader(),
+                "sum by (__name__) (rate(metric[1m]))",
+                120_000,
+                answer,
+            );
+            assert_eq!(pushed.len(), 1, "one group: all series share the name");
+            assert_eq!(pushed[0].labels.get(METRIC_NAME), None, "then dropped");
+        }
+    }
+
+    /// Only the reducing operators fuse. A selecting one leaves the rollup to be
+    /// pushed down on its own and does the selection here.
+    #[test]
+    fn should_not_fuse_operators_without_partial_state() {
+        for query in [
+            "topk(1, rate(metric[1m]))",
+            "bottomk(1, rate(metric[1m]))",
+            "quantile(0.9, rate(metric[1m]))",
+            "count_values(\"v\", rate(metric[1m]))",
+        ] {
+            let (pushed, offered) = evaluate_rollup_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                120_000,
+                RollupAnswer::Rolled,
+            );
+            assert_eq!(
+                offered.len(),
+                1,
+                "{query}: the inner rollup is still pushed"
+            );
+
+            let local = eval_rollup(&grouped_rollup_reader(), query, 120_000);
+            assert_eq!(
+                rendered_samples(local),
+                rendered_samples(pushed),
+                "{query}: unfused result must equal the local one"
+            );
+        }
     }
 }

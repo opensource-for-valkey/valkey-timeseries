@@ -31,16 +31,20 @@ use crate::fanout::{
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_rollup_windows;
+use crate::promql::engine::fanout::type_conversions::proto_labels_to_eval_labels;
 use crate::promql::engine::proto_labels_to_labels;
-use crate::promql::engine::query_reader::RollupRequest;
+use crate::promql::engine::query_reader::{RollupAggregation, RollupRequest};
+use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
+use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
-    RangeSample as ProtoRangeSample, RollupKind as ProtoRollupKind, RollupQuery,
-    RollupQueryResponse, RollupSeries, SeriesSelector as ProtoSeriesSelector,
-    series_selector::Matchers as ProtoMatchers,
+    AggregationKind as ProtoAggregationKind, RangeSample as ProtoRangeSample, RollupGroupPartial,
+    RollupKind as ProtoRollupKind, RollupQuery, RollupQueryResponse, RollupSeries,
+    SeriesSelector as ProtoSeriesSelector, series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::model::RangeSample;
 use promql_parser::label::Matchers;
+use promql_parser::parser::LabelModifier;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
 
@@ -118,6 +122,9 @@ pub(in crate::promql) struct RollupFanoutCommand {
     /// Raw windows from a shard that did not apply the rollup
     /// (`applied == false`), reduced by [`Self::into_result`].
     raw: Vec<RangeSample>,
+    /// Per-`(group, step)` states from shards that also applied the outer
+    /// aggregation. `None` when the request is not a fused one.
+    partials: Option<SteppedPartialGroups>,
     /// Latched when a peer rejected the operation outright — an older node with
     /// no rollup push-down at all. The caller retries without push-down rather
     /// than failing the query.
@@ -142,12 +149,14 @@ impl Default for RollupFanoutCommand {
                 query_end: 0,
                 range_end_ms: 0,
                 param: None,
+                aggregation: None,
             },
             max_series: 0,
             max_points_per_series: 0,
             timeout: get_cluster_command_timeout(),
             rolled: Vec::new(),
             raw: Vec::new(),
+            partials: None,
             unsupported_peer: false,
         }
     }
@@ -161,6 +170,10 @@ impl RollupFanoutCommand {
         max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
+        let partials = rollup
+            .aggregation
+            .as_ref()
+            .map(|agg| SteppedPartialGroups::new(agg.kind));
         Self {
             matchers,
             rollup,
@@ -169,6 +182,7 @@ impl RollupFanoutCommand {
             timeout,
             rolled: Vec::new(),
             raw: Vec::new(),
+            partials,
             unsupported_peer: false,
         }
     }
@@ -179,8 +193,12 @@ impl RollupFanoutCommand {
         self.unsupported_peer
     }
 
-    /// The shards' output as one result: rolled-up series as they arrived, plus
-    /// any raw windows reduced here.
+    /// The shards' output as one result.
+    ///
+    /// Each peer is compensated for whatever it did not do: a peer that shipped
+    /// raw windows has them reduced here, and — for a fused request — a peer
+    /// that reduced but did not group has its per-series values grouped here.
+    /// What comes out is the same either way.
     pub fn into_result(mut self) -> Vec<RangeSample> {
         let raw = std::mem::take(&mut self.raw);
         let mut rolled = std::mem::take(&mut self.rolled);
@@ -192,7 +210,22 @@ impl RollupFanoutCommand {
             rolled.extend(reduce_windows(&self.rollup, &window_ends, raw));
         }
 
-        rolled
+        match self.partials.take() {
+            // Fused: fold in whatever arrived un-grouped, then finalize every
+            // (group, step).
+            Some(mut partials) => {
+                let modifier = self
+                    .rollup
+                    .aggregation
+                    .as_ref()
+                    .and_then(|agg| agg.modifier.as_ref());
+                if !rolled.is_empty() {
+                    partials.accumulate(modifier, rolled);
+                }
+                partials.finalize()
+            }
+            None => rolled,
+        }
     }
 }
 
@@ -272,8 +305,34 @@ impl FanoutCommand for RollupFanoutCommand {
             return Ok(raw_response(windows));
         };
 
+        let reduced = reduce_windows(&rollup, &window_ends, windows);
+
+        // Fused form: group the rolled-up values here too, so what goes back is
+        // one partial per (group, step) rather than one value per series per
+        // step. A grouping this node cannot apply falls back to shipping the
+        // per-series values with `aggregated` false, and the coordinator groups
+        // them — the same degradation the rollup itself gets.
+        if let Some(aggregation) = rollup.aggregation.as_ref() {
+            let mut groups = SteppedPartialGroups::new(aggregation.kind);
+            groups.accumulate(aggregation.modifier.as_ref(), reduced);
+            return Ok(RollupQueryResponse {
+                series: Vec::new(),
+                raw: Vec::new(),
+                applied: true,
+                partials: groups
+                    .into_partials()
+                    .map(|(step_ts, labels, state)| RollupGroupPartial {
+                        labels: labels.iter().map(Into::into).collect(),
+                        step_ts,
+                        state: Some(state.into()),
+                    })
+                    .collect(),
+                aggregated: true,
+            });
+        }
+
         Ok(RollupQueryResponse {
-            series: reduce_windows(&rollup, &window_ends, windows)
+            series: reduced
                 .into_iter()
                 .map(|s| RollupSeries {
                     labels: metric_name_to_proto_labels_from(&s.labels),
@@ -282,6 +341,8 @@ impl FanoutCommand for RollupFanoutCommand {
                 .collect(),
             raw: Vec::new(),
             applied: true,
+            partials: Vec::new(),
+            aggregated: false,
         })
     }
 
@@ -307,6 +368,17 @@ impl FanoutCommand for RollupFanoutCommand {
             scalar_param: self.rollup.param,
             max_series: self.max_series,
             max_points_per_series: self.max_points_per_series,
+            agg_kind: self
+                .rollup
+                .aggregation
+                .as_ref()
+                .map(|agg| ProtoAggregationKind::from(agg.kind) as i32),
+            agg_grouping: self
+                .rollup
+                .aggregation
+                .as_ref()
+                .and_then(|agg| agg.modifier.as_ref())
+                .map(Into::into),
         }
     }
 
@@ -327,6 +399,41 @@ impl FanoutCommand for RollupFanoutCommand {
                 target.socket_address,
                 resp.raw.len(),
                 self.rollup.kind,
+            )));
+        }
+
+        if resp.aggregated {
+            let Some(partials) = self.partials.as_mut() else {
+                return Err(FanoutError::custom(format!(
+                    "TSDB: peer {} grouped a rollup that was not requested grouped",
+                    target.socket_address,
+                )));
+            };
+            // Corrupt-peer defense: an aggregated response carries partials
+            // only; folding stray per-series values in as well would count them
+            // twice.
+            if !resp.series.is_empty() {
+                return Err(FanoutError::custom(format!(
+                    "TSDB: peer {} returned {} series alongside an aggregated rollup",
+                    target.socket_address,
+                    resp.series.len(),
+                )));
+            }
+            for partial in resp.partials {
+                partials.merge(
+                    partial.step_ts,
+                    proto_labels_to_eval_labels(partial.labels),
+                    partial.state.unwrap_or_default().into(),
+                );
+            }
+            return Ok(());
+        }
+
+        if !resp.partials.is_empty() {
+            return Err(FanoutError::custom(format!(
+                "TSDB: peer {} returned {} partials without setting `aggregated`",
+                target.socket_address,
+                resp.partials.len(),
             )));
         }
 
@@ -374,6 +481,7 @@ fn decode_request(req: &RollupQuery) -> Option<RollupRequest> {
     let kind = RollupKind::from(ProtoRollupKind::try_from(req.kind).ok()?);
     Some(RollupRequest {
         kind,
+        aggregation: decode_aggregation(req),
         range_ms: req.range_ms,
         lookback_delta_ms: req.lookback_delta_ms as i64,
         step_ms: req.step_ms,
@@ -384,10 +492,28 @@ fn decode_request(req: &RollupQuery) -> Option<RollupRequest> {
     })
 }
 
+/// The fused aggregation, if the request carries one this node can apply.
+///
+/// An operator it does not know, or one with no mergeable partial state, yields
+/// `None`: the node then reduces the windows but leaves the grouping to the
+/// coordinator, which is the degradation `aggregated = false` describes.
+fn decode_aggregation(req: &RollupQuery) -> Option<RollupAggregation> {
+    let kind = AggregationKind::from(ProtoAggregationKind::try_from(req.agg_kind?).ok()?);
+    if kind.pushdown_strategy() != Some(PushdownStrategy::Reduce) {
+        return None;
+    }
+    Some(RollupAggregation {
+        kind,
+        modifier: req.agg_grouping.clone().map(LabelModifier::from),
+    })
+}
+
 /// A response carrying the unreduced windows, for a shard that could not apply
 /// the requested rollup.
 fn raw_response(series: Vec<RangeSample>) -> RollupQueryResponse {
     RollupQueryResponse {
+        partials: Vec::new(),
+        aggregated: false,
         series: Vec::new(),
         raw: series
             .into_iter()
@@ -452,6 +578,7 @@ mod tests {
     fn request(kind: RollupKind) -> RollupRequest {
         RollupRequest {
             kind,
+            aggregation: None,
             param: param_for(kind),
             range_ms: RANGE_MS,
             lookback_delta_ms: 300_000,
@@ -506,8 +633,29 @@ mod tests {
     /// once the windows have been read.
     fn shard_response(rollup: &RollupRequest, windows: Vec<RangeSample>) -> RollupQueryResponse {
         let ends = rollup.window_ends();
+        let reduced = reduce_windows(rollup, &ends, windows);
+
+        if let Some(aggregation) = rollup.aggregation.as_ref() {
+            let mut groups = SteppedPartialGroups::new(aggregation.kind);
+            groups.accumulate(aggregation.modifier.as_ref(), reduced);
+            return RollupQueryResponse {
+                series: Vec::new(),
+                raw: Vec::new(),
+                applied: true,
+                partials: groups
+                    .into_partials()
+                    .map(|(step_ts, labels, state)| RollupGroupPartial {
+                        labels: labels.iter().map(Into::into).collect(),
+                        step_ts,
+                        state: Some(state.into()),
+                    })
+                    .collect(),
+                aggregated: true,
+            };
+        }
+
         RollupQueryResponse {
-            series: reduce_windows(rollup, &ends, windows)
+            series: reduced
                 .into_iter()
                 .map(|s| RollupSeries {
                     labels: metric_name_to_proto_labels_from(&s.labels),
@@ -516,7 +664,22 @@ mod tests {
                 .collect(),
             raw: Vec::new(),
             applied: true,
+            partials: Vec::new(),
+            aggregated: false,
         }
+    }
+
+    /// A shard that reduced the windows but does not know how to group them —
+    /// an older peer that ignored the `agg_*` fields.
+    fn unfused_shard_response(
+        rollup: &RollupRequest,
+        windows: Vec<RangeSample>,
+    ) -> RollupQueryResponse {
+        let bare = RollupRequest {
+            aggregation: None,
+            ..rollup.clone()
+        };
+        shard_response(&bare, windows)
     }
 
     /// Results as sorted `(labels, points)` so they compare irrespective of the
@@ -685,6 +848,7 @@ mod tests {
 
         let rollup = RollupRequest {
             kind: RollupKind::CountOverTime,
+            aggregation: None,
             range_ms: RANGE_MS,
             lookback_delta_ms: 300_000,
             step_ms: 0,
@@ -751,6 +915,8 @@ mod tests {
             series: vec![RollupSeries::default()],
             raw: vec![ProtoRangeSample::default()],
             applied: true,
+            partials: Vec::new(),
+            aggregated: false,
         };
         assert!(cmd.on_response(stray, &node(7000)).is_err());
     }
@@ -806,5 +972,208 @@ mod tests {
             ),
             grid.window_ends(),
         );
+    }
+
+    // ── Fusion with an outer aggregation ────────────────────────────────
+
+    fn fused(kind: RollupKind, agg: AggregationKind, by: &[&str]) -> RollupRequest {
+        RollupRequest {
+            aggregation: Some(RollupAggregation {
+                kind: agg,
+                modifier: (!by.is_empty()).then(|| {
+                    LabelModifier::Include(promql_parser::label::Labels::new(by.to_vec()))
+                }),
+            }),
+            ..grid_request(kind)
+        }
+    }
+
+    /// Reduce and group on one node — what the fused push-down must equal.
+    fn single_node_fused(rollup: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
+        let ends = rollup.window_ends();
+        let reduced = reduce_windows(rollup, &ends, series);
+        let aggregation = rollup.aggregation.as_ref().expect("fused");
+        let mut groups = SteppedPartialGroups::new(aggregation.kind);
+        groups.accumulate(aggregation.modifier.as_ref(), reduced);
+        groups.finalize()
+    }
+
+    /// The fusion contract: shards reduce *and* group their own slice, the
+    /// coordinator merges the partials, and the answer equals doing both on one
+    /// node over the concatenated input.
+    #[test]
+    fn test_fused_fanout_matches_single_node() {
+        let shards = test_shards();
+        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+
+        for agg in [
+            AggregationKind::Sum,
+            AggregationKind::Avg,
+            AggregationKind::Min,
+            AggregationKind::Max,
+            AggregationKind::Count,
+            AggregationKind::Group,
+            AggregationKind::Stddev,
+            AggregationKind::Stdvar,
+        ] {
+            for by in [&[][..], &["__name__"][..]] {
+                let rollup = fused(RollupKind::SumOverTime, agg, by);
+                let mut cmd = command(rollup.clone());
+                for (index, shard) in shards.iter().enumerate() {
+                    cmd.on_response(
+                        shard_response(&rollup, shard.clone()),
+                        &node(7000 + index as u16),
+                    )
+                    .expect("shard response accepted");
+                }
+
+                assert_eq!(
+                    rendered(single_node_fused(&rollup, all.clone())),
+                    rendered(cmd.into_result()),
+                    "{agg:?} by {by:?}"
+                );
+            }
+        }
+    }
+
+    /// Mixed versions, the case the second handshake bit exists for: one peer
+    /// groups, one only reduces, one does neither. The coordinator compensates
+    /// each and still lands on the single-node answer.
+    #[test]
+    fn test_mixed_version_peers_are_compensated() {
+        let shards = test_shards();
+        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+
+        for agg in [
+            AggregationKind::Sum,
+            AggregationKind::Avg,
+            AggregationKind::Count,
+            AggregationKind::Stddev,
+        ] {
+            let rollup = fused(RollupKind::SumOverTime, agg, &["__name__"]);
+            let mut cmd = command(rollup.clone());
+
+            // Current peer: reduces and groups.
+            cmd.on_response(shard_response(&rollup, shards[0].clone()), &node(7000))
+                .unwrap();
+            // Peer that predates fusion: reduces, ignores the grouping.
+            let unfused = unfused_shard_response(&rollup, shards[1].clone());
+            assert!(unfused.applied && !unfused.aggregated);
+            cmd.on_response(unfused, &node(7001)).unwrap();
+            // Peer that predates rollup push-down entirely: raw windows.
+            let raw = raw_response(shards[2].clone());
+            assert!(!raw.applied && !raw.aggregated);
+            cmd.on_response(raw, &node(7002)).unwrap();
+
+            assert_eq!(
+                rendered(single_node_fused(&rollup, all.clone())),
+                rendered(cmd.into_result()),
+                "{agg:?}"
+            );
+        }
+    }
+
+    /// The request carries the fused aggregation, and what the shard decodes is
+    /// what the coordinator asked for.
+    #[test]
+    fn test_fused_request_round_trip() {
+        use crate::fanout::serialization::{Deserialized, Serialized};
+
+        let rollup = fused(RollupKind::Rate, AggregationKind::Sum, &["job", "env"]);
+        let cmd = RollupFanoutCommand::new(
+            Matchers {
+                matchers: vec![],
+                or_matchers: vec![],
+            },
+            rollup,
+            0,
+            0,
+            Duration::from_secs(1),
+        );
+
+        let request = cmd.generate_request();
+        let mut buf = Vec::new();
+        request.serialize(&mut buf);
+        let decoded = RollupQuery::deserialize(&buf).unwrap();
+        assert_eq!(decoded, request);
+
+        let round_tripped = decode_request(&decoded).expect("known kind");
+        let aggregation = round_tripped.aggregation.expect("fused");
+        assert_eq!(aggregation.kind, AggregationKind::Sum);
+        assert_eq!(
+            aggregation.modifier,
+            Some(LabelModifier::Include(promql_parser::label::Labels::new(
+                vec!["job", "env"]
+            )))
+        );
+    }
+
+    /// An operator with no mergeable partial state is not fused: a shard told to
+    /// group by one reduces the windows and leaves the grouping alone, which the
+    /// coordinator sees as `aggregated == false`.
+    #[test]
+    fn test_unfusable_operator_is_declined_by_the_shard() {
+        let mut req = RollupQuery {
+            kind: ProtoRollupKind::RollupSumOverTime as i32,
+            agg_kind: Some(ProtoAggregationKind::AggTopk as i32),
+            ..RollupQuery::default()
+        };
+        assert!(
+            decode_request(&req).unwrap().aggregation.is_none(),
+            "topk has no partial state and must not be fused"
+        );
+
+        req.agg_kind = Some(ProtoAggregationKind::AggSum as i32);
+        assert!(decode_request(&req).unwrap().aggregation.is_some());
+
+        // Beyond the enum: a newer coordinator's operator.
+        req.agg_kind = Some(99);
+        assert!(decode_request(&req).unwrap().aggregation.is_none());
+    }
+
+    /// A peer that grouped when it was not asked to, or shipped partials without
+    /// saying so, is rejected rather than merged into a wrong answer.
+    #[test]
+    fn test_mismatched_fusion_payload_is_rejected() {
+        // Partials for a request that carried no aggregation.
+        let mut cmd = command(request(RollupKind::SumOverTime));
+        let stray = RollupQueryResponse {
+            series: Vec::new(),
+            raw: Vec::new(),
+            applied: true,
+            partials: vec![RollupGroupPartial::default()],
+            aggregated: true,
+        };
+        assert!(cmd.on_response(stray, &node(7000)).is_err());
+
+        // Partials without the `aggregated` bit set.
+        let mut cmd = command(fused(
+            RollupKind::SumOverTime,
+            AggregationKind::Sum,
+            &["__name__"],
+        ));
+        let stray = RollupQueryResponse {
+            series: Vec::new(),
+            raw: Vec::new(),
+            applied: true,
+            partials: vec![RollupGroupPartial::default()],
+            aggregated: false,
+        };
+        assert!(cmd.on_response(stray, &node(7000)).is_err());
+
+        // Both payload shapes at once.
+        let mut cmd = command(fused(
+            RollupKind::SumOverTime,
+            AggregationKind::Sum,
+            &["__name__"],
+        ));
+        let stray = RollupQueryResponse {
+            series: vec![RollupSeries::default()],
+            raw: Vec::new(),
+            applied: true,
+            partials: vec![RollupGroupPartial::default()],
+            aggregated: true,
+        };
+        assert!(cmd.on_response(stray, &node(7000)).is_err());
     }
 }

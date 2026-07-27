@@ -1,4 +1,4 @@
-use super::aggregations::{AggregationKind, apply_aggregation, eval_aggregation};
+use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, eval_aggregation};
 use crate::common::threads::join;
 use crate::common::time::system_time_to_millis;
 use crate::common::{Sample, Timestamp};
@@ -7,9 +7,11 @@ use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationParam, AggregationRequest, RollupOutcome, RollupRequest,
+    AggregationOutcome, AggregationParam, AggregationRequest, RollupAggregation, RollupOutcome,
+    RollupRequest,
 };
 use crate::promql::engine::{QueryOptions, QueryReader};
+use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
 };
@@ -17,11 +19,12 @@ use crate::promql::exec::types::{
     EvalLabels, PreloadedRollupData, PreloadedRollupSeries, RollupPreloadMap, SeriesMap,
 };
 use crate::promql::exec::utils::{
-    collect_rollup_calls, collect_vector_selectors, merge_step_into_series_map,
+    RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
+    merge_step_into_series_map,
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
-use crate::promql::hashers::{PreloadKey, RollupPreloadKey};
+use crate::promql::hashers::{AggregationKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::model::RangeSample;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
@@ -105,15 +108,29 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let mut seen = AHashSet::new();
-        for call in collect_rollup_calls(expr) {
-            let Some((kind, matrix, param)) = self.pushable_rollup(call) else {
+        for candidate in collect_rollup_candidates(expr) {
+            let Some((kind, matrix, param)) = self.pushable_rollup(candidate.call()) else {
                 continue;
             };
-            let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param);
+            // An aggregation that cannot be fused leaves the rollup to be pushed
+            // down on its own; the aggregation then runs here, per step.
+            let aggregation = match candidate {
+                RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
+                RollupCandidate::Rollup(_) => None,
+            };
+            let key = RollupPreloadKey::new(
+                &matrix.vs,
+                kind,
+                matrix_range_ms(matrix),
+                param,
+                aggregation
+                    .as_ref()
+                    .map(|agg| AggregationKey::new(agg.kind, agg.modifier.as_ref())),
+            );
             if !seen.insert(key.clone()) {
                 continue;
             }
-            self.preload_rollup(key, kind, matrix, param, ctx)?;
+            self.preload_rollup(key, kind, matrix, param, aggregation, ctx)?;
         }
 
         Ok(())
@@ -153,12 +170,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Some((kind, matrix?, param))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn preload_rollup(
         &self,
         key: RollupPreloadKey,
         kind: RollupKind,
         matrix: &MatrixSelector,
         param: Option<f64>,
+        aggregation: Option<RollupAggregation>,
         ctx: &EvalContext,
     ) -> EvalResult<()> {
         let steps: Vec<Timestamp> =
@@ -185,6 +204,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let request = RollupRequest {
             kind,
+            aggregation,
             range_ms: matrix_range_ms(matrix),
             lookback_delta_ms: ctx.lookback_delta_ms,
             step_ms: ctx.step_ms,
@@ -212,6 +232,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
             RollupOutcome::Unsupported => return Ok(()),
             RollupOutcome::Rolled(series) => series,
+            RollupOutcome::Reduced(series) => group_rollup_output(&request, series),
             RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
         };
 
@@ -253,10 +274,20 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// preloaded and has to be evaluated here.
     fn preloaded_rollup(&self, call: &Call, ctx: &EvalContext) -> Option<ExprResult> {
         let (kind, matrix, param) = self.pushable_rollup(call)?;
-        let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param);
+        let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param, None);
+        self.preloaded_rollup_by_key(&key, ctx, false)
+    }
 
+    /// This step's slice of a preloaded rollup, keyed explicitly so the fused
+    /// form — whose entries are groups rather than series — can share it.
+    fn preloaded_rollup_by_key(
+        &self,
+        key: &RollupPreloadKey,
+        ctx: &EvalContext,
+        drop_name: bool,
+    ) -> Option<ExprResult> {
         let guard = self.preloaded_rollups.read().unwrap();
-        let preloaded = guard.get(&key)?;
+        let preloaded = guard.get(key)?;
         let step_idx = ((ctx.evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
 
         let samples = preloaded
@@ -270,7 +301,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     timestamp_ms: ctx.evaluation_ts,
                     value,
                     labels: series.labels.clone(),
-                    drop_name: false,
+                    drop_name,
                 })
             })
             .collect();
@@ -950,9 +981,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-        // First ask the data source to evaluate the whole aggregation where the
-        // data lives (see `QueryReader::query_aggregation`): across a cluster
-        // that turns the input vector into one value per group per shard.
+        // A rollup directly under a decomposable aggregation is pushed down as
+        // one fused request: the shard reduces each series' windows and then
+        // accumulates them into per-group partials, so what crosses the wire is
+        // one partial per group per step rather than one value per series.
+        if let Some(result) = self.evaluate_fused_rollup(aggregate, ctx, preload_eligible)? {
+            return Ok(result);
+        }
+
+        // Otherwise ask the data source to evaluate the whole aggregation where
+        // the data lives (see `QueryReader::query_aggregation`): across a
+        // cluster that turns the input vector into one value per group per
+        // shard.
         if let Some(result) =
             self.evaluate_pushed_down_aggregate(aggregate, ctx, preload_eligible)?
         {
@@ -1086,6 +1126,110 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         self.preloaded_instant.read().unwrap().contains_key(&key)
     }
 
+    /// Try to have the data source evaluate a rollup *and* the aggregation over
+    /// it in one request.
+    ///
+    /// Returns `None` when the query stays on the ordinary paths, which is the
+    /// case unless the operand is a pushable rollup call and the operator has a
+    /// mergeable partial state. Fusing is what turns
+    /// `sum by (job) (rate(m[5m]))` into one float per job per step: without it
+    /// the shard would ship one float per *series*, and a job with a thousand
+    /// pods would ship a thousand.
+    ///
+    /// Only the reducing operators fuse. `topk` needs the individual rolled-up
+    /// samples to choose among, so pushing the selection down would not shrink
+    /// the response — it stays on the unfused path, where the rollup alone is
+    /// still pushed down.
+    fn evaluate_fused_rollup(
+        &self,
+        aggregate: &AggregateExpr,
+        ctx: &EvalContext,
+        preload_eligible: bool,
+    ) -> EvalResult<Option<ExprResult>> {
+        let Expr::Call(call) = strip_parens(&aggregate.expr) else {
+            return Ok(None);
+        };
+        let Some(aggregation) = fusable_aggregation(aggregate) else {
+            return Ok(None);
+        };
+        let Some((kind, matrix, param)) = self.pushable_rollup(call) else {
+            return Ok(None);
+        };
+
+        // The group inherits the pending `__name__` drop from the rollup that
+        // produced its members — the same rule `evaluate_call` applies to an
+        // unfused rollup, applied here because this result never passes through
+        // it. See `drops_metric_name`.
+        let drop_name = drops_metric_name(call);
+
+        let key = RollupPreloadKey::new(
+            &matrix.vs,
+            kind,
+            matrix_range_ms(matrix),
+            param,
+            Some(AggregationKey::new(
+                aggregation.kind,
+                aggregation.modifier.as_ref(),
+            )),
+        );
+
+        // A range query resolved the whole grid before the step loop; this step
+        // reads its slice.
+        if ctx.step_ms > 0 {
+            if !preload_eligible {
+                return Ok(None);
+            }
+            return Ok(self.preloaded_rollup_by_key(&key, ctx, drop_name));
+        }
+
+        // Instant: one request for this evaluation.
+        let range_end_ms = apply_time_modifiers_ms(
+            matrix.vs.at.as_ref(),
+            matrix.vs.offset.as_ref(),
+            ctx.query_start,
+            ctx.query_end,
+            ctx.evaluation_ts,
+        );
+        let request = RollupRequest {
+            kind,
+            aggregation: Some(aggregation),
+            range_ms: matrix_range_ms(matrix),
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            step_ms: ctx.step_ms,
+            query_start: ctx.query_start,
+            query_end: ctx.query_end,
+            range_end_ms,
+            param,
+        };
+
+        let mut options = self.options;
+        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+
+        let grouped = match self.reader.query_rollup(&matrix.vs, &request, options)? {
+            RollupOutcome::Unsupported => return Ok(None),
+            RollupOutcome::Rolled(groups) => groups,
+            // Each of these did less than was asked; make up exactly the
+            // difference, with the same kernels a shard would have used.
+            RollupOutcome::Reduced(series) => group_rollup_output(&request, series),
+            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+        };
+
+        let samples = grouped
+            .into_iter()
+            .filter_map(|group| {
+                let point = group.samples.last()?;
+                Some(EvalSample {
+                    timestamp_ms: ctx.evaluation_ts,
+                    value: point.value,
+                    labels: EvalLabels::from(group.labels),
+                    drop_name,
+                })
+            })
+            .collect();
+
+        Ok(Some(ExprResult::InstantVector(samples)))
+    }
+
     /// Try to have the data source evaluate `call`'s rollup itself.
     ///
     /// Returns `None` when the rollup stays here, which is the case unless all
@@ -1118,6 +1262,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let Some((matrix, param)) = self.rollup_arguments(call, ctx)? else {
             return Ok(None);
         };
+        let aggregation = None;
 
         // Resolve `@`/`offset` here: the source is told the window, never the
         // modifier, so it cannot resolve one differently than the local path.
@@ -1131,6 +1276,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let request = RollupRequest {
             kind,
+            aggregation,
             range_ms: matrix.range.as_millis() as i64,
             lookback_delta_ms: ctx.lookback_delta_ms,
             step_ms: ctx.step_ms,
@@ -1145,7 +1291,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
             RollupOutcome::Unsupported => return Ok(None),
-            RollupOutcome::Rolled(series) => series,
+            // No aggregation was requested, so `Reduced` and `Rolled` say the
+            // same thing here.
+            RollupOutcome::Rolled(series) | RollupOutcome::Reduced(series) => series,
             // The source read the windows but did not reduce them; finish the
             // job, with the same kernel a shard would have used.
             RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
@@ -1215,12 +1363,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     }
 }
 
-/// Reduce raw windows with the request's rollup — what a shard would have done,
-/// run here for a source that returned the windows unreduced.
+/// Do here whatever the source did not: reduce the raw windows, and — when the
+/// request is a fused one — group the result.
+///
+/// This is the compensation path for a source that returned windows unreduced
+/// (a single node, which has nothing to push down to). It runs the same kernels
+/// a shard would, so the answer does not depend on who did the work.
 ///
 /// A series whose every window was empty contributes nothing, which is not the
 /// same as contributing NaN.
 fn reduce_rollup_windows(request: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
+    group_rollup_output(request, reduce_only(request, series))
+}
+
+/// Reduce the raw windows, leaving any fused grouping to the caller.
+fn reduce_only(request: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
     let window_ends = request.window_ends();
     series
         .into_iter()
@@ -1241,8 +1398,42 @@ fn reduce_rollup_windows(request: &RollupRequest, series: Vec<RangeSample>) -> V
         .collect()
 }
 
+/// Apply the request's fused aggregation to per-series rollup output, or pass it
+/// through when the request has none.
+fn group_rollup_output(request: &RollupRequest, reduced: Vec<RangeSample>) -> Vec<RangeSample> {
+    let Some(aggregation) = request.aggregation.as_ref() else {
+        return reduced;
+    };
+
+    let mut partials = SteppedPartialGroups::new(aggregation.kind);
+    partials.accumulate(aggregation.modifier.as_ref(), reduced);
+    partials.finalize()
+}
+
 fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {
     matrix.range.as_millis() as i64
+}
+
+/// The aggregation of `aggregate` as something a shard can fold a rollup into,
+/// or `None` when it cannot be fused.
+///
+/// Two conditions, both about the operator rather than the data: it must have a
+/// mergeable partial state (the reductions do; `topk` and `count_values` do
+/// not), and it must take no parameter — every operator that takes one is in the
+/// group that has no partial state anyway, so a parameter here means the shape
+/// is not fusable.
+fn fusable_aggregation(aggregate: &AggregateExpr) -> Option<RollupAggregation> {
+    if aggregate.param.is_some() {
+        return None;
+    }
+    let kind = AggregationKind::try_from(aggregate.op).ok()?;
+    if kind.pushdown_strategy() != Some(PushdownStrategy::Reduce) {
+        return None;
+    }
+    Some(RollupAggregation {
+        kind,
+        modifier: aggregate.modifier.clone(),
+    })
 }
 
 /// Range-vector functions that report a sample of the input series unchanged,

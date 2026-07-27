@@ -44,8 +44,10 @@ eval range from 0 to 2m step 30s rate(metric[1m])
 eval range from 0 to 2m step 30s irate(metric[1m])
   {} _ 0.1 0.1 0.1 0.1
 
+# `idelta` reads only the last two samples of the window, so — unlike `delta` —
+# it does not grow as the window fills: every full window ends on a 1-unit step.
 eval range from 0 to 2m step 30s idelta(metric[1m])
-  {} _ 3 5 5 5
+  {} _ 1 1 1 1
 
 eval range from 0 to 2m step 30s deriv(metric[1m])
   {} _ 0.1 0.1 0.1 0.1
@@ -119,3 +121,50 @@ eval range from 0 to 2m step 30s sum_over_time(mixed[30s])
 
 eval range from 0 to 2m step 30s last_over_time(mixed[30s])
   mixed NaN 1 NaN _ _
+
+clear
+
+# `irate` and `idelta` read the last two samples of the window and nothing else.
+#
+# These are the float-only cases from upstream's `functions.test`, restated here
+# because the whole region that holds them there sits inside an `ignore` block —
+# it is dense with native histograms, which this engine does not implement, so
+# the float cases are skipped along with them. They are the cases that pin the
+# "last two, not first-and-last" reading, which is the difference between
+# `idelta` and `delta`.
+
+load 5m
+  http_requests_total{path="/foo"} 0+10x10
+  http_requests_total{path="/bar"} 0+10x5 0+10x5
+  http_requests_nan{}              1 NaN NaN 5 11
+
+eval instant at 50m irate(http_requests_total[50m])
+  {path="/foo"} 0.03333333333333333
+  {path="/bar"} 0.03333333333333333
+
+# A counter reset between the final pair: `irate` takes the new value as the
+# whole increase, and 0 is what a reset to 0 yields.
+eval instant at 30m irate(http_requests_total[50m])
+  {path="/foo"} 0.03333333333333333
+  {path="/bar"} 0
+
+eval range from 0 to 20m step 5m irate(http_requests_nan[15m1s])
+  {} _ NaN NaN NaN 0.02
+
+clear
+
+load 5m
+  http_requests{path="/foo"} 0 50 100 150
+  http_requests{path="/bar"} 0 50 100 50
+  http_requests_nan{}        1 NaN NaN 5 11
+
+# Reading first-and-last instead would give 100 and 0 here: the window holds
+# three samples, and the one `idelta` must ignore is the one that differs.
+eval instant at 20m idelta(http_requests[20m])
+  {path="/foo"} 50
+  {path="/bar"} -50
+
+# The final step is the discriminating one: its window opens just before the
+# 5m sample, so first-and-last would subtract a NaN and answer NaN instead of 6.
+eval range from 0 to 20m step 5m idelta(http_requests_nan[15m1s])
+  {} _ NaN NaN NaN 6

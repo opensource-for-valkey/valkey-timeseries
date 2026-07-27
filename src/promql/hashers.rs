@@ -1,9 +1,10 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{HasFingerprint, SeriesFingerprint, create_hasher, hash_key_value};
+use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::Label as ProtoLabel;
 use promql_parser::label::{MatchOp, Matcher};
-use promql_parser::parser::{AtModifier, Offset, VectorSelector};
+use promql_parser::parser::{AtModifier, LabelModifier, Offset, VectorSelector};
 use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -226,6 +227,36 @@ pub(in crate::promql) struct RollupPreloadKey {
     /// `f64` has no `Hash`/`Eq`; the bit pattern does, and two parameters that
     /// differ in bits are different requests.
     param_bits: Option<u64>,
+    /// The fused outer aggregation, when there is one. `sum by (job) (rate(m))`
+    /// and `sum by (pod) (rate(m))` read the same series but are different
+    /// requests, and neither is the bare `rate(m)`.
+    aggregation: Option<AggregationKey>,
+}
+
+/// The identity of a fused aggregation: operator plus grouping.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) struct AggregationKey {
+    kind: AggregationKind,
+    without: bool,
+    /// Sorted, so `by (a, b)` and `by (b, a)` are one request.
+    labels: Vec<String>,
+}
+
+impl AggregationKey {
+    pub(crate) fn new(kind: AggregationKind, modifier: Option<&LabelModifier>) -> Self {
+        let (without, mut labels) = match modifier {
+            Some(LabelModifier::Include(l)) => (false, l.labels.clone()),
+            Some(LabelModifier::Exclude(l)) => (true, l.labels.clone()),
+            None => (false, Vec::new()),
+        };
+        labels.sort();
+        labels.dedup();
+        Self {
+            kind,
+            without,
+            labels,
+        }
+    }
 }
 
 impl RollupPreloadKey {
@@ -234,12 +265,14 @@ impl RollupPreloadKey {
         kind: RollupKind,
         range_ms: i64,
         param: Option<f64>,
+        aggregation: Option<AggregationKey>,
     ) -> Self {
         Self {
             selector: PreloadKey::from_selector(vs),
             kind,
             range_ms,
             param_bits: param.map(f64::to_bits),
+            aggregation,
         }
     }
 }

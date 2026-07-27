@@ -35,20 +35,31 @@ The query resolution step width. Accepts a duration string (e.g., `15s`, `1m`, `
 
 The start time for the range query. Accepts:
 
-- Numeric timestamp in milliseconds
+- Numeric timestamp in **milliseconds** — a bare integer is always milliseconds,
+  with no magnitude detection
+- Numeric timestamp with a decimal point or exponent — **seconds**
+  (`1672531200.5`)
 - RFC3339 formatted date string
 - `*` for the current time
 - `+` for the latest timestamp across all series
 - `-` for the earliest timestamp across all series
 - Duration spec (e.g., `-1h` for 1 hour ago)
 
+> **Note:** `1672531200` and `1672531200.0` are 53 years apart here — the first
+> is milliseconds (1970), the second seconds (2023). And unlike `TIME` on
+> [TS.QUERY](ts.query.md), a bare integer is never interpreted as seconds. Pass
+> an RFC3339 string when the unit matters; a range that lands entirely outside
+> the data returns an empty matrix rather than an error.
+
 </details>
 
 <details open><summary><code>END timestamp</code></summary>
 
-The end time for the range query. Accepts:
+The end time for the range query. Accepts the same forms as `START`, with the
+same millisecond-by-default rule:
 
-- Numeric timestamp in milliseconds
+- Numeric timestamp in **milliseconds**
+- Numeric timestamp with a decimal point or exponent — **seconds**
 - RFC3339 formatted date string
 - `*` for the current time
 - `+` for the latest timestamp across all series
