@@ -1,7 +1,8 @@
+use crate::common::time::system_time_to_millis;
 use crate::promql::QueryValue;
 use crate::promql::engine::promql_engine::PromqlQuerier;
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
-use crate::promql::promqltest::assert::assert_results;
+use crate::promql::promqltest::assert::{StepGrid, assert_results, assert_results_on_grid};
 use crate::promql::promqltest::dsl::*;
 use crate::promql::promqltest::evaluator::{eval_instant, eval_range};
 use crate::promql::promqltest::loader::load_series;
@@ -127,7 +128,19 @@ where
 
                     let result = QueryValue::Matrix(result?);
                     let expected = eval_cmd.expected.clone();
-                    assert_results(result, expected, false, name, eval_count, &eval_cmd.query)?;
+                    let grid = StepGrid {
+                        start_ms: system_time_to_millis(eval_cmd.start),
+                        step_ms: eval_cmd.step.as_millis() as i64,
+                    };
+                    assert_results_on_grid(
+                        result,
+                        expected,
+                        false,
+                        name,
+                        eval_count,
+                        &eval_cmd.query,
+                        Some(grid),
+                    )?;
                 }
             }
 

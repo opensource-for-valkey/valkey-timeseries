@@ -1,6 +1,8 @@
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
-use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
+use crate::promql::engine::query_reader::{
+    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+};
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{
     InstantSample, PromqlResult, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -67,6 +69,19 @@ impl QueryReader for ValkeySeriesQuerier {
         }
         let matchers: Matchers = normalize_selector(selector);
         SERIES_SELECTOR.query_aggregation(matchers, timestamp, aggregation.clone(), options)
+    }
+
+    fn query_rollup(
+        &self,
+        selector: &VectorSelector,
+        rollup: &RollupRequest,
+        options: QueryOptions,
+    ) -> QueryResult<RollupOutcome> {
+        if !crate::config::is_fanout_rollup_pushdown_enabled() {
+            return Ok(RollupOutcome::Unsupported);
+        }
+        let matchers: Matchers = normalize_selector(selector);
+        SERIES_SELECTOR.query_rollup(matchers, rollup.clone(), options)
     }
 }
 
@@ -196,6 +211,18 @@ impl QueryReader for ConcreteSeriesQuerier {
             ConcreteSeriesQuerier::Mock(mock) => {
                 mock.query_aggregation(selector, timestamp, aggregation, options)
             }
+        }
+    }
+
+    fn query_rollup(
+        &self,
+        selector: &VectorSelector,
+        rollup: &RollupRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<RollupOutcome> {
+        match self {
+            ConcreteSeriesQuerier::Actual(local) => local.query_rollup(selector, rollup, options),
+            ConcreteSeriesQuerier::Mock(mock) => mock.query_rollup(selector, rollup, options),
         }
     }
 }

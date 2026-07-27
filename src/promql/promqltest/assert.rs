@@ -23,6 +23,55 @@ pub(super) fn assert_results(
     eval_num: usize,
     query: &str,
 ) -> Result<(), String> {
+    assert_results_on_grid(
+        results,
+        expected,
+        expect_ordered,
+        test_name,
+        eval_num,
+        query,
+        None,
+    )
+}
+
+/// The step grid a range evaluation ran on.
+///
+/// Expectations are written by step position (`{} 1 _ 3` is steps 0 and 2),
+/// while results carry wall-clock timestamps. The grid converts one to the
+/// other, which is what makes it possible to check *which* steps produced a
+/// sample and not just how many.
+#[derive(Clone, Copy)]
+pub(super) struct StepGrid {
+    pub start_ms: i64,
+    pub step_ms: i64,
+}
+
+impl StepGrid {
+    fn step_index(&self, timestamp_ms: i64) -> Result<i64, String> {
+        let offset = timestamp_ms - self.start_ms;
+        if self.step_ms <= 0 || offset < 0 || offset % self.step_ms != 0 {
+            return Err(format!(
+                "sample timestamp {timestamp_ms} does not fall on the step grid \
+                 (start {}, step {})",
+                self.start_ms, self.step_ms
+            ));
+        }
+        Ok(offset / self.step_ms)
+    }
+}
+
+/// [`assert_results`], with the step grid for a range evaluation so that each
+/// series' whole sample sequence is checked — every step's value, and which
+/// steps exist at all.
+pub(super) fn assert_results_on_grid(
+    results: QueryValue,
+    expected: QueryValue,
+    expect_ordered: bool,
+    test_name: &str,
+    eval_num: usize,
+    query: &str,
+    grid: Option<StepGrid>,
+) -> Result<(), String> {
     let result_type = results.value_type();
     let expected_type = expected.value_type();
     let (results, expected) = match (&results, &expected) {
@@ -88,12 +137,88 @@ pub(super) fn assert_results(
             }
         }
 
-        let exp_value = exp.samples[0].value;
-        let result_value = result.samples[0].value;
-        compare_scalar_results(test_name, query, eval_num, result_value, exp_value)?;
+        compare_series_samples(test_name, query, eval_num, exp, result, grid)?;
     }
 
     Ok(())
+}
+
+/// Compare one series' whole sample sequence: the same steps must be present,
+/// and each must carry the same value.
+///
+/// The shape check is the point. A rollup whose window is empty emits nothing
+/// for that step, so `{} 1 _ 1` and `{} 1 1 1` are different results, and a
+/// comparison that only looked at values would call them equal.
+fn compare_series_samples(
+    test_name: &str,
+    query: &str,
+    eval_num: usize,
+    expected: &RangeSample,
+    result: &RangeSample,
+    grid: Option<StepGrid>,
+) -> Result<(), String> {
+    let fail = |msg: String| format!("{test_name} eval #{eval_num} (query: {query}): {msg}");
+
+    // Expectations carry the step position in place of a timestamp; an instant
+    // eval has the single position 0.
+    let actual: Vec<(i64, f64)> = match grid {
+        Some(grid) => result
+            .samples
+            .iter()
+            .map(|s| grid.step_index(s.timestamp).map(|step| (step, s.value)))
+            .collect::<Result<_, _>>()
+            .map_err(fail)?,
+        None => result
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| (idx as i64, s.value))
+            .collect(),
+    };
+
+    if actual.len() != expected.samples.len() {
+        return Err(fail(format!(
+            "series {} has {} samples, expected {} (at steps {:?}, expected steps {:?})",
+            result.labels,
+            actual.len(),
+            expected.samples.len(),
+            actual.iter().map(|(step, _)| *step).collect::<Vec<_>>(),
+            expected
+                .samples
+                .iter()
+                .map(|s| s.timestamp)
+                .collect::<Vec<_>>(),
+        )));
+    }
+
+    for (exp, (step, value)) in expected.samples.iter().zip(actual) {
+        if exp.timestamp != step {
+            return Err(fail(format!(
+                "series {} has a sample at step {step}, expected one at step {}",
+                result.labels, exp.timestamp,
+            )));
+        }
+        if !values_equal(value, exp.value) {
+            return Err(fail(format!(
+                "series {} step {step}: Value mismatch: expected {}, got {value}",
+                result.labels, exp.value,
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// NaN and the infinities are legitimate result values, so each has to compare
+/// equal to itself rather than falling foul of `NaN != NaN` and `inf - inf`.
+fn values_equal(actual: f64, expected: f64) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if actual.is_nan() || expected.is_nan() {
+        return actual.is_nan() && expected.is_nan();
+    }
+    (actual - expected).abs() <= 1e-6
 }
 
 fn compare_scalar_results(
@@ -103,7 +228,7 @@ fn compare_scalar_results(
     result: f64,
     expected: f64,
 ) -> Result<(), String> {
-    if (result - expected).abs() > 1e-6 {
+    if !values_equal(result, expected) {
         return Err(format!(
             "{test_name} eval #{eval_num} (query: {query}): Value mismatch: expected {expected}, got {result}",
         ));

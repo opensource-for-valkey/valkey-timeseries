@@ -4,7 +4,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{HasFingerprint, Labels, SeriesFingerprint};
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
-use crate::promql::hashers::PreloadKey;
+use crate::promql::hashers::{PreloadKey, RollupPreloadKey};
 use ahash::RandomState;
 use enquote::enquote;
 use promql_parser::parser::LabelModifier;
@@ -324,6 +324,29 @@ pub(in crate::promql) struct PreloadedInstantSeries {
     /// Dense array indexed by outer step number. values[i] = Some(Sample) if a
     /// sample exists in the lookback window for that step, None otherwise.
     pub(super) values: Vec<Option<Sample>>,
+}
+
+pub(in crate::promql) type RollupPreloadMap =
+    halfbrown::HashMap<RollupPreloadKey, PreloadedRollupData, RandomState>;
+
+/// A rollup whose whole step grid was evaluated in one go, rather than once per
+/// step. Populated by `Evaluator::preload_rollups` before the step loop.
+pub(in crate::promql) struct PreloadedRollupData {
+    /// Start of the *step* grid — `query_start`, not the window end, which any
+    /// `@`/`offset` on the selector will have shifted. Step index is derived
+    /// from the step timestamp, so this is the right origin.
+    pub eval_start_ms: i64,
+    pub step_ms: i64,
+    pub series: Vec<PreloadedRollupSeries>,
+}
+
+pub(in crate::promql) struct PreloadedRollupSeries {
+    pub(super) labels: EvalLabels,
+    /// Dense array indexed by outer step number. `values[i]` is `Some` when the
+    /// window for that step produced a value and `None` when it held no samples
+    /// — which is not the same as producing NaN, and is why this is an
+    /// `Option<f64>` rather than an `f64` that could be NaN.
+    pub(super) values: Vec<Option<f64>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

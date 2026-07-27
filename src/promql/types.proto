@@ -209,6 +209,98 @@ message AggregationGroupPartial {
   AggregationPartialState state = 2;
 }
 
+/// A PromQL range-vector function a shard can evaluate on its own. Mirrors
+/// `crate::promql::functions::RollupKind`.
+///
+/// Membership is by window locality, not decomposability: a function belongs
+/// here when its output depends on nothing but one series' samples inside the
+/// window. `absent_over_time` is permanently excluded — its answer depends on
+/// series being absent across the whole cluster, which no single shard can see.
+///
+/// The list grows by appending. A shard that decodes a number it does not know
+/// answers `applied = false` and ships the raw windows, so a newer coordinator
+/// degrades instead of getting a wrong answer.
+enum RollupKind {
+  ROLLUP_SUM_OVER_TIME = 0;
+  ROLLUP_COUNT_OVER_TIME = 1;
+  ROLLUP_LAST_OVER_TIME = 2;
+  ROLLUP_AVG_OVER_TIME = 3;
+  ROLLUP_MIN_OVER_TIME = 4;
+  ROLLUP_MAX_OVER_TIME = 5;
+  ROLLUP_STDDEV_OVER_TIME = 6;
+  ROLLUP_STDVAR_OVER_TIME = 7;
+  ROLLUP_MAD_OVER_TIME = 8;
+  ROLLUP_PRESENT_OVER_TIME = 9;
+  ROLLUP_FIRST_OVER_TIME = 10;
+  ROLLUP_QUANTILE_OVER_TIME = 11;
+  ROLLUP_TS_OF_FIRST_OVER_TIME = 12;
+  ROLLUP_TS_OF_LAST_OVER_TIME = 13;
+  ROLLUP_TS_OF_MIN_OVER_TIME = 14;
+  ROLLUP_TS_OF_MAX_OVER_TIME = 15;
+  ROLLUP_RATE = 16;
+  ROLLUP_INCREASE = 17;
+  ROLLUP_DELTA = 18;
+  ROLLUP_IRATE = 19;
+  ROLLUP_IDELTA = 20;
+  ROLLUP_DERIV = 21;
+  ROLLUP_RESETS = 22;
+  ROLLUP_CHANGES = 23;
+}
+
+/// A rollup pushed down to a shard: which series to read, which windows to
+/// reduce, and which function to reduce them with.
+message RollupQuery {
+  SeriesSelector selector = 1;
+  /// The resolved step grid. `step_ms == 0` means a single evaluation, at
+  /// `range_end_ms`; otherwise the windows end at every step from
+  /// `query_start` through `query_end`.
+  int64 query_start = 2;
+  int64 query_end = 3;
+  int64 step_ms = 4;
+  /// Window width: the `[5m]` of `rate(m[5m])`. Each window is
+  /// `(end - range_ms, end]`.
+  int64 range_ms = 5;
+  uint64 lookback_delta_ms = 6;
+  /// Window end for the single-evaluation case, with `@` and `offset` already
+  /// resolved by the coordinator. A shard must never re-derive modifiers: it
+  /// reduces exactly the windows it is told to.
+  int64 range_end_ms = 7;
+  RollupKind kind = 8;
+  /// Numeric function parameter — `quantile_over_time`'s phi. Absent for the
+  /// parameterless rollups.
+  optional double scalar_param = 9;
+  uint64 max_series = 10;
+  /// Bound on the raw points examined per series, enforced shard-side. The
+  /// coordinator separately bounds the rolled-up points it accepts back.
+  uint64 max_points_per_series = 11;
+}
+
+/// One series' rolled-up output: sparse `(window end, value)` pairs.
+///
+/// A window that held no samples is *absent* from `points` — never present with
+/// a NaN value. That distinction is the result, so it has to survive the wire:
+/// NaN is a legitimate rolled-up value.
+message RollupSeries {
+  repeated Label labels = 1;
+  repeated Sample points = 2;
+}
+
+message RollupQueryResponse {
+  /// Set when `applied`: the shard's final per-series rollup values. Because a
+  /// series lives on exactly one shard, the coordinator concatenates these
+  /// rather than merging them.
+  repeated RollupSeries series = 1;
+  /// Set when `applied` is false: the raw windows, for the coordinator to
+  /// reduce itself.
+  repeated RangeSample raw = 2;
+  /// Compatibility handshake: true when the shard applied the requested rollup.
+  /// A shard that does not recognize the requested `kind` (a newer coordinator
+  /// during a rolling upgrade) returns the raw windows in `raw` with `applied`
+  /// false. Absent on a pre-handshake peer (proto3 decodes as false), which is
+  /// exactly the right interpretation.
+  bool applied = 3;
+}
+
 message AggregationQueryResponse {
   /// Set for the reduction operators (sum/avg/min/max/count/group/stddev/
   /// stdvar): one mergeable partial per group the shard saw.

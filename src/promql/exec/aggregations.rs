@@ -147,21 +147,26 @@ pub(in crate::promql) fn apply_aggregation(
     kind: AggregationKind,
     modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
-    mut samples: Vec<EvalSample>,
+    samples: Vec<EvalSample>,
     eval_time: Timestamp,
 ) -> EvalResult<Vec<EvalSample>> {
     if samples.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Materialize any pending __name__ drops on inner expression results before aggregation
-    // so that grouping and aggregation operate on the correct label sets (Prometheus semantics).
-    for sample in samples.iter_mut() {
-        if sample.drop_name {
-            sample.labels.drop_name();
-        }
-    }
-
+    // A pending `__name__` drop is *not* materialized here. Prometheus removes
+    // the name only when the final result is rendered, so an aggregation groups
+    // on the name that is about to disappear and hands the pending drop to its
+    // output groups. That is what makes
+    //
+    //     label_replace(sum by (__name__) (rate(m[5m])), "__name__", "$1", "__name__", "(.+)")
+    //
+    // able to recover the name, and it is why grouping by `__name__` over a
+    // rolled-up vector can collapse two groups into one label set. Dropping the
+    // name first would silently change both.
+    //
+    // `PartialGroups::accumulate` groups the same way, so pushed-down and local
+    // aggregation agree on group membership.
     match kind {
         AggregationKind::Sum
         | AggregationKind::Avg
@@ -195,20 +200,20 @@ fn eval_count_values(
     let label_name = get_param_as_string(param, "count_values")?;
     let groups = group_sample_values(modifier, samples);
     let mut out = Vec::new();
-    for (_, (labels, group_samples)) in groups {
+    for (_, group) in groups {
         let mut counts = BTreeMap::new();
-        for value in group_samples {
+        for value in group.members {
             *counts.entry(sample_value_label(value)).or_insert(0usize) += 1;
         }
 
         for (value_label, count) in counts {
-            let mut labels = labels.clone();
+            let mut labels = group.labels.clone();
             labels.set(&label_name, value_label);
             out.push(EvalSample {
                 labels,
                 timestamp_ms,
                 value: count as f64,
-                drop_name: false,
+                drop_name: group.drop_name,
             });
         }
     }
@@ -302,7 +307,7 @@ fn eval_top_bottom_k(
 
     let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
-        .map(|(_, (_, group))| group)
+        .map(|(_, group)| group.members)
         .iter_into_par()
         .flat_map(|group| select_k_from_group(group, k, order))
         .collect();
@@ -341,7 +346,8 @@ fn eval_limit_k(
     let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
         .iter_into_par()
-        .flat_map(|(_, (_, mut group_samples))| {
+        .flat_map(|(_, group)| {
+            let mut group_samples = group.members;
             group_samples.sort_by_key(sample_hash);
             select_limitk(group_samples, k)
         })
@@ -361,7 +367,8 @@ fn eval_limit_ratio(
     let mut out = Vec::new();
 
     // todo: parallelize
-    for (_, (_, mut group_samples)) in groups.into_iter() {
+    for (_, group) in groups.into_iter() {
+        let mut group_samples = group.members;
         group_samples.sort_by_key(sample_hash);
         let selected = select_limit_ratio(group_samples, k)?;
 
@@ -388,15 +395,15 @@ fn eval_quantile(
 
     let out: Vec<EvalSample> = groups
         .into_iter()
-        .map(|(_, (labels, samples))| (labels, samples))
+        .map(|(_, group)| group)
         .iter_into_par()
-        .map(|(labels, samples)| {
-            let value = sample_quantile(&samples, phi);
+        .map(|group| {
+            let value = sample_quantile(&group.members, phi);
             EvalSample {
-                labels,
+                labels: group.labels,
                 timestamp_ms: eval_time,
                 value,
-                drop_name: false,
+                drop_name: group.drop_name,
             }
         })
         .collect();
@@ -422,15 +429,15 @@ fn eval_reduction_aggregation(
 
     groups
         .into_iter()
-        .map(|(_, (labels, samples))| (labels, samples))
+        .map(|(_, group)| group)
         .iter_into_par()
-        .map(|(labels, samples)| {
-            let value = aggregate_group(kind, &samples);
+        .map(|group| {
+            let value = aggregate_group(kind, &group.members);
             EvalSample {
-                labels,
+                labels: group.labels,
                 value,
                 timestamp_ms,
-                drop_name: false,
+                drop_name: group.drop_name,
             }
         })
         .collect()
@@ -460,10 +467,30 @@ fn aggregate_group(kind: AggregationKind, samples: &[f64]) -> f64 {
     }
 }
 
+/// One aggregation group.
+struct Group<T> {
+    labels: EvalLabels,
+    /// True when any member still owes a `__name__` drop, which the group
+    /// inherits. See [`apply_aggregation`] for why the drop happens after the
+    /// aggregation rather than before it.
+    drop_name: bool,
+    members: Vec<T>,
+}
+
+impl<T> Group<T> {
+    fn new(labels: EvalLabels) -> Self {
+        Self {
+            labels,
+            drop_name: false,
+            members: Vec::new(),
+        }
+    }
+}
+
 fn group_samples(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<(EvalLabels, Vec<EvalSample>)> {
+) -> FingerprintHashMap<Group<EvalSample>> {
     let keyed: Vec<_> = samples
         .into_par()
         .map(|sample| {
@@ -473,11 +500,11 @@ fn group_samples(
         })
         .collect();
 
-    let mut groups: FingerprintHashMap<(EvalLabels, Vec<EvalSample>)> =
-        FingerprintHashMap::default();
+    let mut groups: FingerprintHashMap<Group<EvalSample>> = FingerprintHashMap::default();
     for (key, labels, sample) in keyed {
-        let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
-        entry.1.push(sample);
+        let entry = groups.entry(key).or_insert_with(|| Group::new(labels));
+        entry.drop_name |= sample.drop_name;
+        entry.members.push(sample);
     }
     groups
 }
@@ -485,15 +512,16 @@ fn group_samples(
 fn group_sample_values(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<(EvalLabels, Vec<f64>)> {
-    let mut groups: FingerprintHashMap<(EvalLabels, Vec<f64>)> = FingerprintHashMap::default();
+) -> FingerprintHashMap<Group<f64>> {
+    let mut groups: FingerprintHashMap<Group<f64>> = FingerprintHashMap::default();
 
     for sample in samples {
         let labels = sample.labels.compute_grouping_labels(modifier);
         let key = labels.fingerprint();
 
-        let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
-        entry.1.push(sample.value);
+        let entry = groups.entry(key).or_insert_with(|| Group::new(labels));
+        entry.drop_name |= sample.drop_name;
+        entry.members.push(sample.value);
     }
 
     groups

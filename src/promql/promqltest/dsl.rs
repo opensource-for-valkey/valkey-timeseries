@@ -415,14 +415,46 @@ fn parse_multiple_value_exprs(s: &str) -> Result<Vec<(i64, f64)>, String> {
         for (step, value) in values {
             all.push((step + base_step, value));
         }
-        base_step = all.len() as i64;
+        // Advance by the step positions the expression *covers*, not by the
+        // samples it produced: `_` covers a position without producing one, and
+        // counting samples instead would slide every later value one step
+        // earlier — turning `1 _ 1` into samples at steps 0 and 1.
+        base_step += steps_covered(part)?;
     }
 
     Ok(all)
 }
 
+/// How many step positions a single value expression occupies, whether or not it
+/// yields samples (`_x3` occupies three and yields none).
+fn steps_covered(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    if let Some(count) = s.strip_prefix("_x") {
+        return count
+            .parse::<i64>()
+            .map_err(|_| format!("Invalid repeat count: {s}"));
+    }
+    if s.contains('+') && s.contains('x') {
+        let (_, count_str) = s
+            .split_once('x')
+            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
+        let count: i64 = count_str
+            .parse()
+            .map_err(|_| format!("Invalid count: {count_str}"))?;
+        // Inclusive: `0+10x5` is six samples.
+        return Ok(count + 1);
+    }
+    Ok(1)
+}
+
 fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
     let s = s.trim();
+
+    // `_` marks a step with no sample, and `_xN` a run of them. Neither yields
+    // a value; `steps_covered` accounts for the positions they occupy.
+    if s == "_" || s.starts_with("_x") {
+        return Ok(Vec::new());
+    }
 
     // Check for expansion syntax: "start+step x count"
     // Prometheus promqltest semantics are inclusive:

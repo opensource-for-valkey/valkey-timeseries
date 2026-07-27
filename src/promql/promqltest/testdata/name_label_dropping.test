@@ -41,20 +41,14 @@ eval instant at 10m round(metric_total)
 eval instant at 10m rate(metric_total{env="1"}[10m])
 	{env="1"} 0.2
 
-# ignoring last_over_time unimplemented
-ignore
-
 # Does not drop __name__ for last_over_time function.
 eval instant at 10m last_over_time(metric_total{env="1"}[10m])
 	metric_total{env="1"} 120
-
-
 
 # Does not drop __name__ for first_over_time function.
 eval instant at 10m first_over_time(metric_total{env="1"}[10m])
 	metric_total{env="1"} 60
 
-resume
 # Drops name for other _over_time functions.
 eval instant at 10m max_over_time(metric_total{env="1"}[10m])
 	{env="1"} 120

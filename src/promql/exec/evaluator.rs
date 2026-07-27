@@ -7,17 +7,23 @@ use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationParam, AggregationRequest,
+    AggregationOutcome, AggregationParam, AggregationRequest, RollupOutcome, RollupRequest,
 };
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
 };
-use crate::promql::exec::types::{EvalLabels, SeriesMap};
-use crate::promql::exec::utils::{collect_vector_selectors, merge_step_into_series_map};
+use crate::promql::exec::types::{
+    EvalLabels, PreloadedRollupData, PreloadedRollupSeries, RollupPreloadMap, SeriesMap,
+};
+use crate::promql::exec::utils::{
+    collect_rollup_calls, collect_vector_selectors, merge_step_into_series_map,
+};
+use crate::promql::functions::RollupKind;
 use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
-use crate::promql::hashers::PreloadKey;
+use crate::promql::hashers::{PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
+use crate::promql::model::RangeSample;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
@@ -41,6 +47,9 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: RwLock<PreloadMap>,
+    /// Rollups whose whole step grid was evaluated at the source in one request.
+    /// Populated by preload_rollups() before the step loop.
+    preloaded_rollups: RwLock<RollupPreloadMap>,
     options: QueryOptions,
 }
 
@@ -49,6 +58,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Self {
             reader,
             preloaded_instant: RwLock::new(PreloadMap::default()),
+            preloaded_rollups: RwLock::new(RollupPreloadMap::default()),
             options,
         }
     }
@@ -74,7 +84,198 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .into_fallible_result()
             .collect()?;
 
+        self.preload_rollups(expr, ctx)?;
+
         Ok(())
+    }
+
+    /// Ask the source to evaluate each pushable rollup over the *whole* step
+    /// grid, once, before the step loop starts.
+    ///
+    /// This is where the round-trip collapse lives. Evaluating `rate(m[5m])` at
+    /// a 15s step over six hours is 1440 steps; done per step that is 1440
+    /// fan-outs, each shipping a five-minute window that its twenty neighbours
+    /// also ship. Done here it is one fan-out and one float per series per step.
+    ///
+    /// A rollup that cannot be pushed down is simply not cached, and the step
+    /// loop evaluates it locally as before.
+    fn preload_rollups(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
+        if ctx.step_ms <= 0 {
+            return Ok(());
+        }
+
+        let mut seen = AHashSet::new();
+        for call in collect_rollup_calls(expr) {
+            let Some((kind, matrix, param)) = self.pushable_rollup(call) else {
+                continue;
+            };
+            let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            self.preload_rollup(key, kind, matrix, param, ctx)?;
+        }
+
+        Ok(())
+    }
+
+    /// The rollup a call can be pushed down as, if any.
+    ///
+    /// Unlike the instant path's [`Self::rollup_arguments`], the scalar
+    /// parameter must be a *literal*. One grid request carries one parameter, so
+    /// a parameter that could differ per step — `quantile_over_time(scalar(q),
+    /// m[5m])` — cannot be answered by a single request at all. That is a
+    /// correctness bound, not an optimization: such a call stays local.
+    fn pushable_rollup<'a>(
+        &self,
+        call: &'a Call,
+    ) -> Option<(RollupKind, &'a MatrixSelector, Option<f64>)> {
+        // The coordinator keeps authority over experimental functions: a shard
+        // must never be asked to run one the request was not approved for. The
+        // step loop rejects the query anyway, but preloading runs before it, so
+        // without this the fan-out would go out first.
+        if call.func.experimental && !self.options.enable_experimental_functions {
+            return None;
+        }
+
+        let kind = RollupKind::from_function_name(call.func.name)?;
+
+        let mut matrix = None;
+        let mut param = None;
+        for arg in call.args.args.iter().map(|arg| strip_parens(arg)) {
+            match arg {
+                Expr::MatrixSelector(ms) if matrix.is_none() => matrix = Some(ms),
+                Expr::NumberLiteral(literal) if param.is_none() => param = Some(literal.val),
+                _ => return None,
+            }
+        }
+
+        Some((kind, matrix?, param))
+    }
+
+    fn preload_rollup(
+        &self,
+        key: RollupPreloadKey,
+        kind: RollupKind,
+        matrix: &MatrixSelector,
+        param: Option<f64>,
+        ctx: &EvalContext,
+    ) -> EvalResult<()> {
+        let steps: Vec<Timestamp> =
+            step_times(ctx.query_start, ctx.query_end, ctx.step_ms).collect();
+
+        // Resolve `@`/`offset` here, per step. The source is told window ends
+        // and never a modifier, so it cannot resolve one differently than the
+        // local path would.
+        let window_ends: Vec<Timestamp> = steps
+            .iter()
+            .map(|&step_ts| {
+                apply_time_modifiers_ms(
+                    matrix.vs.at.as_ref(),
+                    matrix.vs.offset.as_ref(),
+                    ctx.query_start,
+                    ctx.query_end,
+                    step_ts,
+                )
+            })
+            .collect();
+        let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
+            return Ok(());
+        };
+
+        let request = RollupRequest {
+            kind,
+            range_ms: matrix_range_ms(matrix),
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            step_ms: ctx.step_ms,
+            query_start: first,
+            query_end: last,
+            range_end_ms: last,
+            param,
+        };
+
+        // The request describes its windows as a start/end/step progression;
+        // `@` collapses every step onto one window end, and `offset` shifts them
+        // uniformly. Verify the progression the source will derive is exactly
+        // the set of ends resolved above rather than trusting that every
+        // modifier shape reduces to one — an unanticipated one stays local
+        // instead of silently answering for the wrong windows.
+        let mut resolved = window_ends.clone();
+        resolved.dedup();
+        if request.window_ends() != resolved {
+            return Ok(());
+        }
+
+        let mut options = self.options;
+        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+
+        let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
+            RollupOutcome::Unsupported => return Ok(()),
+            RollupOutcome::Rolled(series) => series,
+            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+        };
+
+        // Scatter each series' sparse `(window end, value)` pairs onto the step
+        // grid. With `@`, every step shares one window end and therefore one
+        // value; otherwise the mapping is one to one.
+        let series = rolled
+            .into_iter()
+            .map(|s| {
+                let points: ahash::AHashMap<Timestamp, f64> = s
+                    .samples
+                    .iter()
+                    .map(|point| (point.timestamp, point.value))
+                    .collect();
+                let values = window_ends
+                    .iter()
+                    .map(|end| points.get(end).copied())
+                    .collect();
+                PreloadedRollupSeries {
+                    labels: EvalLabels::from(s.labels),
+                    values,
+                }
+            })
+            .collect();
+
+        self.preloaded_rollups.write().unwrap().insert(
+            key,
+            PreloadedRollupData {
+                eval_start_ms: ctx.query_start,
+                step_ms: ctx.step_ms,
+                series,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// This step's slice of a preloaded rollup, or `None` when the call was not
+    /// preloaded and has to be evaluated here.
+    fn preloaded_rollup(&self, call: &Call, ctx: &EvalContext) -> Option<ExprResult> {
+        let (kind, matrix, param) = self.pushable_rollup(call)?;
+        let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param);
+
+        let guard = self.preloaded_rollups.read().unwrap();
+        let preloaded = guard.get(&key)?;
+        let step_idx = ((ctx.evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
+
+        let samples = preloaded
+            .series
+            .iter()
+            .filter_map(|series| {
+                // A step whose window held no samples contributes nothing —
+                // the series is absent at this step, not NaN here.
+                let value = (*series.values.get(step_idx)?)?;
+                Some(EvalSample {
+                    timestamp_ms: ctx.evaluation_ts,
+                    value,
+                    labels: series.labels.clone(),
+                    drop_name: false,
+                })
+            })
+            .collect();
+
+        Some(ExprResult::InstantVector(samples))
     }
 
     /// Convenience wrapper that builds an [`EvalContext`] from a full [`EvalStmt`]
@@ -538,8 +739,40 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )));
         }
 
-        let evaluated_args = self.evaluate_function_args(ctx, call, preload_eligible)?;
-        let result = func.apply_call(evaluated_args, ctx)?;
+        // Ask the data source to evaluate the whole rollup where the data lives
+        // (see `QueryReader::query_rollup`): across a cluster that turns each
+        // series' window into one float per step, instead of shipping the window
+        // — which neighbouring steps would each ship again.
+        //
+        // For a range query that already happened, for every step at once, in
+        // `preload_rollups`; this step just reads its slice. Otherwise the
+        // request is made here, for this one evaluation.
+        // The preloaded grid belongs to the outer range query, so a subquery
+        // step — which carries its own grid and sets `preload_eligible` false —
+        // must not read it, and falls through to a request of its own.
+        let pushed_down = match preload_eligible
+            .then(|| self.preloaded_rollup(call, ctx))
+            .flatten()
+        {
+            Some(result) => Some(result),
+            None => self.evaluate_pushed_down_rollup(call, ctx)?,
+        };
+
+        let mut result = match pushed_down {
+            Some(result) => result,
+            None => {
+                let evaluated_args = self.evaluate_function_args(ctx, call, preload_eligible)?;
+                func.apply_call(evaluated_args, ctx)?
+            }
+        };
+
+        if let ExprResult::InstantVector(samples) = &mut result
+            && drops_metric_name(call)
+        {
+            for sample in samples {
+                sample.drop_name = true;
+            }
+        }
 
         if call.func.return_type == ValueType::Scalar {
             return match result {
@@ -852,6 +1085,194 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let key = PreloadKey::from_selector(selector);
         self.preloaded_instant.read().unwrap().contains_key(&key)
     }
+
+    /// Try to have the data source evaluate `call`'s rollup itself.
+    ///
+    /// Returns `None` when the rollup stays here, which is the case unless all
+    /// of the following hold:
+    ///
+    /// * the function can be evaluated from one series' window alone — see
+    ///   [`RollupKind`];
+    /// * this is a single evaluation (`step_ms == 0`). A range query's whole
+    ///   step grid is pushed in a later phase; until then its steps stay local
+    ///   so that both paths cannot disagree about the grid;
+    /// * the argument is a bare matrix selector. A subquery brings its own step
+    ///   grid, and anything else has to be evaluated before the rollup can see
+    ///   it;
+    /// * the function parameter, if any, is a literal scalar that can be
+    ///   shipped;
+    /// * and the source says it can do it (only a cluster can).
+    fn evaluate_pushed_down_rollup(
+        &self,
+        call: &Call,
+        ctx: &EvalContext,
+    ) -> EvalResult<Option<ExprResult>> {
+        if ctx.step_ms != 0 {
+            return Ok(None);
+        }
+
+        let Some(kind) = RollupKind::from_function_name(call.func.name) else {
+            return Ok(None);
+        };
+
+        let Some((matrix, param)) = self.rollup_arguments(call, ctx)? else {
+            return Ok(None);
+        };
+
+        // Resolve `@`/`offset` here: the source is told the window, never the
+        // modifier, so it cannot resolve one differently than the local path.
+        let range_end_ms = apply_time_modifiers_ms(
+            matrix.vs.at.as_ref(),
+            matrix.vs.offset.as_ref(),
+            ctx.query_start,
+            ctx.query_end,
+            ctx.evaluation_ts,
+        );
+
+        let request = RollupRequest {
+            kind,
+            range_ms: matrix.range.as_millis() as i64,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            step_ms: ctx.step_ms,
+            query_start: ctx.query_start,
+            query_end: ctx.query_end,
+            range_end_ms,
+            param,
+        };
+
+        let mut options = self.options;
+        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+
+        let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
+            RollupOutcome::Unsupported => return Ok(None),
+            RollupOutcome::Rolled(series) => series,
+            // The source read the windows but did not reduce them; finish the
+            // job, with the same kernel a shard would have used.
+            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+        };
+
+        // A single evaluation yields at most one point per series, stamped with
+        // the query's evaluation timestamp rather than the window end — so a
+        // shifted selector still reports at the instant the client asked for.
+        let samples = rolled
+            .into_iter()
+            .filter_map(|s| {
+                let point = s.samples.last()?;
+                Some(EvalSample {
+                    timestamp_ms: ctx.evaluation_ts,
+                    value: point.value,
+                    labels: EvalLabels::from(s.labels),
+                    drop_name: false,
+                })
+            })
+            .collect();
+
+        Ok(Some(ExprResult::InstantVector(samples)))
+    }
+
+    /// The matrix selector and optional scalar parameter of a pushable rollup
+    /// call, or `None` when the call's shape rules push-down out.
+    pub(super) fn rollup_arguments<'a>(
+        &self,
+        call: &'a Call,
+        ctx: &EvalContext,
+    ) -> EvalResult<Option<(&'a MatrixSelector, Option<f64>)>> {
+        let args: Vec<&Expr> = call.args.args.iter().map(|arg| strip_parens(arg)).collect();
+
+        // Find the matrix argument first and give up before evaluating anything
+        // if there is none: a subquery argument, or an expression that has to be
+        // evaluated before the rollup can see it, keeps the whole call local and
+        // the ordinary path will evaluate the arguments anyway.
+        let mut matrices = args
+            .iter()
+            .filter(|arg| matches!(arg, Expr::MatrixSelector(_)));
+        let Some(Expr::MatrixSelector(matrix)) = matrices.next() else {
+            return Ok(None);
+        };
+        if matrices.next().is_some() {
+            return Ok(None);
+        }
+
+        // The remaining argument, if any, must be a scalar that can be shipped.
+        // Position is not fixed: `quantile_over_time` takes phi first, while
+        // `predict_linear` takes the matrix first. Only one such argument is
+        // carried, which is what the request has room for.
+        let mut param = None;
+        for arg in args
+            .iter()
+            .filter(|arg| !matches!(arg, Expr::MatrixSelector(_)))
+        {
+            if param.is_some() {
+                return Ok(None);
+            }
+            match self.evaluate_expr(arg, ctx, false)? {
+                ExprResult::Scalar(value) => param = Some(value),
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(Some((matrix, param)))
+    }
+}
+
+/// Reduce raw windows with the request's rollup — what a shard would have done,
+/// run here for a source that returned the windows unreduced.
+///
+/// A series whose every window was empty contributes nothing, which is not the
+/// same as contributing NaN.
+fn reduce_rollup_windows(request: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
+    let window_ends = request.window_ends();
+    series
+        .into_iter()
+        .filter_map(|s| {
+            let points = request.kind.eval_windows(
+                &s.samples,
+                request.range_ms,
+                request.lookback_delta_ms,
+                request.step_ms,
+                window_ends.iter().copied(),
+                request.param,
+            );
+            (!points.is_empty()).then_some(RangeSample {
+                labels: s.labels,
+                samples: points,
+            })
+        })
+        .collect()
+}
+
+fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {
+    matrix.range.as_millis() as i64
+}
+
+/// Range-vector functions that report a sample of the input series unchanged,
+/// and so keep `__name__`. Every other range-vector function drops it; see
+/// [`drops_metric_name`].
+const NAME_PRESERVING_ROLLUPS: [&str; 2] = ["first_over_time", "last_over_time"];
+
+/// Whether `call` strips `__name__` from its output.
+///
+/// This is the single rule for range-vector functions, and it is deliberately
+/// stated once here rather than per function: a rollup reduces a series to
+/// something that is no longer that metric, so the name goes. The exceptions in
+/// [`NAME_PRESERVING_ROLLUPS`] hand back one of the input samples as-is, so
+/// there is nothing to rename.
+///
+/// The drop is *recorded*, not applied — `drop_name` is materialized once, at
+/// the end of evaluation, by [`Evaluator::cleanup_metric_labels`]. Everything in
+/// between still sees the name, which is what lets
+/// `label_replace(rate(m[5m]), "__name__", …, "__name__", "(.+)")` recover it.
+///
+/// Functions over instant vectors are not covered; each already marks its own
+/// output (`abs` drops, `label_replace` does not), and this rule must not
+/// override them.
+///
+/// The same rule governs pushed-down rollups: a shard returns the label set as
+/// the function leaves it, and the drop is recorded once, here, on the
+/// coordinator.
+fn drops_metric_name(call: &Call) -> bool {
+    !NAME_PRESERVING_ROLLUPS.contains(&call.func.name)
+        && call.func.arg_types.contains(&ValueType::Matrix)
 }
 
 /// Look through parentheses: `sum((metric))` aggregates a selector just as

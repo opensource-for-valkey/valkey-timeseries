@@ -17,13 +17,14 @@ mod tests {
     use crate::common::time::system_time_to_millis;
     use crate::labels::{Label, Labels};
     use crate::promql::engine::query_reader::{
-        AggregationOutcome, AggregationParam, AggregationRequest,
+        AggregationOutcome, AggregationParam, AggregationRequest, RollupOutcome, RollupRequest,
     };
     use crate::promql::engine::test_utils::{
         MemorySeriesQuerier, MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder,
     };
     use crate::promql::engine::{QueryOptions, QueryReader};
     use crate::promql::exec::aggregations::AggregationKind;
+    use crate::promql::functions::RollupKind;
     use crate::tests::approx_eq;
     use promql_parser::parser::token::{T_SUB, TokenType};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -3866,5 +3867,977 @@ mod tests {
                 assert_eq!(offered.len(), 1, "{query}: only the inner aggregation");
             }
         }
+    }
+
+    // ── Rollup semantics lock ───────────────────────────────────────────
+    //
+    // The gates that have to hold before rollup evaluation can be pushed to a
+    // shard: which label set a rollup produces, and which `(series, step)`
+    // pairs exist at all. Both are asserted exactly — a shard has to reproduce
+    // them, not approximate them.
+
+    /// Build a reader holding one series, `metric{job="api"}`, sampled every
+    /// 10s from t=0 through t=300s with value `t/10`.
+    fn rollup_reader() -> MemorySeriesQuerier {
+        let mut builder = MockQueryReaderBuilder::new();
+        let labels = create_labels("metric", vec![("job", "api")]);
+        for i in 0..=30i64 {
+            builder.add_sample(&labels, Sample::new(i * 10_000, i as f64));
+        }
+        builder.build()
+    }
+
+    fn eval_rollup(reader: &MemorySeriesQuerier, query: &str, at_ms: i64) -> Vec<EvalSample> {
+        let evaluator = Evaluator::new(
+            reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+        parse_and_evaluate(
+            &evaluator,
+            query,
+            UNIX_EPOCH + Duration::from_millis(at_ms as u64),
+            Duration::from_secs(300),
+        )
+        .unwrap_or_else(|e| panic!("{query} should evaluate: {e}"))
+    }
+
+    /// Gate G2: a rollup's output label set. Every range-vector function strips
+    /// `__name__`; `first_over_time` and `last_over_time` hand back an input
+    /// sample and keep it. Non-name labels always survive.
+    #[test]
+    fn should_drop_metric_name_from_rollups() {
+        let reader = rollup_reader();
+
+        for query in [
+            "sum_over_time(metric[1m])",
+            "avg_over_time(metric[1m])",
+            "count_over_time(metric[1m])",
+            "min_over_time(metric[1m])",
+            "max_over_time(metric[1m])",
+            "stddev_over_time(metric[1m])",
+            "present_over_time(metric[1m])",
+            "quantile_over_time(0.5, metric[1m])",
+            "ts_of_last_over_time(metric[1m])",
+            "rate(metric[1m])",
+            "irate(metric[1m])",
+            "increase(metric[1m])",
+            "delta(metric[1m])",
+            "idelta(metric[1m])",
+            "deriv(metric[1m])",
+            "changes(metric[1m])",
+            "resets(metric[1m])",
+            "predict_linear(metric[1m], 60)",
+        ] {
+            let result = eval_rollup(&reader, query, 120_000);
+            assert_eq!(result.len(), 1, "{query}: one output series");
+            assert_eq!(
+                result[0].labels.get(METRIC_NAME),
+                None,
+                "{query}: __name__ must be dropped"
+            );
+            assert_eq!(
+                result[0].labels.get("job"),
+                Some("api"),
+                "{query}: other labels are kept"
+            );
+        }
+
+        for query in ["first_over_time(metric[1m])", "last_over_time(metric[1m])"] {
+            let result = eval_rollup(&reader, query, 120_000);
+            assert_eq!(result.len(), 1, "{query}: one output series");
+            assert_eq!(
+                result[0].labels.get(METRIC_NAME),
+                Some("metric"),
+                "{query}: __name__ must be kept"
+            );
+            assert_eq!(
+                result[0].labels.get("job"),
+                Some("api"),
+                "{query}: job kept"
+            );
+        }
+    }
+
+    /// Gate G1: a rollup evaluates the window the matrix selector loaded, once.
+    /// Nothing about the enclosing query's step grid may leak into which samples
+    /// it reduces, so the same instant must give the same answer whether or not
+    /// a step is set.
+    #[test]
+    fn should_evaluate_rollup_over_the_selected_window_only() {
+        let reader = rollup_reader();
+
+        // Window (60s, 120s] holds the samples at 70s..120s: values 7..12.
+        let expected: &[(&str, f64)] = &[
+            ("count_over_time(metric[1m])", 6.0),
+            ("sum_over_time(metric[1m])", 57.0),
+            ("min_over_time(metric[1m])", 7.0),
+            ("max_over_time(metric[1m])", 12.0),
+            ("avg_over_time(metric[1m])", 9.5),
+            ("last_over_time(metric[1m])", 12.0),
+            ("first_over_time(metric[1m])", 7.0),
+        ];
+
+        for (query, want) in expected {
+            let result = eval_rollup(&reader, query, 120_000);
+            assert_eq!(result.len(), 1, "{query}: one output series");
+            assert_eq!(result[0].value, *want, "{query}");
+            assert_eq!(
+                result[0].timestamp_ms, 120_000,
+                "{query}: stamped at the evaluation instant"
+            );
+        }
+    }
+
+    /// Gate G1, continued: `@` and `offset` move the window the rollup reduces
+    /// but not the timestamp its output carries. A shard is told the resolved
+    /// window and must not re-derive either.
+    #[test]
+    fn should_report_shifted_rollups_at_the_query_instant() {
+        let reader = rollup_reader();
+
+        // At t=300s, `offset 3m` selects the window (60s, 120s] — values 7..12.
+        for query in [
+            "sum_over_time(metric[1m] offset 3m)",
+            "sum_over_time(metric[1m] @ 120)",
+        ] {
+            let result = eval_rollup(&reader, query, 300_000);
+            assert_eq!(result.len(), 1, "{query}: one output series");
+            assert_eq!(result[0].value, 57.0, "{query}: shifted window");
+            assert_eq!(
+                result[0].timestamp_ms, 300_000,
+                "{query}: reported at the query instant, not the shifted one"
+            );
+        }
+    }
+
+    /// Gate G3: an empty window produces no sample. The series is absent from
+    /// the result rather than present with NaN, which is the distinction the
+    /// pushed-down transport has to preserve.
+    #[test]
+    fn should_omit_series_whose_window_is_empty() {
+        let reader = rollup_reader();
+
+        // The series ends at t=300s, so a window past it holds nothing.
+        for query in [
+            "count_over_time(metric[1m])",
+            "sum_over_time(metric[1m])",
+            "present_over_time(metric[1m])",
+            "last_over_time(metric[1m])",
+        ] {
+            let result = eval_rollup(&reader, query, 600_000);
+            assert!(
+                result.is_empty(),
+                "{query}: an empty window emits nothing, got {result:?}"
+            );
+        }
+    }
+
+    /// Gate G3, continued: a NaN *value* is a result. It must survive as a
+    /// sample rather than being mistaken for an absent one.
+    #[test]
+    fn should_keep_nan_valued_rollup_results() {
+        let mut builder = MockQueryReaderBuilder::new();
+        let labels = create_labels("metric", vec![("job", "api")]);
+        builder.add_sample(&labels, Sample::new(10_000, f64::NAN));
+        let reader = builder.build();
+
+        for query in ["sum_over_time(metric[1m])", "last_over_time(metric[1m])"] {
+            let result = eval_rollup(&reader, query, 10_000);
+            assert_eq!(result.len(), 1, "{query}: the NaN sample is a result");
+            assert!(result[0].value.is_nan(), "{query}: value stays NaN");
+        }
+
+        // …and counting it sees one sample, not zero.
+        let result = eval_rollup(&reader, "count_over_time(metric[1m])", 10_000);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 1.0, "a NaN sample still counts");
+    }
+
+    // ── Rollup push-down ────────────────────────────────────────────────
+    //
+    // The coordinator side of `QueryReader::query_rollup`: which calls are
+    // offered to the source, what the source is told about the window, and that
+    // whichever side reduces, the answer is the same.
+
+    /// What the source was told about one offered rollup.
+    #[derive(Debug, Clone, PartialEq)]
+    struct OfferedRollup {
+        kind: RollupKind,
+        range_ms: i64,
+        step_ms: i64,
+        range_end_ms: i64,
+        param: Option<f64>,
+    }
+
+    /// A reader that records every rollup it is offered. `answer` decides
+    /// whether it reduces the windows itself (the cluster's role) or hands them
+    /// back raw (the single-node fallback).
+    struct RollupPushdownReader {
+        inner: MemorySeriesQuerier,
+        answer: RollupAnswer,
+        offered: std::sync::Mutex<Vec<OfferedRollup>>,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum RollupAnswer {
+        /// Reduce here, as a shard would.
+        Rolled,
+        /// Return the windows unreduced, as a single node does.
+        Raw,
+        /// Refuse, as a node without push-down does.
+        Unsupported,
+    }
+
+    impl RollupPushdownReader {
+        fn new(inner: MemorySeriesQuerier, answer: RollupAnswer) -> Self {
+            Self {
+                inner,
+                answer,
+                offered: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn offered(&self) -> Vec<OfferedRollup> {
+            self.offered.lock().unwrap().clone()
+        }
+    }
+
+    impl QueryReader for RollupPushdownReader {
+        fn query(
+            &self,
+            selector: &VectorSelector,
+            timestamp: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+            self.inner.query(selector, timestamp, options)
+        }
+
+        fn query_range(
+            &self,
+            selector: &VectorSelector,
+            start_ms: i64,
+            end_ms: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+            self.inner.query_range(selector, start_ms, end_ms, options)
+        }
+
+        fn query_rollup(
+            &self,
+            selector: &VectorSelector,
+            rollup: &RollupRequest,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<RollupOutcome> {
+            self.offered.lock().unwrap().push(OfferedRollup {
+                kind: rollup.kind,
+                range_ms: rollup.range_ms,
+                step_ms: rollup.step_ms,
+                range_end_ms: rollup.range_end_ms,
+                param: rollup.param,
+            });
+
+            if self.answer == RollupAnswer::Unsupported {
+                return Ok(RollupOutcome::Unsupported);
+            }
+
+            let raw = self.inner.query_rollup(selector, rollup, options)?;
+            let RollupOutcome::Raw(windows) = raw else {
+                panic!("the in-memory reader always answers Raw");
+            };
+            if self.answer == RollupAnswer::Raw {
+                return Ok(RollupOutcome::Raw(windows));
+            }
+
+            // Reduce here, exactly as a shard does.
+            let ends = rollup.window_ends();
+            Ok(RollupOutcome::Rolled(
+                windows
+                    .into_iter()
+                    .filter_map(|s| {
+                        let points = rollup.kind.eval_windows(
+                            &s.samples,
+                            rollup.range_ms,
+                            rollup.lookback_delta_ms,
+                            rollup.step_ms,
+                            ends.iter().copied(),
+                            rollup.param,
+                        );
+                        (!points.is_empty()).then_some(crate::promql::RangeSample {
+                            labels: s.labels,
+                            samples: points,
+                        })
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    /// Evaluate `query` at `at_ms` against a reader that answers rollups with
+    /// `answer`, returning the result and what it was offered.
+    fn evaluate_rollup_pushdown(
+        query: &str,
+        at_ms: i64,
+        answer: RollupAnswer,
+    ) -> (Vec<EvalSample>, Vec<OfferedRollup>) {
+        evaluate_rollup_pushdown_on(rollup_reader(), query, at_ms, answer)
+    }
+
+    fn evaluate_rollup_pushdown_on(
+        inner: MemorySeriesQuerier,
+        query: &str,
+        at_ms: i64,
+        answer: RollupAnswer,
+    ) -> (Vec<EvalSample>, Vec<OfferedRollup>) {
+        let reader = RollupPushdownReader::new(inner, answer);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+        let result = parse_and_evaluate(
+            &evaluator,
+            query,
+            UNIX_EPOCH + Duration::from_millis(at_ms as u64),
+            Duration::from_secs(300),
+        )
+        .unwrap_or_else(|e| panic!("{query} should evaluate: {e}"));
+        (result, reader.offered())
+    }
+
+    /// Only a bare `f(selector[range])` whose function can be evaluated from one
+    /// series' window is offered to the source. Everything else stays local.
+    #[test]
+    fn should_offer_only_pushable_rollups() {
+        // Every kind is offered, with the window and function it names.
+        for kind in RollupKind::all() {
+            let query = rollup_query(kind, "1m");
+            let (_, offered) = evaluate_rollup_pushdown(&query, 120_000, RollupAnswer::Rolled);
+            assert_eq!(offered.len(), 1, "{query}: offered once");
+            assert_eq!(offered[0].kind, kind, "{query}");
+            assert_eq!(
+                offered[0].range_ms, 60_000,
+                "{query}: resolved window width"
+            );
+            assert_eq!(offered[0].step_ms, 0, "{query}: single evaluation");
+        }
+
+        // Parentheses around the selector do not change what is reduced.
+        let (_, offered) =
+            evaluate_rollup_pushdown("sum_over_time((metric[1m]))", 120_000, RollupAnswer::Rolled);
+        assert_eq!(offered.len(), 1, "parenthesized selector is still pushable");
+
+        for query in [
+            // Not window-local: the answer depends on absence across the cluster.
+            "absent_over_time(metric[1m])",
+            // Predicts relative to the query's evaluation timestamp, which
+            // `@`/`offset` divorce from the window end a shard is told.
+            "predict_linear(metric[1m], 60)",
+            // Two scalar parameters; the request carries one.
+            "double_exponential_smoothing(metric[1m], 0.5, 0.5)",
+            // A subquery brings its own step grid.
+            "sum_over_time(metric[2m:30s])",
+            // Not a range-vector function at all.
+            "abs(metric)",
+        ] {
+            let (_, offered) = evaluate_rollup_pushdown(query, 120_000, RollupAnswer::Rolled);
+            assert!(offered.is_empty(), "{query}: must not be pushed down");
+        }
+    }
+
+    /// A subquery's *inner* rollup is a bare matrix selector evaluated at an
+    /// instant, once per subquery step, so each step is pushed down on its own.
+    /// The outer rollup, whose argument is the subquery, stays local.
+    #[test]
+    fn should_push_down_a_subquerys_inner_rollup_per_step() {
+        let query = "max_over_time(sum_over_time(metric[1m])[2m:30s])";
+        let (pushed, offered) = evaluate_rollup_pushdown(query, 120_000, RollupAnswer::Rolled);
+
+        // Subquery range (0, 2m] at a 30s step: four evaluations, each its own
+        // single-window request.
+        assert_eq!(offered.len(), 4, "one offer per subquery step");
+        assert!(
+            offered
+                .iter()
+                .all(|o| o.kind == RollupKind::SumOverTime && o.step_ms == 0),
+            "each step is a single evaluation of the inner rollup"
+        );
+        // Subquery steps are evaluated in parallel, so compare the set of
+        // windows rather than the order they were requested in.
+        let mut ends: Vec<i64> = offered.iter().map(|o| o.range_end_ms).collect();
+        ends.sort_unstable();
+        assert_eq!(
+            ends,
+            vec![30_000, 60_000, 90_000, 120_000],
+            "one window per subquery step"
+        );
+
+        let local = eval_rollup(&rollup_reader(), query, 120_000);
+        assert_eq!(local.len(), 1);
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].value, local[0].value, "same answer either way");
+    }
+
+    /// The scalar parameter may sit on either side of the matrix argument:
+    /// `quantile_over_time` takes phi first, `predict_linear` takes the matrix
+    /// first. Neither ordering may disqualify a call from push-down.
+    ///
+    /// Neither function is in the pushable set yet, so this drives the shape
+    /// check through `RollupKind::from_function_name` directly.
+    #[test]
+    fn should_accept_a_scalar_parameter_on_either_side_of_the_matrix() {
+        let reader = RollupPushdownReader::new(rollup_reader(), RollupAnswer::Rolled);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+        let ctx = crate::promql::EvalContext::for_vector_selector(120_000, 300_000);
+
+        for (query, want_param) in [
+            ("quantile_over_time(0.9, metric[1m])", Some(0.9)),
+            ("predict_linear(metric[1m], 60)", Some(60.0)),
+            ("sum_over_time(metric[1m])", None),
+        ] {
+            let Expr::Call(call) = promql_parser::parser::parse(query).unwrap() else {
+                panic!("{query} should parse to a call");
+            };
+            let args = evaluator
+                .rollup_arguments(&call, &ctx)
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let (matrix, param) = args.unwrap_or_else(|| panic!("{query}: should be pushable"));
+            assert_eq!(matrix.range.as_millis() as i64, 60_000, "{query}");
+            assert_eq!(param, want_param, "{query}");
+        }
+
+        // A subquery argument has no matrix selector to push.
+        let Expr::Call(call) =
+            promql_parser::parser::parse("sum_over_time(metric[2m:30s])").unwrap()
+        else {
+            panic!("should parse to a call");
+        };
+        assert!(evaluator.rollup_arguments(&call, &ctx).unwrap().is_none());
+    }
+
+    /// `@` and `offset` are resolved by the coordinator: the source is handed a
+    /// window end and never a modifier to re-derive.
+    #[test]
+    fn should_resolve_modifiers_before_offering_a_rollup() {
+        for (query, want_end) in [
+            ("sum_over_time(metric[1m])", 300_000),
+            ("sum_over_time(metric[1m] offset 3m)", 120_000),
+            ("sum_over_time(metric[1m] @ 120)", 120_000),
+        ] {
+            let (_, offered) = evaluate_rollup_pushdown(query, 300_000, RollupAnswer::Rolled);
+            assert_eq!(offered.len(), 1, "{query}");
+            assert_eq!(offered[0].range_end_ms, want_end, "{query}");
+        }
+    }
+
+    /// Whoever reduces, the answer is the same: a source that rolled up, a
+    /// source that handed back raw windows, and a source with no push-down at
+    /// all must all produce what local evaluation produces.
+    #[test]
+    fn should_match_local_evaluation_however_the_source_answers() {
+        for (dataset, reader) in rollup_datasets() {
+            for kind in RollupKind::all() {
+                for range in ["10s", "1m", "3m"] {
+                    let query = rollup_query(kind, range);
+                    let local = eval_rollup(&reader(), &query, 120_000);
+
+                    for answer in [
+                        RollupAnswer::Rolled,
+                        RollupAnswer::Raw,
+                        RollupAnswer::Unsupported,
+                    ] {
+                        let (pushed, offered) =
+                            evaluate_rollup_pushdown_on(reader(), &query, 120_000, answer);
+                        assert_eq!(offered.len(), 1, "{dataset}/{query}: offered once");
+                        assert_eq!(
+                            rendered_samples(local.clone()),
+                            rendered_samples(pushed),
+                            "{dataset}/{query}: pushed-down result must equal the local one"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same conformance over a step grid, where consecutive windows overlap
+    /// and the source answers once for all of them.
+    #[test]
+    fn should_match_local_evaluation_over_a_grid_for_every_kind() {
+        for (dataset, reader) in rollup_datasets() {
+            for kind in RollupKind::all() {
+                for range in ["10s", "1m", "3m"] {
+                    let query = rollup_query(kind, range);
+                    let (local, offered) = evaluate_range_with_pushdown_on(
+                        reader(),
+                        &query,
+                        0,
+                        300_000,
+                        30_000,
+                        RollupAnswer::Unsupported,
+                    );
+                    assert_eq!(offered.len(), 1, "{dataset}/{query}: offered once");
+                    let local = rendered_steps(local);
+
+                    for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+                        let (pushed, _) = evaluate_range_with_pushdown_on(
+                            reader(),
+                            &query,
+                            0,
+                            300_000,
+                            30_000,
+                            answer,
+                        );
+                        assert_eq!(
+                            local,
+                            rendered_steps(pushed),
+                            "{dataset}/{query}: grid result must equal step-by-step evaluation"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Modifier handling has to hold for every kind too, not just the ones the
+    /// hand-written cases happen to name.
+    #[test]
+    fn should_match_local_evaluation_under_modifiers_for_every_kind() {
+        for kind in RollupKind::all() {
+            for suffix in ["offset 2m", "@ 120", "@ start()", "@ end()"] {
+                let query = rollup_query_with(kind, "1m", suffix);
+                let (local, _) = evaluate_range_with_pushdown_on(
+                    rollup_reader(),
+                    &query,
+                    60_000,
+                    240_000,
+                    60_000,
+                    RollupAnswer::Unsupported,
+                );
+                let (pushed, _) = evaluate_range_with_pushdown_on(
+                    rollup_reader(),
+                    &query,
+                    60_000,
+                    240_000,
+                    60_000,
+                    RollupAnswer::Rolled,
+                );
+                assert_eq!(
+                    rendered_steps(local),
+                    rendered_steps(pushed),
+                    "{query}: modifier parity"
+                );
+            }
+        }
+    }
+
+    /// The label rule is applied once, on the coordinator, so a pushed-down
+    /// rollup drops `__name__` exactly where a local one does.
+    #[test]
+    fn should_apply_the_label_rule_to_pushed_down_rollups() {
+        for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+            let (result, _) =
+                evaluate_rollup_pushdown("sum_over_time(metric[1m])", 120_000, answer);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].labels.get(METRIC_NAME), None, "name dropped");
+            assert_eq!(result[0].labels.get("job"), Some("api"), "job kept");
+
+            let (result, _) =
+                evaluate_rollup_pushdown("last_over_time(metric[1m])", 120_000, answer);
+            assert_eq!(result.len(), 1);
+            assert_eq!(
+                result[0].labels.get(METRIC_NAME),
+                Some("metric"),
+                "name kept"
+            );
+        }
+    }
+
+    /// A range query's steps stay local for now: pushing the grid down is a
+    /// later phase, and until then the two paths must not both own the grid.
+    #[test]
+    fn should_not_push_down_rollups_in_range_queries() {
+        let reader = RollupPushdownReader::new(rollup_reader(), RollupAnswer::Rolled);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+
+        let expr = promql_parser::parser::parse("sum_over_time(metric[1m])").unwrap();
+        let ctx = crate::promql::EvalContext {
+            query_start: 60_000,
+            query_end: 180_000,
+            evaluation_ts: 120_000,
+            step_ms: 30_000,
+            lookback_delta_ms: 300_000,
+        };
+        evaluator.evaluate_with_context(&expr, ctx).unwrap();
+
+        assert!(
+            reader.offered().is_empty(),
+            "a range-query step must not be pushed down yet"
+        );
+    }
+
+    // ── Whole-grid rollup push-down ─────────────────────────────────────
+    //
+    // A range query resolves its rollups once, for every step, before the step
+    // loop runs. These cover what that has to preserve: the number of requests,
+    // which steps exist, and agreement with step-by-step local evaluation.
+
+    /// Drive a range query the way `evaluate_range` does — preload, then one
+    /// evaluation per step — returning `(step, samples)` pairs and what the
+    /// source was offered.
+    fn evaluate_range_with_pushdown(
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        answer: RollupAnswer,
+    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedRollup>) {
+        evaluate_range_with_pushdown_on(rollup_reader(), query, start_ms, end_ms, step_ms, answer)
+    }
+
+    fn evaluate_range_with_pushdown_on(
+        inner: MemorySeriesQuerier,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        answer: RollupAnswer,
+    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedRollup>) {
+        let reader = RollupPushdownReader::new(inner, answer);
+        let evaluator = Evaluator::new(
+            &reader,
+            QueryOptions {
+                timeout: None,
+                ..QueryOptions::default()
+            },
+        );
+        let expr = promql_parser::parser::parse(query).unwrap();
+        let base = crate::promql::EvalContext {
+            query_start: start_ms,
+            query_end: end_ms,
+            evaluation_ts: start_ms,
+            step_ms,
+            lookback_delta_ms: 300_000,
+        };
+
+        evaluator
+            .preload_for_range(&expr, &base)
+            .unwrap_or_else(|e| panic!("{query}: preload failed: {e}"));
+
+        let mut steps = Vec::new();
+        for step_ts in (start_ms..=end_ms).step_by(step_ms as usize) {
+            let ctx = crate::promql::EvalContext {
+                evaluation_ts: step_ts,
+                ..base
+            };
+            let result = evaluator
+                .evaluate_with_context(&expr, ctx)
+                .unwrap_or_else(|e| panic!("{query} at {step_ts}: {e}"));
+            let samples = result.expect_instant_vector("instant vector per step");
+            steps.push((step_ts, samples));
+        }
+
+        (steps, reader.offered())
+    }
+
+    /// Results as sorted `(labels, timestamp, value)` triples for an instant
+    /// evaluation. `{:?}` on the float so NaN compares equal to NaN — a rollup
+    /// may legitimately produce one, and both paths must produce the same one.
+    fn rendered_samples(samples: Vec<EvalSample>) -> Vec<(String, i64, String)> {
+        let mut out: Vec<(String, i64, String)> = samples
+            .into_iter()
+            .map(|s| {
+                (
+                    s.labels.to_string(),
+                    s.timestamp_ms,
+                    format!("{:?}", s.value),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The query for a kind, with its parameter supplied where it takes one.
+    fn rollup_query(kind: RollupKind, range: &str) -> String {
+        rollup_query_with(kind, range, "")
+    }
+
+    fn rollup_query_with(kind: RollupKind, range: &str, suffix: &str) -> String {
+        let selector = format!(
+            "metric[{range}]{}{suffix}",
+            if suffix.is_empty() { "" } else { " " }
+        );
+        match kind {
+            // A literal parameter: the grid path requires one, because a
+            // parameter that varied per step could not be one request.
+            RollupKind::QuantileOverTime => format!("quantile_over_time(0.9, {selector})"),
+            other => format!("{}({selector})", other.function_name()),
+        }
+    }
+
+    /// A named dataset for the conformance suite, built fresh per case so the
+    /// pushed-down and local runs cannot share mutated state.
+    type RollupDataset = (&'static str, fn() -> MemorySeriesQuerier);
+
+    /// The datasets the conformance suite runs against: a dense monotonic
+    /// counter, and one with gaps and a counter reset so the reset-handling and
+    /// empty-window paths are exercised too.
+    fn rollup_datasets() -> Vec<RollupDataset> {
+        vec![("dense", rollup_reader), ("gappy", gappy_rollup_reader)]
+    }
+
+    /// A series with a gap between 60s and 200s and a counter reset at 220s.
+    fn gappy_rollup_reader() -> MemorySeriesQuerier {
+        let mut builder = MockQueryReaderBuilder::new();
+        let labels = create_labels("metric", vec![("job", "api")]);
+        for (ts, value) in [
+            (0i64, 5.0f64),
+            (20_000, 7.0),
+            (40_000, 9.0),
+            (60_000, 9.0),
+            // …gap…
+            (200_000, 20.0),
+            (210_000, 24.0),
+            // counter reset
+            (220_000, 3.0),
+            (240_000, 8.0),
+            (300_000, 8.0),
+        ] {
+            builder.add_sample(&labels, Sample::new(ts, value));
+        }
+        builder.build()
+    }
+
+    /// Results as `(step, labels, value)` triples, sorted, so a pushed-down run
+    /// and a local one compare exactly — including *which* steps produced a
+    /// sample at all.
+    fn rendered_steps(steps: Vec<(i64, Vec<EvalSample>)>) -> Vec<(i64, String, String)> {
+        let mut out: Vec<(i64, String, String)> = steps
+            .into_iter()
+            .flat_map(|(step, samples)| {
+                samples
+                    .into_iter()
+                    .map(move |s| (step, s.labels.to_string(), format!("{:?}", s.value)))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The whole point of the grid phase: one request covering every step, not
+    /// one request per step.
+    #[test]
+    fn should_issue_one_request_for_the_whole_step_grid() {
+        // 0..5m at 30s is eleven steps.
+        let (steps, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m])",
+            0,
+            300_000,
+            30_000,
+            RollupAnswer::Rolled,
+        );
+
+        assert_eq!(steps.len(), 11, "eleven steps evaluated");
+        assert_eq!(offered.len(), 1, "one request for all of them");
+        assert_eq!(offered[0].kind, RollupKind::SumOverTime);
+        assert_eq!(offered[0].step_ms, 30_000, "the grid step is shipped");
+        assert_eq!(offered[0].range_ms, 60_000);
+    }
+
+    /// Two different rollups over the same series are two requests; the same
+    /// rollup written twice is one.
+    #[test]
+    fn should_deduplicate_grid_requests() {
+        let (_, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m]) + sum_over_time(metric[1m])",
+            0,
+            120_000,
+            30_000,
+            RollupAnswer::Rolled,
+        );
+        assert_eq!(offered.len(), 1, "the same rollup is requested once");
+
+        let (_, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m]) + count_over_time(metric[1m])",
+            0,
+            120_000,
+            30_000,
+            RollupAnswer::Rolled,
+        );
+        assert_eq!(
+            offered.len(),
+            2,
+            "different functions are different requests"
+        );
+
+        let (_, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m]) + sum_over_time(metric[2m])",
+            0,
+            120_000,
+            30_000,
+            RollupAnswer::Rolled,
+        );
+        assert_eq!(offered.len(), 2, "different windows are different requests");
+    }
+
+    /// Whoever reduces, every step must hold the same value — and the same
+    /// steps must exist. This is the parity that lets the grid phase be turned
+    /// on at all.
+    #[test]
+    fn should_match_step_by_step_evaluation_over_a_grid() {
+        for query in [
+            "sum_over_time(metric[1m])",
+            "count_over_time(metric[1m])",
+            "last_over_time(metric[1m])",
+            // Range wider than the step: consecutive windows overlap heavily,
+            // which is the shape the push-down exists for.
+            "sum_over_time(metric[3m])",
+            // Range narrower than the step: windows have gaps between them.
+            "count_over_time(metric[10s])",
+        ] {
+            // `Unsupported` is the step-by-step local path.
+            let (local, offered) =
+                evaluate_range_with_pushdown(query, 0, 300_000, 30_000, RollupAnswer::Unsupported);
+            assert_eq!(offered.len(), 1, "{query}: offered, then declined");
+            let local = rendered_steps(local);
+
+            for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+                let (pushed, _) = evaluate_range_with_pushdown(query, 0, 300_000, 30_000, answer);
+                assert_eq!(
+                    local,
+                    rendered_steps(pushed),
+                    "{query}: grid result must equal step-by-step evaluation"
+                );
+            }
+        }
+    }
+
+    /// The sparse shape survives the grid: a step whose window held no samples
+    /// is absent from the result rather than present with NaN.
+    #[test]
+    fn should_preserve_sparse_shape_across_the_grid() {
+        // `rollup_reader` stops at t=300s, so windows past it are empty.
+        let (steps, _) = evaluate_range_with_pushdown(
+            "count_over_time(metric[30s])",
+            240_000,
+            420_000,
+            60_000,
+            RollupAnswer::Rolled,
+        );
+
+        let present: Vec<i64> = steps
+            .iter()
+            .filter(|(_, samples)| !samples.is_empty())
+            .map(|(step, _)| *step)
+            .collect();
+        assert_eq!(
+            present,
+            vec![240_000, 300_000],
+            "steps past the end of the series produce no sample at all"
+        );
+
+        // …and the local path agrees about which steps those are.
+        let (local, _) = evaluate_range_with_pushdown(
+            "count_over_time(metric[30s])",
+            240_000,
+            420_000,
+            60_000,
+            RollupAnswer::Unsupported,
+        );
+        assert_eq!(rendered_steps(steps), rendered_steps(local));
+    }
+
+    /// `offset` shifts every window uniformly, so the grid stays a progression;
+    /// `@` pins every step to one window, which the coordinator broadcasts.
+    /// Neither modifier ever reaches the source.
+    #[test]
+    fn should_resolve_grid_modifiers_before_the_request() {
+        let (steps, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m] offset 1m)",
+            120_000,
+            240_000,
+            60_000,
+            RollupAnswer::Rolled,
+        );
+        assert_eq!(offered.len(), 1);
+        // Windows end a minute before each step: 60s, 120s, 180s.
+        assert_eq!(offered[0].range_end_ms, 180_000, "last window end, shifted");
+        let (local, _) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m] offset 1m)",
+            120_000,
+            240_000,
+            60_000,
+            RollupAnswer::Unsupported,
+        );
+        assert_eq!(
+            rendered_steps(steps),
+            rendered_steps(local),
+            "offset parity"
+        );
+
+        // `@` collapses the grid onto a single window, repeated at every step.
+        let (steps, offered) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m] @ 120)",
+            120_000,
+            240_000,
+            60_000,
+            RollupAnswer::Rolled,
+        );
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].range_end_ms, 120_000, "one pinned window");
+        let values: Vec<String> = steps
+            .iter()
+            .flat_map(|(_, s)| s.iter().map(|s| format!("{:?}", s.value)))
+            .collect();
+        assert_eq!(values.len(), 3, "every step reports the pinned window");
+        assert!(
+            values.windows(2).all(|w| w[0] == w[1]),
+            "and reports the same value: {values:?}"
+        );
+        let (local, _) = evaluate_range_with_pushdown(
+            "sum_over_time(metric[1m] @ 120)",
+            120_000,
+            240_000,
+            60_000,
+            RollupAnswer::Unsupported,
+        );
+        assert_eq!(rendered_steps(steps), rendered_steps(local), "@ parity");
+    }
+
+    /// A rollup inside a subquery keeps its own grid: the outer preload must not
+    /// claim it, or every subquery step would read the outer query's windows.
+    #[test]
+    fn should_not_preload_rollups_inside_a_subquery() {
+        let (_, offered) = evaluate_range_with_pushdown(
+            "max_over_time(sum_over_time(metric[1m])[2m:1m])",
+            120_000,
+            240_000,
+            60_000,
+            RollupAnswer::Rolled,
+        );
+
+        // The inner rollup is still pushed down, but one instant at a time
+        // against the subquery's grid — never as one outer-grid request.
+        assert!(
+            offered.iter().all(|o| o.step_ms == 0),
+            "subquery steps are single evaluations, got {offered:?}"
+        );
     }
 }

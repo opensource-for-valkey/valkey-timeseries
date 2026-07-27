@@ -26,10 +26,10 @@ impl PromQLFunction for PredictLinearFunction {
         let series = range_arg.into_range_vector()?;
         let seconds_ahead = expect_scalar(secs_arg, "predict_linear", "t")?;
 
-        if series.len() < 2 {
-            return Ok(ExprResult::InstantVector(vec![]));
-        }
-
+        // A regression needs two points *within a series*; `sample_regression`
+        // enforces that and returns `None` otherwise, which drops that series
+        // from the output. Counting the series instead would suppress the whole
+        // result whenever the selector matched a single series.
         let eval_time = ctx.evaluation_ts as f64 / 1000_f64;
         let result = eval_range(series, ctx.evaluation_ts, |samples| {
             let (slope, intercept) = sample_regression(samples)?;

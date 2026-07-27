@@ -532,8 +532,11 @@ mod tests {
 
     #[test]
     fn test_simplify_div_by_zero() {
-        // Scalar / 0 is folded by the NumberLiteral early-return (apply_binary_op returns NaN)
-        assert_string_simplify("5.0 / 0.0", "NaN");
+        // Scalar / 0 is folded by the NumberLiteral early-return. PromQL division
+        // is IEEE 754, so this is signed infinity — only 0/0 is NaN.
+        assert_string_simplify("5.0 / 0.0", "Inf");
+        assert_string_simplify("-5.0 / 0.0", "-Inf");
+        assert_string_simplify("0.0 / 0.0", "NaN");
         // Vector / 0 must NOT fold — replacing an instant vector with scalar NaN
         // changes the result type and breaks any aggregation that wraps this expression.
         assert_string_simplify("c2 / 0.0", "c2 / 0.0");
