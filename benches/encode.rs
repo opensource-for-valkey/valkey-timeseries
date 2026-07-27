@@ -18,11 +18,10 @@ fn bench_chunk_sizes(key: support::DatasetKey) -> Vec<usize> {
     }
 }
 
-fn encodings() -> [ChunkEncoding; 3] {
+fn encodings() -> [ChunkEncoding; 2] {
     [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
-        ChunkEncoding::Xor2,
     ]
 }
 

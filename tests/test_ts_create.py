@@ -70,7 +70,6 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
             ("COMPRESSED", "gorilla", "compressed"),
             ("GORILLA", "gorilla", "compressed"),
             ("CHIMP", "chimp", "compressed"),
-            ("xor2", "xor2", "compressed"),
             ("dexor", "dexor", "compressed"),
         ]
 

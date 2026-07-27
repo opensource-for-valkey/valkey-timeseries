@@ -2,7 +2,7 @@
 
 **Status:** Plan only — not yet implemented.
 **Goal:** Characterize the relative strengths and weaknesses of each chunk encoding
-(`Uncompressed`, `Gorilla`, `Xor2`, `DeXor`, `Chimp`) across realistic data
+(`Uncompressed`, `Gorilla`, `DeXor`, `Chimp`) across realistic data
 distributions, and establish repeatable baselines so compression-ratio and latency
 regressions are caught before merge.
 
@@ -20,12 +20,12 @@ regressions are caught before merge.
 
 ## 2. System under test
 
-All five encodings are exercised through the public enum
+All four encodings are exercised through the public enum
 `TimeSeriesChunk` (`src/series/chunks/timeseries_chunk.rs`), constructed with
 `TimeSeriesChunk::new(encoding, chunk_size)`. This is deliberate:
 
-- `Xor2Chunk` is `pub(crate)` (`src/series/chunks/mod.rs`), so an
-  external bench crate cannot name it directly.
+- The concrete chunk types are `pub(crate)` (`src/series/chunks/mod.rs`), so an
+  external bench crate cannot name them directly.
 - The enum dispatch is the code path production queries actually take, so measuring
   through it includes the (small) match overhead uniformly for all encodings.
 
@@ -211,7 +211,7 @@ samples/sec:
   expect and document a large gap between the two shapes — that gap is itself a
   key finding.
 
-Matrix: 5 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
+Matrix: 4 encodings × 7 workloads × `ts_regular` × 4 KiB, plus the §3.2 jitter
 cross for `drift`/`noisy`, plus chunk-size sweep (1 KiB/4 KiB/64 KiB) for
 `drift` and `noisy` only. ≈ 6 × (7 + 4 + 4) × 2 shapes ≈ 180 benchmark points —
 acceptable at criterion defaults (~each point 5s warmup + 5s measure ⇒ budget

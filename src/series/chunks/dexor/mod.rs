@@ -5,7 +5,7 @@
 //!
 //! # How it works
 //!
-//! Binary XOR coders (Gorilla, Chimp, XOR2) exploit shared *binary* prefixes
+//! Binary XOR coders (Gorilla, Chimp) exploit shared *binary* prefixes
 //! between neighbouring samples. Real-world sensor readings are decimal by
 //! origin — `21.5`, `21.6`, `21.7` — and share a decimal prefix that has no
 //! clean binary counterpart. DeXOR works on the decimal representation instead.

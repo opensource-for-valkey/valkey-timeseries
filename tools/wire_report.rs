@@ -62,10 +62,9 @@ const DEFAULT_WORKLOADS: [ValueWorkload; 6] = [
     ValueWorkload::DriftQuantized,
 ];
 
-const ALL_ENCODINGS: [ChunkEncoding; 5] = [
+const ALL_ENCODINGS: [ChunkEncoding; 4] = [
     ChunkEncoding::Uncompressed,
     ChunkEncoding::Gorilla,
-    ChunkEncoding::Xor2,
     ChunkEncoding::DeXor,
     ChunkEncoding::Chimp,
 ];

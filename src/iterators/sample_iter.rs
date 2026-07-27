@@ -1,9 +1,7 @@
 use crate::common::Sample;
 use crate::iterators::TimeSeriesRangeIterator;
 use crate::iterators::vec_sample_iterator::VecSampleIterator;
-use crate::series::chunks::{
-    ChimpChunkIterator, DeXorChunkIterator, GorillaChunkIterator, Xor2RangeIterator,
-};
+use crate::series::chunks::{ChimpChunkIterator, DeXorChunkIterator, GorillaChunkIterator};
 
 #[derive(Default)]
 pub enum SampleIter<'a> {
@@ -13,7 +11,6 @@ pub enum SampleIter<'a> {
     DeXor(Box<DeXorChunkIterator<'a>>),
     Chimp(Box<ChimpChunkIterator<'a>>),
     Range(TimeSeriesRangeIterator<'a>),
-    XOR2(Box<Xor2RangeIterator<'a>>),
     #[default]
     Empty,
 }
@@ -36,9 +33,6 @@ impl<'a> SampleIter<'a> {
     pub fn chimp(iter: ChimpChunkIterator<'a>) -> Self {
         SampleIter::Chimp(Box::new(iter))
     }
-    pub fn xor2(iter: Xor2RangeIterator<'a>) -> Self {
-        SampleIter::XOR2(Box::new(iter))
-    }
 }
 
 impl Iterator for SampleIter<'_> {
@@ -53,7 +47,6 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Chimp(iter) => iter.next(),
             SampleIter::Range(range) => range.next(),
             SampleIter::Empty => None,
-            SampleIter::XOR2(iter) => iter.next(),
         }
     }
 }

@@ -41,8 +41,8 @@ High-level architecture (big picture)
     - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
 - Time-series core lives under `src/series` (storage, encoding, background tasks, indexes). Index/init helpers:
   `init_croaring_allocator()` and `init_background_tasks()` are invoked from `src/lib.rs`.
-  - `src/series/chunks/` implements five encoding formats: **Gorilla** (default), **Uncompressed**,
-    **XOR2**, **DeXOR**, **Chimp** (ELF-on-Chimp). The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
+  - `src/series/chunks/` implements four encoding formats: **Gorilla** (default), **Uncompressed**,
+    **DeXOR**, **Chimp** (ELF-on-Chimp). The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
     Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
     see "Wire encoding policy" under conventions below.
   - ACL filtering per series: `src/series/acl.rs`.
@@ -157,11 +157,11 @@ Benchmarks
 - Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
   `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
   named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (140 rows: encoding × workload × timestamp model × chunk size —
-  28 rows for each of the 5 encodings listed in `encodings()`).
+  `target/bench-reports/compression.csv` and `.md` (112 rows: encoding × workload × timestamp model × chunk size —
+  28 rows for each of the 4 encodings listed in `encodings()`).
   The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
   actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla, dexor and chimp report a `get_size()`
-  heap footprint there (buffer *capacity*, which doubles), while xor2 and uncompressed report bytes in use, so a ratio
+  heap footprint there (buffer *capacity*, which doubles), while uncompressed reports bytes in use, so a ratio
   built on it compares allocator slack instead of compression. The separate `size` column is the full heap footprint,
   including unused capacity.
   Script flags: `--check` fails if any compression ratio drops more than 5% below the baseline, `--save-baseline`

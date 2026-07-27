@@ -15,7 +15,7 @@
 #   tools/wire_report.sh --out-csv /tmp/w.csv --out-md /tmp/w.md
 #   tools/wire_report.sh --quiet                     # files only, no stdout table
 #
-# Values for --encodings: uncompressed, gorilla, xor2, dexor, chimp (or `all`).
+# Values for --encodings: uncompressed, gorilla, dexor, chimp (or `all`).
 # Values for --ts-models: regular, jitter, irregular (or `all`).
 # Workload ids come from `ValueWorkload::id()` (drift, noisy, counter, discrete,
 # periodic, the *_q2 quantized variants, ...) or `all`.

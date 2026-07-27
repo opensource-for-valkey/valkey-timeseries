@@ -61,7 +61,6 @@ impl From<ChunkEncoding> for FanoutChunkEncoding {
         match value {
             ChunkEncoding::Uncompressed => FanoutChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla => FanoutChunkEncoding::Gorilla,
-            ChunkEncoding::Xor2 => FanoutChunkEncoding::Xor2,
             ChunkEncoding::DeXor => FanoutChunkEncoding::Dexor,
             ChunkEncoding::Chimp => FanoutChunkEncoding::Chimp,
         }
@@ -73,7 +72,6 @@ impl From<FanoutChunkEncoding> for ChunkEncoding {
         match value {
             FanoutChunkEncoding::Uncompressed => ChunkEncoding::Uncompressed,
             FanoutChunkEncoding::Gorilla => ChunkEncoding::Gorilla,
-            FanoutChunkEncoding::Xor2 => ChunkEncoding::Xor2,
             FanoutChunkEncoding::Dexor => ChunkEncoding::DeXor,
             FanoutChunkEncoding::Chimp => ChunkEncoding::Chimp,
         }

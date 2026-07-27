@@ -13,7 +13,7 @@ use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, Valk
 /// TS.CREATE key
 ///   [METRIC metric]
 ///   [RETENTION retentionPeriod]
-///   [ENCODING <gorilla|xor2|dexor|chimp|uncompressed|compressed>]
+///   [ENCODING <gorilla|dexor|chimp|uncompressed|compressed>]
 ///   [CHUNK_SIZE chunkSize]
 ///   [DUPLICATE_POLICY duplicatePolicy]
 ///   [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]

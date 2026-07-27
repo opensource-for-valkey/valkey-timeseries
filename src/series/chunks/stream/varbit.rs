@@ -70,8 +70,6 @@ impl std::error::Error for VarbitError {}
 /// the size by around 1%. A more detailed study would be needed for precise
 /// values, but it's appears quite certain that we would end up far below 10%,
 /// which would maybe convince us to invest the increased coding/decoding cost.
-///
-/// TODO(XOR2): Once XOR2 is stable, merge put_varbit_int and put_varbit_int_fast.
 pub fn put_varbit_int(b: &mut BitStream, val: i64) {
     let _ = write_varbit(b, val);
 }
@@ -132,74 +130,6 @@ pub(crate) fn write_varbit<W: BitWrite>(writer: &mut W, value: i64) -> io::Resul
         }
     }
     Ok(())
-}
-
-/// put_varbit_int_fast is like put_varbit_int but combines the prefix and value into
-/// a single write_bits_fast call per bucket, reducing bitstream overhead on the hot
-/// path. It is used by XOR2 encoding.
-///
-/// Encoding layout (same as put_varbit_int, but combined write):
-/// - 0:              1 bit   (just bit 0)
-/// - -3..=3:         2+5=7   bits (prefix 0b10 + 5-bit signed payload, combined)
-/// - -31..=31:       3+9=12  bits (prefix 0b110 + 9-bit signed payload, combined)
-/// - -255..=255:     4+13=17 bits (prefix 0b1110 + 13-bit signed payload, combined)
-/// - -2047..=2047:   5+17=22 bits (prefix 0b11110 + 17-bit signed payload, combined)
-/// - -131071..=131071:       6+24=30 bits (prefix 0b111110 + 24-bit signed payload, combined)
-/// - -16777215..=16777215:   7+32=39 bits (prefix 0b1111110 + 32-bit signed payload, combined)
-/// - -36028797018963967..=36028797018963967: 8+56=64 bits (prefix 0b11111110 + 56-bit signed, combined)
-/// - Everything else: 8+64=72 bits (prefix 0b11111111 + full 64-bit signed, two writes)
-///
-/// For optimal space utilization, each branch didn't need to support any values
-/// of the prior branches, so we could expand the range of each branch. Do
-/// more with fewer bits. It would come at the price of more expensive encoding
-/// and decoding (cutting out and later adding back that center-piece we
-/// skip). With the distributions of values we see in practice, we would reduce
-/// the size by around 1%. A more detailed study would be needed for precise
-/// values, but it appears quite certain that we would end up far below 10%,
-/// which would maybe convince us to invest the increased coding/decoding cost.
-///
-/// TODO(XOR2): Once XOR2 is stable, merge put_varbit_int and put_varbit_int_fast.
-pub fn put_varbit_int_fast(b: &mut BitStream, val: i64) {
-    let uval = val as u64;
-    match val {
-        0 => {
-            // Precisely 0, needs 1 bit.
-            b.write_bit(false);
-        }
-        -3..=3 => {
-            // -3 <= val <= 3: prefix 0b10 (2 bits) + payload (5 bits) = 7 bits total
-            b.write_bits_fast((0b10u64 << 5) | (uval & 0x1F), 7);
-        }
-        -31..=31 => {
-            // -31 <= val <= 31: prefix 0b110 (3 bits) + payload (9 bits) = 12 bits total
-            b.write_bits_fast((0b110u64 << 9) | (uval & 0x1FF), 12);
-        }
-        -255..=255 => {
-            // -255 <= val <= 255: prefix 0b1110 (4 bits) + payload (13 bits) = 17 bits total
-            b.write_bits_fast((0b1110u64 << 13) | (uval & 0x1FFF), 17);
-        }
-        -2047..=2047 => {
-            // -2047 <= val <= 2047: prefix 0b11110 (5 bits) + payload (17 bits) = 22 bits total
-            b.write_bits_fast((0b11110u64 << 17) | (uval & 0x1FFFF), 22);
-        }
-        -131071..=131071 => {
-            // -131071 <= val <= 131071: prefix 0b111110 (6 bits) + payload (24 bits) = 30 bits total
-            b.write_bits_fast((0b111110u64 << 24) | (uval & 0xFFFFFF), 30);
-        }
-        -16777215..=16777215 => {
-            // -16777215 <= val <= 16777215: prefix 0b1111110 (7 bits) + payload (32 bits) = 39 bits total
-            b.write_bits_fast((0b1111110u64 << 32) | (uval & 0xFFFFFFFF), 39);
-        }
-        -36028797018963967..=36028797018963967 => {
-            // -36028797018963967 <= val <= 36028797018963967: prefix 0b11111110 (8 bits) + payload (56 bits) = 64 bits total
-            b.write_bits_fast((0b11111110u64 << 56) | (uval & 0xFFFFFFFFFFFFFF), 64);
-        }
-        _ => {
-            // Worst case: prefix 0b11111111 (8 bits) + full 64-bit value = 72 bits (two writes)
-            b.write_bits_fast(0b11111111u64, 8);
-            b.write_bits_fast(uval, 64);
-        }
-    }
 }
 
 /// Reads a varbit-encoded integer from the input.
@@ -524,33 +454,6 @@ mod tests {
     }
 
     #[test]
-    fn test_put_varbit_int_fast_fuzz() {
-        // Fuzz test with pseudo-random i64 values covering all buckets.
-        // Uses a simple Linear Congruential Generator (LCG) for deterministic reproducibility.
-        let mut seed: u64 = 12345;
-        let lcg_next = |s: &mut u64| {
-            *s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            (*s / 65536) as i64
-        };
-
-        // Generate ~1000 fuzz values
-        for _ in 0..1000 {
-            let val = lcg_next(&mut seed);
-            let mut b = BitStream::new();
-            put_varbit_int_fast(&mut b, val);
-            let bytes = b.into_bytes();
-
-            let mut reader = BitStreamReader::new(&bytes);
-            let out = read_varbit_int(&mut reader).unwrap();
-            assert_eq!(
-                out, val,
-                "put_varbit_int_fast fuzz test failed for value {}",
-                val
-            );
-        }
-    }
-
-    #[test]
     fn test_put_varbit_int_fuzz() {
         // Fuzz test with pseudo-random i64 values covering all buckets.
         // Verifies that put_varbit_int (non-fast) also round-trips correctly.
@@ -600,19 +503,5 @@ mod tests {
                 val
             );
         }
-    }
-
-    #[test]
-    fn test_varbit_int_and_fast_produce_identical_output() {
-        let numbers = VARBIT_INT_BOUNDARY_VALUES;
-
-        let mut slow = BitStream::new();
-        let mut fast = BitStream::new();
-        for n in numbers {
-            put_varbit_int(&mut slow, n);
-            put_varbit_int_fast(&mut fast, n);
-        }
-
-        assert_eq!(slow.bytes(), fast.bytes());
     }
 }

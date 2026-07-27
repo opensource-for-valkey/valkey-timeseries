@@ -20,10 +20,9 @@ mod tests {
         (f1 - f2).abs() < f64::EPSILON
     }
 
-    const CHUNK_TYPES: [ChunkEncoding; 5] = [
+    const CHUNK_TYPES: [ChunkEncoding; 4] = [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
-        ChunkEncoding::Xor2,
         ChunkEncoding::DeXor,
         ChunkEncoding::Chimp,
     ];
