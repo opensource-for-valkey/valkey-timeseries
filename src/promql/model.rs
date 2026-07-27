@@ -305,6 +305,23 @@ impl RangeSample {
     }
 }
 
+#[allow(dead_code)]
+#[repr(u8)]
+pub enum AggregationKind {
+    Avg,
+    Bottomk,
+    Count,
+    CountValues,
+    Group,
+    Limitk,
+    LimitRatio,
+    Max,
+    Min,
+    Quantile,
+    Sum,
+    Topk,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

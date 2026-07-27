@@ -23,6 +23,66 @@ enum KLimitType {
     LimitRatio,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::promql) enum AggregationKind {
+    Sum,
+    Avg,
+    Min,
+    Max,
+    Count,
+    Group,
+    Stddev,
+    Stdvar,
+    Topk,
+    Bottomk,
+    CountValues,
+    Quantile,
+    Limitk,
+    LimitRatio,
+}
+
+impl AggregationKind {
+    pub(in crate::promql) fn is_reduction(&self) -> bool {
+        matches!(
+            self,
+            AggregationKind::Sum
+                | AggregationKind::Avg
+                | AggregationKind::Min
+                | AggregationKind::Max
+                | AggregationKind::Count
+                | AggregationKind::Group
+                | AggregationKind::Stddev
+                | AggregationKind::Stdvar
+        )
+    }
+}
+
+impl TryFrom<TokenType> for AggregationKind {
+    type Error = EvaluationError;
+
+    fn try_from(token: TokenType) -> Result<Self, Self::Error> {
+        match token.id() {
+            T_SUM => Ok(AggregationKind::Sum),
+            T_AVG => Ok(AggregationKind::Avg),
+            T_MIN => Ok(AggregationKind::Min),
+            T_MAX => Ok(AggregationKind::Max),
+            T_COUNT => Ok(AggregationKind::Count),
+            T_GROUP => Ok(AggregationKind::Group),
+            T_STDDEV => Ok(AggregationKind::Stddev),
+            T_STDVAR => Ok(AggregationKind::Stdvar),
+            T_TOPK => Ok(AggregationKind::Topk),
+            T_BOTTOMK => Ok(AggregationKind::Bottomk),
+            T_COUNT_VALUES => Ok(AggregationKind::CountValues),
+            T_QUANTILE => Ok(AggregationKind::Quantile),
+            T_LIMITK => Ok(AggregationKind::Limitk),
+            T_LIMIT_RATIO => Ok(AggregationKind::LimitRatio),
+            _ => Err(EvaluationError::InternalError(format!(
+                "BUG: not an aggregation operator token: {token}"
+            ))),
+        }
+    }
+}
+
 pub(super) fn eval_aggregation(
     expr: &AggregateExpr,
     mut samples: Vec<EvalSample>,
@@ -41,24 +101,25 @@ pub(super) fn eval_aggregation(
         }
     }
 
-    if is_reduction_aggregate(expr.op) {
-        return eval_reduction_aggregation(expr, samples, eval_time);
-    }
+    let kind = AggregationKind::try_from(expr.op)?;
 
-    match expr.op.id() {
-        T_QUANTILE => eval_quantile(expr, param, samples, eval_time),
-        T_COUNT_VALUES => eval_count_values(expr, param, samples, eval_time),
-        T_TOPK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Top),
-        T_BOTTOMK => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Bottom),
-        T_LIMITK => eval_limit_k(expr, param, samples),
-        T_LIMIT_RATIO => eval_limit_ratio(expr, param, samples),
-        _ => {
-            let msg = format!(
-                "BUG: Invalid token ID in eval_aggregation: {:?}",
-                expr.op.id()
-            );
-            Err(EvaluationError::InternalError(msg))
+    match kind {
+        AggregationKind::Sum
+        | AggregationKind::Avg
+        | AggregationKind::Min
+        | AggregationKind::Max
+        | AggregationKind::Count
+        | AggregationKind::Group
+        | AggregationKind::Stddev
+        | AggregationKind::Stdvar => eval_reduction_aggregation(expr, kind, samples, eval_time),
+        AggregationKind::Quantile => eval_quantile(expr, param, samples, eval_time),
+        AggregationKind::CountValues => eval_count_values(expr, param, samples, eval_time),
+        AggregationKind::Topk => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Top),
+        AggregationKind::Bottomk => {
+            eval_top_bottom_k(expr, param, samples, KAggregationOrder::Bottom)
         }
+        AggregationKind::Limitk => eval_limit_k(expr, param, samples),
+        AggregationKind::LimitRatio => eval_limit_ratio(expr, param, samples),
     }
 }
 
@@ -292,6 +353,7 @@ fn sample_quantile(samples: &[EvalSample], phi: f64) -> f64 {
 
 fn eval_reduction_aggregation(
     expr: &AggregateExpr,
+    kind: AggregationKind,
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
 ) -> EvalResult<ExprResult> {
@@ -302,7 +364,7 @@ fn eval_reduction_aggregation(
         .map(|(_, (labels, samples))| (labels, samples))
         .iter_into_par()
         .map(|(labels, samples)| {
-            let value = aggregate_group(expr.op, &samples);
+            let value = aggregate_group(kind, &samples);
             EvalSample {
                 labels,
                 value,
@@ -315,35 +377,28 @@ fn eval_reduction_aggregation(
     Ok(ExprResult::InstantVector(out))
 }
 
-fn aggregate_group(op: TokenType, samples: &[f64]) -> f64 {
-    match op.id() {
-        T_SUM => kahan_sum(samples),
-        T_AVG => kahan_avg(samples),
-        T_MIN => samples
+fn aggregate_group(kind: AggregationKind, samples: &[f64]) -> f64 {
+    match kind {
+        AggregationKind::Sum => kahan_sum(samples),
+        AggregationKind::Avg => kahan_avg(samples),
+        AggregationKind::Min => samples
             .iter()
             .copied()
             .reduce(min_ignore_nan)
             .unwrap_or(f64::NAN),
-        T_MAX => samples
+        AggregationKind::Max => samples
             .iter()
             .copied()
             .reduce(max_ignore_nan)
             .unwrap_or(f64::NAN),
-        T_COUNT => samples.len() as f64,
-        T_GROUP => 1.0,
-        T_STDDEV => kahan_std_dev(samples),
-        T_STDVAR => kahan_variance(samples),
+        AggregationKind::Count => samples.len() as f64,
+        AggregationKind::Group => 1.0,
+        AggregationKind::Stddev => kahan_std_dev(samples),
+        AggregationKind::Stdvar => kahan_variance(samples),
         _ => {
-            unreachable!("BUG: Invalid token ID in aggregate group")
+            unreachable!("BUG: non-reduction aggregation kind reached aggregate_group")
         }
     }
-}
-
-fn is_reduction_aggregate(op: TokenType) -> bool {
-    matches!(
-        op.id(),
-        T_SUM | T_AVG | T_MIN | T_MAX | T_COUNT | T_GROUP | T_STDDEV | T_STDVAR
-    )
 }
 
 fn group_samples(
