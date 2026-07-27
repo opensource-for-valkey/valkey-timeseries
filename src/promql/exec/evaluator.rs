@@ -11,7 +11,6 @@ use crate::promql::engine::query_reader::{
     RollupRequest,
 };
 use crate::promql::engine::{QueryOptions, QueryReader};
-use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
 };
@@ -26,7 +25,6 @@ use crate::promql::functions::RollupKind;
 use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
 use crate::promql::hashers::{AggregationKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
-use crate::promql::model::RangeSample;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
@@ -232,8 +230,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
             RollupOutcome::Unsupported => return Ok(()),
             RollupOutcome::Rolled(series) => series,
-            RollupOutcome::Reduced(series) => group_rollup_output(&request, series),
-            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+            RollupOutcome::Reduced(series) => request.group(series),
+            RollupOutcome::Raw(series) => request.reduce_and_group(series),
         };
 
         // Scatter each series' sparse `(window end, value)` pairs onto the step
@@ -1210,8 +1208,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             RollupOutcome::Rolled(groups) => groups,
             // Each of these did less than was asked; make up exactly the
             // difference, with the same kernels a shard would have used.
-            RollupOutcome::Reduced(series) => group_rollup_output(&request, series),
-            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+            RollupOutcome::Reduced(series) => request.group(series),
+            RollupOutcome::Raw(series) => request.reduce_and_group(series),
         };
 
         let samples = grouped
@@ -1296,7 +1294,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             RollupOutcome::Rolled(series) | RollupOutcome::Reduced(series) => series,
             // The source read the windows but did not reduce them; finish the
             // job, with the same kernel a shard would have used.
-            RollupOutcome::Raw(series) => reduce_rollup_windows(&request, series),
+            RollupOutcome::Raw(series) => request.reduce_and_group(series),
         };
 
         // A single evaluation yields at most one point per series, stamped with
@@ -1361,53 +1359,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         Ok(Some((matrix, param)))
     }
-}
-
-/// Do here whatever the source did not: reduce the raw windows, and — when the
-/// request is a fused one — group the result.
-///
-/// This is the compensation path for a source that returned windows unreduced
-/// (a single node, which has nothing to push down to). It runs the same kernels
-/// a shard would, so the answer does not depend on who did the work.
-///
-/// A series whose every window was empty contributes nothing, which is not the
-/// same as contributing NaN.
-fn reduce_rollup_windows(request: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
-    group_rollup_output(request, reduce_only(request, series))
-}
-
-/// Reduce the raw windows, leaving any fused grouping to the caller.
-fn reduce_only(request: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
-    let window_ends = request.window_ends();
-    series
-        .into_iter()
-        .filter_map(|s| {
-            let points = request.kind.eval_windows(
-                &s.samples,
-                request.range_ms,
-                request.lookback_delta_ms,
-                request.step_ms,
-                window_ends.iter().copied(),
-                request.param,
-            );
-            (!points.is_empty()).then_some(RangeSample {
-                labels: s.labels,
-                samples: points,
-            })
-        })
-        .collect()
-}
-
-/// Apply the request's fused aggregation to per-series rollup output, or pass it
-/// through when the request has none.
-fn group_rollup_output(request: &RollupRequest, reduced: Vec<RangeSample>) -> Vec<RangeSample> {
-    let Some(aggregation) = request.aggregation.as_ref() else {
-        return reduced;
-    };
-
-    let mut partials = SteppedPartialGroups::new(aggregation.kind);
-    partials.accumulate(aggregation.modifier.as_ref(), reduced);
-    partials.finalize()
 }
 
 fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {

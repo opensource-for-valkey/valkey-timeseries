@@ -403,24 +403,14 @@ fn execute_selector_task_local(
         SelectorTaskKind::Rollup(rc) => {
             // Single node: same reasoning as the aggregation task — read the
             // windows and let the caller reduce them outside the module lock.
+            let Some((start, end)) = rc.rollup.fetch_bounds() else {
+                return Ok(SelectorOutput::Rollup(RollupOutcome::Raw(Vec::new())));
+            };
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            let (start, end) = rollup_fetch_bounds(&rc.rollup);
             query_range_local(ctx, selector, start, end, rc.options)
                 .map(|series| SelectorOutput::Rollup(RollupOutcome::Raw(series)))
         }
     }
-}
-
-/// The span of raw samples a rollup needs: the union of its windows, as an
-/// inclusive `[start, end]` pair for storage's `get_range`.
-///
-/// Windows are half-open — `(end - range, end]` — so the lower bound is one
-/// millisecond past the first window's start.
-fn rollup_fetch_bounds(rollup: &RollupRequest) -> (Timestamp, Timestamp) {
-    let ends = rollup.window_ends();
-    let first = ends.first().copied().unwrap_or(rollup.range_end_ms);
-    let last = ends.last().copied().unwrap_or(rollup.range_end_ms);
-    ((first - rollup.range_ms).saturating_add(1), last)
 }
 
 fn calculate_timeout(opts: &QueryOptions) -> Duration {
