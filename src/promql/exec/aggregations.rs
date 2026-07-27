@@ -24,7 +24,7 @@ enum KLimitType {
 }
 
 /// A PromQL aggregation operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregationKind {
     Sum,
     Avg,

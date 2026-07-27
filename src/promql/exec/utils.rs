@@ -1,6 +1,6 @@
 use crate::common::{Sample, Timestamp};
 use crate::promql::exec::types::{EvalSample, SeriesMap};
-use promql_parser::parser::{Call, Expr, VectorSelector};
+use promql_parser::parser::{AggregateExpr, Call, Expr, VectorSelector};
 
 /// Append one evaluation step's instant-vector samples into a per-series map,
 /// stamping each sample with the step timestamp.
@@ -68,40 +68,73 @@ fn collect_vector_selectors_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSe
     }
 }
 
-/// Collect the function calls that are candidates for whole-grid rollup
-/// push-down, in the order they appear.
+/// A place in the AST where a rollup could be pushed down.
+pub(in crate::promql) enum RollupCandidate<'a> {
+    /// A bare rollup call: `rate(m[5m])`. One value per series per step comes
+    /// back.
+    Rollup(&'a Call),
+    /// A rollup directly under an aggregation: `sum by (job) (rate(m[5m]))`.
+    ///
+    /// Offered as one unit so the two can be fused into a single request, which
+    /// returns one value per *group* per step. The caller decides whether the
+    /// operator actually admits fusion and falls back to treating it as a bare
+    /// [`Self::Rollup`] when it does not.
+    Fused(&'a AggregateExpr, &'a Call),
+}
+
+impl<'a> RollupCandidate<'a> {
+    pub(in crate::promql) fn call(&self) -> &'a Call {
+        match self {
+            RollupCandidate::Rollup(call) | RollupCandidate::Fused(_, call) => call,
+        }
+    }
+}
+
+/// Collect the places a rollup could be pushed down, in the order they appear.
 ///
-/// Only the call shape is screened here — whether the function can be pushed
-/// down, and whether its arguments allow it, is decided by the caller. What this
-/// walk *does* decide is scope: a call inside a subquery is skipped, because a
+/// Only shape is screened here — whether the function can be pushed down, and
+/// whether its arguments allow it, is decided by the caller. What this walk
+/// *does* decide is scope: a call inside a subquery is skipped, because a
 /// subquery runs its own step grid and its inner calls are evaluated one instant
 /// at a time against that grid, not the outer query's.
-pub(in crate::promql) fn collect_rollup_calls(expr: &Expr) -> Vec<&Call> {
+///
+/// A call that is offered as part of a [`RollupCandidate::Fused`] pair is not
+/// also offered on its own, so a fusable query yields one candidate rather than
+/// two requests for the same data.
+pub(in crate::promql) fn collect_rollup_candidates(expr: &Expr) -> Vec<RollupCandidate<'_>> {
     let mut out = Vec::new();
-    collect_rollup_calls_inner(expr, &mut out);
+    collect_rollup_candidates_inner(expr, &mut out);
     out
 }
 
-fn collect_rollup_calls_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a Call>) {
+fn collect_rollup_candidates_inner<'a>(expr: &'a Expr, out: &mut Vec<RollupCandidate<'a>>) {
     match expr {
         Expr::Call(call) => {
-            out.push(call);
+            out.push(RollupCandidate::Rollup(call));
             for arg in &call.args.args {
-                collect_rollup_calls_inner(arg, out);
+                collect_rollup_candidates_inner(arg, out);
             }
         }
         Expr::Aggregate(agg) => {
-            collect_rollup_calls_inner(&agg.expr, out);
+            if let Expr::Call(call) = strip_parens(&agg.expr) {
+                out.push(RollupCandidate::Fused(agg, call));
+                // Descend past the call itself: it is already accounted for.
+                for arg in &call.args.args {
+                    collect_rollup_candidates_inner(arg, out);
+                }
+            } else {
+                collect_rollup_candidates_inner(&agg.expr, out);
+            }
             if let Some(ref param) = agg.param {
-                collect_rollup_calls_inner(param, out);
+                collect_rollup_candidates_inner(param, out);
             }
         }
         Expr::Binary(b) => {
-            collect_rollup_calls_inner(&b.lhs, out);
-            collect_rollup_calls_inner(&b.rhs, out);
+            collect_rollup_candidates_inner(&b.lhs, out);
+            collect_rollup_candidates_inner(&b.rhs, out);
         }
-        Expr::Paren(p) => collect_rollup_calls_inner(&p.expr, out),
-        Expr::Unary(u) => collect_rollup_calls_inner(&u.expr, out),
+        Expr::Paren(p) => collect_rollup_candidates_inner(&p.expr, out),
+        Expr::Unary(u) => collect_rollup_candidates_inner(&u.expr, out),
         // Subquery: own step grid, so its calls are not part of this one.
         Expr::Subquery(_)
         | Expr::MatrixSelector(_)
@@ -112,22 +145,36 @@ fn collect_rollup_calls_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a Call>) {
     }
 }
 
+/// Look through parentheses.
+fn strip_parens(expr: &Expr) -> &Expr {
+    let mut current = expr;
+    while let Expr::Paren(paren) = current {
+        current = &paren.expr;
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn calls(query: &str) -> Vec<String> {
         let expr = promql_parser::parser::parse(query).unwrap();
-        collect_rollup_calls(&expr)
+        collect_rollup_candidates(&expr)
             .into_iter()
-            .map(|c| c.func.name.to_string())
+            .map(|c| match c {
+                RollupCandidate::Rollup(call) => call.func.name.to_string(),
+                RollupCandidate::Fused(agg, call) => {
+                    format!("{}/{}", agg.op, call.func.name)
+                }
+            })
             .collect()
     }
 
     #[test]
     fn should_collect_calls_outside_subqueries() {
         assert_eq!(calls("sum_over_time(m[5m])"), vec!["sum_over_time"]);
-        assert_eq!(calls("sum(rate(m[5m]))"), vec!["rate"]);
+        assert_eq!(calls("sum(rate(m[5m]))"), vec!["sum/rate"]);
         assert_eq!(
             calls("abs(sum_over_time(m[5m]))"),
             vec!["abs", "sum_over_time"]

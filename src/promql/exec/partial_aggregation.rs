@@ -20,16 +20,18 @@
 //! PromQL aggregation counts and propagates NaN where the TS reducers reject it,
 //! and it groups by label set rather than by bucket timestamp.
 
-use crate::common::Timestamp;
 use crate::common::math::kahan_inc;
-use crate::labels::HasFingerprint;
+use crate::common::{Sample, Timestamp};
+use crate::labels::{HasFingerprint, Labels};
 use crate::promql::EvalSample;
 use crate::promql::exec::aggregations::{
     AggregationKind, PushdownStrategy, max_ignore_nan, min_ignore_nan,
 };
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
+use crate::promql::model::RangeSample;
 use promql_parser::parser::LabelModifier;
+use std::collections::BTreeMap;
 
 /// Mergeable accumulator for one aggregation group.
 ///
@@ -283,7 +285,7 @@ impl PartialGroups {
             .collect()
     }
 
-    fn entry(&mut self, labels: EvalLabels) -> &mut AggregationPartial {
+    pub(super) fn entry(&mut self, labels: EvalLabels) -> &mut AggregationPartial {
         let key = labels.fingerprint();
         let kind = self.kind;
         &mut self
@@ -291,6 +293,98 @@ impl PartialGroups {
             .entry(key)
             .or_insert_with(|| (labels, AggregationPartial::empty(kind)))
             .1
+    }
+}
+
+/// Per-`(group, step)` mergeable state, for a rollup fused with an outer
+/// aggregation.
+///
+/// One [`PartialGroups`] per step. The merge algebra is per group and identical
+/// at every step — steps never interact — so keying by step on the outside
+/// reuses it whole rather than restating it. A `BTreeMap` keeps the steps
+/// ordered, which is what makes [`finalize`] emit each group's points
+/// chronologically without a sort.
+///
+/// [`finalize`]: SteppedPartialGroups::finalize
+pub(in crate::promql) struct SteppedPartialGroups {
+    kind: AggregationKind,
+    steps: BTreeMap<Timestamp, PartialGroups>,
+}
+
+impl SteppedPartialGroups {
+    /// # Panics
+    /// If `kind` is not a reduction; see [`PartialGroups::new`].
+    pub fn new(kind: AggregationKind) -> Self {
+        Self {
+            kind,
+            steps: BTreeMap::new(),
+        }
+    }
+
+    /// Fold per-series rollup output into the per-`(group, step)` states.
+    ///
+    /// Each series carries its own sparse `(step, value)` points, so a step at
+    /// which a series produced nothing simply does not contribute to that step's
+    /// groups — which is how a group comes to exist at some steps and not
+    /// others.
+    pub fn accumulate(&mut self, modifier: Option<&LabelModifier>, series: Vec<RangeSample>) {
+        let kind = self.kind;
+        for s in series {
+            let labels = EvalLabels::from(s.labels).compute_grouping_labels(modifier);
+            for point in s.samples {
+                self.steps
+                    .entry(point.timestamp)
+                    .or_insert_with(|| PartialGroups::new(kind))
+                    .entry(labels.clone())
+                    .update(kind, point.value);
+            }
+        }
+    }
+
+    /// Merge one shard's state for a `(group, step)` pair.
+    pub fn merge(&mut self, step_ts: Timestamp, labels: EvalLabels, state: AggregationPartial) {
+        let kind = self.kind;
+        self.steps
+            .entry(step_ts)
+            .or_insert_with(|| PartialGroups::new(kind))
+            .merge(labels, state);
+    }
+
+    /// The accumulated states, for transport to the coordinator.
+    pub fn into_partials(
+        self,
+    ) -> impl Iterator<Item = (Timestamp, EvalLabels, AggregationPartial)> {
+        self.steps.into_iter().flat_map(|(step_ts, groups)| {
+            groups
+                .into_partials()
+                .map(move |(labels, state)| (step_ts, labels, state))
+        })
+    }
+
+    /// Finalize into one entry per group, each holding its sparse `(step,
+    /// value)` points in ascending step order.
+    pub fn finalize(self) -> Vec<RangeSample> {
+        let kind = self.kind;
+        let mut by_group: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
+
+        for (step_ts, groups) in self.steps {
+            for (labels, state) in groups.into_partials() {
+                let key = labels.fingerprint();
+                by_group
+                    .entry(key)
+                    .or_insert_with(|| (labels.into_labels(), Vec::new()))
+                    .1
+                    .push(Sample {
+                        timestamp: step_ts,
+                        value: state.finalize(kind),
+                    });
+            }
+        }
+
+        by_group
+            .into_iter()
+            .map(|(_, (labels, samples))| RangeSample { labels, samples })
+            .collect()
     }
 }
 
