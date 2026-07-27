@@ -10,10 +10,7 @@ use support::{
 };
 
 fn encodings() -> [ChunkEncoding; 2] {
-    [
-        ChunkEncoding::Uncompressed,
-        ChunkEncoding::Gorilla,
-    ]
+    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla]
 }
 
 /// Mirror encode.rs: drift and noisy get all three chunk sizes; everything

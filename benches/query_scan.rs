@@ -20,10 +20,7 @@ const SCAN_WORKLOADS: &[ValueWorkload] = &[
 ];
 
 fn encodings() -> [ChunkEncoding; 2] {
-    [
-        ChunkEncoding::Uncompressed,
-        ChunkEncoding::Gorilla,
-    ]
+    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla]
 }
 
 /// The two chunk sizes exercised in query_scan benches.
