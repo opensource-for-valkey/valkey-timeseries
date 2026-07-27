@@ -741,11 +741,6 @@ pub(in crate::promql) fn query_instant_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
-    validate_max_series_(series.len(), options.max_series)?;
-    // No max-points-per-series validation here: an instant query yields at most one
-    // sample per series, so the per-series point limit can never be exceeded. The
-    // series count itself is bounded by `validate_max_series_` above.
-
     // PromQL instant-query semantics: return the most recent sample per series
     // whose timestamp falls within the lookback window (timestamp - lookback_delta, timestamp].
     // This mirrors the Prometheus staleness semantics described in:
@@ -774,6 +769,14 @@ pub(in crate::promql) fn query_instant_local(
         })
         .collect::<Vec<_>>();
 
+    // Bound what the query returns, not what the selector matched: a series
+    // whose latest sample predates the lookback window contributes nothing, so
+    // it must not count against the limit. The cluster paths filter first for
+    // the same reason, and a query's fate should not turn on which one ran it.
+    validate_max_series_(samples.len(), options.max_series)?;
+    // No max-points-per-series validation here: an instant query yields at most one
+    // sample per series, so the per-series point limit can never be exceeded.
+
     Ok(samples)
 }
 
@@ -786,8 +789,6 @@ pub(in crate::promql) fn query_range_local(
 ) -> QueryResult<Vec<RangeSample>> {
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
-
-    validate_max_series_(series.len(), options.max_series)?;
 
     let ranges = series
         .iter()
@@ -805,6 +806,12 @@ pub(in crate::promql) fn query_range_local(
             Some(range)
         })
         .collect::<Vec<_>>();
+
+    // Bound the series the query returns, not the ones the selector matched:
+    // an empty range contributes nothing. This is also the path a single-node
+    // rollup takes, so it must agree with the pushed-down one about which
+    // queries `max_series` rejects.
+    validate_max_series_(ranges.len(), options.max_series)?;
 
     for range in &ranges {
         validate_max_points_per_series(range.samples.len(), options.max_points_per_series)?;
