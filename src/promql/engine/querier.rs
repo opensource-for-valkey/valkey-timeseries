@@ -1,5 +1,6 @@
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
+use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{
     InstantSample, PromqlResult, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -48,6 +49,24 @@ impl QueryReader for ValkeySeriesQuerier {
                 "unexpected query result type".to_string(),
             )),
         }
+    }
+
+    fn query_aggregation(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        aggregation: &AggregationRequest,
+        options: QueryOptions,
+    ) -> QueryResult<AggregationOutcome> {
+        // Only operators with a decomposable form can be evaluated at the
+        // shards; the rest need the whole input on one node.
+        if aggregation.kind.pushdown_strategy().is_none()
+            || !crate::config::is_fanout_aggregation_pushdown_enabled()
+        {
+            return Ok(AggregationOutcome::Unsupported);
+        }
+        let matchers: Matchers = normalize_selector(selector);
+        SERIES_SELECTOR.query_aggregation(matchers, timestamp, aggregation.clone(), options)
     }
 }
 
@@ -157,6 +176,25 @@ impl QueryReader for ConcreteSeriesQuerier {
             }
             ConcreteSeriesQuerier::Mock(mock) => {
                 mock.query_range(selector, start_ms, end_ms, options)
+            }
+        }
+    }
+
+    fn query_aggregation(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        aggregation: &AggregationRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<AggregationOutcome> {
+        match self {
+            ConcreteSeriesQuerier::Actual(local) => {
+                local.query_aggregation(selector, timestamp, aggregation, options)
+            }
+            // The in-memory querier has no shards to push to; the evaluator
+            // aggregates the vector it selects.
+            ConcreteSeriesQuerier::Mock(mock) => {
+                mock.query_aggregation(selector, timestamp, aggregation, options)
             }
         }
     }

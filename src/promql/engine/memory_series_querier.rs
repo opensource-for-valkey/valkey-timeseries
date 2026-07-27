@@ -3,6 +3,7 @@ use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::engine::QueryReader;
+use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
 use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
@@ -196,6 +197,20 @@ impl QueryReader for MemorySeriesQuerier {
 
             Ok(Some(RangeSample { labels, samples }))
         })
+    }
+
+    /// There is nothing to push down to in memory, but answering `Raw` (rather
+    /// than leaving the default `Unsupported`) still routes the evaluator
+    /// through the push-down path, so the whole PromQL test suite exercises it.
+    fn query_aggregation(
+        &self,
+        selector: &VectorSelector,
+        timestamp: i64,
+        _aggregation: &AggregationRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<AggregationOutcome> {
+        self.query(selector, timestamp, options)
+            .map(AggregationOutcome::Raw)
     }
 }
 

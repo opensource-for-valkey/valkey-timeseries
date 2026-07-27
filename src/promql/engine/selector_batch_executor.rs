@@ -6,9 +6,11 @@ use crate::fanout::{FanoutCommand, is_clustered};
 use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeout};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
+use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::engine::{
-    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand,
-    instant_lookback_start_ms, proto_labels_to_labels, validate_max_points, validate_max_series,
+    AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
+    RangeVectorSelectorFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
+    validate_max_points, validate_max_series,
 };
 use crate::promql::{
     InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -39,9 +41,19 @@ struct RangeSelectorCommand {
     options: QueryOptions,
 }
 
+/// An instant vector to select *and* the aggregation to apply to it, so that in
+/// cluster mode both can be pushed to the shards that hold the data.
+struct AggregationSelectorCommand {
+    matchers: Matchers,
+    timestamp: Timestamp,
+    aggregation: AggregationRequest,
+    options: QueryOptions,
+}
+
 enum SelectorTaskKind {
     Vector(InstantVectorSelectorCommand),
     Range(RangeSelectorCommand),
+    Aggregation(AggregationSelectorCommand),
 }
 
 impl SelectorTaskKind {
@@ -49,6 +61,37 @@ impl SelectorTaskKind {
         match self {
             SelectorTaskKind::Vector(iqc) => iqc.options.db,
             SelectorTaskKind::Range(rc) => rc.options.db,
+            SelectorTaskKind::Aggregation(ac) => ac.options.db,
+        }
+    }
+}
+
+/// What a selector task produced. One channel carries every task kind, so the
+/// aggregation task's richer answer (did the source aggregate, or must the
+/// caller?) needs its own variant rather than a bare [`QueryValue`].
+enum SelectorOutput {
+    Value(QueryValue),
+    Aggregation(AggregationOutcome),
+}
+
+impl SelectorOutput {
+    /// Unwrap a plain selector result. The variant is chosen by the task kind,
+    /// so a mismatch is a bug in this module rather than a query error.
+    fn into_value(self) -> QueryResult<QueryValue> {
+        match self {
+            SelectorOutput::Value(value) => Ok(value),
+            SelectorOutput::Aggregation(_) => Err(QueryError::Execution(
+                "BUG: selector task returned an aggregation outcome".to_string(),
+            )),
+        }
+    }
+
+    fn into_aggregation(self) -> QueryResult<AggregationOutcome> {
+        match self {
+            SelectorOutput::Aggregation(outcome) => Ok(outcome),
+            SelectorOutput::Value(_) => Err(QueryError::Execution(
+                "BUG: aggregation task returned a plain selector result".to_string(),
+            )),
         }
     }
 }
@@ -57,7 +100,7 @@ impl SelectorTaskKind {
 struct SelectorTask {
     kind: SelectorTaskKind,
     /// responder receives the processed result (Ok) or the error (Err)
-    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 }
 
 impl SelectorTask {
@@ -139,7 +182,7 @@ impl SelectorBatchExecutor {
             timestamp,
             options,
         });
-        self.submit_selector_task(command)
+        self.submit_selector_task(command)?.into_value()
     }
 
     pub fn query_range(
@@ -155,10 +198,34 @@ impl SelectorBatchExecutor {
             end_timestamp: end,
             options,
         });
-        self.submit_selector_task(command)
+        self.submit_selector_task(command)?.into_value()
     }
 
-    fn submit_selector_task(&self, command: SelectorTaskKind) -> QueryResult<QueryValue> {
+    /// Evaluate `aggregation` over the instant vector `matchers` selects at
+    /// `timestamp`.
+    ///
+    /// In cluster mode the whole aggregation is pushed to the shards and only
+    /// the reduced result comes back. On a single node there is nothing to push
+    /// down to, so the raw instant vector is returned for the caller to
+    /// aggregate — doing it here would hold the module lock for the length of
+    /// the aggregation.
+    pub fn query_aggregation(
+        &self,
+        matchers: Matchers,
+        timestamp: Timestamp,
+        aggregation: AggregationRequest,
+        options: QueryOptions,
+    ) -> QueryResult<AggregationOutcome> {
+        let command = SelectorTaskKind::Aggregation(AggregationSelectorCommand {
+            matchers,
+            timestamp,
+            aggregation,
+            options,
+        });
+        self.submit_selector_task(command)?.into_aggregation()
+    }
+
+    fn submit_selector_task(&self, command: SelectorTaskKind) -> QueryResult<SelectorOutput> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let task = SelectorTask {
             kind: command,
@@ -266,18 +333,29 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
 fn execute_selector_task_local(
     ctx: &Context,
     command: SelectorTaskKind,
-) -> QueryResult<QueryValue> {
+) -> QueryResult<SelectorOutput> {
     match command {
         SelectorTaskKind::Vector(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-            query_instant_local(ctx, selector, timestamp, iqc.options).map(QueryValue::Vector)
+            query_instant_local(ctx, selector, timestamp, iqc.options)
+                .map(|samples| SelectorOutput::Value(QueryValue::Vector(samples)))
         }
         SelectorTaskKind::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            query_range_local(ctx, selector, start, end, rc.options).map(QueryValue::Matrix)
+            query_range_local(ctx, selector, start, end, rc.options)
+                .map(|series| SelectorOutput::Value(QueryValue::Matrix(series)))
+        }
+        SelectorTaskKind::Aggregation(ac) => {
+            // Single node: there is no shard to push the operator to, so hand
+            // the raw vector back and let the caller aggregate it outside the
+            // module lock.
+            let timestamp = ac.timestamp;
+            let selector: SeriesSelector = SeriesSelector::from(ac.matchers);
+            query_instant_local(ctx, selector, timestamp, ac.options)
+                .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples)))
         }
     }
 }
@@ -310,8 +388,8 @@ fn validate_max_points_per_series(
 }
 
 fn deliver_task_result(
-    responder: &mpsc::SyncSender<QueryResult<QueryValue>>,
-    result: QueryResult<QueryValue>,
+    responder: &mpsc::SyncSender<QueryResult<SelectorOutput>>,
+    result: QueryResult<SelectorOutput>,
 ) {
     if responder.send(result).is_err() {
         log_warning("promql: failed to send query response to requester");
@@ -321,7 +399,7 @@ fn deliver_task_result(
 fn execute_cluster_vector_selector(
     ctx: &Context,
     iqc: InstantVectorSelectorCommand,
-    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&iqc.options);
     let timestamp = iqc.timestamp;
@@ -355,7 +433,8 @@ fn execute_cluster_vector_selector(
                     });
                 }
 
-                validate_max_series_(samples.len(), max_series).map(|_| QueryValue::Vector(samples))
+                validate_max_series_(samples.len(), max_series)
+                    .map(|_| SelectorOutput::Value(QueryValue::Vector(samples)))
             }
             Err(e) => {
                 log_warning(format!(
@@ -363,7 +442,7 @@ fn execute_cluster_vector_selector(
                 ));
 
                 // Return empty result on error to avoid failing the entire batch.
-                Ok(QueryValue::Vector(vec![]))
+                Ok(SelectorOutput::Value(QueryValue::Vector(vec![])))
             }
         };
 
@@ -378,7 +457,7 @@ fn execute_cluster_vector_selector(
 fn execute_cluster_range_selector(
     ctx: &Context,
     rc: RangeSelectorCommand,
-    responder: mpsc::SyncSender<QueryResult<QueryValue>>,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&rc.options);
     let cmd = RangeVectorSelectorFanoutCommand::new(
@@ -417,7 +496,7 @@ fn execute_cluster_range_selector(
                         ranges.push(RangeSample { labels, samples });
                     }
 
-                    Ok(QueryValue::Matrix(ranges))
+                    Ok(SelectorOutput::Value(QueryValue::Matrix(ranges)))
                 })
             }
             Err(e) => {
@@ -426,7 +505,75 @@ fn execute_cluster_range_selector(
                 ));
 
                 // Return empty result on error to avoid failing the entire batch.
-                Ok(QueryValue::Matrix(vec![]))
+                Ok(SelectorOutput::Value(QueryValue::Matrix(vec![])))
+            }
+        };
+
+        deliver_task_result(&responder, query_result);
+    };
+
+    if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
+        deliver_task_result(&cloned_responder, Err(e.into()));
+    }
+}
+
+/// Push an aggregation to the shards and reduce their answers here.
+///
+/// The push-down is transparent to the caller: a cluster that cannot evaluate it
+/// (a peer without support) reports [`AggregationOutcome::Unsupported`] and the
+/// caller falls back to selecting the raw vector, so the query still answers.
+fn execute_cluster_aggregation(
+    ctx: &Context,
+    ac: AggregationSelectorCommand,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
+) {
+    let timeout = calculate_timeout(&ac.options);
+    let vector = InstantVectorParams {
+        matchers: ac.matchers,
+        timestamp: ac.timestamp,
+        lookback_delta: ac.options.lookback_delta.as_millis() as u64,
+        max_series: ac.options.max_series as u64,
+        max_points_per_series: ac.options.max_points_per_series.unwrap_or(0) as u64,
+    };
+    let cmd = AggregationFanoutCommand::new(vector, ac.aggregation, timeout);
+
+    let max_series = ac.options.max_series;
+    let targets = cmd.get_targets(ctx);
+    let responder = Arc::new(responder);
+    let cloned_responder = responder.clone();
+
+    let handler = move |cmd: AggregationFanoutCommand, result: FanoutCommandResult| {
+        let query_result = match result {
+            Ok(()) => cmd
+                .into_result()
+                .map_err(QueryError::from)
+                .and_then(|samples| {
+                    // The aggregated vector, not the input, is what this bounds:
+                    // one sample per group.
+                    validate_max_series_(samples.len(), max_series)?;
+                    let samples = samples
+                        .into_iter()
+                        .map(|s| InstantSample {
+                            labels: s.labels.into_labels(),
+                            timestamp_ms: s.timestamp_ms,
+                            value: s.value,
+                        })
+                        .collect();
+                    Ok(SelectorOutput::Aggregation(AggregationOutcome::Aggregated(
+                        samples,
+                    )))
+                }),
+            Err(e) if cmd.peer_unsupported() => {
+                log_warning(format!(
+                    "promql: aggregation push-down unsupported by a peer, falling back: {e}"
+                ));
+                Ok(SelectorOutput::Aggregation(AggregationOutcome::Unsupported))
+            }
+            Err(e) => {
+                log_warning(format!(
+                    "promql: cluster command failed for aggregation query: {e}"
+                ));
+                Err(e.into())
             }
         };
 
@@ -445,6 +592,9 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
         }
         SelectorTaskKind::Range(rc) => {
             execute_cluster_range_selector(ctx, rc, task.responder);
+        }
+        SelectorTaskKind::Aggregation(ac) => {
+            execute_cluster_aggregation(ctx, ac, task.responder);
         }
     }
 }

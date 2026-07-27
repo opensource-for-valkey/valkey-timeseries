@@ -137,3 +137,91 @@ message RangeQuery {
 message RangeQueryResponse {
   repeated RangeSample series = 1;
 }
+
+/// A PromQL aggregation operator. Mirrors
+/// `crate::promql::exec::aggregations::AggregationKind`; QUANTILE has no
+/// decomposable form and is never pushed down, so it is deliberately absent.
+enum AggregationKind {
+  AGG_SUM = 0;
+  AGG_AVG = 1;
+  AGG_MIN = 2;
+  AGG_MAX = 3;
+  AGG_COUNT = 4;
+  AGG_GROUP = 5;
+  AGG_STDDEV = 6;
+  AGG_STDVAR = 7;
+  AGG_TOPK = 8;
+  AGG_BOTTOMK = 9;
+  AGG_COUNT_VALUES = 10;
+  AGG_LIMITK = 11;
+  AGG_LIMIT_RATIO = 12;
+}
+
+/// A `by (...)` / `without (...)` modifier. An absent message means the
+/// aggregation has no modifier: every sample falls into one group whose label
+/// set is empty.
+message AggregationGrouping {
+  /// true for `without (...)`, false for `by (...)`.
+  bool without = 1;
+  repeated string labels = 2;
+}
+
+/// An aggregation pushed down to a shard: the instant-vector parameters that
+/// select the input, plus the operator to apply to it.
+message AggregationQuery {
+  /// Instant-vector parameters (selector, evaluation timestamp, lookback,
+  /// limits) — identical in meaning to a plain `InstantQuery`.
+  InstantQuery query = 1;
+  AggregationKind kind = 2;
+  optional AggregationGrouping grouping = 3;
+  /// Numeric operator parameter: K for topk/bottomk/limitk, the ratio for
+  /// limit_ratio. Absent for the parameterless operators.
+  optional double scalar_param = 4;
+  /// String operator parameter: the destination label for count_values.
+  optional string label_param = 5;
+  /// Timestamp the aggregated output is stamped with — the query's evaluation
+  /// timestamp. It differs from `query.timestamp` (which selects the input)
+  /// when the selector carries an `@` or `offset` modifier.
+  int64 eval_timestamp = 6;
+}
+
+/// Mergeable accumulator for one aggregation group. Field meaning depends on
+/// the request's `kind`:
+///   sum/avg          acc1 = Kahan running sum, acc1_compensation = its
+///                    Neumaier compensation, acc2 = Welford running mean
+///   min/max          acc1 = NaN-ignoring extremum
+///   count/group      count only
+///   stddev/stdvar    acc1 = Welford running mean, acc2 = M2,
+///                    acc1_compensation = the compensation for M2
+/// `count` counts every sample in the group, NaN included — the same
+/// denominator the single-node aggregators use.
+message AggregationPartialState {
+  uint64 count = 1;
+  double acc1 = 2;
+  double acc2 = 3;
+  double acc1_compensation = 4;
+}
+
+/// One (group, shard) partial: the group's label set as computed by the
+/// request's grouping modifier, and the shard's accumulated state for it.
+message AggregationGroupPartial {
+  repeated Label labels = 1;
+  AggregationPartialState state = 2;
+}
+
+message AggregationQueryResponse {
+  /// Set for the reduction operators (sum/avg/min/max/count/group/stddev/
+  /// stdvar): one mergeable partial per group the shard saw.
+  repeated AggregationGroupPartial partials = 1;
+  /// Set for the selection operators (topk/bottomk/limitk/limit_ratio) and
+  /// count_values: the shard's locally selected/counted samples. Also carries
+  /// the raw instant vector when `applied` is false.
+  repeated InstantSample samples = 2;
+  /// Compatibility handshake: true when the shard applied the requested
+  /// aggregation. A shard that does not recognize the requested `kind` (a
+  /// newer coordinator during a rolling upgrade) returns the raw instant
+  /// vector in `samples` with `applied` false, and the coordinator aggregates
+  /// it itself. Absent on a pre-handshake peer (proto3 decodes as false),
+  /// which is exactly the right interpretation.
+  bool applied = 3;
+}

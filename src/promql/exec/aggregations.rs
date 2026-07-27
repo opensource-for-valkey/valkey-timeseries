@@ -6,8 +6,8 @@ use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use orx_parallel::ParIter;
 use orx_parallel::{IntoParIter, IterIntoParIter};
-use promql_parser::parser::AggregateExpr;
 use promql_parser::parser::token::{TokenType, *};
+use promql_parser::parser::{AggregateExpr, LabelModifier};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
@@ -23,8 +23,9 @@ enum KLimitType {
     LimitRatio,
 }
 
+/// A PromQL aggregation operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::promql) enum AggregationKind {
+pub enum AggregationKind {
     Sum,
     Avg,
     Min,
@@ -41,6 +42,26 @@ pub(in crate::promql) enum AggregationKind {
     LimitRatio,
 }
 
+/// How an aggregation operator splits between the shards that hold the data and
+/// the coordinator that answers the query. See
+/// [`crate::promql::exec::partial_aggregation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::promql) enum PushdownStrategy {
+    /// Reductions: each shard ships one mergeable partial state per group and
+    /// the coordinator merges the shards' states per group, then finalizes.
+    Reduce,
+    /// Idempotent selections (topk/bottomk/limitk/limit_ratio): each shard runs
+    /// the operator over its local input and ships the surviving samples; the
+    /// coordinator runs the same operator again over their union. Every sample
+    /// the global answer could contain survives its own shard's selection, so
+    /// re-selecting from the union yields that answer.
+    Select,
+    /// count_values: each shard ships its local per-(group, value) counts and
+    /// the coordinator sums them by output label set. Re-applying the operator
+    /// would count the counts, so this one gets its own merge step.
+    CountValues,
+}
+
 impl AggregationKind {
     pub(in crate::promql) fn is_reduction(&self) -> bool {
         matches!(
@@ -54,6 +75,26 @@ impl AggregationKind {
                 | AggregationKind::Stddev
                 | AggregationKind::Stdvar
         )
+    }
+
+    /// How this operator can be pushed down to the shards, or `None` when it
+    /// has no decomposable form and must see the whole input on one node:
+    /// `quantile` interpolates between a group's values, so no partial state
+    /// smaller than the values themselves exists.
+    pub(in crate::promql) fn pushdown_strategy(&self) -> Option<PushdownStrategy> {
+        if self.is_reduction() {
+            return Some(PushdownStrategy::Reduce);
+        }
+        match self {
+            AggregationKind::Topk
+            | AggregationKind::Bottomk
+            | AggregationKind::Limitk
+            | AggregationKind::LimitRatio => Some(PushdownStrategy::Select),
+            AggregationKind::CountValues => Some(PushdownStrategy::CountValues),
+            AggregationKind::Quantile => None,
+            // Covered by is_reduction above.
+            _ => Some(PushdownStrategy::Reduce),
+        }
     }
 }
 
@@ -85,12 +126,32 @@ impl TryFrom<TokenType> for AggregationKind {
 
 pub(super) fn eval_aggregation(
     expr: &AggregateExpr,
-    mut samples: Vec<EvalSample>,
+    samples: Vec<EvalSample>,
     param: Option<ExprResult>,
     eval_time: Timestamp,
 ) -> EvalResult<ExprResult> {
+    let kind = AggregationKind::try_from(expr.op)?;
+    let samples = apply_aggregation(kind, expr.modifier.as_ref(), param, samples, eval_time)?;
+    Ok(ExprResult::InstantVector(samples))
+}
+
+/// Apply an aggregation operator to an instant vector.
+///
+/// Driven by an explicit `(kind, modifier)` pair rather than an
+/// [`AggregateExpr`] so that the same code serves the single-node evaluator and
+/// both sides of aggregation push-down: a shard applies it to its local slice
+/// of the input, and the coordinator re-applies the selection operators to the
+/// union of the shards' candidates
+/// (see `crate::promql::engine::AggregationFanoutCommand`).
+pub(in crate::promql) fn apply_aggregation(
+    kind: AggregationKind,
+    modifier: Option<&LabelModifier>,
+    param: Option<ExprResult>,
+    mut samples: Vec<EvalSample>,
+    eval_time: Timestamp,
+) -> EvalResult<Vec<EvalSample>> {
     if samples.is_empty() {
-        return Ok(ExprResult::InstantVector(Vec::new()));
+        return Ok(Vec::new());
     }
 
     // Materialize any pending __name__ drops on inner expression results before aggregation
@@ -101,8 +162,6 @@ pub(super) fn eval_aggregation(
         }
     }
 
-    let kind = AggregationKind::try_from(expr.op)?;
-
     match kind {
         AggregationKind::Sum
         | AggregationKind::Avg
@@ -111,26 +170,30 @@ pub(super) fn eval_aggregation(
         | AggregationKind::Count
         | AggregationKind::Group
         | AggregationKind::Stddev
-        | AggregationKind::Stdvar => eval_reduction_aggregation(expr, kind, samples, eval_time),
-        AggregationKind::Quantile => eval_quantile(expr, param, samples, eval_time),
-        AggregationKind::CountValues => eval_count_values(expr, param, samples, eval_time),
-        AggregationKind::Topk => eval_top_bottom_k(expr, param, samples, KAggregationOrder::Top),
-        AggregationKind::Bottomk => {
-            eval_top_bottom_k(expr, param, samples, KAggregationOrder::Bottom)
+        | AggregationKind::Stdvar => Ok(eval_reduction_aggregation(
+            modifier, kind, samples, eval_time,
+        )),
+        AggregationKind::Quantile => eval_quantile(modifier, param, samples, eval_time),
+        AggregationKind::CountValues => eval_count_values(modifier, param, samples, eval_time),
+        AggregationKind::Topk => {
+            eval_top_bottom_k(modifier, param, samples, KAggregationOrder::Top)
         }
-        AggregationKind::Limitk => eval_limit_k(expr, param, samples),
-        AggregationKind::LimitRatio => eval_limit_ratio(expr, param, samples),
+        AggregationKind::Bottomk => {
+            eval_top_bottom_k(modifier, param, samples, KAggregationOrder::Bottom)
+        }
+        AggregationKind::Limitk => eval_limit_k(modifier, param, samples),
+        AggregationKind::LimitRatio => eval_limit_ratio(modifier, param, samples),
     }
 }
 
 fn eval_count_values(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
-) -> EvalResult<ExprResult> {
+) -> EvalResult<Vec<EvalSample>> {
     let label_name = get_param_as_string(param, "count_values")?;
-    let groups = group_sample_values(expr, samples);
+    let groups = group_sample_values(modifier, samples);
     let mut out = Vec::new();
     for (_, (labels, group_samples)) in groups {
         let mut counts = BTreeMap::new();
@@ -149,7 +212,7 @@ fn eval_count_values(
             });
         }
     }
-    Ok(ExprResult::InstantVector(out))
+    Ok(out)
 }
 
 #[derive(Clone, Copy)]
@@ -217,11 +280,11 @@ fn select_k_indices_with_heap(
 }
 
 fn eval_top_bottom_k(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     order: KAggregationOrder,
-) -> EvalResult<ExprResult> {
+) -> EvalResult<Vec<EvalSample>> {
     let name = if order == KAggregationOrder::Top {
         "topk"
     } else {
@@ -230,23 +293,21 @@ fn eval_top_bottom_k(
     let k = get_k_param(param, samples.len(), name)?;
 
     if k == 0 {
-        return Ok(ExprResult::InstantVector(Vec::new()));
+        return Ok(Vec::new());
     }
 
-    if expr.modifier.is_none() {
-        return Ok(ExprResult::InstantVector(select_k_from_group(
-            samples, k, order,
-        )));
+    if modifier.is_none() {
+        return Ok(select_k_from_group(samples, k, order));
     }
 
-    let out: Vec<EvalSample> = group_samples(expr, samples)
+    let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
         .map(|(_, (_, group))| group)
         .iter_into_par()
         .flat_map(|group| select_k_from_group(group, k, order))
         .collect();
 
-    Ok(ExprResult::InstantVector(out))
+    Ok(out)
 }
 
 fn select_k_from_group(
@@ -269,15 +330,15 @@ fn select_k_from_group(
 }
 
 fn eval_limit_k(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
-) -> EvalResult<ExprResult> {
+) -> EvalResult<Vec<EvalSample>> {
     let k = get_k_param(param, samples.len(), "limitk")?;
 
     // For each group sort deterministically by hash and take the first k samples,
     // then flatten the per-group selections into the output vector.
-    let out: Vec<EvalSample> = group_samples(expr, samples)
+    let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
         .iter_into_par()
         .flat_map(|(_, (_, mut group_samples))| {
@@ -286,17 +347,17 @@ fn eval_limit_k(
         })
         .collect();
 
-    Ok(ExprResult::InstantVector(out))
+    Ok(out)
 }
 
 fn eval_limit_ratio(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
-) -> EvalResult<ExprResult> {
+) -> EvalResult<Vec<EvalSample>> {
     let k = get_param_as_scalar(param, "limit_ratio")?;
 
-    let groups = group_samples(expr, samples);
+    let groups = group_samples(modifier, samples);
     let mut out = Vec::new();
 
     // todo: parallelize
@@ -307,15 +368,15 @@ fn eval_limit_ratio(
         out.extend(selected);
     }
 
-    Ok(ExprResult::InstantVector(out))
+    Ok(out)
 }
 
 fn eval_quantile(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     eval_time: Timestamp,
-) -> EvalResult<ExprResult> {
+) -> EvalResult<Vec<EvalSample>> {
     let phi = get_param_as_scalar(param, "quantile")?;
     // make sure it's in range
     if !(0.0..=1.0).contains(&phi) {
@@ -323,7 +384,7 @@ fn eval_quantile(
             "quantile must be between 0.0 and 1.0".to_string(),
         ));
     }
-    let groups = group_samples(expr, samples);
+    let groups = group_samples(modifier, samples);
 
     let out: Vec<EvalSample> = groups
         .into_iter()
@@ -340,7 +401,7 @@ fn eval_quantile(
         })
         .collect();
 
-    Ok(ExprResult::InstantVector(out))
+    Ok(out)
 }
 
 fn sample_quantile(samples: &[EvalSample], phi: f64) -> f64 {
@@ -352,14 +413,14 @@ fn sample_quantile(samples: &[EvalSample], phi: f64) -> f64 {
 }
 
 fn eval_reduction_aggregation(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     kind: AggregationKind,
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
-) -> EvalResult<ExprResult> {
-    let groups = group_sample_values(expr, samples);
+) -> Vec<EvalSample> {
+    let groups = group_sample_values(modifier, samples);
 
-    let out = groups
+    groups
         .into_iter()
         .map(|(_, (labels, samples))| (labels, samples))
         .iter_into_par()
@@ -372,9 +433,7 @@ fn eval_reduction_aggregation(
                 drop_name: false,
             }
         })
-        .collect();
-
-    Ok(ExprResult::InstantVector(out))
+        .collect()
 }
 
 fn aggregate_group(kind: AggregationKind, samples: &[f64]) -> f64 {
@@ -402,11 +461,9 @@ fn aggregate_group(kind: AggregationKind, samples: &[f64]) -> f64 {
 }
 
 fn group_samples(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
 ) -> FingerprintHashMap<(EvalLabels, Vec<EvalSample>)> {
-    let modifier = expr.modifier.as_ref();
-
     let keyed: Vec<_> = samples
         .into_par()
         .map(|sample| {
@@ -426,15 +483,13 @@ fn group_samples(
 }
 
 fn group_sample_values(
-    expr: &AggregateExpr,
+    modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
 ) -> FingerprintHashMap<(EvalLabels, Vec<f64>)> {
     let mut groups: FingerprintHashMap<(EvalLabels, Vec<f64>)> = FingerprintHashMap::default();
 
     for sample in samples {
-        let labels = sample
-            .labels
-            .compute_grouping_labels(expr.modifier.as_ref());
+        let labels = sample.labels.compute_grouping_labels(modifier);
         let key = labels.fingerprint();
 
         let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
@@ -456,7 +511,10 @@ fn sample_value_label(value: f64) -> String {
     }
 }
 
-fn min_ignore_nan(lhs: f64, rhs: f64) -> f64 {
+/// NaN-ignoring minimum. NaN is the identity element (`min_ignore_nan(NaN, v)
+/// == v`), which is what lets the push-down partial fold start from NaN and
+/// still match the single-node `reduce(min_ignore_nan)`.
+pub(super) fn min_ignore_nan(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => f64::NAN,
         (true, false) => rhs,
@@ -465,7 +523,8 @@ fn min_ignore_nan(lhs: f64, rhs: f64) -> f64 {
     }
 }
 
-fn max_ignore_nan(lhs: f64, rhs: f64) -> f64 {
+/// NaN-ignoring maximum; see [`min_ignore_nan`].
+pub(super) fn max_ignore_nan(lhs: f64, rhs: f64) -> f64 {
     match (lhs.is_nan(), rhs.is_nan()) {
         (true, true) => f64::NAN,
         (true, false) => rhs,

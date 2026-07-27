@@ -5,16 +5,19 @@ use crate::labels::filters::{
     SeriesSelector,
 };
 use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel};
+use crate::promql::exec::aggregations::AggregationKind;
+use crate::promql::exec::partial_aggregation::AggregationPartial;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::generated::{
-    InstantSample as ProtoInstantSample, Label as ProtoLabel, LabelMatcher as ProtoLabelMatcher,
-    LabelMatcherList, OrMatcherList, RangeSample as ProtoRangeSample, Sample as ProtoSample,
-    SeriesSelector as ProtoSeriesSelector, label_matcher, series_selector,
-    series_selector::Matchers as ProtoMatchers,
+    AggregationGrouping as ProtoAggregationGrouping, AggregationKind as ProtoAggregationKind,
+    AggregationPartialState as ProtoAggregationPartialState, InstantSample as ProtoInstantSample,
+    Label as ProtoLabel, LabelMatcher as ProtoLabelMatcher, LabelMatcherList, OrMatcherList,
+    RangeSample as ProtoRangeSample, Sample as ProtoSample, SeriesSelector as ProtoSeriesSelector,
+    label_matcher, series_selector, series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::{EvalSample, RangeSample};
-use promql_parser::label::{Matcher, Matchers};
-use promql_parser::parser::VectorSelector;
+use promql_parser::label::{Labels as ModifierLabels, Matcher, Matchers};
+use promql_parser::parser::{LabelModifier, VectorSelector};
 use valkey_module::ValkeyError;
 
 impl TryFrom<i32> for MatchOp {
@@ -566,6 +569,131 @@ impl From<&VectorSelector> for ProtoSeriesSelector {
 
         selector
     }
+}
+
+// ── Aggregation push-down ──────────────────────────────────────────────────
+// Wire conversions for `AggregationFanoutCommand`: the operator, its grouping
+// modifier, the mergeable partial states, and the sample type the selection
+// operators ship.
+
+impl From<AggregationKind> for ProtoAggregationKind {
+    fn from(kind: AggregationKind) -> Self {
+        match kind {
+            AggregationKind::Sum => ProtoAggregationKind::AggSum,
+            AggregationKind::Avg => ProtoAggregationKind::AggAvg,
+            AggregationKind::Min => ProtoAggregationKind::AggMin,
+            AggregationKind::Max => ProtoAggregationKind::AggMax,
+            AggregationKind::Count => ProtoAggregationKind::AggCount,
+            AggregationKind::Group => ProtoAggregationKind::AggGroup,
+            AggregationKind::Stddev => ProtoAggregationKind::AggStddev,
+            AggregationKind::Stdvar => ProtoAggregationKind::AggStdvar,
+            AggregationKind::Topk => ProtoAggregationKind::AggTopk,
+            AggregationKind::Bottomk => ProtoAggregationKind::AggBottomk,
+            AggregationKind::CountValues => ProtoAggregationKind::AggCountValues,
+            AggregationKind::Limitk => ProtoAggregationKind::AggLimitk,
+            AggregationKind::LimitRatio => ProtoAggregationKind::AggLimitRatio,
+            // Never sent: quantile has no decomposable form, so the
+            // coordinator does not push it down (`pushdown_strategy`).
+            AggregationKind::Quantile => unreachable!(
+                "BUG: quantile is not a push-down operator and has no wire representation"
+            ),
+        }
+    }
+}
+
+impl From<ProtoAggregationKind> for AggregationKind {
+    fn from(kind: ProtoAggregationKind) -> Self {
+        match kind {
+            ProtoAggregationKind::AggSum => AggregationKind::Sum,
+            ProtoAggregationKind::AggAvg => AggregationKind::Avg,
+            ProtoAggregationKind::AggMin => AggregationKind::Min,
+            ProtoAggregationKind::AggMax => AggregationKind::Max,
+            ProtoAggregationKind::AggCount => AggregationKind::Count,
+            ProtoAggregationKind::AggGroup => AggregationKind::Group,
+            ProtoAggregationKind::AggStddev => AggregationKind::Stddev,
+            ProtoAggregationKind::AggStdvar => AggregationKind::Stdvar,
+            ProtoAggregationKind::AggTopk => AggregationKind::Topk,
+            ProtoAggregationKind::AggBottomk => AggregationKind::Bottomk,
+            ProtoAggregationKind::AggCountValues => AggregationKind::CountValues,
+            ProtoAggregationKind::AggLimitk => AggregationKind::Limitk,
+            ProtoAggregationKind::AggLimitRatio => AggregationKind::LimitRatio,
+        }
+    }
+}
+
+impl From<&LabelModifier> for ProtoAggregationGrouping {
+    fn from(modifier: &LabelModifier) -> Self {
+        match modifier {
+            LabelModifier::Include(labels) => ProtoAggregationGrouping {
+                without: false,
+                labels: labels.labels.to_vec(),
+            },
+            LabelModifier::Exclude(labels) => ProtoAggregationGrouping {
+                without: true,
+                labels: labels.labels.to_vec(),
+            },
+        }
+    }
+}
+
+impl From<ProtoAggregationGrouping> for LabelModifier {
+    fn from(grouping: ProtoAggregationGrouping) -> Self {
+        let labels = ModifierLabels::new(grouping.labels.iter().map(String::as_str).collect());
+        if grouping.without {
+            LabelModifier::Exclude(labels)
+        } else {
+            LabelModifier::Include(labels)
+        }
+    }
+}
+
+impl From<AggregationPartial> for ProtoAggregationPartialState {
+    fn from(state: AggregationPartial) -> Self {
+        ProtoAggregationPartialState {
+            count: state.count,
+            acc1: state.acc1,
+            acc2: state.acc2,
+            acc1_compensation: state.acc1_c,
+        }
+    }
+}
+
+impl From<ProtoAggregationPartialState> for AggregationPartial {
+    fn from(state: ProtoAggregationPartialState) -> Self {
+        AggregationPartial {
+            count: state.count,
+            acc1: state.acc1,
+            acc2: state.acc2,
+            acc1_c: state.acc1_compensation,
+        }
+    }
+}
+
+impl From<EvalSample> for ProtoInstantSample {
+    fn from(sample: EvalSample) -> Self {
+        ProtoInstantSample {
+            labels: sample.labels.iter().map(ProtoLabel::from).collect(),
+            value: sample.value,
+            timestamp: sample.timestamp_ms,
+            // Aggregated output does not belong to a single key.
+            key: String::new(),
+        }
+    }
+}
+
+impl From<&Label> for ProtoLabel {
+    fn from(label: &Label) -> Self {
+        ProtoLabel {
+            name: label.name.clone(),
+            value: label.value.clone(),
+        }
+    }
+}
+
+/// Rebuild the label set of a group from the wire.
+pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) -> EvalLabels {
+    // Already sorted: the sender derived them from a sorted label set.
+    EvalLabels::shared(labels.into_iter().map(Label::from).collect())
 }
 
 #[cfg(test)]

@@ -367,6 +367,23 @@ impl NodeInfo {
     pub fn is_local(&self) -> bool {
         self.location == NodeLocation::Local
     }
+
+    /// A distinct remote primary on `port`, for tests that need a response
+    /// target and nothing else about the node.
+    #[cfg(test)]
+    pub(crate) fn for_test(port: u16) -> NodeInfo {
+        use std::net::Ipv4Addr;
+        NodeInfo {
+            id: NodeId::default(),
+            shard_id: NodeId::default(),
+            socket_address: SocketAddress {
+                primary_endpoint: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+            },
+            role: NodeRole::Primary,
+            location: NodeLocation::Remote,
+        }
+    }
 }
 
 impl PartialOrd for NodeInfo {
