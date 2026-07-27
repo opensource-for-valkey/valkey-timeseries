@@ -28,8 +28,8 @@ pub enum ChunkEncoding {
     Uncompressed = 1,
     #[default]
     Gorilla = 2,
-    DeXor = 3,
-    Chimp = 4,
+    Chimp = 3,
+    DeXor = 4,
 }
 
 impl ChunkEncoding {
@@ -37,8 +37,8 @@ impl ChunkEncoding {
         match self {
             ChunkEncoding::Uncompressed => "uncompressed",
             ChunkEncoding::Gorilla => "gorilla",
-            ChunkEncoding::DeXor => "dexor",
             ChunkEncoding::Chimp => "chimp",
+            ChunkEncoding::DeXor => "dexor",
         }
     }
 
@@ -59,8 +59,8 @@ impl TryFrom<u8> for ChunkEncoding {
         match value {
             1 => Ok(ChunkEncoding::Uncompressed),
             2 => Ok(ChunkEncoding::Gorilla),
-            3 => Ok(ChunkEncoding::DeXor),
-            4 => Ok(ChunkEncoding::Chimp),
+            3 => Ok(ChunkEncoding::Chimp),
+            4 => Ok(ChunkEncoding::DeXor),
             _ => Err(ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING)),
         }
     }

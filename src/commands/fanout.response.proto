@@ -15,8 +15,8 @@ message Sample {
 enum CompressionType {
   UNCOMPRESSED = 0;
   GORILLA = 1;
-  DEXOR = 2;
-  CHIMP = 3;
+  CHIMP = 2;
+  DEXOR = 3;
 }
 
 message SampleData {
