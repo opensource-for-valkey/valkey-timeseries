@@ -127,6 +127,23 @@ impl FanoutError {
         }
     }
 
+    /// Whether this error means the peer does not know the operation at all,
+    /// rather than that the operation was attempted and failed.
+    ///
+    /// A node that predates a fanout operation rejects the envelope instead of
+    /// answering it. An operation that exists only as an optimization — the
+    /// PromQL push-downs — uses this to tell a rolling upgrade apart from a real
+    /// failure, and falls back to the unoptimized path rather than failing the
+    /// query.
+    pub fn is_unsupported_operation(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::InvalidMessage
+                | ErrorKind::UnknownMessageType
+                | ErrorKind::UnsupportedFeatures
+        )
+    }
+
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         buf.push(self.kind as u8);
         write_byte_slice(buf, self.message.as_str().as_ref());

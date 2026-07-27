@@ -204,6 +204,15 @@ impl From<MetricName> for Vec<ProtoLabel> {
     }
 }
 
+/// The same encoding for a materialized label set as the [`MetricName`] impl
+/// above produces for the index's own representation, so a series carries the
+/// same labels on the wire whichever side built it.
+impl From<&Labels> for Vec<ProtoLabel> {
+    fn from(labels: &Labels) -> Self {
+        labels.iter().map(ProtoLabel::from).collect()
+    }
+}
+
 pub(in crate::promql) fn proto_labels_to_labels(labels: Vec<ProtoLabel>) -> Labels {
     Labels::new(labels.into_iter().map(Label::from).collect())
 }

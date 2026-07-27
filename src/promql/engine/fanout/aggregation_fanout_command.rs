@@ -20,8 +20,8 @@
 
 use crate::common::Timestamp;
 use crate::fanout::{
-    ErrorKind, FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo,
-    get_cluster_command_timeout,
+    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
+    log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
@@ -58,10 +58,7 @@ impl Default for InstantVectorParams {
             guard.lookback_delta.as_millis() as u64
         };
         Self {
-            matchers: Matchers {
-                matchers: vec![],
-                or_matchers: vec![],
-            },
+            matchers: Matchers::empty(),
             timestamp: 0,
             lookback_delta,
             max_series: 0,
@@ -361,19 +358,8 @@ impl FanoutCommand for AggregationFanoutCommand {
         // A peer that does not know this operation at all (rolling upgrade)
         // rejects the envelope rather than answering it. Latch that so the
         // caller can fall back to selecting the raw instant vector.
-        if matches!(
-            error.kind,
-            ErrorKind::InvalidMessage
-                | ErrorKind::UnknownMessageType
-                | ErrorKind::UnsupportedFeatures
-        ) {
-            self.unsupported_peer = true;
-        }
-        crate::common::logging::log_warning(format!(
-            "Fanout operation {}, failed for target {}: {error}",
-            Self::name(),
-            target.socket_address,
-        ))
+        self.unsupported_peer |= error.is_unsupported_operation();
+        log_fanout_failure(Self::name(), target, &error);
     }
 }
 

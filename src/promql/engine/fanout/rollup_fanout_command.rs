@@ -26,8 +26,8 @@
 
 use crate::common::Timestamp;
 use crate::fanout::{
-    ErrorKind, FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo,
-    get_cluster_command_timeout,
+    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
+    log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_rollup_windows;
@@ -136,10 +136,7 @@ impl Default for RollupFanoutCommand {
         // An arbitrary but valid request: this instance only ever stands in for
         // a moved-out command (see `FanoutStateInner`), never accumulates.
         Self {
-            matchers: Matchers {
-                matchers: vec![],
-                or_matchers: vec![],
-            },
+            matchers: Matchers::empty(),
             rollup: RollupRequest {
                 kind: RollupKind::SumOverTime,
                 range_ms: 0,
@@ -335,7 +332,7 @@ impl FanoutCommand for RollupFanoutCommand {
             series: reduced
                 .into_iter()
                 .map(|s| RollupSeries {
-                    labels: metric_name_to_proto_labels_from(&s.labels),
+                    labels: (&s.labels).into(),
                     points: s.samples.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
@@ -385,8 +382,7 @@ impl FanoutCommand for RollupFanoutCommand {
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
         if !resp.applied {
             // Self-describing response from a peer that did not reduce.
-            self.raw
-                .extend(resp.raw.into_iter().map(proto_range_sample_to_native));
+            self.raw.extend(resp.raw.into_iter().map(RangeSample::from));
             return Ok(());
         }
 
@@ -449,19 +445,8 @@ impl FanoutCommand for RollupFanoutCommand {
         // A peer that does not know this operation at all (rolling upgrade)
         // rejects the envelope rather than answering it. Latch that so the
         // caller can fall back to selecting the raw matrix.
-        if matches!(
-            error.kind,
-            ErrorKind::InvalidMessage
-                | ErrorKind::UnknownMessageType
-                | ErrorKind::UnsupportedFeatures
-        ) {
-            self.unsupported_peer = true;
-        }
-        crate::common::logging::log_warning(format!(
-            "Fanout operation {}, failed for target {}: {error}",
-            Self::name(),
-            target.socket_address,
-        ))
+        self.unsupported_peer |= error.is_unsupported_operation();
+        log_fanout_failure(Self::name(), target, &error);
     }
 }
 
@@ -518,35 +503,13 @@ fn raw_response(series: Vec<RangeSample>) -> RollupQueryResponse {
         raw: series
             .into_iter()
             .map(|s| ProtoRangeSample {
-                labels: metric_name_to_proto_labels_from(&s.labels),
+                labels: (&s.labels).into(),
                 samples: s.samples.into_iter().map(Into::into).collect(),
                 key: String::new(),
             })
             .collect(),
         applied: false,
     }
-}
-
-fn proto_range_sample_to_native(s: ProtoRangeSample) -> RangeSample {
-    RangeSample {
-        labels: proto_labels_to_labels(s.labels),
-        samples: s.samples.into_iter().map(Into::into).collect(),
-    }
-}
-
-/// Proto labels for a materialized [`crate::labels::Labels`], matching the
-/// encoding [`metric_name_to_proto_labels`] produces for the index's own
-/// representation.
-fn metric_name_to_proto_labels_from(
-    labels: &crate::labels::Labels,
-) -> Vec<crate::promql::generated::Label> {
-    labels
-        .iter()
-        .map(|l| crate::promql::generated::Label {
-            name: l.name.to_string(),
-            value: l.value.to_string(),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -613,16 +576,7 @@ mod tests {
     }
 
     fn command(rollup: RollupRequest) -> RollupFanoutCommand {
-        RollupFanoutCommand::new(
-            Matchers {
-                matchers: vec![],
-                or_matchers: vec![],
-            },
-            rollup,
-            0,
-            0,
-            Duration::from_secs(1),
-        )
+        RollupFanoutCommand::new(Matchers::empty(), rollup, 0, 0, Duration::from_secs(1))
     }
 
     fn node(port: u16) -> NodeInfo {
@@ -658,7 +612,7 @@ mod tests {
             series: reduced
                 .into_iter()
                 .map(|s| RollupSeries {
-                    labels: metric_name_to_proto_labels_from(&s.labels),
+                    labels: (&s.labels).into(),
                     points: s.samples.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
@@ -859,10 +813,7 @@ mod tests {
             param: Some(0.9),
         };
         let cmd = RollupFanoutCommand::new(
-            Matchers {
-                matchers: vec![],
-                or_matchers: vec![],
-            },
+            Matchers::empty(),
             rollup,
             1_000,
             11_000,
@@ -1080,16 +1031,7 @@ mod tests {
         use crate::fanout::serialization::{Deserialized, Serialized};
 
         let rollup = fused(RollupKind::Rate, AggregationKind::Sum, &["job", "env"]);
-        let cmd = RollupFanoutCommand::new(
-            Matchers {
-                matchers: vec![],
-                or_matchers: vec![],
-            },
-            rollup,
-            0,
-            0,
-            Duration::from_secs(1),
-        );
+        let cmd = RollupFanoutCommand::new(Matchers::empty(), rollup, 0, 0, Duration::from_secs(1));
 
         let request = cmd.generate_request();
         let mut buf = Vec::new();
