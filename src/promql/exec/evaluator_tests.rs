@@ -4154,39 +4154,16 @@ mod tests {
                 return Ok(RollupOutcome::Raw(windows));
             }
 
-            // Reduce here, exactly as a shard does.
-            let ends = rollup.window_ends();
-            let reduced: Vec<crate::promql::RangeSample> = windows
-                .into_iter()
-                .filter_map(|s| {
-                    let points = rollup.kind.eval_windows(
-                        &s.samples,
-                        rollup.range_ms,
-                        rollup.lookback_delta_ms,
-                        rollup.step_ms,
-                        ends.iter().copied(),
-                        rollup.param,
-                    );
-                    (!points.is_empty()).then_some(crate::promql::RangeSample {
-                        labels: s.labels,
-                        samples: points,
-                    })
-                })
-                .collect();
+            // Reduce here, exactly as a shard does — through the request's own
+            // kernels, so this stands in for the shard rather than imitating it.
+            let reduced = rollup.reduce_windows(&rollup.window_ends(), windows);
 
             if self.answer == RollupAnswer::Reduced {
                 return Ok(RollupOutcome::Reduced(reduced));
             }
 
             // …and group, when the request asks for it.
-            let Some(aggregation) = rollup.aggregation.as_ref() else {
-                return Ok(RollupOutcome::Rolled(reduced));
-            };
-            let mut partials = crate::promql::exec::partial_aggregation::SteppedPartialGroups::new(
-                aggregation.kind,
-            );
-            partials.accumulate(aggregation.modifier.as_ref(), reduced);
-            Ok(RollupOutcome::Rolled(partials.finalize()))
+            Ok(RollupOutcome::Rolled(rollup.group(reduced)))
         }
     }
 

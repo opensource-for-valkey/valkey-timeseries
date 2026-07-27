@@ -1,4 +1,6 @@
+use crate::common::Timestamp;
 use crate::promql::exec::aggregations::AggregationKind;
+use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
     ExprResult, PromqlResult, QueryOptions,
@@ -103,11 +105,107 @@ pub struct RollupRequest {
 impl RollupRequest {
     /// The window ends to reduce, in ascending order.
     pub(in crate::promql) fn window_ends(&self) -> Vec<i64> {
-        if self.step_ms <= 0 {
-            return vec![self.range_end_ms];
-        }
-        crate::promql::time::step_times(self.query_start, self.query_end, self.step_ms).collect()
+        rollup_window_ends(
+            self.step_ms,
+            self.query_start,
+            self.query_end,
+            self.range_end_ms,
+        )
     }
+
+    /// The span of raw samples this request's windows cover, or `None` when it
+    /// describes no windows at all.
+    pub(in crate::promql) fn fetch_bounds(&self) -> Option<(Timestamp, Timestamp)> {
+        rollup_fetch_bounds(&self.window_ends(), self.range_ms)
+    }
+
+    /// Reduce raw windows with this request's rollup, over window ends the
+    /// caller already has in hand.
+    ///
+    /// A series whose every window was empty contributes nothing at all, which
+    /// is not the same as contributing NaN — preserving that distinction is what
+    /// the sparse transport exists for.
+    pub(in crate::promql) fn reduce_windows(
+        &self,
+        window_ends: &[Timestamp],
+        series: Vec<RangeSample>,
+    ) -> Vec<RangeSample> {
+        series
+            .into_iter()
+            .filter_map(|s| {
+                let points = self.kind.eval_windows(
+                    &s.samples,
+                    self.range_ms,
+                    self.lookback_delta_ms,
+                    self.step_ms,
+                    window_ends.iter().copied(),
+                    self.param,
+                );
+                (!points.is_empty()).then_some(RangeSample {
+                    labels: s.labels,
+                    samples: points,
+                })
+            })
+            .collect()
+    }
+
+    /// Apply this request's fused aggregation to per-series rollup output, or
+    /// pass it through when the request carries none.
+    pub(in crate::promql) fn group(&self, reduced: Vec<RangeSample>) -> Vec<RangeSample> {
+        let Some(aggregation) = self.aggregation.as_ref() else {
+            return reduced;
+        };
+        let mut partials = SteppedPartialGroups::new(aggregation.kind);
+        partials.accumulate(aggregation.modifier.as_ref(), reduced);
+        partials.finalize()
+    }
+
+    /// Everything this request asks for: reduce the raw windows, and group the
+    /// result when it is a fused request.
+    ///
+    /// This is the compensation path for a source that did less than was asked —
+    /// a single node, which has nothing to push down to, or a peer that predates
+    /// part of the protocol. It runs the same kernels a shard would, so the
+    /// answer does not depend on who did the work.
+    pub(in crate::promql) fn reduce_and_group(&self, series: Vec<RangeSample>) -> Vec<RangeSample> {
+        self.group(self.reduce_windows(&self.window_ends(), series))
+    }
+}
+
+/// The window ends a rollup describes, in ascending order.
+///
+/// Derived from resolved geometry alone — `@` and `offset` are applied before a
+/// request is built — so the coordinator and a shard reading the same request
+/// land on exactly the same windows. `step_ms <= 0` is a single evaluation at
+/// `range_end_ms`.
+///
+/// Taken as loose fields rather than a [`RollupRequest`] because a shard must be
+/// able to derive them for a rollup kind it does not recognize, which is
+/// precisely the case where it has no request to build.
+pub(in crate::promql) fn rollup_window_ends(
+    step_ms: i64,
+    query_start: Timestamp,
+    query_end: Timestamp,
+    range_end_ms: Timestamp,
+) -> Vec<Timestamp> {
+    if step_ms <= 0 {
+        return vec![range_end_ms];
+    }
+    crate::promql::time::step_times(query_start, query_end, step_ms).collect()
+}
+
+/// The inclusive `[start, end]` span of raw samples `window_ends` covers, for
+/// storage's `get_range`.
+///
+/// Windows are half-open — `(end - range, end]` — and `get_range` takes an
+/// inclusive lower bound, so the span starts one millisecond past the first
+/// window's lower bound. `None` when there are no windows to cover.
+pub(in crate::promql) fn rollup_fetch_bounds(
+    window_ends: &[Timestamp],
+    range_ms: i64,
+) -> Option<(Timestamp, Timestamp)> {
+    let (&first, &last) = (window_ends.first()?, window_ends.last()?);
+    Some(((first - range_ms).saturating_add(1), last))
 }
 
 /// What a data source made of a [`RollupRequest`]. Every variant tells the

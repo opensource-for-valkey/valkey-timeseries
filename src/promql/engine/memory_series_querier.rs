@@ -225,14 +225,10 @@ impl QueryReader for MemorySeriesQuerier {
         rollup: &RollupRequest,
         options: QueryOptions,
     ) -> PromqlResult<RollupOutcome> {
-        let ends = rollup.window_ends();
-        let (Some(first), Some(last)) = (ends.first(), ends.last()) else {
+        let Some((start_ms, end_ms)) = rollup.fetch_bounds() else {
             return Ok(RollupOutcome::Raw(Vec::new()));
         };
-        // Windows are half-open, so the inclusive fetch starts one millisecond
-        // past the first window's lower bound.
-        let start_ms = (first - rollup.range_ms).saturating_add(1);
-        self.query_range(selector, start_ms, *last, options)
+        self.query_range(selector, start_ms, end_ms, options)
             .map(RollupOutcome::Raw)
     }
 }

@@ -2,6 +2,7 @@ use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalSample;
+use crate::promql::engine::query_reader::rollup_fetch_bounds;
 use crate::promql::engine::{
     instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
     validate_max_series,
@@ -115,13 +116,9 @@ pub(super) fn local_rollup_windows(
     max_series: u64,
     max_points_per_series: u64,
 ) -> ValkeyResult<Vec<crate::promql::model::RangeSample>> {
-    let (Some(first_end), Some(last_end)) = (window_ends.first(), window_ends.last()) else {
+    let Some((start_time, end_time)) = rollup_fetch_bounds(window_ends, range_ms) else {
         return Ok(Vec::new());
     };
-    // Windows are half-open — `(end - range, end]` — and storage's `get_range`
-    // takes an inclusive lower bound, so start one millisecond later.
-    let start_time = (first_end - range_ms).saturating_add(1);
-    let end_time = *last_end;
 
     let series = series_by_selectors(ctx, &[selector], None)?;
 

@@ -24,7 +24,6 @@
 //! window held no samples is absent from the result, and absence is not the same
 //! as a NaN value.
 
-use crate::common::Timestamp;
 use crate::fanout::{
     FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
     log_fanout_failure,
@@ -33,7 +32,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_rollup_windows;
 use crate::promql::engine::fanout::type_conversions::proto_labels_to_eval_labels;
 use crate::promql::engine::proto_labels_to_labels;
-use crate::promql::engine::query_reader::{RollupAggregation, RollupRequest};
+use crate::promql::engine::query_reader::{RollupAggregation, RollupRequest, rollup_window_ends};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::functions::RollupKind;
@@ -204,7 +203,7 @@ impl RollupFanoutCommand {
         // shard-side reduction here, over the same window ends.
         if !raw.is_empty() {
             let window_ends = self.rollup.window_ends();
-            rolled.extend(reduce_windows(&self.rollup, &window_ends, raw));
+            rolled.extend(self.rollup.reduce_windows(&window_ends, raw));
         }
 
         match self.partials.take() {
@@ -226,34 +225,6 @@ impl RollupFanoutCommand {
     }
 }
 
-/// Reduce raw windows with the requested rollup — the shard-side computation,
-/// run on the coordinator for a peer that could not run it itself.
-fn reduce_windows(
-    rollup: &RollupRequest,
-    window_ends: &[Timestamp],
-    series: Vec<RangeSample>,
-) -> Vec<RangeSample> {
-    series
-        .into_iter()
-        .filter_map(|s| {
-            let points = rollup.kind.eval_windows(
-                &s.samples,
-                rollup.range_ms,
-                rollup.lookback_delta_ms,
-                rollup.step_ms,
-                window_ends.iter().copied(),
-                rollup.param,
-            );
-            // Every window was empty: the series contributes nothing at all,
-            // which is not the same as contributing NaN.
-            (!points.is_empty()).then_some(RangeSample {
-                labels: s.labels,
-                samples: points,
-            })
-        })
-        .collect()
-}
-
 impl FanoutCommand for RollupFanoutCommand {
     type Request = RollupQuery;
     type Response = RollupQueryResponse;
@@ -269,18 +240,15 @@ impl FanoutCommand for RollupFanoutCommand {
         };
         let series_selector: SeriesSelector = selector.try_into()?;
 
-        let rollup = decode_request(&req);
-        let window_ends = match &rollup {
-            Some(rollup) => rollup.window_ends(),
-            // Unknown kind: still ship the windows the coordinator asked about,
-            // derived the same way it would have.
-            None => window_ends_of(
-                req.step_ms,
-                req.query_start,
-                req.query_end,
-                req.range_end_ms,
-            ),
-        };
+        // Derived from the request's geometry rather than from the decoded
+        // rollup, because a kind this node does not recognize still has to ship
+        // the windows the coordinator asked about.
+        let window_ends = rollup_window_ends(
+            req.step_ms,
+            req.query_start,
+            req.query_end,
+            req.range_end_ms,
+        );
 
         let windows = local_rollup_windows(
             ctx,
@@ -294,7 +262,7 @@ impl FanoutCommand for RollupFanoutCommand {
         // An unrecognized rollup means the coordinator is newer than this node.
         // Ship the raw windows and let it reduce them: correct, at the cost of
         // the transfer the push-down would have saved.
-        let Some(rollup) = rollup else {
+        let Some(rollup) = decode_request(&req) else {
             ctx.log_warning(&format!(
                 "Unsupported rollup kind {} in pushed-down query; returning the raw windows",
                 req.kind
@@ -302,7 +270,7 @@ impl FanoutCommand for RollupFanoutCommand {
             return Ok(raw_response(windows));
         };
 
-        let reduced = reduce_windows(&rollup, &window_ends, windows);
+        let reduced = rollup.reduce_windows(&window_ends, windows);
 
         // Fused form: group the rolled-up values here too, so what goes back is
         // one partial per (group, step) rather than one value per series per
@@ -450,15 +418,6 @@ impl FanoutCommand for RollupFanoutCommand {
     }
 }
 
-/// The window ends a request describes, derived identically on both sides so a
-/// shard reduces exactly the windows the coordinator asked about.
-fn window_ends_of(step_ms: i64, query_start: i64, query_end: i64, range_end_ms: i64) -> Vec<i64> {
-    if step_ms <= 0 {
-        return vec![range_end_ms];
-    }
-    crate::promql::time::step_times(query_start, query_end, step_ms).collect()
-}
-
 /// Decode the rollup this node is asked to apply, rejecting a value it does not
 /// know (proto3 decodes an unknown enum to its raw `i32`, which must not be
 /// silently taken for the zero variant).
@@ -515,7 +474,7 @@ fn raw_response(series: Vec<RangeSample>) -> RollupQueryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::Sample;
+    use crate::common::{Sample, Timestamp};
     use crate::labels::{Label, Labels};
 
     const RANGE_MS: i64 = 60_000;
@@ -587,7 +546,7 @@ mod tests {
     /// once the windows have been read.
     fn shard_response(rollup: &RollupRequest, windows: Vec<RangeSample>) -> RollupQueryResponse {
         let ends = rollup.window_ends();
-        let reduced = reduce_windows(rollup, &ends, windows);
+        let reduced = rollup.reduce_windows(&ends, windows);
 
         if let Some(aggregation) = rollup.aggregation.as_ref() {
             let mut groups = SteppedPartialGroups::new(aggregation.kind);
@@ -687,7 +646,7 @@ mod tests {
 
                 let ends = rollup.window_ends();
                 assert_eq!(
-                    rendered(reduce_windows(&rollup, &ends, all.clone())),
+                    rendered(rollup.reduce_windows(&ends, all.clone())),
                     rendered(cmd.into_result()),
                     "{kind:?} ({shape})"
                 );
@@ -716,7 +675,7 @@ mod tests {
 
                 let ends = rollup.window_ends();
                 assert_eq!(
-                    rendered(reduce_windows(&rollup, &ends, all.clone())),
+                    rendered(rollup.reduce_windows(&ends, all.clone())),
                     rendered(cmd.into_result()),
                     "{kind:?} ({shape})"
                 );
@@ -886,21 +845,18 @@ mod tests {
         assert!(!cmd.peer_unsupported());
     }
 
-    /// Both sides derive the window ends from the same fields, so a shard
-    /// reduces exactly the windows the coordinator will ask about.
+    /// The geometry a request describes, which both sides now derive through
+    /// the one [`rollup_window_ends`] — so what is pinned here is the shape
+    /// itself rather than the two sides agreeing about it.
     #[test]
-    fn test_window_ends_agree_across_the_wire() {
+    fn test_window_ends() {
         // Instant: one window, at the resolved end.
         let instant = request(RollupKind::SumOverTime);
         assert_eq!(instant.window_ends(), vec![EVAL_TS]);
+        // Reaching back one full range, exclusive of the lower bound.
         assert_eq!(
-            window_ends_of(
-                0,
-                instant.query_start,
-                instant.query_end,
-                instant.range_end_ms
-            ),
-            instant.window_ends(),
+            instant.fetch_bounds(),
+            Some((EVAL_TS - RANGE_MS + 1, EVAL_TS))
         );
 
         // Grid: every step, which is what the range-query phase will send.
@@ -914,15 +870,18 @@ mod tests {
             grid.window_ends(),
             vec![60_000, 90_000, 120_000, 150_000, 180_000]
         );
-        assert_eq!(
-            window_ends_of(
-                grid.step_ms,
-                grid.query_start,
-                grid.query_end,
-                grid.range_end_ms
-            ),
-            grid.window_ends(),
-        );
+        // One span covering every window, not one fetch per step.
+        assert_eq!(grid.fetch_bounds(), Some((60_000 - RANGE_MS + 1, 180_000)));
+
+        // A grid with no steps in it describes nothing to read.
+        let empty = RollupRequest {
+            step_ms: 30_000,
+            query_start: 180_000,
+            query_end: 60_000,
+            ..request(RollupKind::SumOverTime)
+        };
+        assert!(empty.window_ends().is_empty());
+        assert_eq!(empty.fetch_bounds(), None);
     }
 
     // ── Fusion with an outer aggregation ────────────────────────────────
@@ -942,7 +901,7 @@ mod tests {
     /// Reduce and group on one node — what the fused push-down must equal.
     fn single_node_fused(rollup: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
         let ends = rollup.window_ends();
-        let reduced = reduce_windows(rollup, &ends, series);
+        let reduced = rollup.reduce_windows(&ends, series);
         let aggregation = rollup.aggregation.as_ref().expect("fused");
         let mut groups = SteppedPartialGroups::new(aggregation.kind);
         groups.accumulate(aggregation.modifier.as_ref(), reduced);
