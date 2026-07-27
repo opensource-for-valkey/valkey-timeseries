@@ -27,10 +27,7 @@ pub struct RangeVectorSelectorFanoutCommand {
 
 impl Default for RangeVectorSelectorFanoutCommand {
     fn default() -> Self {
-        let matchers = Matchers {
-            matchers: vec![],
-            or_matchers: vec![],
-        };
+        let matchers = Matchers::empty();
         Self {
             matchers,
             start_time: 0,

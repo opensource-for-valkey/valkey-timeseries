@@ -26,10 +26,7 @@ pub struct InstantVectorSelectorFanoutCommand {
 
 impl Default for InstantVectorSelectorFanoutCommand {
     fn default() -> Self {
-        let matchers = Matchers {
-            matchers: vec![],
-            or_matchers: vec![],
-        };
+        let matchers = Matchers::empty();
         let lookback_delta = {
             let guard = PROMQL_CONFIG.read().unwrap();
             guard.lookback_delta.as_millis() as u64
