@@ -3,7 +3,9 @@ use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::engine::QueryReader;
-use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
+use crate::promql::engine::query_reader::{
+    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+};
 use crate::promql::model::InstantSample;
 use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
@@ -211,6 +213,27 @@ impl QueryReader for MemorySeriesQuerier {
     ) -> PromqlResult<AggregationOutcome> {
         self.query(selector, timestamp, options)
             .map(AggregationOutcome::Raw)
+    }
+
+    /// As with [`Self::query_aggregation`], there is nothing to push down to in
+    /// memory, but answering `Raw` (rather than leaving the default
+    /// `Unsupported`) routes the evaluator through the push-down path, so the
+    /// whole PromQL test suite exercises it.
+    fn query_rollup(
+        &self,
+        selector: &VectorSelector,
+        rollup: &RollupRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<RollupOutcome> {
+        let ends = rollup.window_ends();
+        let (Some(first), Some(last)) = (ends.first(), ends.last()) else {
+            return Ok(RollupOutcome::Raw(Vec::new()));
+        };
+        // Windows are half-open, so the inclusive fetch starts one millisecond
+        // past the first window's lower bound.
+        let start_ms = (first - rollup.range_ms).saturating_add(1);
+        self.query_range(selector, start_ms, *last, options)
+            .map(RollupOutcome::Raw)
     }
 }
 

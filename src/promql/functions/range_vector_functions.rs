@@ -77,27 +77,31 @@ pub(in crate::promql) struct ResetsFunction;
 impl PromQLFunction for ResetsFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, |values| {
-            if values.is_empty() {
-                return Some(0.0);
-            }
-            let mut n = 0;
-            let mut prev_value = values[0].value;
-            for sample in values.iter().skip(1) {
-                let val = sample.value;
-                if val < prev_value {
-                    if change_below_tolerance(val, prev_value) {
-                        // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                        continue;
-                    }
-                    n += 1;
-                }
-                prev_value = val;
-            }
-
-            Some(n as f64)
-        }))
+        Ok(eval_range(samples, ctx.evaluation_ts, rollup_resets))
     }
+}
+
+/// `resets` over one window. Named rather than inline so the pushed-down path
+/// reduces a window with the very same function the local path runs.
+pub(in crate::promql) fn rollup_resets(values: &[Sample]) -> Option<f64> {
+    if values.is_empty() {
+        return Some(0.0);
+    }
+    let mut n = 0;
+    let mut prev_value = values[0].value;
+    for sample in values.iter().skip(1) {
+        let val = sample.value;
+        if val < prev_value {
+            if change_below_tolerance(val, prev_value) {
+                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
+                continue;
+            }
+            n += 1;
+        }
+        prev_value = val;
+    }
+
+    Some(n as f64)
 }
 
 /// Returns the number of times its value has changed within the provided time range as an instant vector.
@@ -107,26 +111,30 @@ pub(in crate::promql) struct ChangesFunction;
 impl PromQLFunction for ChangesFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, |values| {
-            if values.is_empty() {
-                return Some(0.0);
-            }
-            let mut n = 0;
-            let mut prev_value = values[0].value;
-            for sample in values.iter().skip(1) {
-                let val = sample.value;
-                if val != prev_value {
-                    if change_below_tolerance(val, prev_value) {
-                        // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                        continue;
-                    }
-
-                    n += 1;
-                }
-                prev_value = val;
-            }
-
-            Some(n as f64)
-        }))
+        Ok(eval_range(samples, ctx.evaluation_ts, rollup_changes))
     }
+}
+
+/// `changes` over one window. Named rather than inline so the pushed-down path
+/// reduces a window with the very same function the local path runs.
+pub(in crate::promql) fn rollup_changes(values: &[Sample]) -> Option<f64> {
+    if values.is_empty() {
+        return Some(0.0);
+    }
+    let mut n = 0;
+    let mut prev_value = values[0].value;
+    for sample in values.iter().skip(1) {
+        let val = sample.value;
+        if val != prev_value {
+            if change_below_tolerance(val, prev_value) {
+                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
+                continue;
+            }
+
+            n += 1;
+        }
+        prev_value = val;
+    }
+
+    Some(n as f64)
 }

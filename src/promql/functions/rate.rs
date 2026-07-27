@@ -103,15 +103,35 @@ fn counter_reset_increase(values: &[Sample]) -> f64 {
 
 /// Computes extrapolated rate for a series as per Prometheus logic.
 pub(in crate::promql) fn extrapolated_rate(samples: &EvalSamples, kind: RateKind) -> Option<f64> {
-    if samples.values.len() < 2 {
+    extrapolated_rate_window(
+        &samples.values,
+        samples.range_ms,
+        samples.range_end_ms,
+        kind,
+    )
+}
+
+/// The same computation over one explicit window, for callers that hold the
+/// window bounds separately from the samples — the pushed-down grid path, which
+/// slices many windows out of one fetch.
+///
+/// Extrapolation is to the *window's* bounds, so those have to be passed in
+/// rather than inferred from the samples: a window whose last sample sits well
+/// before its end extrapolates differently than one that runs to the end.
+pub(in crate::promql) fn extrapolated_rate_window(
+    samples: &[Sample],
+    range_ms: i64,
+    range_end_ms: i64,
+    kind: RateKind,
+) -> Option<f64> {
+    if samples.len() < 2 {
         return None;
     }
 
-    let range_start = samples.range_end_ms - samples.range_ms;
-    let range_end = samples.range_end_ms;
-    let range_duration_seconds = samples.range_ms as f64 / 1000.0;
+    let range_start = range_end_ms - range_ms;
+    let range_end = range_end_ms;
+    let range_duration_seconds = range_ms as f64 / 1000.0;
 
-    let samples = &samples.values;
     let count = samples.len();
     let first_sample = &samples[0];
     let last_sample = &samples[count - 1];

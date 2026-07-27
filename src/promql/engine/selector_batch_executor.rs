@@ -6,11 +6,13 @@ use crate::fanout::{FanoutCommand, is_clustered};
 use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeout};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
+use crate::promql::engine::query_reader::{
+    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+};
 use crate::promql::engine::{
     AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
-    RangeVectorSelectorFanoutCommand, instant_lookback_start_ms, proto_labels_to_labels,
-    validate_max_points, validate_max_series,
+    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, instant_lookback_start_ms,
+    proto_labels_to_labels, validate_max_points, validate_max_series,
 };
 use crate::promql::{
     InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -50,10 +52,19 @@ struct AggregationSelectorCommand {
     options: QueryOptions,
 }
 
+/// The series to read *and* the rollup to reduce their windows with, so that in
+/// cluster mode both can be pushed to the shards that hold the data.
+struct RollupSelectorCommand {
+    matchers: Matchers,
+    rollup: RollupRequest,
+    options: QueryOptions,
+}
+
 enum SelectorTaskKind {
     Vector(InstantVectorSelectorCommand),
     Range(RangeSelectorCommand),
     Aggregation(AggregationSelectorCommand),
+    Rollup(RollupSelectorCommand),
 }
 
 impl SelectorTaskKind {
@@ -62,6 +73,7 @@ impl SelectorTaskKind {
             SelectorTaskKind::Vector(iqc) => iqc.options.db,
             SelectorTaskKind::Range(rc) => rc.options.db,
             SelectorTaskKind::Aggregation(ac) => ac.options.db,
+            SelectorTaskKind::Rollup(rc) => rc.options.db,
         }
     }
 }
@@ -72,6 +84,7 @@ impl SelectorTaskKind {
 enum SelectorOutput {
     Value(QueryValue),
     Aggregation(AggregationOutcome),
+    Rollup(RollupOutcome),
 }
 
 impl SelectorOutput {
@@ -80,8 +93,8 @@ impl SelectorOutput {
     fn into_value(self) -> QueryResult<QueryValue> {
         match self {
             SelectorOutput::Value(value) => Ok(value),
-            SelectorOutput::Aggregation(_) => Err(QueryError::Execution(
-                "BUG: selector task returned an aggregation outcome".to_string(),
+            _ => Err(QueryError::Execution(
+                "BUG: selector task returned a push-down outcome".to_string(),
             )),
         }
     }
@@ -89,8 +102,17 @@ impl SelectorOutput {
     fn into_aggregation(self) -> QueryResult<AggregationOutcome> {
         match self {
             SelectorOutput::Aggregation(outcome) => Ok(outcome),
-            SelectorOutput::Value(_) => Err(QueryError::Execution(
-                "BUG: aggregation task returned a plain selector result".to_string(),
+            _ => Err(QueryError::Execution(
+                "BUG: aggregation task returned a non-aggregation result".to_string(),
+            )),
+        }
+    }
+
+    fn into_rollup(self) -> QueryResult<RollupOutcome> {
+        match self {
+            SelectorOutput::Rollup(outcome) => Ok(outcome),
+            _ => Err(QueryError::Execution(
+                "BUG: rollup task returned a non-rollup result".to_string(),
             )),
         }
     }
@@ -225,6 +247,27 @@ impl SelectorBatchExecutor {
         self.submit_selector_task(command)?.into_aggregation()
     }
 
+    /// Reduce the windows `matchers` selects with `rollup`.
+    ///
+    /// In cluster mode the whole rollup is pushed to the shards and only one
+    /// value per series per step comes back. On a single node there is nothing
+    /// to push down to, so the raw windows are returned for the caller to reduce
+    /// — doing it here would hold the module lock for the length of the
+    /// reduction.
+    pub fn query_rollup(
+        &self,
+        matchers: Matchers,
+        rollup: RollupRequest,
+        options: QueryOptions,
+    ) -> QueryResult<RollupOutcome> {
+        let command = SelectorTaskKind::Rollup(RollupSelectorCommand {
+            matchers,
+            rollup,
+            options,
+        });
+        self.submit_selector_task(command)?.into_rollup()
+    }
+
     fn submit_selector_task(&self, command: SelectorTaskKind) -> QueryResult<SelectorOutput> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let task = SelectorTask {
@@ -357,7 +400,27 @@ fn execute_selector_task_local(
             query_instant_local(ctx, selector, timestamp, ac.options)
                 .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples)))
         }
+        SelectorTaskKind::Rollup(rc) => {
+            // Single node: same reasoning as the aggregation task — read the
+            // windows and let the caller reduce them outside the module lock.
+            let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
+            let (start, end) = rollup_fetch_bounds(&rc.rollup);
+            query_range_local(ctx, selector, start, end, rc.options)
+                .map(|series| SelectorOutput::Rollup(RollupOutcome::Raw(series)))
+        }
     }
+}
+
+/// The span of raw samples a rollup needs: the union of its windows, as an
+/// inclusive `[start, end]` pair for storage's `get_range`.
+///
+/// Windows are half-open — `(end - range, end]` — so the lower bound is one
+/// millisecond past the first window's start.
+fn rollup_fetch_bounds(rollup: &RollupRequest) -> (Timestamp, Timestamp) {
+    let ends = rollup.window_ends();
+    let first = ends.first().copied().unwrap_or(rollup.range_end_ms);
+    let last = ends.last().copied().unwrap_or(rollup.range_end_ms);
+    ((first - rollup.range_ms).saturating_add(1), last)
 }
 
 fn calculate_timeout(opts: &QueryOptions) -> Duration {
@@ -585,6 +648,68 @@ fn execute_cluster_aggregation(
     }
 }
 
+/// Push a rollup to the shards and collect their per-series values here.
+///
+/// A series lives on exactly one shard, so the shards' outputs are disjoint and
+/// the coordinator concatenates rather than merges. As with aggregation, a
+/// cluster that cannot evaluate the rollup (a peer without support) reports
+/// [`RollupOutcome::Unsupported`] and the caller falls back to selecting the raw
+/// matrix, so the query still answers.
+fn execute_cluster_rollup(
+    ctx: &Context,
+    rc: RollupSelectorCommand,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
+) {
+    let timeout = calculate_timeout(&rc.options);
+    let max_series = rc.options.max_series;
+    let max_points_per_series = rc.options.max_points_per_series;
+    let cmd = RollupFanoutCommand::new(
+        rc.matchers,
+        rc.rollup,
+        max_series as u64,
+        max_points_per_series.unwrap_or(0) as u64,
+        timeout,
+    );
+
+    let targets = cmd.get_targets(ctx);
+    let responder = Arc::new(responder);
+    let cloned_responder = responder.clone();
+
+    let handler = move |cmd: RollupFanoutCommand, result: FanoutCommandResult| {
+        let query_result = match result {
+            Ok(()) => {
+                let series = cmd.into_result();
+                // The rolled-up output, not the input, is what these bound: one
+                // series per input series, one point per step that produced one.
+                validate_max_series_(series.len(), max_series).and_then(|_| {
+                    for s in &series {
+                        validate_max_points_per_series(s.samples.len(), max_points_per_series)?;
+                    }
+                    Ok(SelectorOutput::Rollup(RollupOutcome::Rolled(series)))
+                })
+            }
+            Err(e) if cmd.peer_unsupported() => {
+                log_warning(format!(
+                    "promql: rollup push-down unsupported by a peer, falling back: {e}"
+                ));
+                Ok(SelectorOutput::Rollup(RollupOutcome::Unsupported))
+            }
+            Err(e) => {
+                log_warning(format!(
+                    "promql: cluster command failed for rollup query: {e}"
+                ));
+                Err(e.into())
+            }
+        };
+
+        deliver_task_result(&responder, query_result);
+    };
+
+    if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
+        deliver_task_result(&cloned_responder, Err(e.into()));
+    }
+}
+
 fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
     match task.kind {
         SelectorTaskKind::Vector(iqc) => {
@@ -595,6 +720,9 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
         }
         SelectorTaskKind::Aggregation(ac) => {
             execute_cluster_aggregation(ctx, ac, task.responder);
+        }
+        SelectorTaskKind::Rollup(rc) => {
+            execute_cluster_rollup(ctx, rc, task.responder);
         }
     }
 }

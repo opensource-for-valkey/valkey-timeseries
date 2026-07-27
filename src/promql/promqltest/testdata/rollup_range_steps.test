@@ -1,0 +1,121 @@
+# Rollup semantics across the steps of a range query.
+#
+# A range query is driven one step at a time, and the matrix selector under a
+# rollup loads exactly the window for that step. Every case here uses a range
+# wider than the step, so consecutive windows overlap — the shape a rollup that
+# re-derives its own step grid gets wrong at every step but the last, and the
+# shape rollup push-down has to reproduce from the shard side.
+
+load 10s
+  metric 0+1x30
+
+eval range from 0 to 2m step 30s count_over_time(metric[1m])
+  {} 1 4 6 6 6
+
+eval range from 0 to 2m step 30s sum_over_time(metric[1m])
+  {} 0 6 21 39 57
+
+eval range from 0 to 2m step 30s min_over_time(metric[1m])
+  {} 0 0 1 4 7
+
+eval range from 0 to 2m step 30s max_over_time(metric[1m])
+  {} 0 3 6 9 12
+
+eval range from 0 to 2m step 30s avg_over_time(metric[1m])
+  {} 0 1.5 3.5 6.5 9.5
+
+eval range from 0 to 2m step 30s quantile_over_time(0.5, metric[1m])
+  {} 0 1.5 3.5 6.5 9.5
+
+eval range from 0 to 2m step 30s stddev_over_time(metric[1m])
+  {} 0 1.1180339887498949 1.707825127659933 1.707825127659933 1.707825127659933
+
+eval range from 0 to 2m step 30s changes(metric[1m])
+  {} 0 3 5 5 5
+
+# `metric` climbs by 1 every 10s, so the per-second rate settles at 0.1 once a
+# window is full. Two edges show through: the window at t=0 holds one sample and
+# so has no rate at all, and the one at t=30s starts at value 0 — the counter's
+# zero point — so extrapolation back to the window start is clamped there and
+# the 3-unit rise is spread over the full minute rather than extrapolated.
+eval range from 0 to 2m step 30s rate(metric[1m])
+  {} _ 0.05 0.1 0.1 0.1
+
+eval range from 0 to 2m step 30s irate(metric[1m])
+  {} _ 0.1 0.1 0.1 0.1
+
+eval range from 0 to 2m step 30s idelta(metric[1m])
+  {} _ 3 5 5 5
+
+eval range from 0 to 2m step 30s deriv(metric[1m])
+  {} _ 0.1 0.1 0.1 0.1
+
+eval range from 0 to 2m step 30s resets(metric[1m])
+  {} 0 0 0 0 0
+
+eval range from 0 to 2m step 30s ts_of_last_over_time(metric[1m])
+  {} 0 30 60 90 120
+
+eval range from 0 to 2m step 30s ts_of_first_over_time(metric[1m])
+  {} 0 0 10 40 70
+
+# The window is half-open — `(t-range, t]` — so a step whose window starts
+# exactly on a sample excludes it. At t=1m the window (0, 1m] holds six samples,
+# not the seven that a closed window would.
+eval instant at 1m count_over_time(metric[1m])
+  {} 6
+
+# Rollups drop __name__; the two that hand back an input sample keep it.
+eval range from 0 to 2m step 30s last_over_time(metric[1m])
+  metric 0 3 6 9 12
+
+eval range from 0 to 2m step 30s first_over_time(metric[1m])
+  metric 0 0 1 4 7
+
+# The step grid belongs to the query, not to the rollup: narrowing the range to
+# the step size changes every value, and widening it past the query start pulls
+# in samples from before it.
+eval range from 1m to 2m step 30s sum_over_time(metric[30s])
+  {} 15 24 33
+
+eval range from 1m to 2m step 30s sum_over_time(metric[2m])
+  {} 21 45 78
+
+clear
+
+# A window with no samples produces no sample for that step. The (series, step)
+# pair is absent from the result — it is not present with a NaN value.
+
+load 1m
+  gappy 1 2 3
+
+eval range from 0 to 3m step 30s count_over_time(gappy[20s])
+  {} 1 _ 1 _ 1 _ _
+
+eval range from 0 to 3m step 30s sum_over_time(gappy[20s])
+  {} 1 _ 2 _ 3 _ _
+
+eval range from 0 to 3m step 30s present_over_time(gappy[20s])
+  {} 1 _ 1 _ 1 _ _
+
+# A series whose every window is empty is absent from the result entirely.
+eval range from 2m30s to 3m step 30s count_over_time(gappy[20s])
+  # (no output)
+
+clear
+
+# A NaN value is a result; only an empty window is missing. These two must not
+# be conflated: `count_over_time` counts the NaN sample, and the step after the
+# last sample is absent rather than NaN.
+
+load 30s
+  mixed NaN 1 NaN
+
+eval range from 0 to 2m step 30s count_over_time(mixed[30s])
+  {} 1 1 1 _ _
+
+eval range from 0 to 2m step 30s sum_over_time(mixed[30s])
+  {} NaN 1 NaN _ _
+
+eval range from 0 to 2m step 30s last_over_time(mixed[30s])
+  mixed NaN 1 NaN _ _

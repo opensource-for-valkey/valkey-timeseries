@@ -198,6 +198,17 @@ pub struct RangeFunctionOpts {
     pub step_ms: i64,
 }
 
+/// One window's view for a rollup function.
+///
+/// **`prev_value`, `real_prev_value` and `real_next_value` are only populated
+/// when the caller supplied samples outside the window**, and how much context a
+/// caller supplies differs by path: the local per-step path loads exactly
+/// `(t - range, t]` and so never fills them, while the pushed-down grid path
+/// loads the union of the grid's windows and fills them for every interior
+/// window. A rollup whose value depended on them would therefore answer
+/// differently depending on whether push-down was available — which is why
+/// [`crate::promql::functions::RollupKind`] may only contain functions that
+/// ignore them. `every_kind_ignores_samples_outside_the_window` enforces this.
 #[derive(Default, Clone, Debug)]
 pub(super) struct RollupWindow<'a> {
     /// The value preceding values if it fits the staleness interval.

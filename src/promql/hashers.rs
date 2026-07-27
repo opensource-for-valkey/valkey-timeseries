@@ -1,5 +1,6 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{HasFingerprint, SeriesFingerprint, create_hasher, hash_key_value};
+use crate::promql::functions::RollupKind;
 use crate::promql::generated::Label as ProtoLabel;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, Offset, VectorSelector};
@@ -204,6 +205,41 @@ impl PreloadKey {
             selector: SelectorKey::from_selector(vs),
             offset: vs.offset.as_ref().map(OffsetKey::from),
             at: vs.at.as_ref().map(AtKey::from),
+        }
+    }
+}
+
+/// Structural key for a rollup whose whole step grid was evaluated up front.
+///
+/// Identifies the call, not just the selector: two rollups over the same series
+/// differ by function and by window width, and each is preloaded separately.
+/// Time modifiers come in through [`PreloadKey`], which already captures them.
+///
+/// The scalar parameter is part of the key and is required to be a literal —
+/// see `Evaluator::preload_rollup` for why a parameter that varies per step
+/// cannot be pushed down as one grid request.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) struct RollupPreloadKey {
+    selector: PreloadKey,
+    kind: RollupKind,
+    range_ms: i64,
+    /// `f64` has no `Hash`/`Eq`; the bit pattern does, and two parameters that
+    /// differ in bits are different requests.
+    param_bits: Option<u64>,
+}
+
+impl RollupPreloadKey {
+    pub(crate) fn new(
+        vs: &VectorSelector,
+        kind: RollupKind,
+        range_ms: i64,
+        param: Option<f64>,
+    ) -> Self {
+        Self {
+            selector: PreloadKey::from_selector(vs),
+            kind,
+            range_ms,
+            param_bits: param.map(f64::to_bits),
         }
     }
 }

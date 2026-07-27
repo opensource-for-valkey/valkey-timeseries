@@ -147,3 +147,28 @@ Push-down is controlled by the boolean config `ts-fanout-aggregation-pushdown` (
 via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It is not a mixed-version safety knob —
 version skew is handled automatically by the handshake above — but an emergency/diagnostic escape hatch: flipping it
 off reverts every query to coordinator-side aggregation without a module rollback.
+
+PromQL range-vector functions have their own push-down, controlled by `ts-fanout-rollup-pushdown` (default `no`).
+A PromQL series is owned entirely by one shard, so a rollup over that series' window needs no cross-shard merge
+algebra at all: the shard computes the final value and the coordinator concatenates. What crosses the wire is one
+float per series per step instead of the raw window — which, whenever the range exceeds the step, neighbouring steps
+would each have shipped again. It uses the same handshake as aggregation push-down: a shard that does not recognize
+the requested function returns its raw windows with `applied = false` and the coordinator reduces them itself.
+
+A range query resolves its rollups *once, for the whole step grid*, before the step loop runs — so `rate(m[5m])` at
+a 15s step over six hours is one fan-out rather than 1440, each of which would have shipped a five-minute window
+that its twenty neighbours also shipped. `@` and `offset` are resolved coordinator-side into window ends, so a shard
+is told which windows to reduce and never a modifier to re-derive; `@` collapses the grid onto a single window whose
+value the coordinator broadcasts to every step. Transport is sparse: a step whose window held no samples is absent
+from the response rather than carrying a NaN, because NaN is a legitimate rolled-up value.
+
+Pushed down: the `*_over_time` family (`sum`, `count`, `avg`, `min`, `max`, `stddev`, `stdvar`, `mad`, `present`,
+`first`, `last`, `quantile`), `ts_of_{first,last,min,max}_over_time`, `rate`, `increase`, `delta`, `irate`, `idelta`,
+`deriv`, `resets` and `changes`. Three are evaluated coordinator-side by construction: `absent_over_time` (its answer
+depends on absence across the whole cluster, which no shard can observe), `predict_linear` (it predicts relative to
+the query's evaluation timestamp, which `@`/`offset` divorce from the window end a shard is told), and
+`double_exponential_smoothing` (two scalar parameters; the request carries one).
+
+The toggle defaults off pending cluster-level validation. Interaction with the aggregation toggle is none: they cover
+disjoint query shapes (an instant vector's aggregation vs a matrix selector's reduction), and each is consulted only
+by the coordinator evaluating that shape.

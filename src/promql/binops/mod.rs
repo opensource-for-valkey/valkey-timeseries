@@ -69,21 +69,11 @@ pub(crate) fn apply_binary_op(op: TokenType, left: f64, right: f64) -> EvalResul
         T_ADD => Ok(left + right),
         T_SUB => Ok(left - right),
         T_MUL => Ok(left * right),
-        T_DIV => {
-            if right == 0.0 {
-                Ok(f64::NAN) // Division by zero results in NaN in PromQL
-            } else {
-                Ok(left / right)
-            }
-        }
-        T_MOD => {
-            // Modulo by zero results in NaN in PromQL
-            if right == 0.0 {
-                Ok(f64::NAN)
-            } else {
-                Ok(left % right)
-            }
-        }
+        // PromQL arithmetic is IEEE 754 float arithmetic, so division by zero is
+        // signed infinity (`1 / 0` is `+Inf`) and only `0 / 0` is NaN. Modulo by
+        // zero is NaN, which is what `%` already yields.
+        T_DIV => Ok(left / right),
+        T_MOD => Ok(left % right),
         T_NEQ => Ok(if left != right { 1.0 } else { 0.0 }),
         T_LSS => Ok(if left < right { 1.0 } else { 0.0 }),
         T_GTR => Ok(if left > right { 1.0 } else { 0.0 }),

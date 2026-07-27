@@ -97,6 +97,61 @@ pub(super) fn local_instant_eval_samples(
     Ok(samples)
 }
 
+/// Read the raw windows a pushed-down rollup needs, one entry per series.
+///
+/// The samples returned are exactly those inside the union of the requested
+/// windows — `(first_end - range_ms, last_end]` — so the shard reduces the same
+/// data the coordinator's own matrix selector would have loaded. Series with no
+/// samples in that span are dropped: an empty window contributes nothing.
+///
+/// `max_points_per_series` bounds the *raw* points examined per series, which is
+/// the resource this push-down is trading away; the coordinator separately
+/// bounds the rolled-up points it accepts back.
+pub(super) fn local_rollup_windows(
+    ctx: &Context,
+    selector: SeriesSelector,
+    window_ends: &[Timestamp],
+    range_ms: i64,
+    max_series: u64,
+    max_points_per_series: u64,
+) -> ValkeyResult<Vec<crate::promql::model::RangeSample>> {
+    let (Some(first_end), Some(last_end)) = (window_ends.first(), window_ends.last()) else {
+        return Ok(Vec::new());
+    };
+    // Windows are half-open — `(end - range, end]` — and storage's `get_range`
+    // takes an inclusive lower bound, so start one millisecond later.
+    let start_time = (first_end - range_ms).saturating_add(1);
+    let end_time = *last_end;
+
+    let series = series_by_selectors(ctx, &[selector], None)?;
+    validate_max_series(series.len(), max_series as usize)
+        .map_err(valkey_module::ValkeyError::String)?;
+
+    let windows = series
+        .iter()
+        .map(|(s, _)| s.deref())
+        .iter_into_par()
+        .filter_map(|s| {
+            let samples = s.get_range(start_time, end_time);
+            if samples.is_empty() {
+                return None;
+            }
+            let labels: Labels = (&s.labels).into();
+            Some(crate::promql::model::RangeSample { labels, samples })
+        })
+        .collect::<Vec<_>>();
+
+    if max_points_per_series > 0 && max_points_per_series != u64::MAX {
+        let limit = max_points_per_series as usize;
+        for window in &windows {
+            validate_max_points(window.samples.len(), Some(limit))
+                .map_err(valkey_module::ValkeyError::String)?;
+        }
+    }
+
+    Ok(windows)
+}
+
 pub(super) fn handle_range_query(
     ctx: &Context,
     selector: SeriesSelector,

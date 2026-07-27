@@ -39,8 +39,10 @@ eval instant at 50m count(limitk(100, http_requests) and http_requests)
     {} 6
 
 # Bug #15971.
+# `foo` climbs 1..11 across the steps, so k grows past the six `http_requests`
+# series; from then on limitk returns all of them and the count stays at 6.
 eval range from 0m to 50m step 5m count(limitk(scalar(foo), http_requests))
-	{} 1 2 3 4 5 6 7 8 8 8 8
+	{} 1 2 3 4 5 6 6 6 6 6 6
 
 # limit_ratio
 eval range from 0 to 50m step 5m count(limit_ratio(0.0, http_requests))

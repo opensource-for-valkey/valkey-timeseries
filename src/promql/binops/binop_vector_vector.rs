@@ -1223,10 +1223,11 @@ mod tests {
     // ── division by fill zero ─────────────────────────────────────────────────
 
     #[test]
-    fn test_fill_right_zero_division_yields_nan() {
-        // Prometheus: division by zero → NaN
+    fn test_fill_right_zero_division_yields_infinity() {
+        // PromQL arithmetic is IEEE 754: dividing a positive value by zero is
+        // +Inf, not NaN.
         let lhs = vec![sample(1000, 10.0, &[("env", "prod")])];
-        // No RHS match → fill_right(0) → 10 / 0 = NaN
+        // No RHS match → fill_right(0) → 10 / 0 = +Inf
         let rhs = vec![sample(1000, 1.0, &[("env", "other")])];
 
         let expr = make_expr(
@@ -1243,7 +1244,7 @@ mod tests {
             .unwrap();
 
         let prod = find_sample(&result, "prod").expect("prod should be emitted");
-        assert!(prod.value.is_nan(), "10 / fill(0) should be NaN");
+        assert_eq!(prod.value, f64::INFINITY, "10 / fill(0) should be +Inf");
     }
 
     // ── bool modifier fast-path ─────────────────────────────────────────────

@@ -1,4 +1,5 @@
 use crate::promql::exec::aggregations::AggregationKind;
+use crate::promql::functions::RollupKind;
 use crate::promql::{
     ExprResult, PromqlResult, QueryOptions,
     model::{InstantSample, RangeSample},
@@ -57,6 +58,56 @@ pub enum AggregationOutcome {
     Unsupported,
 }
 
+/// A range-vector function to evaluate over the windows a matrix selector
+/// describes, plus everything needed to reproduce those windows exactly.
+///
+/// Every time-dependent field is *resolved*: `@` and `offset` are applied by the
+/// coordinator before the request is built, so a data source reduces the windows
+/// it is handed and never re-derives a modifier. Paired with the selector passed
+/// alongside it, this is the whole of a `sum_over_time(m[5m] offset 1h)` — which
+/// is what makes it something a source can evaluate close to the data.
+#[derive(Debug, Clone)]
+pub struct RollupRequest {
+    pub kind: RollupKind,
+    /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
+    pub range_ms: i64,
+    pub lookback_delta_ms: i64,
+    /// Step grid of the enclosing query. `step_ms == 0` is a single evaluation
+    /// at [`Self::range_end_ms`].
+    pub step_ms: i64,
+    pub query_start: i64,
+    pub query_end: i64,
+    /// Window end for the single-evaluation case, `@`/`offset` resolved.
+    pub range_end_ms: i64,
+    /// Numeric function parameter, e.g. `quantile_over_time`'s phi.
+    pub param: Option<f64>,
+}
+
+impl RollupRequest {
+    /// The window ends to reduce, in ascending order.
+    pub(in crate::promql) fn window_ends(&self) -> Vec<i64> {
+        if self.step_ms <= 0 {
+            return vec![self.range_end_ms];
+        }
+        crate::promql::time::step_times(self.query_start, self.query_end, self.step_ms).collect()
+    }
+}
+
+/// What a data source made of a [`RollupRequest`]. Every variant tells the
+/// caller what it still has to do.
+pub enum RollupOutcome {
+    /// The source evaluated the rollup. Each entry is one series' sparse
+    /// `(window end, value)` pairs — a window that held no samples is absent,
+    /// not NaN.
+    Rolled(Vec<RangeSample>),
+    /// The source returned the raw windows instead of reducing them (nothing to
+    /// push down to, e.g. a single node): the caller reduces them.
+    Raw(Vec<RangeSample>),
+    /// The source cannot evaluate pushed-down rollups: the caller should select
+    /// the matrix itself and reduce that.
+    Unsupported,
+}
+
 pub trait QueryReader: Send + Sync {
     /// Query instant samples at `timestamp`.
     /// `deadline` is an optional absolute Instant by which the operation should complete.
@@ -93,6 +144,24 @@ pub trait QueryReader: Send + Sync {
     ) -> PromqlResult<AggregationOutcome> {
         Ok(AggregationOutcome::Unsupported)
     }
+
+    /// Evaluate `rollup` over the windows `selector`'s series contribute, at the
+    /// source.
+    ///
+    /// Because a series lives entirely on one node, a source that spans several
+    /// can have each compute its own series' final values and return one float
+    /// per series per step instead of the raw — and, when the range exceeds the
+    /// step, heavily overlapping — windows. Sources that cannot do this say so
+    /// and the caller reduces the matrix itself, so implementing this is purely
+    /// an optimization: the default does nothing.
+    fn query_rollup(
+        &self,
+        _selector: &VectorSelector,
+        _rollup: &RollupRequest,
+        _options: QueryOptions,
+    ) -> PromqlResult<RollupOutcome> {
+        Ok(RollupOutcome::Unsupported)
+    }
 }
 
 impl QueryReader for Arc<dyn QueryReader> {
@@ -125,6 +194,15 @@ impl QueryReader for Arc<dyn QueryReader> {
     ) -> PromqlResult<AggregationOutcome> {
         self.as_ref()
             .query_aggregation(selector, timestamp, aggregation, options)
+    }
+
+    fn query_rollup(
+        &self,
+        selector: &VectorSelector,
+        rollup: &RollupRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<RollupOutcome> {
+        self.as_ref().query_rollup(selector, rollup, options)
     }
 }
 
