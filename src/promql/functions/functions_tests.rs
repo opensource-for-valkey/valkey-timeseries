@@ -6,7 +6,9 @@ mod tests {
     use crate::promql::exec::types::EvalLabels;
     use crate::promql::functions::PromQLFunctionImpl;
     use crate::promql::functions::utils::variance_kahan;
-    use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
+    use crate::promql::functions::{
+        FunctionCallContext, PromQLArg, PromQLFunction, resolve_function,
+    };
     use crate::promql::{
         EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult, is_stale_nan,
     };
@@ -18,6 +20,15 @@ mod tests {
     // ========================================================================
     // Test helpers
     // ========================================================================
+
+    /// A call context for the functions here, none of which read the raw
+    /// argument expressions. The two that do — `absent` and
+    /// `absent_over_time` — are covered in `utils::absent_label_tests`, which
+    /// parses real queries so the matchers under test are the ones the parser
+    /// actually produces.
+    fn no_raw_args(ctx: &EvalContext) -> FunctionCallContext<'_> {
+        FunctionCallContext::new(ctx, &[])
+    }
 
     pub(crate) struct RangeFunctionAdapter {
         inner: PromQLFunctionImpl,
@@ -59,7 +70,7 @@ mod tests {
                 s.range_end_ms = eval_timestamp_ms;
             }
             let arg = PromQLArg::RangeVector(samples);
-            self.inner.apply_call(vec![arg], &ctx)
+            self.inner.apply_call(vec![arg], &no_raw_args(&ctx))
         }
 
         pub(crate) fn apply_rollup(
@@ -86,7 +97,7 @@ mod tests {
                 s.range_end_ms = eval_timestamp_ms;
             }
             let arg = PromQLArg::RangeVector(samples);
-            self.inner.apply_call(vec![arg], &ctx)
+            self.inner.apply_call(vec![arg], &no_raw_args(&ctx))
         }
     }
 
@@ -415,7 +426,7 @@ mod tests {
                     "src".into(),
                     "source-value-(.*)".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -475,7 +486,7 @@ mod tests {
                     "src".into(),
                     "value-(.*)".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -514,7 +525,7 @@ mod tests {
                     "dst".into(),
                     ".*".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -546,7 +557,7 @@ mod tests {
                     "src".into(),
                     "source-value-(.*)".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -578,7 +589,7 @@ mod tests {
                     "src".into(),
                     "(.*)".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap_err();
 
@@ -616,7 +627,7 @@ mod tests {
                     "".into(),
                     "".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap_err();
 
@@ -666,7 +677,7 @@ mod tests {
                     "src1".into(),
                     "src2".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -702,7 +713,7 @@ mod tests {
                     "dst".into(),
                     ",".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 
@@ -806,7 +817,7 @@ mod tests {
                     "__name__".into(),
                     "(.+)".into(),
                 ],
-                &ctx,
+                &no_raw_args(&ctx),
             )
             .unwrap();
 

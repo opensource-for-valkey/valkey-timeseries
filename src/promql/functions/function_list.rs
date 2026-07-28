@@ -89,7 +89,7 @@ macro_rules! impl_promql_function_impl {
     ) => {
         use $crate::promql::functions::types::PromQLArg;
         use $crate::promql::{EvalResult, ExprResult};
-        use $crate::promql::functions::types::PromQLFunction;
+        use $crate::promql::functions::types::{FunctionCallContext, PromQLFunction};
         use $crate::promql::model::EvalContext;
 
         #[allow(clippy::large_enum_variant)]
@@ -175,7 +175,7 @@ macro_rules! impl_promql_function_impl {
                 }
             }
 
-            fn apply_call(&self, evaluated_args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+            fn apply_call(&self, evaluated_args: Vec<PromQLArg>, ctx: &FunctionCallContext) -> EvalResult<ExprResult> {
                 match self {
                     $( Self::$Variant(f) => f.apply_call(evaluated_args, ctx), )*
                 }

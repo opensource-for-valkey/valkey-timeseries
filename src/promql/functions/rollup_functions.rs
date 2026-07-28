@@ -10,11 +10,14 @@ use crate::promql::functions::rate::{RateKind, extrapolated_rate_window};
 use crate::promql::functions::rollups::{
     eval_rollups, eval_rollups_basic, rollup_series_over_grid, window_samples,
 };
+use crate::promql::functions::types::FunctionCallContext;
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
+    labels_for_absent,
 };
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
+use promql_parser::parser::Expr;
 // https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmselect/promql/rollup.go
 
 /// A range-vector function that a shard can evaluate on its own.
@@ -356,7 +359,7 @@ macro_rules! make_rollup_function {
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
-                ctx: &EvalContext,
+                ctx: &FunctionCallContext,
             ) -> EvalResult<ExprResult> {
                 exec_rollup_fn($name, args, ctx, None, $rf)
             }
@@ -386,7 +389,7 @@ macro_rules! basic_rollup_function {
             fn apply_call(
                 &self,
                 args: Vec<PromQLArg>,
-                ctx: &EvalContext,
+                ctx: &FunctionCallContext,
             ) -> EvalResult<ExprResult> {
                 exec_basic_rollup_fn($name, args, ctx, $rf)
             }
@@ -577,17 +580,22 @@ fn rollup_last(samples: &[Sample]) -> f64 {
 ///
 /// Returns an empty vector if the range vector has any elements (i.e., at least
 /// one series with at least one sample in the look-back window), or a
-/// single-element instant vector with value `1` and no labels otherwise.
+/// single-element instant vector with value `1` otherwise.
 ///
-/// This matches Prometheus semantics: the function is used to detect when a
-/// time series is absent from a given range.
+/// The labels on that sample come from the argument selector's matchers, not
+/// from any series — see [`labels_for_absent`]. Reaching them requires the
+/// unevaluated argument, which is why this is one of the few functions to
+/// override `apply_call` rather than implement `apply`.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct AbsentOverTimeFunction;
 
-impl PromQLFunction for AbsentOverTimeFunction {
-    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+impl AbsentOverTimeFunction {
+    fn evaluate(
+        arg: PromQLArg,
+        ctx: &EvalContext,
+        raw_arg: Option<&Expr>,
+    ) -> EvalResult<ExprResult> {
         let series = arg.into_range_vector()?;
-        // todo: what labels should the output sample have?
         let has_samples = series.iter().any(|s| !s.values.is_empty());
         if has_samples {
             Ok(ExprResult::InstantVector(vec![]))
@@ -595,10 +603,30 @@ impl PromQLFunction for AbsentOverTimeFunction {
             Ok(ExprResult::InstantVector(vec![EvalSample {
                 timestamp_ms: ctx.evaluation_ts,
                 value: 1.0,
-                labels: Default::default(),
+                labels: labels_for_absent(raw_arg),
                 drop_name: false,
             }]))
         }
+    }
+}
+
+impl PromQLFunction for AbsentOverTimeFunction {
+    /// Reached only by callers that have no call site to speak of — the AST-less
+    /// path cannot know the matchers, so it answers with no labels.
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Self::evaluate(arg, ctx, None)
+    }
+
+    fn apply_call(
+        &self,
+        args: Vec<PromQLArg>,
+        ctx: &FunctionCallContext,
+    ) -> EvalResult<ExprResult> {
+        let mut args = args;
+        if args.len() != 1 {
+            return Err(exact_arity_error("absent_over_time", 1, args.len()));
+        }
+        Self::evaluate(args.swap_remove(0), ctx, ctx.raw_arg(0))
     }
 }
 
@@ -613,7 +641,11 @@ impl PromQLFunction for QuantileOverTimeFunction {
         Err(exact_arity_error("quantile_over_time", 2, 0))
     }
 
-    fn apply_call(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+    fn apply_call(
+        &self,
+        args: Vec<PromQLArg>,
+        ctx: &FunctionCallContext,
+    ) -> EvalResult<ExprResult> {
         if args.len() != 2 {
             return Err(exact_arity_error("quantile_over_time", 2, args.len()));
         }

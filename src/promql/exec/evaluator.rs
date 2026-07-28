@@ -22,7 +22,7 @@ use crate::promql::exec::utils::{
     merge_step_into_series_map,
 };
 use crate::promql::functions::RollupKind;
-use crate::promql::functions::{PromQLArg, PromQLFunction, resolve_function};
+use crate::promql::functions::{FunctionCallContext, PromQLArg, PromQLFunction, resolve_function};
 use crate::promql::hashers::{AggregationKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
@@ -791,7 +791,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             Some(result) => result,
             None => {
                 let evaluated_args = self.evaluate_function_args(ctx, call, preload_eligible)?;
-                func.apply_call(evaluated_args, ctx)?
+                // The unevaluated arguments travel with the context: `absent` and
+                // `absent_over_time` take their output labels from the argument
+                // selector's matchers, which no evaluated value carries.
+                let call_ctx = FunctionCallContext::new(ctx, &call.args.args);
+                func.apply_call(evaluated_args, &call_ctx)?
             }
         };
 
