@@ -318,8 +318,13 @@ fn handle_batch_compaction(
         handle_sample_compaction(ctx, *sample)?;
     }
 
-    // One recalculation per affected bucket (samples are sorted, so same-bucket entries are
-    // adjacent).
+    // One recalculation per affected bucket, using the *largest* retention floor across
+    // all back-fills to that bucket. When an append between two back-fills advances the
+    // retention window past earlier samples (e.g. MADD 0 v 1001 v 2 v with a retention that
+    // evicts timestamp 0 after 1001 arrives), the first back-fill's floor sees the earlier
+    // samples while the second back-fill's floor does not. Processing in reverse timestamp
+    // order keeps the later (higher) floor, which matches the source state that survives
+    // retention after the batch is complete.
     //
     // A bucket only reaches the destination when it closes, so `recalculate_bucket` (which
     // writes) is for buckets the rule has already moved past. When the rule has no open bucket
@@ -329,7 +334,7 @@ fn handle_batch_compaction(
     // repeat reads as a back-fill, `samples` carries the timestamp once, so it is classified as
     // an upsert and never streams through the append path that would have opened the bucket.
     let mut prev_bucket: Option<Timestamp> = None;
-    for (sample, min_ts) in &upserts {
+    for (sample, min_ts) in upserts.iter().rev() {
         let bucket_start = ctx.rule.calc_bucket_start(sample.timestamp);
         if prev_bucket == Some(bucket_start) {
             continue;
