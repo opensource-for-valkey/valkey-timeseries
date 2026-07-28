@@ -77,6 +77,12 @@ TS._DEBUG
 
 
 ## Build instructions
+
+> **Note:** After pulling or switching branches, always rebuild the module with
+> `cargo build --release` or `./build.sh`. The module binary is not committed to the
+> repository and will be stale after source changes, which can cause new config parameters
+> or commands to appear missing at runtime.
+
 ```
 curl https://sh.rustup.rs -sSf | sh
 sudo yum install clang
