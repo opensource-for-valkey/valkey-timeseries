@@ -77,8 +77,10 @@ jobs:
       - name: Update module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_timeseries.so)" >> $GITHUB_ENV
 
+      # tests/compat needs a live RedisTimeSeries reference server; it is covered
+      # by the compat-smoke job below.
       - name: Run integration tests
-        run: python3 -m pytest --cache-clear -v "tests/"
+        run: python3 -m pytest --cache-clear -v "tests/" --ignore=tests/compat
 
   # RedisTimeSeries compatibility smoke gate (docs/rts-compatibility-test-plan.md §8):
   # Tier A smoke subset diffed against the pinned redis:8.8 reference image,
@@ -231,9 +233,11 @@ jobs:
       - name: Update module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_timeseries.so)" >> $GITHUB_ENV
 
+      # tests/compat needs a live RedisTimeSeries reference server; it is covered
+      # by the compat-smoke job above.
       - name: Run integration tests
         run: |
-          python3 -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" 2>&1 | tee test_output.tmp
+          python3 -m pytest --capture=sys --cache-clear -v "tests/" --ignore=tests/compat -m "not skip_for_asan" 2>&1 | tee test_output.tmp
           if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
             RED='\033[0;31m'
             echo -e "${RED}Memory leaks detected in the following tests:"
