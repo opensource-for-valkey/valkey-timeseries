@@ -263,6 +263,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-cluster-map-expiration-ms',
             'ts-index-build-max-memory',
             'ts-fanout-aggregation-pushdown',
+            'ts-fanout-rollup-pushdown',
             'ts-index-persist',
             'debug-mode',
             'ts-promql-set-lookback-to-step',
