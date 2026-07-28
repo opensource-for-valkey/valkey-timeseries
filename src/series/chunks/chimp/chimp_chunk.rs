@@ -60,7 +60,7 @@ impl ChimpChunk {
             return 0.0;
         }
         let uncompressed_size = self.len() * (size_of::<i64>() + size_of::<f64>());
-        (uncompressed_size / compressed_size) as f64
+        uncompressed_size as f64 / compressed_size as f64
     }
 
     pub fn data_size(&self) -> usize {
