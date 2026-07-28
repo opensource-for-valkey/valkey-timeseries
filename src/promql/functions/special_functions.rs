@@ -1,26 +1,57 @@
-use crate::promql::functions::types::{PromQLArg, PromQLFunction};
+use crate::promql::functions::types::{FunctionCallContext, PromQLArg, PromQLFunction};
+use crate::promql::functions::utils::{exact_arity_error, labels_for_absent};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
+use promql_parser::parser::Expr;
 use std::default::Default;
 
-/// Absent function: returns 1.0 if input is empty, empty vector otherwise
+/// `absent(instant-vector)`
+///
+/// Returns 1.0 if the input is empty, an empty vector otherwise. The labels on
+/// that sample are derived from the argument selector's matchers rather than
+/// from data — see [`labels_for_absent`] — so this overrides `apply_call` to
+/// reach the unevaluated argument.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct AbsentFunction;
 
-impl PromQLFunction for AbsentFunction {
-    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+impl AbsentFunction {
+    fn evaluate(
+        arg: PromQLArg,
+        ctx: &EvalContext,
+        raw_arg: Option<&Expr>,
+    ) -> EvalResult<ExprResult> {
         let samples = arg.into_instant_vector()?;
         if samples.is_empty() {
             // Return a single sample with value 1.0 at the evaluation timestamp
             Ok(ExprResult::InstantVector(vec![EvalSample {
                 timestamp_ms: ctx.evaluation_ts,
                 value: 1.0,
-                labels: Default::default(),
+                labels: labels_for_absent(raw_arg),
                 drop_name: false,
             }]))
         } else {
             // Return empty vector when input has samples
             Ok(ExprResult::InstantVector(vec![]))
         }
+    }
+}
+
+impl PromQLFunction for AbsentFunction {
+    /// Reached only by callers that have no call site to speak of — the AST-less
+    /// path cannot know the matchers, so it answers with no labels.
+    fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Self::evaluate(arg, ctx, None)
+    }
+
+    fn apply_call(
+        &self,
+        args: Vec<PromQLArg>,
+        ctx: &FunctionCallContext,
+    ) -> EvalResult<ExprResult> {
+        let mut args = args;
+        if args.len() != 1 {
+            return Err(exact_arity_error("absent", 1, args.len()));
+        }
+        Self::evaluate(args.swap_remove(0), ctx, ctx.raw_arg(0))
     }
 }
 

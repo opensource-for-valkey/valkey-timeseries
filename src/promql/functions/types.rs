@@ -6,9 +6,32 @@ use promql_parser::parser::Expr;
 use promql_parser::parser::value::ValueType;
 use std::ops::Deref;
 
+/// What a function sees at its call site: the evaluation context, plus the
+/// *unevaluated* argument expressions.
+///
+/// Almost every function is a pure map from evaluated arguments to a result and
+/// wants nothing to do with the AST. `absent`/`absent_over_time` are the
+/// exception: their output *labels* are derived from the argument selector's
+/// matchers rather than from any data (see
+/// [`crate::promql::functions::utils::labels_for_absent`]), so the expression
+/// has to reach them. This context is how.
 pub(crate) struct FunctionCallContext<'a> {
     pub eval_context: &'a EvalContext,
     pub raw_args: &'a [Box<Expr>],
+}
+
+impl<'a> FunctionCallContext<'a> {
+    pub fn new(eval_context: &'a EvalContext, raw_args: &'a [Box<Expr>]) -> Self {
+        Self {
+            eval_context,
+            raw_args,
+        }
+    }
+
+    /// The unevaluated expression for argument `idx`, if the call had one.
+    pub fn raw_arg(&self, idx: usize) -> Option<&'a Expr> {
+        self.raw_args.get(idx).map(|arg| &**arg)
+    }
 }
 
 impl<'a> Deref for FunctionCallContext<'a> {
@@ -161,12 +184,18 @@ pub(crate) trait PromQLFunction {
         self.apply(args[0].clone(), ctx)
     }
 
+    /// Apply the function at a call site, with the unevaluated argument
+    /// expressions available alongside the evaluated ones.
+    ///
+    /// Override this only when the AST is actually needed; `FunctionCallContext`
+    /// derefs to `EvalContext`, so an implementation that ignores `raw_args`
+    /// reads exactly as it would have with a bare context.
     fn apply_call(
         &self,
         evaluated_args: Vec<PromQLArg>,
-        ctx: &EvalContext,
+        ctx: &FunctionCallContext,
     ) -> EvalResult<ExprResult> {
-        self.apply_args(evaluated_args, ctx)
+        self.apply_args(evaluated_args, ctx.eval_context)
     }
 }
 

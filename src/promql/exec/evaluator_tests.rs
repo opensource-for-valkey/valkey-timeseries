@@ -394,6 +394,29 @@ mod tests {
             (1.0, vec![]), // Should return 1.0 when metric doesn't exist
         ]
     )]
+    // The missing series has no labels to report, so absent's come from the
+    // selector's equality matchers — which reach the function only because the
+    // call site hands it the unevaluated argument.
+    #[case(
+        "function_absent_copies_equality_matchers",
+        r#"absent(nonexistent_metric{env="prod",method=~"GE.*"})"#,
+        vec![
+            ("other_metric", vec![("env", "prod")], 0, 5.0),
+        ],
+        vec![
+            (1.0, vec![("env", "prod")]),
+        ]
+    )]
+    #[case(
+        "function_absent_over_time_copies_equality_matchers",
+        r#"absent_over_time(nonexistent_metric{env="prod"}[5m])"#,
+        vec![
+            ("other_metric", vec![("env", "prod")], 0, 5.0),
+        ],
+        vec![
+            (1.0, vec![("env", "prod")]),
+        ]
+    )]
     // Binary Operations - Arithmetic
     #[case(
         "binary_add_vector_scalar",
