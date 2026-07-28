@@ -18,8 +18,8 @@ fn bench_chunk_sizes(key: support::DatasetKey) -> Vec<usize> {
     }
 }
 
-fn encodings() -> [ChunkEncoding; 2] {
-    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla]
+fn encodings() -> [ChunkEncoding; 3] {
+    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla, ChunkEncoding::Chimp]
 }
 
 fn bench_encode_bulk(c: &mut Criterion) {

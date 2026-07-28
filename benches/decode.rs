@@ -9,8 +9,8 @@ use support::{
     build_chunk, chunk_size_id,
 };
 
-fn encodings() -> [ChunkEncoding; 2] {
-    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla]
+fn encodings() -> [ChunkEncoding; 3] {
+    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla, ChunkEncoding::Chimp]
 }
 
 /// Mirror encode.rs: drift and noisy get all three chunk sizes; everything
