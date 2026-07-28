@@ -33,10 +33,9 @@ const DEFAULT_WARMUP: usize = 20;
 const DEFAULT_ITERATIONS: usize = 200;
 const DEFAULT_WORKLOADS: [ValueWorkload; 2] = [ValueWorkload::Drift, ValueWorkload::Noisy];
 
-const ALL_ENCODINGS: [ChunkEncoding; 4] = [
+const ALL_ENCODINGS: [ChunkEncoding; 3] = [
     ChunkEncoding::Uncompressed,
     ChunkEncoding::Gorilla,
-    ChunkEncoding::DeXor,
     ChunkEncoding::Chimp,
 ];
 

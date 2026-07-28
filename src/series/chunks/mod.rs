@@ -1,6 +1,5 @@
 mod chimp;
 mod chunk;
-mod dexor;
 mod elf64;
 mod gorilla;
 mod merge;
@@ -16,7 +15,6 @@ pub(crate) mod utils;
 
 pub use chimp::*;
 pub use chunk::*;
-pub use dexor::*;
 pub use gorilla::*;
 pub use merge::*;
 pub use serialization::*;

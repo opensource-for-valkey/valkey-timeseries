@@ -63,11 +63,10 @@ fn encode_matrix_chunk_sizes(key: &DatasetKey) -> Vec<usize> {
     }
 }
 
-fn encodings() -> [ChunkEncoding; 4] {
+fn encodings() -> [ChunkEncoding; 3] {
     [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
-        ChunkEncoding::DeXor,
         ChunkEncoding::Chimp,
     ]
 }

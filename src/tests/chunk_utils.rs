@@ -76,7 +76,7 @@ pub fn filled_prefix_len(data: &[Sample], encoding: ChunkEncoding, chunk_size: u
 
 /// The number of bytes a chunk has actually written, for compression reporting.
 ///
-/// [`ChunkOps::size`] is not comparable across encodings: gorilla, dexor
+/// [`ChunkOps::size`] is not comparable across encodings: gorilla
 /// and chimp return a `get_size()` heap footprint, which counts buffer *capacity*
 /// and therefore jumps to the next power of two as the buffer grows, while
 /// uncompressed returns the bytes in use. A ratio built on `size()` compares
@@ -90,7 +90,6 @@ pub fn encoded_size(chunk: &TimeSeriesChunk) -> usize {
         // `samples.len() * size_of::<Sample>()` — already exact.
         TimeSeriesChunk::Uncompressed(c) => c.size(),
         TimeSeriesChunk::Gorilla(c) => c.encoder.buf().len(),
-        TimeSeriesChunk::DeXor(c) => c.encoder.buf().len(),
         TimeSeriesChunk::Chimp(c) => c.encoder.bytes().len(),
     }
 }

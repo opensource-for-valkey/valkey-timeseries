@@ -66,11 +66,10 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         # Cases: (ENCODING arg, expected encoding name in TS.INFO, expected chunkType)
         cases = [
             ("UNCOMPRESSED", "uncompressed", "uncompressed"),
-            # COMPRESSED maps to the default compressed encoding (currently gorilla)
-            ("COMPRESSED", "gorilla", "compressed"),
+            # COMPRESSED maps to the default compressed encoding (currently chimp)
+            ("COMPRESSED", "chimp", "compressed"),
             ("GORILLA", "gorilla", "compressed"),
             ("CHIMP", "chimp", "compressed"),
-            ("dexor", "dexor", "compressed"),
         ]
 
         for i, (encoding, expected_name, expected_chunk_type) in enumerate(cases):

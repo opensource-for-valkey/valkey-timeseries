@@ -11,7 +11,9 @@ TS.ALTER key
   [[LABELS [label value ...] | METRIC metricName]
 ```
 #### Options
-- **ENCODING**: The encoding to use for the timeseries. Default is `COMPRESSED`.
+- **ENCODING**: The encoding to use for the timeseries: `CHIMP`, `GORILLA`, `UNCOMPRESSED`, or
+  `COMPRESSED` (an alias for the configured default compressed encoding). Default is `COMPRESSED`,
+  which resolves to `CHIMP` unless `ts-encoding` says otherwise.
 - **DUPLICATE_POLICY**: The policy to use for duplicate samples. Default is `BLOCK`.
 
 ## Required arguments

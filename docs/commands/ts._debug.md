@@ -213,7 +213,7 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | Parameter                      | Type     | Default         | Description                                                                             |
 |--------------------------------|----------|-----------------|-----------------------------------------------------------------------------------------|
 | `ts-chunk-size`                | integer  | 4096            | Maximum memory per time series chunk, in bytes                                          |
-| `ts-encoding`                  | enum     | `COMPRESSED`    | Default chunk encoding: `GORILLA` or `UNCOMPRESSED`                                     |
+| `ts-encoding`                  | enum     | `CHIMP`         | Default chunk encoding: `CHIMP`, `GORILLA` or `UNCOMPRESSED`                            |
 | `ts-duplicate-policy`          | enum     | `BLOCK`         | Policy for handling duplicate timestamps: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, `SUM` |
 | `ts-retention-policy`          | duration | `0` (no expiry) | Default retention period (milliseconds)                                                 |
 | `ts-compaction-policy`         | string   | `None`          | Default compaction rules applied to all new time series                                 |

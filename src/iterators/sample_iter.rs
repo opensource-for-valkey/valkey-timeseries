@@ -1,14 +1,13 @@
 use crate::common::Sample;
 use crate::iterators::TimeSeriesRangeIterator;
 use crate::iterators::vec_sample_iterator::VecSampleIterator;
-use crate::series::chunks::{ChimpChunkIterator, DeXorChunkIterator, GorillaChunkIterator};
+use crate::series::chunks::{ChimpChunkIterator, GorillaChunkIterator};
 
 #[derive(Default)]
 pub enum SampleIter<'a> {
     Slice(std::slice::Iter<'a, Sample>),
     Vec(VecSampleIterator),
     Gorilla(GorillaChunkIterator<'a>),
-    DeXor(Box<DeXorChunkIterator<'a>>),
     Chimp(Box<ChimpChunkIterator<'a>>),
     Range(TimeSeriesRangeIterator<'a>),
     #[default]
@@ -27,9 +26,6 @@ impl<'a> SampleIter<'a> {
     pub fn gorilla(iter: GorillaChunkIterator<'a>) -> Self {
         SampleIter::Gorilla(iter)
     }
-    pub fn dexor(iter: DeXorChunkIterator<'a>) -> Self {
-        SampleIter::DeXor(Box::new(iter))
-    }
     pub fn chimp(iter: ChimpChunkIterator<'a>) -> Self {
         SampleIter::Chimp(Box::new(iter))
     }
@@ -43,7 +39,6 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Slice(slice) => slice.next().copied(),
             SampleIter::Vec(iter) => iter.next(),
             SampleIter::Gorilla(iter) => iter.next(),
-            SampleIter::DeXor(iter) => iter.next(),
             SampleIter::Chimp(iter) => iter.next(),
             SampleIter::Range(range) => range.next(),
             SampleIter::Empty => None,
@@ -66,12 +61,6 @@ impl From<Vec<Sample>> for SampleIter<'_> {
 impl<'a> From<GorillaChunkIterator<'a>> for SampleIter<'a> {
     fn from(value: GorillaChunkIterator<'a>) -> Self {
         Self::Gorilla(value)
-    }
-}
-
-impl<'a> From<DeXorChunkIterator<'a>> for SampleIter<'a> {
-    fn from(value: DeXorChunkIterator<'a>) -> Self {
-        Self::DeXor(Box::new(value))
     }
 }
 

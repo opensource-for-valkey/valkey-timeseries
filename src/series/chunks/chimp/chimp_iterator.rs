@@ -1,7 +1,7 @@
 //! Sample-level ElfOnChimp iterator.
 //!
-//! Mirrors [`DeXorIterator`](crate::series::chunks::DeXorIterator): reads the
-//! interleaved timestamp/value records of a [`ChimpCompressor`] back in order.
+//! Reads the interleaved timestamp/value records of a [`ChimpCompressor`] back
+//! in order.
 
 use super::compressor::{ChimpCompressor, ChimpDecompressor};
 use crate::common::Sample;

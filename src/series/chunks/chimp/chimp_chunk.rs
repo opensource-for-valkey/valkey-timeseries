@@ -2,8 +2,7 @@
 //! layer on top of the Chimp XOR codec, with delta-of-delta timestamps
 //! interleaved in the same bit stream.
 //!
-//! Structurally a twin of [`DeXorChunk`](crate::series::chunks::DeXorChunk) —
-//! the codec is sequential, so every mutation (`remove_range`, `upsert`,
+//! The codec is sequential, so every mutation (`remove_range`, `upsert`,
 //! `merge`, `split`) re-encodes from an iterator rather than patching in place.
 
 use super::chimp_iterator::ChimpIterator;

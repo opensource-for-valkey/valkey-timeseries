@@ -26,10 +26,9 @@ pub const MIN_SAMPLES_FOR_BPS_ESTIMATE: usize = 16;
 #[repr(u8)]
 pub enum ChunkEncoding {
     Uncompressed = 1,
-    #[default]
     Gorilla = 2,
+    #[default]
     Chimp = 3,
-    DeXor = 4,
 }
 
 impl ChunkEncoding {
@@ -38,7 +37,6 @@ impl ChunkEncoding {
             ChunkEncoding::Uncompressed => "uncompressed",
             ChunkEncoding::Gorilla => "gorilla",
             ChunkEncoding::Chimp => "chimp",
-            ChunkEncoding::DeXor => "dexor",
         }
     }
 
@@ -60,7 +58,6 @@ impl TryFrom<u8> for ChunkEncoding {
             1 => Ok(ChunkEncoding::Uncompressed),
             2 => Ok(ChunkEncoding::Gorilla),
             3 => Ok(ChunkEncoding::Chimp),
-            4 => Ok(ChunkEncoding::DeXor),
             _ => Err(ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING)),
         }
     }
@@ -89,7 +86,6 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
         "compressed" => ChunkEncoding::default(),
         "uncompressed" => ChunkEncoding::Uncompressed,
         "gorilla" => ChunkEncoding::Gorilla,
-        "dexor" => ChunkEncoding::DeXor,
         "chimp" => ChunkEncoding::Chimp,
     }
 }
@@ -212,7 +208,6 @@ mod tests {
         let encodings = [
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
-            ChunkEncoding::DeXor,
             ChunkEncoding::Chimp,
         ];
 
@@ -225,8 +220,8 @@ mod tests {
 
     #[test]
     fn chunk_encoding_invalid_u8_returns_err() {
-        // The defined discriminants are contiguous over 1..=4; everything else is invalid.
-        for invalid in [0u8, 5u8, 6u8, 255u8] {
+        // The defined discriminants are contiguous over 1..=3; everything else is invalid.
+        for invalid in [0u8, 4u8, 5u8, 255u8] {
             assert!(
                 ChunkEncoding::try_from(invalid).is_err(),
                 "byte {invalid} should not decode to an encoding"

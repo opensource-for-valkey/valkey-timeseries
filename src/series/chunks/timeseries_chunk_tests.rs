@@ -20,10 +20,9 @@ mod tests {
         (f1 - f2).abs() < f64::EPSILON
     }
 
-    const CHUNK_TYPES: [ChunkEncoding; 4] = [
+    const CHUNK_TYPES: [ChunkEncoding; 3] = [
         ChunkEncoding::Uncompressed,
         ChunkEncoding::Gorilla,
-        ChunkEncoding::DeXor,
         ChunkEncoding::Chimp,
     ];
 
@@ -1260,7 +1259,7 @@ mod tests {
     ///
     /// A manual `GetSize` impl that overrides only `get_size` is invisible to
     /// the derived impl of any type containing it, which silently reported a
-    /// bare `size_of::<TimeSeriesChunk>()` for uncompressed, gorilla and dexor
+    /// bare `size_of::<TimeSeriesChunk>()` for uncompressed and gorilla
     /// series regardless of how many samples they held.
     #[test]
     fn test_memory_usage_counts_encoded_payload() {
@@ -2476,7 +2475,6 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::Chimp,
-            ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);
             let samples = vec![
@@ -2560,7 +2558,6 @@ mod tests {
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
             ChunkEncoding::Chimp,
-            ChunkEncoding::DeXor,
         ] {
             let mut chunk = TimeSeriesChunk::new(encoding, 1024);
             let samples = vec![

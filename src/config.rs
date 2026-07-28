@@ -49,7 +49,7 @@ pub const DECIMAL_DIGITS_MIN: i64 = MIN_DECIMAL_DIGITS as i64;
 pub const SIGNIFICANT_DIGITS_MAX: i64 = MAX_SIGNIFICANT_DIGITS as i64;
 pub const SIGNIFICANT_DIGITS_MIN: i64 = MIN_SIGNIFICANT_DIGITS as i64;
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = CHUNK_SIZE_DEFAULT as usize;
-pub const DEFAULT_CHUNK_ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
+pub const DEFAULT_CHUNK_ENCODING: ChunkEncoding = ChunkEncoding::Chimp;
 pub const DEFAULT_DUPLICATE_POLICY: DuplicatePolicy = DuplicatePolicy::Block;
 pub const IGNORE_MAX_TIME_DIFF_DEFAULT: i64 = 0;
 pub const IGNORE_MAX_TIME_DIFF_MIN: i64 = 0;
@@ -1165,12 +1165,12 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
 mod tests {
     use super::*;
 
-    /// The exact default string each parameter was registered with before the registry
-    /// existed. Registration defaults are user-visible (`CONFIG GET` reports them on a fresh
-    /// server), so the registry must reproduce them byte for byte.
+    /// The exact default string each parameter is registered with. Registration defaults are
+    /// user-visible (`CONFIG GET` reports them on a fresh server), so the registry must
+    /// reproduce them byte for byte and a change here is a change to documented behaviour.
     const EXPECTED_REGISTRATION_DEFAULTS: &[(&str, &str)] = &[
         ("ts-chunk-size", "4096"),
-        ("ts-encoding", "gorilla"),
+        ("ts-encoding", "chimp"),
         // Lowercase: this is what the server registers and what `CONFIG GET` returns.
         // `TS._DEBUG LIST_CONFIGS` reports the same value, having previously hardcoded "BLOCK".
         ("ts-duplicate-policy", "block"),
@@ -1376,7 +1376,6 @@ mod tests {
         for encoding in [
             ChunkEncoding::Uncompressed,
             ChunkEncoding::Gorilla,
-            ChunkEncoding::DeXor,
             ChunkEncoding::Chimp,
         ] {
             assert_eq!(ChunkEncoding::try_from(encoding as u8).ok(), Some(encoding));

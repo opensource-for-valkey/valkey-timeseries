@@ -5,7 +5,6 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::iterators::{FilteredSampleIterator, SampleIter};
 use crate::series::chunks::chimp::ChimpChunk;
-use crate::series::chunks::dexor::DeXorChunk;
 use crate::series::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
 use crate::series::types::ValueFilter;
 use crate::series::{
@@ -24,7 +23,6 @@ use valkey_module::{RedisModuleIO, ValkeyResult};
 pub enum TimeSeriesChunk {
     Uncompressed(UncompressedChunk),
     Gorilla(GorillaChunk),
-    DeXor(DeXorChunk),
     Chimp(ChimpChunk),
 }
 
@@ -40,7 +38,6 @@ impl TimeSeriesChunk {
                 let chunk = GorillaChunk::with_max_size(chunk_size);
                 Gorilla(chunk)
             }
-            ChunkEncoding::DeXor => DeXor(DeXorChunk::with_max_size(chunk_size)),
             ChunkEncoding::Chimp => Chimp(ChimpChunk::with_max_size(chunk_size)),
         }
     }
@@ -49,7 +46,6 @@ impl TimeSeriesChunk {
         match self {
             TimeSeriesChunk::Uncompressed(_) => ChunkEncoding::Uncompressed,
             TimeSeriesChunk::Gorilla(_) => ChunkEncoding::Gorilla,
-            TimeSeriesChunk::DeXor(_) => ChunkEncoding::DeXor,
             TimeSeriesChunk::Chimp(_) => ChunkEncoding::Chimp,
         }
     }
@@ -117,7 +113,6 @@ impl TimeSeriesChunk {
         match self {
             Uncompressed(chunk) => Box::new(chunk.iter()),
             Gorilla(chunk) => Box::new(chunk.iter()),
-            DeXor(chunk) => Box::new(chunk.iter()),
             Chimp(chunk) => Box::new(chunk.iter()),
         }
     }
@@ -127,7 +122,6 @@ impl TimeSeriesChunk {
         match self {
             Uncompressed(chunk) => chunk.range_iter(start, end),
             Gorilla(chunk) => chunk.range_iter(start, end),
-            DeXor(chunk) => chunk.range_iter(start, end),
             Chimp(chunk) => chunk.range_iter(start, end),
         }
     }
@@ -308,7 +302,6 @@ impl Chunk for TimeSeriesChunk {
         match self {
             Uncompressed(chunk) => Ok(Uncompressed(chunk.split()?)),
             Gorilla(chunk) => Ok(Gorilla(chunk.split()?)),
-            DeXor(chunk) => Ok(DeXor(chunk.split()?)),
             Chimp(chunk) => Ok(Chimp(chunk.split()?)),
         }
     }
@@ -319,7 +312,6 @@ impl Chunk for TimeSeriesChunk {
         match self {
             Uncompressed(chunk) => chunk.save_rdb(rdb),
             Gorilla(chunk) => chunk.save_rdb(rdb),
-            DeXor(chunk) => chunk.save_rdb(rdb),
             Chimp(chunk) => chunk.save_rdb(rdb),
         }
     }
@@ -331,7 +323,6 @@ impl Chunk for TimeSeriesChunk {
         let chunk = match chunk_type {
             ChunkEncoding::Uncompressed => Uncompressed(UncompressedChunk::load_rdb(rdb, enc_ver)?),
             ChunkEncoding::Gorilla => Gorilla(GorillaChunk::load_rdb(rdb, enc_ver)?),
-            ChunkEncoding::DeXor => DeXor(DeXorChunk::load_rdb(rdb, enc_ver)?),
             ChunkEncoding::Chimp => Chimp(ChimpChunk::load_rdb(rdb, enc_ver)?),
         };
         Ok(chunk)
@@ -346,10 +337,6 @@ impl Chunk for TimeSeriesChunk {
             }
             Gorilla(chunk) => {
                 dest.push(ChunkEncoding::Gorilla as u8);
-                chunk.serialize(dest)
-            }
-            DeXor(chunk) => {
-                dest.push(ChunkEncoding::DeXor as u8);
                 chunk.serialize(dest)
             }
             Chimp(chunk) => {
@@ -377,10 +364,6 @@ impl Chunk for TimeSeriesChunk {
                 let chunk = GorillaChunk::deserialize(&buf[1..])?;
                 Ok(Gorilla(chunk))
             }
-            ChunkEncoding::DeXor => {
-                let chunk = DeXorChunk::deserialize(&buf[1..])?;
-                Ok(DeXor(chunk))
-            }
             ChunkEncoding::Chimp => {
                 let chunk = ChimpChunk::deserialize(&buf[1..])?;
                 Ok(Chimp(chunk))
@@ -393,7 +376,6 @@ impl Chunk for TimeSeriesChunk {
         match self {
             Uncompressed(chunk) => chunk.debug_digest(dig),
             Gorilla(chunk) => chunk.debug_digest(dig),
-            DeXor(chunk) => chunk.debug_digest(dig),
             Chimp(chunk) => chunk.debug_digest(dig),
         }
     }

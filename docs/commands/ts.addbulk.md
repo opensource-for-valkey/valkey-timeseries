@@ -70,7 +70,7 @@ Override the duplicate policy for this command invocation only. Does not modify 
 
 Storage encoding:
 
-- `COMPRESSED` - Gorilla compression (default)
+- `COMPRESSED` - Chimp compression (default)
 - `UNCOMPRESSED` - Raw storage
 
 </summary>
