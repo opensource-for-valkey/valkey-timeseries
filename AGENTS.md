@@ -23,8 +23,10 @@ Quick start (commands you can run)
   `cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release`
 - Local dev script (recommended):
     - `SERVER_VERSION=unstable ./build.sh`  # builds module, builds valkey-server, runs unit & integration tests
+      (`tests/compat` is excluded — see below)
     - To run ASAN integration pass: `ASAN_BUILD=true SERVER_VERSION=unstable ./build.sh`
     - Run a subset of Python integration tests: `TEST_PATTERN="test_ts_add" SERVER_VERSION=unstable ./build.sh`
+    - Include the compatibility suite: `RTS_COMPAT=1 SERVER_VERSION=unstable ./build.sh`
 - Benchmarks: `cargo bench --features enable-system-alloc` (see Benchmarks below — the feature is mandatory).
 - Compression report: `tools/compression_report.sh` (add `--check` to fail on regressions against a saved baseline).
 - Latency report: `tools/latency_report.sh`. Wire-payload report: `tools/wire_report.sh` (see Benchmarks below).
@@ -37,6 +39,10 @@ Key ENV and behavior (from `./build.sh`)
   `tests/build/binaries/$SERVER_VERSION/valkey-server`. Defaults to `unstable` if not set, which tracks the latest main or branch.
 - `ASAN_BUILD`: when set runs tests with LeakSanitizer checks and fails on leaks.
 - `TEST_PATTERN`: passed to pytest `-k` to select tests.
+- `RTS_COMPAT=1` / `COMPAT_REFERENCE_URL`: either one drops the default `--ignore=tests/compat` so the
+  differential compatibility suite runs too. Unset (the default), `build.sh` never collects `tests/compat`,
+  because those tests need a live RedisTimeSeries reference server. The same two vars are what the harness
+  itself reads to find (or start) that server, so there is no separate build-only switch.
 - `MODULE_PATH` exported after build: `target/release/libvalkey_timeseries{.so,.dylib}` depending on OS.
 
 Setup & Environment Notes
@@ -169,10 +175,13 @@ Testing & debugging notes
   variants) relying on a built `valkey-server` and the `tests/valkeytestframework` helpers (populated by `./build.sh`).
 - To reproduce integration runs locally: run `SERVER_VERSION=unstable ./build.sh` — this will clone/build Valkey and
   copy the server binary to `tests/build/binaries/`.
-- Compat tests are skipped unless a reference server is available:
+- Compat tests need a reference server, so `./build.sh` excludes `tests/compat` outright (`--ignore`, which also
+  avoids importing that directory's `conftest.py` and its PyYAML/`compat_diff` imports); run them explicitly, or
+  set `RTS_COMPAT=1`/`COMPAT_REFERENCE_URL` to fold them back into the build:
   `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
   `docker compose -f docker-compose.compat.yml up -d reference` plus
   `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
+  Without either var a direct `pytest tests/compat` run still collects but skips every test.
   The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1` and is easiest to run via `./run-fuzz.sh`
   (see "Fuzzing" below). Full env var table in `tests/compat/README.md`.
 - pytest markers: `rts_compat` (needs a live reference server), `skip_for_asan`.
@@ -180,8 +189,9 @@ Testing & debugging notes
   leaks are detected.
 - CI (`.github/workflows/ci.yml`): ubuntu + macos build/lint/unit, ubuntu integration tests across
   `unstable`/`8.1`, an ASAN leak job, and a `compat-smoke` job that diffs the smoke subset against the pinned
-  reference (RESP3 only). `compat-smoke` is currently `continue-on-error: true` — non-blocking until the first-run
-  divergences are triaged.
+  reference (RESP3 only). The integration and ASAN jobs pass `--ignore=tests/compat` (same as `build.sh`);
+  `compat-smoke` is the only job that runs the compat suite, and it starts the reference container first.
+  `compat-smoke` is currently `continue-on-error: true` — non-blocking until the first-run divergences are triaged.
 
 Benchmarks
 

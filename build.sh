@@ -139,14 +139,26 @@ fi
 
 export MODULE_PATH="$SCRIPT_DIR/target/release/libvalkey_timeseries$MODULE_EXT"
 
+# The RedisTimeSeries differential compatibility suite (tests/compat) needs a live
+# reference server, so it is excluded from the default build. Set RTS_COMPAT=1 to
+# let the harness start the pinned reference container, or point
+# COMPAT_REFERENCE_URL at an already-running reference server, to include it.
+COMPAT_IGNORE="--ignore=tests/compat"
+if [ "$RTS_COMPAT" = "1" ] || [ -n "$COMPAT_REFERENCE_URL" ]; then
+    echo "Including the compatibility tests (reference server requested)."
+    COMPAT_IGNORE=""
+else
+    echo "Excluding the compatibility tests (set RTS_COMPAT=1 or COMPAT_REFERENCE_URL to include them)."
+fi
+
 echo "Running the integration tests..."
 if [ ! -z "${ASAN_BUILD}" ]; then
     # TEST_PATTERN can be used to run specific tests or test patterns.
     if [[ -n "$TEST_PATTERN" ]]; then
-        run_pytest --capture=sys --cache-clear -v "$SCRIPT_DIR/tests/" -k $TEST_PATTERN 2>&1 | tee test_output.tmp
+        run_pytest --capture=sys --cache-clear -v "$SCRIPT_DIR/tests/" $COMPAT_IGNORE -k $TEST_PATTERN 2>&1 | tee test_output.tmp
     else
         echo "TEST_PATTERN is not set. Running all integration tests."
-        run_pytest --capture=sys --cache-clear -v "$SCRIPT_DIR/tests/" 2>&1 | tee test_output.tmp
+        run_pytest --capture=sys --cache-clear -v "$SCRIPT_DIR/tests/" $COMPAT_IGNORE 2>&1 | tee test_output.tmp
     fi
 
     # Check for memory leaks in the output
@@ -172,10 +184,10 @@ if [ ! -z "${ASAN_BUILD}" ]; then
 else
     # TEST_PATTERN can be used to run specific tests or test patterns.
     if [[ -n "$TEST_PATTERN" ]]; then
-        run_pytest --cache-clear -v "$SCRIPT_DIR/tests/" -k $TEST_PATTERN
+        run_pytest --cache-clear -v "$SCRIPT_DIR/tests/" $COMPAT_IGNORE -k $TEST_PATTERN
     else
         echo "TEST_PATTERN is not set. Running all integration tests."
-        run_pytest --cache-clear -v "$SCRIPT_DIR/tests/"
+        run_pytest --cache-clear -v "$SCRIPT_DIR/tests/" $COMPAT_IGNORE
     fi
 fi
 
