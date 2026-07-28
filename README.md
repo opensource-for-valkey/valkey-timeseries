@@ -115,7 +115,7 @@ ASAN_BUILD=true
 
 `./run-fuzz.sh` drives the RedisTimeSeries differential fuzzer: it generates
 random but valid command sequences and checks every reply against a pinned RedisTimeSeries
-reference server, so an unexplained difference shows up as a test failure with a minimal
+reference server (v8.8), so an unexplained difference shows up as a test failure with a minimal
 reproducer. See [tests/compat/README.md](tests/compat/README.md) for the harness itself and
 [COMPATIBILITY.md](COMPATIBILITY.md) for the compatibility contract.
 
