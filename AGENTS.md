@@ -42,6 +42,12 @@ Key ENV and behavior (from `./build.sh`)
 Setup & Environment Notes
 
 - Rust: edition 2024, minimum supported version `1.92`.
+- **After pulling or switching branches, always rebuild the module.** The module binary
+  (`target/release/libvalkey_timeseries.{so,dylib}`) is not tracked in git and can be stale
+  after source changes — e.g. new config parameters or commands won't be registered, causing
+  opaque failures like `CONFIG GET` returning empty or `run-fuzz.sh` reporting
+  "could not set ts-compatibility-mode=strict (is the module loaded?)". Run
+  `cargo build --release` or `./build.sh` after any checkout that pulls new commits.
 - Python tests: Integration tests use Python. Dependencies are in `requirements.txt` (or via `uv sync`). The `build.sh`
   script handles this, but if running `pytest` manually, ensure packages are installed.
 - Running manually: To manually start a server with the module loaded, run
