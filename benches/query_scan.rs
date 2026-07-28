@@ -18,11 +18,15 @@ const SCAN_WORKLOADS: &[ValueWorkload] = &[
     ValueWorkload::Noisy,
     ValueWorkload::Bursty,
     ValueWorkload::BurstyQuantized,
-    ValueWorkload::Discrete
+    ValueWorkload::Discrete,
 ];
 
 fn encodings() -> [ChunkEncoding; 3] {
-    [ChunkEncoding::Uncompressed, ChunkEncoding::Gorilla, ChunkEncoding::Chimp]
+    [
+        ChunkEncoding::Uncompressed,
+        ChunkEncoding::Gorilla,
+        ChunkEncoding::Chimp,
+    ]
 }
 
 /// The two chunk sizes exercised in query_scan benches.
