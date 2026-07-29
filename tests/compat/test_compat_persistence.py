@@ -14,8 +14,9 @@ behavior so it is discovered by tests, not by users:
     RDB produced by RTS on an older Redis whose RDB version valkey accepts)
     must be refused by the module's own encoding-version guard.
   - Loading an RTS-produced RDB file must be refused with a clear log
-    message — never misparsed. Fixture: test-data/rts-8.8-timeseries.rdb
-    (generated output of the pinned reference image; keys `k` with samples).
+    message — never misparsed. The fixture is written by the reference on
+    demand and cached at test-data/rts-8.8-timeseries.rdb (see the
+    `rts_rdb_fixture` fixture); nothing RedisTimeSeries produced is checked in.
   - The reverse direction (our DUMP into the reference) is out of our
     control; the observed clean rejection is pinned as documentation.
 
@@ -35,9 +36,12 @@ from valkey.exceptions import ResponseError
 from common import VALKEY_SERVER_PATH, get_module_path
 
 _COMPAT_DIR = os.path.dirname(os.path.abspath(__file__))
-RTS_RDB_FIXTURE = os.path.join(
-    os.path.dirname(os.path.dirname(_COMPAT_DIR)), "test-data", "rts-8.8-timeseries.rdb"
-)
+_ROOT_DIR = os.path.dirname(os.path.dirname(_COMPAT_DIR))
+RTS_RDB_FIXTURE = os.path.join(_ROOT_DIR, "test-data", "rts-8.8-timeseries.rdb")
+COMPOSE_FILE = os.path.join(_ROOT_DIR, "docker-compose.compat.yml")
+
+# The key the fixture RDB carries; the load test asserts it does not materialize.
+RTS_RDB_KEY = "k"
 
 # --- CRC-64/Jones (reflected), as used by redis/valkey DUMP footers ---------
 
@@ -64,6 +68,94 @@ def _with_encver(payload: bytes, encver: int) -> bytes:
     mid = (mid & ~0x3FF) | encver
     body = payload[:2] + mid.to_bytes(8, "big") + payload[10:-8]
     return body + _crc64(body).to_bytes(8, "little")
+
+
+def _unavailable(reason: str):
+    """The RTS-produced RDB fixture could not be provided.
+
+    Normally a skip: extracting it needs a reference whose data directory this
+    process can reach, which a run pointed at a remote COMPAT_REFERENCE_URL has
+    no way to do. Under COMPAT_STRICT_SKIPS (set by `build.sh compat`) it is a
+    failure instead — a skip here means the §7.4 RDB-load guarantee silently
+    stopped being checked.
+    """
+    if os.environ.get("COMPAT_STRICT_SKIPS", "").lower() in ("1", "true", "yes"):
+        pytest.fail(f"RTS RDB fixture unavailable (COMPAT_STRICT_SKIPS): {reason}")
+    pytest.skip(reason)
+
+
+def _copy_out_of_compose_container(remote_path: str, dest: str) -> bool:
+    """Lift a file out of the compose-managed reference container."""
+    try:
+        found = subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE, "ps", "-q", "reference"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    container = found.stdout.strip().splitlines()
+    if found.returncode != 0 or not container:
+        return False
+    copied = subprocess.run(
+        ["docker", "cp", f"{container[0]}:{remote_path}", dest],
+        capture_output=True, text=True, timeout=60,
+    )
+    return copied.returncode == 0 and os.path.exists(dest)
+
+
+@pytest.fixture(scope="session")
+def rts_rdb_fixture(reference_url):
+    """An RDB file written by the pinned reference, cached in test-data/.
+
+    Generated rather than checked in: `test-data/` is not tracked, and the
+    clean-room rule is easiest to hold to when nothing RedisTimeSeries produced
+    is vendored at all. The reference writes it on demand — populate a series,
+    SAVE, and lift the file out of the container — so a fresh clone provisions
+    itself on the first run.
+    """
+    if os.path.exists(RTS_RDB_FIXTURE):
+        return RTS_RDB_FIXTURE
+
+    reference = valkey.Valkey.from_url(reference_url)
+    try:
+        reference.flushall()
+        reference.execute_command(
+            "TS.CREATE", RTS_RDB_KEY, "RETENTION", 60000, "LABELS", "sensor", "s1"
+        )
+        for ts, value in ((100, 1.5), (200, 2.5), (300, 3.5)):
+            reference.execute_command("TS.ADD", RTS_RDB_KEY, ts, value)
+        reference.execute_command("SAVE")
+
+        config = reference.execute_command("CONFIG", "GET", "dir", "dbfilename")
+        config = {
+            k.decode() if isinstance(k, bytes) else k:
+            v.decode() if isinstance(v, bytes) else v
+            for k, v in (config.items() if isinstance(config, dict)
+                         else zip(config[::2], config[1::2]))
+        }
+        remote = os.path.join(config["dir"], config["dbfilename"])
+
+        os.makedirs(os.path.dirname(RTS_RDB_FIXTURE), exist_ok=True)
+        if os.path.exists(remote):
+            # Reference running as a local process (binary mode), or its data
+            # directory is bind-mounted here.
+            with open(remote, "rb") as src, open(RTS_RDB_FIXTURE, "wb") as dst:
+                dst.write(src.read())
+        elif not _copy_out_of_compose_container(remote, RTS_RDB_FIXTURE):
+            _unavailable(
+                f"cannot reach the reference's {remote}: it is neither a local "
+                "path nor inside the compose-managed reference container "
+                "(a remote COMPAT_REFERENCE_URL cannot provide this fixture)"
+            )
+        return RTS_RDB_FIXTURE
+    finally:
+        # Leave no dump.rdb behind that a container restart would reload.
+        try:
+            reference.flushall()
+            reference.execute_command("SAVE")
+        except Exception:
+            pass
+        reference.close()
 
 
 @pytest.fixture
@@ -126,13 +218,12 @@ class TestDumpRestore:
 
 
 class TestRdbFileLoad:
-    def test_rts_rdb_file_refused_cleanly(self, tmp_path):
+    def test_rts_rdb_file_refused_cleanly(self, tmp_path, rts_rdb_fixture):
         """Start a fresh subject server on an RTS-produced RDB file: it must
         refuse the file with a clear log message or come up without the data
         — never misparse it into live keys."""
-        assert os.path.exists(RTS_RDB_FIXTURE), f"missing fixture {RTS_RDB_FIXTURE}"
         rdb = tmp_path / "dump.rdb"
-        rdb.write_bytes(open(RTS_RDB_FIXTURE, "rb").read())
+        rdb.write_bytes(open(rts_rdb_fixture, "rb").read())
         logfile = tmp_path / "server.log"
 
         with socket.socket() as s:
@@ -175,7 +266,7 @@ class TestRdbFileLoad:
                 # Server started anyway: the RTS data must NOT have been
                 # misparsed into a live series.
                 probe = valkey.Valkey(port=port)
-                assert probe.execute_command("EXISTS", "k") == 0, (
+                assert probe.execute_command("EXISTS", RTS_RDB_KEY) == 0, (
                     "RTS RDB key materialized on the subject — possible misparse"
                 )
                 assert any(m in log for m in refusal_markers), log[-2000:]
