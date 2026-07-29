@@ -1,8 +1,12 @@
-use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
+use crate::commands::command_parser::{
+    CommandArgToken, parse_command_arg_token, parse_timestamp, parse_value_arg,
+};
 use crate::commands::ts_create::parse_series_options;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, get_timeseries_mut};
+use crate::series::{
+    DuplicatePolicy, SampleAddResult, TimeSeries, create_and_store_series, get_timeseries_mut,
+};
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
@@ -53,14 +57,26 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     )?;
 
     if let Some(mut guard) = guard {
-        // args.done()?;
-        return handle_add(ctx, &mut guard, args, timestamp, timestamp_str, value);
+        // The series already exists, so the creation options are inert — RTS does
+        // not even validate them on this path. ON_DUPLICATE is the exception: it is
+        // a per-call override, so it must still be read (and rejected if invalid).
+        let on_duplicate = parse_on_duplicate(&args)?;
+        return handle_add(
+            ctx,
+            &mut guard,
+            args,
+            timestamp,
+            timestamp_str,
+            value,
+            on_duplicate,
+        );
     }
 
     // clones because of replicate_and_notify
     let original_args = args.clone();
 
     let options = parse_series_options(args, 4, &[])?;
+    let on_duplicate = options.on_duplicate;
 
     let key = &original_args[1];
     // Auto-create: no ts.create event (RTS parity) and no replication from
@@ -74,9 +90,27 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         timestamp,
         timestamp_str,
         value,
+        on_duplicate,
     )
 }
 
+/// Reads `ON_DUPLICATE <policy>` out of an argument list without interpreting any
+/// of the creation options around it.
+fn parse_on_duplicate(args: &[ValkeyString]) -> ValkeyResult<Option<DuplicatePolicy>> {
+    let mut iter = args.iter().skip(4);
+    while let Some(arg) = iter.next() {
+        if parse_command_arg_token(arg.as_slice()) != Some(CommandArgToken::OnDuplicate) {
+            continue;
+        }
+        let Some(value) = iter.next() else {
+            return Err(ValkeyError::Str(error_consts::MISSING_DUPLICATE_POLICY));
+        };
+        return Ok(Some(DuplicatePolicy::try_from(value.as_slice())?));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_add(
     ctx: &Context,
     series: &mut TimeSeries,
@@ -84,12 +118,13 @@ fn handle_add(
     timestamp: Timestamp,
     timestamp_str: &str,
     value: f64,
+    on_duplicate: Option<DuplicatePolicy>,
 ) -> ValkeyResult {
     let mut ignored = false;
 
     let last_ts = series.last_sample.map(|s| s.timestamp);
 
-    let (replication_timestamp, ts, value) = match series.add(timestamp, value, None) {
+    let (replication_timestamp, ts, value) = match series.add(timestamp, value, on_duplicate) {
         SampleAddResult::Ignored(res_ts) => {
             ignored = true;
             let timestamp = if timestamp_str == "*" {
