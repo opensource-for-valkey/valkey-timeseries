@@ -58,13 +58,15 @@ class TestTSDeleteRule(ValkeyTimeSeriesTestCaseBase):
         assert "key does not exist" in str(exc_info.value).lower()
 
     def test_delete_rule_nonexistent_dest(self):
-        """Test error when the destination key doesn't exist."""
+        """A destination that doesn't exist can't be the target of a rule, so it is
+        reported as a missing rule rather than a missing key (RedisTimeSeries
+        parity — it only ever reaches the destination through the source's rules)."""
         source_key = "source"
         self.client.execute_command("TS.CREATE", source_key)
 
         with pytest.raises(Exception) as exc_info:
             self.client.execute_command("TS.DELETERULE", source_key, "nonexistent")
-        assert "key does not exist" in str(exc_info.value).lower()
+        assert "compaction rule does not exist" in str(exc_info.value).lower()
 
     def test_delete_rule_no_rule_exists(self):
         """Test error when no rule exists between a source and dest."""

@@ -1,4 +1,3 @@
-use crate::common::constants::META_KEY_LABEL;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
 use crate::series::index::get_timeseries_index;
@@ -40,15 +39,11 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), true)?;
     // must_exist was passed above. Therefore, unwrap is safe here
     let series = series.unwrap();
-    Ok(get_ts_info(ctx, &series, debugging, None))
+    // The key is what TS.INFO DEBUG reports as `keySelfName`.
+    Ok(get_ts_info(ctx, &series, debugging, &key))
 }
 
-fn get_ts_info(
-    ctx: &Context,
-    ts: &TimeSeries,
-    debug: bool,
-    key: Option<&ValkeyString>,
-) -> ValkeyValue {
+fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) -> ValkeyValue {
     // RESP3 clients receive `labels` and `rules` as native maps; RESP2 clients
     // receive the array-of-pairs / array-of-arrays forms. Everything else is
     // protocol-agnostic.
@@ -109,13 +104,6 @@ fn get_ts_info(
         map.insert("duplicatePolicy".into(), policy.as_str().into());
     } else {
         map.insert("duplicatePolicy".into(), ValkeyValue::Null);
-    }
-
-    if let Some(key) = key {
-        map.insert(
-            ValkeyValueKey::String(META_KEY_LABEL.into()),
-            ValkeyValue::from(key),
-        );
     }
 
     map.insert("labels".into(), get_labels_info(ts, is_resp3));
