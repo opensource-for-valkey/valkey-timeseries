@@ -11,6 +11,7 @@ use super::generated::{
 };
 use crate::aggregators::PartialState;
 use crate::commands::fanout::MGetValue;
+use crate::common::Sample;
 use crate::common::binop::ComparisonOperator;
 use crate::labels::Label;
 use crate::labels::filters::SeriesSelector;
@@ -30,64 +31,70 @@ use crate::{
 use smallvec::SmallVec;
 use valkey_module::{ValkeyError, ValkeyResult, ValkeyValue};
 
-impl From<ComparisonOperator> for FanoutComparisonOperator {
-    fn from(value: ComparisonOperator) -> Self {
-        match value {
-            ComparisonOperator::Equal => FanoutComparisonOperator::Eq,
-            ComparisonOperator::NotEqual => FanoutComparisonOperator::Neq,
-            ComparisonOperator::GreaterThan => FanoutComparisonOperator::Gt,
-            ComparisonOperator::GreaterThanOrEqual => FanoutComparisonOperator::Gte,
-            ComparisonOperator::LessThan => FanoutComparisonOperator::Lt,
-            ComparisonOperator::LessThanOrEqual => FanoutComparisonOperator::Lte,
-        }
-    }
-}
-
-// Decoding direction: every `_UNSPECIFIED` arm below is reachable from a peer
-// (a field the sender omitted decodes as 0), and these conversions run inside
-// the fanout request/response handlers, which are called from the module's C
-// entry points. A panic there unwinds into `extern "C"` and aborts the process,
-// so an ill-formed message must fail as an error, not a crash.
-impl TryFrom<FanoutComparisonOperator> for ComparisonOperator {
-    type Error = ValkeyError;
-
-    fn try_from(value: FanoutComparisonOperator) -> Result<Self, Self::Error> {
-        Ok(match value {
-            FanoutComparisonOperator::Eq => ComparisonOperator::Equal,
-            FanoutComparisonOperator::Neq => ComparisonOperator::NotEqual,
-            FanoutComparisonOperator::Gt => ComparisonOperator::GreaterThan,
-            FanoutComparisonOperator::Gte => ComparisonOperator::GreaterThanOrEqual,
-            FanoutComparisonOperator::Lt => ComparisonOperator::LessThan,
-            FanoutComparisonOperator::Lte => ComparisonOperator::LessThanOrEqual,
-            FanoutComparisonOperator::Unspecified => {
-                return Err(ValkeyError::Str(error_consts::INVALID_COMPARISON_OPERATOR));
+/// Generates the paired conversions between a local enum and its protobuf twin
+/// from a single variant table.
+///
+/// The two directions are deliberately asymmetric. Local -> wire is total: a
+/// local value always has a wire spelling. Wire -> local is fallible, because
+/// the wire enum carries an `_UNSPECIFIED = 0` variant that a peer produces
+/// whenever it omits the field, and these conversions run inside the fanout
+/// handlers, which are invoked from the module's C entry points. A panic there
+/// unwinds into `extern "C"` and aborts the process, so an ill-formed message
+/// has to come back as an error.
+///
+/// Both generated matches are exhaustive over their own enum, so adding a
+/// variant on either side is a compile error here — in one place — rather than a
+/// silently mismapped arm.
+// The type parameters are `ident` rather than `ty` so that `<=>` can be used as
+// the separator: Rust only permits a small set of tokens to follow a `ty`
+// fragment, and `<=` is not among them.
+macro_rules! map_enum {
+    (
+        $local:ident <=> $wire:ident,
+        unspecified => $err:expr,
+        { $($local_variant:ident <=> $wire_variant:ident),+ $(,)? }
+    ) => {
+        impl From<$local> for $wire {
+            fn from(value: $local) -> Self {
+                match value {
+                    $($local::$local_variant => $wire::$wire_variant,)+
+                }
             }
-        })
-    }
-}
-
-impl From<ChunkEncoding> for FanoutChunkEncoding {
-    fn from(value: ChunkEncoding) -> Self {
-        match value {
-            ChunkEncoding::Uncompressed => FanoutChunkEncoding::Uncompressed,
-            ChunkEncoding::Gorilla => FanoutChunkEncoding::Gorilla,
-            ChunkEncoding::Chimp => FanoutChunkEncoding::Chimp,
         }
+
+        impl TryFrom<$wire> for $local {
+            type Error = ValkeyError;
+
+            fn try_from(value: $wire) -> Result<Self, Self::Error> {
+                Ok(match value {
+                    $($wire::$wire_variant => $local::$local_variant,)+
+                    $wire::Unspecified => return Err(ValkeyError::Str($err)),
+                })
+            }
+        }
+    };
+}
+
+map_enum! {
+    ComparisonOperator <=> FanoutComparisonOperator,
+    unspecified => error_consts::INVALID_COMPARISON_OPERATOR,
+    {
+        Equal <=> Eq,
+        NotEqual <=> Neq,
+        GreaterThan <=> Gt,
+        GreaterThanOrEqual <=> Gte,
+        LessThan <=> Lt,
+        LessThanOrEqual <=> Lte,
     }
 }
 
-impl TryFrom<FanoutChunkEncoding> for ChunkEncoding {
-    type Error = ValkeyError;
-
-    fn try_from(value: FanoutChunkEncoding) -> Result<Self, Self::Error> {
-        Ok(match value {
-            FanoutChunkEncoding::Uncompressed => ChunkEncoding::Uncompressed,
-            FanoutChunkEncoding::Gorilla => ChunkEncoding::Gorilla,
-            FanoutChunkEncoding::Chimp => ChunkEncoding::Chimp,
-            FanoutChunkEncoding::Unspecified => {
-                return Err(ValkeyError::Str(error_consts::CHUNK_DECOMPRESSION));
-            }
-        })
+map_enum! {
+    ChunkEncoding <=> FanoutChunkEncoding,
+    unspecified => error_consts::CHUNK_DECOMPRESSION,
+    {
+        Uncompressed <=> Uncompressed,
+        Gorilla <=> Gorilla,
+        Chimp <=> Chimp,
     }
 }
 
@@ -149,6 +156,11 @@ impl From<PostingsStats> for StatsResponse {
                 .map(|v| v.into_iter().map(|s| s.into()).collect())
                 .unwrap_or_default(),
             series_count: value.series_count,
+            // Left empty here on purpose: `PostingsStats` does not carry the
+            // bitmaps. `LabelStatsFanoutCommand::get_local_response` fills both
+            // in from `index.get_label_bitmaps()` right after this conversion,
+            // and the coordinator unions them across shards to avoid
+            // double-counting. They are live wire fields, not vestigial ones.
             labels_bitmap: vec![],
             label_value_pairs_bitmap: vec![],
         }
@@ -192,33 +204,20 @@ impl From<StatsResponse> for PostingsStats {
     }
 }
 
-impl From<BucketTimestamp> for BucketTimestampType {
-    fn from(value: BucketTimestamp) -> Self {
-        match value {
-            BucketTimestamp::Start => BucketTimestampType::Start,
-            BucketTimestamp::End => BucketTimestampType::End,
-            BucketTimestamp::Mid => BucketTimestampType::Mid,
-        }
+map_enum! {
+    BucketTimestamp <=> BucketTimestampType,
+    unspecified => error_consts::INVALID_BUCKET_TIMESTAMP_TYPE,
+    {
+        Start <=> Start,
+        End <=> End,
+        Mid <=> Mid,
     }
 }
 
-impl TryFrom<BucketTimestampType> for BucketTimestamp {
-    type Error = ValkeyError;
-
-    fn try_from(value: BucketTimestampType) -> Result<Self, Self::Error> {
-        Ok(match value {
-            BucketTimestampType::Start => BucketTimestamp::Start,
-            BucketTimestampType::End => BucketTimestamp::End,
-            BucketTimestampType::Mid => BucketTimestamp::Mid,
-            BucketTimestampType::Unspecified => {
-                return Err(ValkeyError::Str(
-                    error_consts::INVALID_BUCKET_TIMESTAMP_TYPE,
-                ));
-            }
-        })
-    }
-}
-
+// `BucketAlignment` stays hand-written: its `Timestamp(i64)` variant carries a
+// payload that lives in a separate `alignment_timestamp` field on the wire, so
+// the pair is not a plain one-to-one variant table. The encode side is folded
+// into `From<&AggregationOptions>`, which has both fields in hand.
 impl TryFrom<BucketAlignmentType> for BucketAlignment {
     type Error = ValkeyError;
 
@@ -235,33 +234,36 @@ impl TryFrom<BucketAlignmentType> for BucketAlignment {
     }
 }
 
-impl From<AggregationType> for FanoutAggregationType {
-    fn from(value: AggregationType) -> Self {
-        match value {
-            AggregationType::All => FanoutAggregationType::All,
-            AggregationType::Any => FanoutAggregationType::Any,
-            AggregationType::Avg => FanoutAggregationType::Avg,
-            AggregationType::Count => FanoutAggregationType::Count,
-            AggregationType::CountAll => FanoutAggregationType::CountAll,
-            AggregationType::CountIf => FanoutAggregationType::CountIf,
-            AggregationType::CountNan => FanoutAggregationType::CountNan,
-            AggregationType::First => FanoutAggregationType::First,
-            AggregationType::Increase => FanoutAggregationType::Increase,
-            AggregationType::IRate => FanoutAggregationType::Irate,
-            AggregationType::Last => FanoutAggregationType::Last,
-            AggregationType::Min => FanoutAggregationType::Min,
-            AggregationType::Max => FanoutAggregationType::Max,
-            AggregationType::None => FanoutAggregationType::None,
-            AggregationType::Sum => FanoutAggregationType::Sum,
-            AggregationType::SumIf => FanoutAggregationType::SumIf,
-            AggregationType::Range => FanoutAggregationType::Range,
-            AggregationType::Rate => FanoutAggregationType::Rate,
-            AggregationType::Share => FanoutAggregationType::ShareIf,
-            AggregationType::StdP => FanoutAggregationType::StdP,
-            AggregationType::StdS => FanoutAggregationType::StdS,
-            AggregationType::VarP => FanoutAggregationType::VarP,
-            AggregationType::VarS => FanoutAggregationType::VarS,
-        }
+// The `IRate <=> Irate` and `Share <=> ShareIf` rows are the reason this is a
+// table: as one visible line each, a mismatch is legible, where the same
+// asymmetry buried in a 23-arm match is not.
+map_enum! {
+    AggregationType <=> FanoutAggregationType,
+    unspecified => error_consts::UNKNOWN_AGGREGATION_TYPE,
+    {
+        All <=> All,
+        Any <=> Any,
+        Avg <=> Avg,
+        Count <=> Count,
+        CountAll <=> CountAll,
+        CountIf <=> CountIf,
+        CountNan <=> CountNan,
+        First <=> First,
+        Increase <=> Increase,
+        IRate <=> Irate,
+        Last <=> Last,
+        Max <=> Max,
+        Min <=> Min,
+        None <=> None,
+        Range <=> Range,
+        Rate <=> Rate,
+        Share <=> ShareIf,
+        StdP <=> StdP,
+        StdS <=> StdS,
+        Sum <=> Sum,
+        SumIf <=> SumIf,
+        VarP <=> VarP,
+        VarS <=> VarS,
     }
 }
 
@@ -277,41 +279,6 @@ impl From<FanoutAggregationType> for FanoutAggregatorConfig {
             aggregator_type: value as i32,
             value_filter: None,
         }
-    }
-}
-
-impl TryFrom<FanoutAggregationType> for AggregationType {
-    type Error = ValkeyError;
-
-    fn try_from(value: FanoutAggregationType) -> Result<Self, Self::Error> {
-        Ok(match value {
-            FanoutAggregationType::All => AggregationType::All,
-            FanoutAggregationType::Any => AggregationType::Any,
-            FanoutAggregationType::Avg => AggregationType::Avg,
-            FanoutAggregationType::Count => AggregationType::Count,
-            FanoutAggregationType::CountAll => AggregationType::CountAll,
-            FanoutAggregationType::CountIf => AggregationType::CountIf,
-            FanoutAggregationType::CountNan => AggregationType::CountNan,
-            FanoutAggregationType::First => AggregationType::First,
-            FanoutAggregationType::Increase => AggregationType::Increase,
-            FanoutAggregationType::Irate => AggregationType::IRate,
-            FanoutAggregationType::Last => AggregationType::Last,
-            FanoutAggregationType::Max => AggregationType::Max,
-            FanoutAggregationType::Min => AggregationType::Min,
-            FanoutAggregationType::None => AggregationType::None,
-            FanoutAggregationType::Range => AggregationType::Range,
-            FanoutAggregationType::Rate => AggregationType::Rate,
-            FanoutAggregationType::ShareIf => AggregationType::Share,
-            FanoutAggregationType::Sum => AggregationType::Sum,
-            FanoutAggregationType::SumIf => AggregationType::SumIf,
-            FanoutAggregationType::StdP => AggregationType::StdP,
-            FanoutAggregationType::StdS => AggregationType::StdS,
-            FanoutAggregationType::VarP => AggregationType::VarP,
-            FanoutAggregationType::VarS => AggregationType::VarS,
-            FanoutAggregationType::Unspecified => {
-                return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
-            }
-        })
     }
 }
 
@@ -393,10 +360,7 @@ impl From<MGetSeriesData> for MGetValue {
             .map(|l| l.map_or_else(FanoutLabel::default, |l| l.into()))
             .collect();
 
-        let sample = value.sample.map(|s| FanoutSample {
-            timestamp: s.timestamp,
-            value: s.value,
-        });
+        let sample = value.sample.map(Into::into);
 
         MGetValue {
             key: value.series_key.to_string_lossy(),
@@ -451,6 +415,24 @@ impl From<Label> for FanoutLabel {
     fn from(value: Label) -> Self {
         FanoutLabel {
             name: value.name,
+            value: value.value,
+        }
+    }
+}
+
+impl From<Sample> for FanoutSample {
+    fn from(value: Sample) -> Self {
+        FanoutSample {
+            timestamp: value.timestamp,
+            value: value.value,
+        }
+    }
+}
+
+impl From<FanoutSample> for Sample {
+    fn from(value: FanoutSample) -> Self {
+        Sample {
+            timestamp: value.timestamp,
             value: value.value,
         }
     }

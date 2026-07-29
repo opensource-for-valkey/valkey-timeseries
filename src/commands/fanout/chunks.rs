@@ -178,7 +178,7 @@ impl TryFrom<MRangeSeriesResult> for SeriesRangeResponse {
             SeriesResultData::Rows(rows) => serialize_rows(&rows)?,
         };
 
-        let labels = convert_labels(value.labels);
+        let labels: Vec<FanoutLabel> = value.labels.into_iter().map(Into::into).collect();
 
         Ok(SeriesRangeResponse {
             key: value.key,
@@ -187,16 +187,6 @@ impl TryFrom<MRangeSeriesResult> for SeriesRangeResponse {
             columns,
         })
     }
-}
-
-fn convert_labels(labels: Vec<Label>) -> Vec<FanoutLabel> {
-    labels
-        .into_iter()
-        .map(|label| FanoutLabel {
-            name: label.name,
-            value: label.value,
-        })
-        .collect()
 }
 
 impl TryFrom<SeriesRangeResponse> for MRangeSeriesResult {
@@ -215,14 +205,7 @@ impl TryFrom<SeriesRangeResponse> for MRangeSeriesResult {
             _ => SeriesResultData::Rows(deserialize_rows(&value.columns).map_err(with_key)?),
         };
 
-        let labels: Vec<Label> = value
-            .labels
-            .into_iter()
-            .map(|label| Label {
-                name: label.name,
-                value: label.value,
-            })
-            .collect::<Vec<_>>();
+        let labels: Vec<Label> = value.labels.into_iter().map(Into::into).collect();
 
         Ok(MRangeSeriesResult {
             key,

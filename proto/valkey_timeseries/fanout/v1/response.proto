@@ -70,6 +70,10 @@ message StatsResponse {
   repeated PostingStat series_count_by_label_name = 3;
   repeated PostingStat series_count_by_label_value_pairs = 4;
   repeated PostingStat series_count_by_focus_label_value = 5;
+  // Serialized roaring bitmaps of label-name and label/value-pair ids. The
+  // coordinator unions these across shards so that distinct counts are not
+  // double-counted for series that several shards know about. Populated by the
+  // fanout handler, not by `From<PostingsStats>`.
   bytes labels_bitmap = 6;
   bytes label_value_pairs_bitmap = 7;
 }
