@@ -45,9 +45,12 @@ pub fn ts_deleterule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         "BUG in delete_rule: should have returned a value before this point (must_exist = true)",
     );
 
-    // Get destination time series (must exist, writable)
+    // Get the destination series. A destination that does not exist can not be the
+    // target of a rule, so it is reported as a missing rule rather than a missing
+    // key — matching RTS, which only ever looks the destination up through the
+    // source's rule list.
     let Some(mut dest_series) =
-        get_timeseries_mut(ctx, dest_key, true, Some(AclPermissions::UPDATE))?
+        get_timeseries_mut(ctx, dest_key, false, Some(AclPermissions::UPDATE))?
     else {
         return Err(ValkeyError::Str(error_consts::COMPACTION_RULE_NOT_FOUND));
     };
