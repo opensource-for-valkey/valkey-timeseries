@@ -247,29 +247,22 @@
     TestOptionParsing::test_unknown_or_inapplicable_option_rejected.
   since: 0.1.0
 
-- id: DIV-0016
-  command: TS.REVRANGE
-  kind: behavior
-  documentation_only: true
-  description: >
-    Under `AGGREGATION first|last ... EMPTY`, a gap bucket's carried-forward
-    fill follows the wrong direction on TS.REVRANGE. RTS fills a gap with the
-    previously *emitted* bucket's value, so its reverse scan carries the
-    chronologically newer neighbour (`last` fills with the newer value,
-    `first` fills NaN); we aggregate forward and reverse the finished buckets,
-    so our carry stays chronological and the two come out swapped. Bucket
-    timestamps and counts match; only the gap fill differs. TS.RANGE (forward)
-    is byte-identical, as are non-EMPTY reverse queries — `first`/`last`
-    themselves were aligned to RTS's scan-order semantics
-    (AggregationOptions::for_scan_order).
-  rationale: >
-    owner decision pending — matching would require either feeding the
-    aggregator reverse-ordered samples (buffering every sample in range rather
-    than one value per bucket, the memory trade the forward design exists to
-    avoid) or a fill pass over the reversed output. Narrow cell: reverse +
-    EMPTY + first/last only. Pinned by
-    TestEmpty::test_empty_carry_forward_is_chronological_not_scan_order.
-  since: 0.1.0
+# DIV-0016 covered the EMPTY carry-forward direction on TS.REVRANGE: a gap
+# bucket's fill was chronological here and scan-ordered on RTS, so reverse
+# `first`/`last` came out swapped. It was removed 2026-07-29 during the sign-off
+# review, when the carry was found to already follow scan order on both engines:
+# `CarryLastEmpty` (src/iterators/utils.rs) runs the fill pass *after* ReverseIter,
+# landed by 0b74495e on 2026-07-22 — after this entry was written, which is why it
+# went stale. Re-probed across seven gap shapes x eight
+# aggregators x both directions x three bucket sizes x ALIGN/BUCKETTIMESTAMP
+# variants: 1008 comparisons, zero mismatches.
+#
+# The entry had gone stale unnoticed because its pinning test asserted only that
+# the bucket *counts* matched, which stayed true after the fix. Per the "remove
+# entries that stop firing" rule (§5.3) the entry is gone, the reverse first/last
+# skip in test_empty_gap_bucket_value_per_aggregator is lifted, and the direction
+# is now pinned positively by TestEmpty::test_empty_carry_forward_follows_scan_order
+# and test_empty_carry_forward_across_bucket_sizes.
 
 - id: DIV-0017
   command: TS.CREATERULE
@@ -282,11 +275,11 @@
     into a third. Accepted-input superset — a TS.CREATERULE valid here errors on
     RedisTimeSeries.
   rationale: >
-    owner decision pending — chaining is a coherent extension (cascading
-    rollups), but it is a real behavioral superset and the circular-dependency
-    guard (check_new_rule_circular_dependency) is what keeps it safe. Confirm
-    the intent, or reject chains to match. Pinned by
-    TestRuleLifecycle::test_rule_on_rule_is_an_accepted_input_superset.
+    Accepted (owner sign-off 2026-07-29, §5.3): chaining is a deliberate extension —
+    cascading rollups (raw -> 1m -> 1h) without a second write path — and the
+    circular-dependency guard (check_new_rule_circular_dependency) is what keeps it
+    safe. Accepted-input superset, so no rule valid on RTS behaves differently here.
+    Pinned by TestRuleLifecycle::test_rule_on_rule_is_an_accepted_input_superset.
   since: 0.1.0
 
 - id: DIV-0018
@@ -331,8 +324,8 @@
     metric-name selector (matching nothing when no such metric exists); RTS
     rejects it with "failed parsing labels". Applies to TS.MRANGE/MGET/QUERYINDEX.
   rationale: >
-    owner decision pending — bare metric-name selectors are valid PromQL and a
-    deliberate extension. Pinned by
+    Accepted (owner sign-off 2026-07-29, §5.3): bare metric-name selectors are valid
+    PromQL and a deliberate part of the filter-grammar extension. Pinned by
     TestFilterLanguage::test_bare_metric_name_matcher_is_a_superset.
   since: 0.1.0
 
@@ -740,15 +733,14 @@
     aggregator names exist, so any 17-element list hits the duplicate check
     first, where RTS reports "Too many aggregation types".
   rationale: >
-    owner decision pending — a repeated column carries no information the
-    caller does not already have (it is a byte-for-byte copy of another column),
-    so rejecting it turns a probable query-builder bug into a visible error
-    rather than silently widening the row. Direction of risk is the safe one: we
-    reject input RTS accepts, so a client migrating from RTS sees an error
-    instead of wrong data. The cost is that a generated query that happens to
+    Accepted (owner sign-off 2026-07-29, §5.3): a repeated column carries no
+    information the caller does not already have (it is a byte-for-byte copy of
+    another column), so rejecting it turns a probable query-builder bug into a
+    visible error rather than silently widening the row. Direction of risk is the
+    safe one: we reject input RTS accepts, so a client migrating from RTS sees an
+    error instead of wrong data. The cost is that a generated query that happens to
     repeat an aggregator stops working and must be de-duplicated caller-side.
-    Pinned by
-    TestDivergences::test_duplicate_aggregator_in_a_list_is_rejected.
+    Pinned by TestDivergences::test_duplicate_aggregator_in_a_list_is_rejected.
   since: 0.1.0
 
 - id: DIV-0037
@@ -764,18 +756,17 @@
     refused there. With a single aggregator, GROUPBY behaves identically on both
     engines. Applies to TS.MRANGE and TS.MREVRANGE.
   rationale: >
-    owner decision pending — an accepted-input superset. Column-wise reduction
-    is the natural reading of the two features composed (each column is an
-    independent series of bucket values, and the reducer is defined on exactly
-    that), and it is already implemented and covered by
-    tests/test_ts_multi_aggregation.py. Being a superset it can not be matched
-    by the registry (§5.2 hard-fails "reference errors, subject succeeds"), and
-    the direction of risk is the portability one: a query written against this
-    combination will not run on RedisTimeSeries, so it is a caveat for users
-    moving the other way rather than a compatibility break for clients arriving
-    from RTS. Pinned by
-    TestDivergences::test_groupby_with_a_multi_aggregator_list_is_a_superset,
-    with test_groupby_with_a_single_aggregator_still_agrees holding the boundary.
+    Accepted (owner sign-off 2026-07-29, §5.3): column-wise reduction is the natural
+    reading of the two features composed (each column is an independent series of
+    bucket values, and the reducer is defined on exactly that), and it is already
+    implemented and covered by tests/test_ts_multi_aggregation.py. Being a superset
+    it can not be matched by the registry (§5.2 hard-fails "reference errors,
+    subject succeeds"), and the direction of risk is the portability one: a query
+    written against this combination will not run on RedisTimeSeries, so it is a
+    caveat for users moving the other way rather than a compatibility break for
+    clients arriving from RTS. Pinned by
+    TestDivergences::test_groupby_with_a_multi_aggregator_list_is_a_superset, with
+    test_groupby_with_a_single_aggregator_still_agrees holding the boundary.
   since: 0.1.0
 
 - id: DIV-0038
@@ -792,13 +783,12 @@
     condition; an aggregator that requires one and is given none, or is given
     one it does not accept, is rejected here.
   rationale: >
-    owner decision pending — an accepted-input superset on the same clause as
-    DIV-0036/0037. The inline-condition syntax exists because the list grammar
-    gives each element its own slot, and it is the only way to express a
-    filtered aggregation without a second round trip. Purely additive: every
-    list RTS accepts still parses and means the same thing here. Non-registrable
-    for the usual §5.2 reason, and the risk direction is portability — code
-    written against these elements will not run on RedisTimeSeries. Pinned by
+    Accepted (owner sign-off 2026-07-29, §5.3): the inline-condition syntax exists
+    because the list grammar gives each element its own slot, and it is the only way
+    to express a filtered aggregation without a second round trip. Purely additive:
+    every list RTS accepts still parses and means the same thing here.
+    Non-registrable for the usual §5.2 reason, and the risk direction is portability
+    — code written against these elements will not run on RedisTimeSeries. Pinned by
     TestDivergences::test_extension_list_elements_are_a_superset.
   since: 0.1.0
 
@@ -876,4 +866,172 @@
     verified to hold sum/avg to exact agreement over every 3-sample combination.
     Pinned by TestSumAvgAccumulation in test_compat_range.py, whose companion
     test_well_conditioned_buckets_agree keeps the agreeing case from being masked.
+  since: 0.1.0
+
+# ---------------------------------------------------------------------------
+# DIV-0040..DIV-0046 are Phase 1 findings: the write-path matrix modules
+# (test_compat_create/alter/add/madd/incrby/rules/info.py, plan §6).
+#
+# All seven are `documentation_only` and pinned by explicit per-engine assertions
+# rather than routed through `diff`, because each is either an accepted-input
+# superset — which §5.2 hard-fails and forbids registering — or an over-strict
+# rejection whose only matching regex would mask real regressions in the same
+# delta class (tests/compat/README.md, "Divergences the registry can not express").
+#
+# ⚠️ All are `behavior`-kind and carry owner sign-off dated 2026-07-29 (§5.3).
+# ---------------------------------------------------------------------------
+
+- id: DIV-0040
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    ENCODING accepts `gorilla` and `chimp` in addition to `compressed` and
+    `uncompressed`; RTS rejects both with "unknown ENCODING parameter". `chimp` is
+    what `compressed` selects here, so the extra names expose the underlying
+    compressor rather than adding a new storage mode. Applies to every command
+    that takes creation options (TS.CREATE, TS.ADD, TS.INCRBY/TS.DECRBY).
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): additional chunk encodings are a
+    deliberate extension and, per the `CompatibilityMode` criterion in
+    src/config.rs, an input RTS rejects is not gated — no RTS-compatible
+    application can depend on it. Pinned by
+    TestParserDivergences::test_extra_encodings_are_a_superset.
+  since: 0.1.0
+
+- id: DIV-0041
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    RETENTION and the TS.ADD timestamp accept duration strings (`1h`, `30m`) and
+    fractional milliseconds (`1.5` -> 1500 ms); RTS accepts a plain integer only
+    ("Couldn't parse RETENTION" / "invalid timestamp"). Both engines reject
+    genuinely unparseable input (`abc`, `100abc`, a leading space).
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): duration-string parsing is a
+    deliberate extension shared by the whole command surface, and the fractional
+    form falls out of the same parser. Pinned by
+    TestParserDivergences::test_duration_string_retention_is_a_superset and
+    TestAddDivergences::test_duration_string_timestamp_is_a_superset.
+  since: 0.1.0
+
+- id: DIV-0042
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    An argument that is not a recognized option is rejected here ("invalid
+    argument"); RTS resolves the options it recognizes by scanning the argument
+    list and silently drops everything else, so `TS.CREATE key BOGUS 1`,
+    `TS.ALTER key BOGUS 1` and an odd trailing LABELS argument all succeed there.
+    On TS.ADD the difference is confined to the auto-create path: against an
+    existing series neither engine interprets the inert creation options at all.
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): deliberately stricter, on the
+    ground stated in src/config.rs — a visible error beats silently ignoring a
+    mistyped option, and strictness is not relaxed to match RTS. Already covered
+    in user-facing terms by COMPATIBILITY.md "A note on stricter input
+    validation". Pinned by
+    TestParserDivergences::test_unrecognized_arguments_are_rejected_not_ignored
+    (and the TS.ALTER / TS.ADD equivalents).
+  since: 0.1.0
+
+- id: DIV-0043
+  command: TS.CREATE
+  kind: behavior
+  documentation_only: true
+  description: >
+    RTS looks for option keywords across the *whole* argument list, including
+    inside the LABELS section: `TS.CREATE key LABELS a 1 RETENTION 100` sets the
+    retention to 100 **and** stores a label named RETENTION, and
+    `TS.CREATE key LABELS CHUNK_SIZE x` fails trying to parse the label's value as
+    a chunk size. Here LABELS ends the option list — everything after it is label
+    pairs and nothing else.
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): matching would mean reproducing a
+    parser quirk in which a label name silently changes an unrelated series
+    property. The label set itself is identical on both engines. Pinned by
+    TestParserDivergences::test_option_keywords_are_not_scanned_inside_labels and
+    test_label_named_like_an_option_is_only_a_label_here.
+  since: 0.1.0
+
+- id: DIV-0044
+  command: TS.ADD
+  kind: behavior
+  documentation_only: true
+  description: >
+    A sample value of `inf` / `-inf` is stored here; RTS rejects it with "invalid
+    value" (TS.ADD) or the per-item equivalent (TS.MADD). NaN is accepted by both.
+    The counter commands are not affected — RTS takes an infinite increment.
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): ±inf is a representable IEEE-754
+    value the read and aggregation paths already handle, and RTS itself accepts it
+    through TS.INCRBY, so the rejection is not a consistent RTS rule to match.
+    Pinned by TestAddDivergences::test_infinite_values_are_a_superset and the
+    TS.MADD equivalent.
+  since: 0.1.0
+
+# DIV-0045 covered TS.MADD auto-creating a missing series where RTS returns a
+# per-item "the key is not a TSDB key" error and creates nothing. It was removed
+# 2026-07-29 when the owner decided in favour of RTS semantics: TS.MADD no longer
+# creates the series, so there is nothing left to diverge. Per the "remove entries
+# that stop firing" rule (§5.3) the entry is gone rather than registered. Parity is
+# pinned by TestPartialFailure::test_missing_key_is_a_per_item_error and
+# test_every_item_failing in test_compat_madd.py, which assert both the per-item
+# error and that the keyspace is untouched.
+
+- id: DIV-0046
+  command: TS.INCRBY
+  kind: behavior
+  documentation_only: true
+  description: >
+    `TS.INCRBY key <n> TIMESTAMP` with no operand makes RedisTimeSeries 8.8 read
+    past the end of its argument vector. It usually replies "TSDB: invalid
+    timestamp", but sometimes dereferences garbage and takes the server down —
+    reproduced 2026-07-29 against the pinned redis:8.8 image with
+    `TS.INCRBY <new-key> 1 TIMESTAMP` (SIGSEGV in RM_StringPtrLen, container exit
+    139). We reply "TSDB: missing timestamp value" and stay up.
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): a reference defect, not a behavior
+    we chose, and one we will not match. The error text is kept as ours rather than
+    aligned to RTS's usual "invalid timestamp": that reply comes from an
+    out-of-bounds read, so there is no defined behavior to align to. Deliberately
+    NOT exercised against the reference by the suite — the input would
+    intermittently kill the shared reference container, so
+    TestTimestampOption::test_timestamp_missing_value asserts only that the subject
+    reports a clean error and survives. Re-check on the next reference bump; if it
+    is fixed upstream, this entry becomes an ordinary error-text delta.
+  since: 0.1.0
+
+# DIV-0047 was uncovered when TS.MADD stopped auto-creating (see the DIV-0045 note
+# above): the missing-key case used to produce a real `ts.add` here, which masked
+# the fact that the two engines notify on different conditions. `documentation_only`
+# and pinned by per-engine assertions in test_compat_notifications.py, because the
+# only registry entry that could match would absorb a genuine "TS.MADD stopped
+# notifying" regression.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0047
+  command: TS.MADD
+  kind: behavior
+  documentation_only: true
+  description: >
+    RTS emits a `ts.add` keyspace event for every TS.MADD *item attempted*,
+    whatever its outcome. We emit one for every item that got as far as a usable
+    series — so the two agree on stored samples and on items a write-time rule
+    rejected (duplicate blocked, older than retention), and differ on items that
+    never reached a series: a missing key, a key holding another type, and an
+    unparseable timestamp or value produce `ts.add` on RTS and nothing here.
+  rationale: >
+    Accepted (owner sign-off 2026-07-29, §5.3): announcing a write to a key that
+    does not exist (and that the same command declined to create) would fire
+    watchers, keyspace-event consumers, and any downstream tooling for something
+    that never happened. Note the divergence is only about *which* failures notify,
+    not about notifying on failure at all: both engines already announce a
+    duplicate blocked by policy. Pinned by TestMaddFailureEvents in
+    test_compat_notifications.py, with
+    TestNotificationParity::test_madd_events_agree_when_every_item_succeeds keeping
+    the success path from being masked.
   since: 0.1.0

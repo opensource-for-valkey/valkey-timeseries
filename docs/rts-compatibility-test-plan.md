@@ -210,6 +210,71 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.INFO` | field-by-field vs frozen 8.8 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
 | `TS.QUERYINDEX` | filter matrix; result ordering (normalize); no-match empty array; requires-non-empty-matcher error |
 
+> **Phase 1 status (2026-07-29):** the write-path matrix is landed and green —
+> `TS.CREATE` (`tests/compat/test_compat_create.py`), `TS.ALTER`
+> (`test_compat_alter.py`), `TS.ADD` (`test_compat_add.py`), `TS.MADD`
+> (`test_compat_madd.py`), `TS.INCRBY`/`TS.DECRBY` (`test_compat_incrby.py`), the
+> `TS.CREATERULE`/`TS.DELETERULE` argument and aggregator surface
+> (`test_compat_rules.py`, with rule *semantics* staying in
+> `test_compat_compaction.py`), and `TS.INFO` field values plus the `DEBUG`
+> variant (`test_compat_info.py`). **The §6 matrix is now complete on both
+> paths.**
+>
+> It found and fixed six subject bugs: (1) `ON_DUPLICATE` was parsed only on
+> TS.ADD's auto-create path, so the documented per-call override was *silently
+> ignored* on every existing series — the case it exists for — and an invalid
+> policy went unvalidated; (2) `TS.ALTER IGNORE ...` reset `duplicatePolicy` to
+> block, because `TimeSeriesOptions` collapsed IGNORE and DUPLICATE_POLICY into one
+> struct that ALTER wrote back wholesale (they are now separate fields, and ALTER
+> parses onto `TimeSeriesOptions::empty()` instead of the module configuration, so
+> an option the command did not name stays `None`); (3) `TS.ALTER RETENTION` did
+> not trim samples already stored, leaving `TS.INFO` disagreeing with `TS.RANGE`
+> exactly as the earlier retention-accounting fix set out to prevent; (4) options
+> were resolved last-occurrence-wins where RTS resolves each from its *first*
+> occurrence and never parses a later repeat; (5) `TS.INFO DEBUG` reported
+> `keySelfName` as null (the key was never passed down, and the `__meta:key__`
+> field it was overloaded with had no reader); (6) `TS.DELETERULE src absent-dst`
+> reported "the key does not exist" where RTS reports "compaction rule does not
+> exist". It also added the legacy bare `COMPRESSED`/`UNCOMPRESSED` keyword RTS
+> still accepts, and aligned ~14 error texts (ENCODING, CHUNK_SIZE,
+> DUPLICATE_POLICY, IGNORE, LABELS, and the counter commands' "invalid
+> increase/decrease value").
+>
+> One finding was resolved by changing the subject rather than registering it:
+> **TS.MADD no longer creates a missing series** (owner decision, 2026-07-29). It
+> used to auto-create the way TS.ADD does, so a mistyped key in a batch silently
+> materialized a series; it now returns the same per-item "the key is not a TSDB
+> key" error RTS returns and leaves the keyspace alone. This was briefly registered
+> as DIV-0045, which is removed per the "entries that stop firing" rule.
+>
+> That change unmasked **DIV-0047**: RTS emits a `ts.add` keyspace event for every
+> TS.MADD *item attempted*, including rejected ones — for a key that does not
+> exist, holds another type, or carries an unparseable value. We notify only where
+> a sample was written. The missing-key case previously produced a real `ts.add`
+> here, which is why the notification suite had been agreeing.
+>
+> Seven divergences are registered — DIV-0040..DIV-0044, DIV-0046 and DIV-0047 —
+> all `behavior`-kind, all reviewed and **signed off as-is on 2026-07-29** (§5.3).
+> Three are additive extensions we keep on the src/config.rs ground that an input
+> RTS rejects is not gated (extra chunk encodings, duration-string retention and
+> timestamps, ±inf sample values); two are deliberate strictness (unrecognized
+> arguments rejected, LABELS terminating the option list); one is the TS.MADD
+> notification set. DIV-0046 is a *reference* defect: `TS.INCRBY key <n> TIMESTAMP`
+> with no operand makes RTS 8.8 read past its argument vector and,
+> non-deterministically, segfault. Its error text is deliberately left as ours
+> rather than aligned to RTS's usual reply, which comes from that out-of-bounds
+> read; the input is never sent to the reference by the suite.
+>
+> **Backlog review (2026-07-29):** the eight entries left pending by earlier phases
+> were reviewed in the same pass. DIV-0017, DIV-0020, DIV-0036, DIV-0037 and
+> DIV-0038 are signed off as-is. DIV-0016 was **removed as stale**: the EMPTY
+> carry-forward direction it described had already been fixed by `CarryLastEmpty`
+> (0b74495e, 2026-07-22), and the entry survived only because its pinning test
+> asserted bucket *counts* rather than values — re-probing found zero mismatches in
+> 1008 comparisons, and the direction is now pinned positively. DIV-0018
+> (`ts-encoding` one-way latch on the reference) and DIV-0021 (TS.DEL count over an
+> expired range) remain pending by choice.
+>
 > **Phase 2 status (2026-07-16):** `TS.RANGE`/`TS.REVRANGE` (`tests/compat/test_compat_range.py`),
 > `TS.MRANGE`/`TS.MREVRANGE` (`tests/compat/test_compat_mrange.py`), `TS.GET`/`TS.MGET`
 > (`tests/compat/test_compat_get.py`), `TS.QUERYINDEX` (`tests/compat/test_compat_queryindex.py`),

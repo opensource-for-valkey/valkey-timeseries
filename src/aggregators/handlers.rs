@@ -113,9 +113,9 @@ impl AggregationHandler for LastAggregator {
     /// previous value for a gap bucket, a gap meaning "no new reading, so the last reading
     /// still stands". That carry cannot be done here: it runs in **output** order, and a
     /// reverse query aggregates forward and reverses the finished buckets, so the value a
-    /// gap must inherit is one this aggregator has not seen yet. `carry_last_empty_buckets`
-    /// applies it after the reversal instead, which lands on RTS in both directions
-    /// (forward `7,7,7,9`; reverse `9,9,9,7`).
+    /// gap must inherit is one this aggregator has not seen yet. `CarryLastEmpty`
+    /// (src/iterators/utils.rs) applies it after the reversal instead, which lands on RTS
+    /// in both directions (forward `7,7,7,9`; reverse `9,9,9,7`).
     fn empty_value(&self) -> Value {
         f64::NAN
     }
