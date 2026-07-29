@@ -168,7 +168,7 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         # Test with invalid increment
         self.verify_error_response(
             self.client, 'TS.INCRBY ts_err xyz',
-            "TSDB: invalid value"
+            "TSDB: invalid increase/decrease value"
         )
 
         # Test with invalid timestamp
@@ -209,7 +209,7 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         """TS.INCRBY should reject NaN as the increment value"""
         self.verify_error_response(
             self.client, 'TS.INCRBY ts_nan_delta nan',
-            "TSDB: cannot increment/decrement a NaN value"
+            "TSDB: invalid increase/decrease value"
         )
 
     def test_incrby_rejects_when_last_sample_is_nan(self):
@@ -219,7 +219,7 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
 
         self.verify_error_response(
             self.client, 'TS.INCRBY ts_nan_sample 1',
-            "TSDB: cannot increment/decrement a NaN value"
+            "TSDB: cannot increment/decrement NaN value"
         )
 
         sample = self.client.execute_command('TS.GET', 'ts_nan_sample')

@@ -23,17 +23,24 @@ pub const END_ALIGN_NEEDS_EXPLICIT_END: &str =
     "TSDB: end alignment can only be used with explicit end timestamp";
 pub const INVALID_ARGUMENT: &str = "TSDB: invalid argument";
 pub const INVALID_VALUE: &str = "TSDB: invalid value";
-pub const CANNOT_INCREMENT_DECREMENT_NAN: &str = "TSDB: cannot increment/decrement a NaN value";
+// Both verbatim RTS text for the counter commands: the first for an unusable
+// increment *operand* (unparseable, empty, NaN), the second for incrementing a
+// series whose last stored sample is NaN.
+pub const INVALID_INCREMENT_VALUE: &str = "TSDB: invalid increase/decrease value";
+pub const CANNOT_INCREMENT_DECREMENT_NAN: &str = "TSDB: cannot increment/decrement NaN value";
 pub const INVALID_BUCKET_ALIGNMENT: &str = "TSDB: invalid bucket alignment";
 pub const INVALID_ALIGNMENT_TIMESTAMP: &str = "TSDB: Couldn't parse alignTimestamp";
 pub const INVALID_BUCKET_TIMESTAMP_TYPE: &str = "TSDB: unknown BUCKETTIMESTAMP parameter";
 pub const INVALID_BOOLEAN: &str = "TSDB: invalid boolean argument";
-pub const INVALID_CHUNK_ENCODING: &str = "TSDB: invalid chunk encoding method";
-pub const MISSING_CHUNK_ENCODING: &str = "TSDB: missing chunk encoding method";
-pub const CANNOT_PARSE_CHUNK_SIZE: &str = "TSDB: couldn't parse CHUNK_SIZE";
+// Exact RTS text for the shared TS.CREATE/TS.ALTER/TS.ADD option surface
+// (verified by probing the reference container). A missing ENCODING *value* is
+// not one of these: RTS reports plain wrong-arity there, so that site returns
+// ValkeyError::WrongArity rather than a TSDB: message.
+pub const INVALID_CHUNK_ENCODING: &str = "TSDB: unknown ENCODING parameter";
+pub const CANNOT_PARSE_CHUNK_SIZE: &str = "TSDB: Couldn't parse CHUNK_SIZE";
 pub const INVALID_CHUNK_SIZE: &str = "TSDB: invalid chunk size";
-pub const INVALID_DUPLICATE_POLICY: &str = "TSDB: invalid duplicate policy";
-pub const MISSING_DUPLICATE_POLICY: &str = "TSDB: missing duplicate policy value";
+pub const INVALID_DUPLICATE_POLICY: &str = "TSDB: Unknown DUPLICATE_POLICY";
+pub const MISSING_DUPLICATE_POLICY: &str = "TSDB: Couldn't parse DUPLICATE_POLICY";
 pub const DEBUG_MODE_DISABLED: &str = "TSDB: TS._DEBUG is disabled. Set the 'ts.debug-mode' configuration parameter to yes to enable it";
 pub const INVALID_DURATION: &str = "TSDB: invalid duration";
 pub const INVALID_INTEGER: &str = "TSDB: invalid integer";
@@ -86,7 +93,7 @@ pub const INVALID_TIMESTAMP_FILTER: &str = "TSDB: FILTER_BY_TS one or more argum
 pub const INVALID_REGEX: &str = "TSDB: invalid regex";
 pub const INVALID_IGNORE_OPTIONS: &str = "TSDB: invalid ignore options";
 pub const CANNOT_PARSE_IGNORE: &str = "TSDB: Couldn't parse IGNORE";
-pub const NEGATIVE_IGNORE_VALUES: &str = "TSDB: IGNORE values cannot be negative";
+pub const NEGATIVE_IGNORE_VALUES: &str = "TSDB: IGNORE arguments cannot be negative";
 
 pub const CANNOT_PARSE_LABELS: &str = "TSDB: Couldn't parse LABELS";
 pub const CANNOT_PARSE_RETENTION: &str = "TSDB: Couldn't parse RETENTION";

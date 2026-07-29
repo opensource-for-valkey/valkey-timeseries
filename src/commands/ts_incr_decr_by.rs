@@ -48,7 +48,10 @@ fn incr_decr(ctx: &Context, args: Vec<ValkeyString>, is_increment: bool) -> Valk
     }
 
     let mut args = args;
-    let delta = parse_value_arg(&args[2])?;
+    // RTS reports every unusable increment operand — unparseable, empty, NaN —
+    // with one message, distinct from TS.ADD's "invalid value".
+    let delta = parse_value_arg(&args[2])
+        .map_err(|_| ValkeyError::Str(error_consts::INVALID_INCREMENT_VALUE))?;
     let timestamp = handle_parse_timestamp(&mut args)?;
     let key_name = &args[1];
 

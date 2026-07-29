@@ -285,7 +285,7 @@ pub fn parse_join_operator(arg: &str) -> ValkeyResult<JoinReducer> {
 pub fn parse_chunk_size(arg: &str) -> ValkeyResult<usize> {
     fn get_error_result() -> ValkeyResult<usize> {
         let msg = format!(
-            "TSDB: CHUNK_SIZE value must be an integer multiple of 8 in the range [{MIN_CHUNK_SIZE} .. {MAX_CHUNK_SIZE}]"
+            "TSDB: CHUNK_SIZE value must be a multiple of 8 in the range [{MIN_CHUNK_SIZE} .. {MAX_CHUNK_SIZE}]"
         );
         Err(ValkeyError::String(msg))
     }
@@ -314,7 +314,8 @@ pub fn parse_chunk_compression(args: &mut CommandArgIterator) -> ValkeyResult<Ch
         ChunkEncoding::try_from(next)
             .map_err(|_| ValkeyError::Str(error_consts::INVALID_CHUNK_ENCODING))
     } else {
-        Err(ValkeyError::Str(error_consts::MISSING_CHUNK_ENCODING))
+        // RTS reports a trailing ENCODING with no value as wrong arity.
+        Err(ValkeyError::WrongArity)
     }
 }
 
@@ -832,12 +833,24 @@ pub fn parse_decimal_digit_rounding(
 }
 
 pub(crate) fn parse_ignore_options(args: &mut CommandArgIterator) -> ValkeyResult<(i64, f64)> {
+    // A missing operand is reported as a parse failure of IGNORE itself, not as
+    // wrong arity: that is what RTS replies for both `IGNORE` and `IGNORE <n>` at
+    // the end of the argument list.
+    let missing = || ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE);
+
     // ignoreMaxTimediff
-    let mut str = args.next_str()?;
-    let ignore_max_timediff =
-        parse_duration_ms(str).map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE))?;
+    let mut str = args.next_str().map_err(|_| missing())?;
+    let ignore_max_timediff = parse_duration_ms(str).map_err(|_| {
+        // A negative time diff does not parse as a duration; report it as the
+        // negative-argument case rather than as unparseable (RTS text).
+        if parse_number(str).is_ok_and(|n| n < 0.0) {
+            ValkeyError::Str(error_consts::NEGATIVE_IGNORE_VALUES)
+        } else {
+            ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE)
+        }
+    })?;
     // ignoreMaxValDiff
-    str = args.next_str()?;
+    str = args.next_str().map_err(|_| missing())?;
     let ignore_max_val_diff =
         parse_number(str).map_err(|_| ValkeyError::Str(error_consts::CANNOT_PARSE_IGNORE))?;
     if ignore_max_timediff < 0 || ignore_max_val_diff < 0.0 {

@@ -98,7 +98,12 @@ impl TimeSeries {
         res.chunk_encoding = options.chunk_encoding;
         res.retention = options.retention.unwrap_or_else(config::retention_period);
         res.rounding = options.rounding;
-        res.sample_duplicates = options.sample_duplicate_policy.unwrap_or_default();
+        let (max_time_delta, max_value_delta) = options.ignore.unwrap_or_default();
+        res.sample_duplicates = SampleDuplicatePolicy {
+            policy: options.duplicate_policy,
+            max_time_delta,
+            max_value_delta,
+        };
 
         // if !options.labels.iter().any(|x| x.name == METRIC_NAME_LABEL) {
         //     return Err(TsdbError::InvalidMetric(
@@ -265,7 +270,7 @@ impl TimeSeries {
     /// compaction: RedisTimeSeries folds a sample into its downstream bucket at
     /// write time, so trimming the source first would drop that contribution from
     /// a bucket recalculation and diverge (see `sample_merge`).
-    pub(super) fn apply_retention(&mut self) {
+    pub(crate) fn apply_retention(&mut self) {
         if self.retention.is_zero() {
             return;
         }
@@ -879,9 +884,7 @@ impl TimeSeries {
         delta: f64,
     ) -> ValkeyResult<SampleAddResult> {
         if delta.is_nan() {
-            return Err(ValkeyError::Str(
-                error_consts::CANNOT_INCREMENT_DECREMENT_NAN,
-            ));
+            return Err(ValkeyError::Str(error_consts::INVALID_INCREMENT_VALUE));
         }
         // if we have at least one sample, increment the last one
         let (timestamp, last_ts, value) = if let Some(sample) = self.last_sample {
