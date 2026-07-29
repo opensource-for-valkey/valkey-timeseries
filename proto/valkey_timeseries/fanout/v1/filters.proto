@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package valkey_timeseries.fanout.v1;
+
+enum MatcherOpType {
+  MATCHER_OP_TYPE_UNSPECIFIED = 0;
+  MATCHER_OP_TYPE_EQUAL = 1;
+  MATCHER_OP_TYPE_NOT_EQUAL = 2;
+  MATCHER_OP_TYPE_REGEX_EQUAL = 3;
+  MATCHER_OP_TYPE_REGEX_NOT_EQUAL = 4;
+  MATCHER_OP_TYPE_STARTS_WITH = 5;
+  MATCHER_OP_TYPE_NOT_STARTS_WITH = 6;
+  MATCHER_OP_TYPE_CONTAINS = 7;
+  MATCHER_OP_TYPE_NOT_CONTAINS = 8;
+  MATCHER_OP_TYPE_MATCH_ALL = 9;
+  MATCHER_OP_TYPE_MATCH_NONE = 10;
+}
+
+message FilterListValue {
+  repeated string values = 1;
+}
+
+message FilterPredicateValue {
+  oneof label_value {
+    bool empty = 1;
+    string single = 2;
+    FilterListValue list = 3;
+  }
+}
+
+message RegexFilterValue {
+  string regex = 1;
+  string prefix = 2;
+  string suffix = 3;
+}
+
+message LabelFilter {
+  string label = 1;
+  MatcherOpType op = 2;
+  oneof matcher {
+    FilterPredicateValue predicate = 3;
+    RegexFilterValue regex = 4;
+  }
+  reserved 5, 6;
+}
+
+message FilterList {
+  repeated LabelFilter matchers = 1;
+}
+
+message OrMatcherList {
+  repeated FilterList filters = 1;
+}
+
+message SeriesSelector {
+  reserved 1;
+  oneof filters {
+    FilterList and_filters = 2;
+    OrMatcherList or_filters = 3;
+  }
+}

@@ -26,6 +26,12 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
 
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Lint protobuf contracts
+        run: buf lint
+
       - name: Set the server version for python integration tests
         run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
 

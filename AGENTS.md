@@ -46,8 +46,8 @@ High-level architecture (big picture)
     Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
     see "Wire encoding policy" under conventions below.
   - ACL filtering per series: `src/series/acl.rs`.
-- Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use protobuf (
-  `src/commands/fanout.*.proto`) and explicit fanout registration (`register_fanout_operations`) to implement
+- Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use the protobuf wire
+  contract in `proto/valkey_timeseries/fanout/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
   cluster-wide queries.
 - Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score, RCF
   variants) exposed via the `TS.OUTLIERS` command.
@@ -253,7 +253,7 @@ Quick tips for code changes
 - Documentation: When adding or modifying commands, remember to update the human-facing docs in `docs/commands/` and the
   supported list in `README.md`. TS._DEBUG is intentionally undocumented.
 - When making cluster changes, search for `*_fanout_command.rs` to copy the fanout pattern and add protobuf messages in
-  `src/commands/fanout.*.proto`.
+  `proto/valkey_timeseries/fanout/v1/`.
 
 Limitations of this document
 

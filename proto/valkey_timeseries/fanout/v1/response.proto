@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package valkey_timeseries.fanout.v1;
+
+import "valkey_timeseries/fanout/v1/common.proto";
+
+message MGetValue {
+  string key = 1;
+  Sample sample = 2;
+  repeated Label labels = 3;
+}
+
+message SeriesRangeResponse {
+  string key = 1;
+  string group_label_value = 2;
+  repeated Label labels = 3;
+  repeated SampleData columns = 4;
+}
+
+message MultiGetResponse {
+  repeated MGetValue values = 1;
+}
+
+message CountResponse {
+  uint64 count = 1;
+}
+
+message ReducePartialState {
+  uint64 count = 1;
+  double acc1 = 2;
+  double acc2 = 3;
+  int64 ts = 4;
+  double acc1_compensation = 5;
+}
+
+message GroupPartialSeries {
+  string group_label_value = 1;
+  repeated string source_keys = 2;
+  repeated int64 bucket_timestamps = 3;
+  repeated ReducePartialState states = 4;
+  uint32 column_count = 5;
+}
+
+message MultiRangeResponse {
+  repeated SeriesRangeResponse series = 1;
+  repeated GroupPartialSeries group_partials = 2;
+  bool applied_aggregation = 3;
+  bool applied_group_reduce = 4;
+  bool applied_count = 5;
+}
+
+message StringListResponse {
+  repeated string values = 1;
+}
+
+message LabelSearchResult {
+  string value = 1;
+  double score = 2;
+  uint64 cardinality = 3;
+}
+
+message LabelSearchResponse {
+  repeated LabelSearchResult results = 1;
+  bool has_more = 2;
+}
+
+message StatsResponse {
+  uint64 series_count = 1;
+  repeated PostingStat series_count_by_metric_name = 2;
+  repeated PostingStat series_count_by_label_name = 3;
+  repeated PostingStat series_count_by_label_value_pairs = 4;
+  repeated PostingStat series_count_by_focus_label_value = 5;
+  bytes labels_bitmap = 6;
+  bytes label_value_pairs_bitmap = 7;
+}

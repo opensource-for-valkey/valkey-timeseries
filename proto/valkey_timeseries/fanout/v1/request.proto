@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package valkey_timeseries.fanout.v1;
+
+import "valkey_timeseries/fanout/v1/common.proto";
+import "valkey_timeseries/fanout/v1/filters.proto";
+
+message MultiGetRequest {
+  bool with_labels = 1;
+  repeated string selected_labels = 2;
+  repeated SeriesSelector filters = 3;
+  bool latest = 4;
+}
+
+message MDelRequest {
+  DateRange range = 1;
+  repeated SeriesSelector filters = 2;
+}
+
+message RangeRequest {
+  DateRange range = 1;
+  uint32 count = 2;
+  repeated int64 timestamp_filter = 3;
+  ValueRange value_filter = 4;
+  AggregationOptions aggregation = 5;
+  bool latest = 6;
+}
+
+message MetaQueryRequest {
+  MetaDateRangeFilter range = 1;
+  repeated SeriesSelector filters = 2;
+}
+
+enum LabelSearchType {
+  LABEL_SEARCH_TYPE_UNSPECIFIED = 0;
+  LABEL_SEARCH_TYPE_NAME = 1;
+  LABEL_SEARCH_TYPE_VALUE = 2;
+  LABEL_SEARCH_TYPE_METRIC_NAME = 3;
+}
+
+enum FuzzySearchAlgorithm {
+  FUZZY_SEARCH_ALGORITHM_UNSPECIFIED = 0;
+  FUZZY_SEARCH_ALGORITHM_NOOP = 1;
+  FUZZY_SEARCH_ALGORITHM_JARO_WINKLER = 2;
+  FUZZY_SEARCH_ALGORITHM_SUBSEQUENCE = 3;
+}
+
+enum LabelResultsSortOrder {
+  LABEL_RESULTS_SORT_ORDER_UNSPECIFIED = 0;
+  LABEL_RESULTS_SORT_ORDER_SCORE_DESC = 1;
+  LABEL_RESULTS_SORT_ORDER_VALUE_ASC = 2;
+  LABEL_RESULTS_SORT_ORDER_VALUE_DESC = 3;
+  LABEL_RESULTS_SORT_ORDER_CARDINALITY_ASC = 4;
+  LABEL_RESULTS_SORT_ORDER_CARDINALITY_DESC = 5;
+}
+
+message LabelSearchRequest {
+  reserved 7;
+  LabelSearchType request_type = 1;
+  string label = 2;
+  repeated string search_terms = 3;
+  double fuzz_threshold = 4;
+  FuzzySearchAlgorithm fuzz_algorithm = 5;
+  bool ignore_case = 6;
+  bool include_metadata = 8;
+  MetaDateRangeFilter range = 9;
+  repeated SeriesSelector filters = 10;
+  LabelResultsSortOrder sort_order = 11;
+  uint32 limit = 12;
+}
+
+message StatsRequest {
+  uint32 limit = 1;
+  optional string selected_label = 2;
+}
+
+message MultiRangeRequest {
+  RangeRequest range = 1;
+  repeated SeriesSelector filters = 2;
+  GroupingOptions grouping = 3;
+  bool with_labels = 4;
+  repeated string selected_labels = 5;
+  bool is_reverse = 6;
+  bool apply_aggregation = 7;
+  bool apply_group_reduce = 8;
+  bool apply_count = 9;
+}

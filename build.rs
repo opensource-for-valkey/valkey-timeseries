@@ -4,10 +4,10 @@ fn main() -> io::Result<()> {
     // Parse .proto sources into descriptors without requiring `protoc`.
     let file_descriptors = protox::compile(
         &[
-            "src/commands/fanout.request.proto",
-            "src/commands/fanout.response.proto",
+            "proto/valkey_timeseries/fanout/v1/request.proto",
+            "proto/valkey_timeseries/fanout/v1/response.proto",
         ],
-        &["src/"],
+        &["proto/"],
     )
     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -20,8 +20,10 @@ fn main() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     // Re-run only when a .proto file changes, not on every Rust edit.
-    println!("cargo:rerun-if-changed=src/commands/fanout.request.proto");
-    println!("cargo:rerun-if-changed=src/commands/fanout.response.proto");
+    println!("cargo:rerun-if-changed=proto/valkey_timeseries/fanout/v1/common.proto");
+    println!("cargo:rerun-if-changed=proto/valkey_timeseries/fanout/v1/filters.proto");
+    println!("cargo:rerun-if-changed=proto/valkey_timeseries/fanout/v1/request.proto");
+    println!("cargo:rerun-if-changed=proto/valkey_timeseries/fanout/v1/response.proto");
 
     Ok(())
 }
