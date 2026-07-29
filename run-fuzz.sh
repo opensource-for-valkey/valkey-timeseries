@@ -202,6 +202,15 @@ if [[ -n "$DERANDOMIZE" && ( -n "$DURATION_SECS" || "$ROUNDS" -gt 1 ) ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# reference server lifecycle (shared with build.sh)
+#
+# The helper exposes provision/start/stop and reports whether we own the reference;
+# it installs no traps of its own, so the teardown below stays in charge.
+# ---------------------------------------------------------------------------
+# shellcheck source=tests/reference_server.sh
+. "$TESTS_DIR/reference_server.sh"
+
+# ---------------------------------------------------------------------------
 # teardown (registered as soon as we own a resource)
 # ---------------------------------------------------------------------------
 SUBJECT_PID=""
@@ -227,10 +236,7 @@ cleanup() {
     elif [[ -n "$SUBJECT_WORKDIR" ]]; then
         warn "subject log kept at $SUBJECT_WORKDIR/subject.log"
     fi
-    if [[ "$REFERENCE_STARTED" == true && -z "$KEEP_REFERENCE" ]]; then
-        log "stopping reference container"
-        docker compose -f "$COMPOSE_FILE" stop reference >/dev/null 2>&1
-    fi
+    compat_reference_stop
     exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -406,27 +412,20 @@ PY
 }
 
 start_reference() {
-    if [[ -n "$REFERENCE_URL" ]]; then
-        log "reference: $REFERENCE_URL (external)"
-        wait_for_ping "$REFERENCE_URL" 5 || die "COMPAT_REFERENCE_URL=$REFERENCE_URL is not reachable"
-        return
-    fi
-    command -v docker >/dev/null 2>&1 || die "docker not found; start a reference yourself and pass --reference-url"
-    # A container someone else started stays up afterwards; only stop what we start.
-    local already=""
-    already="$(docker compose -f "$COMPOSE_FILE" ps -q reference 2>/dev/null || true)"
-    log "starting the pinned reference container on port $REFERENCE_PORT"
-    COMPAT_REFERENCE_PORT="$REFERENCE_PORT" \
-        docker compose -f "$COMPOSE_FILE" up -d --wait reference \
-        || die "could not start the reference container (is Docker running?)"
-    if [[ -n "$already" ]]; then
-        log "reference container was already running — leaving it up on exit"
-    else
+    # Hand our resolved interpreter and knobs to the shared helper, then adopt what it
+    # reports back. Ownership stays visible here: REFERENCE_STARTED drives cleanup().
+    COMPAT_REF_PY=("${PY[@]}")
+    COMPAT_REFERENCE_URL="$REFERENCE_URL"
+    COMPAT_REFERENCE_PORT="$REFERENCE_PORT"
+    COMPAT_KEEP_REFERENCE="$KEEP_REFERENCE"
+
+    compat_reference_start || die "could not provide a reference server"
+
+    REFERENCE_URL="$COMPAT_REFERENCE_URL"
+    if [[ "$COMPAT_REFERENCE_OWNED" == 1 ]]; then
         REFERENCE_STARTED=true
     fi
-    REFERENCE_URL="redis://127.0.0.1:$REFERENCE_PORT"
-    wait_for_ping "$REFERENCE_URL" 30 || die "reference container started but $REFERENCE_URL never answered"
-    log "reference: $REFERENCE_URL (pinned redis:8.8 image)"
+    log "reference: $REFERENCE_URL ($COMPAT_REFERENCE_KIND)"
 }
 
 start_subject() {
