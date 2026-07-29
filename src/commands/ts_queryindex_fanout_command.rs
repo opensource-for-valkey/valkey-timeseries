@@ -1,4 +1,4 @@
-use super::fanout::{IndexQueryRequest, IndexQueryResponse};
+use super::fanout::{MetaQueryRequest, StringListResponse};
 use super::fanout::{deserialize_match_filter_options, serialize_match_filter_options};
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -23,8 +23,8 @@ impl QueryIndexFanoutCommand {
 }
 
 impl FanoutClientCommand for QueryIndexFanoutCommand {
-    type Request = IndexQueryRequest;
-    type Response = IndexQueryResponse;
+    type Request = MetaQueryRequest;
+    type Response = StringListResponse;
 
     fn name() -> &'static str {
         "index_query"
@@ -32,21 +32,21 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
 
     fn get_local_response(
         ctx: &Context,
-        req: IndexQueryRequest,
-    ) -> ValkeyResult<IndexQueryResponse> {
+        req: MetaQueryRequest,
+    ) -> ValkeyResult<StringListResponse> {
         let options = deserialize_match_filter_options(req.range, Some(req.filters))?;
         let keys = series_keys_by_selectors(ctx, &options.matchers, options.date_range)?;
         let keys = keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>();
-        Ok(IndexQueryResponse { keys })
+        Ok(StringListResponse { values: keys })
     }
 
-    fn generate_request(&self) -> IndexQueryRequest {
+    fn generate_request(&self) -> MetaQueryRequest {
         let (range, filters) = serialize_match_filter_options(&self.options);
-        IndexQueryRequest { range, filters }
+        MetaQueryRequest { range, filters }
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        for key in resp.keys {
+        for key in resp.values {
             self.keys.insert(key);
         }
         Ok(())

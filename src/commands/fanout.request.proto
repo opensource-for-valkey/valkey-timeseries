@@ -16,6 +16,9 @@ syntax = "proto3";
 
 package valkey_timeseries.fanout;
 
+// ---------------------------------------------------------------------------
+// Shared primitives
+// ---------------------------------------------------------------------------
 
 message DateRange {
   int64 start = 1;
@@ -33,22 +36,27 @@ message ValueRange {
   double max = 2;
 }
 
-enum MatcherOpType {
-  EQUAL = 0;
-  NOT_EQUAL = 1;
-  REGEX_EQUAL = 2;
-  REGEX_NOT_EQUAL = 3;
-  STARTS_WITH = 4;
-  NOT_STARTS_WITH = 5;
-  CONTAINS = 6;
-  NOT_CONTAINS = 7;
-  MATCH_ALL = 8;
-  MATCH_NONE = 9;
-}
+// ---------------------------------------------------------------------------
+// Label filter types
+// ---------------------------------------------------------------------------
 
-enum MatchersConnector  {
-  AND = 0;
-  OR = 1;
+enum MatcherOpType {
+  // Every meaningful value was shifted up by one to make 0 the sentinel.
+  // An AggregatorConfig message that embeds this enum can detect presence
+  // via the wrapping message, but a bare MatcherOpType field decodes
+  // MATCHER_OP_TYPE_UNSPECIFIED = 0 as "absent" rather than silently
+  // treating it as EQUAL.
+  MATCHER_OP_TYPE_UNSPECIFIED = 0;
+  MATCHER_OP_TYPE_EQUAL = 1;
+  MATCHER_OP_TYPE_NOT_EQUAL = 2;
+  MATCHER_OP_TYPE_REGEX_EQUAL = 3;
+  MATCHER_OP_TYPE_REGEX_NOT_EQUAL = 4;
+  MATCHER_OP_TYPE_STARTS_WITH = 5;
+  MATCHER_OP_TYPE_NOT_STARTS_WITH = 6;
+  MATCHER_OP_TYPE_CONTAINS = 7;
+  MATCHER_OP_TYPE_NOT_CONTAINS = 8;
+  MATCHER_OP_TYPE_MATCH_ALL = 9;
+  MATCHER_OP_TYPE_MATCH_NONE = 10;
 }
 
 message FilterListValue {
@@ -69,15 +77,18 @@ message RegexFilterValue {
   string suffix = 3;
 }
 
+// op discriminates the operation; the oneof carries only the data payload.
+// The two must agree (the decoder validates this).  Fields 5 and 6 were
+// formerly standalone string fields in the oneof, never exercised, and are
+// now reserved.
 message LabelFilter {
   string label = 1;
   MatcherOpType op = 2;
   oneof matcher {
     FilterPredicateValue predicate = 3;
     RegexFilterValue regex = 4;
-    string prefix = 5;
-    string contains = 6;
   }
+  reserved 5, 6;
 }
 
 message FilterList {
@@ -88,12 +99,19 @@ message OrMatcherList {
   repeated FilterList filters = 1;
 }
 
+// Field 1 was removed without a reserved marker; add one so it is never
+// accidentally reused.
 message SeriesSelector {
+  reserved 1;
   oneof filters {
     FilterList and_filters = 2;
     OrMatcherList or_filters = 3;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Request messages
+// ---------------------------------------------------------------------------
 
 message MultiGetRequest {
   bool with_labels = 1;
@@ -107,53 +125,51 @@ message MDelRequest {
   repeated SeriesSelector filters = 2;
 }
 
-
 message RangeRequest {
   DateRange range = 1;
   uint32 count = 2;
   repeated int64 timestamp_filter = 3;
   ValueRange value_filter = 4;
-  optional AggregationOptions aggregation = 5;
+  // message fields are always optional in proto3; the `optional` keyword
+  // is a no-op here so we omit it for consistency.
+  AggregationOptions aggregation = 5;
   bool latest = 6;
 }
 
-message IndexQueryRequest {
+// MetaQueryRequest replaces the structurally-identical IndexQueryRequest
+// and CardinalityRequest.  The wire bytes are unchanged; dispatch is by the
+// handler name in the fanout envelope (e.g. "queryindex", "card").
+message MetaQueryRequest {
   MetaDateRangeFilter range = 1;
   repeated SeriesSelector filters = 2;
 }
 
 enum LabelSearchType {
-  NAME = 0;
-  VALUE = 1;
-  METRIC_NAME = 2;
+  LABEL_SEARCH_TYPE_UNSPECIFIED = 0;
+  LABEL_SEARCH_TYPE_NAME = 1;
+  LABEL_SEARCH_TYPE_VALUE = 2;
+  LABEL_SEARCH_TYPE_METRIC_NAME = 3;
 }
 
 enum FuzzySearchAlgorithm {
-  NOOP = 0;
-  JARO_WINKLER = 1;
-  SUBSEQUENCE = 2;
+  FUZZY_SEARCH_ALGORITHM_UNSPECIFIED = 0;
+  FUZZY_SEARCH_ALGORITHM_NOOP = 1;
+  FUZZY_SEARCH_ALGORITHM_JARO_WINKLER = 2;
+  FUZZY_SEARCH_ALGORITHM_SUBSEQUENCE = 3;
 }
 
 enum LabelResultsSortOrder {
-  SCORE_DESC = 0;
-  VALUE_ASC = 1;
-  VALUE_DESC = 2;
-  CARDINALITY_ASC = 3;
-  CARDINALITY_DESC = 4;
+  LABEL_RESULTS_SORT_ORDER_UNSPECIFIED = 0;
+  LABEL_RESULTS_SORT_ORDER_SCORE_DESC = 1;
+  LABEL_RESULTS_SORT_ORDER_VALUE_ASC = 2;
+  LABEL_RESULTS_SORT_ORDER_VALUE_DESC = 3;
+  LABEL_RESULTS_SORT_ORDER_CARDINALITY_ASC = 4;
+  LABEL_RESULTS_SORT_ORDER_CARDINALITY_DESC = 5;
 }
 
-message LabelNamesRequest {
-  MetaDateRangeFilter range = 1;
-  repeated SeriesSelector filters = 2;
-}
-
-message LabelValuesRequest {
-  string label = 1;
-  MetaDateRangeFilter range = 2;
-  repeated SeriesSelector filters = 3;
-}
-
+// Field 7 was removed without a reserved marker.
 message LabelSearchRequest {
+  reserved 7;
   LabelSearchType request_type = 1;
   string label = 2;
   repeated string search_terms = 3;
@@ -167,67 +183,54 @@ message LabelSearchRequest {
   uint32 limit = 12;
 }
 
-message CardinalityRequest {
-  MetaDateRangeFilter range = 1;
-  repeated SeriesSelector filters = 2;
-}
-
-message MetadataRequest {
-  MetaDateRangeFilter filter = 1;
-  repeated SeriesSelector filters = 2;
-  uint32 limit = 3;
-}
-
-message SearchQueryRequest {
-  int64 start = 1;
-  int64 end = 2;
-  SeriesSelector filters = 3;
-  uint32 limit = 4;
-}
-
 message StatsRequest {
   uint32 limit = 1;
   optional string selected_label = 2;
 }
 
-message ClusterMessage {
-  uint64 request_id = 1;
-  int32 db = 2;
-}
+// ---------------------------------------------------------------------------
+// Aggregation types
+// ---------------------------------------------------------------------------
 
 enum AggregationType {
-  ALL = 0;
-  ANY = 1;
-  AVG = 2;
-  COUNT = 3;
-  COUNT_ALL = 4;
-  COUNT_IF = 5;
-  COUNT_NAN = 6;
-  FIRST = 7;
-  INCREASE = 8;
-  IRATE = 9;
-  LAST = 10;
-  MAX = 11;
-  MIN = 12;
-  NONE = 13;
-  SHARE_IF = 14;
-  SUM = 15;
-  SUM_IF = 16;
-  RANGE = 17;
-  RATE = 18;
-  STD_S = 19;
-  STD_P = 20;
-  VAR_S = 21;
-  VAR_P = 22;
+  // All meaningful values shifted up by one so that 0 is the sentinel.
+  // AggregatorConfig is a message so presence is detectable even without
+  // this, but a bare AggregationType field that decodes to UNSPECIFIED = 0
+  // is safer than one that silently decodes to ALL.
+  AGGREGATION_TYPE_UNSPECIFIED = 0;
+  AGGREGATION_TYPE_ALL = 1;
+  AGGREGATION_TYPE_ANY = 2;
+  AGGREGATION_TYPE_AVG = 3;
+  AGGREGATION_TYPE_COUNT = 4;
+  AGGREGATION_TYPE_COUNT_ALL = 5;
+  AGGREGATION_TYPE_COUNT_IF = 6;
+  AGGREGATION_TYPE_COUNT_NAN = 7;
+  AGGREGATION_TYPE_FIRST = 8;
+  AGGREGATION_TYPE_INCREASE = 9;
+  AGGREGATION_TYPE_IRATE = 10;
+  AGGREGATION_TYPE_LAST = 11;
+  AGGREGATION_TYPE_MAX = 12;
+  AGGREGATION_TYPE_MIN = 13;
+  AGGREGATION_TYPE_NONE = 14;
+  AGGREGATION_TYPE_SHARE_IF = 15;
+  AGGREGATION_TYPE_SUM = 16;
+  AGGREGATION_TYPE_SUM_IF = 17;
+  AGGREGATION_TYPE_RANGE = 18;
+  AGGREGATION_TYPE_RATE = 19;
+  AGGREGATION_TYPE_STD_S = 20;
+  AGGREGATION_TYPE_STD_P = 21;
+  AGGREGATION_TYPE_VAR_S = 22;
+  AGGREGATION_TYPE_VAR_P = 23;
 }
 
 enum ComparisonOperator {
-  GT = 0;
-  GTE = 1;
-  LT = 2;
-  LTE = 3;
-  EQ = 4;
-  NEQ = 5;
+  COMPARISON_OPERATOR_UNSPECIFIED = 0;
+  COMPARISON_OPERATOR_GT = 1;
+  COMPARISON_OPERATOR_GTE = 2;
+  COMPARISON_OPERATOR_LT = 3;
+  COMPARISON_OPERATOR_LTE = 4;
+  COMPARISON_OPERATOR_EQ = 5;
+  COMPARISON_OPERATOR_NEQ = 6;
 }
 
 message ValueComparisonFilter {
@@ -246,18 +249,22 @@ message GroupingOptions {
 }
 
 enum BucketTimestampType {
-  START = 0;
-  END = 1;
-  MID = 2;
+  BUCKET_TIMESTAMP_TYPE_UNSPECIFIED = 0;
+  BUCKET_TIMESTAMP_TYPE_START = 1;
+  BUCKET_TIMESTAMP_TYPE_END = 2;
+  BUCKET_TIMESTAMP_TYPE_MID = 3;
 }
 
 enum BucketAlignmentType {
-  DEFAULT = 0;
-  ALIGN_START = 1;
-  ALIGN_END = 2;
-  TIMESTAMP = 3;
+  BUCKET_ALIGNMENT_TYPE_UNSPECIFIED = 0;
+  BUCKET_ALIGNMENT_TYPE_DEFAULT = 1;
+  BUCKET_ALIGNMENT_TYPE_ALIGN_START = 2;
+  BUCKET_ALIGNMENT_TYPE_ALIGN_END = 3;
+  BUCKET_ALIGNMENT_TYPE_TIMESTAMP = 4;
 }
 
+// Message fields in proto3 are always optional — the `optional` keyword
+// is a no-op for message types, so we omit it here.
 message AggregationOptions {
   // Aggregator list in output column order; must contain at least one entry.
   // A single-aggregator query is simply a one-element list.
@@ -272,7 +279,8 @@ message AggregationOptions {
 message MultiRangeRequest {
   RangeRequest range = 1;
   repeated SeriesSelector filters = 2;
-  optional GroupingOptions grouping = 3;
+  // message field — always optional in proto3, no keyword needed.
+  GroupingOptions grouping = 3;
   bool with_labels = 4;
   repeated string selected_labels = 5;
   bool is_reverse = 6;

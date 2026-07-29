@@ -278,23 +278,11 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
             (MatcherOpType::NotStartsWith, Some(Matcher::Predicate(predicate))) => {
                 PredicateMatch::NotStartsWith(predicate_value_from_fanout(predicate))
             }
-            (MatcherOpType::StartsWith, Some(Matcher::Prefix(prefix))) => {
-                PredicateMatch::StartsWith(PredicateValue::String(prefix.clone()))
-            }
-            (MatcherOpType::NotStartsWith, Some(Matcher::Prefix(prefix))) => {
-                PredicateMatch::NotStartsWith(PredicateValue::String(prefix.clone()))
-            }
             (MatcherOpType::Contains, Some(Matcher::Predicate(predicate))) => {
                 PredicateMatch::Contains(predicate_value_from_fanout(predicate))
             }
             (MatcherOpType::NotContains, Some(Matcher::Predicate(predicate))) => {
                 PredicateMatch::NotContains(predicate_value_from_fanout(predicate))
-            }
-            (MatcherOpType::Contains, Some(Matcher::Contains(needle))) => {
-                PredicateMatch::Contains(PredicateValue::String(needle.clone()))
-            }
-            (MatcherOpType::NotContains, Some(Matcher::Contains(needle))) => {
-                PredicateMatch::NotContains(PredicateValue::String(needle.clone()))
             }
             _ => {
                 return Err(ValkeyError::Str(
@@ -500,24 +488,6 @@ mod tests {
 
         let decoded = LabelFilter::try_from(&fanout).expect("legacy regex payload should decode");
         assert_eq!(decoded.matcher, PredicateMatch::MatchNone);
-    }
-
-    #[test]
-    fn test_legacy_string_prefix_payload_still_decodes() {
-        let fanout = FanoutFilter {
-            label: "instance".into(),
-            op: MatcherOpType::StartsWith as i32,
-            matcher: Some(Matcher::Prefix("server".into())),
-        };
-
-        let decoded = LabelFilter::try_from(&fanout).expect("legacy prefix payload should decode");
-        assert_eq!(
-            decoded,
-            LabelFilter {
-                label: "instance".into(),
-                matcher: PredicateMatch::StartsWith(PredicateValue::String("server".into())),
-            }
-        );
     }
 
     #[test]

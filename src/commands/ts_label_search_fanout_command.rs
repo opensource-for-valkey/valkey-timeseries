@@ -68,6 +68,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             FuzzySearchAlgorithm::JaroWinkler => FuzzyAlgorithm::JaroWinkler,
             FuzzySearchAlgorithm::Subsequence => FuzzyAlgorithm::Subsequence,
             FuzzySearchAlgorithm::Noop => FuzzyAlgorithm::NoOp,
+            FuzzySearchAlgorithm::Unspecified => unreachable!("try_from rejects Unspecified"),
         };
 
         let label = if req.label.is_empty() {
@@ -87,6 +88,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             LabelResultsSortOrder::ScoreDesc => SearchResultOrdering::ScoreDesc,
             LabelResultsSortOrder::CardinalityAsc => SearchResultOrdering::CardinalityAsc,
             LabelResultsSortOrder::CardinalityDesc => SearchResultOrdering::CardinalityDesc,
+            LabelResultsSortOrder::Unspecified => unreachable!("try_from rejects Unspecified"),
         };
 
         let parsed = LabelNameSearchArgs {

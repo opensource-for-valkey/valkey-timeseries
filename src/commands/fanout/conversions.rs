@@ -52,6 +52,9 @@ impl From<FanoutComparisonOperator> for ComparisonOperator {
             FanoutComparisonOperator::Gte => ComparisonOperator::GreaterThanOrEqual,
             FanoutComparisonOperator::Lt => ComparisonOperator::LessThan,
             FanoutComparisonOperator::Lte => ComparisonOperator::LessThanOrEqual,
+            FanoutComparisonOperator::Unspecified => {
+                panic!("TSDB: ComparisonOperator::Unspecified on the wire — protocol error")
+            }
         }
     }
 }
@@ -72,6 +75,9 @@ impl From<FanoutChunkEncoding> for ChunkEncoding {
             FanoutChunkEncoding::Uncompressed => ChunkEncoding::Uncompressed,
             FanoutChunkEncoding::Gorilla => ChunkEncoding::Gorilla,
             FanoutChunkEncoding::Chimp => ChunkEncoding::Chimp,
+            FanoutChunkEncoding::Unspecified => {
+                panic!("TSDB: CompressionType::Unspecified on the wire — protocol error")
+            }
         }
     }
 }
@@ -190,6 +196,9 @@ impl From<BucketTimestampType> for BucketTimestamp {
             BucketTimestampType::Start => BucketTimestamp::Start,
             BucketTimestampType::End => BucketTimestamp::End,
             BucketTimestampType::Mid => BucketTimestamp::Mid,
+            BucketTimestampType::Unspecified => {
+                panic!("TSDB: BucketTimestampType::Unspecified on the wire — protocol error")
+            }
         }
     }
 }
@@ -201,6 +210,9 @@ impl From<BucketAlignmentType> for BucketAlignment {
             BucketAlignmentType::AlignStart => BucketAlignment::Start,
             BucketAlignmentType::AlignEnd => BucketAlignment::End,
             BucketAlignmentType::Timestamp => BucketAlignment::Timestamp(0),
+            BucketAlignmentType::Unspecified => {
+                panic!("TSDB: BucketAlignmentType::Unspecified on the wire — protocol error")
+            }
         }
     }
 }
@@ -276,6 +288,9 @@ impl From<FanoutAggregationType> for AggregationType {
             FanoutAggregationType::StdS => AggregationType::StdS,
             FanoutAggregationType::VarP => AggregationType::VarP,
             FanoutAggregationType::VarS => AggregationType::VarS,
+            FanoutAggregationType::Unspecified => {
+                panic!("TSDB: AggregationType::Unspecified on the wire — protocol error")
+            }
         }
     }
 }

@@ -313,6 +313,9 @@ pub(crate) fn process_label_search_request(
             ))
         };
     match parsed.search_type {
+        LabelSearchType::Unspecified => Err(ValkeyError::Str(
+            "TSDB: LabelSearchType::Unspecified on the wire — protocol error",
+        )),
         LabelSearchType::Name => {
             Ok(querier.get_label_names(ctx, select_hints, Some(&raw_hints))?)
         }

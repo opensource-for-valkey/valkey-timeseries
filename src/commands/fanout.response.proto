@@ -2,6 +2,10 @@ syntax = "proto3";
 
 package valkey_timeseries.fanout;
 
+// ---------------------------------------------------------------------------
+// Shared primitives
+// ---------------------------------------------------------------------------
+
 message Label {
   string name = 1;
   string value = 2;
@@ -13,9 +17,10 @@ message Sample {
 }
 
 enum CompressionType {
-  UNCOMPRESSED = 0;
-  GORILLA = 1;
-  CHIMP = 2;
+  COMPRESSION_TYPE_UNSPECIFIED = 0;
+  COMPRESSION_TYPE_UNCOMPRESSED = 1;
+  COMPRESSION_TYPE_GORILLA = 2;
+  COMPRESSION_TYPE_CHIMP = 3;
 }
 
 message SampleData {
@@ -24,19 +29,14 @@ message SampleData {
   bytes data = 3;
 }
 
-message SeriesChunk {
-  string key = 1;
-  string group_value = 2;
-  repeated Label labels = 3;
-  SampleData data = 4;
-}
-
+// MGetValue carries a single-key response for TS.MGET fanout.
 message MGetValue {
   string key = 1;
   Sample sample = 2;
   repeated Label labels = 3;
 }
 
+// SeriesRangeResponse carries per-series data for TS.MRANGE fanout.
 message SeriesRangeResponse {
   string key = 1;
   string group_label_value = 2;
@@ -49,12 +49,16 @@ message SeriesRangeResponse {
   repeated SampleData columns = 4;
 }
 
+// MultiGetResponse carries the aggregated TS.MGET results from a shard.
 message MultiGetResponse {
   repeated MGetValue values = 1;
 }
 
-message MDelResponse {
-  uint64 deleted_count = 1;
+// CountResponse replaces the structurally-identical MDelResponse
+// (uint64 deleted_count = 1) and CardinalityResponse (uint64 cardinality = 1).
+// Wire bytes are unchanged; dispatch is by handler name.
+message CountResponse {
+  uint64 count = 1;
 }
 
 // Reducer state for one bucket; field meaning depends on the reducer type
@@ -86,6 +90,7 @@ message GroupPartialSeries {
   uint32 column_count = 5;
 }
 
+// MultiRangeResponse carries the aggregated TS.MRANGE results from a shard.
 message MultiRangeResponse {
   repeated SeriesRangeResponse series = 1;
   // Populated instead of `series` when the request set apply_group_reduce.
@@ -100,56 +105,33 @@ message MultiRangeResponse {
   bool applied_count = 5;
 }
 
-message IndexQueryResponse {
-  repeated string keys = 1;
-}
-
-enum ErrorKind {
-  FAILED = 0;
-  NODE_UNREACHABLE = 1;
-  TIMEOUT = 2;
-  UNKNOWN_MESSAGE_TYPE = 3;
-  PERMISSION_DENIED = 4;
-  KEY_PERMISSION_DENIED = 5;
-  SERIALIZATION = 6;
-  BAD_REQUEST = 7;
-  INTERNAL = 8;
-  GENERIC = 9;
-}
-
-message ErrorResponse {
-  ErrorKind kind = 1;
-  string message = 2;
-}
-
-message LabelValuesResponse {
+// StringListResponse replaces the structurally-identical IndexQueryResponse
+// (repeated string keys = 1), LabelNamesResponse, and LabelValuesResponse.
+// Wire bytes are unchanged; dispatch is by handler name.
+message StringListResponse {
   repeated string values = 1;
 }
 
-message LabelNamesResponse {
-  repeated string names = 1;
-}
-
+// LabelSearchResult carries a single fuzzy-match hit.
 message LabelSearchResult {
   string value = 1;
   double score = 2;
   uint64 cardinality = 3;
 }
 
+// LabelSearchResponse carries the aggregated label-search results from a shard.
 message LabelSearchResponse {
   repeated LabelSearchResult results = 1;
   bool has_more = 2;
 }
 
-message CardinalityResponse {
-  uint64 cardinality = 1;
-}
-
+// PostingStat carries a single (name, count) pair used in StatsResponse.
 message PostingStat {
   string name = 1;
   uint64 count = 2;
 }
 
+// StatsResponse carries the aggregated TS.LABELSTATS results from a shard.
 message StatsResponse {
   uint64 series_count = 1;
   repeated PostingStat series_count_by_metric_name = 2;

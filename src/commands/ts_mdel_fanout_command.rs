@@ -1,5 +1,5 @@
 use crate::commands::fanout::filters::{deserialize_matchers_list, serialize_matchers_list};
-use crate::commands::fanout::{DateRange, MDelRequest, MDelResponse};
+use crate::commands::fanout::{CountResponse, DateRange, MDelRequest};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -30,7 +30,7 @@ impl MDelFanoutCommand {
 
 impl FanoutClientCommand for MDelFanoutCommand {
     type Request = MDelRequest;
-    type Response = MDelResponse;
+    type Response = CountResponse;
 
     fn name() -> &'static str {
         "mdel"
@@ -48,8 +48,8 @@ impl FanoutClientCommand for MDelFanoutCommand {
         };
 
         let deleted_count = delete_series_by_selectors(ctx, &filters, range)?;
-        Ok(MDelResponse {
-            deleted_count: deleted_count as u64,
+        Ok(CountResponse {
+            count: deleted_count as u64,
         })
     }
 
@@ -64,7 +64,7 @@ impl FanoutClientCommand for MDelFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        self.total_deleted += resp.deleted_count as usize;
+        self.total_deleted += resp.count as usize;
         Ok(())
     }
 
