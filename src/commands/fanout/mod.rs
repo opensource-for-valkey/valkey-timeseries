@@ -3,6 +3,8 @@
 mod chunks;
 mod conversions;
 pub(crate) mod filters;
+#[cfg(test)]
+mod proptest_roundtrip;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/valkey_timeseries.fanout.v1.rs"));
