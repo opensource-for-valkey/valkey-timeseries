@@ -36,6 +36,14 @@ FLOAT_REL_TOL = 1e-12
 # and type only (plan §5.1 rule 5). Every exemption is enumerated here.
 INFO_TYPE_ONLY_FIELDS = {"memoryUsage", "chunkCount"}
 
+# Per-chunk fields of the TS.INFO DEBUG `Chunks` list that describe the engine's
+# own allocation rather than the stored data. The plan (§6, TS.INFO row) scopes
+# the chunk list to "presence/shape, not byte counts": `size` is the allocated
+# chunk capacity and `bytesPerSample` is derived from it, so both are compared by
+# type only. The sample-bearing fields (startTimestamp/endTimestamp/samples) are
+# compared exactly.
+DEBUG_CHUNK_TYPE_ONLY_FIELDS = {"size", "bytesPerSample"}
+
 
 @dataclass
 class Delta:
@@ -155,6 +163,32 @@ def _pairs_to_dict(value):
     return _generic(value)
 
 
+def _normalize_debug_chunks(value):
+    """The TS.INFO DEBUG chunk list.
+
+    Chunks holding no samples are dropped: an engine that preallocates its first
+    chunk reports one where an engine that allocates lazily reports none, which is
+    the same class of allocation artifact as `chunkCount` (plan §5.1 rule 5).
+    """
+    if not isinstance(value, (list, tuple)):
+        return _generic(value)
+    chunks = []
+    for chunk in value:
+        chunk = _pairs_to_dict(chunk)
+        if not isinstance(chunk, dict):
+            chunks.append(_generic(chunk))
+            continue
+        if chunk.get("samples") == 0:
+            continue
+        chunks.append(
+            {
+                k: TypeOnly(v) if k in DEBUG_CHUNK_TYPE_ONLY_FIELDS else v
+                for k, v in chunk.items()
+            }
+        )
+    return chunks
+
+
 def _normalize_info(reply):
     info = _pairs_to_dict(reply)
     if not isinstance(info, dict):
@@ -163,6 +197,8 @@ def _normalize_info(reply):
     for key, value in info.items():
         if key in INFO_TYPE_ONLY_FIELDS:
             out[key] = TypeOnly(value)
+        elif key == "Chunks":
+            out[key] = _normalize_debug_chunks(value)
         elif key == "labels":
             out[key] = _pairs_to_dict(value)
         elif key == "rules" and isinstance(value, list):
