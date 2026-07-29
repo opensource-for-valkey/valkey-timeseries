@@ -68,7 +68,14 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             FuzzySearchAlgorithm::JaroWinkler => FuzzyAlgorithm::JaroWinkler,
             FuzzySearchAlgorithm::Subsequence => FuzzyAlgorithm::Subsequence,
             FuzzySearchAlgorithm::Noop => FuzzyAlgorithm::NoOp,
-            FuzzySearchAlgorithm::Unspecified => unreachable!("try_from rejects Unspecified"),
+            // `try_from` above rejects only *unknown* discriminants; zero is a
+            // defined variant, and proto3 omits a zero-valued field, so an
+            // unset `fuzz_algorithm` lands here.
+            FuzzySearchAlgorithm::Unspecified => {
+                return Err(ValkeyError::Str(
+                    "TSDB: invalid FUZZY_ALGORITHM value; expected jarowinkler, subsequence, or noop",
+                ));
+            }
         };
 
         let label = if req.label.is_empty() {
@@ -88,7 +95,11 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             LabelResultsSortOrder::ScoreDesc => SearchResultOrdering::ScoreDesc,
             LabelResultsSortOrder::CardinalityAsc => SearchResultOrdering::CardinalityAsc,
             LabelResultsSortOrder::CardinalityDesc => SearchResultOrdering::CardinalityDesc,
-            LabelResultsSortOrder::Unspecified => unreachable!("try_from rejects Unspecified"),
+            LabelResultsSortOrder::Unspecified => {
+                return Err(ValkeyError::Str(
+                    "TSDB: invalid sort order for label search results",
+                ));
+            }
         };
 
         let parsed = LabelNameSearchArgs {

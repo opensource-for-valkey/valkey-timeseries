@@ -43,9 +43,16 @@ impl From<ComparisonOperator> for FanoutComparisonOperator {
     }
 }
 
-impl From<FanoutComparisonOperator> for ComparisonOperator {
-    fn from(value: FanoutComparisonOperator) -> Self {
-        match value {
+// Decoding direction: every `_UNSPECIFIED` arm below is reachable from a peer
+// (a field the sender omitted decodes as 0), and these conversions run inside
+// the fanout request/response handlers, which are called from the module's C
+// entry points. A panic there unwinds into `extern "C"` and aborts the process,
+// so an ill-formed message must fail as an error, not a crash.
+impl TryFrom<FanoutComparisonOperator> for ComparisonOperator {
+    type Error = ValkeyError;
+
+    fn try_from(value: FanoutComparisonOperator) -> Result<Self, Self::Error> {
+        Ok(match value {
             FanoutComparisonOperator::Eq => ComparisonOperator::Equal,
             FanoutComparisonOperator::Neq => ComparisonOperator::NotEqual,
             FanoutComparisonOperator::Gt => ComparisonOperator::GreaterThan,
@@ -53,9 +60,9 @@ impl From<FanoutComparisonOperator> for ComparisonOperator {
             FanoutComparisonOperator::Lt => ComparisonOperator::LessThan,
             FanoutComparisonOperator::Lte => ComparisonOperator::LessThanOrEqual,
             FanoutComparisonOperator::Unspecified => {
-                panic!("TSDB: ComparisonOperator::Unspecified on the wire — protocol error")
+                return Err(ValkeyError::Str(error_consts::INVALID_COMPARISON_OPERATOR));
             }
-        }
+        })
     }
 }
 
@@ -69,16 +76,18 @@ impl From<ChunkEncoding> for FanoutChunkEncoding {
     }
 }
 
-impl From<FanoutChunkEncoding> for ChunkEncoding {
-    fn from(value: FanoutChunkEncoding) -> Self {
-        match value {
+impl TryFrom<FanoutChunkEncoding> for ChunkEncoding {
+    type Error = ValkeyError;
+
+    fn try_from(value: FanoutChunkEncoding) -> Result<Self, Self::Error> {
+        Ok(match value {
             FanoutChunkEncoding::Uncompressed => ChunkEncoding::Uncompressed,
             FanoutChunkEncoding::Gorilla => ChunkEncoding::Gorilla,
             FanoutChunkEncoding::Chimp => ChunkEncoding::Chimp,
             FanoutChunkEncoding::Unspecified => {
-                panic!("TSDB: CompressionType::Unspecified on the wire — protocol error")
+                return Err(ValkeyError::Str(error_consts::CHUNK_DECOMPRESSION));
             }
-        }
+        })
     }
 }
 
@@ -89,10 +98,13 @@ impl From<TimestampRange> for DateRange {
     }
 }
 
-impl From<DateRange> for TimestampRange {
-    fn from(value: DateRange) -> Self {
+impl TryFrom<DateRange> for TimestampRange {
+    type Error = ValkeyError;
+
+    /// `start > end` is rejected rather than asserted: the bounds arrive from a
+    /// peer, so an inverted range is a message to refuse, not an invariant.
+    fn try_from(value: DateRange) -> Result<Self, Self::Error> {
         TimestampRange::from_timestamps(value.start, value.end)
-            .expect("Invalid date range in decode_date_range")
     }
 }
 
@@ -190,30 +202,36 @@ impl From<BucketTimestamp> for BucketTimestampType {
     }
 }
 
-impl From<BucketTimestampType> for BucketTimestamp {
-    fn from(value: BucketTimestampType) -> Self {
-        match value {
+impl TryFrom<BucketTimestampType> for BucketTimestamp {
+    type Error = ValkeyError;
+
+    fn try_from(value: BucketTimestampType) -> Result<Self, Self::Error> {
+        Ok(match value {
             BucketTimestampType::Start => BucketTimestamp::Start,
             BucketTimestampType::End => BucketTimestamp::End,
             BucketTimestampType::Mid => BucketTimestamp::Mid,
             BucketTimestampType::Unspecified => {
-                panic!("TSDB: BucketTimestampType::Unspecified on the wire — protocol error")
+                return Err(ValkeyError::Str(
+                    error_consts::INVALID_BUCKET_TIMESTAMP_TYPE,
+                ));
             }
-        }
+        })
     }
 }
 
-impl From<BucketAlignmentType> for BucketAlignment {
-    fn from(value: BucketAlignmentType) -> Self {
-        match value {
+impl TryFrom<BucketAlignmentType> for BucketAlignment {
+    type Error = ValkeyError;
+
+    fn try_from(value: BucketAlignmentType) -> Result<Self, Self::Error> {
+        Ok(match value {
             BucketAlignmentType::Default => BucketAlignment::Default,
             BucketAlignmentType::AlignStart => BucketAlignment::Start,
             BucketAlignmentType::AlignEnd => BucketAlignment::End,
             BucketAlignmentType::Timestamp => BucketAlignment::Timestamp(0),
             BucketAlignmentType::Unspecified => {
-                panic!("TSDB: BucketAlignmentType::Unspecified on the wire — protocol error")
+                return Err(ValkeyError::Str(error_consts::INVALID_BUCKET_ALIGNMENT));
             }
-        }
+        })
     }
 }
 
@@ -262,9 +280,11 @@ impl From<FanoutAggregationType> for FanoutAggregatorConfig {
     }
 }
 
-impl From<FanoutAggregationType> for AggregationType {
-    fn from(value: FanoutAggregationType) -> Self {
-        match value {
+impl TryFrom<FanoutAggregationType> for AggregationType {
+    type Error = ValkeyError;
+
+    fn try_from(value: FanoutAggregationType) -> Result<Self, Self::Error> {
+        Ok(match value {
             FanoutAggregationType::All => AggregationType::All,
             FanoutAggregationType::Any => AggregationType::Any,
             FanoutAggregationType::Avg => AggregationType::Avg,
@@ -289,9 +309,9 @@ impl From<FanoutAggregationType> for AggregationType {
             FanoutAggregationType::VarP => AggregationType::VarP,
             FanoutAggregationType::VarS => AggregationType::VarS,
             FanoutAggregationType::Unspecified => {
-                panic!("TSDB: AggregationType::Unspecified on the wire — protocol error")
+                return Err(ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE));
             }
-        }
+        })
     }
 }
 
@@ -303,9 +323,12 @@ impl TryFrom<FanoutAggregatorConfig> for AggregatorConfig {
             .aggregator_type
             .try_into()
             .map_err(|_| ValkeyError::Str(error_consts::UNKNOWN_AGGREGATION_TYPE))?;
-        let aggregation_type: AggregationType = aggr_type.into();
+        let aggregation_type: AggregationType = aggr_type.try_into()?;
 
-        let filter = value.value_filter.map(|f| f.into());
+        let filter = value
+            .value_filter
+            .map(ValueComparisonFilter::try_from)
+            .transpose()?;
 
         AggregatorConfig::new(aggregation_type, filter)
     }
@@ -453,14 +476,22 @@ impl From<ValueComparisonFilter> for FanoutValueComparisonFilter {
     }
 }
 
-impl From<FanoutValueComparisonFilter> for ValueComparisonFilter {
-    fn from(value: FanoutValueComparisonFilter) -> Self {
-        let fanout_operator: FanoutComparisonOperator = value.operator.try_into().unwrap();
-        let operator: ComparisonOperator = fanout_operator.into();
-        ValueComparisonFilter {
+impl TryFrom<FanoutValueComparisonFilter> for ValueComparisonFilter {
+    type Error = ValkeyError;
+
+    fn try_from(value: FanoutValueComparisonFilter) -> Result<Self, Self::Error> {
+        // `operator` is a raw i32 off the wire: an unknown discriminant fails
+        // the enum conversion, and a known-but-unspecified one fails the
+        // semantic conversion below.
+        let fanout_operator: FanoutComparisonOperator = value
+            .operator
+            .try_into()
+            .map_err(|_| ValkeyError::Str(error_consts::INVALID_COMPARISON_OPERATOR))?;
+        let operator: ComparisonOperator = fanout_operator.try_into()?;
+        Ok(ValueComparisonFilter {
             operator,
             value: value.value,
-        }
+        })
     }
 }
 
@@ -545,7 +576,7 @@ impl TryFrom<FanoutAggregationOptions> for AggregationOptions {
             .try_into()
             .map_err(|_| ValkeyError::Str(error_consts::INVALID_BUCKET_ALIGNMENT))?;
 
-        let mut alignment: BucketAlignment = fanout_alignment.into();
+        let mut alignment: BucketAlignment = fanout_alignment.try_into()?;
         if matches!(alignment, BucketAlignment::Timestamp(_)) {
             let timestamp = value.alignment_timestamp;
             alignment = BucketAlignment::Timestamp(timestamp);
@@ -556,7 +587,7 @@ impl TryFrom<FanoutAggregationOptions> for AggregationOptions {
         Ok(AggregationOptions {
             aggregations,
             bucket_duration,
-            timestamp_output: timestamp_output.into(),
+            timestamp_output: timestamp_output.try_into()?,
             alignment,
             report_empty,
         })
@@ -576,7 +607,7 @@ impl TryFrom<&RangeRequest> for RangeOptions {
 
     fn try_from(value: &RangeRequest) -> Result<Self, Self::Error> {
         let date_range: TimestampRange = match value.range {
-            Some(r) => r.into(),
+            Some(r) => r.try_into()?,
             None => {
                 return Err(ValkeyError::Str("TSDB: date range is required"));
             }
@@ -1113,5 +1144,55 @@ mod tests {
         );
         assert_eq!(back_to_options.value_filter.unwrap().min, 1.0);
         assert_eq!(back_to_options.value_filter.unwrap().max, 2.0);
+    }
+
+    // A peer that omits an enum field sends nothing, and proto3 decodes the
+    // absent field as 0 — the `_UNSPECIFIED` variant. These conversions run in
+    // the fanout handlers, which are called from the module's C entry points,
+    // so each of these cases must yield an error: a panic there would unwind
+    // into `extern "C"` and abort the whole process.
+    #[test]
+    fn test_unspecified_aggregation_type_is_rejected() {
+        let err = AggregatorConfig::try_from(FanoutAggregatorConfig::default());
+        assert!(err.is_err(), "unspecified aggregator_type must be rejected");
+    }
+
+    #[test]
+    fn test_unspecified_comparison_operator_is_rejected() {
+        let err = ValueComparisonFilter::try_from(FanoutValueComparisonFilter::default());
+        assert!(err.is_err(), "unspecified operator must be rejected");
+    }
+
+    #[test]
+    fn test_unknown_comparison_operator_discriminant_is_rejected() {
+        // Not a defined variant at all, so the i32 -> enum step fails first.
+        let filter = FanoutValueComparisonFilter {
+            operator: 9999,
+            value: 1.0,
+        };
+        assert!(ValueComparisonFilter::try_from(filter).is_err());
+    }
+
+    #[test]
+    fn test_unspecified_bucket_timestamp_and_alignment_are_rejected() {
+        assert!(BucketTimestamp::try_from(BucketTimestampType::Unspecified).is_err());
+        assert!(BucketAlignment::try_from(BucketAlignmentType::Unspecified).is_err());
+    }
+
+    #[test]
+    fn test_unspecified_compression_type_is_rejected() {
+        assert!(ChunkEncoding::try_from(FanoutChunkEncoding::Unspecified).is_err());
+    }
+
+    #[test]
+    fn test_inverted_date_range_is_rejected() {
+        let inverted = DateRange {
+            start: 5_000,
+            end: 1_000,
+        };
+        assert!(
+            TimestampRange::try_from(inverted).is_err(),
+            "start > end must be rejected, not asserted"
+        );
     }
 }

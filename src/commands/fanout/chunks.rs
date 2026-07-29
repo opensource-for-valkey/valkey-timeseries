@@ -43,7 +43,7 @@ pub fn deserialize_chunk(chunk: &SampleData) -> ValkeyResult<TimeSeriesChunk> {
     let deserialized = TimeSeriesChunk::deserialize(data.as_ref())
         .map_err(|_| ValkeyError::Str(error_consts::CHUNK_DECOMPRESSION))?; // ?? better error
 
-    let encoding: ChunkEncoding = encoding.into();
+    let encoding: ChunkEncoding = encoding.try_into()?;
     if encoding != deserialized.get_encoding() {
         log_warning("Invalid encoding type for deserialized time series chunk");
         return Err(ValkeyError::Str(error_consts::CHUNK_DECOMPRESSION));
