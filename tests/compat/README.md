@@ -119,6 +119,13 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `info-fields-8.8.yml` | frozen RTS 8.8 `TS.INFO` field baseline (plan §5.1 rule 3) |
 | `compat_helpers.py` | shared scenario helpers (pinned `TS.CREATE`, aggregator lists, label universe) |
 | `test_compat_smoke.py` | fixed smoke subset — the CI PR gate (plan §8) |
+| `test_compat_create.py` | Phase 1: `TS.CREATE` matrix (plan §6) |
+| `test_compat_alter.py` | Phase 1: `TS.ALTER` matrix (plan §6) |
+| `test_compat_add.py` | Phase 1: `TS.ADD` matrix (plan §6) |
+| `test_compat_madd.py` | Phase 1: `TS.MADD` matrix (plan §6) |
+| `test_compat_incrby.py` | Phase 1: `TS.INCRBY`/`TS.DECRBY` matrix (plan §6) |
+| `test_compat_rules.py` | Phase 1: `TS.CREATERULE`/`TS.DELETERULE` argument and aggregator surface (plan §6) |
+| `test_compat_info.py` | Phase 1: `TS.INFO` field values and the `DEBUG` variant (plan §6) |
 | `test_compat_range.py` | Phase 2: `TS.RANGE`/`TS.REVRANGE` matrix (plan §6) |
 | `test_compat_mrange.py` | Phase 2: `TS.MRANGE`/`TS.MREVRANGE` matrix (plan §6) |
 | `test_compat_multi_aggregation.py` | Phase 2: the `AGGREGATION` aggregator-list surface and its pair-vs-row reply shape (plan §6) |
@@ -138,8 +145,9 @@ The fuzzer's driver script lives at the repository root:
 [`run-fuzz.sh`](../../run-fuzz.sh) — deps, builds, reference + subject servers,
 strict mode, and soak rounds (`--help`).
 
-The §6 read-path matrix is complete, and the Tier C fuzzer (§4.3) is in place.
-Planned (later phases): client-library conformance (§4.2).
+The §6 matrix is complete on both the write and read paths, and the Tier C fuzzer
+(§4.3) is in place. Planned (later phases): §7.2 introspection/ACL parity and
+client-library conformance (§4.2).
 
 ## Differential fuzzer (Tier C, §4.3)
 
