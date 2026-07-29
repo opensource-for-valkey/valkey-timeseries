@@ -13,6 +13,44 @@ RedisTimeSeries source repository is never consulted (AGENTS.md, plan §3
 licensing boundary); running the shipped binary as a test target is what the
 boundary permits.
 
+**Two artifacts, one pin.** The digest-pinned image is canonical. A secondary
+native-binary artifact (`redis-server` + `redistimeseries.so` from the Redis Ltd.
+apt repository) is pinned in
+[tests/reference_server.sh](../tests/reference_server.sh) as
+`COMPAT_REFERENCE_VERSION` plus a per-distro/arch SHA256 table, and is bumped in
+the *same* reviewed change as the digest. The two are only interchangeable once
+an equivalence run is recorded below; until then
+`COMPAT_REFERENCE_MODE=auto` always chooses the image.
+
+---
+
+## Native binary artifact (current pin: 8.8.0)
+
+| | |
+| --- | --- |
+| source | `https://packages.redis.io/deb/pool/<dist>/r/re/redis-server_8.8.0-1rl1~<dist>1_<arch>.deb` |
+| tuples | jammy, noble, bookworm × amd64, arm64 (SHA256s in `tests/reference_server.sh`) |
+| payload | `usr/bin/redis-server`, `usr/lib/redis/modules/redistimeseries.so` |
+| equivalence run | **not yet performed** — every tuple is a *candidate* |
+
+**Equivalence run (required before `auto` may select binary mode).** For a given
+distro/arch, against the image pinned above:
+
+1. Fingerprint both and diff: `INFO server` (`redis_version`, `redis_build_id`,
+   `arch_bits`), `MODULE LIST`, `INFO modules`, the `INFO` field inventory in
+   `tests/compat/info-fields-8.8.yml`, the `CONFIG GET ts-*` surface, and the RDB
+   version footer produced by `SAVE`.
+2. Run the full compat suite against each with identical flags and compare
+   `test-data/compat-report.json` plus the pass/skip/xfail-divergent counts. The
+   8.8.0 image baseline is 1368 passed / 6 skipped.
+3. Equivalence means identical divergence sets and identical counts. Any delta is
+   a finding — a new registry entry, or grounds to leave binary mode off for this
+   pin.
+
+Record the result here and flip the tuple's status to `verified` in
+`tests/reference_server.sh`, along with
+`_COMPAT_REF_EQUIVALENCE_VERIFIED_PIN`.
+
 ---
 
 ## 2026-07-23 — redis:8.6.4 → redis:8.8.0

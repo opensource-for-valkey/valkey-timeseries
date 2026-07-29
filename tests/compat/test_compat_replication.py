@@ -55,6 +55,19 @@ def _reference_image() -> str:
     return compose["services"]["reference"]["image"]
 
 
+def _unavailable(reason: str):
+    """The reference replica could not be provided.
+
+    Normally a skip: this pair needs Docker even when the primary was supplied
+    through COMPAT_REFERENCE_URL, so a Docker-less run should not fail outright.
+    Under COMPAT_STRICT_SKIPS (set by `build.sh compat`) it is a failure instead —
+    a skip here means replication coverage silently disappeared.
+    """
+    if os.environ.get("COMPAT_STRICT_SKIPS", "").lower() in ("1", "true", "yes"):
+        pytest.fail(f"reference replica unavailable (COMPAT_STRICT_SKIPS): {reason}")
+    pytest.skip(reason)
+
+
 def _wait_replica_synced(replica: valkey.Valkey, timeout=SYNC_TIMEOUT_S):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -100,14 +113,14 @@ def reference_pair(reference_url):
         text=True,
     )
     if run.returncode != 0:
-        pytest.skip(f"could not start reference replica container:\n{run.stderr[-500:]}")
+        _unavailable(f"could not start reference replica container:\n{run.stderr[-500:]}")
 
     replica = valkey.Valkey(port=port)
     try:
         _wait_replica_synced(replica)
     except TimeoutError:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-        pytest.skip("reference replica never synced (host.docker.internal reachability?)")
+        _unavailable("reference replica never synced (host.docker.internal reachability?)")
 
     yield primary, replica
 

@@ -48,13 +48,22 @@ succeeds" mismatch always fails and can not be registered away (plan §5.2).
 The suite is skipped unless a reference server is available:
 
 ```sh
-# Option 1: let the harness manage the pinned reference container (needs Docker)
+# Option 1: build + both test phases, reference provisioned and torn down for you
+./build.sh compat
+
+# Option 2: let the harness manage the pinned reference container (needs Docker)
 RTS_COMPAT=1 python3 -m pytest tests/compat -v
 
-# Option 2: point at an already-running reference server
+# Option 3: point at an already-running reference server
 docker compose -f docker-compose.compat.yml up -d reference
 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v
 ```
+
+`./build.sh compat` differs from the other two in that it *fails* rather than skips when
+no reference can be provided: it starts and validates the server itself (via
+`tests/reference_server.sh`) before pytest runs, and checks that the reference reports
+the pinned `redis_version` and timeseries module version. See
+[docs/rts-compat-build-integration-plan.md](../../docs/rts-compat-build-integration-plan.md).
 
 The subject server is launched automatically from the same binary/module
 discovery the rest of the integration suite uses (`tests/common.py`): build the
@@ -68,9 +77,23 @@ Useful environment variables:
 | `RTS_COMPAT=1` | allow the harness to start/stop the reference container |
 | `COMPAT_REFERENCE_URL` | use an existing reference server (skips Docker) |
 | `COMPAT_SUBJECT_URL` | use an existing subject server (skips local launch) |
-| `COMPAT_REFERENCE_PORT` | host port for the compose reference service (default 16379) |
+| `COMPAT_REFERENCE_PORT` | host port for the compose reference service (default 16379; ephemeral in binary mode) |
 | `COMPAT_KEEP_REFERENCE=1` | leave the reference container running after the session |
 | `COMPAT_REPORT_PATH` | where the JSON conformance report is written |
+| `COMPAT_STRICT_SKIPS=1` | turn "reference replica unavailable" skips into failures (set by `./build.sh compat`) |
+
+`build.sh compat` and `run-fuzz.sh` share `tests/reference_server.sh`, which adds:
+
+| Variable | Effect |
+|---|---|
+| `COMPAT_REFERENCE_MODE` | `auto` (default) \| `binary` \| `docker`. `auto` uses the canonical Docker image; `binary` downloads a pinned `redis-server` + `redistimeseries.so` (Linux only) |
+| `COMPAT_REFERENCE_VERSION` | reference release to expect and, in binary mode, download (default 8.8.0 — must match the pinned image) |
+| `COMPAT_REFERENCE_DEB_URL` / `COMPAT_REFERENCE_DEB_SHA256` | deliberate override for an untested distro; both required together |
+
+Binary mode is a local convenience for the non-replication majority of the suite, not a
+Docker replacement: `test_compat_replication.py` starts its reference replica with
+`docker run` regardless of how the primary was obtained. It also has no recorded
+equivalence run against the canonical image yet, so `auto` never selects it.
 
 Plumbing self-check without Docker: point the "reference" at a second instance
 of the subject (`COMPAT_SUBJECT_URL`/`COMPAT_REFERENCE_URL` at two local

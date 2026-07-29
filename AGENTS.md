@@ -39,10 +39,13 @@ Key ENV and behavior (from `./build.sh`)
   `tests/build/binaries/$SERVER_VERSION/valkey-server`. Defaults to `unstable` if not set, which tracks the latest main or branch.
 - `ASAN_BUILD`: when set runs tests with LeakSanitizer checks and fails on leaks.
 - `TEST_PATTERN`: passed to pytest `-k` to select tests.
-- `RTS_COMPAT=1` / `COMPAT_REFERENCE_URL`: either one drops the default `--ignore=tests/compat` so the
-  differential compatibility suite runs too. Unset (the default), `build.sh` never collects `tests/compat`,
-  because those tests need a live RedisTimeSeries reference server. The same two vars are what the harness
-  itself reads to find (or start) that server, so there is no separate build-only switch.
+- `RTS_COMPAT=1` / `COMPAT_REFERENCE_URL` (or the `./build.sh compat` argument): any of them adds a second
+  pytest phase that runs the differential compatibility suite. Unset (the default), `build.sh` never collects
+  `tests/compat`, because those tests need a live RedisTimeSeries reference server. In compat mode `build.sh`
+  provisions, starts and *validates* the reference itself before pytest (`tests/reference_server.sh`), so a
+  missing tool or a pin mismatch fails the build instead of reaching conftest's skip path.
+  `ASAN_BUILD` and compat mode are rejected in combination. See
+  `docs/rts-compat-build-integration-plan.md`.
 - `MODULE_PATH` exported after build: `target/release/libvalkey_timeseries{.so,.dylib}` depending on OS.
 
 Setup & Environment Notes
@@ -147,6 +150,9 @@ Compatibility with RedisTimeSeries
 - [COMPATIBILITY.md](COMPATIBILITY.md) is the contract: what is expected to match RTS 8.8, what is an intentional
   divergence, and what is explicitly a non-goal (RDB/AOF/replication byte formats, error message text, performance,
   internals). Read it before "fixing" a behavior difference — some are deliberate.
+  [docs/topics/redistimeseries-migration.md](docs/topics/redistimeseries-migration.md) is the end-user-facing
+  digest of the same material (what carries over, what to change, the migration checklist); keep the two in sync
+  when the contract moves — the contract is the source of truth, the topic doc is derived.
 - [docs/rts-compatibility-test-plan.md](docs/rts-compatibility-test-plan.md) is the plan the harness implements;
   its section numbers (§5.1 normalization, §5.2 error policy, §5.3 registry, §6 matrix, §7 operational parity)
   are referenced throughout the test code.
@@ -156,6 +162,20 @@ Compatibility with RedisTimeSeries
 - Intentional mismatches go in `tests/compat/divergences.yml` and report as XFAIL-DIVERGENT rather than failing.
   "Reference errors, subject succeeds" always hard-fails and cannot be registered away. Stale entries hide
   regressions — remove entries that stop firing.
+- The reference server lifecycle lives in one place: [tests/reference_server.sh](tests/reference_server.sh),
+  sourced by both `build.sh` and `run-fuzz.sh`. It exposes `compat_reference_provision` / `_start` / `_stop`,
+  installs **no traps** (the caller owns teardown and reads `COMPAT_REFERENCE_OWNED` to know what it started),
+  and validates on every start that the reference reports the pinned `redis_version` and `timeseries` module
+  version — a mismatch aborts rather than silently reinterpreting the registry.
+- The digest-pinned `redis:8.8` image is the canonical reference artifact. A secondary native-binary mode
+  (`COMPAT_REFERENCE_MODE=binary`, Linux-only, pinned deb + SHA256 table in the helper) exists but is **not**
+  selected by `auto` until an equivalence run against the image is recorded in
+  [docs/rts-reference-bumps.md](docs/rts-reference-bumps.md). Bump the image digest and the binary pin in the
+  same reviewed change. Design and rationale: `docs/rts-compat-build-integration-plan.md`.
+- Docker is still required for the whole suite even in binary mode: `test_compat_replication.py` starts its
+  reference replica with `docker run` regardless of how the primary was obtained, and skips when it cannot.
+  `COMPAT_STRICT_SKIPS=1` (set by `./build.sh compat`) turns that skip into a failure so replication coverage
+  cannot vanish silently.
 
 Testing & debugging notes
 
@@ -175,9 +195,16 @@ Testing & debugging notes
   variants) relying on a built `valkey-server` and the `tests/valkeytestframework` helpers (populated by `./build.sh`).
 - To reproduce integration runs locally: run `SERVER_VERSION=unstable ./build.sh` — this will clone/build Valkey and
   copy the server binary to `tests/build/binaries/`.
-- Compat tests need a reference server, so `./build.sh` excludes `tests/compat` outright (`--ignore`, which also
-  avoids importing that directory's `conftest.py` and its PyYAML/`compat_diff` imports); run them explicitly, or
-  set `RTS_COMPAT=1`/`COMPAT_REFERENCE_URL` to fold them back into the build:
+- `build.sh` is Bash (`set -euo pipefail`), derives its root from the script path rather than `pwd`, and rejects
+  unknown positional arguments — it takes `clean`, `compat`, or nothing. In compat mode it runs pytest in **two
+  phases**: `tests/` with `--ignore=tests/compat` first, then `tests/compat` alone with the reference up. With
+  `TEST_PATTERN` set, a phase that collects nothing (pytest exit 5) is tolerated, but a pattern that matches
+  nothing in *either* phase fails the build rather than passing green having run zero tests.
+- Compat tests need a reference server, so a plain `./build.sh` excludes `tests/compat` (`--ignore`, which also
+  avoids importing that directory's `conftest.py` and its PyYAML/`compat_diff` imports). `./build.sh compat`
+  runs them as a separate second phase with a reference it starts, validates and stops itself — provisioning
+  failures, port conflicts and pin mismatches fail the build instead of reaching conftest's skip path.
+  `ASAN_BUILD` plus compat is rejected outright. Or run them explicitly:
   `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
   `docker compose -f docker-compose.compat.yml up -d reference` plus
   `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
@@ -285,8 +312,9 @@ Fuzzing (Tier C differential fuzzer, plan §4.3)
 - It is opt-in and not part of the PR gate — a time-budgeted nightly-style job. It is currently not wired into
   `.github/workflows/ci.yml`; run it by hand.
 - **Preferred entry point: `./run-fuzz.sh`.** It installs the Python deps if missing, builds the module
-  and `valkey-server` if missing, starts the pinned reference container and a subject server, puts the subject in
-  `ts-compatibility-mode strict`, runs the fuzzer in rounds, and tears down whatever it started:
+  and `valkey-server` if missing, starts the reference (via the shared `tests/reference_server.sh`) and a subject
+  server, puts the subject in `ts-compatibility-mode strict`, runs the fuzzer in rounds, and tears down whatever
+  it started — a reference someone else left running is used and left up:
 
   ```sh
   ./run-fuzz.sh                                  # 150 examples/protocol
@@ -371,7 +399,8 @@ Where to look first (key files & directories)
       gate; the tool behind `WIRE_COMPRESSION_MIN_SAMPLES` ("is shipping this compressed worth it").
 - `build.sh` — canonical developer flow for formatting, linting, building, and running tests.
 - `README.md` and `docs/commands/` — human-facing command descriptions and examples.
-- `docs/topics/` — deep-dive topics: `filter-syntax.md`, `label-discovery.md`, `filter-dos-audit.md`.
+- `docs/topics/` — deep-dive topics: `filter-syntax.md`, `label-discovery.md`, `filter-dos-audit.md`,
+  `encodings.md`, `redistimeseries-migration.md` (user-facing digest of `COMPATIBILITY.md`).
 - `COMPATIBILITY.md`, `tests/compat/` — the RTS compatibility contract and its harness.
 
 Quick tips for code changes

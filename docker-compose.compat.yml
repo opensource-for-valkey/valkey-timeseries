@@ -1,9 +1,11 @@
 # RedisTimeSeries compatibility harness — reference (and optional subject) servers.
 # See docs/rts-compatibility-test-plan.md §3 (reference environment) and tests/compat/README.md.
 #
-# The reference image is pinned by digest. Bumping the digest is a reviewed change and
-# must be accompanied by a changelog scan of the corresponding RedisTimeSeries release
-# notes (plan §11, "Reference drift"), recorded in docs/rts-reference-bumps.md.
+# The reference image is pinned by digest and is the canonical reference artifact.
+# Bumping the digest is a reviewed change and must be accompanied by a changelog scan of
+# the corresponding RedisTimeSeries release notes (plan §11, "Reference drift"), recorded
+# in docs/rts-reference-bumps.md. The native binary pin in tests/reference_server.sh
+# (COMPAT_REFERENCE_VERSION) tracks this image and is bumped in the same change.
 #
 # Licensing note: the redis:8.8 image is used strictly as a black-box test target.
 # Nothing from the RedisTimeSeries source repository may be vendored, copied, ported,
