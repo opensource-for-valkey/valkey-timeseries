@@ -63,6 +63,7 @@ proptest = "1"
 
 [build-dependencies]
 prost-build = "0.14"
+protox = "0.9"
 
 [lib]
 name = "valkey_timeseries"

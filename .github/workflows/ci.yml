@@ -26,11 +26,6 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
 
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
       - name: Set the server version for python integration tests
         run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
 
@@ -90,9 +85,6 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
 
-      - name: Install protobuf compiler
-        run: brew install protobuf
-
       - name: Run cargo and clippy format check
         run: |
           cargo fmt --check
@@ -118,11 +110,6 @@ jobs:
         with:
           toolchain: 1.92.0
           components: rustfmt, clippy
-
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
 
       - name: Set the server version for python integration tests
         run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
