@@ -271,8 +271,6 @@ class TestBucketTimestamp:
 
 
 class TestEmpty:
-    # first/last are excluded for the reverse direction only: see
-    # test_empty_carry_forward_direction and DIV-0016.
     @pytest.mark.parametrize("agg", AGGREGATORS)
     def test_empty_gap_bucket_value_per_aggregator(self, diff, range_cmd, agg):
         """The gap in BASE_SAMPLES ([2000,3000)) must materialize under EMPTY.
@@ -281,35 +279,37 @@ class TestEmpty:
         and it is not uniform: sum/count fill 0, most fill NaN, and `last`
         carries the previous bucket's value forward.
         """
-        if range_cmd == "TS.REVRANGE" and agg in ("first", "last"):
-            pytest.skip("DIV-0016: see test_empty_carry_forward_direction")
         mk_populated(diff, "r:empty", BASE_SAMPLES)
         diff(range_cmd, "r:empty", "-", "+", "AGGREGATION", agg, 1000, "EMPTY")
 
-    def test_empty_carry_forward_is_chronological_not_scan_order(self, diff):
-        """DIV-0016: `last`'s EMPTY carry-forward follows the wrong direction
-        under TS.REVRANGE.
+    @pytest.mark.parametrize("agg", ("first", "last"))
+    def test_empty_carry_forward_follows_scan_order(self, diff, range_cmd, agg):
+        """A gap bucket inherits from the previously *emitted* bucket, so which
+        neighbour is carried depends on the scan direction, not on chronology.
 
-        RTS fills a gap bucket with the previously *emitted* bucket's value, so
-        reversing the scan reverses which neighbour is carried: its REVRANGE
-        `last` carries the chronologically newer value, and its REVRANGE `first`
-        fills NaN. We aggregate forward and reverse the finished buckets, so our
-        carry stays chronological and the two come out swapped.
-
-        Forward is byte-identical (test_empty_gap_bucket_value_per_aggregator);
-        only the reverse direction diverges.
+        This was DIV-0016 (our carry stayed chronological, so the reverse
+        direction came out swapped). The entry was removed 2026-07-29 once the
+        carry was confirmed to follow scan order on both engines; these are the
+        assertions that keep it that way, over several gap shapes rather than
+        just the one in BASE_SAMPLES.
         """
-        mk_populated(diff, "r:emptyrev", BASE_SAMPLES)
-        for agg in ("first", "last"):
-            reference = diff.reference.execute_command(
-                "TS.REVRANGE", "r:emptyrev", "-", "+", "AGGREGATION", agg, 1000, "EMPTY"
-            )
-            subject = diff.subject.execute_command(
-                "TS.REVRANGE", "r:emptyrev", "-", "+", "AGGREGATION", agg, 1000, "EMPTY"
-            )
-            assert len(reference) == len(subject), (
-                "bucket count must still match; only the gap fill diverges"
-            )
+        for name, samples in (
+            ("base", BASE_SAMPLES),
+            ("multi", [(0, 1.0), (3000, 2.0), (7000, 3.0)]),
+            ("wide", [(0, 1.0), (9000, 2.0)]),
+            ("dense-then-gap", [(0, 1.0), (500, 2.0), (1000, 3.0), (6000, 4.0)]),
+        ):
+            key = f"r:carry:{name}"
+            mk_populated(diff, key, samples)
+            diff(range_cmd, key, "-", "+", "AGGREGATION", agg, 1000, "EMPTY")
+
+    def test_empty_carry_forward_across_bucket_sizes(self, diff, range_cmd):
+        """The carry has to survive a bucket boundary that does not line up with
+        the samples — a regression here would show as a shifted fill."""
+        mk_populated(diff, "r:carry:sizes", BASE_SAMPLES)
+        for bucket in (500, 2000, 3000):
+            diff(range_cmd, "r:carry:sizes", "-", "+", "AGGREGATION", "last", bucket, "EMPTY")
+            diff(range_cmd, "r:carry:sizes", "-", "+", "AGGREGATION", "first", bucket, "EMPTY")
 
     def test_empty_does_not_extend_past_data(self, diff, range_cmd):
         """EMPTY fills interior gaps; the queried window is wider than the data."""
