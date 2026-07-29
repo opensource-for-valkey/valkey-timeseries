@@ -153,7 +153,7 @@ class TestTsDecrby(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.DECRBY', 'ts_err')
 
         # Non-numeric decrement value
-        with pytest.raises(ResponseError, match="invalid value"):
+        with pytest.raises(ResponseError, match="invalid increase/decrease value"):
             self.client.execute_command('TS.DECRBY', 'ts_err', 'not_a_number')
 
         # Invalid timestamp
@@ -174,7 +174,7 @@ class TestTsDecrby(ValkeyTimeSeriesTestCaseBase):
         """TS.DECRBY should reject NaN as the increment value"""
         self.verify_error_response(
             self.client, 'TS.DECRBY ts_nan_delta nan',
-            "TSDB: cannot increment/decrement a NaN value"
+            "TSDB: invalid increase/decrease value"
         )
 
     def test_decrby_rejects_when_last_sample_is_nan(self):
@@ -184,7 +184,7 @@ class TestTsDecrby(ValkeyTimeSeriesTestCaseBase):
 
         self.verify_error_response(
             self.client, 'TS.DECRBY ts_nan_sample 1',
-            "TSDB: cannot increment/decrement a NaN value"
+            "TSDB: cannot increment/decrement NaN value"
         )
 
         sample = self.client.execute_command('TS.GET', 'ts_nan_sample')

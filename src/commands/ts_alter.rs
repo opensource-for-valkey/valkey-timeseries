@@ -1,8 +1,8 @@
 use crate::commands::command_parser::CommandArgToken;
-use crate::commands::ts_create::parse_series_options;
+use crate::commands::ts_create::parse_series_options_onto;
 use crate::labels::MetricName;
 use crate::series::index::get_timeseries_index;
-use crate::series::{SampleDuplicatePolicy, TimeSeries, TimeSeriesOptions, with_timeseries_mut};
+use crate::series::{TimeSeries, TimeSeriesOptions, with_timeseries_mut};
 use std::ops::Deref;
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
@@ -38,7 +38,10 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let key = args.remove(1);
 
     with_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE), |series| {
-        let options = parse_series_options(
+        // Parse onto an empty baseline, not the module configuration: an option the
+        // command did not name must stay `None` so it can be left untouched.
+        let options = parse_series_options_onto(
+            TimeSeriesOptions::empty(),
             args,
             1,
             &[CommandArgToken::Encoding, CommandArgToken::OnDuplicate],
@@ -52,29 +55,6 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         }
         VALKEY_OK
     })
-}
-
-fn options_from_series(series: &TimeSeries) -> TimeSeriesOptions {
-    let policy_default = SampleDuplicatePolicy::default();
-    let sample_duplicates = if series.sample_duplicates == policy_default {
-        None
-    } else {
-        Some(series.sample_duplicates)
-    };
-    let labels = if series.labels.is_empty() {
-        None
-    } else {
-        Some(series.labels.to_label_vec())
-    };
-    TimeSeriesOptions {
-        retention: Some(series.retention),
-        chunk_size: Some(series.chunk_size_bytes),
-        labels,
-        sample_duplicate_policy: sample_duplicates,
-        chunk_encoding: series.chunk_encoding,
-        rounding: series.rounding,
-        ..Default::default()
-    }
 }
 
 fn update_series(
@@ -116,12 +96,27 @@ fn update_series(
     {
         series.retention = retention;
         has_changed = true;
+        // Retention is applied eagerly on the write path so that TS.INFO agrees
+        // with TS.RANGE; tightening the window here has to trim what is already
+        // stored for the same reason.
+        series.apply_retention();
     }
 
-    if let Some(duplicate_policy) = options.sample_duplicate_policy
-        && duplicate_policy != series.sample_duplicates
+    if let Some(policy) = options.duplicate_policy
+        && Some(policy) != series.sample_duplicates.policy
     {
-        series.sample_duplicates = duplicate_policy;
+        series.sample_duplicates.policy = Some(policy);
+        has_changed = true;
+    }
+
+    // IGNORE and DUPLICATE_POLICY are independent properties: altering one must
+    // leave the other as it was.
+    if let Some((max_time_delta, max_value_delta)) = options.ignore
+        && (max_time_delta != series.sample_duplicates.max_time_delta
+            || max_value_delta != series.sample_duplicates.max_value_delta)
+    {
+        series.sample_duplicates.max_time_delta = max_time_delta;
+        series.sample_duplicates.max_value_delta = max_value_delta;
         has_changed = true;
     }
 

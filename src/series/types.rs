@@ -353,7 +353,12 @@ pub struct TimeSeriesOptions {
     pub chunk_encoding: ChunkEncoding,
     pub chunk_size: Option<usize>,
     pub retention: Option<Duration>,
-    pub sample_duplicate_policy: Option<SampleDuplicatePolicy>,
+    /// `DUPLICATE_POLICY`, when the command named it. Kept separate from
+    /// [`TimeSeriesOptions::ignore`] because `TS.ALTER` must be able to change one
+    /// without disturbing the other.
+    pub duplicate_policy: Option<DuplicatePolicy>,
+    /// `IGNORE maxTimeDiff maxValDiff`, when the command named it.
+    pub ignore: Option<(u64, f64)>,
     pub labels: Option<Vec<Label>>,
     pub rounding: Option<RoundingStrategy>,
     pub on_duplicate: Option<DuplicatePolicy>,
@@ -362,6 +367,17 @@ pub struct TimeSeriesOptions {
 impl TimeSeriesOptions {
     pub fn retention(&mut self, retention: Duration) {
         self.retention = Some(retention);
+    }
+
+    /// Options with nothing set at all — not even the compiled-in chunk size that
+    /// [`Default`] supplies. This is the baseline `TS.ALTER` parses onto, so that
+    /// "option absent from the command" stays distinguishable from "option set to
+    /// its default".
+    pub fn empty() -> Self {
+        TimeSeriesOptions {
+            chunk_size: None,
+            ..Default::default()
+        }
     }
 
     /// Builds options from the module-level configuration. Every value is read from a
@@ -378,11 +394,8 @@ impl TimeSeriesOptions {
             chunk_encoding: chunk_encoding(),
             chunk_size: Some(chunk_size_bytes()),
             rounding: rounding_strategy(),
-            sample_duplicate_policy: Some(SampleDuplicatePolicy {
-                policy: Some(duplicate_policy()),
-                max_time_delta: ignore_max_time_diff(),
-                max_value_delta: ignore_max_value_diff(),
-            }),
+            duplicate_policy: Some(duplicate_policy()),
+            ignore: Some((ignore_max_time_diff(), ignore_max_value_diff())),
             ..Default::default()
         }
     }
@@ -395,7 +408,8 @@ impl Default for TimeSeriesOptions {
             chunk_encoding: ChunkEncoding::default(),
             chunk_size: Some(CHUNK_SIZE_DEFAULT as usize),
             retention: None,
-            sample_duplicate_policy: None,
+            duplicate_policy: None,
+            ignore: None,
             labels: None,
             rounding: None,
             on_duplicate: None,

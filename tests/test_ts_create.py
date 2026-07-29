@@ -141,7 +141,7 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         # Invalid duplicate policy
         with pytest.raises(ResponseError) as excinfo:
             client.execute_command("TS.CREATE", "ts_invalid_policy", "DUPLICATE_POLICY", "INVALID")
-        assert "invalid duplicate policy" in str(excinfo.value).lower()
+        assert "unknown duplicate_policy" in str(excinfo.value).lower()
 
         # Both DECIMAL_DIGITS and SIGNIFICANT_DIGITS (only one allowed)
         with pytest.raises(ResponseError) as excinfo:
