@@ -4,3 +4,10 @@ modules:
 lint:
   use:
     - STANDARD
+  except:
+    # PACKAGE_DIRECTORY_MATCH wants a file's directory to mirror its package, i.e.
+    # `valkey_timeseries/fanout/v1/`. The schema lives at `proto/v1/` instead, so
+    # the rule cannot hold. The package name is kept as-is deliberately: it is the
+    # codegen identity (it names the generated file) and shortening it to match the
+    # directory would buy nothing on the wire, where package names never appear.
+    - PACKAGE_DIRECTORY_MATCH

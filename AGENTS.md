@@ -47,7 +47,7 @@ High-level architecture (big picture)
     see "Wire encoding policy" under conventions below.
   - ACL filtering per series: `src/series/acl.rs`.
 - Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use the protobuf wire
-  contract in `proto/valkey_timeseries/fanout/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
+  contract in `proto/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
   cluster-wide queries.
 - Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score, RCF
   variants) exposed via the `TS.OUTLIERS` command.
@@ -77,7 +77,7 @@ Project-specific conventions and patterns
     - **Only data that actually crosses the network is compressed.** `handle_grouping` in `src/series/mrange.rs` runs
       solely on the node answering the client (`process_mrange` returns early when clustered), so it builds uncompressed
       chunks; compressing there would only be undone by the reply serializer. The clustered branch of
-      `handle_non_grouped`, and `serialize_rows` in `src/commands/fanout/chunks.rs`, are the paths that do compress.
+      `handle_non_grouped`, and `serialize_rows` in `src/commands/fanout_codec/chunks.rs`, are the paths that do compress.
     - **`max_size` is advisory on this path.** Neither `ChimpChunk` nor `GorillaChunk` enforces it in `add_sample` (the
       check is commented out in `gorilla_chunk.rs`), and the fan-out path never calls `is_full()`, so passing a
       `with_max_size(...)` budget there truncates nothing — it only widens the uvarint `max_size` occupies on the wire.
@@ -192,7 +192,7 @@ Benchmarks
   (`tools/wire_report.rs`, same two required features). It exists because neither of the other two answers the question
   the clustered fan-out path asks — `compression_report` fills chunks to capacity and `latency_report` uses a single
   fixed sample count, while the encoding threshold lives at small `n`. Each row replays the real round trip from
-  `src/commands/fanout/chunks.rs` (shard: `set_data` + `Chunk::serialize`; coordinator: `deserialize` +
+  `src/commands/fanout_codec/chunks.rs` (shard: `set_data` + `Chunk::serialize`; coordinator: `deserialize` +
   `iter().collect()`) and reports `wire_bytes` — the exact `SampleData::data` payload, not `encoded_size` — plus encode
   and decode medians, swept across `--sample-counts`. This is the tool to re-run when changing
   `WIRE_COMPRESSION_MIN_SAMPLES` or the wire encoding; it writes `target/bench-reports/wire.{csv,md}`.
@@ -253,7 +253,11 @@ Quick tips for code changes
 - Documentation: When adding or modifying commands, remember to update the human-facing docs in `docs/commands/` and the
   supported list in `README.md`. TS._DEBUG is intentionally undocumented.
 - When making cluster changes, search for `*_fanout_command.rs` to copy the fanout pattern and add protobuf messages in
-  `proto/valkey_timeseries/fanout/v1/`.
+  `proto/v1/`.
+- Protobuf codegen is **checked in** at `proto/v1/generated/valkey_timeseries.fanout.v1.rs`. After editing any `.proto`, run
+  `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file; a normal build fails with instructions if the
+  two disagree, so drift cannot land silently. Local↔wire conversions live beside it in `src/commands/fanout_codec/`
+  (named `fanout_codec` rather than `fanout` so it does not collide with the `src/fanout/` transport layer).
 
 Limitations of this document
 

@@ -1,5 +1,5 @@
-use crate::commands::fanout::filters::{deserialize_matchers_list, serialize_matchers_list};
-use crate::commands::fanout::{CountResponse, DateRange, MDelRequest};
+use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
+use crate::commands::fanout_codec::{CountResponse, DateRange, MDelRequest};
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};

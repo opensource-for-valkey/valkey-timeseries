@@ -1,0 +1,4 @@
+# Checked-in protobuf codegen. Marking it generated collapses it by default in
+# review diffs and keeps it out of language statistics; it is still versioned,
+# and `build.rs` fails the build if it drifts from proto/v1/.
+proto/v1/generated/*.rs linguist-generated=true

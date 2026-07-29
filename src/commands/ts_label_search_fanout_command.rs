@@ -1,6 +1,8 @@
-use super::fanout::generated::{LabelResultsSortOrder, LabelSearchRequest, LabelSearchResponse};
-use crate::commands::fanout::filters::{deserialize_matchers_list, serialize_matchers_list};
-use crate::commands::fanout::{
+use super::fanout_codec::generated::{
+    LabelResultsSortOrder, LabelSearchRequest, LabelSearchResponse,
+};
+use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
+use crate::commands::fanout_codec::{
     FuzzySearchAlgorithm, LabelSearchResult as FanoutLabelSearchResult, LabelSearchType,
 };
 use crate::commands::label_search_utils::{

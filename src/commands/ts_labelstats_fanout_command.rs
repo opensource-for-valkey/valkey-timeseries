@@ -1,4 +1,4 @@
-use super::fanout::generated::{PostingStat as MPostingStat, StatsRequest, StatsResponse};
+use super::fanout_codec::generated::{PostingStat as MPostingStat, StatsRequest, StatsResponse};
 use crate::commands::DEFAULT_STATS_RESULTS_LIMIT;
 use crate::commands::ts_labelstats::reply_with_postings_stats;
 use crate::common::threads::join;

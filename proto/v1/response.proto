@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package valkey_timeseries.fanout.v1;
 
-import "valkey_timeseries/fanout/v1/common.proto";
+import "v1/common.proto";
 
 message MGetValue {
   string key = 1;

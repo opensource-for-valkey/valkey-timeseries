@@ -1,5 +1,5 @@
 use crate::commands::command_parser::{parse_filter_by_range_options, validate_selector_list};
-use crate::commands::fanout::LabelSearchType;
+use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use crate::common::SortDir;
 use crate::common::replies::{

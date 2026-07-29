@@ -10,7 +10,7 @@ use super::generated::{
     ValueComparisonFilter as FanoutValueComparisonFilter, ValueRange as FanoutValueFilter,
 };
 use crate::aggregators::PartialState;
-use crate::commands::fanout::MGetValue;
+use crate::commands::fanout_codec::MGetValue;
 use crate::common::Sample;
 use crate::common::binop::ComparisonOperator;
 use crate::labels::Label;

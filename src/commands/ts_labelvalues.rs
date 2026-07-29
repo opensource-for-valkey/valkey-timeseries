@@ -1,4 +1,4 @@
-use crate::commands::fanout::LabelSearchType;
+use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::label_search_utils::run_label_search;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString};

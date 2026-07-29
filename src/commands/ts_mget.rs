@@ -1,6 +1,6 @@
 use super::ts_mget_fanout_command::MGetFanoutCommand;
 use crate::commands::command_parser::CommandArgToken;
-use crate::commands::fanout::MGetValue;
+use crate::commands::fanout_codec::MGetValue;
 use crate::commands::utils::reply_with_mget_values;
 use crate::commands::{parse_command_arg_token, parse_label_list, parse_series_selector_list};
 use crate::error_consts;

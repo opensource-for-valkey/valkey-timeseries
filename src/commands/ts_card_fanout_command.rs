@@ -1,5 +1,7 @@
-use super::fanout::generated::{CountResponse, MetaQueryRequest};
-use crate::commands::fanout::{deserialize_match_filter_options, serialize_match_filter_options};
+use super::fanout_codec::generated::{CountResponse, MetaQueryRequest};
+use crate::commands::fanout_codec::{
+    deserialize_match_filter_options, serialize_match_filter_options,
+};
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::count_matched_series;

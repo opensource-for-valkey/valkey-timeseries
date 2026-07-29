@@ -1,5 +1,5 @@
 pub mod command_parser;
-mod fanout;
+mod fanout_codec;
 mod label_search_utils;
 mod ts_add;
 mod ts_addbulk;

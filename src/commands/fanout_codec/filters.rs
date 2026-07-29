@@ -5,7 +5,7 @@ use super::generated::{
     SeriesSelector as FanoutSeriesSelector, filter_predicate_value::LabelValue,
     label_filter::Matcher,
 };
-use crate::commands::fanout::series_selector::Filters;
+use crate::commands::fanout_codec::series_selector::Filters;
 use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector, ValueList, validate_contains_value, validate_starts_with_value,

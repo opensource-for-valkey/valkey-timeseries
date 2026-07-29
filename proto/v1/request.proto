@@ -2,8 +2,8 @@ syntax = "proto3";
 
 package valkey_timeseries.fanout.v1;
 
-import "valkey_timeseries/fanout/v1/common.proto";
-import "valkey_timeseries/fanout/v1/filters.proto";
+import "v1/common.proto";
+import "v1/filters.proto";
 
 message MultiGetRequest {
   bool with_labels = 1;

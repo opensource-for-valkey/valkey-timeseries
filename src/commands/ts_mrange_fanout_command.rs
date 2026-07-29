@@ -1,4 +1,4 @@
-use super::fanout::generated::{
+use super::fanout_codec::generated::{
     GroupPartialSeries, MultiRangeRequest, MultiRangeResponse, SeriesRangeResponse,
 };
 use crate::aggregators::MultiAggregateIterator;

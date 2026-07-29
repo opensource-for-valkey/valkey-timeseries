@@ -1,5 +1,5 @@
-use super::fanout::generated::{MGetValue, MultiGetRequest, MultiGetResponse};
-use crate::commands::fanout::filters::{deserialize_matchers_list, serialize_matchers_list};
+use super::fanout_codec::generated::{MGetValue, MultiGetRequest, MultiGetResponse};
+use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
 use crate::commands::process_mget_request;
 use crate::commands::utils::reply_with_mget_values;
 use crate::common::logging::log_error;

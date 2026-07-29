@@ -168,7 +168,7 @@ fn test_bucket_alignment_enum_half_round_trips() {
 
 #[test]
 fn test_aggregation_type_wire_numbers_are_pinned() {
-    // Must match `AGGREGATION_TYPE_*` in proto/valkey_timeseries/fanout/v1/common.proto.
+    // Must match `AGGREGATION_TYPE_*` in proto/v1/common.proto.
     let expected = [
         (AggregationType::All, 1),
         (AggregationType::Any, 2),

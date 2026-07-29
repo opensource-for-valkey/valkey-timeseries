@@ -1,5 +1,5 @@
-use super::fanout::generated::{Label as FanoutLabel, Sample as FanoutSample};
-use crate::commands::fanout::MGetValue;
+use super::fanout_codec::generated::{Label as FanoutLabel, Sample as FanoutSample};
+use crate::commands::fanout_codec::MGetValue;
 use crate::common::replies::{
     IntoRawCtx, reply_label_ex, reply_with_array, reply_with_bulk_string, reply_with_labels,
     reply_with_multi_samples, reply_with_sample_ex, reply_with_samples,
