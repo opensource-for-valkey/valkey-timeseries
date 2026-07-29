@@ -3,8 +3,8 @@ use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
-    PerSeriesSamples, SampleAddResult, SeriesGuardMut, TimeSeriesOptions, create_and_store_series,
-    get_timeseries_mut, multi_series_merge_samples,
+    PerSeriesSamples, SampleAddResult, SeriesGuardMut, get_timeseries_mut,
+    multi_series_merge_samples,
 };
 use ahash::AHashMap;
 use smallvec::SmallVec;
@@ -145,8 +145,6 @@ fn parse_args<'a>(
         AHashMap::with_capacity(sample_count);
     let mut all_inputs: Vec<ParsedInput<'a>> = Vec::with_capacity(sample_count);
 
-    let options = TimeSeriesOptions::from_config();
-
     for (sample_index, chunk) in args.chunks_exact(3).enumerate() {
         let key = &chunk[0];
 
@@ -173,15 +171,11 @@ fn parse_args<'a>(
                         series_samples.series = Some(guard);
                         SampleAddResult::Ok(Sample::default())
                     }
-                    Ok(None) => {
-                        // Auto-create: no ts.create event (RTS parity) and no
-                        // replication from the create helper — MADD replicates its
-                        // successful triples itself.
-                        let guard =
-                            create_and_store_series(ctx, key, options.clone(), false, true)?;
-                        series_samples.series = Some(guard);
-                        SampleAddResult::Ok(Sample::default())
-                    }
+                    // Unlike TS.ADD, TS.MADD does not create the series: a missing
+                    // key is a per-item error and the keyspace is left alone
+                    // (RedisTimeSeries parity — a mistyped key in a batch must not
+                    // silently materialize a series).
+                    Ok(None) => SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY),
                     Err(ValkeyError::WrongType) => {
                         SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY)
                     }
