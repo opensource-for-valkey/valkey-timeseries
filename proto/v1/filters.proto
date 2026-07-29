@@ -41,7 +41,6 @@ message LabelFilter {
     FilterPredicateValue predicate = 3;
     RegexFilterValue regex = 4;
   }
-  reserved 5, 6;
 }
 
 message FilterList {
@@ -53,9 +52,8 @@ message OrMatcherList {
 }
 
 message SeriesSelector {
-  reserved 1;
   oneof filters {
-    FilterList and_filters = 2;
-    OrMatcherList or_filters = 3;
+    FilterList and_filters = 1;
+    OrMatcherList or_filters = 2;
   }
 }

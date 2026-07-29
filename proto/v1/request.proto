@@ -55,18 +55,17 @@ enum LabelResultsSortOrder {
 }
 
 message LabelSearchRequest {
-  reserved 7;
   LabelSearchType request_type = 1;
   string label = 2;
   repeated string search_terms = 3;
   double fuzz_threshold = 4;
   FuzzySearchAlgorithm fuzz_algorithm = 5;
   bool ignore_case = 6;
-  bool include_metadata = 8;
-  MetaDateRangeFilter range = 9;
-  repeated SeriesSelector filters = 10;
-  LabelResultsSortOrder sort_order = 11;
-  uint32 limit = 12;
+  bool include_metadata = 7;
+  MetaDateRangeFilter range = 8;
+  repeated SeriesSelector filters = 9;
+  LabelResultsSortOrder sort_order = 10;
+  uint32 limit = 11;
 }
 
 message StatsRequest {

@@ -389,16 +389,16 @@ pub struct OrMatcherList {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SeriesSelector {
-    #[prost(oneof = "series_selector::Filters", tags = "2, 3")]
+    #[prost(oneof = "series_selector::Filters", tags = "1, 2")]
     pub filters: ::core::option::Option<series_selector::Filters>,
 }
 /// Nested message and enum types in `SeriesSelector`.
 pub mod series_selector {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Filters {
-        #[prost(message, tag = "2")]
+        #[prost(message, tag = "1")]
         AndFilters(super::FilterList),
-        #[prost(message, tag = "3")]
+        #[prost(message, tag = "2")]
         OrFilters(super::OrMatcherList),
     }
 }
@@ -509,15 +509,15 @@ pub struct LabelSearchRequest {
     pub fuzz_algorithm: i32,
     #[prost(bool, tag = "6")]
     pub ignore_case: bool,
-    #[prost(bool, tag = "8")]
+    #[prost(bool, tag = "7")]
     pub include_metadata: bool,
-    #[prost(message, optional, tag = "9")]
+    #[prost(message, optional, tag = "8")]
     pub range: ::core::option::Option<MetaDateRangeFilter>,
-    #[prost(message, repeated, tag = "10")]
+    #[prost(message, repeated, tag = "9")]
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
-    #[prost(enumeration = "LabelResultsSortOrder", tag = "11")]
+    #[prost(enumeration = "LabelResultsSortOrder", tag = "10")]
     pub sort_order: i32,
-    #[prost(uint32, tag = "12")]
+    #[prost(uint32, tag = "11")]
     pub limit: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
