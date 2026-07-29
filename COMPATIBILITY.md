@@ -74,6 +74,20 @@ This section describes areas where Valkey TimeSeries intentionally diverges from
 
 **Migration impact.** Monitoring dashboards, alerting rules, and any operational tooling that scrapes RedisTimeSeries metric names will need to be re-pointed at the Valkey TimeSeries equivalents or adapted to the Valkey TimeSeries metric set. Application code that parses `TS.INFO` should be reviewed as well (see the Migration Guide). Applications that do not consume these metrics programmatically are not affected.
 
+### Cluster and sharding behavior
+
+**What differs.** Not the observable result. Both modules resolve label-based multi-series commands — `TS.MRANGE`, `TS.MREVRANGE`, `TS.MGET`, `TS.QUERYINDEX` — across every shard of a cluster; Redis documents these as "cross-slot (all shards)" in each of its clustered configurations, and RedisTimeSeries has coordinated the fan-out itself since v1.6 (before which it required RedisGears loaded alongside the module). An application issues one command and receives a cluster-wide result on either module. What differs is the mechanism and the failure surface it exposes:
+
+- Valkey TimeSeries fans out over Valkey's native cluster bus. There is no separate coordinator component, no additional network port, and no module-level shared password — RedisTimeSeries required `OSS_GLOBAL_PASSWORD` on every cluster node prior to its 8.0 release, which replaced it with an internal shared-secret mechanism.
+- Valkey TimeSeries bounds each fan-out with the `ts-fanout-command-timeout` configurable and returns an error when a consistent cluster-wide view cannot be established within it. This is a reply an equivalent RedisTimeSeries deployment need not produce.
+- ACL keyspace restrictions are enforced on the fanned-out result (see _Security Architecture_ under Non-Goals).
+
+Requirements common to both modules are unchanged and are not part of this divergence: a compaction rule is a two-key operation whose source and destination must occupy the same hash slot (`TS.CREATERULE`, `TS.DELETERULE`, and any default compaction policy in a clustered deployment), and `TS.MADD` operates within a single slot. Hash tags remain the mechanism for both.
+
+**Why.** Using the cluster bus keeps fan-out inside the machinery an operator already runs, secures, and monitors, rather than introducing a parallel transport with its own ports and credentials to distribute. The timeout is the consequence of that choice being made explicit: a scatter/gather across shards can fail partially, and reporting that as an error is preferred to returning a silently incomplete result set.
+
+**Migration impact.** For deployments on a current RedisTimeSeries, there is generally no application-side fan-out to remove — the module was already doing it. What may exist is *workarounds*: per-shard query-and-merge logic written against a pre-1.6 deployment, or hash-tag co-location adopted solely to keep a multi-series query on one shard. Neither breaks, and both can be retired. Two things do need attention: any `OSS_GLOBAL_PASSWORD` provisioning is obsolete and should be removed from deployment automation, and callers of multi-series commands must handle the fan-out timeout error rather than treating it as an empty result. Deployments with cluster mode disabled are unaffected, regardless of whether they are a single node or a primary with replicas.
+
 ### Persistence and on-disk format
 
 **What differs.** The persistence format used to store series state (across RDB, AOF, and any internal format) does not match RedisTimeSeries's.
@@ -214,9 +228,13 @@ The response format of `TS.INFO` in Valkey TimeSeries differs from RedisTimeSeri
 
 Some fields that RedisTimeSeries exposes through `INFO` (module-level, global) and `TS.INFO` (per-series) have no equivalent in Valkey TimeSeries, either because the underlying metric does not apply to Valkey TimeSeries's implementation or because the format has been restructured. Dashboards, alerts, scripts, and application code that reference such fields need to have those references removed or remapped to the closest Valkey TimeSeries equivalent.
 
-### 5. Remove application-side cluster fan-out (cluster mode only)
+### 5. Retire cluster workarounds and handle the fan-out timeout (cluster mode only)
 
-This step applies only to deployments running in cluster mode. Valkey TimeSeries performs cluster-wide fan-out for label-based multi-series commands internally, over Valkey's native cluster bus, so any application-side logic that RedisTimeSeries required — issuing a query per shard and merging the results, or restricting queries to a single shard — can be removed and replaced with a single command that returns the cluster-wide result. No separate coordinator component and no additional network ports are involved, so there is no new firewall or security-group configuration to perform. As part of this step, make sure callers handle the timeout error a cross-shard operation may return when a consistent cluster-wide view cannot be established (see _Cluster and sharding behavior_ above). Deployments with cluster mode disabled do not require this step, regardless of whether they consist of a single node or a primary with one or more replicas.
+This step applies only to deployments running in cluster mode. Both modules perform cluster-wide fan-out for label-based multi-series commands internally, so in most cases there is no application-side fan-out to remove — see _Cluster and sharding behavior_ above. What to audit instead: per-shard query-and-merge logic written against a pre-1.6 RedisTimeSeries (which needed RedisGears loaded alongside the module to make `TS.MGET`, `TS.MRANGE`, and `TS.QUERYINDEX` cluster-aware), and hash-tag co-location adopted solely to confine a multi-series query to one shard. Both are safe to keep and no longer necessary; a single command returns the cluster-wide result on either module.
+
+Two changes do require action. Remove any `OSS_GLOBAL_PASSWORD` provisioning from deployment automation: Valkey TimeSeries has no module-level shared password, uses no separate coordinator component and no additional network ports, so there is no new firewall or security-group configuration to perform. And make sure callers handle the timeout error a cross-shard operation may return when a consistent cluster-wide view cannot be established within `ts-fanout-command-timeout`, rather than treating it as an empty result.
+
+Hash tags are still required where they always were, on both modules: a compaction rule's source and destination must share a hash slot, as must the keys of a single `TS.MADD`. Deployments with cluster mode disabled do not require this step, regardless of whether they consist of a single node or a primary with one or more replicas.
 
 ### 6. Remove dependencies on error message contents and on log messages
 
