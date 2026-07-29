@@ -121,11 +121,15 @@ class TestNotifications(ValkeyTimeSeriesTestCaseBase):
 
         self.create_subscribe_clients()
 
+        # TS.MADD does not create series (RedisTimeSeries parity), so they have to
+        # exist before the batch — otherwise every item is a per-item error and no
+        # ts.add event is emitted at all.
+        keys = ["ts:notifications:madd1", "ts:notifications:madd2"]
+        for key in keys:
+            self.create_ts(key)
+
         # Clear any existing notifications
         self.collect_notifications(timeout=0.5)
-
-        # Execute TS.MADD with multiple time series
-        keys = ["ts:notifications:madd1", "ts:notifications:madd2"]
 
         result = self.client.execute_command("TS.MADD", keys[0], 1500, 10.0, keys[1], 2000, 20.0)
         assert isinstance(result, list) and len(result) == len(keys)

@@ -13,6 +13,9 @@ TS.MADD key timestamp value [key timestamp value ...]
 The command accepts triplets of arguments: `key`, `timestamp`, and `value`. Each triplet adds a sample with the given
 `timestamp` and `value` to the time series stored at `key`.
 
+Unlike [`TS.ADD`](ts.add.md), `TS.MADD` does not create series: each `key` must already exist. A triplet naming a
+missing key fails with a per-item error and creates nothing, leaving the rest of the batch unaffected.
+
 ## Required Arguments
 
 - `key`: The name of the time series key
@@ -32,6 +35,10 @@ An array of results, one for each sample added, in the order they were provided.
 
 - `ERR wrong number of arguments` if the number of arguments is not a multiple of 3 or is less than 3
 - `TSDB: invalid permissions` if the user lacks the required ACL permissions
+
+Per-item errors are returned in place of that item's result and do not abort the rest of the batch:
+
+- `TSDB: the key is not a TSDB key` if the key does not exist, or exists and holds another type
 - `TSDB: invalid timestamp` if a timestamp cannot be parsed
 - `TSDB: invalid value` if a value cannot be parsed as a number
 
