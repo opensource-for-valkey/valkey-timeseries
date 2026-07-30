@@ -7,10 +7,10 @@
 //! the whole `MultiRangeResponse`; [`resolve_labels`] is the coordinator-side
 //! inverse.
 //!
-//! [`resolve_labels`] is safe to call on any response without the caller first 
-//! establishing that it was interned. It rewrites `labels` only for series that 
-//! actually carry refs, so a series that has none passes through untouched instead 
-//! of being emptied. Note that within one response version that guard changes no 
+//! [`resolve_labels`] is safe to call on any response without the caller first
+//! establishing that it was interned. It rewrites `labels` only for series that
+//! actually carry refs, so a series that has none passes through untouched instead
+//! of being emptied. Note that within one response version that guard changes no
 //! outcome (a label-less series interns to empty refs and its `labels` is already empty);
 //! it is there so the function cannot be misused into silently discarding labels.
 //!
