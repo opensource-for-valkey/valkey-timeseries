@@ -819,6 +819,7 @@ mod tests {
                     value: value.into(),
                 })
                 .collect(),
+            sources: Vec::new(),
             data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
                 UncompressedChunk::from_vec(data),
             )),
