@@ -7,17 +7,12 @@
 //! the whole `MultiRangeResponse`; [`resolve_labels`] is the coordinator-side
 //! inverse.
 //!
-//! Unlike the aggregation/count push-downs, this is **unconditional**: there is
-//! no request opt-in and no `applied_*` echo, because the module is unreleased
-//! and there is no deployed peer whose decoder has to be asked first.
-//!
-//! [`resolve_labels`] is nonetheless total — safe to call on any response
-//! without the caller first establishing that it was interned. It rewrites
-//! `labels` only for series that actually carry refs, so a series that has none
-//! passes through untouched instead of being emptied. Note that within one
-//! version that guard changes no outcome (a label-less series interns to empty
-//! refs and its `labels` is already empty); it is there so the function cannot
-//! be misused into silently discarding labels.
+//! [`resolve_labels`] is safe to call on any response without the caller first 
+//! establishing that it was interned. It rewrites `labels` only for series that 
+//! actually carry refs, so a series that has none passes through untouched instead 
+//! of being emptied. Note that within one response version that guard changes no 
+//! outcome (a label-less series interns to empty refs and its `labels` is already empty);
+//! it is there so the function cannot be misused into silently discarding labels.
 //!
 //! `resolve_labels` runs on peer-controlled input, so it returns `Err` on any
 //! malformed index or ragged ref-array pair rather than panicking (see the
