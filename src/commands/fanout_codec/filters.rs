@@ -88,11 +88,11 @@ impl From<&LabelFilter> for FanoutFilter {
         let (matcher, op) = match &source.matcher {
             PredicateMatch::Equal(value) => {
                 let value = predicate_value_to_fanout(value);
-                (Matcher::Predicate(value), MatcherOpType::Equal)
+                (Matcher::Value(value), MatcherOpType::Equal)
             }
             PredicateMatch::NotEqual(value) => {
                 let value = predicate_value_to_fanout(value);
-                (Matcher::Predicate(value), MatcherOpType::NotEqual)
+                (Matcher::Value(value), MatcherOpType::NotEqual)
             }
             PredicateMatch::MatchAll => {
                 return FanoutFilter {
@@ -118,19 +118,19 @@ impl From<&LabelFilter> for FanoutFilter {
             }
             PredicateMatch::NotStartsWith(prefix) => {
                 let value = predicate_value_to_fanout(prefix);
-                (Matcher::Predicate(value), MatcherOpType::NotStartsWith)
+                (Matcher::Value(value), MatcherOpType::NotStartsWith)
             }
             PredicateMatch::StartsWith(prefix) => {
                 let value = predicate_value_to_fanout(prefix);
-                (Matcher::Predicate(value), MatcherOpType::StartsWith)
+                (Matcher::Value(value), MatcherOpType::StartsWith)
             }
             PredicateMatch::Contains(value) => {
                 let value = predicate_value_to_fanout(value);
-                (Matcher::Predicate(value), MatcherOpType::Contains)
+                (Matcher::Value(value), MatcherOpType::Contains)
             }
             PredicateMatch::NotContains(value) => {
                 let value = predicate_value_to_fanout(value);
-                (Matcher::Predicate(value), MatcherOpType::NotContains)
+                (Matcher::Value(value), MatcherOpType::NotContains)
             }
         };
 
@@ -248,10 +248,10 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
             ValkeyError::Str("TSDB: invalid matcher operation, cannot convert from i32")
         })?;
         let matcher = match (op, value.matcher.as_ref()) {
-            (MatcherOpType::Equal, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::Equal, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::Equal(predicate_value_from_fanout(predicate))
             }
-            (MatcherOpType::NotEqual, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::NotEqual, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::NotEqual(predicate_value_from_fanout(predicate))
             }
             (MatcherOpType::MatchAll, None) => PredicateMatch::MatchAll,
@@ -272,16 +272,16 @@ impl TryFrom<&FanoutFilter> for LabelFilter {
             (MatcherOpType::RegexNotEqual, Some(Matcher::Regex(regex))) => {
                 PredicateMatch::RegexNotEqual(regex_matcher_from_fanout(regex)?)
             }
-            (MatcherOpType::StartsWith, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::StartsWith, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::StartsWith(predicate_value_from_fanout(predicate))
             }
-            (MatcherOpType::NotStartsWith, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::NotStartsWith, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::NotStartsWith(predicate_value_from_fanout(predicate))
             }
-            (MatcherOpType::Contains, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::Contains, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::Contains(predicate_value_from_fanout(predicate))
             }
-            (MatcherOpType::NotContains, Some(Matcher::Predicate(predicate))) => {
+            (MatcherOpType::NotContains, Some(Matcher::Value(predicate))) => {
                 PredicateMatch::NotContains(predicate_value_from_fanout(predicate))
             }
             _ => {
@@ -524,7 +524,7 @@ mod tests {
         let fanout = FanoutFilter {
             label: "instance".into(),
             op: MatcherOpType::RegexEqual as i32,
-            matcher: Some(Matcher::Predicate(FanoutPredicateValue {
+            matcher: Some(Matcher::Value(FanoutPredicateValue {
                 label_value: Some(LabelValue::Single("server1".into())),
             })),
         };

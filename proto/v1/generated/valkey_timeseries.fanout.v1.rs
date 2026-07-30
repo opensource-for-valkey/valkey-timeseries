@@ -372,7 +372,7 @@ pub mod label_filter {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Matcher {
         #[prost(message, tag = "3")]
-        Predicate(super::FilterPredicateValue),
+        Value(super::FilterPredicateValue),
         #[prost(message, tag = "4")]
         Regex(super::RegexFilterValue),
     }

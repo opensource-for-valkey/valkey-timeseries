@@ -38,7 +38,7 @@ message LabelFilter {
   string label = 1;
   MatcherOpType op = 2;
   oneof matcher {
-    FilterPredicateValue predicate = 3;
+    FilterPredicateValue value = 3;
     RegexFilterValue regex = 4;
   }
 }
