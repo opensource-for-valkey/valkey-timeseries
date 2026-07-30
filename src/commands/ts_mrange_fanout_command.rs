@@ -1,3 +1,4 @@
+use super::fanout_codec;
 use super::fanout_codec::generated::{
     GroupPartialSeries, MultiRangeRequest, MultiRangeResponse, SeriesRangeResponse,
 };
@@ -130,6 +131,9 @@ impl FanoutClientCommand for MRangeFanoutCommand {
                 applied_aggregation: true,
                 applied_group_reduce: true,
                 applied_count: apply_count,
+                // No `series` in this branch, so nothing to intern.
+                symbol_table_names: Vec::new(),
+                symbol_table_values: Vec::new(),
             });
         }
 
@@ -142,15 +146,24 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         let series = process_mrange_query(ctx, options, true, limit)?;
 
         // Convert MRangeSeriesResult to SeriesResponse
-        let serialized: Result<Vec<SeriesRangeResponse>, _> =
-            series.into_iter().map(|x| x.try_into()).collect();
+        let mut serialized: Vec<SeriesRangeResponse> = series
+            .into_iter()
+            .map(|x| x.try_into())
+            .collect::<Result<_, _>>()?;
+
+        // Unconditional: the ref arrays are self-describing, so no request
+        // opt-in or response echo is needed to make this decodable.
+        let (symbol_table_names, symbol_table_values) =
+            fanout_codec::symbol_table::intern_labels(&mut serialized);
 
         Ok(MultiRangeResponse {
-            series: serialized?,
+            series: serialized,
             group_partials: Vec::new(),
             applied_aggregation: apply_aggregation,
             applied_group_reduce: false,
             applied_count: apply_count,
+            symbol_table_names,
+            symbol_table_values,
         })
     }
 
@@ -163,14 +176,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        let mut resp = resp;
-        // Tag each series with the shard's applied_aggregation echo so the
-        // reply path can compensate per response (compatibility handshake).
-        let bucketed = resp.applied_aggregation;
-        self.series
-            .extend(resp.series.into_iter().map(|series| (series, bucketed)));
-        self.group_partials.append(&mut resp.group_partials);
-        Ok(())
+        self.ingest_response(resp).map_err(Into::into)
     }
 
     fn reply(&mut self, ctx: &FanoutContext) -> Status {
@@ -199,6 +205,28 @@ impl FanoutClientCommand for MRangeFanoutCommand {
 }
 
 impl MRangeFanoutCommand {
+    /// Resolve symbol-table label refs (if the shard used them) and fold the
+    /// response into accumulated state. Split out from `on_response` so it can
+    /// be driven directly in tests without constructing a `NodeInfo`.
+    fn ingest_response(&mut self, mut resp: MultiRangeResponse) -> ValkeyResult<()> {
+        // Resolve here, while the response still owns its symbol table —
+        // downstream (self.series and everything built from it) never needs to
+        // know interning happened. No flag to check: `resolve_labels` is driven
+        // by the per-series ref arrays and is a no-op where there are none.
+        fanout_codec::symbol_table::resolve_labels(
+            &mut resp.series,
+            &resp.symbol_table_names,
+            &resp.symbol_table_values,
+        )?;
+        // Tag each series with the shard's applied_aggregation echo so the
+        // reply path can compensate per response (compatibility handshake).
+        let bucketed = resp.applied_aggregation;
+        self.series
+            .extend(resp.series.into_iter().map(|series| (series, bucketed)));
+        self.group_partials.append(&mut resp.group_partials);
+        Ok(())
+    }
+
     /// Post-process the accumulated shard responses into the final reply
     /// series, compensating per response for shards that did not honor the
     /// push-down flags (compatibility handshake): raw series are aggregated
@@ -767,6 +795,35 @@ mod tests {
 
     fn to_response(result: MRangeSeriesResult) -> SeriesRangeResponse {
         result.try_into().expect("serialize series result")
+    }
+
+    fn series_result_with_labels(
+        key: &str,
+        data: Vec<Sample>,
+        labels: &[(&str, &str)],
+    ) -> MRangeSeriesResult {
+        MRangeSeriesResult {
+            key: key.into(),
+            group_label_value: None,
+            labels: labels
+                .iter()
+                .map(|&(name, value)| crate::labels::Label {
+                    name: name.into(),
+                    value: value.into(),
+                })
+                .collect(),
+            data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
+                UncompressedChunk::from_vec(data),
+            )),
+        }
+    }
+
+    fn label_pairs(series: &SeriesRangeResponse) -> Vec<(String, String)> {
+        series
+            .labels
+            .iter()
+            .map(|l| (l.name.clone(), l.value.clone()))
+            .collect()
     }
 
     fn avg_aggregation(bucket_duration: u64) -> AggregationOptions {
@@ -2024,5 +2081,141 @@ mod tests {
                 "reverse={is_reverse} count={count:?}"
             );
         }
+    }
+
+    /// End-to-end through `ingest_response`: a shard that interned its labels
+    /// (as `get_local_response` always does) must resolve back to exactly the
+    /// labels it started with, with the shared `region` value collapsed to one
+    /// dictionary entry.
+    #[test]
+    fn ingest_response_resolves_symbol_table_labels() {
+        let mut wire = vec![
+            to_response(series_result_with_labels(
+                "a",
+                samples(&[(0, 1.0)]),
+                &[("region", "us-east-1"), ("env", "prod")],
+            )),
+            to_response(series_result_with_labels(
+                "b",
+                samples(&[(0, 2.0)]),
+                &[("region", "us-east-1"), ("env", "staging")],
+            )),
+        ];
+        let expected: Vec<Vec<(String, String)>> = wire.iter().map(label_pairs).collect();
+
+        let (symbol_table_names, symbol_table_values) =
+            fanout_codec::symbol_table::intern_labels(&mut wire);
+        assert_eq!(symbol_table_names.len(), 2, "region, env");
+        assert_eq!(symbol_table_values.len(), 3, "us-east-1, prod, staging");
+        assert!(wire.iter().all(|s| s.labels.is_empty()), "interned away");
+
+        let resp = MultiRangeResponse {
+            series: wire,
+            group_partials: Vec::new(),
+            applied_aggregation: false,
+            applied_group_reduce: false,
+            applied_count: false,
+            symbol_table_names,
+            symbol_table_values,
+        };
+
+        let mut cmd = MRangeFanoutCommand::default();
+        cmd.ingest_response(resp).expect("ingest_response");
+
+        assert_eq!(cmd.series.len(), 2);
+        for ((series, _bucketed), want) in cmd.series.iter().zip(&expected) {
+            assert_eq!(&label_pairs(series), want, "series '{}'", series.key);
+        }
+    }
+
+    /// Peer-controlled input: a symbol-table response whose ref arrays point
+    /// past the end of the dictionary must be rejected, not indexed.
+    #[test]
+    fn ingest_response_rejects_out_of_range_symbol_table_ref() {
+        let resp = MultiRangeResponse {
+            series: vec![SeriesRangeResponse {
+                key: "a".into(),
+                group_label_value: String::new(),
+                labels: Vec::new(),
+                columns: Vec::new(),
+                label_name_refs: vec![7],
+                label_value_refs: vec![0],
+            }],
+            group_partials: Vec::new(),
+            applied_aggregation: false,
+            applied_group_reduce: false,
+            applied_count: false,
+            symbol_table_names: Vec::new(),
+            symbol_table_values: vec!["us-east-1".into()],
+        };
+
+        let mut cmd = MRangeFanoutCommand::default();
+        let err = cmd
+            .ingest_response(resp)
+            .expect_err("out-of-range ref must be rejected");
+        assert!(err.to_string().contains("out of range"), "{err}");
+        assert!(
+            cmd.series.is_empty(),
+            "a rejected response must not be partially ingested"
+        );
+    }
+
+    /// `ingest_response` resolves unconditionally, with no flag to consult, so
+    /// a response carrying `labels` directly and no refs has to survive the
+    /// trip intact. Guards against the resolve step being made destructive.
+    #[test]
+    fn ingest_response_passes_through_uninterned_labels() {
+        let wire = to_response(series_result_with_labels(
+            "a",
+            samples(&[(0, 1.0)]),
+            &[("region", "us-east-1")],
+        ));
+        let expected = label_pairs(&wire);
+        assert!(!expected.is_empty(), "premise: the series has labels");
+
+        let resp = MultiRangeResponse {
+            series: vec![wire],
+            group_partials: Vec::new(),
+            applied_aggregation: false,
+            applied_group_reduce: false,
+            applied_count: false,
+            // No symbol table and no refs: labels carried directly.
+            symbol_table_names: Vec::new(),
+            symbol_table_values: Vec::new(),
+        };
+
+        let mut cmd = MRangeFanoutCommand::default();
+        cmd.ingest_response(resp).expect("ingest_response");
+
+        assert_eq!(cmd.series.len(), 1);
+        assert_eq!(label_pairs(&cmd.series[0].0), expected);
+    }
+
+    /// A label-less series survives the unconditional round trip: it interns to
+    /// empty refs, which is the same shape as an uninterned series, and must
+    /// come back as label-less rather than erroring.
+    #[test]
+    fn ingest_response_handles_label_less_series() {
+        let mut wire = vec![to_response(series_result("a", None, samples(&[(0, 1.0)])))];
+        let (symbol_table_names, symbol_table_values) =
+            fanout_codec::symbol_table::intern_labels(&mut wire);
+        assert!(symbol_table_names.is_empty());
+        assert!(symbol_table_values.is_empty());
+
+        let resp = MultiRangeResponse {
+            series: wire,
+            group_partials: Vec::new(),
+            applied_aggregation: false,
+            applied_group_reduce: false,
+            applied_count: false,
+            symbol_table_names,
+            symbol_table_values,
+        };
+
+        let mut cmd = MRangeFanoutCommand::default();
+        cmd.ingest_response(resp).expect("ingest_response");
+
+        assert_eq!(cmd.series.len(), 1);
+        assert!(cmd.series[0].0.labels.is_empty());
     }
 }

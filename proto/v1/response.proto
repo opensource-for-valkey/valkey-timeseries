@@ -15,6 +15,16 @@ message SeriesRangeResponse {
   string group_label_value = 2;
   repeated Label labels = 3;
   repeated SampleData columns = 4;
+  // Label storage, used in place of `labels`: parallel arrays, one entry per
+  // label, indexing into `MultiRangeResponse.symbol_table_names` /
+  // `symbol_table_values`. Interning is unconditional, so there is no
+  // `applied_*` flag; non-empty ref arrays are themselves the signal.
+  //
+  // Both arrays empty means there is nothing to resolve — either the series has
+  // no labels, or it carries them in `labels` directly. A decoder must leave
+  // `labels` alone in that case rather than overwriting it.
+  repeated uint32 label_name_refs = 5;
+  repeated uint32 label_value_refs = 6;
 }
 
 message MultiGetResponse {
@@ -47,6 +57,11 @@ message MultiRangeResponse {
   bool applied_aggregation = 3;
   bool applied_group_reduce = 4;
   bool applied_count = 5;
+  // Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
+  // index into. Label interning is unconditional, so these are populated
+  // whenever `series` carries any labels; empty otherwise.
+  repeated string symbol_table_names = 6;
+  repeated string symbol_table_values = 7;
 }
 
 message StringListResponse {

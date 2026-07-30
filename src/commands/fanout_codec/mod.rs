@@ -5,6 +5,7 @@ mod conversions;
 pub(crate) mod filters;
 #[cfg(test)]
 mod proptest_roundtrip;
+pub(crate) mod symbol_table;
 
 /// Generated protobuf types for the fanout wire contract.
 ///
