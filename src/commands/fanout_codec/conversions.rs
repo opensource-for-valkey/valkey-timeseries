@@ -1167,14 +1167,15 @@ mod tests {
     }
 
     #[test]
-    fn test_inverted_date_range_is_rejected() {
+    fn test_inverted_date_range_selects_no_samples() {
         let inverted = DateRange {
             start: 5_000,
             end: 1_000,
         };
+        let range = TimestampRange::try_from(inverted).expect("start > end is not an error");
         assert!(
-            TimestampRange::try_from(inverted).is_err(),
-            "start > end must be rejected, not asserted"
+            range.is_inverted(),
+            "start > end must be tagged inverted, matching RedisTimeSeries' empty-result semantics"
         );
     }
 }
