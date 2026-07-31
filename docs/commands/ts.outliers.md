@@ -100,6 +100,41 @@ Detects shifts in the mean by accumulating deviations from the target. No additi
 
 ---
 
+#### ESD
+
+Generalized Extreme Studentized Deviate test (Rosner, 1983).
+
+```
+METHOD ESD [ALPHA alpha] [MAX_OUTLIERS max] [HYBRID | CLASSIC]
+```
+
+**Options:**
+
+* `ALPHA` - Significance level for the test, in the range `(0, 1)`. Default: `0.05`. Lower values are more conservative
+  and report fewer outliers.
+* `MAX_OUTLIERS` - Upper bound on how many outliers to search for. Must be less than half the number of samples in the
+  range. Default: `n/2`.
+* `HYBRID` - Studentize against the median and a normal-consistent MAD. **Default.** Robust: the reference point barely
+  moves as outliers are removed.
+* `CLASSIC` - Studentize against the mean and sample standard deviation, as in Rosner's original procedure. Both are
+  themselves pulled by the outliers under test.
+
+Unlike the fence-based methods, ESD does not take a threshold. It works down from the most extreme observation,
+re-testing after each removal, and compares each test statistic against a critical value derived from `ALPHA` and the
+remaining sample size. The number of outliers is therefore an output of the test rather than a consequence of a
+threshold you picked — which makes ESD the method to reach for when you do not know how deviant "too deviant" is.
+
+`HYBRID` is preferred for most series. `CLASSIC` is available for reproducing published Rosner results and for data
+already known to be clean apart from the outliers being sought; on a series where the outliers are large, the mean and
+standard deviation are inflated by those same outliers and the test loses power against them (the masking effect).
+
+One caveat specific to `HYBRID`: when more than half the samples in the range share a single value, the MAD is zero,
+the test statistic is undefined, and no outliers are reported. Use `CLASSIC` on such series.
+
+ESD reports no `method_info` in `FULL` output — it fits no fences or control limits.
+
+---
+
 #### EWMA
 
 Exponentially Weighted Moving Average.
@@ -264,8 +299,10 @@ Returns anomaly information based on the `OUTPUT` format:
 * `parameters` - A map of the parameters used for the detection method.
 * `seasonality` - (optional) A map describing the seasonality parameters used.
 * `method_info` - Algorithm-specific metadata (map, if available):
-    * For IQR: `lower_fence`, `upper_fence`
+    * For the fence-based methods (ZSCORE, MODIFIED-ZSCORE, MAD, DOUBLE-MAD, IQR): `lower_fence`, `upper_fence`, and
+      `center_line` where the method defines one
     * For SPC methods (CUSUM, EWMA): `control_limits`, `center_line`
+    * Omitted for ESD, RCF, and SMOOTHED-ZSCORE, which fit no fences or control limits
 
 #### CLEANED format
 
@@ -383,6 +420,51 @@ Extract normal operating data with anomalies removed:
 </details>
 
 <details open>
+<summary><b>Detect an unknown number of outliers with ESD</b></summary>
+
+Find latency spikes without choosing a threshold — the test decides how many outliers there are:
+
+```valkey-cli
+127.0.0.1:6379> TS.OUTLIERS latency:p99 - + METHOD ESD
+1) 1) (integer) 1609603200000
+   2) "812.4"
+   3) (integer) 1
+   4) "0.9936787608707793"
+2) 1) (integer) 1609606800000
+   2) "655.1"
+   3) (integer) 1
+   4) "0.9919286813470485"
+```
+
+Tighten the significance level and cap the search to report only the most extreme few:
+
+```valkey-cli
+127.0.0.1:6379> TS.OUTLIERS latency:p99 - + METHOD ESD ALPHA 0.01 MAX_OUTLIERS 5 OUTPUT FULL
+1) "method"
+2) "esd"
+3) "direction"
+4) "both"
+5) "samples"
+6)  1) 1) (integer) 1609459200000
+       2) "98"
+       3) "0.28670901283740885"
+       4) (integer) 0
+    ...
+7) "parameters"
+8) 1) "alpha"
+   2) "0.01"
+   3) "hybrid"
+   4) (integer) 1
+   5) "max_outliers"
+   6) (integer) 5
+```
+
+Note the absence of a `method_info` key, and that `parameters` reports `hybrid` as a flag rather than echoing an
+estimator name.
+
+</details>
+
+<details open>
 <summary><b>Random Cut Forest for contextual anomalies</b></summary>
 
 Detect pattern-based anomalies using a sliding window:
@@ -415,6 +497,8 @@ Detect pattern-based anomalies using a sliding window:
     * Use `DIRECTION` to filter results when only interested in one type of anomaly
     * Single seasonality periods are faster than multiple
     * RCF is more computationally expensive but better for complex patterns
+    * ESD re-tests the sample after each removal, so its cost scales with `MAX_OUTLIERS`; lower that bound if you only
+      care about the few most extreme samples
 
 ## See also
 

@@ -116,10 +116,10 @@ impl Detector {
             AnomalyDetectionMethodOptions::Esd(options) => {
                 let ESDOutlierOptions {
                     alpha,
-                    hybrid,
+                    estimator,
                     max_outliers,
                 } = options.clone().unwrap_or_default();
-                Detector::Esd(ESDOutlierDetector::new(alpha, hybrid, max_outliers))
+                Detector::Esd(ESDOutlierDetector::new(alpha, estimator, max_outliers))
             }
         };
 

@@ -1,7 +1,7 @@
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetectionMethodOptions, AnomalyDirection, AnomalyMethod, AnomalyOptions,
-    AnomalyResult, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, MADAnomalyOptions, MethodInfo,
-    RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions, RCFThreshold,
+    AnomalyResult, ESDOutlierOptions, EWMA_DEFAULT_ALPHA, EsdEstimator, MADAnomalyOptions,
+    MethodInfo, RCF_DEFAULT_NUM_TREES, RCF_DEFAULT_SAMPLE_SIZE, RCFOptions, RCFThreshold,
     SmoothedZScoreOptions, detect_anomalies,
 };
 use crate::analysis::seasonality::Seasonality;
@@ -548,19 +548,25 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
 
     let mut esd_options = ESDOutlierOptions::default();
 
-    while let Some(arg) = args.next() {
-        let arg_slice = arg.as_slice();
-
-        if is_command_option(arg_slice) {
+    // Peek before consuming: a trailing command option (OUTPUT, DIRECTION, ...)
+    // belongs to the caller's loop. Consuming it here and then breaking would
+    // swallow the token and leave its argument to be parsed as a top-level one.
+    while let Some(arg) = args.peek() {
+        if is_command_option(arg.as_slice()) {
             break;
         }
+        let arg = args.next().unwrap();
+        let arg_slice = arg.as_slice();
 
         hashify::fnc_map_ignore_case!(arg_slice,
            "ALPHA" => {
                 esd_options.alpha = parse_single_value(args, "ALPHA")?;
             },
             "HYBRID" => {
-                esd_options.hybrid = true;
+                esd_options.estimator = EsdEstimator::Hybrid;
+            },
+            "CLASSIC" => {
+                esd_options.estimator = EsdEstimator::Classic;
             },
             "MAX_OUTLIERS" => {
                 esd_options.max_outliers = Some(parse_single_value(args, "MAX_OUTLIERS")? as usize);
@@ -946,7 +952,7 @@ fn reply_with_parameters(
             ctx.reply_with_string("alpha");
             ctx.reply_with_double(o.alpha);
             ctx.reply_with_string("hybrid");
-            ctx.reply_with_bool(o.hybrid);
+            ctx.reply_with_bool(o.estimator.is_hybrid());
             if let Some(max) = o.max_outliers {
                 ctx.reply_with_string("max_outliers");
                 ctx.reply_with_integer(max as i64);

@@ -5,14 +5,49 @@ use crate::analysis::outliers::{
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 
+/// Which location/scale pair the studentized statistic is built from.
+///
+/// The distinction is the one the literature draws between Rosner's generalized
+/// ESD and the "hybrid" variant. Rosner's procedure studentizes against the
+/// mean and sample standard deviation; both are themselves pulled by the
+/// outliers under test, which is the masking effect ESD's step-down loop is
+/// trying to overcome. The hybrid form substitutes the median and a
+/// normal-consistent MAD, so the reference point barely moves as outliers are
+/// removed.
+///
+/// This was previously a `hybrid: bool` whose `true` arm selected *mean/std* —
+/// the opposite of what the name claims in Rosner and in Twitter's S-H-ESD.
+/// Naming the two variants removes the polarity that hid the inversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EsdEstimator {
+    /// Median and normal-consistent MAD. Robust, and the default.
+    #[default]
+    Hybrid,
+    /// Mean and sample standard deviation, as in Rosner (1983).
+    Classic,
+}
+
+impl EsdEstimator {
+    pub fn is_hybrid(&self) -> bool {
+        *self == EsdEstimator::Hybrid
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EsdEstimator::Hybrid => "hybrid",
+            EsdEstimator::Classic => "classic",
+        }
+    }
+}
+
 /// ESD (Extreme Studentized Deviate) anomaly detector
 /// https://www.itl.nist.gov/div898/handbook/eda/section3/eda35h3.htm
 #[derive(Clone, Debug)]
 pub struct ESDOutlierOptions {
     /// Significance level for the statistical test (e.g., 0.05)
     pub alpha: f64,
-    /// Whether to use the hybrid ESD test (mean/std if true; median/MAD if false)
-    pub hybrid: bool,
+    /// Location/scale pair backing the test statistic.
+    pub estimator: EsdEstimator,
     /// Maximum number of outliers to detect. Must be < n/2.
     pub max_outliers: Option<usize>,
 }
@@ -21,7 +56,7 @@ impl Default for ESDOutlierOptions {
     fn default() -> Self {
         ESDOutlierOptions {
             alpha: 0.05,
-            hybrid: false,
+            estimator: EsdEstimator::Hybrid,
             max_outliers: None,
         }
     }
@@ -35,8 +70,8 @@ impl Default for ESDOutlierOptions {
 pub struct ESDOutlierDetector {
     /// Significance level for a hypothesis test. Lower alpha means more conservative (fewer outliers).
     alpha: f64,
-    /// if true, use mean/std; if false, use median/MAD
-    hybrid: bool,
+    /// Location/scale pair backing the test statistic.
+    estimator: EsdEstimator,
     /// Maximum number of outliers to detect. Must be < n/2. If None, uses len(data)/2.
     max_outliers: Option<usize>,
 }
@@ -45,17 +80,17 @@ impl Default for ESDOutlierDetector {
     fn default() -> Self {
         ESDOutlierDetector {
             alpha: 0.05,
-            hybrid: false,
+            estimator: EsdEstimator::Hybrid,
             max_outliers: None,
         }
     }
 }
 
 impl ESDOutlierDetector {
-    pub fn new(alpha: f64, hybrid: bool, max_outliers: Option<usize>) -> Self {
+    pub fn new(alpha: f64, estimator: EsdEstimator, max_outliers: Option<usize>) -> Self {
         ESDOutlierDetector {
             alpha,
-            hybrid,
+            estimator,
             max_outliers,
         }
     }
@@ -71,14 +106,14 @@ impl AnomalyDetector for ESDOutlierDetector {
     }
 
     fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
-        detect_anomalies_esd(ts, self.alpha, self.hybrid, self.max_outliers)
+        detect_anomalies_esd(ts, self.alpha, self.estimator, self.max_outliers)
     }
 }
 
 fn detect_anomalies_esd(
     data: &[f64],
     alpha: f64,
-    hybrid: bool,
+    estimator: EsdEstimator,
     max_outliers: Option<usize>,
 ) -> TimeSeriesAnalysisResult<AnomalyResult> {
     let n = data.len();
@@ -101,7 +136,7 @@ fn detect_anomalies_esd(
     };
 
     // Perform ESD test
-    let (anomalies, scores) = esd_test(data, alpha, hybrid, max_outliers)?;
+    let (anomalies, scores) = esd_test(data, alpha, estimator, max_outliers)?;
 
     Ok(AnomalyResult {
         anomalies,
@@ -129,7 +164,7 @@ fn esd_score_stat_over_stat_plus_lambda(stat: f64, lambda: f64) -> f64 {
 ///
 /// - `data`: slice of f64 values (original data)
 /// - `alpha`: significance level (default 0.05)
-/// - `hybrid`: if true, use mean/std; if false, use median/MAD
+/// - `estimator`: location/scale pair backing the statistic — see [`EsdEstimator`]
 /// - `max_outliers`: optional maximum number of outliers to search for. If None, uses len(data)/2.
 ///
 /// Returns a `TimeSeriesAnalysisResult<(Vec<Anomaly>, Vec<f64>)>` pair where `anomalies` contains
@@ -138,7 +173,7 @@ fn esd_score_stat_over_stat_plus_lambda(stat: f64, lambda: f64) -> f64 {
 fn esd_test(
     data: &[f64],
     alpha: f64,
-    hybrid: bool,
+    estimator: EsdEstimator,
     max_out: usize,
 ) -> TimeSeriesAnalysisResult<(Vec<Anomaly>, Vec<f64>)> {
     let n_total = data.len();
@@ -162,11 +197,11 @@ fn esd_test(
         }
 
         let current_vals = active_points(&masked);
-        let Some((loc, _scale)) = loc_and_scale(&current_vals, hybrid) else {
+        let Some((loc, _scale)) = loc_and_scale(&current_vals, estimator) else {
             break;
         };
 
-        let (test_stat, test_idx) = calc_test_statistic(&current_vals, hybrid);
+        let (test_stat, test_idx) = calc_test_statistic(&current_vals, estimator);
 
         // compute critical value using the current non-masked count
         let n = n_non_masked as f64;
@@ -228,7 +263,7 @@ fn esd_test(
     // After loop, score any remaining unmasked observations using the last lambda if available.
     score_active_points(
         &active_points(&masked),
-        hybrid,
+        estimator,
         last_lambda.unwrap_or(0.0),
         &mut scores,
     );
@@ -238,13 +273,13 @@ fn esd_test(
 
 /// Calculate the test statistic and index for the (masked) data.
 /// Returns (test_statistic, index_in_original_array)
-fn calc_test_statistic(values: &[(usize, f64)], hybrid: bool) -> (f64, usize) {
+fn calc_test_statistic(values: &[(usize, f64)], estimator: EsdEstimator) -> (f64, usize) {
     // If empty, return 0,0
     if values.is_empty() {
         return (0.0, 0);
     }
 
-    let Some((loc, scale)) = loc_and_scale(values, hybrid) else {
+    let Some((loc, scale)) = loc_and_scale(values, estimator) else {
         return (0.0f64, 0);
     };
 
@@ -274,33 +309,36 @@ fn active_points(masked: &[Option<f64>]) -> Vec<(usize, f64)> {
 }
 
 /// Compute the location and scale used by the ESD detector.
-fn loc_and_scale(values: &[(usize, f64)], hybrid: bool) -> Option<(f64, f64)> {
+fn loc_and_scale(values: &[(usize, f64)], estimator: EsdEstimator) -> Option<(f64, f64)> {
     if values.is_empty() {
         return None;
     }
 
-    let loc = if hybrid {
-        mean_values(values)
-    } else {
-        median_values(values)
-    };
-
-    let scale = if hybrid {
-        std_sample_values(values, loc)
-    } else {
-        let mut abs_devs: Vec<f64> = values.iter().map(|(_, x)| (x - loc).abs()).collect();
-        abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mad = calculate_median_sorted(&abs_devs);
-        // MAD * 1.4826 is a consistent estimator for the standard deviation of a normal distribution
-        mad * 1.4826
-    };
-
-    Some((loc, scale))
+    match estimator {
+        EsdEstimator::Classic => {
+            let loc = mean_values(values);
+            let scale = std_sample_values(values, loc);
+            Some((loc, scale))
+        }
+        EsdEstimator::Hybrid => {
+            let loc = median_values(values);
+            let mut abs_devs: Vec<f64> = values.iter().map(|(_, x)| (x - loc).abs()).collect();
+            abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mad = calculate_median_sorted(&abs_devs);
+            // MAD * 1.4826 is a consistent estimator for the standard deviation of a normal distribution
+            Some((loc, mad * 1.4826))
+        }
+    }
 }
 
 /// Score a set of active observations using the provided lambda.
-fn score_active_points(values: &[(usize, f64)], hybrid: bool, lambda: f64, scores: &mut [f64]) {
-    let Some((loc, scale)) = loc_and_scale(values, hybrid) else {
+fn score_active_points(
+    values: &[(usize, f64)],
+    estimator: EsdEstimator,
+    lambda: f64,
+    scores: &mut [f64],
+) {
+    let Some((loc, scale)) = loc_and_scale(values, estimator) else {
         return;
     };
 
@@ -347,9 +385,55 @@ mod tests {
         // simple data with an outlier at index 4
         let data = [1.0, 1.1, 0.9, 1.05, 10.0];
         let values = active_points(&data.iter().cloned().map(Some).collect::<Vec<_>>());
-        let (stat, idx) = calc_test_statistic(&values, false);
+        let (stat, idx) = calc_test_statistic(&values, EsdEstimator::Hybrid);
         assert_eq!(idx, 4);
         assert!(stat > 0.0);
+    }
+
+    /// `Hybrid` must studentize against median/MAD and `Classic` against
+    /// mean/std. The two were transposed behind a `hybrid: bool` whose `true`
+    /// arm selected mean/std — the opposite of the name. A single left-skewed
+    /// sample separates them: the mean is dragged below the median, so the two
+    /// locations cannot coincide.
+    #[test]
+    fn estimator_selects_the_documented_location_and_scale() {
+        let data = [-20.0, 1.0, 1.1, 0.9, 1.05, 1.2];
+        let values = active_points(&data.iter().cloned().map(Some).collect::<Vec<_>>());
+
+        let (hybrid_loc, _) = loc_and_scale(&values, EsdEstimator::Hybrid).unwrap();
+        let (classic_loc, classic_scale) = loc_and_scale(&values, EsdEstimator::Classic).unwrap();
+
+        let expected_median = 1.025; // mean of the two middle values, 1.0 and 1.05
+        assert!(
+            (hybrid_loc - expected_median).abs() < 1e-9,
+            "Hybrid must locate at the median, got {hybrid_loc}"
+        );
+
+        let expected_mean = data.iter().sum::<f64>() / data.len() as f64;
+        assert!(
+            (classic_loc - expected_mean).abs() < 1e-9,
+            "Classic must locate at the mean, got {classic_loc}"
+        );
+
+        // The mean is dragged toward the outlier; the median is not.
+        assert!(classic_loc < hybrid_loc);
+
+        // Classic's scale is the sample standard deviation, which the outlier
+        // inflates far beyond a MAD-based scale.
+        let (_, hybrid_scale) = loc_and_scale(&values, EsdEstimator::Hybrid).unwrap();
+        assert!(
+            classic_scale > hybrid_scale,
+            "the outlier must inflate Classic's scale ({classic_scale}) past Hybrid's ({hybrid_scale})"
+        );
+    }
+
+    /// The default must be the robust variant, so `METHOD ESD` with no estimator
+    /// token keeps studentizing against median/MAD.
+    #[test]
+    fn default_estimator_is_hybrid() {
+        assert_eq!(EsdEstimator::default(), EsdEstimator::Hybrid);
+        assert_eq!(ESDOutlierOptions::default().estimator, EsdEstimator::Hybrid);
+        assert!(ESDOutlierOptions::default().estimator.is_hybrid());
     }
 
     #[test]
@@ -360,12 +444,13 @@ mod tests {
         // Mean = 2.81, Std = 4.02, max_dev = (10-2.81) = 7.19, R = 1.78
         // t_crit (df=3, p=0.005) = 4.54, Lambda = (4*4.54)/sqrt(25-10+5*20.6) = 1.71
         // Since R > Lambda, index 4 is an outlier.
-        let (anomalies, scores) = esd_test(&data, 0.05, true, 2).unwrap();
+        // The arithmetic above is mean/std, so this case is `Classic`.
+        let (anomalies, scores) = esd_test(&data, 0.05, EsdEstimator::Classic, 2).unwrap();
 
         // outlier at index 4 should be detected
         assert!(anomalies.iter().any(|a| a.index == 4));
 
-        // value 10.0 is above the median, so the signal must be Positive
+        // value 10.0 is above the location estimate, so the signal must be Positive
         let outlier = anomalies.iter().find(|a| a.index == 4).unwrap();
         assert!(matches!(outlier.signal, AnomalySignal::Positive));
         assert_eq!(outlier.value, 10.0);
@@ -393,7 +478,8 @@ mod tests {
     fn test_esd_detects_negative_outlier() {
         // index 0 (value -10.0) is below the median — should be Negative signal
         let data = vec![-10.0, 1.0, 1.1, 0.9, 1.05];
-        let (anomalies, scores) = esd_test(&data, 0.05, false, data.len() / 2).unwrap();
+        let (anomalies, scores) =
+            esd_test(&data, 0.05, EsdEstimator::Hybrid, data.len() / 2).unwrap();
 
         assert!(anomalies.iter().any(|a| a.index == 0));
         let outlier = anomalies.iter().find(|a| a.index == 0).unwrap();
@@ -412,7 +498,8 @@ mod tests {
             2.92, 2.93, 3.21, 3.26, 3.30, 3.59, 3.68, 4.30, 4.64, 5.34, 5.42, 6.01,
         ];
 
-        let result = detect_anomalies_esd(&data, 0.05, true, Some(10)).unwrap();
+        // Rosner's published result is the mean/std procedure, i.e. `Classic`.
+        let result = detect_anomalies_esd(&data, 0.05, EsdEstimator::Classic, Some(10)).unwrap();
         // Rosner's test on this data (with alpha=0.05) detects 3 outliers: 6.01, 5.42, 5.34
         assert_eq!(result.anomalies.len(), 3);
         let indices: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
