@@ -1,4 +1,4 @@
-use super::utils::normalize_unbounded_score;
+use super::utils::normalize_evidence;
 use crate::analysis::math::{calculate_mean, calculate_mean_std_dev, quantile};
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
@@ -280,19 +280,11 @@ impl RcfOutlierDetector {
     ///
     /// # Score consistency
     ///
-    /// All score-related fields in the returned [`AnomalyResult`] are normalized to the
-    /// `[0, 1]` range:
-    ///
-    /// | Field                     | Scale        |
-    /// |---------------------------|--------------|
-    /// | `AnomalyResult::scores[i]`| [0, 1]       |
-    /// | `Anomaly::score`          | [0, 1]       |
-    /// | `AnomalyResult::threshold`| depends      |
-    ///
-    /// For `StdDev` thresholding, `AnomalyResult::threshold` is the raw Z-score cutoff.
-    /// For `Contamination` thresholding, it is the normalized RCF score at the quantile.
-    ///
-    /// Callers can apply [`normalize_rcf_score`] to any raw RCF score.
+    /// Both modes report scores on the module-wide scale: `0.5` sits exactly on
+    /// the cutoff, so `score > 0.5` ⟺ flagged, whichever threshold mode is in
+    /// use. `AnomalyResult::threshold` stays on the *requested* scale — the
+    /// standard-deviation multiple, or the contamination fraction — since that
+    /// is what is echoed back in `parameters`.
     ///
     /// # Direction
     ///
@@ -353,53 +345,62 @@ impl RcfOutlierDetector {
         }
     }
 
-    fn detect_with_zscores(
-        &mut self,
+    /// Both threshold modes reduce to the same shape: a cutoff on the raw forest
+    /// scores, an evidence quantity measured against it, and a direction taken
+    /// from the data values.
+    ///
+    /// They used to disagree on all three. `StdDev` reported a normalized
+    /// *z-score of the batch's forest scores* while `Contamination` reported
+    /// `1 - e^(-raw)` of the forest score itself — same method, same field, two
+    /// scales, and switching threshold mode silently changed what the number
+    /// meant. Expressing both as evidence against their own cutoff makes the two
+    /// modes agree with each other and each mode agree with its own verdict.
+    fn assemble(
+        &self,
         values: &[f64],
-        raw_scores: Vec<f64>,
+        raw_scores: &[f64],
+        evidence: impl Fn(f64) -> f64,
+        boundary: f64,
         threshold: f64,
     ) -> AnomalyResult {
-        let mut scores = raw_scores;
+        // Direction comes from the value distribution. The `StdDev` path used to
+        // compare each data value against the mean of the *forest scores* —
+        // unrelated units, so the reported direction depended on whether the
+        // series happened to live on the same numeric scale as the forest's
+        // internal statistic.
+        let value_mean = calculate_mean(values);
 
-        // Compute a stable center-line for directional classification.
-        // The mean over the full slice is used so that the signal assignment is
-        // independent of point ordering and robust to a small number of outliers.
-        let (mean, std_dev) = calculate_mean_std_dev(&scores);
-        let score_cutoff = mean + std_dev * threshold;
-
+        let mut scores = Vec::with_capacity(raw_scores.len());
         let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
-        for (index, (score, &value)) in scores.iter_mut().zip(values.iter()).enumerate() {
-            // Suppress anomaly flagging during the warmup window.  The forest has not
-            // yet learned enough of the distribution to produce reliable scores, so
-            // detections in this region are likely false positives.  Scores are still
-            // recorded above, so AnomalyResult::scores always has one entry per point.
+
+        for (index, (&raw_score, &value)) in raw_scores.iter().zip(values.iter()).enumerate() {
+            let score = normalize_evidence(evidence(raw_score), boundary);
+            scores.push(score);
+
+            // Suppress anomaly flagging during the warmup window. The forest has
+            // not yet learned enough of the distribution to produce reliable
+            // scores, so detections here are likely false positives. Scores are
+            // still recorded, so `scores` always has one entry per point — which
+            // is why this window is a documented carve-out from the 0.5 contract
+            // rather than a violation of it.
             if index < self.output_after {
                 continue;
             }
 
-            let z_score = (*score - mean) / std_dev;
-            let z_abs = z_score.abs();
-            let normalized_score = normalize_unbounded_score(z_abs);
-
-            if *score > score_cutoff {
-                // Derive a direction by comparing the anomalous value to the mean score.
-                let signal = if value >= mean {
+            if score > 0.5 {
+                let signal = if value >= value_mean {
                     AnomalySignal::Positive
                 } else {
                     AnomalySignal::Negative
                 };
 
-                // Store the raw score — consistent with AnomalyResult::scores and
-                // AnomalyResult::threshold so callers can compare all three uniformly.
                 anomalies.push(Anomaly {
                     index,
                     signal,
                     value,
-                    score: normalized_score,
+                    score,
                 });
             }
-
-            *score = normalized_score;
         }
 
         AnomalyResult {
@@ -411,6 +412,34 @@ impl RcfOutlierDetector {
         }
     }
 
+    /// Cutoff at `mean + threshold * std_dev` of the batch's forest scores.
+    ///
+    /// Evidence is floored at zero, which is what makes the score one-sided.
+    /// It used to be `|z|`, so a point whose forest score was unusually *low* —
+    /// i.e. more ordinary than average — received a high anomaly score while the
+    /// verdict, a plain `>` against the cutoff, correctly declined to flag it.
+    fn detect_with_zscores(
+        &mut self,
+        values: &[f64],
+        raw_scores: Vec<f64>,
+        threshold: f64,
+    ) -> AnomalyResult {
+        let (mean, std_dev) = calculate_mean_std_dev(&raw_scores);
+
+        self.assemble(
+            values,
+            &raw_scores,
+            |raw| raw - mean,
+            threshold * std_dev,
+            threshold,
+        )
+    }
+
+    /// Cutoff at the `1 - contamination` quantile of the forest scores.
+    ///
+    /// By construction roughly a `contamination` fraction of samples exceed that
+    /// quantile, so roughly that fraction score above 0.5 — which is exactly
+    /// what the caller asked for.
     fn detect_with_contamination(
         &self,
         values: &[f64],
@@ -420,61 +449,19 @@ impl RcfOutlierDetector {
         let start = self.output_after.min(raw_scores.len());
         let usable_scores = &raw_scores[start..];
 
-        // If everything is in warmup, still return normalized scores but no anomalies.
-        if usable_scores.is_empty() {
-            let scores = raw_scores.into_iter().map(normalize_rcf_score).collect();
-
-            return AnomalyResult {
-                scores,
-                anomalies: Vec::new(),
-                threshold: contamination, // effectively unreachable during a warmup-only result
-                method: AnomalyMethod::RandomCutForest,
-                method_info: None,
-            };
-        }
-
         // Keep contamination in a safe open interval for quantile selection.
         let contamination = contamination.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
 
-        let raw_threshold = quantile(usable_scores, 1.0 - contamination);
+        // If everything is in warmup there is no usable distribution to take a
+        // quantile of. An unusable boundary scores every point 0.0, and the
+        // warmup window flags nothing regardless.
+        let boundary = if usable_scores.is_empty() {
+            f64::NAN
+        } else {
+            quantile(usable_scores, 1.0 - contamination)
+        };
 
-        // Direction should be based on the value distribution, not the score distribution.
-        let value_mean = calculate_mean(values);
-
-        let mut scores = Vec::with_capacity(raw_scores.len());
-        let mut anomalies: Vec<Anomaly> = Vec::with_capacity(4);
-
-        for (index, (&raw_score, &value)) in raw_scores.iter().zip(values.iter()).enumerate() {
-            let normalized_score = normalize_rcf_score(raw_score);
-            scores.push(normalized_score);
-
-            if index < self.output_after {
-                continue;
-            }
-
-            if raw_score > raw_threshold {
-                let signal = if value >= value_mean {
-                    AnomalySignal::Positive
-                } else {
-                    AnomalySignal::Negative
-                };
-
-                anomalies.push(Anomaly {
-                    index,
-                    signal,
-                    value,
-                    score: normalized_score,
-                });
-            }
-        }
-
-        AnomalyResult {
-            scores,
-            anomalies,
-            threshold: contamination,
-            method: AnomalyMethod::RandomCutForest,
-            method_info: None,
-        }
+        self.assemble(values, &raw_scores, |raw| raw, boundary, contamination)
     }
 }
 
@@ -490,28 +477,6 @@ impl AnomalyDetector for RcfOutlierDetector {
     fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
         RcfOutlierDetector::detect(self, ts)
     }
-}
-
-/// Normalize an RCF raw anomaly score to the range \[0, 1\].
-///
-/// Uses the transformation `1 - e^(-raw_score)`:
-///
-/// | raw score | normalized |
-/// |-----------|------------|
-/// | 0         | 0.000      |
-/// | 1         | 0.632      |
-/// | 2         | 0.865      |
-/// | 3         | 0.950      |
-/// | ∞         | 1.000      |
-///
-/// Note: [`RcfOutlierDetector::detect`] stores **raw** scores in both
-/// `AnomalyResult::scores` and `Anomaly::score`. Apply this function when a
-/// \[0, 1\] value is required for display or cross-method comparison.
-pub fn normalize_rcf_score(raw_score: f64) -> f64 {
-    if raw_score.is_nan() || raw_score < 0.0 {
-        return 0.0;
-    }
-    1.0 - (-raw_score).exp()
 }
 
 #[cfg(test)]
@@ -957,6 +922,123 @@ mod tests {
                     anomaly.value
                 );
             }
+        }
+    }
+
+    /// Direction must come from the data, on a value scale deliberately unlike
+    /// the forest's.
+    ///
+    /// `StdDev` used to pick a signal by comparing each data *value* to the mean
+    /// of the *forest scores* — unrelated units, so the answer depended on
+    /// whether the series happened to live near the forest's own numeric range.
+    /// Raw RCF scores sit around 1-4; a series near 10,000 therefore has every
+    /// value above that mean, and every anomaly was reported `Positive`,
+    /// including the dips. `detect_assigns_direction_relative_to_mean` above
+    /// cannot catch this: it builds a series centered on zero, where the two
+    /// scales happen to agree.
+    #[test]
+    fn detect_assigns_direction_on_the_data_scale_not_the_forest_scale() {
+        let mut ts: Vec<f64> = (0..120).map(|i| 10_000.0 + (i % 7) as f64).collect();
+        ts[60] = 90_000.0; // unmistakable high spike
+        ts[90] = -70_000.0; // unmistakable low dip
+
+        for threshold in [RCFThreshold::StdDev(2.0), RCFThreshold::Contamination(0.05)] {
+            let mut detector = RcfOutlierDetector::new(RCFOptions {
+                num_trees: Some(50),
+                sample_size: Some(64),
+                threshold: Some(threshold),
+                output_after: Some(20),
+                ..Default::default()
+            })
+            .unwrap();
+
+            let result = detector.detect(&ts).unwrap();
+
+            let dip = result.anomalies.iter().find(|a| a.index == 90);
+            assert!(
+                dip.is_some(),
+                "{threshold:?}: the dip at index 90 should be detected"
+            );
+            assert_eq!(
+                dip.unwrap().signal,
+                AnomalySignal::Negative,
+                "{threshold:?}: a value far *below* the series mean must be Negative"
+            );
+
+            if let Some(spike) = result.anomalies.iter().find(|a| a.index == 60) {
+                assert_eq!(
+                    spike.signal,
+                    AnomalySignal::Positive,
+                    "{threshold:?}: a value far above the series mean must be Positive"
+                );
+            }
+        }
+    }
+
+    /// The score is one-sided, matching the verdict.
+    ///
+    /// `StdDev` used to score `|z|` of the forest scores while flagging on a
+    /// plain `>` against the cutoff, so a point whose forest score was unusually
+    /// *low* — more ordinary than average — received a high anomaly score and
+    /// was correctly not flagged. Score and verdict disagreed by construction.
+    #[test]
+    fn stddev_scores_are_one_sided() {
+        let mut ts = vec![10.0f64; 120];
+        ts[80] = 900.0;
+
+        let mut detector = RcfOutlierDetector::new(RCFOptions {
+            num_trees: Some(50),
+            sample_size: Some(64),
+            threshold: Some(RCFThreshold::StdDev(3.0)),
+            output_after: Some(20),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = detector.detect(&ts).unwrap();
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+
+        for (index, &score) in result.scores.iter().enumerate().skip(20) {
+            assert_eq!(
+                score > 0.5,
+                flagged.contains(&index),
+                "score[{index}] = {score} disagrees with the verdict"
+            );
+        }
+    }
+
+    /// Both threshold modes report on the same scale. They used to report a
+    /// normalized z-score of the forest scores and `1 - e^(-raw)` of the forest
+    /// score respectively, so switching threshold mode silently changed what the
+    /// number meant.
+    #[test]
+    fn both_threshold_modes_put_the_boundary_at_one_half() {
+        let mut ts: Vec<f64> = (0..200).map(|i| 10.0 + (i as f64 * 0.1).sin()).collect();
+        ts[150] = 100.0;
+
+        for threshold in [RCFThreshold::StdDev(3.0), RCFThreshold::Contamination(0.05)] {
+            let mut detector = RcfOutlierDetector::new(RCFOptions {
+                num_trees: Some(50),
+                sample_size: Some(64),
+                threshold: Some(threshold),
+                output_after: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
+
+            let result = detector.detect(&ts).unwrap();
+
+            for anomaly in &result.anomalies {
+                assert!(
+                    anomaly.score > 0.5,
+                    "{threshold:?}: a flagged point scored {}, at or below the boundary",
+                    anomaly.score
+                );
+            }
+            assert!(
+                result.scores.iter().all(|s| (0.0..=1.0).contains(s)),
+                "{threshold:?}: scores must stay in [0, 1]"
+            );
         }
     }
 

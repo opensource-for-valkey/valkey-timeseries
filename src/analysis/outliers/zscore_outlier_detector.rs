@@ -1,6 +1,6 @@
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
-use crate::analysis::outliers::utils::normalize_unbounded_score;
+use crate::analysis::outliers::utils::normalize_evidence;
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
     detect_pointwise,
@@ -52,6 +52,28 @@ impl ZScoreOutlierDetector {
         (value - self.mean) / self.std_dev
     }
 
+    /// Deviation from the mean, and the distance out to the fence.
+    ///
+    /// `|z| > T` and `|value - mean| > T * sigma` are the same test, but only
+    /// the second is expressed in the units `model_info` reports as fences. The
+    /// distance is read off the fences rather than recomputed, so a value
+    /// sitting exactly on a reported fence produces evidence and boundary from
+    /// the identical subtraction and scores exactly `0.5`.
+    #[inline]
+    fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
+        let deviation = value - self.mean;
+        if self.std_dev < f64::EPSILON {
+            // Constant to within rounding: no scale, so nothing to be past.
+            return (deviation, f64::NAN);
+        }
+        let boundary = if deviation >= 0.0 {
+            self.upper_fence - self.mean
+        } else {
+            self.mean - self.lower_fence
+        };
+        (deviation, boundary)
+    }
+
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
         if !self.is_trained {
             self.train(ts)?;
@@ -93,19 +115,24 @@ impl AnomalyDetector for ZScoreOutlierDetector {
 }
 
 impl PointDetector for ZScoreOutlierDetector {
+    /// Evidence is the departure from the mean and the boundary is the fence it
+    /// is tested against, so the score crosses 0.5 exactly where `classify`
+    /// starts flagging — for any threshold, rather than at 0.75 for `T=3` and
+    /// 0.857 for `T=6`.
     fn score(&self, value: f64) -> f64 {
-        let z_abs = self.get_zscore(value).abs();
-        normalize_unbounded_score(z_abs)
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        normalize_evidence(deviation.abs(), boundary)
     }
 
     fn classify(&self, value: f64) -> AnomalySignal {
-        let zscore = self.get_zscore(value);
-        let z_abs = zscore.abs();
-        if z_abs > self.threshold {
-            match zscore.signum() {
-                1.0 => AnomalySignal::Positive,
-                -1.0 => AnomalySignal::Negative,
-                _ => AnomalySignal::None,
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        // A NaN on either side — a missing reading, or a scale that was never
+        // fitted — fails this comparison, which is how it stays unflagged.
+        if deviation.abs() > boundary {
+            if deviation > 0.0 {
+                AnomalySignal::Positive
+            } else {
+                AnomalySignal::Negative
             }
         } else {
             AnomalySignal::None
@@ -145,11 +172,28 @@ mod tests {
             "Should detect at least 2 anomalies, found {anomaly_count}"
         );
 
-        // Anomalies should have high scores
+        // Anomalies score above the 0.5 boundary. The absolute magnitude is not
+        // the interesting part and used to be read as one: `|z| ≈ 5` against
+        // `T = 3` is `r ≈ 1.67`, which is ~0.625 — a firm anomaly, even though
+        // it looks unimpressive next to the old scale, where any point at all
+        // past `T = 3` already scored 0.75.
         let score_25 = result.scores[25];
         let score_75 = result.scores[75];
-        assert!(score_25 > 0.8);
-        assert!(score_75 > 0.8);
+        assert!(
+            score_25 > 0.5,
+            "index 25 should read as an anomaly: {score_25}"
+        );
+        assert!(
+            score_75 > 0.5,
+            "index 75 should read as an anomaly: {score_75}"
+        );
+
+        // And they must outrank the ordinary points around them.
+        let typical = result.scores[10];
+        assert!(
+            typical < 0.5 && typical < score_25.min(score_75),
+            "a baseline point scored {typical}, against {score_25} and {score_75}"
+        );
     }
 
     #[test]
@@ -259,14 +303,16 @@ mod tests {
             "Should detect at least 2 anomalies, found {anomaly_count}"
         );
 
+        // On the normalized scale "high" means past the 0.5 boundary, which is
+        // where the detector itself draws the line.
         assert!(
-            result.scores[25] > 0.75,
-            "Expected high normalized score at index 25, got {}",
+            result.scores[25] > 0.5,
+            "Expected an above-boundary score at index 25, got {}",
             result.scores[25]
         );
         assert!(
-            result.scores[75] > 0.75,
-            "Expected high normalized score at index 75, got {}",
+            result.scores[75] > 0.5,
+            "Expected an above-boundary score at index 75, got {}",
             result.scores[75]
         );
     }
@@ -300,15 +346,15 @@ mod tests {
             "Expected negative anomaly at index 5"
         );
 
-        // And have "high" normalized scores.
+        // And score past the boundary, which is what "high" means on this scale.
         assert!(
-            result.scores[4] > 0.6,
-            "Expected high score at index 4, got {}",
+            result.scores[4] > 0.5,
+            "Expected an above-boundary score at index 4, got {}",
             result.scores[4]
         );
         assert!(
-            result.scores[5] > 0.6,
-            "Expected high score at index 5, got {}",
+            result.scores[5] > 0.5,
+            "Expected an above-boundary score at index 5, got {}",
             result.scores[5]
         );
     }

@@ -1,4 +1,4 @@
-use super::utils::{normalize_unbounded_score, normalize_value};
+use super::utils::{normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
 use crate::analysis::outliers::{
@@ -93,8 +93,10 @@ impl CusumOutlierDetector {
             cusum_pos = f64::max(0.0, cusum_pos + deviation - self.k);
             cusum_neg = f64::max(0.0, cusum_neg - deviation - self.k);
 
-            // Already in sigmas; normalize straight to [0, 1].
-            let score = normalize_unbounded_score(f64::max(cusum_pos, cusum_neg));
+            // Both arms and the decision interval are in sigmas, so the
+            // accumulated drift is the evidence and `h` is the boundary it is
+            // tested against — the same comparison the signal below makes.
+            let score = normalize_evidence(f64::max(cusum_pos, cusum_neg), threshold);
             scores.push(score);
 
             let signal = if cusum_pos > threshold {

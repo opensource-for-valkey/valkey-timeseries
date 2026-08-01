@@ -1,4 +1,4 @@
-use super::utils::get_anomaly_direction;
+use super::utils::normalize_evidence;
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::outliers::mad_estimator::{
     HarrellDavisNormalizedEstimator, InvariantMADEstimator, MedianAbsoluteDeviationEstimator,
@@ -18,18 +18,31 @@ use crate::analysis::quantile_estimators::Samples;
 /// https://aakinshin.net/posts/harrell-davis-double-mad-outlier-detector/
 #[derive(Debug)]
 pub struct DoubleMadOutlierDetector {
-    /// Optional computed fences. They may be None when the detector is constructed
-    /// without data and will be computed when `train` is called (or on first detect).
-    lower_fence: Option<f64>,
-    upper_fence: Option<f64>,
+    /// Fitted location and the two one-sided scale estimates, or `None` until
+    /// the detector has been trained.
+    fitted: Option<Fitted>,
     /// Configured threshold (k)
     threshold: f64,
-    /// Midpoint between fences (optional until trained)
-    midpoint: Option<f64>,
-    /// Half range between fences (optional until trained)
-    half_range: Option<f64>,
     /// Options describing estimator (kept so the detector can be trained later)
     estimator: AnomalyMADEstimator,
+}
+
+/// What training produces: the median, and one MAD per side.
+#[derive(Debug, Clone, Copy)]
+struct Fitted {
+    median: f64,
+    lower_mad: f64,
+    upper_mad: f64,
+}
+
+impl Fitted {
+    fn lower_fence(&self, k: f64) -> f64 {
+        self.median - k * self.lower_mad
+    }
+
+    fn upper_fence(&self, k: f64) -> f64 {
+        self.median + k * self.upper_mad
+    }
 }
 
 impl DoubleMadOutlierDetector {
@@ -37,11 +50,8 @@ impl DoubleMadOutlierDetector {
 
     pub fn new(threshold: f64, estimator: AnomalyMADEstimator) -> Self {
         DoubleMadOutlierDetector {
-            lower_fence: None,
-            upper_fence: None,
+            fitted: None,
             threshold,
-            midpoint: None,
-            half_range: None,
             estimator,
         }
     }
@@ -55,25 +65,23 @@ impl DoubleMadOutlierDetector {
     /// Returns true when the detector has been trained and fences have been computed.
     /// Callers may use this to decide whether to call `train` prior to scoring/classifying.
     pub fn is_trained(&self) -> bool {
-        self.lower_fence.is_some()
-            && self.upper_fence.is_some()
-            && self.midpoint.is_some()
-            && self.half_range.is_some()
+        self.fitted.is_some()
     }
 
-    fn compute_fences(
-        estimator: impl MedianAbsoluteDeviationEstimator,
-        sample: &Samples,
-        k: f64,
-    ) -> (f64, f64, f64, f64) {
-        let median = estimator.quantile_estimator().median(sample);
-        let lower_mad = estimator.lower_mad(sample);
-        let upper_mad = estimator.upper_mad(sample);
-        let lower_fence = median - k * lower_mad;
-        let upper_fence = median + k * upper_mad;
-        let midpoint = (lower_fence + upper_fence) / 2.0;
-        let half_range = (upper_fence - lower_fence) / 2.0;
-        (lower_fence, upper_fence, midpoint, half_range)
+    pub fn lower_fence(&self) -> Option<f64> {
+        self.fitted.map(|f| f.lower_fence(self.threshold))
+    }
+
+    pub fn upper_fence(&self) -> Option<f64> {
+        self.fitted.map(|f| f.upper_fence(self.threshold))
+    }
+
+    fn fit(estimator: impl MedianAbsoluteDeviationEstimator, sample: &Samples) -> Fitted {
+        Fitted {
+            median: estimator.quantile_estimator().median(sample),
+            lower_mad: estimator.lower_mad(sample),
+            upper_mad: estimator.upper_mad(sample),
+        }
     }
 
     /// Train the detector using explicit Samples and optional estimator.
@@ -83,78 +91,63 @@ impl DoubleMadOutlierDetector {
         k: f64,
         estimator: Option<E>,
     ) {
-        let mut apply_fences = |(l, u, m, h): (f64, f64, f64, f64)| {
-            self.lower_fence = Some(l);
-            self.upper_fence = Some(u);
-            self.midpoint = Some(m);
-            self.half_range = Some(h);
-            self.threshold = k;
-        };
-
-        match estimator {
-            Some(est) => {
-                apply_fences(Self::compute_fences(est, samples, k));
-            }
+        self.fitted = Some(match estimator {
+            Some(est) => Self::fit(est, samples),
             None => match self.estimator {
                 AnomalyMADEstimator::Simple => {
-                    let est = SimpleNormalizedEstimator::default();
-                    apply_fences(Self::compute_fences(est, samples, k));
+                    Self::fit(SimpleNormalizedEstimator::default(), samples)
                 }
                 AnomalyMADEstimator::HarrellDavis => {
-                    let est = HarrellDavisNormalizedEstimator;
-                    apply_fences(Self::compute_fences(est, samples, k));
+                    Self::fit(HarrellDavisNormalizedEstimator, samples)
                 }
                 AnomalyMADEstimator::Invariant => {
-                    let est = InvariantMADEstimator::default();
-                    apply_fences(Self::compute_fences(est, samples, k));
+                    Self::fit(InvariantMADEstimator::default(), samples)
                 }
             },
-        }
+        });
+        self.threshold = k;
+    }
+
+    /// Deviation from the median, and the distance out to the fence on the
+    /// sample's *own* side.
+    ///
+    /// The fences are asymmetric by construction, so evidence has to be measured
+    /// against the one the value is actually approaching. `r = 1` at either
+    /// fence and `r = 0` at the median, whichever side the value falls on.
+    ///
+    /// The distance is taken as `fence - median` rather than the algebraically
+    /// equal `k * mad`, so that a value sitting exactly on a reported fence
+    /// produces evidence and boundary from the identical subtraction and scores
+    /// exactly `0.5`.
+    ///
+    /// Returns `None` when the detector has not been trained, in which case
+    /// there is no model to measure against.
+    #[inline]
+    fn deviation_and_boundary(&self, value: f64) -> Option<(f64, f64)> {
+        let fitted = self.fitted?;
+        let deviation = value - fitted.median;
+        let boundary = if deviation >= 0.0 {
+            fitted.upper_fence(self.threshold) - fitted.median
+        } else {
+            fitted.median - fitted.lower_fence(self.threshold)
+        };
+        Some((deviation, boundary))
     }
 
     /// Calculates a normalized anomaly score in [0, 1].
     ///
-    /// - Returns 0.0 when the value equals the midpoint between fences (least anomalous).
-    /// - Returns values approaching 1.0 as the value moves further beyond the fences.
-    /// - Values within fences return scores < 0.5, values outside return scores >= 0.5.
+    /// - `0.0` at the median (least anomalous).
+    /// - `0.5` exactly on the fence for the value's own side.
+    /// - approaching `1.0` as the value moves further beyond that fence.
     pub fn get_anomaly_score(&self, value: f64) -> f64 {
-        // If not trained (no fences), we cannot compute a meaningful score.
-        // Caller should ensure `train` is called before scoring. As a
-        // fallback, treat everything as non-anomalous (score 0.0).
-        let midpoint = match self.midpoint {
-            Some(m) => m,
-            None => return 0.0,
-        };
-
-        let half_range = match self.half_range {
-            Some(h) => h,
-            None => return 0.0,
-        };
-
-        // Guard against zero range (all values identical)
-        if half_range <= 0.0 {
-            return if (value - midpoint).abs() < f64::EPSILON {
-                0.0
-            } else {
-                1.0
-            };
+        match self.deviation_and_boundary(value) {
+            Some((deviation, boundary)) => normalize_evidence(deviation.abs(), boundary),
+            None => 0.0,
         }
-
-        // Calculate the distance from midpoint, normalized by half_range
-        let normalized_distance = (value - midpoint).abs() / half_range;
-
-        // Map to [0, 1] using a sigmoid-like transformation:
-        // - distance = 0 → score = 0
-        // - distance = 1 (at fence) → score = 0.5
-        // - distance → ∞ → score → 1
-        normalized_distance / (1.0 + normalized_distance)
     }
 
     pub fn is_outlier(&self, value: f64) -> bool {
-        match (self.lower_fence, self.upper_fence) {
-            (Some(l), Some(u)) => value < l || value > u,
-            _ => false,
-        }
+        self.classify(value).is_anomaly()
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -176,9 +169,9 @@ impl AnomalyDetector for DoubleMadOutlierDetector {
 
     fn model_info(&self) -> Option<MethodInfo> {
         Some(MethodInfo::Fenced {
-            lower_fence: self.lower_fence.unwrap_or(f64::NAN),
-            upper_fence: self.upper_fence.unwrap_or(f64::NAN),
-            center_line: None,
+            lower_fence: self.lower_fence().unwrap_or(f64::NAN),
+            upper_fence: self.upper_fence().unwrap_or(f64::NAN),
+            center_line: self.fitted.map(|f| f.median),
         })
     }
 
@@ -202,10 +195,20 @@ impl PointDetector for DoubleMadOutlierDetector {
     }
 
     fn classify(&self, value: f64) -> AnomalySignal {
-        // If fences are not computed yet, treat everything as non-anomalous
-        match (self.lower_fence, self.upper_fence) {
-            (Some(l), Some(u)) => get_anomaly_direction(l, u, value),
-            _ => AnomalySignal::None,
+        // If the detector is untrained, there is no fence to be outside of.
+        let Some((deviation, boundary)) = self.deviation_and_boundary(value) else {
+            return AnomalySignal::None;
+        };
+        // A NaN on either side — a missing reading, or a scale that was never
+        // fitted — fails this comparison, which is how it stays unflagged.
+        if deviation.abs() > boundary {
+            if deviation > 0.0 {
+                AnomalySignal::Positive
+            } else {
+                AnomalySignal::Negative
+            }
+        } else {
+            AnomalySignal::None
         }
     }
 }

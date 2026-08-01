@@ -3,6 +3,7 @@ use crate::analysis::outliers::mad_estimator::{
     HarrellDavisNormalizedEstimator, InvariantMADEstimator, MedianAbsoluteDeviationEstimator,
     SimpleNormalizedEstimator,
 };
+use crate::analysis::outliers::utils::normalize_evidence;
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMADEstimator, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
     PointDetector, detect_pointwise,
@@ -54,7 +55,7 @@ impl MadOutlierDetector {
 
     /// Returns whether a value is an outlier, according to the detector.
     pub fn is_outlier(&self, value: f64) -> bool {
-        value < self.lower_fence || value > self.upper_fence
+        self.classify(value).is_anomaly()
     }
 
     /// Returns the lower fence.
@@ -67,35 +68,42 @@ impl MadOutlierDetector {
         self.upper_fence
     }
 
+    /// Deviation from the median, and the distance out to the fence on the
+    /// value's own side.
+    ///
+    /// The single source of truth for scoring and classification, so the two
+    /// cannot disagree about which side of the fence a value falls on. The
+    /// boundary is taken as `fence - median` rather than the algebraically equal
+    /// `k * mad` so that a value sitting *exactly on the reported fence* yields
+    /// evidence and boundary from the identical subtraction, and therefore
+    /// scores exactly `0.5`. Recomputing `k * mad` instead leaves the two
+    /// differing by a rounding step, which lands the fence on the flagged side.
+    #[inline]
+    fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
+        let deviation = value - self.median;
+        let boundary = if deviation >= 0.0 {
+            self.upper_fence - self.median
+        } else {
+            self.median - self.lower_fence
+        };
+        (deviation, boundary)
+    }
+
     /// Returns a normalized anomaly score in `[0..1]` describing how "anomalous" `value` is.
     ///
     /// Interpretation:
     /// - `0.0` means "at the median" (no deviation).
-    /// - `1.0` means "at or beyond the configured MAD fence" (i.e., `k * mad` away from the median).
+    /// - `0.5` means "exactly on the configured MAD fence" (i.e., `k * mad` away
+    ///   from the median).
+    /// - values approaching `1.0` lie progressively further beyond the fence.
     ///
-    /// This is computed as:
-    /// `score = clamp(|value - median| / (k * mad), 0..1)`
-    /// where `k` is inferred from the detector's fences.
+    /// This used to `clamp(|value - median| / (k * mad), 0..1)`, which saturated
+    /// at the fence: a point 3.1 MADs out and one 300 MADs out both scored
+    /// exactly `1.0`, so the field advertised as a score carried no ranking at
+    /// all among the samples it had flagged.
     pub fn get_anomaly_score(&self, value: f64) -> f64 {
-        if !value.is_finite() {
-            return 0.0;
-        }
-        if !self.mad.is_finite() || self.mad <= 0.0 {
-            return 0.0;
-        }
-
-        let k = self.k;
-        if !k.is_finite() || k <= 0.0 {
-            return 0.0;
-        }
-
-        let denom = k * self.mad;
-        if !denom.is_finite() || denom <= 0.0 {
-            return 0.0;
-        }
-
-        let raw = (value - self.median).abs() / denom;
-        raw.clamp(0.0, 1.0)
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        normalize_evidence(deviation.abs(), boundary)
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -163,10 +171,15 @@ impl PointDetector for MadOutlierDetector {
     }
 
     fn classify(&self, value: f64) -> AnomalySignal {
-        if value < self.lower_fence {
-            AnomalySignal::Negative
-        } else if value > self.upper_fence {
-            AnomalySignal::Positive
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        // A NaN on either side — a missing reading, or a scale that was never
+        // fitted — fails this comparison, which is how it stays unflagged.
+        if deviation.abs() > boundary {
+            if deviation > 0.0 {
+                AnomalySignal::Positive
+            } else {
+                AnomalySignal::Negative
+            }
         } else {
             AnomalySignal::None
         }
@@ -200,16 +213,48 @@ mod tests {
         let score_at_median = detector.get_anomaly_score(2.0);
         assert_eq!(score_at_median, 0.0);
 
-        // Exactly at the upper fence should be 1.0
+        // Exactly at the upper fence is the detection boundary, so 0.5.
         let score_at_upper_fence = detector.get_anomaly_score(detector.upper_fence());
-        assert!((score_at_upper_fence - 1.0).abs() < f64::EPSILON);
+        assert!(
+            (score_at_upper_fence - 0.5).abs() < 1e-9,
+            "the fence is the boundary and must score 0.5, got {score_at_upper_fence}"
+        );
 
-        // Beyond the fence clamps to 1.0
+        // Beyond the fence the score keeps climbing without ever reaching 1.0.
         let score_beyond = detector.get_anomaly_score(1e9);
-        assert!((score_beyond - 1.0).abs() < f64::EPSILON);
+        assert!(
+            score_beyond > 0.5 && score_beyond < 1.0,
+            "expected a strictly-inside-(0.5, 1.0) score past the fence, got {score_beyond}"
+        );
 
-        // Non-finite values are treated as non-anomalous for scoring purposes
+        // A missing reading is not evidence of an anomaly.
         let score_nan = detector.get_anomaly_score(f64::NAN);
         assert_eq!(score_nan, 0.0);
+
+        // An infinite reading is maximally anomalous, and is flagged as such.
+        assert_eq!(detector.get_anomaly_score(f64::INFINITY), 1.0);
+        assert!(detector.is_outlier(f64::INFINITY));
+    }
+
+    /// The saturation this replaced made every flagged sample score exactly
+    /// `1.0`, so `FULL` output could not tell a marginal outlier from an extreme
+    /// one.
+    #[test]
+    fn test_scores_rank_samples_beyond_the_fence() {
+        let data = [1.0, 2.0, 2.0, 2.0, 3.0, 14.0];
+        let mut detector = MadOutlierDetector::default();
+        detector.train(&data).unwrap();
+
+        let fence = detector.upper_fence();
+        let span = fence - detector.median;
+
+        let just_past = detector.get_anomaly_score(fence + span * 0.1);
+        let well_past = detector.get_anomaly_score(fence + span * 10.0);
+        let far_past = detector.get_anomaly_score(fence + span * 1000.0);
+
+        assert!(
+            0.5 < just_past && just_past < well_past && well_past < far_past && far_past < 1.0,
+            "expected a strict ranking, got {just_past} < {well_past} < {far_past}"
+        );
     }
 }

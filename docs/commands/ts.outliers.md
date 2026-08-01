@@ -283,7 +283,8 @@ Returns anomaly information based on the `OUTPUT` format:
 * `timestamp` - Sample timestamp (integer)
 * `value` - Sample value (float)
 * `signal` - Anomaly direction: `1` (positive) or `-1` (negative)
-* `score` - Anomaly score (0.0-1.0, higher = stronger anomaly)
+* `score` - Anomaly score (0.0-1.0, higher = stronger anomaly). A sample scores exactly `0.5` at the method's detection
+  boundary, so every score reported here is above `0.5`. See [Anomaly scores](#anomaly-scores).
 
 #### FULL format
 
@@ -294,7 +295,8 @@ Returns anomaly information based on the `OUTPUT` format:
 * `samples` - Array of sample tuples: `[[timestamp, value, score, signal], ...]`
     * `timestamp` - Sample timestamp (integer)
     * `value` - Original sample value (double)
-    * `score` - Calculated anomaly score (0.0-1.0)
+    * `score` - Calculated anomaly score (0.0-1.0). `score > 0.5` for the samples the method flagged, `score <= 0.5` for
+      the rest. See [Anomaly scores](#anomaly-scores).
     * `signal` - Deviation direction (`-1`, `0`, `1`)
 * `parameters` - A map of the parameters used for the detection method.
 * `seasonality` - (optional) A map describing the seasonality parameters used.
@@ -307,6 +309,33 @@ Returns anomaly information based on the `OUTPUT` format:
 #### CLEANED format
 
 **Array reply:** Cleaned samples only, as `[[timestamp, value], ...]`
+
+## Anomaly scores
+
+Every method reports `score` on one scale, whatever `METHOD` and `THRESHOLD` were requested:
+
+> **A sample scores exactly `0.5` at the method's detection boundary.**
+> `score > 0.5` means the sample was flagged; `score <= 0.5` means it was not.
+
+The boundary belongs to the not-flagged side: a sample sitting *exactly* on the fence scores `0.5` and is not reported
+as an anomaly.
+
+This makes `score > 0.5` a valid anomaly test without knowing which method produced the number or what threshold it was
+given, and makes scores comparable across methods. `0.0` and `1.0` are asymptotic — a score approaches `1.0` as evidence
+grows, but only degenerate or non-finite input reaches it exactly:
+
+* An infinite sample value is maximally anomalous: score `1.0`, and flagged.
+* A `NaN` sample scores `0.0` and is never flagged — a missing reading is not evidence of an anomaly.
+* When a method's fitted scale collapses to zero (a robust estimator on a series that is more than half constant), any
+  deviation at all scores `1.0` and is flagged.
+
+The `THRESHOLD` echoed back in `parameters` stays on the **method's own** scale — standard deviations for `ZSCORE`, `k`
+for `MAD`, the decision interval for `CUSUM`, a fraction for `CONTAMINATION`. It is not on the score scale, and under
+this contract it is not needed as one: the score-scale boundary is always `0.5`.
+
+**With `SEASONALITY`**, detection runs on the seasonally adjusted residuals. Only the reported `value` is restored to the
+original observation — `score` stays in the adjusted domain, because it describes the residual, which is what was
+actually tested. Scores are comparable across methods only when computed over the same domain.
 
 ## Complexity
 
@@ -491,6 +520,8 @@ Detect pattern-based anomalies using a sliding window:
 * **Score normalization:**
     * All anomaly scores normalized to [0.0, 1.0] range
     * Higher scores indicate stronger anomalies
+    * `0.5` is the detection boundary for every method — see [Anomaly scores](#anomaly-scores)
+    * With `SEASONALITY`, scores describe the seasonally adjusted residual, not the original value
 * **Timestamp preservation:**
     * Output timestamps match original series timestamps
 * **Performance tips:**

@@ -1,4 +1,4 @@
-use super::utils::{get_anomaly_direction, normalize_unbounded_score, normalize_value};
+use super::utils::{normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::{calculate_mean, calculate_std_dev};
 use crate::analysis::outliers::{
@@ -63,26 +63,39 @@ impl EwmaOutlierDetector {
                 * (1.0 - (1.0 - self.alpha).powi(2 * (i as i32 + 1)));
             let ewma_std = ewma_variance.sqrt();
 
-            let raw_score = if !ewma_std.is_finite() || ewma_std <= f64::EPSILON {
-                0.0
+            // The smoothed average's departure from target is the evidence; the
+            // control limit that departure is tested against is the boundary.
+            // Both grow with the observation index, which is why the limits are
+            // recomputed each step rather than fixed at `multiplier * sigma`.
+            let deviation = ewma - self.target;
+            let boundary = self.multiplier * ewma_std;
+
+            // A control limit at or below rounding noise is not a limit. The
+            // EWMA recurrence carries its own error — `0.3*3.0 + 0.7*3.0` is not
+            // exactly `3.0` — so a zero-width limit would flag every point of a
+            // constant series on floating-point dust. NaN is the module's
+            // "no boundary to be past" sentinel: it scores 0.0 and fails the
+            // comparison below, so both agree that nothing is testable here.
+            let boundary = if boundary <= f64::EPSILON {
+                f64::NAN
             } else {
-                (ewma - self.target).abs() / ewma_std
+                boundary
             };
 
-            let score = normalize_unbounded_score(raw_score);
+            let score = normalize_evidence(deviation.abs(), boundary);
             scores.push(score);
 
-            if ewma_std <= f64::EPSILON {
-                continue; // No variation, skip anomaly detection
-            }
-
-            let distance = self.multiplier * ewma_std;
-            let ucl = self.target + distance;
-            let lcl = self.target - distance;
-
-            // Fix: Handle zero variance case where ucl == lcl == target
-            // If distance is effectively zero, we only flag anomalies if there is a real deviation
-            let signal = get_anomaly_direction(lcl, ucl, ewma);
+            // A NaN limit — the degenerate case above — fails this comparison,
+            // which is how it stays unflagged.
+            let signal = if deviation.abs() > boundary {
+                if deviation > 0.0 {
+                    AnomalySignal::Positive
+                } else {
+                    AnomalySignal::Negative
+                }
+            } else {
+                AnomalySignal::None
+            };
 
             if signal != AnomalySignal::None {
                 anomalies.push(Anomaly {

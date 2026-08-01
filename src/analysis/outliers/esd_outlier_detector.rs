@@ -1,4 +1,5 @@
 use crate::analysis::math::calculate_median_sorted;
+use crate::analysis::outliers::utils::normalize_evidence;
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
 };
@@ -121,10 +122,8 @@ fn detect_anomalies_esd(
     // Parameter check: max_outliers
     let max_outliers = match max_outliers {
         Some(m) if m >= n / 2 => {
-            let message = format!(
-                "max_outliers must be less than n/2. Got max_outliers = {} and n = {}",
-                m, n
-            );
+            let message =
+                format!("max_outliers must be less than n/2. Got max_outliers = {m} and n = {n}",);
             let err = TimeSeriesAnalysisError::InvalidParameter {
                 name: "max_outliers".to_string(),
                 message,
@@ -147,17 +146,29 @@ fn detect_anomalies_esd(
     })
 }
 
-/// Map a test statistic and the ESD critical value (lambda) to [0.0, 1.0].
-/// Uses score = stat / (stat + lambda). Handles edge cases.
-fn esd_score_stat_over_stat_plus_lambda(stat: f64, lambda: f64) -> f64 {
-    if !stat.is_finite() || stat <= 0.0 {
-        return 0.0;
+/// A candidate produced by one iteration of the step-down loop, with everything
+/// the decision rule and the score each need.
+///
+/// The statistic and its critical value are kept *as numbers*. The truncation
+/// rule used to recover "was `stat > lambda`?" by asking whether the presentation
+/// score exceeded 0.5, which coupled a statistical decision to a display
+/// convention — and made rescoring the retained candidates impossible without
+/// changing the values the decision reads.
+struct Candidate {
+    index: usize,
+    value: f64,
+    signal: AnomalySignal,
+    /// The studentized statistic for this iteration.
+    stat: f64,
+    /// The critical value this iteration's statistic was tested against.
+    lambda: f64,
+}
+
+impl Candidate {
+    /// Rosner's per-iteration test, asked of the statistics directly.
+    fn rejects_null(&self) -> bool {
+        self.stat > self.lambda
     }
-    if !lambda.is_finite() || lambda <= 0.0 {
-        // Fallback denom to 1.0 to avoid division by zero and still provide a monotonic mapping
-        return (stat / (stat + 1.0)).clamp(0.0, 1.0);
-    }
-    (stat / (stat + lambda)).clamp(0.0, 1.0)
 }
 
 /// Perform the Extreme Studentized Deviate (ESD) test to detect potential outliers in the data.
@@ -180,7 +191,7 @@ fn esd_test(
 
     // masked representation: Some(value) for active, None for masked
     let mut masked: Vec<Option<f64>> = data.iter().cloned().map(Some).collect();
-    let mut anomalies: Vec<Anomaly> = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     // per-observation scores (original ordering)
     let mut scores: Vec<f64> = vec![0.0; n_total];
@@ -226,12 +237,6 @@ fn esd_test(
         // remember latest lambda
         last_lambda = Some(critical_value);
 
-        // compute normalized score for this candidate
-        let score = esd_score_stat_over_stat_plus_lambda(test_stat, critical_value);
-        if test_idx < scores.len() {
-            scores[test_idx] = score;
-        }
-
         let value = data[test_idx];
         let signal = if value > loc {
             AnomalySignal::Positive
@@ -239,28 +244,73 @@ fn esd_test(
             AnomalySignal::Negative
         };
 
-        anomalies.push(Anomaly {
-            signal,
-            value,
-            score,
+        candidates.push(Candidate {
             index: test_idx,
+            value,
+            signal,
+            stat: test_stat,
+            lambda: critical_value,
         });
 
         // mask that index (in original indexing)
         masked[test_idx] = None;
     }
 
-    // Standard ESD: find the largest k such that R_i > lambda_i for all i <= k
-    let mut k = 0;
-    for (i, anomaly) in anomalies.iter().enumerate() {
-        if anomaly.score > 0.5 {
-            // score > 0.5 means test_stat > critical_value
-            k = i + 1;
-        }
-    }
-    anomalies.truncate(k);
+    // Rosner's step-down rule: find the largest k whose statistic beats its own
+    // critical value, and declare all candidates i <= k outliers — including any
+    // that individually failed their own test. The decision reads the statistics
+    // directly, so it no longer depends on the presentation scale.
+    let k = candidates
+        .iter()
+        .rposition(Candidate::rejects_null)
+        .map_or(0, |i| i + 1);
 
-    // After loop, score any remaining unmasked observations using the last lambda if available.
+    // Candidates past k were tested and not rejected. They keep their own
+    // per-iteration score, which sits at or below 0.5 by construction.
+    for candidate in &candidates[k..] {
+        scores[candidate.index] = normalize_evidence(candidate.stat, candidate.lambda);
+    }
+
+    candidates.truncate(k);
+
+    // Retained candidates are scored against lambda_k — the critical value that
+    // actually justified the family-wise decision — rather than each against its
+    // own. Every retained candidate was admitted by that one test, so that is
+    // the test they should be measured against.
+    //
+    // The statistic is generally non-increasing across iterations (each removes
+    // the most extreme remaining point), so retained candidates land above
+    // lambda_k on their own. That is not guaranteed, though: the scale estimate
+    // shrinks alongside the statistic. Flooring at the accepted statistic keeps
+    // every retained candidate at least as anomalous as the one whose test
+    // admitted the whole family, which is what makes `score > 0.5 <=> flagged`
+    // hold here without a carve-out.
+    let anomalies: Vec<Anomaly> = if let Some(accepted) = candidates.last() {
+        let (lambda_k, stat_k) = (accepted.lambda, accepted.stat);
+        candidates
+            .iter()
+            .map(|candidate| {
+                let score = normalize_evidence(candidate.stat.max(stat_k), lambda_k);
+                scores[candidate.index] = score;
+                Anomaly {
+                    signal: candidate.signal,
+                    value: candidate.value,
+                    score,
+                    index: candidate.index,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Score whatever the loop never masked. These points were examined and not
+    // rejected, so their scores must sit on the not-flagged side — but `max_out`
+    // can stop the loop with strong outliers still active, whose statistic would
+    // otherwise exceed the last critical value. Widening the boundary to the
+    // largest surviving statistic puts the most extreme of them exactly on 0.5
+    // and the rest below, which keeps them ranked instead of clamping them into
+    // a tie.
     score_active_points(
         &active_points(&masked),
         estimator,
@@ -288,7 +338,7 @@ fn calc_test_statistic(values: &[(usize, f64)], estimator: EsdEstimator) -> (f64
     let (max_idx, max_dev) = values
         .iter()
         .map(|(i, x)| (*i, (x - loc).abs()))
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .max_by(|a, b| a.1.total_cmp(&b.1))
         .unwrap();
 
     if scale == 0.0 || scale.is_nan() {
@@ -323,7 +373,7 @@ fn loc_and_scale(values: &[(usize, f64)], estimator: EsdEstimator) -> Option<(f6
         EsdEstimator::Hybrid => {
             let loc = median_values(values);
             let mut abs_devs: Vec<f64> = values.iter().map(|(_, x)| (x - loc).abs()).collect();
-            abs_devs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            abs_devs.sort_by(f64::total_cmp);
             let mad = calculate_median_sorted(&abs_devs);
             // MAD * 1.4826 is a consistent estimator for the standard deviation of a normal distribution
             Some((loc, mad * 1.4826))
@@ -331,7 +381,13 @@ fn loc_and_scale(values: &[(usize, f64)], estimator: EsdEstimator) -> Option<(f6
     }
 }
 
-/// Score a set of active observations using the provided lambda.
+/// Score the observations the step-down loop never rejected.
+///
+/// The boundary is widened to the largest surviving statistic when that exceeds
+/// `lambda`. The procedure declined to reject any of these points, so none of
+/// them may score above 0.5 — but `max_outliers` can halt the loop while genuine
+/// outliers are still active, and those would otherwise beat the last critical
+/// value. Widening rather than clamping keeps the ordering among them intact.
 fn score_active_points(
     values: &[(usize, f64)],
     estimator: EsdEstimator,
@@ -346,10 +402,15 @@ fn score_active_points(
         return;
     }
 
-    for (idx, val) in values.iter() {
-        let stat = (val - loc).abs() / scale;
-        let sc = esd_score_stat_over_stat_plus_lambda(stat, lambda);
-        scores[*idx] = sc;
+    let stats: Vec<(usize, f64)> = values
+        .iter()
+        .map(|(idx, val)| (*idx, (val - loc).abs() / scale))
+        .collect();
+
+    let boundary = stats.iter().map(|(_, stat)| *stat).fold(lambda, f64::max);
+
+    for (idx, stat) in stats {
+        scores[idx] = normalize_evidence(stat, boundary);
     }
 }
 
@@ -372,7 +433,7 @@ fn std_sample_values(values: &[(usize, f64)], mean: f64) -> f64 {
 /// Helper: median for unsorted values (Vec<(idx,f64)>)
 fn median_values(values: &[(usize, f64)]) -> f64 {
     let mut v: Vec<f64> = values.iter().map(|(_, x)| *x).collect();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(f64::total_cmp);
     calculate_median_sorted(&v)
 }
 
@@ -486,6 +547,105 @@ mod tests {
         assert!(matches!(outlier.signal, AnomalySignal::Negative));
         assert_eq!(outlier.value, -10.0);
         assert_eq!(scores.len(), data.len());
+    }
+
+    /// Rosner's rule admits candidates as a family: every candidate up to the
+    /// largest `k` with `stat_k > lambda_k` is declared an outlier, including
+    /// any that failed its own test. Those retained candidates are scored
+    /// against `lambda_k` — the critical value that actually justified the
+    /// decision — so a flagged sample can never score at or below the boundary.
+    #[test]
+    fn retained_candidates_all_score_past_the_boundary() {
+        let fixtures: Vec<Vec<f64>> = vec![
+            // Rosner (1983).
+            vec![
+                -0.25, 0.68, 0.94, 1.15, 1.20, 1.26, 1.26, 1.34, 1.38, 1.43, 1.49, 1.49, 1.55,
+                1.56, 1.58, 1.65, 1.69, 1.70, 1.76, 1.77, 1.81, 1.91, 1.94, 1.96, 1.99, 2.06, 2.09,
+                2.10, 2.14, 2.15, 2.23, 2.24, 2.26, 2.35, 2.37, 2.40, 2.47, 2.54, 2.62, 2.64, 2.90,
+                2.92, 2.92, 2.93, 3.21, 3.26, 3.30, 3.59, 3.68, 4.30, 4.64, 5.34, 5.42, 6.01,
+            ],
+            // A cluster of outliers on one side, which is where the step-down
+            // rule retains candidates that failed their own test.
+            {
+                let mut v: Vec<f64> = (0..40).map(|i| 10.0 + (i % 5) as f64 * 0.1).collect();
+                v.extend([60.0, 62.0, 64.0, 66.0]);
+                v
+            },
+            // Outliers on both sides.
+            {
+                let mut v: Vec<f64> = (0..40).map(|i| 10.0 + (i % 5) as f64 * 0.1).collect();
+                v.extend([80.0, 82.0, -60.0, -62.0]);
+                v
+            },
+        ];
+
+        for (estimator, alpha) in [
+            (EsdEstimator::Classic, 0.05),
+            (EsdEstimator::Hybrid, 0.05),
+            (EsdEstimator::Classic, 0.2),
+            (EsdEstimator::Hybrid, 0.01),
+        ] {
+            for data in &fixtures {
+                let result =
+                    detect_anomalies_esd(data, alpha, estimator, Some(data.len() / 4)).unwrap();
+
+                let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+                for (i, &score) in result.scores.iter().enumerate() {
+                    assert_eq!(
+                        score > 0.5,
+                        flagged.contains(&i),
+                        "{estimator:?}/alpha={alpha}: score[{i}] = {score} disagrees with the verdict"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The truncation rule must read the statistics, not the presentation
+    /// score. Coupling them meant a change to the score scale would silently
+    /// change which samples ESD reports — and made rescoring the retained
+    /// candidates impossible, since that changes the values the loop reads.
+    #[test]
+    fn truncation_is_independent_of_the_score_scale() {
+        let mut data: Vec<f64> = (0..40).map(|i| 10.0 + (i % 5) as f64 * 0.1).collect();
+        data.extend([60.0, 62.0, 64.0]);
+
+        let result = detect_anomalies_esd(&data, 0.05, EsdEstimator::Classic, Some(10)).unwrap();
+
+        // The three planted outliers, and nothing else.
+        let mut indices: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, vec![40, 41, 42]);
+    }
+
+    /// `max_outliers` can stop the loop while genuine outliers are still active.
+    /// Those points were not rejected, so they must not read as flagged however
+    /// extreme they are — while still being ranked against each other.
+    #[test]
+    fn unrejected_points_stay_on_the_not_flagged_side() {
+        let mut data: Vec<f64> = (0..40).map(|i| 10.0 + (i % 5) as f64 * 0.1).collect();
+        data.extend([500.0, 400.0, 300.0, 200.0]);
+
+        // Only one removal allowed, so three strong outliers survive the loop.
+        let result = detect_anomalies_esd(&data, 0.05, EsdEstimator::Classic, Some(1)).unwrap();
+
+        let flagged: Vec<usize> = result.anomalies.iter().map(|a| a.index).collect();
+        for (i, &score) in result.scores.iter().enumerate() {
+            assert_eq!(
+                score > 0.5,
+                flagged.contains(&i),
+                "score[{i}] = {score} disagrees with the verdict"
+            );
+        }
+
+        // The survivors are still ordered by how extreme they are.
+        assert!(
+            result.scores[41] > result.scores[42] && result.scores[42] > result.scores[43],
+            "surviving outliers must stay ranked, got {} {} {}",
+            result.scores[41],
+            result.scores[42],
+            result.scores[43]
+        );
     }
 
     #[test]

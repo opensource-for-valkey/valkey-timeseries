@@ -4,6 +4,7 @@
 /// Port of the golang implementation here:
 /// https://github.com/MicahParks/peakdetect
 /// Original License: Apache-2.0
+use super::utils::normalize_evidence;
 use super::{Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal};
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 
@@ -183,29 +184,20 @@ impl SmoothedZScoreAnomalyDetector {
 
     /// Calculates a normalized anomaly score in [0, 1] for `value`.
     ///
-    /// The score is based on the current moving mean and standard deviation:
-    /// `z = |value - prev_mean| / prev_std_dev`.
-    /// It is then mapped to [0, 1) via `z / (threshold + z)` so that:
+    /// Evidence is the departure from the moving mean; the boundary is the
+    /// `threshold * prev_std_dev` that [`Self::next`] tests it against. So:
     /// - `0.0` when `value == prev_mean`
-    /// - `0.5` when `z == threshold`
-    /// - approaches `1.0` as `z` grows
+    /// - `0.5` when the deviation sits exactly on the threshold
+    /// - approaches `1.0` as the deviation grows
+    ///
+    /// This algorithm already satisfied the 0.5 contract — `z / (threshold + z)`
+    /// is `normalize_evidence(deviation, threshold * std_dev)` rearranged — so
+    /// routing it through the shared helper changes no value. It is written this
+    /// way so the arithmetic lives in one place rather than being re-derived,
+    /// and so the degenerate cases cannot drift from the rest of the module.
     pub fn get_anomaly_score(&self, value: f64) -> f64 {
         let deviation = (value - self.prev_mean).abs();
-
-        // Guard against degenerate or invalid std dev.
-        if !self.prev_std_dev.is_finite() || self.prev_std_dev <= 0.0 {
-            return if deviation <= f64::EPSILON { 0.0 } else { 1.0 };
-        }
-
-        // Guard against nonsensical thresholds.
-        if !self.threshold.is_finite() || self.threshold <= 0.0 {
-            return 0.0;
-        }
-
-        let z = deviation / self.prev_std_dev;
-        let score = z / (self.threshold + z);
-
-        score.clamp(0.0, 1.0)
+        normalize_evidence(deviation, self.threshold * self.prev_std_dev)
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {

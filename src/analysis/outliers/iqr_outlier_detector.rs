@@ -1,4 +1,4 @@
-use super::utils::{get_anomaly_direction, normalize_unbounded_score, normalize_value};
+use super::utils::{normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
@@ -12,6 +12,10 @@ pub const IQR_DEFAULT_THRESHOLD: f64 = 1.5;
 pub struct IQROutlierDetector {
     lower_fence: f64,
     upper_fence: f64,
+    /// Quartile midpoint `(Q1 + Q3) / 2`. Both fences extend from their own
+    /// quartile by the same `T * IQR`, so they sit symmetrically about this
+    /// point — which makes it the center evidence is measured from.
+    center: f64,
     iqr: f64,
     threshold: f64,
 }
@@ -36,9 +40,29 @@ impl IQROutlierDetector {
         IQROutlierDetector {
             lower_fence,
             upper_fence,
+            center: (q1 + q3) / 2.0,
             iqr,
             threshold,
         }
+    }
+
+    /// Deviation from the quartile midpoint, and the distance out to the fence.
+    ///
+    /// `upper_fence - center == center - lower_fence == IQR * (0.5 + T)`, since
+    /// each fence extends `T * IQR` past its own quartile. The distance is read
+    /// off the fences rather than recomputed, so a value sitting exactly on a
+    /// reported fence produces evidence and boundary from the identical
+    /// subtraction and scores exactly `0.5`. Scoring and classification both
+    /// read this pair, so they cannot disagree about which side a value is on.
+    #[inline]
+    fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
+        let deviation = value - self.center;
+        let boundary = if deviation >= 0.0 {
+            self.upper_fence - self.center
+        } else {
+            self.center - self.lower_fence
+        };
+        (deviation, boundary)
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
@@ -55,7 +79,7 @@ impl AnomalyDetector for IQROutlierDetector {
         Some(MethodInfo::Fenced {
             lower_fence: self.lower_fence,
             upper_fence: self.upper_fence,
-            center_line: Some((self.lower_fence + self.upper_fence) / 2.0),
+            center_line: Some(self.center),
         })
     }
 
@@ -65,25 +89,31 @@ impl AnomalyDetector for IQROutlierDetector {
 }
 
 impl PointDetector for IQROutlierDetector {
+    /// Evidence is the distance from the quartile midpoint, not the distance
+    /// *past* the fence.
+    ///
+    /// Measuring past the fence meant every in-range sample scored exactly
+    /// `0.0` — the majority of any series, and the whole purpose of `FULL`
+    /// output. A near-miss was indistinguishable from a sample sitting on the
+    /// median.
     fn score(&self, value: f64) -> f64 {
-        // Guard against degenerate IQR to avoid division by zero / NaN.
-        if !self.iqr.is_finite() || self.iqr <= f64::EPSILON {
-            return 0.0;
-        }
-
-        let raw = if value < self.lower_fence {
-            (self.lower_fence - value) / self.iqr
-        } else if value > self.upper_fence {
-            (value - self.upper_fence) / self.iqr
-        } else {
-            0.0
-        };
-
-        normalize_unbounded_score(raw)
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        normalize_evidence(deviation.abs(), boundary)
     }
 
     fn classify(&self, value: f64) -> AnomalySignal {
-        get_anomaly_direction(self.lower_fence, self.upper_fence, value)
+        let (deviation, boundary) = self.deviation_and_boundary(value);
+        // A NaN on either side — a missing reading, or a scale that was never
+        // fitted — fails this comparison, which is how it stays unflagged.
+        if deviation.abs() > boundary {
+            if deviation > 0.0 {
+                AnomalySignal::Positive
+            } else {
+                AnomalySignal::Negative
+            }
+        } else {
+            AnomalySignal::None
+        }
     }
 }
 
@@ -99,6 +129,7 @@ pub(super) fn detect_anomalies_iqr(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::analysis::outliers::MethodInfo;
     use crate::analysis::outliers::iqr_outlier_detector::detect_anomalies_iqr;
 
@@ -144,6 +175,78 @@ mod tests {
         for score in &result.scores {
             assert!(score.is_finite(), "Score should be finite");
             assert!(*score >= 0.0, "Score should be non-negative");
+        }
+    }
+
+    /// In-range samples must be graded, not flattened.
+    ///
+    /// Evidence used to be the distance *past* the fence, so every sample inside
+    /// the fences scored exactly `0.0` — the majority of any series, and the
+    /// whole reason `FULL` output has a score column. A near-miss was
+    /// indistinguishable from a sample sitting on the median.
+    #[test]
+    fn test_iqr_grades_samples_inside_the_fences() {
+        let values: Vec<f64> = (0..24).map(|i| 40.0 + (i % 6) as f64).collect();
+
+        let detector = IQROutlierDetector::new(&values, 1.5);
+        let result = detect_anomalies_iqr(&values, Some(1.5)).unwrap();
+
+        assert!(
+            result.anomalies.is_empty(),
+            "no sample in this spread is outside the fences, got {:?}",
+            result.anomalies
+        );
+
+        // Nothing was flagged, so every score sits at or below the boundary...
+        for (i, &score) in result.scores.iter().enumerate() {
+            assert!(
+                score <= 0.5,
+                "unflagged sample {i} scored {score}, above the boundary"
+            );
+        }
+
+        // ...and they are still ranked by distance from the center, which used
+        // to be a column of identical zeros.
+        let center = detector.center;
+        let at_center = detector.score(center);
+        let near = detector.score(center + 1.0);
+        let far = detector.score(center + 2.0);
+
+        assert_eq!(at_center, 0.0, "a sample at the center is maximally normal");
+        assert!(
+            at_center < near && near < far && far < 0.5,
+            "expected in-range samples to be ranked, got {at_center} < {near} < {far}"
+        );
+    }
+
+    /// The score crosses 0.5 exactly at the fences the method reports.
+    #[test]
+    fn test_iqr_boundary_sits_at_one_half() {
+        let values: Vec<f64> = (0..24).map(|i| 40.0 + (i % 6) as f64).collect();
+
+        let mut detector = IQROutlierDetector::new(&values, 1.5);
+        let result = detector.detect(&values).unwrap();
+
+        let Some(MethodInfo::Fenced {
+            lower_fence,
+            upper_fence,
+            ..
+        }) = result.method_info
+        else {
+            panic!("IQR reports fences");
+        };
+
+        for fence in [lower_fence, upper_fence] {
+            assert!(
+                (detector.score(fence) - 0.5).abs() < 1e-12,
+                "the fence at {fence} scored {}, expected exactly 0.5",
+                detector.score(fence)
+            );
+            assert_eq!(
+                detector.classify(fence),
+                AnomalySignal::None,
+                "the fence belongs to the not-flagged side"
+            );
         }
     }
 
