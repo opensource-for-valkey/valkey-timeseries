@@ -337,13 +337,13 @@ fn parse_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOp
         let arg_slice = arg.as_slice();
         hashify::fnc_map_ignore_case!(arg_slice,
             "THRESHOLD" => {
-                threshold = Some(parse_single_value(args, "THRESHOLD")?);
+                threshold = Some(parse_positive_value(args, "THRESHOLD")?);
             },
             "INFLUENCE" => {
-                influence = Some(parse_single_value(args, "INFLUENCE")?);
+                influence = Some(parse_positive_value(args, "INFLUENCE")?);
             },
             "LAG" => {
-                lag = Some(parse_single_value(args, "LAG")? as usize);
+                lag = Some(parse_positive_value(args, "LAG")? as usize);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown zscore option {arg}")));
@@ -397,13 +397,13 @@ fn parse_smoothed_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<
         let arg_slice = arg.as_slice();
         hashify::fnc_map_ignore_case!(arg_slice,
             "THRESHOLD" => {
-                smoothed_options.threshold = parse_single_value(args, "THRESHOLD")?;
+                smoothed_options.threshold = parse_positive_value(args, "THRESHOLD")?;
             },
             "INFLUENCE" => {
-                smoothed_options.influence = parse_single_value(args, "INFLUENCE")?;
+                smoothed_options.influence = parse_positive_value(args, "INFLUENCE")?;
             },
             "LAG" => {
-                smoothed_options.lag = parse_single_value(args, "LAG")? as usize;
+                smoothed_options.lag = parse_positive_value(args, "LAG")? as usize;
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown smoothed zscore option {arg}")));
@@ -434,7 +434,7 @@ fn parse_mad_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                  mad_options.estimator = estimator_arg.parse()?;
             },
             "THRESHOLD" => {
-                 mad_options.k = parse_single_value(args, "THRESHOLD")?;
+                 mad_options.k = parse_positive_value(args, "THRESHOLD")?;
             },
             _ => {
                  return Err(ValkeyError::String(format!("TSDB: unknown Mad option {arg}")));
@@ -467,7 +467,7 @@ fn parse_double_mad_options(args: &mut CommandArgIterator) -> ValkeyResult<Anoma
                 double_mad_options.estimator = estimator_arg.parse()?;
             },
             "THRESHOLD" => {
-                double_mad_options.k = parse_single_value(args, "THRESHOLD")?;
+                double_mad_options.k = parse_positive_value(args, "THRESHOLD")?;
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown Double Mad option {arg}")));
@@ -501,20 +501,20 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
         let arg_slice = arg.as_slice();
         hashify::fnc_map_ignore_case!(arg_slice,
             "NUM_TREES" => {
-                rcf_options.num_trees = Some(parse_single_value(args, "NUM_TREES")? as usize);
+                rcf_options.num_trees = Some(parse_positive_value(args, "NUM_TREES")? as usize);
             },
             "SAMPLE_SIZE" => {
-                rcf_options.sample_size = Some(parse_single_value(args, "SAMPLE_SIZE")? as usize);
+                rcf_options.sample_size = Some(parse_positive_value(args, "SAMPLE_SIZE")? as usize);
             },
             "THRESHOLD" => {
-                let val = parse_single_value(args, "THRESHOLD")?;
+                let val = parse_positive_value(args, "THRESHOLD")?;
                 rcf_options.threshold = Some(
                     RCFThreshold::std_dev(val)
                         .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?
                 );
             },
             "CONTAMINATION" => {
-                let val = parse_single_value(args, "CONTAMINATION")?;
+                let val = parse_positive_value(args, "CONTAMINATION")?;
                 rcf_options.threshold = Some(
                     RCFThreshold::contamination(val)
                         .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?
@@ -524,10 +524,10 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 rcf_options.time_decay = Some(parse_single_value(args, "DECAY")?);
             },
             "SHINGLE_SIZE" => {
-                rcf_options.shingle_size = Some(parse_single_value(args, "SHINGLE_SIZE")? as usize);
+                rcf_options.shingle_size = Some(parse_positive_value(args, "SHINGLE_SIZE")? as usize);
             },
             "OUTPUT_AFTER" => {
-                rcf_options.output_after = Some(parse_single_value(args, "OUTPUT_AFTER")? as usize);
+                rcf_options.output_after = Some(parse_positive_value(args, "OUTPUT_AFTER")? as usize);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown RCF option {arg}")));
@@ -560,7 +560,7 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
 
         hashify::fnc_map_ignore_case!(arg_slice,
            "ALPHA" => {
-                esd_options.alpha = parse_single_value(args, "ALPHA")?;
+                esd_options.alpha = parse_positive_value(args, "ALPHA")?;
             },
             "HYBRID" => {
                 esd_options.estimator = EsdEstimator::Hybrid;
@@ -569,7 +569,7 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 esd_options.estimator = EsdEstimator::Classic;
             },
             "MAX_OUTLIERS" => {
-                esd_options.max_outliers = Some(parse_single_value(args, "MAX_OUTLIERS")? as usize);
+                esd_options.max_outliers = Some(parse_positive_value(args, "MAX_OUTLIERS")? as usize);
             },
             _ => {
                 return Err(ValkeyError::String(format!("TSDB: unknown ESD option {arg}")));
@@ -587,7 +587,7 @@ fn parse_optional_threshold_option(args: &mut CommandArgIterator) -> ValkeyResul
         && arg.eq_ignore_ascii_case(b"threshold")
     {
         let _ = args.next();
-        Ok(Some(parse_single_value(args, "THRESHOLD")?))
+        Ok(Some(parse_positive_value(args, "THRESHOLD")?))
     } else {
         Ok(None)
     }
@@ -605,6 +605,16 @@ fn parse_single_value(iter: &mut CommandArgIterator, option_name: &str) -> Valke
             "TSDB: invalid value for {option_name}: {value_str}"
         ))
     })
+}
+
+fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {
+    let value = parse_single_value(iter, option_name)?;
+    if value <= 0.0 {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be positive"
+        )));
+    }
+    Ok(value)
 }
 
 fn send_reply(

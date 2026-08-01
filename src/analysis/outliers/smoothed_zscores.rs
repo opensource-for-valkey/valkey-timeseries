@@ -128,6 +128,11 @@ impl SmoothedZScoreAnomalyDetector {
                 "the length of the initial values is zero, the length is used as the lag for the algorithm".to_string()
             ));
         }
+        if threshold < 0.0 {
+            return Err(TimeSeriesAnalysisError::InvalidInput(format!(
+                "threshold must be non-negative, got {threshold}"
+            )));
+        }
 
         let mut res = Self {
             index: 0,
@@ -545,6 +550,22 @@ mod tests {
         match result.unwrap_err() {
             TimeSeriesAnalysisError::InvalidInput(msg) => {
                 assert!(msg.contains("zero"));
+            }
+            _ => panic!("Expected InvalidInput error"),
+        }
+    }
+
+    #[test]
+    fn test_new_rejects_negative_threshold() {
+        // A negative threshold flips the sign of `threshold * std_dev`, which
+        // breaks the 0.5 contract: `classify` (a plain `score > boundary`) would
+        // flag almost every point, while `normalize_evidence` treats the
+        // negative boundary as unusable and reports 0.0 for the same point.
+        let result = SmoothedZScoreAnomalyDetector::new(0.5, -1.0, 5);
+
+        match result {
+            Err(TimeSeriesAnalysisError::InvalidInput(msg)) => {
+                assert!(msg.contains("non-negative"));
             }
             _ => panic!("Expected InvalidInput error"),
         }
