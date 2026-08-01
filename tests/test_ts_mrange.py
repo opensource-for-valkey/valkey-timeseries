@@ -453,3 +453,140 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
         assert len(result) == 1
         # Should return empty data
         assert len(result[0][2]) == 0
+
+    def setup_exclude_empty_data(self):
+        """Three series sharing s=1: `s` and `t` have samples in [-, 500],
+        `u` only has one at 2000, and `n` only has a NaN at 150."""
+        for key in ('s', 't', 'u', 'n'):
+            self.client.execute_command('TS.CREATE', key, 'LABELS', 's', '1', 't', '1')
+        self.client.execute_command('TS.MADD',
+                                    's', 100, 100, 't', 100, 100,
+                                    's', 200, 200, 't', 300, 300,
+                                    's', 400, 400, 't', 400, 400,
+                                    'u', 2000, 2000)
+        self.client.execute_command('TS.ADD', 'n', 150, 'nan')
+
+    def test_mrange_exclude_empty(self):
+        """EXCLUDEEMPTY drops matched series that report no samples in the range."""
+        self.setup_exclude_empty_data()
+
+        # By default every matched series is reported, `u` with an empty list.
+        result = self.client.execute_command('TS.MRANGE', '-', 500, 'FILTER', 's=1')
+        assert [series[0] for series in result] == [b'n', b's', b't', b'u']
+        assert result[3][2] == []
+
+        result = self.client.execute_command('TS.MRANGE', '-', 500, 'EXCLUDEEMPTY',
+                                             'FILTER', 's=1')
+        # `u` has no samples in the range; `n`'s only sample is NaN, which is
+        # still a reported sample, so it stays.
+        assert [series[0] for series in result] == [b'n', b's', b't']
+
+    def test_mrevrange_exclude_empty(self):
+        """EXCLUDEEMPTY applies identically to the reverse-order command."""
+        self.setup_exclude_empty_data()
+
+        result = self.client.execute_command('TS.MREVRANGE', '-', 500, 'EXCLUDEEMPTY',
+                                             'FILTER', 's=1')
+        assert [series[0] for series in result] == [b'n', b's', b't']
+        for series in result:
+            timestamps = [sample[0] for sample in series[2]]
+            assert timestamps == sorted(timestamps, reverse=True)
+
+    def test_mrange_exclude_empty_all_series_empty(self):
+        """When nothing has samples in the range, the reply is empty rather than
+        a list of empty series."""
+        self.setup_exclude_empty_data()
+
+        result = self.client.execute_command('TS.MRANGE', 5000, 6000, 'FILTER', 's=1')
+        assert len(result) == 4
+
+        result = self.client.execute_command('TS.MRANGE', 5000, 6000, 'EXCLUDEEMPTY',
+                                             'FILTER', 's=1')
+        assert result == []
+
+    def test_mrange_exclude_empty_after_sample_filters(self):
+        """Emptiness is judged on what is reported, so a series emptied by
+        FILTER_BY_VALUE or FILTER_BY_TS is excluded too."""
+        self.setup_exclude_empty_data()
+
+        # Only `s` and `t` have samples with values in [0, 500]; `u`'s sample is
+        # 2000 and `n`'s is NaN, which no value filter matches.
+        result = self.client.execute_command('TS.MRANGE', '-', '+', 'EXCLUDEEMPTY',
+                                             'FILTER_BY_VALUE', 0, 500, 'FILTER', 's=1')
+        assert [series[0] for series in result] == [b's', b't']
+
+        # FILTER_BY_TS terminates its timestamp list at EXCLUDEEMPTY.
+        result = self.client.execute_command('TS.MRANGE', '-', '+',
+                                             'FILTER_BY_TS', 100, 200, 'EXCLUDEEMPTY',
+                                             'FILTER', 's=1')
+        assert [series[0] for series in result] == [b's', b't']
+        assert [sample[0] for sample in result[0][2]] == [100, 200]
+        assert [sample[0] for sample in result[1][2]] == [100]
+
+    def test_mrange_exclude_empty_with_aggregation(self):
+        """Under AGGREGATION the rule applies to the produced buckets."""
+        self.setup_exclude_empty_data()
+
+        result = self.client.execute_command('TS.MRANGE', '-', 500, 'AGGREGATION', 'sum', 100,
+                                             'EXCLUDEEMPTY', 'FILTER', 's=1')
+        # `u` produces no buckets in the range. `n`'s only sample is NaN, and sum
+        # ignores NaN values, so its single bucket has no values to report either.
+        assert [series[0] for series in result] == [b's', b't']
+
+    def test_mrange_exclude_empty_with_selected_labels(self):
+        """SELECTED_LABELS ends its label list at EXCLUDEEMPTY rather than
+        swallowing the flag as a label name."""
+        self.setup_exclude_empty_data()
+
+        result = self.client.execute_command('TS.MRANGE', '-', 500,
+                                             'SELECTED_LABELS', 't', 'EXCLUDEEMPTY',
+                                             'FILTER', 's=1')
+        assert [series[0] for series in result] == [b'n', b's', b't']
+        for series in result:
+            assert series[1] == [[b't', b'1']]
+
+    def test_mrange_exclude_empty_with_groupby_is_an_error(self):
+        """GROUPBY collapses series into groups, so there is no per-series
+        emptiness left to act on; the combination is rejected."""
+        self.setup_exclude_empty_data()
+
+        for command in ('TS.MRANGE', 'TS.MREVRANGE'):
+            # before FILTER
+            with pytest.raises(ResponseError, match="TSDB: EXCLUDEEMPTY is not allowed with GROUPBY"):
+                self.client.execute_command(command, '-', 500, 'EXCLUDEEMPTY',
+                                            'FILTER', 's=1', 'GROUPBY', 't', 'REDUCE', 'max')
+            # and after the GROUPBY ... REDUCE block
+            with pytest.raises(ResponseError, match="TSDB: EXCLUDEEMPTY is not allowed with GROUPBY"):
+                self.client.execute_command(command, '-', 500,
+                                            'FILTER', 's=1', 'GROUPBY', 't', 'REDUCE', 'max',
+                                            'EXCLUDEEMPTY')
+
+    def test_mrange_exclude_empty_accepted_in_every_option_position(self):
+        """The flag is an option token, so it is honored wherever options are
+        accepted — including the trailing position the documented syntax uses.
+
+        DIV-0050: RedisTimeSeries rejects the trailing form because its FILTER
+        expression list does not stop at EXCLUDEEMPTY. Ours does, like every
+        other option token; in this dialect a bare word is a metric-name
+        selector, so not stopping would read the documented form as
+        `__name__="EXCLUDEEMPTY"` and reply empty instead of erroring.
+        """
+        self.setup_exclude_empty_data()
+
+        expected = [b'n', b's', b't']
+        for args in (
+            ('EXCLUDEEMPTY', 'FILTER', 's=1'),
+            ('EXCLUDEEMPTY', 'WITHLABELS', 'FILTER', 's=1'),
+            ('LATEST', 'EXCLUDEEMPTY', 'FILTER', 's=1'),
+            ('FILTER', 's=1', 'EXCLUDEEMPTY'),
+        ):
+            result = self.client.execute_command('TS.MRANGE', '-', 500, *args)
+            assert [series[0] for series in result] == expected, args
+
+    def test_mrange_exclude_empty_case_insensitive(self):
+        """Like every other token, the flag is matched case-insensitively."""
+        self.setup_exclude_empty_data()
+
+        result = self.client.execute_command('TS.MRANGE', '-', 500, 'excludeempty',
+                                             'FILTER', 's=1')
+        assert [series[0] for series in result] == [b'n', b's', b't']

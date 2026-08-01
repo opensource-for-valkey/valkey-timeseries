@@ -368,6 +368,102 @@ class TestKeyStates:
         diff(mrange_cmd, "-", "+", "FILTER", "k=v")
 
 
+class TestExcludeEmpty:
+    """EXCLUDEEMPTY (since RTS 8.10): drop matched series that report nothing.
+
+    The rule is about the *reported* payload, not the stored series — probed
+    against the reference: a series emptied by FILTER_BY_VALUE/FILTER_BY_TS, or
+    whose in-range samples produce no bucket under AGGREGATION, is dropped just
+    like one with no samples in the range, while a series reporting a NaN sample
+    is kept.
+    """
+
+    def _universe(self, diff):
+        """`s`/`t` report in [-, 500]; `u` only has a sample at 2000; `n` only a
+        NaN at 150."""
+        mk_populated(diff, "x:s", [(100, 100.0), (200, 200.0), (400, 400.0)],
+                     "LABELS", "k", "v", "g", "1")
+        mk_populated(diff, "x:t", [(100, 100.0), (300, 300.0), (400, 400.0)],
+                     "LABELS", "k", "v", "g", "1")
+        mk_populated(diff, "x:u", [(2000, 2000.0)], "LABELS", "k", "v", "g", "2")
+        mk_populated(diff, "x:n", [(150, float("nan"))], "LABELS", "k", "v", "g", "2")
+
+    def test_excludes_series_with_no_samples_in_range(self, diff, mrange_cmd):
+        self._universe(diff)
+        diff(mrange_cmd, "-", 500, "FILTER", "k=v")
+        diff(mrange_cmd, "-", 500, "EXCLUDEEMPTY", "FILTER", "k=v")
+
+    def test_nan_only_series_is_not_empty(self, diff, mrange_cmd):
+        self._universe(diff)
+        diff(mrange_cmd, 140, 160, "EXCLUDEEMPTY", "FILTER", "k=v")
+
+    def test_all_series_empty_yields_empty_reply(self, diff, mrange_cmd):
+        self._universe(diff)
+        diff(mrange_cmd, 5000, 6000, "FILTER", "k=v")
+        diff(mrange_cmd, 5000, 6000, "EXCLUDEEMPTY", "FILTER", "k=v")
+
+    def test_applies_after_sample_filters(self, diff, mrange_cmd):
+        self._universe(diff)
+        diff(mrange_cmd, "-", "+", "EXCLUDEEMPTY",
+             "FILTER_BY_VALUE", 0, 500, "FILTER", "k=v")
+        diff(mrange_cmd, "-", "+", "FILTER_BY_TS", 100, 200, "EXCLUDEEMPTY",
+             "FILTER", "k=v")
+
+    @pytest.mark.parametrize("agg", ["sum", "count", "avg", "max"])
+    def test_with_aggregation(self, diff, mrange_cmd, agg):
+        self._universe(diff)
+        diff(mrange_cmd, "-", 500, "EXCLUDEEMPTY",
+             "AGGREGATION", agg, 100, "FILTER", "k=v")
+        diff(mrange_cmd, "-", 500, "EXCLUDEEMPTY",
+             "AGGREGATION", agg, 100, "EMPTY", "FILTER", "k=v")
+
+    def test_with_count_and_labels(self, diff, mrange_cmd):
+        self._universe(diff)
+        diff(mrange_cmd, "-", 500, "EXCLUDEEMPTY", "COUNT", 2,
+             "WITHLABELS", "FILTER", "k=v")
+        # SELECTED_LABELS ends its label list at EXCLUDEEMPTY rather than
+        # consuming the flag as a label name.
+        diff(mrange_cmd, "-", 500, "SELECTED_LABELS", "g", "EXCLUDEEMPTY",
+             "FILTER", "k=v")
+
+    def test_groupby_combination_rejected(self, diff, mrange_cmd):
+        """Both engines reject it, with the same message."""
+        self._universe(diff)
+        with pytest.raises(ResponseError, match="EXCLUDEEMPTY is not allowed with GROUPBY"):
+            diff(mrange_cmd, "-", 500, "EXCLUDEEMPTY", "FILTER", "k=v",
+                 "GROUPBY", "g", "REDUCE", "max")
+        with pytest.raises(ResponseError, match="EXCLUDEEMPTY is not allowed with GROUPBY"):
+            diff(mrange_cmd, "-", 500, "FILTER", "k=v",
+                 "GROUPBY", "g", "REDUCE", "max", "EXCLUDEEMPTY")
+
+    @pytest.mark.parametrize("prefix", [
+        (),
+        ("WITHLABELS",),
+        ("LATEST",),
+        ("COUNT", 5),
+    ])
+    def test_accepted_before_filter_in_any_option_position(self, diff, mrange_cmd, prefix):
+        self._universe(diff)
+        diff(mrange_cmd, "-", 500, *prefix, "EXCLUDEEMPTY", "FILTER", "k=v")
+
+    def test_trailing_position_is_a_superset(self, diff, mrange_cmd):
+        """DIV-0050/DIV-0051: `FILTER <expr...> EXCLUDEEMPTY` — the trailing
+        position the documented syntax uses.
+
+        RTS's FILTER expression list does not stop at the token, so it reads it
+        as a filter expression and replies "failed parsing labels". Ours stops
+        there, like it does for every other option token, and honors the flag.
+        Same extended-FILTER-grammar root cause as DIV-0020: in our dialect a
+        bare token is a metric-name selector, so *not* stopping would answer the
+        documented form with a silent empty array.
+        """
+        self._universe(diff)
+        _ref_rejects_subject_accepts(diff, mrange_cmd, "-", 500,
+                                     "FILTER", "k=v", "EXCLUDEEMPTY")
+        assert len(diff.subject.execute_command(
+            mrange_cmd, "-", 500, "FILTER", "k=v", "EXCLUDEEMPTY")) == 3
+
+
 class TestArgParsing:
     def test_missing_filter_rejected(self, diff, mrange_cmd):
         # No FILTER at all: RTS arity error, we "no FILTER given". Both reject.

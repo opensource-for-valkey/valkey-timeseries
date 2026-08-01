@@ -262,7 +262,16 @@ impl MRangeFanoutCommand {
         } else if self.options.grouping.is_some() {
             handle_grouping(series, &self.options)
         } else {
-            handle_basic(series, &self.options)
+            let mut results = handle_basic(series, &self.options)?;
+            // Authoritative EXCLUDEEMPTY pass. Shards already drop empty series
+            // when they honor `exclude_empty`, but a peer that ignores the field
+            // (or coordinator-side aggregation that empties a series) must not
+            // change the reply. GROUPBY is rejected with EXCLUDEEMPTY at parse
+            // time, so only this branch can see the flag.
+            if self.options.exclude_empty {
+                results.retain(|result| !result.data.is_empty());
+            }
+            Ok(results)
         }
     }
 }
@@ -1243,6 +1252,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// EXCLUDEEMPTY rides on the request so shards can drop empty series before
+    /// shipping, but the coordinator is the authority: a peer that ignores the
+    /// field (here, both shards) must not be able to put an empty series back
+    /// into the reply.
+    #[test]
+    fn test_exclude_empty_reapplied_at_coordinator() {
+        let mut options = mrange_options(0, 500);
+        options.exclude_empty = true;
+
+        let mut command = MRangeFanoutCommand::new(options);
+        let request = command.generate_request();
+        assert!(request.exclude_empty, "shards are told to pre-filter");
+        // The shard rebuilds its options from the request, so the flag has to
+        // survive both directions of the codec for the pre-filter to happen.
+        assert!(
+            MRangeOptions::try_from(&request).unwrap().exclude_empty
+                && MRangeOptions::try_from(request).unwrap().exclude_empty
+        );
+
+        let responses = vec![
+            (
+                to_response(series_result("s", None, samples(&[(100, 1.0), (400, 4.0)]))),
+                false,
+            ),
+            (to_response(series_result("u", None, Vec::new())), false),
+        ];
+        let results = command.process_responses(responses, Vec::new()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "s");
+
+        // Without the flag the empty series is reported, as before.
+        let mut options = mrange_options(0, 500);
+        options.exclude_empty = false;
+        let mut command = MRangeFanoutCommand::new(options);
+        assert!(!command.generate_request().exclude_empty);
+        let responses = vec![
+            (
+                to_response(series_result("s", None, samples(&[(100, 1.0), (400, 4.0)]))),
+                false,
+            ),
+            (to_response(series_result("u", None, Vec::new())), false),
+        ];
+        let mut results = command.process_responses(responses, Vec::new()).unwrap();
+        sort_mrange_results(&mut results, false);
+        assert_eq!(results.len(), 2);
+        assert!(results[1].data.is_empty());
     }
 
     /// COUNT push-down latch: flag mirrors config && COUNT presence.

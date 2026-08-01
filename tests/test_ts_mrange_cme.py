@@ -1,6 +1,7 @@
-from valkey import ValkeyCluster
+from valkey import ResponseError, ValkeyCluster
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
+import pytest
 
 
 class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
@@ -423,3 +424,53 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                 assert series[2][0][1] == b'40'
             elif 'ts:{slot2}:dst_rev' in key:
                 assert series[2][0][1] == b'30'
+
+    def test_mrange_cme_exclude_empty(self):
+        """EXCLUDEEMPTY drops empty series regardless of which shard owns them.
+
+        The series with no in-range samples are split across two slots, so a
+        correct result requires both the shard-side pre-filter and the
+        coordinator's authoritative pass to agree.
+        """
+        self.setup_clustered_data()
+
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        # Two more series matching 'sensor=temp'/'sensor=humid', one per slot,
+        # with samples well outside the queried range.
+        cluster_client.execute_command('TS.CREATE', 'ts:{slot1}:temp3', 'LABELS', 'sensor', 'temp', 'region', 'north')
+        cluster_client.execute_command('TS.CREATE', 'ts:{slot2}:humid3', 'LABELS', 'sensor', 'humid', 'region', 'north')
+        cluster_client.execute_command('TS.ADD', 'ts:{slot1}:temp3', 900000, 1)
+        cluster_client.execute_command('TS.ADD', 'ts:{slot2}:humid3', 900000, 1)
+
+        client = self.new_client_for_primary(0)
+
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                        'FILTER', 'sensor=~".+"')
+        assert len(result) == 6
+        empty = [series[0] for series in result if len(series[2]) == 0]
+        assert sorted(empty) == [b'ts:{slot1}:temp3', b'ts:{slot2}:humid3']
+
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"')
+        assert [series[0] for series in result] == [
+            b'ts:{slot1}:temp1', b'ts:{slot1}:temp2',
+            b'ts:{slot2}:humid1', b'ts:{slot2}:humid2',
+        ]
+
+        result = client.execute_command('TS.MREVRANGE', self.start_ts, self.start_ts + 100,
+                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"')
+        assert len(result) == 4
+        for series in result:
+            timestamps = [sample[0] for sample in series[2]]
+            assert timestamps == sorted(timestamps, reverse=True)
+
+    def test_mrange_cme_exclude_empty_with_groupby_is_an_error(self):
+        """The GROUPBY conflict is rejected at parse time, before any fanout."""
+        self.setup_clustered_data()
+
+        client = self.new_client_for_primary(0)
+        for command in ('TS.MRANGE', 'TS.MREVRANGE'):
+            with pytest.raises(ResponseError, match="TSDB: EXCLUDEEMPTY is not allowed with GROUPBY"):
+                client.execute_command(command, self.start_ts, self.start_ts + 100,
+                                       'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"',
+                                       'GROUPBY', 'region', 'REDUCE', 'max')

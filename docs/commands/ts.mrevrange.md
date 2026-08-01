@@ -12,4 +12,8 @@ TS.MREVRANGE fromTimestamp toTimestamp
     [[ALIGN align] AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]]
     [GROUPBY label REDUCE reducer[(op value)]]
     FILTER selector...
+    [EXCLUDEEMPTY]
 ```
+
+Identical to [TS.MRANGE](ts.mrange.md) except that samples are returned in
+descending timestamp order; see that page for the full argument reference.

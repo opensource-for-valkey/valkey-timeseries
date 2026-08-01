@@ -7,7 +7,7 @@ use crate::common::hash::hash_f64;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::labels::Label;
 use crate::labels::filters::SeriesSelector;
-use crate::series::chunks::TimeSeriesChunk;
+use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::{DateRange, TimestampRange, ValueFilter};
 use get_size2::GetSize;
 use smallvec::{SmallVec, smallvec};
@@ -322,6 +322,9 @@ pub struct MRangeOptions {
     pub selected_labels: Vec<String>,
     pub grouping: Option<RangeGroupingOptions>,
     pub is_reverse: bool,
+    /// `EXCLUDEEMPTY`: drop matched series that report no samples/buckets for the
+    /// query. Mutually exclusive with `grouping` (rejected at parse time).
+    pub exclude_empty: bool,
 }
 
 /// Per-series MRANGE result data. `TimeSeriesChunk` can only store
@@ -347,6 +350,17 @@ impl From<TimeSeriesChunk> for SeriesResultData {
 }
 
 impl SeriesResultData {
+    /// Whether this series reports nothing at all — the emptiness `EXCLUDEEMPTY`
+    /// tests. It is the *reported* payload that counts, so a series whose samples
+    /// were all removed by FILTER_BY_TS/FILTER_BY_VALUE, or whose only in-range
+    /// samples produced no bucket, is empty; one reporting a NaN sample is not.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            SeriesResultData::Chunk(chunk) => chunk.is_empty(),
+            SeriesResultData::Rows(rows) => rows.is_empty(),
+        }
+    }
+
     /// Iterate the raw samples of the `Chunk` variant. The coordinator ingest
     /// paths only ever hold chunks (rows never cross the wire); `Rows` yields
     /// nothing.

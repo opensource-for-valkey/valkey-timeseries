@@ -83,4 +83,8 @@ message MultiRangeRequest {
   bool apply_aggregation = 7;
   bool apply_group_reduce = 8;
   bool apply_count = 9;
+  // EXCLUDEEMPTY: shards drop series with no reported samples before shipping.
+  // Purely a transfer optimization — the coordinator re-applies the filter, so a
+  // peer that ignores this field still produces the same reply.
+  bool exclude_empty = 10;
 }

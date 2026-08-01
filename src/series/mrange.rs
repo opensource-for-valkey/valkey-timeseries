@@ -236,9 +236,18 @@ fn process_mrange(
         }
     }
     let is_grouped = options.grouping.is_some();
+    let exclude_empty = options.exclude_empty;
 
     if is_clustered {
-        return Ok(handle_non_grouped(metas, options, true, limit));
+        // Shard side: a series lives entirely on one shard, so its emptiness is
+        // already decided here and dropping it now only saves transfer. The
+        // coordinator re-applies EXCLUDEEMPTY regardless, so a peer that ignores
+        // the request flag still yields the same reply.
+        let mut items = handle_non_grouped(metas, options, true, limit);
+        if exclude_empty {
+            items.retain(|item| !item.data.is_empty());
+        }
+        return Ok(items);
     }
 
     let mut items = if is_grouped {
@@ -246,6 +255,12 @@ fn process_mrange(
     } else {
         handle_non_grouped(metas, options, false, None)
     };
+
+    // EXCLUDEEMPTY is rejected together with GROUPBY at parse time, so this only
+    // ever trims per-series results.
+    if exclude_empty {
+        items.retain(|item| !item.data.is_empty());
+    }
 
     sort_mrange_results(&mut items, is_grouped);
 
@@ -675,6 +690,82 @@ mod tests {
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    fn keys_of(results: &[MRangeSeriesResult]) -> Vec<&str> {
+        let mut keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+        keys.sort();
+        keys
+    }
+
+    /// EXCLUDEEMPTY drops exactly the series that report nothing, and it judges
+    /// the *reported* payload rather than the stored series: a series whose only
+    /// in-range sample is NaN still reports and is kept, while one emptied by
+    /// FILTER_BY_VALUE is dropped just like one with no samples in the range.
+    #[test]
+    fn test_exclude_empty_drops_series_with_no_reported_samples() {
+        let in_range = make_series(&[(100, 100.0), (400, 400.0)]);
+        let out_of_range = make_series(&[(2000, 2000.0)]);
+        let nan_only = make_series(&[(150, f64::NAN)]);
+
+        let metas = || {
+            vec![
+                meta(&in_range, "s", None),
+                meta(&out_of_range, "u", None),
+                meta(&nan_only, "n", None),
+            ]
+        };
+
+        let mut options = MRangeOptions {
+            range: RangeOptions::with_range(0, 500).unwrap(),
+            ..Default::default()
+        };
+
+        // Default: every matched series is reported, empty payload included.
+        let results = process_mrange(metas(), options.clone(), false, None).unwrap();
+        assert_eq!(keys_of(&results), vec!["n", "s", "u"]);
+
+        options.exclude_empty = true;
+        let results = process_mrange(metas(), options.clone(), false, None).unwrap();
+        assert_eq!(
+            keys_of(&results),
+            vec!["n", "s"],
+            "only `u` reports nothing"
+        );
+
+        // Shard side (clustered): same decision, made before the payload ships.
+        let results = process_mrange(metas(), options.clone(), true, None).unwrap();
+        assert_eq!(keys_of(&results), vec!["n", "s"]);
+
+        // A value filter that removes every sample makes a series empty too.
+        options.range.value_filter = Some(crate::series::ValueFilter::new(0.0, 200.0).unwrap());
+        let results = process_mrange(metas(), options, false, None).unwrap();
+        assert_eq!(
+            keys_of(&results),
+            vec!["s"],
+            "NaN fails the value filter, leaving `n` with nothing to report"
+        );
+    }
+
+    /// Under AGGREGATION, emptiness is decided on the buckets: a series with no
+    /// in-range samples produces none and is dropped, and MREVRANGE ordering
+    /// does not change which series survive.
+    #[test]
+    fn test_exclude_empty_with_aggregation_and_reverse() {
+        let in_range = make_series(&[(100, 100.0), (400, 400.0)]);
+        let out_of_range = make_series(&[(2000, 2000.0)]);
+
+        let mut options = multi_options(100);
+        options.range.date_range = crate::series::TimestampRange::from_timestamps(0, 500).unwrap();
+        options.exclude_empty = true;
+
+        for is_reverse in [false, true] {
+            options.is_reverse = is_reverse;
+            let metas = vec![meta(&in_range, "s", None), meta(&out_of_range, "u", None)];
+            let results = process_mrange(metas, options.clone(), false, None).unwrap();
+            assert_eq!(keys_of(&results), vec!["s"], "reverse={is_reverse}");
+            assert_eq!(rows_of(&results[0]).len(), 2);
         }
     }
 

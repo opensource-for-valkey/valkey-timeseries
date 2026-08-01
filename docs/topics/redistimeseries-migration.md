@@ -40,9 +40,9 @@ shapes.
 
 Query semantics are equally in-contract: label matchers (`label=value`, `label!=value`,
 `label=(v1,v2)`, presence/absence forms), `AGGREGATION` with `ALIGN` / `BUCKETTIMESTAMP` /
-`EMPTY`, `FILTER_BY_TS`, `FILTER_BY_VALUE`, `COUNT`, `WITHLABELS`, `SELECTED_LABELS`, and
-`GROUPBY … REDUCE`. The same query over equivalently configured series returns the same
-series and the same samples.
+`EMPTY`, `FILTER_BY_TS`, `FILTER_BY_VALUE`, `COUNT`, `WITHLABELS`, `SELECTED_LABELS`,
+`GROUPBY … REDUCE`, and `EXCLUDEEMPTY`. The same query over equivalently configured
+series returns the same series and the same samples.
 
 If any of the above behaves differently, that is a **defect** — report it.
 

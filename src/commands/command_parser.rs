@@ -93,6 +93,7 @@ command_arg_tokens! {
     Empty => "EMPTY",
     Encoding => "ENCODING",
     End => "END",
+    ExcludeEmpty => "EXCLUDEEMPTY",
     False => "FALSE",
     Filter => "FILTER",
     FilterByTs => "FILTER_BY_TS",
@@ -1064,11 +1065,14 @@ pub(super) fn parse_filter_by_range_options(
 }
 
 pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResult<MRangeOptions> {
-    const RANGE_OPTION_ARGS: [CommandArgToken; 12] = [
+    // Tokens that end a variable-length argument list (FILTER, SELECTED_LABELS,
+    // FILTER_BY_TS).
+    const RANGE_OPTION_ARGS: [CommandArgToken; 13] = [
         CommandArgToken::Align,
         CommandArgToken::Aggregation,
         CommandArgToken::Count,
         CommandArgToken::BucketTimestamp,
+        CommandArgToken::ExcludeEmpty,
         CommandArgToken::Filter,
         CommandArgToken::FilterByTs,
         CommandArgToken::FilterByValue,
@@ -1133,6 +1137,16 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                     options.range.timestamp_filter = Some(value);
                 }
             }
+            CommandArgToken::ExcludeEmpty => {
+                // Accepted in any option position, including the trailing one the
+                // documented syntax uses (`FILTER ... [GROUPBY ...] [EXCLUDEEMPTY]`).
+                // The reference rejects `FILTER l=v EXCLUDEEMPTY` because its filter
+                // list does not stop at the token; ours does, like every other option
+                // token. Registered as DIV-0050 — in this dialect a bare word is a
+                // metric-name selector, so not stopping would silently turn the
+                // documented form into `__name__="EXCLUDEEMPTY"` and reply empty.
+                options.exclude_empty = true;
+            }
             CommandArgToken::GroupBy => {
                 let value = parse_grouping_params(args)?;
                 if repeated.accept(token) {
@@ -1183,6 +1197,13 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         return Err(ValkeyError::Str(
             error_consts::WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED,
         ));
+    }
+
+    // GROUPBY collapses the matched series into per-group results, so there is no
+    // per-series emptiness left for EXCLUDEEMPTY to act on; the reference rejects
+    // the combination rather than picking a meaning for it.
+    if options.exclude_empty && options.grouping.is_some() {
+        return Err(ValkeyError::Str(error_consts::EXCLUDE_EMPTY_WITH_GROUPBY));
     }
 
     Ok(options)

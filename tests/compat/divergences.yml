@@ -1087,3 +1087,41 @@
     divergence for now.
   since: 0.1.0
   details_regex: "reference='TSDB: Empty aggregation type in list'"
+
+# DIV-0050 (feature parity 2026-08-01): EXCLUDEEMPTY, added for TS.MRANGE /
+# TS.MREVRANGE. The flag's semantics match the reference exactly (probed against
+# the redis:8.10 pin); only the accepted argument positions differ, as below.
+
+- id: DIV-0050
+  command: TS.MRANGE
+  kind: behavior
+  description: >
+    `FILTER <expr...> EXCLUDEEMPTY` (the trailing position the documented syntax
+    uses, `... FILTER filterExpr... [GROUPBY ...] [EXCLUDEEMPTY]`) is accepted
+    here and honored as the flag; RTS 8.10 replies "TSDB: failed parsing labels"
+    because its FILTER expression list does not stop at the token. Both engines
+    agree on every other position (before FILTER, and after a complete
+    GROUPBY ... REDUCE block) and on the flag's effect.
+  rationale: >
+    Accepted (feature addition 2026-08-01) — an accepted-input superset, scoped
+    to one token in one position. This dialect additionally treats a bare word
+    as a metric-name selector (docs/topics/filter-syntax.md), so *not* stopping
+    the filter list at EXCLUDEEMPTY would parse the documented form as
+    `__name__="EXCLUDEEMPTY"` and reply with an empty array — a silent wrong
+    answer where RTS at least errors. Every other option token (COUNT, LATEST,
+    WITHLABELS, GROUPBY, ...) already terminates the FILTER list, so making this
+    one the exception would be inconsistent as well as unsafe.
+  since: 0.1.0
+  documentation_only: true
+
+- id: DIV-0051
+  command: TS.MREVRANGE
+  kind: behavior
+  description: >
+    TS.MREVRANGE twin of DIV-0050: `FILTER <expr...> EXCLUDEEMPTY` is accepted
+    here and rejected by RTS 8.10. Same parser, same rationale.
+  rationale: see DIV-0050 (registry matching is per-command, so the entry is
+    duplicated rather than shared; delete both together if the decision is
+    ever reversed)
+  since: 0.1.0
+  documentation_only: true

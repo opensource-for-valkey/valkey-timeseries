@@ -128,6 +128,7 @@ pub const NO_CLUSTER_NODES_AVAILABLE: &str = "TSDB: no cluster nodes available";
 pub const WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED: &str =
     "TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
 pub const EMPTY_SELECTED_LABELS: &str = "TSDB: SELECT_LABELS should have at least 1 parameter";
+pub const EXCLUDE_EMPTY_WITH_GROUPBY: &str = "TSDB: EXCLUDEEMPTY is not allowed with GROUPBY";
 pub const COMPACTION_CIRCULAR_DEPENDENCY: &str = "TSDB: circular dependency in compaction rules";
 pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exist";
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";

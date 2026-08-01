@@ -547,6 +547,11 @@ pub struct MultiRangeRequest {
     pub apply_group_reduce: bool,
     #[prost(bool, tag = "9")]
     pub apply_count: bool,
+    /// EXCLUDEEMPTY: shards drop series with no reported samples before shipping.
+    /// Purely a transfer optimization — the coordinator re-applies the filter, so a
+    /// peer that ignores this field still produces the same reply.
+    #[prost(bool, tag = "10")]
+    pub exclude_empty: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

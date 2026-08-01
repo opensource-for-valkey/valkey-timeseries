@@ -353,6 +353,12 @@ def _read_op(
         if draw(st.booleans()):
             groupby = ["GROUPBY", draw(st.sampled_from(LABEL_NAMES)),
                        "REDUCE", draw(st.sampled_from(reducers))]
+        # EXCLUDEEMPTY: both engines reject it alongside GROUPBY, so it is only
+        # drawn for ungrouped reads. Emitted before FILTER — the trailing
+        # position is an accepted-input superset (DIV-0050) that would diverge
+        # by construction rather than finding anything.
+        if not groupby and draw(st.booleans()):
+            opts.append("EXCLUDEEMPTY")
         return (f"TS.{kind}", frm, to, *opts, "FILTER", *draw(_filter()), *groupby)
     if kind == "MGET":
         opts = ["WITHLABELS"] if draw(st.booleans()) else []

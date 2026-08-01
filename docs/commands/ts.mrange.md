@@ -14,6 +14,7 @@ TS.MRANGE fromTimestamp toTimestamp
     [[ALIGN align] AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]]
     FILTER selector...
     [GROUPBY label REDUCE reducer[(op value)]]
+    [EXCLUDEEMPTY]
 ```
 
 ## Required Arguments
@@ -241,6 +242,27 @@ Same inline condition syntax as `AGGREGATION` (see above): required for `countif
 GROUPBY region REDUCE countif(>20.0)
 ```
 
+### EXCLUDEEMPTY
+
+Omit matched series that report no samples for the query. By default every series
+passing `FILTER` is reported, including those with an empty sample list.
+
+Emptiness is judged on what would be reported, not on the stored series: a series
+left with nothing by `FILTER_BY_TS`/`FILTER_BY_VALUE`, or one whose in-range
+samples produce no bucket under `AGGREGATION`, is omitted just like one with no
+samples in the range. A series reporting a `NaN` sample is *not* empty and is kept.
+
+`EXCLUDEEMPTY` cannot be combined with `GROUPBY ... REDUCE` — grouping collapses
+the matched series into per-group results, leaving no per-series emptiness to act
+on, so the combination is rejected with
+`TSDB: EXCLUDEEMPTY is not allowed with GROUPBY`.
+
+**Example:**
+
+```
+TS.MRANGE - 500 EXCLUDEEMPTY FILTER region=us-west
+```
+
 ## Return Value
 
 Returns an array where each element represents a matched series (or group when using `GROUPBY`):
@@ -359,10 +381,31 @@ O(n×m×k) where:
          2) "0"
 ```
 
+### Query excluding series with no samples in the range
+
+```bash
+127.0.0.1:6379> TS.MRANGE - 500 WITHLABELS FILTER s=1
+1) 1) "s"
+   ...
+2) 1) "u"
+   2) 1) 1) "s"
+         2) "1"
+   3) (empty array)
+
+127.0.0.1:6379> TS.MRANGE - 500 WITHLABELS EXCLUDEEMPTY FILTER s=1
+1) 1) "s"
+   2) 1) 1) "s"
+         2) "1"
+   3) 1) 1) (integer) 100
+         2) "100"
+```
+
 ## Notes
 
 - All filter selectors must match for a series to be included (logical AND)
 - For clustered deployments, the command fans out to all shards automatically
+- `EXCLUDEEMPTY` is applied on every shard and again on the coordinator, so a
+  series is omitted regardless of which shard owns it
 - When using `GROUPBY`, series are grouped by the specified label value
 - Aggregation is applied before grouping when both are specified
 - `LATEST` is useful when you have compaction rules and want aggregated data without querying compacted series directly

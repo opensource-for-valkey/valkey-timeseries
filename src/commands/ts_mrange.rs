@@ -15,6 +15,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 //   [[ALIGN align] AGGREGATION aggregator bucketDuration [CONDITION op value] [BUCKETTIMESTAMP bt] [EMPTY]]
 //   FILTER filterExpr...
 //   [GROUPBY label REDUCE reducer]
+//   [EXCLUDEEMPTY]
 #[valkey_module_macros::command({
     name: "ts.mrange",
     flags: [ReadOnly],

@@ -700,6 +700,7 @@ impl TryFrom<&MultiRangeRequest> for MRangeOptions {
             selected_labels,
             grouping,
             is_reverse,
+            exclude_empty: value.exclude_empty,
         })
     }
 }
@@ -732,6 +733,7 @@ impl TryFrom<MultiRangeRequest> for MRangeOptions {
             selected_labels,
             grouping,
             is_reverse,
+            exclude_empty: value.exclude_empty,
         })
     }
 }
@@ -758,6 +760,7 @@ impl TryFrom<&MRangeOptions> for MultiRangeRequest {
             apply_aggregation: false,
             apply_group_reduce: false,
             apply_count: false,
+            exclude_empty: value.exclude_empty,
         })
     }
 }
@@ -783,6 +786,7 @@ impl TryFrom<MRangeOptions> for MultiRangeRequest {
             apply_aggregation: false,
             apply_group_reduce: false,
             apply_count: false,
+            exclude_empty: value.exclude_empty,
         })
     }
 }
