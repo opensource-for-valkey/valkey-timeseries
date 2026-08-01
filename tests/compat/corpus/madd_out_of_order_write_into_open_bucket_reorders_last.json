@@ -1,0 +1,16 @@
+{
+  "description": "A distinct, never-before-advanced timestamp that lands in the rule's currently open bucket is a genuine out-of-order write, not a duplicate-policy fold, even though the bucket has not closed yet: `TS.MADD fz:k0 1999 1` opens the [1500,2000) bucket (AGGREGATION last 500), then a separate `TS.MADD fz:k0 1500 0` back-fills the same still-open bucket with an earlier timestamp, then `TS.MADD fz:k0 2000 0` closes it. Streaming the 1500 write straight into the open `last` aggregator (call order) overwrites its value with 0; recalculating the bucket from source (timestamp order) correctly keeps last=1 from ts=1999, which is what RTS reports.",
+  "origin": "fuzzer shrink 2026-07-31",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:k0", "RETENTION", "0", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "BLOCK", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:rollup", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATERULE", "fz:k0", "fz:rollup", "AGGREGATION", "last", "500"],
+    ["TS.MADD", "fz:k0", "1999", "1"],
+    ["TS.MADD", "fz:k0", "1500", "0"],
+    ["TS.MADD", "fz:k0", "2000", "0"],
+    ["TS.RANGE", "fz:rollup", "0", "1500"],
+    ["TS.RANGE", "fz:rollup", "-", "+"],
+    ["TS.RANGE", "fz:k0", "-", "+"]
+  ]
+}

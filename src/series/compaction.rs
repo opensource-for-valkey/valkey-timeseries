@@ -263,23 +263,43 @@ fn handle_batch_compaction(
     let mut advanced: SmallVec<[Timestamp; TEMP_VEC_LEN]> = SmallVec::new();
     let mut backfilled: SmallVec<[(Timestamp, Timestamp); TEMP_VEC_LEN]> = SmallVec::new();
     let mut high_water = prev_last;
+    // The bucket the rule is still accumulating into, tracked through the replay — not just
+    // `ctx.rule.bucket_start`, which is the *pre-batch* value and does not see this batch's own
+    // forward advances as they happen one by one.
+    let mut open_bucket = ctx.rule.bucket_start;
     for &ts in input_order {
         match high_water {
             // A repeat of a timestamp this same batch already appended is a duplicate-policy
-            // fold, not a back-fill. The append is what advances the rule through its buckets,
-            // and `samples` carries one entry per timestamp holding the folded value, so
-            // classifying the repeat as a back-fill would take that entry out of the append
-            // stream entirely: the bucket it should have closed stays open and unpublished,
-            // while the bucket it opened gets written to the destination as though it were
-            // historical. `TS.MADD k 0 0 k 500 0 k 500 0` published bucket 500 and lost
+            // fold, not a back-fill, but only while it still lands in the bucket the rule is
+            // currently accumulating into. The append is what advances the rule through its
+            // buckets, and `samples` carries one entry per timestamp holding the folded value,
+            // so classifying an open-bucket repeat as a back-fill would take that entry out of
+            // the append stream entirely: the bucket it should have closed stays open and
+            // unpublished, while the bucket it opened gets written to the destination as though
+            // it were historical. `TS.MADD k 0 0 k 500 0 k 500 0` published bucket 500 and lost
             // bucket 0 that way.
+            //
+            // A repeat whose bucket a *later* forward advance in this same batch has since
+            // closed is a genuine back-fill into already-published history, exactly like a
+            // repeat of a distinct earlier timestamp: `TS.MADD k 0 0 k 2000 0 k 1000 0` closes
+            // bucket 0 on the middle item, and the trailing `1000` back-fills it.
+            //
+            // A timestamp this call has *not* itself advanced through — even one that lands in
+            // the currently open bucket — is a genuine out-of-order write, not a fold: it must
+            // go through recalculation, which replays the bucket's stored samples in timestamp
+            // order. Streaming it straight into the open aggregator via the append path assumes
+            // call order is timestamp order, which order-sensitive aggregators like `last`/
+            // `first` depend on — two separate `TS.MADD` calls, `1999` then `1500`, into the
+            // same still-open 500ms bucket must report `last`=1 (`1999`'s value); streaming
+            // `1500` straight in overwrites it with `1500`'s value instead.
             Some(max) if ts <= max => {
-                if !advanced.contains(&ts) {
+                if !advanced.contains(&ts) || Some(ctx.rule.calc_bucket_start(ts)) != open_bucket {
                     backfilled.push((ts, max));
                 }
             }
             _ => {
                 high_water = Some(ts);
+                open_bucket = Some(ctx.rule.calc_bucket_start(ts));
                 advanced.push(ts);
             }
         }

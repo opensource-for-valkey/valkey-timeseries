@@ -1,0 +1,15 @@
+{
+  "description": "A repeated timestamp inside one TS.MADD is only a duplicate-policy fold when it still lands in the bucket the rule is currently accumulating into (madd_duplicate_ts_must_not_publish_open_bucket's fz:ob4). When a later, distinct item in the same batch has since closed that bucket with a forward advance, the repeat is a genuine back-fill into already-published history and must recalculate the closed bucket (here also dropping fz:k0's ts=0 sample, which the batch's own advance to ts=2000 pushes below the RETENTION=1000 floor): reference reports count=1 (bucket [0,2000) holds only ts=1000 once ts=0 is trimmed), where classifying the repeat as a fold left ts=0 folded into the bucket alongside ts=1000, reporting count=2.",
+  "origin": "fuzzer shrink 2026-07-31",
+  "expect_divergence": null,
+  "commands": [
+    ["TS.CREATE", "fz:k0", "RETENTION", "1000", "ENCODING", "COMPRESSED", "CHUNK_SIZE", "128", "DUPLICATE_POLICY", "FIRST", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATE", "fz:rollup", "LABELS", "metric", "cpu", "host", "h1"],
+    ["TS.CREATERULE", "fz:k0", "fz:rollup", "AGGREGATION", "count", "2000"],
+    ["TS.ADD", "fz:k0", "0", "0"],
+    ["TS.MADD", "fz:k0", "1000", "0", "fz:k0", "2000", "0", "fz:k0", "1000", "0"],
+    ["TS.RANGE", "fz:rollup", "-", "+"],
+    ["TS.RANGE", "fz:k0", "-", "+"],
+    ["TS.MGET", "FILTER", "metric=cpu"]
+  ]
+}
