@@ -32,6 +32,22 @@ mod tests {
         assert_eq!(detector.score(median), 0.0);
     }
 
+    /// All-NaN training data (every reading in the window was missing) used to
+    /// panic: NaN filtering left `Samples` empty, and the quantile estimators
+    /// index into `sample.values` unconditionally. Training must instead leave
+    /// the detector in its existing untrained state (`fitted: None`), so
+    /// nothing is flagged.
+    #[test]
+    fn train_on_all_nan_data_does_not_panic() {
+        let data = [f64::NAN, f64::NAN, f64::NAN];
+        let mut detector = DoubleMadOutlierDetector::new(3.0, AnomalyMADEstimator::Simple);
+        detector.train(&data).unwrap();
+
+        assert!(!detector.is_trained());
+        assert_eq!(detector.classify(0.0), AnomalySignal::None);
+        assert_eq!(detector.score(0.0), 0.0);
+    }
+
     /// Data cases for SimpleQuantileEstimator
     fn simple_qe_test_data_map() -> HashMap<&'static str, TestData<'static>> {
         let mut map = HashMap::new();

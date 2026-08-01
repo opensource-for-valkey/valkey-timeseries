@@ -85,12 +85,25 @@ impl DoubleMadOutlierDetector {
     }
 
     /// Train the detector using explicit Samples and optional estimator.
+    ///
+    /// A `samples` that is empty after NaN filtering (e.g. every reading in
+    /// the window was missing) leaves `self.fitted` at `None` rather than
+    /// fitting: the quantile estimators index into `sample.values`
+    /// unconditionally and panic on an empty sample. `None` is the detector's
+    /// existing untrained/no-model state — every reader already treats it as
+    /// "nothing to measure against" (`classify` returns `None`, `score`
+    /// returns `0.0`, `model_info` reports NaN fences).
     fn train_from_samples<E: MedianAbsoluteDeviationEstimator>(
         &mut self,
         samples: &Samples,
         k: f64,
         estimator: Option<E>,
     ) {
+        self.threshold = k;
+        if samples.is_empty() {
+            self.fitted = None;
+            return;
+        }
         self.fitted = Some(match estimator {
             Some(est) => Self::fit(est, samples),
             None => match self.estimator {
@@ -105,7 +118,6 @@ impl DoubleMadOutlierDetector {
                 }
             },
         });
-        self.threshold = k;
     }
 
     /// Deviation from the median, and the distance out to the fence on the

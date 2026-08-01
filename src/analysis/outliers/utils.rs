@@ -140,7 +140,8 @@ mod tests {
         let upper_fence = 4.0;
 
         for value in [center, center + 5.0, center - 5.0] {
-            let (_, boundary) = deviation_and_fence_distance(value, center, lower_fence, upper_fence);
+            let (_, boundary) =
+                deviation_and_fence_distance(value, center, lower_fence, upper_fence);
             assert!(
                 boundary.is_nan(),
                 "expected an unusable boundary for value {value}, got {boundary}"

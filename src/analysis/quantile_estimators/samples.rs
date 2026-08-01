@@ -93,11 +93,32 @@ mod tests {
 
     #[test]
     fn new_weighted_drops_nan_and_its_paired_weight() {
-        let sample =
-            Samples::new_weighted(vec![(1.0, 10.0), (f64::NAN, 99.0), (2.0, 20.0)]);
+        let sample = Samples::new_weighted(vec![(1.0, 10.0), (f64::NAN, 99.0), (2.0, 20.0)]);
 
         assert_eq!(sample.values, vec![1.0, 2.0]);
         assert_eq!(sample.sorted_weights, Some(vec![10.0, 20.0]));
         assert_eq!(sample.weighted_size(), 30.0);
+    }
+
+    /// All-NaN input (every reading in the window was missing) must produce a
+    /// well-formed empty sample, not just one that happens not to panic while
+    /// being built — callers (e.g. `MadOutlierDetector::train`) decide whether
+    /// to fit against `is_empty()`/`weighted_size() == 0.0`.
+    #[test]
+    fn new_unweighted_all_nan_yields_an_empty_sample() {
+        let sample = Samples::new_unweighted(vec![f64::NAN, f64::NAN, f64::NAN]);
+
+        assert!(sample.is_empty());
+        assert_eq!(sample.len(), 0);
+        assert_eq!(sample.weighted_size(), 0.0);
+    }
+
+    #[test]
+    fn new_weighted_all_nan_yields_an_empty_sample_with_zero_weight() {
+        let sample = Samples::new_weighted(vec![(f64::NAN, 10.0), (f64::NAN, 20.0)]);
+
+        assert!(sample.is_empty());
+        assert_eq!(sample.sorted_weights, Some(Vec::new()));
+        assert_eq!(sample.weighted_size(), 0.0);
     }
 }

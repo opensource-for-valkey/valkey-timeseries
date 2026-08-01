@@ -125,6 +125,14 @@ impl AnomalyDetector for MadOutlierDetector {
             estimator: impl MedianAbsoluteDeviationEstimator,
         ) -> (f64, f64) {
             let samples = Samples::from(data.to_vec());
+            // Every reading was NaN (missing): nothing survived filtering, and
+            // the quantile estimators index into `sample.values`
+            // unconditionally, panicking on an empty sample. NaN here is the
+            // detector's own untrained state (see `Default`), which already
+            // reads as "nothing to measure against" everywhere fences are used.
+            if samples.is_empty() {
+                return (f64::NAN, f64::NAN);
+            }
             let median = estimator.quantile_estimator().median(&samples);
             let mad = estimator.mad(&samples);
             (median, mad)
@@ -197,6 +205,23 @@ mod tests {
 
         assert!(!detector.is_outlier(detector.median));
         assert_eq!(detector.get_anomaly_score(detector.median), 0.0);
+    }
+
+    /// All-NaN training data (every reading in the window was missing) used to
+    /// panic: NaN filtering left `Samples` empty, and the quantile estimators
+    /// index into `sample.values` unconditionally. Training must instead land
+    /// in the detector's own untrained-equivalent state — NaN fences — so
+    /// nothing is flagged.
+    #[test]
+    fn train_on_all_nan_data_does_not_panic() {
+        let data = [f64::NAN, f64::NAN, f64::NAN];
+        let mut detector = MadOutlierDetector::default();
+        detector.train(&data).unwrap();
+
+        assert!(detector.median.is_nan());
+        assert!(detector.mad.is_nan());
+        assert!(!detector.is_outlier(0.0));
+        assert_eq!(detector.get_anomaly_score(0.0), 0.0);
     }
 
     #[test]
