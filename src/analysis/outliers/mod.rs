@@ -424,13 +424,11 @@ pub trait AnomalyDetector {
     /// raw evidence, which would anchor the boundary wherever the threshold
     /// happened to put it and make scores incomparable across methods.
     ///
-    /// Three windows are exempt, because they are scored without ever being
+    /// Two windows are exempt, because they are scored without ever being
     /// classified:
     ///
     /// - RCF's warmup window (`0..output_after`),
-    /// - the smoothed z-score's first `lag` samples,
-    /// - ESD's retained candidates, which Rosner's step-down rule admits as a
-    ///   family rather than individually.
+    /// - the smoothed z-score's first `lag` samples.
     ///
     /// `±∞` observations are maximally anomalous: they score `1.0` and are
     /// flagged. `NaN` observations score `0.0` and are never flagged — a missing
