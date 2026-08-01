@@ -326,8 +326,10 @@ grows, but only degenerate or non-finite input reaches it exactly:
 
 * An infinite sample value is maximally anomalous: score `1.0`, and flagged.
 * A `NaN` sample scores `0.0` and is never flagged — a missing reading is not evidence of an anomaly.
-* When a method's fitted scale collapses to zero (a robust estimator on a series that is more than half constant), any
-  deviation at all scores `1.0` and is flagged.
+* When a method's fitted scale collapses to zero (a robust estimator on a series that is more than half constant), the
+  outcome depends on the method: `MAD`, `DOUBLE-MAD`, and `IQR` treat the collapsed fence as zero-width, so any deviation
+  at all scores `1.0` and is flagged; `ZSCORE`, `MODIFIED-ZSCORE`, `CUSUM`, and `EWMA` treat a collapsed scale as having
+  no boundary to test against, so every sample scores `0.0` and stays unflagged.
 
 The `THRESHOLD` echoed back in `parameters` stays on the **method's own** scale — standard deviations for `ZSCORE`, `k`
 for `MAD`, the decision interval for `CUSUM`, a fraction for `CONTAMINATION`. It is not on the score scale, and under
