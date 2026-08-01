@@ -156,16 +156,16 @@ pub fn create_row_iterator<'a>(
     let aligned_timestamp = aggregation
         .alignment
         .get_aligned_timestamp(start_ts, end_ts);
-    // Same scan-order swap the sample path applies: this stream is aggregated forward and
-    // reversed at the end too, so `first`/`last` have to be exchanged for a reverse query.
+    // first/last are chronological (earliest/latest sample) regardless of direction: this
+    // stream is aggregated forward and reversed at the end, which already lands on the
+    // chronological answer, so the aggregation is used as requested.
     let carry = last_carry_mask(aggregation);
-    let scan_aggregation = aggregation.for_scan_order(is_reverse);
-    let aggr_iter = MultiAggregateIterator::new(filtered, &scan_aggregation, aligned_timestamp);
+    let aggr_iter = MultiAggregateIterator::new(filtered, aggregation, aligned_timestamp);
 
     finalize_row_iterator(aggr_iter, is_reverse, options.count, carry)
 }
 
-/// Apply reversal, the `last` EMPTY carry and COUNT to a row stream (COUNT limits output
+/// Apply the `last` EMPTY carry, reversal and COUNT to a row stream (COUNT limits output
 /// buckets, exactly like the sample path).
 pub(crate) fn finalize_row_iterator<'a, I: Iterator<Item = MultiSample> + 'a>(
     iter: I,
@@ -175,8 +175,8 @@ pub(crate) fn finalize_row_iterator<'a, I: Iterator<Item = MultiSample> + 'a>(
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
     match (is_reverse, carry) {
         (true, Some(mask)) => {
-            let filled = CarryLastEmpty::new(ReverseIter::new(iter), mask);
-            apply_iter_limit!(filled, count)
+            let rev = ReverseIter::new(CarryLastEmpty::new(iter, mask));
+            apply_iter_limit!(rev, count)
         }
         (true, None) => {
             let rev = ReverseIter::new(iter);
@@ -223,11 +223,11 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     let count = options.count;
 
-    // Helper to apply reversal, the EMPTY carry and limits, then box.
+    // Helper to apply the EMPTY carry, reversal and limits, then box.
     // This ensures we only box once at the very end of the chain.
     //
-    // Order matters: the carry runs on the reversed stream (output order) but before COUNT,
-    // so a truncated reply still carries from the buckets that precede it.
+    // Order matters: the carry runs chronologically (before reversal, if any) but before
+    // COUNT, so a truncated reply still carries from the buckets that precede it in time.
     fn finalize<'a, I: Iterator<Item = Sample> + 'a>(
         iter: I,
         is_reverse: bool,
@@ -236,8 +236,8 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
     ) -> Box<dyn Iterator<Item = Sample> + 'a> {
         match (is_reverse, carry) {
             (true, Some(mask)) => {
-                let filled = CarryLastEmpty::new(ReverseIter::new(iter), mask);
-                apply_iter_limit!(filled, count)
+                let rev = ReverseIter::new(CarryLastEmpty::new(iter, mask));
+                apply_iter_limit!(rev, count)
             }
             (true, None) => {
                 let rev = ReverseIter::new(iter);
@@ -255,8 +255,7 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
         (Some(agg), Some(grp)) => {
             // No carry here: the group reducer combines across series, so a gap in one
             // series is not a gap in the reduced bucket.
-            let scan_agg = agg.for_scan_order(is_reverse);
-            let aggr_iter = create_aggregate_iterator(filtered, options, &scan_agg);
+            let aggr_iter = create_aggregate_iterator(filtered, options, agg);
             let aggregator = grp.aggregation.create_aggregator();
             let reducer = ReduceIterator::new(aggr_iter, aggregator);
             finalize(reducer, is_reverse, count, None)
@@ -268,8 +267,7 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
         }
         (Some(agg), None) => {
             let carry = last_carry_mask(agg);
-            let scan_agg = agg.for_scan_order(is_reverse);
-            let aggr_iter = create_aggregate_iterator(filtered, options, &scan_agg);
+            let aggr_iter = create_aggregate_iterator(filtered, options, agg);
             finalize(aggr_iter, is_reverse, count, carry)
         }
         (None, None) => finalize(filtered, is_reverse, count, None),
@@ -294,19 +292,18 @@ impl BucketValues for MultiSample {
     }
 }
 
-/// Fills each `last` column's gap buckets with the previously *emitted* value.
+/// Fills each `last` column's gap buckets with the chronologically preceding value.
 ///
-/// RTS's EMPTY fill for `last` is "the value already reported for the preceding bucket",
-/// which is a statement about output order, not about time: forward over `7 _ _ _ 9` it
-/// reports `7,7,7,9`, and in reverse it reports `9,9,9,7`. Running in output order — after
-/// `ReverseIter` — is what makes one rule cover both, and it is also why the aggregator
-/// itself cannot do the carry (see `LastAggregator::empty_value`).
+/// RTS's EMPTY fill for `last` is "the value already reported for the preceding bucket in
+/// time" (RedisTimeSeries 8.10; prior RTS pins defined the carry against output order
+/// instead, so a reverse query carried from the chronologically *later* neighbor — see the
+/// 8.10 reference bump for the reproducer). We always aggregate forward and reverse the
+/// finished buckets, so running the carry *before* `ReverseIter` — while the stream is still
+/// chronological — lands on the same answer for both directions with one rule; running it
+/// after reversal is also why the aggregator itself cannot do the carry (see
+/// `LastAggregator::empty_value`).
 ///
-/// `carry[i]` marks the columns whose *requested* aggregator is `last`. It must be built
-/// from the request rather than from the aggregators actually running, because a reverse
-/// query swaps `first`/`last` to compensate for scanning forward (`for_scan_order`) — the
-/// fill rule follows the name the caller asked for, while the swap only decides which
-/// sample of a non-empty bucket wins.
+/// `carry[i]` marks the columns whose requested aggregator is `last`.
 pub(crate) struct CarryLastEmpty<I: Iterator> {
     inner: I,
     carry: SmallVec<[bool; 2]>,

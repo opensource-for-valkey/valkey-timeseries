@@ -482,15 +482,15 @@ mod tests {
         let samples: Vec<Sample> =
             TimeSeriesRangeIterator::new(None, &series, &options, true).collect();
 
-        // RedisTimeSeries defines first/last against the *scan*, not against time: under
-        // TS.REVRANGE, `last` is the bucket's OLDEST non-NaN sample. Buckets come back newest
-        // first, so [2000, 4000) yields 5.0 (at t=2000) and [0, 2000) yields 1.0 (at t=0).
-        // Reference-checked against RedisTimeSeries 8.6.
+        // RedisTimeSeries defines first/last chronologically — the bucket's latest non-NaN
+        // sample by timestamp — independent of query direction. Buckets come back newest
+        // first under TS.REVRANGE, so [2000, 4000) yields 7.0 (at t=3000, the bucket's latest)
+        // and [0, 2000) yields 3.0 (at t=1000). Reference-checked against RedisTimeSeries 8.10.
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].timestamp, 2000);
-        assert_eq!(samples[0].value, 5.0);
+        assert_eq!(samples[0].value, 7.0);
         assert_eq!(samples[1].timestamp, 0);
-        assert_eq!(samples[1].value, 1.0);
+        assert_eq!(samples[1].value, 3.0);
     }
 
     #[test]

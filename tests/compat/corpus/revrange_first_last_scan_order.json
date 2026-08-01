@@ -1,5 +1,5 @@
 {
-  "description": "TS.REVRANGE first/last aggregation must reflect reverse scan order per bucket.",
+  "description": "TS.REVRANGE first/last aggregation is chronological (earliest/latest sample per bucket), matching TS.RANGE, regardless of query direction (RedisTimeSeries 8.10).",
   "origin": "manual reproducer",
   "expect_divergence": null,
   "commands": [

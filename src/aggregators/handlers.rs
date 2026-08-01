@@ -110,12 +110,13 @@ impl AggregationHandler for LastAggregator {
     /// NaN, like every other non-counting aggregator.
     ///
     /// `last` is the one aggregator whose EMPTY fill is not a constant — RTS reports the
-    /// previous value for a gap bucket, a gap meaning "no new reading, so the last reading
-    /// still stands". That carry cannot be done here: it runs in **output** order, and a
-    /// reverse query aggregates forward and reverses the finished buckets, so the value a
-    /// gap must inherit is one this aggregator has not seen yet. `CarryLastEmpty`
-    /// (src/iterators/utils.rs) applies it after the reversal instead, which lands on RTS
-    /// in both directions (forward `7,7,7,9`; reverse `9,9,9,7`).
+    /// chronologically previous non-empty bucket's value for a gap, a gap meaning "no new
+    /// reading, so the last reading still stands" (RedisTimeSeries 8.10; carry is timeline-
+    /// based, independent of query direction). That carry cannot be done here: this
+    /// aggregator is reset per bucket and has no visibility across buckets. `CarryLastEmpty`
+    /// (src/iterators/utils.rs) applies it across the chronological stream instead — before
+    /// `ReverseIter`, so a reverse query still carries forward in time rather than from
+    /// whichever bucket happens to be emitted first.
     fn empty_value(&self) -> Value {
         f64::NAN
     }
