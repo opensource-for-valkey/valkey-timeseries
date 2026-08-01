@@ -507,14 +507,21 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 rcf_options.sample_size = Some(parse_positive_value(args, "SAMPLE_SIZE")? as usize);
             },
             "THRESHOLD" => {
-                let val = parse_positive_value(args, "THRESHOLD")?;
+                // Positivity is `RCFThreshold::std_dev`'s job, not this parser's:
+                // it produces the specific "std_dev threshold must be positive"
+                // message, whereas a generic pre-check here would shadow it with
+                // a less informative one for every out-of-range value.
+                let val = parse_finite_value(args, "THRESHOLD")?;
                 rcf_options.threshold = Some(
                     RCFThreshold::std_dev(val)
                         .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?
                 );
             },
             "CONTAMINATION" => {
-                let val = parse_positive_value(args, "CONTAMINATION")?;
+                // Same reasoning as THRESHOLD above: `RCFThreshold::contamination`
+                // validates the full `(0..0.5]` range and reports it, so this
+                // parser only needs to guard against non-finite input.
+                let val = parse_finite_value(args, "CONTAMINATION")?;
                 rcf_options.threshold = Some(
                     RCFThreshold::contamination(val)
                         .map_err(|e| ValkeyError::String(format!("TSDB: {e}")))?
@@ -608,15 +615,24 @@ fn parse_single_value(iter: &mut CommandArgIterator, option_name: &str) -> Valke
 }
 
 fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {
+    let value = parse_finite_value(iter, option_name)?;
+    if value <= 0.0 {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
+/// Rejects NaN/infinite input but leaves range validation to the caller.
+/// For options backed by a constructor with its own range check (e.g.
+/// `RCFThreshold::std_dev`/`::contamination`), pre-filtering here for
+/// positivity would shadow that constructor's more specific error message.
+fn parse_finite_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {
     let value = parse_single_value(iter, option_name)?;
     if !value.is_finite() {
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be finite"
-        )));
-    }
-    if value <= 0.0 {
-        return Err(ValkeyError::String(format!(
-            "TSDB: {option_name} must be positive"
         )));
     }
     Ok(value)
