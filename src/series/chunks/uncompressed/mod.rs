@@ -224,7 +224,14 @@ impl UncompressedChunk {
         let max_size = read_usize(&mut buf)?;
         let max_elements = read_usize(&mut buf)?;
         let len = read_usize(&mut buf)?;
-        let mut samples = Vec::with_capacity(len);
+        // `len` is untrusted (corrupt/malicious peer, truncated RDB, ...): every
+        // sample needs at least 1 byte (uvarint timestamp) + 8 bytes (f64 value),
+        // so capping the reservation to what the remaining buffer could possibly
+        // hold prevents an attacker-controlled `Vec::with_capacity` from
+        // requesting an unbounded allocation, which aborts the process rather
+        // than returning an `Err`.
+        let capacity = len.min(buf.len() / 9);
+        let mut samples = Vec::with_capacity(capacity);
         for _ in 0..len {
             let ts = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)? as i64;
             let val = try_read_f64_le(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
@@ -1452,5 +1459,25 @@ mod tests {
         let new_chunk = empty_chunk.split().unwrap();
         assert!(empty_chunk.samples.is_empty());
         assert!(new_chunk.samples.is_empty());
+    }
+
+    /// A corrupt/malicious peer can declare an absurd sample count in the
+    /// `len` header while sending only a handful of bytes. `deserialize_raw`
+    /// must reject this via the normal EOF error path rather than reserving
+    /// `len` elements up front: a multi-terabyte `Vec::with_capacity` request
+    /// aborts the process (allocation failure is not a catchable panic), which
+    /// turns a malformed fan-out payload into a crash.
+    #[test]
+    fn test_deserialize_raw_rejects_oversized_len_without_huge_allocation() {
+        use crate::common::encoding::write_uvarint;
+
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 0); // max_size
+        write_uvarint(&mut buf, 0); // max_elements
+        write_uvarint(&mut buf, u64::MAX); // len: wildly larger than the buffer could hold
+        // No sample payload follows, so decoding must fail on the first read.
+
+        let result = super::UncompressedChunk::deserialize_raw(&buf);
+        assert!(result.is_err(), "oversized len must be rejected, not honored");
     }
 }
