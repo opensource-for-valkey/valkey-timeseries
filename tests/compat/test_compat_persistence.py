@@ -1,7 +1,7 @@
-"""Persistence interop with RedisTimeSeries 8.8 (test plan §7.4).
+"""Persistence interop with RedisTimeSeries 8.10 (test plan §7.4).
 
 Both engines register the same module type name — `TSDB-TYPE` — with
-incompatible payload formats (ours: encver 1; RTS 8.8: encver 9). RTS→valkey
+incompatible payload formats (ours: encver 1; RTS 8.10: encver 9). RTS→valkey
 RDB/DUMP migration is explicitly NOT supported (owner decision, 2026-07-16;
 DIV-0010): there is no format converter and none is planned. Migration is by
 re-ingest (see COMPATIBILITY.md). This module pins the *defined-failure*
@@ -15,7 +15,7 @@ behavior so it is discovered by tests, not by users:
     must be refused by the module's own encoding-version guard.
   - Loading an RTS-produced RDB file must be refused with a clear log
     message — never misparsed. The fixture is written by the reference on
-    demand and cached at test-data/rts-8.8-timeseries.rdb (see the
+    demand and cached at test-data/rts-8.10-timeseries.rdb (see the
     `rts_rdb_fixture` fixture); nothing RedisTimeSeries produced is checked in.
   - The reverse direction (our DUMP into the reference) is out of our
     control; the observed clean rejection is pinned as documentation.
@@ -37,7 +37,7 @@ from common import VALKEY_SERVER_PATH, get_module_path
 
 _COMPAT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ROOT_DIR = os.path.dirname(os.path.dirname(_COMPAT_DIR))
-RTS_RDB_FIXTURE = os.path.join(_ROOT_DIR, "test-data", "rts-8.8-timeseries.rdb")
+RTS_RDB_FIXTURE = os.path.join(_ROOT_DIR, "test-data", "rts-8.10-timeseries.rdb")
 COMPOSE_FILE = os.path.join(_ROOT_DIR, "docker-compose.compat.yml")
 
 # The key the fixture RDB carries; the load test asserts it does not materialize.
@@ -187,7 +187,7 @@ class TestDumpRestore:
     def test_foreign_encver_rejected_by_module_guard(self, clients):
         """A TSDB-TYPE payload with a foreign encoding version must be refused
         by the module itself, independent of the server's RDB-version
-        envelope (which is what rejects genuine Redis-8.8 payloads today)."""
+        envelope (which is what rejects genuine Redis-8.10 payloads today)."""
         subject, _ = clients
         subject.execute_command("TS.CREATE", "own")
         subject.execute_command("TS.ADD", "own", 100, 1.5)
@@ -196,7 +196,7 @@ class TestDumpRestore:
         # Sanity: the same payload with its true encver round-trips.
         assert subject.execute_command("RESTORE", "own-copy", 0, payload) == b"OK"
 
-        mutated = _with_encver(payload, 9)  # RTS 8.8's encver
+        mutated = _with_encver(payload, 9)  # RTS 8.10's encver
         with pytest.raises(ResponseError, match="Bad data format"):
             subject.execute_command("RESTORE", "own-9", 0, mutated)
         assert subject.execute_command("EXISTS", "own-9") == 0

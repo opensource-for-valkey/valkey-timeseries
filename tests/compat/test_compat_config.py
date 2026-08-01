@@ -1,4 +1,4 @@
-"""Configuration parity with RedisTimeSeries 8.8 (test plan §7.1).
+"""Configuration parity with RedisTimeSeries 8.10 (test plan §7.1).
 
 Diffs the `ts-*` config surface between the two engines: names, defaults,
 mutability (CONFIG SET accept/reject), and value validation — including the
@@ -26,7 +26,7 @@ import pytest
 import valkey
 from valkey.exceptions import ResponseError
 
-# The complete RTS 8.8 ts-* surface with its defaults, observed black-box
+# The complete RTS 8.10 ts-* surface with its defaults, observed black-box
 # against the pinned reference image (values as CONFIG GET reports them).
 RTS_CONFIG_DEFAULTS = {
     "ts-retention-policy": "0",
@@ -60,6 +60,9 @@ REFERENCE_ONLY_CONFIGS = {
     # Selects the wire protocol for libmr, the cluster fan-out layer RTS uses
     # for TS.MRANGE/TS.MGET/TS.QUERYINDEX. New in the 8.8 reference bump.
     "ts-libmr-protocol": "DIV-0034",
+    # Immutable boolean, default `yes`; no observable command-level effect
+    # found by black-box probing. New in the 8.10 reference bump.
+    "ts-topology-events": "DIV-0048",
 }
 
 # Registered default-value divergences: subject default != reference default,

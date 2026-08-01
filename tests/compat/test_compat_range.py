@@ -489,7 +489,7 @@ class TestOptionParsing:
         ],
     )
     def test_unknown_or_inapplicable_option_rejected(self, diff, range_cmd, tail):
-        """DIV-0015: we reject what RTS 8.8 silently ignores.
+        """DIV-0015: we reject what RTS 8.10 silently ignores.
 
         RTS's range parser drops trailing tokens it does not recognize or can
         not apply — `TS.RANGE k - + GARBAGE` returns samples. We reject them.
@@ -528,7 +528,7 @@ class TestOptionParsing:
         """DIV-0013: we accept range bounds RTS rejects.
 
         `*` (now) and unit-suffixed offsets (`-1h`) are deliberate extensions to
-        the bound grammar; RTS 8.8 answers both with "wrong fromTimestamp".
+        the bound grammar; RTS 8.10 answers both with "wrong fromTimestamp".
         Asserted per-engine because plan §5.2 makes an accepted-input superset
         non-registrable — the harness hard-fails it through `diff` by design, so
         this test states the gap explicitly instead of hiding it.

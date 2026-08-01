@@ -136,7 +136,7 @@ MATCHERS = [
 ]
 LABEL_NAMES = ["metric", "host", "region"]
 
-# Valid GROUPBY reducers (RTS 8.8). `first`/`last`/`twa` are not reducers.
+# Valid GROUPBY reducers (RTS 8.10). `first`/`last`/`twa` are not reducers.
 GROUP_REDUCERS = ["sum", "min", "max", "avg", "range", "count", "std.p", "std.s", "var.p", "var.s"]
 
 # The variance family. RTS evaluates it with the naive E[x^2]-E[x]^2 identity, which

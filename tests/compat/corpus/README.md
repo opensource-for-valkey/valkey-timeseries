@@ -1,7 +1,7 @@
 # Differential fuzzer regression corpus
 
 Each `*.json` file here is a minimal command sequence that must stay
-byte-identical to RedisTimeSeries 8.8. `test_compat_corpus.py` replays every
+byte-identical to RedisTimeSeries 8.10. `test_compat_corpus.py` replays every
 file through the `diff` client under RESP2 and RESP3; a regression that reopens
 the underlying bug fails as a plain mismatch.
 

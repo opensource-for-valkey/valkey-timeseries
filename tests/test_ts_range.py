@@ -1330,7 +1330,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         Bucket emission is per-aggregator: the bucket is returned iff that aggregation
         accepted a sample from it. COUNTALL/COUNTNAN accept NaNs and report the count;
         every other aggregator ignores them and the bucket is omitted entirely.
-        Reference-checked against RedisTimeSeries 8.8.
+        Reference-checked against RedisTimeSeries 8.10.
         """
         self.client.execute_command('TS.CREATE', 'ts_all_nan')
 

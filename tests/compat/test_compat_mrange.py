@@ -25,7 +25,7 @@ MRANGE_COMMANDS = ("TS.MRANGE", "TS.MREVRANGE")
 
 # Reducers valid for GROUPBY ... REDUCE. A strict subset of the aggregator set:
 # first/last (scan-order dependent) and twa are rejected with "Invalid reducer
-# type". Probed black-box against RTS 8.8.
+# type". Probed black-box against RTS 8.10.
 GROUP_REDUCERS = (
     "avg",
     "sum",

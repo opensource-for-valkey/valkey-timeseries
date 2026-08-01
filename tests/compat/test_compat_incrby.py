@@ -152,11 +152,14 @@ class TestTimestampOption:
     def test_timestamp_missing_value(self, diff, counter):
         """Subject-only, deliberately not diffed.
 
-        `TS.INCRBY key <n> TIMESTAMP` with no operand makes RedisTimeSeries 8.8
-        read past the end of its argument vector: it usually replies "TSDB: invalid
+        `TS.INCRBY key <n> TIMESTAMP` with no operand makes RedisTimeSeries read
+        past the end of its argument vector: it usually replies "TSDB: invalid
         timestamp" but sometimes dereferences garbage and takes the server down
-        (SIGSEGV in RM_StringPtrLen, reproduced 2026-07-29 on the pinned image,
-        `TS.INCRBY <new-key> 1 TIMESTAMP`). Sending it to the reference would
+        (SIGSEGV in RM_StringPtrLen, reproduced 2026-07-29 on the redis:8.8 pinned
+        image, `TS.INCRBY <new-key> 1 TIMESTAMP`). Not reproduced in 15 attempts
+        against the redis:8.10 pin on 2026-08-01, but a memory-layout-dependent
+        out-of-bounds read does not become safe just because it didn't crash this
+        time — treat it as still present. Sending it to the reference would
         intermittently kill the shared container, so only the subject — which must
         report a clean error and stay up — is exercised here."""
         diff.subject.execute_command("TS.CREATE", "f:ts:novalue")

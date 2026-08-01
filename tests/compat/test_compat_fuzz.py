@@ -2,7 +2,7 @@
 
 Hypothesis generates valid-by-construction command sequences (see
 fuzz_strategies.py) and replays each through a `DiffClient`, so every reply is
-diffed against RedisTimeSeries 8.8. A generated program that produces any
+diffed against RedisTimeSeries 8.10. A generated program that produces any
 unregistered divergence fails the example; Hypothesis then shrinks it to a
 minimal reproducer, which a human promotes into the regression corpus
 (tests/compat/corpus/, replayed by test_compat_corpus.py) as a golden Tier A

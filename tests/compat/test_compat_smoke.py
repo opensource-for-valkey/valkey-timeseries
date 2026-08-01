@@ -206,13 +206,13 @@ class TestErrorConditions:
 
 
 class TestInfoBaseline:
-    """Validates the frozen RTS 8.8 TS.INFO baseline (plan §5.1 rule 3).
+    """Validates the frozen RTS 8.10 TS.INFO baseline (plan §5.1 rule 3).
 
     Runs against the REFERENCE server only: if this fails, either the frozen
     file is wrong or the reference image drifted on a digest bump.
     """
 
-    BASELINE_PATH = os.path.join(os.path.dirname(__file__), "info-fields-8.8.yml")
+    BASELINE_PATH = os.path.join(os.path.dirname(__file__), "info-fields-8.10.yml")
 
     def _info_field_names(self, client, key):
         reply = client.execute_command("TS.INFO", key)
@@ -234,7 +234,7 @@ class TestInfoBaseline:
         actual = self._info_field_names(diff.reference, "smoke:baseline")
 
         assert actual == expected, (
-            "RTS 8.8 TS.INFO field set drifted from tests/compat/info-fields-8.8.yml.\n"
+            "RTS 8.10 TS.INFO field set drifted from tests/compat/info-fields-8.10.yml.\n"
             f"  missing from reference: {sorted(expected - actual)}\n"
             f"  new in reference:       {sorted(actual - expected)}\n"
             "Update the frozen baseline in the same reviewed change as the image bump."
@@ -254,5 +254,5 @@ class TestInfoBaseline:
 
         missing = sorted(expected - actual)
         assert not missing, (
-            f"subject TS.INFO is missing frozen RTS 8.8 fields: {missing}"
+            f"subject TS.INFO is missing frozen RTS 8.10 fields: {missing}"
         )

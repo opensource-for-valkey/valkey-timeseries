@@ -12,7 +12,7 @@ which is incompatible with that license.
 **Do not consult, fetch, vendor, copy, or port RedisTimeSeries source or test code**, and do not
 reproduce it from memory. Compatibility behavior must be derived only from public command
 documentation and black-box observation of a running reference server. Running the pinned
-`redis:8.8` image as a test target is fine; its source is off-limits. See
+`redis:8.10` image as a test target is fine; its source is off-limits. See
 [tests/compat/README.md](tests/compat/README.md).
 
 Quick start (commands you can run)
@@ -147,7 +147,7 @@ Cargo features
 
 Compatibility with RedisTimeSeries
 
-- [COMPATIBILITY.md](COMPATIBILITY.md) is the contract: what is expected to match RTS 8.8, what is an intentional
+- [COMPATIBILITY.md](COMPATIBILITY.md) is the contract: what is expected to match RTS 8.10, what is an intentional
   divergence, and what is explicitly a non-goal (RDB/AOF/replication byte formats, error message text, performance,
   internals). Read it before "fixing" a behavior difference — some are deliberate.
   [docs/topics/redistimeseries-migration.md](docs/topics/redistimeseries-migration.md) is the end-user-facing
@@ -157,7 +157,7 @@ Compatibility with RedisTimeSeries
   its section numbers (§5.1 normalization, §5.2 error policy, §5.3 registry, §6 matrix, §7 operational parity)
   are referenced throughout the test code.
 - `tests/compat/` is the differential harness. Each test uses a `diff` fixture that sends every command to both the
-  subject (valkey-server + this module) and the reference (pinned `redis:8.8`), normalizes both replies, and asserts
+  subject (valkey-server + this module) and the reference (pinned `redis:8.10`), normalizes both replies, and asserts
   equality — automatically parametrized over RESP2 and RESP3.
 - Intentional mismatches go in `tests/compat/divergences.yml` and report as XFAIL-DIVERGENT rather than failing.
   "Reference errors, subject succeeds" always hard-fails and cannot be registered away. Stale entries hide
@@ -167,7 +167,7 @@ Compatibility with RedisTimeSeries
   installs **no traps** (the caller owns teardown and reads `COMPAT_REFERENCE_OWNED` to know what it started),
   and validates on every start that the reference reports the pinned `redis_version` and `timeseries` module
   version — a mismatch aborts rather than silently reinterpreting the registry.
-- The digest-pinned `redis:8.8` image is the canonical reference artifact. A secondary native-binary mode
+- The digest-pinned `redis:8.10` image is the canonical reference artifact. A secondary native-binary mode
   (`COMPAT_REFERENCE_MODE=binary`, Linux-only, pinned deb + SHA256 table in the helper) exists but is **not**
   selected by `auto` until an equivalence run against the image is recorded in
   [docs/rts-reference-bumps.md](docs/rts-reference-bumps.md). Bump the image digest and the binary pin in the
@@ -307,7 +307,7 @@ Fuzzing (Tier C differential fuzzer, plan §4.3)
 - There is no `cargo-fuzz`/libFuzzer target. The only fuzzer is `tests/compat/test_compat_fuzz.py`: Hypothesis
   generates valid-by-construction command sequences (`tests/compat/fuzz_strategies.py`) over a small key/label
   universe and replays each through the same `diff` client the rest of `tests/compat` uses, so every reply is
-  checked against the pinned `redis:8.8` reference. It therefore needs a reference server just like the other
+  checked against the pinned `redis:8.10` reference. It therefore needs a reference server just like the other
   compat tests, plus `hypothesis` installed (`requirements.txt` / `uv sync`).
 - It is opt-in and not part of the PR gate — a time-budgeted nightly-style job. It is currently not wired into
   `.github/workflows/ci.yml`; run it by hand.

@@ -1,6 +1,6 @@
 """TS.INFO parity matrix (test plan §6, TS.INFO row).
 
-The frozen RTS 8.8 field baseline (`info-fields-8.8.yml`, plan §5.1 rule 3) is
+The frozen RTS 8.10 field baseline (`info-fields-8.10.yml`, plan §5.1 rule 3) is
 checked in test_compat_smoke.py. This module covers what that check does not: the
 *values* of those fields field-by-field as the series is mutated (ALTER,
 CREATERULE, DEL, retention trimming, chunk splits), the DEBUG variant, and the
@@ -8,7 +8,7 @@ key-state and parsing dimensions.
 
 Every `diff("TS.INFO", ...)` compares the whole reply, so each scenario here is a
 field-by-field assertion; extra fields we emit are absorbed by DIV-0001 and a
-missing or value-mismatched RTS 8.8 field fails.
+missing or value-mismatched RTS 8.10 field fails.
 
 Written clean-room from public RedisTimeSeries documentation and black-box
 observation of the reference server. Do NOT consult RedisTimeSeries source or

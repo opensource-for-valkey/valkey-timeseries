@@ -1,6 +1,6 @@
 # RedisTimeSeries compatibility harness
 
-Differential tests that verify valkey-timeseries behaves like RedisTimeSeries 8.8
+Differential tests that verify valkey-timeseries behaves like RedisTimeSeries 8.10
 on the shared command surface. Implements Tier A of
 [docs/rts-compatibility-test-plan.md](../../docs/rts-compatibility-test-plan.md);
 the compatibility contract itself is described in
@@ -19,7 +19,7 @@ compatibility tests.** Everything in this directory must be derived from:
 - black-box observation of the reference server's behavior.
 
 Nothing from the RedisTimeSeries repository may be vendored, copied, ported, or
-fetched at CI time. Running the official `redis:8.8` binary image as a black-box
+fetched at CI time. Running the official `redis:8.10` binary image as a black-box
 test target is fine; its source and tests are off-limits.
 
 The pinned image is a reviewed choice: see
@@ -30,7 +30,7 @@ at each bump, and add a section there when changing the pin.
 
 Each test gets a `diff` fixture: a `DiffClient` that sends every command to
 **both** engines — the *subject* (valkey-server + this module) and the
-*reference* (pinned `redis:8.8` Docker image) — normalizes both replies
+*reference* (pinned `redis:8.10` Docker image) — normalizes both replies
 (`compat_normalize.py`, plan §5.1), and asserts equality. Tests are just command
 sequences; they are automatically parametrized over RESP2 and RESP3.
 
@@ -87,7 +87,7 @@ Useful environment variables:
 | Variable | Effect |
 |---|---|
 | `COMPAT_REFERENCE_MODE` | `auto` (default) \| `binary` \| `docker`. `auto` uses the canonical Docker image; `binary` downloads a pinned `redis-server` + `redistimeseries.so` (Linux only) |
-| `COMPAT_REFERENCE_VERSION` | reference release to expect and, in binary mode, download (default 8.8.0 — must match the pinned image) |
+| `COMPAT_REFERENCE_VERSION` | reference release to expect and, in binary mode, download (default 8.10.0 — must match the pinned image) |
 | `COMPAT_REFERENCE_DEB_URL` / `COMPAT_REFERENCE_DEB_SHA256` | deliberate override for an untested distro; both required together |
 
 Binary mode is a local convenience for the non-replication majority of the suite, not a
@@ -116,7 +116,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `compat_normalize.py` | reply normalization and structural diffing (plan §5.1) |
 | `compat_registry.py` | known-divergence registry loader (plan §5.3) |
 | `divergences.yml` | the registry — single source of truth for intentional divergences |
-| `info-fields-8.8.yml` | frozen RTS 8.8 `TS.INFO` field baseline (plan §5.1 rule 3) |
+| `info-fields-8.10.yml` | frozen RTS 8.10 `TS.INFO` field baseline (plan §5.1 rule 3) |
 | `compat_helpers.py` | shared scenario helpers (pinned `TS.CREATE`, aggregator lists, label universe) |
 | `test_compat_smoke.py` | fixed smoke subset — the CI PR gate (plan §8) |
 | `test_compat_create.py` | Phase 1: `TS.CREATE` matrix (plan §6) |

@@ -34,7 +34,7 @@
   kind: reply-superset
   description: >
     TS.INFO returns additional fields (metric, encoding, rounding) beyond the
-    RedisTimeSeries 8.8 field set.
+    RedisTimeSeries 8.10 field set.
   rationale: extension metadata; extra fields are additive and invisible to
     map-parsing clients
   since: 0.1.0
@@ -121,7 +121,7 @@
   command: CONFIG
   kind: behavior
   description: >
-    `ts-num-threads` defaults to 4; RTS 8.8 defaults to 3. Name, range,
+    `ts-num-threads` defaults to 4; RTS 8.10 defaults to 3. Name, range,
     immutability, and semantics (query worker pool size) are unchanged —
     only the out-of-the-box value differs.
   rationale: sizes our rayon pool for parallel query processing; 4 is the
@@ -135,7 +135,7 @@
   description: >
     RTS-produced RDB files and DUMP payloads cannot be loaded (and ours
     cannot be loaded by RTS). Both modules register the module type name
-    TSDB-TYPE with incompatible payload formats (ours encver 1, RTS 8.8
+    TSDB-TYPE with incompatible payload formats (ours encver 1, RTS 8.10
     encver 9); every load path fails cleanly by design — RESTORE errors
     without creating a key, an RTS RDB file is refused at startup with a
     clear log message, and the module's encoding-version guard rejects any
@@ -152,7 +152,7 @@
   command: TS.RANGE
   kind: unsupported
   description: >
-    The `twa` (time-weighted average) aggregator is not implemented. RTS 8.8
+    The `twa` (time-weighted average) aggregator is not implemented. RTS 8.10
     computes a time-weighted average over the bucket; we reject the aggregator
     name with "TSDB: unknown aggregation type" on every command that takes an
     AGGREGATION token (TS.RANGE/TS.REVRANGE/TS.MRANGE/TS.MREVRANGE and
@@ -183,7 +183,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    The range-bound grammar accepts two forms RTS 8.8 rejects with
+    The range-bound grammar accepts two forms RTS 8.10 rejects with
     "wrong fromTimestamp": `*` (the current time) and unit-suffixed relative
     offsets (`-1h`, `-30m`, `-2d`). This is an accepted-input superset — a
     query valid here errors on RedisTimeSeries. A *bare* negative integer is
@@ -209,7 +209,7 @@
   documentation_only: true
   description: >
     A repeated option (e.g. `COUNT 5 COUNT 2`) is accepted by both engines but
-    resolved differently: RTS 8.8 keeps the first occurrence, we keep the last.
+    resolved differently: RTS 8.10 keeps the first occurrence, we keep the last.
     Neither errors.
   rationale: >
     Accepted (owner sign-off 2026-07-17, §5.3): keep our last-occurrence-wins
@@ -231,7 +231,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    We reject unknown or inapplicable trailing tokens; RTS 8.8 silently ignores
+    We reject unknown or inapplicable trailing tokens; RTS 8.10 silently ignores
     them. `TS.RANGE k - + GARBAGE` returns samples on RTS and errors here, as do
     `WITHLABELS` (not a TS.RANGE option) and `EMPTY`/`BUCKETTIMESTAMP` without
     an accompanying AGGREGATION. ALIGN without AGGREGATION is the exception RTS
@@ -269,7 +269,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    A compaction destination may itself be the source of another rule. RTS 8.8
+    A compaction destination may itself be the source of another rule. RTS 8.10
     refuses ("TSDB: the source key already has a source rule"), making a
     destination a leaf; we accept the chain, so a downstream series can compact
     into a third. Accepted-input superset — a TS.CREATERULE valid here errors on
@@ -287,7 +287,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    `ts-encoding` is a one-way latch on RTS 8.8: CONFIG SET can move it away
+    `ts-encoding` is a one-way latch on RTS 8.10: CONFIG SET can move it away
     from the default `compressed` (e.g. to `uncompressed`) but never back —
     the set returns OK yet the value stays put. Ours is fully reversible. The
     default (compressed) matches; only runtime mutability diverges. Because the
@@ -642,7 +642,7 @@
   kind: behavior
   description: >
     TS.INCRBY with a negative TIMESTAMP is rejected ("must be a nonnegative integer");
-    RTS 8.8 accepts it and stores a sample at that negative timestamp. TS.ADD and
+    RTS 8.10 accepts it and stores a sample at that negative timestamp. TS.ADD and
     TS.MADD reject it on both engines — the gap is specific to the counter commands.
   rationale: >
     Accepted (owner sign-off 2026-07-22, §5.3): an RTS validation gap, not intended
@@ -661,7 +661,7 @@
   command: TS.DECRBY
   kind: behavior
   description: >
-    TS.DECRBY with a negative TIMESTAMP is rejected; RTS 8.8 accepts it. Same gap as
+    TS.DECRBY with a negative TIMESTAMP is rejected; RTS 8.10 accepts it. Same gap as
     DIV-0032.
   rationale: see DIV-0032
   since: 0.1.0
@@ -671,11 +671,11 @@
   command: CONFIG
   kind: unsupported
   description: >
-    `ts-libmr-protocol` (default `INTERNAL`) is present on RTS 8.8 and has no
+    `ts-libmr-protocol` (default `INTERNAL`) is present on RTS 8.10 and has no
     subject equivalent. It selects the wire protocol spoken between nodes by
     libmr, the MapReduce layer RTS uses to fan TS.MRANGE/TS.MGET/TS.QUERYINDEX
     out across cluster shards. New in the 8.8 reference bump (absent from the
-    previous 8.6 pin).
+    previous 8.6 pin); still present, unchanged, on the 8.10 pin.
   rationale: >
     Accepted (reference bump 2026-07-23): configures an RTS-internal transport
     this engine does not have. Cross-shard fan-out here is not libmr-based, so
@@ -692,10 +692,11 @@
   description: >
     `ts-num-threads` is immutable here — `CONFIG SET` is rejected by the server
     with "can't set immutable config" and the value can only be chosen at
-    startup (valkey.conf or MODULE LOAD args). RTS 8.8 accepts it at runtime
+    startup (valkey.conf or MODULE LOAD args). RTS 8.10 accepts it at runtime
     (validated to 1..16) and resizes its pool. This is a change in the
-    reference, not in this engine: RTS 8.6, the previous pin, rejected the same
-    CONFIG SET as immutable exactly as we do.
+    reference, not in this engine: RTS 8.6, the previous-previous pin, rejected
+    the same CONFIG SET as immutable exactly as we do; the mutability change
+    landed at the 8.6 -> 8.8 bump and is unchanged on 8.10.
   rationale: >
     Accepted (reference bump 2026-07-23, §5.3 sign-off): the config sizes the
     module's global rayon thread pool, which is built once at load and shared by
@@ -724,7 +725,7 @@
   documentation_only: true
   description: >
     A repeated aggregator inside an AGGREGATION list is rejected here and
-    accepted by RTS 8.8. RTS treats the list positionally, so
+    accepted by RTS 8.10. RTS treats the list positionally, so
     `AGGREGATION avg,avg 1000` returns two identical columns; we reject the
     whole clause with "duplicate aggregation 'avg'". The check is
     case-insensitive on the aggregator name (`avg,AVG` is a duplicate) and
@@ -749,7 +750,7 @@
   documentation_only: true
   description: >
     GROUPBY/REDUCE combined with a multi-aggregator AGGREGATION list is rejected
-    by RTS 8.8 ("GROUPBY is not allowed when multiple aggregators are
+    by RTS 8.10 ("GROUPBY is not allowed when multiple aggregators are
     specified") and supported here: we apply the reducer to each column
     independently and return a grouped row of the same width. RTS enforces the
     restriction on list *length*, so even a list of one repeated aggregator is
@@ -774,7 +775,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    The list-element grammar accepts two forms RTS 8.8 has no vocabulary for,
+    The list-element grammar accepts two forms RTS 8.10 has no vocabulary for,
     both answered there with "Unknown aggregation type": aggregator names this
     engine adds (`rate`, `countif`, `sumif`, …), and the inline per-element
     condition `name(condition)` — e.g. `AGGREGATION countif(>15),avg 1000`,
@@ -986,7 +987,7 @@
   kind: behavior
   documentation_only: true
   description: >
-    `TS.INCRBY key <n> TIMESTAMP` with no operand makes RedisTimeSeries 8.8 read
+    `TS.INCRBY key <n> TIMESTAMP` with no operand makes RedisTimeSeries read
     past the end of its argument vector. It usually replies "TSDB: invalid
     timestamp", but sometimes dereferences garbage and takes the server down —
     reproduced 2026-07-29 against the pinned redis:8.8 image with
@@ -1002,6 +1003,11 @@
     TestTimestampOption::test_timestamp_missing_value asserts only that the subject
     reports a clean error and survives. Re-check on the next reference bump; if it
     is fixed upstream, this entry becomes an ordinary error-text delta.
+    Re-checked at the 8.10 bump (2026-08-01): not reproduced in 15 attempts on a
+    disposable redis:8.10 container (all clean "TSDB: invalid timestamp" replies,
+    server stayed up). Left registered rather than removed — an unreproduced
+    memory-layout-dependent out-of-bounds read is not the same as a fixed one, and
+    the entry still describes correct, tested subject behavior either way.
   since: 0.1.0
 
 # DIV-0047 was uncovered when TS.MADD stopped auto-creating (see the DIV-0045 note
@@ -1035,3 +1041,49 @@
     TestNotificationParity::test_madd_events_agree_when_every_item_succeeds keeping
     the success path from being masked.
   since: 0.1.0
+
+# DIV-0048 (reference bump 2026-08-01): a second RTS-internal config surfaced
+# alongside ts-libmr-protocol (DIV-0034), same shape — no subject equivalent,
+# registered reference-only rather than gated.
+
+- id: DIV-0048
+  command: CONFIG
+  kind: unsupported
+  description: >
+    `ts-topology-events` (default `yes`, immutable — `CONFIG SET` rejected with
+    "can't set immutable config") is present on RTS 8.10 and has no subject
+    equivalent. New in the 8.10 reference bump (absent from the previous 8.8
+    pin). Black-box probing only shows a boolean immutable flag; its effect was
+    not further probed (no observable command-level behavior found under
+    default `yes`).
+  rationale: >
+    Accepted (reference bump 2026-08-01): same treatment as DIV-0034
+    (`ts-libmr-protocol`) — an RTS-internal knob this engine has no
+    corresponding subsystem for. Registering it as reference-only keeps the
+    config-parity test's "every RTS name must exist on the subject" rule
+    intact for the rest of the surface; revisit if this engine grows a
+    comparable topology-change-notification concept.
+  since: 0.1.0
+
+# DIV-0049 (reference bump 2026-08-01): RTS 8.10 grew a dedicated error message
+# for the empty-string aggregator case, previously (8.8 and earlier) folded into
+# the generic "unknown aggregation type" text. Only the empty-string case is
+# affected — every other bogus aggregator name still errors identically on both
+# engines (TestAggregators::test_unknown_aggregator_rejected's `median`,
+# `average`, `p99` cases are unaffected).
+
+- id: DIV-0049
+  command: TS.CREATERULE
+  kind: error-text
+  description: >
+    `AGGREGATION ""` (empty string): RTS 8.10 replies "TSDB: Empty aggregation
+    type in list"; this module replies "TSDB: Unknown aggregation type", the
+    same generic text it uses for every other unrecognized aggregator name.
+  rationale: >
+    Accepted (reference bump 2026-08-01): both sides reject the input (no
+    accepted-input-superset risk), and diverge only in wording, which plan
+    §5.2 treats as reportable rather than gating. Pending a reviewed decision
+    on whether to special-case the empty string; left as a generic-message
+    divergence for now.
+  since: 0.1.0
+  details_regex: "reference='TSDB: Empty aggregation type in list'"

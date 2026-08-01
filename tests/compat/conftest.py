@@ -4,7 +4,7 @@ See docs/rts-compatibility-test-plan.md §4.1 and tests/compat/README.md.
 
 Server resolution:
 
-  reference (RedisTimeSeries 8.8)
+  reference (RedisTimeSeries 8.10)
     1. COMPAT_REFERENCE_URL, if set (e.g. redis://127.0.0.1:16379) — any
        already-running reference server, including one started manually with
        `docker compose -f docker-compose.compat.yml up -d reference`.
@@ -107,7 +107,7 @@ def reference_url():
     if not _truthy("RTS_COMPAT"):
         pytest.skip(
             "RTS compatibility tests need a reference server: set "
-            "COMPAT_REFERENCE_URL to a running RedisTimeSeries 8.8 instance, or "
+            "COMPAT_REFERENCE_URL to a running RedisTimeSeries 8.10 instance, or "
             "set RTS_COMPAT=1 to let the harness start the pinned Docker image "
             "(docker-compose.compat.yml)."
         )

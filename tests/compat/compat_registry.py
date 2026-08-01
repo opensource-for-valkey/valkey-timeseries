@@ -1,7 +1,7 @@
 """Known-divergence registry (test plan §5.3).
 
 `divergences.yml` is the single source of truth for intentional divergences from
-RedisTimeSeries 8.8. The differential harness consults it before failing a test:
+RedisTimeSeries 8.10. The differential harness consults it before failing a test:
 a mismatch fully covered by registry entries is recorded as XFAIL-DIVERGENT in the
 conformance report instead of failing.
 

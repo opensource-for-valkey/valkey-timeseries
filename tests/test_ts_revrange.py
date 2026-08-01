@@ -236,10 +236,10 @@ class TestTimeSeriesRevRange(ValkeyTimeSeriesTestCaseBase):
         ('MIN', 1.0),
         ('MAX', 6.0),
         ('COUNT', 6.0),
-        # first/last follow the scan, so TS.REVRANGE reports the newest sample
-        # as FIRST — the mirror of TS.RANGE, and what RedisTimeSeries does.
-        ('FIRST', 6.0),
-        ('LAST', 1.0),
+        # first/last are chronological (earliest/latest sample), the same as
+        # TS.RANGE, regardless of query direction (RedisTimeSeries 8.10).
+        ('FIRST', 1.0),
+        ('LAST', 6.0),
         ('RANGE', 5.0),
         ('STD.P', 1.708),
         ('STD.S', 1.871),

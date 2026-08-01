@@ -7,15 +7,15 @@
 # in docs/rts-reference-bumps.md. The native binary pin in tests/reference_server.sh
 # (COMPAT_REFERENCE_VERSION) tracks this image and is bumped in the same change.
 #
-# Licensing note: the redis:8.8 image is used strictly as a black-box test target.
+# Licensing note: the redis:8.10 image is used strictly as a black-box test target.
 # Nothing from the RedisTimeSeries source repository may be vendored, copied, ported,
 # or fetched at CI time (plan §3, licensing boundary).
 
 services:
   reference:
-    # redis:8.8 multi-arch index digest, resolved 2026-07-23.
-    # Bundled timeseries module: 80800 (was 80602 on the previous redis:8.6 pin).
-    image: redis:8.8@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b
+    # redis:8.10 multi-arch index digest, resolved 2026-08-01.
+    # Bundled timeseries module: 81000 (was 80800 on the previous redis:8.8 pin).
+    image: redis:8.10@sha256:c29e49ab2f85760a3827b53882e6dd9f5c6c3f0bb7d724e07bb31cbf275a5236
     command:
       - redis-server
       - --enable-debug-command

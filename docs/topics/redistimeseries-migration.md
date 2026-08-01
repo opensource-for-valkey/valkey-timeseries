@@ -290,7 +290,7 @@ CONFIG GET ts-compatibility-mode
 | Value | Behavior |
 |---|---|
 | `extended` (default) | valkey-timeseries semantics |
-| `strict` | Resolve the gated cases the way RedisTimeSeries 8.8 resolves them |
+| `strict` | Resolve the gated cases the way RedisTimeSeries 8.10 resolves them |
 
 Settable at runtime and at startup, fully reversible, and applies only to subsequent
 commands — it rewrites no stored state, so switching either direction is safe.

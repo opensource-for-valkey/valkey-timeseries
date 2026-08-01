@@ -32,7 +32,7 @@ from compat_helpers import AGGREGATORS, mk_populated, mk_series
 RANGE_COMMANDS = ("TS.RANGE", "TS.REVRANGE")
 MRANGE_COMMANDS = ("TS.MRANGE", "TS.MREVRANGE")
 
-# Every aggregator name RTS 8.8 accepts as a list element, minus `twa`
+# Every aggregator name RTS 8.10 accepts as a list element, minus `twa`
 # (DIV-0012: unimplemented here, so a list containing it errors on one side
 # only — pinned by test_twa_inside_a_list_is_rejected). The 8.6 NaN counters
 # are ordinary list elements and are included.
@@ -454,7 +454,7 @@ class TestNanColumns:
 
 class TestDivergences:
     def test_duplicate_aggregator_in_a_list_is_rejected(self, diff, range_cmd):
-        """DIV-0036: we reject a repeated aggregator; RTS 8.8 accepts it.
+        """DIV-0036: we reject a repeated aggregator; RTS 8.10 accepts it.
 
         RTS treats the list positionally — `AGGREGATION avg,avg` returns two
         identical columns — while we reject the whole clause with "duplicate
