@@ -1,6 +1,6 @@
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_mean_std_dev;
-use crate::analysis::outliers::utils::normalize_evidence;
+use crate::analysis::outliers::utils::{deviation_and_fence_distance, normalize_evidence};
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
     detect_pointwise,
@@ -61,17 +61,11 @@ impl ZScoreOutlierDetector {
     /// the identical subtraction and scores exactly `0.5`.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        let deviation = value - self.mean;
         if self.std_dev < f64::EPSILON {
             // Constant to within rounding: no scale, so nothing to be past.
-            return (deviation, f64::NAN);
+            return (value - self.mean, f64::NAN);
         }
-        let boundary = if deviation >= 0.0 {
-            self.upper_fence - self.mean
-        } else {
-            self.mean - self.lower_fence
-        };
-        (deviation, boundary)
+        deviation_and_fence_distance(value, self.mean, self.lower_fence, self.upper_fence)
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {

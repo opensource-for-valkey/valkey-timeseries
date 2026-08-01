@@ -3,7 +3,7 @@ use crate::analysis::outliers::mad_estimator::{
     HarrellDavisNormalizedEstimator, InvariantMADEstimator, MedianAbsoluteDeviationEstimator,
     SimpleNormalizedEstimator,
 };
-use crate::analysis::outliers::utils::normalize_evidence;
+use crate::analysis::outliers::utils::{deviation_and_fence_distance, normalize_evidence};
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMADEstimator, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo,
     PointDetector, detect_pointwise,
@@ -80,13 +80,7 @@ impl MadOutlierDetector {
     /// differing by a rounding step, which lands the fence on the flagged side.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        let deviation = value - self.median;
-        let boundary = if deviation >= 0.0 {
-            self.upper_fence - self.median
-        } else {
-            self.median - self.lower_fence
-        };
-        (deviation, boundary)
+        deviation_and_fence_distance(value, self.median, self.lower_fence, self.upper_fence)
     }
 
     /// Returns a normalized anomaly score in `[0..1]` describing how "anomalous" `value` is.

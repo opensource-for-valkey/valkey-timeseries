@@ -60,6 +60,32 @@ pub(super) fn normalize_evidence(evidence: f64, boundary: f64) -> f64 {
     score
 }
 
+/// Signed deviation from `center`, and the distance out to the fence on the
+/// value's own side.
+///
+/// The boundary is taken as the fence-minus-center subtraction rather than a
+/// recomputation (e.g. `k * mad`), so a value sitting *exactly on the
+/// reported fence* yields evidence and boundary from the identical
+/// subtraction and scores exactly `0.5` via [`normalize_evidence`]. Shared by
+/// every fenced detector (MAD, IQR, Z-score, modified Z-score) so scoring and
+/// classification read the same pair and cannot disagree about which side of
+/// the fence a value falls on.
+#[inline]
+pub(super) fn deviation_and_fence_distance(
+    value: f64,
+    center: f64,
+    lower_fence: f64,
+    upper_fence: f64,
+) -> (f64, f64) {
+    let deviation = value - center;
+    let boundary = if deviation >= 0.0 {
+        upper_fence - center
+    } else {
+        center - lower_fence
+    };
+    (deviation, boundary)
+}
+
 #[inline]
 pub(super) fn normalize_value(v: f64) -> f64 {
     if v.is_nan() { 0.0 } else { v }

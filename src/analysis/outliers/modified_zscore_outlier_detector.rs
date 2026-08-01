@@ -1,4 +1,4 @@
-use super::utils::{normalize_evidence, normalize_value};
+use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::math::calculate_median_sorted;
 use crate::analysis::outliers::{
@@ -60,18 +60,12 @@ impl ModifiedZScoreOutlierDetector {
     /// rounding step about a value sitting exactly on the fence.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        let deviation = value - self.median;
         if self.mad_scaled <= 1e-10 {
             // No usable scale: nothing to be past.
-            return (deviation, f64::NAN);
+            return (value - self.median, f64::NAN);
         }
         let (lower_fence, upper_fence) = self.fences();
-        let boundary = if deviation >= 0.0 {
-            upper_fence - self.median
-        } else {
-            self.median - lower_fence
-        };
-        (deviation, boundary)
+        deviation_and_fence_distance(value, self.median, lower_fence, upper_fence)
     }
 
     /// The fences `model_info` reports, and the ones `deviation_and_boundary`

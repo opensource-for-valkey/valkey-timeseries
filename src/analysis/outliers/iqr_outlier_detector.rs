@@ -1,4 +1,4 @@
-use super::utils::{normalize_evidence, normalize_value};
+use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
@@ -56,13 +56,7 @@ impl IQROutlierDetector {
     /// read this pair, so they cannot disagree about which side a value is on.
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> (f64, f64) {
-        let deviation = value - self.center;
-        let boundary = if deviation >= 0.0 {
-            self.upper_fence - self.center
-        } else {
-            self.center - self.lower_fence
-        };
-        (deviation, boundary)
+        deviation_and_fence_distance(value, self.center, self.lower_fence, self.upper_fence)
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
