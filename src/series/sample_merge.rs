@@ -260,6 +260,8 @@ fn add_group_sequentially(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sam
             .add_deferring_retention(item.timestamp, item.value, None);
         if res.is_ok() {
             touched.push(item.timestamp);
+            input.added_order.push(item.timestamp);
+        } else if matches!(res, SampleAddResult::Duplicate) {
             // Input order, duplicates included: a repeated timestamp does not advance the
             // running max, so it reads as a back-fill exactly as RTS applies it.
             input.added_order.push(item.timestamp);
