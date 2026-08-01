@@ -113,7 +113,7 @@ ASAN_BUILD=true
 
 #### Compatibility fuzzing
 
-`./run-fuzz.sh` drives the RedisTimeSeries differential fuzzer: it generates
+`./fuzz.sh` drives the RedisTimeSeries differential fuzzer: it generates
 random but valid command sequences and checks every reply against a pinned RedisTimeSeries
 reference server (v8.8), so an unexplained difference shows up as a test failure with a minimal
 reproducer. See [tests/compat/README.md](tests/compat/README.md) for the harness itself and
@@ -125,25 +125,25 @@ subject server, and tears both down when it finishes:
 
 ```
 # quick check: 150 examples per protocol
-./run-fuzz.sh
+./fuzz.sh
 
 # nightly-style soak: 20k examples per round, new rounds until 20 minutes are up
-./run-fuzz.sh --examples 20000 --duration 20m --stats
+./fuzz.sh --examples 20000 --duration 20m --stats
 
 # reproduce a finding: one protocol, fixed seed, verbose
-./run-fuzz.sh --protocol resp3 --derandomize --seed 4 -v
+./fuzz.sh --protocol resp3 --derandomize --seed 4 -v
 
 # replay the checked-in regression corpus instead of generating new cases
-./run-fuzz.sh --suite corpus
+./fuzz.sh --suite corpus
 
 # reuse servers you already have running (skips Docker and the local launch)
-./run-fuzz.sh --reference-url redis://127.0.0.1:16379 \
+./fuzz.sh --reference-url redis://127.0.0.1:16379 \
               --subject-url   redis://127.0.0.1:16390
 ```
 
 It puts the subject in `ts-compatibility-mode strict` by default (`--compat-mode`), so the
 intentional, documented divergences do not fail the run — a failure means an *unregistered*
-divergence worth investigating. Run `./run-fuzz.sh --help` for the full option
+divergence worth investigating. Run `./fuzz.sh --help` for the full option
 list, including `--rounds`, `--filter`, `--reference-port`, `--keep-reference`,
 `--server-version`, `--skip-build`, `--rebuild`, `--skip-install`, `--python`, `--report`
 and `--dry-run`; anything after `--` is passed through to pytest.

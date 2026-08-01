@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # reference_server.sh — provision, start and stop the RedisTimeSeries compatibility
-# reference server. Sourceable; used by build.sh and run-fuzz.sh.
+# reference server. Sourceable; used by build.sh and fuzz.sh.
 #
 # See docs/rts-compat-build-integration-plan.md. The digest-pinned redis:8.8 image in
 # docker-compose.compat.yml is the canonical reference artifact (§3); the native binary

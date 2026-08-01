@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-fuzz.sh — drive the RedisTimeSeries differential compatibility fuzzer
+# fuzz.sh — drive the RedisTimeSeries differential compatibility fuzzer
 # (test plan §4.3, tests/compat/README.md).
 #
 # What it does, in order:
@@ -28,7 +28,7 @@
 # tests/compat/README.md.
 #
 # ---------------------------------------------------------------------------
-# Usage: ./run-fuzz.sh [options] [-- extra pytest args]
+# Usage: ./fuzz.sh [options] [-- extra pytest args]
 #
 # Workload
 #   -n, --examples N        Hypothesis examples per protocol per round
@@ -84,11 +84,11 @@
 # Everything after `--` is passed to pytest verbatim.
 #
 # Examples
-#   ./run-fuzz.sh                        # quick 150-example check
-#   ./run-fuzz.sh -n 20000 -d 20m --stats  # nightly soak
-#   ./run-fuzz.sh -p resp3 --derandomize --seed 4 -v   # debug a find
-#   ./run-fuzz.sh -s corpus              # replay the corpus only
-#   ./run-fuzz.sh --reference-url redis://127.0.0.1:16379
+#   ./fuzz.sh                        # quick 150-example check
+#   ./fuzz.sh -n 20000 -d 20m --stats  # nightly soak
+#   ./fuzz.sh -p resp3 --derandomize --seed 4 -v   # debug a find
+#   ./fuzz.sh -s corpus              # replay the corpus only
+#   ./fuzz.sh --reference-url redis://127.0.0.1:16379
 #
 # Exit status: 0 all rounds clean; otherwise the failing pytest status (1 =
 # divergence or error, 5 = nothing collected).

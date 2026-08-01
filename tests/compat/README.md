@@ -82,7 +82,7 @@ Useful environment variables:
 | `COMPAT_REPORT_PATH` | where the JSON conformance report is written |
 | `COMPAT_STRICT_SKIPS=1` | turn "reference replica unavailable" skips into failures (set by `./build.sh compat`) |
 
-`build.sh compat` and `run-fuzz.sh` share `tests/reference_server.sh`, which adds:
+`build.sh compat` and `fuzz.sh` share `tests/reference_server.sh`, which adds:
 
 | Variable | Effect |
 |---|---|
@@ -142,7 +142,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `corpus/` | checked-in minimal reproducers (fuzzer shrinks + hand-written), see `corpus/README.md` |
 
 The fuzzer's driver script lives at the repository root:
-[`run-fuzz.sh`](../../run-fuzz.sh) — deps, builds, reference + subject servers,
+[`fuzz.sh`](../../fuzz.sh) — deps, builds, reference + subject servers,
 strict mode, and soak rounds (`--help`).
 
 The §6 matrix is complete on both the write and read paths, and the Tier C fuzzer
@@ -165,14 +165,14 @@ COMPAT_FUZZ=1 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 \
 Note that a subject in the default `extended` mode fails on the first *gated*
 intentional divergence (e.g. DIV-0023) and Hypothesis stops there, so a soak run
 wants `CONFIG SET ts.ts-compatibility-mode strict` on the subject first.
-`run-fuzz.sh` (at the repository root) does all of the above — dependencies,
+`fuzz.sh` (at the repository root) does all of the above — dependencies,
 builds, both servers, strict mode, and rounds until a wall-clock budget is spent:
 
 ```sh
 # from the repository root
-./run-fuzz.sh                                  # 150 examples/protocol
-./run-fuzz.sh --examples 20000 --duration 20m  # soak (plan §4.3)
-./run-fuzz.sh --help                           # all options
+./fuzz.sh                                  # 150 examples/protocol
+./fuzz.sh --examples 20000 --duration 20m  # soak (plan §4.3)
+./fuzz.sh --help                           # all options
 ```
 
 Knobs: `COMPAT_FUZZ_MAX_EXAMPLES` (default 150 per protocol) and
