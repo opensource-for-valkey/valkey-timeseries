@@ -1478,6 +1478,9 @@ mod tests {
         // No sample payload follows, so decoding must fail on the first read.
 
         let result = super::UncompressedChunk::deserialize_raw(&buf);
-        assert!(result.is_err(), "oversized len must be rejected, not honored");
+        assert!(
+            result.is_err(),
+            "oversized len must be rejected, not honored"
+        );
     }
 }
