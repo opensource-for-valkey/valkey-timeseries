@@ -184,6 +184,21 @@ impl PointDetector for MadOutlierDetector {
 mod tests {
     use super::*;
 
+    /// A negative `k` inverts the fences. Before `deviation_and_boundary`
+    /// mapped a negative fence distance to NaN, this flagged essentially every
+    /// point — including the median itself — while still scoring it `0.0`,
+    /// since `normalize_evidence` already treated the negative boundary as
+    /// unusable. Both must now agree that there is nothing to be past.
+    #[test]
+    fn negative_k_does_not_flag_the_median() {
+        let data = [1.0, 2.0, 2.0, 2.0, 3.0, 14.0];
+        let mut detector = MadOutlierDetector::new(-3.0, AnomalyMADEstimator::Simple);
+        detector.train(&data).unwrap();
+
+        assert!(!detector.is_outlier(detector.median));
+        assert_eq!(detector.get_anomaly_score(detector.median), 0.0);
+    }
+
     #[test]
     fn test_mad_outlier_detector() {
         let data = [1.0, 2.0, 2.0, 2.0, 3.0, 14.0];

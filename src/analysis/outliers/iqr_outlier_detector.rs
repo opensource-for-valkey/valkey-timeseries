@@ -127,6 +127,20 @@ mod tests {
     use crate::analysis::outliers::MethodInfo;
     use crate::analysis::outliers::iqr_outlier_detector::detect_anomalies_iqr;
 
+    /// A negative threshold inverts the fences. Before `deviation_and_boundary`
+    /// mapped a negative fence distance to NaN, this flagged essentially every
+    /// point — including the quartile midpoint itself — while still scoring it
+    /// `0.0`, since `normalize_evidence` already treated the negative boundary
+    /// as unusable. Both must now agree that there is nothing to be past.
+    #[test]
+    fn negative_threshold_does_not_flag_the_center() {
+        let values: Vec<f64> = (0..24).map(|i| 40.0 + (i % 6) as f64).collect();
+        let detector = IQROutlierDetector::new(&values, -1.5);
+
+        assert_eq!(detector.classify(detector.center), AnomalySignal::None);
+        assert_eq!(detector.score(detector.center), 0.0);
+    }
+
     #[test]
     fn test_iqr_anomaly_detection() {
         let mut ts = vec![1.0; 100];

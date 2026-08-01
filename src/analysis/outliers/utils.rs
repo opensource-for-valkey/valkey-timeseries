@@ -72,9 +72,18 @@ pub(super) fn normalize_evidence(evidence: f64, boundary: f64) -> f64 {
 /// recomputation (e.g. `k * mad`), so a value sitting *exactly on the
 /// reported fence* yields evidence and boundary from the identical
 /// subtraction and scores exactly `0.5` via [`normalize_evidence`]. Shared by
-/// every fenced detector (MAD, IQR, Z-score, modified Z-score) so scoring and
-/// classification read the same pair and cannot disagree about which side of
-/// the fence a value falls on.
+/// every fenced detector (MAD, double MAD, IQR, Z-score, modified Z-score) so
+/// scoring and classification read the same pair and cannot disagree about
+/// which side of the fence a value falls on.
+///
+/// A misconfigured detector (a non-positive threshold) inverts its fences,
+/// which would otherwise make this subtraction negative. `classify`'s
+/// `deviation.abs() > boundary` is then true for essentially every value —
+/// even the center itself — while [`normalize_evidence`] already treats a
+/// negative boundary as unusable and reports `0.0`. Mapping it to `NaN` here
+/// keeps the two in agreement: both sides read the fences as having nothing
+/// to be past, rather than classify flagging what scoring calls maximally
+/// normal.
 #[inline]
 pub(super) fn deviation_and_fence_distance(
     value: f64,
@@ -88,6 +97,7 @@ pub(super) fn deviation_and_fence_distance(
     } else {
         center - lower_fence
     };
+    let boundary = if boundary < 0.0 { f64::NAN } else { boundary };
     (deviation, boundary)
 }
 
@@ -114,6 +124,29 @@ pub(super) fn get_anomaly_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-positive threshold inverts the fences (`upper < center < lower`),
+    /// which used to make this return a negative boundary — `classify`'s
+    /// `deviation.abs() > boundary` is then true for essentially every value,
+    /// including the center itself, while `normalize_evidence` already reports
+    /// `0.0` for a negative boundary. Mapping it to NaN keeps both readings
+    /// "nothing to be past" in agreement.
+    #[test]
+    fn inverted_fences_from_a_negative_threshold_yield_no_usable_boundary() {
+        let center = 10.0;
+        // As if built from `median - k * mad` / `median + k * mad` with a
+        // negative `k`: the fences swap sides.
+        let lower_fence = 16.0;
+        let upper_fence = 4.0;
+
+        for value in [center, center + 5.0, center - 5.0] {
+            let (_, boundary) = deviation_and_fence_distance(value, center, lower_fence, upper_fence);
+            assert!(
+                boundary.is_nan(),
+                "expected an unusable boundary for value {value}, got {boundary}"
+            );
+        }
+    }
 
     /// The anchor the whole contract rests on: evidence sitting exactly on the
     /// boundary scores `0.5`, whatever the boundary happens to be.

@@ -1,4 +1,4 @@
-use super::utils::normalize_evidence;
+use super::utils::{deviation_and_fence_distance, normalize_evidence};
 use crate::analysis::TimeSeriesAnalysisResult;
 use crate::analysis::outliers::mad_estimator::{
     HarrellDavisNormalizedEstimator, InvariantMADEstimator, MedianAbsoluteDeviationEstimator,
@@ -125,13 +125,14 @@ impl DoubleMadOutlierDetector {
     #[inline]
     fn deviation_and_boundary(&self, value: f64) -> Option<(f64, f64)> {
         let fitted = self.fitted?;
-        let deviation = value - fitted.median;
-        let boundary = if deviation >= 0.0 {
-            fitted.upper_fence(self.threshold) - fitted.median
-        } else {
-            fitted.median - fitted.lower_fence(self.threshold)
-        };
-        Some((deviation, boundary))
+        let lower_fence = fitted.lower_fence(self.threshold);
+        let upper_fence = fitted.upper_fence(self.threshold);
+        Some(deviation_and_fence_distance(
+            value,
+            fitted.median,
+            lower_fence,
+            upper_fence,
+        ))
     }
 
     /// Calculates a normalized anomaly score in [0, 1].

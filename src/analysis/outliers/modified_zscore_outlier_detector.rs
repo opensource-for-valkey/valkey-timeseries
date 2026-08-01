@@ -170,6 +170,23 @@ fn detect_anomalies_modified_zscore(
 #[cfg(test)]
 mod tests {
     use super::detect_anomalies_modified_zscore;
+    use super::*;
+    use crate::analysis::outliers::{AnomalyDetector, AnomalySignal, PointDetector};
+
+    /// A negative threshold inverts the fences. Before `deviation_and_boundary`
+    /// mapped a negative fence distance to NaN, this flagged essentially every
+    /// point — including the median itself — while still scoring it `0.0`,
+    /// since `normalize_evidence` already treated the negative boundary as
+    /// unusable. Both must now agree that there is nothing to be past.
+    #[test]
+    fn negative_threshold_does_not_flag_the_median() {
+        let ts = vec![1.0, 2.0, 1.5, 2.2, 1.8, 10.0, 2.1, 1.9];
+        let mut detector = ModifiedZScoreOutlierDetector::new(-3.5);
+        detector.train(&ts).unwrap();
+
+        assert_eq!(detector.classify(detector.median), AnomalySignal::None);
+        assert_eq!(detector.score(detector.median), 0.0);
+    }
 
     #[test]
     fn test_modified_zscore() {
