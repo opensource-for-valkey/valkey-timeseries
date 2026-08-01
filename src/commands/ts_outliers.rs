@@ -609,6 +609,11 @@ fn parse_single_value(iter: &mut CommandArgIterator, option_name: &str) -> Valke
 
 fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {
     let value = parse_single_value(iter, option_name)?;
+    if !value.is_finite() {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be finite"
+        )));
+    }
     if value <= 0.0 {
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be positive"

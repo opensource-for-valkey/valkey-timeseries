@@ -128,6 +128,11 @@ impl SmoothedZScoreAnomalyDetector {
                 "the length of the initial values is zero, the length is used as the lag for the algorithm".to_string()
             ));
         }
+        if !threshold.is_finite() {
+            return Err(TimeSeriesAnalysisError::InvalidInput(format!(
+                "threshold must be finite, got {threshold}"
+            )));
+        }
         if threshold < 0.0 {
             return Err(TimeSeriesAnalysisError::InvalidInput(format!(
                 "threshold must be non-negative, got {threshold}"
@@ -568,6 +573,28 @@ mod tests {
                 assert!(msg.contains("non-negative"));
             }
             _ => panic!("Expected InvalidInput error"),
+        }
+    }
+
+    /// `NaN < 0.0` is `false`, so the non-negative check alone lets a NaN
+    /// threshold through; `f64::INFINITY < 0.0` is also `false`. Either one
+    /// reaching `threshold * prev_std_dev` makes every comparison in `next`
+    /// false, so the detector goes permanently inert without ever reporting an
+    /// error. Finiteness must be checked first.
+    #[test]
+    fn test_new_rejects_non_finite_threshold() {
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = SmoothedZScoreAnomalyDetector::new(0.5, threshold, 5);
+
+            match result {
+                Err(TimeSeriesAnalysisError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("finite"),
+                        "expected a finiteness error for threshold {threshold}, got: {msg}"
+                    );
+                }
+                _ => panic!("Expected InvalidInput error for threshold {threshold}"),
+            }
         }
     }
 
