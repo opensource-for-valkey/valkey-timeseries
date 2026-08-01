@@ -47,8 +47,13 @@ pub(super) fn normalize_evidence(evidence: f64, boundary: f64) -> f64 {
         return 1.0;
     }
 
-    let r = evidence / boundary;
-    let score = r / (r + 1.0);
+    // `evidence / (evidence + boundary)` rather than `r / (r + 1.0)` with
+    // `r = evidence / boundary`: algebraically identical, but the latter
+    // overflows to infinity (and then NaN from inf/inf) when `evidence` is
+    // huge and `boundary` is tiny, since the intermediate ratio can exceed
+    // `f64::MAX` even though neither input, nor the true score, is anywhere
+    // near it.
+    let score = evidence / (evidence + boundary);
 
     if score <= 0.5 && evidence > boundary {
         // `evidence / boundary` rounds to exactly 1.0 when evidence is a single
@@ -146,6 +151,19 @@ mod tests {
         // The two exact 1.0s the contract admits.
         assert_eq!(normalize_evidence(f64::INFINITY, 3.0), 1.0);
         assert_eq!(normalize_evidence(100.0, 0.0), 1.0);
+    }
+
+    /// Huge evidence against a vanishingly small (but usable) boundary must
+    /// still land in `[0, 1]`. The naive `r = evidence / boundary` overflows to
+    /// infinity here even though neither input is infinite, which then turns
+    /// `r / (r + 1.0)` into `inf / inf`, i.e. NaN.
+    #[test]
+    fn huge_evidence_against_a_tiny_boundary_stays_finite_and_in_range() {
+        let score = normalize_evidence(1e300, f64::MIN_POSITIVE / 2.0);
+        assert!(
+            score.is_finite() && (0.0..=1.0).contains(&score),
+            "expected a finite score in [0, 1], got {score}"
+        );
     }
 
     /// A collapsed scale is what a robust estimator reports for a series that is
