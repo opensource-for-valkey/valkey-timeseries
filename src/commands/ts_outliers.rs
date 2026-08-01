@@ -340,7 +340,7 @@ fn parse_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOp
                 threshold = Some(parse_positive_value(args, "THRESHOLD")?);
             },
             "INFLUENCE" => {
-                influence = Some(parse_positive_value(args, "INFLUENCE")?);
+                influence = Some(parse_unit_interval_value(args, "INFLUENCE")?);
             },
             "LAG" => {
                 lag = Some(parse_positive_value(args, "LAG")? as usize);
@@ -400,7 +400,7 @@ fn parse_smoothed_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<
                 smoothed_options.threshold = parse_positive_value(args, "THRESHOLD")?;
             },
             "INFLUENCE" => {
-                smoothed_options.influence = parse_positive_value(args, "INFLUENCE")?;
+                smoothed_options.influence = parse_unit_interval_value(args, "INFLUENCE")?;
             },
             "LAG" => {
                 smoothed_options.lag = parse_positive_value(args, "LAG")? as usize;
@@ -617,6 +617,23 @@ fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> Val
     if value <= 0.0 {
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
+/// `INFLUENCE` is a mixing weight — `influence * value + (1 - influence) *
+/// prev_value` — so anything outside `[0, 1]` turns that blend into an
+/// extrapolation rather than an interpolation. `0` (no influence) is valid and
+/// meaningful, which rules out reusing `parse_positive_value`.
+fn parse_unit_interval_value(
+    iter: &mut CommandArgIterator,
+    option_name: &str,
+) -> ValkeyResult<f64> {
+    let value = parse_single_value(iter, option_name)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be between 0 and 1 inclusive"
         )));
     }
     Ok(value)

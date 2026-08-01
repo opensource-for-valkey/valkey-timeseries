@@ -128,6 +128,14 @@ impl SmoothedZScoreAnomalyDetector {
                 "the length of the initial values is zero, the length is used as the lag for the algorithm".to_string()
             ));
         }
+        // `influence` is a mixing weight — `influence * value + (1 - influence)
+        // * prev_value` — so anything outside `[0, 1]` turns that blend into an
+        // extrapolation rather than an interpolation.
+        if !(0.0..=1.0).contains(&influence) {
+            return Err(TimeSeriesAnalysisError::InvalidInput(format!(
+                "influence must be between 0 and 1 inclusive, got {influence}"
+            )));
+        }
         if !threshold.is_finite() {
             return Err(TimeSeriesAnalysisError::InvalidInput(format!(
                 "threshold must be finite, got {threshold}"
@@ -596,6 +604,30 @@ mod tests {
                 _ => panic!("Expected InvalidInput error for threshold {threshold}"),
             }
         }
+    }
+
+    /// `influence` blends `value` and `prev_value`: outside `[0, 1]` that blend
+    /// becomes an extrapolation rather than an interpolation, which the
+    /// algorithm was never designed to handle.
+    #[test]
+    fn test_new_rejects_influence_outside_unit_interval() {
+        for influence in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = SmoothedZScoreAnomalyDetector::new(influence, 3.0, 5);
+
+            match result {
+                Err(TimeSeriesAnalysisError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("influence"),
+                        "expected an influence error for {influence}, got: {msg}"
+                    );
+                }
+                _ => panic!("Expected InvalidInput error for influence {influence}"),
+            }
+        }
+
+        // The documented endpoints must still be accepted.
+        assert!(SmoothedZScoreAnomalyDetector::new(0.0, 3.0, 5).is_ok());
+        assert!(SmoothedZScoreAnomalyDetector::new(1.0, 3.0, 5).is_ok());
     }
 
     #[test]
