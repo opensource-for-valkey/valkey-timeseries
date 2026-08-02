@@ -48,7 +48,7 @@ impl<I: Iterator<Item = Sample>> Iterator for ReduceIterator<I> {
                 let value = if has_samples {
                     AggregationHandler::finalize(&mut self.aggregator)
                 } else {
-                    f64::NAN
+                    self.aggregator.empty_group_value()
                 };
 
                 AggregationHandler::reset(&mut self.aggregator);
@@ -67,7 +67,9 @@ impl<I: Iterator<Item = Sample>> Iterator for ReduceIterator<I> {
         let value = if has_samples {
             AggregationHandler::finalize(&mut self.aggregator)
         } else {
-            AggregationHandler::empty_value(&self.aggregator)
+            // Was `empty_value()`, which disagreed with the mid-stream branch above for `sum`:
+            // the last group of an all-NaN run reported 0 while every earlier one reported NaN.
+            self.aggregator.empty_group_value()
         };
 
         Some(Sample {

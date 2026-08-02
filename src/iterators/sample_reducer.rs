@@ -32,8 +32,10 @@ where
             // Finalize aggregator to get the aggregated value
             AggregationHandler::finalize(&mut self.aggregator)
         } else {
-            // No samples were aggregated (should not happen since we always include the first sample), return NaN
-            f64::NAN
+            // The aggregator accepted nothing from this group — every value was NaN, which
+            // EMPTY makes routine, since the per-series fill contributes a NaN to the reduce.
+            // Tallies report 0 for that; everything else reports NaN.
+            self.aggregator.empty_group_value()
         };
 
         self.has_samples = false;
@@ -194,6 +196,83 @@ mod tests {
                 value: 5.0
             }
         );
+    }
+
+    #[test]
+    fn count_reduces_an_all_nan_group_to_zero() {
+        // A tally of nothing is 0, not "undefined". EMPTY makes this routine: the per-series
+        // fill contributes a NaN to every reduce, so a bucket no series covered arrives here
+        // as an all-NaN group. RedisTimeSeries reports 0 for it under `REDUCE count`.
+        let aggregator: Aggregator = AggregationType::Count.into();
+        let samples = vec![
+            Sample {
+                timestamp: 1,
+                value: f64::NAN,
+            },
+            Sample {
+                timestamp: 1,
+                value: f64::NAN,
+            },
+            Sample {
+                timestamp: 2,
+                value: 5.0,
+            },
+        ];
+
+        let result: Vec<Sample> = SampleReducer::new(samples.into_iter(), aggregator).collect();
+
+        assert_eq!(
+            result,
+            vec![
+                Sample {
+                    timestamp: 1,
+                    value: 0.0
+                },
+                Sample {
+                    timestamp: 2,
+                    value: 1.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn all_nan_group_at_end_of_stream_agrees_with_mid_stream() {
+        // The final group takes a separate exit path in these reducers; it must not disagree
+        // with the mid-stream branch. `sum` reports NaN in both, `count` reports 0 in both.
+        for (aggregation, expected_is_nan) in [
+            (AggregationType::Sum, true),
+            (AggregationType::Count, false),
+        ] {
+            let samples = vec![
+                Sample {
+                    timestamp: 1,
+                    value: f64::NAN,
+                },
+                Sample {
+                    timestamp: 2,
+                    value: f64::NAN,
+                },
+            ];
+            let aggregator: Aggregator = aggregation.into();
+            let result: Vec<Sample> = SampleReducer::new(samples.into_iter(), aggregator).collect();
+
+            assert_eq!(result.len(), 2, "{aggregation:?}");
+            assert_eq!(
+                result[0].value.is_nan(),
+                expected_is_nan,
+                "mid-stream group for {aggregation:?}"
+            );
+            assert_eq!(
+                result[1].value.is_nan(),
+                expected_is_nan,
+                "final group for {aggregation:?}"
+            );
+            if !expected_is_nan {
+                assert_eq!(result[0].value, 0.0);
+                assert_eq!(result[1].value, 0.0);
+            }
+        }
     }
 
     #[test]

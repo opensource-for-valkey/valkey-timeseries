@@ -5,8 +5,10 @@ use smallvec::SmallVec;
 /// Column-wise GROUPBY/REDUCE over multi-aggregation rows: groups rows by
 /// timestamp and reduces each aggregation column independently with its own
 /// clone of the REDUCE aggregator. NaN inputs are skipped per column exactly
-/// as `SampleReducer` does; an all-NaN column yields NaN. A series that
-/// produced no row for a timestamp simply contributes nothing to any column.
+/// as `SampleReducer` does; an all-NaN column yields whatever the aggregator
+/// reports for a group it accepted nothing from — 0 for the tallies, NaN for
+/// the rest (see [`Aggregator::empty_group_value`]). A series that produced no
+/// row for a timestamp simply contributes nothing to any column.
 pub struct RowReducer<I>
 where
     I: Iterator<Item = MultiSample>,
@@ -56,7 +58,7 @@ where
                 let value = if *has_samples {
                     AggregationHandler::finalize(aggregator)
                 } else {
-                    f64::NAN
+                    aggregator.empty_group_value()
                 };
                 AggregationHandler::reset(aggregator);
                 *has_samples = false;

@@ -28,7 +28,8 @@ pub enum PartialReducerKind {
     /// Like Sum, but zero accepted values finalizes to 0 instead of NaN
     /// (sumif's update always "succeeds", so its empty_value 0.0 applies).
     SumIf,
-    /// count only (also countall, countnan — acceptance differs)
+    /// count only (also countall, countnan — acceptance differs).
+    /// Zero accepted values finalizes to 0: a tally of nothing is 0.
     Count,
     /// Like Count, but zero accepted values finalizes to 0 instead of NaN.
     CountIf,
@@ -52,8 +53,9 @@ pub enum PartialReducerKind {
 }
 
 /// Mergeable accumulator for one bucket timestamp.
-/// `count == 0` means no value was accepted (all rejected/NaN) and the bucket
-/// finalizes to NaN — the "all-NaN group yields NaN" rule of `SampleReducer`.
+/// `count == 0` means no value was accepted (all rejected/NaN). The bucket then
+/// finalizes to 0 for the tallying kinds and NaN for the rest, matching
+/// `SampleReducer` via [`Aggregator::empty_group_value`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PartialState {
     pub count: u64,
@@ -272,14 +274,18 @@ impl PartialReducer {
     }
 
     /// Finalizes a (merged) state into the reduced value. A state with
-    /// `count == 0` yields NaN for every kind — the all-rejected/NaN rule.
+    /// `count == 0` yields 0 for the tallying kinds and NaN for the rest.
     pub fn finalize(kind: PartialReducerKind, state: &PartialState) -> f64 {
         if state.count == 0 {
-            // countif/sumif accept every sample (the CONDITION merely gates
-            // accumulation), so a bucket with zero matches finalizes to their
-            // empty_value 0.0; all other reducers yield NaN.
+            // A tally of nothing is 0, while a function of nothing is undefined. `Count`
+            // covers count/countall/countnan; countif/sumif accept every sample (the
+            // CONDITION merely gates accumulation), so zero matches is still a count of
+            // zero. Everything else yields NaN. Must track `Aggregator::empty_group_value`,
+            // which `test_partial_matches_sample_reducer_for_arbitrary_partitions` enforces.
             return match kind {
-                PartialReducerKind::CountIf | PartialReducerKind::SumIf => 0.0,
+                PartialReducerKind::Count
+                | PartialReducerKind::CountIf
+                | PartialReducerKind::SumIf => 0.0,
                 _ => f64::NAN,
             };
         }

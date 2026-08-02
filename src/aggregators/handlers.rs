@@ -1236,4 +1236,19 @@ impl Aggregator {
             Aggregator::SumIf(_) => AggregationType::SumIf,
         }
     }
+
+    /// Value for a group this aggregator accepted no member of — every value was NaN, or
+    /// every value failed the aggregator's condition.
+    ///
+    /// This is deliberately *not* `empty_value()`, which answers the different question of
+    /// what an empty *bucket* holds. The two disagree on `sum`: an empty bucket sums to 0,
+    /// but a group of nothing-but-NaN sums to NaN. See
+    /// [`AggregationType::reduces_empty_to_zero`].
+    pub fn empty_group_value(&self) -> Value {
+        if self.aggregation_type().reduces_empty_to_zero() {
+            0.0
+        } else {
+            f64::NAN
+        }
+    }
 }

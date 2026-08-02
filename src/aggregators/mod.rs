@@ -196,6 +196,27 @@ impl AggregationType {
         !self.is_filtered()
     }
 
+    /// What this aggregator reports for a group it accepted nothing from — `true` for 0,
+    /// `false` for NaN. Reached when every member value is NaN, which `EMPTY` makes routine:
+    /// the per-series fill contributes a NaN to the reduce.
+    ///
+    /// A tally of nothing is 0, while a function of nothing is undefined. RedisTimeSeries
+    /// agrees on the two aggregators it has here — `count` reduces an all-NaN group to 0 and
+    /// `sum`/`min`/`max`/`avg`/`std.*` reduce it to NaN (confirmed against the reference) —
+    /// even though an empty *bucket* sums to 0. `sumif`/`countif` follow `count` because
+    /// their condition gates accumulation rather than acceptance, so "nothing matched" is
+    /// still a count of zero.
+    pub fn reduces_empty_to_zero(&self) -> bool {
+        matches!(
+            self,
+            AggregationType::Count
+                | AggregationType::CountAll
+                | AggregationType::CountIf
+                | AggregationType::CountNan
+                | AggregationType::SumIf
+        )
+    }
+
     // In the aggregation logic where Last/First are handled:
     // When is_reverse is true, swap the behavior of First and Last
     pub fn apply_reverse_adjusted(&self, is_reverse: bool) -> AggregationType {
