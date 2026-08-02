@@ -4,7 +4,8 @@ Produces random but *valid-by-construction* command sequences over a small
 key/label universe: a create phase (series with random options + labels and at
 most one compaction rule), an interleaved write phase (ADD/MADD/INCRBY/DECRBY/
 DEL with adversarial timestamps and values), and a read phase (RANGE/REVRANGE/
-GET/MRANGE/MREVRANGE/MGET/QUERYINDEX with random option combinations).
+GET/MRANGE/MREVRANGE/NRANGE/NREVRANGE/MGET/QUERYINDEX with random option
+combinations).
 
 The generator deliberately stays inside the input space both engines accept, so
 that a failure is a *reply* divergence (values, float formatting, aggregation,
@@ -24,7 +25,13 @@ drown the fuzz signal. Concretely the generator never emits:
     (DIV-0024..0029 — see VARIANCE_AGGREGATORS below);
   - an ill-conditioned aggregator (the variance family, or sum/avg) together with the
     adversarial value set — see ILL_CONDITIONED_AGGREGATORS;
-  - `EMPTY` over an unbounded span (see MAX_EMPTY_BUCKETS — it OOM-kills either engine).
+  - `EMPTY` over an unbounded span (see MAX_EMPTY_BUCKETS — it OOM-kills either engine);
+  - a repeated aggregator inside one `AGGREGATION` list (`avg,avg`), which RTS accepts and
+    we reject — the stricter direction, registrable but not registered;
+  - a compaction destination in a `TS.NRANGE`/`TS.NREVRANGE` key list, except forward over
+    a non-variance rule (see `programs`);
+  - `EMPTY` on a *reverse* read that can reach a compaction destination (the second symptom
+    of DIV-0030/0031 — the reference repeats the whole bucket run).
 
 Everything a command emits is a `str`, so a shrunk failing example round-trips
 losslessly into a JSON corpus file (see corpus/ and test_compat_corpus.py).
@@ -115,6 +122,15 @@ RETENTIONS = ["0", "1000", "5000"]
 CHUNK_SIZES = ["128", "4096", "1024"]
 BUCKETS = ["500", "1000", "2000"]
 BUCKET_TIMESTAMPS = ["-", "+", "~"]
+ALIGNMENTS = ["start", "end", "0", "1000"]
+
+# An ALIGN offset that is not a multiple of the bucket duration puts a bucket boundary below
+# timestamp 0 once data sits within one bucket of it, and there the reference suppresses the
+# leading/trailing EMPTY fill while we report it (DIV-0054, pinned per engine in
+# tests/compat/test_compat_range.py). These two keep the grid non-negative over the
+# non-negative timestamps this universe generates: `0` aligns to the epoch, and `start` to the
+# window start, at or after which every sample the query reads lies.
+EMPTY_SAFE_ALIGNMENTS = ["start", "0"]
 
 # An `EMPTY` aggregation query materializes one bucket for every bucket-duration across the
 # *whole queried span*, not just the ones holding samples. Combined with the far-future
@@ -212,6 +228,11 @@ def _labels(draw) -> List[str]:
     return labels
 
 
+def _align_choices(empty: bool) -> List[str]:
+    """Alignments safe to draw alongside (or without) `EMPTY` — see EMPTY_SAFE_ALIGNMENTS."""
+    return EMPTY_SAFE_ALIGNMENTS if empty else ALIGNMENTS
+
+
 def _empty_is_safe(bounds: Tuple[str, str], bucket: str) -> bool:
     """True if `EMPTY` over `bounds` at `bucket` yields a bounded number of buckets.
 
@@ -232,13 +253,17 @@ def _range_options(
     aggregation_allowed: bool = True,
     value_filter_allowed: bool = True,
     aggregators: List[str] = list(AGGREGATORS),
+    empty_allowed: bool = True,
 ) -> List[str]:
     """Options common to TS.RANGE/REVRANGE (emitted in RTS syntax order).
 
     `bounds` is the already-drawn (from, to) pair; it gates `EMPTY` (see `_empty_is_safe`).
     `value_filter_allowed` is False when the read can reach a std/var compaction target,
     where a value predicate turns DIV-0024..0029 into an unregistrable shape delta (see
-    VARIANCE_AGGREGATORS).
+    VARIANCE_AGGREGATORS). `empty_allowed` is False for a *reverse* read that can reach a
+    compaction destination: `EMPTY` there hits the second symptom of DIV-0030/0031, where the
+    reference repeats the whole bucket run, and the row-count delta that produces is likewise
+    unregistrable. Dropping `EMPTY` keeps the registered shape generated.
     """
     opts: List[str] = []
     if draw(st.booleans()):
@@ -249,13 +274,64 @@ def _range_options(
     if draw(st.booleans()):
         opts += ["COUNT", str(draw(st.integers(min_value=1, max_value=10)))]
     if aggregation_allowed and draw(st.booleans()):
-        if draw(st.booleans()):
-            opts += ["ALIGN", draw(st.sampled_from(["start", "end", "0", "1000"]))]
+        # EMPTY is decided before ALIGN because it narrows which alignments are safe to draw.
         bucket = draw(st.sampled_from(BUCKETS))
+        empty = empty_allowed and _empty_is_safe(bounds, bucket) and draw(st.booleans())
+        if draw(st.booleans()):
+            opts += ["ALIGN", draw(st.sampled_from(_align_choices(empty)))]
         opts += ["AGGREGATION", draw(st.sampled_from(aggregators)), bucket]
         if draw(st.booleans()):
             opts += ["BUCKETTIMESTAMP", draw(st.sampled_from(BUCKET_TIMESTAMPS))]
-        if _empty_is_safe(bounds, bucket) and draw(st.booleans()):
+        if empty:
+            opts.append("EMPTY")
+    return opts
+
+
+@st.composite
+def _nrange_options(
+    draw,
+    bounds: Tuple[str, str],
+    key_count: int,
+    aggregators: List[str] = list(AGGREGATORS),
+) -> List[str]:
+    """Options for TS.NRANGE/TS.NREVRANGE (emitted in RTS syntax order).
+
+    Identical to `_range_options` apart from the AGGREGATION clause, which takes one
+    aggregator argument per key — in key order, ahead of the single shared bucket duration.
+    Each argument is a comma-separated list, drawn `unique` because RTS accepts a repeated
+    aggregator inside one list (`avg,avg`) and we reject it.
+
+    `value_filter_allowed` has no counterpart here: the key list never names a std/var
+    compaction destination, which is the only case the guard exists for (see `programs`).
+    """
+    opts: List[str] = []
+    if draw(st.booleans()):
+        opts.append("LATEST")
+    if draw(st.booleans()):
+        lo, hi = sorted(draw(st.sampled_from(VALUES)) for _ in range(2))
+        opts += ["FILTER_BY_VALUE", lo, hi]
+    if draw(st.booleans()):
+        opts += ["COUNT", str(draw(st.integers(min_value=1, max_value=10)))]
+    if draw(st.booleans()):
+        # See `_range_options`: EMPTY first, because it narrows the safe alignments.
+        bucket = draw(st.sampled_from(BUCKETS))
+        empty = _empty_is_safe(bounds, bucket) and draw(st.booleans())
+        if draw(st.booleans()):
+            opts += ["ALIGN", draw(st.sampled_from(_align_choices(empty)))]
+        per_key = [
+            ",".join(
+                draw(
+                    st.lists(
+                        st.sampled_from(aggregators), min_size=1, max_size=2, unique=True
+                    )
+                )
+            )
+            for _ in range(key_count)
+        ]
+        opts += ["AGGREGATION", *per_key, bucket]
+        if draw(st.booleans()):
+            opts += ["BUCKETTIMESTAMP", draw(st.sampled_from(BUCKET_TIMESTAMPS))]
+        if empty:
             opts.append("EMPTY")
     return opts
 
@@ -275,6 +351,14 @@ def _bounds(draw) -> Tuple[str, str]:
 def _filter(draw) -> List[str]:
     matchers = draw(st.lists(st.sampled_from(MATCHERS), min_size=1, max_size=2, unique=True))
     return matchers
+
+
+# The read commands `_read_op` draws from. A module constant so a focused run (or a
+# bisect) can narrow it to one command without touching the strategy.
+READ_KINDS = [
+    "RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "NRANGE", "NREVRANGE",
+    "MGET", "QUERYINDEX",
+]
 
 
 # -- write / read op strategies ---------------------------------------------
@@ -319,23 +403,25 @@ def _read_op(
     variance_rollup: bool = False,
     aggregators: List[str] = list(AGGREGATORS),
     reducers: List[str] = GROUP_REDUCERS,
+    pivot_keys: List[str] = list(BASE_KEYS),
 ) -> Command:
     """One read command. `variance_rollup` is True when the program created a std/var
     compaction rule, which withholds FILTER_BY_VALUE from reads that can reach the
     rollup — directly by key, or via a matcher (its labels are in the MATCHERS set).
     `aggregators`/`reducers` are narrowed to exclude the ill-conditioned families (the
     variance family and sum/avg) for programs written with the full adversarial value
-    set — see ILL_CONDITIONED_AGGREGATORS."""
-    kind = draw(st.sampled_from(
-        ["RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "MGET", "QUERYINDEX"]
-    ))
+    set — see ILL_CONDITIONED_AGGREGATORS. `pivot_keys` is the pool TS.NRANGE/TS.NREVRANGE
+    draw their explicit key list from; it is narrower than `keys` (see `programs`)."""
+    kind = draw(st.sampled_from(READ_KINDS))
     if kind in ("RANGE", "REVRANGE"):
         key = draw(st.sampled_from(keys))
         frm, to = draw(_bounds())
         value_filter_allowed = not (variance_rollup and key == ROLLUP_KEY)
+        # See `_range_options`: EMPTY is withheld from a reverse read of the destination.
+        empty_allowed = not (kind == "REVRANGE" and key == ROLLUP_KEY)
         return (f"TS.{kind}", key, frm, to,
                 *draw(_range_options((frm, to), value_filter_allowed=value_filter_allowed,
-                                    aggregators=aggregators)))
+                                    aggregators=aggregators, empty_allowed=empty_allowed)))
     if kind == "GET":
         key = draw(st.sampled_from(keys))
         opt = ["LATEST"] if draw(st.booleans()) else []
@@ -347,7 +433,9 @@ def _read_op(
             opts.append("WITHLABELS")
         # A matcher can select the rollup, so the guard applies to the whole command.
         opts += draw(_range_options((frm, to), value_filter_allowed=not variance_rollup,
-                                    aggregators=aggregators))
+                                    aggregators=aggregators,
+                                    empty_allowed=not (kind == "MREVRANGE"
+                                                       and ROLLUP_KEY in keys)))
         # GROUPBY...REDUCE is the trailing clause, AFTER FILTER (RTS syntax order).
         groupby: List[str] = []
         if draw(st.booleans()):
@@ -360,6 +448,18 @@ def _read_op(
         if not groupby and draw(st.booleans()):
             opts.append("EXCLUDEEMPTY")
         return (f"TS.{kind}", frm, to, *opts, "FILTER", *draw(_filter()), *groupby)
+    if kind in ("NRANGE", "NREVRANGE"):
+        # An explicit key list, not a filter: order matters and repeats are legal (each
+        # occurrence gets its own reply column), so the draw is neither sorted nor unique.
+        # The reverse command draws from the same pool minus the rollup — see `programs`.
+        pool = pivot_keys if kind == "NRANGE" else [k for k in pivot_keys if k != ROLLUP_KEY]
+        key_list = [
+            draw(st.sampled_from(pool))
+            for _ in range(draw(st.integers(min_value=1, max_value=3)))
+        ]
+        frm, to = draw(_bounds())
+        return (f"TS.{kind}", str(len(key_list)), *key_list, frm, to,
+                *draw(_nrange_options((frm, to), len(key_list), aggregators=aggregators)))
     if kind == "MGET":
         opts = ["WITHLABELS"] if draw(st.booleans()) else []
         return ("TS.MGET", *opts, "FILTER", *draw(_filter()))
@@ -415,10 +515,29 @@ def programs(draw) -> List[Command]:
                          rollup_agg, draw(st.sampled_from(BUCKETS))))
         read_keys = list(keys) + [ROLLUP_KEY]  # rollup is readable, not writable
 
+    # The pool TS.NRANGE/TS.NREVRANGE name their keys from. Both divergence classes a read
+    # of a compaction destination can reproduce are registered per command, and neither has
+    # an entry for the pivot commands, so the rollup is admitted only where it cannot
+    # reproduce either:
+    #
+    #   - the variance cancellation of DIV-0024..0029 needs a std|var rule, hence the
+    #     `variance_rollup` gate;
+    #   - the empty reply of DIV-0030/0031 needs reverse + LATEST + AGGREGATION over a
+    #     destination, which is reverse-only — hence TS.NREVRANGE drops the rollup from
+    #     the pool in `_read_op` while TS.NRANGE keeps it.
+    #
+    # Keeping the forward case is what preserves LATEST coverage for the pivot commands:
+    # LATEST is a no-op on a series that is not a compaction.
+    pivot_keys = list(keys)
+    if ROLLUP_KEY in read_keys and not variance_rollup:
+        pivot_keys.append(ROLLUP_KEY)
+
     for _ in range(draw(st.integers(min_value=0, max_value=14))):
         commands.append(draw(_write_op(keys, deletable, values, deltas)))
 
     for _ in range(draw(st.integers(min_value=1, max_value=8))):
-        commands.append(draw(_read_op(read_keys, variance_rollup, aggregators, reducers)))
+        commands.append(
+            draw(_read_op(read_keys, variance_rollup, aggregators, reducers, pivot_keys))
+        )
 
     return commands

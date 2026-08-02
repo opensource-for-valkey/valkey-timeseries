@@ -40,7 +40,7 @@
   since: 0.1.0
   details_regex: '^\$\.(metric|encoding|rounding)\b'
 
-# DIV-0002..DIV-0007 share one root cause (findings doc #13): sample values are
+# DIV-0002..DIV-0007 and DIV-0052..DIV-0053 share one root cause (findings doc #13): sample values are
 # replied via RedisModule_ReplyWithDouble, so the RESP2 bulk-string text comes
 # from valkey-core's fpconv/d2string formatter ("0.5", "1e+100"), while RTS
 # formats with its own internal method ("5E-1", "1E100"). The parsed values are
@@ -100,6 +100,25 @@
   kind: float-format
   description: >
     RESP2 sample-value text uses valkey-core's double formatting instead of
+    RTS's notation; values parse identically (same cause as DIV-0002).
+  rationale: same root cause as DIV-0002
+  since: 0.1.0
+
+- id: DIV-0052
+  command: TS.NRANGE
+  kind: float-format
+  description: >
+    RESP2 pivoted-row value text uses valkey-core's double formatting instead of
+    RTS's notation (e.g. 0.1 vs 1E-1, nan vs NaN); values parse identically
+    (same cause as DIV-0002).
+  rationale: same root cause as DIV-0002
+  since: 0.1.0
+
+- id: DIV-0053
+  command: TS.NREVRANGE
+  kind: float-format
+  description: >
+    RESP2 pivoted-row value text uses valkey-core's double formatting instead of
     RTS's notation; values parse identically (same cause as DIV-0002).
   rationale: same root cause as DIV-0002
   since: 0.1.0
