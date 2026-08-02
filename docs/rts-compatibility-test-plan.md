@@ -30,22 +30,28 @@ A compatibility claim in the README should reference the layer(s) we actually ga
 
 ### 2.1 In scope — the shared command surface
 
-The 17 commands RedisTimeSeries 8.8 exposed, and still the actively-compared surface:
+The 17 commands RedisTimeSeries 8.8 exposed, plus `TS.READ` from the 8.10 bump — the
+actively-compared surface:
 
 `TS.CREATE`, `TS.ALTER`, `TS.ADD`, `TS.MADD`, `TS.INCRBY`, `TS.DECRBY`, `TS.DEL`,
-`TS.CREATERULE`, `TS.DELETERULE`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`,
-`TS.GET`, `TS.MGET`, `TS.INFO`, `TS.QUERYINDEX`
+`TS.CREATERULE`, `TS.DELETERULE`, `TS.RANGE`, `TS.REVRANGE`, `TS.READ`, `TS.MRANGE`,
+`TS.MREVRANGE`, `TS.GET`, `TS.MGET`, `TS.INFO`, `TS.QUERYINDEX`
 
 **Not yet in scope — new in the 8.10 reference bump.** `COMMAND LIST FILTERBY MODULE
-timeseries` against the 8.10 reference also surfaces `TS.NRANGE`, `TS.NREVRANGE`,
+timeseries` against the 8.10 reference also surfaces `TS.NRANGE`, `TS.NREVRANGE` and
 `TS.QUERYLABELS` (a `LABELS|VALUES`-subtyped query, overlapping our own
-`TS.LABELNAMES`/`TS.LABELVALUES` extensions) and `TS.READ`, absent from the 17 above and from
-the 8.8 pin. They are visible, non-hidden, `@read @timeseries`-categorized commands, not internal
-cluster-fanout helpers. Our module implements none of them. They are deliberately left out of the
-compared surface for this bump rather than silently pulled in — extending §2.1 means writing
-dedicated compat coverage and deciding registry treatment for four unimplemented commands, which
-is follow-up work, not a pin bump. See the 2026-08-01 entry in
-[docs/rts-reference-bumps.md](rts-reference-bumps.md).
+`TS.LABELNAMES`/`TS.LABELVALUES` extensions), absent from the 17 above and from the 8.8 pin.
+They are visible, non-hidden, `@read @timeseries`-categorized commands, not internal
+cluster-fanout helpers. They are deliberately left out of the compared surface rather than
+silently pulled in — extending §2.1 means writing dedicated compat coverage and deciding
+registry treatment for each, which is follow-up work, not a pin bump. See the 2026-08-01 entry
+in [docs/rts-reference-bumps.md](rts-reference-bumps.md).
+
+`TS.READ` was moved *into* §2.1 on 2026-08-02, when the module implemented it; its coverage is
+`tests/compat/test_compat_read.py` and its row is in the §6 matrix below. It is the one in-scope
+command excluded from the §4.3 fuzzer, because a drawn `BLOCK` clause would stall the synchronous
+`DiffClient` and hang the soak instead of failing it — see the note above `READ_KINDS` in
+`fuzz_strategies.py`.
 
 ### 2.2 In scope — cross-cutting behavior
 
@@ -216,6 +222,7 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.DELETERULE` | removes compaction; INFO reflects removal; nonexistent-rule error |
 | `TS.RANGE`/`TS.REVRANGE` | `-`/`+` bounds; inclusive boundaries; COUNT; AGGREGATION × all aggregators × bucket boundary cases; ALIGN (`-`, `+`, `start`, `end`, explicit ts); BUCKETTIMESTAMP (`-`, `+`, `~`); EMPTY (gap buckets, value per aggregator: NaN vs 0 semantics); FILTER_BY_TS (dup ts, unsorted list); FILTER_BY_VALUE (min>max); LATEST on compacted target; combination ordering rules |
 | `TS.MRANGE`/`TS.MREVRANGE` | full filter language matrix; WITHLABELS vs SELECTED_LABELS (missing label → nil); GROUPBY/REDUCE × all reducers, incl. empty groups and label-absent series; everything from RANGE applied per-series; reply nesting shape RESP2 vs RESP3 (this is where RESP3 differs most) |
+| `TS.READ` | cursor forms (literal, `-`, `+`, `$`) and one-time resolution; `$` at `i64::MAX` (empty, no overflow); inclusive lower bound; MAX_COUNT truncation and the unbounded default; either option order; the arity-vs-`TSDB:` failure split (duplicated/malformed → wrong-arity, out-of-range values → `TSDB:`); `min_count > max_count` rejected before key access; BLOCK — immediate satisfaction, threshold wakeup, partial and empty timeout snapshots, key removal → empty array, blocking on a missing key, no sample consumption across readers; deny-blocking ordering (data when satisfied even inside MULTI/EVAL, error only when it would have to wait) |
 | `TS.GET` | empty series reply shape; LATEST semantics on compaction target with open bucket |
 | `TS.MGET` | filter matrix; WITHLABELS/SELECTED_LABELS; empty-series entries |
 | `TS.INFO` | field-by-field vs frozen 8.10 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |

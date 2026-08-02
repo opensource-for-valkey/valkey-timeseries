@@ -34,9 +34,16 @@ copy.
 
 Issue the same commands with the same client libraries. `TS.CREATE`, `TS.ALTER`,
 `TS.DEL`, `TS.CREATERULE`, `TS.DELETERULE`, `TS.ADD`, `TS.MADD`, `TS.INCRBY`,
-`TS.DECRBY`, `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`,
-`TS.INFO`, `TS.QUERYINDEX`, and `TS.QUERYLABELS` all keep their argument order, option
-names, and reply shapes.
+`TS.DECRBY`, `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.READ`, `TS.MRANGE`,
+`TS.MREVRANGE`, `TS.INFO`, `TS.QUERYINDEX`, and `TS.QUERYLABELS` all keep their argument
+order, option names, and reply shapes.
+
+`TS.READ` includes the blocking form: cursor sentinels (`-`, `+`, `$`), `BLOCK milliseconds
+min_count`, and `MAX_COUNT` all behave as they do on RedisTimeSeries 8.10, down to returning a
+partial snapshot at timeout and an empty array when the key is removed. In cluster mode it is an
+ordinary single-key command, and a client blocked when its slot migrates is released with a
+`MOVED` naming the new owner rather than left waiting. See
+[`TS.READ`](../commands/ts.read.md).
 
 Query semantics are equally in-contract: label matchers (`label=value`, `label!=value`,
 `label=(v1,v2)`, presence/absence forms), `AGGREGATION` with `ALIGN` / `BUCKETTIMESTAMP` /

@@ -78,6 +78,22 @@ Writing dedicated compat coverage and deciding registry treatment for four
 unimplemented commands is follow-up work, tracked here rather than blocking the
 pin bump.
 
+> **Follow-up, 2026-08-02 — `TS.READ` implemented and now in scope.** One of the
+> four is done. `TS.READ` is implemented (`src/commands/ts_read.rs`, with the
+> block-on-keys adapter in `src/common/block_on_keys.rs`), moved into §2.1 of
+> [rts-compatibility-test-plan.md](rts-compatibility-test-plan.md), and given a
+> §6 matrix row plus dedicated coverage in `tests/compat/test_compat_read.py`.
+> One deliberate difference is recorded rather than fixed: its key spec
+> declares `RO`+`ACCESS` where the reference declares `RO` alone (this module's
+> convention for every read command; `ACCESS` is what makes ACL key-permission
+> checking meaningful). The `dont_cache` tip *is* matched — the
+> command macro's `tips` field can express it, so no metadata divergence was
+> needed. `TS.READ` is the one in-scope command excluded from the fuzzer: a
+> drawn `BLOCK` would stall the synchronous `DiffClient` and hang the soak.
+> `TS.NRANGE`, `TS.NREVRANGE` and `TS.QUERYLABELS` are implemented but remain
+> outside the compared surface; the entry above is preserved as the historical
+> record of the bump.
+
 **2. New config `ts-topology-events` (default `yes`, immutable).** Present on
 8.10, absent on 8.8. `CONFIG SET` is rejected with "can't set immutable config"
 regardless of value; black-box probing found no observable command-level effect

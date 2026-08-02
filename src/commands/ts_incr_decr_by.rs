@@ -1,6 +1,7 @@
 use crate::commands::CommandArgToken;
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::commands::ts_create::parse_series_options;
+use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, get_timeseries_mut};
@@ -117,6 +118,9 @@ fn handle_update(
     // existing sample in place, which compaction must treat as an upsert rather than a
     // fresh append (see `run_compaction_for_increment`).
     let prev_last_ts = series.last_sample.map(|s| s.timestamp);
+    // An increment at the last timestamp updates in place and adds nothing readable, so only a
+    // genuine count increase wakes blocked `TS.READ` readers.
+    let samples_before = series.total_samples;
 
     let result = series.increment_sample_value(timestamp, delta)?;
     match result {
@@ -125,6 +129,9 @@ fn handle_update(
             // compaction rules; without this a counter maintained by
             // TS.INCRBY/TS.DECRBY never reaches its downstream series.
             run_compaction_for_increment(ctx, series, key_name, added, prev_last_ts)?;
+            if series.total_samples > samples_before {
+                signal_timeseries_ready(ctx, key_name);
+            }
             replicate_and_notify(ctx, key_name, is_increment, added.timestamp)
         }
         SampleAddResult::Ignored(_ts) => {

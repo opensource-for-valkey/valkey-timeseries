@@ -355,6 +355,19 @@ def _filter(draw) -> List[str]:
 
 # The read commands `_read_op` draws from. A module constant so a focused run (or a
 # bisect) can narrow it to one command without touching the strategy.
+#
+# `TS.READ` is deliberately absent, and must stay that way unless two conditions are met
+# first. It is the only blocking command on the compared surface, and generated programs run
+# through the synchronous `DiffClient`: a drawn `BLOCK` clause would leave the reference
+# waiting while the subject is asked to run the same command, stalling the whole program
+# rather than failing it — the soak would hang, not report. Dedicated coverage lives in
+# test_compat_read.py, which drives both engines concurrently.
+#
+# To add it later: (1) emit only the non-blocking form — cursor plus optional MAX_COUNT,
+# never BLOCK; and (2) review the registry first. Retention- and bounds-related divergence
+# entries are keyed by command name, so a TS.READ hit on the same underlying behavior would
+# not match the TS.RANGE entry that already covers it and would fail the soak as an
+# unregistered divergence.
 READ_KINDS = [
     "RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "NRANGE", "NREVRANGE",
     "MGET", "QUERYINDEX", "QUERYLABELS",

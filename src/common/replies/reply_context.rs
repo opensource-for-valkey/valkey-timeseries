@@ -25,6 +25,22 @@ impl ReplyContext {
         }
     }
 
+    /// The underlying raw context, for the free reply helpers in
+    /// [`super::raw_replies`] that take an [`IntoRawCtx`] rather than a `ReplyContext`.
+    #[inline]
+    pub(crate) fn raw(&self) -> *mut raw::RedisModuleCtx {
+        self.raw_ctx
+    }
+
+    /// The wrapped [`Context`], for helpers that need the crate type — key access, context flags,
+    /// and ACL identity. Inside a blocked-client reply or timeout callback this carries the real
+    /// blocked client, so both protocol detection and ACL lookups behave as they do on the
+    /// original command call.
+    #[inline]
+    pub(crate) fn context(&self) -> &Context {
+        &self.ctx
+    }
+
     /// Log a message at the specified `level` using the underlying context.
     pub fn log(&self, level: ValkeyLogLevel, message: &str) {
         self.ctx.log(level, message);

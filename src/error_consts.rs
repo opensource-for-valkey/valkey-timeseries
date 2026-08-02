@@ -142,6 +142,18 @@ pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exis
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";
 pub const TOO_MANY_SAMPLES: &str = "TSDB: too many samples";
 
+// TS.READ. All four texts are verbatim from the 8.10 reference (probed 2026-08-01, see
+// docs/ts-read-implementation-plan.md §6). Note the failure *class* split the reference uses:
+// duplicated/malformed options resolve to plain wrong-arity, only the value-range failures
+// below get a TSDB: message.
+pub const READ_MAX_COUNT_MUST_BE_POSITIVE: &str = "TSDB: MAX_COUNT must be a positive integer";
+pub const READ_MIN_COUNT_MUST_BE_POSITIVE: &str =
+    "TSDB: BLOCK min_count must be a positive integer";
+pub const READ_BLOCK_MS_MUST_BE_NON_NEGATIVE: &str =
+    "TSDB: BLOCK milliseconds must be a non-negative integer";
+pub const READ_MIN_COUNT_EXCEEDS_MAX_COUNT: &str = "TSDB: BLOCK min_count must be <= MAX_COUNT";
+pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK) is not allowed inside MULTI, EVAL, or a deny-blocking context";
+
 // TS.QUERYLABELS
 pub const UNKNOWN_QUERY_LABELS_SUBTYPE: &str =
     "TSDB: unknown subtype, must be one of LABELS|VALUES";

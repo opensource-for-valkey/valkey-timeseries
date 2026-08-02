@@ -364,6 +364,7 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
             ('TS.DEL', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
             ('TS.GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@timeseries']),
             ('TS.RANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
+            ('TS.READ', [b'readonly', b'module'], [b'@read', b'@timeseries']),
             ('TS.REVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
             ('TS.MRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
             ('TS.MREVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),

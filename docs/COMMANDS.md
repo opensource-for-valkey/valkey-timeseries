@@ -28,5 +28,6 @@
 - [`TS.QUERYINDEX`](commands/ts.queryindex.md)
 - [`TS.QUERYLABELS`](commands/ts.querylabels.md)
 - [`TS.RANGE`](commands/ts.range.md)
+- [`TS.READ`](commands/ts.read.md)
 - [`TS.REVRANGE`](commands/ts.revrange.md)
 - [`TS._DEBUG`](commands/ts._debug.md)

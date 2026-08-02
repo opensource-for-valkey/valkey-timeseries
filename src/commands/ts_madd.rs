@@ -1,4 +1,5 @@
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
+use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
@@ -91,8 +92,12 @@ fn handle_update(
     );
 
     let mut per_series_samples: Vec<PerSeriesSamples> = Vec::with_capacity(4);
+    // Sample counts before the merge, so blocked `TS.READ` readers are woken only for series
+    // that actually gained a sample. Collected here because the mutable borrows taken by
+    // `PerSeriesSamples` below run until the merge returns.
+    let mut counts_before: SmallVec<[(&ValkeyString, usize); 8]> = SmallVec::new();
 
-    for (_key, samples) in input_map.iter_mut() {
+    for (key, samples) in input_map.iter_mut() {
         let res = samples.err;
         if !res.is_ok() {
             // Series-level error applies to every sample in that series
@@ -105,6 +110,8 @@ fn handle_update(
         let Some(series) = &mut samples.series else {
             continue;
         };
+
+        counts_before.push((*key, series.total_samples));
 
         let mut s = PerSeriesSamples::new(series.deref_mut());
         for input in samples.samples.iter() {
@@ -125,6 +132,15 @@ fn handle_update(
     for (index, res) in merged {
         if let Some(slot) = results.get_mut(index) {
             *slot = res;
+        }
+    }
+
+    for (key, count_before) in counts_before {
+        if let Some(samples) = input_map.get(key)
+            && let Some(series) = &samples.series
+            && series.total_samples > count_before
+        {
+            signal_timeseries_ready(ctx, key);
         }
     }
 

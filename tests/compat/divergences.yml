@@ -123,6 +123,17 @@
   rationale: same root cause as DIV-0002
   since: 0.1.0
 
+- id: DIV-0055
+  command: TS.READ
+  kind: float-format
+  description: >
+    RESP2 sample-value text uses valkey-core's double formatting instead of
+    RTS's notation (e.g. 0.1 vs 1E-1); values parse identically
+    (same cause as DIV-0002). Applies to both the immediate and the blocking
+    form — the reply is built by the same sample writer either way.
+  rationale: same root cause as DIV-0002
+  since: 0.1.0
+
 - id: DIV-0008
   command: CONFIG
   kind: config-name

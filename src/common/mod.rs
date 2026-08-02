@@ -1,6 +1,7 @@
 pub mod alloc;
 pub mod binary_search;
 pub mod binop;
+pub mod block_on_keys;
 pub mod constants;
 pub mod context;
 pub mod encoding;

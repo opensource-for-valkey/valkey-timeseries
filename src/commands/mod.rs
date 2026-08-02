@@ -37,6 +37,7 @@ mod ts_queryindex_fanout_command;
 mod ts_querylabels;
 mod ts_querylabels_fanout_command;
 mod ts_range;
+mod ts_read;
 mod utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on

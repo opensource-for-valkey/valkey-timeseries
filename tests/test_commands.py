@@ -30,6 +30,7 @@ class TestTimeSeriesCommandKeys(ValkeyTimeSeriesTestCaseBase):
         (["TS.INCRBY", "k", "1"], [b"k"]),
         (["TS.DECRBY", "k", "1"], [b"k"]),
         (["TS.RANGE", "k", "-", "+"], [b"k"]),
+        (["TS.READ", "k", "0"], [b"k"]),
         (["TS.REVRANGE", "k", "-", "+"], [b"k"]),
         (["TS.OUTLIERS", "k", "-", "+", "MAD", "3"], [b"k"]),
         (["TS.MADD", "k1", "1", "1.0", "k2", "2", "2.0"], [b"k1", b"k2"]),
@@ -81,7 +82,7 @@ class TestTimeSeriesCommandKeys(ValkeyTimeSeriesTestCaseBase):
         # Every user-facing command is registered with a summary, complexity and since via the
         # command-info annotations. Spot-check a representative set across the read/write and
         # keyed/keyless categories.
-        for command in ["TS.CREATE", "TS.ADD", "TS.RANGE", "TS.MGET", "TS.CREATERULE"]:
+        for command in ["TS.CREATE", "TS.ADD", "TS.RANGE", "TS.READ", "TS.MGET", "TS.CREATERULE"]:
             docs = self.client.execute_command(f"COMMAND DOCS {command}")
             assert docs and docs[0].decode().upper() == command, (
                 f"COMMAND DOCS did not return an entry for {command}"

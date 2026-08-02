@@ -130,6 +130,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `test_compat_mrange.py` | Phase 2: `TS.MRANGE`/`TS.MREVRANGE` matrix (plan §6) |
 | `test_compat_multi_aggregation.py` | Phase 2: the `AGGREGATION` aggregator-list surface and its pair-vs-row reply shape (plan §6) |
 | `test_compat_get.py` | Phase 2: `TS.GET`/`TS.MGET` matrix (plan §6) |
+| `test_compat_read.py` | Phase 2: `TS.READ` matrix (plan §6). The only suite that drives both engines *concurrently* — `TS.READ ... BLOCK` would deadlock `DiffClient.execute_command`, which runs the reference and the subject in sequence, so it collects each outcome on its own connection and diffs them through `DiffClient.compare_outcomes`. `TS.READ` is deliberately excluded from the fuzzer for the same reason; see the note above `READ_KINDS` in `fuzz_strategies.py`. |
 | `test_compat_queryindex.py` | Phase 2: `TS.QUERYINDEX` matrix (plan §6) |
 | `test_compat_querylabels.py` | Phase 2: `TS.QUERYLABELS` matrix (plan §6) |
 | `test_compat_compaction.py` | Phase 2: compaction deep-dive (plan §6) |

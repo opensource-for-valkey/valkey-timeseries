@@ -38,6 +38,7 @@ pub use labels::Label;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod tests;
 
+use crate::common::block_on_keys::check_blocking_module_apis;
 use crate::series::background_tasks::init_background_tasks;
 use crate::series::index::init_croaring_allocator;
 use crate::series::index::persistence::check_required_module_apis;
@@ -107,6 +108,15 @@ fn preload(ctx: &Context, args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
+    // TS.READ's block-on-keys path dereferences these directly; fail the load rather than the
+    // first blocking read.
+    if let Err(symbol) = check_blocking_module_apis() {
+        ctx.log_warning(&format!(
+            "Required module API {symbol} is unavailable on this server; refusing to load"
+        ));
+        return Status::Err;
+    }
+
     Status::Ok
 }
 
@@ -134,6 +144,7 @@ const COMMAND_ACL_CATEGORIES: &[(&str, &str)] = &[
     ("ts.nrange", "read timeseries"),
     ("ts.nrevrange", "read timeseries"),
     ("ts.range", "read timeseries"),
+    ("ts.read", "read timeseries"),
     ("ts.revrange", "read timeseries"),
     ("ts.info", "read fast timeseries"),
     ("ts.queryindex", "read timeseries"),

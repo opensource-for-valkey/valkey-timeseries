@@ -2,6 +2,7 @@ use crate::commands::command_parser::{
     CommandArgToken, parse_command_arg_token, parse_timestamp, parse_value_arg,
 };
 use crate::commands::ts_create::parse_series_options;
+use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
@@ -123,6 +124,12 @@ fn handle_add(
     let mut ignored = false;
 
     let last_ts = series.last_sample.map(|s| s.timestamp);
+    // Compared after the add to decide whether to wake blocked `TS.READ` readers. A count
+    // comparison rather than `!is_upsert`: an out-of-order insert *below* the tail is not an
+    // append, but it does add a sample that a reader's cursor may already cover. Duplicates,
+    // ignored writes, and value-only updates leave the count unchanged and correctly do not
+    // signal.
+    let samples_before = series.total_samples;
 
     let (replication_timestamp, ts, value) = match series.add(timestamp, value, on_duplicate) {
         SampleAddResult::Ignored(res_ts) => {
@@ -176,6 +183,10 @@ fn handle_add(
             // If the sample is not an upsert, we run compaction
             series.run_compaction(ctx, sample)?;
         }
+    }
+
+    if series.total_samples > samples_before {
+        signal_timeseries_ready(ctx, &args[1]);
     }
 
     replicate_and_notify(ctx, args, replication_timestamp);

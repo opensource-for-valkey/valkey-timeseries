@@ -40,6 +40,17 @@ pub fn is_real_user_client(ctx: &Context) -> bool {
     true
 }
 
+/// Whether the current execution context forbids blocking the client — inside `MULTI`, a Lua
+/// script, or a nested module call.
+///
+/// This must be consulted before every `RM_BlockClientOnKeys*` call. It is not a defensive check:
+/// the server asserts `!deny_blocking || (islua || ismulti)` inside `moduleBlockClient` and aborts
+/// the process when it fails.
+#[inline]
+pub fn is_blocking_denied(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::DENY_BLOCKING)
+}
+
 #[inline]
 pub fn is_acl_enforced(ctx: &Context) -> bool {
     // Replicated (master-link) and AOF-applied commands must not trigger ACL checks:

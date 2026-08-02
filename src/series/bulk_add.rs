@@ -3,6 +3,7 @@
 //! This module provides bulk insertion of samples into a time series, with support for duplicate
 //! policies and automatic compaction handling. It is optimized for high-throughput data ingestion
 //! scenarios by leveraging parallel processing and efficient sample merging.
+use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
@@ -478,6 +479,9 @@ fn notify_added(ctx: &Context, event: &str, ids: &[SeriesRef]) {
             };
             let key = ctx.create_string(key.as_ref());
             ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key);
+            // The sole caller already gated on the series' sample count having grown, which is
+            // exactly the condition that can satisfy a blocked `TS.READ`.
+            signal_timeseries_ready(ctx, &key);
         }
     });
 }

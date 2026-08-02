@@ -96,6 +96,29 @@ class DiffClient:
 
         ref_reply, ref_err = self._run(self.reference, args)
         sub_reply, sub_err = self._run(self.subject, args)
+        return self._settle_outcomes(record, args, (ref_reply, ref_err), (sub_reply, sub_err))
+
+    def compare_outcomes(self, args, reference, subject):
+        """Diff one command pair that the caller executed itself.
+
+        `execute_command` runs the reference and then the subject sequentially, so a *blocking*
+        command would deadlock there — the first engine would still be waiting when the second
+        is asked to run. Callers that must drive both engines concurrently (see
+        test_compat_read.py) collect the outcomes on their own connections and hand them back
+        here, so the comparison policy, known-divergence registry, divergence log, and
+        reproducer history all behave exactly as they do for an ordinary command.
+
+        `reference` and `subject` are each a `(reply, error)` pair, where exactly one element
+        is None.
+        """
+        record = CommandRecord(args=tuple(args))
+        self.history.append(record)
+        return self._settle_outcomes(record, args, reference, subject)
+
+    def _settle_outcomes(self, record, args, reference, subject):
+        """Apply the §5.2 error policy and reply diff to one already-executed command pair."""
+        ref_reply, ref_err = reference
+        sub_reply, sub_err = subject
         record.reference_reply, record.subject_reply = ref_reply, sub_reply
         record.reference_error = str(ref_err) if ref_err is not None else None
         record.subject_error = str(sub_err) if sub_err is not None else None
