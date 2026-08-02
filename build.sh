@@ -144,6 +144,29 @@ if [ "$NEEDS_BUILD" = true ]; then
     cd "$SCRIPT_DIR"
 fi
 
+# ASAN_BUILD only changes how pytest is invoked and what its output is scanned for — it
+# instruments nothing itself. The "LeakSanitizer: detected memory leaks" line it greps for can
+# only come from a valkey-server built with SANITIZER=address (see the asan-build job in
+# .github/workflows/ci.yml, which instruments the server and leaves the Rust module alone: the
+# module allocates through the server's allocator, so instrumenting the server covers it).
+# Against an ordinary binary the grep can never match and the phase reports success having
+# checked nothing, so refuse the run instead of passing vacuously.
+if [ -n "$ASAN_BUILD" ]; then
+    if ! grep -aq "AddressSanitizer" "$BINARY_PATH"; then
+        echo "ERROR: ASAN_BUILD is set, but '$BINARY_PATH' is not ASAN-instrumented," >&2
+        echo "so the leak check could not detect anything. Build an instrumented server:" >&2
+        echo "  (cd tests/build/valkey && make distclean && make -j SANITIZER=address valkey-server)" >&2
+        echo "  cp tests/build/valkey/src/valkey-server '$BINARY_PATH'" >&2
+        exit 2
+    fi
+    if [ "$(uname)" = "Darwin" ]; then
+        echo "ERROR: LeakSanitizer is not available on macOS, so ASAN_BUILD can not detect" >&2
+        echo "leaks here (and an instrumented server wedges at startup on darwin/arm64)." >&2
+        echo "Run the ASAN gate on Linux — CI's asan-build job, or a Linux container." >&2
+        exit 2
+    fi
+fi
+
 TEST_FRAMEWORK_REPO="https://github.com/valkey-io/valkey-test-framework"
 TEST_FRAMEWORK_DIR="tests/valkeytestframework"
 
