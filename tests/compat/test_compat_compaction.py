@@ -731,3 +731,37 @@ class TestReverseLatestAggregationOnDestination:
         diff("TS.ADD", "c:lplain", 0, 0)
         diff("TS.ADD", "c:lplain", 500, 0)
         diff("TS.REVRANGE", "c:lplain", "-", 1, "LATEST", "AGGREGATION", "avg", 500)
+
+    def test_with_empty_the_reference_repeats_the_whole_bucket_run(self, diff):
+        """Same broken RTS path, second symptom: adding `EMPTY` turns "returns nothing"
+        into "returns everything twice".
+
+        With the range reaching past the open bucket — where the plain reverse+LATEST read
+        agrees (see test_dropping_any_single_condition_agrees) — RTS replies with the
+        window's five buckets as an all-NaN run followed by the same five carrying their
+        values, ten rows for a five-bucket window. We reply with the five, which is our
+        forward reply reversed. Per-engine again: the delta is a row-count difference, and
+        the registry entries are scoped to the empty-reply shape.
+        """
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", "c:esrc")
+            client.execute_command("TS.CREATE", "c:edst")
+            client.execute_command(
+                "TS.CREATERULE", "c:esrc", "c:edst", "AGGREGATION", "avg", 500
+            )
+            client.execute_command("TS.ADD", "c:esrc", 0, 0)
+            client.execute_command("TS.ADD", "c:esrc", 2000, 0)
+            client.execute_command("TS.MADD", "c:esrc", 3000, 0)  # opens [3000,3500)
+
+        args = ("TS.REVRANGE", "c:edst", 0, 2001, "LATEST",
+                "AGGREGATION", "avg", 500, "EMPTY")
+        ref = diff.reference.execute_command(*args)
+        sub = diff.subject.execute_command(*args)
+
+        assert [row[0] for row in ref] == [2000, 1500, 1000, 500, 0] * 2, ref
+        assert [row[0] for row in sub] == [2000, 1500, 1000, 500, 0], sub
+
+        # Our reply is the forward one reversed, and the forward one agrees with RTS.
+        diff("TS.RANGE", "c:edst", 0, 2001, "LATEST", "AGGREGATION", "avg", 500, "EMPTY")
+        # Dropping LATEST agrees too, so EMPTY alone is not the trigger.
+        diff("TS.REVRANGE", "c:edst", 0, 2001, "AGGREGATION", "avg", 500, "EMPTY")

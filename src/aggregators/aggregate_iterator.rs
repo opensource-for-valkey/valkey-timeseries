@@ -177,9 +177,7 @@ impl AggregationHelper {
     /// only the *reported* timestamp is clamped (see [`Self::render_timestamp`]),
     /// matching RTS `CalcBucketStart`/`BucketStartNormalize`.
     fn calc_bucket_start(&self, ts: Timestamp) -> Timestamp {
-        let diff = ts - self.align_timestamp;
-        let delta = self.bucket_duration as i64;
-        ts - ((diff % delta + delta) % delta)
+        bucket_start_for(ts, self.align_timestamp, self.bucket_duration)
     }
 
     /// Reply timestamp for a bucket: clamp the start to 0 first, then apply the
@@ -191,6 +189,20 @@ impl AggregationHelper {
     }
 }
 
+/// True (unclamped) start of the bucket holding `ts`, for a grid aligned on
+/// `align_timestamp`. Negative when the alignment offset places the bucket before 0; only the
+/// *reported* timestamp is clamped. Shared with the callers that have to reason about the
+/// grid without an iterator in hand (see `iterators::empty_fill_bounds`).
+pub(crate) fn bucket_start_for(
+    ts: Timestamp,
+    align_timestamp: Timestamp,
+    bucket_duration: u64,
+) -> Timestamp {
+    let diff = ts - align_timestamp;
+    let delta = bucket_duration as i64;
+    ts - ((diff % delta + delta) % delta)
+}
+
 pub fn aggregate(
     options: &AggregationOptions,
     aligned_timestamp: Timestamp,
@@ -200,6 +212,52 @@ pub fn aggregate(
     iterator.collect()
 }
 
+/// How far an `EMPTY` fill may run past the samples the query itself sees.
+///
+/// A bucket is reported iff it falls in the intersection of the query window with the extent
+/// of the samples passing the query's filters — and that extent is taken over the *whole*
+/// series, not the queried slice of it. So a bucket holding nothing is still reported when
+/// passing data exists on both sides of it, while the window's own edge is only reached when
+/// the series really has passing data beyond it. Both directions are RedisTimeSeries 8.10
+/// behavior, confirmed by black-box probing of the reference.
+///
+/// The sample stream is clipped to the window and so cannot answer "is there anything out
+/// there?"; these fields carry exactly that outside knowledge. `start` is
+/// `Some(query_start)` when a passing sample exists before the window, `end` is
+/// `Some(query_end)` when one exists after it. A `None` side means the fill stops at the
+/// first (or last) sample the query actually saw, which is also the default — an iterator
+/// built without bounds fills interior gaps only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmptyFillBounds {
+    pub start: Option<Timestamp>,
+    pub end: Option<Timestamp>,
+    /// Value of the last passing sample *before* the window, or NaN when there is none.
+    /// `last`'s EMPTY fill is "the value of the last sample before the bucket's start", so a
+    /// leading gap bucket inherits a sample the query itself never reads. Carried here
+    /// rather than looked up downstream because it comes from the same scan as `start`.
+    pub carry_seed: f64,
+}
+
+impl Default for EmptyFillBounds {
+    fn default() -> Self {
+        Self {
+            start: None,
+            end: None,
+            carry_seed: f64::NAN,
+        }
+    }
+}
+
+impl EmptyFillBounds {
+    pub fn new(start: Option<Timestamp>, end: Option<Timestamp>) -> Self {
+        Self {
+            start,
+            end,
+            ..Default::default()
+        }
+    }
+}
+
 /// Bucketing iterator over N >= 1 aggregators; yields one row per bucket with
 /// `values[i]` produced by `options.aggregations[i]`.
 pub struct MultiAggregateIterator<T: Iterator<Item = Sample>> {
@@ -207,34 +265,31 @@ pub struct MultiAggregateIterator<T: Iterator<Item = Sample>> {
     aggregator: AggregationHelper,
     empty_buckets: VecDeque<MultiSample>,
     init: bool,
-    query_range: Option<(Timestamp, Timestamp)>,
+    empty_fill: EmptyFillBounds,
 }
 
 impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
     pub fn new(inner: T, options: &AggregationOptions, aligned_timestamp: Timestamp) -> Self {
-        let aggregator = AggregationHelper::new(options, aligned_timestamp);
-        Self {
+        Self::with_empty_fill(
             inner,
-            aggregator,
-            empty_buckets: VecDeque::new(),
-            init: false,
-            query_range: None,
-        }
+            options,
+            aligned_timestamp,
+            EmptyFillBounds::default(),
+        )
     }
 
-    pub fn with_range(
+    pub fn with_empty_fill(
         inner: T,
         options: &AggregationOptions,
         aligned_timestamp: Timestamp,
-        query_start: Timestamp,
-        query_end: Timestamp,
+        empty_fill: EmptyFillBounds,
     ) -> Self {
         Self {
             inner,
             aggregator: AggregationHelper::new(options, aligned_timestamp),
             empty_buckets: VecDeque::new(),
             init: false,
-            query_range: Some((query_start, query_end)),
+            empty_fill,
         }
     }
 
@@ -259,12 +314,22 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         self.empty_buckets.pop_front()
     }
 
+    /// One past the last bucket of `ts`, for the exclusive end `add_empty_bucket_internal` takes.
+    fn bucket_end_exclusive(&self, ts: Timestamp) -> Timestamp {
+        self.aggregator
+            .calc_bucket_start(ts)
+            .saturating_add_unsigned(self.aggregator.bucket_duration)
+    }
+
+    /// Buckets between the window start and the first sample the query saw. Only reached when
+    /// passing data exists before the window, which is what makes those buckets reportable —
+    /// otherwise they would end before the series' earliest passing sample.
     fn enqueue_leading_empty_buckets(&mut self, first_sample_ts: Timestamp) {
         if !self.aggregator.report_empty {
             return;
         }
 
-        if let Some((query_start, _)) = self.query_range {
+        if let Some(query_start) = self.empty_fill.start {
             let requested_first_bucket = self.aggregator.calc_bucket_start(query_start);
             let first_sample_bucket = self.aggregator.calc_bucket_start(first_sample_ts);
             self.aggregator.add_empty_bucket_internal(
@@ -275,17 +340,17 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         }
     }
 
+    /// The window holds no sample of its own. It is still reported — as one run of empty
+    /// buckets — when passing data exists on *both* sides, i.e. the window is a gap inside
+    /// the data rather than past its edge.
     fn enqueue_full_empty_range_if_needed(&mut self) {
         if !self.aggregator.report_empty {
             return;
         }
 
-        if let Some((query_start, query_end)) = self.query_range {
+        if let (Some(query_start), Some(query_end)) = (self.empty_fill.start, self.empty_fill.end) {
             let first_bucket = self.aggregator.calc_bucket_start(query_start);
-            let end_exclusive = self
-                .aggregator
-                .calc_bucket_start(query_end)
-                .saturating_add_unsigned(self.aggregator.bucket_duration);
+            let end_exclusive = self.bucket_end_exclusive(query_end);
             self.aggregator.add_empty_bucket_internal(
                 &mut self.empty_buckets,
                 first_bucket,
@@ -331,6 +396,9 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         None
     }
 
+    /// Buckets between the last sample the query saw and the window end. Like the leading
+    /// side, only reached when passing data exists beyond the window — otherwise those
+    /// buckets would begin after the series' latest passing sample.
     fn finalize_last_bucket_if_any(&mut self) -> Option<MultiSample> {
         if !self.aggregator.saw_sample {
             return None;
@@ -339,13 +407,9 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         let bucket = self.finalize_bucket(None);
 
         if self.aggregator.report_empty
-            && let Some((_, query_end)) = self.query_range
+            && let Some(query_end) = self.empty_fill.end
         {
-            let end_exclusive = self
-                .aggregator
-                .calc_bucket_start(query_end)
-                .saturating_add_unsigned(self.aggregator.bucket_duration);
-
+            let end_exclusive = self.bucket_end_exclusive(query_end);
             self.aggregator.add_empty_bucket_internal(
                 &mut self.empty_buckets,
                 self.aggregator.bucket_range_end,
@@ -367,6 +431,12 @@ impl<T: Iterator<Item = Sample>> Iterator for MultiAggregateIterator<T> {
 
         if !self.ensure_initialized() {
             return self.pop_empty_bucket();
+        }
+
+        // Initialization may have queued the buckets that precede the first sample; they
+        // come before it in time, so they must come before it in the output too.
+        if let Some(row) = self.pop_empty_bucket() {
+            return Some(row);
         }
 
         if let Some(bucket) = self.process_bucket() {
@@ -395,24 +465,22 @@ impl<T: Iterator<Item = Sample>> AggregateIterator<T> {
         }
     }
 
-    pub fn with_range(
+    pub fn with_empty_fill(
         inner: T,
         options: &AggregationOptions,
         aligned_timestamp: Timestamp,
-        query_start: Timestamp,
-        query_end: Timestamp,
+        empty_fill: EmptyFillBounds,
     ) -> Self {
         debug_assert!(
             !options.is_multi(),
             "AggregateIterator requires a single aggregator; use MultiAggregateIterator"
         );
         Self {
-            inner: MultiAggregateIterator::with_range(
+            inner: MultiAggregateIterator::with_empty_fill(
                 inner,
                 options,
                 aligned_timestamp,
-                query_start,
-                query_end,
+                empty_fill,
             ),
         }
     }
@@ -539,11 +607,70 @@ mod tests {
     fn test_align_offset_empty_buckets_match_reference() {
         let options = align_250_options(BucketTimestamp::Start, true);
         let samples = vec![Sample::new(0, 1.0), Sample::new(2900, 5.0)];
-        let result: Vec<Sample> =
-            AggregateIterator::with_range(samples.into_iter(), &options, 250, 0, 3000).collect();
+        let result: Vec<Sample> = AggregateIterator::with_empty_fill(
+            samples.into_iter(),
+            &options,
+            250,
+            EmptyFillBounds::new(Some(0), Some(3000)),
+        )
+        .collect();
 
         let actual: Vec<(Timestamp, f64)> = result.iter().map(|s| (s.timestamp, s.value)).collect();
         assert_eq!(actual, [(0, 1.0), (250, 0.0), (1250, 0.0), (2250, 5.0)]);
+    }
+
+    /// The bounds only ever *extend* the fill past the samples in hand: with both sides set,
+    /// the run reaches the window's own edges; with neither, it stops at the first and last
+    /// sample. Same samples, same query — only the outside knowledge differs.
+    #[test]
+    fn test_empty_fill_bounds_extend_the_run() {
+        let options = align_250_options(BucketTimestamp::Start, true);
+        let samples = vec![Sample::new(1300, 1.0)];
+
+        let timestamps = |bounds: EmptyFillBounds| -> Vec<Timestamp> {
+            AggregateIterator::with_empty_fill(samples.clone().into_iter(), &options, 250, bounds)
+                .map(|s| s.timestamp)
+                .collect()
+        };
+
+        // Anchored to the single sample: one bucket, no fill in either direction.
+        assert_eq!(timestamps(EmptyFillBounds::default()), vec![1250]);
+        // Data known to exist before the window: fill back to the window start, whose bucket
+        // begins at -750 under this alignment and so reports as 0.
+        assert_eq!(
+            timestamps(EmptyFillBounds::new(Some(0), None)),
+            vec![0, 250, 1250]
+        );
+        // ...and after it: fill forward to the window end.
+        assert_eq!(
+            timestamps(EmptyFillBounds::new(None, Some(3000))),
+            vec![1250, 2250]
+        );
+        assert_eq!(
+            timestamps(EmptyFillBounds::new(Some(0), Some(3000))),
+            vec![0, 250, 1250, 2250]
+        );
+    }
+
+    /// A window holding no sample at all is reported only when data is known on *both* sides
+    /// — the window is then a gap inside the data rather than past its edge.
+    #[test]
+    fn test_empty_fill_bounds_on_a_window_with_no_samples() {
+        let options = align_250_options(BucketTimestamp::Start, true);
+
+        let timestamps = |bounds: EmptyFillBounds| -> Vec<Timestamp> {
+            AggregateIterator::with_empty_fill(std::iter::empty(), &options, 250, bounds)
+                .map(|s| s.timestamp)
+                .collect()
+        };
+
+        assert_eq!(
+            timestamps(EmptyFillBounds::new(Some(1000), Some(3000))),
+            vec![250, 1250, 2250]
+        );
+        assert!(timestamps(EmptyFillBounds::new(Some(1000), None)).is_empty());
+        assert!(timestamps(EmptyFillBounds::new(None, Some(3000))).is_empty());
+        assert!(timestamps(EmptyFillBounds::default()).is_empty());
     }
 
     #[test]

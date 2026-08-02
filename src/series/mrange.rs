@@ -1,4 +1,6 @@
-use crate::aggregators::{PartialReducer, PartialRowReducer, PartialSampleReducer, PartialState};
+use crate::aggregators::{
+    EmptyFillBounds, PartialReducer, PartialRowReducer, PartialSampleReducer, PartialState,
+};
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
@@ -637,6 +639,9 @@ fn group_series_by_label<'a>(
     grouped
 }
 
+/// Adapter over an already-materialized sample stream (no series in hand), so the `EMPTY`
+/// fill stays anchored to those samples — see [`EmptyFillBounds`]. `create_iter` above is the
+/// per-series path, and it derives the wider bounds from the series itself.
 pub fn create_mrange_iterator_adapter<'a>(
     base_iter: impl Iterator<Item = Sample> + 'a,
     options: &MRangeOptions,
@@ -646,6 +651,7 @@ pub fn create_mrange_iterator_adapter<'a>(
         &options.range,
         &options.grouping,
         options.is_reverse,
+        EmptyFillBounds::default(),
     )
 }
 

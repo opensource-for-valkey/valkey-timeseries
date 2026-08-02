@@ -242,7 +242,12 @@ TS.RANGE cpu:utilization 1609459200000 1609545600000 AGGREGATION countif(>90),su
 ## Behavior Notes
 
 - **Timestamp Inclusivity:** Both `fromTimestamp` and `toTimestamp` are inclusive
-- **Empty Buckets:** Omitted by default; use `EMPTY` to include them
+- **Empty Buckets:** Omitted by default; use `EMPTY` to include them. The buckets reported are
+  those the query window and the series' own data extent have in common, so an empty bucket
+  appears wherever data exists on both sides of it — including past the last sample inside the
+  window, when the series continues beyond it — and no bucket is reported before the series'
+  first sample or after its last, however wide the window is. `FILTER_BY_TS`/`FILTER_BY_VALUE`
+  narrow that extent to the samples they keep.
 - **Filtered Aggregators:** Condition filters are applied within each bucket after timestamp/value filters
 - **Reverse Queries:** `TS.REVRANGE` adjusts semantics of `FIRST`/`LAST` appropriately
 - **Bucket Boundaries:** Computed based on alignment and `bucketDuration`

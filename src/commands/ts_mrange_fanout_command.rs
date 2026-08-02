@@ -2,6 +2,7 @@ use super::fanout_codec;
 use super::fanout_codec::generated::{
     GroupPartialSeries, MultiRangeRequest, MultiRangeResponse, SeriesRangeResponse,
 };
+use crate::aggregators::EmptyFillBounds;
 use crate::aggregators::MultiAggregateIterator;
 use crate::aggregators::{PartialReducer, PartialState};
 use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
@@ -303,11 +304,16 @@ fn normalize_response_series(
                 return Ok(response);
             }
             let mut result = MRangeSeriesResult::try_from(response)?;
+            // Default `EMPTY` bounds: the coordinator holds the shard's samples, already
+            // clipped to the query window, and no series to look outside it with — so the
+            // fill stays anchored to those samples (interior gaps only). A shard that
+            // bucketed for itself returns above with the wider fill applied.
             let samples: Vec<Sample> = create_sample_iterator_adapter(
                 result.data.sample_iter(),
                 &shard_range,
                 &None,
                 false,
+                EmptyFillBounds::default(),
             )
             .collect();
             result.data = SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
@@ -742,6 +748,7 @@ fn process_series_list(series: &[MRangeSeriesResult], options: &MRangeOptions) -
             &options.range,
             &options.grouping,
             reverse_aggr,
+            EmptyFillBounds::default(),
         )
         .collect()
     } else if series.len() == 1 {
@@ -750,6 +757,7 @@ fn process_series_list(series: &[MRangeSeriesResult], options: &MRangeOptions) -
             &options.range,
             &options.grouping,
             reverse_aggr,
+            EmptyFillBounds::default(),
         )
         .collect()
     } else {
@@ -762,6 +770,7 @@ fn process_series_list(series: &[MRangeSeriesResult], options: &MRangeOptions) -
             &options.range,
             &options.grouping,
             reverse_aggr,
+            EmptyFillBounds::default(),
         )
         .collect()
     }
@@ -869,7 +878,14 @@ mod tests {
     /// Simulate what a push-down shard returns: the per-series aggregation
     /// pipeline applied to the raw samples.
     fn shard_aggregate(raw: Vec<Sample>, options: &MRangeOptions) -> Vec<Sample> {
-        create_sample_iterator_adapter(raw.into_iter(), &options.range, &None, false).collect()
+        create_sample_iterator_adapter(
+            raw.into_iter(),
+            &options.range,
+            &None,
+            false,
+            EmptyFillBounds::default(),
+        )
+        .collect()
     }
 
     /// Push-down equivalence: shard-side bucketing + coordinator post-processing

@@ -758,3 +758,130 @@ class TestSumAvgAccumulation:
         property fuzz_strategies.WELL_CONDITIONED_VALUES relies on."""
         mk_populated(diff, f"r:wc:{agg}", [(0, 10.0), (1, -5.0), (2, 2.0), (3, -1.0)])
         diff("TS.RANGE", f"r:wc:{agg}", "-", "+", "AGGREGATION", agg, 1000)
+
+
+class TestEmptyFillSpan:
+    """The span `EMPTY` fills: the query window clipped to the series' own extent.
+
+    A bucket is reported iff it falls inside both, so the fill runs past the samples the
+    query saw whenever the series continues beyond the window — and stops at the data
+    otherwise. Every case here agrees with RedisTimeSeries 8.10 and is diffed as such;
+    the one state that does not is pinned separately in TestEmptyFillDivergence.
+    """
+
+    @pytest.mark.parametrize("bucket_ts", ("-", "+", "~"))
+    def test_fill_reaches_the_window_end_when_data_continues(self, diff, range_cmd, bucket_ts):
+        """The window ends mid-series: the bucket after the last in-window sample is still
+        reported, because the series has data beyond the window."""
+        mk_populated(diff, "r:fill:end", [(0, 0.0), (501, 7.0)])
+        diff(range_cmd, "r:fill:end", 0, 500, "AGGREGATION", "min", 500,
+             "BUCKETTIMESTAMP", bucket_ts, "EMPTY")
+
+    def test_fill_stops_at_the_data_when_the_window_runs_past_it(self, diff, range_cmd):
+        """Mirror image: nothing beyond the last sample, so the fill stops there however
+        far the window reaches."""
+        mk_populated(diff, "r:fill:past", [(0, 0.0), (501, 7.0)])
+        diff(range_cmd, "r:fill:past", 0, 9000, "AGGREGATION", "min", 500, "EMPTY")
+        diff(range_cmd, "r:fill:past", 0, 9000, "AGGREGATION", "sum", 500, "EMPTY")
+
+    def test_fill_reaches_the_window_start_when_data_precedes_it(self, diff, range_cmd):
+        """Leading side of the same rule."""
+        mk_populated(diff, "r:fill:lead", [(0, 1.0), (5000, 2.0)])
+        diff(range_cmd, "r:fill:lead", 2000, 3000, "AGGREGATION", "min", 1000, "EMPTY")
+        # ...and stops at the first sample when the window opens before the series.
+        diff(range_cmd, "r:fill:lead", 0, 9000, "AGGREGATION", "min", 1000, "EMPTY")
+
+    def test_window_that_is_a_pure_gap_is_reported(self, diff, range_cmd):
+        """No sample inside the window at all: still reported, as one run of empty
+        buckets, because data exists on both sides."""
+        mk_populated(diff, "r:fill:gap", [(1000, 1.0), (5000, 2.0)])
+        diff(range_cmd, "r:fill:gap", 2000, 3000, "AGGREGATION", "min", 1000, "EMPTY")
+        diff(range_cmd, "r:fill:gap", 2000, 3000, "AGGREGATION", "last", 1000, "EMPTY")
+
+    def test_window_outside_the_extent_reports_nothing(self, diff, range_cmd):
+        """Past either edge there is no intersection, so nothing is reported — the case
+        that keeps the rule from degenerating into "fill the whole window"."""
+        mk_populated(diff, "r:fill:outside", [(1000, 1.0), (5000, 2.0)])
+        diff(range_cmd, "r:fill:outside", 0, 999, "AGGREGATION", "min", 1000, "EMPTY")
+        diff(range_cmd, "r:fill:outside", 5001, 9000, "AGGREGATION", "min", 1000, "EMPTY")
+
+    def test_the_window_edge_bucket_boundary(self, diff, range_cmd):
+        """A bucket starting exactly on the window end is reported; one starting past it
+        is not. Off-by-one on either side changes the row count."""
+        mk_populated(diff, "r:fill:edge", [(300, 1.0), (5000, 7.0)])
+        for end in (749, 750, 1249, 1250, 1251):
+            diff(range_cmd, "r:fill:edge", 300, end, "ALIGN", 250,
+                 "AGGREGATION", "min", 500, "EMPTY")
+
+    def test_filters_decide_which_samples_bound_the_fill(self, diff, range_cmd):
+        """The extent is measured over the samples that pass the query's filters, so a
+        filter that removes the data beyond the window pulls the fill back in — and one
+        that leaves it lets the fill reach the window edge."""
+        mk_populated(diff, "r:fill:filter", [(0, 0.0), (501, 99.0)])
+        # 99 fails the filter: nothing passes beyond the window, so no trailing bucket.
+        diff(range_cmd, "r:fill:filter", 0, 500, "AGGREGATION", "min", 500, "EMPTY",
+             "FILTER_BY_VALUE", 0, 10)
+        # ...and it passes with a wider filter, so the trailing bucket comes back.
+        diff(range_cmd, "r:fill:filter", 0, 500, "AGGREGATION", "min", 500, "EMPTY",
+             "FILTER_BY_VALUE", 0, 100)
+        # FILTER_BY_TS is bounded by the window, so nothing outside it can pass.
+        diff(range_cmd, "r:fill:filter", 0, 500, "AGGREGATION", "min", 500, "EMPTY",
+             "FILTER_BY_TS", 0)
+
+    def test_no_in_window_sample_passes_the_filter(self, diff, range_cmd):
+        """A filter that empties the window suppresses the reply entirely, even though
+        the unfiltered series has data on both sides of it."""
+        mk_populated(diff, "r:fill:nofilter", [(0, 99.0), (501, 0.0)])
+        diff(range_cmd, "r:fill:nofilter", 0, 500, "AGGREGATION", "min", 500, "EMPTY",
+             "FILTER_BY_VALUE", 0, 1)
+
+    def test_retention_bounds_the_extent(self, diff, range_cmd):
+        """Trimmed samples are not part of the extent, so they cannot anchor a fill."""
+        for client in (diff.reference, diff.subject):
+            client.execute_command("TS.CREATE", "r:fill:ret", "RETENTION", 2000)
+            client.execute_command("TS.ADD", "r:fill:ret", 1000, 1.0)
+            client.execute_command("TS.ADD", "r:fill:ret", 5000, 2.0)
+        diff(range_cmd, "r:fill:ret", 0, 9000, "AGGREGATION", "min", 1000, "EMPTY")
+
+    def test_empty_series_reports_nothing(self, diff, range_cmd):
+        mk_series(diff, "r:fill:none")
+        diff(range_cmd, "r:fill:none", 0, 5000, "AGGREGATION", "min", 1000, "EMPTY")
+
+
+class TestEmptyFillDivergence:
+    """DIV-0054: an `ALIGN` offset that is not a multiple of the bucket duration puts a
+    bucket boundary below timestamp 0, and there the reference suppresses the leading and
+    trailing fill. Asserted per engine — the delta is a plain row-count difference, which
+    no registry regex could scope without also absorbing real bugs.
+    """
+
+    SAMPLES = [(0, 0.0), (501, 7.0)]
+    QUERY = (0, 500, "ALIGN", 250, "AGGREGATION", "min", 500, "EMPTY")
+
+    def test_forward_fill_is_suppressed_on_a_negative_grid(self, diff):
+        mk_populated(diff, "r:neg:grid", self.SAMPLES)
+        reference = diff.reference.execute_command("TS.RANGE", "r:neg:grid", *self.QUERY)
+        subject = diff.subject.execute_command("TS.RANGE", "r:neg:grid", *self.QUERY)
+        assert [row[0] for row in reference] == [0], reference
+        assert [row[0] for row in subject] == [0, 250], subject
+
+    def test_the_reference_reports_that_bucket_in_reverse(self, diff):
+        """What makes it a self-contradiction rather than a rule: RTS's own reverse reply
+        returns the bucket its forward reply dropped, and we agree with the reverse one."""
+        mk_populated(diff, "r:neg:rev", self.SAMPLES)
+        for client in (diff.reference, diff.subject):
+            rows = client.execute_command("TS.REVRANGE", "r:neg:rev", *self.QUERY)
+            assert [row[0] for row in rows] == [250, 0], rows
+
+    def test_the_reference_reports_that_bucket_when_it_holds_a_sample(self, diff):
+        """And the same forward query returns it as soon as the bucket is not empty, so
+        the omission is about the fill, not about the bucket being out of range."""
+        mk_populated(diff, "r:neg:data", [(0, 0.0), (300, 5.0), (501, 7.0)])
+        diff("TS.RANGE", "r:neg:data", *self.QUERY)
+
+    def test_non_negative_grids_agree(self, diff, range_cmd):
+        """The boundary of the divergence: shift the same data off timestamp 0 and the
+        aligned grid stays non-negative, where the engines agree exactly."""
+        mk_populated(diff, "r:neg:shifted", [(300, 0.0), (801, 7.0)])
+        diff(range_cmd, "r:neg:shifted", 300, 800, "ALIGN", 250,
+             "AGGREGATION", "min", 500, "EMPTY")

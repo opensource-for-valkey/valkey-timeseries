@@ -601,6 +601,16 @@
 # two commands, which is an accepted-input-superset class §5.2 would normally hard-fail;
 # the pinning test below is what keeps that from going unnoticed.
 #
+# ⚠️ Second symptom, same path (Tier C fuzzer, 2026-08-01): add `EMPTY` and "returns
+# nothing" becomes "returns everything twice" — RTS replies with the window's buckets as an
+# all-NaN run followed by the same buckets carrying their values, ten rows for a five-bucket
+# window, even where the range reaches past the open bucket and the plain reverse+LATEST read
+# agrees. Our reply is the forward one reversed. Not matched either: the delta is a row-count
+# difference, which no regex could scope without absorbing real length bugs. Pinned by
+# TestReverseLatestAggregationOnDestination::test_with_empty_the_reference_repeats_the_whole_bucket_run,
+# and fuzz_strategies.py keeps the generator off `EMPTY` for reverse LATEST reads that can
+# reach a destination (the plain shape is still generated, so these entries keep firing).
+#
 # ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
 
 - id: DIV-0030
@@ -1128,3 +1138,52 @@
     ever reversed)
   since: 0.1.0
   documentation_only: true
+
+# DIV-0054 (2026-08-01, found while fixing the EMPTY fill span): the reference suppresses
+# the leading/trailing EMPTY fill when the aligned bucket grid puts a bucket boundary below
+# timestamp 0 — i.e. when `ALIGN` is not a multiple of the bucket duration and the data sits
+# near 0. It is reachable only in that state:
+#
+#   TS.ADD k 0 0 ; TS.ADD k 501 0
+#   TS.RANGE    k 0 500 ALIGN 250 AGGREGATION min 500 EMPTY  -> RTS [[0,0]]
+#   TS.REVRANGE k 0 500 ALIGN 250 AGGREGATION min 500 EMPTY  -> RTS [[250,nan],[0,0]]
+#
+# The two RTS replies are not the same row set, and the bucket it drops from the forward
+# reply is one it *does* report when the bucket holds a sample ([[0,0],[250,5]]), and one its
+# own reverse reply reports as NaN. Interior fill agrees with us in the same state (pinned by
+# aggregate_iterator::tests::test_align_offset_empty_buckets_match_reference), so this is the
+# leading/trailing fill only.
+#
+# Reviewed decision: do NOT match — the DIV-0023/DIV-0030 pattern, where the reference
+# contradicts itself and reproducing it would mean dropping in-range buckets that our own
+# reverse reply returns. Every non-negative grid agrees exactly, boundary cases included
+# (`bucket_start == query_end` is reported, `> query_end` is not); see
+# tests/compat/corpus/empty_fill_reaches_the_query_window_edges.json for the agreeing side.
+#
+# documentation_only: the delta is a plain length difference on a command whose every real
+# bug is also a length or value difference, so no regex could scope it safely. Pinned instead
+# by TestEmptyFillDivergence in tests/compat/test_compat_range.py, which asserts both engines
+# explicitly. fuzz_strategies.py keeps the generator off the negative-grid combination
+# (`_align_choices`) rather than registering it away.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0054
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    With `EMPTY` and an `ALIGN` offset that is not a multiple of the bucket duration,
+    a bucket grid extending below timestamp 0 makes RTS 8.10 suppress the leading and
+    trailing empty-bucket fill entirely; we report those buckets, as RTS's own
+    TS.REVRANGE reply does. Non-negative grids agree exactly. Applies to
+    TS.RANGE/REVRANGE and the TS.MRANGE and TS.NRANGE families, which share the
+    aggregation core.
+  rationale: >
+    Reproducing it would mean dropping in-range buckets that the reference itself
+    returns for the same query in the other direction, and that it returns in the
+    forward direction as soon as the bucket holds a sample — the DIV-0023/DIV-0030
+    pattern of declining to copy the reference contradicting itself. The affected
+    state is narrow (ALIGN offset off-grid, data within one bucket of timestamp 0)
+    and the correction is additive: we return buckets RTS omits, never fewer.
+  since: 0.1.0
