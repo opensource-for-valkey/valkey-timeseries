@@ -2,6 +2,7 @@ import pytest
 from valkey import ResponseError
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkeytestframework.conftest import resource_port_tracker
 
 
 class TestTsQueryLabels(ValkeyTimeSeriesTestCaseBase):

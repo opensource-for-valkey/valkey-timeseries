@@ -1,6 +1,7 @@
 from valkey import Valkey, ValkeyCluster
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
+from valkeytestframework.conftest import resource_port_tracker
 
 # use hash tags to ensure keys are distributed across cluster nodes
 TS1 = b'ts:{1}:cpu'
