@@ -17,8 +17,20 @@ documentation and black-box observation of a running reference server. Running t
 
 Quick start (commands you can run)
 
-- Prerequisite: `protoc` (protobuf compiler) must be installed — the build compiles
-  `src/commands/fanout.*.proto` via `build.rs`. (`brew install protobuf` / `apt-get install protobuf-compiler`.)
+- Prerequisites: a Rust toolchain, and nothing else. In particular **`protoc` is not required**:
+  `build.rs` parses `proto/v1/*.proto` with [`protox`](https://docs.rs/protox), a pure-Rust
+  protobuf compiler, precisely so the build needs no external toolchain. This holds for
+  regeneration too (`VALKEY_TS_PROTO_REGEN=1`), which goes through the same path. No CI job
+  installs a protobuf compiler — if you find yourself adding one to fix a build, the problem is
+  something else.
+- If `build.rs` fails saying the generated file `is missing` or `is out of date`, that is a
+  *schema drift* error, not a missing-toolchain error: the fix is
+  `VALKEY_TS_PROTO_REGEN=1 cargo build` plus committing the result. Installing `protoc` will not
+  help. See the protobuf-codegen note under "Quick tips for code changes".
+- Editing a `.proto` does mean one external tool, but only in CI: `buf lint` runs against the
+  `proto/` module (`buf.yaml`, `STANDARD` minus `PACKAGE_DIRECTORY_MATCH`). Install
+  [`buf`](https://buf.build) to check it locally; a lint failure there is separate from the
+  codegen-drift failure above.
 - Build + checks (mirrors CI):
   `cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release`
 - Local dev script (recommended):
@@ -418,6 +430,9 @@ Quick tips for code changes
   `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file; a normal build fails with instructions if the
   two disagree, so drift cannot land silently. Local↔wire conversions live beside it in `src/commands/fanout_codec/`
   (named `fanout_codec` rather than `fanout` so it does not collide with the `src/fanout/` transport layer).
+  Every build still parses the schema — `build.rs` compiles all four of `proto/v1/{common,filters,request,response}.proto`
+  with `protox` and diffs the result against the checked-in file — so the generated code is verified, not merely trusted.
+  No `protoc` is involved on either path; see Prerequisites above.
 - Behavior changes on the shared RTS surface should be checked against `tests/compat` and, if the difference is
   deliberate, recorded in `COMPATIBILITY.md` and/or `divergences.yml` (`behavior`-kind entries need explicit
   sign-off in the PR that introduces them).
