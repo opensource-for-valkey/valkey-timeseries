@@ -1,4 +1,4 @@
-# Known-divergence registry (docs/rts-compatibility-test-plan.md §5.3).
+# Known-divergence registry (docs/plans/rts-compatibility-test-plan.md §5.3).
 #
 # The single source of truth consulted by the differential harness. A mismatch
 # fully covered by an entry here is recorded as XFAIL-DIVERGENT in the conformance

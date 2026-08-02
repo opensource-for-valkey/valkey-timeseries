@@ -2,7 +2,7 @@
 
 Authored from the public command documentation and black-box observation of the pinned
 reference only; no RedisTimeSeries source or test code was consulted. The observations these
-scenarios were derived from are recorded in docs/ts-read-implementation-plan.md §6.
+scenarios were derived from are recorded in docs/plans/ts-read-implementation-plan.md §6.
 
 TS.READ is the first *blocking* command in the compared surface, which the harness was not
 built for: `DiffClient.execute_command` runs the reference and then the subject sequentially,

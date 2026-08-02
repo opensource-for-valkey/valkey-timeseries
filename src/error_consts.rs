@@ -143,7 +143,7 @@ pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator
 pub const TOO_MANY_SAMPLES: &str = "TSDB: too many samples";
 
 // TS.READ. All four texts are verbatim from the 8.10 reference (probed 2026-08-01, see
-// docs/ts-read-implementation-plan.md §6). Note the failure *class* split the reference uses:
+// docs/plans/ts-read-implementation-plan.md §6). Note the failure *class* split the reference uses:
 // duplicated/malformed options resolve to plain wrong-arity, only the value-range failures
 // below get a TSDB: message.
 pub const READ_MAX_COUNT_MUST_BE_POSITIVE: &str = "TSDB: MAX_COUNT must be a positive integer";

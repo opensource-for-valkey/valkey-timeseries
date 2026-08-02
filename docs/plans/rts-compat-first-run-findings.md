@@ -10,11 +10,11 @@
 > first run against the *then-current* `redis:8.6` pin. The harness moved to
 > `redis:8.8` on 2026-07-23; the 8.6 references below are preserved deliberately
 > so the record stays faithful to what was observed. For the current reference
-> see [docker-compose.compat.yml](../docker-compose.compat.yml) and
-> [tests/compat/README.md](../tests/compat/README.md).
+> see [docker-compose.compat.yml](../../docker-compose.compat.yml) and
+> [tests/compat/README.md](../../tests/compat/README.md).
 
 This is the raw triage input the test plan's Phase 1 calls for
-(docs/rts-compatibility-test-plan.md §10): each finding must be resolved as either a
+(docs/plans/rts-compatibility-test-plan.md §10): each finding must be resolved as either a
 module fix or a reviewed entry in `tests/compat/divergences.yml`. Reproducers are in
 the failure output of `tests/compat/test_compat_smoke.py`; every finding below was
 observed directly against the pinned reference image.

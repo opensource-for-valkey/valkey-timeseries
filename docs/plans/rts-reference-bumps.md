@@ -1,7 +1,7 @@
 # RTS reference pin — bump log
 
 Running record of every change to the pinned reference image in
-[docker-compose.compat.yml](../docker-compose.compat.yml). The plan requires a
+[docker-compose.compat.yml](../../docker-compose.compat.yml). The plan requires a
 digest bump to be a reviewed change accompanied by a scan of what moved
 (§11, "Reference drift"); this file is that record.
 
@@ -16,7 +16,7 @@ boundary permits.
 **Two artifacts, one pin.** The digest-pinned image is canonical. A secondary
 native-binary artifact (`redis-server` + `redistimeseries.so` from the Redis Ltd.
 apt repository) is pinned in
-[tests/reference_server.sh](../tests/reference_server.sh) as
+[tests/reference_server.sh](../../tests/reference_server.sh) as
 `COMPAT_REFERENCE_VERSION` plus a per-distro/arch SHA256 table, and is bumped in
 the *same* reviewed change as the digest. The two are only interchangeable once
 an equivalence run is recorded below; until then
@@ -142,7 +142,7 @@ Updated in the same change: the Rust unit test asserting the old scan-order
 values (`test_reverse_iteration_with_last_aggregation_and_nan_values`), the
 Python `test_revrange_all_aggregation_types[FIRST/LAST]` expectations (swapped
 back to chronological), and the corpus fixture's stale description.
-`docs/rts-compatibility-test-plan.md` §6 and `COMPATIBILITY.md` do not name
+`docs/plans/rts-compatibility-test-plan.md` §6 and `COMPATIBILITY.md` do not name
 this behavior explicitly and needed no changes.
 
 **5. `TS.CREATERULE ... AGGREGATION ""` (empty string) gets a more specific

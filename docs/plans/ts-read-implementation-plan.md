@@ -13,12 +13,12 @@ work changed an answer, a dated note says so inline rather than silently rewriti
 
 | Where it landed | |
 | --- | --- |
-| Command | [src/commands/ts_read.rs](../src/commands/ts_read.rs) |
-| Block-on-keys FFI adapter | [src/common/block_on_keys.rs](../src/common/block_on_keys.rs) |
+| Command | [src/commands/ts_read.rs](../../src/commands/ts_read.rs) |
+| Block-on-keys FFI adapter | [src/common/block_on_keys.rs](../../src/common/block_on_keys.rs) |
 | Readiness signals | `ts_add`, `ts_madd`, `ts_incr_decr_by`, `series/bulk_add.rs`, `series/compaction.rs` |
-| Standalone tests | [tests/test_ts_read.py](../tests/test_ts_read.py) |
-| Cluster tests | [tests/test_ts_read_cme.py](../tests/test_ts_read_cme.py) |
-| Differential tests | [tests/compat/test_compat_read.py](../tests/compat/test_compat_read.py) |
+| Standalone tests | [tests/test_ts_read.py](../../tests/test_ts_read.py) |
+| Cluster tests | [tests/test_ts_read_cme.py](../../tests/test_ts_read_cme.py) |
+| Differential tests | [tests/compat/test_compat_read.py](../../tests/compat/test_compat_read.py) |
 
 **Three things the plan got wrong, all found by the work:**
 
@@ -80,7 +80,7 @@ Two metadata details need an explicit decision rather than a silent choice:
   metadata test quietly assert an empty tip list as if it matched.
 - **Key-spec flags.** The reference declares `RO` only, for `TS.READ` and for its other read
   commands alike. This module's read commands declare `[ReadOnly, Access]`
-  (see [ts_get.rs](../src/commands/ts_get.rs#L11)). Follow the module's existing convention —
+  (see [ts_get.rs](../../src/commands/ts_get.rs#L11)). Follow the module's existing convention —
   `ACCESS` is the semantically correct flag for a command that returns key data to the caller, and
   changing it would weaken ACL key-permission checking — and record the deliberate difference
   rather than treating it as a bug to fix later.
@@ -93,12 +93,12 @@ Two metadata details need an explicit decision rather than a silent choice:
 >   line: one asserts it declares exactly `dont_cache`, the other that no *other* command declares
 >   any tip, so the first cannot quietly become unrepresentative.
 > - **Key spec: `RO` + `ACCESS`, deliberately different.** Followed the module convention as
->   directed. Recorded in [COMPATIBILITY.md](../COMPATIBILITY.md) as the command's one
+>   directed. Recorded in [COMPATIBILITY.md](../../COMPATIBILITY.md) as the command's one
 >   deliberate metadata difference, and asserted in `test_ts_command.py` so it stays intentional
 >   instead of drifting.
 >
 > Both live in `TestTimeSeriesCommand` in
-> [tests/test_ts_command.py](../tests/test_ts_command.py).
+> [tests/test_ts_command.py](../../tests/test_ts_command.py).
 
 `timestamp` is an inclusive lower-bound cursor, typed as a *string* argument in `COMMAND DOCS`
 so that sentinels are accepted **[P]**. Accept only a non-negative 64-bit integer — a negative
@@ -131,7 +131,7 @@ RESP2                          RESP3
 ```
 
 An empty result is an empty array under both protocols **[P]**. Use
-[`reply_with_samples`](../src/common/replies/raw_replies.rs#L133), which already produces exactly
+[`reply_with_samples`](../../src/common/replies/raw_replies.rs#L133), which already produces exactly
 this shape and already handles the RESP2/RESP3 value split; it accepts a raw
 `*mut RedisModuleCtx`, so it is usable unchanged from an FFI callback.
 
@@ -199,11 +199,11 @@ Add a dedicated `ts_read` command module containing:
 - a strict parser for the command-specific timestamp vocabulary and optional arguments;
 - one retrieval function shared by the initial command, readiness callback, and timeout callback.
 
-New error strings belong in [error_consts.rs](../src/error_consts.rs) with the module's other
+New error strings belong in [error_consts.rs](../../src/error_consts.rs) with the module's other
 `TSDB:` messages.
 
 The retrieval function should open the series with read/access permissions and iterate from the
-resolved cursor through `MAX_TIMESTAMP` ([constants.rs](../src/common/constants.rs#L3) — the
+resolved cursor through `MAX_TIMESTAMP` ([constants.rs](../../src/common/constants.rs#L3) — the
 module's spelling for `i64::MAX`). Return enough state for callers to distinguish a missing key,
 wrong type, insufficient count, and a reply-ready snapshot. Readiness must always be re-evaluated
 from current stored data because retention, out-of-order writes, or other clients may have changed
@@ -233,18 +233,18 @@ isolate unsafe code in a small adapter around:
 - `RedisModule_SignalKeyAsReady`.
 
 This is a different mechanism from the module's existing blocking path — `TS.OUTLIERS` uses
-[`block_client`](../src/common/replies/thread_safe_reply_context.rs#L49) plus a thread-pool spawn
+[`block_client`](../../src/common/replies/thread_safe_reply_context.rs#L49) plus a thread-pool spawn
 and a `ThreadSafeReplyContext`, whose `BlockedClient` unblocks on drop. The new adapter must not
 reuse that ownership model: a block-on-keys handle stays registered after the command returns, so
 it must not be tied to a guard that unblocks in `Drop`. Keep the two paths visibly separate.
 
 Use crate `Context`, `ValkeyString`, key access, and reply helpers for all surrounding work;
-[`ReplyContext::new`](../src/common/replies/reply_context.rs#L21) takes a raw context pointer and
+[`ReplyContext::new`](../../src/common/replies/reply_context.rs#L21) takes a raw context pointer and
 so is directly constructible inside the callbacks. Add the three raw symbols to the load-time
 required-API check. That check currently lives in
-[persistence.rs](../src/series/index/persistence.rs#L315), which is the wrong home for blocking
+[persistence.rs](../../src/series/index/persistence.rs#L315), which is the wrong home for blocking
 symbols — hoist it to a neutral module, or add a second checker called from the same place in
-[`preload`](../src/lib.rs#L103).
+[`preload`](../../src/lib.rs#L103).
 
 The blocked-client private state owns the key bytes, resolved cursor, `min_count`, and optional
 `max_count`. Allocate it as a `Box`, pass its pointer to Valkey, and recover it only by reference
@@ -255,7 +255,7 @@ no panic may cross the FFI boundary.
 
 The protocol version does **not** need to be captured into the private state: the reply and
 timeout callbacks receive a context carrying the real blocked client, so
-[`is_resp3_client`](../src/common/replies/raw_replies.rs#L13) reports the client's actual protocol
+[`is_resp3_client`](../../src/common/replies/raw_replies.rs#L13) reports the client's actual protocol
 inside them **[S]**. The same holds for ACL identity — see
 [§7](#7-server-mechanics-valkey-808-153-g4733aed65) for why, and for the one callback where it
 does not hold.
@@ -315,18 +315,18 @@ a committed mutation increases a series' stored sample count:
   already-existing destination series.
 
 `TS._RESTORE` is deliberately absent from that list: it installs its payload through
-[`set_value`](../src/commands/ts_asm_restore.rs#L63), which is `RM_ModuleTypeSetValue`, which
+[`set_value`](../../src/commands/ts_asm_restore.rs#L63), which is `RM_ModuleTypeSetValue`, which
 deletes and re-adds through `dbAdd` — so it signals for free, as does every other series
 installation in this module **[S]**.
 
-Use final mutation results — [`SampleAddResult`](../src/series/types.rs#L295) discriminates
+Use final mutation results — [`SampleAddResult`](../../src/series/types.rs#L295) discriminates
 `Ok` from `Duplicate`/`Ignored`/`TooOld` — or before/after sample counts, not merely parse success
 or replication eligibility. Do not signal ignored writes, rejected writes, deletions of samples, or
 value-only upserts: none can increase the qualifying count. It is harmless for a signal to wake
 several clients because each callback independently rechecks its cursor and threshold.
 
 Audit the non-command paths in
-[server_events.rs](../src/series/index/server_events.rs#L532) rather than assuming they are
+[server_events.rs](../../src/series/index/server_events.rs#L532) rather than assuming they are
 covered. `loaded`, `restore`, `rename_to`, `copy_to`, and `move_to` all install a series under a
 watched name; each is expected to be free via `dbAdd`, but each is also a place where this module
 already runs code, and the *overwrite* variants (`RESTORE ... REPLACE`, `COPY ... REPLACE`,
@@ -342,7 +342,7 @@ and re-signals them **[S]**.
 ### Registration and cluster behavior
 
 Register the command through the existing command attribute path, add its `read timeseries`
-mapping to the central ACL table in [lib.rs](../src/lib.rs#L119), and expose the module from
+mapping to the central ACL table in [lib.rs](../../src/lib.rs#L119), and expose the module from
 `src/commands/mod.rs`.
 
 `TS.READ` remains a local, single-key command in cluster mode. Its key specification lets Valkey
@@ -441,7 +441,7 @@ elapsed-time equality. Include all parsing and key-state cases plus the blocking
 On failure, ensure worker clients are closed or explicitly unblocked so the suite cannot hang or
 leak state into the next test.
 
-**Exclude `TS.READ` from the fuzzer.** [`_read_op`](../tests/compat/fuzz_strategies.py#L400) draws
+**Exclude `TS.READ` from the fuzzer.** [`_read_op`](../../tests/compat/fuzz_strategies.py#L400) draws
 from the in-scope read surface and feeds a synchronous `DiffClient`; a drawn `BLOCK` would stall
 the generated program and hang the soak rather than fail it. Either omit the command from the
 strategy entirely or restrict it to the non-blocking form. Adding it to §2.1 of the test plan
@@ -483,20 +483,20 @@ Alongside the implementation:
 
 - add `docs/commands/ts.read.md` with syntax, cursor guidance, blocking behavior, return shape,
   paging examples, and the recommendation to advance with `last_returned_timestamp + 1`;
-- add `TS.READ` to [README.md](../README.md), [docs/COMMANDS.md](COMMANDS.md), and
-  [docs/overview.md](overview.md);
-- add it to the compatible query-command list in [COMPATIBILITY.md](../COMPATIBILITY.md) and make
-  the corresponding change in [docs/topics/redistimeseries-migration.md](topics/redistimeseries-migration.md);
-- update the registered-command inventory in [AGENTS.md](../AGENTS.md) ("Currently registered
+- add `TS.READ` to [README.md](../../README.md), [docs/COMMANDS.md](../COMMANDS.md), and
+  [docs/overview.md](../overview.md);
+- add it to the compatible query-command list in [COMPATIBILITY.md](../../COMPATIBILITY.md) and make
+  the corresponding change in [docs/topics/redistimeseries-migration.md](../topics/redistimeseries-migration.md);
+- update the registered-command inventory in [AGENTS.md](../../AGENTS.md) ("Currently registered
   commands", under "Quick tips for code changes");
-- add a suite-table row to [tests/compat/README.md](../tests/compat/README.md);
-- in [docs/rts-compatibility-test-plan.md](rts-compatibility-test-plan.md), move it out of the
+- add a suite-table row to [tests/compat/README.md](../../tests/compat/README.md);
+- in [docs/plans/rts-compatibility-test-plan.md](rts-compatibility-test-plan.md), move it out of the
   §2.1 "not yet in scope" note *and* add its per-command row to the §6 matrix;
 - add a dated completion note to the 2026-08-01 entry in
-  [docs/rts-reference-bumps.md](rts-reference-bumps.md#L68), which tracks the same follow-up;
+  [docs/plans/rts-reference-bumps.md](rts-reference-bumps.md#L68), which tracks the same follow-up;
   preserve the historical reference-bump entry itself.
 
-[docs/commands/index.md](commands/index.md) is deliberately **not** on this list. It is stale — it
+[docs/commands/index.md](../commands/index.md) is deliberately **not** on this list. It is stale — it
 sits inside an ```` ```aiignore ```` fence, omits `TS.QUERYINDEX`, `TS.QUERYLABELS`, and
 `TS.REVRANGE`, and lists a `TS.STATS` that has no page. Adding one more entry to it would deepen
 the inconsistency; either fix the file as separate work or leave it alone.
@@ -505,7 +505,7 @@ the inconsistency; either fix the file as separate work or leave it alone.
 > directed — it is still stale, still separate work.
 >
 > Two notes for anyone following the paths above. The planning docs have since moved into
-> `docs/`, so this file, the compatibility test plan, the bump log, and the first-run
+> `docs/plans/`, so this file, the compatibility test plan, the bump log, and the first-run
 > findings are now siblings; links here were rewritten to match. And the compatibility contract
 > ended up recording **one** deliberate difference, not two — the key-spec flags. The
 > slot-migration caveat drafted alongside it was withdrawn once the server turned out to redirect
@@ -589,7 +589,7 @@ The feature is complete when:
 ## 6. Reference observations (2026-08-01)
 
 Probed against the digest-pinned reference from
-[docker-compose.compat.yml](../docker-compose.compat.yml#L18):
+[docker-compose.compat.yml](../../docker-compose.compat.yml#L18):
 `redis:8.10@sha256:c29e49ab2f85760a3827b53882e6dd9f5c6c3f0bb7d724e07bb31cbf275a5236`
 (server 8.10.0, bundled `timeseries` 81000). Black-box only; no reference source was consulted.
 
@@ -645,7 +645,7 @@ the FFI questions the design depends on; re-verify if the minimum supported serv
 | …the free-private-data callback? | Same pointer, but it may be `NULL` if the client was already destroyed. The free callback must not touch client, ACL, or protocol state. | `module.c:280`, `module.c:8499` |
 | Is `bc->client` ever a fake client? | Only under Lua/`MULTI`, where it is `NULL` by construction — and we refuse to block there. `reply_client`/`thread_safe_ctx_client` are the fakes, and neither is what the callbacks receive. | `module.c:279-302`, `module.c:8378` |
 | Is `is_resp3_client` correct inside the callbacks? | Yes. `RESP3` is derived from `ctx->client->resp`, which is the real client's protocol. | `module.c:4135` |
-| Are ACL/current-user lookups safe inside the callbacks? | Yes, for the same reason — the context carries the real client and therefore a real user. The null-user crash mode documented in [context.rs](../src/common/context.rs#L44) does not apply here. | `module.c:4131`, `module.c:8662` |
+| Are ACL/current-user lookups safe inside the callbacks? | Yes, for the same reason — the context carries the real client and therefore a real user. The null-user crash mode documented in [context.rs](../../src/common/context.rs#L44) does not apply here. | `module.c:4131`, `module.c:8662` |
 | What happens if we block a deny-blocking client? | `serverAssert(!c->flag.deny_blocking \|\| (islua \|\| ismulti))` — the server aborts. The pre-check is mandatory. | `module.c:8361` |
 | Does `CLIENT UNBLOCK` work on our blocked clients? | Only if a timeout callback is registered. | `module.c:9077` |
 

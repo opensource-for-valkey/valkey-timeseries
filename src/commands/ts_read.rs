@@ -1,7 +1,7 @@
 //! `TS.READ` — read samples at or after a cursor, optionally waiting for more to arrive.
 //!
 //! Behavior is pinned to the 8.10 reference by black-box probe; see
-//! `docs/ts-read-implementation-plan.md` §1 and §6 for the captured observations behind each
+//! `docs/plans/ts-read-implementation-plan.md` §1 and §6 for the captured observations behind each
 //! decision here.
 
 use crate::common::block_on_keys::{BlockedKeyHandler, ReadyStatus, block_client_on_key};

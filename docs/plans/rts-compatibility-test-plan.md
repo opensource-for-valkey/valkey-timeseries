@@ -45,7 +45,7 @@ They are visible, non-hidden, `@read @timeseries`-categorized commands, not inte
 cluster-fanout helpers. They are deliberately left out of the compared surface rather than
 silently pulled in — extending §2.1 means writing dedicated compat coverage and deciding
 registry treatment for each, which is follow-up work, not a pin bump. See the 2026-08-01 entry
-in [docs/rts-reference-bumps.md](rts-reference-bumps.md).
+in [docs/plans/rts-reference-bumps.md](rts-reference-bumps.md).
 
 `TS.READ` was moved *into* §2.1 on 2026-08-02, when the module implemented it; its coverage is
 `tests/compat/test_compat_read.py` and its row is in the §6 matrix below. It is the one in-scope
@@ -451,7 +451,7 @@ Bring-up is done when:
 
 - **Reference drift:** Redis 8.8.x patch releases can change behavior; digest pinning + reviewed
   bumps mitigate. Track RTS release notes on bump, and record what moved in
-  `docs/rts-reference-bumps.md` (bump log, one section per pin change).
+  `docs/plans/rts-reference-bumps.md` (bump log, one section per pin change).
 - **Float formatting** is the most likely source of high-volume noise; the §5.1 policy decision
   (exact vs tolerance for sample values) should be made in Phase 0, deliberately, not under
   pressure of a red CI.

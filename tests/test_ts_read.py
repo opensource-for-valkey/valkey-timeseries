@@ -3,7 +3,7 @@
     TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count]
 
 Every assertion here is anchored to an observation of the pinned RedisTimeSeries 8.10 reference
-recorded in docs/ts-read-implementation-plan.md §6, or to a server mechanic established in §7.
+recorded in docs/plans/ts-read-implementation-plan.md §6, or to a server mechanic established in §7.
 Probe numbers in the docstrings refer to that table.
 
 Synchronization note: these tests never sleep to wait for a reader to block. A blocked reader is

@@ -79,7 +79,7 @@ pub(crate) fn check_blocking_module_apis() -> Result<(), &'static str> {
 ///
 /// Only needed when an *existing* key's value grows in place. Installing a new value — including
 /// through `RM_ModuleTypeSetValue`, which every series creation in this module goes through —
-/// already signals via the server's `dbAdd`. See docs/ts-read-implementation-plan.md §7.
+/// already signals via the server's `dbAdd`. See docs/plans/ts-read-implementation-plan.md §7.
 pub(crate) fn signal_timeseries_ready(ctx: &Context, key: &ValkeyString) {
     // Absence is a load-time invariant (`check_blocking_module_apis`), but a missing signal must
     // never take the server down mid-write: the cost of skipping it is a reader that waits for

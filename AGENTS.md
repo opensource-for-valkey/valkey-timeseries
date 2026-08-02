@@ -153,7 +153,7 @@ Compatibility with RedisTimeSeries
   [docs/topics/redistimeseries-migration.md](docs/topics/redistimeseries-migration.md) is the end-user-facing
   digest of the same material (what carries over, what to change, the migration checklist); keep the two in sync
   when the contract moves — the contract is the source of truth, the topic doc is derived.
-- [docs/rts-compatibility-test-plan.md](docs/rts-compatibility-test-plan.md) is the plan the harness implements;
+- [docs/plans/rts-compatibility-test-plan.md](docs/plans/rts-compatibility-test-plan.md) is the plan the harness implements;
   its section numbers (§5.1 normalization, §5.2 error policy, §5.3 registry, §6 matrix, §7 operational parity)
   are referenced throughout the test code.
 - `tests/compat/` is the differential harness. Each test uses a `diff` fixture that sends every command to both the
@@ -170,7 +170,7 @@ Compatibility with RedisTimeSeries
 - The digest-pinned `redis:8.10` image is the canonical reference artifact. A secondary native-binary mode
   (`COMPAT_REFERENCE_MODE=binary`, Linux-only, pinned deb + SHA256 table in the helper) exists but is **not**
   selected by `auto` until an equivalence run against the image is recorded in
-  [docs/rts-reference-bumps.md](docs/rts-reference-bumps.md). Bump the image digest and the binary pin in the
+  [docs/plans/rts-reference-bumps.md](docs/plans/rts-reference-bumps.md). Bump the image digest and the binary pin in the
   same reviewed change. Design and rationale: `docs/rts-compat-build-integration-plan.md`.
 - Docker is still required for the whole suite even in binary mode: `test_compat_replication.py` starts its
   reference replica with `docker run` regardless of how the primary was obtained, and skips when it cannot.

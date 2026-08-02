@@ -2,7 +2,7 @@
 
 Differential tests that verify valkey-timeseries behaves like RedisTimeSeries 8.10
 on the shared command surface. Implements Tier A of
-[docs/rts-compatibility-test-plan.md](../../docs/rts-compatibility-test-plan.md);
+[docs/plans/rts-compatibility-test-plan.md](../../docs/plans/rts-compatibility-test-plan.md);
 the compatibility contract itself is described in
 [COMPATIBILITY.md](../../COMPATIBILITY.md).
 
@@ -23,7 +23,7 @@ fetched at CI time. Running the official `redis:8.10` binary image as a black-bo
 test target is fine; its source and tests are off-limits.
 
 The pinned image is a reviewed choice: see
-[docs/rts-reference-bumps.md](../../docs/rts-reference-bumps.md) for what moved
+[docs/plans/rts-reference-bumps.md](../../docs/plans/rts-reference-bumps.md) for what moved
 at each bump, and add a section there when changing the pin.
 
 ## How it works

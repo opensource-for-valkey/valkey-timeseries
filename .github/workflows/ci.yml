@@ -82,13 +82,13 @@ jobs:
       - name: Run integration tests
         run: python3 -m pytest --cache-clear -v "tests/" --ignore=tests/compat
 
-  # RedisTimeSeries compatibility smoke gate (docs/rts-compatibility-test-plan.md §8):
+  # RedisTimeSeries compatibility smoke gate (docs/plans/rts-compatibility-test-plan.md §8):
   # Tier A smoke subset diffed against the pinned redis:8.10 reference image,
   # RESP3 only, single subject server version.
   compat-smoke:
     runs-on: ubuntu-latest
     # Non-blocking until the first-run divergences are triaged
-    # (docs/rts-compat-first-run-findings.md); flip to blocking as the
+    # (docs/plans/rts-compat-first-run-findings.md); flip to blocking as the
     # Phase 1 exit action.
     continue-on-error: true
     env:

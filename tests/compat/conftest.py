@@ -1,6 +1,6 @@
 """Fixtures for the RedisTimeSeries differential compatibility harness.
 
-See docs/rts-compatibility-test-plan.md §4.1 and tests/compat/README.md.
+See docs/plans/rts-compatibility-test-plan.md §4.1 and tests/compat/README.md.
 
 Server resolution:
 

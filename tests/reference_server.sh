@@ -38,12 +38,12 @@ _COMPAT_REF_COMPOSE_FILE="$_COMPAT_REF_ROOT/docker-compose.compat.yml"
 
 # --- pin -------------------------------------------------------------------
 # Must track the image pinned in docker-compose.compat.yml. Bump both together, in
-# one reviewed change recorded in docs/rts-reference-bumps.md.
+# one reviewed change recorded in docs/plans/rts-reference-bumps.md.
 COMPAT_REFERENCE_VERSION="${COMPAT_REFERENCE_VERSION:-8.10.0}"
 COMPAT_REFERENCE_MODULE_VERSION="${COMPAT_REFERENCE_MODULE_VERSION:-81000}"
 
 # The pin for which a §3.1 equivalence run (native binary vs. the pinned image) has
-# been recorded in docs/rts-reference-bumps.md. While this does not match
+# been recorded in docs/plans/rts-reference-bumps.md. While this does not match
 # COMPAT_REFERENCE_VERSION, `auto` never selects binary mode — it is not yet known
 # that the two artifacts behave identically.
 _COMPAT_REF_EQUIVALENCE_VERIFIED_PIN=""
@@ -409,7 +409,7 @@ if problems:
     print(
         "The registry claims in tests/compat/divergences.yml and info-fields-8.10.yml\n"
         "were probed against the pinned reference; re-probe them before moving the pin\n"
-        "(docs/rts-reference-bumps.md).",
+        "(docs/plans/rts-reference-bumps.md).",
         file=sys.stderr,
     )
     sys.exit(1)
