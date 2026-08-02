@@ -27,6 +27,7 @@ venv
 .junie
 .venv
 .ai
+.hypothesis
 .junie
 .idea
 .vscode
