@@ -49,6 +49,7 @@ class TestTimeSeriesCommandKeys(ValkeyTimeSeriesTestCaseBase):
         ["TS.MREVRANGE", "-", "+", "FILTER", "a=b"],
         ["TS.MDEL", "FILTER", "a=b"],
         ["TS.QUERYINDEX", "FILTER", "a=b"],
+        ["TS.QUERYLABELS", "LABELS", "FILTER", "a=b"],
         ["TS.CARD", "FILTER", "a=b"],
         ["TS.LABELNAMES", "FILTER", "a=b"],
         ["TS.LABELVALUES", "label", "FILTER", "a=b"],

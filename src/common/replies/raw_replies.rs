@@ -258,6 +258,24 @@ pub fn reply_with_array<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
     raw::reply_with_array(raw_ctx, len as c_long)
 }
 
+/// Reply with a set of bulk strings.
+///
+/// RESP2 clients receive a regular array (the wire form of a set there); RESP3
+/// clients receive a native set reply via `ValkeyModule_ReplyWithSet`. Used by
+/// `TS.QUERYLABELS`, whose reply is a set of distinct label names or values.
+pub fn reply_with_string_set<C: IntoRawCtx>(ctx: C, values: &[String]) -> Status {
+    let raw_ctx = ctx.into_raw();
+    if is_resp3_client(raw_ctx) {
+        raw::reply_with_set(raw_ctx, values.len() as c_long);
+    } else {
+        reply_with_array(raw_ctx, values.len());
+    }
+    for value in values {
+        reply_with_bulk_string(raw_ctx, value);
+    }
+    Status::Ok
+}
+
 pub fn reply_with_array_len<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
     let raw_ctx = ctx.into_raw() as *mut ValkeyModuleCtx;
     unsafe {

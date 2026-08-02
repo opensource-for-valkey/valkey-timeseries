@@ -31,6 +31,18 @@ message MetaQueryRequest {
   repeated SeriesSelector filters = 2;
 }
 
+enum QueryLabelsSubtype {
+  QUERY_LABELS_SUBTYPE_UNSPECIFIED = 0;
+  QUERY_LABELS_SUBTYPE_LABELS = 1;
+  QUERY_LABELS_SUBTYPE_VALUES = 2;
+}
+
+message QueryLabelsRequest {
+  QueryLabelsSubtype subtype = 1;
+  string label = 2;
+  repeated SeriesSelector filters = 3;
+}
+
 enum LabelSearchType {
   LABEL_SEARCH_TYPE_UNSPECIFIED = 0;
   LABEL_SEARCH_TYPE_NAME = 1;

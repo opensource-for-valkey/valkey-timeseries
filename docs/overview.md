@@ -53,6 +53,7 @@ The command set generally follows the `TS.<COMMAND>` pattern.
 
 * `TS.INFO`: Retrieve detailed information and statistics about a specific time series.
 * `TS.QUERYINDEX`: Retrieve all series keys matching a label filter.
+* `TS.QUERYLABELS`: Retrieve all label names, or all values of a given label, for series matching a filter.
 * `TS.CARD`: Get the cardinality of the index for a specific label filter.
 * `TS.LABELNAMES`: Get all label names used in the index.
 * `TS.METRICNAMES`: Search metric names with substring and optional fuzzy matching.

@@ -496,6 +496,15 @@ pub struct MetaQueryRequest {
     pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QueryLabelsRequest {
+    #[prost(enumeration = "QueryLabelsSubtype", tag = "1")]
+    pub subtype: i32,
+    #[prost(string, tag = "2")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "3")]
+    pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LabelSearchRequest {
     #[prost(enumeration = "LabelSearchType", tag = "1")]
     pub request_type: i32,
@@ -552,6 +561,35 @@ pub struct MultiRangeRequest {
     /// peer that ignores this field still produces the same reply.
     #[prost(bool, tag = "10")]
     pub exclude_empty: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum QueryLabelsSubtype {
+    Unspecified = 0,
+    Labels = 1,
+    Values = 2,
+}
+impl QueryLabelsSubtype {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "QUERY_LABELS_SUBTYPE_UNSPECIFIED",
+            Self::Labels => "QUERY_LABELS_SUBTYPE_LABELS",
+            Self::Values => "QUERY_LABELS_SUBTYPE_VALUES",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "QUERY_LABELS_SUBTYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "QUERY_LABELS_SUBTYPE_LABELS" => Some(Self::Labels),
+            "QUERY_LABELS_SUBTYPE_VALUES" => Some(Self::Values),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

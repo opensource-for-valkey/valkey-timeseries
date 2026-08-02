@@ -29,13 +29,14 @@ use crate::common::context::{get_acl_user, get_current_db};
 use crate::common::hash::IntMap;
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
-use crate::series::acl::has_all_keys_permissions;
+use crate::series::acl::{check_key_read_permission, has_all_keys_permissions};
 use crate::series::request_types::MetaDateRangeFilter;
 use crate::series::{SeriesGuard, SeriesRef, TimeSeries, get_timeseries};
 use blart::AsBytes;
 use orx_parallel::{IterIntoParIter, ParIter};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// Series IDs found to have no backing key during a query, accumulated under the postings
@@ -67,6 +68,70 @@ pub fn series_by_selectors<'a>(
     drop(postings);
     index.mark_ids_as_stale(&stale);
     result
+}
+
+/// Returns the distinct label names (when `label` is `None`) or the distinct values of
+/// `label` across the series matching `selectors` — or across every indexed series when
+/// `selectors` is empty. Backs `TS.QUERYLABELS`.
+///
+/// Unlike `TS.QUERYINDEX` (which reveals every match regardless of read access) and
+/// unlike the coarse all-or-nothing gate the label-search commands apply, this applies
+/// per-series `ACCESS` checks and *silently omits* series the caller may not read, so
+/// names/values belonging only to unreadable series never appear in the result.
+pub fn query_labels_distinct(
+    ctx: &Context,
+    selectors: &[SeriesSelector],
+    label: Option<&str>,
+) -> ValkeyResult<BTreeSet<String>> {
+    let db = get_current_db(ctx);
+    let index = get_db_index(db);
+    let postings = index.get_postings();
+
+    let mut stale = StaleIds::new();
+    let ids: Vec<SeriesRef> = if selectors.is_empty() {
+        postings.all_postings.iter().collect()
+    } else {
+        let refs = postings.postings_for_selectors(selectors)?;
+        refs.iter().collect()
+    };
+
+    let mut result: BTreeSet<String> = BTreeSet::new();
+    for id in ids {
+        let Some(key) = postings.get_key_by_id(id) else {
+            stale.push(id);
+            continue;
+        };
+        let k = ctx.create_string(key.as_bytes());
+        // TS.QUERYLABELS contract: silently omit series the caller may not read rather
+        // than erroring on the first unreadable match (that is the coarse gate the
+        // label-search commands use, and it is deliberately not applied here).
+        if !check_key_read_permission(ctx, &k) {
+            continue;
+        }
+        // No `ACCESS` permission is passed here: the read check above already ran, and
+        // passing it would turn an unreadable key into a hard error instead of a skip.
+        let Some(guard) = get_timeseries(ctx, &k, None, false)? else {
+            stale.push(id);
+            continue;
+        };
+        let ts = guard.as_ref();
+        match label {
+            None => {
+                for lbl in ts.labels.iter() {
+                    result.insert(lbl.name.to_string());
+                }
+            }
+            Some(name) => {
+                if let Some(lbl) = ts.get_label(name) {
+                    result.insert(lbl.value.to_string());
+                }
+            }
+        }
+    }
+
+    drop(postings);
+    index.mark_ids_as_stale(&stale);
+    Ok(result)
 }
 
 #[allow(dead_code)]

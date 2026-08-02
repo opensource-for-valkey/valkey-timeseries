@@ -220,6 +220,7 @@ value/duplicated/case-insensitivity), **key states** (missing key, WRONGTYPE, em
 | `TS.MGET` | filter matrix; WITHLABELS/SELECTED_LABELS; empty-series entries |
 | `TS.INFO` | field-by-field vs frozen 8.10 baseline; DEBUG variant (chunk list: presence/shape, not byte counts); after ALTER/CREATERULE/DEL mutations |
 | `TS.QUERYINDEX` | filter matrix; result ordering (normalize); no-match empty array; requires-non-empty-matcher error |
+| `TS.QUERYLABELS` | `LABELS`/`VALUES` subtype; FILTER matrix and no-FILTER (all series); absent-label empty result; no-match empty; RESP3 set reply (order-normalized); unknown-subtype/missing-label/FILTER errors |
 
 > **Phase 1 status (2026-07-29):** the write-path matrix is landed and green —
 > `TS.CREATE` (`tests/compat/test_compat_create.py`), `TS.ALTER`

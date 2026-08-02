@@ -137,6 +137,7 @@ const COMMAND_ACL_CATEGORIES: &[(&str, &str)] = &[
     ("ts.revrange", "read timeseries"),
     ("ts.info", "read fast timeseries"),
     ("ts.queryindex", "read timeseries"),
+    ("ts.querylabels", "read timeseries"),
     ("ts.card", "read timeseries"),
     ("ts.labelnames", "read timeseries"),
     ("ts.labelvalues", "read timeseries"),

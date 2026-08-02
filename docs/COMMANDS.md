@@ -26,6 +26,7 @@
 - [`TS.NREVRANGE`](commands/ts.nrevrange.md)
 - [`TS.OUTLIERS`](commands/ts.outliers.md)
 - [`TS.QUERYINDEX`](commands/ts.queryindex.md)
+- [`TS.QUERYLABELS`](commands/ts.querylabels.md)
 - [`TS.RANGE`](commands/ts.range.md)
 - [`TS.REVRANGE`](commands/ts.revrange.md)
 - [`TS._DEBUG`](commands/ts._debug.md)

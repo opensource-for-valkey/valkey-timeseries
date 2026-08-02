@@ -1,6 +1,6 @@
 use super::raw_replies::{
-    IntoRawCtx, reply, reply_error_string, reply_with_array_len, reply_with_bulk_string,
-    reply_with_simple_string,
+    IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_array_len,
+    reply_with_bulk_string, reply_with_simple_string,
 };
 use crate::series::index::{TimeSeriesIndexGuard, get_db_index};
 use std::ops::Deref;
@@ -92,6 +92,18 @@ impl ReplyContext {
     /// Start a map reply with the given length.
     pub fn reply_with_map(&self, len: usize) -> Status {
         raw::reply_with_map(self.raw_ctx, len as c_long)
+    }
+
+    /// Start a set reply (RESP3) or array reply (RESP2) with the given length.
+    ///
+    /// `TS.QUERYLABELS` replies with a set of distinct label names/values; RESP2
+    /// clients receive the equivalent array form.
+    pub fn reply_with_set(&self, len: usize) -> Status {
+        if is_resp3_client(self.raw_ctx) {
+            raw::reply_with_set(self.raw_ctx, len as c_long)
+        } else {
+            self.reply_with_array(len)
+        }
     }
 
     /// Start a postponed-length array reply.

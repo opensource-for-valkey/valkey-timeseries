@@ -357,7 +357,7 @@ def _filter(draw) -> List[str]:
 # bisect) can narrow it to one command without touching the strategy.
 READ_KINDS = [
     "RANGE", "REVRANGE", "GET", "MRANGE", "MREVRANGE", "NRANGE", "NREVRANGE",
-    "MGET", "QUERYINDEX",
+    "MGET", "QUERYINDEX", "QUERYLABELS",
 ]
 
 
@@ -463,6 +463,15 @@ def _read_op(
     if kind == "MGET":
         opts = ["WITHLABELS"] if draw(st.booleans()) else []
         return ("TS.MGET", *opts, "FILTER", *draw(_filter()))
+    if kind == "QUERYLABELS":
+        # FILTER is optional; the fuzzer never emits a bare metric-name matcher, so
+        # the generator stays inside the shared accepted input space (DIV-0020).
+        opts: List[str] = []
+        if draw(st.booleans()):
+            opts = ["FILTER", *draw(_filter())]
+        if draw(st.booleans()):
+            return ("TS.QUERYLABELS", "LABELS", *opts)
+        return ("TS.QUERYLABELS", "VALUES", draw(st.sampled_from(LABEL_NAMES)), *opts)
     return ("TS.QUERYINDEX", *draw(_filter()))
 
 

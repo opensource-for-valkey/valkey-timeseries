@@ -131,6 +131,7 @@ Entries that stop firing should be removed — a stale entry hides regressions.
 | `test_compat_multi_aggregation.py` | Phase 2: the `AGGREGATION` aggregator-list surface and its pair-vs-row reply shape (plan §6) |
 | `test_compat_get.py` | Phase 2: `TS.GET`/`TS.MGET` matrix (plan §6) |
 | `test_compat_queryindex.py` | Phase 2: `TS.QUERYINDEX` matrix (plan §6) |
+| `test_compat_querylabels.py` | Phase 2: `TS.QUERYLABELS` matrix (plan §6) |
 | `test_compat_compaction.py` | Phase 2: compaction deep-dive (plan §6) |
 | `test_compat_config.py` | §7.1 configuration parity |
 | `test_compat_notifications.py` | §7.3 keyspace notifications |

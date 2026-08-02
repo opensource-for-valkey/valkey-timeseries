@@ -141,3 +141,9 @@ pub const COMPACTION_CIRCULAR_DEPENDENCY: &str = "TSDB: circular dependency in c
 pub const COMPACTION_RULE_NOT_FOUND: &str = "TSDB: compaction rule does not exist";
 pub const INVALID_COMPARISON_OPERATOR: &str = "TSDB: invalid comparison operator";
 pub const TOO_MANY_SAMPLES: &str = "TSDB: too many samples";
+
+// TS.QUERYLABELS
+pub const UNKNOWN_QUERY_LABELS_SUBTYPE: &str =
+    "TSDB: unknown subtype, must be one of LABELS|VALUES";
+pub const QUERY_LABELS_EXPECTED_FILTER: &str = "TSDB: unknown argument, expected FILTER";
+pub const FILTER_WITH_NO_EXPRESSIONS: &str = "TSDB: FILTER given with no filter expressions";

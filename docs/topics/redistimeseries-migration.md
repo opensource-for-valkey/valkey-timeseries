@@ -35,8 +35,8 @@ copy.
 Issue the same commands with the same client libraries. `TS.CREATE`, `TS.ALTER`,
 `TS.DEL`, `TS.CREATERULE`, `TS.DELETERULE`, `TS.ADD`, `TS.MADD`, `TS.INCRBY`,
 `TS.DECRBY`, `TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`,
-`TS.INFO`, and `TS.QUERYINDEX` all keep their argument order, option names, and reply
-shapes.
+`TS.INFO`, `TS.QUERYINDEX`, and `TS.QUERYLABELS` all keep their argument order, option
+names, and reply shapes.
 
 Query semantics are equally in-contract: label matchers (`label=value`, `label!=value`,
 `label=(v1,v2)`, presence/absence forms), `AGGREGATION` with `ALIGN` / `BUCKETTIMESTAMP` /
@@ -82,8 +82,8 @@ at the valkey-timeseries metric set.
 
 **You almost certainly have no application-side fan-out to remove.** Current
 RedisTimeSeries already fans label-based multi-series commands out across the cluster
-itself: Redis documents `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, and `TS.QUERYINDEX` as
-"cross-slot (all shards)" in *every* clustered configuration, and exposes
+itself: Redis documents `TS.MGET`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`, and
+`TS.QUERYLABELS` as "cross-slot (all shards)" in *every* clustered configuration, and exposes
 `NUM_THREADS` / `ts-num-threads` as "the maximum number of per-shard threads for cross-key
 queries when using cluster mode." valkey-timeseries does the same over Valkey's native
 cluster bus. This step exists to clean up *workarounds*, not to replace missing function.

@@ -1673,6 +1673,62 @@ pub(super) fn parse_query_index_command_args(
     })
 }
 
+/// Options parsed from the `TS.QUERYLABELS` argument list.
+///
+/// `label` is `None` for the `LABELS` subtype and `Some(name)` for `VALUES name`.
+/// `matchers` is empty when no `FILTER` block was given, meaning "all indexed series".
+#[derive(Debug, Clone, Default)]
+pub struct QueryLabelsOptions {
+    pub label: Option<String>,
+    pub matchers: Vec<SeriesSelector>,
+}
+
+/// Parses `TS.QUERYLABELS <LABELS | VALUES label> [FILTER filterExpr [filterExpr ...]]`.
+///
+/// Mirrors the RedisTimeSeries 8.10 surface: the `FILTER` keyword is explicit (unlike
+/// `TS.QUERYINDEX`, whose selectors are bare), `LABELS`/`VALUES` are case-insensitive,
+/// a `VALUES` without a label is an arity error, and an `FILTER` block must carry at
+/// least one expression and one bounded matcher (`label=value` / `label=(...)`).
+pub(super) fn parse_query_labels_command_args(
+    args: &mut CommandArgIterator,
+) -> ValkeyResult<QueryLabelsOptions> {
+    // <LABELS | VALUES label>
+    let Some(subtype) = args.next() else {
+        return Err(ValkeyError::Str(error_consts::UNKNOWN_QUERY_LABELS_SUBTYPE));
+    };
+    let label = if subtype.eq_ignore_ascii_case(b"LABELS") {
+        None
+    } else if subtype.eq_ignore_ascii_case(b"VALUES") {
+        let Some(label) = args.next() else {
+            return Err(ValkeyError::WrongArity);
+        };
+        Some(label.to_string_lossy())
+    } else {
+        return Err(ValkeyError::Str(error_consts::UNKNOWN_QUERY_LABELS_SUBTYPE));
+    };
+
+    // [FILTER filterExpr [filterExpr ...]]
+    let mut matchers = Vec::with_capacity(4);
+    if let Some(token) = peek_token(args)
+        && token == CommandArgToken::Filter
+    {
+        args.next(); // consume FILTER
+        while let Ok(arg) = args.next_str() {
+            let selector = parse_series_selector(arg)?;
+            matchers.push(selector);
+        }
+        if matchers.is_empty() {
+            return Err(ValkeyError::Str(error_consts::FILTER_WITH_NO_EXPRESSIONS));
+        }
+        validate_selector_list(&matchers)?;
+    } else if args.peek().is_some() {
+        // Anything other than FILTER after the subtype is rejected.
+        return Err(ValkeyError::Str(error_consts::QUERY_LABELS_EXPECTED_FILTER));
+    }
+
+    Ok(QueryLabelsOptions { label, matchers })
+}
+
 pub const DEFAULT_STATS_RESULTS_LIMIT: usize = 10;
 pub const MAX_STATS_RESULTS_LIMIT: usize = 1000;
 

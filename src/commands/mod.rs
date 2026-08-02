@@ -34,6 +34,8 @@ mod ts_nrange;
 mod ts_outliers;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;
+mod ts_querylabels;
+mod ts_querylabels_fanout_command;
 mod ts_range;
 mod utils;
 
@@ -56,6 +58,7 @@ use ts_mdel_fanout_command::MDelFanoutCommand;
 use ts_mget_fanout_command::MGetFanoutCommand;
 use ts_mrange_fanout_command::MRangeFanoutCommand;
 use ts_queryindex_fanout_command::QueryIndexFanoutCommand;
+use ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
 
 pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<LabelStatsFanoutCommand>()?;
@@ -65,6 +68,7 @@ pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<MGetFanoutCommand>()?;
     register_fanout_operation::<MRangeFanoutCommand>()?;
     register_fanout_operation::<QueryIndexFanoutCommand>()?;
+    register_fanout_operation::<QueryLabelsFanoutCommand>()?;
     Ok(())
 }
 

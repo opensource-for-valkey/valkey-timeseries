@@ -2,9 +2,9 @@
 
 ## Overview
 
-The `FILTER` argument in `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX` and `TS.MDEL` commands allows you to select which
-time series to query based on their labels. You can provide one or more filter expressions to match series with specific
-label values.
+The `FILTER` argument in `TS.MRANGE`, `TS.MREVRANGE`, `TS.QUERYINDEX`, `TS.QUERYLABELS` and `TS.MDEL` commands allows
+you to select which time series to query based on their labels. You can provide one or more filter expressions to match
+series with specific label values.
 
 ## Syntax
 
