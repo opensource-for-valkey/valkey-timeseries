@@ -21,7 +21,7 @@ use crate::parser::{
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
     AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS, MRangeOptions, MatchFilterOptions,
-    MetaDateRangeFilter, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
+    MetaDateRangeFilter, NRangeOptions, RangeGroupingOptions, RangeOptions, ValueComparisonFilter,
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
 use crate::series::{TimestampRange, TimestampValue};
@@ -693,13 +693,27 @@ pub fn parse_aggregation_options(
         ..Default::default()
     };
 
-    let valid_tokens = [
+    parse_aggregation_modifiers(args, &mut aggr)?;
+
+    aggr.aggregations = build_aggregator_configs(aggregators)?;
+
+    Ok(aggr)
+}
+
+/// Parse the trailing modifiers of an AGGREGATION clause (`ALIGN`, `BUCKETTIMESTAMP`,
+/// `EMPTY`), which follow the bucket duration in any order. Shared by the single-clause
+/// form and TS.NRANGE's per-key form, where one set of modifiers governs every key.
+fn parse_aggregation_modifiers(
+    args: &mut CommandArgIterator,
+    aggr: &mut AggregationOptions,
+) -> ValkeyResult<()> {
+    const VALID_TOKENS: [CommandArgToken; 3] = [
         CommandArgToken::Align,
         CommandArgToken::Empty,
         CommandArgToken::BucketTimestamp,
     ];
 
-    parse_optional_token_block(args, &valid_tokens, 3, |token, args| match token {
+    parse_optional_token_block(args, &VALID_TOKENS, 3, |token, args| match token {
         CommandArgToken::Empty => {
             aggr.report_empty = true;
             Ok(())
@@ -715,11 +729,7 @@ pub fn parse_aggregation_options(
             Ok(())
         }
         _ => Ok(()),
-    })?;
-
-    aggr.aggregations = build_aggregator_configs(aggregators)?;
-
-    Ok(aggr)
+    })
 }
 
 /// Build the per-aggregator configs of an AGGREGATION clause from the parsed
@@ -1039,6 +1049,210 @@ pub fn parse_range_options(args: &mut CommandArgIterator) -> ValkeyResult<RangeO
     // filter out timestamp filters that are outside the range
     if let Some(ts_filter) = options.timestamp_filter.as_mut() {
         let (start_ts, end_ts) = options.date_range.get_timestamps(None);
+        ts_filter.retain(|&ts| ts >= start_ts && ts <= end_ts);
+    }
+
+    Ok(options)
+}
+
+/// Parse the `numkeys key [key ...]` prefix of TS.NRANGE.
+///
+/// Key order and duplicates are preserved: the reply has one column block per key argument, in
+/// the order given, so the list is kept verbatim rather than deduplicated (unlike TS.JOIN,
+/// which rejects a repeated key because its two sides would then be the same series).
+fn parse_numkeys_and_keys(args: &mut CommandArgIterator) -> ValkeyResult<Vec<ValkeyString>> {
+    let arg = args.next_arg().map_err(|_| ValkeyError::WrongArity)?;
+    let numkeys = arg
+        .parse_integer()
+        .map_err(|_| ValkeyError::Str(error_consts::INVALID_NUMKEYS))?;
+    if numkeys < 1 {
+        return Err(ValkeyError::Str(error_consts::INVALID_NUMKEYS));
+    }
+    let numkeys = numkeys as usize;
+
+    // The two range bounds follow the keys and are mandatory, so a numkeys that would swallow
+    // them is wrong arity — which is what RedisTimeSeries reports for it, rather than the
+    // unparseable timestamp the overrun turns into.
+    if args.len() < numkeys + 2 {
+        return Err(ValkeyError::WrongArity);
+    }
+
+    let mut keys = Vec::with_capacity(numkeys);
+    for _ in 0..numkeys {
+        keys.push(args.next_arg()?);
+    }
+    Ok(keys)
+}
+
+/// Parse TS.NRANGE's `AGGREGATION` clause: one aggregator list per key, in key order, followed
+/// by the single `bucketDuration` and modifiers that every key shares.
+///
+/// Each list is the same comma-separated form TS.RANGE accepts (`avg`, `min,max`,
+/// `countif(>5)`), so a key contributes one output column per aggregator it names.
+fn parse_nrange_aggregation_options(
+    args: &mut CommandArgIterator,
+    key_count: usize,
+) -> ValkeyResult<Vec<AggregationOptions>> {
+    // AGGREGATION token already seen.
+    let mut per_key = Vec::with_capacity(key_count);
+    for index in 0..key_count {
+        let arg = args
+            .next_str()
+            .map_err(|_e| ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH))?;
+        let elements = parse_aggregation_list(arg).map_err(|e| {
+            // A well-formed bucket duration where an aggregator was expected means fewer
+            // aggregators than keys were supplied; say that rather than reporting the
+            // duration as an unknown aggregation type.
+            if index > 0 && parse_bucket_duration_str(arg).is_ok() {
+                ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH)
+            } else {
+                e
+            }
+        })?;
+        per_key.push(elements);
+    }
+
+    let bucket_duration_arg = args
+        .next_arg()
+        .map_err(|_e| ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH))?;
+    let bucket_duration = parse_bucket_duration_arg(&bucket_duration_arg).map_err(|e| {
+        // Symmetrically: another aggregator list where the duration belongs means more
+        // aggregators than keys.
+        if parse_aggregation_list(&bucket_duration_arg.to_string_lossy()).is_ok() {
+            ValkeyError::Str(error_consts::AGGREGATOR_COUNT_MISMATCH)
+        } else {
+            e
+        }
+    })?;
+
+    let mut shared: AggregationOptions = AggregationOptions {
+        bucket_duration: bucket_duration.as_millis() as u64,
+        timestamp_output: BucketTimestamp::Start,
+        ..Default::default()
+    };
+    parse_aggregation_modifiers(args, &mut shared)?;
+
+    per_key
+        .into_iter()
+        .map(|elements| {
+            Ok(AggregationOptions {
+                aggregations: build_aggregator_configs(elements)?,
+                ..shared.clone()
+            })
+        })
+        .collect()
+}
+
+/// TS.NRANGE twin of [`parse_align_for_aggregation`]: `ALIGN align` must be followed by the
+/// AGGREGATION clause it aligns, and the alignment then applies to every key.
+fn parse_align_for_nrange_aggregation(
+    args: &mut CommandArgIterator,
+    key_count: usize,
+) -> ValkeyResult<Vec<AggregationOptions>> {
+    // ALIGN token already seen
+    let alignment_str = args.next_str()?;
+    let alignment = BucketAlignment::try_from(alignment_str)?;
+
+    expect_next_token(args, CommandArgToken::Aggregation)
+        .map_err(|_| ValkeyError::Str(error_consts::ALIGN_REQUIRES_AGGREGATION))?;
+
+    let mut aggregations = parse_nrange_aggregation_options(args, key_count)?;
+    for aggregation in aggregations.iter_mut() {
+        aggregation.alignment = alignment;
+    }
+    Ok(aggregations)
+}
+
+/// TS.NRANGE / TS.NREVRANGE numkeys key [key ...] fromTimestamp toTimestamp
+///   [LATEST]
+///   [FILTER_BY_TS ts...]
+///   [FILTER_BY_VALUE min max]
+///   [COUNT count]
+///   [[ALIGN align] AGGREGATION aggregators [aggregators ...] bucketDuration
+///     [BUCKETTIMESTAMP bt] [EMPTY]]
+pub(super) fn parse_nrange_options(args: &mut CommandArgIterator) -> ValkeyResult<NRangeOptions> {
+    const NRANGE_OPTION_ARGS: [CommandArgToken; 7] = [
+        CommandArgToken::Align,
+        CommandArgToken::Aggregation,
+        CommandArgToken::Count,
+        CommandArgToken::BucketTimestamp,
+        CommandArgToken::FilterByTs,
+        CommandArgToken::FilterByValue,
+        CommandArgToken::Latest,
+    ];
+
+    let keys = parse_numkeys_and_keys(args)?;
+    let key_count = keys.len();
+    let date_range = parse_timestamp_range(args)?;
+
+    let mut options = NRangeOptions {
+        range: RangeOptions {
+            date_range,
+            ..Default::default()
+        },
+        keys,
+        ..Default::default()
+    };
+
+    let mut repeated = RepeatedOptions::new();
+
+    while let Some(arg) = args.next() {
+        let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        match token {
+            CommandArgToken::Align => {
+                let value = parse_align_for_nrange_aggregation(args, key_count)?;
+                // See parse_range_options: ALIGN fills the AGGREGATION slot too.
+                if repeated.accept(CommandArgToken::Align)
+                    & repeated.accept(CommandArgToken::Aggregation)
+                {
+                    options.aggregations = value;
+                }
+            }
+            CommandArgToken::Aggregation => {
+                let value = parse_nrange_aggregation_options(args, key_count)?;
+                if repeated.accept(token) {
+                    options.aggregations = value;
+                }
+            }
+            CommandArgToken::Count => {
+                let value = parse_count_arg(args)?;
+                if repeated.accept(token) {
+                    options.range.count = Some(value);
+                }
+            }
+            CommandArgToken::FilterByValue => {
+                let value = parse_value_filter(args)?;
+                if repeated.accept(token) {
+                    options.range.value_filter = Some(value);
+                }
+            }
+            CommandArgToken::FilterByTs => {
+                let value = parse_timestamp_filter(args, &NRANGE_OPTION_ARGS)?;
+                if repeated.accept(token) {
+                    options.range.timestamp_filter = Some(value);
+                }
+            }
+            CommandArgToken::Latest => {
+                // Idempotent: a repeat sets the same flag, so no resolution needed.
+                options.range.latest = true;
+            }
+            _ => {
+                return if token == CommandArgToken::Invalid {
+                    Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT))
+                } else {
+                    let msg = format!("TSDB: invalid argument '{token}'");
+                    Err(ValkeyError::String(msg))
+                };
+            }
+        }
+    }
+
+    // Every key shares one alignment, so checking the first is checking all of them.
+    validate_align_against_bounds(&options.range.date_range, options.aggregations.first())?;
+
+    // filter out timestamp filters that are outside the range
+    if let Some(ts_filter) = options.range.timestamp_filter.as_mut() {
+        let (start_ts, end_ts) = options.range.date_range.get_timestamps(None);
         ts_filter.retain(|&ts| ts >= start_ts && ts <= end_ts);
     }
 

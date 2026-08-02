@@ -327,6 +327,41 @@ pub struct MRangeOptions {
     pub exclude_empty: bool,
 }
 
+/// TS.NRANGE / TS.NREVRANGE: a range over an explicit list of keys, pivoted so
+/// that each reply row is one timestamp followed by one value per requested
+/// column.
+///
+/// Key order is significant and duplicates are allowed — the reply has one
+/// column block per `keys` entry, in the order given — so this holds the keys
+/// verbatim rather than a set.
+#[derive(Debug, Default, Clone)]
+pub struct NRangeOptions {
+    /// Shared range parameters. `range.aggregation` is unused: TS.NRANGE takes
+    /// one aggregation clause per key, held in [`Self::aggregations`].
+    pub range: RangeOptions,
+    pub keys: Vec<ValkeyString>,
+    /// Empty in raw mode; otherwise exactly one entry per key, in key order.
+    /// The syntax has a single `bucketDuration`/`ALIGN`/`BUCKETTIMESTAMP`/`EMPTY`,
+    /// so every entry carries the same bucket parameters and they differ only in
+    /// their aggregator list.
+    pub aggregations: Vec<AggregationOptions>,
+    pub is_reverse: bool,
+}
+
+impl NRangeOptions {
+    /// The aggregation clause requested for key `index`, or `None` in raw mode.
+    pub fn aggregation_for(&self, index: usize) -> Option<&AggregationOptions> {
+        self.aggregations.get(index)
+    }
+
+    /// Number of reply columns contributed by key `index`: one per aggregator
+    /// under `AGGREGATION`, otherwise the single raw sample value.
+    pub fn column_count(&self, index: usize) -> usize {
+        self.aggregation_for(index)
+            .map_or(1, |agg| agg.aggregations.len())
+    }
+}
+
 /// Per-series MRANGE result data. `TimeSeriesChunk` can only store
 /// `(ts, f64)` pairs, so multi-aggregation output uses a second
 /// representation. Only the `Chunk` variant ever crosses the wire in fanout

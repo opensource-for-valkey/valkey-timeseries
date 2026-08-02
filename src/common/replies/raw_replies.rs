@@ -170,6 +170,37 @@ pub fn reply_with_multi_samples<C: IntoRawCtx, T: std::borrow::Borrow<MultiSampl
     reply_with_array_len(raw_ctx, len);
 }
 
+/// One pivoted row: `[timestamp, [value, ...]]`.
+///
+/// The values are nested in their own array rather than flattened into the row as
+/// [`reply_with_multi_sample`] does — TS.NRANGE's row spans several series, so the value list
+/// is a unit of its own.
+pub fn reply_with_pivot_row<C: IntoRawCtx>(ctx: C, row: &MultiSample) {
+    let raw_ctx = ctx.into_raw();
+    reply_with_array(raw_ctx, 2);
+    reply_with_integer(raw_ctx, row.timestamp);
+    reply_with_array(raw_ctx, row.values.len());
+    for value in &row.values {
+        raw::reply_with_double(raw_ctx, *value);
+    }
+}
+
+pub fn reply_with_pivot_rows<C: IntoRawCtx, T: std::borrow::Borrow<MultiSample>>(
+    ctx: C,
+    rows: impl Iterator<Item = T>,
+) {
+    let raw_ctx = ctx.into_raw();
+    reply_with_postponed_array(raw_ctx);
+
+    let mut len = 0;
+    for row in rows {
+        reply_with_pivot_row(raw_ctx, row.borrow());
+        len += 1;
+    }
+
+    reply_with_array_len(raw_ctx, len);
+}
+
 pub fn reply_with_integer<C: IntoRawCtx>(ctx: C, value: i64) -> Status {
     let raw_ctx = ctx.into_raw();
     raw::reply_with_long_long(raw_ctx, value)

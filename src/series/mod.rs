@@ -11,6 +11,7 @@ pub mod index;
 mod ingest_normalize;
 pub mod mrange;
 mod multi_del;
+pub mod nrange;
 pub mod request_types;
 mod sample_merge;
 pub mod serialization;

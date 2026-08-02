@@ -34,6 +34,10 @@ class TestTimeSeriesCommandKeys(ValkeyTimeSeriesTestCaseBase):
         (["TS.OUTLIERS", "k", "-", "+", "MAD", "3"], [b"k"]),
         (["TS.MADD", "k1", "1", "1.0", "k2", "2", "2.0"], [b"k1", b"k2"]),
         (["TS.JOIN", "k1", "k2", "-", "+"], [b"k1", b"k2"]),
+        # numkeys-style key spec: the count at index 1 says how many keys follow.
+        (["TS.NRANGE", "2", "k1", "k2", "-", "+"], [b"k1", b"k2"]),
+        (["TS.NRANGE", "1", "k1", "-", "+"], [b"k1"]),
+        (["TS.NREVRANGE", "2", "k1", "k2", "-", "+"], [b"k1", b"k2"]),
         (["TS.CREATERULE", "src", "dst", "AGGREGATION", "avg", "60000"], [b"src", b"dst"]),
         (["TS.DELETERULE", "src", "dst"], [b"src", b"dst"]),
     ]

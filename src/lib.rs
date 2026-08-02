@@ -131,6 +131,8 @@ const COMMAND_ACL_CATEGORIES: &[(&str, &str)] = &[
     ("ts.mdel", "write timeseries"),
     ("ts.mrange", "read timeseries"),
     ("ts.mrevrange", "read timeseries"),
+    ("ts.nrange", "read timeseries"),
+    ("ts.nrevrange", "read timeseries"),
     ("ts.range", "read timeseries"),
     ("ts.revrange", "read timeseries"),
     ("ts.info", "read fast timeseries"),

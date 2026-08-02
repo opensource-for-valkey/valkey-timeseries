@@ -729,7 +729,8 @@
     `AGGREGATION avg,avg 1000` returns two identical columns; we reject the
     whole clause with "duplicate aggregation 'avg'". The check is
     case-insensitive on the aggregator name (`avg,AVG` is a duplicate) and
-    applies to TS.RANGE/REVRANGE/MRANGE/MREVRANGE. A side effect is that the
+    applies to TS.RANGE/REVRANGE/MRANGE/MREVRANGE, and to the per-key lists of
+    TS.NRANGE/TS.NREVRANGE (confirmed against the reference 2026-08-01). A side effect is that the
     16-element list cap is unreachable here through a repeat: only 15 distinct
     aggregator names exist, so any 17-element list hits the duplicate check
     first, where RTS reports "Too many aggregation types".
@@ -782,7 +783,9 @@
     which counts only the samples matching the condition in the first column
     while the second aggregates normally. Each element carries its own
     condition; an aggregator that requires one and is given none, or is given
-    one it does not accept, is rejected here.
+    one it does not accept, is rejected here. The same grammar backs the per-key
+    lists of TS.NRANGE/TS.NREVRANGE, so the superset extends there too
+    (confirmed against the reference 2026-08-01).
   rationale: >
     Accepted (owner sign-off 2026-07-29, §5.3): the inline-condition syntax exists
     because the list grammar gives each element its own slot, and it is the only way

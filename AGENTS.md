@@ -407,7 +407,7 @@ Quick tips for code changes
 
 - Add new commands: create `src/commands/ts_<name>.rs`, add function `ts_<name>_cmd`, then register in `valkey_module!`
   in `src/lib.rs`. Currently registered commands: TS.CREATE, TS.ALTER, TS.ADD, TS.ADDBULK, TS.GET, TS.MGET, TS.MADD,
-  TS.DEL, TS.DECRBY, TS.INCRBY, TS.JOIN, TS.MDEL, TS.MRANGE, TS.MREVRANGE, TS.RANGE, TS.REVRANGE, TS.INFO,
+  TS.DEL, TS.DECRBY, TS.INCRBY, TS.JOIN, TS.MDEL, TS.MRANGE, TS.MREVRANGE, TS.NRANGE, TS.NREVRANGE, TS.RANGE, TS.REVRANGE, TS.INFO,
   TS.QUERYINDEX, TS.CARD, TS.LABELNAMES, TS.LABELVALUES, TS.METRICNAMES, TS.LABELSTATS, TS.CREATERULE,
   TS.DELETERULE, TS.OUTLIERS, TS._DEBUG (hidden admin command, no user-facing docs needed).
 - Documentation: When adding or modifying commands, remember to update the human-facing docs in `docs/commands/` and the

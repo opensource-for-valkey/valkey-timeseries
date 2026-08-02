@@ -100,6 +100,33 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(Exception, match="No permissions to access a key"):
             no_read_client.execute_command('TS.RANGE', 'ts:acl:range_test', '-', '+')
 
+    def test_ts_nrange_acl_permissions(self):
+        """TS.NRANGE fails closed when the user cannot read *every* key it names."""
+        # Two series under different prefixes, so a key pattern can cover one but not the other.
+        for key in ('ts:acl:nrange:allowed', 'ts:acl:other:denied'):
+            self.client.execute_command('TS.CREATE', key)
+            self.client.execute_command('TS.ADD', key, 1000, 1.0)
+
+        self.create_test_user('nrange_partial', 'password123', [
+            '+@read', '+@timeseries', '~ts:acl:nrange:*', '&*'
+        ])
+        partial_client = self.get_user_client('nrange_partial', 'password123')
+
+        # The permitted key on its own is fine.
+        result = partial_client.execute_command('TS.NRANGE', 1, 'ts:acl:nrange:allowed', '-', '+')
+        assert len(result) == 1
+
+        # Adding a key the user cannot read fails the whole query, in either position and in
+        # either direction.
+        for command in ('TS.NRANGE', 'TS.NREVRANGE'):
+            for argv in (
+                    (2, 'ts:acl:nrange:allowed', 'ts:acl:other:denied', '-', '+'),
+                    (2, 'ts:acl:other:denied', 'ts:acl:nrange:allowed', '-', '+'),
+            ):
+                with pytest.raises(ResponseError) as exc_info:
+                    partial_client.execute_command(command, *argv)
+                assert 'NOPERM' in str(exc_info.value) or 'permission' in str(exc_info.value).lower()
+
     def test_compaction_rule_acl_permissions(self):
         """Test compaction rule operations with ACL permissions"""
         # Setup source and destination series as admin
@@ -340,6 +367,9 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
             ('TS.REVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
             ('TS.MRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
             ('TS.MREVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
+            # movablekeys comes from the numkeys key spec: the key positions are not fixed.
+            ('TS.NRANGE', [b'readonly', b'module', b'movablekeys'], [b'@read', b'@timeseries']),
+            ('TS.NREVRANGE', [b'readonly', b'module', b'movablekeys'], [b'@read', b'@timeseries']),
             ('TS.INCRBY', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
             ('TS.DECRBY', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
             ('TS.CREATERULE', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),

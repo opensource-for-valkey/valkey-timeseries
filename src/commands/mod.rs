@@ -30,6 +30,7 @@ mod ts_mget;
 mod ts_mget_fanout_command;
 mod ts_mrange;
 mod ts_mrange_fanout_command;
+mod ts_nrange;
 mod ts_outliers;
 mod ts_queryindex;
 mod ts_queryindex_fanout_command;

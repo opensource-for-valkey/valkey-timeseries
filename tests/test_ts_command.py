@@ -22,7 +22,9 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
     # series by FILTER expressions rather than positional keys, so they expose no key range
     # (0, 0, 0). MADD takes a key every third argument (1, -1, 3); JOIN/CREATERULE/DELETERULE
     # take two adjacent keys (1, 2, 1); the remaining keyed commands take a single key at
-    # position 1 (1, 1, 1).
+    # position 1 (1, 1, 1). NRANGE/NREVRANGE take a `numkeys key [key ...]` prefix, which the
+    # legacy triple cannot express: they report no key range and carry `movablekeys` instead,
+    # so clients must ask COMMAND GETKEYS (see test_commands.py).
     COMMAND_INFO = {
         "TS.CREATE":      (-2, 1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.ALTER":       (-2, 1,  1, 1, [b"write", b"denyoom", b"module"]),
@@ -38,6 +40,8 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.MDEL":        (-2, 0,  0, 0, [b"write", b"denyoom", b"module"]),
         "TS.MRANGE":      (-4, 0,  0, 0, [b"readonly", b"module"]),
         "TS.MREVRANGE":   (-4, 0,  0, 0, [b"readonly", b"module"]),
+        "TS.NRANGE":      (-5, 0,  0, 0, [b"readonly", b"module", b"movablekeys"]),
+        "TS.NREVRANGE":   (-5, 0,  0, 0, [b"readonly", b"module", b"movablekeys"]),
         "TS.RANGE":       (-4, 1,  1, 1, [b"readonly", b"module"]),
         "TS.REVRANGE":    (-4, 1,  1, 1, [b"readonly", b"module"]),
         "TS.INFO":        (-2, 1,  1, 1, [b"readonly", b"module"]),

@@ -67,6 +67,14 @@ pub const INVALID_REDUCER_TYPE: &str = "TSDB: Invalid reducer type";
 pub const INVALID_AGGREGATION_CONDITION: &str = "TSDB: invalid aggregation condition";
 pub const MULTI_AGGREGATION_UNSUPPORTED: &str =
     "TSDB: multiple aggregations are not supported for TS.JOIN";
+// TS.NRANGE takes its keys as an explicit `numkeys key [key ...]` prefix. Both texts are
+// RedisTimeSeries 8.10's, confirmed by probing the reference container; a numkeys that
+// overruns the argument list is reported there as wrong arity rather than with a message of
+// its own, so this file has no constant for it.
+pub const INVALID_NUMKEYS: &str = "TSDB: numkeys must be a positive integer";
+// One AGGREGATION operand per key, in key order (each a comma-separated aggregator list).
+pub const AGGREGATOR_COUNT_MISMATCH: &str =
+    "TSDB: the number of AGGREGATION arguments must be equal to numkeys";
 pub const INVALID_START_TIMESTAMP: &str = "TSDB: wrong fromTimestamp";
 pub const INVALID_END_TIMESTAMP: &str = "TSDB: wrong toTimestamp";
 // Write-path rejection of a negative absolute timestamp. The range family does not use

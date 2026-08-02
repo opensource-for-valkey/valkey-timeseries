@@ -28,7 +28,9 @@ The contract applies only to features that Valkey TimeSeries actually implements
 
 ### Command and argument syntax
 
-The set of commands exposed by the module, their argument ordering, their flag and option names, and the shape of their replies are expected to match RedisTimeSeries. This includes series-management commands (e.g. `TS.CREATE`, `TS.ALTER`, `TS.DEL`), the compaction-rule commands (`TS.CREATERULE`, `TS.DELETERULE`), ingestion commands (`TS.ADD`, `TS.MADD`, `TS.INCRBY`, `TS.DECRBY`), and query commands (`TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.INFO`, `TS.QUERYINDEX`). Applications using standard RedisTimeSeries client libraries should be able to issue these commands unmodified and receive replies they can parse with existing response handlers.
+The set of commands exposed by the module, their argument ordering, their flag and option names, and the shape of their replies are expected to match RedisTimeSeries. This includes series-management commands (e.g. `TS.CREATE`, `TS.ALTER`, `TS.DEL`), the compaction-rule commands (`TS.CREATERULE`, `TS.DELETERULE`), ingestion commands (`TS.ADD`, `TS.MADD`, `TS.INCRBY`, `TS.DECRBY`), and query commands (`TS.GET`, `TS.MGET`, `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE`, `TS.NRANGE`, `TS.NREVRANGE`, `TS.INFO`, `TS.QUERYINDEX`). Applications using standard RedisTimeSeries client libraries should be able to issue these commands unmodified and receive replies they can parse with existing response handlers.
+
+One gap in that surface is worth naming: the `twa` aggregator, which RedisTimeSeries lists for the whole range family, is not supported by this module at all. Every other aggregator RedisTimeSeries documents is, alongside this module's own [extensions](#extensions).
 
 ### Query language and semantics
 
