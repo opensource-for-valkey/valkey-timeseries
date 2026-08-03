@@ -9,13 +9,11 @@ Status: Proposed
 
 The proposed feature is ValkeyTimeSeries, which is a [Rust](https://www.rust-lang.org/) based Module that brings a native time series data type to Valkey.
 
-To help users migrate from Redis and RedisTimeSeries, as well as capitalize on existing OSS RedisTimeSeries client libraries, 
-the module is designed to be API-compatible with Redis Ltd.’s RedisTimeSeries.
+The module provides a purpose-built time series data type optimized for high write throughput, compression, and real-time analytics. It is API-compatible with existing TimeSeries client libraries, enabling straightforward adoption for teams already using time series workloads on compatible systems.
 
 ## Motivation
 
-Support for a time series data type in Valkey is essential for developers wanting to use Valkey in domains like observability, 
-monitoring, IoT, and analytics.
+Support for a time series data type in Valkey is essential for developers wanting to use Valkey in domains like observability, monitoring, IoT, and analytics.
 
 Valkey TimeSeries aims to enable the unique characteristics of time-series data:
 
@@ -23,80 +21,154 @@ Valkey TimeSeries aims to enable the unique characteristics of time-series data:
 * Real-Time Analytics: support real-time querying and computation, allowing users to detect trends, anomalies, or patterns as they occur.
 * Time-centric Queries: allow for time-based aggregations and querying over specific time intervals with high efficiency.
 
-Although Valkey time series modeling can be achieved natively in ValKey using built-in types like `stream`s and `zset`s,
-a dedicated time series data type can provide better performance, memory efficiency, and ease of use for time series workloads.
+Although Valkey time series modeling can be achieved natively in Valkey using built-in types like `stream`s and `zset`s, a dedicated time series data type provides better performance, memory efficiency, and ease of use for time series workloads.
 
-Redis‘ TimeSeries module is published under a proprietary license, hence cannot be distributed freely with ValKey.
+## Use Cases
+
+### Infrastructure and Application Monitoring
+
+Collect metrics from distributed services — CPU, memory, request latencies, error rates — and query them in real time. Compaction rules automatically downsample high-resolution data into coarser rollups (e.g. per-minute → per-hour → per-day) while retaining full-resolution data for recent windows.
+
+```
+TS.CREATE cpu:host42 RETENTION 604800000 LABELS host host42 metric cpu
+TS.ADD cpu:host42 * 73.2
+TS.RANGE cpu:host42 -1h * AGGREGATION avg 60000
+```
+
+### IoT Sensor Ingestion
+
+Handle continuous streams of sensor readings (temperature, pressure, vibration) at high write throughput. Deduplication intervals and retention policies manage data lifecycle automatically, and bulk ingestion via `TS.ADDBULK` reduces round trips for batch uploads from edge devices.
+
+```
+TS.CREATE sensor:temp:floor3 RETENTION 2592000000 DEDUPE_INTERVAL 1000 LABELS type temperature location floor3
+TS.ADDBULK sensor:temp:floor3 '{"values":[22.1,22.3,22.2],"timestamps":[1700000000000,1700000001000,1700000002000]}'
+```
+
+### Real-Time Anomaly Detection
+
+Detect outliers in operational data as it arrives. The `TS.OUTLIERS` command applies statistical methods (Z-score, IQR, EWMA, Random Cut Forest, etc.) directly on stored samples, with optional seasonality adjustment for periodic workloads.
+
+```
+TS.CREATE request_latency:api LABELS service api metric latency
+TS.ADD request_latency:api * 12.4
+TS.OUTLIERS request_latency:api -1h * SEASONALITY 24 METHOD MODIFIED-ZSCORE THRESHOLD 3.5
+```
+
+### Financial and Trading Analytics
+
+Join price feeds from different instruments using `TS.JOIN` with ASOF semantics to compute spreads, correlations, or portfolio metrics even when timestamps across sources are not perfectly aligned.
+
+```
+TS.CREATE trades:buy LABELS instrument AAPL side buy
+TS.CREATE trades:sell LABELS instrument AAPL side sell
+TS.ADD trades:buy 1700000000000 150.25
+TS.ADD trades:buy 1700000000100 150.30
+TS.ADD trades:sell 1700000000050 150.10
+TS.ADD trades:sell 1700000000120 150.20
+TS.JOIN trades:buy trades:sell -1h * ASOF NEAREST 5ms ALLOW_EXACT_MATCH REDUCE sub
+```
+
+### SLA and Threshold Reporting
+
+Use conditional aggregators (`countif`, `share`, `all`, `any`) to answer questions like "what percentage of requests exceeded our latency target in each 5-minute window?" directly in a single query without client-side post-processing.
+
+```
+TS.CREATE request_latency:db LABELS service db metric latency
+TS.ADD request_latency:db * 45.2
+TS.ADD request_latency:db * 112.7
+TS.ADD request_latency:db * 89.1
+TS.RANGE request_latency:db -24h * AGGREGATION share 300000 CONDITION > 100
+```
+
+### Multi-Tenant Observability Platforms
+
+Label-based indexing with Prometheus-style selectors lets platforms query across thousands of series by tenant, region, or service without pre-aggregating. Cluster fanout distributes multi-range queries across shards transparently.
+
+```
+TS.CREATE http_req:billing:us-east LABELS service billing region us-east metric http_requests
+TS.CREATE http_req:billing:us-west LABELS service billing region us-west metric http_requests
+TS.ADD http_req:billing:us-east * 1024
+TS.ADD http_req:billing:us-west * 876
+TS.MRANGE -6h * FILTER http_requests{service="billing",region=~"us-.*"} AGGREGATION rate 60000
+```
 
 ## Design Considerations
 
-The ValkeyTimeSeries module brings a time series module data type to Valkey and provides commands to create 
-time series, operate on them (add sample, query, perform aggregations, compactions, downsampling, and joins, etc.).
-It allows customization of the properties of each series (compression, retention, compactions, etc.) through commands and 
-configurations. 
+The ValkeyTimeSeries module brings a time series module data type to Valkey and provides commands to create time series, operate on them (add sample, query, perform aggregations, compactions, downsampling, and joins, etc.). It allows customization of the properties of each series (compression, retention, compactions, etc.) through commands and configurations.
 
 We aim to be efficient both in memory usage and performance. This is achieved through:
+
 * use of parallelism and background tasks where appropriate (multi-chunk fetches, series compactions, index maintenance, etc.)
 * efficient memory management (interning for labels, index prefix compression, Roaring Bitmaps for series ids)
 * efficient filtering and indexing
 
+### Write Amplification
+
+Disk-based time series databases (TimescaleDB, InfluxDB, Prometheus, ClickHouse, OpenSearch) suffer from write amplification: each ingested sample triggers index updates, WAL writes, compactions, flushes, and LSM/SSTable merges that multiply the actual I/O by 10–50x. This is the dominant bottleneck for high write-ratio workloads like per-second metrics ingestion and IoT streams.
+
+ValkeyTimeSeries sidesteps this class of problem entirely by operating in-memory:
+
+* **No WAL/journal per write.** Samples are appended directly to the active chunk in memory. Persistence uses Valkey's existing RDB snapshots and AOF log, amortizing the cost across all data types rather than penalizing each sample insertion individually.
+* **No LSM compaction storms.** There are no SSTables, no background merge threads competing for I/O, and no tail-latency spikes from compaction pressure during peak ingestion.
+* **Append-only chunk model.** Each chunk is a contiguous compressed buffer that only grows until full, then seals. No in-place mutation, no page splits, no B-tree rebalancing.
+* **Index writes are metadata-only.** The ART+Roaring bitmap index updates a few pointers when a new series is created — not on every sample — so sustained write throughput is dominated by the append path, not indexing overhead.
+* **Compaction is logical, not physical.** Downsampling rules aggregate into destination series asynchronously; they never rewrite source data in place.
+
+The trade-off is capacity: the working set must fit in memory. For workloads where the hot window fits (minutes to weeks of high-resolution data, with retention-based pruning and compaction rules rolling up history), this architecture delivers sustained write throughput that disk-based systems cannot match without write amplification mitigations (batching, buffering, or losing durability guarantees).
+
+This in-memory-first approach is not new to time series: [kdb+](https://kx.com/products/kdb/) has demonstrated for decades that keeping the hot path in memory is the way to achieve the lowest latency and highest throughput for tick-level financial data. kdb+ ingests millions of records per second into in-memory tables (the "real-time database"), only spilling to disk as immutable historical partitions once the data cools. ValkeyTimeSeries applies the same principle — memory for the write path, compression and retention for capacity management — but within the Valkey ecosystem, accessible via standard clients and without a proprietary query language.
+
 We have the following terminologies:
-* TimeSeries Object: The top level structure representing the data type. It contains metadata and a list of lower-level
-                chunks containing the actual sample data.
+* TimeSeries Object: The top level structure representing the data type. It contains metadata and a list of lower-level chunks containing the actual sample data.
 * Sample: A tuple of timestamp and value.
 * Chunk: A container for samples. Chunks have configurable size and encoding policies.
 
-### Enhancements over RedisTimeSeries
+### Key Capabilities
 * `Multi-db Support` - allow users to create time series objects in different databases.
 * `Joins` - ValkeyTimeSeries supports joins between time series objects, including INNER, OUTER, and ASOF joins
 * `Filtering` - support filtering using Prometheus style selectors
 * `Compaction` - support for creating compaction rules based on other compactions.
     ```bash
-    redis> TS.CREATE visitor:count:1m
+    127.0.0.1:6379> TS.CREATE visitor:count:1m
     OK
-    redis> TS.CREATE visitors:count:1h
+    127.0.0.1:6379> TS.CREATE visitors:count:1h
     OK
-    redis> TS.CREATE visitors:count:1d
+    127.0.0.1:6379> TS.CREATE visitors:count:1d
     OK
     
-    redis> TS.CREATERULE visitor:count:1m visitors:count:1h AGGREGATION sum 1h
+    127.0.0.1:6379> TS.CREATERULE visitor:count:1m visitors:count:1h AGGREGATION sum 1h
     OK
-    redis> TS.CREATERULE visitors:count:1h visitors:count:1d AGGREGATION sum 1d
+    127.0.0.1:6379> TS.CREATERULE visitors:count:1h visitors:count:1d AGGREGATION sum 1d
     OK
     ```
     
     In addition, default compactions can specify a filter expression to select which keys they are applied to.
 
     ```bash
-    redis> CONFIG SET ts-compaction-policy avg:2h:10d|^metrics:memory:*;sum:60s:1h:5s|^metrics:cpu:*
+    127.0.0.1:6379> CONFIG SET ts-compaction-policy avg:2h:10d|^metrics:memory:*;sum:60s:1h:5s|^metrics:cpu:*
     OK
     ```
 * `Aggregation` - extended set of aggregations like `increase`, `rate`, and `irate`, as well as conditional aggregators like `all`, `any`, `countif`, `share` and `sumif`.
 * `Metadata` - support for returning metadata on time series objects (label names, label values, cardinality, etc)
 * `Rounding` - support for rounding sample values to specified precision. This is enforced for all samples in a time series.
 * `Active Expiration` - support for active pruning of time series data based on retention.
-* `Developer Ergonomics` - support for relative timestamps in queries, e.g. `TS.RANGE key -6hrs -3hrs`, unit suffixes (e.g. `1s`, `3mb`, `20K`), 
-    and a more expressive query language.
+* `Developer Ergonomics` - support for relative timestamps in queries, e.g. `TS.RANGE key -6hrs -3hrs`, unit suffixes (e.g. `1s`, `3mb`, `20K`), and a more expressive query language.
 
 ### Module OnLoad
 
-Upon loading, the module registers a new time series module-based data type, creates time series (TS.*) commands,
-timeseries specific configurations, and the TimeSeries ACL category.
+Upon loading, the module registers a new time series module-based data type, creates time series (TS.*) commands, timeseries specific configurations, and the TimeSeries ACL category.
 
 * Module name: ts
 * Data type name: `TSDB-TYPE`
 * Module shared object file name: `libvalkey_timeseries.[so|dylib|dll]`
 
-With the Module name as "ts", ValkeyTimeSeries is compatible with RedisTimeseries in its Module name, which is accessible by clients
-through HELLO, MODULE LIST, and INFO commands. Also, metrics and configs will be prefixed with this name (by design for Modules).
+With the Module name as "ts", the module name is accessible by clients through HELLO, MODULE LIST, and INFO commands. Metrics and configs are prefixed with this name (by design for Modules).
 
-Regarding the Module Data type name, because ValkeyTimeSeries's Module Data type (the current version) is not compatible with
-RedisTimeSeries, it is not named the same as RedisTimeSeries's. 
+The Module Data type name is `TSDB-TYPE`, specific to ValkeyTimeSeries's internal representation.
 
 ### Module Unload
 
-Once the Module has been loaded, the `MODULE UNLOAD` will be rejected since Module Data type is created on load.
-Valkey does not allow unloading of Modules that export a module data type.
+Once the Module has been loaded, the `MODULE UNLOAD` will be rejected since Module Data type is created on load. Valkey does not allow unloading of Modules that export a module data type.
 
 ```
 127.0.0.1:6379> MODULE UNLOAD timeseries
@@ -111,46 +183,27 @@ ValkeyTimeSeries implements persistence-related Module data type callbacks for t
 * rdb_load: Deserializes time series objects from RDB.
 * aof_rewrite: Emits commands into the AOF during the AOF rewriting process.
 
-### RDB Compatibility with RedisTimeSeries
+### RDB Format
 
-ValkeyTimeSeries is _**not**_ RDB Compatible with RedisTimeSeries.
-
-The metadata that gets written to the RDB is specific to the Module data type's structure and struct members.
-Additionally, the data within the underlying time series is specific to the implementation of
-the time series.
-
-Because of this, it is not possible to be RDB compatible with RedisTimeSeries.
+The RDB format is specific to ValkeyTimeSeries's internal data structures and encoding implementation. It is not compatible with other time series module implementations.
 
 ### AOF Rewrite handling
 
-Module data types (including timeseries) can implement a callback function that will be triggered for TimeSeries objects to rewrite
-its data as command/s. From the AOF callback, we will handle AOF rewrite by using `DUMP` and `RESTORE`.
+Module data types (including timeseries) can implement a callback function that will be triggered for TimeSeries objects to rewrite its data as command/s. From the AOF callback, we will handle AOF rewrite by using `DUMP` and `RESTORE`.
 
-### Migrating workloads from RedisTimeSeries:
+### Migrating existing workloads
 
-Customers that currently use RedisTimeSeries can move to ValkeyTimeSeries using two approaches:
+Users running time series workloads on other systems can move to ValkeyTimeSeries using two approaches:
 
-1. Create the time series objects to have the same properties using TS.CREATE / TS.ALTER on Valkey (with ValkeyTimeSeries loaded).
-Re-populate the time series objects by inserting items by moving the existing samples to the Valkey server
-(with ValkeyTimeSeries loaded). The workload can be moved without any errors since we are API Compatible.
+1. **Recreate and repopulate**: Create the time series objects with the same properties using TS.CREATE / TS.ALTER on Valkey (with ValkeyTimeSeries loaded), then repopulate by replaying samples via TS.ADD. The API-compatible surface means existing client code requires minimal changes.
 
-Pros
-* This is the simplest option in terms of effort—assuming the user is fine with recreating time series objects and adding
-    items on the Valkey server (with ValkeyTimeSeries).
+2. **AOF replay**: Generate an AOF file from the source server capturing the time series creation and insertion commands, then replay it against a Valkey server with ValkeyTimeSeries loaded. Once caught up, redirect the live workload.
 
-Cons
-* The user will need to re-create the time series (using TS.CREATE/TS.ADD) and populate these objects **AFTER**
-    switching to Valkey (with ValkeyTimeSeries).
-
-Users can generate an AOF file from a server (that has the RedisTimeSeries module loaded) and with an ongoing timeseries workload
-that creates time series and inserts items into them. Next, this can be re-played on a Valkey Server (with ValkeyTimeSeries loaded).
-Then, the user can move their existing workload to the Valkey server (with ValkeyTimeSeries loaded).
+Note that RDB files from other implementations are not compatible — migration must use the command-level approaches above.
 
 ### Memory Management
 
-On Module Load, the Rust Module overrides the memory allocator that delegates the allocation and deallocation tasks
-to the Valkey server using the existing Module APIs: ValkeyModule_Alloc and ValkeyModule_Free. This API panics if unable
-to allocate enough memory.
+On Module Load, the Rust Module overrides the memory allocator that delegates the allocation and deallocation tasks to the Valkey server using the existing Module APIs: ValkeyModule_Alloc and ValkeyModule_Free. This API panics if unable to allocate enough memory.
 
 The timeseries data type also supports memory management related callbacks:
 
@@ -166,40 +219,32 @@ Every TimeSeries-based write operation (creation, adding, and removing samples) 
 ## Specification
 
 ### TimeSeries Structure
-Each time series object is represented by a sorted list of chunks, each containing a list of samples. Each sample is a tuple
-of 64bit epoch-based timestamp and a 64bit float value. 
 
-A time series is optionally identified by a series of label-value pairs used to retrieve the series in queries. Given that these
-labels are used to group semantically similar time series, they are necessarily duplicated. We take advantage of this fact to 
-intern label-value pairs, meaning that only a single allocation is made per unique pair, irrespective of the number of series
-it occurs in.
+Each time series object is represented by a sorted list of chunks, each containing a list of samples. Each sample is a tuple of 64bit epoch-based timestamp and a 64bit float value.
+
+A time series is optionally identified by a series of label-value pairs used to retrieve the series in queries. Given that these labels are used to group semantically similar time series, they are necessarily duplicated. We take advantage of this fact to intern label-value pairs, meaning that only a single allocation is made per unique pair, irrespective of the number of series it occurs in.
 
 The time series object also contains metadata like the retention policy, compaction policy, etc.
 
 ### TimeSeries Value Encoding
-TimeSeries Chunks have configurable sample encoding strategies, defaulting to Gorilla XOR compression.
-Chunks can also be configured to store values as Uncompressed, but this is provided only for compatibility with RedisTimeseries.
+
+TimeSeries Chunks have configurable sample encoding strategies, defaulting to Gorilla XOR compression. Chunks can also be configured to store values as Uncompressed for use cases where raw access is preferred over compression savings.
 
 ### TimeSeries Indexing
-In addition to labels, a time series is uniquely identified by an opaque unsigned 64bit int. Each label-value pair
-is mapped to the id of each series that contains that attribute. The mapping is implemented as an [Adaptive Radix Tree (ART)](https://db.in.tum.de/~leis/papers/ART.pdf) (pdf), 
-where each node is a 64bit [Roaring BitMap](https://roaringbitmap.org/about/).
 
-The ART allows for efficient lookups and insertions, while the Roaring BitMap performs fast set operations on the series ids.
-In addition, the ART supports path compression for additional memory savings based on our indexing scheme (see below).
+In addition to labels, a time series is uniquely identified by an opaque unsigned 64bit int. Each label-value pair is mapped to the id of each series that contains that attribute. The mapping is implemented as an [Adaptive Radix Tree (ART)](https://db.in.tum.de/~leis/papers/ART.pdf) (pdf), where each node is a 64bit [Roaring BitMap](https://roaringbitmap.org/about/).
+
+The ART allows for efficient lookups and insertions, while the Roaring BitMap performs fast set operations on the series ids. In addition, the ART supports path compression for additional memory savings based on our indexing scheme (see below).
 
 ### TimeSeries Indexing Scheme
-The ART is used to index time series based on their labels. For each unique combination of label and value, we create a key by concatenating 
-the label and value strings. E.g. "region=us-west-2". This key is used to manage a 64bit roaring bitmap that contains the ids of all time series 
-that have that label-value pair. To retrieve ids for a given list of label-value pairs, we look up the keys in the ART and perform an intersection.
-The ART natively supports range queries, so we can efficiently find keys with a given prefix. For example, we can search on the prefix "region=" to
-find all time series with a label "region".
+
+The ART is used to index time series based on their labels. For each unique combination of label and value, we create a key by concatenating the label and value strings. E.g. "region=us-west-2". This key is used to manage a 64bit roaring bitmap that contains the ids of all time series that have that label-value pair. To retrieve ids for a given list of label-value pairs, we look up the keys in the ART and perform an intersection. The ART natively supports range queries, so we can efficiently find keys with a given prefix. For example, we can search on the prefix "region=" to find all time series with a label "region".
 
 We also maintain a mapping from id to a valkey key to retrieve the time series after querying.
 
 ### TimeSeries Filter Enhancements
-We support an extension to the RedisTimeseries filter syntax to support regex-based filtering using the operators `=~` and `!~`. 
-For example:
+
+The filter syntax supports regex-based filtering using the operators `=~` and `!~`. For example:
 
 * `TS.QUERYINDEX region=~us-west.*` will return all time series that have a label `region` with a value that starts with `us-west`.
 
@@ -215,20 +260,17 @@ We also support `"OR"` matching for Prometheus style selectors. For example:
 
 * `TS.QUERYINDEX latency{region="us-west" or region="us-east"}` will return all series recording latency samples in either `us-west` or `us-east` regions.
 
-As per Prometheus conventions, all regex matchers are anchored. For example, a matcher of `env=~"foo"` is treated as `env=~"^foo$"`, so any anchors 
-used in the query will be redundant. 
+As per Prometheus conventions, all regex matchers are anchored. For example, a matcher of `env=~"foo"` is treated as `env=~"^foo$"`, so any anchors used in the query will be redundant.
 
-Note that for selectors of the form `metric{label="value"}`, `metric` is matched against the reserved `__name__` label. In other words,
-the series is expected to have a label `__name__` with the value `metric`.
+Note that for selectors of the form `metric{label="value"}`, `metric` is matched against the reserved `__name__` label. In other words, the series is expected to have a label `__name__` with the value `metric`.
 
 ### RDB Format
 
 During RDB save, the Module data type callback is invoked, and we store series-specific data.
 
-
 ### TimeSeries Command API
 
-The following are supported TimeSeries commands with API syntax compatible with RedisTimeSeries:
+The following are the supported TimeSeries commands:
 
 ### TS.CREATE
 
@@ -256,8 +298,7 @@ is key name for the time series.
 
 ### Optional Arguments
 <summary><code>retentionPeriod</code>
-The period of time for which to keep series samples. Retention can be specified as an integer indication
-the duration as milliseconds, or a duration expression like `3wk`
+The period of time for which to keep series samples. Retention can be specified as an integer indication the duration as milliseconds, or a duration expression like `3wk`
 </summary>
 
 <summary><code>chunkSize</code>
@@ -265,8 +306,7 @@ The chunk size for the timeseries, in bytes. Default is `4096`.
 </summary>
 
 <summary><code>dedupeInterval</code>
-Limits sample ingest to the timeseries. If a sample arrives less than `dedupeInterval` from the most
-recent sample it is ignored. Default is `0`
+Limits sample ingest to the timeseries. If a sample arrives less than `dedupeInterval` from the most recent sample it is ignored. Default is `0`
 </summary>
 
 <summary><code>LABELS</code>
@@ -287,6 +327,7 @@ Note that the `LABELS` and `METRIC` options are mutually exclusive, and at most 
 
 ---
 ### TS.CREATERULE
+
 #### Syntax
 
 ```
@@ -295,8 +336,7 @@ TS.CREATERULE sourceKey destKey
     [alignTimestamp]
 ```
 
-Create a compaction rule that aggregates data from `sourceKey` into `destKey` using the specified aggregation
-function and bucket duration.
+Create a compaction rule that aggregates data from `sourceKey` into `destKey` using the specified aggregation function and bucket duration.
 
 ---
 ### TS.ALTER
@@ -311,8 +351,7 @@ TS.ALTER key
   [[LABELS [label value ...] | METRIC metricName]
 ```
 
-Alter an existing time series. This command allows you to change the properties of a time series, such as its 
-retention period, chunk size, and duplicate policy.
+Alter an existing time series. This command allows you to change the properties of a time series, such as its retention period, chunk size, and duplicate policy.
 
 #### Options
 - **ENCODING**: The encoding to use for the timeseries. Default is `COMPRESSED`.
@@ -326,8 +365,7 @@ is key name for the time series.
 
 #### Optional Arguments
 <summary><code>retentionPeriod</code>
-The period of time for which to keep series samples. Retention can be specified as an integer indication
-the duration as milliseconds, or a duration expression like `3wk`
+The period of time for which to keep series samples. Retention can be specified as an integer indication the duration as milliseconds, or a duration expression like `3wk`
 </summary>
 
 <summary><code>chunkSize</code>
@@ -343,7 +381,6 @@ TS.ADD key timestamp value
 ```
 
 Add a sample to a time series. If the key does not exist, it is created with the specified timestamp and value.
-
 
 #### Required Arguments
 
@@ -396,6 +433,7 @@ TS.DEL requests:status:200 587396550 1587396550
 ```
 ---
 ### TS.DELETERULE
+
 #### Syntax
 
 ```
@@ -412,10 +450,9 @@ Delete a compaction rule that aggregates data from `sourceKey` into `destKey`.
 TS.MADD <key> <item> [<item> ...]
 ```
 Add multiple samples to a time series. If the key does not exist, it is created with the specified timestamp and value.
-
-
 ---
 ### TS.GET
+
 #### Syntax
 ```
 TS.GET <key> [LATEST]
@@ -426,6 +463,7 @@ is a compaction.
 
 ---
 ### TS.MGET
+
 #### Syntax
 ```
 TS.MGET 
@@ -471,8 +509,7 @@ TS.DECRBY key delta
   [[LABELS [label value ...] | METRIC metricName]
 ```
 
-Decrement the value of the last sample in a time series. If the key does not exist, it is created with the specified 
-timestamp and value.
+Decrement the value of the last sample in a time series. If the key does not exist, it is created with the specified timestamp and value.
 
 #### Required Arguments
 <summary><code>key</code>
@@ -536,12 +573,10 @@ Include only samples at the specified timestamp(s). Multiple timestamps can be p
 Include only samples with values in `[min, max]`. Both bounds are inclusive. Applied before aggregation.
 </details>
 <details open><summary><code>COUNT count</code></summary>
-Limit output to the first `count` samples or buckets. When used with aggregation, limits bucket
-count (not samples per bucket).
+Limit output to the first `count` samples or buckets. When used with aggregation, limits bucket count (not samples per bucket).
 </details>
 <details open><summary><code>AGGREGATION aggregator bucketDuration [CONDITION op value]</code></summary>
-Aggregate raw samples into fixed-size time buckets. See [Aggregators](#aggregators) for supported aggregation functions.
-`aggregator` is the aggregation function to apply, and `bucketDuration` is the bucket size in milliseconds (must be positive).
+Aggregate raw samples into fixed-size time buckets. See [Aggregators](#aggregators) for supported aggregation functions. `aggregator` is the aggregation function to apply, and `bucketDuration` is the bucket size in milliseconds (must be positive).
 
 Optionally, a `CONDITION` can be provided to apply a comparison filter for conditional aggregators (e.g., `countif`, `sumif`, `share`, `all/any/none`).
 - `op` is a comparison operator: `>`, `<`, `>=`, `<=`, `==`, or `!=`
@@ -569,7 +604,6 @@ Which timestamp to return for each bucket:
 - `mid` — Bucket midpoint
 
 </details>
-
 
 ### Supported Aggregators
 
@@ -746,6 +780,7 @@ Query a range of data across multiple series
 
 ---
 ### TS.MREVRANGE
+
 #### Syntax
 ```
 TS.MREVRANGE fromTimestamp toTimestamp 
@@ -785,13 +820,12 @@ Start timestamp, inclusive. Results will only be returned for series which have 
 
 End timestamp, inclusive.
 
-If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only the keys of series which 
-do *NOT* have samples in the specified range.
+If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only the keys of series which do *NOT* have samples in the specified range.
 
 ---
 ### New Commands
 
-The following are NEW commands that are not included in RedisTimeSeries:
+The following are additional commands unique to ValkeyTimeSeries:
 
 ---
 
@@ -821,9 +855,8 @@ TS.ADDBULK key data
 </summary>
 
 <summary><code>data</code>
- 
-JSON payload containing sample data. Must be a single JSON object with `values` and `timestamps` arrays. Up to 1000 samples 
-can be ingested per command.
+
+JSON payload containing sample data. Must be a single JSON object with `values` and `timestamps` arrays. Up to 1000 samples can be ingested per command.
 </summary>
 
 #### Optional arguments
@@ -939,8 +972,7 @@ The `data` argument expects a JSON object with the following structure:
 - **Duplicate handling:** Controlled by `DUPLICATE_POLICY` (or `ON_DUPLICATE` override)
 - **Chunk allocation:** New chunks are created automatically as needed
 - **Series creation:** If the key doesn't exist, a new series is created with the provided options
-- **Ingestion count:** Only successfully inserted samples are counted; dropped or blocked samples are excluded from the
-  success count
+- **Ingestion count:** Only successfully inserted samples are counted; dropped or blocked samples are excluded from the success count
 
 ### Examples
 
@@ -993,8 +1025,7 @@ TS.MDEL [fromTimestamp toTimestamp] FILTER selector...
 TS.MDEL FILTER selector...
 ```
 
-Delete samples in a timestamp range, or delete entire time series, for all series matching a label filter, possibly
-across a cluster.
+Delete samples in a timestamp range, or delete entire time series, for all series matching a label filter, possibly across a cluster.
 
 #### Summary
 
@@ -1037,8 +1068,7 @@ Integer reply:
 
 #### Permissions and ACLs
 
-The module enforces DELETE permission on matching keys. Clients must have permission to delete the 
-matching series or global delete permission.
+The module enforces DELETE permission on matching keys. Clients must have permission to delete the matching series or global delete permission.
 
 #### Errors
 
@@ -1083,8 +1113,7 @@ TS.MDEL FILTER api_latency{service=auth,region~="us-east-?",env=staging}
 TS.CARD [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp] FILTER filter...
 ```
 
-Returns the number of unique time series that match a given filter set. A time range can optionally be provided to
-restrict the results to only series which have samples in the range `[fromTimestamp, toTimestamp]`.
+Returns the number of unique time series that match a given filter set. A time range can optionally be provided to restrict the results to only series which have samples in the range `[fromTimestamp, toTimestamp]`.
 
 #### Required arguments
 
@@ -1101,8 +1130,7 @@ Start timestamp, inclusive. Results will only be returned for series which have 
 
 End timestamp, inclusive.
 
-If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only series which do *NOT* have 
-samples in the specified range.
+If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only series which do *NOT* have samples in the specified range.
 
 #### Return
 
@@ -1126,17 +1154,14 @@ Returns a list of label names for select series. If a time range is specified, o
 <code>fromTimestamp</code>
 Repeated series selector argument that selects the series to return. At least one selector argument must be provided.
 
-
 ### Optional Arguments
 <code>fromTimestamp</code>
 
-If specified along with `toTimestamp`, this limits the result to only labels from series which
-have data in the date range [`fromTimestamp` .. `toTimestamp`]
+If specified along with `toTimestamp`, this limits the result to only labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`]
 
 <code>toTimestamp</code>
 
-If specified along with `fromTimestamp`, this limits the result to only labels from series which
-have data in the date range [`fromTimestamp` .. `toTimestamp`]
+If specified along with `fromTimestamp`, this limits the result to only labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`]
 
 If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only series which do *NOT* have
 samples in the specified range.
@@ -1171,8 +1196,7 @@ TS.LABELVALUES label
     FILTER selector...
 ```
 
-Returns a list of label values for a provided label name. Optionally a time range can be specified to limit the result to only 
-labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`].
+Returns a list of label values for a provided label name. Optionally a time range can be specified to limit the result to only labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`].
 
 #### Required Arguments
 
@@ -1184,19 +1208,15 @@ Repeated series selector argument that selects the series to return. At least on
 
 The label name for which to retrieve mut values.
 
-
 #### Optional Arguments
 
 <code>fromTimestamp</code>
 
-If specified along with `toTimestamp`, this limits the result to only labels from series which
-have data in the date range [`fromTimestamp` .. `toTimestamp`]
-
+If specified along with `toTimestamp`, this limits the result to only labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`]
 
 <code>toTimestamp</code>
 
-If specified along with `fromTimestamp`, this limits the result to only labels from series which
-have data in the date range [`fromTimestamp` .. `toTimestamp`]
+If specified along with `fromTimestamp`, this limits the result to only labels from series which have data in the date range [`fromTimestamp` .. `toTimestamp`]
 
 If **`NOT`** is specified before `fromTimestamp` and `toTimestamp`, the result will include only series which do *NOT* have
 samples in the specified range.
@@ -1204,7 +1224,6 @@ samples in the specified range.
 <code>limit</code>
 
 The maximum number of label values to return. If not specified, all values are returned.
-
 
 #### Return
 
@@ -1330,18 +1349,14 @@ Both keys must have been created before `TS.JOIN` is called.
 `toTimestamp` is the last timestamp of the requested range, or a relative delta from `fromTimestamp`
 </summary>
 
-
 #### Optional arguments
 
 <summary><code>LEFT</code>
-outputs the matching samples between both tables. In case no samples match from the left series, it returns 
-those items with null values.
+outputs the matching samples between both tables. In case no samples match from the left series, it returns those items with null values.
 </summary>
 
 <summary><code>RIGHT</code>
-outputs all samples in the right series. In case no samples match from the left series, it returns
-those items with null values.
-
+outputs all samples in the right series. In case no samples match from the left series, it returns those items with null values.
 </summary>
 
 <summary><code>INNER</code>
@@ -1353,42 +1368,33 @@ returns samples for which no matching timestamp exists in the `right` series.
 </summary>
 
 <summary><code>SEMI</code>
-returns samples for which no corresponding timestamp exists in the `right` series. It does not return any 
-values from the right table.
+returns samples for which no corresponding timestamp exists in the `right` series. It does not return any values from the right table.
 </summary>
 
 <summary><code>FULL</code>
-returns samples from both left and right series. If no matching rows exist for the row in the left series, the value of 
-the right series will have nulls. Correspondingly, the value of the left series will have nulls if there are no matching 
-rows for the sample in the right series.
+returns samples from both left and right series. If no matching rows exist for the row in the left series, the value of the right series will have nulls. Correspondingly, the value of the left series will have nulls if there are no matching rows for the sample in the right series.
 </summary>
 
 <summary><code>ASOF</code>
-match each sample in the left series with the closest preceding or following sample in the right series based on
-timestamps. They are particularly useful for analyzing time-series data where records from different sources may not have
-perfectly aligned timestamps. ASOF joins solve the problem of finding the value of a varying property at a specific point in time.
+match each sample in the left series with the closest preceding or following sample in the right series based on timestamps. They are particularly useful for analyzing time-series data where records from different sources may not have perfectly aligned timestamps. ASOF joins solve the problem of finding the value of a varying property at a specific point in time.
 </summary>
 
 #### How ASOF Joins Work
 
-When using `ASOF` joins, the join operation looks for the closest matching timestamp in the right series for each
-timestamp in the left series, based on the specified `direction` and `tolerance`.
+When using `ASOF` joins, the join operation looks for the closest matching timestamp in the right series for each timestamp in the left series, based on the specified `direction` and `tolerance`.
 
 `direction` specifies how to find the closest match:
 - `PREVIOUS` (default) selects the last row in the right series whose timeseries is less than or equal to the left’s timestamp.
 - `NEXT` (default) selects the first row in the right series whose timestamp is greater than or equal to the left’s timestamp.
 - `NEAREST` selects the last row in the right series whose timestamp is nearest to the left’s timestamp.
 
-`tolerance` sets a limit on how far apart the timestamps can be while still considering them a match.
-The tolerance can be specified as:
+`tolerance` sets a limit on how far apart the timestamps can be while still considering them a match. The tolerance can be specified as:
 - An integer representing milliseconds
 - A duration specified as a string, e.g., 2m
 
 `ALLOW_EXACT_MATCH` is a boolean flag that determines whether to allow exact matches between the left and right series.
 
-If not specified, there is no tolerance limit (equivalent to an infinite tolerance). When set, JOIN ASOF will only match
-keys within the specified tolerance range. Any potential matches outside this range will be treated as no match.
-
+If not specified, there is no tolerance limit (equivalent to an infinite tolerance). When set, JOIN ASOF will only match keys within the specified tolerance range. Any potential matches outside this range will be treated as no match.
 
 #### Example
 Suppose we want to get the spreads between buy and sell trades in a trading application
@@ -1397,15 +1403,11 @@ Suppose we want to get the spreads between buy and sell trades in a trading appl
 TS.JOIN trades:buy trades:sell -1hr * ASOF NEAREST 2ms ALLOW_EXACT_MATCH REDUCE sub
 ```
 
-The result has all samples from the `buy` series joined with samples from the `sell` series. For each timestamp from the
-`buy` series, the query looks for a timestamp that nearest to it from the `sell` series, within a tolerance of
-2 milliseconds. If no matching timestamp is found, NULL is inserted.
+The result has all samples from the `buy` series joined with samples from the `sell` series. For each timestamp from the `buy` series, the query looks for a timestamp that nearest to it from the `sell` series, within a tolerance of 2 milliseconds. If no matching timestamp is found, NULL is inserted.
 
 The `sub` transform function is then supplied to subtract the `sell` value from the `buy` value for each sample returned.
 
-The tolerance parameter is particularly useful when working with time series data where exact matches are rare, but you
-want to find the closest match within a reasonable time frame. It helps prevent incorrect matches that might occur if the 
-nearest available data point is too far away in time or value.
+The tolerance parameter is particularly useful when working with time series data where exact matches are rare, but you want to find the closest match within a reasonable time frame. It helps prevent incorrect matches that might occur if the nearest available data point is too far away in time or value.
 
 <code>`count`</code> the maximum number of samples to return.
 
@@ -1445,12 +1447,9 @@ performs an operation on the value in each returned row.
 Returns one of these replies:
 
 - @simple-string-reply - `OK` if executed correctly
-- @error-reply on error (invalid arguments, wrong key type, etc.), when `sourceKey` does not exist, when `destKey` does not exist, 
-when `sourceKey` is already a destination of a compaction rule, when `destKey` is already a source or a destination of a compaction rule, or when `sourceKey` and `destKey` are identical
+- @error-reply on error (invalid arguments, wrong key type, etc.), when `sourceKey` does not exist, when `destKey` does not exist, when `sourceKey` is already a destination of a compaction rule, when `destKey` is already a source or a destination of a compaction rule, or when `sourceKey` and `destKey` are identical
 
 #### Examples
-
-
 Create a time series to store the temperatures measured in Mexico City and Toronto.
 
 ```
@@ -1461,8 +1460,6 @@ OK
 ```
 
 ... Add data
-
-
 Next, run the join.
 
 ```
@@ -1874,9 +1871,9 @@ Detect pattern-based anomalies using a sliding window:
     * RCF is more computationally expensive but better for complex patterns
 
 ---
-### Differences from RedisTimeSeries
+### Notable Behaviors
 
-* Our command parser is more lenient than RedisTimeSeries. For example, the order of optional arguments does not matter for 
+* The command parser is lenient — the order of optional arguments does not matter for
   commands like TS.CREATE and TS.ALTER when not specifying variadic arguments like LABELS.
 * We support Prometheus style selectors in TS.QUERYINDEX, TS.MGET, TS.MRANGE, and TS.MREVRANGE.
 * We support new index metadata commands: TS.CARD, TS.LABELNAMES, TS.LABELVALUES, TS.STATS.
@@ -1895,28 +1892,22 @@ Detect pattern-based anomalies using a sliding window:
 
 We do not currently support the TWA (Time-Weighted Average) aggregation function.
 
-
 ### Possible Future Enhancements
 
-* Work is in progress to support [PromQL](https://prometheus.io/docs/prometheus/latest/querying/basics/) as a query language, 
-including transform, aggregation, and rollup function support. A stretch goal is to support alerts and notifications based on the query results.
+* Work is in progress to support [PromQL](https://prometheus.io/docs/prometheus/latest/querying/basics/) as a query language, including transform, aggregation, and rollup function support. A stretch goal is to support alerts and notifications based on the query results.
 
 * We may support a tiered storage model where data is moved to higher compression chunks (with higher access latency) after a certain period of time. 
 
 * Support more complex analysis, like forecasting and anomaly detection.
 
-
 ### Configurations
 
-The default properties for TimeSeries can be controlled using configs. The values of the
-configs below are only used on a timeseries if the user does not specify the properties explicitly. Example: Using
-TS.CREATE or TS.ADD can override the default properties.
+The default properties for TimeSeries can be controlled using configs. The values of the configs below are only used on a timeseries if the user does not specify the properties explicitly. Example: Using TS.CREATE or TS.ADD can override the default properties.
 
 Supported Module configurations:
 - **`ts-retention-policy`** : The default retention policy for time series (ms). Default to `0`, which means no retention policy.
 - **`ts-duplicate-policy`**: The default duplicate policy for time series. Default to `LAST`, which means the last sample is kept when duplicates are added.
-- **`ts-chunk-size-bytes`**: Controls the default chunk memory capacity. When create operations (`TS.CREATE`/`TS.ADD`/`TS.INCRBY`/`TS.DECRBY`) are used, the timeseries created
-    will use the capacity specified by this setting.
+- **`ts-chunk-size-bytes`**: Controls the default chunk memory capacity. When create operations (`TS.CREATE`/`TS.ADD`/`TS.INCRBY`/`TS.DECRBY`) are used, the timeseries created will use the capacity specified by this setting.
 - **`ts-encoding`**: The default encoding for time series. Default to `COMPRESSED`, which means the samples are compressed using Gorilla XOR compression.
 - **`ts-ignore-max-time-diff`**: The distance in time between samples below which they are considered duplicated. Default to 0, which means no deduplication is performed.
 - **`ts-ignore-max-val-diff`**: The value delta between samples below which they are considered duplicated.
@@ -1931,8 +1922,7 @@ There are four existing ACL categories that are updated to include new TimeSerie
 
 ### Keyspace Event Notification
 
-Every timeseries-based write command (that involves mutation as explained in the section above) will be made to publish
-a keyspace event after the data is mutated. Commands include: TS.CREATE, TS.ADD, TS.MADD.
+Every timeseries-based write command (that involves mutation as explained in the section above) will be made to publish a keyspace event after the data is mutated. Commands include: TS.CREATE, TS.ADD, TS.MADD.
 
 * Event type: VALKEYMODULE_NOTIFY_GENERIC
 * Event name: One of the two event names will be published based on the command and scenario:
@@ -1944,8 +1934,6 @@ a keyspace event after the data is mutated. Commands include: TS.CREATE, TS.ADD,
  * ts.createrule:src
  * ts.del
  * ts.madd
-
-
 Users can subscribe to the time series events via the standard keyspace event pub/sub. For example,
 
 ```text
@@ -1956,8 +1944,7 @@ Users can subscribe to the time series events via the standard keyspace event pu
 ```
 
 ## References
-* [valkey-timeseries GitHub Repo](https://github.com/ccollie/valkey-timeseries)
-* [RedisTimeSeries](https://oss.redislabs.com/redistimeseries/)
+* [valkey-timeseries GitHub Repo](https://github.com/valkey-io/valkey-timeseries)
 * [Prometheus](https://prometheus.io/)
 * [Adaptive Radix Tree (ART)](https://db.in.tum.de/~leis/papers/ART.pdf)
 * [Roaring Bitmaps](https://roaringbitmap.org/about/)
