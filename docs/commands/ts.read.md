@@ -41,6 +41,10 @@ so a reader on a not-yet-created key is woken by the first write.
 `milliseconds` is the wait limit; `0` waits indefinitely. `min_count` must be positive, and may
 not exceed `MAX_COUNT` when both are given.
 
+The wait limit is either a bare number of milliseconds or a unit-suffixed duration — see
+[Duration syntax](#duration-syntax) below. `BLOCK 5000 1`, `BLOCK 5s 1`, and `BLOCK 2h5m 1` all
+name a wait limit; `BLOCK 0 1` and `BLOCK 0s 1` both wait indefinitely.
+
 If the threshold is already met the command returns immediately without waiting. Otherwise it
 waits until one of:
 
@@ -57,6 +61,25 @@ reply is unbounded — `TS.READ key -` with no cap reads the whole series.
 `==`, `!=`, `>`, `>=`, `<`, `<=`, and `value` is a number.
 
 All three clauses are optional, may appear in any order, and their keywords are case-insensitive.
+
+### Duration syntax
+
+The `BLOCK` wait limit accepts either spelling:
+
+- **A bare number** — a count of milliseconds. `BLOCK 5000 1` waits up to five seconds.
+- **A unit-suffixed duration** — a number followed by one of `ms`, `s`, `m`, `h`, `d`, `w`, or `y`
+  (milliseconds, seconds, minutes, hours, days, weeks, years; a week is 7 days and a year 365).
+  Segments may be chained and are summed, so `BLOCK 2h5m 1` waits up to two hours and five
+  minutes. The number may be fractional — `1.5s` is 1500 ms — and the total is rounded to whole
+  milliseconds.
+
+A suffix is lowercase and joined to its number as a single argument, so `1S` and `3wk` are
+rejected, as is any negative duration. An unparseable wait limit reports the same error as a
+negative one: `TSDB: BLOCK milliseconds must be a non-negative integer`.
+
+This is the same duration syntax `TS.CREATE` takes for `RETENTION` and `DEDUPE_INTERVAL`. The bare
+millisecond form is the portable one — use it where the command also has to run against
+RedisTimeSeries.
 
 ## CONDITION
 
@@ -143,10 +166,11 @@ Read just the newest sample, then only what comes after it:
 (empty array)
 ```
 
-Wait up to 5 seconds for two new samples:
+Wait up to 5 seconds for two new samples — the wait limit may be written either way:
 
 ```
 > TS.READ temperature:room1 $ BLOCK 5000 2
+> TS.READ temperature:room1 $ BLOCK 5s 2
 ```
 
 Take a page at a time:
@@ -164,7 +188,7 @@ Alert when more than 5% of requests in a one-minute window take longer than 500 
 one fraction per minute; a worker then tails that compacted series, and `CONDITION` does the
 threshold test on the server so the worker is woken only by a breach:
 
-``` redis 
+``` 
 > TS.CREATE api:latency:raw
 OK
 > TS.CREATE api:latency:over_500ms:1m
@@ -174,7 +198,7 @@ OK
 ```
 
 Block until the condition is met. `share(>500)` returns a fraction from `0.0` to `1.0`, so `0.05` represents 5%. 
-``` redis
+```
 > TS.READ api:latency:over_500ms:1m $ BLOCK 60000 1 CONDITION > 0.05
 ```
 
@@ -277,7 +301,7 @@ this for you.
 | Negative or unparseable `timestamp` | `TSDB: invalid timestamp` |
 | `MAX_COUNT` zero, negative, or non-integer | `TSDB: MAX_COUNT must be a positive integer` |
 | `min_count` zero or negative | `TSDB: BLOCK min_count must be a positive integer` |
-| Negative `milliseconds` | `TSDB: BLOCK milliseconds must be a non-negative integer` |
+| Negative `milliseconds`, or a wait limit that is neither a number of milliseconds nor a valid [duration](#duration-syntax) | `TSDB: BLOCK milliseconds must be a non-negative integer` |
 | `min_count` greater than `max_count` | `TSDB: BLOCK min_count must be <= MAX_COUNT` |
 | `CONDITION` operator outside the six spellings | `TSDB: invalid comparison operator` |
 | `CONDITION` value not a number | `TSDB: CONDITION value must be a number` |
