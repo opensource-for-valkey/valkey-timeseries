@@ -264,8 +264,7 @@ call. Two ways to avoid it:
   to the new tail regardless of how selective the condition is. This is the right default for
   alerting, where old non-matching data is of no interest.
 - **Advance the cursor separately.** Track the frontier with an unconditioned read (or
-  [`TS.GET`](./ts.get.md)) and pass that timestamp to the conditioned read, so the cursor keeps
-  moving even through stretches where nothing matches.
+  [`TS.GET`](./ts.get.md)) and pass one millisecond past that timestamp to the conditioned read, so the cursor keeps moving even through stretches where nothing matches.
 
 A sparse condition over a `-` cursor on a large series is the shape to avoid: every unsatisfied
 call reads the whole tail looking for matches that are not there.
