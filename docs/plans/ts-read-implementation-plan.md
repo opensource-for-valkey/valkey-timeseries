@@ -53,10 +53,16 @@ There are currently no **[A]** rows in §1. Anything added later that cannot be 
 Register the following command:
 
 ```text
-TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count]
+TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count] [CONDITION op value]
 ```
 
-Command metadata, captured verbatim from the reference **[P]**:
+`CONDITION` is an additive Valkey TimeSeries extension that landed after this plan shipped; the
+reference has no counterpart and rejects the clause. See
+[`ts-read-condition-plan.md`](./ts-read-condition-plan.md). The rest of this section describes the
+reference-compatible surface.
+
+Command metadata, captured verbatim from the reference **[P]** — so the Complexity and Summary
+rows below are historical reference data, not the strings this module registers today:
 
 | Property | Value |
 | --- | --- |
@@ -72,11 +78,18 @@ Command metadata, captured verbatim from the reference **[P]**:
 | Complexity | `O(log(n)+k) where n is the number of samples in the series and k is the number of returned samples` |
 | Summary | `Read: return up to max_count samples with timestamp >= timestamp. With BLOCK, waits up to milliseconds ms until at least min_count qualifying samples exist` |
 
-The Complexity and Summary rows are a snapshot of the original implementation. Both were revised
-when the additive `CONDITION` clause landed — see
-[`ts-read-condition-plan.md`](./ts-read-condition-plan.md) — because a sparse value condition can
-require examining many timestamp-eligible samples before finding `min_count` matches. No test pins
-either string; `tests/test_ts_command.py` pins arity, flags, key specs, and the `dont_cache` tip.
+Both rows were revised when `CONDITION` landed, because a sparse value condition can require
+examining many timestamp-eligible samples before finding `min_count` matches — so complexity is now
+stated over the samples *examined*, not the samples returned. As registered today in
+[ts_read.rs](../../src/commands/ts_read.rs#L397):
+
+| Property | Value as registered |
+| --- | --- |
+| Complexity | `O(log(n)+m) where n is the number of samples in the series and m is the number of samples examined. Without CONDITION m is the number of returned samples; with CONDITION a sparse condition may examine every sample at or after timestamp` |
+| Summary | `Read: return up to max_count samples with timestamp >= timestamp, optionally only those whose value satisfies CONDITION. With BLOCK, waits up to milliseconds ms until at least min_count qualifying samples exist` |
+
+No test pins either string; `tests/test_ts_command.py` pins arity, flags, key specs, and the
+`dont_cache` tip.
 
 Two metadata details need an explicit decision rather than a silent choice:
 
