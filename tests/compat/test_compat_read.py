@@ -13,6 +13,10 @@ drive both engines concurrently on dedicated connections and hand the outcomes b
 Timing is compared loosely on purpose: both engines must resolve within a generous bound, and
 a wakeup must be visibly faster than the timeout it beat. Exact elapsed-time equality is not a
 compatibility property.
+
+`CONDITION` must never appear here. It is an additive Valkey TimeSeries extension the reference
+rejects outright, so sending it would produce an error on one side and data on the other — a
+harness failure rather than a divergence. Its coverage lives in tests/test_ts_read.py.
 """
 
 from __future__ import annotations

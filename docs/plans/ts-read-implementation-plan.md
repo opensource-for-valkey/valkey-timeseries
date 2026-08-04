@@ -72,6 +72,12 @@ Command metadata, captured verbatim from the reference **[P]**:
 | Complexity | `O(log(n)+k) where n is the number of samples in the series and k is the number of returned samples` |
 | Summary | `Read: return up to max_count samples with timestamp >= timestamp. With BLOCK, waits up to milliseconds ms until at least min_count qualifying samples exist` |
 
+The Complexity and Summary rows are a snapshot of the original implementation. Both were revised
+when the additive `CONDITION` clause landed — see
+[`ts-read-condition-plan.md`](./ts-read-condition-plan.md) — because a sparse value condition can
+require examining many timestamp-eligible samples before finding `min_count` matches. No test pins
+either string; `tests/test_ts_command.py` pins arity, flags, key specs, and the `dont_cache` tip.
+
 Two metadata details need an explicit decision rather than a silent choice:
 
 - **`dont_cache` tip.** The reference sets it; no command in this module sets any tip, and the

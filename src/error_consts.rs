@@ -153,6 +153,10 @@ pub const READ_BLOCK_MS_MUST_BE_NON_NEGATIVE: &str =
     "TSDB: BLOCK milliseconds must be a non-negative integer";
 pub const READ_MIN_COUNT_EXCEEDS_MAX_COUNT: &str = "TSDB: BLOCK min_count must be <= MAX_COUNT";
 pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK) is not allowed inside MULTI, EVAL, or a deny-blocking context";
+// CONDITION is an additive extension with no reference text to match; the wording follows the
+// clause-named style of the probed constants above. A bad operator reuses
+// INVALID_COMPARISON_OPERATOR, which `ComparisonOperator::try_from` already returns.
+pub const READ_CONDITION_VALUE_MUST_BE_A_NUMBER: &str = "TSDB: CONDITION value must be a number";
 
 // TS.QUERYLABELS
 pub const UNKNOWN_QUERY_LABELS_SUBTYPE: &str =

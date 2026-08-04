@@ -1,10 +1,14 @@
 """Integration tests for TS.READ.
 
     TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count]
+                          [CONDITION op value]
 
 Every assertion here is anchored to an observation of the pinned RedisTimeSeries 8.10 reference
 recorded in docs/plans/ts-read-implementation-plan.md §6, or to a server mechanic established in §7.
 Probe numbers in the docstrings refer to that table.
+
+`CONDITION` is the exception: it is an additive Valkey TimeSeries extension the reference rejects
+outright, so its tests are anchored to docs/plans/ts-read-condition-plan.md rather than to a probe.
 
 Synchronization note: these tests never sleep to wait for a reader to block. A blocked reader is
 detected through `blocked_clients` in `INFO clients`, so the write that is supposed to wake it is
@@ -15,6 +19,7 @@ happen has always happened by the time a subsequent command on another connectio
 
 import json
 import threading
+import time
 
 import pytest
 import valkey
@@ -926,6 +931,668 @@ class TestTsReadAcl(TsReadTestBase):
             assert self.client.execute_command("PING")
         finally:
             blocked.close(self.client)
+
+
+class TestTsReadConditionValidation(TsReadTestBase):
+    """CONDITION argument validation.
+
+    Unlike the clauses above, CONDITION is an additive extension with no reference behavior to
+    match — but it follows the same two failure classes. Note where the line falls: a bad
+    *operator* is a TSDB: error rather than wrong-arity, because the clause is unambiguously
+    present and only its operator token is wrong.
+    """
+
+    ARITY_ERROR = "wrong number of arguments"
+
+    @pytest.mark.parametrize(
+        "operator",
+        ["==", "!=", ">", ">=", "<", "<="],
+        ids=["eq", "neq", "gt", "gte", "lt", "lte"],
+    )
+    def test_all_six_operators_are_accepted(self, operator):
+        self.seed("k", [100])
+        self.client.execute_command("TS.READ", "k", "-", "CONDITION", operator, "10")
+
+    @pytest.mark.parametrize(
+        "operator",
+        ["=", ">500", "=>", "<>", "gt", "!", "~"],
+        ids=["single-eq", "fused", "arrow", "sql-neq", "word", "bang", "tilde"],
+    )
+    def test_operators_outside_the_six_are_rejected_as_operators(self, operator):
+        """A fused `CONDITION >500` is an invalid operator, not wrong-arity.
+
+        `TS.READ` has no reason to accept the fused spelling the inline per-aggregator form uses
+        (`countif(>5)`), which exists only because an aggregator name and its condition must share
+        one token. A spaced clause matches every other TS.READ option.
+        """
+        self.seed("k", [100])
+        with pytest.raises(ResponseError, match="invalid comparison operator"):
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", operator, "500")
+
+    @pytest.mark.parametrize(
+        "value", ["abc", "", "5x", "1,5", "--1"],
+        ids=["word", "empty", "trailing", "comma", "double-sign"],
+    )
+    def test_non_numeric_condition_values_are_rejected(self, value):
+        self.seed("k", [100])
+        with pytest.raises(ResponseError, match="CONDITION value must be a number"):
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", ">", value)
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            ["CONDITION"],
+            ["CONDITION", ">"],
+            ["CONDITION", ">", "1", "CONDITION", "<", "2"],
+            ["CONDITION", ">", "1", "EXTRA"],
+        ],
+        ids=["bare", "no-value", "duplicate", "trailing-token"],
+    )
+    def test_malformed_condition_clauses_are_arity_errors(self, extra):
+        self.seed("k", [100])
+        with pytest.raises(ResponseError, match=self.ARITY_ERROR):
+            self.client.execute_command("TS.READ", "k", "-", *extra)
+
+    def test_clauses_parse_in_any_order_and_any_case(self):
+        self.seed("k", [100, 200, 300])
+        expected = [[100, b"10"], [200, b"20"]]
+        for extra in (
+            ["BLOCK", LONG_BLOCK_MS, 2, "MAX_COUNT", 2, "CONDITION", "<", 30],
+            ["CONDITION", "<", 30, "BLOCK", LONG_BLOCK_MS, 2, "MAX_COUNT", 2],
+            ["MAX_COUNT", 2, "CONDITION", "<", 30, "BLOCK", LONG_BLOCK_MS, 2],
+            ["condition", "<", 30, "block", LONG_BLOCK_MS, 2, "max_count", 2],
+            ["CoNdItIoN", "<", 30, "BlOcK", LONG_BLOCK_MS, 2, "Max_Count", 2],
+        ):
+            assert self.client.execute_command("TS.READ", "k", "-", *extra) == expected
+
+    def test_special_float_values_are_accepted(self):
+        """The same spellings TS.ADD accepts for a sample value."""
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, "nan")
+        self.client.execute_command("TS.ADD", "k", 200, "inf")
+        self.client.execute_command("TS.ADD", "k", 300, 5)
+
+        # `==` and `!=` carry the module's custom NaN handling.
+        assert self.timestamps(
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", "==", "nan")
+        ) == [100]
+        assert self.timestamps(
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", "!=", "nan")
+        ) == [200, 300]
+        assert self.timestamps(
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", "==", "inf")
+        ) == [200]
+        assert self.timestamps(
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", ">", "-inf")
+        ) == [200, 300]
+        assert self.timestamps(
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", ">", "1e0")
+        ) == [200, 300]
+
+    def test_ordering_operators_never_match_a_nan_on_either_side(self):
+        """Plain IEEE: an ordering comparison against NaN is always false."""
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, "nan")
+        self.client.execute_command("TS.ADD", "k", 200, 5)
+
+        for operator in [">", ">=", "<", "<="]:
+            assert (
+                self.client.execute_command(
+                    "TS.READ", "k", "-", "CONDITION", operator, "nan"
+                )
+                == []
+            ), f"`{operator} nan` must match nothing"
+            # And the NaN *sample* never satisfies an ordering condition either.
+            assert self.timestamps(
+                self.client.execute_command(
+                    "TS.READ", "k", "-", "CONDITION", operator, "5"
+                )
+            ) in ([], [200]), f"the NaN sample must never satisfy `{operator} 5`"
+
+
+class TestTsReadConditionImmediate(TsReadTestBase):
+    """CONDITION without BLOCK: it filters every read, not just a blocked one."""
+
+    def seed_mixed(self, key="k"):
+        """Values alternate below and above the 500 threshold used throughout."""
+        self.client.execute_command("TS.CREATE", key)
+        for ts, value in [(100, 1), (200, 600), (300, 2), (400, 700), (500, 3)]:
+            self.client.execute_command("TS.ADD", key, ts, value)
+
+    def test_filters_an_immediate_read(self):
+        self.seed_mixed()
+        assert self.client.execute_command(
+            "TS.READ", "k", "-", "CONDITION", ">", 500
+        ) == [[200, b"600"], [400, b"700"]]
+
+    def test_no_matches_reads_empty(self):
+        self.seed_mixed()
+        assert (
+            self.client.execute_command("TS.READ", "k", "-", "CONDITION", ">", 10000)
+            == []
+        )
+
+    def test_the_condition_applies_after_the_cursor(self):
+        """A match below the cursor stays excluded — timestamp first, value second."""
+        self.seed_mixed()
+        assert self.client.execute_command(
+            "TS.READ", "k", 300, "CONDITION", ">", 500
+        ) == [[400, b"700"]]
+
+    def test_max_count_caps_matches_not_source_samples(self):
+        """The case a cap-then-filter implementation gets wrong.
+
+        Every match sits past position `max_count` in the underlying series, so a `MAX_COUNT` that
+        bounded the *scan* rather than the matches would report nothing at all.
+        """
+        self.client.execute_command("TS.CREATE", "k")
+        for ts in range(50):
+            self.client.execute_command("TS.ADD", "k", ts, 1)
+        for ts, value in [(50, 600), (51, 700), (52, 800)]:
+            self.client.execute_command("TS.ADD", "k", ts, value)
+
+        assert self.client.execute_command(
+            "TS.READ", "k", "-", "MAX_COUNT", 2, "CONDITION", ">", 500
+        ) == [[50, b"600"], [51, b"700"]]
+
+    def test_reads_do_not_consume_and_conditions_are_independent(self):
+        """Two conditions over the same stored data see disjoint sets, repeatably."""
+        self.seed_mixed()
+        for _ in range(2):
+            assert self.timestamps(
+                self.client.execute_command("TS.READ", "k", "-", "CONDITION", ">", 500)
+            ) == [200, 400]
+            assert self.timestamps(
+                self.client.execute_command("TS.READ", "k", "-", "CONDITION", "<", 500)
+            ) == [100, 300, 500]
+
+    def test_resp2_and_resp3_reply_shapes_are_unchanged(self):
+        self.seed_mixed()
+        assert self.client.execute_command(
+            "TS.READ", "k", "-", "CONDITION", ">", 500
+        ) == [[200, b"600"], [400, b"700"]]
+
+        c3 = valkey.Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
+        try:
+            assert c3.execute_command("TS.READ", "k", "-", "CONDITION", ">", 500) == [
+                [200, 600.0],
+                [400, 700.0],
+            ]
+            assert c3.execute_command("TS.READ", "k", "-", "CONDITION", ">", 10000) == []
+        finally:
+            c3.close()
+
+
+class TestTsReadConditionBlocking(TsReadTestBase):
+    """A blocked reader's threshold counts *matching* samples."""
+
+    def test_a_non_matching_write_leaves_the_reader_blocked(self):
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 100, 1)
+            assert self.blocked_clients() == 1
+            assert reader.is_pending()
+
+            self.client.execute_command("TS.ADD", "k", 200, 600)
+            assert reader.result() == [[200, b"600"]]
+        finally:
+            reader.close(self.client)
+
+    def test_min_count_counts_matches(self):
+        """Five samples qualify by timestamp; only the second matching one releases the reader."""
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2, "CONDITION", ">", 500
+        )
+        try:
+            for ts, value in [(100, 1), (200, 600), (300, 2), (400, 3)]:
+                self.client.execute_command("TS.ADD", "k", ts, value)
+            assert reader.is_pending(), "one match is not two"
+
+            self.client.execute_command("TS.ADD", "k", 500, 700)
+            assert reader.result() == [[200, b"600"], [500, b"700"]]
+        finally:
+            reader.close(self.client)
+
+    def test_timeout_returns_the_filtered_partial_result(self):
+        self.client.execute_command("TS.CREATE", "k")
+        for ts, value in [(100, 1), (200, 600), (300, 2)]:
+            self.client.execute_command("TS.ADD", "k", ts, value)
+        reader = self.timeout_reader(
+            "TS.READ", "k", "-", "BLOCK", SHORT_BLOCK_MS, 3, "CONDITION", ">", 500
+        )
+        try:
+            assert reader.result() == [[200, b"600"]]
+        finally:
+            reader.close(self.client)
+
+    def test_timeout_with_no_matches_returns_an_empty_array(self):
+        self.client.execute_command("TS.CREATE", "k")
+        for ts in [100, 200, 300]:
+            self.client.execute_command("TS.ADD", "k", ts, 1)
+        reader = self.timeout_reader(
+            "TS.READ", "k", "-", "BLOCK", SHORT_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            assert reader.result() == []
+        finally:
+            reader.close(self.client)
+
+    def test_a_non_matching_wakeup_does_not_extend_the_deadline(self):
+        """The original block stays live across a NotReady wakeup; it is not re-armed.
+
+        Returning `ReadyStatus::NotReady` keeps the single native block registered at command
+        time, along with its deadline. Explicitly unblocking and re-blocking would instead restart
+        the clock on every non-matching write — an easy way for a busy series to make a finite
+        BLOCK effectively unbounded.
+
+        The sleep here is deliberate: unlike the rest of this module, the behavior under test is
+        *when* the reply arrives, so the clock has to be allowed to advance.
+        """
+        block_ms = 3000
+        self.client.execute_command("TS.CREATE", "k")
+        started = time.monotonic()
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", block_ms, 1, "CONDITION", ">", 500
+        )
+        try:
+            # Two thirds of the way through the block, then a write that cannot satisfy it.
+            time.sleep(block_ms * 2 / 3 / 1000)
+            self.client.execute_command("TS.ADD", "k", 100, 1)
+            assert reader.is_pending()
+
+            assert reader.result() == [], "the timeout snapshot has no matches"
+            elapsed = time.monotonic() - started
+            assert elapsed < (block_ms + block_ms * 2 / 3) / 1000, (
+                f"replied after {elapsed:.2f}s: the wakeup restarted the {block_ms}ms deadline "
+                "instead of keeping it"
+            )
+        finally:
+            reader.close(self.client)
+
+    def test_block_zero_stays_pending_across_non_matching_writes(self):
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 1, "CONDITION", ">", 500)
+        try:
+            for ts in [100, 200, 300]:
+                self.client.execute_command("TS.ADD", "k", ts, 1)
+            assert self.blocked_clients() == 1
+            assert reader.is_pending()
+
+            self.client.execute_command("TS.ADD", "k", 400, 600)
+            assert reader.result() == [[400, b"600"]]
+        finally:
+            reader.close(self.client)
+
+    def test_max_count_caps_a_conditioned_wakeup_reply(self):
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2,
+            "MAX_COUNT", 2, "CONDITION", ">", 500,
+        )
+        try:
+            self.client.execute_command(
+                "TS.MADD", "k", 100, 1, "k", 200, 600, "k", 300, 700, "k", 400, 800
+            )
+            assert reader.result() == [[200, b"600"], [300, b"700"]]
+        finally:
+            reader.close(self.client)
+
+    def test_min_count_releases_the_reader_before_max_count_is_reached(self):
+        """`min_count` and `max_count` are separate bounds: 2 matches release a cap of 4.
+
+        A reader that waited for `max_count` matches would sit through the write that met its
+        stated threshold — the bug this pins is "cap treated as the threshold".
+        """
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2, "MAX_COUNT", 4,
+            "CONDITION", ">", 500,
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 100, 1)
+            self.client.execute_command("TS.ADD", "k", 200, 600)
+            assert reader.is_pending(), "one match is not two"
+
+            self.client.execute_command("TS.ADD", "k", 300, 700)
+            assert reader.result() == [[200, b"600"], [300, b"700"]]
+        finally:
+            reader.close(self.client)
+
+    def test_a_wakeup_reply_is_capped_at_max_count_above_one(self):
+        """Six matches land at once under `BLOCK ... 2 MAX_COUNT 4`: the four earliest come back."""
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2, "MAX_COUNT", 4,
+            "CONDITION", ">", 500,
+        )
+        try:
+            pairs = []
+            for i in range(12):
+                pairs += ["k", 100 * (i + 1), 1 if i % 2 == 0 else 600 + i]
+            self.client.execute_command("TS.MADD", *pairs)
+            assert self.timestamps(reader.result()) == [200, 400, 600, 800]
+        finally:
+            reader.close(self.client)
+
+    def test_a_blocked_reader_finds_matches_past_position_max_count(self):
+        """Filter-before-take on the blocking path.
+
+        Every match sits past position `max_count` in the series, so a scan bounded by position
+        rather than by matches would leave this reader blocked until its timeout.
+        """
+        self.client.execute_command("TS.CREATE", "k")
+        for ts in range(1, 51):
+            self.client.execute_command("TS.ADD", "k", ts, 1)
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2, "MAX_COUNT", 3,
+            "CONDITION", ">", 500,
+        )
+        try:
+            self.client.execute_command(
+                "TS.MADD", "k", 100, 600, "k", 200, 700, "k", 300, 800, "k", 400, 900
+            )
+            assert reader.result() == [[100, b"600"], [200, b"700"], [300, b"800"]]
+        finally:
+            reader.close(self.client)
+
+    def test_a_timeout_partial_is_not_capped_away_by_max_count(self):
+        """Timing out below `min_count` still returns the matches found, with MAX_COUNT > 1."""
+        self.client.execute_command("TS.CREATE", "k")
+        for ts, value in [(100, 1), (200, 600), (300, 2)]:
+            self.client.execute_command("TS.ADD", "k", ts, value)
+        reader = self.timeout_reader(
+            "TS.READ", "k", "-", "BLOCK", SHORT_BLOCK_MS, 3, "MAX_COUNT", 5,
+            "CONDITION", ">", 500,
+        )
+        try:
+            assert reader.result() == [[200, b"600"]]
+        finally:
+            reader.close(self.client)
+
+    def test_independent_readers_with_different_conditions(self):
+        """One write can satisfy one reader's condition and not another's."""
+        self.client.execute_command("TS.CREATE", "k")
+        high = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        low = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", "<", 10
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 100, 600)
+            assert high.result() == [[100, b"600"]]
+            assert low.is_pending()
+
+            self.client.execute_command("TS.ADD", "k", 200, 1)
+            assert low.result() == [[200, b"1"]]
+        finally:
+            high.close(self.client)
+            low.close(self.client)
+
+    def test_cursor_stays_fixed_while_blocked_with_a_condition(self):
+        """A matching sample backfilled below the resolved cursor still does not count."""
+        self.client.execute_command("TS.CREATE", "k")
+        for ts in [100, 200]:
+            self.client.execute_command("TS.ADD", "k", ts, 1)
+        reader = self.reader(
+            "TS.READ", "k", "$", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            # Matches the condition, but sits below the cursor resolved at 201.
+            self.client.execute_command("TS.ADD", "k", 150, 600)
+            assert self.blocked_clients() == 1
+            assert reader.is_pending()
+
+            self.client.execute_command("TS.ADD", "k", 300, 700)
+            assert reader.result() == [[300, b"700"]]
+        finally:
+            reader.close(self.client)
+
+    def test_out_of_order_matching_write_above_the_cursor_wakes_a_reader(self):
+        """The guarantee that rules out a scan watermark: a match can land mid-tail."""
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 1)
+        self.client.execute_command("TS.ADD", "k", 500, 1)
+        reader = self.reader(
+            "TS.READ", "k", 200, "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 300, 600)
+            assert reader.result() == [[300, b"600"]]
+        finally:
+            reader.close(self.client)
+
+    def test_retention_can_trim_a_match_the_reader_had_counted(self):
+        """Readiness is re-evaluated from current data, never accumulated across wakeups.
+
+        The first match falls out of the retention window before the threshold is reached, so the
+        reader must go back to needing two matches rather than treating the counted one as banked.
+        """
+        self.client.execute_command("TS.CREATE", "k", "RETENTION", 1000)
+        self.client.execute_command("TS.ADD", "k", 1000, 600)
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2, "CONDITION", ">", 500
+        )
+        try:
+            # Advances the window past the first match: it is no longer readable.
+            self.client.execute_command("TS.ADD", "k", 5000, 700)
+            assert self.blocked_clients() == 1
+            assert reader.is_pending(), "the trimmed match must not still count"
+
+            self.client.execute_command("TS.ADD", "k", 5100, 800)
+            assert reader.result() == [[5000, b"700"], [5100, b"800"]]
+        finally:
+            reader.close(self.client)
+
+
+class TestTsReadConditionInPlaceUpdates(TsReadTestBase):
+    """An in-place value update does not wake a conditioned reader.
+
+    The readiness signal is gated on the series' sample *count* growing, so a write that rewrites
+    an existing timestamp adds nothing for a count-based reader and deliberately does not signal.
+    With a condition, such a write can change the matching set anyway — a sample rewritten from
+    100 to 600 newly satisfies `CONDITION > 500` — and the reader still does not wake.
+
+    This is documented, not a defect: the reader observes the new value at its next wakeup from an
+    appending write, or in its timeout snapshot, because `reread` always re-evaluates current
+    stored data. The consequence for callers is that a series maintained purely by in-place
+    updates should be paired with a finite BLOCK rather than BLOCK 0.
+    """
+
+    def test_on_duplicate_crossing_the_threshold_does_not_wake(self):
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 100)
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 100, 600, "ON_DUPLICATE", "LAST")
+            assert self.blocked_clients() == 1
+            assert reader.is_pending()
+
+            # A genuine append releases it, and the rewritten value is in the reply.
+            self.client.execute_command("TS.ADD", "k", 200, 700)
+            assert reader.result() == [[100, b"600"], [200, b"700"]]
+        finally:
+            reader.close(self.client)
+
+    @pytest.mark.parametrize("command,delta", [("TS.INCRBY", 500), ("TS.DECRBY", 500)])
+    def test_incr_decr_at_the_last_timestamp_does_not_wake(self, command, delta):
+        threshold = 500 if command == "TS.INCRBY" else -500
+        operator = ">" if command == "TS.INCRBY" else "<"
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 100 if command == "TS.INCRBY" else -100)
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", operator, threshold
+        )
+        try:
+            self.client.execute_command(command, "k", delta, "TIMESTAMP", 100)
+            assert self.blocked_clients() == 1
+            assert reader.is_pending()
+
+            self.client.execute_command("TS.ADD", "k", 200, 900 if command == "TS.INCRBY" else -900)
+            reply = reader.result()
+            assert self.timestamps(reply) == [100, 200]
+        finally:
+            reader.close(self.client)
+
+    def test_a_timeout_still_surfaces_the_updated_value(self):
+        """No append ever arrives, so the timeout snapshot is where the caller sees it."""
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 100)
+        reader = self.timeout_reader(
+            "TS.READ", "k", "-", "BLOCK", SHORT_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        try:
+            self.client.execute_command("TS.ADD", "k", 100, 600, "ON_DUPLICATE", "LAST")
+            assert reader.result() == [[100, b"600"]]
+        finally:
+            reader.close(self.client)
+
+
+class TestTsReadConditionLifecycle(TsReadTestBase):
+    """A conditioned reader follows the same lifecycle as any other blocked TS.READ."""
+
+    CONDITION = ("CONDITION", ">", 500)
+
+    def test_deletion_releases_a_conditioned_reader(self):
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 600)
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 9, *self.CONDITION
+        )
+        try:
+            self.client.execute_command("DEL", "k")
+            assert reader.result() == []
+        finally:
+            reader.close(self.client)
+
+    def test_wrong_type_replacement_errors_a_conditioned_reader(self):
+        reader = self.reader(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, *self.CONDITION
+        )
+        try:
+            self.client.execute_command("SET", "k", "not-a-series")
+            with pytest.raises(ResponseError, match="WRONGTYPE"):
+                reader.result()
+        finally:
+            reader.close(self.client)
+
+    def test_client_unblock_timeout_delivers_the_filtered_snapshot(self):
+        self.client.execute_command("TS.CREATE", "k")
+        for ts, value in [(100, 1), (200, 600)]:
+            self.client.execute_command("TS.ADD", "k", ts, value)
+        reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 5, *self.CONDITION)
+        try:
+            client_id = reader.client_id()
+            assert client_id is not None
+            assert self.client.execute_command("CLIENT", "UNBLOCK", client_id, "TIMEOUT") == 1
+            assert reader.result() == [[200, b"600"]]
+            wait_for_equal(self.blocked_clients, 0, timeout=REPLY_TIMEOUT)
+        finally:
+            reader.close(self.client)
+
+    def test_client_unblock_error_reports_an_error(self):
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 5, *self.CONDITION)
+        try:
+            client_id = reader.client_id()
+            assert self.client.execute_command("CLIENT", "UNBLOCK", client_id, "ERROR") == 1
+            with pytest.raises(ResponseError, match="UNBLOCKED"):
+                reader.result()
+            wait_for_equal(self.blocked_clients, 0, timeout=REPLY_TIMEOUT)
+        finally:
+            reader.close(self.client)
+
+    def test_revoking_access_while_blocked_terminates_a_conditioned_reader(self):
+        self.client.execute_command("TS.CREATE", "k")
+        self.client.execute_command("TS.ADD", "k", 100, 1)
+        self.client.execute_command(
+            "ACL", "SETUSER", "cond_revocable", "ON", ">pw", "+@read", "+@timeseries", "~k"
+        )
+
+        blocked = _BlockedReader(
+            self.server,
+            ("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, *self.CONDITION),
+        )
+        blocked.client.execute_command("AUTH", "cond_revocable", "pw")
+        blocked.start()
+        try:
+            wait_for_equal(self.blocked_clients, 1, timeout=REPLY_TIMEOUT)
+            self.client.execute_command(
+                "ACL", "SETUSER", "cond_revocable", "ON", ">pw", "+@read", "+@timeseries",
+                "resetkeys", "~other:*",
+            )
+            # A matching write, so only the revocation can be what ends this reader.
+            self.client.execute_command("TS.ADD", "k", 200, 600)
+
+            with pytest.raises(ResponseError):
+                blocked.result()
+            wait_for_equal(self.blocked_clients, 0, timeout=REPLY_TIMEOUT)
+            assert self.client.execute_command("PING")
+        finally:
+            blocked.close(self.client)
+
+
+class TestTsReadConditionDenyBlocking(TsReadTestBase):
+    """A condition makes "would have to block" the common case, so both paths matter."""
+
+    ERROR = "not allowed inside MULTI, EVAL, or a deny-blocking context"
+
+    def seed_mixed(self):
+        self.client.execute_command("TS.CREATE", "k")
+        for ts, value in [(100, 1), (200, 600)]:
+            self.client.execute_command("TS.ADD", "k", ts, value)
+
+    def test_multi_returns_data_when_the_condition_is_already_satisfied(self):
+        self.seed_mixed()
+        pipe = self.client.pipeline(transaction=True)
+        pipe.execute_command(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 500
+        )
+        assert pipe.execute()[0] == [[200, b"600"]]
+
+    def test_multi_errors_when_the_condition_is_unsatisfied(self):
+        """Timestamp-eligible samples exist; none match, so the read would have to wait."""
+        self.seed_mixed()
+        pipe = self.client.pipeline(transaction=True)
+        pipe.execute_command(
+            "TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1, "CONDITION", ">", 10000
+        )
+        with pytest.raises(ResponseError, match=self.ERROR):
+            pipe.execute()
+        assert self.blocked_clients() == 0
+
+    def test_lua_returns_data_when_the_condition_is_already_satisfied(self):
+        self.seed_mixed()
+        script = (
+            "return redis.call('TS.READ', KEYS[1], '-', 'BLOCK', '1000', '1',"
+            " 'CONDITION', '>', '500')"
+        )
+        assert self.client.eval(script, 1, "k") == [[200, b"600"]]
+
+    def test_lua_errors_when_the_condition_is_unsatisfied(self):
+        self.seed_mixed()
+        script = (
+            "return redis.call('TS.READ', KEYS[1], '-', 'BLOCK', '1000', '1',"
+            " 'CONDITION', '>', '10000')"
+        )
+        with pytest.raises(ResponseError, match=self.ERROR):
+            self.client.eval(script, 1, "k")
+        assert self.blocked_clients() == 0
+
+    def test_a_non_blocking_conditioned_read_is_fine_in_multi_and_lua(self):
+        self.seed_mixed()
+        pipe = self.client.pipeline(transaction=True)
+        pipe.execute_command("TS.READ", "k", "-", "CONDITION", ">", 10000)
+        assert pipe.execute() == [[]]
+
+        script = "return redis.call('TS.READ', KEYS[1], '-', 'CONDITION', '>', '10000')"
+        assert self.client.eval(script, 1, "k") == []
 
 
 class TestTsReadOnReplica(ReplicationTestCase):

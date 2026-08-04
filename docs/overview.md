@@ -42,8 +42,9 @@ The command set generally follows the `TS.<COMMAND>` pattern.
 * `TS.MGET`: Retrieve the last sample from multiple series matching a filter.
 * `TS.RANGE`: Query a range of samples from a single series.
 * `TS.MRANGE`: Query ranges across multiple series based on filters.
-* `TS.READ`: Read samples at or after a timestamp, optionally blocking until enough new samples
-  arrive. The streaming counterpart to `TS.RANGE`, for tailing a series.
+* `TS.READ`: Read samples at or after a timestamp, optionally filtered by a value condition and
+  optionally blocking until enough matching samples arrive. The streaming counterpart to
+  `TS.RANGE`, for tailing a series and for alerting on it.
 
 ### Compaction & Rules
 
