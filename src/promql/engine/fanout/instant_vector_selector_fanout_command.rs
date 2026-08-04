@@ -6,7 +6,6 @@ use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, InstantSample, SeriesSelector as ProtoSeriesSelector,
-    series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::hashers::FingerprintHashSet;
 use promql_parser::label::Matchers;
@@ -85,7 +84,7 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             ctx.log_warning("Received instant query with no selector, returning empty response");
             return Ok(InstantQueryResponse { samples: vec![] });
         };
-        let series_selector: SeriesSelector = selector.try_into()?;
+        let series_selector: SeriesSelector = (&selector).try_into()?;
         handle_instant_query(
             ctx,
             series_selector,
@@ -101,11 +100,7 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
     }
 
     fn generate_request(&self) -> InstantQuery {
-        let matchers: ProtoMatchers =
-            ProtoMatchers::try_from(&self.matchers).expect("invalid matchers");
-        let selector = ProtoSeriesSelector {
-            matchers: Some(matchers),
-        };
+        let selector = ProtoSeriesSelector::from(&self.matchers);
         InstantQuery {
             selector: Some(selector),
             timestamp: self.timestamp,

@@ -33,7 +33,7 @@ use crate::promql::exec::partial_aggregation::{PartialGroups, merge_count_values
 use crate::promql::generated::{
     AggregationGroupPartial, AggregationKind as ProtoAggregationKind, AggregationQuery,
     AggregationQueryResponse, InstantQuery, InstantSample as ProtoInstantSample,
-    SeriesSelector as ProtoSeriesSelector, series_selector::Matchers as ProtoMatchers,
+    SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::{EvalResult, EvalSample, ExprResult};
 use promql_parser::label::Matchers;
@@ -231,7 +231,7 @@ impl FanoutCommand for AggregationFanoutCommand {
             );
             return Ok(AggregationQueryResponse::default());
         };
-        let series_selector: SeriesSelector = selector.try_into()?;
+        let series_selector: SeriesSelector = (&selector).try_into()?;
         let samples = local_instant_eval_samples(
             ctx,
             series_selector,
@@ -287,12 +287,8 @@ impl FanoutCommand for AggregationFanoutCommand {
     }
 
     fn generate_request(&self) -> AggregationQuery {
-        let matchers: ProtoMatchers =
-            ProtoMatchers::try_from(&self.vector.matchers).expect("invalid matchers");
         let query = InstantQuery {
-            selector: Some(ProtoSeriesSelector {
-                matchers: Some(matchers),
-            }),
+            selector: Some(ProtoSeriesSelector::from(&self.vector.matchers)),
             timestamp: self.vector.timestamp,
             lookback_delta: self.vector.lookback_delta,
             max_series: self.vector.max_series,
@@ -375,10 +371,11 @@ fn raw_response(samples: Vec<EvalSample>) -> AggregationQueryResponse {
 
 /// Decode the operator and how to apply it, rejecting a value this node does not
 /// know (proto3 decodes an unknown enum to its raw `i32`, which must not be
-/// silently taken for the zero variant) as well as one that is known but never
-/// pushed down. Both cases mean this node cannot honor the request.
+/// silently taken for the zero variant), the unset zero variant itself, and one
+/// that is known but never pushed down. All three mean this node cannot honor
+/// the request.
 fn decode_kind(kind: i32) -> Option<(AggregationKind, PushdownStrategy)> {
-    let kind = AggregationKind::from(ProtoAggregationKind::try_from(kind).ok()?);
+    let kind = AggregationKind::try_from(ProtoAggregationKind::try_from(kind).ok()?).ok()?;
     Some((kind, kind.pushdown_strategy()?))
 }
 
@@ -662,7 +659,7 @@ mod tests {
         let decoded = AggregationQuery::deserialize(&buf).unwrap();
 
         assert_eq!(decoded, request);
-        assert_eq!(decoded.kind, ProtoAggregationKind::AggTopk as i32);
+        assert_eq!(decoded.kind, ProtoAggregationKind::Topk as i32);
         assert_eq!(decoded.scalar_param, Some(5.0));
         assert_eq!(decoded.label_param, None);
         let grouping = decoded.grouping.clone().expect("grouping present");
@@ -682,17 +679,21 @@ mod tests {
     }
 
     /// Only the decomposable operators are pushed down, and an operator this
-    /// node does not know is never mistaken for the zero variant.
+    /// node does not know is never mistaken for a real one.
     #[test]
     fn test_decode_kind() {
         assert_eq!(
-            decode_kind(0),
+            decode_kind(ProtoAggregationKind::Sum as i32),
             Some((AggregationKind::Sum, PushdownStrategy::Reduce))
         );
         assert_eq!(
-            decode_kind(ProtoAggregationKind::AggLimitRatio as i32),
+            decode_kind(ProtoAggregationKind::LimitRatio as i32),
             Some((AggregationKind::LimitRatio, PushdownStrategy::Select))
         );
+        // Zero is `AGGREGATION_KIND_UNSPECIFIED` — what a peer sends when it
+        // omits the field — not an operator. Reading it as one would silently
+        // apply whichever operator happened to be listed first.
+        assert_eq!(decode_kind(0), None);
         // Beyond the enum: a newer coordinator's operator.
         assert_eq!(decode_kind(99), None);
         assert_eq!(decode_kind(-1), None);

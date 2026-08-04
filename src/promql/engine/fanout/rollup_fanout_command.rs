@@ -39,73 +39,83 @@ use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, RangeSample as ProtoRangeSample, RollupGroupPartial,
     RollupKind as ProtoRollupKind, RollupQuery, RollupQueryResponse, RollupSeries,
-    SeriesSelector as ProtoSeriesSelector, series_selector::Matchers as ProtoMatchers,
+    SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::model::RangeSample;
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyResult};
+use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 impl From<RollupKind> for ProtoRollupKind {
     fn from(kind: RollupKind) -> Self {
         match kind {
-            RollupKind::SumOverTime => ProtoRollupKind::RollupSumOverTime,
-            RollupKind::CountOverTime => ProtoRollupKind::RollupCountOverTime,
-            RollupKind::LastOverTime => ProtoRollupKind::RollupLastOverTime,
-            RollupKind::AvgOverTime => ProtoRollupKind::RollupAvgOverTime,
-            RollupKind::MinOverTime => ProtoRollupKind::RollupMinOverTime,
-            RollupKind::MaxOverTime => ProtoRollupKind::RollupMaxOverTime,
-            RollupKind::StddevOverTime => ProtoRollupKind::RollupStddevOverTime,
-            RollupKind::StdvarOverTime => ProtoRollupKind::RollupStdvarOverTime,
-            RollupKind::MadOverTime => ProtoRollupKind::RollupMadOverTime,
-            RollupKind::PresentOverTime => ProtoRollupKind::RollupPresentOverTime,
-            RollupKind::FirstOverTime => ProtoRollupKind::RollupFirstOverTime,
-            RollupKind::QuantileOverTime => ProtoRollupKind::RollupQuantileOverTime,
-            RollupKind::TsOfFirstOverTime => ProtoRollupKind::RollupTsOfFirstOverTime,
-            RollupKind::TsOfLastOverTime => ProtoRollupKind::RollupTsOfLastOverTime,
-            RollupKind::TsOfMinOverTime => ProtoRollupKind::RollupTsOfMinOverTime,
-            RollupKind::TsOfMaxOverTime => ProtoRollupKind::RollupTsOfMaxOverTime,
-            RollupKind::Rate => ProtoRollupKind::RollupRate,
-            RollupKind::Increase => ProtoRollupKind::RollupIncrease,
-            RollupKind::Delta => ProtoRollupKind::RollupDelta,
-            RollupKind::IRate => ProtoRollupKind::RollupIrate,
-            RollupKind::IDelta => ProtoRollupKind::RollupIdelta,
-            RollupKind::Deriv => ProtoRollupKind::RollupDeriv,
-            RollupKind::Resets => ProtoRollupKind::RollupResets,
-            RollupKind::Changes => ProtoRollupKind::RollupChanges,
+            RollupKind::SumOverTime => ProtoRollupKind::SumOverTime,
+            RollupKind::CountOverTime => ProtoRollupKind::CountOverTime,
+            RollupKind::LastOverTime => ProtoRollupKind::LastOverTime,
+            RollupKind::AvgOverTime => ProtoRollupKind::AvgOverTime,
+            RollupKind::MinOverTime => ProtoRollupKind::MinOverTime,
+            RollupKind::MaxOverTime => ProtoRollupKind::MaxOverTime,
+            RollupKind::StddevOverTime => ProtoRollupKind::StddevOverTime,
+            RollupKind::StdvarOverTime => ProtoRollupKind::StdvarOverTime,
+            RollupKind::MadOverTime => ProtoRollupKind::MadOverTime,
+            RollupKind::PresentOverTime => ProtoRollupKind::PresentOverTime,
+            RollupKind::FirstOverTime => ProtoRollupKind::FirstOverTime,
+            RollupKind::QuantileOverTime => ProtoRollupKind::QuantileOverTime,
+            RollupKind::TsOfFirstOverTime => ProtoRollupKind::TsOfFirstOverTime,
+            RollupKind::TsOfLastOverTime => ProtoRollupKind::TsOfLastOverTime,
+            RollupKind::TsOfMinOverTime => ProtoRollupKind::TsOfMinOverTime,
+            RollupKind::TsOfMaxOverTime => ProtoRollupKind::TsOfMaxOverTime,
+            RollupKind::Rate => ProtoRollupKind::Rate,
+            RollupKind::Increase => ProtoRollupKind::Increase,
+            RollupKind::Delta => ProtoRollupKind::Delta,
+            RollupKind::IRate => ProtoRollupKind::Irate,
+            RollupKind::IDelta => ProtoRollupKind::Idelta,
+            RollupKind::Deriv => ProtoRollupKind::Deriv,
+            RollupKind::Resets => ProtoRollupKind::Resets,
+            RollupKind::Changes => ProtoRollupKind::Changes,
         }
     }
 }
 
-impl From<ProtoRollupKind> for RollupKind {
-    fn from(kind: ProtoRollupKind) -> Self {
-        match kind {
-            ProtoRollupKind::RollupSumOverTime => RollupKind::SumOverTime,
-            ProtoRollupKind::RollupCountOverTime => RollupKind::CountOverTime,
-            ProtoRollupKind::RollupLastOverTime => RollupKind::LastOverTime,
-            ProtoRollupKind::RollupAvgOverTime => RollupKind::AvgOverTime,
-            ProtoRollupKind::RollupMinOverTime => RollupKind::MinOverTime,
-            ProtoRollupKind::RollupMaxOverTime => RollupKind::MaxOverTime,
-            ProtoRollupKind::RollupStddevOverTime => RollupKind::StddevOverTime,
-            ProtoRollupKind::RollupStdvarOverTime => RollupKind::StdvarOverTime,
-            ProtoRollupKind::RollupMadOverTime => RollupKind::MadOverTime,
-            ProtoRollupKind::RollupPresentOverTime => RollupKind::PresentOverTime,
-            ProtoRollupKind::RollupFirstOverTime => RollupKind::FirstOverTime,
-            ProtoRollupKind::RollupQuantileOverTime => RollupKind::QuantileOverTime,
-            ProtoRollupKind::RollupTsOfFirstOverTime => RollupKind::TsOfFirstOverTime,
-            ProtoRollupKind::RollupTsOfLastOverTime => RollupKind::TsOfLastOverTime,
-            ProtoRollupKind::RollupTsOfMinOverTime => RollupKind::TsOfMinOverTime,
-            ProtoRollupKind::RollupTsOfMaxOverTime => RollupKind::TsOfMaxOverTime,
-            ProtoRollupKind::RollupRate => RollupKind::Rate,
-            ProtoRollupKind::RollupIncrease => RollupKind::Increase,
-            ProtoRollupKind::RollupDelta => RollupKind::Delta,
-            ProtoRollupKind::RollupIrate => RollupKind::IRate,
-            ProtoRollupKind::RollupIdelta => RollupKind::IDelta,
-            ProtoRollupKind::RollupDeriv => RollupKind::Deriv,
-            ProtoRollupKind::RollupResets => RollupKind::Resets,
-            ProtoRollupKind::RollupChanges => RollupKind::Changes,
-        }
+/// `None` for `ROLLUP_KIND_UNSPECIFIED` — the value a peer produces when it
+/// omits the field. It joins the "kind I do not recognize" case: the shard
+/// answers `applied = false` and ships the raw windows.
+impl TryFrom<ProtoRollupKind> for RollupKind {
+    type Error = ValkeyError;
+
+    fn try_from(kind: ProtoRollupKind) -> Result<Self, Self::Error> {
+        Ok(match kind {
+            ProtoRollupKind::SumOverTime => RollupKind::SumOverTime,
+            ProtoRollupKind::CountOverTime => RollupKind::CountOverTime,
+            ProtoRollupKind::LastOverTime => RollupKind::LastOverTime,
+            ProtoRollupKind::AvgOverTime => RollupKind::AvgOverTime,
+            ProtoRollupKind::MinOverTime => RollupKind::MinOverTime,
+            ProtoRollupKind::MaxOverTime => RollupKind::MaxOverTime,
+            ProtoRollupKind::StddevOverTime => RollupKind::StddevOverTime,
+            ProtoRollupKind::StdvarOverTime => RollupKind::StdvarOverTime,
+            ProtoRollupKind::MadOverTime => RollupKind::MadOverTime,
+            ProtoRollupKind::PresentOverTime => RollupKind::PresentOverTime,
+            ProtoRollupKind::FirstOverTime => RollupKind::FirstOverTime,
+            ProtoRollupKind::QuantileOverTime => RollupKind::QuantileOverTime,
+            ProtoRollupKind::TsOfFirstOverTime => RollupKind::TsOfFirstOverTime,
+            ProtoRollupKind::TsOfLastOverTime => RollupKind::TsOfLastOverTime,
+            ProtoRollupKind::TsOfMinOverTime => RollupKind::TsOfMinOverTime,
+            ProtoRollupKind::TsOfMaxOverTime => RollupKind::TsOfMaxOverTime,
+            ProtoRollupKind::Rate => RollupKind::Rate,
+            ProtoRollupKind::Increase => RollupKind::Increase,
+            ProtoRollupKind::Delta => RollupKind::Delta,
+            ProtoRollupKind::Irate => RollupKind::IRate,
+            ProtoRollupKind::Idelta => RollupKind::IDelta,
+            ProtoRollupKind::Deriv => RollupKind::Deriv,
+            ProtoRollupKind::Resets => RollupKind::Resets,
+            ProtoRollupKind::Changes => RollupKind::Changes,
+            ProtoRollupKind::Unspecified => {
+                return Err(ValkeyError::Str(
+                    "TSDB: rollup push-down request carries no function",
+                ));
+            }
+        })
     }
 }
 
@@ -238,7 +248,7 @@ impl FanoutCommand for RollupFanoutCommand {
             ctx.log_warning("Received rollup query with no selector, returning empty response");
             return Ok(RollupQueryResponse::default());
         };
-        let series_selector: SeriesSelector = selector.try_into()?;
+        let series_selector: SeriesSelector = (&selector).try_into()?;
 
         // Derived from the request's geometry rather than from the decoded
         // rollup, because a kind this node does not recognize still has to ship
@@ -316,13 +326,8 @@ impl FanoutCommand for RollupFanoutCommand {
     }
 
     fn generate_request(&self) -> RollupQuery {
-        let matchers: ProtoMatchers =
-            ProtoMatchers::try_from(&self.matchers).expect("invalid matchers");
-
         RollupQuery {
-            selector: Some(ProtoSeriesSelector {
-                matchers: Some(matchers),
-            }),
+            selector: Some(ProtoSeriesSelector::from(&self.matchers)),
             query_start: self.rollup.query_start,
             query_end: self.rollup.query_end,
             step_ms: self.rollup.step_ms,
@@ -420,9 +425,10 @@ impl FanoutCommand for RollupFanoutCommand {
 
 /// Decode the rollup this node is asked to apply, rejecting a value it does not
 /// know (proto3 decodes an unknown enum to its raw `i32`, which must not be
-/// silently taken for the zero variant).
+/// silently taken for the zero variant) and equally the unset zero variant
+/// itself.
 fn decode_request(req: &RollupQuery) -> Option<RollupRequest> {
-    let kind = RollupKind::from(ProtoRollupKind::try_from(req.kind).ok()?);
+    let kind = RollupKind::try_from(ProtoRollupKind::try_from(req.kind).ok()?).ok()?;
     Some(RollupRequest {
         kind,
         aggregation: decode_aggregation(req),
@@ -442,7 +448,8 @@ fn decode_request(req: &RollupQuery) -> Option<RollupRequest> {
 /// `None`: the node then reduces the windows but leaves the grouping to the
 /// coordinator, which is the degradation `aggregated = false` describes.
 fn decode_aggregation(req: &RollupQuery) -> Option<RollupAggregation> {
-    let kind = AggregationKind::from(ProtoAggregationKind::try_from(req.agg_kind?).ok()?);
+    let kind =
+        AggregationKind::try_from(ProtoAggregationKind::try_from(req.agg_kind?).ok()?).ok()?;
     if kind.pushdown_strategy() != Some(PushdownStrategy::Reduce) {
         return None;
     }
@@ -785,7 +792,7 @@ mod tests {
         let decoded = RollupQuery::deserialize(&buf).unwrap();
 
         assert_eq!(decoded, request);
-        assert_eq!(decoded.kind, ProtoRollupKind::RollupCountOverTime as i32);
+        assert_eq!(decoded.kind, ProtoRollupKind::CountOverTime as i32);
         assert_eq!(decoded.range_ms, RANGE_MS);
         assert_eq!(decoded.range_end_ms, EVAL_TS - 3_600_000);
         assert_eq!(decoded.step_ms, 0);
@@ -804,11 +811,15 @@ mod tests {
     #[test]
     fn test_decode_rejects_unknown_kind() {
         let mut req = RollupQuery {
-            kind: ProtoRollupKind::RollupSumOverTime as i32,
+            kind: ProtoRollupKind::SumOverTime as i32,
             ..RollupQuery::default()
         };
         assert!(decode_request(&req).is_some());
 
+        // Zero is `ROLLUP_KIND_UNSPECIFIED` — what a peer sends when it omits
+        // the field — not a rollup.
+        req.kind = 0;
+        assert!(decode_request(&req).is_none());
         // Beyond the enum: a newer coordinator's rollup.
         req.kind = 99;
         assert!(decode_request(&req).is_none());
@@ -1015,8 +1026,8 @@ mod tests {
     #[test]
     fn test_unfusable_operator_is_declined_by_the_shard() {
         let mut req = RollupQuery {
-            kind: ProtoRollupKind::RollupSumOverTime as i32,
-            agg_kind: Some(ProtoAggregationKind::AggTopk as i32),
+            kind: ProtoRollupKind::SumOverTime as i32,
+            agg_kind: Some(ProtoAggregationKind::Topk as i32),
             ..RollupQuery::default()
         };
         assert!(
@@ -1024,7 +1035,7 @@ mod tests {
             "topk has no partial state and must not be fused"
         );
 
-        req.agg_kind = Some(ProtoAggregationKind::AggSum as i32);
+        req.agg_kind = Some(ProtoAggregationKind::Sum as i32);
         assert!(decode_request(&req).unwrap().aggregation.is_some());
 
         // Beyond the enum: a newer coordinator's operator.

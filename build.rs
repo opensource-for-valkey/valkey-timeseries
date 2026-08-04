@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::{env, fs, io};
 
-/// Every `.proto` in the fanout contract. All four are listed explicitly rather
-/// than relying on `request`/`response` to pull `common`/`filters` in through
-/// their imports: if an import is dropped, an explicit list keeps the types in
-/// codegen instead of silently removing them.
-const PROTOS: [&str; 4] = [
+/// Every `.proto` in the fanout contract. All five are listed explicitly rather
+/// than relying on `request`/`response`/`promql` to pull `common`/`filters` in
+/// through their imports: if an import is dropped, an explicit list keeps the
+/// types in codegen instead of silently removing them.
+const PROTOS: [&str; 5] = [
     "proto/v1/common.proto",
     "proto/v1/filters.proto",
+    "proto/v1/promql.proto",
     "proto/v1/request.proto",
     "proto/v1/response.proto",
 ];
@@ -84,14 +85,6 @@ fn main() -> io::Result<()> {
             )));
         }
     }
-
-    // The promql surface has its own, unrelated proto contract; it is compiled
-    // dynamically into OUT_DIR rather than checked in like the fanout wire types.
-    println!("cargo:rerun-if-changed=src/promql/types.proto");
-    prost_build::Config::new()
-        .out_dir(&out_dir)
-        .compile_protos(&["src/promql/types.proto"], &["src/"])
-        .map_err(io::Error::other)?;
 
     // Generate one #[test] per `.test` file under the promqltest testdata
     // directory, included via

@@ -455,6 +455,444 @@ impl MatcherOpType {
         }
     }
 }
+/// / A single series value at a point in time.
+/// /
+/// / Returned by instant (point-in-time) PromQL queries.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstantSample {
+    /// / The labels identifying this series.
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    /// / The value of the sample.
+    #[prost(double, tag = "2")]
+    pub value: f64,
+    /// / Timestamp in milliseconds since Unix epoch.
+    #[prost(int64, tag = "3")]
+    pub timestamp: i64,
+    /// / Optional valkey key for this sample, if any.
+    #[prost(string, tag = "4")]
+    pub key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstantQuery {
+    #[prost(message, optional, tag = "1")]
+    pub selector: ::core::option::Option<SeriesSelector>,
+    #[prost(int64, tag = "2")]
+    pub timestamp: i64,
+    #[prost(uint64, tag = "3")]
+    pub lookback_delta: u64,
+    #[prost(uint64, tag = "4")]
+    pub max_series: u64,
+    #[prost(uint64, tag = "5")]
+    pub max_points_per_series: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InstantQueryResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub samples: ::prost::alloc::vec::Vec<InstantSample>,
+}
+/// / A series with values over a time range.
+/// /
+/// / Returned by range PromQL queries.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeSample {
+    /// / The labels identifying this series.
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    /// / The samples in this series.
+    #[prost(message, repeated, tag = "2")]
+    pub samples: ::prost::alloc::vec::Vec<Sample>,
+    /// / Optional valkey key for this series, if any.
+    #[prost(string, tag = "3")]
+    pub key: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeQuery {
+    #[prost(message, optional, tag = "1")]
+    pub selector: ::core::option::Option<SeriesSelector>,
+    #[prost(int64, tag = "2")]
+    pub start_time: i64,
+    #[prost(int64, tag = "3")]
+    pub end_time: i64,
+    #[prost(uint64, tag = "4")]
+    pub max_series: u64,
+    #[prost(uint64, tag = "5")]
+    pub max_points_per_series: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RangeQueryResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub series: ::prost::alloc::vec::Vec<RangeSample>,
+}
+/// / A `by (...)` / `without (...)` modifier. An absent message means the
+/// / aggregation has no modifier: every sample falls into one group whose label
+/// / set is empty.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AggregationGrouping {
+    /// / true for `without (...)`, false for `by (...)`.
+    #[prost(bool, tag = "1")]
+    pub without: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// / An aggregation pushed down to a shard: the instant-vector parameters that
+/// / select the input, plus the operator to apply to it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregationQuery {
+    /// / Instant-vector parameters (selector, evaluation timestamp, lookback,
+    /// / limits) — identical in meaning to a plain `InstantQuery`.
+    #[prost(message, optional, tag = "1")]
+    pub query: ::core::option::Option<InstantQuery>,
+    #[prost(enumeration = "AggregationKind", tag = "2")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "3")]
+    pub grouping: ::core::option::Option<AggregationGrouping>,
+    /// / Numeric operator parameter: K for topk/bottomk/limitk, the ratio for
+    /// / limit_ratio. Absent for the parameterless operators.
+    #[prost(double, optional, tag = "4")]
+    pub scalar_param: ::core::option::Option<f64>,
+    /// / String operator parameter: the destination label for count_values.
+    #[prost(string, optional, tag = "5")]
+    pub label_param: ::core::option::Option<::prost::alloc::string::String>,
+    /// / Timestamp the aggregated output is stamped with — the query's evaluation
+    /// / timestamp. It differs from `query.timestamp` (which selects the input)
+    /// / when the selector carries an `@` or `offset` modifier.
+    #[prost(int64, tag = "6")]
+    pub eval_timestamp: i64,
+}
+/// / Mergeable accumulator for one aggregation group. Field meaning depends on
+/// / the request's `kind`:
+/// /   sum/avg          acc1 = Kahan running sum, acc1_compensation = its
+/// /                    Neumaier compensation, acc2 = Welford running mean
+/// /   min/max          acc1 = NaN-ignoring extremum
+/// /   count/group      count only
+/// /   stddev/stdvar    acc1 = Welford running mean, acc2 = M2,
+/// /                    acc1_compensation = the compensation for M2
+/// / `count` counts every sample in the group, NaN included — the same
+/// / denominator the single-node aggregators use.
+/// /
+/// / Deliberately distinct from `ReducePartialState` in `response.proto`, which
+/// / carries the same four accumulators plus a bucket timestamp for the TS.MRANGE
+/// / group-reduce path. The two ride different requests and evolve separately.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct AggregationPartialState {
+    #[prost(uint64, tag = "1")]
+    pub count: u64,
+    #[prost(double, tag = "2")]
+    pub acc1: f64,
+    #[prost(double, tag = "3")]
+    pub acc2: f64,
+    #[prost(double, tag = "4")]
+    pub acc1_compensation: f64,
+}
+/// / One (group, shard) partial: the group's label set as computed by the
+/// / request's grouping modifier, and the shard's accumulated state for it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregationGroupPartial {
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    #[prost(message, optional, tag = "2")]
+    pub state: ::core::option::Option<AggregationPartialState>,
+}
+/// / A rollup pushed down to a shard: which series to read, which windows to
+/// / reduce, and which function to reduce them with.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollupQuery {
+    #[prost(message, optional, tag = "1")]
+    pub selector: ::core::option::Option<SeriesSelector>,
+    /// / The resolved step grid. `step_ms == 0` means a single evaluation, at
+    /// / `range_end_ms`; otherwise the windows end at every step from
+    /// / `query_start` through `query_end`.
+    #[prost(int64, tag = "2")]
+    pub query_start: i64,
+    #[prost(int64, tag = "3")]
+    pub query_end: i64,
+    #[prost(int64, tag = "4")]
+    pub step_ms: i64,
+    /// / Window width: the `\[5m\]` of `rate(m\[5m\])`. Each window is
+    /// / `(end - range_ms, end]`.
+    #[prost(int64, tag = "5")]
+    pub range_ms: i64,
+    #[prost(uint64, tag = "6")]
+    pub lookback_delta_ms: u64,
+    /// / Window end for the single-evaluation case, with `@` and `offset` already
+    /// / resolved by the coordinator. A shard must never re-derive modifiers: it
+    /// / reduces exactly the windows it is told to.
+    #[prost(int64, tag = "7")]
+    pub range_end_ms: i64,
+    #[prost(enumeration = "RollupKind", tag = "8")]
+    pub kind: i32,
+    /// / Numeric function parameter — `quantile_over_time`'s phi. Absent for the
+    /// / parameterless rollups.
+    #[prost(double, optional, tag = "9")]
+    pub scalar_param: ::core::option::Option<f64>,
+    #[prost(uint64, tag = "10")]
+    pub max_series: u64,
+    /// / Bound on the raw points examined per series, enforced shard-side. The
+    /// / coordinator separately bounds the rolled-up points it accepts back.
+    #[prost(uint64, tag = "11")]
+    pub max_points_per_series: u64,
+    /// / An outer aggregation to fuse with the rollup: `sum by (job) (rate(m\[5m\]))`
+    /// / asks the shard to group its rolled-up values as well as compute them, so
+    /// / what crosses the wire is one partial per group per step rather than one
+    /// / value per *series* per step. Absent when the rollup is not under a
+    /// / decomposable aggregation.
+    /// /
+    /// / Only the reducing operators appear here; the selecting ones (topk and
+    /// / friends) need the individual samples and are not fused.
+    #[prost(enumeration = "AggregationKind", optional, tag = "12")]
+    pub agg_kind: ::core::option::Option<i32>,
+    #[prost(message, optional, tag = "13")]
+    pub agg_grouping: ::core::option::Option<AggregationGrouping>,
+}
+/// / One `(group, step, shard)` partial for a fused rollup+aggregation: the
+/// / group's label set as computed by the request's grouping modifier, the step it
+/// / belongs to, and the shard's accumulated state for that pair.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollupGroupPartial {
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    #[prost(int64, tag = "2")]
+    pub step_ts: i64,
+    #[prost(message, optional, tag = "3")]
+    pub state: ::core::option::Option<AggregationPartialState>,
+}
+/// / One series' rolled-up output: sparse `(window end, value)` pairs.
+/// /
+/// / A window that held no samples is *absent* from `points` — never present with
+/// / a NaN value. That distinction is the result, so it has to survive the wire:
+/// / NaN is a legitimate rolled-up value.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollupSeries {
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    #[prost(message, repeated, tag = "2")]
+    pub points: ::prost::alloc::vec::Vec<Sample>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RollupQueryResponse {
+    /// / Set when `applied`: the shard's final per-series rollup values. Because a
+    /// / series lives on exactly one shard, the coordinator concatenates these
+    /// / rather than merging them.
+    #[prost(message, repeated, tag = "1")]
+    pub series: ::prost::alloc::vec::Vec<RollupSeries>,
+    /// / Set when `applied` is false: the raw windows, for the coordinator to
+    /// / reduce itself.
+    #[prost(message, repeated, tag = "2")]
+    pub raw: ::prost::alloc::vec::Vec<RangeSample>,
+    /// / Compatibility handshake: true when the shard applied the requested rollup.
+    /// / A shard that does not recognize the requested `kind` (a newer coordinator
+    /// / during a rolling upgrade) returns the raw windows in `raw` with `applied`
+    /// / false. Absent on a pre-handshake peer (proto3 decodes as false), which is
+    /// / exactly the right interpretation.
+    #[prost(bool, tag = "3")]
+    pub applied: bool,
+    /// / Set when `aggregated`: one mergeable partial per `(group, step)`.
+    #[prost(message, repeated, tag = "4")]
+    pub partials: ::prost::alloc::vec::Vec<RollupGroupPartial>,
+    /// / Second handshake bit, for the fused form: true when the shard applied the
+    /// / outer aggregation as well as the rollup.
+    /// /
+    /// / It has to be separate from `applied`, because a shard that predates fusion
+    /// / silently ignores the `agg_*` fields and answers `applied = true` with
+    /// / per-series rollup values. Reading that as "aggregated" would drop the
+    /// / grouping entirely; reading `aggregated == false` makes the coordinator
+    /// / group those values itself, which is correct at the cost of the transfer
+    /// / the fusion would have saved.
+    #[prost(bool, tag = "5")]
+    pub aggregated: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AggregationQueryResponse {
+    /// / Set for the reduction operators (sum/avg/min/max/count/group/stddev/
+    /// / stdvar): one mergeable partial per group the shard saw.
+    #[prost(message, repeated, tag = "1")]
+    pub partials: ::prost::alloc::vec::Vec<AggregationGroupPartial>,
+    /// / Set for the selection operators (topk/bottomk/limitk/limit_ratio) and
+    /// / count_values: the shard's locally selected/counted samples. Also carries
+    /// / the raw instant vector when `applied` is false.
+    #[prost(message, repeated, tag = "2")]
+    pub samples: ::prost::alloc::vec::Vec<InstantSample>,
+    /// / Compatibility handshake: true when the shard applied the requested
+    /// / aggregation. A shard that does not recognize the requested `kind` (a
+    /// / newer coordinator during a rolling upgrade) returns the raw instant
+    /// / vector in `samples` with `applied` false, and the coordinator aggregates
+    /// / it itself. Absent on a pre-handshake peer (proto3 decodes as false),
+    /// / which is exactly the right interpretation.
+    #[prost(bool, tag = "3")]
+    pub applied: bool,
+}
+/// / A PromQL aggregation operator. Mirrors
+/// / `crate::promql::exec::aggregations::AggregationKind`; QUANTILE has no
+/// / decomposable form and is never pushed down, so it is deliberately absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AggregationKind {
+    Unspecified = 0,
+    Sum = 1,
+    Avg = 2,
+    Min = 3,
+    Max = 4,
+    Count = 5,
+    Group = 6,
+    Stddev = 7,
+    Stdvar = 8,
+    Topk = 9,
+    Bottomk = 10,
+    CountValues = 11,
+    Limitk = 12,
+    LimitRatio = 13,
+}
+impl AggregationKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "AGGREGATION_KIND_UNSPECIFIED",
+            Self::Sum => "AGGREGATION_KIND_SUM",
+            Self::Avg => "AGGREGATION_KIND_AVG",
+            Self::Min => "AGGREGATION_KIND_MIN",
+            Self::Max => "AGGREGATION_KIND_MAX",
+            Self::Count => "AGGREGATION_KIND_COUNT",
+            Self::Group => "AGGREGATION_KIND_GROUP",
+            Self::Stddev => "AGGREGATION_KIND_STDDEV",
+            Self::Stdvar => "AGGREGATION_KIND_STDVAR",
+            Self::Topk => "AGGREGATION_KIND_TOPK",
+            Self::Bottomk => "AGGREGATION_KIND_BOTTOMK",
+            Self::CountValues => "AGGREGATION_KIND_COUNT_VALUES",
+            Self::Limitk => "AGGREGATION_KIND_LIMITK",
+            Self::LimitRatio => "AGGREGATION_KIND_LIMIT_RATIO",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "AGGREGATION_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "AGGREGATION_KIND_SUM" => Some(Self::Sum),
+            "AGGREGATION_KIND_AVG" => Some(Self::Avg),
+            "AGGREGATION_KIND_MIN" => Some(Self::Min),
+            "AGGREGATION_KIND_MAX" => Some(Self::Max),
+            "AGGREGATION_KIND_COUNT" => Some(Self::Count),
+            "AGGREGATION_KIND_GROUP" => Some(Self::Group),
+            "AGGREGATION_KIND_STDDEV" => Some(Self::Stddev),
+            "AGGREGATION_KIND_STDVAR" => Some(Self::Stdvar),
+            "AGGREGATION_KIND_TOPK" => Some(Self::Topk),
+            "AGGREGATION_KIND_BOTTOMK" => Some(Self::Bottomk),
+            "AGGREGATION_KIND_COUNT_VALUES" => Some(Self::CountValues),
+            "AGGREGATION_KIND_LIMITK" => Some(Self::Limitk),
+            "AGGREGATION_KIND_LIMIT_RATIO" => Some(Self::LimitRatio),
+            _ => None,
+        }
+    }
+}
+/// / A PromQL range-vector function a shard can evaluate on its own. Mirrors
+/// / `crate::promql::functions::RollupKind`.
+/// /
+/// / Membership is by window locality, not decomposability: a function belongs
+/// / here when its output depends on nothing but one series' samples inside the
+/// / window. `absent_over_time` is permanently excluded — its answer depends on
+/// / series being absent across the whole cluster, which no single shard can see.
+/// /
+/// / The list grows by appending. A shard that decodes a number it does not know
+/// / answers `applied = false` and ships the raw windows, so a newer coordinator
+/// / degrades instead of getting a wrong answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RollupKind {
+    Unspecified = 0,
+    SumOverTime = 1,
+    CountOverTime = 2,
+    LastOverTime = 3,
+    AvgOverTime = 4,
+    MinOverTime = 5,
+    MaxOverTime = 6,
+    StddevOverTime = 7,
+    StdvarOverTime = 8,
+    MadOverTime = 9,
+    PresentOverTime = 10,
+    FirstOverTime = 11,
+    QuantileOverTime = 12,
+    TsOfFirstOverTime = 13,
+    TsOfLastOverTime = 14,
+    TsOfMinOverTime = 15,
+    TsOfMaxOverTime = 16,
+    Rate = 17,
+    Increase = 18,
+    Delta = 19,
+    Irate = 20,
+    Idelta = 21,
+    Deriv = 22,
+    Resets = 23,
+    Changes = 24,
+}
+impl RollupKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ROLLUP_KIND_UNSPECIFIED",
+            Self::SumOverTime => "ROLLUP_KIND_SUM_OVER_TIME",
+            Self::CountOverTime => "ROLLUP_KIND_COUNT_OVER_TIME",
+            Self::LastOverTime => "ROLLUP_KIND_LAST_OVER_TIME",
+            Self::AvgOverTime => "ROLLUP_KIND_AVG_OVER_TIME",
+            Self::MinOverTime => "ROLLUP_KIND_MIN_OVER_TIME",
+            Self::MaxOverTime => "ROLLUP_KIND_MAX_OVER_TIME",
+            Self::StddevOverTime => "ROLLUP_KIND_STDDEV_OVER_TIME",
+            Self::StdvarOverTime => "ROLLUP_KIND_STDVAR_OVER_TIME",
+            Self::MadOverTime => "ROLLUP_KIND_MAD_OVER_TIME",
+            Self::PresentOverTime => "ROLLUP_KIND_PRESENT_OVER_TIME",
+            Self::FirstOverTime => "ROLLUP_KIND_FIRST_OVER_TIME",
+            Self::QuantileOverTime => "ROLLUP_KIND_QUANTILE_OVER_TIME",
+            Self::TsOfFirstOverTime => "ROLLUP_KIND_TS_OF_FIRST_OVER_TIME",
+            Self::TsOfLastOverTime => "ROLLUP_KIND_TS_OF_LAST_OVER_TIME",
+            Self::TsOfMinOverTime => "ROLLUP_KIND_TS_OF_MIN_OVER_TIME",
+            Self::TsOfMaxOverTime => "ROLLUP_KIND_TS_OF_MAX_OVER_TIME",
+            Self::Rate => "ROLLUP_KIND_RATE",
+            Self::Increase => "ROLLUP_KIND_INCREASE",
+            Self::Delta => "ROLLUP_KIND_DELTA",
+            Self::Irate => "ROLLUP_KIND_IRATE",
+            Self::Idelta => "ROLLUP_KIND_IDELTA",
+            Self::Deriv => "ROLLUP_KIND_DERIV",
+            Self::Resets => "ROLLUP_KIND_RESETS",
+            Self::Changes => "ROLLUP_KIND_CHANGES",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ROLLUP_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "ROLLUP_KIND_SUM_OVER_TIME" => Some(Self::SumOverTime),
+            "ROLLUP_KIND_COUNT_OVER_TIME" => Some(Self::CountOverTime),
+            "ROLLUP_KIND_LAST_OVER_TIME" => Some(Self::LastOverTime),
+            "ROLLUP_KIND_AVG_OVER_TIME" => Some(Self::AvgOverTime),
+            "ROLLUP_KIND_MIN_OVER_TIME" => Some(Self::MinOverTime),
+            "ROLLUP_KIND_MAX_OVER_TIME" => Some(Self::MaxOverTime),
+            "ROLLUP_KIND_STDDEV_OVER_TIME" => Some(Self::StddevOverTime),
+            "ROLLUP_KIND_STDVAR_OVER_TIME" => Some(Self::StdvarOverTime),
+            "ROLLUP_KIND_MAD_OVER_TIME" => Some(Self::MadOverTime),
+            "ROLLUP_KIND_PRESENT_OVER_TIME" => Some(Self::PresentOverTime),
+            "ROLLUP_KIND_FIRST_OVER_TIME" => Some(Self::FirstOverTime),
+            "ROLLUP_KIND_QUANTILE_OVER_TIME" => Some(Self::QuantileOverTime),
+            "ROLLUP_KIND_TS_OF_FIRST_OVER_TIME" => Some(Self::TsOfFirstOverTime),
+            "ROLLUP_KIND_TS_OF_LAST_OVER_TIME" => Some(Self::TsOfLastOverTime),
+            "ROLLUP_KIND_TS_OF_MIN_OVER_TIME" => Some(Self::TsOfMinOverTime),
+            "ROLLUP_KIND_TS_OF_MAX_OVER_TIME" => Some(Self::TsOfMaxOverTime),
+            "ROLLUP_KIND_RATE" => Some(Self::Rate),
+            "ROLLUP_KIND_INCREASE" => Some(Self::Increase),
+            "ROLLUP_KIND_DELTA" => Some(Self::Delta),
+            "ROLLUP_KIND_IRATE" => Some(Self::Irate),
+            "ROLLUP_KIND_IDELTA" => Some(Self::Idelta),
+            "ROLLUP_KIND_DERIV" => Some(Self::Deriv),
+            "ROLLUP_KIND_RESETS" => Some(Self::Resets),
+            "ROLLUP_KIND_CHANGES" => Some(Self::Changes),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiGetRequest {
     #[prost(bool, tag = "1")]

@@ -182,7 +182,7 @@ Planned files:
 
 - `src/promql/engine/fanout/rollup_fanout_command.rs` (new)
 - `src/promql/engine/fanout/mod.rs` register command
-- `src/promql/types.proto` add `RollupQuery`, `RollupQueryResponse`,
+- `proto/v1/promql.proto` (then `src/promql/types.proto`) add `RollupQuery`, `RollupQueryResponse`,
   `RollupKind`, `RollupSeries`
 - `src/promql/engine/query_reader.rs` add `RollupRequest` + `RollupOutcome` +
   `query_rollup` (default unsupported)
@@ -301,7 +301,7 @@ than being special-cased.
 instant `sum_over_time`/`count_over_time`/`last_over_time` through the push-down
 path rather than around it.
 
-Landed in: `promql/types.proto`, `engine/fanout/rollup_fanout_command.rs` (new),
+Landed in: `promql/types.proto` (now `proto/v1/promql.proto`), `engine/fanout/rollup_fanout_command.rs` (new),
 `engine/fanout/{mod,query_utils}.rs`, `engine/query_reader.rs`,
 `engine/selector_batch_executor.rs`, `engine/{querier,memory_series_querier}.rs`,
 `exec/evaluator.rs`, `functions/{mod,rollup_functions}.rs`, `config.rs`.

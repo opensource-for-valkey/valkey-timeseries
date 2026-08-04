@@ -11,82 +11,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// PromQL push-down: the shard-side half of instant, range, rollup and
+// aggregation evaluation.
+//
+// This is the same wire contract as the rest of `proto/v1/` — a PromQL
+// push-down *is* a fanout — so it shares the package, and with it `Label`,
+// `Sample` and `SeriesSelector`. It used to live at `src/promql/types.proto`
+// with its own package and its own copies of those three; the copies drifted
+// (`Sample` had its two field numbers the other way round) and the selector was
+// a strictly weaker matcher than the one in `filters.proto`, so both sides now
+// share one definition.
+
 syntax = "proto3";
-package valkey_timeseries.promql;
 
-message Sample {
-  double value = 1;
-  int64 timestamp = 2;
-}
+package valkey_timeseries.fanout.v1;
 
-
-// TimeSeries represents samples and labels for a single time series.
-message TimeSeries {
-  // For a timeseries to be valid, the labels field is required.
-  repeated Label labels = 1;
-  repeated Sample samples = 2;
-}
-
-message Label {
-  string name = 1;
-  string value = 2;
-}
-
-message Labels {
-  repeated Label labels = 1;
-}
-
-// Matcher specifies a rule, which can match or set of labels or not.
-message LabelMatcher {
-  enum Type {
-    EQ = 0;
-    NEQ = 1;
-    RE = 2;
-    NRE = 3;
-  }
-  Type type = 1;
-  string name = 2;
-  string value = 3;
-}
-
-message LabelMatcherList {
-  repeated LabelMatcher matchers = 1;
-}
-
-message OrMatcherList {
-  repeated LabelMatcherList filters = 1;
-}
-
-message SeriesSelector {
-  oneof matchers {
-    LabelMatcherList and_filters = 1;
-    OrMatcherList or_filters = 2;
-  }
-}
-
-// Chunk represents a TSDB chunk.
-// Time range [min, max] is inclusive.
-message Chunk {
-  int64 min_time_ms = 1;
-  int64 max_time_ms = 2;
-
-  // We require this to match chunkenc.Encoding.
-  enum Encoding {
-    UNKNOWN = 0;
-    XOR = 1;
-    PCO = 2;
-  }
-  Encoding type = 3;
-  bytes data = 4;
-}
-
-// ChunkedSeries represents single, encoded time series.
-message ChunkedSeries {
-  // Labels should be sorted.
-  repeated Label labels = 1;
-  // Chunks will be in start time order and may overlap.
-  repeated Chunk chunks = 2;
-}
+import "v1/common.proto";
+import "v1/filters.proto";
 
 /// A single series value at a point in time.
 ///
@@ -98,7 +39,7 @@ message InstantSample {
   double value = 2;
   /// Timestamp in milliseconds since Unix epoch.
   int64 timestamp = 3;
-  /// Option valkey key for this sample, if any.
+  /// Optional valkey key for this sample, if any.
   string key = 4;
 }
 
@@ -122,7 +63,7 @@ message RangeSample {
   repeated Label labels = 1;
   /// The samples in this series.
   repeated Sample samples = 2;
-  /// Option valkey key for this series, if any.
+  /// Optional valkey key for this series, if any.
   string key = 3;
 }
 
@@ -142,19 +83,20 @@ message RangeQueryResponse {
 /// `crate::promql::exec::aggregations::AggregationKind`; QUANTILE has no
 /// decomposable form and is never pushed down, so it is deliberately absent.
 enum AggregationKind {
-  AGG_SUM = 0;
-  AGG_AVG = 1;
-  AGG_MIN = 2;
-  AGG_MAX = 3;
-  AGG_COUNT = 4;
-  AGG_GROUP = 5;
-  AGG_STDDEV = 6;
-  AGG_STDVAR = 7;
-  AGG_TOPK = 8;
-  AGG_BOTTOMK = 9;
-  AGG_COUNT_VALUES = 10;
-  AGG_LIMITK = 11;
-  AGG_LIMIT_RATIO = 12;
+  AGGREGATION_KIND_UNSPECIFIED = 0;
+  AGGREGATION_KIND_SUM = 1;
+  AGGREGATION_KIND_AVG = 2;
+  AGGREGATION_KIND_MIN = 3;
+  AGGREGATION_KIND_MAX = 4;
+  AGGREGATION_KIND_COUNT = 5;
+  AGGREGATION_KIND_GROUP = 6;
+  AGGREGATION_KIND_STDDEV = 7;
+  AGGREGATION_KIND_STDVAR = 8;
+  AGGREGATION_KIND_TOPK = 9;
+  AGGREGATION_KIND_BOTTOMK = 10;
+  AGGREGATION_KIND_COUNT_VALUES = 11;
+  AGGREGATION_KIND_LIMITK = 12;
+  AGGREGATION_KIND_LIMIT_RATIO = 13;
 }
 
 /// A `by (...)` / `without (...)` modifier. An absent message means the
@@ -195,6 +137,10 @@ message AggregationQuery {
 ///                    acc1_compensation = the compensation for M2
 /// `count` counts every sample in the group, NaN included — the same
 /// denominator the single-node aggregators use.
+///
+/// Deliberately distinct from `ReducePartialState` in `response.proto`, which
+/// carries the same four accumulators plus a bucket timestamp for the TS.MRANGE
+/// group-reduce path. The two ride different requests and evolve separately.
 message AggregationPartialState {
   uint64 count = 1;
   double acc1 = 2;
@@ -221,30 +167,31 @@ message AggregationGroupPartial {
 /// answers `applied = false` and ships the raw windows, so a newer coordinator
 /// degrades instead of getting a wrong answer.
 enum RollupKind {
-  ROLLUP_SUM_OVER_TIME = 0;
-  ROLLUP_COUNT_OVER_TIME = 1;
-  ROLLUP_LAST_OVER_TIME = 2;
-  ROLLUP_AVG_OVER_TIME = 3;
-  ROLLUP_MIN_OVER_TIME = 4;
-  ROLLUP_MAX_OVER_TIME = 5;
-  ROLLUP_STDDEV_OVER_TIME = 6;
-  ROLLUP_STDVAR_OVER_TIME = 7;
-  ROLLUP_MAD_OVER_TIME = 8;
-  ROLLUP_PRESENT_OVER_TIME = 9;
-  ROLLUP_FIRST_OVER_TIME = 10;
-  ROLLUP_QUANTILE_OVER_TIME = 11;
-  ROLLUP_TS_OF_FIRST_OVER_TIME = 12;
-  ROLLUP_TS_OF_LAST_OVER_TIME = 13;
-  ROLLUP_TS_OF_MIN_OVER_TIME = 14;
-  ROLLUP_TS_OF_MAX_OVER_TIME = 15;
-  ROLLUP_RATE = 16;
-  ROLLUP_INCREASE = 17;
-  ROLLUP_DELTA = 18;
-  ROLLUP_IRATE = 19;
-  ROLLUP_IDELTA = 20;
-  ROLLUP_DERIV = 21;
-  ROLLUP_RESETS = 22;
-  ROLLUP_CHANGES = 23;
+  ROLLUP_KIND_UNSPECIFIED = 0;
+  ROLLUP_KIND_SUM_OVER_TIME = 1;
+  ROLLUP_KIND_COUNT_OVER_TIME = 2;
+  ROLLUP_KIND_LAST_OVER_TIME = 3;
+  ROLLUP_KIND_AVG_OVER_TIME = 4;
+  ROLLUP_KIND_MIN_OVER_TIME = 5;
+  ROLLUP_KIND_MAX_OVER_TIME = 6;
+  ROLLUP_KIND_STDDEV_OVER_TIME = 7;
+  ROLLUP_KIND_STDVAR_OVER_TIME = 8;
+  ROLLUP_KIND_MAD_OVER_TIME = 9;
+  ROLLUP_KIND_PRESENT_OVER_TIME = 10;
+  ROLLUP_KIND_FIRST_OVER_TIME = 11;
+  ROLLUP_KIND_QUANTILE_OVER_TIME = 12;
+  ROLLUP_KIND_TS_OF_FIRST_OVER_TIME = 13;
+  ROLLUP_KIND_TS_OF_LAST_OVER_TIME = 14;
+  ROLLUP_KIND_TS_OF_MIN_OVER_TIME = 15;
+  ROLLUP_KIND_TS_OF_MAX_OVER_TIME = 16;
+  ROLLUP_KIND_RATE = 17;
+  ROLLUP_KIND_INCREASE = 18;
+  ROLLUP_KIND_DELTA = 19;
+  ROLLUP_KIND_IRATE = 20;
+  ROLLUP_KIND_IDELTA = 21;
+  ROLLUP_KIND_DERIV = 22;
+  ROLLUP_KIND_RESETS = 23;
+  ROLLUP_KIND_CHANGES = 24;
 }
 
 /// A rollup pushed down to a shard: which series to read, which windows to

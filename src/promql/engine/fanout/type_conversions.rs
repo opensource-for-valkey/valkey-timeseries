@@ -1,4 +1,3 @@
-use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::filters::{
     FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
@@ -11,183 +10,12 @@ use crate::promql::exec::types::EvalLabels;
 use crate::promql::generated::{
     AggregationGrouping as ProtoAggregationGrouping, AggregationKind as ProtoAggregationKind,
     AggregationPartialState as ProtoAggregationPartialState, InstantSample as ProtoInstantSample,
-    Label as ProtoLabel, LabelMatcher as ProtoLabelMatcher, LabelMatcherList, OrMatcherList,
-    RangeSample as ProtoRangeSample, Sample as ProtoSample, SeriesSelector as ProtoSeriesSelector,
-    label_matcher, series_selector, series_selector::Matchers as ProtoMatchers,
+    Label as ProtoLabel, RangeSample as ProtoRangeSample, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::{EvalSample, RangeSample};
 use promql_parser::label::{Labels as ModifierLabels, Matcher, Matchers};
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use valkey_module::ValkeyError;
-
-impl TryFrom<i32> for MatchOp {
-    type Error = ValkeyError;
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
-        let op = label_matcher::Type::try_from(value)?;
-        Ok(op.into())
-    }
-}
-
-impl From<Matcher> for ProtoLabelMatcher {
-    fn from(matcher: Matcher) -> Self {
-        use promql_parser::label::MatchOp;
-        match matcher.op {
-            MatchOp::Equal => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Eq.into(),
-                name: matcher.name,
-                value: matcher.value,
-            },
-            MatchOp::NotEqual => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Neq.into(),
-                name: matcher.name,
-                value: matcher.value,
-            },
-            MatchOp::Re(re) => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Re as i32,
-                name: matcher.name,
-                value: re.as_str().to_string(),
-            },
-            MatchOp::NotRe(re) => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Nre as i32,
-                name: matcher.name,
-                value: re.as_str().to_string(),
-            },
-        }
-    }
-}
-
-impl From<&Matcher> for ProtoLabelMatcher {
-    fn from(matcher: &Matcher) -> Self {
-        use promql_parser::label::MatchOp;
-        match &matcher.op {
-            MatchOp::Equal => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Eq.into(),
-                name: matcher.name.clone(),
-                value: matcher.value.clone(),
-            },
-            MatchOp::NotEqual => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Neq.into(),
-                name: matcher.name.clone(),
-                value: matcher.value.clone(),
-            },
-            MatchOp::Re(re) => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Re as i32,
-                name: matcher.name.clone(),
-                value: re.as_str().to_string(),
-            },
-            MatchOp::NotRe(re) => ProtoLabelMatcher {
-                r#type: label_matcher::Type::Nre as i32,
-                name: matcher.name.clone(),
-                value: re.as_str().to_string(),
-            },
-        }
-    }
-}
-
-impl TryFrom<&Matchers> for ProtoMatchers {
-    type Error = ValkeyError;
-
-    fn try_from(matchers: &Matchers) -> Result<Self, Self::Error> {
-        if !matchers.matchers.is_empty() {
-            // If there are any matchers, we need to convert them to ProtoMatchers
-            Ok(ProtoMatchers::AndFilters(LabelMatcherList {
-                matchers: matchers
-                    .matchers
-                    .iter()
-                    .map(ProtoLabelMatcher::from)
-                    .collect(),
-            }))
-        } else if !matchers.or_matchers.is_empty() {
-            let filters = matchers
-                .or_matchers
-                .iter()
-                .map(|group| LabelMatcherList {
-                    matchers: group.iter().map(ProtoLabelMatcher::from).collect(),
-                })
-                .collect();
-            Ok(ProtoMatchers::OrFilters(OrMatcherList { filters }))
-        } else {
-            // If there are no matchers, we can return an empty And matcher (or we could define a separate variant for this case)
-            Ok(ProtoMatchers::AndFilters(LabelMatcherList {
-                matchers: Vec::new(),
-            }))
-        }
-    }
-}
-
-impl From<Matchers> for ProtoMatchers {
-    fn from(matchers: Matchers) -> Self {
-        if !matchers.matchers.is_empty() {
-            // If there are any matchers, we need to convert them to ProtoMatchers
-            ProtoMatchers::AndFilters(LabelMatcherList {
-                matchers: matchers
-                    .matchers
-                    .into_iter()
-                    .map(ProtoLabelMatcher::from)
-                    .collect(),
-            })
-        } else if !matchers.or_matchers.is_empty() {
-            let filters = matchers
-                .or_matchers
-                .into_iter()
-                .map(|group| LabelMatcherList {
-                    matchers: group.into_iter().map(ProtoLabelMatcher::from).collect(),
-                })
-                .collect();
-            ProtoMatchers::OrFilters(OrMatcherList { filters })
-        } else {
-            // If there are no matchers, we can return an empty And matcher (or we could define a separate variant for this case)
-            ProtoMatchers::AndFilters(LabelMatcherList {
-                matchers: Vec::new(),
-            })
-        }
-    }
-}
-
-impl From<Matchers> for ProtoSeriesSelector {
-    fn from(matchers: Matchers) -> Self {
-        ProtoSeriesSelector {
-            matchers: Some(matchers.into()),
-        }
-    }
-}
-
-impl From<ProtoLabel> for Label {
-    fn from(proto: ProtoLabel) -> Self {
-        Label {
-            name: proto.name,
-            value: proto.value,
-        }
-    }
-}
-
-impl From<Label> for ProtoLabel {
-    fn from(label: Label) -> Self {
-        ProtoLabel {
-            name: label.name,
-            value: label.value,
-        }
-    }
-}
-
-impl From<Sample> for ProtoSample {
-    fn from(sample: Sample) -> Self {
-        ProtoSample {
-            timestamp: sample.timestamp,
-            value: sample.value,
-        }
-    }
-}
-
-impl From<ProtoSample> for Sample {
-    fn from(proto: ProtoSample) -> Self {
-        Sample {
-            timestamp: proto.timestamp,
-            value: proto.value,
-        }
-    }
-}
 
 impl From<InternedLabel<'_>> for ProtoLabel {
     fn from(label: InternedLabel) -> Self {
@@ -219,91 +47,6 @@ pub(in crate::promql) fn proto_labels_to_labels(labels: Vec<ProtoLabel>) -> Labe
 
 pub(in crate::promql) fn metric_name_to_proto_labels(metric_name: &MetricName) -> Vec<ProtoLabel> {
     metric_name.iter().map(ProtoLabel::from).collect()
-}
-
-impl From<label_matcher::Type> for MatchOp {
-    fn from(proto_type: label_matcher::Type) -> Self {
-        match proto_type {
-            label_matcher::Type::Eq => MatchOp::Equal,
-            label_matcher::Type::Neq => MatchOp::NotEqual,
-            label_matcher::Type::Re => MatchOp::RegexEqual,
-            label_matcher::Type::Nre => MatchOp::RegexNotEqual,
-        }
-    }
-}
-
-impl TryFrom<ProtoLabelMatcher> for LabelFilter {
-    type Error = ValkeyError;
-
-    fn try_from(proto: ProtoLabelMatcher) -> Result<Self, Self::Error> {
-        let operator: MatchOp = proto.r#type.try_into()?;
-        let matcher = match operator {
-            MatchOp::Equal | MatchOp::NotEqual => {
-                let value = if proto.value.is_empty() {
-                    PredicateValue::Empty
-                } else {
-                    PredicateValue::String(proto.value.clone())
-                };
-                if operator == MatchOp::Equal {
-                    PredicateMatch::Equal(value)
-                } else {
-                    PredicateMatch::NotEqual(value)
-                }
-            }
-            MatchOp::RegexEqual | MatchOp::RegexNotEqual => {
-                // For regex matchers, an empty value doesn't make sense. We can choose to treat it as matching nothing or everything.
-                // Here we will treat it as matching nothing (i.e., it won't match any series).
-                if proto.value.is_empty() {
-                    panic!("Invalid regex matcher with empty value");
-                }
-                let matcher = RegexMatcher::create(&proto.value)
-                    .map_err(|e| ValkeyError::String(e.to_string()))?;
-                if operator == MatchOp::RegexEqual {
-                    PredicateMatch::RegexEqual(matcher)
-                } else {
-                    PredicateMatch::RegexNotEqual(matcher)
-                }
-            }
-            _ => unreachable!("Invalid branch reached"),
-        };
-
-        Ok(LabelFilter {
-            label: proto.name,
-            matcher,
-        })
-    }
-}
-
-impl TryFrom<ProtoSeriesSelector> for SeriesSelector {
-    type Error = ValkeyError;
-
-    fn try_from(value: ProtoSeriesSelector) -> Result<Self, Self::Error> {
-        match value.matchers {
-            Some(ProtoMatchers::AndFilters(and_filters)) => {
-                let mut filters = FilterList::default();
-                for filter in and_filters.matchers.into_iter() {
-                    let f = filter.try_into()?;
-                    filters.push(f);
-                }
-                Ok(SeriesSelector::And(filters))
-            }
-            Some(ProtoMatchers::OrFilters(or_filters)) => {
-                let mut or_list: OrFiltersList = OrFiltersList::default();
-                for and_filters in or_filters.filters.into_iter() {
-                    let mut filters = FilterList::default();
-                    for group in and_filters.matchers.into_iter() {
-                        let g = group.try_into()?;
-                        filters.push(g);
-                    }
-                    or_list.push(filters);
-                }
-                Ok(SeriesSelector::Or(or_list))
-            }
-            _ => Err(ValkeyError::Str(
-                "Invalid matcher type in SeriesSelector conversion",
-            )),
-        }
-    }
 }
 
 impl From<ProtoInstantSample> for EvalSample {
@@ -520,63 +263,26 @@ impl From<&Matchers> for SeriesSelector {
     }
 }
 
+// A PromQL selector reaches the wire the same way a TS.* one does: through the
+// local `SeriesSelector`, then through the `filters.proto` encoding. PromQL used
+// to carry its own four-operator `LabelMatcher` message; the shared one is a
+// superset of it, and going through a single encoder is what keeps the two
+// halves of the contract from drifting apart again.
+impl From<&Matchers> for ProtoSeriesSelector {
+    fn from(matchers: &Matchers) -> Self {
+        (&SeriesSelector::from(matchers)).into()
+    }
+}
+
 impl From<VectorSelector> for ProtoSeriesSelector {
     fn from(vs: VectorSelector) -> Self {
-        let mut selector = ProtoSeriesSelector::from(vs.matchers);
-        if let Some(name) = vs.name {
-            let name_filter = ProtoLabelMatcher {
-                name: METRIC_NAME_LABEL.to_string(),
-                value: name.to_string(),
-                r#type: label_matcher::Type::Eq as i32,
-            };
-            match selector.matchers {
-                Some(series_selector::Matchers::AndFilters(ref mut filters)) => {
-                    filters.matchers.insert(0, name_filter);
-                }
-                Some(series_selector::Matchers::OrFilters(ref mut or_list)) => {
-                    for filters in or_list.filters.iter_mut() {
-                        filters.matchers.insert(0, name_filter.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        selector
+        (&SeriesSelector::from(vs)).into()
     }
 }
 
 impl From<&VectorSelector> for ProtoSeriesSelector {
     fn from(vs: &VectorSelector) -> Self {
-        // Build a ProtoSeriesSelector from a borrowed VectorSelector without cloning the
-        // whole VectorSelector. We reuse the TryFrom<&Matchers> impl to build the
-        // inner ProtoMatchers, then insert the __name__ matcher if a metric name is set.
-        let mut selector = ProtoSeriesSelector {
-            matchers: Some(
-                ProtoMatchers::try_from(&vs.matchers)
-                    .expect("invalid matchers when converting VectorSelector to proto"),
-            ),
-        };
-
-        if let Some(ref name) = vs.name {
-            let name_filter = ProtoLabelMatcher {
-                name: METRIC_NAME_LABEL.to_string(),
-                value: name.to_string(),
-                r#type: label_matcher::Type::Eq as i32,
-            };
-            match selector.matchers {
-                Some(series_selector::Matchers::AndFilters(ref mut filters)) => {
-                    filters.matchers.insert(0, name_filter);
-                }
-                Some(series_selector::Matchers::OrFilters(ref mut or_list)) => {
-                    for filters in or_list.filters.iter_mut() {
-                        filters.matchers.insert(0, name_filter.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        selector
+        (&SeriesSelector::from(vs)).into()
     }
 }
 
@@ -588,19 +294,19 @@ impl From<&VectorSelector> for ProtoSeriesSelector {
 impl From<AggregationKind> for ProtoAggregationKind {
     fn from(kind: AggregationKind) -> Self {
         match kind {
-            AggregationKind::Sum => ProtoAggregationKind::AggSum,
-            AggregationKind::Avg => ProtoAggregationKind::AggAvg,
-            AggregationKind::Min => ProtoAggregationKind::AggMin,
-            AggregationKind::Max => ProtoAggregationKind::AggMax,
-            AggregationKind::Count => ProtoAggregationKind::AggCount,
-            AggregationKind::Group => ProtoAggregationKind::AggGroup,
-            AggregationKind::Stddev => ProtoAggregationKind::AggStddev,
-            AggregationKind::Stdvar => ProtoAggregationKind::AggStdvar,
-            AggregationKind::Topk => ProtoAggregationKind::AggTopk,
-            AggregationKind::Bottomk => ProtoAggregationKind::AggBottomk,
-            AggregationKind::CountValues => ProtoAggregationKind::AggCountValues,
-            AggregationKind::Limitk => ProtoAggregationKind::AggLimitk,
-            AggregationKind::LimitRatio => ProtoAggregationKind::AggLimitRatio,
+            AggregationKind::Sum => ProtoAggregationKind::Sum,
+            AggregationKind::Avg => ProtoAggregationKind::Avg,
+            AggregationKind::Min => ProtoAggregationKind::Min,
+            AggregationKind::Max => ProtoAggregationKind::Max,
+            AggregationKind::Count => ProtoAggregationKind::Count,
+            AggregationKind::Group => ProtoAggregationKind::Group,
+            AggregationKind::Stddev => ProtoAggregationKind::Stddev,
+            AggregationKind::Stdvar => ProtoAggregationKind::Stdvar,
+            AggregationKind::Topk => ProtoAggregationKind::Topk,
+            AggregationKind::Bottomk => ProtoAggregationKind::Bottomk,
+            AggregationKind::CountValues => ProtoAggregationKind::CountValues,
+            AggregationKind::Limitk => ProtoAggregationKind::Limitk,
+            AggregationKind::LimitRatio => ProtoAggregationKind::LimitRatio,
             // Never sent: quantile has no decomposable form, so the
             // coordinator does not push it down (`pushdown_strategy`).
             AggregationKind::Quantile => unreachable!(
@@ -610,23 +316,33 @@ impl From<AggregationKind> for ProtoAggregationKind {
     }
 }
 
-impl From<ProtoAggregationKind> for AggregationKind {
-    fn from(kind: ProtoAggregationKind) -> Self {
-        match kind {
-            ProtoAggregationKind::AggSum => AggregationKind::Sum,
-            ProtoAggregationKind::AggAvg => AggregationKind::Avg,
-            ProtoAggregationKind::AggMin => AggregationKind::Min,
-            ProtoAggregationKind::AggMax => AggregationKind::Max,
-            ProtoAggregationKind::AggCount => AggregationKind::Count,
-            ProtoAggregationKind::AggGroup => AggregationKind::Group,
-            ProtoAggregationKind::AggStddev => AggregationKind::Stddev,
-            ProtoAggregationKind::AggStdvar => AggregationKind::Stdvar,
-            ProtoAggregationKind::AggTopk => AggregationKind::Topk,
-            ProtoAggregationKind::AggBottomk => AggregationKind::Bottomk,
-            ProtoAggregationKind::AggCountValues => AggregationKind::CountValues,
-            ProtoAggregationKind::AggLimitk => AggregationKind::Limitk,
-            ProtoAggregationKind::AggLimitRatio => AggregationKind::LimitRatio,
-        }
+/// `None` for `AGGREGATION_KIND_UNSPECIFIED` — the value a peer produces when it
+/// omits the field. Callers treat that the same way they treat an operator they
+/// do not recognize: answer `applied = false` and let the coordinator aggregate.
+impl TryFrom<ProtoAggregationKind> for AggregationKind {
+    type Error = ValkeyError;
+
+    fn try_from(kind: ProtoAggregationKind) -> Result<Self, Self::Error> {
+        Ok(match kind {
+            ProtoAggregationKind::Sum => AggregationKind::Sum,
+            ProtoAggregationKind::Avg => AggregationKind::Avg,
+            ProtoAggregationKind::Min => AggregationKind::Min,
+            ProtoAggregationKind::Max => AggregationKind::Max,
+            ProtoAggregationKind::Count => AggregationKind::Count,
+            ProtoAggregationKind::Group => AggregationKind::Group,
+            ProtoAggregationKind::Stddev => AggregationKind::Stddev,
+            ProtoAggregationKind::Stdvar => AggregationKind::Stdvar,
+            ProtoAggregationKind::Topk => AggregationKind::Topk,
+            ProtoAggregationKind::Bottomk => AggregationKind::Bottomk,
+            ProtoAggregationKind::CountValues => AggregationKind::CountValues,
+            ProtoAggregationKind::Limitk => AggregationKind::Limitk,
+            ProtoAggregationKind::LimitRatio => AggregationKind::LimitRatio,
+            ProtoAggregationKind::Unspecified => {
+                return Err(ValkeyError::Str(
+                    "TSDB: aggregation push-down request carries no operator",
+                ));
+            }
+        })
     }
 }
 
@@ -690,15 +406,6 @@ impl From<EvalSample> for ProtoInstantSample {
     }
 }
 
-impl From<&Label> for ProtoLabel {
-    fn from(label: &Label) -> Self {
-        ProtoLabel {
-            name: label.name.clone(),
-            value: label.value.clone(),
-        }
-    }
-}
-
 /// Rebuild the label set of a group from the wire.
 pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) -> EvalLabels {
     // Already sorted: the sender derived them from a sorted label set.
@@ -710,6 +417,50 @@ mod tests {
     use super::*;
     use promql_parser::label::{MatchOp as PromMatchOp, Matcher, Matchers};
     use promql_parser::parser::VectorSelector;
+
+    /// A PromQL selector now rides the shared `filters.proto` encoding rather
+    /// than a four-operator message of its own. This pins the composition: what
+    /// the shard decodes has to be what the coordinator meant, for the regex and
+    /// negated forms as much as for plain equality.
+    #[test]
+    fn test_vector_selector_survives_the_shared_wire_encoding() {
+        let vs = VectorSelector {
+            name: Some("http_requests_total".to_string()),
+            matchers: Matchers {
+                matchers: vec![
+                    Matcher::new(PromMatchOp::Equal, "job", "api"),
+                    Matcher::new(PromMatchOp::NotEqual, "env", "dev"),
+                    Matcher::new(
+                        PromMatchOp::Re(RegexMatcher::create("server[0-9]+").unwrap().regex),
+                        "instance",
+                        "server[0-9]+",
+                    ),
+                ],
+                or_matchers: vec![],
+            },
+            offset: None,
+            at: None,
+        };
+
+        let expected = SeriesSelector::from(&vs);
+        let wire = ProtoSeriesSelector::from(&vs);
+        let decoded = SeriesSelector::try_from(&wire).expect("selector should decode");
+
+        assert_eq!(decoded, expected);
+        // The `__name__` filter the metric name expands into has to come back
+        // too — dropping it would silently widen the selector to every metric.
+        match &decoded {
+            SeriesSelector::And(filters) => {
+                assert_eq!(filters.len(), 4);
+                assert_eq!(filters[0].label, METRIC_NAME_LABEL);
+                assert!(filters[0].matches("http_requests_total"));
+                assert!(!filters[0].matches("other_metric"));
+                assert!(filters[3].matches("server42"));
+                assert!(!filters[3].matches("laptop"));
+            }
+            other => panic!("expected SeriesSelector::And, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_vector_selector_to_series_selector_with_name() {

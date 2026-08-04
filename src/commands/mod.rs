@@ -37,6 +37,9 @@ mod analysis_runner;
 pub mod command_parser;
 mod debug;
 mod fanout_codec;
+// `pub(crate)` rather than private: `crate::promql` shares this wire contract
+// and re-exports `generated` from here.
+pub(crate) mod fanout_codec;
 mod label_search_utils;
 mod promql_utils;
 mod ts_add;

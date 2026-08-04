@@ -33,11 +33,12 @@ RTS_COMPAT=1 SERVER_VERSION=unstable ./build.sh                 # + compat suite
 ASAN_BUILD=true SERVER_VERSION=unstable ./build.sh              # ASAN pass
 SERVER_VERSION=unstable ./build.sh --parallel=auto              # parallel integration tests (serial default)
 
-# Unit / doc tests
+# Unit / doc / PromQL conformance tests
 cargo test --features enable-system-alloc
 cargo test --doc --features enable-system-alloc
+cargo test --features enable-system-alloc -- promql_tests   # or `-- should_pass_<fixture_stem>`
 
-# Benchmarks & reports (--help on each script for flags)
+# Benchmarks & reports (see docs/ for methodology; --help on each script for flags)
 cargo bench --features enable-system-alloc
 tools/compression_report.sh [--check|--save-baseline]
 tools/latency_report.sh
@@ -47,6 +48,11 @@ tools/fleet_loader.sh [-p PORT] [--preset small|medium|large] [--flush]      # f
 
 # Compatibility fuzzer (needs Docker; strict mode required for a soak — see Warnings below)
 ./fuzz.sh --examples 20000 --duration 20m --stats
+
+# Docker
+make docker-build && make docker-up      # standalone
+make docker-up-cluster                    # 3-node cluster
+make docker-test / make docker-down
 ```
 
 Key `./build.sh` env vars: `SERVER_VERSION` (`unstable` (default) or `8.1`, the versions CI tests), `ASAN_BUILD`,
@@ -87,8 +93,8 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
 
 ## Conventions
 
-- Commit messages follow Conventional Commits: `type(scope): summary` (e.g. `refactor(threads): ...`,
-  `fix(series): ...`).
+- Commit messages follow Conventional Commits: `type(scope): summary` (e.g. `perf(promql): ...`,
+  `fix(threads): ...`).
 - **Command registration is two-part and both parts are enforced at compile/test time.** A handler
   gets `#[valkey_module_macros::command({...})]`, but that attribute sets no ACL categories — so each
   handler also needs an `acl_categories!(IDENT, "ts.name", "cats")` declaration immediately above it
@@ -100,15 +106,13 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
 - Wire encoding for cluster fan-out is decided in exactly one place — `samples_to_chunk[_lossless]`
   in `src/series/chunks/serialization.rs` (below `WIRE_COMPRESSION_MIN_SAMPLES`=16 samples:
   uncompressed; at/above: Chimp). Don't hand-roll encoding at a call site or add a third tier —
-  both were tried and didn't survive measurement (see `tools/wire_report.sh`). `max_size` is
-  advisory on this path (neither chunk type enforces it in `add_sample`, and fan-out never checks
-  `is_full()`) — use `default()`.
-- After editing a `.proto`: run `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file
-  under `proto/v1/generated/` — a normal build fails loudly if they disagree, so drift can't land
-  silently.
+  both were tried and didn't survive measurement (see `tools/wire_report.sh`).
 - Behavior changes on the shared RTS surface: check against `tests/compat`, and if the difference is
   deliberate, record it in [COMPATIBILITY.md](COMPATIBILITY.md) and/or `tests/compat/divergences.yml`
   (behavior-kind entries need explicit PR sign-off).
+- After editing a `.proto`: run `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file
+  under `proto/v1/generated/` — a normal build fails loudly if they disagree, so drift can't land
+  silently.
 - When adding/changing a command, update `docs/COMMANDS.md`, `docs/commands/`, `docs/overview.md`,
   and `README.md` (skip this for `TS._DEBUG`/`TS._RESTORE` — intentionally undocumented internals).
 
@@ -118,6 +122,8 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   (`crate::tests::generators`) for fixtures rather than hand-rolled loops.
 - Integration: Python pytest under `tests/` (`test_ts_*.py`, `*_cme.py` = cluster-mode variants),
   driven by `./build.sh`.
+- PromQL conformance: `.test` DSL files in `src/promql/promqltest/testdata/`, auto-generated into one
+  `#[test]` per file by `build.rs` — no server needed, pure in-memory querier.
 - Compatibility harness (`tests/compat/`): diffs every reply against a pinned `redis:8.10` reference
   server, RESP2 + RESP3. Excluded from a plain `./build.sh`; opt in with `RTS_COMPAT=1` or
   `./build.sh compat`. Intentional mismatches go in `divergences.yml` as XFAIL-DIVERGENT — "reference
@@ -146,15 +152,19 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   `extended`, so gated divergences fail it as new bugs and Hypothesis stops in ~30s. `fuzz.sh` sets
   strict mode for you; driving pytest directly means doing it yourself
   (`CONFIG SET ts.ts-compatibility-mode strict`).
+- `max_size` is advisory on the wire encoding path — neither `ChimpChunk` nor `GorillaChunk` enforces
+  it in `add_sample`, and fan-out never checks `is_full()`. Use `default()` there.
 - `ASAN_BUILD` and compat mode (`RTS_COMPAT=1`) are mutually exclusive in `build.sh`.
 - A `[[bin]]` target (e.g. `compression_report`) doesn't pull in dev-dependencies, so
   `cargo run --bin compression_report` needs `--features enable-system-alloc,test-utils` named
   explicitly, even though `cargo test`/`cargo bench` get `test-utils` automatically via the
   self dev-dependency.
+- `CONFIG SET` is not live for `ts-promql-*` params — they're seeded once at startup from
+  `PROMQL_CONFIG`; there is no config-changed handler for them.
 
 ## Where to look first
 
-`build.sh`, `Cargo.toml`, `src/lib.rs`, `src/commands/*`, `src/series/*`, `tests/`,
+`build.sh`, `Cargo.toml`, `src/lib.rs`, `src/commands/*`, `src/series/*`, `src/promql/*`, `tests/`,
 [COMPATIBILITY.md](COMPATIBILITY.md), [tests/compat/README.md](tests/compat/README.md),
 `docs/COMMANDS.md`, `docs/overview.md`.
 

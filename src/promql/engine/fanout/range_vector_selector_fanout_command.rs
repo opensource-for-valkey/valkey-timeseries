@@ -6,7 +6,6 @@ use crate::labels::{HasFingerprint, filters::SeriesSelector};
 use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
     RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
-    series_selector::Matchers as ProtoMatchers,
 };
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
@@ -83,7 +82,7 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
             ctx.log_warning("Received range query with no selector, returning empty response");
             return Ok(RangeQueryResponse { series: vec![] });
         };
-        let series_selector: SeriesSelector = selector.try_into()?;
+        let series_selector: SeriesSelector = (&selector).try_into()?;
         handle_range_query(
             ctx,
             series_selector,
@@ -99,11 +98,7 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
     }
 
     fn generate_request(&self) -> RangeQuery {
-        let matchers: ProtoMatchers =
-            ProtoMatchers::try_from(&self.matchers).expect("invalid matchers");
-        let selector = ProtoSeriesSelector {
-            matchers: Some(matchers),
-        };
+        let selector = ProtoSeriesSelector::from(&self.matchers);
         RangeQuery {
             selector: Some(selector),
             start_time: self.start_time,
