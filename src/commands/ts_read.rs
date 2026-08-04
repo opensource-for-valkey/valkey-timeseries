@@ -135,16 +135,22 @@ fn parse_read_options(args: &[&str]) -> ValkeyResult<ReadOptions> {
                     return Err(ValkeyError::WrongArity);
                 }
                 let timeout_str = iter.next().ok_or(ValkeyError::WrongArity)?;
-                let timeout_ms = parse_duration_ms(timeout_str)?;
-                if timeout_ms < 0 {
-                    return Err(ValkeyError::Str(error_consts::READ_BLOCK_MS_MUST_BE_NON_NEGATIVE));
-                }
+                let timeout_ms = if let Ok(value) = timeout_str.parse::<i64>() {
+                    if value < 0 {
+                        return Err(ValkeyError::Str(error_consts::READ_BLOCK_MS_MUST_BE_NON_NEGATIVE));
+                    }
+                    value
+                } else {
+                    parse_duration_ms(timeout_str).map_err(|_| {
+                        ValkeyError::Str(error_consts::READ_BLOCK_MS_MUST_BE_NON_NEGATIVE)
+                    })?
+                };
                 let min_count = iter.next()
                     .ok_or(ValkeyError::WrongArity)
                     .map(parse_i64)?
                     .filter(|c| *c > 0)
                     .ok_or(ValkeyError::Str(error_consts::READ_MIN_COUNT_MUST_BE_POSITIVE))?;
-                
+
                 options.block = Some(BlockOptions {
                     timeout_ms,
                     min_count: min_count as usize,
