@@ -145,8 +145,9 @@ fn collect_rollup_candidates_inner<'a>(expr: &'a Expr, out: &mut Vec<RollupCandi
     }
 }
 
-/// Look through parentheses.
-fn strip_parens(expr: &Expr) -> &Expr {
+/// Look through parentheses: `sum((metric))` aggregates a selector just as
+/// `sum(metric)` does.
+pub(in crate::promql) fn strip_parens(expr: &Expr) -> &Expr {
     let mut current = expr;
     while let Expr::Paren(paren) = current {
         current = &paren.expr;

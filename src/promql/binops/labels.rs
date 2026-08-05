@@ -1,11 +1,14 @@
 use crate::labels::{HasFingerprint, Label, SeriesFingerprint};
 use crate::promql::exec::types::EvalLabels;
+use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
-use promql_parser::parser::token::{T_ADD, T_DIV, T_LOR, T_MUL, T_SUB, TokenType};
+use promql_parser::parser::token::{
+    T_ADD, T_BOTTOMK, T_DIV, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_MUL, T_SUB, T_TOPK, TokenType,
+};
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
 use regex::{Regex, escape};
 use std::borrow::Cow;
@@ -150,14 +153,36 @@ pub(in crate::promql) fn push_down_filters<'a>(
     Ok(Cow::Borrowed(dest))
 }
 
+/// Returns true when the aggregation collapses its input into label-less groups,
+/// so its result carries no labels for `get_common_label_filters` to derive
+/// filters from.
 #[inline]
 fn is_aggregate_non_grouping(agg: &AggregateExpr) -> bool {
-    let Some(modifier) = &agg.modifier else {
+    // topk/bottomk/limitk/limit_ratio select whole input series and pass them
+    // through untouched, so their output always carries the input's labels
+    // regardless of the modifier.
+    if matches!(agg.op.id(), T_TOPK | T_BOTTOMK | T_LIMITK | T_LIMIT_RATIO) {
         return false;
-    };
-    match modifier {
-        LabelModifier::Include(args) => args.labels.is_empty(),
-        LabelModifier::Exclude(args) => args.labels.is_empty(),
+    }
+    match &agg.modifier {
+        // `sum(x)` and `sum by () (x)` both collapse everything into a single
+        // group whose label set is empty (see `EvalLabels::compute_grouping_labels`).
+        None => true,
+        Some(LabelModifier::Include(args)) => args.labels.is_empty(),
+        // `without (...)` retains every label it does not list — including
+        // `without ()`, which retains them all.
+        Some(LabelModifier::Exclude(_)) => false,
+    }
+}
+
+/// Returns true when this operand's result can yield common label filters worth
+/// pushing into the other side. Scalars and strings carry no labels at all, and
+/// label-less aggregations collapse their input into groups with no labels.
+fn can_derive_filters_from(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
+        Expr::Aggregate(agg) => !is_aggregate_non_grouping(agg),
+        _ => true,
     }
 }
 
@@ -174,17 +199,16 @@ pub(in crate::promql) fn can_push_down_common_filters(be: &BinaryExpr) -> bool {
         return false;
     }
 
-    be.op.id() != T_LOR
-        && match (&be.lhs.as_ref(), &be.rhs.as_ref()) {
-            (Expr::Aggregate(left), Expr::Aggregate(right)) => {
-                !(is_aggregate_non_grouping(left) || is_aggregate_non_grouping(right))
-            }
-            (Expr::StringLiteral(_), _) => false,
-            (_, Expr::StringLiteral(_)) => false,
-            (Expr::NumberLiteral(_), _) => false,
-            (_, Expr::NumberLiteral(_)) => false,
-            _ => true,
-        }
+    // `or` keeps series from both sides, so filters derived from one side must
+    // not prune the other.
+    if be.op.id() == T_LOR {
+        return false;
+    }
+
+    // Both sides are checked: filters flow from whichever side is evaluated
+    // first into the other, and either side alone being label-less makes the
+    // pushdown pointless.
+    can_derive_filters_from(&be.lhs) && can_derive_filters_from(&be.rhs)
 }
 
 pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec<Matcher> {
@@ -244,4 +268,77 @@ fn join_regexp_values(values: AHashSet<&str>) -> String {
         }
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `query` and return its top-level binary expression.
+    fn binary_expr(query: &str) -> BinaryExpr {
+        match promql_parser::parser::parse(query).expect("query should parse") {
+            Expr::Binary(be) => be,
+            other => panic!("expected a binary expression, got {other:?}"),
+        }
+    }
+
+    fn can_push_down(query: &str) -> bool {
+        can_push_down_common_filters(&binary_expr(query))
+    }
+
+    #[test]
+    fn pushdown_allowed_for_label_bearing_operands() {
+        assert!(can_push_down("metric_a * metric_b"));
+        assert!(can_push_down("rate(metric_a[5m]) * metric_b"));
+    }
+
+    #[test]
+    fn or_never_pushes_down() {
+        // `or` keeps unmatched series from both sides, so neither side's labels
+        // may prune the other.
+        assert!(!can_push_down("metric_a or metric_b"));
+    }
+
+    #[test]
+    fn scalar_operands_carry_no_labels() {
+        assert!(!can_push_down("metric_a * 2"));
+        assert!(!can_push_down("2 * metric_a"));
+    }
+
+    #[test]
+    fn aggregation_without_grouping_carries_no_labels() {
+        // `sum(x)` collapses to a single label-less group, so there is nothing
+        // to derive filters from — even though it has no by/without modifier.
+        assert!(!can_push_down("sum(metric_a) * metric_b"));
+        assert!(!can_push_down("metric_a * sum(metric_b)"));
+        // `by ()` is the explicit spelling of the same thing.
+        assert!(!can_push_down("sum by () (metric_a) * metric_b"));
+    }
+
+    #[test]
+    fn aggregation_with_grouping_keeps_labels() {
+        assert!(can_push_down("sum by (job) (metric_a) * metric_b"));
+        assert!(can_push_down(
+            "sum without (instance) (metric_a) * metric_b"
+        ));
+        // `without ()` excludes nothing, so it retains every label — it is the
+        // most grouping-preserving form, not a non-grouping one.
+        assert!(can_push_down("sum without () (metric_a) * metric_b"));
+    }
+
+    #[test]
+    fn selection_aggregations_pass_labels_through() {
+        // topk/bottomk/limitk/limit_ratio return whole input series untouched,
+        // so their output carries the input's labels whatever the modifier says.
+        assert!(can_push_down("topk(3, metric_a) * metric_b"));
+        assert!(can_push_down("bottomk(3, metric_a) * metric_b"));
+        assert!(can_push_down("limitk(3, metric_a) by () * metric_b"));
+        assert!(can_push_down("topk(3, metric_a) by () * metric_b"));
+    }
+
+    #[test]
+    fn parenthesized_operands_are_seen_through() {
+        assert!(!can_push_down("(sum(metric_a)) * metric_b"));
+        assert!(can_push_down("(sum by (job) (metric_a)) * metric_b"));
+    }
 }

@@ -19,7 +19,7 @@ use crate::promql::exec::types::{
 };
 use crate::promql::exec::utils::{
     RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
-    merge_step_into_series_map,
+    merge_step_into_series_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{FunctionCallContext, PromQLArg, PromQLFunction, resolve_function};
@@ -1419,16 +1419,6 @@ const NAME_PRESERVING_ROLLUPS: [&str; 2] = ["first_over_time", "last_over_time"]
 fn drops_metric_name(call: &Call) -> bool {
     !NAME_PRESERVING_ROLLUPS.contains(&call.func.name)
         && call.func.arg_types.contains(&ValueType::Matrix)
-}
-
-/// Look through parentheses: `sum((metric))` aggregates a selector just as
-/// `sum(metric)` does.
-fn strip_parens(expr: &Expr) -> &Expr {
-    let mut current = expr;
-    while let Expr::Paren(paren) = current {
-        current = &paren.expr;
-    }
-    current
 }
 
 fn to_eval_samples(samples: Vec<InstantSample>) -> Vec<EvalSample> {
