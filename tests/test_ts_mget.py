@@ -150,12 +150,15 @@ class TestTimeSeriesMget(ValkeyTimeSeriesTestCaseBase):
         result.sort(key=lambda x: x[0])
 
         assert len(result) == 2
-        # Each series should return an empty array for the sample
+        # No labels were requested, so element 2 is empty; element 3 is the
+        # sample slot, which an empty series reports as an empty array (not nil).
         assert result[0][0] == b'empty_ts1'
         assert result[0][1] == []
+        assert result[0][2] == []
 
         assert result[1][0] == b'empty_ts2'
         assert result[1][1] == []
+        assert result[1][2] == []
 
     def test_mget_error_cases(self):
         """Test error cases for TS.MGET"""

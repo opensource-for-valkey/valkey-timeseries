@@ -39,7 +39,7 @@ pub fn reply_with_fanout_sample(ctx: &Context, sample: &Option<FanoutSample>) {
     if let Some(s) = sample {
         reply_with_sample_ex(ctx, s.timestamp, s.value);
     } else {
-        raw::reply_with_null(ctx.ctx);
+        reply_with_array(ctx, 0);
     }
 }
 
