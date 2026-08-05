@@ -34,7 +34,7 @@ use ahash::AHashSet;
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
 use orx_parallel::{IterIntoParIter, ParIter};
-use promql_parser::parser::token::{T_LAND, T_LOR};
+use promql_parser::parser::token::T_LAND;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, SubqueryExpr, UnaryExpr,
@@ -829,47 +829,54 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         Ok(result)
     }
 
+    /// Whether `preload_for_range` has already computed step grids for this
+    /// query.
+    ///
+    /// Filter pushdown rewrites a selector's matchers, which changes its
+    /// [`PreloadKey`] — so the rewritten subtree misses the grid preloaded for
+    /// it and falls back to one live query per step. That trade is only worth
+    /// making when there is no grid to lose. An instant query never calls
+    /// `preload_for_range`, so both maps stay empty and pushdown costs nothing.
+    fn has_preloaded_data(&self) -> bool {
+        !self.preloaded_instant.read().unwrap().is_empty()
+            || !self.preloaded_rollups.read().unwrap().is_empty()
+    }
+
     fn evaluate_binary_expr(
         &self,
         expr: &BinaryExpr,
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-        // Unwrap parentheses to find bare VectorSelectors eligible for filter pushdown
-        fn unwrap_paren_selector(e: &Expr) -> Option<&Expr> {
-            match e {
-                Expr::VectorSelector(_) => Some(e),
-                Expr::Paren(pe) if matches!(*pe.expr, Expr::VectorSelector(_)) => {
-                    Some(pe.expr.as_ref())
-                }
-                _ => None,
-            }
-        }
-
         let lhs = expr.lhs.as_ref();
         let rhs = expr.rhs.as_ref();
 
-        match (unwrap_paren_selector(lhs), unwrap_paren_selector(rhs)) {
-            (Some(l), Some(r)) => self.eval_vector_vector_binop(ctx, expr, l, r, preload_eligible),
-            _ => {
-                let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
-                    join(
-                        || self.evaluate_expr(lhs, ctx, preload_eligible),
-                        || self.evaluate_expr(rhs, ctx, preload_eligible),
-                    )
-                } else {
-                    (
-                        self.evaluate_expr(lhs, ctx, preload_eligible),
-                        self.evaluate_expr(rhs, ctx, preload_eligible),
-                    )
-                };
-
-                eval_binary_expr(expr, left_result?, right_result?)
-            }
+        if can_push_down_common_filters(expr) && !self.has_preloaded_data() {
+            return self.eval_binop_with_pushdown(ctx, expr, lhs, rhs, preload_eligible);
         }
+
+        let (left_result, right_result) = if should_parallelize_binary_expr(expr) {
+            join(
+                || self.evaluate_expr(lhs, ctx, preload_eligible),
+                || self.evaluate_expr(rhs, ctx, preload_eligible),
+            )
+        } else {
+            (
+                self.evaluate_expr(lhs, ctx, preload_eligible),
+                self.evaluate_expr(rhs, ctx, preload_eligible),
+            )
+        };
+
+        eval_binary_expr(expr, left_result?, right_result?)
     }
 
-    fn eval_vector_vector_binop(
+    /// Evaluate a binary operation one side at a time, using the labels of the
+    /// first result to narrow the selectors of the second.
+    ///
+    /// The caller has already established via `can_push_down_common_filters`
+    /// that both operands are instant vectors whose labels can produce useful
+    /// filters, and that the operator prunes non-matching series.
+    fn eval_binop_with_pushdown(
         &self,
         ctx: &EvalContext,
         be: &BinaryExpr,
@@ -887,20 +894,6 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         } else {
             (expr_first, expr_second, false)
         };
-
-        if !can_push_down_common_filters(be) {
-            let (left, right) = join(
-                || self.evaluate_expr(eval_first_expr, ctx, preload_eligible),
-                || self.evaluate_expr(eval_second_expr, ctx, preload_eligible),
-            );
-            let first = left?;
-            let second = right?;
-            return if is_swapped_for_eval {
-                eval_binary_expr(be, second, first)
-            } else {
-                eval_binary_expr(be, first, second)
-            };
-        }
 
         // Execute the binary operation in the following way:
         //
@@ -926,15 +919,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         //
         // - Queries, which get additional labels from `info` metrics.
         //   See https://www.robustperception.io/exposing-the-software-version-to-prometheus
-        //
-        // Invariant: be.lhs and be.rhs are both ExprResult::InstantVector
         let first = self.evaluate_expr(eval_first_expr, ctx, preload_eligible)?;
 
-        // if first.is_empty() && be.op == Or, the result will be empty,
-        // since `first` OR `second` would return an empty result in any case.
-        if first.is_empty() && op == T_LOR {
-            return Ok(ExprResult::InstantVector(vec![]));
-        }
         let sec_expr = push_down_filters(be, &first, eval_second_expr)?;
         let second = self.evaluate_expr(&sec_expr, ctx, preload_eligible)?;
 
@@ -1462,6 +1448,7 @@ fn get_function_arg(call: &Call, idx: usize) -> EvalResult<(&Expr, ValueType)> {
     Ok((arg, expected_type))
 }
 
+/// Whether evaluating `expr` reaches storage, and so is worth its own thread.
 fn is_selector(expr: &Expr) -> bool {
     match expr {
         Expr::Unary(ue) => is_selector(&ue.expr),
@@ -1474,6 +1461,12 @@ fn is_selector(expr: &Expr) -> bool {
             let rhs = be.rhs.as_ref();
             is_selector(lhs) || is_selector(rhs)
         }
+        // An aggregation or subquery reads whatever its inner expression reads.
+        // Without these, `sum by (job) (a) / sum by (job) (b)` — and anything
+        // over a subquery — is neither parallelized here nor eligible for
+        // filter pushdown, and evaluates one side after the other for nothing.
+        Expr::Aggregate(agg) => is_selector(&agg.expr),
+        Expr::Subquery(sq) => is_selector(&sq.expr),
         _ => false,
     }
 }

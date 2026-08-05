@@ -417,6 +417,18 @@ mod tests {
         r#"count_values("foo", bar{a="b",c="d"}) + baz{foo="c",x="q",z="r"}"#,
         r#"count_values("foo", bar{a="b",c="d"}) + baz{foo="c",x="q",z="r"}"#
     )]
+    // `without` does not list the value label, so nothing but this guard stops
+    // `foo="c"` reaching `bar` — where `foo` is not a series label at all and
+    // the filter would match nothing.
+    #[case(
+        r#"count_values("foo", bar{a="b"}) without (x) + baz{foo="c"}"#,
+        r#"count_values("foo", bar{a="b"}) without (x) + baz{a="b",foo="c"}"#
+    )]
+    // Filters on labels the input really carries still push through `without`.
+    #[case(
+        r#"count_values("foo", bar{a="b"}) without (x) + baz{foo="c",z="r"}"#,
+        r#"count_values("foo", bar{a="b",z="r"}) without (x) + baz{a="b",foo="c",z="r"}"#
+    )]
     fn test_count_values(#[case] q: &str, #[case] result_expected: &str) {
         validate_optimized(q, result_expected);
     }

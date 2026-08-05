@@ -3720,6 +3720,147 @@ mod tests {
         );
     }
 
+    // ── Filter pushdown beyond bare selectors ──────────────────────────────
+    //
+    // `evaluate_binary_expr` routes any binary op whose operands can yield
+    // common label filters through `eval_binop_with_pushdown`, not just
+    // selector-on-selector. These tests assert the filters actually reach the
+    // selector *inside* an aggregation or rollup, and that the answers stay
+    // correct while doing it.
+
+    /// A reader that records the selector of every point query it serves, so a
+    /// test can assert which matchers were injected before the read.
+    struct SelectorRecordingReader {
+        inner: MemorySeriesQuerier,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SelectorRecordingReader {
+        fn selectors(&self) -> Vec<String> {
+            let mut seen = self.seen.lock().unwrap().clone();
+            seen.sort();
+            seen
+        }
+
+        fn record(&self, selector: &VectorSelector) {
+            self.seen.lock().unwrap().push(selector.to_string());
+        }
+    }
+
+    impl QueryReader for SelectorRecordingReader {
+        fn query(
+            &self,
+            selector: &VectorSelector,
+            timestamp: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+            self.record(selector);
+            self.inner.query(selector, timestamp, options)
+        }
+
+        fn query_range(
+            &self,
+            selector: &VectorSelector,
+            start_ms: i64,
+            end_ms: i64,
+            options: QueryOptions,
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+            self.record(selector);
+            self.inner.query_range(selector, start_ms, end_ms, options)
+        }
+    }
+
+    fn evaluate_recording_selectors(
+        data: TestSampleData,
+        query: &str,
+    ) -> (Vec<EvalSample>, Vec<String>) {
+        let (inner, end_time) = setup_mock_reader(data);
+        let reader = SelectorRecordingReader {
+            inner,
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let mut result = parse_and_evaluate(&evaluator, query, end_time, Duration::from_secs(300))
+            .unwrap_or_else(|e| panic!("{query} should evaluate: {e:?}"));
+        sort_samples_by_labels(&mut result);
+        (result, reader.selectors())
+    }
+
+    /// The canonical ratio query. Both sides are aggregations, so before the
+    /// gate was widened this took neither the pushdown path nor the parallel
+    /// one — it evaluated `errors` in full and discarded most of it.
+    #[test]
+    fn pushdown_reaches_the_selector_inside_an_aggregation() {
+        let data: TestSampleData = vec![
+            ("requests", vec![("job", "api"), ("pod", "p1")], 0, 100.0),
+            ("requests", vec![("job", "api"), ("pod", "p2")], 1, 200.0),
+            // Only the api errors can match; the worker series is dead weight
+            // that the injected `job="api"` filter should never fetch.
+            ("errors", vec![("job", "api"), ("pod", "p1")], 2, 3.0),
+            ("errors", vec![("job", "worker"), ("pod", "p9")], 3, 999.0),
+        ];
+
+        let (result, selectors) =
+            evaluate_recording_selectors(data, "sum by (job) (requests) / sum by (job) (errors)");
+
+        assert_results_match(&result, &[(100.0, vec![("job", "api")])]);
+        assert!(
+            selectors
+                .iter()
+                .any(|s| s.contains("errors") && s.contains(r#"job="api""#)),
+            "the grouping label should reach the inner selector, got {selectors:?}"
+        );
+    }
+
+    /// A filter must not be pushed past an aggregation that does not group by
+    /// it: restricting the input would change the aggregate's value, not just
+    /// prune series that could never match.
+    #[test]
+    fn pushdown_stops_at_an_aggregation_that_drops_the_label() {
+        let data: TestSampleData = vec![
+            ("requests", vec![("job", "api"), ("pod", "p1")], 0, 10.0),
+            ("errors", vec![("job", "api"), ("pod", "p1")], 1, 4.0),
+            ("errors", vec![("job", "worker"), ("pod", "p1")], 2, 6.0),
+        ];
+
+        // RHS groups by `pod`, so its output has no `job` label at all. The sum
+        // must cover both error series (4 + 6 = 10), giving 10 / 10 = 1.
+        let (result, selectors) =
+            evaluate_recording_selectors(data, "sum by (pod) (requests) / sum by (pod) (errors)");
+
+        assert_results_match(&result, &[(1.0, vec![("pod", "p1")])]);
+        assert!(
+            !selectors
+                .iter()
+                .any(|s| s.contains("errors") && s.contains("job")),
+            "`job` is not a grouping label and must not be pushed, got {selectors:?}"
+        );
+    }
+
+    /// Rollups were already parallelized but never received filters, because
+    /// `rate(...)` is a Call rather than a bare selector.
+    #[test]
+    fn pushdown_reaches_the_selector_inside_a_rollup() {
+        let data: TestSampleData = vec![
+            ("hits", vec![("env", "prod")], 0, 1.0),
+            ("hits", vec![("env", "prod")], 1, 2.0),
+            ("misses", vec![("env", "prod")], 0, 1.0),
+            ("misses", vec![("env", "prod")], 1, 3.0),
+            ("misses", vec![("env", "staging")], 1, 99.0),
+        ];
+
+        let (result, selectors) =
+            evaluate_recording_selectors(data, "rate(hits[5m]) < rate(misses[5m])");
+
+        assert_eq!(result.len(), 1, "one env matches");
+        assert!(
+            selectors
+                .iter()
+                .any(|s| s.contains("misses") && s.contains(r#"env="prod""#)),
+            "the common env filter should reach the matrix selector, got {selectors:?}"
+        );
+    }
+
     // ── Aggregation push-down hook ─────────────────────────────────────────
     // `evaluate_pushed_down_aggregate` offers each aggregation to the data
     // source before evaluating it here. These tests pin down which

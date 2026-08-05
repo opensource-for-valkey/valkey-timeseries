@@ -9,6 +9,7 @@ use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{
     T_ADD, T_BOTTOMK, T_DIV, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_MUL, T_SUB, T_TOPK, TokenType,
 };
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
 use regex::{Regex, escape};
 use std::borrow::Cow;
@@ -176,11 +177,16 @@ fn is_aggregate_non_grouping(agg: &AggregateExpr) -> bool {
 }
 
 /// Returns true when this operand's result can yield common label filters worth
-/// pushing into the other side. Scalars and strings carry no labels at all, and
-/// label-less aggregations collapse their input into groups with no labels.
+/// pushing into the other side.
 fn can_derive_filters_from(expr: &Expr) -> bool {
+    // Only instant vectors carry labels to match on. This also keeps the
+    // rewriter away from scalar-valued subtrees: pushing a filter into the
+    // selector under `scalar(x)` would change the value it yields rather than
+    // prune series that could not have matched.
+    if expr.value_type() != ValueType::Vector {
+        return false;
+    }
     match strip_parens(expr) {
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => false,
         Expr::Aggregate(agg) => !is_aggregate_non_grouping(agg),
         _ => true,
     }
@@ -303,6 +309,10 @@ mod tests {
     fn scalar_operands_carry_no_labels() {
         assert!(!can_push_down("metric_a * 2"));
         assert!(!can_push_down("2 * metric_a"));
+        // `scalar(x)` is scalar-valued: pushing a filter into `metric_b` would
+        // change the value it yields, not prune a series that could not match.
+        assert!(!can_push_down("metric_a > scalar(metric_b)"));
+        assert!(!can_push_down("scalar(metric_b) > metric_a"));
     }
 
     #[test]

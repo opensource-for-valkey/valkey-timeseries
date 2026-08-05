@@ -3,7 +3,7 @@ use crate::promql::functions::{PromqlFunctionKind, resolve_function};
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
 use promql_parser::label::{METRIC_NAME, Matcher, Matchers};
-use promql_parser::parser::token::{T_LOR, T_LUNLESS};
+use promql_parser::parser::token::{T_COUNT_VALUES, T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, Expr, LabelModifier, VectorMatchCardinality};
 use smallvec::SmallVec;
@@ -384,11 +384,22 @@ pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut V
             push_down_binary_op_filters_in_place(&mut bo.rhs, common_filters);
         }
         Aggregate(aggr) => {
+            // Grouping labels pass through an aggregation unchanged, so a filter
+            // on one is equally true of the input series. A label the aggregation
+            // *synthesizes* is not: `count_values` writes its value label onto the
+            // output, and the input series carry no such label, so pushing a
+            // filter on it into the selector would match nothing.
+            if aggr.op.id() == T_COUNT_VALUES
+                && let Some(label_name) = aggr.param.as_deref()
+            {
+                *common_filters = drop_label_filters_for_label_name(common_filters, label_name);
+            }
             trim_filters_by_aggr_modifier(common_filters, aggr);
             push_down_binary_op_filters_in_place(&mut aggr.expr, common_filters);
-            if let Some(expr) = aggr.param.as_mut() {
-                push_down_binary_op_filters_in_place(expr, common_filters);
-            }
+            // `aggr.param` is a scalar or string (the `k` of topk, the quantile,
+            // the count_values label) — never an operand of the binary op's label
+            // matching. Rewriting a selector under it, as in `topk(scalar(x), y)`,
+            // would change the parameter's value rather than prune series.
         }
         Paren(p) => push_down_binary_op_filters_in_place(&mut p.expr, common_filters),
         _ => {}
