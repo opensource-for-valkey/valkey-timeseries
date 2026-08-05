@@ -1,7 +1,7 @@
 use crate::promql::{EvalResult, EvaluationError, ExprResult};
 use promql_parser::parser::BinaryExpr;
 use promql_parser::parser::token::{
-    T_ADD, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MOD, T_MUL, T_NEQ, T_SUB, TokenType,
+    T_ADD, T_ATAN2, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MOD, T_MUL, T_NEQ, T_POW, T_SUB, TokenType,
 };
 
 mod binop_range_scalar;
@@ -80,6 +80,8 @@ pub(crate) fn apply_binary_op(op: TokenType, left: f64, right: f64) -> EvalResul
         T_LTE => Ok(if left <= right { 1.0 } else { 0.0 }),
         T_GTE => Ok(if left >= right { 1.0 } else { 0.0 }),
         T_EQLC => Ok(if left == right { 1.0 } else { 0.0 }),
+        T_POW => Ok(left.powf(right)),
+        T_ATAN2 => Ok(left.atan2(right)),
         _ => Err(EvaluationError::InternalError(format!(
             "Binary operator not yet implemented: {:?}",
             op
