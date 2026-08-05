@@ -1,0 +1,36 @@
+# Regression: deriv() and predict_linear() over a constant series.
+#
+# `sample_regression` returns (slope, intercept). Its all-equal shortcut used to
+# return them swapped, so a flat line reported slope = value, intercept = 0.
+# deriv() then answered the series value instead of 0, and predict_linear()
+# answered value * elapsed instead of value.
+#
+# Not covered by functions.test: its whole deriv/predict_linear region sits
+# inside an `ignore` block, which is how this survived. Found by differential
+# comparison against Prometheus (docs/plans/synthetic-data-generation-plan.md).
+
+load 15s
+	up{instance="web-01", job="api"}	1+0x19
+	steady_gauge{instance="web-01"}	7.5+0x19
+	zero_gauge{instance="web-01"}	0+0x19
+
+# A flat line has zero slope.
+eval instant at 285s deriv(up[5m])
+	{instance="web-01", job="api"} 0
+
+eval instant at 285s deriv(steady_gauge[5m])
+	{instance="web-01"} 0
+
+# Zero, where a swapped tuple would be invisible.
+eval instant at 285s deriv(zero_gauge[5m])
+	{instance="web-01"} 0
+
+# A flat line predicts itself, at any horizon.
+eval instant at 285s predict_linear(up[5m], 0)
+	{instance="web-01", job="api"} 1
+
+eval instant at 285s predict_linear(up[5m], 300)
+	{instance="web-01", job="api"} 1
+
+eval instant at 285s predict_linear(steady_gauge[5m], 3600)
+	{instance="web-01"} 7.5
