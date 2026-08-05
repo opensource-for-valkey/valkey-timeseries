@@ -1,7 +1,8 @@
 use crate::promql::{EvalResult, EvaluationError, ExprResult};
 use promql_parser::parser::BinaryExpr;
 use promql_parser::parser::token::{
-    T_ADD, T_ATAN2, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MOD, T_MUL, T_NEQ, T_POW, T_SUB, TokenType,
+    T_ADD, T_ATAN2, T_DIV, T_EQLC, T_GTE, T_GTR, T_LSS, T_LTE, T_MOD, T_MUL, T_NEQ, T_POW, T_SUB,
+    TokenType,
 };
 
 mod binop_range_scalar;
@@ -63,6 +64,7 @@ pub(crate) fn eval_binary_expr(
         }
     }
 }
+
 pub(crate) fn apply_binary_op(op: TokenType, left: f64, right: f64) -> EvalResult<f64> {
     // Use the token constants with TokenType::new() for clean comparison
     match op.id() {
