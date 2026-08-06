@@ -157,8 +157,9 @@ fn duplicate_side_error(side: &str) -> EvaluationError {
 /// minus `__name__`, so a hashmap-free merge-join is safe and correct.
 fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
     // One-to-one, no on/ignoring matching, no fill values => safe merge-join.
-    // We also support the `bool` modifier here; the fast-path will emit
-    // explicit 0.0 results for unmatched LHS entries when needed.
+    // The `bool` modifier needs no special handling here: it only changes the
+    // output of matched pairs (0/1 instead of filter), while unmatched entries
+    // drop out of the result exactly as they do without `bool`.
     ctx.is_one_to_one && ctx.matching.is_none() && !ctx.has_fill
 }
 
@@ -182,10 +183,8 @@ fn eval_arith_ops_fast_path(
             let mut sub_res = Vec::new();
             let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
             let mut k = start;
-            let mut matched = false;
 
             while k < right_sorted.len() && right_sorted[k].0 == lhs_fp {
-                matched = true;
                 let (_, rhs) = &right_sorted[k];
                 k += 1;
 
@@ -219,16 +218,6 @@ fn eval_arith_ops_fast_path(
                 sub_res.push(EvalSample {
                     timestamp_ms: lhs.timestamp_ms,
                     value: output_value,
-                    labels,
-                    drop_name: lhs.drop_name || return_bool,
-                });
-            }
-
-            if !matched && is_comparison && return_bool {
-                let labels = result_metric(std::mem::take(&mut lhs.labels), operator, None);
-                sub_res.push(EvalSample {
-                    timestamp_ms: lhs.timestamp_ms,
-                    value: 0.0,
                     labels,
                     drop_name: lhs.drop_name || return_bool,
                 });
@@ -1271,12 +1260,13 @@ mod tests {
     // ── bool modifier fast-path ─────────────────────────────────────────────
 
     #[test]
-    fn test_bool_fast_path_emits_false_for_unmatched_lhs() {
+    fn test_bool_fast_path_omits_unmatched_lhs() {
         // LHS: {env="prod", v=5}, {env="dev", v=2}
         // RHS: {env="prod", v=3} (no dev on RHS)
         // op: > bool
         // prod: 5 > 3 = 1.0 (true)
-        // dev:  no match = 0.0 (false)
+        // dev:  no match => omitted; `bool` only changes the output of matched
+        //       pairs, it never turns unmatched entries into results
         let lhs = vec![
             sample(1000, 5.0, &[("env", "prod")]),
             sample(1000, 2.0, &[("env", "dev")]),
@@ -1290,15 +1280,15 @@ mod tests {
             .into_instant_vector()
             .unwrap();
 
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 1);
         let prod = find_sample(&result, "prod").expect("prod sample missing");
         assert_eq!(prod.value, 1.0);
         assert!(prod.drop_name);
 
-        let dev =
-            find_sample(&result, "dev").expect("dev sample missing (bool should emit it as 0.0)");
-        assert_eq!(dev.value, 0.0);
-        assert!(dev.drop_name);
+        assert!(
+            find_sample(&result, "dev").is_none(),
+            "unmatched lhs series must be omitted, even with bool"
+        );
     }
 
     #[test]
@@ -1329,7 +1319,7 @@ mod tests {
         // op: > bool
         // 1: 10 > 2 = 1.0
         // 2: 5 > 7 = 0.0
-        // 3: no match = 0.0
+        // 3: no match => omitted
         // (RHS id=4 doesn't match anything on LHS, so it's dropped)
         let lhs = vec![
             sample(1000, 10.0, &[("id", "1")]),
@@ -1350,7 +1340,7 @@ mod tests {
             .unwrap();
         result.sort_by(|x, y| x.labels.cmp(&y.labels));
 
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert_eq!(
             result
                 .iter()
@@ -1367,13 +1357,9 @@ mod tests {
                 .value,
             0.0
         );
-        assert_eq!(
-            result
-                .iter()
-                .find(|s| s.labels.get("id") == Some("3"))
-                .unwrap()
-                .value,
-            0.0
+        assert!(
+            result.iter().all(|s| s.labels.get("id") != Some("3")),
+            "unmatched lhs series id=3 must be omitted, even with bool"
         );
         for s in &result {
             assert!(s.drop_name);

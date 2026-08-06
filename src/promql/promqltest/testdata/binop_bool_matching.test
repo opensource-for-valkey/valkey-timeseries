@@ -1,0 +1,29 @@
+# Regression coverage for `bool` comparisons over partially matched vectors.
+# The `bool` modifier changes the output of matched pairs (0/1 instead of
+# filtering), but unmatched vector elements must still be omitted from the
+# result — they are never synthesized as 0.
+#
+# The vendored operators.test never exercises this: its bool cases use a
+# single series per side, so an absent RHS sample empties the whole RHS
+# vector and short-circuits before matching. Here the RHS is non-empty but
+# matches only one of the two LHS series.
+
+load 5m
+  left_side{env="prod"}  5 5
+  left_side{env="dev"}   2 2
+  right_side{env="prod"} 3 3
+
+# prod matches and compares true -> 1; dev has no RHS match -> omitted.
+eval instant at 5m left_side > bool right_side
+  {env="prod"} 1
+
+# prod matches and compares false -> 0 (bool keeps matched-false results);
+# dev still has no RHS match -> omitted, not 0.
+eval instant at 5m left_side < bool right_side
+  {env="prod"} 0
+
+# Same shape with on(env) matching must agree with the unmodified form.
+eval instant at 5m left_side > bool on(env) right_side
+  {env="prod"} 1
+
+clear
