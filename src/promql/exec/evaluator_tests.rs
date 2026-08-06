@@ -5023,6 +5023,109 @@ mod tests {
         assert_eq!(rendered_steps(steps), rendered_steps(local), "@ parity");
     }
 
+    /// The subquery preload must resolve `@`/`offset` exactly as the per-step
+    /// path it replaces does, or a step reads the wrong window.
+    ///
+    /// `metric[2m:30s]` takes the bare-selector fast path, which Phase 2 leaves
+    /// alone; `(metric)[2m:30s]` wraps the same selector in a `Paren`, which the
+    /// fast path does not look through — so it takes the general per-step path
+    /// that the sub-evaluator now preloads. The two describe identical samples,
+    /// so any divergence is the preload resolving a modifier differently. This
+    /// matters most for `@ start()`/`@ end()`, which resolve against the
+    /// *enclosing* query's bounds, not the subquery's grid.
+    #[test]
+    fn subquery_preload_matches_the_unpreloaded_path_for_every_modifier_shape() {
+        for modifiers in [
+            "",
+            " offset 30s",
+            " offset -30s",
+            " @ 100",
+            " @ start()",
+            " @ end()",
+            " @ start() offset 30s",
+            " @ end() offset -30s",
+        ] {
+            let bare = format!("max_over_time(metric{modifiers}[2m:30s])");
+            let parened = format!("max_over_time((metric{modifiers})[2m:30s])");
+            let (bare_steps, _) = evaluate_range_with_pushdown(
+                &bare,
+                200_000,
+                260_000,
+                30_000,
+                RollupAnswer::Unsupported,
+            );
+            let (paren_steps, _) = evaluate_range_with_pushdown(
+                &parened,
+                200_000,
+                260_000,
+                30_000,
+                RollupAnswer::Unsupported,
+            );
+            assert_eq!(
+                rendered_steps(paren_steps),
+                rendered_steps(bare_steps),
+                "preloaded and per-step paths disagree for modifier shape `{modifiers}`"
+            );
+        }
+    }
+
+    /// A time modifier on a subquery's inner selector must be honoured.
+    ///
+    /// `evaluate_subquery_vector_selector` builds its grid from the subquery's
+    /// start/end/step alone and never reads the selector's `at`/`offset`, so it
+    /// used to answer every one of these shapes with the *unmodified* series.
+    /// `evaluate_subquery` therefore keeps modifier-carrying selectors off that
+    /// fast path. Pinned with absolute values, so the two paths cannot drift
+    /// into agreeing on something wrong.
+    #[test]
+    fn subquery_inner_selector_honours_its_time_modifiers() {
+        // rollup_reader(): sample value i at t = i * 10s, for i in 0..=30.
+        for (modifiers, want) in [
+            // Pinned instants: the same value at every outer step.
+            (" @ 100", "10.0"),
+            (" @ start()", "20.0"),
+            (" @ end()", "26.0"),
+            (" @ start() offset 30s", "17.0"),
+            (" @ end() offset -30s", "29.0"),
+        ] {
+            let query = format!("max_over_time(metric{modifiers}[2m:30s])");
+            let (steps, _) = evaluate_range_with_pushdown(
+                &query,
+                200_000,
+                260_000,
+                30_000,
+                RollupAnswer::Unsupported,
+            );
+            let values: Vec<String> = rendered_steps(steps)
+                .into_iter()
+                .map(|(_, _, value)| value)
+                .collect();
+            assert_eq!(values, vec![want; 3], "{query}");
+        }
+
+        // `offset` shifts every subquery step back (or forward), so the maximum
+        // over the grid shifts with it rather than staying put.
+        for (modifiers, want) in [
+            ("", "18.0"),
+            (" offset 30s", "15.0"),
+            (" offset -30s", "21.0"),
+        ] {
+            let query = format!("max_over_time(metric{modifiers}[2m:30s])");
+            let (steps, _) = evaluate_range_with_pushdown(
+                &query,
+                200_000,
+                200_000,
+                30_000,
+                RollupAnswer::Unsupported,
+            );
+            let values: Vec<String> = rendered_steps(steps)
+                .into_iter()
+                .map(|(_, _, value)| value)
+                .collect();
+            assert_eq!(values, vec![want.to_string()], "{query}");
+        }
+    }
+
     /// A rollup inside a subquery keeps its own grid: the outer preload must not
     /// claim it, or every subquery step would read the outer query's windows.
     ///

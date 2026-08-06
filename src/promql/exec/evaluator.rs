@@ -859,8 +859,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ));
         }
 
-        // Fast path: if inner expression is a pure VectorSelector, evaluate over range once
-        if let Expr::VectorSelector(ref selector) = *subquery.expr {
+        // Fast path: if inner expression is a pure VectorSelector, evaluate over range once.
+        //
+        // Only for a selector with no time modifiers of its own.
+        // `evaluate_subquery_vector_selector` derives its whole grid from the
+        // subquery's start/end/step (`QueryPlan::for_subquery_vector_selector`)
+        // and never sees `at`/`offset`, so a modifier on the inner selector
+        // would be silently dropped. Those shapes take the general per-step
+        // path below, which resolves modifiers through
+        // `apply_time_modifiers_ms` — and which subquery-scoped preloading now
+        // serves from one span fetch rather than one read per step, so the
+        // detour is no longer expensive.
+        if let Expr::VectorSelector(ref selector) = *subquery.expr
+            && selector.at.is_none()
+            && selector.offset.is_none()
+        {
             return self.evaluate_subquery_vector_selector(
                 selector,
                 subquery_start_ms,

@@ -85,6 +85,20 @@ Phase 2 artifacts (finding 1.2 subquery-scoped preloading):
   108.7 ms (−78.7%)**. The same run confirms Phase 1 on `non_pushable_rollup`:
   **3.33 s → 48.2 ms (−98.6%)**.
 
+Bug found and fixed while landing Phase 2 (pre-existing, unrelated to the
+optimization itself): `evaluate_subquery_vector_selector` — the bare-selector
+subquery fast path — derives its whole grid from the subquery's
+start/end/step via `QueryPlan::for_subquery_vector_selector` and never reads
+the selector's `at`/`offset`, so it **silently ignored time modifiers on a
+subquery's inner selector**: `metric offset 30s[2m:30s]`,
+`metric @ start()[2m:30s]` and friends all returned the unmodified series.
+`evaluate_subquery` now keeps modifier-carrying selectors off that fast path,
+sending them down the general per-step path — which resolves modifiers through
+`apply_time_modifiers_ms`, and which Phase 2 preloading makes cheap (one span
+fetch, not one read per step). Pinned by
+`subquery_inner_selector_honours_its_time_modifiers` with absolute values and
+by `subquery_preload_matches_the_unpreloaded_path_for_every_modifier_shape`.
+
 Goal: identify where PromQL query execution does redundant storage/cluster
 round trips or redundant per-step CPU work, and lay out a prioritized,
 verifiable plan for eliminating them.
