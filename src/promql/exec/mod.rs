@@ -1,3 +1,4 @@
+mod bitset;
 mod evaluator;
 mod pipeline;
 pub mod types;

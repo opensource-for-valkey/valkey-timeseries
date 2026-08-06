@@ -4,6 +4,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{HasFingerprint, Labels, SeriesFingerprint, fingerprint_labels};
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
+use crate::promql::exec::bitset::BitSet;
 use crate::promql::hashers::{MatrixPreloadKey, PreloadKey, RollupPreloadKey};
 use ahash::RandomState;
 use enquote::enquote;
@@ -372,7 +373,7 @@ pub(in crate::promql) enum StepGrid<T> {
         offset: usize,
         values: Vec<T>,
         /// One bit per entry of `values`; bit *i* set means `values[i]` is present.
-        present: Vec<u64>,
+        present: BitSet,
     },
 }
 
@@ -393,7 +394,7 @@ impl<T: Copy> StepGrid<T> {
                 present,
             } => {
                 let i = step.checked_sub(*offset)?;
-                if i >= values.len() || present.get(i / 64)? >> (i % 64) & 1 == 0 {
+                if i >= values.len() || i >= present.len() || !present.get(i) {
                     return None;
                 }
                 Some(values[i])
@@ -411,7 +412,7 @@ pub(in crate::promql) struct StepGridBuilder<T> {
     offset: Option<usize>,
     next_step: usize,
     values: Vec<T>,
-    present: Vec<u64>,
+    present: BitSet,
     /// How many pushed steps were present. Trimming only ever drops absent
     /// steps, so comparing this against the trimmed length is an exact O(1)
     /// test for "no holes remain" — no need to rescan the bitmap.
@@ -424,7 +425,7 @@ impl<T: Copy + Default> StepGridBuilder<T> {
             offset: None,
             next_step: 0,
             values: Vec::with_capacity(steps),
-            present: Vec::with_capacity(steps.div_ceil(64)),
+            present: BitSet::with_capacity(steps),
             present_count: 0,
         }
     }
@@ -437,7 +438,7 @@ impl<T: Copy + Default> StepGridBuilder<T> {
             Some(v) => {
                 self.offset.get_or_insert(step);
                 self.values.push(v);
-                self.push_bit(true);
+                self.present.push(true);
                 self.present_count += 1;
             }
             // Absent steps before the first present one are dropped rather
@@ -445,37 +446,25 @@ impl<T: Copy + Default> StepGridBuilder<T> {
             // hold a slot so later steps keep their index.
             None if self.offset.is_some() => {
                 self.values.push(T::default());
-                self.push_bit(false);
+                self.present.push(false);
             }
             None => {}
-        }
-    }
-
-    fn push_bit(&mut self, set: bool) {
-        let i = self.values.len() - 1;
-        if i / 64 >= self.present.len() {
-            self.present.push(0);
-        }
-        if set {
-            self.present[i / 64] |= 1 << (i % 64);
         }
     }
 
     /// Finish the grid, dropping the trailing run of absent steps and shedding
     /// the bitmap entirely when nothing inside the span is absent.
     pub(in crate::promql) fn finish(mut self) -> StepGrid<T> {
-        let last_present = (0..self.values.len())
-            .rev()
-            .find(|&i| self.present[i / 64] >> (i % 64) & 1 == 1);
+        let last_present = (0..self.values.len()).rev().find(|&i| self.present.get(i));
         match last_present {
             Some(last) => {
                 self.values.truncate(last + 1);
-                self.present.truncate(last / 64 + 1);
+                self.present.truncate(last + 1);
             }
             // Nothing was ever present: keep an empty grid, not a run of holes.
             None => {
                 self.values.clear();
-                self.present.clear();
+                self.present.clear_all();
             }
         }
         self.values.shrink_to_fit();
