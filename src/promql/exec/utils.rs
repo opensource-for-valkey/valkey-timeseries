@@ -21,17 +21,6 @@ pub(in crate::promql) fn merge_step_into_series_map(
     }
 }
 
-/// Filter samples to (start_ms, end_ms] using binary search on sorted timestamps.
-/// Samples are sorted by timestamp_ms (storage invariant), so we use partition_point
-/// to find bounds in O(log n) instead of scanning the full vector.
-pub fn filter_samples_binary_search(samples: &[Sample], start_ms: i64, end_ms: i64) -> Vec<Sample> {
-    // Find the first index where timestamp_ms > start_ms
-    let lo = samples.partition_point(|s| s.timestamp <= start_ms);
-    // Find the last index where timestamp_ms > end_ms
-    let hi = samples.partition_point(|s| s.timestamp <= end_ms);
-    samples[lo..hi].to_vec()
-}
-
 pub(super) fn collect_vector_selectors(expr: &Expr) -> Vec<&VectorSelector> {
     let mut out = Vec::new();
     collect_vector_selectors_inner(expr, &mut out);
