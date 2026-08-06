@@ -99,6 +99,58 @@ fetch, not one read per step). Pinned by
 `subquery_inner_selector_honours_its_time_modifiers` with absolute values and
 by `subquery_preload_matches_the_unpreloaded_path_for_every_modifier_shape`.
 
+Phase 3 artifacts (profile, then only what it justified):
+
+- **How it was profiled.** No sampling profiler was usable on the dev machine
+  (`xctrace` needs full Xcode, `dtrace` needs SIP disabled), so attribution
+  came from temporary in-process counters wrapped around each Tier 2
+  candidate, run in release over the Phase 0 bench shapes. The
+  instrumentation was removed before commit; it is reproducible by
+  re-applying the same counters. Figures below are **CPU time** summed across
+  the parallel step loop, not wall time.
+- **2.1 aggregation grouping — confirmed, fixed more simply than proposed.**
+  `compute_grouping_labels` cost 826 ms of CPU over 1.1M calls (~750 ns each)
+  for `sum by (le)` at 1100 series × 1000 steps: `retain` goes through
+  `make_owned`, which clones *every* label of the source set into owned
+  `String`s before dropping the ones the modifier excludes — 1100 label sets
+  built per step to keep 11. But grouping needs a *key* per sample and
+  *labels* only once per group. `EvalLabels::compute_grouping_key` hashes the
+  filtered view instead (allocation-free), and the label set is materialized
+  only when a group is new. That is simpler than the planned
+  operation-scoped memo tables — no memo, no cross-step state, no lock
+  traffic, nothing keyed on AST identity. Equivalence holds by construction
+  (both paths go through the new `labels::fingerprint_labels`, and filtering
+  preserves order) and is pinned by
+  `grouping_key_matches_the_materialized_grouping_labels`. Result: 826 ms →
+  190 ms of CPU; `group_sample_values` overall 1349 ms → 577 ms.
+- **2.1 binary-op match keys — REFUTED; the cost was somewhere else.**
+  `compute_binary_match_key` was only 33 ms of CPU (165 ns × 200K) for
+  `a_hundred - b_hundred`, so the memo this document proposed would have
+  addressed ~4% of that query. What actually dominated was
+  `collect_fingerprints` at **840 ms** of CPU: `into_par()` fanning a
+  *100-element* map across threads, twice per step, nested inside the
+  already-parallel step loop — ~420 µs of fan-out to do ~16 µs of hashing.
+  Gating it on `PARALLEL_MATCH_KEY_THRESHOLD` (2048) cut it to 56 ms. This is
+  exactly the substitution the phase's "profile first" gate exists to
+  prevent, and the §2.1 proposal below is left standing as written so the
+  miss stays on the record.
+- **Deliberately not landed.** The 2.2 prepare pass, re-keying `SeriesMap` by
+  fingerprint, and `ensure_unique_labelsets` — the profile does not justify
+  them. `merge_step_into_series_map` measured 3.4 ms (`high_card_sum_by`) and
+  23 ms (`vector_join`) of CPU, and the preload-lookup path 57 ms / 17 ms,
+  all far below the two paths above. They remain planned, not implemented.
+- **Benchmark caveat.** Wall-clock on this dev machine is unreliable for
+  these parallel shapes — the *same* binary measured 94 ms and 174 ms on
+  consecutive `vector_join` runs, drifting with thermal/frequency state. The
+  figures below therefore come from an **interleaved A/B** — revert → measure
+  → restore → measure, three rounds — so drift cancels rather than being
+  charged to the change. Means over the three rounds:
+  `high_card_sum_by` 212.8 ms → 148.0 ms (**−30%**), `vector_join`
+  178.1 ms → 94.8 ms (**−47%**). Per-round spread was ±3% on each side, and
+  the direction was identical in all three rounds. Single-shot before/after
+  runs on this machine should not be trusted; any one round in isolation
+  overstates the win (round 1 alone read −35% / −50%).
+
 Goal: identify where PromQL query execution does redundant storage/cluster
 round trips or redundant per-step CPU work, and lay out a prioritized,
 verifiable plan for eliminating them.

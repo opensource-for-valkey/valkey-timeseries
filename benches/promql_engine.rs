@@ -509,9 +509,91 @@ fn bench_phase0_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: the grouping path behind PromQL's *selection* operators.
+///
+/// `group_samples` serves `quantile`, `limitk` and `limit_ratio` unconditionally
+/// and `topk`/`bottomk` when they carry a `by`/`without` modifier — note
+/// `topk(k, v)` *without* a modifier short-circuits past it, which is why the
+/// existing `topk(1, a_X)` cases never exercised this and it went unprofiled
+/// through Phase 3 (see docs/plans/promql-execution-optimization-plan.md).
+///
+/// Swept across cardinality because that is the open question: keying the
+/// samples was parallel before Phase 3 and is sequential now, and a fan-out
+/// only pays once the input is large enough to cover it.
+fn bench_group_samples(c: &mut Criterion) {
+    const INTERVAL_MS: i64 = 10_000;
+    const NUM_INTERVALS: usize = 200;
+
+    let querier = MemorySeriesQuerier::new();
+    // Three cardinalities of the same shape: `le` buckets across a `l` fan-out,
+    // so `by (le)` yields few large groups and `without (le)` many small ones.
+    for (metric, fanout) in [("g_small", 10), ("g_mid", 100), ("g_large", 2000)] {
+        for i in 0..fanout {
+            for j in 0..11 {
+                let le = if j == 10 {
+                    "+Inf".to_string()
+                } else {
+                    j.to_string()
+                };
+                let labels =
+                    Labels::from_pairs(&[("__name__", metric), ("l", &i.to_string()), ("le", &le)]);
+                for s in 0..NUM_INTERVALS {
+                    let ts = (s as i64) * INTERVAL_MS;
+                    querier.add_sample(&labels, Sample::new(ts, (s + i + j) as f64));
+                }
+            }
+        }
+    }
+    let reader: Arc<dyn QueryReader> = Arc::new(querier);
+
+    let opts = QueryOptions {
+        timeout: None,
+        deadline: None,
+        ..QueryOptions::default()
+    };
+    let query_time = ms_to_system_time((NUM_INTERVALS as i64 - 1) * INTERVAL_MS);
+
+    // (case, query, samples reaching group_samples)
+    let cases = [
+        ("quantile_110", "quantile(0.95, g_small)"),
+        ("quantile_1100", "quantile(0.95, g_mid)"),
+        ("quantile_22000", "quantile(0.95, g_large)"),
+        ("quantile_by_le_22000", "quantile by (le) (0.95, g_large)"),
+        (
+            "quantile_without_le_22000",
+            "quantile without (le) (0.95, g_large)",
+        ),
+        ("topk_by_le_22000", "topk by (le) (5, g_large)"),
+        ("limitk_22000", "limitk(5, g_large)"),
+    ];
+
+    let mut group = c.benchmark_group("group_samples");
+    if use_flat_sampling() {
+        group.sampling_mode(SamplingMode::Flat);
+    }
+    for (name, query) in cases {
+        let expr = parse(query).expect("valid group_samples benchmark query");
+        group.bench_with_input(BenchmarkId::new("query", name), &query, |b, _| {
+            b.iter(|| {
+                let stmt = EvalStmt {
+                    expr: expr.clone(),
+                    start: query_time,
+                    end: query_time,
+                    interval: Duration::ZERO,
+                    lookback_delta: opts.lookback_delta,
+                };
+                let result = evaluate_instant(reader.clone(), stmt, query_time, opts)
+                    .expect("group_samples benchmark should evaluate");
+                black_box(result);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = promql_engine_benches;
     config = benchmark_config();
-    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline
+    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline, bench_group_samples
 );
 criterion_main!(promql_engine_benches);

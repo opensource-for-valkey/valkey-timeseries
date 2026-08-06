@@ -493,11 +493,17 @@ impl<T> Group<T> {
 /// reduction path and always was. This used to fan the keying out with
 /// `into_par()`, but the per-sample cost that fan-out was parallelizing was
 /// mostly the label allocation that [`EvalLabels::compute_grouping_key`] now
-/// avoids; what remains is a hash, and the sibling binary-op path measured a
-/// fan-out over a small input costing far more than the hashing it spread
-/// (see `PARALLEL_MATCH_KEY_THRESHOLD`). Note this path was not itself
-/// profiled: the Phase 3 bench shapes cover reductions and joins, not
-/// selections.
+/// avoids; what remains is a hash.
+///
+/// Measured, on the `group_samples` bench group (interleaved A/B, two rounds,
+/// keeping the allocation-free key on both sides so only the parallelism
+/// differs). Restoring the fan-out costs **+15%** at 110 samples and **+12%**
+/// at 1100 — the ordinary cardinalities — and buys at most ~3.5% back at
+/// 22000, and only for the many-small-groups shape (`without (le)`). It is
+/// not worth a size threshold here: unlike the binary-op path, which pays the
+/// fan-out twice per step inside an already-parallel step loop, this runs once
+/// per evaluation, so the ceiling on the win is small and the floor is a
+/// double-digit regression on the common case.
 fn group_samples(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
