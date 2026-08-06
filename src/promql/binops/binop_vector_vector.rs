@@ -421,21 +421,24 @@ fn eval_arith_ops(
                     let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                     let many_samples = take_group(&mut many_it, many_key);
 
-                    let should_check_duplicates = !ctx.is_comparison;
-
-                    if should_check_duplicates {
-                        if one_samples.len() > 1 {
-                            return Err(duplicate_side_error(duplicate_one_side(&ctx)));
+                    // Cardinality validation is determined purely by label
+                    // matching (i.e. by the match-key groups formed above),
+                    // not by whether the operator is a comparison or by the
+                    // truth value of any individual comparison. A comparison
+                    // that would evaluate false must still error on an
+                    // ambiguous many-to-one/one-to-many match, exactly like
+                    // an arithmetic operator would.
+                    if one_samples.len() > 1 {
+                        return Err(duplicate_side_error(duplicate_one_side(&ctx)));
+                    }
+                    if ctx.is_one_to_one {
+                        let mut iter = many_samples.into_iter();
+                        let sample = iter.next().unwrap();
+                        if iter.next().is_some() {
+                            return Err(duplicate_side_error(duplicate_many_side(&ctx)));
                         }
-                        if ctx.is_one_to_one {
-                            let mut iter = many_samples.into_iter();
-                            let sample = iter.next().unwrap();
-                            if iter.next().is_some() {
-                                return Err(duplicate_side_error(duplicate_many_side(&ctx)));
-                            }
-                            result.extend(handle_match(&ctx, &sample, &one_samples));
-                            continue;
-                        }
+                        result.extend(handle_match(&ctx, &sample, &one_samples));
+                        continue;
                     }
 
                     if one_samples.len() < MATCH_PARALLEL_THRESHOLD {
@@ -506,7 +509,10 @@ fn skip_group_count(
 
 #[inline]
 fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalResult<()> {
-    if !ctx.is_one_to_one && !ctx.is_comparison && one_group_len > 1 {
+    // Cardinality is a property of the match-key grouping, independent of
+    // whether the operator is a comparison — see the matched-key branch
+    // above for the full rationale.
+    if !ctx.is_one_to_one && one_group_len > 1 {
         return Err(duplicate_side_error(if ctx.is_group_right {
             "left"
         } else {
@@ -544,7 +550,10 @@ fn emit_fill_for_many(
     fill_val: f64,
     result: &mut Vec<EvalSample>,
 ) -> EvalResult<()> {
-    let should_check_duplicates = !ctx.is_comparison && !ctx.is_one_to_one;
+    // Cardinality is a property of the match-key grouping, independent of
+    // whether the operator is a comparison — see the matched-key branch in
+    // `eval_arith_ops` for the full rationale.
+    let should_check_duplicates = !ctx.is_one_to_one;
 
     fn process_one(
         ctx: &ArithOpContext,
@@ -559,7 +568,7 @@ fn emit_fill_for_many(
     }
 
     // Validate that a "one" side group does not contain duplicates when grouped
-    // (non one-to-one) matching is in effect for a non-comparison operator.
+    // (non one-to-one) matching is in effect.
     if should_check_duplicates {
         for (i, sample) in one_samples.into_iter().enumerate() {
             process_one(ctx, &sample, fill_val, result);
@@ -1364,5 +1373,67 @@ mod tests {
         for s in &result {
             assert!(s.drop_name);
         }
+    }
+
+    // ── comparison cardinality validation ───────────────────────────────────
+
+    #[test]
+    fn test_one_to_one_comparison_errors_on_ambiguous_many_side() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::LabelModifier;
+
+        // LHS: two series sharing job="a" (differ by instance) — ambiguous
+        // one-to-one match against a single RHS series with job="a". This
+        // must error regardless of the comparison's truth value: cardinality
+        // is decided by the match key, not by the comparison result.
+        let lhs = vec![
+            sample(1000, 5.0, &[("job", "a"), ("instance", "1")]),
+            sample(1000, 3.0, &[("job", "a"), ("instance", "2")]),
+        ];
+        let rhs = vec![sample(1000, 1.0, &[("job", "a")])];
+
+        let modifier = BinModifier::default().with_matching(Some(LabelModifier::Include(
+            ModifierLabels::new(vec!["job"]),
+        )));
+        let expr = make_expr(T_GTR, Some(modifier));
+
+        let err = eval_binop_vector_vector(&expr, lhs, rhs).expect_err(
+            "ambiguous one-to-one match must error even though both sides compare true",
+        );
+        assert!(
+            err.to_string()
+                .contains("many-to-many matching not allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_one_to_one_comparison_errors_even_when_all_matches_are_false() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::LabelModifier;
+
+        // Same shape as above, but both comparisons would evaluate false.
+        // Without bool, a false comparison is normally filtered out of the
+        // result — but that filtering must not suppress the cardinality
+        // error, since the ambiguity exists independent of any value.
+        let lhs = vec![
+            sample(1000, 1.0, &[("job", "a"), ("instance", "1")]),
+            sample(1000, 2.0, &[("job", "a"), ("instance", "2")]),
+        ];
+        let rhs = vec![sample(1000, 100.0, &[("job", "a")])];
+
+        let modifier = BinModifier::default().with_matching(Some(LabelModifier::Include(
+            ModifierLabels::new(vec!["job"]),
+        )));
+        let expr = make_expr(T_GTR, Some(modifier));
+
+        let err = eval_binop_vector_vector(&expr, lhs, rhs).expect_err(
+            "ambiguous one-to-one match must error even though both sides compare false",
+        );
+        assert!(
+            err.to_string()
+                .contains("many-to-many matching not allowed"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -2602,21 +2602,23 @@ mod tests {
 
     #[test]
     fn should_evaluate_group_left_comparison() {
-        // given: comparison with group_left filters out false results
+        // given: comparison with group_left filters out false results. For
+        // group_left, left is many (multiple cpu_usage series may match one
+        // memory_bytes series) and right must remain unique per match key.
         let test_data: TestSampleData = vec![
-            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
             (
-                "memory_bytes",
+                "cpu_usage",
                 vec![("env", "prod"), ("instance", "i1")],
-                1,
-                100.0,
+                0,
+                150.0,
             ),
             (
-                "memory_bytes",
+                "cpu_usage",
                 vec![("env", "prod"), ("instance", "i2")],
-                2,
-                200.0,
+                1,
+                50.0,
             ),
+            ("memory_bytes", vec![("env", "prod")], 2, 100.0),
         ];
         let (reader, end_time) = setup_mock_reader(test_data);
         let evaluator = Evaluator::new(&reader, QueryOptions::default());
@@ -2642,6 +2644,53 @@ mod tests {
                     ("instance", "i1"),
                 ],
             )],
+        );
+    }
+
+    #[test]
+    fn should_error_group_left_comparison_duplicate_on_right_side() {
+        // given: group_left where the right (one) side has duplicates after
+        // matching. Cardinality is decided by the match key alone, so this
+        // must error for a comparison exactly as it does for arithmetic
+        // (see should_error_group_left_duplicate_on_right_side below) —
+        // even though one of the two comparisons (150 > 200) is false.
+        let test_data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 150.0),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i1")],
+                1,
+                100.0,
+            ),
+            (
+                "memory_bytes",
+                vec![("env", "prod"), ("instance", "i2")],
+                2,
+                200.0,
+            ),
+        ];
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let lookback_delta = Duration::from_secs(300);
+
+        // when
+        let result = parse_and_evaluate(
+            &evaluator,
+            "cpu_usage > on(env) group_left memory_bytes",
+            end_time,
+            lookback_delta,
+        );
+
+        // then: error - the one (right) side has duplicates, regardless of
+        // whether the individual comparisons are true or false
+        assert!(
+            result.is_err(),
+            "Expected error for duplicate series on the one (right) side"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate series on the right side"),
+            "Error should mention right side: {err}"
         );
     }
 
