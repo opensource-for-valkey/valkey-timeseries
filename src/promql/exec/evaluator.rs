@@ -16,7 +16,7 @@ use crate::promql::exec::pipeline::{
 };
 use crate::promql::exec::types::{
     EvalLabels, MatrixPreloadMap, PreloadedMatrixData, PreloadedMatrixSeries, PreloadedRollupData,
-    PreloadedRollupSeries, RollupPreloadMap, SeriesMap,
+    PreloadedRollupSeries, RollupPreloadMap, SeriesMap, StepGridBuilder,
 };
 use crate::promql::exec::utils::{
     RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
@@ -504,10 +504,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     .iter()
                     .map(|point| (point.timestamp, point.value))
                     .collect();
-                let values = window_ends
-                    .iter()
-                    .map(|end| points.get(end).copied())
-                    .collect();
+                let mut values = StepGridBuilder::with_capacity(window_ends.len());
+                for end in &window_ends {
+                    values.push(points.get(end).copied());
+                }
+                let values = values.finish();
                 PreloadedRollupSeries {
                     labels: EvalLabels::from(s.labels),
                     values,
@@ -553,7 +554,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .filter_map(|series| {
                 // A step whose window held no samples contributes nothing —
                 // the series is absent at this step, not NaN here.
-                let value = (*series.values.get(step_idx)?)?;
+                let value = series.values.get(step_idx)?;
                 Some(EvalSample {
                     timestamp_ms: ctx.evaluation_ts,
                     value,
@@ -627,10 +628,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                     )
                 });
 
-                let mut values = Vec::with_capacity(num_steps);
+                let mut values = StepGridBuilder::with_capacity(num_steps);
                 for_each_step_sample(&samples, steps, lookback_delta_ms, |_, latest| {
                     values.push(latest.copied());
                 });
+                let values = values.finish();
 
                 PreloadedInstantSeries {
                     labels: labels.into(),
@@ -1010,7 +1012,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
                 let mut samples = Vec::new();
                 for series in &preloaded.series {
-                    if let Some(Some(sample)) = series.values.get(step_idx) {
+                    if let Some(sample) = series.values.get(step_idx) {
                         samples.push(EvalSample {
                             timestamp_ms: sample.timestamp,
                             value: sample.value,

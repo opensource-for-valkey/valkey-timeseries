@@ -340,6 +340,164 @@ impl From<Vec<Label>> for EvalLabels {
     }
 }
 
+/// A per-step grid of values in which some steps hold nothing.
+///
+/// Replaces `Vec<Option<T>>` for the preload grids, which is wasteful at scale
+/// in two separate ways. `Option<Sample>` costs 24 bytes to carry 16 bytes of
+/// payload — neither `i64` nor `f64` has a spare niche, so the discriminant is
+/// a whole word — and a series that only exists for part of the query range
+/// still pays for every step outside it. This stores one packed value per step
+/// with a one-bit-per-step presence bitmap, and drops the absent runs at either
+/// end of the grid entirely.
+///
+/// Measured over a 2000-series, 1440-step range query: 69.2 MB → 46.5 MB when
+/// every series spans the whole range (the packing alone), and 69.2 MB →
+/// 12.1 MB when each series spans a quarter of it (packing plus trimming).
+///
+/// Absence lives in the bitmap and never in the value, so a stored NaN is a
+/// *present* NaN — preserving the absent-vs-NaN distinction that the rollup
+/// and selector paths depend on.
+pub(in crate::promql) enum StepGrid<T> {
+    /// Every step from `offset` onwards is present, so there is no bitmap to
+    /// consult. This is the common shape — a series that reports without gaps
+    /// over the part of the range it exists for — and it is the one on the hot
+    /// read path, so it reads with a single bounds-checked load. Carrying a
+    /// bitmap here measurably cost CPU: a step loop over 1100 series touches
+    /// one cache line per series per step, and a second allocation made it two.
+    Dense { offset: usize, values: Vec<T> },
+    /// Some step inside the grid's span is absent, so presence has to be
+    /// stored. One bit per step, which is still far cheaper than the word of
+    /// `Option` discriminant per step that this replaces.
+    Sparse {
+        offset: usize,
+        values: Vec<T>,
+        /// One bit per entry of `values`; bit *i* set means `values[i]` is present.
+        present: Vec<u64>,
+    },
+}
+
+impl<T: Copy> StepGrid<T> {
+    /// The value at `step`, or `None` when that step holds nothing.
+    ///
+    /// A step before the grid's first stored value, past its last, or marked
+    /// absent all answer `None`. `step` is derived by dividing timestamps, so
+    /// an out-of-range evaluation timestamp can produce a nonsensically large
+    /// index; that lands past the end and answers `None` rather than
+    /// panicking, as the `Vec<Option<T>>` lookup it replaces did.
+    pub(in crate::promql) fn get(&self, step: usize) -> Option<T> {
+        match self {
+            StepGrid::Dense { offset, values } => values.get(step.checked_sub(*offset)?).copied(),
+            StepGrid::Sparse {
+                offset,
+                values,
+                present,
+            } => {
+                let i = step.checked_sub(*offset)?;
+                if i >= values.len() || present.get(i / 64)? >> (i % 64) & 1 == 0 {
+                    return None;
+                }
+                Some(values[i])
+            }
+        }
+    }
+}
+
+/// Streaming builder for a [`StepGrid`], fed one step at a time in step order.
+///
+/// Streaming matters: materializing a `Vec<Option<T>>` and converting would
+/// pay the very peak this type exists to avoid, so values are packed as they
+/// arrive and leading absent steps are never stored at all.
+pub(in crate::promql) struct StepGridBuilder<T> {
+    offset: Option<usize>,
+    next_step: usize,
+    values: Vec<T>,
+    present: Vec<u64>,
+    /// How many pushed steps were present. Trimming only ever drops absent
+    /// steps, so comparing this against the trimmed length is an exact O(1)
+    /// test for "no holes remain" — no need to rescan the bitmap.
+    present_count: usize,
+}
+
+impl<T: Copy + Default> StepGridBuilder<T> {
+    pub(in crate::promql) fn with_capacity(steps: usize) -> Self {
+        Self {
+            offset: None,
+            next_step: 0,
+            values: Vec::with_capacity(steps),
+            present: Vec::with_capacity(steps.div_ceil(64)),
+            present_count: 0,
+        }
+    }
+
+    /// Append the next step's value.
+    pub(in crate::promql) fn push(&mut self, value: Option<T>) {
+        let step = self.next_step;
+        self.next_step += 1;
+        match value {
+            Some(v) => {
+                self.offset.get_or_insert(step);
+                self.values.push(v);
+                self.push_bit(true);
+                self.present_count += 1;
+            }
+            // Absent steps before the first present one are dropped rather
+            // than stored; once the grid has started, an absent step has to
+            // hold a slot so later steps keep their index.
+            None if self.offset.is_some() => {
+                self.values.push(T::default());
+                self.push_bit(false);
+            }
+            None => {}
+        }
+    }
+
+    fn push_bit(&mut self, set: bool) {
+        let i = self.values.len() - 1;
+        if i / 64 >= self.present.len() {
+            self.present.push(0);
+        }
+        if set {
+            self.present[i / 64] |= 1 << (i % 64);
+        }
+    }
+
+    /// Finish the grid, dropping the trailing run of absent steps and shedding
+    /// the bitmap entirely when nothing inside the span is absent.
+    pub(in crate::promql) fn finish(mut self) -> StepGrid<T> {
+        let last_present = (0..self.values.len())
+            .rev()
+            .find(|&i| self.present[i / 64] >> (i % 64) & 1 == 1);
+        match last_present {
+            Some(last) => {
+                self.values.truncate(last + 1);
+                self.present.truncate(last / 64 + 1);
+            }
+            // Nothing was ever present: keep an empty grid, not a run of holes.
+            None => {
+                self.values.clear();
+                self.present.clear();
+            }
+        }
+        self.values.shrink_to_fit();
+        let offset = self.offset.unwrap_or(0);
+
+        // Leading and trailing absences are gone, so the grid is dense unless
+        // a step inside the remaining span is absent.
+        if self.present_count == self.values.len() {
+            return StepGrid::Dense {
+                offset,
+                values: self.values,
+            };
+        }
+        self.present.shrink_to_fit();
+        StepGrid::Sparse {
+            offset,
+            values: self.values,
+            present: self.present,
+        }
+    }
+}
+
 pub(in crate::promql) type PreloadMap =
     halfbrown::HashMap<PreloadKey, PreloadedInstantData, RandomState>;
 
@@ -352,9 +510,9 @@ pub(in crate::promql) struct PreloadedInstantData {
 
 pub(in crate::promql) struct PreloadedInstantSeries {
     pub(super) labels: EvalLabels,
-    /// Dense array indexed by outer step number. values[i] = Some(Sample) if a
-    /// sample exists in the lookback window for that step, None otherwise.
-    pub(super) values: Vec<Option<Sample>>,
+    /// Indexed by outer step number: a step is present when a sample exists in
+    /// the lookback window for it, absent otherwise.
+    pub(super) values: StepGrid<Sample>,
 }
 
 pub(in crate::promql) type RollupPreloadMap =
@@ -373,11 +531,11 @@ pub(in crate::promql) struct PreloadedRollupData {
 
 pub(in crate::promql) struct PreloadedRollupSeries {
     pub(super) labels: EvalLabels,
-    /// Dense array indexed by outer step number. `values[i]` is `Some` when the
-    /// window for that step produced a value and `None` when it held no samples
-    /// — which is not the same as producing NaN, and is why this is an
-    /// `Option<f64>` rather than an `f64` that could be NaN.
-    pub(super) values: Vec<Option<f64>>,
+    /// Indexed by outer step number. A step is present when the window for it
+    /// produced a value and absent when it held no samples — which is not the
+    /// same as producing NaN, and is why absence lives in the grid's presence
+    /// bitmap rather than in the `f64`.
+    pub(super) values: StepGrid<f64>,
 }
 
 pub(in crate::promql) type MatrixPreloadMap =
@@ -620,5 +778,93 @@ mod grouping_key_tests {
         assert_eq!(a.compute_grouping_key(m), b.compute_grouping_key(m));
         // Different `le` -> different group.
         assert_ne!(a.compute_grouping_key(m), c.compute_grouping_key(m));
+    }
+}
+
+#[cfg(test)]
+mod step_grid_tests {
+    use super::*;
+
+    fn build<T: Copy + Default>(items: &[Option<T>]) -> StepGrid<T> {
+        let mut b = StepGridBuilder::with_capacity(items.len());
+        for &v in items {
+            b.push(v);
+        }
+        b.finish()
+    }
+
+    /// The grid must answer exactly what the `Vec<Option<T>>` it replaces
+    /// would, for every index — including the ones outside it.
+    fn assert_matches<T: Copy + Default + PartialEq + std::fmt::Debug>(items: &[Option<T>]) {
+        let grid = build(items);
+        for (i, want) in items.iter().enumerate() {
+            assert_eq!(grid.get(i), *want, "step {i} of {items:?}");
+        }
+        // Past the end, and the huge index a negative step timestamp produces
+        // once cast to usize.
+        assert_eq!(grid.get(items.len()), None, "one past the end of {items:?}");
+        assert_eq!(grid.get(usize::MAX), None, "wrapped index on {items:?}");
+    }
+
+    #[test]
+    fn grid_answers_exactly_what_a_vec_of_options_would() {
+        assert_matches::<u32>(&[]);
+        assert_matches(&[None::<u32>, None, None]);
+        assert_matches(&[Some(1u32), Some(2), Some(3)]);
+        // Leading absent run — dropped from storage, still absent on read.
+        assert_matches(&[None, None, Some(7u32), Some(8)]);
+        // Trailing absent run — likewise.
+        assert_matches(&[Some(7u32), Some(8), None, None]);
+        // Interior holes must keep later steps on their own index.
+        assert_matches(&[Some(1u32), None, None, Some(4), None, Some(6)]);
+        assert_matches(&[None, Some(1u32), None, Some(3), None]);
+        // Longer than one bitmap word, with a hole either side of the boundary.
+        let mut long: Vec<Option<u32>> = (0..200u32).map(Some).collect();
+        long[63] = None;
+        long[64] = None;
+        long[128] = None;
+        assert_matches(&long);
+    }
+
+    /// The distinction the rollup path depends on: a stored NaN is a *present*
+    /// NaN, not an absent step.
+    #[test]
+    fn grid_separates_an_absent_step_from_a_present_nan() {
+        let grid = build(&[Some(f64::NAN), None, Some(1.5)]);
+        let got = grid.get(0).expect("step 0 is present");
+        assert!(got.is_nan(), "a present NaN survives as a present NaN");
+        assert_eq!(grid.get(1), None, "step 1 holds nothing");
+        assert_eq!(grid.get(2), Some(1.5));
+    }
+
+    /// Trimming is the point: absent runs at either end cost no storage.
+    #[test]
+    fn grid_drops_absent_runs_at_both_ends() {
+        let mut items = vec![None::<u64>; 500];
+        items[400] = Some(1);
+        items[402] = Some(2);
+        let grid = build(&items);
+        // Only steps 400..=402 are stored, not all 500.
+        let StepGrid::Sparse { offset, values, .. } = &grid else {
+            panic!("a grid with an interior hole is sparse");
+        };
+        assert_eq!(values.len(), 3, "stored slots");
+        assert_eq!(*offset, 400);
+        assert_matches(&items);
+
+        // A grid that is absent throughout stores nothing at all.
+        let empty = build(&vec![None::<u64>; 500]);
+        let StepGrid::Dense { values, .. } = &empty else {
+            panic!("an empty grid has no holes to record");
+        };
+        assert_eq!(values.len(), 0);
+
+        // A grid with no interior holes sheds the bitmap entirely.
+        let dense = build(&[None, Some(1u64), Some(2), Some(3), None]);
+        let StepGrid::Dense { offset, values } = &dense else {
+            panic!("a gapless grid is dense");
+        };
+        assert_eq!((*offset, values.len()), (1, 3));
+        assert_matches(&[None, Some(1u64), Some(2), Some(3), None]);
     }
 }
