@@ -210,6 +210,28 @@ impl PreloadKey {
     }
 }
 
+/// Structural key for a matrix selector whose raw sample span was preloaded
+/// for the outer step grid: the selector (time modifiers included, via
+/// [`PreloadKey`]) plus the window width.
+///
+/// The window width is part of the key because it sets the fetch span:
+/// `m[5m]` and `m[1h]` read different spans even though they select the same
+/// series.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) struct MatrixPreloadKey {
+    selector: PreloadKey,
+    range_ms: i64,
+}
+
+impl MatrixPreloadKey {
+    pub(crate) fn new(vs: &VectorSelector, range_ms: i64) -> Self {
+        Self {
+            selector: PreloadKey::from_selector(vs),
+            range_ms,
+        }
+    }
+}
+
 /// Structural key for a rollup whose whole step grid was evaluated up front.
 ///
 /// Identifies the call, not just the selector: two rollups over the same series

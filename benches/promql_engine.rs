@@ -434,9 +434,84 @@ fn bench_join_query(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: Phase 0 baselines for the execution optimization plan.
+///
+/// Focused range-query cases pinning the shapes named in
+/// `docs/plans/promql-execution-optimization-plan.md` §3 Phase 0, so later
+/// phases have a stable before/after comparison:
+///
+/// - (a) `non_pushable_rollup`: `predict_linear` is outside `RollupKind`, so
+///   the step loop re-fetches its window per step (plan finding 1.1). Its
+///   `pushable_rollup` twin runs the same window through the one-request grid
+///   preload, measuring the gap Phase 1 closes.
+/// - (b) `subquery_over_expr`: a non-trivial inner expression issues one
+///   rollup request per inner step per outer step (plan finding 1.2).
+/// - (c) `high_card_sum_by`: per-step regrouping/hashing over a preloaded
+///   high-cardinality selector (plan finding 2.1).
+/// - (d) `vector_join`: per-step binop matching across two preloaded
+///   selectors (plan finding 2.1).
+fn bench_phase0_baseline(c: &mut Criterion) {
+    const INTERVAL_MS: i64 = 10_000; // 10s scrape interval
+    const NUM_INTERVALS: usize = 8640 + 1000; // a day of history + query headroom
+
+    let reader = setup_range_query_test_data(INTERVAL_MS, NUM_INTERVALS);
+
+    let step = Duration::from_secs(10);
+    let end = SystemTime::UNIX_EPOCH + Duration::from_secs((NUM_INTERVALS - 1) as u64 * 10);
+
+    // (case name, query, steps)
+    let cases = [
+        (
+            "non_pushable_rollup",
+            "predict_linear(a_hundred[5m], 60)",
+            512_u64,
+        ),
+        ("pushable_rollup", "rate(a_hundred[5m])", 512),
+        (
+            "subquery_over_expr",
+            "max_over_time(rate(a_ten[1m])[5m:1m])",
+            128,
+        ),
+        ("high_card_sum_by", "sum by (le) (h_hundred)", 1000),
+        ("vector_join", "a_hundred - b_hundred", 1000),
+    ];
+
+    let opts = QueryOptions {
+        timeout: None,
+        deadline: None,
+        ..QueryOptions::default()
+    };
+
+    let mut group = c.benchmark_group("phase0_baseline");
+    if use_flat_sampling() {
+        group.sampling_mode(SamplingMode::Flat);
+    }
+
+    for (name, query, steps) in cases {
+        let ast = parse(query).expect("valid phase0 benchmark query");
+        let start = end - Duration::from_secs(steps * 10);
+
+        group.bench_with_input(BenchmarkId::new("query", name), &ast, |b, ast| {
+            b.iter(|| {
+                let stmt = EvalStmt {
+                    expr: ast.clone(),
+                    start,
+                    end,
+                    interval: step,
+                    lookback_delta: opts.lookback_delta,
+                };
+                let result = evaluate_range(reader.clone(), stmt, opts)
+                    .expect("phase0 benchmark should evaluate");
+                black_box(result);
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = promql_engine_benches;
     config = benchmark_config();
-    targets = bench_evaluate_instant, bench_range_query, bench_join_query
+    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline
 );
 criterion_main!(promql_engine_benches);

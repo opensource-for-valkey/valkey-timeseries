@@ -4,7 +4,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{HasFingerprint, Labels, SeriesFingerprint};
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
-use crate::promql::hashers::{PreloadKey, RollupPreloadKey};
+use crate::promql::hashers::{MatrixPreloadKey, PreloadKey, RollupPreloadKey};
 use ahash::RandomState;
 use enquote::enquote;
 use promql_parser::parser::LabelModifier;
@@ -347,6 +347,27 @@ pub(in crate::promql) struct PreloadedRollupSeries {
     /// — which is not the same as producing NaN, and is why this is an
     /// `Option<f64>` rather than an `f64` that could be NaN.
     pub(super) values: Vec<Option<f64>>,
+}
+
+pub(in crate::promql) type MatrixPreloadMap =
+    halfbrown::HashMap<MatrixPreloadKey, PreloadedMatrixData, RandomState>;
+
+/// A matrix selector's raw samples over the whole span its outer-grid windows
+/// cover, fetched in one request by `Evaluator::preload_matrices` and sliced
+/// per step by `Evaluator::evaluate_matrix_selector`.
+///
+/// This is the fallback grid for rollups that could not be pushed down: it
+/// holds *raw* samples rather than reduced values, so any range-vector
+/// function — pushable or not — can evaluate its window from it.
+pub(in crate::promql) struct PreloadedMatrixData {
+    pub series: Vec<PreloadedMatrixSeries>,
+}
+
+pub(in crate::promql) struct PreloadedMatrixSeries {
+    pub(super) labels: EvalLabels,
+    /// Sorted ascending by timestamp (the storage invariant); spans every
+    /// window of the step grid.
+    pub(super) samples: Vec<Sample>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

@@ -1,6 +1,6 @@
 use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, eval_aggregation};
 use crate::common::threads::join;
-use crate::common::time::system_time_to_millis;
+use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
 use crate::promql::binops::{
@@ -15,20 +15,24 @@ use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
 };
 use crate::promql::exec::types::{
-    EvalLabels, PreloadedRollupData, PreloadedRollupSeries, RollupPreloadMap, SeriesMap,
+    EvalLabels, MatrixPreloadMap, PreloadedMatrixData, PreloadedMatrixSeries, PreloadedRollupData,
+    PreloadedRollupSeries, RollupPreloadMap, SeriesMap,
 };
 use crate::promql::exec::utils::{
     RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
     merge_step_into_series_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
-use crate::promql::functions::{FunctionCallContext, PromQLArg, PromQLFunction, resolve_function};
-use crate::promql::hashers::{AggregationKey, PreloadKey, RollupPreloadKey};
+use crate::promql::functions::{
+    FunctionCallContext, PromQLArg, PromQLFunction, resolve_function, window_samples,
+};
+use crate::promql::hashers::{AggregationKey, MatrixPreloadKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, InstantSample, PreloadMap,
+    QueryError,
 };
 use ahash::AHashSet;
 use orx_parallel::ParallelizableCollection;
@@ -43,6 +47,13 @@ use promql_parser::parser::{
 use std::sync::RwLock;
 use std::time::Duration;
 
+/// How many preload requests may be in flight at once.
+///
+/// Each preload request is a blocking cluster fanout (or a whole-span read on
+/// a single node), so unbounded parallelism would multiply concurrent fanouts
+/// and peak memory. Mirrors the batch size of the selector executor.
+const MAX_CONCURRENT_PRELOAD_REQUESTS: usize = 4;
+
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: &'reader R,
     /// Preloaded per-step instant vector data for range queries.
@@ -51,6 +62,10 @@ pub(crate) struct Evaluator<'reader, R: QueryReader> {
     /// Rollups whose whole step grid was evaluated at the source in one request.
     /// Populated by preload_rollups() before the step loop.
     preloaded_rollups: RwLock<RollupPreloadMap>,
+    /// Raw spans for matrix selectors that no rollup grid covers, so the step
+    /// loop slices windows locally instead of re-fetching them per step.
+    /// Populated by preload_matrices() before the step loop.
+    preloaded_matrices: RwLock<MatrixPreloadMap>,
     options: QueryOptions,
 }
 
@@ -60,8 +75,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             reader,
             preloaded_instant: RwLock::new(PreloadMap::default()),
             preloaded_rollups: RwLock::new(RollupPreloadMap::default()),
+            preloaded_matrices: RwLock::new(MatrixPreloadMap::default()),
             options,
         }
+    }
+
+    /// Fail fast once the query deadline has passed, so a preload phase that
+    /// issues several requests stops scheduling more of them.
+    fn check_deadline(&self) -> EvalResult<()> {
+        if let Some(deadline) = self.options.deadline
+            && deadline > 0
+            && current_time_millis() > deadline
+        {
+            return Err(EvaluationError::Query(QueryError::Timeout));
+        }
+        Ok(())
     }
 
     /// Preload VectorSelector data for all steps of a range query.
@@ -86,6 +114,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .collect()?;
 
         self.preload_rollups(expr, ctx)?;
+        self.preload_matrices(expr, ctx)?;
 
         Ok(())
     }
@@ -106,6 +135,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let mut seen = AHashSet::new();
+        let mut requests = Vec::new();
         for candidate in collect_rollup_candidates(expr) {
             let Some((kind, matrix, param)) = self.pushable_rollup(candidate.call()) else {
                 continue;
@@ -128,10 +158,171 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             if !seen.insert(key.clone()) {
                 continue;
             }
-            self.preload_rollup(key, kind, matrix, param, aggregation, ctx)?;
+            requests.push((key, kind, matrix, param, aggregation));
         }
 
+        // One request per distinct rollup, in parallel but capped: each is a
+        // blocking round trip, so `rate(a[5m]) / rate(b[5m])` should pay one
+        // fanout latency, not two in sequence — while a query with many
+        // rollups must not open one fanout per rollup all at once. The
+        // fallible collect stops scheduling after the first error.
+        let _: Vec<()> = requests
+            .into_par()
+            .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
+            .map(|(key, kind, matrix, param, aggregation)| {
+                self.check_deadline()?;
+                self.preload_rollup(key, kind, matrix, param, aggregation, ctx)
+            })
+            .into_fallible_result()
+            .collect()?;
+
         Ok(())
+    }
+
+    /// Fetch, once, the raw span every remaining matrix selector's windows
+    /// cover.
+    ///
+    /// This is the fallback grid for rollups that cannot be pushed down —
+    /// `query_rollup` unsupported or disabled, a function outside
+    /// [`RollupKind`], a non-literal parameter. Without it every step
+    /// re-fetches its own window, and neighbouring steps re-ship mostly the
+    /// same samples (a `[5m]` window at a 15s step is fetched ~20 times over).
+    /// With it the span is read in one request and each step slices its window
+    /// locally, in `evaluate_matrix_selector`.
+    ///
+    /// A call already answered by a preloaded rollup grid is skipped: its
+    /// matrix argument is never evaluated, so a span for it would be dead
+    /// weight.
+    ///
+    /// Bounded by design (see
+    /// `docs/plans/promql-execution-optimization-plan.md` §4): the span read
+    /// is subject to the reader's own `max_series` / `max_points_per_series`
+    /// validation, and a failed read leaves the map unpopulated so the step
+    /// loop falls back to exactly the per-step path that ran before this
+    /// optimization — a query that succeeds per-step keeps succeeding.
+    fn preload_matrices(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
+        if ctx.step_ms <= 0 {
+            return Ok(());
+        }
+
+        let rollups = self.preloaded_rollups.read().unwrap();
+        let mut seen = AHashSet::new();
+        let mut targets: Vec<(MatrixPreloadKey, &MatrixSelector)> = Vec::new();
+        for candidate in collect_rollup_candidates(expr) {
+            let call = candidate.call();
+            // A call the step loop will reject anyway must not trigger a
+            // fetch for its arguments.
+            if call.func.experimental && !self.options.enable_experimental_functions {
+                continue;
+            }
+            // Mirror the key the step loop will look up: covered calls short-
+            // circuit in evaluate_call / evaluate_fused_rollup before their
+            // arguments are evaluated.
+            if let Some((kind, matrix, param)) = self.pushable_rollup(call) {
+                let aggregation = match candidate {
+                    RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
+                    RollupCandidate::Rollup(_) => None,
+                };
+                let key = RollupPreloadKey::new(
+                    &matrix.vs,
+                    kind,
+                    matrix_range_ms(matrix),
+                    param,
+                    aggregation
+                        .as_ref()
+                        .map(|agg| AggregationKey::new(agg.kind, agg.modifier.as_ref())),
+                );
+                if rollups.contains_key(&key) {
+                    continue;
+                }
+            }
+            for arg in call.args.args.iter().map(|arg| strip_parens(arg)) {
+                if let Expr::MatrixSelector(ms) = arg {
+                    let key = MatrixPreloadKey::new(&ms.vs, matrix_range_ms(ms));
+                    if seen.insert(key.clone()) {
+                        targets.push((key, ms));
+                    }
+                }
+            }
+        }
+        drop(rollups);
+
+        let _: Vec<()> = targets
+            .into_par()
+            .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
+            .map(|(key, matrix)| -> EvalResult<()> {
+                self.check_deadline()?;
+                self.preload_matrix(key, matrix, ctx);
+                Ok(())
+            })
+            .into_fallible_result()
+            .collect()?;
+
+        Ok(())
+    }
+
+    /// Read one matrix selector's whole span and cache it for per-step
+    /// slicing.
+    ///
+    /// Errors are deliberately not propagated: the cache is an optimization,
+    /// and the per-step path the step loop falls back to reproduces the
+    /// unpreloaded behavior exactly, including its per-window limit checks. A
+    /// span that exceeds the reader's limits therefore downgrades the query to
+    /// the per-step path instead of failing it.
+    fn preload_matrix(&self, key: MatrixPreloadKey, matrix: &MatrixSelector, ctx: &EvalContext) {
+        let window_ends = self.resolved_window_ends(&matrix.vs, ctx);
+        let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
+            return;
+        };
+        let range_ms = matrix_range_ms(matrix);
+        // Windows are half-open — `(end - range, end]` — against an
+        // inclusive-lower-bound reader, so start one past the earliest
+        // window's lower bound. Same convention as `rollup_fetch_bounds` and
+        // the per-step pipeline.
+        let start_ms = (first - range_ms).saturating_add(1);
+
+        match self
+            .reader
+            .query_range(&matrix.vs, start_ms, last, self.options)
+        {
+            Ok(series) => {
+                let series = series
+                    .into_iter()
+                    .map(|s| PreloadedMatrixSeries {
+                        labels: EvalLabels::from(s.labels),
+                        samples: s.samples,
+                    })
+                    .collect();
+                self.preloaded_matrices
+                    .write()
+                    .unwrap()
+                    .insert(key, PreloadedMatrixData { series });
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "matrix preload failed; falling back to per-step windows"
+                );
+            }
+        }
+    }
+
+    /// The window ends of the outer step grid for `vs` — one per step, in step
+    /// order, with `@`/`offset` resolved here so a source (or the preloaded
+    /// span's fetch bounds) can never resolve a modifier differently than the
+    /// local path would.
+    fn resolved_window_ends(&self, vs: &VectorSelector, ctx: &EvalContext) -> Vec<Timestamp> {
+        step_times(ctx.query_start, ctx.query_end, ctx.step_ms)
+            .map(|step_ts| {
+                apply_time_modifiers_ms(
+                    vs.at.as_ref(),
+                    vs.offset.as_ref(),
+                    ctx.query_start,
+                    ctx.query_end,
+                    step_ts,
+                )
+            })
+            .collect()
     }
 
     /// The rollup a call can be pushed down as, if any.
@@ -178,24 +369,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         aggregation: Option<RollupAggregation>,
         ctx: &EvalContext,
     ) -> EvalResult<()> {
-        let steps: Vec<Timestamp> =
-            step_times(ctx.query_start, ctx.query_end, ctx.step_ms).collect();
-
         // Resolve `@`/`offset` here, per step. The source is told window ends
         // and never a modifier, so it cannot resolve one differently than the
         // local path would.
-        let window_ends: Vec<Timestamp> = steps
-            .iter()
-            .map(|&step_ts| {
-                apply_time_modifiers_ms(
-                    matrix.vs.at.as_ref(),
-                    matrix.vs.offset.as_ref(),
-                    ctx.query_start,
-                    ctx.query_end,
-                    step_ts,
-                )
-            })
-            .collect();
+        let window_ends = self.resolved_window_ends(&matrix.vs, ctx);
         let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
             return Ok(());
         };
@@ -490,7 +667,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
                 self.evaluate_vector_selector(vector_selector, ctx, preload_eligible)
             }
             Expr::MatrixSelector(matrix_selector) => {
-                self.evaluate_matrix_selector(matrix_selector, ctx)
+                self.evaluate_matrix_selector(matrix_selector, ctx, preload_eligible)
             }
             Expr::Call(call) => self.evaluate_call(call, ctx, preload_eligible),
             Expr::Extension(_) => Err(EvaluationError::InternalError(
@@ -503,9 +680,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         &self,
         matrix_selector: &MatrixSelector,
         ctx: &EvalContext,
+        preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
         let vector_selector = &matrix_selector.vs;
-        let range = matrix_selector.range;
+        let range_ms = matrix_range_ms(matrix_selector);
 
         // Apply time modifiers to evaluation_ts
         let adjusted_eval_ts = apply_time_modifiers_ms(
@@ -516,7 +694,40 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             ctx.evaluation_ts,
         );
 
-        let plan = QueryPlan::for_matrix(adjusted_eval_ts, range.as_millis() as i64);
+        // Slice this step's window out of the preloaded span, if the
+        // selector's whole grid was fetched up front (`preload_matrices`).
+        // The slice is exactly what the live fetch below would return — the
+        // same half-open `(end - range, end]` window, and a series whose
+        // window is empty is absent rather than present-and-empty — so the
+        // two paths cannot disagree.
+        //
+        // Subquery steps carry their own grid (`preload_eligible == false`)
+        // and must not read the outer query's span: their windows can reach
+        // outside its fetch bounds, and a truncated window would be silently
+        // wrong rather than slow.
+        if preload_eligible {
+            let key = MatrixPreloadKey::new(vector_selector, range_ms);
+            let guard = self.preloaded_matrices.read().unwrap();
+            if let Some(preloaded) = guard.get(&key) {
+                let series = preloaded
+                    .series
+                    .iter()
+                    .filter_map(|s| {
+                        let window = window_samples(&s.samples, adjusted_eval_ts, range_ms)?;
+                        Some(EvalSamples {
+                            labels: s.labels.clone(),
+                            drop_name: false,
+                            range_ms,
+                            values: window.to_vec(),
+                            range_end_ms: adjusted_eval_ts,
+                        })
+                    })
+                    .collect();
+                return Ok(ExprResult::RangeVector(series));
+            }
+        }
+
+        let plan = QueryPlan::for_matrix(adjusted_eval_ts, range_ms);
 
         execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
     }
@@ -776,6 +987,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // For a range query that already happened, for every step at once, in
         // `preload_rollups`; this step just reads its slice. Otherwise the
         // request is made here, for this one evaluation.
+        //
         // The preloaded grid belongs to the outer range query, so a subquery
         // step — which carries its own grid and sets `preload_eligible` false —
         // must not read it, and falls through to a request of its own.
@@ -840,6 +1052,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     fn has_preloaded_data(&self) -> bool {
         !self.preloaded_instant.read().unwrap().is_empty()
             || !self.preloaded_rollups.read().unwrap().is_empty()
+            || !self.preloaded_matrices.read().unwrap().is_empty()
     }
 
     fn evaluate_binary_expr(

@@ -1,3 +1,4 @@
+pub mod counting_query_reader;
 mod fanout;
 pub mod memory_series_querier;
 pub mod promql_config;

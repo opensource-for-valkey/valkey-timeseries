@@ -1569,7 +1569,7 @@ mod tests {
         };
 
         let result = evaluator
-            .evaluate_matrix_selector(&matrix_selector, &eval_ctx)
+            .evaluate_matrix_selector(&matrix_selector, &eval_ctx, true)
             .unwrap();
 
         // then: verify results
@@ -2090,7 +2090,7 @@ mod tests {
             lookback_delta_ms: 300_000,
         };
         let result = evaluator
-            .evaluate_matrix_selector(&matrix_selector, &ctx)
+            .evaluate_matrix_selector(&matrix_selector, &ctx, true)
             .unwrap();
 
         // then: should get samples in range (5_700_000, 6_000_000] (exclusive start, inclusive end)
