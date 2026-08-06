@@ -1,6 +1,6 @@
 # PromQL Execution Optimization Assessment
 
-Status: **Phases 0 and 1 implemented** (2026-08-05); Phases 2+ are planned
+Status: **Phases 0, 1 and 2 implemented** (2026-08-05); Phases 3+ are planned
 only.
 Findings from a code review of the `promql` module on branch `promql`,
 2026-08-05. Revised 2026-08-05 after review: instrumentation placement
@@ -49,6 +49,41 @@ parallel rollup preload):
 - Updated call-count pins: non-pushable rollup range query is now
   `query_range == 1` (was `== steps`); fused-rollup coverage and
   mixed pushable/non-pushable cases pinned alongside.
+
+Phase 2 artifacts (finding 1.2 subquery-scoped preloading):
+
+- `PreloadGrid` (`src/promql/exec/evaluator.rs`): splits what `EvalContext`
+  conflated — the **step grid** being filled (`start_ms`/`end_ms`/`step_ms`)
+  from the bounds `@ start()`/`@ end()` resolve against
+  (`at_start_ms`/`at_end_ms`). They coincide for a range query and diverge for
+  a subquery, whose `@` modifiers refer to the *enclosing* query. Every
+  `preload_*` function now takes a grid instead of a context;
+  `preload_for_range` is a thin wrapper over the new `preload_grid`.
+- `Evaluator::evaluate_subquery` builds a **sub-evaluator** owning its own
+  preload maps, calls `preload_grid` on the subquery's aligned grid, and steps
+  it with `preload_eligible = true`. A sub-context rather than a grid identity
+  on the evaluator-global maps, per §1.2: entries keyed only by selector would
+  answer the wrong grid, and an evaluator that drops with the subquery makes
+  that structurally impossible and nests for free. Both
+  `collect_vector_selectors` and `collect_rollup_candidates` already stop at
+  `Expr::Subquery`, so the walk covers exactly the nodes evaluated at that grid.
+- `evaluate_fused_rollup` no longer uses `ctx.step_ms > 0` as a proxy for "a
+  grid was preloaded": it consults the map first (the preloaded entry carries
+  its own `eval_start_ms`/`step_ms`), and only then falls back to the
+  range-step-stays-local rule. Without this a subquery step — which has
+  `step_ms == 0` — could not read its own grid.
+- **Preload failure is best-effort**, on the Phase 1 rule (§4): a reader-limit
+  rejection downgrades the subquery to the per-step path rather than failing a
+  query that used to succeed. A deadline propagates, since more work cannot
+  help.
+- Updated call-count pins: `max_over_time(rate(a[1m])[4m:1m])` is now
+  `query_rollup == 1` (was `== inner steps`); new pins cover a subquery over a
+  binary expression (one fetch per deduplicated selector, was inner_steps ×
+  selectors), nested subqueries, and a range query over a subquery (one fetch
+  per *outer* step, was outer × inner).
+- Measured (CI profile, in-memory reader): `subquery_over_expr` **509 ms →
+  108.7 ms (−78.7%)**. The same run confirms Phase 1 on `non_pushable_rollup`:
+  **3.33 s → 48.2 ms (−98.6%)**.
 
 Goal: identify where PromQL query execution does redundant storage/cluster
 round trips or redundant per-step CPU work, and lay out a prioritized,
@@ -289,7 +324,7 @@ Also folds in:
 |---|---|---|
 | 0 ✅ | Baseline: extend `benches/promql_engine.rs` with range-query benches for (a) non-pushable rollup, (b) subquery-over-expression, (c) high-cardinality `sum by`, (d) vector-vector join — landed as the `phase0_baseline` group. Add a **counting `QueryReader` wrapper** (test-only decorator with atomic per-method counters around the inner reader) so tests can assert reader-call counts — landed as `src/promql/engine/counting_query_reader.rs`. `query_stats` is *not* the place for this — it tracks completed-query durations keyed by query string (`src/promql/engine/query_stats.rs`), not reader activity. | Makes every later claim falsifiable |
 | 1 ✅ | 1.1 **bounded** matrix grid preload — with the query-limit decision, memory budget, and deadline fallback of §4 resolved first — plus 1.3 concurrency-capped parallel rollup preload | O(steps)× fewer reads; preload latency ∝ #rollups → bounded rounds |
-| 2 | 1.2 subquery-scoped preloading (sub-context ownership) | Removes the steps × inner-steps request blow-up |
+| 2 ✅ | 1.2 subquery-scoped preloading (sub-context ownership) — landed as `PreloadGrid` + a per-subquery sub-evaluator | Removes the steps × inner-steps request blow-up; `subquery_over_expr` −78.7% |
 | 3 | Profile. Then 2.1 operation-scoped memo tables and 2.2 prepare pass, as **independent, benchmark-gated changes** — land only what the profile and Phase 0 benches justify | CPU-bound range queries at high cardinality |
 | 4 | Tier 3 packing of existing preload structures as profiling justifies | Peak-memory headroom |
 

@@ -4234,6 +4234,11 @@ mod tests {
         step_ms: i64,
         range_end_ms: i64,
         param: Option<f64>,
+        /// The grid the request covers. Recorded so a subquery's rollup can be
+        /// shown to run over the *subquery's* grid rather than the enclosing
+        /// query's — the two are indistinguishable from `step_ms` alone.
+        query_start: i64,
+        query_end: i64,
     }
 
     /// A reader that records every rollup it is offered. `answer` decides
@@ -4304,6 +4309,8 @@ mod tests {
                 step_ms: rollup.step_ms,
                 range_end_ms: rollup.range_end_ms,
                 param: rollup.param,
+                query_start: rollup.query_start,
+                query_end: rollup.query_end,
             });
 
             if self.answer == RollupAnswer::Unsupported {
@@ -4405,32 +4412,30 @@ mod tests {
         }
     }
 
-    /// A subquery's *inner* rollup is a bare matrix selector evaluated at an
-    /// instant, once per subquery step, so each step is pushed down on its own.
-    /// The outer rollup, whose argument is the subquery, stays local.
+    /// A subquery's *inner* rollup is pushed down once, over the subquery's own
+    /// step grid, rather than once per subquery step (plan finding 1.2). The
+    /// outer rollup, whose argument is the subquery, stays local.
     #[test]
-    fn should_push_down_a_subquerys_inner_rollup_per_step() {
+    fn should_push_down_a_subquerys_inner_rollup_over_its_own_grid() {
         let query = "max_over_time(sum_over_time(metric[1m])[2m:30s])";
         let (pushed, offered) = evaluate_rollup_pushdown(query, 120_000, RollupAnswer::Rolled);
 
-        // Subquery range (0, 2m] at a 30s step: four evaluations, each its own
-        // single-window request.
-        assert_eq!(offered.len(), 4, "one offer per subquery step");
-        assert!(
-            offered
-                .iter()
-                .all(|o| o.kind == RollupKind::SumOverTime && o.step_ms == 0),
-            "each step is a single evaluation of the inner rollup"
-        );
-        // Subquery steps are evaluated in parallel, so compare the set of
-        // windows rather than the order they were requested in.
-        let mut ends: Vec<i64> = offered.iter().map(|o| o.range_end_ms).collect();
-        ends.sort_unstable();
+        // Subquery range (0, 2m] at a 30s step aligns to four evaluation points
+        // — 30s, 60s, 90s, 120s — and all four are covered by one request whose
+        // grid is exactly that progression.
+        assert_eq!(offered.len(), 1, "one offer for the whole subquery grid");
+        assert_eq!(offered[0].kind, RollupKind::SumOverTime);
+        assert_eq!(offered[0].range_ms, 60_000, "the inner window width");
         assert_eq!(
-            ends,
-            vec![30_000, 60_000, 90_000, 120_000],
-            "one window per subquery step"
+            offered[0].step_ms, 30_000,
+            "the subquery's resolution is the grid step"
         );
+        assert_eq!(
+            (offered[0].query_start, offered[0].query_end),
+            (30_000, 120_000),
+            "the grid spans the subquery's aligned steps"
+        );
+        assert_eq!(offered[0].range_end_ms, 120_000, "last window end");
 
         let local = eval_rollup(&rollup_reader(), query, 120_000);
         assert_eq!(local.len(), 1);
@@ -5020,21 +5025,47 @@ mod tests {
 
     /// A rollup inside a subquery keeps its own grid: the outer preload must not
     /// claim it, or every subquery step would read the outer query's windows.
+    ///
+    /// Since Phase 2 the subquery preloads its grid in a sub-evaluator, so the
+    /// inner rollup is one request *per outer step* — each covering that step's
+    /// subquery grid — rather than one per (outer step × subquery step), and
+    /// never one request over the outer query's own grid.
     #[test]
-    fn should_not_preload_rollups_inside_a_subquery() {
-        let (_, offered) = evaluate_range_with_pushdown(
-            "max_over_time(sum_over_time(metric[1m])[2m:1m])",
+    fn should_preload_a_subquerys_rollup_on_the_subquerys_grid() {
+        let query = "max_over_time(sum_over_time(metric[1m])[2m:1m])";
+        let (steps, offered) =
+            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, RollupAnswer::Rolled);
+
+        // Outer steps 120s/180s/240s. Each one's subquery is (t-2m, t] at a 1m
+        // resolution, which aligns to {t-1m, t} — so each offer's grid is that
+        // pair, never the outer query's 120s..240s.
+        let mut grids: Vec<(i64, i64)> = offered
+            .iter()
+            .map(|o| (o.query_start, o.query_end))
+            .collect();
+        grids.sort_unstable();
+        assert_eq!(
+            grids,
+            vec![(60_000, 120_000), (120_000, 180_000), (180_000, 240_000)],
+            "one request per outer step, over that step's subquery grid"
+        );
+        assert!(
+            offered.iter().all(|o| o.step_ms == 60_000),
+            "the subquery's resolution is the grid step, got {offered:?}"
+        );
+
+        // Whichever side reduced, the answer matches the fully local path.
+        let (local, _) = evaluate_range_with_pushdown(
+            query,
             120_000,
             240_000,
             60_000,
-            RollupAnswer::Rolled,
+            RollupAnswer::Unsupported,
         );
-
-        // The inner rollup is still pushed down, but one instant at a time
-        // against the subquery's grid — never as one outer-grid request.
-        assert!(
-            offered.iter().all(|o| o.step_ms == 0),
-            "subquery steps are single evaluations, got {offered:?}"
+        assert_eq!(
+            rendered_steps(steps),
+            rendered_steps(local),
+            "push-down parity"
         );
     }
 

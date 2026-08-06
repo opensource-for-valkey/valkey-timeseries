@@ -54,6 +54,75 @@ use std::time::Duration;
 /// and peak memory. Mirrors the batch size of the selector executor.
 const MAX_CONCURRENT_PRELOAD_REQUESTS: usize = 4;
 
+/// The step grid a preload phase fills, plus the bounds `@ start()`/`@ end()`
+/// resolve against.
+///
+/// [`EvalContext`] conflates the two: for a range query the grid *is*
+/// `query_start..query_end`, and those same bounds are what `@ start()` and
+/// `@ end()` mean. A subquery breaks that identity — it evaluates its inner
+/// expression over its own aligned resolution, while `@ start()`/`@ end()`
+/// inside it still refer to the **outer** query's bounds (PromQL resolves
+/// them against the enclosing query, never the subquery). Preloading a
+/// subquery's grid therefore needs both, kept apart.
+#[derive(Clone, Copy, Debug)]
+struct PreloadGrid {
+    /// First step of the grid.
+    start_ms: Timestamp,
+    /// Last step of the grid; the grid is `start_ms..=end_ms` by `step_ms`.
+    end_ms: Timestamp,
+    step_ms: i64,
+    /// What `@ start()` resolves to — the outer query's start, not the grid's.
+    at_start_ms: Timestamp,
+    /// What `@ end()` resolves to — the outer query's end, not the grid's.
+    at_end_ms: Timestamp,
+    lookback_delta_ms: i64,
+}
+
+impl PreloadGrid {
+    /// The grid of an outer range query, where the two sets of bounds coincide.
+    fn for_range(ctx: &EvalContext) -> Self {
+        Self {
+            start_ms: ctx.query_start,
+            end_ms: ctx.query_end,
+            step_ms: ctx.step_ms,
+            at_start_ms: ctx.query_start,
+            at_end_ms: ctx.query_end,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+        }
+    }
+
+    /// The grid of a subquery: its own aligned resolution, but `@`-modifier
+    /// bounds inherited from the enclosing query, exactly as
+    /// `eval_subquery_step` leaves `query_start`/`query_end` untouched so the
+    /// per-step fallback path resolves them the same way.
+    fn for_subquery(
+        aligned_start_ms: Timestamp,
+        end_ms: Timestamp,
+        step_ms: i64,
+        ctx: &EvalContext,
+    ) -> Self {
+        Self {
+            start_ms: aligned_start_ms,
+            end_ms,
+            step_ms,
+            at_start_ms: ctx.query_start,
+            at_end_ms: ctx.query_end,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+        }
+    }
+
+    fn steps(&self) -> impl Iterator<Item = Timestamp> {
+        step_times(self.start_ms, self.end_ms, self.step_ms)
+    }
+
+    fn expected_steps(&self) -> usize {
+        if self.step_ms <= 0 {
+            return 0;
+        }
+        ((self.end_ms - self.start_ms) / self.step_ms) as usize + 1
+    }
+}
+
 pub(crate) struct Evaluator<'reader, R: QueryReader> {
     reader: &'reader R,
     /// Preloaded per-step instant vector data for range queries.
@@ -100,6 +169,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         expr: &Expr,
         ctx: &EvalContext,
     ) -> EvalResult<()> {
+        self.preload_grid(expr, &PreloadGrid::for_range(ctx))
+    }
+
+    /// Fill every preload map for one step grid.
+    ///
+    /// Shared by the outer range query and by subquery sub-evaluators — the
+    /// grid, not the enclosing [`EvalContext`], says which steps to cover.
+    fn preload_grid(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
         // Deduplicate by PreloadKey, then parallelize the loading
         let mut seen = AHashSet::new();
         let unique_selectors: Vec<_> = collect_vector_selectors(expr)
@@ -109,12 +186,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
 
         let _: Vec<()> = unique_selectors
             .par()
-            .map(|&vs| self.preload_vector_selector(vs, ctx))
+            .map(|&vs| self.preload_vector_selector(vs, grid))
             .into_fallible_result()
             .collect()?;
 
-        self.preload_rollups(expr, ctx)?;
-        self.preload_matrices(expr, ctx)?;
+        self.preload_rollups(expr, grid)?;
+        self.preload_matrices(expr, grid)?;
 
         Ok(())
     }
@@ -129,8 +206,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     ///
     /// A rollup that cannot be pushed down is simply not cached, and the step
     /// loop evaluates it locally as before.
-    fn preload_rollups(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
-        if ctx.step_ms <= 0 {
+    fn preload_rollups(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
+        if grid.step_ms <= 0 {
             return Ok(());
         }
 
@@ -171,7 +248,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
             .map(|(key, kind, matrix, param, aggregation)| {
                 self.check_deadline()?;
-                self.preload_rollup(key, kind, matrix, param, aggregation, ctx)
+                self.preload_rollup(key, kind, matrix, param, aggregation, grid)
             })
             .into_fallible_result()
             .collect()?;
@@ -200,8 +277,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// validation, and a failed read leaves the map unpopulated so the step
     /// loop falls back to exactly the per-step path that ran before this
     /// optimization — a query that succeeds per-step keeps succeeding.
-    fn preload_matrices(&self, expr: &Expr, ctx: &EvalContext) -> EvalResult<()> {
-        if ctx.step_ms <= 0 {
+    fn preload_matrices(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
+        if grid.step_ms <= 0 {
             return Ok(());
         }
 
@@ -252,7 +329,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
             .map(|(key, matrix)| -> EvalResult<()> {
                 self.check_deadline()?;
-                self.preload_matrix(key, matrix, ctx);
+                self.preload_matrix(key, matrix, grid);
                 Ok(())
             })
             .into_fallible_result()
@@ -269,8 +346,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// unpreloaded behavior exactly, including its per-window limit checks. A
     /// span that exceeds the reader's limits therefore downgrades the query to
     /// the per-step path instead of failing it.
-    fn preload_matrix(&self, key: MatrixPreloadKey, matrix: &MatrixSelector, ctx: &EvalContext) {
-        let window_ends = self.resolved_window_ends(&matrix.vs, ctx);
+    fn preload_matrix(&self, key: MatrixPreloadKey, matrix: &MatrixSelector, grid: &PreloadGrid) {
+        let window_ends = self.resolved_window_ends(&matrix.vs, grid);
         let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
             return;
         };
@@ -307,18 +384,23 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
     }
 
-    /// The window ends of the outer step grid for `vs` — one per step, in step
-    /// order, with `@`/`offset` resolved here so a source (or the preloaded
-    /// span's fetch bounds) can never resolve a modifier differently than the
-    /// local path would.
-    fn resolved_window_ends(&self, vs: &VectorSelector, ctx: &EvalContext) -> Vec<Timestamp> {
-        step_times(ctx.query_start, ctx.query_end, ctx.step_ms)
+    /// The window ends of `grid` for `vs` — one per step, in step order, with
+    /// `@`/`offset` resolved here so a source (or the preloaded span's fetch
+    /// bounds) can never resolve a modifier differently than the local path
+    /// would.
+    ///
+    /// `@ start()`/`@ end()` resolve against the grid's *at* bounds, which for
+    /// a subquery grid are the enclosing query's — matching what the per-step
+    /// fallback in `evaluate_vector_selector` / `evaluate_matrix_selector`
+    /// computes from `ctx.query_start`/`ctx.query_end`.
+    fn resolved_window_ends(&self, vs: &VectorSelector, grid: &PreloadGrid) -> Vec<Timestamp> {
+        grid.steps()
             .map(|step_ts| {
                 apply_time_modifiers_ms(
                     vs.at.as_ref(),
                     vs.offset.as_ref(),
-                    ctx.query_start,
-                    ctx.query_end,
+                    grid.at_start_ms,
+                    grid.at_end_ms,
                     step_ts,
                 )
             })
@@ -367,12 +449,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         matrix: &MatrixSelector,
         param: Option<f64>,
         aggregation: Option<RollupAggregation>,
-        ctx: &EvalContext,
+        grid: &PreloadGrid,
     ) -> EvalResult<()> {
         // Resolve `@`/`offset` here, per step. The source is told window ends
         // and never a modifier, so it cannot resolve one differently than the
         // local path would.
-        let window_ends = self.resolved_window_ends(&matrix.vs, ctx);
+        let window_ends = self.resolved_window_ends(&matrix.vs, grid);
         let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
             return Ok(());
         };
@@ -381,8 +463,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             kind,
             aggregation,
             range_ms: matrix_range_ms(matrix),
-            lookback_delta_ms: ctx.lookback_delta_ms,
-            step_ms: ctx.step_ms,
+            lookback_delta_ms: grid.lookback_delta_ms,
+            step_ms: grid.step_ms,
             query_start: first,
             query_end: last,
             range_end_ms: last,
@@ -402,7 +484,7 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         }
 
         let mut options = self.options;
-        options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
+        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
 
         let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
             RollupOutcome::Unsupported => return Ok(()),
@@ -436,8 +518,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         self.preloaded_rollups.write().unwrap().insert(
             key,
             PreloadedRollupData {
-                eval_start_ms: ctx.query_start,
-                step_ms: ctx.step_ms,
+                eval_start_ms: grid.start_ms,
+                step_ms: grid.step_ms,
                 series,
             },
         );
@@ -491,18 +573,21 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         self.preload_for_range(&stmt.expr, &ctx)
     }
 
-    fn preload_vector_selector(&self, vs: &VectorSelector, ctx: &EvalContext) -> EvalResult<()> {
-        let eval_start_ms = ctx.query_start;
-        let eval_end_ms = ctx.query_end;
-        let step_ms = ctx.step_ms;
-        let lookback_delta_ms = ctx.lookback_delta_ms;
+    fn preload_vector_selector(&self, vs: &VectorSelector, grid: &PreloadGrid) -> EvalResult<()> {
+        let eval_start_ms = grid.start_ms;
+        let eval_end_ms = grid.end_ms;
+        let step_ms = grid.step_ms;
+        let lookback_delta_ms = grid.lookback_delta_ms;
 
-        // Compute fetch range via selector_bounds
+        // Compute fetch range via selector_bounds. The `at_*` pair is what
+        // `@ start()`/`@ end()` mean and the `eval_*` pair is the grid being
+        // covered; they differ for a subquery grid, whose `@` modifiers still
+        // refer to the enclosing query.
         let (earliest_ms, latest_ms) = selector_bounds(
             vs.at.as_ref(),
             vs.offset.as_ref(),
-            eval_start_ms,
-            eval_end_ms,
+            grid.at_start_ms,
+            grid.at_end_ms,
             eval_start_ms,
             eval_end_ms,
             lookback_delta_ms,
@@ -511,12 +596,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // Fetch all series + samples for the full time range
         let series_samples = self.fetch_series_samples(vs, earliest_ms, latest_ms)?;
 
-        let num_steps = ctx.expected_steps();
+        let num_steps = grid.expected_steps();
 
         // Clone the time-modifier options so they can be captured across parallel tasks.
         // AtModifier and Offset are small Copy-like enums; cloning is cheap.
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
+        let at_start_ms = grid.at_start_ms;
+        let at_end_ms = grid.at_end_ms;
 
         // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
@@ -524,17 +611,18 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             .map(|(labels, samples)| {
                 // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
                 // timestamp; however, when resolving `@ start()` / `@ end()` inside the
-                // preloading phase we must use the outer query bounds so that
+                // preloading phase we must use the enclosing query's bounds so that
                 // `@ start()`/`@ end()` sweep the full query range across steps.
-                // Pass `eval_start_ms`/`eval_end_ms` as the `query_start`/`query_end`
-                // parameters so AtModifier::Start/End resolve correctly during preload.
+                // Pass `at_start_ms`/`at_end_ms` as the `query_start`/`query_end`
+                // parameters so AtModifier::Start/End resolve exactly as the
+                // per-step fallback path resolves them from the EvalContext.
                 let steps = (0..num_steps).map(|step_idx| {
                     let eval_ts_i = eval_start_ms + (step_idx as i64) * step_ms;
                     apply_time_modifiers_ms(
                         at_modifier.as_ref(),
                         offset_mod.as_ref(),
-                        eval_start_ms,
-                        eval_end_ms,
+                        at_start_ms,
+                        at_end_ms,
                         eval_ts_i,
                     )
                 });
@@ -701,10 +789,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // window is empty is absent rather than present-and-empty — so the
         // two paths cannot disagree.
         //
-        // Subquery steps carry their own grid (`preload_eligible == false`)
-        // and must not read the outer query's span: their windows can reach
-        // outside its fetch bounds, and a truncated window would be silently
-        // wrong rather than slow.
+        // The span read is the one `self`'s map holds. A subquery's steps run
+        // on a sub-evaluator whose span was fetched for the subquery's own
+        // grid, so they never reach into the outer query's span — whose fetch
+        // bounds their windows can fall outside of, where a truncated window
+        // would be silently wrong rather than slow.
         if preload_eligible {
             let key = MatrixPreloadKey::new(vector_selector, range_ms);
             let guard = self.preloaded_matrices.read().unwrap();
@@ -789,6 +878,42 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
         const PARALLEL_SUBQUERY_STEP_THRESHOLD: usize = 4;
 
+        // Preload the subquery's *own* grid, in a sub-evaluator that owns the
+        // maps.
+        //
+        // Without this each inner step reads live: an inner rollup issues a
+        // `query_rollup` per inner step and an inner selector a `query` per
+        // inner step, so a range query over `max_over_time(rate(m[5m])[1h:1m])`
+        // costs outer_steps × 60 requests — the worst asymptotic shape in the
+        // engine (plan finding 1.2). Preloading collapses the inner dimension
+        // to one request per distinct selector/rollup.
+        //
+        // A sub-evaluator rather than a grid identity on the evaluator-global
+        // maps: the subquery's grid is not the outer query's, so entries keyed
+        // only by selector would answer the wrong grid. Scoping them to an
+        // evaluator that drops with the subquery makes that structurally
+        // impossible, and nests naturally for a subquery inside a subquery.
+        // `collect_vector_selectors` / `collect_rollup_candidates` both stop at
+        // `Expr::Subquery`, so this walk covers exactly the nodes evaluated at
+        // this grid.
+        let sub = Evaluator::new(self.reader, self.options);
+        let grid = PreloadGrid::for_subquery(aligned_start_ms, subquery_end_ms, step_ms, ctx);
+        if let Err(err) = sub.preload_grid(&subquery.expr, &grid) {
+            // A deadline means the query is over; more work cannot help.
+            if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
+                return Err(err);
+            }
+            // Otherwise best-effort, on the same rule as the matrix preload
+            // (plan §4): the per-step path below reproduces the unpreloaded
+            // behavior exactly, so a preload that trips a reader limit
+            // downgrades the subquery to per-step reads rather than failing a
+            // query that used to succeed.
+            tracing::debug!(
+                error = %err,
+                "subquery preload failed; falling back to per-step evaluation"
+            );
+        }
+
         // Evaluate the inner expression at each step within the subquery range.
         // orx-parallel's `collect` preserves input order, so `step_results` is in
         // ascending step-timestamp order and per-series sample appends below
@@ -797,14 +922,14 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
                 let mut results = Vec::with_capacity(expected_steps);
                 for current_time_ms in steps {
-                    let res = self.eval_subquery_step(subquery, ctx, current_time_ms)?;
+                    let res = sub.eval_subquery_step(subquery, ctx, current_time_ms)?;
                     results.push(res);
                 }
                 results
             } else {
                 steps
                     .iter_into_par()
-                    .map(|eval_ts| self.eval_subquery_step(subquery, ctx, eval_ts))
+                    .map(|eval_ts| sub.eval_subquery_step(subquery, ctx, eval_ts))
                     .into_fallible_result()
                     .collect()?
             };
@@ -856,8 +981,11 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
-        // Fast path: use preloaded data if available (outer range-query context only).
-        // Disabled inside subqueries which have their own step grid/lookback context.
+        // Fast path: use preloaded data if available. The step index comes from
+        // the preloaded entry's own `eval_start_ms`/`step_ms`, so this serves
+        // an outer range-query grid and a subquery sub-evaluator's grid alike;
+        // `preload_eligible` says only whether `self`'s maps describe the grid
+        // being stepped over.
         if preload_eligible {
             let preload_key = PreloadKey::from_selector(vector_selector);
             let guard = self.preloaded_instant.read().unwrap();
@@ -898,6 +1026,12 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
     }
 
+    /// Evaluate the subquery's inner expression at one of its steps.
+    ///
+    /// Must be called on the sub-evaluator whose maps were preloaded for this
+    /// subquery's grid (see `evaluate_subquery`), never on the enclosing
+    /// query's evaluator: the fast paths below read whichever maps `self`
+    /// holds, and the outer query's describe a different grid.
     fn eval_subquery_step(
         &self,
         subquery: &SubqueryExpr,
@@ -912,12 +1046,15 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             // Inner expression evaluation for a subquery step is an instant
             // evaluation at `current_time_ms`; keep `query_start/query_end`
             // unchanged so @start()/@end() still resolve to the outer query
-            // bounds.
+            // bounds. `step_ms` stays 0 for the same reason: it describes the
+            // evaluation, not the grid — the grid lives in the preloaded data,
+            // which carries its own `eval_start_ms`/`step_ms`.
             step_ms: 0,
         };
 
-        // Disable preload fast path — subquery has its own step grid/lookback context.
-        let result = self.evaluate_expr(&subquery.expr, &new_ctx, false)?;
+        // Preload-eligible against *this* evaluator's maps, which cover the
+        // subquery's grid.
+        let result = self.evaluate_expr(&subquery.expr, &new_ctx, true)?;
 
         // PromQL requires subquery inner expression to evaluate to an instant vector. Enforce this invariant at runtime.
         let ExprResult::InstantVector(samples) = result else {
@@ -988,9 +1125,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // `preload_rollups`; this step just reads its slice. Otherwise the
         // request is made here, for this one evaluation.
         //
-        // The preloaded grid belongs to the outer range query, so a subquery
-        // step — which carries its own grid and sets `preload_eligible` false —
-        // must not read it, and falls through to a request of its own.
+        // The grid read here is whichever one `self`'s maps hold: the outer
+        // range query's, or — inside a subquery sub-evaluator — the subquery's
+        // own. A step whose grid was not preloaded falls through to a request
+        // of its own.
         let pushed_down = match preload_eligible
             .then(|| self.preloaded_rollup(call, ctx))
             .flatten()
@@ -1374,16 +1512,24 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             )),
         );
 
-        // A range query resolved the whole grid before the step loop; this step
-        // reads its slice.
-        if ctx.step_ms > 0 {
-            if !preload_eligible {
-                return Ok(None);
-            }
-            return Ok(self.preloaded_rollup_by_key(&key, ctx, drop_name));
+        // A grid resolved before the step loop answers this step from its
+        // slice — the outer range query's grid, or a subquery's own when this
+        // is a sub-evaluator step. The preloaded entry carries its own
+        // `eval_start_ms`/`step_ms`, so which grid it is need not be
+        // re-derived from `ctx` here.
+        if preload_eligible && let Some(slice) = self.preloaded_rollup_by_key(&key, ctx, drop_name)
+        {
+            return Ok(Some(slice));
         }
 
-        // Instant: one request for this evaluation.
+        // A range-query step that no grid covers stays local, so the
+        // pushed-down and local paths cannot disagree about window geometry.
+        if ctx.step_ms > 0 {
+            return Ok(None);
+        }
+
+        // A single evaluation — an instant query, or a subquery step the
+        // preload did not cover: one request for this evaluation.
         let range_end_ms = apply_time_modifiers_ms(
             matrix.vs.at.as_ref(),
             matrix.vs.offset.as_ref(),

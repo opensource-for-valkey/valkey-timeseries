@@ -441,20 +441,77 @@ mod tests {
     }
 
     #[test]
-    fn instant_subquery_over_expr_requests_per_inner_step() {
+    fn instant_subquery_over_expr_is_one_grid_request() {
         let (counting, reader) = build_reader();
         // The subquery grid for [4m:1m] ending at t=3_600_000 has 4 aligned
-        // inner steps; each one issues its own query_rollup for the inner
-        // rate() (plan finding 1.2). The outer max_over_time takes a subquery
-        // argument, so it cannot be pushed down itself.
-        //
-        // Phase 2 (subquery-scoped preloading) changes this pin to:
-        //   query_rollup == 1 (one grid request over the subquery's grid).
+        // inner steps. Before Phase 2 each one issued its own query_rollup for
+        // the inner rate() (plan finding 1.2); subquery-scoped preloading now
+        // covers the whole grid in one request. The outer max_over_time takes a
+        // subquery argument, so it is never pushed down itself.
         run_instant(reader, "max_over_time(rate(a[1m])[4m:1m])", 3_600_000);
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_rollup: 4,
+                query_rollup: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn instant_subquery_over_expr_preloads_each_selector_once() {
+        let (counting, reader) = build_reader();
+        // The inner expression is not a bare selector, so it takes the general
+        // per-step path. The subquery grid for [4m:1m] ending at t=3_600_000
+        // has 4 aligned steps, which before Phase 2 meant 4 × 2 live `query`
+        // calls — one per selector per inner step. Subquery-scoped preloading
+        // makes it one span fetch per deduplicated selector, and the steps read
+        // from those.
+        run_instant(reader, "max_over_time((a + b)[4m:1m])", 3_600_000);
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_range: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn instant_nested_subquery_preloads_each_inner_grid() {
+        let (counting, reader) = build_reader();
+        // Nested subqueries nest sub-evaluators. The outer [4m:2m] grid has 2
+        // aligned steps and nothing of its own to preload (its inner expression
+        // is a subquery, which both collectors stop at). Each of those 2 steps
+        // evaluates the inner [2m:1m] subquery, whose own sub-evaluator
+        // preloads `a` once for its 2-step grid — so 2 fetches total, where
+        // before Phase 2 there were 2 × 2 live `query` calls.
+        run_instant(
+            reader,
+            "max_over_time(max_over_time((a)[2m:1m])[4m:2m])",
+            3_600_000,
+        );
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_range: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn range_subquery_over_expr_is_one_fetch_per_outer_step() {
+        let (counting, reader) = build_reader();
+        // The outer range query cannot preload across subquery boundaries — each
+        // outer step's subquery covers a different window — so the request count
+        // is one per outer step rather than the outer_steps × inner_steps
+        // product that plan finding 1.2 describes (5 × 4 = 20 before Phase 2).
+        run_range(reader, "max_over_time((a)[4m:1m])");
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_range: RANGE_STEPS,
                 ..Default::default()
             }
         );
