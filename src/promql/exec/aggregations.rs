@@ -341,16 +341,12 @@ fn eval_limit_k(
 ) -> EvalResult<Vec<EvalSample>> {
     let k = get_k_param(param, samples.len(), "limitk")?;
 
-    // For each group sort deterministically by hash and take the first k samples,
-    // then flatten the per-group selections into the output vector.
+    // For each group take the k samples with the smallest label hashes, then
+    // flatten the per-group selections into the output vector.
     let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
         .iter_into_par()
-        .flat_map(|(_, group)| {
-            let mut group_samples = group.members;
-            group_samples.sort_by_key(sample_hash);
-            select_limitk(group_samples, k)
-        })
+        .flat_map(|(_, group)| select_limitk(group.members, k))
         .collect();
 
     Ok(out)
@@ -368,11 +364,7 @@ fn eval_limit_ratio(
 
     // todo: parallelize
     for (_, group) in groups.into_iter() {
-        let mut group_samples = group.members;
-        group_samples.sort_by_key(sample_hash);
-        let selected = select_limit_ratio(group_samples, k)?;
-
-        out.extend(selected);
+        out.extend(select_limit_ratio(group.members, k)?);
     }
 
     Ok(out)
@@ -600,10 +592,34 @@ fn coerce_k_size(k_param: f64, input_len: usize) -> usize {
     if coerced < 1 { 0 } else { coerced as usize }
 }
 
+/// The `k` samples of a group whose label hashes are smallest, in hash order.
+///
+/// Hashing the labels is what costs here, so it happens exactly once per
+/// sample. The previous `sort_by_key(sample_hash)` recomputed the fingerprint
+/// on *every comparison* — O(n log n) label hashes to answer a question that
+/// needs n of them, which is why `limitk` over 22000 samples cost ~2x what the
+/// other selection operators did.
+///
+/// Selection is partial: only the boundary is resolved (`select_nth_unstable`,
+/// O(n) average), and only the surviving `k` are ordered. Same subset and same
+/// order as the full sort produced — the sole difference is which of two
+/// samples wins a *tie* in the 128-bit label fingerprint, i.e. duplicate label
+/// sets within one group, which selectors do not produce.
 fn select_limitk(samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
-    let mut samples = samples;
-    samples.truncate(k);
-    samples
+    let keep = k.min(samples.len());
+    if keep == 0 {
+        return Vec::new();
+    }
+    let mut keyed: Vec<(u128, EvalSample)> = samples
+        .into_iter()
+        .map(|sample| (sample_hash(&sample), sample))
+        .collect();
+    if keep < keyed.len() {
+        keyed.select_nth_unstable_by_key(keep, |(hash, _)| *hash);
+        keyed.truncate(keep);
+    }
+    keyed.sort_unstable_by_key(|(hash, _)| *hash);
+    keyed.into_iter().map(|(_, sample)| sample).collect()
 }
 
 fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<EvalSample>> {
@@ -620,20 +636,27 @@ fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<Ev
         return Ok(Vec::new());
     }
 
+    // One hash per sample, kept alongside it: the caller used to sort the whole
+    // group by `sample_hash` before filtering, which recomputed the fingerprint
+    // per comparison and then per surviving sample. The filter never depended
+    // on that order — only the output order did, which sorting the survivors
+    // reproduces for a fraction of the work.
     let max = u128::MAX as f64;
-    if ratio > 0.0 {
-        Ok(samples
-            .into_iter()
-            .filter(|sample| (sample_hash(sample) as f64) / max < ratio)
-            .collect())
+    let keep: Box<dyn Fn(u128) -> bool> = if ratio > 0.0 {
+        Box::new(move |hash| (hash as f64) / max < ratio)
     } else {
         // For negative ratios, select the complement side of the hash space.
         let threshold = 1.0 + ratio;
-        Ok(samples
-            .into_iter()
-            .filter(|sample| (sample_hash(sample) as f64) / max >= threshold)
-            .collect())
-    }
+        Box::new(move |hash| (hash as f64) / max >= threshold)
+    };
+
+    let mut selected: Vec<(u128, EvalSample)> = samples
+        .into_iter()
+        .map(|sample| (sample_hash(&sample), sample))
+        .filter(|(hash, _)| keep(*hash))
+        .collect();
+    selected.sort_unstable_by_key(|(hash, _)| *hash);
+    Ok(selected.into_iter().map(|(_, sample)| sample).collect())
 }
 
 fn get_param(param: Option<ExprResult>, function_name: &str) -> EvalResult<ExprResult> {
@@ -684,4 +707,89 @@ fn get_k_param(param: Option<ExprResult>, sample_len: usize, name: &str) -> Eval
 
 fn sample_hash(sample: &EvalSample) -> u128 {
     sample.labels.fingerprint()
+}
+
+#[cfg(test)]
+mod limit_selection_tests {
+    use super::*;
+    use crate::labels::Labels;
+
+    fn sample(i: usize) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value: i as f64,
+            labels: EvalLabels::from(
+                Labels::from_pairs(&[("__name__", "m"), ("l", &i.to_string())]).0,
+            ),
+            drop_name: false,
+        }
+    }
+
+    fn names(samples: &[EvalSample]) -> Vec<String> {
+        samples.iter().map(|s| s.labels.to_string()).collect()
+    }
+
+    /// The oracle: what the previous implementation did — sort the whole group
+    /// by label hash, then take the first `k`.
+    fn full_sort_then_truncate(mut samples: Vec<EvalSample>, k: usize) -> Vec<EvalSample> {
+        samples.sort_by_key(sample_hash);
+        samples.truncate(k);
+        samples
+    }
+
+    /// `select_limitk` replaced a full sort with a partial selection. It must
+    /// pick the same subset *and* present it in the same order.
+    #[test]
+    fn limitk_matches_a_full_sort_for_every_k() {
+        let samples: Vec<EvalSample> = (0..64).map(sample).collect();
+        for k in [0, 1, 2, 7, 31, 63, 64, 65, 1000] {
+            assert_eq!(
+                names(&select_limitk(samples.clone(), k)),
+                names(&full_sort_then_truncate(samples.clone(), k)),
+                "k = {k}"
+            );
+        }
+        // Degenerate group sizes.
+        for n in [0usize, 1, 2] {
+            let small: Vec<EvalSample> = (0..n).map(sample).collect();
+            for k in [0, 1, 2, 3] {
+                assert_eq!(
+                    names(&select_limitk(small.clone(), k)),
+                    names(&full_sort_then_truncate(small.clone(), k)),
+                    "n = {n}, k = {k}"
+                );
+            }
+        }
+    }
+
+    /// `limit_ratio` no longer sorts before filtering, because the filter never
+    /// depended on the order — only the output did.
+    #[test]
+    fn limit_ratio_matches_sorting_before_filtering() {
+        let samples: Vec<EvalSample> = (0..64).map(sample).collect();
+        let max = u128::MAX as f64;
+        for ratio in [1.0, 0.75, 0.5, 0.25, -0.25, -0.5, -1.0] {
+            let mut sorted = samples.clone();
+            sorted.sort_by_key(sample_hash);
+            let want: Vec<EvalSample> = sorted
+                .into_iter()
+                .filter(|s| {
+                    let h = sample_hash(s) as f64 / max;
+                    if ratio > 0.0 {
+                        h < ratio
+                    } else {
+                        h >= 1.0 + ratio
+                    }
+                })
+                .collect();
+            assert_eq!(
+                names(&select_limit_ratio(samples.clone(), ratio).unwrap()),
+                names(&want),
+                "ratio = {ratio}"
+            );
+        }
+        // A zero ratio selects nothing; NaN is rejected.
+        assert!(select_limit_ratio(samples.clone(), 0.0).unwrap().is_empty());
+        assert!(select_limit_ratio(samples, f64::NAN).is_err());
+    }
 }

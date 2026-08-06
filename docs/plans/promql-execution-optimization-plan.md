@@ -134,6 +134,20 @@ Phase 3 artifacts (profile, then only what it justified):
   exactly the substitution the phase's "profile first" gate exists to
   prevent, and the §2.1 proposal below is left standing as written so the
   miss stays on the record.
+- **`group_samples` — the gap Phase 3 left, since closed.** Phase 3 also made
+  `group_samples` (the grouping behind `quantile`, `limitk`, `limit_ratio`,
+  and `topk`/`bottomk` *with* a modifier) sequential, on a path the bench
+  shapes did not cover. The existing `topk(1, a_X)` cases never reached it:
+  `eval_top_bottom_k` short-circuits past grouping when there is no modifier.
+  A dedicated `group_samples` bench group now covers it across cardinality,
+  and an interleaved A/B — allocation-free key on both sides, so only the
+  parallelism differs — says the sequential choice was right: restoring the
+  fan-out costs **+15%** at 110 samples and **+12%** at 1100, and returns at
+  most ~3.5% at 22000, only for the many-small-groups `without (le)` shape.
+  No threshold was added: unlike the binary-op path, this runs once per
+  evaluation rather than twice per step inside a parallel step loop, so the
+  ceiling on the win is small and the floor is a double-digit regression on
+  ordinary inputs.
 - **Deliberately not landed.** The 2.2 prepare pass, re-keying `SeriesMap` by
   fingerprint, and `ensure_unique_labelsets` — the profile does not justify
   them. `merge_step_into_series_map` measured 3.4 ms (`high_card_sum_by`) and
