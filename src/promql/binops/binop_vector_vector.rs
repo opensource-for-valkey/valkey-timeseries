@@ -592,18 +592,39 @@ fn emit_fill_for_many(
     Ok(())
 }
 
+/// Operand size at which computing binary-op match keys is worth spreading
+/// across threads. Below it the fan-out costs more than the hashing it
+/// parallelizes — see `collect_fingerprints`.
+const PARALLEL_MATCH_KEY_THRESHOLD: usize = 2048;
+
 fn collect_fingerprints(
     ctx: &ArithOpContext,
     samples: Vec<EvalSample>,
 ) -> Vec<(SeriesFingerprint, EvalSample)> {
-    // Compute (key, sample) pairs in parallel (hashing is the expensive part).
-    let mut kvs: Vec<(SeriesFingerprint, EvalSample)> = samples
-        .into_par()
-        .map(|s| {
-            let key = compute_binary_match_key(&s.labels, ctx.matching);
-            (key, s)
-        })
-        .collect();
+    // Fanning this out costs far more than it saves on ordinary inputs: one
+    // match key is ~165ns, so a 100-series operand is ~16us of real work
+    // against a fan-out that measured ~420us per call — and the range-query
+    // step loop is *already* parallel, so this would be parallelism nested
+    // inside parallelism. Only a genuinely large operand, where the hashing
+    // dominates the fan-out, goes wide.
+    let mut kvs: Vec<(SeriesFingerprint, EvalSample)> =
+        if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
+            samples
+                .into_par()
+                .map(|s| {
+                    let key = compute_binary_match_key(&s.labels, ctx.matching);
+                    (key, s)
+                })
+                .collect()
+        } else {
+            samples
+                .into_iter()
+                .map(|s| {
+                    let key = compute_binary_match_key(&s.labels, ctx.matching);
+                    (key, s)
+                })
+                .collect()
+        };
 
     kvs.sort_unstable_by_key(|(key, _sample)| *key);
 
