@@ -1,7 +1,7 @@
 use crate::Label;
 use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::labels::{HasFingerprint, Labels, SeriesFingerprint};
+use crate::labels::{HasFingerprint, Labels, SeriesFingerprint, fingerprint_labels};
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::hashers::{MatrixPreloadKey, PreloadKey, RollupPreloadKey};
@@ -184,6 +184,37 @@ impl EvalLabels {
             Some(LabelModifier::Exclude(label_list)) => {
                 this.retain(|k| !label_list.labels.contains(&k.name));
                 this
+            }
+        }
+    }
+
+    /// The fingerprint [`Self::compute_grouping_labels`] would produce, without
+    /// building the label set.
+    ///
+    /// Grouping only needs the *labels* of a group once, when the group is
+    /// first seen — but it needs a *key* for every sample. Materializing the
+    /// labels to get that key is what made grouping expensive: `retain` goes
+    /// through `make_owned`, which clones every label of the source set into
+    /// owned `String`s before dropping the ones the modifier excludes, so a
+    /// 1100-series `sum by (le)` allocated 1100 label sets per step to keep 11.
+    ///
+    /// Hashing the filtered view instead is allocation-free and yields the
+    /// *same* value: [`HasFingerprint`] for `[Label]` hashes each `(name,
+    /// value)` pair in order, and filtering preserves order, so this and
+    /// `compute_grouping_labels(m).fingerprint()` agree by construction. The
+    /// no-modifier case hashes nothing, matching the empty set that
+    /// `compute_grouping_labels` returns for it.
+    pub(crate) fn compute_grouping_key(
+        &self,
+        modifier: Option<&LabelModifier>,
+    ) -> SeriesFingerprint {
+        match modifier {
+            None => fingerprint_labels(std::iter::empty()),
+            Some(LabelModifier::Include(label_list)) => {
+                fingerprint_labels(self.iter().filter(|l| label_list.labels.contains(&l.name)))
+            }
+            Some(LabelModifier::Exclude(label_list)) => {
+                fingerprint_labels(self.iter().filter(|l| !label_list.labels.contains(&l.name)))
             }
         }
     }
@@ -507,5 +538,87 @@ impl From<String> for ExprResult {
 impl From<&str> for ExprResult {
     fn from(value: &str) -> Self {
         Self::String(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod grouping_key_tests {
+    use super::*;
+    use promql_parser::label::Labels as LabelList;
+
+    fn labels(pairs: &[(&str, &str)]) -> EvalLabels {
+        EvalLabels::shared(
+            pairs
+                .iter()
+                .map(|(n, v)| Label {
+                    name: n.to_string(),
+                    value: v.to_string(),
+                })
+                .collect(),
+        )
+    }
+
+    fn modifier(names: &[&str], include: bool) -> LabelModifier {
+        let list = LabelList {
+            labels: names.iter().map(|n| n.to_string()).collect(),
+        };
+        if include {
+            LabelModifier::Include(list)
+        } else {
+            LabelModifier::Exclude(list)
+        }
+    }
+
+    /// `compute_grouping_key` exists only because it is the fingerprint of the
+    /// set `compute_grouping_labels` builds — computed without building it. If
+    /// the two ever disagree, grouping silently splits or merges groups, so
+    /// pin the equivalence across every modifier shape.
+    #[test]
+    fn grouping_key_matches_the_materialized_grouping_labels() {
+        let sets = [
+            labels(&[]),
+            labels(&[("__name__", "http_requests")]),
+            labels(&[("__name__", "http_requests"), ("job", "api"), ("le", "0.5")]),
+            // A value that collides with a neighbouring name/value boundary if
+            // the separator were dropped.
+            labels(&[("a", "bc"), ("ab", "c")]),
+        ];
+        let modifiers = [
+            None,
+            Some(modifier(&[], true)),
+            Some(modifier(&[], false)),
+            Some(modifier(&["le"], true)),
+            Some(modifier(&["le"], false)),
+            Some(modifier(&["job", "le"], true)),
+            Some(modifier(&["job", "le"], false)),
+            Some(modifier(&["__name__"], true)),
+            Some(modifier(&["absent"], true)),
+        ];
+
+        for set in &sets {
+            for m in &modifiers {
+                let m = m.as_ref();
+                assert_eq!(
+                    set.compute_grouping_key(m),
+                    set.compute_grouping_labels(m).fingerprint(),
+                    "labels {set} with modifier {m:?}"
+                );
+            }
+        }
+    }
+
+    /// The point of the key: distinct groups must stay distinct.
+    #[test]
+    fn grouping_key_separates_groups_it_should() {
+        let by_le = Some(modifier(&["le"], true));
+        let m = by_le.as_ref();
+        let a = labels(&[("__name__", "h"), ("l", "1"), ("le", "0.5")]);
+        let b = labels(&[("__name__", "h"), ("l", "2"), ("le", "0.5")]);
+        let c = labels(&[("__name__", "h"), ("l", "1"), ("le", "1.0")]);
+
+        // Same `le` -> same group, whatever else differs.
+        assert_eq!(a.compute_grouping_key(m), b.compute_grouping_key(m));
+        // Different `le` -> different group.
+        assert_ne!(a.compute_grouping_key(m), c.compute_grouping_key(m));
     }
 }

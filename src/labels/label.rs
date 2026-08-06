@@ -104,12 +104,26 @@ fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
     state.write(value.as_bytes());
 }
 
+/// Fingerprint a sequence of labels, in the order given.
+///
+/// The same scheme [`HasFingerprint`] for `[Label]` uses — it is defined in
+/// terms of this — so fingerprinting a *filtered view* of a label set equals
+/// fingerprinting the label set you would get by materializing that filter.
+/// That equivalence is what lets a caller key by a projection (an aggregation's
+/// `by`/`without` grouping, say) without allocating the projected set, and it
+/// only holds while both go through here.
+pub(crate) fn fingerprint_labels<'a>(
+    labels: impl IntoIterator<Item = &'a Label>,
+) -> SeriesFingerprint {
+    let mut hasher = super::hash::create_hasher();
+    for label in labels {
+        super::hash::hash_key_value(&mut hasher, &label.name, &label.value);
+    }
+    hasher.finish_128()
+}
+
 impl HasFingerprint for [Label] {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = super::hash::create_hasher();
-        for label in self {
-            super::hash::hash_key_value(&mut hasher, &label.name, &label.value);
-        }
-        hasher.finish_128()
+        fingerprint_labels(self)
     }
 }

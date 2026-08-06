@@ -4,8 +4,8 @@ use crate::labels::HasFingerprint;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
+use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
-use orx_parallel::{IntoParIter, IterIntoParIter};
 use promql_parser::parser::token::{TokenType, *};
 use promql_parser::parser::{AggregateExpr, LabelModifier};
 use std::cmp::Ordering;
@@ -487,22 +487,27 @@ impl<T> Group<T> {
     }
 }
 
+/// Group whole samples, for the selection operators (topk/bottomk/limitk).
+///
+/// Sequential, like [`group_sample_values`] — which serves the far hotter
+/// reduction path and always was. This used to fan the keying out with
+/// `into_par()`, but the per-sample cost that fan-out was parallelizing was
+/// mostly the label allocation that [`EvalLabels::compute_grouping_key`] now
+/// avoids; what remains is a hash, and the sibling binary-op path measured a
+/// fan-out over a small input costing far more than the hashing it spread
+/// (see `PARALLEL_MATCH_KEY_THRESHOLD`). Note this path was not itself
+/// profiled: the Phase 3 bench shapes cover reductions and joins, not
+/// selections.
 fn group_samples(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
 ) -> FingerprintHashMap<Group<EvalSample>> {
-    let keyed: Vec<_> = samples
-        .into_par()
-        .map(|sample| {
-            let labels = sample.labels.compute_grouping_labels(modifier);
-            let key = labels.fingerprint();
-            (key, labels, sample)
-        })
-        .collect();
-
     let mut groups: FingerprintHashMap<Group<EvalSample>> = FingerprintHashMap::default();
-    for (key, labels, sample) in keyed {
-        let entry = groups.entry(key).or_insert_with(|| Group::new(labels));
+    for sample in samples {
+        let key = sample.labels.compute_grouping_key(modifier);
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| Group::new(sample.labels.compute_grouping_labels(modifier)));
         entry.drop_name |= sample.drop_name;
         entry.members.push(sample);
     }
@@ -516,10 +521,13 @@ fn group_sample_values(
     let mut groups: FingerprintHashMap<Group<f64>> = FingerprintHashMap::default();
 
     for sample in samples {
-        let labels = sample.labels.compute_grouping_labels(modifier);
-        let key = labels.fingerprint();
+        // Key every sample without allocating; build the group's label set
+        // only when the group is new. See `compute_grouping_key`.
+        let key = sample.labels.compute_grouping_key(modifier);
 
-        let entry = groups.entry(key).or_insert_with(|| Group::new(labels));
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| Group::new(sample.labels.compute_grouping_labels(modifier)));
         entry.drop_name |= sample.drop_name;
         entry.members.push(sample.value);
     }
