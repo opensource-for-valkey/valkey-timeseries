@@ -271,12 +271,10 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
     /// matrix argument is never evaluated, so a span for it would be dead
     /// weight.
     ///
-    /// Bounded by design (see
-    /// `docs/plans/promql-execution-optimization-plan.md` §4): the span read
-    /// is subject to the reader's own `max_series` / `max_points_per_series`
-    /// validation, and a failed read leaves the map unpopulated so the step
-    /// loop falls back to exactly the per-step path that ran before this
-    /// optimization — a query that succeeds per-step keeps succeeding.
+    /// Bounded by design: the span read is subject to the reader's own
+    /// `max_series` / `max_points_per_series` validation, and a failed read
+    /// leaves the map unpopulated so the step loop falls back to exactly the
+    /// per-step path that ran before this optimization — a query that succeeds per-step keeps succeeding.
     fn preload_matrices(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
         if grid.step_ms <= 0 {
             return Ok(());
@@ -900,8 +898,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         // `query_rollup` per inner step and an inner selector a `query` per
         // inner step, so a range query over `max_over_time(rate(m[5m])[1h:1m])`
         // costs outer_steps × 60 requests — the worst asymptotic shape in the
-        // engine (plan finding 1.2). Preloading collapses the inner dimension
-        // to one request per distinct selector/rollup.
+        // engine. Preloading collapses the inner dimension to one request per
+        // distinct selector/rollup.
         //
         // A sub-evaluator rather than a grid identity on the evaluator-global
         // maps: the subquery's grid is not the outer query's, so entries keyed
@@ -918,9 +916,8 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
                 return Err(err);
             }
-            // Otherwise best-effort, on the same rule as the matrix preload
-            // (plan §4): the per-step path below reproduces the unpreloaded
-            // behavior exactly, so a preload that trips a reader limit
+            // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
+            // reproduces the unpreloaded  behavior exactly, so a preload that trips a reader limit
             // downgrades the subquery to per-step reads rather than failing a
             // query that used to succeed.
             tracing::debug!(
