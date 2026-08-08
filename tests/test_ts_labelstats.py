@@ -483,6 +483,27 @@ class TestTsStats(ValkeyTimeSeriesTestCaseBase):
         assert stats['labelValueCountByLabelName'] == []
         assert stats['seriesCountByLabelValuePair'] == []
 
+    def test_stats_filter_after_series_deletion(self):
+        """Test TS.LABELSTATS FILTER stops counting a series once its key is deleted."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['region=us-east-1'])
+        assert stats['totalSeries'] == 3
+        pair_counts = {item[0]: item[1] for item in stats['seriesCountByLabelValuePair']}
+        assert pair_counts.get('status=404') == 1
+
+        # ts2 is the only us-east-1 series with status=404.
+        self.client.delete('ts2')
+
+        stats = self.get_stats(filters=['region=us-east-1'])
+        assert stats['totalSeries'] == 2
+        pair_counts = {item[0]: item[1] for item in stats['seriesCountByLabelValuePair']}
+        assert pair_counts.get('region=us-east-1') == 2
+        assert 'status=404' not in pair_counts
+        # __name__, region, env, status still, but one fewer status value.
+        assert stats['totalLabels'] == 4
+        assert stats['totalLabelValuePairs'] == 6
+
     def test_stats_filter_prometheus_style_selector(self):
         """Test TS.LABELSTATS FILTER accepts Prometheus-style selectors."""
         self.create_filter_fixtures()

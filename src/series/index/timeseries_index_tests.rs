@@ -606,4 +606,59 @@ mod tests {
             0
         );
     }
+
+    /// A tombstoned id is still present in the posting lists until the background pass drains
+    /// them, so the filtered path has to mask it out of both `series_count` and every
+    /// intersection — otherwise a deleted series keeps inflating the report.
+    #[test]
+    fn test_stats_by_selectors_excludes_stale_ids() {
+        let index = TimeSeriesIndex::new();
+
+        let doomed = create_series_from_metric_name(r#"http_requests{region="us",host="a"}"#);
+        let live = create_series_from_metric_name(r#"http_requests{region="us",host="b"}"#);
+        index.index_timeseries(&doomed, b"s0");
+        index.index_timeseries(&live, b"s1");
+
+        let selectors = vec![SeriesSelector::parse(r#"region="us""#).unwrap()];
+
+        let before = index
+            .stats_by_selectors(&selectors, "host", 10)
+            .expect("call should succeed");
+        assert_eq!(before.series_count, 2);
+        assert_eq!(
+            count_of(&before.series_count_by_label_value_pairs, "region=us"),
+            2
+        );
+
+        index.mark_id_as_stale(doomed.id);
+
+        let after = index
+            .stats_by_selectors(&selectors, "host", 10)
+            .expect("call should succeed");
+
+        assert_eq!(
+            after.series_count, 1,
+            "the tombstoned series must not be counted"
+        );
+        assert_eq!(
+            count_of(&after.series_count_by_label_value_pairs, "region=us"),
+            1,
+            "intersections must be taken against the stale-masked set"
+        );
+        assert_eq!(
+            count_of(&after.series_count_by_label_value_pairs, "host=a"),
+            0
+        );
+        assert_eq!(
+            count_of(&after.series_count_by_label_value_pairs, "host=b"),
+            1
+        );
+
+        // The label carried only by the tombstoned series drops out entirely.
+        let focus = after
+            .series_count_by_focus_label_value
+            .expect("expected focus label values for host");
+        assert_eq!(count_of(&focus, "a"), 0);
+        assert_eq!(count_of(&focus, "b"), 1);
+    }
 }
