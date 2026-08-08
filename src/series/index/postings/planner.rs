@@ -258,6 +258,17 @@ impl<'a> Terms<'a> {
 }
 
 impl Postings {
+    /// The postings matching every filter in `filters` (an AND-list), stale ids removed.
+    /// An empty list matches every series.
+    pub fn postings_for_label_filters<'a>(
+        &'a self,
+        filters: &[LabelFilter],
+    ) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
+        let terms = self.terms();
+        let result = terms.postings_for_label_filters(filters)?;
+        Ok(terms.mask_cow(result))
+    }
+
     pub fn postings_for_selector<'a>(
         &'a self,
         selector: &SeriesSelector,

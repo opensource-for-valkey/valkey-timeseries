@@ -1,5 +1,7 @@
+use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
 use super::fanout_codec::generated::{PostingStat as MPostingStat, StatsRequest, StatsResponse};
 use crate::commands::DEFAULT_STATS_RESULTS_LIMIT;
+use crate::commands::command_parser::LabelStatsOptions;
 use crate::commands::ts_labelstats::reply_with_postings_stats;
 use crate::common::threads::join;
 use crate::fanout::{FanoutClientCommand, FanoutCommandResult, FanoutContext, NodeInfo};
@@ -24,22 +26,19 @@ struct StatsResults {
 }
 
 pub struct LabelStatsFanoutCommand {
-    pub limit: usize,
-    pub selected_label: Option<String>,
+    options: LabelStatsOptions,
     state: StatsResults,
 }
 
 impl LabelStatsFanoutCommand {
-    pub fn new(limit: usize, selected_label: Option<String>) -> Self {
-        let limit = if limit == 0 {
-            DEFAULT_STATS_RESULTS_LIMIT
-        } else {
-            limit
-        };
+    pub fn new(options: LabelStatsOptions) -> Self {
+        let mut options = options;
+        if options.limit == 0 {
+            options.limit = DEFAULT_STATS_RESULTS_LIMIT;
+        }
 
         Self {
-            limit,
-            selected_label,
+            options,
             state: StatsResults::default(),
         }
     }
@@ -47,7 +46,10 @@ impl LabelStatsFanoutCommand {
 
 impl Default for LabelStatsFanoutCommand {
     fn default() -> Self {
-        Self::new(DEFAULT_STATS_RESULTS_LIMIT, None)
+        Self::new(LabelStatsOptions {
+            limit: DEFAULT_STATS_RESULTS_LIMIT,
+            ..Default::default()
+        })
     }
 }
 
@@ -64,8 +66,18 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
         let index_guard = get_timeseries_index(ctx);
         let index = index_guard.deref();
         let label = req.selected_label.as_deref().unwrap_or("");
-        let (stats, (labels_bitmap, label_value_pairs_bitmap)) =
-            join(|| index.stats(label, limit), || index.get_label_bitmaps());
+
+        // Resolve the filter once: the counts and the label fingerprints have to be taken over
+        // the same set of series, or the coordinator's distinct totals would cover series that
+        // contributed nothing to the counts.
+        let matchers = deserialize_matchers_list(Some(req.filters))?;
+        let matching = index.matching_postings(&matchers)?;
+        let matching = matching.as_ref();
+
+        let (stats, (labels_bitmap, label_value_pairs_bitmap)) = join(
+            || index.stats_restricted(matching, label, limit),
+            || index.label_bitmaps_restricted(matching),
+        );
 
         let mut response: StatsResponse = stats.into();
         response.labels_bitmap = serialize_bitmap(&labels_bitmap);
@@ -76,8 +88,10 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
 
     fn generate_request(&self) -> StatsRequest {
         StatsRequest {
-            limit: self.limit as u32,
-            selected_label: self.selected_label.clone(),
+            limit: self.options.limit as u32,
+            selected_label: self.options.label.clone(),
+            filters: serialize_matchers_list(&self.options.filters)
+                .expect("serialize matchers list"),
         }
     }
 
@@ -108,13 +122,13 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     }
 
     fn reply(&mut self, ctx: &FanoutContext) -> Status {
-        let limit = self.limit;
+        let limit = self.options.limit;
         let state = std::mem::take(&mut self.state);
 
         // Calculate num_labels from the aggregated map to ensure uniqueness
         let label_count = state.labels_bitmap.cardinality() as usize;
         let total_label_value_pairs = state.label_value_pairs_bitmap.cardinality() as usize;
-        let focused = if self.selected_label.is_some() {
+        let focused = if self.options.label.is_some() {
             Some(collect_map_values(
                 state.series_count_by_focus_label_value,
                 limit,

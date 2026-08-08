@@ -10,7 +10,7 @@ use crate::common::context::{get_acl_user, is_acl_enforced};
 use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
-use crate::labels::filters::SeriesSelector;
+use crate::labels::filters::{LabelFilter, SeriesSelector};
 use crate::labels::{Label, SeriesLabel};
 use crate::series::acl::{clone_permissions, has_all_keys_permissions};
 use crate::series::index::IndexKey;
@@ -358,7 +358,96 @@ impl TimeSeriesIndex {
         })
     }
 
+    /// The series matching every one of `selectors` (AND-ed together), or `None` when `selectors`
+    /// is empty and nothing is being restricted.
+    ///
+    /// The distinction matters to [`TimeSeriesIndex::stats_restricted`] and
+    /// [`TimeSeriesIndex::label_bitmaps_restricted`]: `None` means "the whole index", while
+    /// `Some(empty)` means "a filter was applied and nothing matched".
+    pub fn matching_postings(
+        &self,
+        selectors: &[SeriesSelector],
+    ) -> ValkeyResult<Option<PostingsBitmap>> {
+        if selectors.is_empty() {
+            return Ok(None);
+        }
+        let inner = read_lock(&self.inner);
+        Ok(Some(inner.postings_for_selectors(selectors)?.into_owned()))
+    }
+
+    /// Cardinality statistics over the whole index.
+    ///
+    /// `label` names the label whose values are broken out in `series_count_by_focus_label_value`
+    /// (the metric name when empty), and `limit` bounds the length of each top-N list.
     pub fn stats(&self, label: &str, limit: usize) -> PostingsStats {
+        self.collect_stats(None, label, limit)
+    }
+
+    /// [`TimeSeriesIndex::stats`], restricted to the series matching `filters` (AND-ed together).
+    ///
+    /// Every count reported is relative to the matching series alone — `series_count`,
+    /// `label_count` and `total_label_value_pairs` included — so a label carried only by
+    /// non-matching series does not appear at all. An empty `filters` slice matches everything and
+    /// is equivalent to [`TimeSeriesIndex::stats`].
+    pub fn stats_filtered(
+        &self,
+        filters: &[LabelFilter],
+        label: &str,
+        limit: usize,
+    ) -> ValkeyResult<PostingsStats> {
+        if filters.is_empty() {
+            return Ok(self.stats(label, limit));
+        }
+
+        let matching = {
+            let inner = read_lock(&self.inner);
+            inner.postings_for_label_filters(filters)?.into_owned()
+        };
+
+        Ok(self.stats_restricted(Some(&matching), label, limit))
+    }
+
+    /// [`TimeSeriesIndex::stats`], restricted to the series matching `selectors` (AND-ed together).
+    /// The selector-level counterpart of [`TimeSeriesIndex::stats_filtered`]; an empty `selectors`
+    /// slice matches everything.
+    pub fn stats_by_selectors(
+        &self,
+        selectors: &[SeriesSelector],
+        label: &str,
+        limit: usize,
+    ) -> ValkeyResult<PostingsStats> {
+        let matching = self.matching_postings(selectors)?;
+        Ok(self.stats_restricted(matching.as_ref(), label, limit))
+    }
+
+    /// [`TimeSeriesIndex::stats`] over a pre-resolved set of series — see
+    /// [`TimeSeriesIndex::matching_postings`]. Callers that need more than one statistic over the
+    /// same filter resolve the set once and pass it to each.
+    pub fn stats_restricted(
+        &self,
+        matching: Option<&PostingsBitmap>,
+        label: &str,
+        limit: usize,
+    ) -> PostingsStats {
+        if matching.is_some_and(PostingsBitmap::is_empty) {
+            // A filter matched nothing, so there are no series, no labels and no label-value pairs
+            // to report. Still report the (empty) focus-label list, as the unfiltered path does.
+            return PostingsStats {
+                series_count_by_focus_label_value: Some(Vec::new()),
+                ..Default::default()
+            };
+        }
+        self.collect_stats(matching, label, limit)
+    }
+
+    /// The shared body of the `stats` family. When `matching` is given, each posting list is
+    /// counted through its intersection with that set.
+    fn collect_stats(
+        &self,
+        matching: Option<&PostingsBitmap>,
+        label: &str,
+        limit: usize,
+    ) -> PostingsStats {
         let mut per_label_counts: AHashMap<String, u64> = AHashMap::new();
 
         let mut metric_name_counts = StatsMaxHeap::new(limit);
@@ -366,9 +455,12 @@ impl TimeSeriesIndex {
         let mut label_value_pair_counts = StatsMaxHeap::new(limit);
         let mut focus_label_value_counts = StatsMaxHeap::new(limit);
 
-        let series_count = {
-            let inner = read_lock(&self.inner);
-            inner.count() as u64
+        let series_count = match matching {
+            Some(matching) => matching.cardinality(),
+            None => {
+                let inner = read_lock(&self.inner);
+                inner.count() as u64
+            }
         };
 
         let mut total_label_value_pairs = 0usize;
@@ -381,7 +473,7 @@ impl TimeSeriesIndex {
         };
 
         const BATCH_SIZE: usize = 512;
-        let mut iterator = BatchIterator::new(self, BATCH_SIZE);
+        let mut iterator = BatchIterator::restricted(self, BATCH_SIZE, matching);
 
         while !iterator.is_complete() {
             iterator.next_batch(|key, _, count| {
@@ -455,13 +547,29 @@ impl TimeSeriesIndex {
     /// merge these bitmaps across nodes using a bitwise OR operation. The cardinality of the resulting bitmap will give us
     /// the total number of unique key=value pairs across the cluster without double-counting.
     pub fn get_label_bitmaps(&self) -> (Bitmap64, Bitmap64) {
+        self.label_bitmaps_restricted(None)
+    }
+
+    /// [`TimeSeriesIndex::get_label_bitmaps`] over a pre-resolved set of series — see
+    /// [`TimeSeriesIndex::matching_postings`]. Label names and pairs carried only by series outside
+    /// `matching` are left out of both fingerprints, which keeps a cluster-wide distinct count
+    /// consistent with the per-shard counts computed over the same set.
+    pub fn label_bitmaps_restricted(
+        &self,
+        matching: Option<&PostingsBitmap>,
+    ) -> (Bitmap64, Bitmap64) {
         const BATCH_SIZE: usize = 512;
 
         let mut label_names_bitmap = Bitmap64::default();
         let mut label_value_pairs_bitmap = Bitmap64::default();
+
+        if matching.is_some_and(PostingsBitmap::is_empty) {
+            return (label_names_bitmap, label_value_pairs_bitmap);
+        }
+
         let hasher = DeterministicHasher::default();
 
-        let mut iterator = BatchIterator::new(self, BATCH_SIZE);
+        let mut iterator = BatchIterator::restricted(self, BATCH_SIZE, matching);
 
         while !iterator.is_complete() {
             iterator.next_batch(|key, _bitmap, _| {
@@ -554,6 +662,9 @@ impl TimeSeriesIndex {
 /// Helper struct for batch iteration over the label index
 struct BatchIterator<'a> {
     index: &'a TimeSeriesIndex,
+    /// When set, posting lists are counted through their intersection with this set rather than
+    /// in full. Must be stale-free — see [`BatchIterator::restricted`].
+    matching: Option<&'a PostingsBitmap>,
     cursor: Option<IndexKey>,
     batch_size: usize,
     is_finished: bool,
@@ -561,8 +672,20 @@ struct BatchIterator<'a> {
 
 impl<'a> BatchIterator<'a> {
     fn new(index: &'a TimeSeriesIndex, batch_size: usize) -> Self {
+        Self::restricted(index, batch_size, None)
+    }
+
+    /// An iterator reporting the size of each posting list within `matching` only. `matching` must
+    /// already have stale ids removed (as everything out of [`Postings::postings_for_selector`]
+    /// and friends does), since the intersection is reported as-is.
+    fn restricted(
+        index: &'a TimeSeriesIndex,
+        batch_size: usize,
+        matching: Option<&'a PostingsBitmap>,
+    ) -> Self {
         Self {
             index,
+            matching,
             cursor: None,
             batch_size,
             is_finished: false,
@@ -613,7 +736,10 @@ impl<'a> BatchIterator<'a> {
 
             processed_in_batch += 1;
 
-            let cardinality = Self::adjusted_cardinality(&inner, bitmap, has_stale_ids);
+            let cardinality = match self.matching {
+                Some(matching) => bitmap.and_cardinality(matching),
+                None => Self::adjusted_cardinality(&inner, bitmap, has_stale_ids),
+            };
             if cardinality > 0
                 && let ControlFlow::Break(_) = processor(key, bitmap, cardinality)
             {

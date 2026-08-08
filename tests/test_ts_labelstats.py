@@ -9,12 +9,16 @@ from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 class TestTsStats(ValkeyTimeSeriesTestCaseBase):
     """Test suite for TS.LABELSTATS command."""
 
-    def get_stats(self, limit: int | None = None, label=None):
+    def get_stats(self, limit: int | None = None, label=None, filters=None):
         args = ['TS.LABELSTATS']
         if limit is not None:
             args.extend(['LIMIT', limit])
         if label is not None:
             args.extend(['LABEL', label])
+        # FILTER is variadic, so it always goes last.
+        if filters is not None:
+            args.append('FILTER')
+            args.extend(filters)
 
         result = self.client.execute_command(*args)
         stats = parse_stats_response(result)
@@ -373,3 +377,129 @@ class TestTsStats(ValkeyTimeSeriesTestCaseBase):
         """Test TS.LABELSTATS with invalid argument combinations"""
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.LABELSTATS', 'INVALID_ARG', 'value')
+
+    def create_filter_fixtures(self):
+        """Four series: three in us-east-1, one in eu-west-1 carrying a label nothing else has."""
+        self.client.execute_command('TS.CREATE', 'ts1', 'LABELS', '__name__', 'http_requests',
+                                    'region', 'us-east-1', 'env', 'prod', 'status', '200')
+        self.client.execute_command('TS.CREATE', 'ts2', 'LABELS', '__name__', 'http_requests',
+                                    'region', 'us-east-1', 'env', 'prod', 'status', '404')
+        self.client.execute_command('TS.CREATE', 'ts3', 'LABELS', '__name__', 'db_queries',
+                                    'region', 'us-east-1', 'env', 'dev', 'status', '200')
+        self.client.execute_command('TS.CREATE', 'ts4', 'LABELS', '__name__', 'http_requests',
+                                    'region', 'eu-west-1', 'env', 'prod', 'status', '200',
+                                    'tier', 'edge')
+
+    def test_stats_filter_restricts_counts(self):
+        """Test TS.LABELSTATS FILTER reports counts over the matching series only."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['region=us-east-1'])
+
+        assert stats['totalSeries'] == 3
+
+        metric_counts = {item[0]: item[1] for item in stats['seriesCountByMetricName']}
+        assert metric_counts.get('http_requests') == 2
+        assert metric_counts.get('db_queries') == 1
+
+        pair_counts = {item[0]: item[1] for item in stats['seriesCountByLabelValuePair']}
+        assert pair_counts.get('region=us-east-1') == 3
+        assert pair_counts.get('status=200') == 2
+        assert pair_counts.get('env=prod') == 2
+        # The eu-west-1 series contributes nothing.
+        assert 'region=eu-west-1' not in pair_counts
+
+    def test_stats_filter_omits_labels_of_non_matching_series(self):
+        """Test TS.LABELSTATS FILTER excludes labels carried only by non-matching series."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['region=us-east-1'])
+
+        # 'tier' belongs to the eu-west-1 series alone.
+        label_counts = {item[0]: item[1] for item in stats['labelValueCountByLabelName']}
+        assert 'tier' not in label_counts
+
+        pair_counts = {item[0]: item[1] for item in stats['seriesCountByLabelValuePair']}
+        assert 'tier=edge' not in pair_counts
+
+        # __name__, region, env, status — but not tier.
+        assert stats['totalLabels'] == 4
+        # 2 metric names + 1 region + 2 envs + 2 statuses.
+        assert stats['totalLabelValuePairs'] == 7
+
+    def test_stats_filter_with_label_and_limit(self):
+        """Test TS.LABELSTATS FILTER combined with LABEL and LIMIT."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(limit=5, label='env', filters=['region=us-east-1'])
+
+        assert stats['totalSeries'] == 3
+
+        # Focus label values are not decoded by parse_stats_response, so they stay as bytes.
+        focus_counts = {item[0]: item[1] for item in stats['seriesCountByFocusLabelValue']}
+        assert focus_counts.get(b'prod') == 2
+        assert focus_counts.get(b'dev') == 1
+
+    def test_stats_filter_multiple_selectors_are_intersected(self):
+        """Test TS.LABELSTATS with several FILTER selectors, which are AND-ed."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['region=us-east-1', 'env=prod'])
+
+        assert stats['totalSeries'] == 2
+
+        pair_counts = {item[0]: item[1] for item in stats['seriesCountByLabelValuePair']}
+        assert pair_counts.get('env=prod') == 2
+        assert 'env=dev' not in pair_counts
+
+    def test_stats_filter_no_matching_series(self):
+        """Test TS.LABELSTATS FILTER that matches nothing reports zero everywhere."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['region=ap-south-1'])
+
+        assert stats['totalSeries'] == 0
+        assert stats['totalLabels'] == 0
+        assert stats['totalLabelValuePairs'] == 0
+        assert stats['seriesCountByMetricName'] == []
+        assert stats['labelValueCountByLabelName'] == []
+        assert stats['seriesCountByLabelValuePair'] == []
+
+    def test_stats_filter_prometheus_style_selector(self):
+        """Test TS.LABELSTATS FILTER accepts Prometheus-style selectors."""
+        self.create_filter_fixtures()
+
+        stats = self.get_stats(filters=['http_requests{env="prod"}'])
+
+        assert stats['totalSeries'] == 3
+        metric_counts = {item[0]: item[1] for item in stats['seriesCountByMetricName']}
+        assert metric_counts.get('http_requests') == 3
+        assert 'db_queries' not in metric_counts
+
+    def test_stats_filter_with_no_expressions(self):
+        """Test TS.LABELSTATS FILTER given without any selector."""
+        with pytest.raises(ResponseError):
+            self.client.execute_command('TS.LABELSTATS', 'FILTER')
+
+    def test_stats_filter_all_negative_matchers(self):
+        """Test TS.LABELSTATS FILTER rejects an unbounded (all-negative) selector list."""
+        with pytest.raises(ResponseError, match='at least one matcher'):
+            self.client.execute_command('TS.LABELSTATS', 'FILTER', 'region!=us-east-1')
+
+    def test_stats_filter_invalid_selector(self):
+        """Test TS.LABELSTATS FILTER with a malformed selector."""
+        with pytest.raises(ResponseError):
+            self.client.execute_command('TS.LABELSTATS', 'FILTER', '{{{')
+
+    def test_stats_filter_after_label_and_limit(self):
+        """Test that LABEL and LIMIT are still parsed when FILTER follows them."""
+        self.create_filter_fixtures()
+
+        result = self.client.execute_command('TS.LABELSTATS', 'LABEL', 'status', 'LIMIT', '1',
+                                             'FILTER', 'region=us-east-1')
+        stats = parse_stats_response(result)
+
+        assert stats['totalSeries'] == 3
+        # LIMIT 1 applies to every top-N section.
+        assert len(stats['seriesCountByMetricName']) == 1
+        assert len(stats['seriesCountByFocusLabelValue']) == 1

@@ -5,7 +5,7 @@ Returns label cardinality statistics about the timeseries data.
 ## Syntax
 
 ```
-TS.LABELSTATS [LABEL <label-name>] [LIMIT <n>]
+TS.LABELSTATS [LABEL <label-name>] [LIMIT <n>] [FILTER selector [selector ...]]
 ```
 
 ## Description
@@ -22,6 +22,9 @@ It returns the following statistics:
   - labels by usage
   - label=value pairs by usage
 
+With `FILTER`, every one of those statistics is computed over the matching series alone
+instead of over the whole index.
+
 ## Optional Arguments
 
 - `LABEL <label-name>`  
@@ -31,6 +34,18 @@ It returns the following statistics:
 
 - `LIMIT <n>`  
   Limits the number of items returned in each top-N section. Higher values may increase runtime.
+
+- `FILTER <selector> [selector ...]`  
+  Restricts the report to the series matching every listed selector. See
+  [filter syntax](../topics/filter-syntax.md). Because the list is variadic it consumes the rest
+  of the argument list, so `FILTER` must be the last option given; `LABEL` and `LIMIT` have to
+  precede it. At least one selector must follow `FILTER`, and the list must contain at least one
+  positive matcher — a list of only negative matchers such as `region!=us` is rejected with
+  `TSDB: please provide at least one matcher`.
+
+  Labels carried only by non-matching series are excluded entirely: they contribute to neither
+  `totalLabels`, `totalLabelValuePairs`, nor any of the top-K sections. When nothing matches,
+  every count is zero and every section is empty.
 
 ## Return
 
@@ -85,7 +100,7 @@ TS.LABELSTATS
 ```
 
 ```aiignore
-valkey> TS.LABELSTATS http_requests 10
+valkey> TS.LABELSTATS LABEL http_requests 10
  1) totalSeries
  2) (integer) 1247
  3) totalLabelValuePairs
@@ -140,6 +155,22 @@ TS.LABELSTATS LIMIT 5
 ```
 
 Useful in production when you want a quick snapshot with minimal overhead.
+
+### Restricting the report to a subset of series
+
+```text
+TS.LABELSTATS LABEL status LIMIT 5 FILTER region=us-east-1
+```
+
+Reports the same sections, but counting only the series labelled `region=us-east-1`. Selectors
+are AND-ed, so several can be combined:
+
+```text
+TS.LABELSTATS FILTER region=us-east-1 env=prod
+```
+
+This answers "which labels drive cardinality inside this slice of the index?" — for example,
+narrowing to a single tenant or metric family before hunting for a high-cardinality label.
 
 ### Complexity
 

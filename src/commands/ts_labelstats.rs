@@ -1,9 +1,14 @@
+use crate::commands::command_parser::{CommandArgToken, parse_command_arg_token};
 use crate::commands::parse_stats_command_args;
 use crate::commands::ts_labelstats_fanout_command::LabelStatsFanoutCommand;
 use crate::common::replies::ReplyContext;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::{PostingStat, PostingsStats, get_timeseries_index};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+
+/// `TS.LABELSTATS` without a `FILTER` block: the command name plus `LABEL <label>` and
+/// `LIMIT <n>`. `FILTER` is variadic, so only the arguments preceding it are bounded.
+const MAX_FIXED_ARGS: usize = 5;
 
 /// https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
 #[valkey_module_macros::command({
@@ -16,21 +21,25 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
     key_spec: []
 })]
 pub fn ts_labelstats_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() > 5 {
+    let fixed_args = args
+        .iter()
+        .position(|arg| parse_command_arg_token(arg) == Some(CommandArgToken::Filter))
+        .unwrap_or(args.len());
+    if fixed_args > MAX_FIXED_ARGS {
         return Err(ValkeyError::WrongArity);
     }
 
     let mut args = args.into_iter().skip(1).peekable();
-    let (label, limit) = parse_stats_command_args(&mut args)?;
+    let options = parse_stats_command_args(&mut args)?;
 
     if is_clustered(ctx) {
-        let operation = LabelStatsFanoutCommand::new(limit, label);
+        let operation = LabelStatsFanoutCommand::new(options);
         return operation.exec(ctx);
     }
 
     let index = get_timeseries_index(ctx);
-    let selected_label = label.as_deref().unwrap_or("");
-    let stats = index.stats(selected_label, limit);
+    let selected_label = options.label.as_deref().unwrap_or("");
+    let stats = index.stats_by_selectors(&options.filters, selected_label, options.limit)?;
     let reply_ctx = ReplyContext::new(ctx.ctx);
 
     reply_with_postings_stats(&reply_ctx, &stats);

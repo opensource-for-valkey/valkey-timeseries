@@ -1732,23 +1732,40 @@ pub(super) fn parse_query_labels_command_args(
 pub const DEFAULT_STATS_RESULTS_LIMIT: usize = 10;
 pub const MAX_STATS_RESULTS_LIMIT: usize = 1000;
 
+#[derive(Debug, Clone, Default)]
+pub struct LabelStatsOptions {
+    pub label: Option<String>,
+    pub limit: usize,
+    pub filters: Vec<SeriesSelector>,
+}
+
+/// Parses `TS.LABELSTATS [LABEL <label>] [LIMIT <n>] [FILTER filterExpr [filterExpr ...]]`.
+///
+/// `FILTER` is variadic and so has to come last: it consumes every remaining argument, and a
+/// `LABEL` or `LIMIT` after it would be read as a selector expression (and rejected as one).
 pub(super) fn parse_stats_command_args(
     args: &mut CommandArgIterator,
-) -> ValkeyResult<(Option<String>, usize)> {
-    let mut label: Option<String> = None;
-    let mut limit = DEFAULT_STATS_RESULTS_LIMIT;
+) -> ValkeyResult<LabelStatsOptions> {
+    let mut options = LabelStatsOptions {
+        limit: DEFAULT_STATS_RESULTS_LIMIT,
+        ..Default::default()
+    };
 
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         match token {
             CommandArgToken::Label => {
-                label = Some(args.next_string()?);
+                options.label = Some(args.next_string()?);
             }
             CommandArgToken::Limit => {
                 let next = args
                     .next_str()
                     .map_err(|_| ValkeyError::Str(error_consts::MISSING_LIMIT_VALUE))?;
-                limit = parse_limit_value(next)?.unwrap_or(DEFAULT_STATS_RESULTS_LIMIT);
+                options.limit = parse_limit_value(next)?.unwrap_or(DEFAULT_STATS_RESULTS_LIMIT);
+            }
+            CommandArgToken::Filter => {
+                // Runs to the end of the argument list, so the loop terminates after this.
+                options.filters = parse_series_selector_list(args, &[])?;
             }
             _ => {
                 let msg = "TSDB: invalid argument";
@@ -1757,7 +1774,7 @@ pub(super) fn parse_stats_command_args(
         };
     }
 
-    Ok((label, limit))
+    Ok(options)
 }
 
 fn parse_limit_value(val: &str) -> ValkeyResult<Option<usize>> {

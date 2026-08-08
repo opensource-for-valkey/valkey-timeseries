@@ -529,12 +529,14 @@ pub struct LabelSearchRequest {
     #[prost(uint32, tag = "11")]
     pub limit: u32,
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatsRequest {
     #[prost(uint32, tag = "1")]
     pub limit: u32,
     #[prost(string, optional, tag = "2")]
     pub selected_label: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub filters: ::prost::alloc::vec::Vec<SeriesSelector>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiRangeRequest {

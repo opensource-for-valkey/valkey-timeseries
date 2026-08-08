@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use crate::common::constants::METRIC_NAME_LABEL;
     use crate::labels::Label;
-    use crate::labels::filters::SeriesSelector;
-    use crate::series::index::{TimeSeriesIndex, next_timeseries_id};
+    use crate::labels::filters::{LabelFilter, SeriesSelector};
+    use crate::series::index::{PostingStat, TimeSeriesIndex, next_timeseries_id};
     use crate::series::time_series::TimeSeries;
 
     fn create_series_from_metric_name(prometheus_name: &str) -> TimeSeries {
@@ -435,5 +436,174 @@ mod tests {
             .find(|s| s.name == "db_queries")
             .expect("db_queries metric should be present");
         assert_eq!(db_metric.count, 1);
+    }
+
+    /// The index used by the `stats_filtered` tests: four `region="us"` series (three
+    /// `http_requests`, one `db_queries`) plus one `region="eu"` series carrying a `tier` label
+    /// that no other series has.
+    fn filtered_stats_index() -> TimeSeriesIndex {
+        let index = TimeSeriesIndex::new();
+
+        let series = [
+            r#"http_requests{method="GET",status="200",region="us"}"#,
+            r#"http_requests{method="GET",status="404",region="us"}"#,
+            r#"http_requests{method="POST",status="200",region="us"}"#,
+            r#"http_requests{method="POST",status="200",region="eu",tier="edge"}"#,
+            r#"db_queries{method="SELECT",status="200",region="us"}"#,
+        ];
+
+        for (i, prom_name) in series.iter().enumerate() {
+            let ts = create_series_from_metric_name(prom_name);
+            index.index_timeseries(&ts, format!("s{i}").as_bytes());
+        }
+
+        index
+    }
+
+    fn count_of(stats: &[PostingStat], name: &str) -> u64 {
+        stats
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.count)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn test_stats_filtered_no_filters_matches_unfiltered() {
+        let index = filtered_stats_index();
+
+        let unfiltered = index.stats("method", 10);
+        let filtered = index
+            .stats_filtered(&[], "method", 10)
+            .expect("call should succeed");
+
+        assert_eq!(filtered.series_count, unfiltered.series_count);
+        assert_eq!(filtered.label_count, unfiltered.label_count);
+        assert_eq!(
+            filtered.total_label_value_pairs,
+            unfiltered.total_label_value_pairs
+        );
+        assert_eq!(
+            filtered.series_count_by_label_value_pairs.len(),
+            unfiltered.series_count_by_label_value_pairs.len()
+        );
+        assert_eq!(
+            count_of(&filtered.series_count_by_metric_name, "http_requests"),
+            4
+        );
+    }
+
+    #[test]
+    fn test_stats_filtered_counts_matching_series_only() {
+        let index = filtered_stats_index();
+
+        let filters = [LabelFilter::equals("region".to_string(), "us")];
+        let stats = index
+            .stats_filtered(&filters, "method", 10)
+            .expect("call should succeed");
+
+        // Four of the five series are in us-east; the eu one drops out of every count.
+        assert_eq!(stats.series_count, 4);
+
+        assert_eq!(
+            count_of(&stats.series_count_by_metric_name, "http_requests"),
+            3
+        );
+        assert_eq!(
+            count_of(&stats.series_count_by_metric_name, "db_queries"),
+            1
+        );
+
+        let focus = stats
+            .series_count_by_focus_label_value
+            .expect("expected focus label values for method");
+        assert_eq!(count_of(&focus, "GET"), 2);
+        assert_eq!(
+            count_of(&focus, "POST"),
+            1,
+            "the POST/eu series is excluded"
+        );
+        assert_eq!(count_of(&focus, "SELECT"), 1);
+
+        let pairs = &stats.series_count_by_label_value_pairs;
+        assert_eq!(count_of(pairs, "region=us"), 4);
+        assert_eq!(count_of(pairs, "status=200"), 3);
+        assert_eq!(count_of(pairs, "status=404"), 1);
+        assert_eq!(
+            count_of(pairs, "region=eu"),
+            0,
+            "region=eu has no matching series and must not be reported"
+        );
+    }
+
+    #[test]
+    fn test_stats_filtered_omits_labels_of_non_matching_series() {
+        let index = filtered_stats_index();
+
+        let filters = [LabelFilter::equals("region".to_string(), "us")];
+        let stats = index
+            .stats_filtered(&filters, "", 10)
+            .expect("call should succeed");
+
+        // `tier` belongs to the eu series alone, so it contributes neither a label name, a
+        // label-value pair, nor a bump to the totals.
+        assert_eq!(count_of(&stats.series_count_by_label_name, "tier"), 0);
+        assert_eq!(
+            count_of(&stats.series_count_by_label_value_pairs, "tier=edge"),
+            0
+        );
+
+        // __name__, method, status and region — but not tier.
+        assert_eq!(stats.label_count, 4);
+        // Two metric names, three methods, two statuses and one region.
+        assert_eq!(stats.total_label_value_pairs, 8);
+    }
+
+    #[test]
+    fn test_stats_filtered_no_matching_series() {
+        let index = filtered_stats_index();
+
+        let filters = [LabelFilter::equals("region".to_string(), "apac")];
+        let stats = index
+            .stats_filtered(&filters, "method", 10)
+            .expect("call should succeed");
+
+        assert_eq!(stats.series_count, 0);
+        assert_eq!(stats.label_count, 0);
+        assert_eq!(stats.total_label_value_pairs, 0);
+        assert!(stats.series_count_by_metric_name.is_empty());
+        assert!(stats.series_count_by_label_name.is_empty());
+        assert!(stats.series_count_by_label_value_pairs.is_empty());
+        match stats.series_count_by_focus_label_value {
+            Some(v) => assert!(v.is_empty()),
+            None => panic!("expected Some(vec) for focus label when nothing matches"),
+        }
+    }
+
+    #[test]
+    fn test_stats_filtered_intersects_multiple_filters() {
+        let index = filtered_stats_index();
+
+        // AND-ed together: us-east series that are not 404s.
+        let filters = [
+            LabelFilter::equals("region".to_string(), "us"),
+            LabelFilter::not_equals("status".to_string(), "404"),
+        ];
+        let stats = index
+            .stats_filtered(&filters, METRIC_NAME_LABEL, 10)
+            .expect("call should succeed");
+
+        assert_eq!(stats.series_count, 3);
+
+        let focus = stats
+            .series_count_by_focus_label_value
+            .expect("expected focus label values for the metric name");
+        assert_eq!(count_of(&focus, "http_requests"), 2);
+        assert_eq!(count_of(&focus, "db_queries"), 1);
+
+        assert_eq!(
+            count_of(&stats.series_count_by_label_value_pairs, "status=404"),
+            0
+        );
     }
 }
