@@ -378,6 +378,24 @@ class TestTsStats(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.LABELSTATS', 'INVALID_ARG', 'value')
 
+    def test_stats_focus_section_only_with_label(self):
+        """Test the focus section is present iff LABEL was given (same shape as cluster mode)."""
+        self.client.execute_command('TS.CREATE', 'ts1', 'LABELS', '__name__', 'm1', 'host', 'h1')
+        self.client.execute_command('TS.CREATE', 'ts2', 'LABELS', '__name__', 'm2', 'host', 'h2')
+
+        bare = parse_stats_response(self.client.execute_command('TS.LABELSTATS'))
+        assert 'seriesCountByFocusLabelValue' not in bare
+
+        labelled = parse_stats_response(
+            self.client.execute_command('TS.LABELSTATS', 'LABEL', 'host'))
+        assert 'seriesCountByFocusLabelValue' in labelled
+
+        # An explicit empty LABEL still asks for a focus section, defaulting to the metric name.
+        empty = parse_stats_response(
+            self.client.execute_command('TS.LABELSTATS', 'LABEL', ''))
+        focus = {item[0]: item[1] for item in empty['seriesCountByFocusLabelValue']}
+        assert focus == {b'm1': 1, b'm2': 1}
+
     def create_filter_fixtures(self):
         """Four series: three in us-east-1, one in eu-west-1 carrying a label nothing else has."""
         self.client.execute_command('TS.CREATE', 'ts1', 'LABELS', '__name__', 'http_requests',

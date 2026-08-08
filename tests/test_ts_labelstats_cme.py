@@ -353,6 +353,21 @@ class TestTsStatsCluster(ValkeyTimeSeriesClusterTestCase):
         assert focus_label_counts.get(b'metric1') == 2
         assert focus_label_counts.get(b'metric2') == 1
 
+    def test_stats_cluster_focus_section_only_with_label(self):
+        """Test the cluster reply shape matches standalone: focus section iff LABEL was given."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+
+        cluster.execute_command('TS.CREATE', 'ts:{1}', 'LABELS', '__name__', 'm1', 'host', 'h1')
+        cluster.execute_command('TS.CREATE', 'ts:{2}', 'LABELS', '__name__', 'm2', 'host', 'h2')
+
+        assert 'seriesCountByFocusLabelValue' not in self.get_stats()
+        assert 'seriesCountByFocusLabelValue' in self.get_stats(label='host')
+
+        # An explicit empty LABEL still asks for a focus section, defaulting to the metric name.
+        focus = {item[0]: item[1] for item in
+                 self.get_stats(label='')['seriesCountByFocusLabelValue']}
+        assert focus == {b'm1': 1, b'm2': 1}
+
     def create_filter_fixtures(self):
         """Six series spread across shards: four in us-east, two in eu-west."""
         cluster: ValkeyCluster = self.new_cluster_client()
