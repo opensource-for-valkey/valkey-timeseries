@@ -502,7 +502,7 @@ mod tests {
             .stats_filtered(&filters, "method", 10)
             .expect("call should succeed");
 
-        // Four of the five series are in us-east; the eu one drops out of every count.
+        // Four of the five series match region="us"; the eu one drops out of every count.
         assert_eq!(stats.series_count, 4);
 
         assert_eq!(
