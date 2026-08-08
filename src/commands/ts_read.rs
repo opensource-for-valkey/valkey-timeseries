@@ -1258,14 +1258,17 @@ mod tests {
             ("-2.5E-2", -0.025),
             ("-0", -0.0),
         ] {
+            let parsed = parse(&["CONDITION", ">", spelling])
+                .unwrap()
+                .condition
+                .unwrap()
+                .value;
+            assert_eq!(parsed, expected, "value {spelling}");
+            // -0.0 == 0.0, so the equality above can't tell the two zeroes apart.
             assert_eq!(
-                parse(&["CONDITION", ">", spelling])
-                    .unwrap()
-                    .condition
-                    .unwrap()
-                    .value,
-                expected,
-                "value {spelling}"
+                parsed.is_sign_negative(),
+                expected.is_sign_negative(),
+                "sign of {spelling}"
             );
         }
     }
