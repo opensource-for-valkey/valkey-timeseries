@@ -8,7 +8,7 @@ use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
-use crate::promql::utils::range_bounds_to_system_time;
+use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
 use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
 use promql_parser::parser::{EvalStmt, Expr};
@@ -170,6 +170,22 @@ pub fn evaluate_range(
         ));
     }
 
+    let start_ms = system_time_to_millis(start);
+    let end_ms = system_time_to_millis(end);
+
+    // Reject an over-wide step grid before anything is sized from it. The preload
+    // phase reserves one slot per step — `(end - start) / step` of them — so an
+    // unbounded `END` (the `+` sentinel resolves to i64::MAX) would otherwise drive a
+    // multi-terabyte allocation and abort the server. `max_points_per_series` carries
+    // the configured `ts-promql-max-points-per-timeseries`; 0 (its default) is unlimited.
+    validate_max_points_per_timeseries(
+        start_ms,
+        end_ms,
+        step,
+        opts.max_points_per_series.unwrap_or(0),
+    )
+    .map_err(QueryError::from)?;
+
     let evaluator = Evaluator::new(&reader, opts);
     let deadline = resolve_deadline_ms(opts);
 
@@ -180,9 +196,6 @@ pub fn evaluate_range(
     if deadline > 0 && current_time_millis() > deadline {
         return Err(QueryError::Timeout);
     }
-
-    let start_ms = system_time_to_millis(start);
-    let end_ms = system_time_to_millis(end);
 
     let step_ms = step.as_millis() as i64;
     let lookback_delta_ms = lookback_delta.as_millis() as i64;

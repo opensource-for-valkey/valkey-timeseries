@@ -46,7 +46,10 @@ pub(in crate::promql) fn range_bounds_to_secs(
 
 #[inline]
 fn calc_points(start: Timestamp, end: Timestamp, step: &Duration) -> i64 {
-    (end - start).saturating_div((step.as_millis() + 1) as i64)
+    // Saturating: `end` can be the i64::MAX sentinel and `start` any timestamp, so a plain
+    // `end - start` would overflow at the extremes — the exact input this guards against.
+    end.saturating_sub(start)
+        .saturating_div((step.as_millis() + 1) as i64)
 }
 
 /// The minimum number of points per timeseries for enabling time rounding.
@@ -118,8 +121,69 @@ pub(crate) fn validate_max_points_per_timeseries(
             "too many points for the given step={:?}, start={start} and end={end}: {points}; cannot exceed {}",
             step, max_points_per_timeseries
         );
-        Err(EvaluationError::InternalError(msg))
+        // A request-level rejection (the window is too wide for the step), not a server
+        // fault: classify it so the surfaced error reads as a bad argument.
+        Err(EvaluationError::ArgumentError(msg))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod max_points_tests {
+    use super::*;
+    use crate::common::constants::MAX_TIMESTAMP;
+
+    #[test]
+    fn zero_limit_is_unlimited() {
+        // The default configuration (0). Even the pathological i64::MAX window must pass,
+        // so an unconfigured server is never made to reject queries by this guard.
+        assert!(
+            validate_max_points_per_timeseries(0, MAX_TIMESTAMP, Duration::from_millis(1), 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unbounded_end_sentinel_is_rejected_when_limited() {
+        // `END +` resolves to i64::MAX; with a finite limit this is the abort case the guard
+        // exists to stop. It must be rejected rather than allowed to size a preload buffer.
+        let err =
+            validate_max_points_per_timeseries(0, MAX_TIMESTAMP, Duration::from_millis(1), 100_000)
+                .expect_err("an i64::MAX window must exceed a finite limit");
+        assert!(matches!(err, EvaluationError::ArgumentError(_)));
+    }
+
+    #[test]
+    fn within_limit_passes() {
+        // 1000 steps of 1ms, limit 100000: comfortably under, must be accepted.
+        assert!(
+            validate_max_points_per_timeseries(0, 1000, Duration::from_millis(1), 100_000).is_ok()
+        );
+    }
+
+    #[test]
+    fn one_past_limit_is_rejected() {
+        // step+1 divisor: a 1ms step counts points as span/2. A 2*(limit)+2 ms span yields
+        // limit+1 points — the first value that must trip the ceiling.
+        let limit = 10usize;
+        let span = 2 * (limit as i64 + 1);
+        assert!(
+            validate_max_points_per_timeseries(0, span, Duration::from_millis(1), limit).is_err()
+        );
+    }
+
+    #[test]
+    fn extreme_span_does_not_overflow() {
+        // start below zero with the max end must not panic/overflow in calc_points; it just
+        // yields a huge point count that the limit rejects.
+        let err = validate_max_points_per_timeseries(
+            i64::MIN,
+            MAX_TIMESTAMP,
+            Duration::from_millis(1),
+            100_000,
+        )
+        .expect_err("saturated span still exceeds the limit");
+        assert!(matches!(err, EvaluationError::ArgumentError(_)));
     }
 }

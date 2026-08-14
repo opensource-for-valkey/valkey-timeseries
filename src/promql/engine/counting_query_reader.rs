@@ -227,6 +227,41 @@ mod tests {
     }
 
     #[test]
+    fn range_unbounded_end_is_rejected_before_any_fetch() {
+        // `END +` resolves to i64::MAX, making the step grid (end - start) / step
+        // astronomically large. With a finite points limit the query must be rejected up
+        // front — before the preload phase sizes a per-step buffer from that width and
+        // before the reader is even queried. A zero fetch count proves the guard runs ahead
+        // of the allocation, which is the whole point of wiring it in here.
+        let (counting, reader) = build_reader();
+        let opts = QueryOptions {
+            timeout: None,
+            deadline: None,
+            max_points_per_series: Some(100_000),
+            ..QueryOptions::default()
+        };
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("a").expect("valid test query"),
+            start: ms(RANGE_START_MS),
+            end: ms(i64::MAX),
+            interval: STEP,
+            lookback_delta: opts.lookback_delta,
+        };
+
+        let err = evaluate_range(reader, stmt, opts)
+            .expect_err("an unbounded-end range query must be rejected, not evaluated");
+        assert!(
+            err.to_string().contains("too many points"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts::default(),
+            "the reader must not be queried once the point ceiling rejects the window"
+        );
+    }
+
+    #[test]
     fn range_duplicate_selectors_are_deduplicated() {
         let (counting, reader) = build_reader();
         // Both operands share one PreloadKey, so one fetch serves both sides
