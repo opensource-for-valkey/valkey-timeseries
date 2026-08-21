@@ -11,8 +11,8 @@ use crate::promql::engine::query_reader::{
 };
 use crate::promql::engine::{
     AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
-    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, instant_lookback_start_ms,
-    proto_labels_to_labels, validate_max_points, validate_max_series,
+    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_series_range,
+    instant_lookback_start_ms, proto_labels_to_labels, validate_max_points, validate_max_series,
 };
 use crate::promql::{
     InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
@@ -20,6 +20,7 @@ use crate::promql::{
 use crate::series::index::series_by_selectors;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
+use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, mpsc};
@@ -785,7 +786,14 @@ pub(in crate::promql) fn query_range_local(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
-            let samples = s.get_range(start_time, end_time);
+            let samples =
+                match get_series_range(s, start_time, end_time, options.max_points_per_series) {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        log_warning(&err);
+                        return Some(Err(QueryError::Execution(err)));
+                    }
+                };
             if samples.is_empty() {
                 return None;
             }
@@ -793,19 +801,16 @@ pub(in crate::promql) fn query_range_local(
             let labels: Labels = (&s.labels).into();
 
             let range = RangeSample { samples, labels };
-            Some(range)
+            Some(Ok(range))
         })
-        .collect::<Vec<_>>();
+        .into_fallible_result()
+        .collect::<Vec<_>>()?;
 
     // Bound the series the query returns, not the ones the selector matched:
     // an empty range contributes nothing. This is also the path a single-node
     // rollup takes, so it must agree with the pushed-down one about which
     // queries `max_series` rejects.
     validate_max_series_(ranges.len(), options.max_series)?;
-
-    for range in &ranges {
-        validate_max_points_per_series(range.samples.len(), options.max_points_per_series)?;
-    }
 
     Ok(ranges)
 }

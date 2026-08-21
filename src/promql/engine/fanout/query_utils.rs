@@ -4,7 +4,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalSample;
 use crate::promql::engine::query_reader::rollup_fetch_bounds;
 use crate::promql::engine::{
-    instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
+    get_series_range, instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
     validate_max_series,
 };
 use crate::promql::generated::Sample as PromSample;
@@ -14,6 +14,7 @@ use crate::promql::generated::{
 use crate::series::index::series_by_selectors;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
+use orx_parallel::ParIterResult;
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyResult};
 
@@ -169,6 +170,16 @@ fn bound_windows(
     Ok(windows)
 }
 
+/// Translate the wire form of the per-series point limit for [`get_series_range`].
+///
+/// On the wire both `0` and `u64::MAX` mean "unlimited", while `get_series_range`
+/// reads `Some(0)` as "this series contributes nothing" — so the sentinels have to
+/// become `None` before the limit reaches the reader.
+fn points_limit(max_points_per_series: u64) -> Option<usize> {
+    (max_points_per_series > 0 && max_points_per_series != u64::MAX)
+        .then_some(max_points_per_series as usize)
+}
+
 pub(super) fn handle_range_query(
     ctx: &Context,
     selector: SeriesSelector,
@@ -178,36 +189,34 @@ pub(super) fn handle_range_query(
     max_points_per_series: u64,
 ) -> ValkeyResult<RangeQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
+    let max_points = points_limit(max_points_per_series);
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par()
-        .filter_map(|s| {
-            let series_samples = s.get_range(start_time, end_time);
+        .map(|s| {
+            // `get_series_range` applies the per-series point limit from the chunk headers
+            // first, so a shard rejects an over-wide span before decoding it instead of
+            // after materializing the whole thing.
+            let series_samples = get_series_range(s, start_time, end_time, max_points)?;
             if series_samples.is_empty() {
-                return None;
+                return Ok(None);
             }
             let samples: Vec<PromSample> = series_samples.into_iter().map(Sample::into).collect();
             let labels = metric_name_to_proto_labels(&s.labels);
-            let range = RangeSample {
+            Ok(Some(RangeSample {
                 labels,
                 samples,
                 key: "".to_string(),
-            };
-            Some(range)
+            }))
         })
-        .collect::<Vec<_>>();
+        .into_fallible_result()
+        .filter_map(|range| range)
+        .collect::<Vec<_>>()
+        .map_err(valkey_module::ValkeyError::String)?;
 
     validate_max_series(ranges.len(), max_series as usize)
         .map_err(valkey_module::ValkeyError::String)?;
-
-    if max_points_per_series > 0 && max_points_per_series != u64::MAX {
-        let limit = max_points_per_series as usize;
-        for range in &ranges {
-            validate_max_points(range.samples.len(), Some(limit))
-                .map_err(valkey_module::ValkeyError::String)?;
-        }
-    }
 
     Ok(RangeQueryResponse { series: ranges })
 }
