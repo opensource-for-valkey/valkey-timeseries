@@ -1001,7 +1001,12 @@ impl TimeSeries {
 
         let right = &self.chunks[start_idx..];
         let (idx, _found) = find_last_ge_index(right, end);
-        let end_idx = start_idx + idx;
+        // Clamped because every caller slices `chunks[start_idx..=end_idx]`. Past
+        // `LINEAR_SCAN_MAX` chunks `find_last_ge_index` binary-searches, and a binary search
+        // for a timestamp beyond the last chunk returns the insertion point - one past the
+        // end - where the linear scan it replaces returns the last chunk. `TS.RANGE ... +`
+        // over a series with more than 16 chunks is exactly that query.
+        let end_idx = (start_idx + idx).min(len - 1);
 
         // imagine this scenario:
         // chunk start timestamps = [10, 20, 30, 40]
