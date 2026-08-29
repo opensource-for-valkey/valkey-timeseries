@@ -37,8 +37,8 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
     /// By default, it retrieves a random replica per shard.
-    fn get_targets(&self, ctx: &Context) -> FanoutTargets {
-        get_fanout_targets(ctx, FanoutTargetMode::Random)
+    fn get_targets(&self, _ctx: &Context) -> FanoutTargetMode {
+        FanoutTargetMode::Random
     }
 
     /// Execute the fanout operation across cluster nodes.
@@ -91,11 +91,10 @@ pub trait FanoutCommand: Default + Send + 'static {
 }
 
 /// Execute the fanout operation across cluster nodes.
-/// todo: pass in nodes to target instead of letting the command decide, for better separation of concerns.
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
-    targets: FanoutTargets,
+    targets: FanoutTargetMode,
     timeout: Duration,
     f: F,
 ) -> FanoutResult
@@ -103,11 +102,10 @@ where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     let op = command;
-
     let FanoutTargets {
         nodes: targets,
         cluster_fingerprint,
-    } = targets;
+    } = get_fanout_targets(ctx, targets);
 
     let req = op.generate_request();
     let outstanding = targets.len();

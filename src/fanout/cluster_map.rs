@@ -28,17 +28,21 @@ pub const NUM_SLOTS: u16 = 16384;
 /// Enumeration for fanout target modes
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum FanoutTargetMode {
+    /// Select only the local node
+    Local,
     /// Default: randomly select one node per shard
     #[default]
     Random,
     /// Select only replicas, one per shard
     ReplicasOnly,
     /// Select one replica per shard (if available), otherwise primary
-    OneReplicaPerShard,
+    ReplicaPerShard,
     /// Select all primary (master) nodes
     Primary,
     /// Select all nodes (both primary and replica)
     All,
+    /// Randomly select one node per slot
+    Slot(u16), 
 }
 
 /// Node role enumeration
@@ -584,12 +588,29 @@ impl ClusterMap {
     /// Helper function to refresh targets in CreateNewClusterMap
     pub fn get_targets(&self, target_mode: FanoutTargetMode) -> Arc<HashSet<NodeInfo>> {
         match target_mode {
+            FanoutTargetMode::Local => self.random_one_from_local(),
             FanoutTargetMode::Primary => self.primary_targets(),
             FanoutTargetMode::ReplicasOnly => self.replica_targets(),
             FanoutTargetMode::All => self.all_targets(),
-            FanoutTargetMode::OneReplicaPerShard => self.random_one_replica_per_shard(),
+            FanoutTargetMode::ReplicaPerShard => self.random_one_replica_per_shard(),
             FanoutTargetMode::Random => self.random_one_per_shard(),
+            FanoutTargetMode::Slot(slot) => self.random_one_from_slot(slot),
         }
+    }
+
+    fn random_one_from_local(&self) -> Arc<HashSet<NodeInfo>> {
+        let mut targets = HashSet::new();
+        match self.get_local_shard() {
+            Some(local_shard) => {
+                let mut rng_ = rng();
+                let node = local_shard.pick_target(&mut rng_, false, false);
+                targets.insert(node);
+            }
+            None => {
+                log_warning("No local shard found in cluster map");
+            }
+        }
+        Arc::new(targets)
     }
 
     fn random_one_per_shard(&self) -> Arc<HashSet<NodeInfo>> {
@@ -607,6 +628,16 @@ impl ClusterMap {
         for shard in self.shards.iter().filter(|shard| !shard.is_empty()) {
             // prefer a replica, fall back to primary if no replicas exist
             targets.insert(shard.pick_target(&mut rng_, false, true));
+        }
+        Arc::new(targets)
+    }
+
+    fn random_one_from_slot(&self, slot: u16) -> Arc<HashSet<NodeInfo>> {
+        let mut targets = HashSet::new();
+        if let Some(shard) = self.get_shard_by_slot(slot) {
+            let mut rng_ = rng();
+            let node = shard.pick_target(&mut rng_, false, false);
+            targets.insert(node);
         }
         Arc::new(targets)
     }

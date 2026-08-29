@@ -3,7 +3,7 @@ use crate::error_consts;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 /// Fanout error. Designed mostly for compactness since it's sent over the wire.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FanoutError {
     pub kind: ErrorKind,
 
@@ -207,6 +207,22 @@ impl From<ErrorKind> for FanoutError {
 impl core::fmt::Display for ErrorKind {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
         write!(fmt, "{}", self.as_str())
+    }
+}
+
+impl core::fmt::Debug for FanoutError {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
+        fmt.debug_struct("FanoutError")
+            .field("kind", &self.kind)
+            .field(
+                "message",
+                &if self.message.is_empty() {
+                    self.kind.as_str()
+                } else {
+                    self.message.as_str()
+                },
+            )
+            .finish()
     }
 }
 

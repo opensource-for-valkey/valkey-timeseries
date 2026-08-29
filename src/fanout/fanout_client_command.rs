@@ -21,8 +21,8 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
     /// By default, it retrieves a random replica per shard.
-    fn get_targets(&self, ctx: &Context) -> FanoutTargets {
-        get_fanout_targets(ctx, FanoutTargetMode::Random)
+    fn get_targets(&self, _ctx: &Context) -> FanoutTargetMode {
+        FanoutTargetMode::Random
     }
 
     fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response>;
@@ -88,7 +88,7 @@ impl<T: FanoutClientCommand> FanoutCommand for T {
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
     /// By default, it retrieves a random replica per shard.
-    fn get_targets(&self, ctx: &Context) -> FanoutTargets {
+    fn get_targets(&self, ctx: &Context) -> FanoutTargetMode {
         FanoutClientCommand::get_targets(self, ctx)
     }
 
