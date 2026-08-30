@@ -26,8 +26,8 @@ use valkey_module::{
 pub const NUM_SLOTS: u16 = 16384;
 
 /// Enumeration for fanout target modes
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum FanoutTargetMode {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum FanoutTarget {
     /// Select only the local node
     Local,
     /// Default: randomly select one node per shard
@@ -42,7 +42,24 @@ pub enum FanoutTargetMode {
     /// Select all nodes (both primary and replica)
     All,
     /// Randomly select one node per slot
-    Slot(u16), 
+    Slots(SmallVec<[u16; 4]>), 
+}
+
+impl FanoutTarget {
+    pub fn for_slots(slots: &[u16]) -> Self {
+        FanoutTarget::Slots(slots.iter().copied().collect())
+    }
+    
+    pub fn for_hash_tags(hash_tags: &[&str]) -> Self {
+        let mut slots = SmallVec::<[u16; 4]>::new();
+        for tag in hash_tags {
+            let slot = calculate_hash_slot(tag.as_ref());
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+        FanoutTarget::Slots(slots)
+    }
 }
 
 /// Node role enumeration
@@ -586,15 +603,15 @@ impl ClusterMap {
     }
 
     /// Helper function to refresh targets in CreateNewClusterMap
-    pub fn get_targets(&self, target_mode: FanoutTargetMode) -> Arc<HashSet<NodeInfo>> {
+    pub fn get_targets(&self, target_mode: FanoutTarget) -> Arc<HashSet<NodeInfo>> {
         match target_mode {
-            FanoutTargetMode::Local => self.random_one_from_local(),
-            FanoutTargetMode::Primary => self.primary_targets(),
-            FanoutTargetMode::ReplicasOnly => self.replica_targets(),
-            FanoutTargetMode::All => self.all_targets(),
-            FanoutTargetMode::ReplicaPerShard => self.random_one_replica_per_shard(),
-            FanoutTargetMode::Random => self.random_one_per_shard(),
-            FanoutTargetMode::Slot(slot) => self.random_one_from_slot(slot),
+            FanoutTarget::Local => self.random_one_from_local(),
+            FanoutTarget::Primary => self.primary_targets(),
+            FanoutTarget::ReplicasOnly => self.replica_targets(),
+            FanoutTarget::All => self.all_targets(),
+            FanoutTarget::ReplicaPerShard => self.random_one_replica_per_shard(),
+            FanoutTarget::Random => self.random_one_per_shard(),
+            FanoutTarget::Slots(slots) => self.random_for_slots(&slots),
         }
     }
 
@@ -632,14 +649,20 @@ impl ClusterMap {
         Arc::new(targets)
     }
 
-    fn random_one_from_slot(&self, slot: u16) -> Arc<HashSet<NodeInfo>> {
+    fn random_for_slots(&self, slots: &[u16]) -> Arc<HashSet<NodeInfo>> {
         let mut targets = HashSet::new();
+        for &slot in slots {
+            self.random_one_from_slot(slot, &mut targets);
+        }
+        Arc::new(targets)
+    }
+    
+    fn random_one_from_slot(&self, slot: u16, targets: &mut HashSet<NodeInfo>) {
         if let Some(shard) = self.get_shard_by_slot(slot) {
             let mut rng_ = rng();
             let node = shard.pick_target(&mut rng_, false, false);
             targets.insert(node);
         }
-        Arc::new(targets)
     }
 
     #[inline]

@@ -4,7 +4,7 @@ use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
 use crate::fanout::serialization::{Deserialized, Serializable};
-use crate::fanout::{FanoutResult, FanoutTargetMode, FanoutTargets, NodeInfo, get_fanout_targets};
+use crate::fanout::{compute_query_fanout_mode, get_fanout_targets, FanoutResult, FanoutTarget, NodeInfo};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT, ValkeyResult};
@@ -37,8 +37,8 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
     /// By default, it retrieves a random replica per shard.
-    fn get_targets(&self, _ctx: &Context) -> FanoutTargetMode {
-        FanoutTargetMode::Random
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        compute_query_fanout_mode(ctx)
     }
 
     /// Execute the fanout operation across cluster nodes.
@@ -94,7 +94,7 @@ pub trait FanoutCommand: Default + Send + 'static {
 pub fn exec_command<OP: FanoutCommand, F>(
     ctx: &Context,
     command: OP,
-    targets: FanoutTargetMode,
+    targets: FanoutTarget,
     timeout: Duration,
     f: F,
 ) -> FanoutResult
@@ -102,10 +102,7 @@ where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     let op = command;
-    let FanoutTargets {
-        nodes: targets,
-        cluster_fingerprint,
-    } = get_fanout_targets(ctx, targets);
+    let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
 
     let req = op.generate_request();
     let outstanding = targets.len();

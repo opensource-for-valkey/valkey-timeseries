@@ -1,4 +1,4 @@
-use crate::fanout::FanoutTargetMode;
+use crate::fanout::FanoutTarget;
 use std::sync::atomic::AtomicBool;
 use valkey_module::{Context, ContextFlags, ValkeyResult};
 pub(crate) const SLOT_SIZE: u16 = 16384;
@@ -30,11 +30,11 @@ fn is_valkey_version_legacy(context: &Context) -> bool {
         .is_ok_and(|version| version.major < 9)
 }
 
-pub fn compute_query_fanout_mode(context: &Context) -> FanoutTargetMode {
+pub fn compute_query_fanout_mode(context: &Context) -> FanoutTarget {
     #[cfg(test)]
     if FORCE_REPLICAS_READONLY.load(std::sync::atomic::Ordering::Relaxed) {
         // Testing only
-        return FanoutTargetMode::ReplicasOnly;
+        return FanoutTarget::ReplicasOnly;
     }
 
     // Determine fanout mode based on Valkey version and client read-only status.
@@ -42,17 +42,17 @@ pub fn compute_query_fanout_mode(context: &Context) -> FanoutTargetMode {
     if is_valkey_version_legacy(context) {
         // Valkey 8 doesn't provide a way to determine if a client is READONLY,
         // So we choose random distribution.
-        FanoutTargetMode::Random
+        FanoutTarget::Random
     } else {
         match is_client_read_only(context) {
-            Ok(true) => FanoutTargetMode::Random,
-            Ok(false) => FanoutTargetMode::Primary,
+            Ok(true) => FanoutTarget::Random,
+            Ok(false) => FanoutTarget::Primary,
             Err(_) => {
                 // If we can't determine client read-only status, default to Random
                 crate::common::logging::log_warning(
                     "Could not determine client read-only status, defaulting to Random fanout mode.",
                 );
-                FanoutTargetMode::Random
+                FanoutTarget::Random
             }
         }
     }
