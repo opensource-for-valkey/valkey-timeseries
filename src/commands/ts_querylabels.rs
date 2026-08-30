@@ -6,7 +6,7 @@ use crate::series::index::query_labels_distinct;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
-/// TS.QUERYLABELS <LABELS | VALUES label> [FILTER filterExpr [filterExpr ...]]
+/// TS.QUERYLABELS <LABELS | VALUES label> [TAG hashtag,...] [FILTER filterExpr [filterExpr ...]]
 ///
 /// Returns the distinct label names (with `LABELS`) or the distinct values of a single
 /// label (with `VALUES label`) across the time series matching the optional `FILTER`

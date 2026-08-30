@@ -590,3 +590,40 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command('TS.MRANGE', '-', 500, 'excludeempty',
                                              'FILTER', 's=1')
         assert [series[0] for series in result] == [b'n', b's', b't']
+
+    def test_mrange_tag_is_accepted_and_ignored_outside_a_cluster(self):
+        """TAG only scopes the cluster fanout, so a standalone server still answers in full.
+
+        Like the other option tokens it is honored wherever options are accepted,
+        including the trailing position after the FILTER expression list.
+        """
+        self.setup_data()
+
+        expected = [b'ts1', b'ts2']
+
+        for command in ('TS.MRANGE', 'TS.MREVRANGE'):
+            for args in (
+                ('TAG', 'anything', 'FILTER', 'sensor=temp'),
+                ('TAG', 'a,b,c', 'FILTER', 'sensor=temp'),
+                ('TAG', '{braced}', 'FILTER', 'sensor=temp'),
+                ('tag', 'lowercase', 'FILTER', 'sensor=temp'),
+                ('WITHLABELS', 'TAG', 'x', 'FILTER', 'sensor=temp'),
+                ('FILTER', 'sensor=temp', 'TAG', 'trailing'),
+            ):
+                result = self.client.execute_command(command, self.start_ts, self.start_ts + 100, *args)
+                assert sorted(series[0] for series in result) == expected, (command, args)
+                for series in result:
+                    assert len(series[2]) == 10
+
+    def test_mrange_tag_requires_a_value(self):
+        """An empty TAG value is rejected rather than treated as 'no tags'."""
+        self.setup_data()
+
+        for command in ('TS.MRANGE', 'TS.MREVRANGE'):
+            with pytest.raises(ResponseError, match="missing TAG argument"):
+                self.client.execute_command(command, self.start_ts, self.start_ts + 100,
+                                            'TAG', '', 'FILTER', 'sensor=temp')
+
+            with pytest.raises(ResponseError, match="missing TAG argument"):
+                self.client.execute_command(command, self.start_ts, self.start_ts + 100,
+                                            'FILTER', 'sensor=temp', 'TAG')

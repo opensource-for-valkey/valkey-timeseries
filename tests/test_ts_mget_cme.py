@@ -300,3 +300,95 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
             label_dict = {l[0]: l[1] for l in labels}
             # All should have the 'type' label with value 'usage'
             assert label_dict[b'type'] == b'usage'
+
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded (e.g. {shard1} and {shard2} land on the same primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def setup_tagged_data(self, cluster_client: ValkeyCluster):
+        """One series per primary, all matching FILTER name=tagged."""
+        tags = self.tag_per_primary(cluster_client)
+        keys = []
+        for i, tag in enumerate(tags):
+            key = f'ts:{{{tag}}}:cpu'
+            cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'name', 'tagged', 'shard', str(i))
+            cluster_client.execute_command('TS.ADD', key, 1000, i)
+            keys.append(key.encode())
+        return tags, keys
+
+    def test_mget_cme_tag_scopes_fanout(self):
+        """TS.MGET TAG restricts the fanout to the shards owning the tags' slots"""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        tags, keys = self.setup_tagged_data(cluster_client)
+
+        client = self.new_client_for_primary(0)
+
+        def mget_keys(*args):
+            result = client.execute_command('TS.MGET', *args, 'FILTER', 'name=tagged')
+            return sorted(r[0] for r in result)
+
+        # Without TAG every shard answers.
+        assert mget_keys() == sorted(keys)
+
+        # A single tag reaches only the shard owning its slot, so each query sees
+        # exactly the one series stored under that tag.
+        for tag, key in zip(tags, keys):
+            assert mget_keys('TAG', tag) == [key], f'TAG {tag}'
+
+        # Tags are comma separated and the reply is their union.
+        assert mget_keys('TAG', ','.join(tags[:2])) == sorted(keys[:2])
+        assert mget_keys('TAG', ','.join(tags)) == sorted(keys)
+
+        # A repeated tag resolves to the same shard, not a duplicated reply.
+        assert mget_keys('TAG', f'{tags[0]},{tags[0]}') == [keys[0]]
+
+        # The braced form hashes to the same slot as the bare tag.
+        assert mget_keys('TAG', '{%s}' % tags[0]) == [keys[0]]
+
+    def test_mget_cme_tag_with_other_options(self):
+        """TAG composes with the other TS.MGET options, in any position"""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        tags, keys = self.setup_tagged_data(cluster_client)
+
+        client = self.new_client_for_primary(0)
+
+        result = client.execute_command('TS.MGET', 'WITHLABELS', 'TAG', tags[1], 'FILTER', 'name=tagged')
+        assert len(result) == 1
+        assert result[0][0] == keys[1]
+        assert {l[0]: l[1] for l in result[0][1]} == {b'name': b'tagged', b'shard': b'1'}
+
+        # TAG before another option parses the same way.
+        result = client.execute_command('TS.MGET', 'TAG', tags[1], 'LATEST', 'SELECTED_LABELS', 'shard',
+                                        'FILTER', 'name=tagged')
+        assert len(result) == 1
+        assert result[0][0] == keys[1]
+        assert {l[0]: l[1] for l in result[0][1]} == {b'shard': b'1'}
+
+    def test_mget_cme_tag_on_shard_without_matches(self):
+        """A TAG pointing at a shard with no matching series yields an empty reply"""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster_client)
+
+        # Only the first primary holds a matching series.
+        key = f'ts:{{{tags[0]}}}:only'
+        cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'name', 'lonely')
+        cluster_client.execute_command('TS.ADD', key, 1000, 1)
+
+        client = self.new_client_for_primary(0)
+        assert client.execute_command('TS.MGET', 'TAG', tags[1], 'FILTER', 'name=lonely') == []
+        assert client.execute_command('TS.MGET', 'TAG', tags[0], 'FILTER', 'name=lonely')[0][0] == key.encode()

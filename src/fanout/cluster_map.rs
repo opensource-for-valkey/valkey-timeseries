@@ -43,6 +43,8 @@ pub enum FanoutTarget {
     All,
     /// Randomly select one node per slot
     Slots(SmallVec<[u16; 4]>), 
+    /// Select a random node from each of the slots corresponding to the hash tags provided
+    HashTags(Vec<String>),
 }
 
 impl FanoutTarget {
@@ -612,6 +614,16 @@ impl ClusterMap {
             FanoutTarget::ReplicaPerShard => self.random_one_replica_per_shard(),
             FanoutTarget::Random => self.random_one_per_shard(),
             FanoutTarget::Slots(slots) => self.random_for_slots(&slots),
+            FanoutTarget::HashTags(hash_tags) => {
+                let mut slots = SmallVec::<[u16; 4]>::new();
+                for tag in hash_tags {
+                    let slot = calculate_hash_slot(tag.as_ref());
+                    if !slots.contains(&slot) {
+                        slots.push(slot);
+                    }
+                }
+                self.random_for_slots(&slots)
+            }
         }
     }
 

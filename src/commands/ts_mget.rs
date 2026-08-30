@@ -1,5 +1,5 @@
 use super::ts_mget_fanout_command::MGetFanoutCommand;
-use crate::commands::command_parser::CommandArgToken;
+use crate::commands::command_parser::{parse_tags, CommandArgToken};
 use crate::commands::fanout_codec::MGetValue;
 use crate::commands::utils::reply_with_mget_values;
 use crate::commands::{parse_command_arg_token, parse_label_list, parse_series_selector_list};
@@ -14,6 +14,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 /// TS.MGET
 ///   [LATEST]
 ///   [WITHLABELS | SELECTED_LABELS label...]
+///   [TAG HASH_TAG,..]
 ///   [FILTER filterExpr...]
 #[valkey_module_macros::command({
     name: "ts.mget",
@@ -58,6 +59,7 @@ pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> 
         CommandArgToken::Filter,
         CommandArgToken::Latest,
         CommandArgToken::WithLabels,
+        CommandArgToken::Tag,
     ];
 
     let mut options = MGetRequest::default();
@@ -96,6 +98,9 @@ pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> 
             }
             CommandArgToken::Latest => {
                 options.latest = true;
+            }
+            CommandArgToken::Tag => {
+                options.tags = parse_tags(&mut args)?;
             }
             CommandArgToken::Filter => {
                 return Err(ValkeyError::Str("TSDB: FILTER must be the last argument"));

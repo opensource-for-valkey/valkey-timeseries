@@ -474,3 +474,98 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                 client.execute_command(command, self.start_ts, self.start_ts + 100,
                                        'EXCLUDEEMPTY', 'FILTER', 'sensor=~".+"',
                                        'GROUPBY', 'region', 'REDUCE', 'max')
+
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded ({slot1} and {slot2} happen to share a primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def setup_tagged_data(self):
+        """One series per primary, all matching FILTER sensor=tagged."""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster_client)
+
+        self.start_ts = 1000
+        keys = []
+        for i, tag in enumerate(tags):
+            key = f'ts:{{{tag}}}:sensor'
+            cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'sensor', 'tagged', 'shard', str(i))
+            for offset in range(0, 100, 10):
+                cluster_client.execute_command('TS.ADD', key, self.start_ts + offset, i * 100 + offset)
+            keys.append(key.encode())
+        return tags, keys
+
+    def test_mrange_cme_tag_scopes_fanout(self):
+        """TS.MRANGE TAG restricts the fanout to the shards owning the tags' slots"""
+        tags, keys = self.setup_tagged_data()
+        client = self.new_client_for_primary(0)
+
+        def mrange_keys(*args):
+            result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                            *args, 'FILTER', 'sensor=tagged')
+            # Every returned series still carries its samples.
+            for series in result:
+                assert len(series[2]) == 10
+            return sorted(series[0] for series in result)
+
+        # Without TAG every shard answers.
+        assert mrange_keys() == sorted(keys)
+
+        # A single tag reaches only the shard owning its slot.
+        for tag, key in zip(tags, keys):
+            assert mrange_keys('TAG', tag) == [key], f'TAG {tag}'
+
+        # Tags are comma separated and the reply is their union.
+        assert mrange_keys('TAG', ','.join(tags[:2])) == sorted(keys[:2])
+        assert mrange_keys('TAG', ','.join(tags)) == sorted(keys)
+
+        # The braced form hashes to the same slot as the bare tag.
+        assert mrange_keys('TAG', '{%s}' % tags[0]) == [keys[0]]
+
+    def test_mrevrange_cme_tag_scopes_fanout(self):
+        """TAG scopes TS.MREVRANGE the same way, and composes with other options"""
+        tags, keys = self.setup_tagged_data()
+        client = self.new_client_for_primary(0)
+
+        result = client.execute_command('TS.MREVRANGE', self.start_ts, self.start_ts + 100,
+                                        'TAG', tags[2], 'COUNT', 3, 'WITHLABELS',
+                                        'FILTER', 'sensor=tagged')
+        assert len(result) == 1
+        assert result[0][0] == keys[2]
+        assert {l[0]: l[1] for l in result[0][1]} == {b'sensor': b'tagged', b'shard': b'2'}
+
+        timestamps = [sample[0] for sample in result[0][2]]
+        assert timestamps == [self.start_ts + 90, self.start_ts + 80, self.start_ts + 70]
+
+    def test_mrange_cme_tag_with_aggregation_and_groupby(self):
+        """A TAG-scoped fanout still aggregates and groups over the shards it reached"""
+        tags, keys = self.setup_tagged_data()
+        client = self.new_client_for_primary(0)
+
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                        'TAG', ','.join(tags[:2]),
+                                        'AGGREGATION', 'max', 100,
+                                        'FILTER', 'sensor=tagged')
+        assert sorted(series[0] for series in result) == sorted(keys[:2])
+
+        # GROUPBY collapses only the series the TAG-scoped fanout returned.
+        result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
+                                        'TAG', tags[0],
+                                        'FILTER', 'sensor=tagged',
+                                        'GROUPBY', 'sensor', 'REDUCE', 'max')
+        assert len(result) == 1
+        assert result[0][0] == b'sensor=tagged'

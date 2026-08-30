@@ -1,10 +1,10 @@
 use super::fanout_codec::generated::{MGetValue, MultiGetRequest, MultiGetResponse};
 use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
 use crate::commands::process_mget_request;
-use crate::commands::utils::reply_with_mget_values;
+use crate::commands::utils::{get_multi_command_targets, reply_with_mget_values};
 use crate::common::logging::log_error;
 use crate::error_consts;
-use crate::fanout::{FanoutClientCommand, NodeInfo};
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::request_types::MGetRequest;
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
@@ -32,6 +32,10 @@ impl FanoutClientCommand for MGetFanoutCommand {
         "mget"
     }
 
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        get_multi_command_targets(ctx, &self.options.tags)
+    }
+
     fn get_local_response(ctx: &Context, req: MultiGetRequest) -> ValkeyResult<MultiGetResponse> {
         let filters = deserialize_matchers_list(Some(req.filters))
             .map_err(|_e| ValkeyError::Str(error_consts::COMMAND_DESERIALIZATION_ERROR))?;
@@ -41,6 +45,7 @@ impl FanoutClientCommand for MGetFanoutCommand {
             filters,
             selected_labels: req.selected_labels,
             latest: req.latest,
+            tags: vec![],
         };
 
         let results = process_mget_request(ctx, mreq)?;

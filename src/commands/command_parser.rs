@@ -129,6 +129,7 @@ command_arg_tokens! {
     SignificantDigits => "SIGNIFICANT_DIGITS",
     Start => "START",
     Step => "STEP",
+    Tag => "TAG",
     Timestamp => "TIMESTAMP",
     True => "TRUE",
     Uncompressed => "UNCOMPRESSED",
@@ -1278,10 +1279,23 @@ pub(super) fn parse_filter_by_range_options(
     }
 }
 
+pub(super) fn parse_tags(args: &mut CommandArgIterator) -> ValkeyResult<Vec<String>> {
+    let Some(arg) = args.peek() else {
+        return Err(ValkeyError::Str(error_consts::MISSING_TAG));
+    };
+    if arg.is_empty() {
+        return Err(ValkeyError::Str(error_consts::MISSING_TAG));
+    }
+    let arg = arg.to_string_lossy();
+    args.next();
+    let tags = arg.split(',').map(|s| s.to_string()).collect();
+    Ok(tags)
+}
+
 pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResult<MRangeOptions> {
     // Tokens that end a variable-length argument list (FILTER, SELECTED_LABELS,
     // FILTER_BY_TS).
-    const RANGE_OPTION_ARGS: [CommandArgToken; 13] = [
+    const RANGE_OPTION_ARGS: &[CommandArgToken] = &[
         CommandArgToken::Align,
         CommandArgToken::Aggregation,
         CommandArgToken::Count,
@@ -1294,6 +1308,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         CommandArgToken::GroupBy,
         CommandArgToken::Reduce,
         CommandArgToken::SelectedLabels,
+        CommandArgToken::Tag,
         CommandArgToken::WithLabels,
     ];
 
@@ -1383,6 +1398,12 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 }
                 if repeated.accept(token) {
                     options.selected_labels = value;
+                }
+            }
+            CommandArgToken::Tag => {
+                let value = parse_tags(args)?;
+                if repeated.accept(token) {
+                    options.tags = value;
                 }
             }
             CommandArgToken::WithLabels => {
@@ -1682,6 +1703,7 @@ pub(super) fn parse_query_index_command_args(
 pub struct QueryLabelsOptions {
     pub label: Option<String>,
     pub matchers: Vec<SeriesSelector>,
+    pub tags: Vec<String>,
 }
 
 /// Parses `TS.QUERYLABELS <LABELS | VALUES label> [FILTER filterExpr [filterExpr ...]]`.
@@ -1708,6 +1730,16 @@ pub(super) fn parse_query_labels_command_args(
         return Err(ValkeyError::Str(error_consts::UNKNOWN_QUERY_LABELS_SUBTYPE));
     };
 
+    let mut tags = Vec::new();
+    
+    // [TAG tag [tag ...]]
+    if let Some(token) = peek_token(args)
+        && token == CommandArgToken::Tag
+    {
+        args.next(); // consume TAG
+        tags = parse_tags(args)?;
+    }
+
     // [FILTER filterExpr [filterExpr ...]]
     let mut matchers = Vec::with_capacity(4);
     if let Some(token) = peek_token(args)
@@ -1727,7 +1759,7 @@ pub(super) fn parse_query_labels_command_args(
         return Err(ValkeyError::Str(error_consts::QUERY_LABELS_EXPECTED_FILTER));
     }
 
-    Ok(QueryLabelsOptions { label, matchers })
+    Ok(QueryLabelsOptions { label, matchers, tags })
 }
 
 pub const DEFAULT_STATS_RESULTS_LIMIT: usize = 10;

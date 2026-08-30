@@ -9,6 +9,7 @@ use crate::common::replies::{
 use crate::labels::Label;
 use crate::series::request_types::{MRangeOptions, MRangeSeriesResult, SeriesResultData};
 use valkey_module::{Context, Status, ValkeyResult, ValkeyValue, raw};
+use crate::fanout::{FanoutTarget, compute_query_fanout_mode};
 
 pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
     let raw_ctx = ctx.into_raw();
@@ -200,4 +201,11 @@ fn reply_with_mget_value<C: IntoRawCtx>(ctx: C, value: &MGetValue) -> Status {
     reply_with_fanout_labels(raw_ctx, &value.labels);
     reply_with_fanout_sample(raw_ctx, &value.sample);
     Status::Ok
+}
+
+pub(super) fn get_multi_command_targets(context: &Context, tags: &[String]) -> FanoutTarget {
+    if tags.is_empty() {
+        return compute_query_fanout_mode(context);
+    }
+    FanoutTarget::HashTags(tags.to_vec())
 }

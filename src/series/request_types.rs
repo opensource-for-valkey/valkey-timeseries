@@ -320,6 +320,7 @@ pub struct MRangeOptions {
     pub filters: Vec<SeriesSelector>,
     pub with_labels: bool,
     pub selected_labels: Vec<String>,
+    pub tags: Vec<String>,
     pub grouping: Option<RangeGroupingOptions>,
     pub is_reverse: bool,
     /// `EXCLUDEEMPTY`: drop matched series that report no samples/buckets for the
@@ -432,6 +433,10 @@ pub struct MGetRequest {
     pub filters: Vec<SeriesSelector>,
     pub selected_labels: Vec<String>,
     pub latest: bool,
+    /// Optional hash tags to restrict the fanout to a subset of cluster nodes. The fanout will
+    /// only be sent to nodes that own at least one of the specified tags. If empty, the fanout
+    /// will be sent to all nodes.
+    pub tags: Vec<String>,
 }
 
 pub struct MGetSeriesData {
