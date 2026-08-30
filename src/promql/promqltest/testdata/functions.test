@@ -1667,6 +1667,22 @@ resume
 
 clear
 
+# double_exponential_smoothing is applied independently to each series window.
+# A selector that matches only one series must produce the same answer that
+# series has when other series are present in the range vector.
+load 25m
+	m{inst="a"}	95 100 105
+	m{inst="b"}	190 200 210
+
+eval instant at 50m double_exponential_smoothing(m[50m], 0.5, 0.5)
+	{inst="a"} 110
+	{inst="b"} 220
+
+eval instant at 50m double_exponential_smoothing(m{inst="a"}[50m], 0.5, 0.5)
+	{inst="a"} 110
+
+clear
+
 # Test for abs, ceil(), floor(), round().
 
 load 5m

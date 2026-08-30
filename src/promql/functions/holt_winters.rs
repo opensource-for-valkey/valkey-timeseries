@@ -71,11 +71,6 @@ fn eval_double_exponential_smoothing(
         return Err(EvaluationError::ArgumentError(msg));
     }
 
-    // Can't do smoothing with less than 2 points
-    if series.len() < 2 {
-        return Ok(ExprResult::InstantVector(vec![]));
-    }
-
     let out = series
         .into_par()
         .filter_map(|s| {
