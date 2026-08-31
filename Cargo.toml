@@ -2,7 +2,7 @@
 name = "valkey-timeseries"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.92.0"
+rust-version = "1.96.0"
 readme = "README.md"
 repository = "https://github.com/ccollie/valkey-timeseries"
 homepage = "https://github.com/ccollie/valkey-timeseries"
@@ -12,15 +12,15 @@ description = "A Timeseries data type for Valkey"
 ahash = { version = "0.8", features = ["std"] }
 arc-swap = "1.9"
 blart = "0.5"
-bon = "3.9"
+bon = "3.10.0"
 byte-pool = "0.2.4"
 cfg-if = "1.0.4"
-croaring = "2.6"
+croaring = "2.7.0"
 enquote = "1.1.0"
 enum_dispatch = "0.3.13"
 get-size2 = { version = "0.11.0", features = ["derive"] }
 hashify = { version = "0.2" }
-itertools = "0.14"
+itertools = "0.15.0"
 linkme = "0.3"
 logos = "0.16"
 orx-parallel = "3.4"
@@ -43,7 +43,7 @@ rayon-core = "1.13"
 regex = "1"
 strum = { version = "0.28", features = ["derive"] }
 strum_macros = "0.28"
-simd-json = "0.18.0"
+simd-json = "0.18.1"
 log = "0.4"
 statrs = "0.19.1"
 welch-sde = "0.1.0"
@@ -58,7 +58,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.10"
 rand_distr = "0.6"
 test-case = "3.3"
-serial_test = { version = "3.5.0", default-features = false }
+serial_test = { version = "4.0.1", default-features = false }
 proptest = "1"
 
 [build-dependencies]

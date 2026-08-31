@@ -23,7 +23,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.96.0
           components: rustfmt, clippy
 
       - name: Set up Buf
@@ -156,7 +156,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.96.0
           components: rustfmt, clippy
 
       - name: Run cargo and clippy format check
@@ -182,7 +182,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.96.0
           components: rustfmt, clippy
 
       - name: Set the server version for python integration tests

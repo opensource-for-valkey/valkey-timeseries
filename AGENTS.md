@@ -62,7 +62,7 @@ Key ENV and behavior (from `./build.sh`)
 
 Setup & Environment Notes
 
-- Rust: edition 2024, minimum supported version `1.92`.
+- Rust: edition 2024, minimum supported version `1.96`.
 - **After pulling or switching branches, always rebuild the module.** The module binary
   (`target/release/libvalkey_timeseries.{so,dylib}`) is not tracked in git and can be stale
   after source changes — e.g. new config parameters or commands won't be registered, causing
