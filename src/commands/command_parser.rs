@@ -1452,9 +1452,10 @@ fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinTy
         if let Some(next_arg) = args.peek()
             && let Ok(arg_str) = next_arg.try_as_str()
         {
-            // durations in all cases start with an ascii digit, e.g., 1000 or 40 ms
-            let ch = arg_str.chars().next().unwrap();
-            if ch.is_ascii_digit() {
+            // durations in all cases start with an ascii digit, e.g., 1000 or 40 ms.
+            // An empty argument is not a duration; fall through and let the syntax
+            // handling below report it rather than indexing into an empty string.
+            if arg_str.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
                 let tolerance_ms = parse_duration_ms(arg_str)?;
                 if tolerance_ms < 0 {
                     return Err(ValkeyError::Str(error_consts::INVALID_ASOF_TOLERANCE));
