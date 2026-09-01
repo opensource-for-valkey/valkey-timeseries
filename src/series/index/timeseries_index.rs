@@ -243,51 +243,57 @@ impl TimeSeriesIndex {
         let mut keys: Vec<ValkeyString> = Vec::new();
         let mut missing_keys: Vec<SeriesRef> = Vec::new();
 
-        let postings = read_lock(&self.inner);
-
-        // get keys from ids
-        let ids = postings.postings_for_selectors(filters)?;
-
-        let mut expected_count = ids.cardinality() as usize;
-        if expected_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        keys.reserve(expected_count);
-
-        let current_user = get_acl_user(ctx);
-        let is_user_client = is_acl_enforced(ctx);
-
         let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
-        let can_access_all_keys = has_all_keys_permissions(ctx, &current_user, acl_permissions);
 
-        for series_ref in ids.iter() {
-            let key = postings.get_key_by_id(series_ref);
-            match key {
-                Some(key) => {
-                    let real_key = ctx.create_string(key.as_ref());
-                    if is_user_client
-                        && !can_access_all_keys
-                        && let Some(perms) = &cloned_perms
-                    {
-                        // check if the user has permission for this key
-                        if ctx
-                            .acl_check_key_permission(&current_user, &real_key, perms)
-                            .is_err()
+        // The read guard is confined to this block. Recording the dangling ids collected below
+        // needs the *write* lock, and `RwLock` is not reentrant: asking for it while this thread
+        // still held the read guard deadlocked the server -- and did so on the self-healing path,
+        // which only runs once the index is already inconsistent.
+        let expected_count = {
+            let postings = read_lock(&self.inner);
+
+            // get keys from ids
+            let ids = postings.postings_for_selectors(filters)?;
+
+            let expected_count = ids.cardinality() as usize;
+            if expected_count == 0 {
+                return Ok(Vec::new());
+            }
+
+            keys.reserve(expected_count);
+
+            let current_user = get_acl_user(ctx);
+            let is_user_client = is_acl_enforced(ctx);
+            let can_access_all_keys = has_all_keys_permissions(ctx, &current_user, acl_permissions);
+
+            for series_ref in ids.iter() {
+                let key = postings.get_key_by_id(series_ref);
+                match key {
+                    Some(key) => {
+                        let real_key = ctx.create_string(key.as_ref());
+                        if is_user_client
+                            && !can_access_all_keys
+                            && let Some(perms) = &cloned_perms
                         {
-                            break;
+                            // check if the user has permission for this key
+                            if ctx
+                                .acl_check_key_permission(&current_user, &real_key, perms)
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
+                        keys.push(real_key);
                     }
-                    keys.push(real_key);
-                }
-                None => {
-                    // this should not happen, but in case it does, we log an error and continue
-                    missing_keys.push(series_ref);
+                    None => {
+                        // this should not happen, but in case it does, we log an error and continue
+                        missing_keys.push(series_ref);
+                    }
                 }
             }
-        }
 
-        expected_count -= missing_keys.len();
+            expected_count - missing_keys.len()
+        };
 
         if keys.len() != expected_count {
             // User does not have permission to read some keys, or some keys are missing

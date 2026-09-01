@@ -824,9 +824,9 @@ fn collect_label_names(
     hints: &SearchHints,
 ) -> TsdbResult<LabelQueryResult> {
     let index = get_timeseries_index(ctx);
-    let postings = index.get_postings();
     with_search_filter(hints, |filter| {
         if can_use_unscoped_scan(select_hints) {
+            let postings = index.get_postings();
             return Ok(collect_unscoped_label_names(&postings, hints));
         }
 
@@ -846,7 +846,17 @@ fn collect_label_names(
         // todo! set a max limit on the number of series we scan here, to avoid OOM or stalls for very
         // broad selectors with many matches. We can still apply the filter and return results,
         // but we should avoid scanning an unbounded number of series.
+        //
+        // Resolve the matching series before touching the postings lock: `series_by_selectors`
+        // takes the read lock itself and then takes the *write* lock to record any dangling ids
+        // it found. `RwLock` is not reentrant, so holding a read guard across this call
+        // deadlocked the server as soon as the index had one stale id to repair.
         let matched_series = series_by_selectors(ctx, &opts.selectors, opts.date_range)?;
+
+        // The cardinality lookups are the only use of the postings index here, so take the read
+        // guard afterwards, and only when a lookup is actually going to happen.
+        let postings = need_cardinality.then(|| index.get_postings());
+
         for (ts, _) in matched_series {
             for label in ts.labels.iter() {
                 // DO NOT use `names.insert()`, as it would require an allocation even if the label name is already see
@@ -859,8 +869,8 @@ fn collect_label_names(
 
                 if accepted {
                     // fetch the cardinality
-                    let cardinality = if need_cardinality {
-                        let cardinality = get_label_cardinality(&postings, label.name);
+                    let cardinality = if let Some(postings) = postings.as_ref() {
+                        let cardinality = get_label_cardinality(postings, label.name);
                         if cardinality == 0 {
                             continue;
                         }
@@ -893,10 +903,13 @@ fn collect_label_values(
     }
 
     let index = get_timeseries_index(ctx);
-    let postings = index.get_postings();
 
     with_search_filter(search_hints, |filter| {
         if can_use_unscoped_scan(select_hints) {
+            // The only use of the postings index on this path. Taking the guard here rather than
+            // for the whole function keeps it off the `series_by_selectors` call below, which
+            // locks the same `RwLock` -- for writing, when it has a dangling id to record.
+            let postings = index.get_postings();
             return Ok(collect_unscoped_label_values(
                 &postings,
                 label_name,

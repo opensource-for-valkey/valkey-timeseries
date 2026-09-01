@@ -176,52 +176,61 @@ fn fetch_series_batch<'a>(
     };
 
     let index = get_timeseries_index(ctx);
-    let postings_guard = index.get_postings();
 
     let mut stale_ids: SmallVec<[SeriesRef; 8]> = SmallVec::new();
     let mut result: Vec<SeriesGuardMut<'a>> = Vec::with_capacity(batch_size);
     let mut keys: Vec<ValkeyString> = Vec::with_capacity(batch_size);
 
-    let postings = postings_guard.deref();
-    // Read ids in chunks until we gather `buf_size` valid series or cursor is exhausted.
-    for id in cursor.by_ref() {
-        let Some(k) = postings.get_key_by_id(id) else {
-            stale_ids.push(id);
-            continue;
-        };
+    // Two phases per round, and the split is load-bearing: opening a key runs the server's
+    // lazy-expiry check, which reaps an expired series through this module's `unlink` callback
+    // and takes the postings *write* lock on this same thread. Holding the read guard across
+    // `get_timeseries` therefore deadlocks. See `series::index::querier::resolve_series_keys`.
+    //
+    // Keep going until the batch is full or the cursor runs dry, so an all-stale round still
+    // reports progress rather than looking like the end of the postings.
+    while result.len() < batch_size {
+        let wanted = batch_size - result.len();
+        let mut resolved: Vec<(SeriesRef, ValkeyString)> = Vec::with_capacity(wanted);
 
-        let key = ctx.create_string(k.as_bytes());
-
-        if is_user_client
-            && !has_all_keys_permission
-            && ctx
-                .acl_check_key_permission(&user, &key, &AclPermissions::DELETE)
-                .is_err()
         {
-            continue;
-        }
-
-        match get_timeseries(ctx, &key) {
-            Err(_) => {
-                stale_ids.push(id);
-                continue;
-            }
-            Ok(None) => {
-                stale_ids.push(id);
-                continue;
-            }
-            Ok(Some(series)) => {
-                result.push(series);
-                keys.push(key);
+            let postings_guard = index.get_postings();
+            let postings = postings_guard.deref();
+            for id in cursor.by_ref() {
+                match postings.get_key_by_id(id) {
+                    Some(k) => resolved.push((id, ctx.create_string(k.as_bytes()))),
+                    None => stale_ids.push(id),
+                }
+                if resolved.len() == wanted {
+                    break;
+                }
             }
         }
 
-        if result.len() >= batch_size {
+        let exhausted = resolved.len() < wanted;
+
+        for (id, key) in resolved {
+            if is_user_client
+                && !has_all_keys_permission
+                && ctx
+                    .acl_check_key_permission(&user, &key, &AclPermissions::DELETE)
+                    .is_err()
+            {
+                continue;
+            }
+
+            match get_timeseries(ctx, &key) {
+                Err(_) | Ok(None) => stale_ids.push(id),
+                Ok(Some(series)) => {
+                    result.push(series);
+                    keys.push(key);
+                }
+            }
+        }
+
+        if exhausted {
             break;
         }
     }
-
-    drop(postings_guard);
 
     if !stale_ids.is_empty() {
         let mut postings_guard = index.get_postings_mut();

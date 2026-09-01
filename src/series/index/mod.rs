@@ -138,13 +138,19 @@ pub fn get_series_by_id(
         return Ok(None);
     };
     let mut state = 0;
-    index.with_postings(&mut state, |posting, _| {
-        let Some(key) = posting.get_key_by_id(id) else {
-            return Ok(None);
-        };
-        let real_key = ctx.create_string(key.as_ref());
-        get_timeseries_mut(ctx, &real_key, must_exist, permissions)
-    })
+    // Resolve the key under the postings guard, then open it *after* the guard is gone.
+    // Opening a key runs the server's lazy-expiry check, which reaps an expired series through
+    // this module's `unlink` callback -- and that takes the postings write lock on this same
+    // thread. See `series::index::querier::resolve_series_keys`.
+    let real_key = index.with_postings(&mut state, |posting, _| {
+        posting
+            .get_key_by_id(id)
+            .map(|key| ctx.create_string(key.as_ref()))
+    });
+    let Some(real_key) = real_key else {
+        return Ok(None);
+    };
+    get_timeseries_mut(ctx, &real_key, must_exist, permissions)
 }
 
 pub fn get_series_key_by_id(ctx: &Context, id: SeriesRef) -> Option<ValkeyString> {
