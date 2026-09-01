@@ -17,6 +17,24 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+/// Apply `TS.MDEL` on this node and propagate its *effects* to this node's replicas and AOF.
+///
+/// The command itself is deliberately not replicated verbatim by any caller:
+///
+/// * In cluster mode each shard runs its own slice inside a fanout RPC handler. That context has
+///   no client argv for `ReplicateVerbatim` to copy, and a replica replaying `TS.MDEL` would fan
+///   the command out across the cluster a second time. Before this, the clustered branch simply
+///   returned without replicating at all, so a cluster-mode `TS.MDEL` never reached any replica.
+/// * Even standalone, a verbatim replay re-resolves both the filter and the timestamp bounds on
+///   the replica. Wall-clock bounds (`TimestampValue::Now` and `Relative`) resolve through
+///   `as_timestamp` against whichever node is evaluating them, so a replica applying the replayed
+///   command can delete a different window than the primary did.
+///
+/// Propagating resolved effects avoids both: `DEL <key>` per key removed, and
+/// `TS.DEL <key> <start> <end>` with absolute millisecond bounds per series whose range changed.
+/// `TS.DEL` is the exact operation performed here (`remove_range` followed by
+/// `CompactionOp::RemoveRange`), so the replica re-derives the same downstream compaction the
+/// primary did, the same way it does for a client-issued `TS.DEL`.
 pub fn delete_series_by_selectors(
     ctx: &Context,
     selectors: &[SeriesSelector],
@@ -52,7 +70,12 @@ fn handle_delete_keys(ctx: &Context, filters: &[SeriesSelector]) -> ValkeyResult
     let keys = index.keys_for_selectors(ctx, filters, Some(AclPermissions::DELETE))?;
     let mut total_deleted = 0;
     for key in keys {
-        total_deleted += delete_key(ctx, &ctx.create_string(key.as_ref()))?;
+        let key = ctx.create_string(key.as_ref());
+        if delete_key(ctx, &key)? == 0 {
+            continue;
+        }
+        total_deleted += 1;
+        ctx.replicate("DEL", &[&key]);
     }
     Ok(total_deleted)
 }
@@ -98,6 +121,8 @@ fn delete_range_batch(
     end_ts: Timestamp,
 ) -> ValkeyResult<usize> {
     let mut total_deleted = 0;
+    let start_arg = ctx.create_string(start_ts.to_string());
+    let end_arg = ctx.create_string(end_ts.to_string());
     let mut series = series;
     let res = series
         .par_mut()
@@ -128,6 +153,8 @@ fn delete_range_batch(
                     end: end_ts,
                 },
             )?;
+            // Propagate the resolved effect; see `delete_series_by_selectors`.
+            ctx.replicate("TS.DEL", &[&keys[i], &start_arg, &end_arg]);
         }
     }
 

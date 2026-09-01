@@ -36,9 +36,11 @@ pub fn ts_mdel_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return operation.exec(ctx);
     }
 
+    // `delete_series_by_selectors` propagates the resolved effects itself (`DEL` / `TS.DEL`), on
+    // this path and on the clustered one above. Replicating verbatim here as well would apply the
+    // deletion twice on the replica, and would re-resolve relative timestamp bounds against the
+    // replica's clock.
     let total_deleted = delete_series_by_selectors(ctx, &filters, date_range)?;
-
-    ctx.replicate_verbatim();
 
     Ok(ValkeyValue::from(total_deleted))
 }

@@ -40,6 +40,17 @@ pub fn is_real_user_client(ctx: &Context) -> bool {
     true
 }
 
+/// Whether this server is a replica.
+///
+/// Server-level state, not client state: `RM_GetContextFlags` reads it from the server, so this
+/// is valid from a detached/thread-safe context as well as from a command context. Used to keep
+/// a cluster fanout write from being applied locally when the coordinator's cluster map is stale
+/// enough to have addressed us as a primary (see `MDelFanoutCommand::get_local_response`).
+#[inline]
+pub fn is_replica(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::SLAVE)
+}
+
 /// Whether the current execution context forbids blocking the client — inside `MULTI`, a Lua
 /// script, or a nested module call.
 ///

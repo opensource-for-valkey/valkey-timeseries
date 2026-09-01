@@ -132,6 +132,7 @@ pub const PERMISSION_DENIED: &str = "TSDB: current user doesn't have read permis
 pub const COMMAND_SERIALIZATION_ERROR: &str = "TSDB: command serialization error";
 pub const COMMAND_DESERIALIZATION_ERROR: &str = "TSDB: command deserialization error";
 pub const CLUSTER_MODE_ERROR: &str = "TSDB: cluster mode not supported";
+pub const FANOUT_WRITE_ON_REPLICA: &str = "TSDB: refusing to apply a fanout write on a replica";
 pub const NO_CLUSTER_NODES_AVAILABLE: &str = "TSDB: no cluster nodes available";
 pub const WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED: &str =
     "TSDB: cannot accept WITHLABELS and SELECT_LABELS together";

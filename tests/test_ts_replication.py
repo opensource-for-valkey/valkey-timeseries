@@ -250,6 +250,64 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert result[1][0] == 4000
         assert result[2][0] == 5000
 
+    def test_replication_ts_mdel_series(self):
+        """TS.MDEL without a range replicates the keys it removed.
+
+        `TS.MDEL` is not replicated verbatim (see `delete_series_by_selectors`): a verbatim replay
+        would re-evaluate the filter, and the timestamp bounds, on the replica. It propagates the
+        resolved effects instead, so this pins that the replica ends up with the same keyspace.
+        """
+        client = self.client
+
+        for name in ("cpu", "cpu2", "mem"):
+            key = f"ts:mdel_series:{name}"
+            metric = "cpu" if name.startswith("cpu") else "mem"
+            client.execute_command(f"TS.CREATE {key} LABELS name {metric}")
+            client.execute_command(f"TS.ADD {key} 1000 10")
+
+        self.wait_for_replication()
+
+        deleted = client.execute_command("TS.MDEL FILTER name=cpu")
+        assert deleted == 2
+
+        self.wait_for_replication()
+
+        replica = self.replicas[0].client
+        for name in ("cpu", "cpu2"):
+            key = f"ts:mdel_series:{name}"
+            assert client.execute_command(f"EXISTS {key}") == 0
+            assert replica.execute_command(f"EXISTS {key}") == 0
+        assert replica.execute_command("EXISTS ts:mdel_series:mem") == 1
+
+    def test_replication_ts_mdel_range(self):
+        """TS.MDEL with a range replicates the samples it removed, and only those."""
+        client = self.client
+
+        keys = ["ts:mdel_range:cpu", "ts:mdel_range:mem"]
+        for key in keys:
+            metric = "cpu" if key.endswith("cpu") else "mem"
+            client.execute_command(f"TS.CREATE {key} LABELS name {metric}")
+            for ts in (1000, 2000, 3000, 4000, 5000):
+                client.execute_command(f"TS.ADD {key} {ts} {ts}")
+
+        self.wait_for_replication()
+
+        deleted = client.execute_command("TS.MDEL 2000 3000 FILTER name=cpu")
+        assert deleted == 2
+
+        self.wait_for_replication()
+
+        replica = self.replicas[0].client
+        for key in keys:
+            assert replica.execute_command(f"TS.RANGE {key} - +") == client.execute_command(
+                f"TS.RANGE {key} - +"
+            )
+        assert [row[0] for row in replica.execute_command("TS.RANGE ts:mdel_range:cpu - +")] == [
+            1000,
+            4000,
+            5000,
+        ]
+
     def test_replication_ts_alter(self):
         """Test that TS.ALTER replicates correctly"""
         key = "ts:alter"
