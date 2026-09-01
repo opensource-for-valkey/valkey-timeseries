@@ -13,8 +13,8 @@ use crate::series::index::persistence::{
     on_loading_ended, on_loading_failed, on_loading_started, should_skip_load_indexing,
 };
 use crate::series::index::{
-    TIMESERIES_INDEX, clear_timeseries_index, get_db_index, get_timeseries_index,
-    get_timeseries_index_for_db, index_series_by_key,
+    TIMESERIES_INDEX, clear_all_timeseries_indexes, clear_timeseries_index, get_db_index,
+    get_timeseries_index, get_timeseries_index_for_db, index_series_by_key,
 };
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::remove_all_stale_series_internal;
@@ -23,7 +23,10 @@ use range_set_blaze::RangeSetBlaze;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
-use valkey_module::server_events::{LoadingSubevent, PersistenceSubevent};
+use valkey_module::server_events::{
+    FLUSH_SERVER_EVENTS_LIST, FlushSubevent, LoadingSubevent, PersistenceSubevent,
+    SWAPDB_SERVER_EVENTS_LIST,
+};
 use valkey_module::{Context, MODULE_CONTEXT, NotifyEvent, ValkeyResult, logging, raw};
 use valkey_module_macros::{loading_event_handler, persistence_event_handler};
 
@@ -574,6 +577,34 @@ pub(crate) fn generic_key_events_handler(
     );
 }
 
+/// Re-dispatch a server event to the `valkey-module` handlers this module's own subscription
+/// displaced.
+///
+/// `RM_SubscribeToServerEvent` keeps exactly one callback per (module, event) and *replaces* an
+/// existing one rather than chaining. `valkey-module` subscribes its own dispatcher for any event
+/// that has `#[..._event_handler]` functions, and it does so before `initialize` runs — so every
+/// raw subscription taken here silently discards that dispatcher and everything behind it. This
+/// module subscribes to FLUSHDB and SWAPDB directly because it needs the event payload
+/// (`RedisModuleFlushInfo::dbnum`, `RedisModuleSwapDbInfo`), which the macro surface does not
+/// expose, so the dispatcher has to be driven from here instead.
+///
+/// This is not hypothetical: `series_data_type::flushed_event_handler` — the `IS_FLUSHING` flag
+/// that lets the per-key `free`/`unlink` callbacks skip index maintenance during a flush — never
+/// ran at all, leaving the flag permanently false and that fast path dead.
+fn dispatch_displaced_handlers<T: Copy>(
+    ctx: *mut raw::RedisModuleCtx,
+    handlers: &[fn(&Context, T)],
+    payload: T,
+) {
+    if handlers.is_empty() {
+        return;
+    }
+    let ctx = Context::new(ctx);
+    for handler in handlers {
+        handler(&ctx, payload);
+    }
+}
+
 unsafe extern "C" fn on_flush_event(
     ctx: *mut raw::RedisModuleCtx,
     _eid: raw::RedisModuleEvent,
@@ -584,14 +615,28 @@ unsafe extern "C" fn on_flush_event(
         let fi: &raw::RedisModuleFlushInfo = unsafe { &*(data as *mut raw::RedisModuleFlushInfo) };
 
         if fi.dbnum == -1 {
+            // FLUSHALL, and the implicit flush a replica performs on a full resync: every
+            // database is gone. The per-key `free`/`unlink` callbacks that would otherwise
+            // retire each series are deliberately skipped while a flush is in progress, so
+            // dropping the indexes here is the only thing that retires them — leaving this to
+            // clear the delayed-keys map alone left the whole index dangling, every id pointing
+            // at a key that no longer exists.
+            clear_all_timeseries_indexes();
             clear_delayed_keys_map();
         } else {
-            let ctx = Context::new(ctx);
-            set_current_db(&ctx, fi.dbnum);
-            clear_timeseries_index(&ctx);
+            clear_timeseries_index(fi.dbnum);
             clear_delayed_keys_in_db(fi.dbnum);
         }
     };
+
+    // After the index work, so `IS_FLUSHING` stays set across it and is cleared only once the
+    // index agrees with the (now empty) keyspace.
+    let flush_sub_event = if sub_event == raw::REDISMODULE_SUBEVENT_FLUSHDB_START {
+        FlushSubevent::Started
+    } else {
+        FlushSubevent::Ended
+    };
+    dispatch_displaced_handlers(ctx, &FLUSH_SERVER_EVENTS_LIST, flush_sub_event);
 }
 
 fn swap_timeseries_index_dbs(from_db: i32, to_db: i32) {
@@ -603,9 +648,9 @@ fn swap_timeseries_index_dbs(from_db: i32, to_db: i32) {
 }
 
 unsafe extern "C" fn on_swap_db_event(
-    _ctx: *mut raw::RedisModuleCtx,
+    ctx: *mut raw::RedisModuleCtx,
     eid: raw::RedisModuleEvent,
-    _sub_event: u64,
+    sub_event: u64,
     data: *mut c_void,
 ) {
     if eid.id == raw::REDISMODULE_EVENT_SWAPDB {
@@ -617,6 +662,11 @@ unsafe extern "C" fn on_swap_db_event(
 
         swap_timeseries_index_dbs(from_db, to_db);
     }
+
+    // This module has no `#[swapdb_event_handler]` today, so this list is empty and the call
+    // costs nothing — but see `dispatch_displaced_handlers`: without it, the first one added
+    // would silently never run.
+    dispatch_displaced_handlers(ctx, &SWAPDB_SERVER_EVENTS_LIST, sub_event);
 }
 
 pub(crate) fn register_server_event_handlers(ctx: &Context) -> ValkeyResult<()> {

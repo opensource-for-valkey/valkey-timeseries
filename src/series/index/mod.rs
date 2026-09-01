@@ -190,12 +190,15 @@ pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
     }
 }
 
-pub fn clear_timeseries_index(ctx: &Context) {
-    let db = get_current_db(ctx);
-    let map = TIMESERIES_INDEX.pin();
-    map.remove(&db);
+/// Drops the index for a single database. Takes the db explicitly: the only caller is the
+/// FLUSHDB handler, whose event context should not have its selected db mutated just to
+/// communicate which database was flushed.
+pub fn clear_timeseries_index(db: i32) {
+    TIMESERIES_INDEX.pin().remove(&db);
 }
 
+/// Drops every database's index. Used for the `dbnum == -1` flush -- `FLUSHALL`, and the
+/// implicit flush a replica performs on a full resync.
 pub fn clear_all_timeseries_indexes() {
     TIMESERIES_INDEX.pin().clear();
 }
