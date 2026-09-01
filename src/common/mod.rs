@@ -8,6 +8,7 @@ pub mod encoding;
 pub mod hash;
 pub mod humanize;
 pub mod logging;
+pub mod module_options;
 pub mod pool;
 pub mod rdb;
 pub mod replies;

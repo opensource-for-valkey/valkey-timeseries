@@ -9,6 +9,7 @@ extern crate strum_macros;
 extern crate valkey_module_macros;
 
 use crate::commands::register_fanout_operations;
+use crate::common::module_options::{HANDLE_IO_ERRORS, declare_module_options};
 use crate::common::threads::init_thread_pool;
 use crate::config::register_config;
 use crate::fanout::{init_fanout, is_clustered};
@@ -181,6 +182,11 @@ fn assign_command_acl_categories(_ctx: &Context) {}
 
 fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     init_croaring_allocator();
+
+    // Declare this first: until the server knows the module handles IO errors, any short
+    // read while loading a TSDB-TYPE payload panics the server from inside `rdb_load`
+    // rather than returning an error we can report.
+    declare_module_options(ctx, HANDLE_IO_ERRORS);
 
     if let Err(e) = register_config(ctx, args) {
         let msg = format!("Failed to register config: {e}");

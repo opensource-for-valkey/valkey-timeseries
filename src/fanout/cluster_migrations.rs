@@ -1,3 +1,4 @@
+use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{read_lock, write_lock};
 use crate::fanout::cluster_map::NUM_SLOTS;
 use crate::fanout::is_clustered;
@@ -361,22 +362,10 @@ pub fn register_atomic_slot_migration_event_handler(
         ctx.log_warning("Failed to subscribe to atomic slot migration events");
     }
     // Declare that this module handles atomic slot migration events, so the
-    // server will permit ASM operations involving this module. This maps to
-    // the VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION flag in the
-    // Valkey module API.
-    // VALKEYMODULE_OPTIONS_HANDLE_ATOMIC_SLOT_MIGRATION == (1 << 5)
-    unsafe {
-        if let Some(set_opts) = raw::ValkeyModule_SetModuleOptions {
-            let flag = 1 << 5;
-            set_opts(ctx.ctx as *mut raw::ValkeyModuleCtx, flag);
-            ctx.log_notice(&format!(
-                "Declared module options in init: HANDLE_ATOMIC_SLOT_MIGRATION (0x{:x})",
-                flag
-            ));
-        } else {
-            ctx.log_notice("ValkeyModule_SetModuleOptions not available in raw bindings (init)");
-        }
-    }
+    // server will permit ASM operations involving this module. Declared through
+    // `declare_module_options` because `SetModuleOptions` takes the complete mask:
+    // passing this flag alone would drop the options declared at init.
+    declare_module_options(ctx, HANDLE_ATOMIC_SLOT_MIGRATION);
 }
 
 #[cfg(test)]
