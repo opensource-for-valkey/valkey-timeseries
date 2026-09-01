@@ -1475,6 +1475,13 @@ mod tests {
     /// `len` elements up front: a multi-terabyte `Vec::with_capacity` request
     /// aborts the process (allocation failure is not a catchable panic), which
     /// turns a malformed fan-out payload into a crash.
+    ///
+    /// Scope: this covers the in-memory fan-out wire path only. It says nothing
+    /// about the RDB path (`load_rdb`'s `rdb_load_len` cap), which reads through
+    /// `RedisModuleIO` and fails differently -- an in-memory buffer returns `Err`
+    /// on a short read whether or not the module declares `HANDLE_IO_ERRORS`,
+    /// so this test passed even while a truncated RDB aborted the server.
+    /// The RDB path is covered end-to-end by `tests/test_rdb_corrupt_load.py`.
     #[test]
     fn test_deserialize_raw_rejects_oversized_len_without_huge_allocation() {
         use crate::common::encoding::write_uvarint;

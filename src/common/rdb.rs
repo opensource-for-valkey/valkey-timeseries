@@ -126,9 +126,10 @@ pub const MAX_RDB_COLLECTION_LEN: usize = 16 * 1024 * 1024;
 /// `Vec::with_capacity`/`HashMap::with_capacity`) and rejects it if it exceeds `max`.
 ///
 /// RDB/AOF/`TS._RESTORE` payloads are untrusted: a corrupt or adversarial length field is
-/// otherwise trusted as-is and handed straight to `with_capacity`, and this crate builds with
-/// `panic = "abort"`, so an oversized value there kills the whole process instead of failing the
-/// load with a clean error.
+/// otherwise trusted as-is and handed straight to `with_capacity`, where an oversized value
+/// aborts the process on allocation failure instead of failing the load with a clean error.
+/// An allocation abort is not a panic, so it cannot be caught or reported after the fact --
+/// the length has to be rejected before it reaches the allocator.
 pub fn rdb_load_len(rdb: *mut RedisModuleIO, max: usize) -> ValkeyResult<usize> {
     let len = rdb_load_usize(rdb)?;
     if len > max {
