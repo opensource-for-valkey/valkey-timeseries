@@ -57,7 +57,6 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     for chunk in series.chunks[..last].iter_mut() {
         seal_chunk(chunk);
     }
-
     // Recount instead of adjusting by a delta. `merge_by_capacity` reports how many samples it
     // *wrote into the destination*, which is not a count of samples the series lost: the old code
     // subtracted it from a counter that no branch could ever raise above zero, underflowing
