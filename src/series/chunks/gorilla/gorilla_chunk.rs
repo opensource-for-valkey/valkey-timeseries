@@ -270,7 +270,11 @@ impl Chunk for GorillaChunk {
         Self: Sized,
     {
         let mut left_chunk = GorillaEncoder::new();
-        let mut right_chunk = GorillaChunk::default();
+        // `with_max_size`, not `default()`: the upper half has to inherit the budget the series
+        // was created with. `default()` stamps `DEFAULT_CHUNK_SIZE_BYTES` on it, silently
+        // discarding the user's `CHUNK_SIZE` -- and `save_rdb` writes `max_size` out, so the
+        // wrong budget survives a reload. `ChimpChunk::split` already inherits it.
+        let mut right_chunk = GorillaChunk::with_max_size(self.max_size);
 
         if self.is_empty() {
             return Ok(self.clone());
@@ -411,6 +415,95 @@ mod tests {
             .interval(Duration::from_millis(1000))
             .build()
             .generate()
+    }
+
+    /// A split half inherits the source's `max_size`.
+    ///
+    /// This used to build the upper half with `default()`, stamping `DEFAULT_CHUNK_SIZE_BYTES`
+    /// on it and discarding whatever `CHUNK_SIZE` the series was created with -- measured at 4096
+    /// for a source of 1024. Since `save_rdb` persists `max_size`, the wrong budget also survived
+    /// a reload. `ChimpChunk` and `UncompressedChunk` both already inherited it.
+    #[test]
+    fn test_split_inherits_the_source_max_size() {
+        for max_size in [256usize, 1024, 16384, 65536] {
+            let mut chunk = GorillaChunk::with_max_size(max_size);
+            for sample in generate_samples(100).iter() {
+                chunk.add_sample(sample).unwrap();
+            }
+
+            let right = chunk.split().unwrap();
+
+            assert_eq!(chunk.max_size, max_size, "source lost its budget");
+            assert_eq!(
+                right.max_size, max_size,
+                "the upper half of a {max_size}-byte chunk was given a {}-byte budget",
+                right.max_size,
+            );
+        }
+    }
+
+    /// Splitting must not lose or reorder samples while it redistributes them.
+    #[test]
+    fn test_split_preserves_every_sample() {
+        let expected = generate_samples(101);
+        let mut chunk = GorillaChunk::with_max_size(8192);
+        for sample in expected.iter() {
+            chunk.add_sample(sample).unwrap();
+        }
+
+        let right = chunk.split().unwrap();
+
+        let actual: Vec<Sample> = chunk.iter().chain(right.iter()).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(chunk.len() + right.len(), expected.len());
+    }
+
+    /// Iterating an empty chunk yields nothing rather than panicking.
+    ///
+    /// `GorillaIterator::new` computed `num_samples - 1` unguarded. `get_range` checks
+    /// `is_empty` first, but `iter`/`range_iter` do not -- and an empty gorilla chunk is
+    /// ordinary: `TimeSeries::append_chunk` creates one before the first sample lands. In a
+    /// debug build that subtraction panicked with "attempt to subtract with overflow"; with no
+    /// FFI panic barrier in the module, that is a server abort.
+    #[test]
+    fn test_iterating_an_empty_chunk_is_not_an_underflow() {
+        let chunk = GorillaChunk::with_max_size(1024);
+        assert!(chunk.is_empty());
+
+        assert_eq!(chunk.iter().count(), 0);
+        assert_eq!(chunk.range_iter(i64::MIN, i64::MAX).count(), 0);
+        assert_eq!(chunk.range_iter(0, 1000).count(), 0);
+        assert_eq!(chunk.get_range(0, 1000).unwrap(), vec![]);
+    }
+
+    /// Splitting a single-sample chunk leaves one half empty, and callers iterate both.
+    ///
+    /// Which half is empty differs by encoding, so this deliberately does not assert a side:
+    /// `mid` is `len / 2` = 0 here, so gorilla and chimp send the only sample to the *upper*
+    /// half and leave the source empty, while `UncompressedChunk::split` special-cases `len == 1`
+    /// and returns an empty upper half instead. Both halves must iterate without underflowing
+    /// and the sample must survive exactly once.
+    ///
+    /// (`split` is only reached from `should_split`/`is_full`, which need a chunk at or past
+    /// `max_size` >= 48 bytes, so a one-sample split does not arise in practice. That asymmetry
+    /// is untested elsewhere and left as-is; this only pins the iterator behaviour.)
+    #[test]
+    fn test_iterating_the_empty_half_of_a_split_is_not_an_underflow() {
+        let sample = Sample {
+            timestamp: 1000,
+            value: 1.0,
+        };
+        let mut chunk = GorillaChunk::with_max_size(1024);
+        chunk.add_sample(&sample).unwrap();
+
+        let right = chunk.split().unwrap();
+
+        assert!(
+            chunk.is_empty() || right.is_empty(),
+            "a one-sample split should leave one half empty"
+        );
+        let all: Vec<Sample> = chunk.iter().chain(right.iter()).collect();
+        assert_eq!(all, vec![sample]);
     }
 
     fn decompress(chunk: &GorillaChunk) -> Vec<Sample> {

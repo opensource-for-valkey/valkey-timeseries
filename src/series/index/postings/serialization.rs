@@ -457,7 +457,7 @@ mod tests {
         );
     }
 
-    /// [`MIN_ENTRY_BYTES`] is load-bearing for the entry-count check, and it is derived from a
+    /// [`MIN_ENTRY_BYTES`] is important for the entry-count check, and it is derived from a
     /// croaring format detail. Pin it against what the encoder actually writes.
     #[test]
     fn min_entry_bytes_matches_encoder() {

@@ -26,7 +26,13 @@ impl GorillaIterator<'_> {
         let last_timestamp = encoder.last_ts;
         let last_value = encoder.last_value;
         let reader = BitStreamReader::new(buf);
-        let last_idx = num_samples - 1;
+        // Saturating: an empty encoder has no last sample, and this is reachable. `GorillaChunk`
+        // guards `get_range` with `is_empty`, but `iter`/`range_iter` do not, and a series always
+        // holds at least one chunk -- a freshly appended one is empty until the first sample
+        // lands. A plain `- 1` panicked there ("attempt to subtract with overflow") in any debug
+        // build, which without an FFI panic barrier takes the whole server down. `next` returns
+        // `None` immediately when `num_samples` is zero, so the value is never read.
+        let last_idx = num_samples.saturating_sub(1);
 
         GorillaIterator {
             reader,

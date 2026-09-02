@@ -1606,7 +1606,7 @@ class TestTsReadOnReplica(ReplicationTestCase):
     while working perfectly on the primary.
 
     TS.READ is `readonly`, so serving it from a replica is the expected deployment shape for
-    fanning reads out — which makes this path load-bearing rather than incidental.
+    fanning reads out — which makes this path consequential rather than incidental.
     """
 
     REPLICAS_COUNT = 1

@@ -24,7 +24,7 @@ work changed an answer, a dated note says so inline rather than silently rewriti
 
 1. **The cluster question answers itself.** §2 called slot migration "genuinely open" and guessed
    a blocked client would hang until timeout. The server already redirects it. See the resolution
-   note in [§2](#registration-and-cluster-behavior) — it is the most load-bearing correction here,
+   note in [§2](#registration-and-cluster-behavior) — it is the most consequential correction here,
    because it is the reason no cluster event handling was written.
 2. **The `dont_cache` tip was expressible.** §1 doubted the macro could emit tips and offered a
    metadata divergence as the fallback. It can; no divergence was needed.

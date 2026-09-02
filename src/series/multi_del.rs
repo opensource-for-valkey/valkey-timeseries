@@ -181,7 +181,7 @@ fn fetch_series_batch<'a>(
     let mut result: Vec<SeriesGuardMut<'a>> = Vec::with_capacity(batch_size);
     let mut keys: Vec<ValkeyString> = Vec::with_capacity(batch_size);
 
-    // Two phases per round, and the split is load-bearing: opening a key runs the server's
+    // Two phases per round, and the split is important: opening a key runs the server's
     // lazy-expiry check, which reaps an expired series through this module's `unlink` callback
     // and takes the postings *write* lock on this same thread. Holding the read guard across
     // `get_timeseries` therefore deadlocks. See `series::index::querier::resolve_series_keys`.

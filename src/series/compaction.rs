@@ -230,7 +230,7 @@ fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> TsdbResult<()>
 /// back-filling. Comparing against `prev_last` alone is not equivalent — on a series that the
 /// batch itself populates (`prev_last == None`) every item outranks it, so
 /// `TS.MADD k 0 v k 2000 v k 1000 v` would stream as three appends and never recalculate the
-/// bucket `1000` back-fills. That distinction is load-bearing under retention: only the
+/// bucket `1000` back-fills. That distinction is consequential under retention: only the
 /// recalculation reads the source back through the retention-clamped iterator, which is what
 /// drops a sample the pending trim is about to evict.
 ///
