@@ -23,6 +23,15 @@ pub fn create_key_string(ctx: &Context, key: &[u8]) -> ValkeyString {
     ValkeyString::create_from_slice(ctx.ctx, key)
 }
 
+/// Render a binary key name for a log line or an error message.
+///
+/// Lossy on purpose, and only for human-readable diagnostics: a key holding a non-UTF-8 byte
+/// still has to appear in a message somehow. Never build a client reply out of this — reply with
+/// the raw bytes (`reply_with_slice`) so the caller gets back exactly the name it used.
+pub fn key_for_display(key: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(key)
+}
+
 // Safety: RedisModule_GetSelectedDb is safe to call
 pub fn get_current_db(ctx: &Context) -> i32 {
     unsafe { RedisModule_GetSelectedDb.unwrap()(ctx.ctx) }

@@ -411,13 +411,18 @@ impl SeriesResultData {
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct MRangeSeriesResult {
-    pub key: String,
+    /// The series key, verbatim. Valkey key names are binary-safe, so this is
+    /// raw bytes rather than a `String`: routing them through `String` means a
+    /// lossy UTF-8 conversion, and the client would get a mangled name back for
+    /// any key holding a non-UTF-8 byte. For a GROUPBY result this instead holds
+    /// the synthetic `<label>=<value>` group name.
+    pub key: Vec<u8>,
     pub group_label_value: Option<String>,
     pub labels: Vec<Label>,
     /// Source series keys backing a GROUPBY group (sorted). Empty for
     /// non-grouped results. RESP3 replies report these in the per-group
     /// `sources` metadata map regardless of WITHLABELS.
-    pub sources: Vec<String>,
+    pub sources: Vec<Vec<u8>>,
     pub data: SeriesResultData,
 }
 

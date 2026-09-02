@@ -4,7 +4,7 @@ use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::replies::{
     IntoRawCtx, is_resp3_client, reply_label_ex, reply_with_array, reply_with_bulk_string,
     reply_with_labels, reply_with_labels_map, reply_with_map, reply_with_multi_samples,
-    reply_with_sample_ex, reply_with_samples,
+    reply_with_sample_ex, reply_with_samples, reply_with_slice,
 };
 use crate::labels::Label;
 use crate::series::request_types::{MRangeOptions, MRangeSeriesResult, SeriesResultData};
@@ -79,7 +79,9 @@ impl MRangeReplyShape {
 pub fn reply_with_mrange_series_result(ctx: &Context, series: &MRangeSeriesResult) {
     reply_with_array(ctx, 3);
 
-    reply_with_bulk_string(ctx, &series.key);
+    // Raw bytes, not a `&str`: key names are binary-safe, so the client must get back exactly
+    // the name it used.
+    reply_with_slice(ctx, &series.key);
 
     // series.labels has the same count as selected_labels
     reply_with_labels(ctx, &series.labels);
@@ -119,7 +121,7 @@ pub(super) fn reply_with_mrange_series_results(
     // [labels-map, {reducers: [...]}, {sources: [...]}, samples].
     reply_with_map(ctx, series_results.len());
     for series in series_results {
-        reply_with_bulk_string(ctx, &series.key);
+        reply_with_slice(ctx, &series.key);
         if let Some(grouping) = &shape.grouping {
             reply_with_array(ctx, 4);
             let labels: Vec<&Label> = series
@@ -138,7 +140,7 @@ pub(super) fn reply_with_mrange_series_results(
             reply_with_bulk_string(ctx, "sources");
             reply_with_array(ctx, series.sources.len());
             for source in &series.sources {
-                reply_with_bulk_string(ctx, source);
+                reply_with_slice(ctx, source);
             }
         } else {
             reply_with_array(ctx, 3);
@@ -162,7 +164,7 @@ pub(super) fn reply_with_mget_values<C: IntoRawCtx>(ctx: C, values: &[MGetValue]
         // RESP3: map keyed by series key; each value is [labels-map, sample].
         reply_with_map(raw_ctx, values.len());
         for value in values {
-            reply_with_bulk_string(raw_ctx, value.key.as_str());
+            reply_with_slice(raw_ctx, &value.key);
             reply_with_array(raw_ctx, 2);
             reply_with_fanout_labels_map(raw_ctx, &value.labels);
             reply_with_fanout_sample(raw_ctx, &value.sample);
@@ -194,7 +196,7 @@ fn reply_with_fanout_labels_map<C: IntoRawCtx>(ctx: C, labels: &[FanoutLabel]) {
 fn reply_with_mget_value<C: IntoRawCtx>(ctx: C, value: &MGetValue) -> Status {
     let raw_ctx = ctx.into_raw();
     reply_with_array(raw_ctx, 3);
-    reply_with_bulk_string(raw_ctx, value.key.as_str());
+    reply_with_slice(raw_ctx, &value.key);
     reply_with_fanout_labels(raw_ctx, &value.labels);
     reply_with_fanout_sample(raw_ctx, &value.sample);
     Status::Ok

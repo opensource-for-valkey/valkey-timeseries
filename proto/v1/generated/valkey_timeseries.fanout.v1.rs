@@ -697,8 +697,12 @@ impl LabelResultsSortOrder {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MGetValue {
-    #[prost(string, tag = "1")]
-    pub key: ::prost::alloc::string::String,
+    /// Key names are binary-safe in Valkey (an interior NUL or a non-UTF-8 byte is
+    /// legal), so this is `bytes`, not `string`: proto3 `string` requires valid
+    /// UTF-8 and would force a lossy conversion that corrupts the name the client
+    /// sees. Same for every other key-name field below.
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(message, optional, tag = "2")]
     pub sample: ::core::option::Option<Sample>,
     #[prost(message, repeated, tag = "3")]
@@ -706,8 +710,8 @@ pub struct MGetValue {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SeriesRangeResponse {
-    #[prost(string, tag = "1")]
-    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub key: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "2")]
     pub group_label_value: ::prost::alloc::string::String,
     #[prost(message, repeated, tag = "3")]
@@ -754,8 +758,8 @@ pub struct ReducePartialState {
 pub struct GroupPartialSeries {
     #[prost(string, tag = "1")]
     pub group_label_value: ::prost::alloc::string::String,
-    #[prost(string, repeated, tag = "2")]
-    pub source_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    pub source_keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     #[prost(int64, repeated, tag = "3")]
     pub bucket_timestamps: ::prost::alloc::vec::Vec<i64>,
     #[prost(message, repeated, tag = "4")]

@@ -20,6 +20,7 @@
 //! treated as untrusted throughout this crate).
 
 use super::generated::{Label, SeriesRangeResponse};
+use crate::common::context::key_for_display;
 use std::collections::HashMap;
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -97,7 +98,7 @@ pub fn resolve_labels(
         if name_refs.len() != value_refs.len() {
             return Err(ValkeyError::String(format!(
                 "TSDB: malformed symbol-table response: series '{}' has {} label name refs but {} value refs",
-                s.key,
+                key_for_display(&s.key),
                 name_refs.len(),
                 value_refs.len()
             )));
@@ -108,14 +109,14 @@ pub fn resolve_labels(
             let name = names.get(name_idx as usize).ok_or_else(|| {
                 ValkeyError::String(format!(
                     "TSDB: malformed symbol-table response: series '{}' label name ref {name_idx} out of range ({} names)",
-                    s.key,
+                    key_for_display(&s.key),
                     names.len()
                 ))
             })?;
             let value = values.get(value_idx as usize).ok_or_else(|| {
                 ValkeyError::String(format!(
                     "TSDB: malformed symbol-table response: series '{}' label value ref {value_idx} out of range ({} values)",
-                    s.key,
+                    key_for_display(&s.key),
                     values.len()
                 ))
             })?;
@@ -177,7 +178,12 @@ mod tests {
 
         resolve_labels(&mut batch, &names, &values).expect("resolve");
         for (got, want) in batch.iter().zip(&original) {
-            assert_eq!(got.labels, want.labels, "series '{}'", want.key);
+            assert_eq!(
+                got.labels,
+                want.labels,
+                "series '{}'",
+                key_for_display(&want.key)
+            );
             assert!(got.label_name_refs.is_empty());
             assert!(got.label_value_refs.is_empty());
         }

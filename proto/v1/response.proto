@@ -5,13 +5,17 @@ package valkey_timeseries.fanout.v1;
 import "v1/common.proto";
 
 message MGetValue {
-  string key = 1;
+  // Key names are binary-safe in Valkey (an interior NUL or a non-UTF-8 byte is
+  // legal), so this is `bytes`, not `string`: proto3 `string` requires valid
+  // UTF-8 and would force a lossy conversion that corrupts the name the client
+  // sees. Same for every other key-name field below.
+  bytes key = 1;
   Sample sample = 2;
   repeated Label labels = 3;
 }
 
 message SeriesRangeResponse {
-  string key = 1;
+  bytes key = 1;
   string group_label_value = 2;
   repeated Label labels = 3;
   repeated SampleData columns = 4;
@@ -45,7 +49,7 @@ message ReducePartialState {
 
 message GroupPartialSeries {
   string group_label_value = 1;
-  repeated string source_keys = 2;
+  repeated bytes source_keys = 2;
   repeated int64 bucket_timestamps = 3;
   repeated ReducePartialState states = 4;
   uint32 column_count = 5;

@@ -363,7 +363,7 @@ impl From<MGetSeriesData> for MGetValue {
         let sample = value.sample.map(Into::into);
 
         MGetValue {
-            key: value.series_key.to_string_lossy(),
+            key: value.series_key.as_slice().to_vec(),
             labels,
             sample,
         }

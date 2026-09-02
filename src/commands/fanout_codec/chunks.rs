@@ -1,4 +1,5 @@
 use super::generated::{CompressionType, Label as FanoutLabel, SampleData, SeriesRangeResponse};
+use crate::common::context::key_for_display;
 use crate::common::logging::log_warning;
 use crate::common::{MultiSample, Sample};
 use crate::error_consts;
@@ -203,7 +204,9 @@ impl TryFrom<SeriesRangeResponse> for MRangeSeriesResult {
         // 1 column => raw/single-aggregation chunk; >= 2 => multi-aggregation
         // rows; 0 => an empty multi-aggregation series (no buckets). Decode
         // failures name the series so triage can locate the owning shard.
-        let with_key = |e: ValkeyError| ValkeyError::String(format!("{e} (series '{key}')"));
+        let with_key = |e: ValkeyError| {
+            ValkeyError::String(format!("{e} (series '{}')", key_for_display(&key)))
+        };
         let data = match value.columns.len() {
             0 => SeriesResultData::Rows(Vec::new()),
             1 => SeriesResultData::Chunk(deserialize_chunk(&value.columns[0]).map_err(with_key)?),

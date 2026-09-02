@@ -10,21 +10,31 @@ is the binary-safe replacement; these tests keep every path that handles keyspac
 
 The same defect is what made a corrupt RDB crash the server rather than fail the load, since a
 mutated byte can land in a key name -- see test_rdb_corrupt_load.py.
+
+`TestNonUtf8KeyNames` covers the other half of binary safety: not crashing is not enough, the
+name in the reply has to be the name the client used. `TS.MGET`/`TS.MRANGE`/`TS.MREVRANGE` used
+to carry the key through a proto3 `string` field and a `to_string_lossy()`, so any non-UTF-8
+byte came back as U+FFFD and the client could not use the returned name to address the series.
 """
 
 import pytest
+import valkey
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import wait_for_equal
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
-# An interior NUL is the byte that used to abort the server. The names stay otherwise-valid UTF-8
-# on purpose: `TS.MGET`/`TS.MRANGE`/`TS.MREVRANGE` echo the key name back through a lossy UTF-8
-# conversion, so a byte like \xff comes back as U+FFFD. That is a separate reply-encoding defect,
-# not this one, and mixing the two here would make these tests fail for the wrong reason.
+# An interior NUL is the byte that used to abort the server. These names stay otherwise-valid
+# UTF-8 so a failure here points at the crash defect alone; `TestNonUtf8KeyNames` below adds the
+# bytes that no UTF-8 conversion survives.
 NUL_KEY = b"bin\x00key"
 NUL_KEY_2 = b"bin\x00key2"
 NUL_COPY = b"bin\x00copy"
+
+# Not valid UTF-8 in any position, so a name that survives round-trip proves the bytes were never
+# routed through a `String`.
+RAW_KEY = b"raw\x00k\xff\xfe"
+RAW_KEY_2 = b"raw\x00k2\xfd"
 
 CRASH_MARKERS = ("Guru Meditation", "panicked at", "STACK TRACE", "VALKEY BUG REPORT")
 
@@ -96,3 +106,60 @@ class TestBinaryKeyNames(ValkeyTimeSeriesTestCaseBase):
         assert client.execute_command("TS.QUERYINDEX", "host=bin") == [NUL_KEY]
         assert client.execute_command("TS.GET", NUL_KEY) == [5000, b"5"]
         self._assert_no_crash()
+
+
+class TestNonUtf8KeyNames(ValkeyTimeSeriesTestCaseBase):
+    """The multi-series replies must echo the key name byte for byte."""
+
+    def _resp3_client(self):
+        """A RESP3 (HELLO 3) client against the same server as self.client."""
+        return valkey.Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
+
+    def _seed(self, client):
+        for key, value in ((RAW_KEY, 1.0), (RAW_KEY_2, 2.0)):
+            client.execute_command("TS.CREATE", key, "LABELS", "host", "raw", "grp", "g1")
+            client.execute_command("TS.ADD", key, 1000, value)
+
+    def test_mget_and_mrange_echo_the_key_verbatim(self):
+        client = self.server.get_new_client()
+        self._seed(client)
+
+        # KEYS is the reference: whatever the server itself reports is what these must match.
+        expected = sorted([RAW_KEY, RAW_KEY_2])
+        assert sorted(client.execute_command("KEYS", "*")) == expected
+        assert sorted(client.execute_command("TS.QUERYINDEX", "host=raw")) == expected
+
+        for cmd in (
+            ("TS.MGET", "FILTER", "host=raw"),
+            ("TS.MRANGE", "-", "+", "FILTER", "host=raw"),
+            ("TS.MREVRANGE", "-", "+", "FILTER", "host=raw"),
+        ):
+            got = sorted(row[0] for row in client.execute_command(*cmd))
+            assert got == expected, f"{cmd[0]} mangled the key name: {got}"
+
+    def test_resp3_replies_echo_the_key_verbatim(self):
+        """RESP3 keys the map by series name, so a mangled name also collides across series."""
+        client = self._resp3_client()
+        self._seed(client)
+        expected = sorted([RAW_KEY, RAW_KEY_2])
+
+        for cmd in (
+            ("TS.MGET", "FILTER", "host=raw"),
+            ("TS.MRANGE", "-", "+", "FILTER", "host=raw"),
+            ("TS.MREVRANGE", "-", "+", "FILTER", "host=raw"),
+        ):
+            got = sorted(client.execute_command(*cmd).keys())
+            assert got == expected, f"{cmd[0]} mangled the key name: {got}"
+
+    def test_groupby_sources_echo_the_key_verbatim(self):
+        """The RESP3 `sources` metadata lists the group's member keys."""
+        client = self._resp3_client()
+        self._seed(client)
+
+        reply = client.execute_command(
+            "TS.MRANGE", "-", "+", "FILTER", "host=raw", "GROUPBY", "grp", "REDUCE", "sum"
+        )
+        group = reply[b"grp=g1"]
+        sources = next(v for entry in group if isinstance(entry, dict)
+                       for k, v in entry.items() if k == b"sources")
+        assert sorted(sources) == sorted([RAW_KEY, RAW_KEY_2])

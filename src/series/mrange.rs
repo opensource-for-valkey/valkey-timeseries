@@ -2,6 +2,7 @@ use crate::aggregators::{
     EmptyFillBounds, PartialReducer, PartialRowReducer, PartialSampleReducer, PartialState,
 };
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
+use crate::common::context::key_for_display;
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::create_sample_iterator_adapter;
@@ -23,7 +24,8 @@ use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 struct MRangeSeriesMeta<'a> {
     series: &'a TimeSeries,
-    source_key: String,
+    /// The series key, verbatim. Binary, not `String` — see `MRangeSeriesResult::key`.
+    source_key: Vec<u8>,
     latest: Option<Sample>,
     group_label_value: Option<String>,
 }
@@ -55,7 +57,7 @@ impl SampleLimit {
 /// into mergeable partial states.
 pub(crate) struct GroupPartialsResult {
     pub group_label_value: String,
-    pub source_keys: Vec<String>,
+    pub source_keys: Vec<Vec<u8>>,
     /// Ascending; `states` holds `column_count` entries per timestamp.
     pub timestamps: Vec<Timestamp>,
     /// Row-major: bucket i, column j at `states[i * column_count + j]`.
@@ -99,7 +101,7 @@ pub(crate) fn process_mrange_group_partials(
         .iter()
         .map(|(guard, key)| MRangeSeriesMeta {
             series: guard,
-            source_key: key.to_string(),
+            source_key: key.as_slice().to_vec(),
             group_label_value: None,
             latest: get_latest(&options.range, ctx, guard),
         })
@@ -121,7 +123,7 @@ pub(crate) fn process_mrange_group_partials(
         .into_iter()
         .iter_into_par()
         .map(|(label_value, group_data)| {
-            let mut source_keys: Vec<String> = group_data
+            let mut source_keys: Vec<Vec<u8>> = group_data
                 .series
                 .iter()
                 .map(|m| m.source_key.clone())
@@ -202,7 +204,7 @@ pub(crate) fn process_mrange_query(
         .iter()
         .map(|(guard, key)| MRangeSeriesMeta {
             series: guard,
-            source_key: key.to_string(),
+            source_key: key.as_slice().to_vec(),
             group_label_value: None,
             latest: {
                 // This is done upfront to enable parallel series processing below
@@ -415,7 +417,7 @@ fn handle_grouping(
                 )))
             };
             let labels = group_data.labels;
-            let key = format!("{}={}", grouping.group_label, label_value);
+            let key = format!("{}={}", grouping.group_label, label_value).into_bytes();
             MRangeSeriesResult {
                 key,
                 group_label_value: Some(label_value),
@@ -567,9 +569,16 @@ pub(crate) fn build_mrange_grouped_labels(
     group_label_name: &str,
     group_label_value: &str,
     reducer_name_str: &str,
-    source_identifiers: &[String],
+    source_identifiers: &[Vec<u8>],
 ) -> Vec<Label> {
-    let sources = source_identifiers.join(",");
+    // The `__source__` label is a label *value*, and labels are UTF-8 strings throughout the
+    // module, so a source key holding a non-UTF-8 byte cannot round-trip here. This is the one
+    // place a key name is rendered lossily; the reply's own key field stays raw bytes.
+    let sources = source_identifiers
+        .iter()
+        .map(|key| key_for_display(key))
+        .collect::<Vec<_>>()
+        .join(",");
     vec![
         Label {
             name: group_label_name.into(),
@@ -598,7 +607,7 @@ fn collect_group_label_values(metas: &mut Vec<MRangeSeriesMeta>, grouping: &Rang
 struct GroupedSeriesData<'a> {
     series: Vec<MRangeSeriesMeta<'a>>,
     labels: Vec<Label>,
-    source_keys: Vec<String>,
+    source_keys: Vec<Vec<u8>>,
 }
 
 fn group_series_by_label<'a>(
@@ -700,7 +709,12 @@ mod tests {
     }
 
     fn keys_of(results: &[MRangeSeriesResult]) -> Vec<&str> {
-        let mut keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+        // Keys are bytes; every key these tests build is ASCII, so the unwrap doubles as an
+        // assertion that nothing mangled them on the way through.
+        let mut keys: Vec<&str> = results
+            .iter()
+            .map(|r| std::str::from_utf8(&r.key).expect("test keys are ASCII"))
+            .collect();
         keys.sort();
         keys
     }
@@ -795,7 +809,7 @@ mod tests {
         sort_mrange_results(&mut results, false);
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].key, "a");
+        assert_eq!(results[0].key, b"a");
         let rows = rows_of(&results[0]);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].timestamp, 0);
@@ -824,7 +838,7 @@ mod tests {
         let results = handle_grouping(metas, options.clone()).unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].key, "region=us");
+        assert_eq!(results[0].key, b"region=us");
         let rows = rows_of(&results[0]);
         // ts 0: avg 2+10=12, max 3+12=15; ts 100: a only; ts 200: b only
         assert_eq!(rows.len(), 3);

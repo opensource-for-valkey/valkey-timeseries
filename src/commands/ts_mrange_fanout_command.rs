@@ -6,6 +6,7 @@ use crate::aggregators::EmptyFillBounds;
 use crate::aggregators::MultiAggregateIterator;
 use crate::aggregators::{PartialReducer, PartialState};
 use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
+use crate::common::context::key_for_display;
 use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -421,7 +422,7 @@ fn serialize_request(request: &MRangeOptions) -> MultiRangeRequest {
 }
 
 struct GroupData {
-    keys: SmallVec<[String; 8]>,
+    keys: SmallVec<[Vec<u8>; 8]>,
     series: Vec<MRangeSeriesResult>,
 }
 
@@ -453,12 +454,12 @@ fn handle_grouping(
 /// Short, bounded rendering of a partial's source keys for error/log context:
 /// enough to identify the owning shard without flooding the message when a
 /// group has many members.
-fn sources_preview(source_keys: &[String]) -> String {
+fn sources_preview(source_keys: &[Vec<u8>]) -> String {
     const MAX_SHOWN: usize = 3;
     let mut preview = source_keys
         .iter()
         .take(MAX_SHOWN)
-        .cloned()
+        .map(|key| key_for_display(key))
         .collect::<Vec<_>>()
         .join(",");
     if source_keys.len() > MAX_SHOWN {
@@ -501,7 +502,7 @@ fn handle_group_partials(
     };
 
     type BucketStates = SmallVec<[PartialState; 4]>;
-    type MergedGroup = (BTreeMap<i64, BucketStates>, BTreeSet<String>);
+    type MergedGroup = (BTreeMap<i64, BucketStates>, BTreeSet<Vec<u8>>);
     let mut groups: BTreeMap<String, MergedGroup> = BTreeMap::new();
     for partial in partials {
         // Corrupt-peer defense: states must be row-major with exactly the
@@ -570,7 +571,7 @@ fn handle_group_partials(
                 )))
             };
 
-            let sources: Vec<String> = sources.into_iter().collect(); // sorted via BTreeSet
+            let sources: Vec<Vec<u8>> = sources.into_iter().collect(); // sorted via BTreeSet
             let labels = if options.with_labels {
                 build_mrange_grouped_labels(
                     &group_options.group_label,
@@ -583,7 +584,7 @@ fn handle_group_partials(
             };
 
             MRangeSeriesResult {
-                key: format!("{}={}", group_options.group_label, label),
+                key: format!("{}={}", group_options.group_label, label).into_bytes(),
                 group_label_value: Some(label),
                 labels,
                 sources,
@@ -709,7 +710,7 @@ fn process_group(
     };
 
     MRangeSeriesResult {
-        key: format!("{}={}", group_options.group_label, label),
+        key: format!("{}={}", group_options.group_label, label).into_bytes(),
         group_label_value: Some(label),
         labels,
         sources: data.keys.to_vec(),
@@ -971,7 +972,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let group = &results[0];
-        assert_eq!(group.key, "region=us");
+        assert_eq!(group.key, "region=us".as_bytes());
         assert_eq!(group.group_label_value.as_deref(), Some("us"));
         assert_eq!(
             result_samples(group),
@@ -991,7 +992,7 @@ mod tests {
         let results = handle_grouping(make_responses(), &options).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].labels.is_empty());
-        assert_eq!(results[0].key, "region=us");
+        assert_eq!(results[0].key, "region=us".as_bytes());
     }
 
     /// The request flag mirrors the latched push-down decision.
@@ -1077,7 +1078,7 @@ mod tests {
                 PartialSampleReducer::new(shard_samples.into_iter(), reducer.clone()).unzip();
             GroupPartialSeries {
                 group_label_value: "us".into(),
-                source_keys: keys.iter().map(|s| s.to_string()).collect(),
+                source_keys: keys.iter().map(|s| s.as_bytes().to_vec()).collect(),
                 bucket_timestamps,
                 states: states.into_iter().map(Into::into).collect(),
                 column_count: 1,
@@ -1093,7 +1094,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let group = &results[0];
-        assert_eq!(group.key, "region=us");
+        assert_eq!(group.key, "region=us".as_bytes());
         assert_eq!(
             result_samples(group),
             samples(&[(0, 10.0), (100, 3.0), (200, 7.0)]),
@@ -1238,7 +1239,7 @@ mod tests {
                     };
                     GroupPartialSeries {
                         group_label_value: "us".into(),
-                        source_keys: keys.iter().map(|s| s.to_string()).collect(),
+                        source_keys: keys.iter().map(|s| s.as_bytes().to_vec()).collect(),
                         bucket_timestamps,
                         states: states.into_iter().map(Into::into).collect(),
                         column_count: 1,
@@ -1298,7 +1299,7 @@ mod tests {
         ];
         let results = command.process_responses(responses, Vec::new()).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].key, "s");
+        assert_eq!(results[0].key, "s".as_bytes());
 
         // Without the flag the empty series is reported, as before.
         let mut options = mrange_options(0, 500);
@@ -1501,7 +1502,7 @@ mod tests {
         let results = handle_grouping(responses, &options).unwrap();
         assert_eq!(results.len(), 1);
         let group = &results[0];
-        assert_eq!(group.key, "region=us");
+        assert_eq!(group.key, "region=us".as_bytes());
         let rows = result_rows(group);
 
         // column-wise sum across series per bucket timestamp:
@@ -1644,7 +1645,10 @@ mod tests {
 
         GroupPartialSeries {
             group_label_value: "us".into(),
-            source_keys: members.iter().map(|(key, _)| key.to_string()).collect(),
+            source_keys: members
+                .iter()
+                .map(|(key, _)| key.as_bytes().to_vec())
+                .collect(),
             bucket_timestamps,
             states: buckets.into_iter().flatten().map(Into::into).collect(),
             column_count: columns as u32,
@@ -1891,7 +1895,7 @@ mod tests {
     /// sources_preview stays bounded for large groups.
     #[test]
     fn test_sources_preview_bounded() {
-        let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
+        let keys: Vec<Vec<u8>> = (0..10).map(|i| format!("k{i}").into_bytes()).collect();
         assert_eq!(sources_preview(&keys[..2]), "k0,k1");
         assert_eq!(sources_preview(&keys[..3]), "k0,k1,k2");
         assert_eq!(sources_preview(&keys), "k0,k1,k2,+7 more");
@@ -2206,7 +2210,12 @@ mod tests {
 
         assert_eq!(cmd.series.len(), 2);
         for ((series, _bucketed), want) in cmd.series.iter().zip(&expected) {
-            assert_eq!(&label_pairs(series), want, "series '{}'", series.key);
+            assert_eq!(
+                &label_pairs(series),
+                want,
+                "series '{}'",
+                key_for_display(&series.key)
+            );
         }
     }
 
