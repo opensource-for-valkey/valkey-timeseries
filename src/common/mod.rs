@@ -10,7 +10,6 @@ pub mod humanize;
 pub mod logging;
 pub mod module_info;
 pub mod module_options;
-pub mod module_info;
 pub mod pool;
 pub mod rdb;
 pub mod replies;
