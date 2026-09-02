@@ -170,3 +170,31 @@ class TestTimeSeriesAlter(ValkeyTimeSeriesTestCaseBase):
         # Unknown option
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.ALTER', self.key, 'UNKNOWN_OPTION', 'value')
+
+    def test_alter_rounding(self):
+        """Test altering SIGNIFICANT_DIGITS / DECIMAL_DIGITS"""
+        self.setup_data()
+
+        assert self.client.execute_command('TS.ALTER', self.key, 'SIGNIFICANT_DIGITS', 3) == b'OK'
+        info = self.ts_info(self.key)
+        assert info['rounding'] == [b'significantDigits', 3]
+        # Rounding applies to values written after the change
+        self.client.execute_command('TS.ADD', self.key, 2000, 3.14159)
+        assert self.client.execute_command('TS.GET', self.key) == [2000, b'3.14']
+
+        assert self.client.execute_command('TS.ALTER', self.key, 'DECIMAL_DIGITS', 1) == b'OK'
+        info = self.ts_info(self.key)
+        assert info['rounding'] == [b'decimalDigits', 1]
+        self.client.execute_command('TS.ADD', self.key, 3000, 2.71828)
+        assert self.client.execute_command('TS.GET', self.key) == [3000, b'2.7']
+
+        # An ALTER that does not mention rounding leaves it unchanged
+        assert self.client.execute_command('TS.ALTER', self.key, 'RETENTION', 60000) == b'OK'
+        info = self.ts_info(self.key)
+        assert info['rounding'] == [b'decimalDigits', 1]
+        assert info['retentionTime'] == 60000
+
+        # The two rounding options are mutually exclusive
+        with pytest.raises(ResponseError):
+            self.client.execute_command(
+                'TS.ALTER', self.key, 'SIGNIFICANT_DIGITS', 3, 'DECIMAL_DIGITS', 1)

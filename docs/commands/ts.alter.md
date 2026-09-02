@@ -51,11 +51,15 @@ Returns `OK` on success.
 
 ## Complexity
 
-O(1), excluding label-index maintenance when labels are changed.
+O(1), excluding label-index maintenance when labels are changed and the
+retention trim that runs when `RETENTION` is tightened. That trim drops whole
+expired chunks and then rewrites the boundary chunk, so it is O(C + S), where
+C is the number of expired chunks and S is the number of samples in the first
+surviving chunk.
 
 ## ACL categories
 
-`@write`, `@fast`, `@timeseries`
+`@write`, `@timeseries`
 
 ## Examples
 

@@ -109,6 +109,15 @@ fn update_series(
         has_changed = true;
     }
 
+    // SIGNIFICANT_DIGITS / DECIMAL_DIGITS only affect values written after the
+    // change; samples already stored are left as they are.
+    if let Some(rounding) = options.rounding
+        && Some(rounding) != series.rounding
+    {
+        series.rounding = Some(rounding);
+        has_changed = true;
+    }
+
     // IGNORE and DUPLICATE_POLICY are independent properties: altering one must
     // leave the other as it was.
     if let Some((max_time_delta, max_value_delta)) = options.ignore
