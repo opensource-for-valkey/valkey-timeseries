@@ -1,6 +1,8 @@
 //! This module subscribes to Valkey events to ensure secondary index consistency.
 //!
-use crate::common::context::{get_current_db, register_server_event_handler, set_current_db};
+use crate::common::context::{
+    create_key_string, get_current_db, register_server_event_handler, set_current_db,
+};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::{log_debug, log_notice};
 use crate::common::sync::{lock, read_lock, write_lock};
@@ -87,7 +89,7 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
     let mut postings = write_lock(&index.inner);
 
     for key_name in batch.iter() {
-        let valkey_key = ctx.create_string(key_name.as_ref());
+        let valkey_key = create_key_string(&ctx, key_name.as_ref());
         let writeable_key = ctx.open_key_writable(&valkey_key);
         let Ok(Some(series)) = writeable_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) else {
             skipped += 1;
@@ -461,7 +463,7 @@ fn loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
 fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
     let new_db = get_current_db(ctx);
     // fetch the series from the new
-    let valkey_key = ctx.create_string(key);
+    let valkey_key = create_key_string(ctx, key);
     let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
         logging::log_warning("Failed to load series for key move");
         return;
@@ -479,7 +481,7 @@ fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
 
 fn handle_key_rename(ctx: &Context, _old_key: &[u8], new_key: &[u8]) {
     let index = get_timeseries_index(ctx);
-    let key = ctx.create_string(new_key);
+    let key = create_key_string(ctx, new_key);
     let Ok(Some(series)) = get_timeseries(ctx, &key, None, false) else {
         logging::log_warning("Failed to load series for key rename");
         return;
@@ -518,7 +520,7 @@ fn handle_key_restore(ctx: &Context, key: &[u8]) {
 /// key type, so non-timeseries keys are ignored quietly.
 fn handle_key_copy(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
-    let valkey_key = ctx.create_string(key);
+    let valkey_key = create_key_string(ctx, key);
     let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
         return;
     };

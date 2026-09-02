@@ -3,10 +3,25 @@ use std::os::raw::c_int;
 use valkey_module::{
     Context, ContextFlags, RedisModule_GetSelectedDb, RedisModule_SelectDb, Status, ValkeyError,
     ValkeyModule_GetServerInfo, ValkeyModule_ServerInfoGetFieldSigned, ValkeyModuleCtx,
-    ValkeyModuleServerInfoData, ValkeyResult, raw,
+    ValkeyModuleServerInfoData, ValkeyResult, ValkeyString, raw,
 };
 
 use crate::fanout::{FANOUT_ACL_USER, fanout_acl_scope_active, is_clustered};
+
+/// Build a `ValkeyString` from raw key bytes without going through `CString`.
+///
+/// `Context::create_string` funnels its argument through `CString::new(..).unwrap()`, so any
+/// byte string holding an interior NUL panics. Valkey key names are binary-safe, so that is not
+/// a corrupt-input-only concern: `TS.CREATE "a\0b"` is a legal key, and the same bytes come back
+/// out of an RDB, a `RESTORE`, a rename, or the postings index. Worse, most of those paths run
+/// inside a keyspace-notification or data-type callback, which is `extern "C"` and cannot unwind
+/// — the panic becomes an `abort`, taking the whole server down with it.
+///
+/// Every conversion of keyspace-derived bytes into a `ValkeyString` must go through here.
+/// `create_string` stays fine for module-authored literals and formatted numbers.
+pub fn create_key_string(ctx: &Context, key: &[u8]) -> ValkeyString {
+    ValkeyString::create_from_slice(ctx.ctx, key)
+}
 
 // Safety: RedisModule_GetSelectedDb is safe to call
 pub fn get_current_db(ctx: &Context) -> i32 {

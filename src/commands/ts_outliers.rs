@@ -127,8 +127,6 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    let key = ctx.create_string(key);
-
     let samples = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
         Ok(Some(series)) => {
             let (start, end) = date_range.get_series_range(&series, None, false);

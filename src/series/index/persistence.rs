@@ -14,7 +14,7 @@
 use super::postings::Postings;
 use super::postings::serialization;
 use super::{TIMESERIES_INDEX, get_db_index, index_series_by_key};
-use crate::common::context::{get_current_db, set_current_db};
+use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
@@ -582,7 +582,7 @@ fn reconcile_db(db: i32) {
             let save_db = get_current_db(&ctx);
             set_current_db(&ctx, db);
             for (id, key) in &window {
-                let valkey_key = ctx.create_string(key.as_ref());
+                let valkey_key = create_key_string(&ctx, key.as_ref());
                 let key_handle = ctx.open_key(&valkey_key);
                 match key_handle.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
                     Ok(Some(series)) if series.id == *id => {}

@@ -22,6 +22,7 @@
 
 use super::postings::BulkIndexEntry;
 use super::{IndexKey, get_db_index};
+use crate::common::context::create_key_string;
 use crate::common::logging::{log_debug, log_notice};
 use crate::common::sync::lock;
 use crate::config::index_build_max_memory;
@@ -96,7 +97,7 @@ pub(crate) fn try_buffer_loaded_key(ctx: &Context, db: i32, key: &[u8]) -> bool 
         return false;
     }
 
-    let valkey_key = ctx.create_string(key);
+    let valkey_key = create_key_string(ctx, key);
     let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
         return true;
     };

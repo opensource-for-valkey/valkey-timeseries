@@ -1,5 +1,5 @@
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::get_current_db;
+use crate::common::context::{create_key_string, get_current_db};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::check_key_permissions;
@@ -222,7 +222,7 @@ fn add_default_compactions(
         let duration_str = bucket_duration.to_string();
         labels.push(Label::new("time_bucket", &duration_str));
 
-        let child_key = ctx.create_string(dest_key);
+        let child_key = create_key_string(ctx, dest_key.as_bytes());
         let options = TimeSeriesOptions {
             src_id: Some(series.id),
             retention: Some(Duration::from_millis(retention)),

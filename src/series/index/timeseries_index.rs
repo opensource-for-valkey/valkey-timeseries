@@ -6,7 +6,7 @@ use std::sync::{RwLock, RwLockReadGuard};
 use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
 use super::postings::{Postings, PostingsBitmap};
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{get_acl_user, is_acl_enforced};
+use crate::common::context::{create_key_string, get_acl_user, is_acl_enforced};
 use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
@@ -270,7 +270,7 @@ impl TimeSeriesIndex {
                 let key = postings.get_key_by_id(series_ref);
                 match key {
                     Some(key) => {
-                        let real_key = ctx.create_string(key.as_ref());
+                        let real_key = create_key_string(ctx, key.as_ref());
                         if is_user_client
                             && !can_access_all_keys
                             && let Some(perms) = &cloned_perms

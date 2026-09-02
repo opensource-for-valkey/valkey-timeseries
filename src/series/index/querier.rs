@@ -25,7 +25,7 @@
 use super::postings::{EMPTY_BITMAP, KeyType, Postings};
 use super::{PostingsBitmap, get_db_index, get_timeseries_index};
 use crate::common::Timestamp;
-use crate::common::context::{get_acl_user, get_current_db};
+use crate::common::context::{create_key_string, get_acl_user, get_current_db};
 use crate::common::hash::IntMap;
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
@@ -74,7 +74,7 @@ fn resolve_series_keys(
     let mut resolved = Vec::with_capacity(capacity_estimate);
     for id in ids {
         match postings.get_key_by_id(id) {
-            Some(key) => resolved.push((id, ctx.create_string(key.as_bytes()))),
+            Some(key) => resolved.push((id, create_key_string(ctx, key.as_bytes()))),
             None => stale.push(id),
         }
     }
@@ -442,7 +442,7 @@ pub(super) fn get_guard_from_key<'a>(
     ctx: &'a Context,
     key: &KeyType,
 ) -> ValkeyResult<Option<SeriesGuard<'a>>> {
-    let real_key = ctx.create_string(key.as_bytes());
+    let real_key = create_key_string(ctx, key.as_bytes());
     let perms = Some(AclPermissions::ACCESS);
     get_timeseries(ctx, &real_key, perms, false)
 }

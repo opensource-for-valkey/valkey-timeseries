@@ -1,3 +1,4 @@
+use crate::common::context::create_key_string;
 use crate::series::index::{TIMESERIES_INDEX, get_timeseries_index, with_timeseries_postings};
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries_mut};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -57,7 +58,7 @@ pub(super) fn fetch_series_batch(
                     continue;
                 };
 
-                let key = ctx.create_string(k.as_ref());
+                let key = create_key_string(ctx, k.as_ref());
                 let Ok(Some(series)) = get_timeseries_mut(ctx, &key, false, None) else {
                     stale_ids.push(id);
                     continue;

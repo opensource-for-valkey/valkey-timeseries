@@ -1,5 +1,6 @@
 use crate::aggregators::{AggregationHandler, Aggregator, calc_bucket_start};
 use crate::common::block_on_keys::signal_timeseries_ready;
+use crate::common::context::create_key_string;
 use crate::common::logging::log_warning;
 use crate::common::rdb::{
     RdbSerializable, rdb_load_bool, rdb_load_timestamp, rdb_save_bool, rdb_save_timestamp,
@@ -1049,7 +1050,7 @@ fn notify_compaction(ctx: &Context, ids: &[SeriesRef]) {
                 ctx.log_warning("Compaction notification failed: series key not found");
                 continue;
             };
-            let key = ctx.create_string(key.as_ref());
+            let key = create_key_string(ctx, key.as_ref());
             ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add:dest", &key);
             // Callers only reach here for destinations that materialized a sample, so this is
             // the one place both direct and cascaded compaction output can wake a `TS.READ`

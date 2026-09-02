@@ -7,7 +7,7 @@ mod postings;
 mod querier;
 mod timeseries_index;
 
-use crate::common::context::get_current_db;
+use crate::common::context::{create_key_string, get_current_db};
 use croaring::Portable;
 use papaya::{Guard, HashMap, LocalGuard};
 use std::sync::LazyLock;
@@ -147,7 +147,7 @@ pub fn get_series_by_id(
     let real_key = index.with_postings(&mut state, |posting, _| {
         posting
             .get_key_by_id(id)
-            .map(|key| ctx.create_string(key.as_ref()))
+            .map(|key| create_key_string(ctx, key.as_ref()))
     });
     let Some(real_key) = real_key else {
         return Ok(None);
@@ -161,7 +161,7 @@ pub fn get_series_key_by_id(ctx: &Context, id: SeriesRef) -> Option<ValkeyString
     let mut state = 0;
     index_guard.with_postings(&mut state, |posting, _| {
         let key = posting.get_key_by_id(id)?;
-        Some(ctx.create_string(key.as_ref()))
+        Some(create_key_string(ctx, key.as_ref()))
     })
 }
 
@@ -181,7 +181,7 @@ pub fn remove_series_from_index(ts: &TimeSeries) {
 /// database, and inserts it into the index if not already present.
 pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
-    let valkey_key = ctx.create_string(key);
+    let valkey_key = create_key_string(ctx, key);
     let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
         return;
     };

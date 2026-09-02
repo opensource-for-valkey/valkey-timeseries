@@ -1,5 +1,5 @@
 use crate::common::Timestamp;
-use crate::common::context::{get_acl_user, is_acl_enforced};
+use crate::common::context::{create_key_string, get_acl_user, is_acl_enforced};
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
@@ -70,7 +70,7 @@ fn handle_delete_keys(ctx: &Context, filters: &[SeriesSelector]) -> ValkeyResult
     let keys = index.keys_for_selectors(ctx, filters, Some(AclPermissions::DELETE))?;
     let mut total_deleted = 0;
     for key in keys {
-        let key = ctx.create_string(key.as_ref());
+        let key = create_key_string(ctx, key.as_ref());
         if delete_key(ctx, &key)? == 0 {
             continue;
         }
@@ -197,7 +197,7 @@ fn fetch_series_batch<'a>(
             let postings = postings_guard.deref();
             for id in cursor.by_ref() {
                 match postings.get_key_by_id(id) {
-                    Some(k) => resolved.push((id, ctx.create_string(k.as_bytes()))),
+                    Some(k) => resolved.push((id, create_key_string(ctx, k.as_bytes()))),
                     None => stale_ids.push(id),
                 }
                 if resolved.len() == wanted {
