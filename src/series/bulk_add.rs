@@ -9,7 +9,7 @@ use crate::error_consts;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::index::with_timeseries_postings;
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
-use crate::series::{DuplicatePolicy, SampleAddResult, SeriesRef, TimeSeries};
+use crate::series::{DuplicatePolicy, SampleAddResult, SeriesRef, TimeSeries, seal_chunk};
 use orx_parallel::{IterIntoParIter, ParIter, ParallelizableCollection};
 use simd_json::base::{ValueAsArray, ValueAsScalar};
 use simd_json::borrowed::Value;
@@ -359,6 +359,10 @@ pub(super) fn merge_samples_into_series(
             .map(|&(group_pos, samples)| {
                 let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
                 let res = exec_merge(&mut chunk, samples, resolved_policy);
+                // This group's samples are all this chunk will ever hold: the sort below places
+                // it among chunks that already own every neighbouring timestamp. (The one that
+                // lands last does become the new append target and will regrow once.)
+                seal_chunk(&mut chunk);
                 (group_pos, chunk, res)
             })
             .collect::<Vec<_>>();

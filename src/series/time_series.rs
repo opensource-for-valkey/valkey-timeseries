@@ -34,6 +34,27 @@ use valkey_module::{ValkeyError, ValkeyResult};
 pub type TimeseriesId = u64;
 pub type SeriesRef = u64;
 
+/// Hand a sealed chunk's unused buffer back to the allocator.
+///
+/// A compressed chunk's bit stream is a `Vec` grown by doubling, so a chunk that has just
+/// reached `chunk_size_bytes` holds up to twice that in allocation. Measured over a 20,000
+/// sample series at `CHUNK_SIZE 4096`: 208,069 bytes of `MEMORY USAGE` against 109,537 bytes of
+/// encoded data, a 1.90x overhang that lives as long as the series does. On an append-only
+/// workload that is every chunk but the last.
+///
+/// Only call this where a chunk provably stops being the append target -- it is the definition
+/// of "sealed" here, not a general-purpose compaction. It costs nothing on the other side:
+/// `upsert_sample` and the out-of-order path of `merge_samples` discard the buffer and re-encode
+/// into a fresh one regardless, so a later back-fill into a sealed chunk neither benefits from
+/// nor pays for the shrink. An in-order `merge_samples` into a sealed chunk does append in place
+/// and will regrow, but from a smaller base and still by doubling, so the cost stays amortized
+/// O(1) per byte.
+pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
+    if let Err(e) = chunk.optimize() {
+        logging::log_warning(format!("TSDB: Error compacting a sealed chunk: {e:?}"));
+    }
+}
+
 /// Represents a time series consisting of chunks of samples, each with a timestamp and value.
 #[derive(Clone, Debug, Hash, PartialEq, GetSize)]
 pub struct TimeSeries {
@@ -312,6 +333,11 @@ impl TimeSeries {
 
     /// (Possibly) add a new chunk and append the given sample.
     fn add_chunk_with_sample(&mut self, sample: Sample) -> TsdbResult<()> {
+        // Reached only when the tail chunk is full, so the chunk we are leaving behind will
+        // never be the append target again: seal it before the new one takes over.
+        if let Some(sealed) = self.chunks.last_mut() {
+            seal_chunk(sealed);
+        }
         let mut chunk = self.create_chunk();
         chunk.add_sample(&sample)?;
         self.chunks.push(chunk);
@@ -469,7 +495,11 @@ impl TimeSeries {
                 .par_mut()
                 .filter(|c| c.is_full())
                 .flat_map(|chunks| {
-                    if let Ok(split_chunk) = chunks.split() {
+                    if let Ok(mut split_chunk) = chunks.split() {
+                        // `split` re-encodes both halves from scratch, so both arrive with a
+                        // doubling-grown buffer around half a chunk of data.
+                        seal_chunk(chunks);
+                        seal_chunk(&mut split_chunk);
                         Some(split_chunk)
                     } else {
                         errored.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -480,7 +510,9 @@ impl TimeSeries {
         } else {
             let mut new_chunks = Vec::with_capacity(std::cmp::max(2, self.chunks.len() / 6));
             for c in self.chunks.iter_mut().filter(|c| c.is_full()) {
-                if let Ok(split_chunk) = c.split() {
+                if let Ok(mut split_chunk) = c.split() {
+                    seal_chunk(c);
+                    seal_chunk(&mut split_chunk);
                     new_chunks.push(split_chunk);
                 } else {
                     errored.store(true, std::sync::atomic::Ordering::Relaxed);

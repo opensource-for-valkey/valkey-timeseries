@@ -1,5 +1,5 @@
 use super::chunks::{ChunkOps, merge_by_capacity};
-use super::time_series::TimeSeries;
+use super::time_series::{TimeSeries, seal_chunk};
 use crate::error::TsdbResult;
 
 /// Compact a series in place: drop expired data, then pull each chunk's samples forward into
@@ -47,6 +47,15 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
     series.chunks.retain(|chunk| !chunk.is_empty());
     if series.chunks.len() < saved_len {
         series.chunks.shrink_to_fit();
+    }
+
+    // Every survivor just absorbed samples from its successors, growing its bit stream by
+    // doubling; and defrag is exactly the point at which the caller is asking for memory back.
+    // The last chunk is still the append target, so it is left alone to avoid a regrow on the
+    // next write.
+    let last = series.chunks.len().saturating_sub(1);
+    for chunk in series.chunks[..last].iter_mut() {
+        seal_chunk(chunk);
     }
 
     // Recount instead of adjusting by a delta. `merge_by_capacity` reports how many samples it

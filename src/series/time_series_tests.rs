@@ -1826,4 +1826,112 @@ mod tests {
         let result = ts.increment_sample_value(Some(100), 50.0);
         assert!(result.is_ok());
     }
+
+    /// Every chunk but the tail must be holding a tight buffer.
+    ///
+    /// A compressed chunk's bit stream grows by doubling, so a chunk that has just filled to
+    /// `chunk_size_bytes` is sitting on up to twice that in allocation -- measured at 1.90x over
+    /// a 20,000-sample series before `seal_chunk` was wired into the append path. The tail is
+    /// deliberately left alone: it is still the append target.
+    #[test]
+    fn test_sealed_chunks_do_not_hold_spare_capacity() {
+        for encoding in [
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Uncompressed,
+        ] {
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_size: Some(1024),
+                chunk_encoding: encoding,
+                ..Default::default()
+            })
+            .unwrap();
+
+            for i in 0..20_000i64 {
+                series.add(1_600_000_000_000 + i * 1000, i as f64 * 1.37, None);
+            }
+            assert!(
+                series.chunks.len() > 4,
+                "{encoding:?}: only {} chunks, the seal path is barely exercised",
+                series.chunks.len()
+            );
+
+            let sealed = &series.chunks[..series.chunks.len() - 1];
+            for (i, chunk) in sealed.iter().enumerate() {
+                let payload = chunk.size();
+                let allocated = chunk.memory_usage() - size_of::<TimeSeriesChunk>();
+                assert!(
+                    allocated <= payload + payload / 8,
+                    "{encoding:?}: sealed chunk {i} holds {allocated} bytes of allocation for \
+                     {payload} bytes of data",
+                );
+            }
+        }
+    }
+
+    /// Sealing must not lose, reorder or corrupt anything it compacts.
+    #[test]
+    fn test_sealing_preserves_every_sample() {
+        for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_size: Some(1024),
+                chunk_encoding: encoding,
+                ..Default::default()
+            })
+            .unwrap();
+
+            let expected: Vec<Sample> = (0..20_000i64)
+                .map(|i| Sample {
+                    timestamp: 1_600_000_000_000 + i * 1000,
+                    value: i as f64 * 1.37,
+                })
+                .collect();
+            for sample in expected.iter() {
+                series.add(sample.timestamp, sample.value, None);
+            }
+
+            assert_eq!(series.total_samples, expected.len());
+            let actual: Vec<Sample> = series.chunks.iter().flat_map(|c| c.iter()).collect();
+            assert_eq!(
+                actual, expected,
+                "{encoding:?}: sealing altered the samples"
+            );
+        }
+    }
+
+    /// A sealed chunk still accepts a back-fill -- the shrink must not make it look full or
+    /// immutable.
+    #[test]
+    fn test_a_sealed_chunk_still_accepts_a_backfill() {
+        let mut series = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_size: Some(1024),
+            chunk_encoding: ChunkEncoding::Gorilla,
+            ..Default::default()
+        })
+        .unwrap();
+
+        for i in 0..20_000i64 {
+            series.add(1_600_000_000_000 + i * 1000, i as f64, None);
+        }
+        let before = series.total_samples;
+
+        // Land between two existing samples in the first, long-sealed chunk.
+        let backfilled = Sample {
+            timestamp: 1_600_000_000_500,
+            value: -1.0,
+        };
+        assert!(
+            series
+                .add(backfilled.timestamp, backfilled.value, None)
+                .is_ok()
+        );
+
+        assert_eq!(series.total_samples, before + 1);
+        assert_eq!(
+            series.chunks[0]
+                .iter()
+                .find(|s| s.timestamp == backfilled.timestamp),
+            Some(backfilled),
+        );
+    }
 }

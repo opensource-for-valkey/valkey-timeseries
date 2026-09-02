@@ -153,6 +153,30 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         reported = self._ts_info(client, "mem:cover")[b"memoryUsage"]
         assert reported >= payload, f"memoryUsage {reported} is below {payload} bytes of payload"
 
+    def test_sealed_chunks_do_not_hold_double_their_payload(self):
+        """A chunk that is no longer the append target hands its spare capacity back.
+
+        The bit stream is a `Vec` grown by doubling, so a chunk that has just filled to
+        `CHUNK_SIZE` sits on up to twice that in allocation, for the life of the series.
+        Measured over this series before the seal was wired in: 208,069 bytes reported for
+        109,537 bytes of encoded data. Only the tail chunk may still carry slack.
+        """
+        client = self.server.get_new_client()
+        client.execute_command("TS.CREATE", "mem:sealed", "CHUNK_SIZE", CHUNK_SIZE)
+        self._fill(client, "mem:sealed", 20000)
+
+        chunks = self._chunks(client, "mem:sealed")
+        assert len(chunks) > 4, "series barely chunked, the seal path is untested"
+
+        payload = sum(c[b"size"] for c in chunks)
+        reported = self._ts_info(client, "mem:sealed")[b"memoryUsage"]
+        # One tail chunk of slack, plus per-chunk struct overhead.
+        budget = payload + CHUNK_SIZE * 2 + len(chunks) * 256
+        assert reported <= budget, (
+            f"memoryUsage {reported} against {payload} bytes of payload in {len(chunks)} "
+            f"chunks: sealed chunks are still holding their doubled buffers"
+        )
+
     # ---- the index --------------------------------------------------------------
 
     def test_info_reports_index_memory(self):
