@@ -63,8 +63,19 @@ impl ChimpChunk {
         uncompressed_size as f64 / compressed_size as f64
     }
 
+    /// Bytes of encoded data. This is what `max_size` bounds, what `TS.INFO DEBUG` reports as a
+    /// chunk's `size`, and what `bytes_per_sample` amortizes.
+    ///
+    /// It deliberately excludes the writer's spare capacity and the encoder's own stack bytes.
+    /// The bit stream grows by doubling, so counting `Vec::capacity` reported up to ~2x the data
+    /// actually held: a chunk created with `CHUNK_SIZE 4096` reported 8288. `is_full` has always
+    /// measured the payload, and `UncompressedChunk::size` is likewise `len`-based, so the three
+    /// now agree. It also fed `utilization`, and so `should_split` -- which only governs an
+    /// upsert into an already-sealed chunk; the append path is gated by `is_full` and was
+    /// unaffected. The full allocation is still reported by `memory_usage`, which is what
+    /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
     pub fn data_size(&self) -> usize {
-        self.encoder.get_size()
+        self.encoder.bytes().len()
     }
 
     /// Estimate the remaining capacity based on the current data size and `max_size`.

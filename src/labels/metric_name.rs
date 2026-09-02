@@ -5,7 +5,7 @@ use crate::common::string_interner::InternedString;
 use crate::parser::ParseError;
 use crate::parser::metric_name::parse_metric_name;
 use enquote::enquote;
-use get_size2::GetSize;
+use get_size2::{GetSize, GetSizeTracker};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
@@ -57,18 +57,20 @@ impl SeriesLabel for InternedLabel<'_> {
 pub struct MetricName(Vec<InternedString>);
 
 impl GetSize for MetricName {
-    fn get_size(&self) -> usize {
-        self.0
-            .iter()
-            .map(|i| {
-                // we count the full size (stack and heap) only for unique strings
-                if i.is_unique() {
-                    i.get_size()
-                } else {
-                    size_of::<InternedString>()
-                }
-            })
-            .sum()
+    /// `get_heap_size_with_tracker` is the extension point a containing type's derived `GetSize`
+    /// calls. This used to override `get_size` instead, which left `TimeSeries`' derived impl on
+    /// the trait default of zero: a series carrying 40 labels and ~1.9KB of interned strings
+    /// reported a `memoryUsage` of exactly `size_of::<TimeSeries>()`, labels included for free.
+    ///
+    /// The tracker is deliberately not consulted for the strings themselves. It exists to charge
+    /// a shared allocation once per traversal, which here would bill one arbitrary series for a
+    /// label the whole keyspace shares and the rest nothing. [`InternedString::amortized_size`]
+    /// splits it evenly instead, so per-key numbers add up across the keyspace.
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        // The spare capacity is real: `add_label` inserts into the middle of the vector.
+        let vec_bytes = self.0.capacity() * size_of::<InternedString>();
+        let string_bytes: usize = self.0.iter().map(InternedString::amortized_size).sum();
+        (vec_bytes + string_bytes, tracker)
     }
 }
 
@@ -306,5 +308,60 @@ mod tests {
         let display = format!("{metric_name}");
 
         assert_eq!(display, "metric{key1=\"value1\",key2=\"value2\"}");
+    }
+
+    /// The heap accounting has to hang off `get_heap_size_with_tracker`, because that -- not
+    /// `get_size` -- is what a containing type's derived `GetSize` calls. Overriding `get_size`
+    /// alone reported the labels as costing nothing at all from inside `TimeSeries`.
+    #[test]
+    fn test_heap_size_counts_interned_labels() {
+        let empty = MetricName::default().get_heap_size();
+
+        let mut metric_name = MetricName::with_capacity(8);
+        for i in 0..8 {
+            metric_name.add_label(
+                &format!("heap_size_label_{i}"),
+                &format!("a_reasonably_long_label_value_{i}"),
+            );
+        }
+
+        let labelled = metric_name.get_heap_size();
+        let payload: usize = (0..8)
+            .map(|i| format!("heap_size_label_{i}=a_reasonably_long_label_value_{i}").len())
+            .sum();
+
+        assert!(
+            labelled >= empty + payload,
+            "heap size {labelled} does not cover {payload} bytes of label text over the empty \
+             baseline of {empty}",
+        );
+    }
+
+    /// One pool allocation backs every series carrying the same pair, so each holder reports a
+    /// share of it: charging all of it to all of them would make the sum of `MEMORY USAGE` over
+    /// a keyspace exceed what the module holds by the sharing factor.
+    #[test]
+    fn test_shared_labels_are_amortized_across_holders() {
+        let mut only = MetricName::with_capacity(1);
+        only.add_label("amortize_probe", "shared_value_for_the_amortization_test");
+        let sole_holder = only.get_heap_size();
+
+        let mut sharers = Vec::new();
+        for _ in 0..4 {
+            let mut mn = MetricName::with_capacity(1);
+            mn.add_label("amortize_probe", "shared_value_for_the_amortization_test");
+            sharers.push(mn);
+        }
+
+        let per_holder = sharers[0].get_heap_size();
+        assert!(
+            per_holder < sole_holder,
+            "a pair shared five ways ({per_holder}) should cost each holder less than one held \
+             alone ({sole_holder})",
+        );
+        // Every holder agrees, and together they account for the whole allocation once.
+        for mn in &sharers {
+            assert_eq!(mn.get_heap_size(), per_holder);
+        }
     }
 }

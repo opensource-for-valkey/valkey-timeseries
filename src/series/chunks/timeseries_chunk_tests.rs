@@ -7,7 +7,7 @@ mod tests {
     use crate::series::chunks::merge::merge_by_capacity;
     use crate::series::{
         DuplicatePolicy, SampleAddResult,
-        chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk},
+        chunks::{Chunk, ChunkEncoding, ChunkOps, MIN_CHUNK_SIZE, TimeSeriesChunk},
     };
     use crate::tests::chunk_utils::encoded_size;
     use crate::tests::generators::{DataGenerator, ValueWorkload};
@@ -1283,6 +1283,70 @@ mod tests {
                 "{chunk_type:?}: memory_usage {filled} does not cover {payload} encoded \
                  bytes over the empty baseline of {empty}",
             );
+        }
+    }
+
+    /// `size()` is the encoded payload, for every encoding.
+    ///
+    /// Gorilla and chimp used to return the encoder's `get_size()` — the bit stream's `Vec`
+    /// *capacity* plus the encoder struct's own stack bytes. The stream grows by doubling, so
+    /// that over-reported the data by up to ~2x (measured: a chimp chunk holding 2282 encoded
+    /// bytes reported 4192), which `TS.INFO DEBUG` surfaces directly as a chunk's `size` and
+    /// `bytesPerSample`. `is_full` always measured the payload; this is the assertion that the
+    /// two agree.
+    #[test]
+    fn test_chunk_size_reports_encoded_bytes() {
+        const SAMPLE_COUNT: usize = 2000;
+
+        for chunk_type in CHUNK_TYPES {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 1024 * 1024);
+            for sample in generate_random_samples(SAMPLE_COUNT).iter() {
+                chunk.add_sample(sample).unwrap();
+            }
+
+            let reported = chunk.size();
+            let written = match &chunk {
+                TimeSeriesChunk::Uncompressed(c) => c.samples.len() * size_of::<Sample>(),
+                TimeSeriesChunk::Gorilla(c) => c.encoder.buf().len(),
+                TimeSeriesChunk::Chimp(c) => c.encoder.bytes().len(),
+            };
+
+            assert_eq!(
+                reported, written,
+                "{chunk_type:?}: size() reported {reported} for {written} encoded bytes",
+            );
+            // The allocation is still reported in full, and is never smaller than the payload.
+            assert!(
+                chunk.memory_usage() >= reported,
+                "{chunk_type:?}: memory_usage {} is below the {reported} bytes of payload",
+                chunk.memory_usage(),
+            );
+        }
+    }
+
+    /// A compressed chunk pushed past `max_size` must not wrap its remaining capacity.
+    ///
+    /// `GorillaChunk::remaining_capacity` was a plain `max_size - data_size()`, and this crate
+    /// builds release without `overflow-checks`, so an over-full chunk wrapped to a `usize` near
+    /// `usize::MAX` — which `remaining_samples` then divided into a huge sample estimate.
+    #[test]
+    fn test_remaining_capacity_saturates_on_an_over_full_chunk() {
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, MIN_CHUNK_SIZE);
+            for sample in generate_random_samples(4096).iter() {
+                let _ = chunk.add_sample(sample);
+            }
+            assert!(
+                chunk.size() > MIN_CHUNK_SIZE,
+                "{chunk_type:?}: chunk never exceeded max_size, the guard is untested",
+            );
+
+            let remaining = match &chunk {
+                TimeSeriesChunk::Gorilla(c) => c.remaining_capacity(),
+                TimeSeriesChunk::Chimp(c) => c.remaining_capacity(),
+                TimeSeriesChunk::Uncompressed(_) => unreachable!(),
+            };
+            assert_eq!(remaining, 0, "{chunk_type:?}: remaining capacity wrapped");
         }
     }
 

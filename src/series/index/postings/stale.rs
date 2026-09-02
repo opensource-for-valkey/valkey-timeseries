@@ -32,6 +32,12 @@ impl StaleSet {
         self.ids.cardinality()
     }
 
+    /// Bytes the tombstone bitmap's roaring containers occupy.
+    #[inline]
+    pub(in crate::series::index) fn heap_size(&self) -> usize {
+        crate::series::index::memory::bitmap_heap_size(&self.ids)
+    }
+
     /// How many of `postings`' ids are stale. Cheaper than masking when only the count is wanted.
     #[inline]
     pub(in crate::series::index) fn stale_count_in(&self, postings: &PostingsBitmap) -> u64 {

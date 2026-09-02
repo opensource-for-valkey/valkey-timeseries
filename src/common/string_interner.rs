@@ -268,6 +268,26 @@ impl InternedString {
         self.ref_count() == 1
     }
 
+    /// Bytes the pool allocated for this value: the `Arc` control block (the strong and weak
+    /// counts) followed by the payload.
+    ///
+    /// `GetSize` on the inner `Arc<[u8]>` counts the payload only, which understates every
+    /// interned string by a fixed 16 bytes on a 64-bit target -- material for label values,
+    /// which are short.
+    pub fn allocated_size(&self) -> usize {
+        2 * size_of::<usize>() + self.arc.len()
+    }
+
+    /// This holder's share of [`Self::allocated_size`].
+    ///
+    /// A single pool allocation backs every series carrying the same `label=value` pair, so
+    /// charging all of it to each holder would multiply-count it: summing `MEMORY USAGE` over a
+    /// keyspace would report far more memory than the module holds. Splitting it evenly keeps
+    /// that sum equal to the pool's real footprint, which is the number capacity planning wants.
+    pub fn amortized_size(&self) -> usize {
+        self.allocated_size().div_ceil(self.ref_count().max(1))
+    }
+
     /// Return the number of unique interned strings.
     pub fn interned_count() -> usize {
         read_lock(&STRING_POOL).len()
