@@ -41,7 +41,7 @@ pub static VK_TIME_SERIES_TYPE: ValkeyType = ValkeyType::new(
         aux_load: Some(aux_load),
         aux_save: None,
         aux_save_triggers: REDISMODULE_AUX_BEFORE_RDB as i32,
-        free_effort: None,
+        free_effort: Some(free_effort),
         unlink: Some(unlink),
         copy: Some(copy),
         defrag: Some(defrag),
@@ -144,13 +144,47 @@ unsafe extern "C" fn mem_usage(value: *const c_void) -> usize {
     series.memory_usage()
 }
 
+/// How much work freeing this value is, in allocations.
+///
+/// Without this callback the server assumes 1, which is below its `LAZYFREE_THRESHOLD` of 64, so
+/// every series -- a multi-million-sample one included -- was freed synchronously on the main
+/// thread and `UNLINK`, `lazyfree-lazy-expire` and friends did nothing for this type.
+///
+/// Registering it means `free` can now run on a lazyfree thread for any sizeable series, which
+/// is why that callback no longer touches the index at all -- see the comment there.
+unsafe extern "C" fn free_effort(_key: *mut RedisModuleString, value: *const c_void) -> usize {
+    if value.is_null() {
+        return 1;
+    }
+    let series = unsafe { &*value.cast::<TimeSeries>() };
+    series.free_effort()
+}
+
+/// Drop the value. Deliberately nothing else -- in particular, no index work.
+///
+/// The server reaches this through exactly one call site (`freeModuleObject`, from
+/// `decrRefCount`), and only from three places above it: `dbGenericDelete` and `dbOverwrite`,
+/// both of which fire `unlink` first, and `emptyDbStructure`, where a flush retires whole
+/// indexes at once. So `unlink` is the sole owner of index retirement and this callback has
+/// nothing left to do.
+///
+/// It used to call `remove_series_from_index` here as well, which was not merely redundant:
+///
+///   * on every `DEL`/`UNLINK` it took the index write lock to remove an id that `unlink` had
+///     removed moments earlier, logging "Tried to remove non-existing series id" each time --
+///     one spurious warning per deleted series, reproduced at 8 for 8 deletes; and
+///   * on a `FLUSHALL ASYNC` it did the same per key. `IS_FLUSHING` does not cover that: the
+///     flush-end event fires as soon as `emptyData` returns, while the bio thread is still
+///     draining the queue, so most of those frees see the flag already cleared and go on to
+///     search an index that has just been emptied wholesale.
+///
+/// That second case is the reason this matters more now than it did. `free_effort` routinely
+/// puts this callback on a lazyfree thread, so the redundant write lock would be taken from a
+/// background thread, contending with main-thread queries for no result.
 #[allow(unused)]
 unsafe extern "C" fn free(value: *mut c_void) {
     let sm = value.cast::<TimeSeries>();
-    let series = unsafe { Box::from_raw(sm) };
-    // todo: it may be helpful to push index deletion to a background thread
-    remove_series_from_index(&series);
-    drop(series);
+    drop(unsafe { Box::from_raw(sm) });
 }
 
 #[allow(non_snake_case, unused)]
@@ -175,6 +209,8 @@ unsafe extern "C" fn copy(
     Box::into_raw(Box::new(new_series)).cast::<c_void>()
 }
 
+/// Retire the series from the index. This is the *only* place that happens for a single key --
+/// see `free` for why, and for the paths the server guarantees reach here first.
 unsafe extern "C" fn unlink(_key: *mut RedisModuleString, value: *const c_void) {
     if value.is_null() {
         return;
@@ -193,10 +229,15 @@ unsafe extern "C" fn defrag(
     }
     // Convert the pointer to a TimeSeries so we can operate on it.
     let series: &mut TimeSeries = unsafe { &mut *(*value).cast::<TimeSeries>() };
-    match defrag_series(series) {
-        Ok(_) => 0,
-        Err(_) => 1,
+    if let Err(e) = defrag_series(series) {
+        logging::log_warning(format!("TSDB: Error defragmenting series: {e:?}"));
     }
+    // Always "done". A non-zero return asks the server to call us again with the cursor it
+    // passed, and `defrag_series` is not incremental -- it compacts the whole series in one
+    // call. Returning 1 on failure, as this did, would have spun `moduleLateDefrag` on a series
+    // that fails every time. That path was unreachable while `free_effort` was unregistered
+    // (effort 1 always defragged inline); registering it makes a large series take it.
+    0
 }
 
 /// # Safety

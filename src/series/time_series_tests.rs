@@ -1934,4 +1934,82 @@ mod tests {
             Some(backfilled),
         );
     }
+
+    /// The server's own `LAZYFREE_THRESHOLD`. Anything at or below this is freed inline; above
+    /// it, the value is handed to a background thread (`lazyfree.c`).
+    const LAZYFREE_THRESHOLD: usize = 64;
+
+    /// A series big enough to be worth a thread hop must report enough effort to get one.
+    ///
+    /// The callback used to be unregistered, which the server reads as an effort of 1 -- so a
+    /// multi-million-sample series was always freed on the main thread and `UNLINK` and the
+    /// `lazyfree-lazy-*` settings did nothing for this type.
+    #[test]
+    fn test_free_effort_crosses_the_lazyfree_threshold_for_a_large_series() {
+        let mut series = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_size: Some(1024),
+            ..Default::default()
+        })
+        .unwrap();
+        for i in 0..200_000i64 {
+            series.add(1_600_000_000_000 + i * 1000, i as f64 * 1.37, None);
+        }
+
+        assert!(
+            series.chunks.len() > LAZYFREE_THRESHOLD,
+            "series only has {} chunks; the threshold is not being exercised",
+            series.chunks.len()
+        );
+        assert!(
+            series.free_effort() > LAZYFREE_THRESHOLD,
+            "a {}-chunk series reports an effort of {}, at or below the threshold of \
+             {LAZYFREE_THRESHOLD}: it would still be freed on the main thread",
+            series.chunks.len(),
+            series.free_effort(),
+        );
+    }
+
+    /// The converse: a small series must stay inline. Handing every value to the bio thread is
+    /// slower than freeing a couple of allocations here, which is the whole reason the server
+    /// has a threshold rather than always deferring.
+    #[test]
+    fn test_free_effort_keeps_a_small_series_inline() {
+        let mut series = create_test_series();
+        for i in 0..10i64 {
+            series.add(1_600_000_000_000 + i * 1000, i as f64, None);
+        }
+        assert!(
+            series.free_effort() <= LAZYFREE_THRESHOLD,
+            "a 10-sample series reports an effort of {}",
+            series.free_effort()
+        );
+    }
+
+    /// Effort tracks the allocation count, so it has to grow with the chunks.
+    #[test]
+    fn test_free_effort_grows_with_the_series() {
+        let build = |samples: i64| {
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_size: Some(1024),
+                ..Default::default()
+            })
+            .unwrap();
+            for i in 0..samples {
+                series.add(1_600_000_000_000 + i * 1000, i as f64 * 1.37, None);
+            }
+            series
+        };
+
+        let small = build(5_000);
+        let large = build(100_000);
+        assert!(large.chunks.len() > small.chunks.len());
+        assert!(
+            large.free_effort() > small.free_effort(),
+            "{} chunks reports {} effort, {} chunks reports {}",
+            large.chunks.len(),
+            large.free_effort(),
+            small.chunks.len(),
+            small.free_effort(),
+        );
+    }
 }

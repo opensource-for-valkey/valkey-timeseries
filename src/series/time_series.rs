@@ -966,6 +966,29 @@ impl TimeSeries {
         size_of::<Self>() + self.get_heap_size()
     }
 
+    /// The number of heap allocations dropping this series will release.
+    ///
+    /// This is the `free_effort` the server compares against its `LAZYFREE_THRESHOLD` (64) to
+    /// decide between freeing the value inline and handing it to a background thread. Leaving
+    /// the callback unregistered means the server assumes 1, so a series of any size was always
+    /// freed synchronously on the main thread -- `UNLINK` and every `lazyfree-lazy-*` setting
+    /// were inert for this type. The same figure also decides whether active defrag handles the
+    /// value inline or defers it to the incremental `defragLater` queue.
+    ///
+    /// Counting allocations, not bytes, is what the server's own estimators do (a quicklist
+    /// reports its node count, a stream its macro nodes): the cost being modelled is the number
+    /// of `free` calls, not the volume.
+    pub fn free_effort(&self) -> usize {
+        // The chunk vector, plus one buffer per chunk -- a bit stream for the compressed
+        // encodings, a sample vector for the uncompressed one.
+        let chunks = 1 + self.chunks.len();
+        // The label vector, plus one interned string per label. Shared pairs survive the drop,
+        // so this is an upper bound; labels are a rounding error next to chunks either way.
+        let labels = 1 + self.labels.len();
+        let rules = 1 + self.rules.len();
+        chunks + labels + rules
+    }
+
     /// Returns the minimum timestamp of the time series, considering the retention period.
     pub(crate) fn get_min_timestamp(&self) -> Timestamp {
         if self.retention.is_zero() {
