@@ -127,13 +127,14 @@ pub fn query_labels_distinct(
     // Resolve under the guard, open afterwards. See [`resolve_series_keys`].
     let resolved = {
         let postings = index.get_postings();
-        let ids: Vec<SeriesRef> = if selectors.is_empty() {
-            postings.all_postings.iter().collect()
+        if selectors.is_empty() {
+            // Iterate the bitmap in place: collecting it first would allocate a `Vec` holding
+            // every series id in the database before a single key is resolved.
+            resolve_series_keys(ctx, &postings, postings.all_postings.iter(), &mut stale)
         } else {
             let refs = postings.postings_for_selectors(selectors)?;
-            refs.iter().collect()
-        };
-        resolve_series_keys(ctx, &postings, ids.into_iter(), &mut stale)
+            resolve_series_keys(ctx, &postings, refs.iter(), &mut stale)
+        }
     };
 
     let mut result: BTreeSet<String> = BTreeSet::new();

@@ -78,6 +78,8 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
                 client.execute_command('TS._RESTORE', f'garbage{i}', blob)
             except Exception as e:
                 assert 'failed to deserialize' in str(e), f'unexpected error for {blob!r}: {e}'
+            else:
+                raise AssertionError(f'TS._RESTORE accepted a garbage payload: {blob!r}')
             assert client.ping()
         assert self.server.is_alive()
 
@@ -95,6 +97,8 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
                 client.execute_command('TS._RESTORE', f'trunc{cut}', payload[:cut])
             except Exception as e:
                 assert 'failed to deserialize' in str(e), f'unexpected error at cut {cut}: {e}'
+            else:
+                raise AssertionError(f'TS._RESTORE accepted a payload truncated to {cut} bytes')
             assert client.ping(), f'server died on truncation at {cut} bytes'
         assert self.server.is_alive()
 

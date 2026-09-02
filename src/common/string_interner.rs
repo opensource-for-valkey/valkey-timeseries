@@ -58,6 +58,16 @@ static STRING_POOL: LazyLock<StringContainer> =
 /// Total memory used by all interned strings.
 static STRING_MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes the pool allocated for `arc`: the `Arc` control block (the strong and weak counts)
+/// followed by the payload.
+///
+/// `GetSize` on `Arc<[u8]>` counts the payload only, which understates every interned string by
+/// a fixed 16 bytes on a 64-bit target -- material for label values, which are short. Every site
+/// that accounts for pool memory goes through here so the counters agree.
+fn arc_allocated_size(arc: &Arc<[u8]>) -> usize {
+    2 * size_of::<usize>() + arc.len()
+}
+
 #[derive(Default)]
 pub struct BucketStats {
     pub count: usize,
@@ -237,7 +247,7 @@ impl InternedString {
         }
 
         // Insert new value
-        let size = val.get_size();
+        let size = arc_allocated_size(&val);
         pool.insert(val.clone());
         STRING_MEMORY_USED.fetch_add(size, std::sync::atomic::Ordering::SeqCst);
 
@@ -269,13 +279,9 @@ impl InternedString {
     }
 
     /// Bytes the pool allocated for this value: the `Arc` control block (the strong and weak
-    /// counts) followed by the payload.
-    ///
-    /// `GetSize` on the inner `Arc<[u8]>` counts the payload only, which understates every
-    /// interned string by a fixed 16 bytes on a 64-bit target -- material for label values,
-    /// which are short.
+    /// counts) followed by the payload. See [`arc_allocated_size`].
     pub fn allocated_size(&self) -> usize {
-        2 * size_of::<usize>() + self.arc.len()
+        arc_allocated_size(&self.arc)
     }
 
     /// This holder's share of [`Self::allocated_size`].
@@ -313,7 +319,7 @@ impl InternedString {
 
         for arc in pool.iter() {
             let ref_count = Arc::strong_count(arc) - 1; // exclude the pool's reference
-            let allocated = arc.get_size();
+            let allocated = arc_allocated_size(arc);
             let bytes = arc.as_ref().len();
 
             let by_ref_stats = stats.by_ref_stats.entry(ref_count).or_default();
@@ -456,7 +462,7 @@ impl Drop for InternedString {
         // Only remove/account if the pool currently contains this arc AND `self` is
         // the last external reference at the moment we hold the write lock.
         if Arc::strong_count(&self.arc) == 2 && pool.remove(&self.arc) {
-            let size = self.arc.get_size();
+            let size = arc_allocated_size(&self.arc);
             STRING_MEMORY_USED.fetch_sub(size, std::sync::atomic::Ordering::SeqCst);
         }
     }
