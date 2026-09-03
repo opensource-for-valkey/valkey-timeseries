@@ -237,10 +237,10 @@ fn parse_label_filters_internal(p: &mut Lexer<Token>) -> ParseResult<(FilterList
             matchers.push(matcher);
         }
 
-        let tok = tok.unwrap_or_else(|| {
-            let (t, _) = expect_one_of_tokens(p, &[Comma, RightBrace, OpOr]).unwrap();
-            t
-        });
+        let tok = match tok {
+            Some(tok) => tok,
+            None => expect_one_of_tokens(p, &[Comma, RightBrace, OpOr])?.0,
+        };
 
         if tok == RightBrace || tok == OpOr {
             return Ok((matchers, tok, metric_name_seen));

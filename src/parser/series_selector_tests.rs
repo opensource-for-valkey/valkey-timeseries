@@ -101,6 +101,13 @@ mod tests {
     }
 
     #[test]
+    fn test_regex_matcher_with_trailing_token_returns_parse_error() {
+        let result = parse_series_selector(r#"{job=~"prometheus" unexpected}"#);
+
+        assert!(result.is_err(), "malformed selector must not panic");
+    }
+
+    #[test]
     fn test_series_selector_number_literal_value() {
         let input = "job=1234";
         let result = parse_series_selector(input).unwrap();
