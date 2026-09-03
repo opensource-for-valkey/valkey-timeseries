@@ -54,18 +54,45 @@ fn incr_decr(ctx: &Context, args: Vec<ValkeyString>, is_increment: bool) -> Valk
     let delta = parse_value_arg(&args[2])
         .map_err(|_| ValkeyError::Str(error_consts::INVALID_INCREMENT_VALUE))?;
     let timestamp = handle_parse_timestamp(&mut args)?;
-    let key_name = &args[1];
 
-    if let Some(mut series) = get_timeseries_mut(
+    // Captured for replication before the create path consumes `args`. `TIMESTAMP` has
+    // already been stripped above, so `create_options` holds only the auto-creation
+    // arguments (RETENTION, LABELS, CHUNK_SIZE, ...) that a replica needs to build the
+    // same series.
+    let key_name = args[1].clone();
+    let delta_arg = args[2].clone();
+    let create_options = args[3..].to_vec();
+
+    let outcome = if let Some(mut series) = get_timeseries_mut(
         ctx,
-        key_name,
+        &key_name,
         false,
         Some(AclPermissions::UPDATE | AclPermissions::ACCESS),
     )? {
-        handle_update(ctx, &mut series, key_name, timestamp, delta, is_increment)
+        handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)?
     } else {
-        create_series_and_update(ctx, args, timestamp, delta, is_increment)
+        create_series_and_update(ctx, args, timestamp, delta, is_increment)?
+    };
+
+    if outcome.replicate {
+        replicate_and_notify(
+            ctx,
+            &key_name,
+            &delta_arg,
+            &create_options,
+            is_increment,
+            outcome.timestamp,
+        );
     }
+
+    Ok(ValkeyValue::Integer(outcome.timestamp))
+}
+
+/// What a successful increment settled on: the sample timestamp to report to the
+/// caller, and whether the series actually changed and so must be propagated.
+struct IncrOutcome {
+    timestamp: Timestamp,
+    replicate: bool,
 }
 
 fn create_series_and_update(
@@ -74,7 +101,7 @@ fn create_series_and_update(
     timestamp: Option<Timestamp>,
     delta: f64,
     is_increment: bool,
-) -> ValkeyResult {
+) -> ValkeyResult<IncrOutcome> {
     let key_name = args.remove(1);
     const INVALID_ARGS: &[CommandArgToken] = &[CommandArgToken::OnDuplicate];
 
@@ -111,7 +138,7 @@ fn handle_update(
     timestamp: Option<Timestamp>,
     delta: f64,
     is_increment: bool,
-) -> ValkeyResult {
+) -> ValkeyResult<IncrOutcome> {
     let delta = if !is_increment { -delta } else { delta };
 
     // Captured before the write: an increment at exactly the last timestamp updates the
@@ -132,12 +159,15 @@ fn handle_update(
             if series.total_samples > samples_before {
                 signal_timeseries_ready(ctx, key_name);
             }
-            replicate_and_notify(ctx, key_name, is_increment, added.timestamp)
+            Ok(IncrOutcome {
+                timestamp: added.timestamp,
+                replicate: true,
+            })
         }
-        SampleAddResult::Ignored(_ts) => {
-            let last_ts = series.last_timestamp();
-            Ok(ValkeyValue::Integer(last_ts))
-        }
+        SampleAddResult::Ignored(_ts) => Ok(IncrOutcome {
+            timestamp: series.last_timestamp(),
+            replicate: false,
+        }),
         SampleAddResult::Duplicate => Err(ValkeyError::Str(error_consts::DUPLICATE_SAMPLE_BLOCKED)),
         SampleAddResult::Error(err) => Err(ValkeyError::Str(err)),
         _ => {
@@ -178,18 +208,33 @@ fn run_compaction_for_increment(
     })
 }
 
+/// Propagate the increment with the timestamp the primary actually used.
+///
+/// Verbatim replication is wrong here: without an explicit `TIMESTAMP`, a replica (or an
+/// AOF reload) re-derives "now" and lands the increment on a different timestamp than the
+/// primary. That diverges the sample set outright, and then diverges retention trimming
+/// and compaction-bucket assignment on top of it. Sending the resolved timestamp — plus
+/// the original auto-creation options, so a replica that has to create the series gets the
+/// same retention, labels and chunk size — makes the write deterministic.
 fn replicate_and_notify(
     ctx: &Context,
     key_name: &ValkeyString,
+    delta_arg: &ValkeyString,
+    create_options: &[ValkeyString],
     is_increment: bool,
     ts: Timestamp,
-) -> ValkeyResult {
-    let event = if is_increment {
-        "ts.incrby"
+) {
+    let (command, event) = if is_increment {
+        ("TS.INCRBY", "ts.incrby")
     } else {
-        "ts.decrby"
+        ("TS.DECRBY", "ts.decrby")
     };
-    ctx.replicate_verbatim();
+
+    let timestamp_token = ctx.create_string("TIMESTAMP");
+    let timestamp_arg = ctx.create_string(ts.to_string().as_bytes());
+    let mut replication_args = vec![key_name, delta_arg, &timestamp_token, &timestamp_arg];
+    replication_args.extend(create_options.iter());
+
+    ctx.replicate(command, &*replication_args);
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
-    Ok(ValkeyValue::Integer(ts))
 }

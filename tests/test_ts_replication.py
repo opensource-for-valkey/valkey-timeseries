@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import List
 
 import pytest
@@ -399,3 +400,161 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         info_dict = parse_info_response(info)
         # Rules should be empty or not present
         assert "rules" not in info_dict or len(info_dict["rules"]) == 0
+
+    def assert_series_matches_replica(self, key):
+        """Assert the replica holds byte-identical samples for `key`."""
+        self.wait_for_replication()
+        replica_client = self.replicas[0].client
+        primary_samples = self.client.execute_command(f"TS.RANGE {key} - +")
+        replica_samples = replica_client.execute_command(f"TS.RANGE {key} - +")
+        assert replica_samples == primary_samples
+        return primary_samples
+
+    def await_propagated_command(self, monitor, name, deadline_seconds=5):
+        """Return the first command MONITOR reports on the replica whose name is `name`."""
+        deadline = time.time() + deadline_seconds
+        while time.time() < deadline:
+            entry = monitor.next_command()
+            if entry is None:
+                continue
+            command = entry.get("command", "")
+            if command.lower().startswith(name.lower()):
+                return command
+        raise AssertionError(f"{name} was never propagated to the replica")
+
+    def test_replication_ts_incrby_propagates_explicit_timestamp(self):
+        """The propagated TS.INCRBY carries the timestamp the primary resolved.
+
+        Whether an implicit "now" visibly diverges depends on how far apart the primary's
+        and replica's clock reads happen to land, so assert the propagated command itself:
+        MONITOR on the replica shows exactly what arrived over the replication link.
+        """
+        key = "ts:incr_propagated"
+
+        monitor_client = self.replicas[0].get_new_client()
+        monitor_client.connection_pool.connection_kwargs["socket_timeout"] = 5
+
+        with monitor_client.monitor() as monitor:
+            returned = self.client.execute_command(f"TS.INCRBY {key} 3 RETENTION 60000")
+            propagated = self.await_propagated_command(monitor, "ts.incrby")
+
+        parts = propagated.split()
+        assert parts[1].strip('"') == key
+        assert "TIMESTAMP" in [p.strip('"').upper() for p in parts], (
+            f"TS.INCRBY propagated without an explicit timestamp: {propagated}"
+        )
+        ts_index = [p.strip('"').upper() for p in parts].index("TIMESTAMP")
+        assert int(parts[ts_index + 1].strip('"')) == returned
+        # The auto-creation options ride along so a replica that has to create the series
+        # builds the same one.
+        assert "RETENTION" in [p.strip('"').upper() for p in parts]
+
+    def test_replication_ts_incrby_without_timestamp(self):
+        """TS.INCRBY without TIMESTAMP must land on the same timestamp on the replica.
+
+        The primary derives "now" when the caller omits TIMESTAMP. If the command were
+        replicated verbatim the replica would derive its own clock reading and diverge.
+        """
+        key = "ts:incr_no_ts"
+
+        assert self.client.execute_command(f"TS.CREATE {key}") == b"OK"
+
+        returned = []
+        for _ in range(5):
+            returned.append(self.client.execute_command(f"TS.INCRBY {key} 1"))
+
+        samples = self.assert_series_matches_replica(key)
+
+        # Every sample sits on a timestamp the primary reported, not one the replica invented.
+        assert {ts for ts, _ in samples} <= set(returned)
+        # The counter total survives regardless of how many increments collapsed into the
+        # same millisecond.
+        assert sum(float(v) for _, v in samples) == 5.0
+
+    def test_replication_ts_decrby_without_timestamp(self):
+        """TS.DECRBY without TIMESTAMP replicates the primary's resolved timestamp."""
+        key = "ts:decr_no_ts"
+
+        assert self.client.execute_command(f"TS.CREATE {key}") == b"OK"
+        self.client.execute_command(f"TS.ADD {key} * 100")
+
+        for _ in range(4):
+            self.client.execute_command(f"TS.DECRBY {key} 2.5")
+
+        self.assert_series_matches_replica(key)
+
+    def test_replication_ts_incrby_autocreates_with_options(self):
+        """An auto-creating TS.INCRBY carries its creation options to the replica."""
+        key = "ts:incr_autocreate"
+
+        self.client.execute_command(
+            f"TS.INCRBY {key} 7 RETENTION 500000 CHUNK_SIZE 128 LABELS sensor temp room r1"
+        )
+
+        self.wait_for_replication()
+        replica_client = self.replicas[0].client
+
+        assert replica_client.execute_command(f"EXISTS {key}") == 1
+
+        info = parse_info_response(replica_client.execute_command(f"TS.INFO {key}"))
+        assert info["retentionTime"] == 500000
+        assert info["chunkSize"] == 128
+        assert info["labels"] == {"sensor": "temp", "room": "r1"}
+
+        self.assert_series_matches_replica(key)
+
+    def test_replication_ts_incrby_retention_trim(self):
+        """Retention trimming driven by TS.INCRBY leaves the same window on the replica.
+
+        The clock-derived first sample anchors every later timestamp. If the replica read
+        its own clock it would anchor elsewhere and then either reject the explicit-timestamp
+        increments as too old or keep a stray sample of its own — either way the retained
+        window would differ.
+        """
+        key = "ts:incr_retention"
+
+        assert self.client.execute_command(f"TS.CREATE {key} RETENTION 5000") == b"OK"
+
+        anchor = self.client.execute_command(f"TS.INCRBY {key} 1")
+        for i in range(1, 10):
+            self.client.execute_command(f"TS.INCRBY {key} 1 TIMESTAMP {anchor + i * 1000}")
+
+        self.assert_series_matches_replica(key)
+
+        # Trimming is chunk-granular, so which old samples survive is an implementation
+        # detail — but the retained window's endpoints must be identical on both sides.
+        primary_info = parse_info_response(self.client.execute_command(f"TS.INFO {key}"))
+        replica_info = parse_info_response(
+            self.replicas[0].client.execute_command(f"TS.INFO {key}")
+        )
+        assert primary_info["lastTimestamp"] == anchor + 9000
+        assert replica_info["firstTimestamp"] == primary_info["firstTimestamp"]
+        assert replica_info["lastTimestamp"] == primary_info["lastTimestamp"]
+        assert replica_info["totalSamples"] == primary_info["totalSamples"]
+
+    def test_replication_ts_incrby_compaction(self):
+        """Compaction fed by TS.INCRBY produces the same destination series on the replica.
+
+        Bucket boundaries are absolute, so an anchor sample the replica timed itself would
+        distribute the rollup across different buckets.
+        """
+        source_key = "ts:incr_comp_src"
+        dest_key = "ts:incr_comp_dst"
+
+        assert self.client.execute_command(f"TS.CREATE {source_key}") == b"OK"
+        assert self.client.execute_command(f"TS.CREATE {dest_key}") == b"OK"
+        assert self.client.execute_command(
+            f"TS.CREATERULE {source_key} {dest_key} AGGREGATION sum 1000"
+        ) == b"OK"
+
+        anchor = self.client.execute_command(f"TS.INCRBY {source_key} 2")
+        for i in range(1, 12):
+            self.client.execute_command(
+                f"TS.INCRBY {source_key} 2 TIMESTAMP {anchor + i * 400}"
+            )
+        # Close the trailing bucket so the rollup is committed on both sides.
+        self.client.execute_command(f"TS.INCRBY {source_key} 2 TIMESTAMP {anchor + 20000}")
+
+        self.assert_series_matches_replica(source_key)
+        dest_samples = self.assert_series_matches_replica(dest_key)
+        assert len(dest_samples) > 0
