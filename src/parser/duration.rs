@@ -74,56 +74,40 @@ pub fn parse_duration_value(s: &str) -> ParseResult<i64> {
 }
 
 fn scan_duration_segment(s: &str) -> ParseResult<(f64, &str)> {
-    fn parse_prefix(str: &str, i: usize) -> ParseResult<f64> {
-        let num_str = &str[0..i];
+    fn parse_prefix(str: &str, end: usize) -> ParseResult<f64> {
+        let num_str = &str[..end];
         match num_str.parse::<f64>() {
             Ok(num) => Ok(num),
             Err(_) => Err(ParseError::InvalidDuration(num_str.to_string())),
         }
     }
 
-    let mut i = 0;
-    let mut suffix_char = '\0';
+    let mut suffix_start = s.len();
+    let mut suffix_char = None;
 
-    for ch in s.chars() {
+    for (index, ch) in s.char_indices() {
         if matches!(ch, 'd' | 'h' | 'm' | 's' | 'w' | 'y') {
-            suffix_char = ch;
+            suffix_start = index;
+            suffix_char = Some(ch);
             break;
         }
-        i += 1;
     }
 
-    let number_part = parse_prefix(s, i)?;
-    let multiplier = match suffix_char {
-        'm' => {
-            if i + 1 < s.len() {
-                let cursor = &s[i..];
-                let curr = cursor.chars().nth(1).unwrap();
-                if curr == 's' {
-                    // duration in ms
-                    i += 1;
-                    1.0
-                } else {
-                    MILLIS_PER_MINUTE
-                }
-            } else {
-                // duration in minutes
-                MILLIS_PER_MINUTE
-            }
-        }
-        's' => MILLIS_PER_SECOND,
-        'h' => MILLIS_PER_HOUR,
-        'd' => MILLIS_PER_DAY,
-        'w' => MILLIS_PER_WEEK,
-        'y' => MILLIS_PER_YEAR,
-        _ => {
-            i -= 1;
-            1.0
-        }
+    let number_part = parse_prefix(s, suffix_start)?;
+    let (multiplier, suffix_len) = match suffix_char {
+        Some('m') if s[suffix_start..].starts_with("ms") => (1.0, 2),
+        Some('m') => (MILLIS_PER_MINUTE, 1),
+        Some('s') => (MILLIS_PER_SECOND, 1),
+        Some('h') => (MILLIS_PER_HOUR, 1),
+        Some('d') => (MILLIS_PER_DAY, 1),
+        Some('w') => (MILLIS_PER_WEEK, 1),
+        Some('y') => (MILLIS_PER_YEAR, 1),
+        Some(_) => (1.0, 0),
+        None => (1.0, 0),
     };
 
     let duration = number_part * multiplier;
-    let remaining = &s[i + 1..];
+    let remaining = &s[suffix_start + suffix_len..];
     Ok((duration, remaining))
 }
 
@@ -333,6 +317,11 @@ mod tests {
         f("3D");
         f("3H");
         f("3S")
+    }
+
+    #[test]
+    fn test_duration_unicode_prefix_returns_error() {
+        assert!(parse_duration_value("éé1s").is_err());
     }
 
     #[test]
