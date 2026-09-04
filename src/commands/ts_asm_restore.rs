@@ -16,7 +16,7 @@
 //! The same command is emitted during ordinary AOF rewrites when the AOF is written in command
 //! format (i.e. without the RDB preamble), so this path is also exercised on plain AOF load.
 
-use crate::common::context::get_current_db;
+use crate::common::context::{get_current_db, is_real_user_client};
 use crate::series::TimeSeries;
 use crate::series::index::index_series_by_key;
 use crate::series::index::server_events::{add_delayed_indexing_key, is_in_asm_slot_import};
@@ -25,7 +25,18 @@ use std::os::raw::c_void;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};
 
 /// `TS._RESTORE key <serialized-payload>`
+///
+/// Internal-only: fed by `aof_rewrite`/AOF replay, never meant to be invoked by a regular
+/// client. The payload bypasses `RESTORE`'s DUMP footer (version/CRC) checks entirely, so a
+/// direct client call can be used to inject a crafted `TimeSeries` straight past that
+/// validation. `is_real_user_client` rejects any caller that isn't the AOF-replay sentinel or a
+/// replicated (master-link) command, mirroring the same guard used for `is_acl_enforced`.
 pub fn ts_asm_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if is_real_user_client(ctx) {
+        return Err(ValkeyError::Str(
+            "ERR TS._RESTORE is an internal command and cannot be invoked directly",
+        ));
+    }
     if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
     }
