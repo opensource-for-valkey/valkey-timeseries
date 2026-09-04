@@ -29,6 +29,12 @@ const MAX_RCF_NUM_TREES: usize = 512;
 const MAX_RCF_SAMPLE_SIZE: usize = 4096;
 const MAX_RCF_SHINGLE_SIZE: usize = 128;
 
+// krcf's storage is proportional to num_trees * sample_size * shingle_size
+// (point store plus per-tree node stores). Each individual option is bounded
+// above, but the maximum combination (512 * 4096 * 128 ~= 268M points) still
+// drives multi-gigabyte allocations, so also cap the product directly.
+const MAX_RCF_COMBINED_BUDGET: u128 = 16 * 1024 * 1024;
+
 static COMMAND_OPTIONS: [CommandArgToken; 4] = [
     CommandArgToken::Direction,
     CommandArgToken::Output,
@@ -662,6 +668,17 @@ fn validate_rcf_options(options: &AnomalyOptions, sample_count: usize) -> Valkey
         )));
     }
 
+    let num_trees = rcf_options.num_trees.unwrap_or(RCF_DEFAULT_NUM_TREES);
+    let sample_size = rcf_options.sample_size.unwrap_or(RCF_DEFAULT_SAMPLE_SIZE);
+    let shingle_size = rcf_options.shingle_size.unwrap_or(1);
+
+    let combined = (num_trees as u128) * (sample_size as u128) * (shingle_size as u128);
+    if combined > MAX_RCF_COMBINED_BUDGET {
+        return Err(ValkeyError::String(format!(
+            "TSDB: combined NUM_TREES * SAMPLE_SIZE * SHINGLE_SIZE ({num_trees} * {sample_size} * {shingle_size} = {combined}) exceeds the maximum allowed budget of {MAX_RCF_COMBINED_BUDGET}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -1087,5 +1104,41 @@ fn reply_with_parameters(
         AnomalyDetectionMethodOptions::Cusum => {
             ctx.reply_with_map(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rcf_options_rejects_max_combination() {
+        let options = AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Rcf(RCFOptions {
+                num_trees: Some(MAX_RCF_NUM_TREES),
+                sample_size: Some(MAX_RCF_SAMPLE_SIZE),
+                shingle_size: Some(MAX_RCF_SHINGLE_SIZE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_rcf_options(&options, MAX_RCF_SAMPLE_SIZE)
+            .expect_err("maximum NUM_TREES/SAMPLE_SIZE/SHINGLE_SIZE combination must be rejected");
+        assert!(
+            err.to_string().contains("combined"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rcf_options_accepts_default_combination() {
+        let options = AnomalyOptions {
+            options: AnomalyDetectionMethodOptions::Rcf(RCFOptions::default()),
+            ..Default::default()
+        };
+
+        validate_rcf_options(&options, RCF_DEFAULT_SAMPLE_SIZE)
+            .expect("default RCF option combination must be within the budget");
     }
 }
