@@ -11,7 +11,7 @@ use core::mem::size_of;
 use get_size2::{GetSize, GetSizeTracker};
 use std::hash::Hash;
 use valkey_module::digest::Digest;
-use valkey_module::{RedisModuleIO, ValkeyResult, raw};
+use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
 pub const MAX_UNCOMPRESSED_SAMPLES: usize = 256;
 const FLAG_SERIALIZE_UNCOMPRESSED: u8 = 0b00000001;
@@ -248,6 +248,9 @@ impl UncompressedChunk {
                 value: val,
             });
         }
+        if !samples_are_strictly_increasing(&samples) {
+            return Err(TsdbError::ChunkDecoding);
+        }
         Ok(UncompressedChunk {
             max_size,
             samples,
@@ -271,6 +274,12 @@ fn binary_search_samples_by_timestamp(samples: &[Sample], ts: Timestamp) -> (usi
         Ok(pos) => (pos, true),
         Err(pos) => (pos, false),
     }
+}
+
+fn samples_are_strictly_increasing(samples: &[Sample]) -> bool {
+    samples
+        .windows(2)
+        .all(|pair| pair[0].timestamp < pair[1].timestamp)
 }
 
 fn get_sample_index(samples: &[Sample], ts: Timestamp) -> (usize, bool) {
@@ -488,6 +497,11 @@ impl Chunk for UncompressedChunk {
                 timestamp: ts,
                 value: val,
             });
+        }
+        if !samples_are_strictly_increasing(&samples) {
+            return Err(ValkeyError::String(
+                "Invalid uncompressed chunk: samples are not strictly ordered".to_owned(),
+            ));
         }
         Ok(UncompressedChunk {
             max_size,
@@ -1541,5 +1555,21 @@ mod tests {
             result.is_err(),
             "oversized len must be rejected, not honored"
         );
+    }
+
+    #[test]
+    fn test_deserialize_raw_rejects_unsorted_samples() {
+        use crate::common::encoding::{write_f64_le, write_uvarint};
+
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 256 * SAMPLE_SIZE as u64); // max_size
+        write_uvarint(&mut buf, 256); // max_elements
+        write_uvarint(&mut buf, 2); // len
+        write_uvarint(&mut buf, 20);
+        write_f64_le(&mut buf, 2.0);
+        write_uvarint(&mut buf, 10);
+        write_f64_le(&mut buf, 1.0);
+
+        assert!(super::UncompressedChunk::deserialize_raw(&buf).is_err());
     }
 }
