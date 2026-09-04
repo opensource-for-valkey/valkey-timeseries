@@ -2,7 +2,41 @@ use crate::aggregators::{AggregationHandler, Aggregator, BucketTimestamp};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::series::request_types::AggregationOptions;
 use smallvec::SmallVec;
-use std::collections::VecDeque;
+
+/// A pending run of empty (gap-fill) buckets, generated one at a time instead of being
+/// materialized up front. `[start, bucket_duration wide) * ceil((end_exclusive - start) /
+/// bucket_duration)` can span the entire query window when the series has a sparse or
+/// adversarial gap (e.g. one sample at each end of an i64 timestamp range), so eagerly
+/// allocating a `Vec`/`VecDeque` sized to that count -- or even just looping to push every
+/// row -- does unbounded work up front regardless of how many rows the caller actually
+/// consumes. `next_row` instead advances the cursor by one bucket per call, so a downstream
+/// `.take(COUNT)` (see `iterators::utils`) bounds the real work to what is actually read.
+///
+/// Invariant relied on by `AggregationHelper`/`MultiAggregateIterator`: at most one run is
+/// ever pending at a time -- each is fully drained (via `next_row`) before the next is
+/// queued (via `queue`). See the call sites in this file for why that holds.
+#[derive(Debug, Default, Clone, Copy)]
+struct EmptyBucketRun {
+    next_bucket: Timestamp,
+    end_exclusive: Timestamp,
+}
+
+impl EmptyBucketRun {
+    fn is_empty(&self) -> bool {
+        self.next_bucket >= self.end_exclusive
+    }
+
+    /// Replace the run with `[start, end_exclusive)`. The caller must have drained any
+    /// previously queued run first -- see the type-level invariant above.
+    fn queue(&mut self, start: Timestamp, end_exclusive: Timestamp) {
+        debug_assert!(
+            self.is_empty(),
+            "queuing an empty-bucket run over one that has not been drained"
+        );
+        self.next_bucket = start;
+        self.end_exclusive = end_exclusive;
+    }
+}
 
 /// Helper class for minimizing monomorphization overhead for AggregationIterator.
 /// Holds one aggregator per AGGREGATION list entry; all share the bucket bookkeeping,
@@ -60,7 +94,7 @@ impl AggregationHelper {
 
     fn add_empty_bucket_internal(
         &self,
-        samples: &mut VecDeque<MultiSample>,
+        run: &mut EmptyBucketRun,
         start_bucket: Timestamp,
         end_bucket_exclusive: Timestamp,
     ) {
@@ -68,25 +102,18 @@ impl AggregationHelper {
             return;
         }
 
-        let count = ((end_bucket_exclusive - start_bucket) / self.bucket_duration as i64) as usize;
-        samples.reserve(count);
-
-        for bucket_start in
-            (start_bucket..end_bucket_exclusive).step_by(self.bucket_duration as usize)
-        {
-            samples.push_back(self.empty_row(self.render_timestamp(bucket_start)));
-        }
+        run.queue(start_bucket, end_bucket_exclusive);
     }
 
     fn add_empty_buckets_between_timestamps(
         &self,
-        samples: &mut VecDeque<MultiSample>,
+        run: &mut EmptyBucketRun,
         first_ts: Timestamp,
         end_ts: Timestamp,
     ) {
         let start = self.calc_bucket_start(first_ts);
         let end = self.calc_bucket_start(end_ts);
-        self.add_empty_bucket_internal(samples, start, end);
+        self.add_empty_bucket_internal(run, start, end);
     }
 
     fn output_timestamp(&self) -> Timestamp {
@@ -96,7 +123,7 @@ impl AggregationHelper {
     fn complete_bucket(
         &mut self,
         last_ts: Option<Timestamp>,
-        empty_buckets: &mut VecDeque<MultiSample>,
+        empty_buckets: &mut EmptyBucketRun,
     ) -> Option<MultiSample> {
         // Emission is a property of the aggregator, not of the bucket: RTS returns a bucket
         // iff *this* aggregation took something from it. So a bucket holding only NaNs is
@@ -263,7 +290,7 @@ impl EmptyFillBounds {
 pub struct MultiAggregateIterator<T: Iterator<Item = Sample>> {
     inner: T,
     aggregator: AggregationHelper,
-    empty_buckets: VecDeque<MultiSample>,
+    empty_buckets: EmptyBucketRun,
     init: bool,
     empty_fill: EmptyFillBounds,
 }
@@ -287,7 +314,7 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
         Self {
             inner,
             aggregator: AggregationHelper::new(options, aligned_timestamp),
-            empty_buckets: VecDeque::new(),
+            empty_buckets: EmptyBucketRun::default(),
             init: false,
             empty_fill,
         }
@@ -311,7 +338,17 @@ impl<T: Iterator<Item = Sample>> MultiAggregateIterator<T> {
 
     #[inline]
     fn pop_empty_bucket(&mut self) -> Option<MultiSample> {
-        self.empty_buckets.pop_front()
+        if self.empty_buckets.is_empty() {
+            return None;
+        }
+
+        let bucket_start = self.empty_buckets.next_bucket;
+        self.empty_buckets.next_bucket =
+            bucket_start.saturating_add_unsigned(self.aggregator.bucket_duration);
+        Some(
+            self.aggregator
+                .empty_row(self.aggregator.render_timestamp(bucket_start)),
+        )
     }
 
     /// One past the last bucket of `ts`, for the exclusive end `add_empty_bucket_internal` takes.
@@ -832,6 +869,41 @@ mod tests {
         // A bucket holding only NaNs is empty, so without EMPTY it is omitted rather than
         // reported as a zero count (reference-checked against RedisTimeSeries 8.6).
         assert!(result.is_empty());
+    }
+
+    /// F2: `EMPTY` gap fill must not eagerly materialize every bucket in the gap up front.
+    /// A client-controlled gap this wide (`TS.ADD k 0 1`, `TS.ADD k i64::MAX 1`, then
+    /// `AGGREGATION sum 1 EMPTY`) used to compute `count = gap / bucket_duration` and
+    /// `VecDeque::reserve(count)` before generating a single row -- an allocation request
+    /// far beyond what any caller (bounded by `.take(COUNT)` downstream) would ever consume.
+    /// Taking a handful of rows here must return promptly with only the two real samples'
+    /// worth of work plus the requested fill rows -- not billions of pre-reserved slots.
+    #[test]
+    fn test_empty_fill_over_huge_gap_is_lazy() {
+        // ~9.2 billion buckets span this gap. Eagerly reserving/materializing that many
+        // `MultiSample` rows up front is exactly the multi-gigabyte allocation / capacity
+        // overflow F2 describes; a lazy cursor instead does only as much work as `.take`
+        // below actually consumes.
+        let bucket_duration = 1_000_000_000;
+        let samples = vec![Sample::new(0, 1.0), Sample::new(i64::MAX, 2.0)];
+
+        let options = AggregationOptions {
+            aggregations: smallvec::smallvec![AggregationType::Sum.into()],
+            bucket_duration,
+            timestamp_output: BucketTimestamp::Start,
+            alignment: BucketAlignment::Start,
+            report_empty: true,
+        };
+
+        let iterator = AggregateIterator::new(samples.into_iter(), &options, 0);
+        let result: Vec<Sample> = iterator.take(5).collect();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], Sample::new(0, 1.0));
+        for (i, sample) in result.iter().enumerate().skip(1) {
+            assert_eq!(sample.timestamp, i as i64 * bucket_duration as i64);
+            assert_eq!(sample.value, 0.0);
+        }
     }
 
     #[test]
