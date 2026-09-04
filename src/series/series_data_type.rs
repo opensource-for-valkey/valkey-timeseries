@@ -258,7 +258,7 @@ unsafe extern "C" fn aof_rewrite(
     // rewrites and for atomic slot migration). In the child the module GIL mutex is inherited in a
     // locked state, so we must NOT lock a context or invoke commands (e.g. `DUMP`). Instead we
     // serialize the value directly through the type's own `rdb_save` callback, which needs no lock,
-    // and emit `TS._RESTORE key <payload>` — reconstructed by `ts_asm_restore_cmd` on replay.
+    // and emit `TS._RESTORE key <payload>` — reconstructed by `ts_restore_cmd` on replay.
     let raw_type = *VK_TIME_SERIES_TYPE.raw_type.borrow();
     let payload = unsafe {
         raw::RedisModule_SaveDataTypeToString.unwrap()(std::ptr::null_mut(), value, raw_type)
