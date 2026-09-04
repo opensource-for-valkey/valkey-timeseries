@@ -8,6 +8,12 @@ on the RedisModuleIO instead and surfaces as a clean error.
 
 The command is registered `write timeseries admin`, so `+@timeseries` grants it; a truncated or
 corrupt payload is reachable by any client holding that category.
+
+`TS._RESTORE` also rejects any direct (non-replicated, non-AOF-replay) client unless
+`ts.debug-mode` is enabled -- the same escape hatch `TS._DEBUG` uses to expose module internals
+to integration tests. `ValkeyTimeSeriesTestCaseDebugMode` loads the module with debug-mode on so
+`execute_command('TS._RESTORE', ...)` reaches the handler directly instead of having to fabricate
+a replication stream.
 """
 
 import os
@@ -17,11 +23,11 @@ import pytest
 
 from valkeytestframework.util.waiters import *
 from valkeytestframework.valkey_test_case import ValkeyAction
-from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 
 
-class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
+class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
 
     def _genuine_payload(self, key='payload_src', bucket_duration=None):
         """Produce a real TS._RESTORE payload by way of the command-format AOF.

@@ -17,6 +17,7 @@
 //! format (i.e. without the RDB preamble), so this path is also exercised on plain AOF load.
 
 use crate::common::context::{get_current_db, is_real_user_client};
+use crate::config::is_debug_mode_enabled;
 use crate::series::TimeSeries;
 use crate::series::index::index_series_by_key;
 use crate::series::index::server_events::{add_delayed_indexing_key, is_in_asm_slot_import};
@@ -31,8 +32,13 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 /// direct client call can be used to inject a crafted `TimeSeries` straight past that
 /// validation. `is_real_user_client` rejects any caller that isn't the AOF-replay sentinel or a
 /// replicated (master-link) command, mirroring the same guard used for `is_acl_enforced`.
-pub fn ts_asm_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if is_real_user_client(ctx) {
+///
+/// The direct-client guard is waived when `ts.debug-mode` is enabled, the same escape hatch
+/// `TS._DEBUG` uses to expose module internals to integration tests. This lets tests drive
+/// malformed/truncated/corrupt payloads straight at the handler instead of having to fabricate
+/// an AOF or a replication stream to reach it.
+pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if is_real_user_client(ctx) && !is_debug_mode_enabled() {
         return Err(ValkeyError::Str(
             "ERR TS._RESTORE is an internal command and cannot be invoked directly",
         ));
