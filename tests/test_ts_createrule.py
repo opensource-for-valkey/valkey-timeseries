@@ -546,13 +546,8 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
             "AGGREGATION", "sum", "120000"
         )
 
-        self.client.execute_command(
-            "TS.CREATERULE", key_c, key_a,
-            "AGGREGATION", "max", "300000"
-        )
-
-        # Try to create a circular rule: C -> A (should fail)
-        with pytest.raises(ResponseError, match="TSDB: the destination key already has a src rule"):
+        # Try to create a circular rule: C -> A (should fail, closes the A -> B -> C -> A cycle)
+        with pytest.raises(ResponseError, match="TSDB: circular dependency in compaction rules"):
             self.client.execute_command(
                 "TS.CREATERULE", key_c, key_a,
                 "AGGREGATION", "max", "300000"
