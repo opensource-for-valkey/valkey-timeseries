@@ -516,21 +516,15 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         assert len(info["rules"]) == 1
         print(info["rules"])
 
-        self.client.execute_command(
-            "TS.CREATERULE", key_b, key_a,
-            "AGGREGATION", "sum", "60000"
-        )
-
-        print("Created rule from B to A")
-        info_b = self.ts_info(key_b)
-        print(info_b)
-
-        # Try to create a circular rule: B -> A (should fail)
-        with pytest.raises(ResponseError, match="TSDB: the destination key already has a src rule"):
+        # Try to create a circular rule while B has no rules of its own. This
+        # used to bypass the cycle check's early return.
+        with pytest.raises(ResponseError, match="TSDB: circular dependency in compaction rules"):
             self.client.execute_command(
                 "TS.CREATERULE", key_b, key_a,
                 "AGGREGATION", "sum", "60000"
             )
+
+        assert self.ts_info(key_b)["rules"] == []
 
     def test_prevent_indirect_circular_dependency(self):
         """Test preventing indirect circular dependency (A -> B -> C -> A)"""

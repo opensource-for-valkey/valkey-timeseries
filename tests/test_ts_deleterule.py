@@ -48,6 +48,15 @@ class TestTSDeleteRule(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command("TS.DELETERULE", source_key, dest_key, "extra")
         assert "wrong number of arguments" in str(exc_info.value).lower()
 
+    def test_delete_rule_rejects_same_source_and_destination(self):
+        key = "test:delete_rule:self"
+        self.client.execute_command("TS.CREATE", key)
+
+        with pytest.raises(Exception, match="compaction rule does not exist"):
+            self.client.execute_command("TS.DELETERULE", key, key)
+
+        assert self.client.ping()
+
     def test_delete_rule_nonexistent_source(self):
         """Test error when the source key doesn't exist."""
         dest_key = "dest"

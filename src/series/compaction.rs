@@ -8,13 +8,15 @@ use crate::common::rdb::{
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
-use crate::series::index::{get_series_by_id, with_timeseries_postings};
-use crate::series::{DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries};
+use crate::series::index::{get_series_by_id, get_series_key_by_id, with_timeseries_postings};
+use crate::series::{
+    DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries,
+};
 use get_size2::GetSize;
 use orx_parallel::{ParIter, ParallelizableCollectionMut};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use topo_sort::{SortResults, TopoSort};
+use topo_sort::TopoSort;
 use valkey_module::{Context, NotifyEvent, ValkeyError, ValkeyResult, raw};
 
 const PARALLEL_THRESHOLD: usize = 2;
@@ -1280,30 +1282,53 @@ pub fn check_circular_dependencies(ctx: &Context, series: &mut TimeSeries) -> Va
 /// Check if adding a new compaction rule would create a circular dependency
 pub fn check_new_rule_circular_dependency(
     ctx: &Context,
-    series: &mut TimeSeries,
-    dest: &mut TimeSeries,
+    source_id: SeriesRef,
+    dest_id: SeriesRef,
 ) -> ValkeyResult<()> {
-    if series.rules.is_empty() {
-        return Ok(());
-    }
-
-    let mut graph = build_dependency_graph(ctx, series)?;
-    if graph.is_empty() {
-        return Ok(());
-    }
-
-    // Check if the new rule would create a circular dependency
-    // log_info(format!("candidate rule {} -> {}", series.id, dest.id));
-    graph.insert(series.id, vec![dest.id]);
-    build_dependency_graph_internal(ctx, dest, &mut graph)?;
-
-    let SortResults::Full(_nodes) = graph.into_vec_nodes() else {
+    // Adding source -> destination creates a cycle exactly when the
+    // destination can already reach the source. Traverse with read-only
+    // guards: callers acquire mutable guards only after this check, so a
+    // path that reaches source_id cannot alias an existing mutable borrow.
+    if dependency_reaches(
+        ctx,
+        dest_id,
+        source_id,
+        &mut std::collections::HashSet::new(),
+    )? {
         return Err(ValkeyError::Str(
             error_consts::COMPACTION_CIRCULAR_DEPENDENCY,
         ));
-    };
+    }
 
     Ok(())
+}
+
+fn dependency_reaches(
+    ctx: &Context,
+    current_id: SeriesRef,
+    target_id: SeriesRef,
+    visited: &mut std::collections::HashSet<SeriesRef>,
+) -> ValkeyResult<bool> {
+    if current_id == target_id {
+        return Ok(true);
+    }
+    if !visited.insert(current_id) {
+        return Ok(false);
+    }
+
+    let Some(key) = get_series_key_by_id(ctx, current_id) else {
+        return Ok(false);
+    };
+    let Some(series) = get_timeseries(ctx, &key, None, false)? else {
+        return Ok(false);
+    };
+
+    for rule in &series.rules {
+        if dependency_reaches(ctx, rule.dest_id, target_id, visited)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn build_dependency_graph(

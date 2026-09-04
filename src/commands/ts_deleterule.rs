@@ -34,6 +34,12 @@ pub fn ts_deleterule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     let source_key = &args[1];
     let dest_key = &args[2];
 
+    // A self-rule cannot exist, and opening the same key twice as mutable
+    // guards would create two aliases to the same series value.
+    if source_key == dest_key {
+        return Err(ValkeyError::Str(error_consts::COMPACTION_RULE_NOT_FOUND));
+    }
+
     // Get source time series (must exist, writable)
     let mut source_series = get_timeseries_mut(
         ctx,

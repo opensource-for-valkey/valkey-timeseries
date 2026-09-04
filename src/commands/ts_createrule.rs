@@ -7,7 +7,8 @@ use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{
-    CompactionRule, SeriesRef, check_new_rule_circular_dependency, get_timeseries_mut,
+    CompactionRule, SeriesRef, check_new_rule_circular_dependency, get_timeseries,
+    get_timeseries_mut,
 };
 use valkey_module::{
     AclPermissions, Context, NextArg, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult,
@@ -51,7 +52,47 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         ));
     }
 
-    // Get source time series (must exist, writable)
+    // Read both series while validating the rule. The mutable guards are
+    // acquired only after cycle detection so recursive reachability checks
+    // cannot alias either series.
+    let (source_id, dest_id, rule) = {
+        let source_series =
+            get_timeseries(ctx, &source_key, Some(AclPermissions::UPDATE), true)?.expect(
+                "BUG in create_rule: should have returned a value before this point (must_exist = true)",
+            );
+        let source_id = source_series.id;
+
+        let dest_series =
+            get_timeseries(ctx, &dest_key, Some(AclPermissions::UPDATE), true)?.expect(
+                "BUG in create_rule: should have returned a value before this point (must_exist = true)",
+            );
+        let dest_id = dest_series.id;
+
+        if dest_series.is_compaction() {
+            return Err(ValkeyError::Str(
+                "TSDB: the destination key already has a src rule",
+            ));
+        }
+
+        // check for duplicate compaction rule
+        if source_series
+            .rules
+            .iter()
+            .any(|rule| rule.dest_id == dest_id)
+        {
+            // match error from redis-ts
+            return Err(ValkeyError::Str(
+                "TSDB: the destination key already has a src rule",
+            ));
+        }
+
+        // Parse aggregation options
+        let rule = parse_args(&mut args, dest_id)?;
+        (source_id, dest_id, rule)
+    };
+
+    check_new_rule_circular_dependency(ctx, source_id, dest_id)?;
+
     let mut source_series = get_timeseries_mut(
         ctx,
         &source_key,
@@ -61,39 +102,10 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     .expect(
         "BUG in create_rule: should have returned a value before this point (must_exist = true)",
     );
-
-    let source_id = source_series.id;
-
-    // Get destination time series (must exist, writable)
     let mut dest_series = get_timeseries_mut(ctx, &dest_key, true, Some(AclPermissions::UPDATE))?
         .expect(
-        "BUG in create_rule: should have returned a value before this point (must_exist = true)",
-    );
-
-    let dest_id = dest_series.id;
-
-    if dest_series.is_compaction() {
-        return Err(ValkeyError::Str(
-            "TSDB: the destination key already has a src rule",
-        ));
-    }
-
-    // check for duplicate compaction rule
-    if source_series
-        .rules
-        .iter()
-        .any(|rule| rule.dest_id == dest_id)
-    {
-        // match error from redis-ts
-        return Err(ValkeyError::Str(
-            "TSDB: the destination key already has a src rule",
-        ));
-    }
-
-    // Parse aggregation options
-    let rule = parse_args(&mut args, dest_id)?;
-
-    check_new_rule_circular_dependency(ctx, &mut source_series, &mut dest_series)?;
+            "BUG in create_rule: should have returned a value before this point (must_exist = true)",
+        );
 
     source_series.add_compaction_rule(rule);
     // Add the rule to the destination series
