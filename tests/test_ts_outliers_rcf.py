@@ -573,6 +573,30 @@ class TestRCFOutlierDetector(ValkeyTimeSeriesTestCaseBase):
                     "CONTAMINATION", bad_val,
                 )
 
+    def test_rcf_resource_options_are_bounded(self):
+        """RCF sizing options reject non-integers and unsafe resource sizes."""
+        key = "rcf:options:bounded"
+        _add(self.client, key, 1_000, [10.0] * 10)
+
+        invalid_options = (
+            ("NUM_TREES", "1e300", "invalid integer value"),
+            ("NUM_TREES", 513, "must be between"),
+            ("SAMPLE_SIZE", "1e300", "invalid integer value"),
+            ("SAMPLE_SIZE", 1, "must be between"),
+            ("SAMPLE_SIZE", 4097, "must be between"),
+            ("SHINGLE_SIZE", 1.5, "invalid integer value"),
+            ("SHINGLE_SIZE", 129, "must be between"),
+            ("SHINGLE_SIZE", 11, "cannot exceed the number of samples"),
+        )
+
+        for option, value, message in invalid_options:
+            with pytest.raises(ResponseError, match=message):
+                self.client.execute_command(
+                    "TS.OUTLIERS", key, "-", "+",
+                    "METHOD", "rcf",
+                    option, value,
+                )
+
     def test_rcf_option_decay(self):
         """DECAY option is accepted and the detector adapts to shifting data."""
         key = "rcf:options:decay"

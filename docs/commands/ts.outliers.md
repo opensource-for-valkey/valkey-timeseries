@@ -258,11 +258,11 @@ METHOD RCF [NUM_TREES trees]
 
 **Options:**
 
-* `NUM_TREES` - Number of trees in forest. Default: `100`
-* `SAMPLE_SIZE` - Sample size per tree. Default: `256`
+* `NUM_TREES` - Number of trees in forest. Default: `100`. Must be an integer from `1` to `512`.
+* `SAMPLE_SIZE` - Sample size per tree. Default: `256`. Must be an integer from `2` to `4096`.
 * `THRESHOLD` - Anomaly score threshold in standard deviations. Default: `3.0`
 * `CONTAMINATION` - The amount of contamination in the data set, i.e., the proportion of outliers in the data set.
-* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Use values > 1 for contextual anomalies.
+* `SHINGLE_SIZE` - Sliding window size. Default: `1`. Must be an integer from `1` to `128` and no larger than the number of samples in the query range. Use values > 1 for contextual anomalies.
 * `OUTPUT_AFTER` - Warmup period (samples). Default: `32`
 * `DECAY` - Time decay factor (0-1). Default: `0.1`. Controls how quickly old data is forgotten.
 

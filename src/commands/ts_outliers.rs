@@ -22,6 +22,13 @@ use valkey_module::{
 
 const MAX_SEASONALITY_PERIODS: usize = 4;
 
+// Keep the RCF resource requirements bounded before they reach krcf. In
+// particular, krcf allocates storage proportional to sample_size * num_trees
+// and shingle_size increases the dimensionality of every point.
+const MAX_RCF_NUM_TREES: usize = 512;
+const MAX_RCF_SAMPLE_SIZE: usize = 4096;
+const MAX_RCF_SHINGLE_SIZE: usize = 128;
+
 static COMMAND_OPTIONS: [CommandArgToken; 4] = [
     CommandArgToken::Direction,
     CommandArgToken::Output,
@@ -135,6 +142,8 @@ fn process_request(
         Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
         Err(e) => return Err(e),
     };
+
+    validate_rcf_options(&options, samples.len())?;
 
     if !should_run_in_background(samples.len(), options.method()) {
         let values: Vec<f64> = samples.iter().map(|s| s.value).collect();
@@ -499,10 +508,20 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
         let arg_slice = arg.as_slice();
         hashify::fnc_map_ignore_case!(arg_slice,
             "NUM_TREES" => {
-                rcf_options.num_trees = Some(parse_positive_value(args, "NUM_TREES")? as usize);
+                rcf_options.num_trees = Some(parse_bounded_integer(
+                    args,
+                    "NUM_TREES",
+                    1,
+                    MAX_RCF_NUM_TREES,
+                )?);
             },
             "SAMPLE_SIZE" => {
-                rcf_options.sample_size = Some(parse_positive_value(args, "SAMPLE_SIZE")? as usize);
+                rcf_options.sample_size = Some(parse_bounded_integer(
+                    args,
+                    "SAMPLE_SIZE",
+                    2,
+                    MAX_RCF_SAMPLE_SIZE,
+                )?);
             },
             "THRESHOLD" => {
                 // Positivity is `RCFThreshold::std_dev`'s job, not this parser's:
@@ -529,7 +548,12 @@ fn parse_rcf_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
                 rcf_options.time_decay = Some(parse_single_value(args, "DECAY")?);
             },
             "SHINGLE_SIZE" => {
-                rcf_options.shingle_size = Some(parse_positive_value(args, "SHINGLE_SIZE")? as usize);
+                rcf_options.shingle_size = Some(parse_bounded_integer(
+                    args,
+                    "SHINGLE_SIZE",
+                    1,
+                    MAX_RCF_SHINGLE_SIZE,
+                )?);
             },
             "OUTPUT_AFTER" => {
                 rcf_options.output_after = Some(parse_positive_value(args, "OUTPUT_AFTER")? as usize);
@@ -596,6 +620,49 @@ fn parse_optional_threshold_option(args: &mut CommandArgIterator) -> ValkeyResul
     } else {
         Ok(None)
     }
+}
+
+fn parse_bounded_integer(
+    iter: &mut CommandArgIterator,
+    option_name: &str,
+    min: usize,
+    max: usize,
+) -> ValkeyResult<usize> {
+    let Ok(value_str) = iter.next_str() else {
+        return Err(ValkeyError::String(format!(
+            "TSDB: Missing value for {option_name}"
+        )));
+    };
+
+    let value = value_str.parse::<u64>().map_err(|_e| {
+        ValkeyError::String(format!(
+            "TSDB: invalid integer value for {option_name}: {value_str}"
+        ))
+    })?;
+
+    if value < min as u64 || value > max as u64 {
+        return Err(ValkeyError::String(format!(
+            "TSDB: {option_name} must be between {min} and {max}"
+        )));
+    }
+
+    Ok(value as usize)
+}
+
+fn validate_rcf_options(options: &AnomalyOptions, sample_count: usize) -> ValkeyResult<()> {
+    let AnomalyDetectionMethodOptions::Rcf(rcf_options) = &options.options else {
+        return Ok(());
+    };
+
+    if let Some(shingle_size) = rcf_options.shingle_size
+        && shingle_size > sample_count
+    {
+        return Err(ValkeyError::String(format!(
+            "TSDB: SHINGLE_SIZE ({shingle_size}) cannot exceed the number of samples ({sample_count})"
+        )));
+    }
+
+    Ok(())
 }
 
 fn parse_single_value(iter: &mut CommandArgIterator, option_name: &str) -> ValkeyResult<f64> {
