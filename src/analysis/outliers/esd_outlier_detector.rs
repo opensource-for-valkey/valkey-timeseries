@@ -187,6 +187,16 @@ fn esd_test(
     estimator: EsdEstimator,
     max_out: usize,
 ) -> TimeSeriesAnalysisResult<(Vec<Anomaly>, Vec<f64>)> {
+    // This is normally enforced by the command parser, but ESD is also used
+    // through the analysis API. Keeping the invariant here prevents invalid
+    // quantiles from reaching `statrs`, which asserts its CDF input range.
+    if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+        return Err(TimeSeriesAnalysisError::InvalidParameter {
+            name: "alpha".to_string(),
+            message: format!("alpha must be in the range (0, 1), got {alpha}"),
+        });
+    }
+
     let n_total = data.len();
 
     // masked representation: Some(value) for active, None for masked
@@ -221,7 +231,11 @@ fn esd_test(
             break;
         }
 
-        let prob = 1.0 - alpha / (2.0 * n);
+        // A valid alpha/n pair already produces a value in this interval. Clamp
+        // as a final guard against future changes or floating-point edge cases:
+        // `StudentsT::inverse_cdf` asserts rather than returning an error for a
+        // probability outside its closed input range.
+        let prob = (1.0 - alpha / (2.0 * n)).clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
         let student_t = StudentsT::new(0.0, 1.0, df).map_err(|e| {
             TimeSeriesAnalysisError::InvalidParameter {
                 name: "df".to_string(),
@@ -533,6 +547,18 @@ mod tests {
             .map(|(i, _)| i)
             .unwrap();
         assert_eq!(max_idx, 4);
+    }
+
+    #[test]
+    fn invalid_alpha_returns_an_error_before_calling_statrs() {
+        let data = [1.0, 1.1, 0.9, 1.05, 1.2, 1.0, 0.95, 1.1, 1.05, 10.0];
+        let err = detect_anomalies_esd(&data, 13.0, EsdEstimator::Classic, Some(1))
+            .expect_err("an ESD alpha outside (0, 1) must be rejected");
+
+        assert!(matches!(
+            err,
+            TimeSeriesAnalysisError::InvalidParameter { ref name, .. } if name == "alpha"
+        ));
     }
 
     #[test]

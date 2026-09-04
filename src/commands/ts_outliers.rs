@@ -565,7 +565,7 @@ fn parse_esd_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOptio
 
         hashify::fnc_map_ignore_case!(arg_slice,
            "ALPHA" => {
-                esd_options.alpha = parse_positive_value(args, "ALPHA")?;
+                esd_options.alpha = parse_esd_alpha(args)?;
             },
             "HYBRID" => {
                 esd_options.estimator = EsdEstimator::Hybrid;
@@ -618,6 +618,19 @@ fn parse_positive_value(iter: &mut CommandArgIterator, option_name: &str) -> Val
         return Err(ValkeyError::String(format!(
             "TSDB: {option_name} must be positive"
         )));
+    }
+    Ok(value)
+}
+
+/// ESD alpha is a statistical significance level, whose valid range is the
+/// open unit interval. In particular, accepting values above one can produce
+/// an invalid quantile probability in the ESD detector.
+fn parse_esd_alpha(iter: &mut CommandArgIterator) -> ValkeyResult<f64> {
+    let value = parse_finite_value(iter, "ALPHA")?;
+    if !(0.0..1.0).contains(&value) {
+        return Err(ValkeyError::Str(
+            "TSDB: ALPHA must be greater than 0 and less than 1",
+        ));
     }
     Ok(value)
 }

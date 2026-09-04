@@ -57,6 +57,14 @@ class TestOutliersMethods(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match="the key does not exist"):
             self.client.execute_command('TS.OUTLIERS', 'nonexistent', "-", "+", "method", "zscore")
 
+    def test_esd_rejects_alpha_outside_open_unit_interval(self):
+        """ESD alpha must be validated before it reaches statrs' inverse CDF."""
+        with pytest.raises(ResponseError, match="ALPHA must be greater than 0 and less than 1"):
+            self.client.execute_command(
+                'TS.OUTLIERS', 'test:outliers:esd:alpha', '-', '+',
+                'METHOD', 'esd', 'ALPHA', 13,
+            )
+
     def test_method_spc_cusum_negative_spike(self):
         """Test SPC CUSUM control chart method negative spike."""
         key = 'test:outliers:method:cusum'
