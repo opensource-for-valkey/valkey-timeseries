@@ -38,7 +38,10 @@ impl<'a> SeriesSampleIterator<'a> {
         end: Timestamp,
         is_reverse: bool,
     ) -> Self {
-        let chunks_done = series.chunks.is_empty();
+        // Match TimestampRange semantics: an inverted window contains no samples.
+        // Marking it done here prevents every iterator caller from having to rely
+        // on its underlying chunk encoding to handle the range safely.
+        let chunks_done = series.chunks.is_empty() || start > end;
         let chunk_index: usize = if is_reverse && !series.is_empty() {
             series.chunks.len() - 1
         } else {

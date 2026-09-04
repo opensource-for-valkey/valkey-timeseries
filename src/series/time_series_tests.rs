@@ -1437,6 +1437,28 @@ mod tests {
     }
 
     #[test]
+    fn test_inverted_range_on_uncompressed_series_is_empty_and_does_not_delete() {
+        let mut time_series = TimeSeries::with_options(TimeSeriesOptions {
+            chunk_encoding: ChunkEncoding::Uncompressed,
+            ..Default::default()
+        })
+        .unwrap();
+        for timestamp in [10, 20, 30, 40, 50] {
+            time_series.add(timestamp, 1.0, None);
+        }
+
+        assert!(time_series.get_range(40, 20).is_empty());
+        assert!(
+            time_series
+                .get_range_filtered(40, 20, None, None)
+                .is_empty()
+        );
+        assert_eq!(time_series.range_iter(40, 20).count(), 0);
+        assert_eq!(time_series.remove_range(40, 20).unwrap(), 0);
+        assert_eq!(time_series.iter().count(), 5);
+    }
+
+    #[test]
     fn test_get_range_with_matching_start_and_end_time() {
         let mut time_series = TimeSeries::default();
 

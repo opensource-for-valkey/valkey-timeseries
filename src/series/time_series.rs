@@ -611,6 +611,9 @@ impl TimeSeries {
 
     /// Get the time series between given start and end time (both inclusive).
     pub fn get_range(&self, start_time: Timestamp, end_time: Timestamp) -> Vec<Sample> {
+        if start_time > end_time {
+            return Vec::new();
+        }
         if !self.overlaps(start_time, end_time) {
             return Vec::new();
         }
@@ -634,7 +637,9 @@ impl TimeSeries {
         timestamp_filter: Option<&[Timestamp]>,
         value_filter: Option<ValueFilter>,
     ) -> Vec<Sample> {
-        debug_assert!(start_timestamp <= end_timestamp);
+        if start_timestamp > end_timestamp {
+            return Vec::new();
+        }
 
         // TODO: propagate errors
         let mut samples = if let Some(ts_filter) = timestamp_filter {
@@ -813,7 +818,9 @@ impl TimeSeries {
     }
 
     pub fn remove_range(&mut self, start_ts: Timestamp, end_ts: Timestamp) -> TsdbResult<usize> {
-        debug_assert!(start_ts <= end_ts);
+        if start_ts > end_ts {
+            return Ok(0);
+        }
 
         let mut deleted_samples = 0;
 

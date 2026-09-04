@@ -168,6 +168,14 @@ impl UncompressedChunk {
     ///
     /// Used to get an inclusive bound for series chunks (all chunks containing samples in the range [start_index...=end_index])
     fn get_index_bounds(&self, start: Timestamp, end: Timestamp) -> Option<(usize, usize)> {
+        // An inverted window selects no samples. This guard is required before
+        // independently locating both bounds: otherwise `start_idx` can be
+        // greater than `end_idx`, which is not a valid inclusive slice/drain
+        // range.
+        if start > end {
+            return None;
+        }
+
         let len = self.samples.len();
         if len == 0 {
             return None;
@@ -670,6 +678,36 @@ mod tests {
     }
 
     #[test]
+    fn test_inverted_range_returns_no_samples() {
+        let samples = vec![
+            Sample {
+                timestamp: 10,
+                value: 1.0,
+            },
+            Sample {
+                timestamp: 20,
+                value: 2.0,
+            },
+            Sample {
+                timestamp: 30,
+                value: 3.0,
+            },
+            Sample {
+                timestamp: 40,
+                value: 4.0,
+            },
+            Sample {
+                timestamp: 50,
+                value: 5.0,
+            },
+        ];
+        let chunk = UncompressedChunk::new(1000, &samples);
+
+        assert!(chunk.get_range_slice(40, 20).is_empty());
+        assert!(chunk.get_range_as_ref(40, 20).is_none());
+    }
+
+    #[test]
     fn test_remove_range() {
         let samples = vec![
             Sample {
@@ -791,6 +829,12 @@ mod tests {
         let removed = empty_chunk.remove_range(10, 20).unwrap();
         assert_eq!(removed, 0);
         assert!(empty_chunk.samples.is_empty());
+
+        // An inverted range is valid and selects nothing.
+        let mut chunk = UncompressedChunk::new(1000, &samples);
+        let removed = chunk.remove_range(40, 20).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(chunk.samples, samples);
     }
 
     #[test]
