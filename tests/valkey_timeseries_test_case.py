@@ -1,3 +1,4 @@
+import operator
 import os
 import shutil
 import pytest
@@ -146,10 +147,14 @@ class ReplicationGroup:
         # *current* (ever-increasing) offset and compared it against the
         # replica's offset captured once at call-time — a condition that can
         # never be satisfied once the primary advances past that snapshot.
+        # The replica's offset can jump past the snapshotted target in a single poll (e.g. a
+        # PING lands between polls), so it may never land on the exact value -- wait for it to
+        # reach or pass the target instead of matching it exactly.
         target = self.get_primary_repl_offset()
         wait_for_equal(
             lambda: self.get_replica_repl_offset(index),
             target,
+            op=operator.ge,
             timeout=TEST_MAX_WAIT_TIME_SECONDS,
         )
 
