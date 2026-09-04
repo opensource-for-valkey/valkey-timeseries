@@ -16,6 +16,10 @@ use regex_syntax::parse as parse_regex;
 
 // Beyond this, it's better to use regexp.
 const MAX_OR_VALUES: usize = 16;
+// Prefix extraction is an index optimization, not a reason to materialize an
+// unbounded string from an otherwise compact regex repetition. Larger patterns
+// fall back to the regular compiler, whose size limit applies.
+const MAX_REPETITION_PREFIX_BYTES: u64 = 4 * 1024;
 
 pub(crate) fn parse_regex_matcher(expr: &str, is_equal: bool) -> ParseResult<PredicateMatch> {
     if is_match_all_regex_pattern(expr) {
@@ -519,6 +523,10 @@ fn repetition_to_prefix_rem(rep: &regex_syntax::hir::Repetition) -> Option<(Stri
     if rep.min == 0 {
         return None;
     }
+    let prefix_len = u64::from(rep.min).checked_mul(lit.len() as u64)?;
+    if prefix_len > MAX_REPETITION_PREFIX_BYTES {
+        return None;
+    }
     let prefix = lit.repeat(rep.min as usize);
     let escaped = regex::escape(&lit);
     let rem = match rep.max {
@@ -792,7 +800,9 @@ fn extract_trailing_literal_sequence(sre: &Hir) -> Option<String> {
 
 #[cfg(test)]
 mod test {
-    use super::{RegexDecomposition, decompose_regex, remove_start_end_anchors};
+    use super::{
+        RegexDecomposition, decompose_regex, parse_regex_matcher, remove_start_end_anchors,
+    };
     use crate::labels::filters::{PredicateMatch, PredicateValue};
 
     #[test]
@@ -1217,6 +1227,14 @@ mod test {
             }
             other => panic!("unexpected decomposition: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_oversized_repetition_prefix_falls_back_to_limited_compilation() {
+        // Decomposition must not expand this compact syntax into a multi-gigabyte
+        // prefix. The normal compiler rejects it under its configured size limit.
+        assert!(decompose_regex("^(abcde){900000000}").is_err());
+        assert!(parse_regex_matcher("a{999999999}", true).is_err());
     }
 
     #[test]
