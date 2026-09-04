@@ -87,6 +87,8 @@ impl RdbSerializable for CompactionRule {
         let has_samples = rdb_load_bool(rdb)?;
         let bucket_start = if start_ts == -1 { None } else { Some(start_ts) };
 
+        validate_restored_rule_parameters(bucket_duration, align_timestamp)?;
+
         Ok(CompactionRule {
             dest_id,
             aggregator,
@@ -96,6 +98,32 @@ impl RdbSerializable for CompactionRule {
             has_samples,
         })
     }
+}
+
+fn validate_restored_rule_parameters(
+    bucket_duration: u64,
+    align_timestamp: Timestamp,
+) -> ValkeyResult<()> {
+    if bucket_duration == 0 {
+        return Err(ValkeyError::Str(error_consts::BUCKET_DURATION_TOO_SMALL));
+    }
+
+    // calc_bucket_start converts the duration to i64 for its modulo
+    // arithmetic. Reject values that would become negative after that cast.
+    if bucket_duration > i64::MAX as u64 {
+        return Err(ValkeyError::String(format!(
+            "TSDB: compaction rule bucket duration is too large: {bucket_duration}"
+        )));
+    }
+
+    // TS.CREATERULE parses alignTimestamp as a non-negative timestamp. Keep
+    // restored rules within the same domain rather than importing a value that
+    // cannot be produced by the command path.
+    if align_timestamp < 0 {
+        return Err(ValkeyError::Str(error_consts::INVALID_ALIGNMENT_TIMESTAMP));
+    }
+
+    Ok(())
 }
 
 struct CompactionContext<'a> {
@@ -1311,4 +1339,30 @@ fn build_dependency_graph_internal(
         build_dependency_graph_internal(ctx, dest, graph)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_restored_rule_parameters;
+    use crate::common::Timestamp;
+
+    #[test]
+    fn restored_rule_rejects_zero_bucket_duration() {
+        assert!(validate_restored_rule_parameters(0, 0).is_err());
+    }
+
+    #[test]
+    fn restored_rule_rejects_duration_that_overflows_signed_arithmetic() {
+        assert!(validate_restored_rule_parameters(i64::MAX as u64 + 1, 0).is_err());
+    }
+
+    #[test]
+    fn restored_rule_rejects_negative_alignment() {
+        assert!(validate_restored_rule_parameters(1, -1).is_err());
+    }
+
+    #[test]
+    fn restored_rule_accepts_valid_parameters() {
+        assert!(validate_restored_rule_parameters(1, Timestamp::MAX).is_ok());
+    }
 }

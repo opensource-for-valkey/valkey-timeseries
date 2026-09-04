@@ -13,6 +13,7 @@ corrupt payload is reachable by any client holding that category.
 import os
 import random
 import re
+import pytest
 
 from valkeytestframework.util.waiters import *
 from valkeytestframework.valkey_test_case import ValkeyAction
@@ -22,7 +23,7 @@ from valkeytestframework.conftest import resource_port_tracker
 
 class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
 
-    def _genuine_payload(self, key='payload_src'):
+    def _genuine_payload(self, key='payload_src', bucket_duration=None):
         """Produce a real TS._RESTORE payload by way of the command-format AOF.
 
         `aof_rewrite` emits `TS._RESTORE key <blob>`, where the blob is what the type's
@@ -32,7 +33,15 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
         client.config_set('aof-use-rdb-preamble', 'no')
 
         # Populate before enabling AOF so the rewrite this triggers already contains the series.
+        if bucket_duration is not None:
+            destination = f'{key}:destination'
+            client.execute_command('TS.CREATE', destination)
         client.execute_command('TS.CREATE', key, 'LABELS', 'host', 'a', 'region', 'b')
+        if bucket_duration is not None:
+            client.execute_command(
+                'TS.CREATERULE', key, destination,
+                'AGGREGATION', 'sum', bucket_duration,
+            )
         for i in range(1, 201):
             client.execute_command('TS.ADD', key, 1000 + i * 1000, i)
 
@@ -117,4 +126,23 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseBase):
             except Exception:
                 pass  # any clean error is fine; only a dead server is a failure
             assert client.ping(), f'server died on corrupt payload, trial {trial}'
+        assert self.server.is_alive()
+
+    def test_restore_zero_duration_rule_is_rejected(self):
+        """A restored zero-duration rule is rejected before a later write can divide by zero."""
+        client = self.client
+        payload = self._genuine_payload(key='zero_duration_src', bucket_duration=12345)
+
+        # RedisModule_SaveUnsigned stores the opcode followed by an RDB length.
+        # 12345 is a two-byte 14-bit length (0x70, 0x39); retain that width when
+        # changing the value to zero so the rest of the payload stays aligned.
+        encoded_duration = b'\x02\x70\x39'
+        zero_duration = b'\x02\x40\x00'
+        assert payload.count(encoded_duration) == 1
+        malformed = payload.replace(encoded_duration, zero_duration)
+
+        with pytest.raises(Exception, match='failed to deserialize'):
+            client.execute_command('TS._RESTORE', 'zero_duration_restored', malformed)
+
+        assert client.ping()
         assert self.server.is_alive()
