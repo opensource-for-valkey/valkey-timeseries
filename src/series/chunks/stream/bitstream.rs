@@ -63,8 +63,7 @@ impl BitStream {
 
     pub(crate) fn deserialize(src: &mut &[u8]) -> io::Result<Self> {
         let count = try_read_uvarint(src)
-            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?
-            as u8;
+            .map_err(|_| io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?;
 
         if count > 8 {
             return Err(io::Error::new(
@@ -81,10 +80,20 @@ impl BitStream {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
 
+        if count != 0 && len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid chunk bits: non-zero count with empty stream",
+            ));
+        }
+
         let stream = src[..len].to_vec();
         *src = &src[len..];
 
-        Ok(Self { stream, count })
+        Ok(Self {
+            stream,
+            count: count as u8,
+        })
     }
 
     /// Get the underlying bytes.
@@ -306,7 +315,8 @@ impl RdbSerializable for BitStream {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_rdb_state;
+    use super::{BitStream, validate_rdb_state};
+    use crate::common::encoding::write_uvarint;
 
     #[test]
     fn rdb_load_rejects_nonzero_count_with_empty_stream() {
@@ -319,5 +329,36 @@ mod tests {
         assert!(validate_rdb_state(&[], 0).is_ok());
         assert!(validate_rdb_state(&[0], 0).is_ok());
         assert!(validate_rdb_state(&[0], 1).is_ok());
+    }
+
+    #[test]
+    fn deserialize_rejects_nonzero_count_with_empty_stream() {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 1); // count
+        write_uvarint(&mut buf, 0); // len
+        let mut src = buf.as_slice();
+        assert!(BitStream::deserialize(&mut src).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_range_count_without_truncating() {
+        let mut buf = Vec::new();
+        // 264 truncates to 8 as u8, which would otherwise pass the `> 8` check.
+        write_uvarint(&mut buf, 264); // count
+        write_uvarint(&mut buf, 0); // len
+        let mut src = buf.as_slice();
+        assert!(BitStream::deserialize(&mut src).is_err());
+    }
+
+    #[test]
+    fn deserialize_accepts_byte_aligned_and_partial_streams() {
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, 3); // count
+        write_uvarint(&mut buf, 2); // len
+        buf.extend_from_slice(&[0xAB, 0xCD]);
+        let mut src = buf.as_slice();
+        let bs = BitStream::deserialize(&mut src).expect("valid partial stream");
+        assert_eq!(bs.count, 3);
+        assert_eq!(bs.stream, vec![0xAB, 0xCD]);
     }
 }
