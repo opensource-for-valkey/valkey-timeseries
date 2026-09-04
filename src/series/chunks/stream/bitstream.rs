@@ -19,6 +19,23 @@ pub struct BitStream {
     pub(in crate::series::chunks) count: u8,
 }
 
+fn validate_rdb_state(bytes: &[u8], count: u64) -> ValkeyResult<u8> {
+    if count > 8 {
+        return Err(ValkeyError::String(format!("Invalid chunk bits: {count}")));
+    }
+
+    // A partial byte can only exist after at least one byte has been
+    // written. Without this check, the next append indexes the last byte of
+    // an empty stream and panics.
+    if count != 0 && bytes.is_empty() {
+        return Err(ValkeyError::String(
+            "Invalid chunk bits: non-zero count with empty stream".to_owned(),
+        ));
+    }
+
+    Ok(count as u8)
+}
+
 impl BitStream {
     pub fn new() -> Self {
         Self {
@@ -277,15 +294,30 @@ impl RdbSerializable for BitStream {
         Self: Sized,
     {
         let bytes = raw::load_string_buffer(rdb)?.as_ref().to_vec();
-        let count = raw::load_unsigned(rdb)? as u8;
-
-        if count > 8 {
-            return Err(ValkeyError::String(format!("Invalid chunk bits: {count}")));
-        }
+        let count = raw::load_unsigned(rdb)?;
+        let count = validate_rdb_state(&bytes, count)?;
 
         Ok(Self {
             stream: bytes,
-            count,
+            count: count as u8,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_rdb_state;
+
+    #[test]
+    fn rdb_load_rejects_nonzero_count_with_empty_stream() {
+        // This state makes the first append index stream[len - 1].
+        assert!(validate_rdb_state(&[], 1).is_err());
+    }
+
+    #[test]
+    fn rdb_load_accepts_byte_aligned_and_partial_streams() {
+        assert!(validate_rdb_state(&[], 0).is_ok());
+        assert!(validate_rdb_state(&[0], 0).is_ok());
+        assert!(validate_rdb_state(&[0], 1).is_ok());
     }
 }
