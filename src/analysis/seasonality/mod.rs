@@ -224,4 +224,12 @@ mod tests {
             "with no detectable period the input must be returned unchanged"
         );
     }
+
+    #[test]
+    fn test_auto_three_samples_returns_input_unchanged() {
+        let data = vec![1.0, 2.0, 1.0];
+        let result = seasonally_adjust(&data, &Seasonality::Auto).unwrap();
+
+        assert_eq!(result, data);
+    }
 }

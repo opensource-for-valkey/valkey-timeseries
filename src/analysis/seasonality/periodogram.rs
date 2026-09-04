@@ -165,6 +165,18 @@ impl Detector {
         let data_len = data.len();
         let n_per_segment = (max_period * 2).min(data_len as u32 / 2).max(1);
         let max_fft_size = (n_per_segment as f64).log2().floor() as usize;
+
+        // welch-sde computes `2 << (dft_log2_max_size - 1)` while building
+        // the transform. A one-point segment produces a zero log-size, so
+        // return the empty result that auto-seasonality already treats as
+        // "no detectable period" instead of passing an invalid size to it.
+        if max_fft_size == 0 {
+            return Periodogram {
+                periods: Vec::new(),
+                powers: Vec::new(),
+            };
+        }
+
         let n_segments = (data_len as f64 / n_per_segment as f64).ceil() as usize;
 
         let welch: SpectralDensity<'_, f64> = SpectralDensity::builder(data, frequency)
@@ -260,5 +272,15 @@ mod test {
                 "Test case {i}"
             );
         }
+    }
+
+    #[test]
+    fn short_input_has_no_periodogram() {
+        let data = [1.0, 2.0, 1.0];
+        let periodogram = Detector::default().periodogram(&data);
+
+        assert!(periodogram.periods.is_empty());
+        assert!(periodogram.powers.is_empty());
+        assert!(Detector::default().detect(&data).is_empty());
     }
 }
