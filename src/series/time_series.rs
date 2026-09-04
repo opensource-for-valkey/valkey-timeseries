@@ -1050,7 +1050,7 @@ impl TimeSeries {
         start: Timestamp,
         end: Timestamp,
     ) -> Option<(usize, usize)> {
-        if self.is_empty() {
+        if self.is_empty() || start > end {
             return None;
         }
 
@@ -1304,5 +1304,27 @@ mod tests {
         assert_eq!(ts.total_samples, 1);
         assert_eq!(ts.first_timestamp, 100);
         assert_eq!(ts.last_timestamp(), 100);
+    }
+
+    #[test]
+    fn test_get_chunk_index_bounds_rejects_inverted_range() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        fn s(timestamp: Timestamp, value: f64) -> Sample {
+            Sample { timestamp, value }
+        }
+
+        let c1 = TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+            s(10, 1.0),
+            s(20, 2.0),
+        ]));
+        let c2 = TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+            s(30, 3.0),
+            s(40, 4.0),
+        ]));
+        let ts = TimeSeries::from_chunks(vec![c1, c2]).unwrap();
+
+        assert!(ts.get_chunk_index_bounds(40, 20).is_none());
+        assert!(!ts.has_samples_in_range(40, 20));
     }
 }
