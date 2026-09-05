@@ -419,13 +419,19 @@ pub(in crate::promql) struct StepGridBuilder<T> {
     present_count: usize,
 }
 
+// Preloading can create a builder for every matching series. Keep the initial
+// allocation small: most sparse series either never begin or have a short
+// retained span, while dense grids grow amortized as values arrive.
+const STEP_GRID_INITIAL_CAPACITY: usize = 64;
+
 impl<T: Copy + Default> StepGridBuilder<T> {
     pub(in crate::promql) fn with_capacity(steps: usize) -> Self {
+        let initial_capacity = steps.min(STEP_GRID_INITIAL_CAPACITY);
         Self {
             offset: None,
             next_step: 0,
-            values: Vec::with_capacity(steps),
-            present: BitSet::with_capacity(steps),
+            values: Vec::with_capacity(initial_capacity),
+            present: BitSet::with_capacity(initial_capacity),
             present_count: 0,
         }
     }
@@ -855,5 +861,15 @@ mod step_grid_tests {
         };
         assert_eq!((*offset, values.len()), (1, 3));
         assert_matches(&[None, Some(1u64), Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn grid_builder_bounds_its_initial_allocation() {
+        let builder = StepGridBuilder::<u64>::with_capacity(1_000_000);
+
+        assert!(
+            builder.values.capacity() <= STEP_GRID_INITIAL_CAPACITY,
+            "a sparse grid must not reserve every requested step"
+        );
     }
 }
