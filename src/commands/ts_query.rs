@@ -3,7 +3,7 @@ use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::system_time_to_millis;
-use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant};
+use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant, try_acquire_promql_query};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -34,11 +34,16 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // happens to have selected at the time the worker thread runs.
     opts.db = get_current_db(ctx);
 
+    let Some(permit) = try_acquire_promql_query() else {
+        return Err(ValkeyError::Str("TSDB: too many concurrent PromQL queries"));
+    };
+
     let blocked_client = create_blocked_client(ctx);
     let eval_ts = eval_stmt.start;
 
     let querier = get_promql_querier(ctx);
-    std::thread::spawn(move || {
+    crate::common::threads::spawn(move || {
+        let _permit = permit;
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
 
         let result = match evaluate_instant(querier, eval_stmt, eval_ts, opts) {

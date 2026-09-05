@@ -4,7 +4,7 @@ use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::current_time_millis;
 use crate::promql::QueryValue;
-use crate::promql::engine::{PROMQL_CONFIG, evaluate_range};
+use crate::promql::engine::{PROMQL_CONFIG, evaluate_range, try_acquire_promql_query};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -39,10 +39,15 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // happens to have selected at the time the worker thread runs.
     opts.db = get_current_db(ctx);
 
+    let Some(permit) = try_acquire_promql_query() else {
+        return Err(ValkeyError::Str("TSDB: too many concurrent PromQL queries"));
+    };
+
     let blocked_client = create_blocked_client(ctx);
     let querier = get_promql_querier(ctx);
 
-    std::thread::spawn(move || {
+    crate::common::threads::spawn(move || {
+        let _permit = permit;
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
 
         let result = match evaluate_range(querier, eval_stmt, opts) {
