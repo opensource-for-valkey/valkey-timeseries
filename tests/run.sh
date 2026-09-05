@@ -1,22 +1,5 @@
 #!/usr/bin/env bash
 
-# A cancelled run can leave servers behind, so clean up before starting -- but only
-# our own. The previous version killed every valkey-server and every pytest on the
-# host, which is antisocial on a shared machine and fatal when two runs overlap.
-#
-# The match is on the module every server in this suite loads. Matching the
-# test-data path instead would miss the standalone tests, whose servers are started
-# with a relative logfile and a cwd, so their command line never mentions it.
-kill_our_servers() {
-  pkill -9 -f "valkey-server.*libvalkey_timeseries" 2>/dev/null || true
-}
-
-echo "Killing servers left over from a previous run of this suite"
-kill_our_servers
-
-# A cancelled run must not leave servers holding their ports.
-trap kill_our_servers EXIT INT TERM
-
 os_type=$(uname)
 MODULE_EXT=".so"
 if [[ "$os_type" == "Darwin" ]]; then
@@ -30,11 +13,39 @@ else
   exit 1
 fi
 
+BUILD=${BUILD:-debug}
+PROGNAME="${BASH_SOURCE[0]}"
+CWD="$(cd "$(dirname "$PROGNAME")" &>/dev/null && pwd)"
+ROOT=$(cd "$CWD/.." && pwd)
+export MODULE_PATH="$ROOT/target/$BUILD/libvalkey_timeseries${MODULE_EXT}"
+
+# A cancelled run can leave servers behind, so clean up before starting -- but only
+# our own. The previous version killed every valkey-server and every pytest on the
+# host, which is antisocial on a shared machine and fatal when two runs overlap.
+#
+# The match is on this checkout's module path (not just the module's basename),
+# so a concurrent run from a different checkout or worktree is never touched.
+# Matching the test-data path instead would miss the standalone tests, whose
+# servers are started with a relative logfile and a cwd, so their command line
+# never mentions it.
+kill_our_servers() {
+  pkill -9 -f "valkey-server.*${MODULE_PATH}" 2>/dev/null || true
+}
+
+echo "Killing servers left over from a previous run of this suite"
+kill_our_servers
+
+# A cancelled run must not leave servers holding their ports.
+trap kill_our_servers EXIT INT TERM
+
 # Serial unless asked otherwise; see docs/plans/parallel-integration-tests-plan.md.
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-0}"
 
 is_valid_parallel_workers() {
-  [ "$1" = "auto" ] || [ "$1" = "logical" ] || [[ "$1" =~ ^[0-9]+$ ]]
+  # An explicit count must fit within the 100 port bands tests/parallel_ports.py
+  # hands out (MAX_WORKERS); a higher xdist worker index has no port band and
+  # crashes at collection time.
+  [ "$1" = "auto" ] || [ "$1" = "logical" ] || { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -le 100 ]; }
 }
 
 PASSTHRU=()
@@ -95,20 +106,13 @@ if [ "$RESOLVED_WORKERS" -gt 1 ]; then
   echo "Running integration tests across $RESOLVED_WORKERS workers"
 fi
 
-BUILD=${BUILD:-debug}
 # If environment variable SERVER_VERSION is not set, default to "unstable"
 if [ -z "$SERVER_VERSION" ]; then
     echo "SERVER_VERSION environment variable is not set. Defaulting to \"unstable\"."
     export SERVER_VERSION="unstable"
 fi
-PROGNAME="${BASH_SOURCE[0]}"
-CWD="$(cd "$(dirname "$PROGNAME")" &>/dev/null && pwd)"
 BINARY_PATH="$CWD/build/binaries/$SERVER_VERSION/valkey-server"
 PORT=${PORT:-6379}
-ROOT=$(cd $CWD/.. && pwd)
-
-export MODULE_PATH="$ROOT/target/$BUILD/libvalkey_timeseries${MODULE_EXT}"
-
 
 REPO_URL="https://github.com/valkey-io/valkey.git"
 

@@ -521,7 +521,17 @@ class ValkeyTimeSeriesClusterTestCase(ValkeyTimeSeriesTestCaseCommon):
                     is_primary=True,
                 )
 
-                replicas = []
+                primary_node = Node(
+                    server=server,
+                    client=client,
+                    logfile=logfile,
+                )
+                # Append the group as soon as the primary is up so the finally
+                # block's cleanup can find (and kill) it even if a later replica
+                # in this group fails to start.
+                rg = ReplicationGroup(primary=primary_node, replicas=[])
+                self.replication_groups.append(rg)
+
                 for _ in range(0, replica_count):
                     # Start the replicas
                     i = i + 1
@@ -535,21 +545,13 @@ class ValkeyTimeSeriesClusterTestCase(ValkeyTimeSeriesTestCaseCommon):
                             is_primary=False,
                         )
                     )
-                    replicas.append(
+                    rg.replicas.append(
                         Node(
                             server=replica_server,
                             client=replica_client,
                             logfile=replica_logfile,
                         )
                     )
-
-                primary_node = Node(
-                    server=server,
-                    client=client,
-                    logfile=logfile,
-                )
-                rg = ReplicationGroup(primary=primary_node, replicas=replicas)
-                self.replication_groups.append(rg)
 
             for rg in self.replication_groups:
                 self.nodes.append(rg.primary)

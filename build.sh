@@ -48,7 +48,10 @@ RUN_COMPAT=false
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-0}"
 
 is_valid_parallel_workers() {
-    [ "$1" = "auto" ] || [ "$1" = "logical" ] || [[ "$1" =~ ^[0-9]+$ ]]
+    # An explicit count must fit within the 100 port bands tests/parallel_ports.py
+    # hands out (MAX_WORKERS); a higher xdist worker index has no port band and
+    # crashes at collection time.
+    [ "$1" = "auto" ] || [ "$1" = "logical" ] || { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -le 100 ]; }
 }
 
 POSITIONAL=""
