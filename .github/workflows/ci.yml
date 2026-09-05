@@ -18,7 +18,7 @@ jobs:
       matrix:
         server_version: ["unstable", "8.1"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -100,7 +100,7 @@ jobs:
     env:
       SERVER_VERSION: "8.1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # No protobuf compiler is installed here on purpose: build.rs parses
       # proto/v1/*.proto with protox (pure Rust), so protoc is never invoked. The
@@ -157,7 +157,7 @@ jobs:
   build-macos-latest:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -183,7 +183,7 @@ jobs:
       matrix:
         server_version: ["unstable", "8.1"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
