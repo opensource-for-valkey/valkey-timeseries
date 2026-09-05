@@ -10,7 +10,7 @@ use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
-use orx_parallel::{IterIntoParIter, ParIter, ParIterResult};
+use orx_parallel::{IntoParIter, ParIter, ParIterResult};
 use promql_parser::parser::{EvalStmt, Expr};
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -234,14 +234,17 @@ pub fn evaluate_range(
     // Ordering is preserved: `collect` keeps input order within a
     // chunk, and chunks are drained in ascending step order, so the per-series
     // sample vectors stay chronologically sorted without an extra sort.
-    let step_ts: Vec<Timestamp> = step_times(start_ms, end_ms, step_ms).collect();
+    let mut step_ts = step_times(start_ms, end_ms, step_ms);
     let mut series_map = SeriesMap::default();
 
-    for chunk in step_ts.chunks(STEP_MERGE_CHUNK_SIZE) {
+    loop {
+        let chunk: Vec<Timestamp> = step_ts.by_ref().take(STEP_MERGE_CHUNK_SIZE).collect();
+        if chunk.is_empty() {
+            break;
+        }
+
         let chunk_results: Vec<(Timestamp, ExprResult)> = chunk
-            .iter()
-            .copied()
-            .iter_into_par()
+            .into_par()
             .map(eval_step)
             .into_fallible_result()
             .collect()?;
