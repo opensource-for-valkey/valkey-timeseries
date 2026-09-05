@@ -37,7 +37,7 @@ use crate::promql::{
 use ahash::AHashSet;
 use orx_parallel::ParallelizableCollection;
 use orx_parallel::{IntoParIter, ParIterResult};
-use orx_parallel::{IterIntoParIter, ParIter};
+use orx_parallel::ParIter;
 use promql_parser::parser::token::T_LAND;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
@@ -888,8 +888,9 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
         let (aligned_start_ms, _, _, expected_steps) =
             compute_subquery_alignment(subquery_start_ms, subquery_end_ms, step_ms, 0);
 
-        let steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
+        let mut steps = step_times(aligned_start_ms, subquery_end_ms, step_ms);
         const PARALLEL_SUBQUERY_STEP_THRESHOLD: usize = 4;
+        const SUBQUERY_STEP_BATCH_SIZE: usize = 64;
 
         // Preload the subquery's *own* grid, in a sub-evaluator that owns the
         // maps.
@@ -926,29 +927,33 @@ impl<'reader, R: QueryReader> Evaluator<'reader, R> {
             );
         }
 
-        // Evaluate the inner expression at each step within the subquery range.
-        // orx-parallel's `collect` preserves input order, so `step_results` is in
-        // ascending step-timestamp order and per-series sample appends below
-        // produce chronologically sorted vectors without an extra sort.
-        let step_results: Vec<(i64, Vec<EvalSample>)> =
-            if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
-                let mut results = Vec::with_capacity(expected_steps);
-                for current_time_ms in steps {
-                    let res = sub.eval_subquery_step(subquery, ctx, current_time_ms)?;
-                    results.push(res);
+        let mut series_map = SeriesMap::default();
+        if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
+            for current_time_ms in steps {
+                let (current_time_ms, samples) =
+                    sub.eval_subquery_step(subquery, ctx, current_time_ms)?;
+                merge_step_into_series_map(&mut series_map, current_time_ms, samples);
+            }
+        } else {
+            // Evaluate in bounded batches. Collecting every inner step before
+            // merging makes a long subquery retain one vector per step in
+            // addition to the final series map.
+            loop {
+                let batch: Vec<_> = steps.by_ref().take(SUBQUERY_STEP_BATCH_SIZE).collect();
+                if batch.is_empty() {
+                    break;
                 }
-                results
-            } else {
-                steps
-                    .iter_into_par()
+                let step_results: Vec<(i64, Vec<EvalSample>)> = batch
+                    .into_par()
                     .map(|eval_ts| sub.eval_subquery_step(subquery, ctx, eval_ts))
                     .into_fallible_result()
-                    .collect()?
-            };
-
-        let mut series_map = SeriesMap::default();
-        for (current_time_ms, samples) in step_results {
-            merge_step_into_series_map(&mut series_map, current_time_ms, samples);
+                    .collect()?;
+                // Parallel collection preserves batch input order, and batches
+                // are consumed chronologically, so series values stay sorted.
+                for (current_time_ms, samples) in step_results {
+                    merge_step_into_series_map(&mut series_map, current_time_ms, samples);
+                }
+            }
         }
 
         let vector = series_map
