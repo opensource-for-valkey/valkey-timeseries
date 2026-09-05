@@ -394,6 +394,8 @@ mod selector_batch_executor_tests {
     use super::{SelectorTaskQueue, selector_fanout_failure};
     use crate::fanout::FanoutError;
     use crate::promql::QueryError;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
 
     #[test]
     fn enqueue_claims_processor_after_idle_transition() {
@@ -420,6 +422,45 @@ mod selector_batch_executor_tests {
         assert_eq!(queue.next_batch(1), Some(vec![1]));
         assert_eq!(queue.next_batch(1), Some(vec![2]));
         assert_eq!(queue.next_batch(1), None);
+    }
+
+    #[test]
+    fn idle_transition_interleaving_never_leaves_a_task_unowned() {
+        let queue = Arc::new(Mutex::new(SelectorTaskQueue::default()));
+        {
+            let mut queue = queue.lock().unwrap();
+            assert!(queue.enqueue(1));
+            assert_eq!(queue.next_batch(1), Some(vec![1]));
+        }
+
+        // Either the processor observes task 2 before becoming idle, or the
+        // enqueuer claims ownership after the idle transition. Both outcomes
+        // must leave a processor responsible for task 2.
+        let start = Arc::new(Barrier::new(2));
+        let processor_queue = queue.clone();
+        let processor_start = start.clone();
+        let processor = thread::spawn(move || {
+            processor_start.wait();
+            processor_queue.lock().unwrap().next_batch(1)
+        });
+
+        let enqueuer_queue = queue.clone();
+        let enqueuer = thread::spawn(move || {
+            start.wait();
+            enqueuer_queue.lock().unwrap().enqueue(2)
+        });
+
+        let processor_batch = processor.join().unwrap();
+        let enqueuer_claimed_processor = enqueuer.join().unwrap();
+        let mut queue = queue.lock().unwrap();
+
+        if enqueuer_claimed_processor {
+            assert_eq!(processor_batch, None);
+            assert_eq!(queue.next_batch(1), Some(vec![2]));
+        } else {
+            assert_eq!(processor_batch, Some(vec![2]));
+            assert_eq!(queue.next_batch(1), None);
+        }
     }
 
     #[test]

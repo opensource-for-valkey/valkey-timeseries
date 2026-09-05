@@ -143,6 +143,8 @@ mod tests {
     use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
     use crate::promql::engine::{evaluate_instant, evaluate_range};
     use promql_parser::parser::EvalStmt;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const INTERVAL_MS: i64 = 10_000;
@@ -258,6 +260,53 @@ mod tests {
             counting.counts(),
             ReaderCallCounts::default(),
             "the reader must not be queried once the point ceiling rejects the window"
+        );
+    }
+
+    #[test]
+    fn concurrent_oversized_ranges_are_rejected_before_any_fetch() {
+        // Each caller gets an independent range guard. Starting several at once
+        // must not allow any one of them to begin preloading an unbounded grid.
+        let (counting, reader) = build_reader();
+        let start = Arc::new(Barrier::new(4));
+        let mut callers = Vec::new();
+
+        for _ in 0..4 {
+            let reader = reader.clone();
+            let start = start.clone();
+            callers.push(thread::spawn(move || {
+                let opts = QueryOptions {
+                    timeout: None,
+                    deadline: None,
+                    max_points_per_series: Some(100_000),
+                    ..QueryOptions::default()
+                };
+                let stmt = EvalStmt {
+                    expr: promql_parser::parser::parse("a").expect("valid test query"),
+                    start: ms(RANGE_START_MS),
+                    end: ms(i64::MAX),
+                    interval: STEP,
+                    lookback_delta: opts.lookback_delta,
+                };
+                start.wait();
+                evaluate_range(reader, stmt, opts)
+                    .expect_err("the point guard must reject each oversized range")
+            }));
+        }
+
+        for caller in callers {
+            assert!(
+                caller
+                    .join()
+                    .unwrap()
+                    .to_string()
+                    .contains("too many points")
+            );
+        }
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts::default(),
+            "no concurrent caller may reach a preload fetch"
         );
     }
 

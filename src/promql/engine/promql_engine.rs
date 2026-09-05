@@ -471,6 +471,55 @@ mod tests {
     }
 
     #[test]
+    fn optimized_range_evaluation_matches_unoptimized_results() {
+        let querier = MemorySeriesQuerier::new();
+        let labels = crate::labels::Labels::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "range_metric".to_string(),
+        }]);
+        for timestamp in [4_000_000, 4_001_000] {
+            querier.add_sample(&labels, Sample::new(timestamp, -0.0));
+        }
+        let tsdb = PromqlQuerier::with_query_reader(Arc::new(querier));
+        let start = UNIX_EPOCH + Duration::from_secs(4_000);
+        let end = UNIX_EPOCH + Duration::from_secs(4_001);
+        let step = Duration::from_secs(1);
+
+        let unoptimized = tsdb
+            .eval_query_range(
+                "range_metric + (1 - 1)",
+                start..=end,
+                step,
+                &QueryOptions {
+                    optimize_queries: false,
+                    ..QueryOptions::default()
+                },
+            )
+            .expect("unoptimized range query must evaluate");
+        let optimized = tsdb
+            .eval_query_range(
+                "range_metric + (1 - 1)",
+                start..=end,
+                step,
+                &QueryOptions {
+                    optimize_queries: true,
+                    ..QueryOptions::default()
+                },
+            )
+            .expect("optimized range query must evaluate");
+
+        assert_eq!(unoptimized.len(), 1);
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(unoptimized[0].labels, optimized[0].labels);
+        assert!(unoptimized[0].labels.get("__name__").is_none());
+        assert_eq!(unoptimized[0].samples.len(), optimized[0].samples.len());
+        for (unoptimized, optimized) in unoptimized[0].samples.iter().zip(&optimized[0].samples) {
+            assert_eq!(unoptimized.timestamp, optimized.timestamp);
+            assert_eq!(unoptimized.value.to_bits(), optimized.value.to_bits());
+        }
+    }
+
+    #[test]
     fn eval_query_should_return_instant_vector() {
         let tsdb = create_tsdb_with_data();
         let query_time = UNIX_EPOCH + Duration::from_secs(4100);

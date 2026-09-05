@@ -116,6 +116,42 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         finally:
             self.client.execute_command('ACL', 'DELUSER', 'promql_reader')
 
+    def test_query_keeps_acl_identity_isolated_between_callers(self):
+        """One worker context must not reuse the preceding caller's ACL scope."""
+        for key, metric in (
+            ('promql:alice', 'alice_metric'),
+            ('promql:bob', 'bob_metric'),
+        ):
+            self.client.execute_command('TS.CREATE', key, 'LABELS', '__name__', metric)
+            self.client.execute_command('TS.ADD', key, 1000, 1)
+
+        self.client.execute_command(
+            'ACL', 'SETUSER', 'promql_alice', 'ON', '>pw',
+            '+@read', '+@timeseries', '+TS.QUERY', '~promql:alice'
+        )
+        self.client.execute_command(
+            'ACL', 'SETUSER', 'promql_bob', 'ON', '>pw',
+            '+@read', '+@timeseries', '+TS.QUERY', '~promql:bob'
+        )
+        alice = self.server.get_new_client()
+        bob = self.server.get_new_client()
+        try:
+            alice.execute_command('AUTH', 'promql_alice', 'pw')
+            bob.execute_command('AUTH', 'promql_bob', 'pw')
+
+            assert alice.execute_command('TS.QUERY', 'alice_metric', 'TIME', 1)
+            with pytest.raises(ResponseError, match='permission'):
+                alice.execute_command('TS.QUERY', 'bob_metric', 'TIME', 1)
+
+            assert bob.execute_command('TS.QUERY', 'bob_metric', 'TIME', 1)
+            with pytest.raises(ResponseError, match='permission'):
+                bob.execute_command('TS.QUERY', 'alice_metric', 'TIME', 1)
+        finally:
+            alice.close()
+            bob.close()
+            self.client.execute_command('ACL', 'DELUSER', 'promql_alice')
+            self.client.execute_command('ACL', 'DELUSER', 'promql_bob')
+
     def test_query_basic_metric_name(self):
         """Test basic TS.QUERY with just a metric name."""
         self.setup_simple_series()
@@ -499,4 +535,3 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             'sum(increase(http_requests_total{environment="production"}[2m]))', time
         )
         self._assert_single_value(result, 120.0)
-

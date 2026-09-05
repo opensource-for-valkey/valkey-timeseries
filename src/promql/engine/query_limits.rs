@@ -103,6 +103,29 @@ mod tests {
     }
 
     #[test]
+    fn range_limit_allows_the_exact_in_range_boundary() {
+        let mut series = TimeSeries::new();
+        for timestamp in 0..=10 {
+            assert!(matches!(
+                series.add(timestamp, timestamp as f64, None),
+                SampleAddResult::Ok(_)
+            ));
+        }
+
+        let samples =
+            get_series_range(&series, 5, 7, Some(3)).expect("the configured boundary is inclusive");
+
+        assert_eq!(
+            samples,
+            vec![
+                Sample::new(5, 5.0),
+                Sample::new(6, 6.0),
+                Sample::new(7, 7.0)
+            ]
+        );
+    }
+
+    #[test]
     fn range_limit_rejects_when_the_filtered_result_exceeds_the_limit() {
         let mut series = TimeSeries::new();
         for timestamp in 0..=10 {
