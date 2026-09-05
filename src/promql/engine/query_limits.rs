@@ -51,10 +51,16 @@ pub(in crate::promql) fn get_series_range(
     // Chunk headers only describe the entire chunk. A chunk that overlaps the
     // query may contain many samples outside the requested interval, so its
     // length is an upper bound rather than the number of returned points.
-    // Validate the decoded, range-filtered result to enforce the documented
-    // per-series limit exactly.
-    let samples = series.get_range(start_time, end_time);
-    validate_max_points(samples.len(), max_points_per_series)?;
+    // Stream the range instead: a rejected query keeps at most the permitted
+    // samples and the sample that proves the limit was exceeded.
+    let mut samples = Vec::new();
+    for sample in series.range_iter(start_time, end_time) {
+        if samples.len() >= points_count {
+            validate_max_points(points_count.saturating_add(1), max_points_per_series)?;
+        }
+        samples.push(sample);
+    }
+
     Ok(samples)
 }
 
