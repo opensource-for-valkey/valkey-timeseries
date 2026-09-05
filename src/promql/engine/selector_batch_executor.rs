@@ -3,7 +3,7 @@ use crate::common::logging::log_warning;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutCommand, is_clustered, with_fanout_user};
-use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeout};
+use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::query_reader::{
@@ -390,8 +390,10 @@ impl SelectorBatchExecutor {
 }
 
 #[cfg(test)]
-mod selector_task_queue_tests {
-    use super::SelectorTaskQueue;
+mod selector_batch_executor_tests {
+    use super::{SelectorTaskQueue, selector_fanout_failure};
+    use crate::fanout::FanoutError;
+    use crate::promql::QueryError;
 
     #[test]
     fn enqueue_claims_processor_after_idle_transition() {
@@ -418,6 +420,22 @@ mod selector_task_queue_tests {
         assert_eq!(queue.next_batch(1), Some(vec![1]));
         assert_eq!(queue.next_batch(1), Some(vec![2]));
         assert_eq!(queue.next_batch(1), None);
+    }
+
+    #[test]
+    fn selector_fanout_failure_preserves_timeout() {
+        assert!(matches!(
+            selector_fanout_failure("instant", FanoutError::timeout()),
+            QueryError::Timeout
+        ));
+    }
+
+    #[test]
+    fn selector_fanout_failure_is_not_an_empty_result() {
+        assert!(matches!(
+            selector_fanout_failure("range", FanoutError::custom("shard unavailable")),
+            QueryError::Execution(message) if message.contains("shard unavailable")
+        ));
     }
 }
 
@@ -542,6 +560,16 @@ fn deliver_task_result(
     }
 }
 
+/// Convert a cluster selector failure into the query result delivered to the
+/// evaluator. An empty selector result is a valid PromQL answer, so it must
+/// never be used to hide a failed shard request.
+fn selector_fanout_failure(query_kind: &str, error: FanoutError) -> QueryError {
+    log_warning(format!(
+        "promql: cluster command failed for {query_kind} query: {error}"
+    ));
+    error.into()
+}
+
 fn execute_cluster_vector_selector(
     ctx: &Context,
     iqc: InstantVectorSelectorCommand,
@@ -582,14 +610,7 @@ fn execute_cluster_vector_selector(
                 validate_max_series_(samples.len(), max_series)
                     .map(|_| SelectorOutput::Value(QueryValue::Vector(samples)))
             }
-            Err(e) => {
-                log_warning(format!(
-                    "promql: cluster command failed for instant query: {e}"
-                ));
-
-                // Return empty result on error to avoid failing the entire batch.
-                Ok(SelectorOutput::Value(QueryValue::Vector(vec![])))
-            }
+            Err(e) => Err(selector_fanout_failure("instant", e)),
         };
 
         deliver_task_result(&responder, query_result);
@@ -645,14 +666,7 @@ fn execute_cluster_range_selector(
                     Ok(SelectorOutput::Value(QueryValue::Matrix(ranges)))
                 })
             }
-            Err(e) => {
-                log_warning(format!(
-                    "promql: cluster command failed for range query: {e}"
-                ));
-
-                // Return empty result on error to avoid failing the entire batch.
-                Ok(SelectorOutput::Value(QueryValue::Matrix(vec![])))
-            }
+            Err(e) => Err(selector_fanout_failure("range", e)),
         };
 
         deliver_task_result(&responder, query_result);
