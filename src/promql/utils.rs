@@ -46,10 +46,17 @@ pub(in crate::promql) fn range_bounds_to_secs(
 
 #[inline]
 fn calc_points(start: Timestamp, end: Timestamp, step: &Duration) -> i64 {
-    // Saturating: `end` can be the i64::MAX sentinel and `start` any timestamp, so a plain
-    // `end - start` would overflow at the extremes — the exact input this guards against.
+    if end < start {
+        return 0;
+    }
+
+    // A range grid includes both bounds: 0..=1000 at a 1ms step has 1,001
+    // points. Saturate the conversion and arithmetic because an unbounded end
+    // is represented by i64::MAX.
+    let step_ms = i64::try_from(step.as_millis()).unwrap_or(i64::MAX).max(1);
     end.saturating_sub(start)
-        .saturating_div((step.as_millis() + 1) as i64)
+        .saturating_div(step_ms)
+        .saturating_add(1)
 }
 
 /// The minimum number of points per timeseries for enabling time rounding.
@@ -156,20 +163,27 @@ mod max_points_tests {
 
     #[test]
     fn within_limit_passes() {
-        // 1000 steps of 1ms, limit 100000: comfortably under, must be accepted.
+        // 0..=999 at a 1ms step has exactly 1,000 points.
         assert!(
-            validate_max_points_per_timeseries(0, 1000, Duration::from_millis(1), 100_000).is_ok()
+            validate_max_points_per_timeseries(0, 999, Duration::from_millis(1), 1_000).is_ok()
         );
     }
 
     #[test]
     fn one_past_limit_is_rejected() {
-        // step+1 divisor: a 1ms step counts points as span/2. A 2*(limit)+2 ms span yields
-        // limit+1 points — the first value that must trip the ceiling.
+        // The inclusive end contributes one point, so 0..=10 has 11 points.
         let limit = 10usize;
-        let span = 2 * (limit as i64 + 1);
         assert!(
-            validate_max_points_per_timeseries(0, span, Duration::from_millis(1), limit).is_err()
+            validate_max_points_per_timeseries(0, limit as i64, Duration::from_millis(1), limit)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn inclusive_grid_count_rejects_ranges_that_exceed_the_limit() {
+        // This used to count only 500 points by dividing by step + 1.
+        assert!(
+            validate_max_points_per_timeseries(0, 1_000, Duration::from_millis(1), 600).is_err()
         );
     }
 

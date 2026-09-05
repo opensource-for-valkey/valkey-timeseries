@@ -1,5 +1,5 @@
 use crate::common::{Sample, Timestamp};
-use crate::series::{TimeSeries, chunks::ChunkOps};
+use crate::series::TimeSeries;
 
 pub(crate) const MAX_SERIES_ERROR_MSG: &str =
     "the query returns more than the configured max series limit";
@@ -48,34 +48,14 @@ pub(in crate::promql) fn get_series_range(
     if !series.overlaps(start_time, end_time) {
         return Ok(Vec::new());
     }
-    let Some(range) = series.get_chunk_index_bounds(start_time, end_time) else {
-        return Ok(Vec::new());
-    };
-
-    // do a cheap check to see if the sample count exceed the max, without decoding
-    let (start_index, end_index) = range;
-    let chunks = &series.chunks[start_index..=end_index];
-    // only count points in the chunks that overlap with the range, as some chunks may be partially outside the range
-    // this allows us to avoid decoding if it's not necessary
-    let count: usize = chunks
-        .iter()
-        .filter_map(|chunk| {
-            if chunk.overlaps(start_time, end_time) {
-                Some(chunk.len())
-            } else {
-                None
-            }
-        })
-        .sum();
-    if count > points_count {
-        Err(format!(
-            "{MAX_POINTS_PER_SERIES_ERROR_MSG}: {count} > {points_count}",
-        ))
-    } else {
-        let samples = series.get_range(start_time, end_time);
-        validate_max_points(samples.len(), max_points_per_series)?;
-        Ok(samples)
-    }
+    // Chunk headers only describe the entire chunk. A chunk that overlaps the
+    // query may contain many samples outside the requested interval, so its
+    // length is an upper bound rather than the number of returned points.
+    // Validate the decoded, range-filtered result to enforce the documented
+    // per-series limit exactly.
+    let samples = series.get_range(start_time, end_time);
+    validate_max_points(samples.len(), max_points_per_series)?;
+    Ok(samples)
 }
 
 pub(in crate::promql) fn validate_max_points(
@@ -92,5 +72,43 @@ pub(in crate::promql) fn validate_max_points(
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::series::SampleAddResult;
+
+    #[test]
+    fn range_limit_counts_only_samples_inside_the_requested_interval() {
+        let mut series = TimeSeries::new();
+        for timestamp in 0..=10 {
+            assert!(matches!(
+                series.add(timestamp, timestamp as f64, None),
+                SampleAddResult::Ok(_)
+            ));
+        }
+
+        let samples = get_series_range(&series, 5, 5, Some(1))
+            .expect("one in-range sample must not be rejected by its larger chunk");
+
+        assert_eq!(samples, vec![Sample::new(5, 5.0)]);
+    }
+
+    #[test]
+    fn range_limit_rejects_when_the_filtered_result_exceeds_the_limit() {
+        let mut series = TimeSeries::new();
+        for timestamp in 0..=10 {
+            assert!(matches!(
+                series.add(timestamp, timestamp as f64, None),
+                SampleAddResult::Ok(_)
+            ));
+        }
+
+        let error = get_series_range(&series, 5, 7, Some(2))
+            .expect_err("three in-range samples exceed the two-point limit");
+
+        assert!(error.contains("3 > 2"));
     }
 }
