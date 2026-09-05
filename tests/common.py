@@ -21,7 +21,10 @@ SERVER_PATH = f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/{SE
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 SERVER_VERSION = os.environ.get("SERVER_VERSION", "unstable")
 VALKEY_SERVER_PATH = f"{SCRIPT_DIR}/build/binaries/{SERVER_VERSION}/valkey-server"
-TEST_DIR = f"{ROOT_PATH}/test-data"
+# TEST_DIR is overridable so that each pytest-xdist worker can be given its own
+# directory (tests/conftest.py sets it before this module is imported). Serial runs
+# see the unsuffixed default and are unaffected.
+TEST_DIR = os.environ.get("TEST_DIR") or f"{ROOT_PATH}/test-data"
 LOGS_DIR = f"{TEST_DIR}/logs"
 
 if "VALKEY_SERVER_PATH" in os.environ:

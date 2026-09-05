@@ -180,8 +180,22 @@ class ReplicationGroup:
         for replica in rg.replicas:
             kill_node(replica)
 
+# Cluster formation (MEET plus gossip convergence) is the most load-sensitive wait in
+# the suite: with several workers each starting a 3-node cluster, ten seconds is not
+# always enough on a busy machine. Overridable so a slow runner can be accommodated
+# without editing tests.
+CLUSTER_MEET_TIMEOUT_SECONDS = int(os.environ.get("CLUSTER_MEET_TIMEOUT", "60"))
+
+
 class ValkeyTimeSeriesTestCaseCommon(ValkeyTestCase):
     """Common base class for the various Search test cases"""
+
+    # The framework defaults this to the relative path "test-data", which resolves
+    # against the process cwd and is therefore shared by every worker -- and moves
+    # under the cluster tests, which chdir while starting nodes. TEST_DIR is absolute
+    # and already carries the worker suffix (tests/conftest.py), so tests that build
+    # paths from self.testdir get worker isolation without knowing about it.
+    testdir = TEST_DIR
 
     def resolve_module_path(self) -> str:
         """Resolve and validate the module path used by test servers."""
@@ -439,26 +453,30 @@ class ValkeyTimeSeriesClusterTestCase(ValkeyTimeSeriesTestCaseCommon):
 
         os.makedirs(testdir, exist_ok=True)
         curdir = os.getcwd()
-        os.chdir(testdir)
-        lines = self.get_config_file_lines(testdir, port)
+        # The chdir must be undone even when a node fails to start: the process cwd
+        # is shared by every later test in this worker, and leaving it inside a
+        # torn-down test directory breaks all of them, not just this one.
+        try:
+            os.chdir(testdir)
+            lines = self.get_config_file_lines(testdir, port)
 
-        conf_file = f"{testdir}/valkey_{port}.conf"
-        with open(conf_file, "w+") as f:
-            for line in lines:
-                f.write(f"{line}\n")
-            f.write("\n")
-            f.close()
+            conf_file = f"{testdir}/valkey_{port}.conf"
+            with open(conf_file, "w+") as f:
+                for line in lines:
+                    f.write(f"{line}\n")
+                f.write("\n")
 
-        role = "primary" if is_primary else "replica"
-        logfile = f"{testdir}/logfile-{role}-{port}.log"
-        server, client = self.create_server(
-            testdir=testdir,
-            server_path=server_path,
-            args={"logfile": logfile},
-            port=port,
-            conf_file=conf_file,
-        )
-        os.chdir(curdir)
+            role = "primary" if is_primary else "replica"
+            logfile = f"{testdir}/logfile-{role}-{port}.log"
+            server, client = self.create_server(
+                testdir=testdir,
+                server_path=server_path,
+                args={"logfile": logfile},
+                port=port,
+                conf_file=conf_file,
+            )
+        finally:
+            os.chdir(curdir)
         self.wait_for_logfile(logfile, "Ready to accept connections")
         # Verify each node loaded the exact module artifact requested for this test run.
         self.wait_for_logfile(logfile, f"Module 'ts' loaded from {module_path}")
@@ -467,106 +485,117 @@ class ValkeyTimeSeriesClusterTestCase(ValkeyTimeSeriesTestCaseCommon):
 
     @pytest.fixture(autouse=True)
     def setup_test(self, request):
-        module_path = self.resolve_module_path()
-        replica_count = self.REPLICAS_COUNT
-        # Extract parameters from pytest's parametrize decorator
-        if hasattr(request.node, 'callspec') and 'setup_test' in request.node.callspec.params:
-            param_value = request.node.callspec.params['setup_test']
-            if isinstance(param_value, dict) and 'replica_count' in param_value:
-                replica_count = param_value['replica_count']
-
         self.replication_groups: list[ReplicationGroup] = list()
-        ports = []
-        for i in range(0, self.CLUSTER_SIZE):
-            ports.append(self.get_bind_port())
-            for _ in range(0, replica_count):
-                ports.append(self.get_bind_port())
-
-        test_name = self.normalize_dir_name(request.node.name)
-        testdir_base = f"{TEST_DIR}/{test_name}"
-
-        if os.path.exists(testdir_base):
-            shutil.rmtree(testdir_base)
-
-        for i in range(0, len(ports), replica_count + 1):
-            primary_port = ports[i]
-            server, client, logfile = self.start_server(
-                primary_port,
-                test_name,
-                module_path,
-                True,
-                is_primary=True,
-            )
-
-            replicas = []
-            for _ in range(0, replica_count):
-                # Start the replicas
-                i = i + 1
-                replica_port = ports[i]
-                replica_server, replica_client, replica_logfile = (
-                    self.start_server(
-                        replica_port,
-                        test_name,
-                        module_path,
-                        cluster_enabled=True,
-                        is_primary=False,
-                    )
-                )
-                replicas.append(
-                    Node(
-                        server=replica_server,
-                        client=replica_client,
-                        logfile=replica_logfile,
-                    )
-                )
-
-            primary_node = Node(
-                server=server,
-                client=client,
-                logfile=logfile,
-            )
-            rg = ReplicationGroup(primary=primary_node, replicas=replicas)
-            self.replication_groups.append(rg)
-
         self.nodes: List[Node] = list()
-        for rg in self.replication_groups:
-            self.nodes.append(rg.primary)
-            self.nodes += rg.replicas
+        # Every node started below must be torn down even if setup fails partway:
+        # a half-built cluster otherwise leaves servers holding their ports for the
+        # rest of the session, which strands every later test that lands on them.
+        try:
+            module_path = self.resolve_module_path()
+            replica_count = self.REPLICAS_COUNT
+            # Extract parameters from pytest's parametrize decorator
+            if hasattr(request.node, 'callspec') and 'setup_test' in request.node.callspec.params:
+                param_value = request.node.callspec.params['setup_test']
+                if isinstance(param_value, dict) and 'replica_count' in param_value:
+                    replica_count = param_value['replica_count']
 
-        # Split the slots
-        ranges = self._split_range_pairs(0, 16384, self.CLUSTER_SIZE)
-        node_idx = 0
-        for start, end in ranges:
-            self.add_slots(node_idx, start, end)
-            node_idx = node_idx + 1
+            ports = []
+            for i in range(0, self.CLUSTER_SIZE):
+                ports.append(self.get_bind_port())
+                for _ in range(0, replica_count):
+                    ports.append(self.get_bind_port())
 
-        # Perform cluster meet
-        for node_idx in range(0, self.CLUSTER_SIZE):
-            self.cluster_meet(node_idx, self.CLUSTER_SIZE)
+            test_name = self.normalize_dir_name(request.node.name)
+            testdir_base = f"{TEST_DIR}/{test_name}"
 
-        waiters.wait_for_equal(
-            lambda: self._wait_for_meet(
-                self.CLUSTER_SIZE + (self.CLUSTER_SIZE * replica_count)
-            ),
-            True,
-            timeout=10,
-        )
+            if os.path.exists(testdir_base):
+                shutil.rmtree(testdir_base)
 
-        # Wait for the cluster to be up
-        for rg in self.replication_groups:
-            logging.info(
-                f"Waiting for cluster to change state...{rg.primary.logfile}"
+            for i in range(0, len(ports), replica_count + 1):
+                primary_port = ports[i]
+                server, client, logfile = self.start_server(
+                    primary_port,
+                    test_name,
+                    module_path,
+                    True,
+                    is_primary=True,
+                )
+
+                replicas = []
+                for _ in range(0, replica_count):
+                    # Start the replicas
+                    i = i + 1
+                    replica_port = ports[i]
+                    replica_server, replica_client, replica_logfile = (
+                        self.start_server(
+                            replica_port,
+                            test_name,
+                            module_path,
+                            cluster_enabled=True,
+                            is_primary=False,
+                        )
+                    )
+                    replicas.append(
+                        Node(
+                            server=replica_server,
+                            client=replica_client,
+                            logfile=replica_logfile,
+                        )
+                    )
+
+                primary_node = Node(
+                    server=server,
+                    client=client,
+                    logfile=logfile,
+                )
+                rg = ReplicationGroup(primary=primary_node, replicas=replicas)
+                self.replication_groups.append(rg)
+
+            for rg in self.replication_groups:
+                self.nodes.append(rg.primary)
+                self.nodes += rg.replicas
+
+            # Split the slots
+            ranges = self._split_range_pairs(0, 16384, self.CLUSTER_SIZE)
+            node_idx = 0
+            for start, end in ranges:
+                self.add_slots(node_idx, start, end)
+                node_idx = node_idx + 1
+
+            # Perform cluster meet
+            for node_idx in range(0, self.CLUSTER_SIZE):
+                self.cluster_meet(node_idx, self.CLUSTER_SIZE)
+
+            waiters.wait_for_equal(
+                lambda: self._wait_for_meet(
+                    self.CLUSTER_SIZE + (self.CLUSTER_SIZE * replica_count)
+                ),
+                True,
+                timeout=CLUSTER_MEET_TIMEOUT_SECONDS,
             )
-            self.wait_for_logfile(
-                rg.primary.logfile, "Cluster state changed: ok"
-            )
-            rg.setup_replications_cluster()
-        logging.info("Cluster is up and running!")
-        yield
 
-        # Cleanup
-        for rg in self.replication_groups:
-            ReplicationGroup.cleanup(rg)
+            # Wait for the cluster to be up
+            for rg in self.replication_groups:
+                logging.info(
+                    f"Waiting for cluster to change state...{rg.primary.logfile}"
+                )
+                self.wait_for_logfile(
+                    rg.primary.logfile, "Cluster state changed: ok"
+                )
+                rg.setup_replications_cluster()
+            logging.info("Cluster is up and running!")
+            yield
+        finally:
+            cleanup_error = None
+            for rg in self.replication_groups:
+                try:
+                    ReplicationGroup.cleanup(rg)
+                except Exception as e:  # keep tearing down the remaining groups
+                    logging.error("Error during ReplicationGroup.cleanup: %s", e)
+                    if cleanup_error is None:
+                        cleanup_error = e
+            if cleanup_error is not None:
+                raise cleanup_error
 
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         module_path = self.resolve_module_path()

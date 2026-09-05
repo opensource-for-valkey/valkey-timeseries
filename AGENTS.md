@@ -39,6 +39,8 @@ Quick start (commands you can run)
     - To run ASAN integration pass: `ASAN_BUILD=true SERVER_VERSION=unstable ./build.sh`
     - Run a subset of Python integration tests: `TEST_PATTERN="test_ts_add" SERVER_VERSION=unstable ./build.sh`
     - Include the compatibility suite: `RTS_COMPAT=1 SERVER_VERSION=unstable ./build.sh`
+    - Run the integration tests in parallel: `SERVER_VERSION=unstable ./build.sh --parallel`
+      (or `-j8` for a fixed worker count). Serial is the default.
 - Benchmarks: `cargo bench --features enable-system-alloc` (see Benchmarks below — the feature is mandatory).
 - Compression report: `tools/compression_report.sh` (add `--check` to fail on regressions against a saved baseline).
 - Latency report: `tools/latency_report.sh`. Wire-payload report: `tools/wire_report.sh` (see Benchmarks below).
@@ -51,6 +53,15 @@ Key ENV and behavior (from `./build.sh`)
   `tests/build/binaries/$SERVER_VERSION/valkey-server`. Defaults to `unstable` if not set, which tracks the latest main or branch.
 - `ASAN_BUILD`: when set runs tests with LeakSanitizer checks and fails on leaks.
 - `TEST_PATTERN`: passed to pytest `-k` to select tests.
+- `PARALLEL_WORKERS` (equivalently `--parallel[=N]` / `-j[=N]`): number of pytest-xdist workers for the
+  integration phase. `auto` means one per core capped at 32; `0` and `1` both mean serial, which is the
+  default. Each worker gets its own port band and its own `test-data/<worker>` directory
+  (`tests/conftest.py`), so tests do not need to know they are sharing a machine. Two phases ignore this
+  knob on purpose: the compatibility suite always runs serially because its fixtures share one reference
+  server on a fixed port, and the ASAN job stays serial because its leak attribution depends on ordered
+  pytest output. See `docs/plans/parallel-integration-tests-plan.md`.
+- `CLUSTER_MEET_TIMEOUT`: seconds to wait for cluster formation in cluster tests (default 60). Raise it on a
+  slow or heavily loaded runner rather than lowering the worker count.
 - `RTS_COMPAT=1` / `COMPAT_REFERENCE_URL` (or the `./build.sh compat` argument): any of them adds a second
   pytest phase that runs the differential compatibility suite. Unset (the default), `build.sh` never collects
   `tests/compat`, because those tests need a live RedisTimeSeries reference server. In compat mode `build.sh`

@@ -6,7 +6,8 @@ requires-python=">=3.11,<3.12"
 keywords = ["timeseries", "gorilla", "compression"]
 dependencies = [
     "valkey",
-    "pytest==6.2.5",
+    "pytest==7.4.3",
+    "pytest-xdist>=3.5.0",
     "pytest-html",
     "PyYAML",
     "hypothesis",

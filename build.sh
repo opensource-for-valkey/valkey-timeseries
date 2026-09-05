@@ -2,13 +2,20 @@
 
 # Script to run format checks valkey-timeseries module, build it and generate .so files, run unit and integration tests.
 #
-# Usage: ./build.sh [clean|compat]
+# Usage: ./build.sh [--parallel[=N] | -j[=N]] [clean|compat]
 #
 #   (no argument)  format checks, build, unit tests, integration tests
 #   clean          remove build artifacts and exit
 #   compat         also run the RedisTimeSeries compatibility suite (tests/compat),
 #                  provisioning and starting a reference server first.
 #                  Equivalent to RTS_COMPAT=1 ./build.sh
+#
+#   --parallel[=N] run the integration tests across N pytest-xdist workers.
+#   -j[=N]         N may be "auto" (one per core, capped at 32), or an integer;
+#                  0 and 1 both mean serial. Defaults to serial when not given.
+#                  Also settable as PARALLEL_WORKERS. The compatibility suite
+#                  always runs serially: it shares one reference server and a
+#                  fixed port. See docs/plans/parallel-integration-tests-plan.md.
 #
 # See docs/rts-compat-build-integration-plan.md for the compatibility integration.
 
@@ -21,7 +28,10 @@ cd "$SCRIPT_DIR"
 echo "Script Directory: $SCRIPT_DIR"
 
 usage() {
-    sed -n '3,14p' "${BASH_SOURCE[0]}" | sed -e 's/^# \{0,1\}//'
+    # Print the header comment block (from line 3 to the first blank/non-comment
+    # line) rather than a hardcoded range, so editing the header cannot silently
+    # truncate --help.
+    awk 'NR<3 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "${BASH_SOURCE[0]}"
 }
 
 # Optional environment knobs, defaulted so `set -u` does not trip over them.
@@ -32,13 +42,62 @@ COMPAT_REFERENCE_URL="${COMPAT_REFERENCE_URL:-}"
 
 RUN_COMPAT=false
 
-if [ "$#" -gt 1 ]; then
-    echo "ERROR: too many arguments: $*" >&2
-    usage >&2
+# Serial by default: parallelism is opt-in so that an unattended run of this script
+# behaves exactly as it did before, and so a failure is never blamed on concurrency
+# nobody asked for.
+PARALLEL_WORKERS="${PARALLEL_WORKERS:-0}"
+
+is_valid_parallel_workers() {
+    [ "$1" = "auto" ] || [ "$1" = "logical" ] || [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+POSITIONAL=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --parallel|-j)
+            shift
+            if [ "$#" -gt 0 ] && [[ "$1" != -* ]] && is_valid_parallel_workers "$1"; then
+                PARALLEL_WORKERS="$1"
+                shift
+            else
+                PARALLEL_WORKERS="auto"
+            fi
+            ;;
+        --parallel=*|-j=*)
+            PARALLEL_WORKERS="${1#*=}"
+            shift
+            if ! is_valid_parallel_workers "$PARALLEL_WORKERS"; then
+                echo "ERROR: invalid worker count '$PARALLEL_WORKERS'; expected auto, logical or an integer." >&2
+                exit 2
+            fi
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "ERROR: unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            if [ -n "$POSITIONAL" ]; then
+                echo "ERROR: too many arguments: $POSITIONAL $1" >&2
+                usage >&2
+                exit 2
+            fi
+            POSITIONAL="$1"
+            shift
+            ;;
+    esac
+done
+
+if ! is_valid_parallel_workers "$PARALLEL_WORKERS"; then
+    echo "ERROR: invalid PARALLEL_WORKERS='$PARALLEL_WORKERS'; expected auto, logical or an integer." >&2
     exit 2
 fi
 
-case "${1:-}" in
+case "$POSITIONAL" in
     "")
         ;;
     clean)
@@ -52,16 +111,41 @@ case "${1:-}" in
     compat)
         RUN_COMPAT=true
         ;;
-    -h|--help)
-        usage
-        exit 0
-        ;;
     *)
-        echo "ERROR: unknown argument: $1" >&2
+        echo "ERROR: unknown argument: $POSITIONAL" >&2
         usage >&2
         exit 2
         ;;
 esac
+
+# Resolve "auto" to a worker count once, here, so both the log line and the pytest
+# invocation agree. The cap keeps a 64-core machine from starting 192 valkey-servers.
+resolve_workers() {
+    local requested="$1"
+    if [ "$requested" = "auto" ] || [ "$requested" = "logical" ]; then
+        local cores
+        if [ "$(uname)" = "Darwin" ]; then
+            cores=$(sysctl -n hw.ncpu)
+        else
+            cores=$(nproc)
+        fi
+        if [ "$cores" -gt 32 ]; then cores=32; fi
+        if [ "$cores" -lt 1 ]; then cores=1; fi
+        echo "$cores"
+    else
+        echo "$requested"
+    fi
+}
+
+XDIST_ARGS=()
+RESOLVED_WORKERS=$(resolve_workers "$PARALLEL_WORKERS")
+if [ "$RESOLVED_WORKERS" -gt 1 ]; then
+    # loadscope keeps a test class on one worker. Several classes here share
+    # per-class directories under test-data/, so splitting a class across workers
+    # would reintroduce exactly the collisions the port bands remove.
+    XDIST_ARGS=(-n "$RESOLVED_WORKERS" --dist=loadscope)
+    echo "Integration tests will run across $RESOLVED_WORKERS workers."
+fi
 
 # The compatibility suite needs a live reference server. It runs when asked for
 # explicitly (`./build.sh compat`, RTS_COMPAT=1) or when an external reference is
@@ -291,6 +375,9 @@ assert_something_ran() {
 # tests/compat is excluded here and run on its own below, so that a compat failure is
 # attributable and the reference server is only up while it is actually needed.
 PHASE1_ARGS=("$SCRIPT_DIR/tests/" "--ignore=$SCRIPT_DIR/tests/compat")
+if [ "${#XDIST_ARGS[@]}" -gt 0 ]; then
+    PHASE1_ARGS+=("${XDIST_ARGS[@]}")
+fi
 if [ -n "$TEST_PATTERN" ]; then
     PHASE1_ARGS+=(-k "$TEST_PATTERN")
 else
@@ -335,6 +422,9 @@ if [ "$RUN_COMPAT" = true ]; then
     # a silent skip rather than a failure.
     export COMPAT_STRICT_SKIPS=1
 
+    # Deliberately serial, whatever --parallel said. The compat fixtures are
+    # session-scoped around a single reference server on a fixed port, and each
+    # worker would FLUSHALL the others' data out from under them.
     PHASE2_ARGS=("$SCRIPT_DIR/tests/compat" -rs)
     if [ -n "$TEST_PATTERN" ]; then
         PHASE2_ARGS+=(-k "$TEST_PATTERN")

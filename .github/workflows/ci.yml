@@ -79,8 +79,14 @@ jobs:
 
       # tests/compat needs a live RedisTimeSeries reference server; it is covered
       # by the compat-smoke job below.
+      #
+      # -n auto spreads the suite over the runner's cores. loadscope keeps a test
+      # class on one worker, which several classes here rely on for their per-class
+      # directories under test-data/. Ports and working directories are partitioned
+      # per worker in tests/conftest.py; see
+      # docs/plans/parallel-integration-tests-plan.md.
       - name: Run integration tests
-        run: python3 -m pytest --cache-clear -v "tests/" --ignore=tests/compat
+        run: python3 -m pytest --cache-clear -v -n auto --dist=loadscope "tests/" --ignore=tests/compat
 
   # RedisTimeSeries compatibility smoke gate (docs/plans/rts-compatibility-test-plan.md §8):
   # Tier A smoke subset diffed against the pinned redis:8.10 reference image,
@@ -233,6 +239,12 @@ jobs:
 
       # tests/compat needs a live RedisTimeSeries reference server; it is covered
       # by the compat-smoke job above.
+      #
+      # Deliberately serial. The leak attribution below reads the test name from the
+      # two lines above each LeakSanitizer report, which only holds while pytest
+      # output is ordered; xdist interleaves workers and prefixes lines with [gwN].
+      # Routing sanitizer output to per-server files would lift this restriction --
+      # see docs/plans/parallel-integration-tests-plan.md section 3.6.
       - name: Run integration tests
         run: |
           python3 -m pytest --capture=sys --cache-clear -v "tests/" --ignore=tests/compat -m "not skip_for_asan" 2>&1 | tee test_output.tmp
