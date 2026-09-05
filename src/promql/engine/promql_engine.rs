@@ -3,6 +3,8 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
+use crate::promql::exec::planner::PlannedQuery;
+use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{EvalLabels, SeriesMap};
 use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
@@ -192,19 +194,26 @@ pub fn evaluate_range(
     )
     .map_err(QueryError::from)?;
 
-    let evaluator = Evaluator::new(&reader, opts);
     let deadline = resolve_deadline_ms(opts);
 
-    evaluator
-        .preload_for_range_from_stmt(&stmt)
+    let step_ms = step.as_millis() as i64;
+    let lookback_delta_ms = lookback_delta.as_millis() as i64;
+    let range_ctx = crate::promql::EvalContext {
+        query_start: start_ms,
+        query_end: end_ms,
+        evaluation_ts: end_ms,
+        lookback_delta_ms,
+        step_ms,
+    };
+    let plan = PlannedQuery::for_range(&stmt.expr, &range_ctx);
+    let prepared = Preloader::new(reader.as_ref(), opts)
+        .prepare(plan)
         .map_err(QueryError::from)?;
+    let evaluator = Evaluator::with_prepared(reader.as_ref(), opts, prepared);
 
     if deadline > 0 && current_time_millis() > deadline {
         return Err(QueryError::Timeout);
     }
-
-    let step_ms = step.as_millis() as i64;
-    let lookback_delta_ms = lookback_delta.as_millis() as i64;
 
     let eval_step = |t: Timestamp| -> QueryResult<(Timestamp, ExprResult)> {
         // Best-effort per-step timeout check.

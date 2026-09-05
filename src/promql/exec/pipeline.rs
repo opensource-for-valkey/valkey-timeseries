@@ -269,7 +269,7 @@ pub(crate) struct PipelineTimings {
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
 /// Branching on `QueryPathKind` handles the behavioral differences between
 /// instant vector selectors, matrix selectors, and subquery fast paths.
-pub(crate) fn execute_selector_pipeline<R: QueryReader>(
+pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
     reader: &R,
     plan: &QueryPlan,
     selector: &VectorSelector,
