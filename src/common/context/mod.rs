@@ -113,6 +113,11 @@ pub fn is_acl_enforced(ctx: &Context) -> bool {
 }
 
 pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
+    // A detached/thread-safe context has no client, so `get_current_user` reads
+    // `ctx->client->user->name` and returns empty. Background selector work
+    // (PromQL) carries the caller's identity in the thread-local fanout scope
+    // instead, so prefer it whenever that scope is active — including on a
+    // single node, not just in cluster fanout.
     let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
     if let Some(identity) = fanout_identity {
         return ctx.create_string(identity.name.as_str());
