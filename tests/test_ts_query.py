@@ -93,6 +93,29 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert db1_result.result[0].metric['db'] == '1'
         assert db1_result.result[0].value.value == 22
 
+    def test_query_preserves_callers_acl_identity(self):
+        """The background selector read must enforce the command caller's key ACL."""
+        self.client.execute_command(
+            'TS.CREATE', 'promql:allowed', 'LABELS', '__name__', 'allowed_metric'
+        )
+        self.client.execute_command('TS.ADD', 'promql:allowed', 1000, 1)
+        self.client.execute_command(
+            'TS.CREATE', 'promql:denied', 'LABELS', '__name__', 'denied_metric'
+        )
+        self.client.execute_command('TS.ADD', 'promql:denied', 1000, 1)
+        self.client.execute_command(
+            'ACL', 'SETUSER', 'promql_reader', 'ON', '>pw',
+            '+@read', '+@timeseries', '+TS.QUERY', '~promql:allowed'
+        )
+        limited = self.server.get_new_client()
+        try:
+            limited.execute_command('AUTH', 'promql_reader', 'pw')
+            assert limited.execute_command('TS.QUERY', 'allowed_metric', 'TIME', 1)
+            with pytest.raises(ResponseError, match='permission'):
+                limited.execute_command('TS.QUERY', 'denied_metric', 'TIME', 1)
+        finally:
+            self.client.execute_command('ACL', 'DELUSER', 'promql_reader')
+
     def test_query_basic_metric_name(self):
         """Test basic TS.QUERY with just a metric name."""
         self.setup_simple_series()

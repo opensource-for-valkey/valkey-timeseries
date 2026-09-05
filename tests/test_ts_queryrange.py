@@ -115,6 +115,33 @@ class TestTsQueryRange(ValkeyTimeSeriesTestCaseBase):
         assert len(db1_result.result) == 1
         assert db1_result.result[0].metric["db"] == "1"
 
+    def test_queryrange_preserves_callers_acl_identity(self):
+        """Range-query selector reads retain the blocked client's ACL identity."""
+        self.client.execute_command(
+            "TS.CREATE", "promql:range:allowed", "LABELS", "__name__", "allowed_range_metric"
+        )
+        self.client.execute_command("TS.ADD", "promql:range:allowed", 1000, 1)
+        self.client.execute_command(
+            "TS.CREATE", "promql:range:denied", "LABELS", "__name__", "denied_range_metric"
+        )
+        self.client.execute_command("TS.ADD", "promql:range:denied", 1000, 1)
+        self.client.execute_command(
+            "ACL", "SETUSER", "promql_range_reader", "ON", ">pw",
+            "+@read", "+@timeseries", "+TS.QUERYRANGE", "~promql:range:allowed"
+        )
+        limited = self.server.get_new_client()
+        try:
+            limited.execute_command("AUTH", "promql_range_reader", "pw")
+            assert limited.execute_command(
+                "TS.QUERYRANGE", "allowed_range_metric", "STEP", 1000, "START", 1000, "END", 2000
+            )
+            with pytest.raises(ResponseError, match="permission"):
+                limited.execute_command(
+                    "TS.QUERYRANGE", "denied_range_metric", "STEP", 1000, "START", 1000, "END", 2000
+                )
+        finally:
+            self.client.execute_command("ACL", "DELUSER", "promql_range_reader")
+
     def test_queryrange_returns_matrix_for_metric(self):
         self.setup_simple_series()
 

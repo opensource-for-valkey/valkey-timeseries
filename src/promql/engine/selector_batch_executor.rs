@@ -2,7 +2,7 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
-use crate::fanout::{FanoutCommand, is_clustered};
+use crate::fanout::{FanoutCommand, is_clustered, with_fanout_user};
 use crate::fanout::{FanoutCommandResult, exec_command, get_cluster_command_timeout};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
@@ -22,6 +22,7 @@ use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -122,6 +123,10 @@ impl SelectorOutput {
 /// A single batched request for a `SelectorBatchExecutor`.
 struct SelectorTask {
     kind: SelectorTaskKind,
+    /// The client identity captured before PromQL evaluation moved onto a
+    /// background thread. It must accompany every selector read, including
+    /// reads that start a cluster fanout.
+    caller_user: Option<String>,
     /// responder receives the processed result (Ok) or the error (Err)
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 }
@@ -144,11 +149,11 @@ impl SelectorTask {
 /// # Design
 ///
 /// Unlike a traditional executor that spawns a dedicated background thread, `SelectorBatchExecutor` uses
-/// **cooperative batching**: each caller that submits a task attempts to become the "processor"
-/// by acquiring the receiver lock. The processor drains all pending tasks from the shared
-/// channel with `try_recv()`, processes them under a single `MODULE_CONTEXT` acquisition, then
-/// releases the lock. This eliminates the need for a dedicated thread while preserving batching
-/// behaviour.
+/// **cooperative batching**: enqueueing a task and claiming the idle processor role happen
+/// under one queue lock. The claimed processor drains pending tasks, processes them under a
+/// single `MODULE_CONTEXT` acquisition, and atomically marks the queue idle only after it has
+/// observed no more work. This eliminates the lost-wakeup window where a task could be queued
+/// after the final drain but before the previous processor returned.
 ///
 /// For local queries, the executor processes the task directly, so processing is essentially serialized.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
@@ -181,16 +186,54 @@ impl SelectorTask {
 /// let _ = executor.query(matchers, now, options);
 /// ```
 pub struct SelectorBatchExecutor {
-    sender: mpsc::Sender<SelectorTask>,
-    receiver: Mutex<mpsc::Receiver<SelectorTask>>,
+    queue: Mutex<SelectorTaskQueue<SelectorTask>>,
+}
+
+/// Queue state guarded as one unit so the transition from an active processor
+/// to idle cannot race with task submission.
+struct SelectorTaskQueue<T> {
+    pending: VecDeque<T>,
+    processor_active: bool,
+}
+
+impl<T> Default for SelectorTaskQueue<T> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            processor_active: false,
+        }
+    }
+}
+
+impl<T> SelectorTaskQueue<T> {
+    /// Queue a task and return whether this caller acquired processor ownership.
+    fn enqueue(&mut self, task: T) -> bool {
+        self.pending.push_back(task);
+        if self.processor_active {
+            false
+        } else {
+            self.processor_active = true;
+            true
+        }
+    }
+
+    /// Take the next bounded batch. An empty queue atomically releases
+    /// processor ownership while holding the same lock used by [`Self::enqueue`].
+    fn next_batch(&mut self, max_batch_size: usize) -> Option<Vec<T>> {
+        if self.pending.is_empty() {
+            self.processor_active = false;
+            return None;
+        }
+
+        let len = self.pending.len().min(max_batch_size);
+        Some(self.pending.drain(..len).collect())
+    }
 }
 
 impl SelectorBatchExecutor {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
-            sender: tx,
-            receiver: Mutex::new(rx),
+            queue: Mutex::new(SelectorTaskQueue::default()),
         }
     }
 
@@ -199,13 +242,15 @@ impl SelectorBatchExecutor {
         matchers: Matchers,
         timestamp: Timestamp,
         options: QueryOptions,
+        caller_user: Option<String>,
     ) -> QueryResult<QueryValue> {
         let command = SelectorTaskKind::Vector(InstantVectorSelectorCommand {
             matchers,
             timestamp,
             options,
         });
-        self.submit_selector_task(command)?.into_value()
+        self.submit_selector_task(command, caller_user)?
+            .into_value()
     }
 
     pub fn query_range(
@@ -214,6 +259,7 @@ impl SelectorBatchExecutor {
         start: Timestamp,
         end: Timestamp,
         options: QueryOptions,
+        caller_user: Option<String>,
     ) -> QueryResult<QueryValue> {
         let command = SelectorTaskKind::Range(RangeSelectorCommand {
             matchers,
@@ -221,7 +267,8 @@ impl SelectorBatchExecutor {
             end_timestamp: end,
             options,
         });
-        self.submit_selector_task(command)?.into_value()
+        self.submit_selector_task(command, caller_user)?
+            .into_value()
     }
 
     /// Evaluate `aggregation` over the instant vector `matchers` selects at
@@ -238,6 +285,7 @@ impl SelectorBatchExecutor {
         timestamp: Timestamp,
         aggregation: AggregationRequest,
         options: QueryOptions,
+        caller_user: Option<String>,
     ) -> QueryResult<AggregationOutcome> {
         let command = SelectorTaskKind::Aggregation(AggregationSelectorCommand {
             matchers,
@@ -245,7 +293,8 @@ impl SelectorBatchExecutor {
             aggregation,
             options,
         });
-        self.submit_selector_task(command)?.into_aggregation()
+        self.submit_selector_task(command, caller_user)?
+            .into_aggregation()
     }
 
     /// Reduce the windows `matchers` selects with `rollup`.
@@ -260,32 +309,44 @@ impl SelectorBatchExecutor {
         matchers: Matchers,
         rollup: RollupRequest,
         options: QueryOptions,
+        caller_user: Option<String>,
     ) -> QueryResult<RollupOutcome> {
         let command = SelectorTaskKind::Rollup(RollupSelectorCommand {
             matchers,
             rollup,
             options,
         });
-        self.submit_selector_task(command)?.into_rollup()
+        self.submit_selector_task(command, caller_user)?
+            .into_rollup()
     }
 
-    fn submit_selector_task(&self, command: SelectorTaskKind) -> QueryResult<SelectorOutput> {
+    fn submit_selector_task(
+        &self,
+        command: SelectorTaskKind,
+        caller_user: Option<String>,
+    ) -> QueryResult<SelectorOutput> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let task = SelectorTask {
             kind: command,
+            caller_user,
             responder: result_tx,
         };
 
-        // Send our task to the shared channel.
-        if let Err(e) = self.sender.send(task) {
-            let msg = format!("promql: failed to submit selector task to executor: {e}");
-            log_warning(msg.clone());
-            return Err(QueryError::Execution(msg));
-        }
+        // Submission and the idle-to-active transition share one lock. If a
+        // prior processor just observed an empty queue, this caller claims the
+        // processor role before releasing the lock, so its task cannot be left
+        // waiting for a processor that has already exited.
+        let should_process = {
+            let mut queue = self.queue.lock().unwrap_or_else(|poisoned| {
+                log_warning("promql: selector queue lock was poisoned; recovering queue state");
+                poisoned.into_inner()
+            });
+            queue.enqueue(task)
+        };
 
-        // Try to become the processor. If another caller is already processing,
-        // we simply wait for our result — they will handle our task too.
-        self.try_drain_and_execute_batches();
+        if should_process {
+            self.drain_and_execute_batches();
+        }
 
         match result_rx.recv() {
             Ok(res) => match res {
@@ -299,47 +360,22 @@ impl SelectorBatchExecutor {
         }
     }
 
-    /// Attempt to become the batch processor. Drains all pending requests from
-    /// the shared channel and processes them under a single `MODULE_CONTEXT`
-    /// acquisition. Repeats until the channel is empty.
-    ///
-    /// The receiver lock is released between drain-and-process cycles so that
-    /// other callers can step in if needed, and to avoid holding the lock
-    /// across potentially long `MODULE_CONTEXT` critical sections.
-    fn try_drain_and_execute_batches(&self) {
+    /// Drain batches while this caller owns processor responsibility. The queue
+    /// lock is held only to take work or atomically release that ownership; no
+    /// Valkey operations run while it is held.
+    fn drain_and_execute_batches(&self) {
         loop {
             let batch = {
-                // Scope the receiver lock to just draining — release before
-                // we acquire MODULE_CONTEXT to avoid lock inversion.
-                let rx = match self.receiver.try_lock() {
-                    Ok(rx) => rx,
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        // Another thread is currently draining / processing.
-                        // Our request is already in the channel; the other
-                        // thread will pick it up in its next drain iteration.
-                        return;
-                    }
-                    Err(std::sync::TryLockError::Poisoned(_)) => {
-                        // A previous processor panicked. The channel is still
-                        // intact; continue and recover.
-                        continue;
-                    }
-                };
-
-                let mut batch = Vec::with_capacity(MAX_BATCH_SIZE);
-                while let Ok(req) = rx.try_recv() {
-                    batch.push(req);
-                    if batch.len() >= MAX_BATCH_SIZE {
-                        break;
-                    }
-                }
-                batch
-                // MutexGuard dropped here — receiver lock released
+                let mut queue = self.queue.lock().unwrap_or_else(|poisoned| {
+                    log_warning("promql: selector queue lock was poisoned; recovering queue state");
+                    poisoned.into_inner()
+                });
+                queue.next_batch(MAX_BATCH_SIZE)
             };
 
-            if batch.is_empty() {
-                break; // nothing left to process
-            }
+            let Some(batch) = batch else {
+                return;
+            };
 
             let ctx = MODULE_CONTEXT.lock();
             for req in batch {
@@ -347,27 +383,83 @@ impl SelectorBatchExecutor {
             }
             // ctx dropped here — MODULE_CONTEXT released
 
-            // Loop back to check for requests that arrived while we were
-            // inside the MODULE_CONTEXT critical section.
+            // Loop back to take tasks that arrived during execution, or
+            // atomically release ownership if the queue is now empty.
         }
     }
 }
 
+#[cfg(test)]
+mod selector_task_queue_tests {
+    use super::SelectorTaskQueue;
+
+    #[test]
+    fn enqueue_claims_processor_after_idle_transition() {
+        let mut queue = SelectorTaskQueue::default();
+
+        assert!(queue.enqueue(1));
+        assert_eq!(queue.next_batch(4), Some(vec![1]));
+        assert!(queue.processor_active);
+
+        // This is the processor's final empty observation. Because it flips
+        // `processor_active` under the queue lock, a subsequent enqueue must
+        // claim processor ownership instead of waiting for a departed worker.
+        assert_eq!(queue.next_batch(4), None);
+        assert!(!queue.processor_active);
+        assert!(queue.enqueue(2));
+    }
+
+    #[test]
+    fn one_processor_drains_tasks_submitted_while_it_is_active() {
+        let mut queue = SelectorTaskQueue::default();
+
+        assert!(queue.enqueue(1));
+        assert!(!queue.enqueue(2));
+        assert_eq!(queue.next_batch(1), Some(vec![1]));
+        assert_eq!(queue.next_batch(1), Some(vec![2]));
+        assert_eq!(queue.next_batch(1), None);
+    }
+}
+
 fn execute_selector_task(ctx: &Context, task: SelectorTask) {
+    let SelectorTask {
+        kind,
+        caller_user,
+        responder,
+    } = task;
     let original_db = get_current_db(ctx);
-    let target_db = task.db();
+    let target_db = kind.db();
 
     if target_db != original_db {
         let _ = set_current_db(ctx, target_db);
     }
 
-    if is_clustered(ctx) {
-        // In cluster mode, execute_selector_task_cluster handles sending the response itself.
-        execute_selector_task_cluster(ctx, task)
-    } else {
-        let result = execute_selector_task_local(ctx, task.kind);
-        deliver_task_result(&task.responder, result);
-    };
+    let error_responder = responder.clone();
+    let result = with_fanout_user(ctx, caller_user.as_deref(), |ctx| {
+        if is_clustered(ctx) {
+            // The fanout command captures the authenticated user while this
+            // scope is active and propagates it to every shard.
+            execute_selector_task_cluster(
+                ctx,
+                SelectorTask {
+                    kind,
+                    caller_user: None,
+                    responder,
+                },
+            );
+        } else {
+            let result = execute_selector_task_local(ctx, kind);
+            deliver_task_result(&responder, result);
+        }
+        Ok(())
+    });
+
+    if let Err(err) = result {
+        deliver_task_result(
+            &error_responder,
+            Err(QueryError::Execution(err.to_string())),
+        );
+    }
 
     if target_db != original_db {
         let _ = set_current_db(ctx, original_db);

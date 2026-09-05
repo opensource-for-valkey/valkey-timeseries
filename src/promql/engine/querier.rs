@@ -17,7 +17,12 @@ pub static SERIES_SELECTOR: LazyLock<SelectorBatchExecutor> =
     LazyLock::new(SelectorBatchExecutor::new);
 
 /// A concrete implementation of QueryReader that queries the Valkey keyspace.
-pub struct ValkeySeriesQuerier;
+pub struct ValkeySeriesQuerier {
+    /// Identity captured while handling the client command. Selector work runs
+    /// later, often on another thread, where Valkey's context no longer carries
+    /// the original client user.
+    caller_user: Option<String>,
+}
 
 impl QueryReader for ValkeySeriesQuerier {
     fn query(
@@ -27,7 +32,7 @@ impl QueryReader for ValkeySeriesQuerier {
         options: QueryOptions,
     ) -> QueryResult<Vec<InstantSample>> {
         let matchers: Matchers = normalize_selector(selector);
-        match SERIES_SELECTOR.query(matchers, timestamp, options) {
+        match SERIES_SELECTOR.query(matchers, timestamp, options, self.caller_user.clone()) {
             Ok(QueryValue::Vector(samples)) => Ok(samples),
             Err(e) => Err(e),
             _ => Err(QueryError::Execution(
@@ -44,7 +49,13 @@ impl QueryReader for ValkeySeriesQuerier {
         options: QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
         let matchers: Matchers = normalize_selector(selector);
-        match SERIES_SELECTOR.query_range(matchers, start_ms, end_ms, options) {
+        match SERIES_SELECTOR.query_range(
+            matchers,
+            start_ms,
+            end_ms,
+            options,
+            self.caller_user.clone(),
+        ) {
             Ok(QueryValue::Matrix(samples)) => Ok(samples),
             Err(e) => Err(e),
             _ => Err(QueryError::Execution(
@@ -68,7 +79,13 @@ impl QueryReader for ValkeySeriesQuerier {
             return Ok(AggregationOutcome::Unsupported);
         }
         let matchers: Matchers = normalize_selector(selector);
-        SERIES_SELECTOR.query_aggregation(matchers, timestamp, aggregation.clone(), options)
+        SERIES_SELECTOR.query_aggregation(
+            matchers,
+            timestamp,
+            aggregation.clone(),
+            options,
+            self.caller_user.clone(),
+        )
     }
 
     fn query_rollup(
@@ -81,7 +98,7 @@ impl QueryReader for ValkeySeriesQuerier {
             return Ok(RollupOutcome::Unsupported);
         }
         let matchers: Matchers = normalize_selector(selector);
-        SERIES_SELECTOR.query_rollup(matchers, rollup.clone(), options)
+        SERIES_SELECTOR.query_rollup(matchers, rollup.clone(), options, self.caller_user.clone())
     }
 }
 
@@ -152,7 +169,9 @@ impl ConcreteSeriesQuerier {
             if #[cfg(test)] {
                 ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new())
             } else {
-                ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier)
+                let user = _ctx.get_current_user().to_string();
+                let caller_user = (!user.is_empty()).then_some(user);
+                ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier { caller_user })
             }
         }
     }
