@@ -17,14 +17,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use valkey_module::Context;
 
-fn parse_query(query: &str, options: &QueryOptions) -> QueryResult<Expr> {
-    let mut expr = promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)?;
+fn parse_query(query: &str) -> QueryResult<Expr> {
+    promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)
+}
+
+fn optimize_statement(stmt: &mut EvalStmt, options: &QueryOptions) -> QueryResult<()> {
     if options.optimize_queries {
-        // todo: better error handling for optimization errors (e.g. include original query in error message)
-        expr = optimize_expr(expr)
+        // Keep this at the shared evaluation boundary so command handlers and
+        // the convenience API apply precisely the same optional rewrites.
+        stmt.expr = optimize_expr(stmt.expr.clone())
             .map_err(|e| QueryError::InvalidQuery(format!("optimization error: {e}")))?;
     }
-    Ok(expr)
+    Ok(())
 }
 
 /// Number of range-query steps evaluated in parallel and folded into the series
@@ -53,7 +57,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         time: Option<SystemTime>,
         opts: QueryOptions,
     ) -> QueryResult<QueryValue> {
-        let expr = parse_query(query, &opts)?;
+        let expr = parse_query(query)?;
 
         let query_time = time.unwrap_or_else(SystemTime::now);
         let lookback_delta = opts.lookback_delta;
@@ -79,7 +83,7 @@ pub(crate) trait PromqlEngine: Send + Sync {
         step: Duration,
         opts: QueryOptions,
     ) -> QueryResult<Vec<RangeSample>> {
-        let expr = parse_query(query, &opts)?;
+        let expr = parse_query(query)?;
 
         let lookback_delta = opts.lookback_delta;
         let stmt = EvalStmt {
@@ -101,10 +105,11 @@ pub(crate) trait PromqlEngine: Send + Sync {
 /// Evaluate an instant PromQL query against the given reader.
 pub fn evaluate_instant(
     reader: Arc<dyn QueryReader>,
-    stmt: EvalStmt,
+    mut stmt: EvalStmt,
     query_time: SystemTime,
     opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
+    optimize_statement(&mut stmt, &opts)?;
     let deadline = resolve_deadline_ms(opts);
     let evaluator = Evaluator::new(&reader, opts);
 
@@ -156,9 +161,10 @@ pub fn evaluate_instant(
 /// Returns the result and the EvalStats for metrics publishing.
 pub fn evaluate_range(
     reader: Arc<dyn QueryReader>,
-    stmt: EvalStmt,
+    mut stmt: EvalStmt,
     opts: QueryOptions,
 ) -> QueryResult<Vec<RangeSample>> {
+    optimize_statement(&mut stmt, &opts)?;
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;
@@ -391,6 +397,65 @@ mod tests {
         }
 
         PromqlQuerier::with_query_reader(Arc::new(querier))
+    }
+
+    #[test]
+    fn optimized_identity_arithmetic_matches_unoptimized_results() {
+        let querier = MemorySeriesQuerier::new();
+        let labels = crate::labels::Labels::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "signed_zero".to_string(),
+        }]);
+        querier.add_sample(&labels, Sample::new(4_000_000, -0.0));
+        let tsdb = PromqlQuerier::with_query_reader(Arc::new(querier));
+        let query_time = UNIX_EPOCH + Duration::from_secs(4_000);
+
+        for query in [
+            "signed_zero + 0",
+            "0 + signed_zero",
+            "signed_zero * 1",
+            "1 * signed_zero",
+            "signed_zero / 1",
+        ] {
+            let unoptimized = tsdb
+                .eval_query(
+                    query,
+                    Some(query_time),
+                    &QueryOptions {
+                        optimize_queries: false,
+                        ..QueryOptions::default()
+                    },
+                )
+                .expect("unoptimized query must evaluate");
+            let optimized = tsdb
+                .eval_query(
+                    query,
+                    Some(query_time),
+                    &QueryOptions {
+                        optimize_queries: true,
+                        ..QueryOptions::default()
+                    },
+                )
+                .expect("optimized query must evaluate");
+
+            let (QueryValue::Vector(unoptimized), QueryValue::Vector(optimized)) =
+                (unoptimized, optimized)
+            else {
+                panic!("{query} must return an instant vector");
+            };
+            assert_eq!(unoptimized.len(), 1, "{query}");
+            assert_eq!(optimized.len(), 1, "{query}");
+            assert_eq!(unoptimized[0].labels, optimized[0].labels, "{query}");
+            assert!(
+                unoptimized[0].labels.get("__name__").is_none(),
+                "{query} must drop the metric name"
+            );
+            assert_eq!(
+                unoptimized[0].value.to_bits(),
+                optimized[0].value.to_bits(),
+                "{query} must preserve the exact floating-point result"
+            );
+        }
     }
 
     #[test]

@@ -21,9 +21,7 @@
 use crate::parser::ParseResult;
 use crate::promql::optimizer::const_folding::fold_constants;
 use crate::promql::optimizer::pushdown::pushdown_filters_in_place;
-use crate::promql::optimizer::utils::{
-    expr_contains, is_null, is_number, is_one, is_op_with, is_zero,
-};
+use crate::promql::optimizer::utils::{expr_contains, is_null, is_number, is_op_with};
 use promql_parser::label::{Matcher, Matchers};
 use promql_parser::parser::token::{T_ADD, T_DIV, T_LAND, T_LOR, T_MUL, TokenType};
 use promql_parser::parser::{BinaryExpr, Expr, ParenExpr};
@@ -64,8 +62,8 @@ pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
 /// Apply algebraic optimization rules to a binary expression.
 ///
 /// This covers constant folding (both sides are number literals) and
-/// operator-specific rewrites such as `A + 0 → A`, `A + A → A * 2`,
-/// `A OR (A AND B) → A`, `A * 1 → A`, `A / 1 → A`, etc.
+/// operator-specific rewrites such as `A + A → A * 2` and
+/// `A OR (A AND B) → A`.
 fn optimize_binary(binary: BinaryExpr) -> Expr {
     let BinaryExpr {
         lhs,
@@ -80,12 +78,6 @@ fn optimize_binary(binary: BinaryExpr) -> Expr {
         //
         // Rules for Add
         //
-
-        // A + 0 --> A
-        T_ADD if is_zero(&right) => left,
-
-        // 0 + A --> A
-        T_ADD if is_zero(&left) => right,
 
         // A + A --> A * 2
         // Our use case envisions that this expression involving metric selectors
@@ -171,18 +163,8 @@ fn optimize_binary(binary: BinaryExpr) -> Expr {
         }
 
         //
-        // Rules for Mul
-        //
-        // A * 1 --> A
-        T_MUL if is_one(&right) => left,
-        // 1 * A --> A
-        T_MUL if is_one(&left) => right,
-
-        //
         // Rules for Div
         //
-        // A / 1 --> A
-        T_DIV if is_one(&right) => left,
         // A / A --> NAN if A.is_nan() else 1.0. The NaN comparison can be valid for
         // NumberLiteral, but not for VectorSelector, Subquery, Aggregation, etc.
         T_DIV if left == right && is_number(&left) => {
@@ -221,7 +203,7 @@ fn optimize_internal(expr: Expr) -> Expr {
             let was_binary = matches!(&*p.expr, Expr::Binary(_));
             let inner = optimize_internal(*p.expr);
             // Strip the Paren wrapper only when the inner was a Binary that
-            // simplified to a leaf (e.g., `(A + 0)` → `A`). In all other
+            // simplified to a leaf. In all other
             // cases—unchanged Binaries, VectorSelectors with `@` modifiers,
             // Aggregates, Calls, etc.—preserve the Paren so that simplification
             // rules can inspect and unwrap it, and so that operator precedence
@@ -449,8 +431,10 @@ mod tests {
 
     #[test]
     fn test_simplify_mul_by_one() {
-        assert_string_simplify("c2 * 1.0", "c2");
-        assert_string_simplify("1.0 * c2", "c2");
+        // Vector arithmetic must execute so it can drop __name__ and preserve
+        // IEEE-754 details such as signed zero.
+        assert_string_simplify("c2 * 1.0", "c2 * 1.0");
+        assert_string_simplify("1.0 * c2", "1.0 * c2");
 
         assert_string_simplify("45.0 * 1.0", "45.0");
         assert_string_simplify("1.0 * 89.0", "89.0");
@@ -472,13 +456,10 @@ mod tests {
         // 0 + A --> A, where A is numeric
         assert_string_simplify("0.0 + 5.0", "5.0");
 
-        // 0 + A --> A
-        // Only simplify when A is numeric
-        assert_string_simplify("0.0 + c2", "c2");
+        // Vector arithmetic must execute even when the scalar is an identity.
+        assert_string_simplify("0.0 + c2", "0.0 + c2");
 
-        // A + 0 --> A if A
-        // Only simplify when A is numeric
-        assert_string_simplify("foo + 0.0", "foo");
+        assert_string_simplify("foo + 0.0", "foo + 0.0");
     }
 
     #[test]
@@ -505,9 +486,8 @@ mod tests {
 
     #[test]
     fn test_simplify_div_by_one() {
-        // A / 1 = A
-        // should remain unchanged for non-numeric A
-        assert_string_simplify("c2 / 1.0", "c2");
+        // Vector division must execute to apply its label semantics.
+        assert_string_simplify("c2 / 1.0", "c2 / 1.0");
 
         // return A for numeric A
         assert_string_simplify("42.0 / 1.0", "42.0");
@@ -603,9 +583,9 @@ mod tests {
 
     #[test]
     fn test_simplify_nested_variants() {
-        assert_string_simplify("abs(c1 + 0.0)", "abs(c1)");
-        assert_string_simplify("sum(c1 + 0.0)", "sum(c1)");
-        assert_string_simplify("-(c1 + 0.0)", "-c1");
+        assert_string_simplify("abs(c1 + 0.0)", "abs(c1 + 0.0)");
+        assert_string_simplify("sum(c1 + 0.0)", "sum(c1 + 0.0)");
+        assert_string_simplify("-(c1 + 0.0)", "-(c1 + 0.0)");
     }
 
     // ------------------------------
