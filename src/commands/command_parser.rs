@@ -1758,6 +1758,38 @@ mod tests {
     use super::*;
     use strum::IntoEnumIterator;
 
+    #[test]
+    fn explicit_timeout_replaces_the_default_deadline() {
+        let mut config = PromqlConfig::default();
+        config.max_query_duration = Duration::from_secs(1);
+        let mut options = crate::promql::QueryOptions {
+            timeout: Some(Duration::from_secs(30)),
+            deadline: Some(i64::MAX),
+            ..Default::default()
+        };
+        let requested = Duration::from_millis(5);
+        let before = current_time_millis();
+
+        set_query_timeout(&config, &mut options, requested);
+
+        let after = current_time_millis();
+        assert_eq!(options.timeout, Some(requested));
+        let deadline = options.deadline.expect("TIMEOUT must set a deadline");
+        assert!(deadline >= before.saturating_add(requested.as_millis() as i64));
+        assert!(deadline <= after.saturating_add(requested.as_millis() as i64));
+    }
+
+    #[test]
+    fn explicit_timeout_is_capped_by_the_configured_maximum() {
+        let mut config = PromqlConfig::default();
+        config.max_query_duration = Duration::from_millis(5);
+        let mut options = crate::promql::QueryOptions::default();
+
+        set_query_timeout(&config, &mut options, Duration::from_secs(1));
+
+        assert_eq!(options.timeout, Some(Duration::from_millis(5)));
+    }
+
     /// DIV-0014. Built directly rather than through `RepeatedOptions::new()` so
     /// the two modes are exercised without touching the process-wide config,
     /// which the rest of the suite runs against in parallel.
