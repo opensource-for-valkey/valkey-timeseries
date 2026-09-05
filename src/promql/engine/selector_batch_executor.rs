@@ -852,10 +852,7 @@ pub(in crate::promql) fn query_instant_local(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
-            // Fetch all samples within [lookback_start_ms, timestamp] and pick the last one.
-            let range = s.get_range(lookback_start_ms, timestamp);
-
-            let sample = range.last()?;
+            let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
 
             let labels: Labels = (&s.labels).into();
             Some(InstantSample {

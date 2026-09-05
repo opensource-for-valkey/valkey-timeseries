@@ -41,7 +41,7 @@ pub(super) fn handle_instant_query(
             let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
             let end_time = timestamp;
 
-            let sample = *s.get_range(start_time, end_time).last()?;
+            let sample = s.last_sample_in_range(start_time, end_time)?;
             let labels = metric_name_to_proto_labels(&s.labels);
             Some(InstantSample {
                 labels,
@@ -80,7 +80,7 @@ pub(super) fn local_instant_eval_samples(
         .map(|(s, _)| s.deref())
         .iter_into_par()
         .filter_map(|s| {
-            let sample = *s.get_range(start_time, timestamp).last()?;
+            let sample = s.last_sample_in_range(start_time, timestamp)?;
             let labels: Labels = (&s.labels).into();
             Some(EvalSample {
                 labels: labels.into(),
