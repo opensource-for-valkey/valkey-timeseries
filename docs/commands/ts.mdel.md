@@ -66,8 +66,8 @@ Deletes all api latency time series that have both `region=us-west` and `status=
 ## Notes
 
 - The command automatically replicates to replicas and AOF
-- In cluster mode, the operation fans out to one primary node per shard (including hash-tag-selected primaries when
-  `HASHTAG` is specified)
+- In cluster mode, without `HASHTAG`, the operation fans out to one primary node per shard. With `HASHTAG`, it targets
+  only the primary nodes that own the supplied tags.
 - Deleted samples trigger compaction on the affected series
 - Keyspace events are emitted for each modified series (`ts.del`)
 - Use with caution – overly broad filters may delete more data than intended
