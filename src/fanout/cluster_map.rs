@@ -1,3 +1,4 @@
+use crate::common::hash::DeterministicHasher;
 use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
 use crate::fanout::calculate_hash_slot;
@@ -10,7 +11,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
@@ -156,7 +157,7 @@ impl SlotRangeSet {
 
     /// Helper method to calculate slot fingerprint
     fn calculate_fingerprint(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = DeterministicHasher::default();
         self.hash(&mut hasher);
         hasher.finish()
     }
@@ -919,7 +920,7 @@ impl ClusterMap {
     }
 
     fn compute_cluster_fingerprint(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = DeterministicHasher::default();
         for shard in self.shards.iter() {
             hasher.write(shard.id.as_bytes());
             shard.slots_fingerprint.hash(&mut hasher);
