@@ -325,3 +325,44 @@ class TestTimeSeriesLabelValues(ValkeyTimeSeriesClusterTestCase):
         parsed = LabelSearchResponse.parse(raw)
         values = [lv.value for lv in parsed.results]
         assert b'updated' in values
+
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded (e.g. {1} and {2} can land on the same primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def test_labelvalues_hashtag_scopes_cluster_fanout(self):
+        """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client = self.new_client_for_primary(0)
+
+        tag_a, tag_b, tag_c = self.tag_per_primary(cluster)
+
+        cluster.execute_command('TS.CREATE', f'ts:{{{tag_a}}}:cpu', 'LABELS', 'name', 'cpu')
+        cluster.execute_command('TS.CREATE', f'ts:{{{tag_a}}}:disk', 'LABELS', 'name', 'disk')
+        cluster.execute_command('TS.CREATE', f'ts:{{{tag_b}}}:mem', 'LABELS', 'name', 'memory')
+        cluster.execute_command('TS.CREATE', f'ts:{{{tag_c}}}:net', 'LABELS', 'name', 'network')
+
+        raw = client.execute_command('TS.LABELVALUES', 'name', 'HASHTAG', tag_a, 'FILTER', 'name=~".+"')
+        assert [item.value for item in LabelSearchResponse.parse(raw).results] == [b'cpu', b'disk']
+
+        # Combining two tags on different primaries unions their values, while the
+        # third primary's tag (network) stays excluded.
+        raw = client.execute_command(
+            'TS.LABELVALUES', 'name', 'FILTER', 'name=~".+"', 'HASHTAG', f'{tag_a},{tag_b}'
+        )
+        assert [item.value for item in LabelSearchResponse.parse(raw).results] == [b'cpu', b'disk', b'memory']

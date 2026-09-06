@@ -321,3 +321,95 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         # filter excluding certain range
         result = client.execute_command('TS.QUERYINDEX', 'FILTER_BY_RANGE', 'NOT', 500, 1500, 'name=cpu')
         assert result == [TS2]
+
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded (e.g. {1} and {2} can land on the same primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def test_queryindex_hashtag_scopes_cluster_fanout(self):
+        """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client: Valkey = self.new_client_for_primary(0)
+
+        tag_a, tag_b, tag_c = self.tag_per_primary(cluster)
+
+        key_a = f'qi:tagged:{{{tag_a}}}'.encode()
+        key_b = f'qi:tagged:{{{tag_b}}}'.encode()
+        key_c = f'qi:tagged:{{{tag_c}}}'.encode()
+        for key in (key_a, key_b, key_c):
+            cluster.execute_command('TS.CREATE', key, 'LABELS', 'scope', 'tagged')
+
+        # Without HASHTAG every shard is asked.
+        assert client.execute_command('TS.QUERYINDEX', 'scope=tagged') == sorted([key_a, key_b, key_c])
+
+        # One tag -> one shard.
+        assert client.execute_command('TS.QUERYINDEX', 'HASHTAG', tag_a, 'scope=tagged') == [key_a]
+
+        # Several tags -> the union of their shards, deduplicated by the coordinator.
+        result = client.execute_command('TS.QUERYINDEX', 'HASHTAG', f'{tag_a},{tag_c}', 'scope=tagged')
+        assert result == sorted([key_a, key_c])
+
+        # Repeating a tag does not duplicate the shard's keys.
+        result = client.execute_command('TS.QUERYINDEX', 'HASHTAG', f'{tag_b},{tag_b}', 'scope=tagged')
+        assert result == [key_b]
+
+    def test_queryindex_hashtag_with_filter_by_range(self):
+        """HASHTAG and FILTER_BY_RANGE compose, in either order, ahead of the selectors."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client: Valkey = self.new_client_for_primary(0)
+
+        tag_a, tag_b, _tag_c = self.tag_per_primary(cluster)
+
+        key_a = f'qi:ranged:{{{tag_a}}}'.encode()
+        key_b = f'qi:ranged:{{{tag_b}}}'.encode()
+        for key in (key_a, key_b):
+            cluster.execute_command('TS.CREATE', key, 'LABELS', 'scope', 'ranged')
+            cluster.execute_command('TS.ADD', key, 1000, 1)
+
+        for args in (
+            ('HASHTAG', tag_a, 'FILTER_BY_RANGE', 500, 1500),
+            ('FILTER_BY_RANGE', 500, 1500, 'HASHTAG', tag_a),
+        ):
+            assert client.execute_command('TS.QUERYINDEX', *args, 'scope=ranged') == [key_a], args
+
+        # The shard scoping applies to the NOT form too: key_b is out of scope, not merely
+        # out of range, so nothing comes back.
+        result = client.execute_command('TS.QUERYINDEX', 'HASHTAG', tag_a,
+                                        'FILTER_BY_RANGE', 'NOT', 500, 1500, 'scope=ranged')
+        assert result == []
+
+    def test_queryindex_hashtag_unknown_tag_returns_nothing(self):
+        """A tag whose slot holds no matching series yields an empty reply, not an error."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client: Valkey = self.new_client_for_primary(0)
+
+        tag_a, tag_b, _tag_c = self.tag_per_primary(cluster)
+        cluster.execute_command('TS.CREATE', f'qi:only:{{{tag_a}}}', 'LABELS', 'scope', 'only')
+
+        assert client.execute_command('TS.QUERYINDEX', 'HASHTAG', tag_b, 'scope=only') == []
+
+    def test_queryindex_hashtag_error_cases(self):
+        """HASHTAG needs a non-empty value, and a selector must remain after it."""
+        client: Valkey = self.new_client_for_primary(0)
+
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            client.execute_command('TS.QUERYINDEX', 'HASHTAG', '', 'name=cpu')
+
+        # No FILTER keyword delimits the tag list, so the selector is eaten as the tag.
+        with pytest.raises(ResponseError, match="please provide at least one matcher"):
+            client.execute_command('TS.QUERYINDEX', 'HASHTAG', 'name=cpu')

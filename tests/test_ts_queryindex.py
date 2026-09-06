@@ -268,3 +268,54 @@ class TestTsQueryIndex(ValkeyTimeSeriesTestCaseBase):
         # query for series without data in range
         result = self.client.execute_command('TS.QUERYINDEX', 'FILTER_BY_RANGE', 'NOT', start_ts, end_ts, 'name=cpu')
         assert result == [b'ts10']
+
+    def test_hashtag_is_accepted_and_ignored_outside_a_cluster(self):
+        """HASHTAG only scopes the cluster fanout, so a standalone server still answers in full."""
+        self.setup_test_data(self.client)
+
+        expected = [b'ts1', b'ts2', b'ts5', b'ts6']
+
+        for args in (
+            ('HASHTAG', 'anything'),
+            ('HASHTAG', 'a,b,c'),
+            ('HASHTAG', '{braced}'),
+            ('hashtag', 'lowercase'),
+        ):
+            result = self.client.execute_command('TS.QUERYINDEX', *args, 'name=cpu')
+            assert result == expected, args
+
+    def test_hashtag_combines_with_filter_by_range_in_either_order(self):
+        """Both leading options are recognised regardless of their relative order."""
+        self.client.execute_command('TS.CREATE', 'ts:in', 'LABELS', 'name', 'cpu')
+        self.client.execute_command('TS.CREATE', 'ts:out', 'LABELS', 'name', 'cpu')
+        self.client.execute_command('TS.ADD', 'ts:in', 1000, 1)
+        self.client.execute_command('TS.ADD', 'ts:out', 9000, 1)
+
+        for args in (
+            ('FILTER_BY_RANGE', 1000, 2000, 'HASHTAG', 'tag'),
+            ('HASHTAG', 'tag', 'FILTER_BY_RANGE', 1000, 2000),
+        ):
+            result = self.client.execute_command('TS.QUERYINDEX', *args, 'name=cpu')
+            assert result == [b'ts:in'], args
+
+        result = self.client.execute_command('TS.QUERYINDEX', 'HASHTAG', 'tag',
+                                             'FILTER_BY_RANGE', 'NOT', 1000, 2000, 'name=cpu')
+        assert result == [b'ts:out']
+
+    def test_hashtag_error_cases(self):
+        """HASHTAG needs a non-empty value, and at least one selector must remain after it."""
+        self.setup_test_data(self.client)
+
+        # An empty value is rejected rather than treated as "no tags".
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            self.client.execute_command('TS.QUERYINDEX', 'HASHTAG', '', 'name=cpu')
+
+        # There is no FILTER keyword to delimit the tag list, so a selector placed where the
+        # value belongs is swallowed as the tag list and no selector is left.
+        with pytest.raises(ResponseError, match="please provide at least one matcher"):
+            self.client.execute_command('TS.QUERYINDEX', 'HASHTAG', 'name=cpu')
+
+        # Trailing HASHTAG is a selector position: `HASHTAG` and `tag` are read as bare
+        # metric-name selectors (__name__="HASHTAG" and __name__="tag"), which no series
+        # matches, so the query silently returns nothing instead of scoping a fanout.
+        assert self.client.execute_command('TS.QUERYINDEX', 'name=cpu', 'HASHTAG', 'tag') == []

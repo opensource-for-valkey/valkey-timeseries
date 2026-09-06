@@ -43,6 +43,45 @@ class TestTsStatsCluster(ValkeyTimeSeriesClusterTestCase):
         # Total: 5 pairs
         assert stats['totalLabelValuePairs'] == 5
 
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded (e.g. {1} and {2} can land on the same primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def test_labelstats_hashtag_scopes_cluster_fanout(self):
+        """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client = self.new_client_for_primary(0)
+
+        tag1, tag2 = self.tag_per_primary(cluster)[:2]
+
+        cluster.execute_command('TS.CREATE', f'stats:tagged:{{{tag1}}}', 'LABELS', 'scope', 'tagged', 'region', 'one')
+        cluster.execute_command('TS.CREATE', f'stats:tagged:{{{tag2}}}', 'LABELS', 'scope', 'tagged', 'region', 'two')
+
+        stats = parse_stats_response(
+            client.execute_command('TS.LABELSTATS', 'HASHTAG', tag1, 'FILTER', 'scope=tagged')
+        )
+        assert stats['totalSeries'] == 1
+
+        stats = parse_stats_response(
+            client.execute_command('TS.LABELSTATS', 'FILTER', 'scope=tagged', 'HASHTAG', f'{tag1},{tag2}')
+        )
+        assert stats['totalSeries'] == 2
+
     def test_stats_cluster_top_k_aggregation(self):
         """Test TS.LABELSTATS aggregates top-k lists across shards correctly."""
         cluster: ValkeyCluster = self.new_cluster_client()

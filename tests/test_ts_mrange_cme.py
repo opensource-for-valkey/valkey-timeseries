@@ -509,8 +509,8 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
             keys.append(key.encode())
         return tags, keys
 
-    def test_mrange_cme_tag_scopes_fanout(self):
-        """TS.MRANGE TAG restricts the fanout to the shards owning the tags' slots"""
+    def test_mrange_cme_hashtag_scopes_fanout(self):
+        """TS.MRANGE HASHTAG restricts fanout to the shards owning the tags' slots"""
         tags, keys = self.setup_tagged_data()
         client = self.new_client_for_primary(0)
 
@@ -522,27 +522,27 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                 assert len(series[2]) == 10
             return sorted(series[0] for series in result)
 
-        # Without TAG every shard answers.
+        # Without HASHTAG every shard answers.
         assert mrange_keys() == sorted(keys)
 
         # A single tag reaches only the shard owning its slot.
         for tag, key in zip(tags, keys):
-            assert mrange_keys('TAG', tag) == [key], f'TAG {tag}'
+            assert mrange_keys('HASHTAG', tag) == [key], f'HASHTAG {tag}'
 
         # Tags are comma separated and the reply is their union.
-        assert mrange_keys('TAG', ','.join(tags[:2])) == sorted(keys[:2])
-        assert mrange_keys('TAG', ','.join(tags)) == sorted(keys)
+        assert mrange_keys('HASHTAG', ','.join(tags[:2])) == sorted(keys[:2])
+        assert mrange_keys('HASHTAG', ','.join(tags)) == sorted(keys)
 
         # The braced form hashes to the same slot as the bare tag.
-        assert mrange_keys('TAG', '{%s}' % tags[0]) == [keys[0]]
+        assert mrange_keys('HASHTAG', '{%s}' % tags[0]) == [keys[0]]
 
-    def test_mrevrange_cme_tag_scopes_fanout(self):
-        """TAG scopes TS.MREVRANGE the same way, and composes with other options"""
+    def test_mrevrange_cme_hashtag_scopes_fanout(self):
+        """HASHTAG scopes TS.MREVRANGE the same way and composes with other options"""
         tags, keys = self.setup_tagged_data()
         client = self.new_client_for_primary(0)
 
         result = client.execute_command('TS.MREVRANGE', self.start_ts, self.start_ts + 100,
-                                        'TAG', tags[2], 'COUNT', 3, 'WITHLABELS',
+                                        'HASHTAG', tags[2], 'COUNT', 3, 'WITHLABELS',
                                         'FILTER', 'sensor=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[2]
@@ -551,20 +551,20 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
         timestamps = [sample[0] for sample in result[0][2]]
         assert timestamps == [self.start_ts + 90, self.start_ts + 80, self.start_ts + 70]
 
-    def test_mrange_cme_tag_with_aggregation_and_groupby(self):
-        """A TAG-scoped fanout still aggregates and groups over the shards it reached"""
+    def test_mrange_cme_hashtag_with_aggregation_and_groupby(self):
+        """A HASHTAG-scoped fanout still aggregates and groups over the shards it reached"""
         tags, keys = self.setup_tagged_data()
         client = self.new_client_for_primary(0)
 
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                        'TAG', ','.join(tags[:2]),
+                                        'HASHTAG', ','.join(tags[:2]),
                                         'AGGREGATION', 'max', 100,
                                         'FILTER', 'sensor=tagged')
         assert sorted(series[0] for series in result) == sorted(keys[:2])
 
-        # GROUPBY collapses only the series the TAG-scoped fanout returned.
+        # GROUPBY collapses only the series the HASHTAG-scoped fanout returned.
         result = client.execute_command('TS.MRANGE', self.start_ts, self.start_ts + 100,
-                                        'TAG', tags[0],
+                                        'HASHTAG', tags[0],
                                         'FILTER', 'sensor=tagged',
                                         'GROUPBY', 'sensor', 'REDUCE', 'max')
         assert len(result) == 1

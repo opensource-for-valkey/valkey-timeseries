@@ -261,3 +261,43 @@ class TestTsLabelNamesCME(ValkeyTimeSeriesClusterTestCase):
         # the positive matcher, which also excludes ts8 and ts9 -- neither has a 'name' label.
         result = exec_sorted_values(client, 'FILTER', 'name=~".+"', 'node!~"node[12]"')
         assert result == [b'name', b'node', b'ts6', b'ts7', b'type']
+
+    def tag_per_primary(self, cluster_client: ValkeyCluster):
+        """Return one hash tag per primary, each owned by a different node.
+
+        The tag -> slot -> node mapping depends on how the harness splits the slot
+        range across primaries, so the tags are discovered at runtime rather than
+        hard-coded (e.g. {1} and {2} can land on the same primary here).
+        """
+        by_node = {}
+        for i in range(1000):
+            tag = f'tag{i}'
+            node = cluster_client.get_node_from_key('{%s}' % tag)
+            by_node.setdefault((node.host, node.port), tag)
+            if len(by_node) == self.CLUSTER_SIZE:
+                break
+
+        assert len(by_node) == self.CLUSTER_SIZE, \
+            f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
+        return [by_node[node] for node in sorted(by_node)]
+
+    def test_labelnames_hashtag_scopes_cluster_fanout(self):
+        """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+        client: Valkey = self.new_client_for_primary(0)
+
+        tag_a, tag_b, tag_c = self.tag_per_primary(cluster_client)
+
+        # Each series carries a marker label unique to itself so membership in the
+        # HASHTAG-scoped label-name set can be checked precisely.
+        cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_a}}}:1', 'LABELS', 'name', 'cpu', 'markA1', '1')
+        cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_a}}}:2', 'LABELS', 'name', 'memory', 'markA2', '1')
+        cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_b}}}:1', 'LABELS', 'name', 'disk', 'markB1', '1')
+        cluster_client.execute_command('TS.CREATE', f'ts:{{{tag_c}}}:1', 'LABELS', 'name', 'network', 'markC1', '1')
+
+        assert exec_sorted_values(client, 'HASHTAG', tag_a, 'FILTER', 'name=~".+"') == [
+            b'markA1', b'markA2', b'name',
+        ]
+        assert exec_sorted_values(client, 'FILTER', 'name=~".+"', 'HASHTAG', f'{tag_a},{tag_b}') == [
+            b'markA1', b'markA2', b'markB1', b'name',
+        ]

@@ -331,8 +331,8 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
             keys.append(key.encode())
         return tags, keys
 
-    def test_mget_cme_tag_scopes_fanout(self):
-        """TS.MGET TAG restricts the fanout to the shards owning the tags' slots"""
+    def test_mget_cme_hashtag_scopes_fanout(self):
+        """TS.MGET HASHTAG restricts fanout to the shards owning the tags' slots"""
         cluster_client: ValkeyCluster = self.new_cluster_client()
         tags, keys = self.setup_tagged_data(cluster_client)
 
@@ -342,45 +342,45 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
             result = client.execute_command('TS.MGET', *args, 'FILTER', 'name=tagged')
             return sorted(r[0] for r in result)
 
-        # Without TAG every shard answers.
+        # Without HASHTAG every shard answers.
         assert mget_keys() == sorted(keys)
 
         # A single tag reaches only the shard owning its slot, so each query sees
         # exactly the one series stored under that tag.
         for tag, key in zip(tags, keys):
-            assert mget_keys('TAG', tag) == [key], f'TAG {tag}'
+            assert mget_keys('HASHTAG', tag) == [key], f'HASHTAG {tag}'
 
         # Tags are comma separated and the reply is their union.
-        assert mget_keys('TAG', ','.join(tags[:2])) == sorted(keys[:2])
-        assert mget_keys('TAG', ','.join(tags)) == sorted(keys)
+        assert mget_keys('HASHTAG', ','.join(tags[:2])) == sorted(keys[:2])
+        assert mget_keys('HASHTAG', ','.join(tags)) == sorted(keys)
 
         # A repeated tag resolves to the same shard, not a duplicated reply.
-        assert mget_keys('TAG', f'{tags[0]},{tags[0]}') == [keys[0]]
+        assert mget_keys('HASHTAG', f'{tags[0]},{tags[0]}') == [keys[0]]
 
         # The braced form hashes to the same slot as the bare tag.
-        assert mget_keys('TAG', '{%s}' % tags[0]) == [keys[0]]
+        assert mget_keys('HASHTAG', '{%s}' % tags[0]) == [keys[0]]
 
-    def test_mget_cme_tag_with_other_options(self):
-        """TAG composes with the other TS.MGET options, in any position"""
+    def test_mget_cme_hashtag_with_other_options(self):
+        """HASHTAG composes with the other TS.MGET options, in any position"""
         cluster_client: ValkeyCluster = self.new_cluster_client()
         tags, keys = self.setup_tagged_data(cluster_client)
 
         client = self.new_client_for_primary(0)
 
-        result = client.execute_command('TS.MGET', 'WITHLABELS', 'TAG', tags[1], 'FILTER', 'name=tagged')
+        result = client.execute_command('TS.MGET', 'WITHLABELS', 'HASHTAG', tags[1], 'FILTER', 'name=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[1]
         assert {l[0]: l[1] for l in result[0][1]} == {b'name': b'tagged', b'shard': b'1'}
 
-        # TAG before another option parses the same way.
-        result = client.execute_command('TS.MGET', 'TAG', tags[1], 'LATEST', 'SELECTED_LABELS', 'shard',
+        # HASHTAG before another option parses the same way.
+        result = client.execute_command('TS.MGET', 'HASHTAG', tags[1], 'LATEST', 'SELECTED_LABELS', 'shard',
                                         'FILTER', 'name=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[1]
         assert {l[0]: l[1] for l in result[0][1]} == {b'shard': b'1'}
 
-    def test_mget_cme_tag_on_shard_without_matches(self):
-        """A TAG pointing at a shard with no matching series yields an empty reply"""
+    def test_mget_cme_hashtag_on_shard_without_matches(self):
+        """A HASHTAG pointing at a shard with no matching series yields an empty reply"""
         cluster_client: ValkeyCluster = self.new_cluster_client()
         tags = self.tag_per_primary(cluster_client)
 
@@ -390,5 +390,5 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
         cluster_client.execute_command('TS.ADD', key, 1000, 1)
 
         client = self.new_client_for_primary(0)
-        assert client.execute_command('TS.MGET', 'TAG', tags[1], 'FILTER', 'name=lonely') == []
-        assert client.execute_command('TS.MGET', 'TAG', tags[0], 'FILTER', 'name=lonely')[0][0] == key.encode()
+        assert client.execute_command('TS.MGET', 'HASHTAG', tags[1], 'FILTER', 'name=lonely') == []
+        assert client.execute_command('TS.MGET', 'HASHTAG', tags[0], 'FILTER', 'name=lonely')[0][0] == key.encode()

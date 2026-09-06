@@ -291,7 +291,11 @@ class TestTsStats(ValkeyTimeSeriesTestCaseBase):
     def test_stats_wrong_arity(self):
         """Test TS.LABELSTATS with the wrong number of arguments."""
         with pytest.raises(ResponseError, match='wrong number of arguments'):
-            self.client.execute_command('TS.LABELSTATS', 'LIMIT', 10, "LABEL", 'status', 4)  # Too many arguments
+            # LIMIT, LABEL, and HASHTAG fill every fixed slot; the trailing 4
+            # pushes the fixed-argument count past MAX_FIXED_ARGS.
+            self.client.execute_command(
+                'TS.LABELSTATS', 'LIMIT', 10, 'LABEL', 'status', 'HASHTAG', '{tag}', 4
+            )
 
     def test_stats_after_series_deletion(self):
         """Test TS.LABELSTATS after deleting series."""
