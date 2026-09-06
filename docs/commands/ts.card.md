@@ -21,10 +21,10 @@ Repeated series selector argument that selects the series to return. Optional.
 
 ### Optional Arguments
 
-- fromTimestamp
-Start timestamp, inclusive. Results will only be returned for series which have samples in the range `[fromTimestamp, toTimestamp]`
+- rangeStart
+Start timestamp, inclusive. Results will only be returned for series which have samples in the range `[rangeStart, rangeEnd]`
 
-- toTimestamp
+- rangeEnd
 End timestamp, inclusive.
 
 - HASHTAG hash_tag,...

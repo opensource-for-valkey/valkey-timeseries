@@ -30,6 +30,30 @@ fn is_valkey_version_legacy(context: &Context) -> bool {
         .is_ok_and(|version| version.major < 9)
 }
 
+/// Determines whether a query may fan out to replicas based on Valkey version and client
+/// read-only status. The following logic is based on the issue
+/// https://github.com/valkey-io/valkey-search/issues/139
+///
+/// Returns `true` if replicas may be targeted (client is READONLY, or its status can't be
+/// determined), `false` if only primaries should be targeted.
+pub fn client_allows_replica_fanout(context: &Context) -> bool {
+    if is_valkey_version_legacy(context) {
+        // Valkey 8 doesn't provide a way to determine if a client is READONLY,
+        // So we choose random distribution.
+        return true;
+    }
+    match is_client_read_only(context) {
+        Ok(allowed) => allowed,
+        Err(_) => {
+            // If we can't determine client read-only status, default to Random
+            crate::common::logging::log_warning(
+                "Could not determine client read-only status, defaulting to Random fanout mode.",
+            );
+            true
+        }
+    }
+}
+
 pub fn compute_query_fanout_mode(context: &Context) -> FanoutTarget {
     #[cfg(test)]
     if FORCE_REPLICAS_READONLY.load(std::sync::atomic::Ordering::Relaxed) {
@@ -37,24 +61,10 @@ pub fn compute_query_fanout_mode(context: &Context) -> FanoutTarget {
         return FanoutTarget::ReplicasOnly;
     }
 
-    // Determine fanout mode based on Valkey version and client read-only status.
-    // The following logic is based on the issue https://github.com/valkey-io/valkey-search/issues/139
-    if is_valkey_version_legacy(context) {
-        // Valkey 8 doesn't provide a way to determine if a client is READONLY,
-        // So we choose random distribution.
+    if client_allows_replica_fanout(context) {
         FanoutTarget::Random
     } else {
-        match is_client_read_only(context) {
-            Ok(true) => FanoutTarget::Random,
-            Ok(false) => FanoutTarget::Primary,
-            Err(_) => {
-                // If we can't determine client read-only status, default to Random
-                crate::common::logging::log_warning(
-                    "Could not determine client read-only status, defaulting to Random fanout mode.",
-                );
-                FanoutTarget::Random
-            }
-        }
+        FanoutTarget::Primary
     }
 }
 

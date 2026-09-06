@@ -1288,7 +1288,10 @@ pub(super) fn parse_hash_tags(args: &mut CommandArgIterator) -> ValkeyResult<Vec
     }
     let arg = arg.to_string_lossy();
     args.next();
-    let tags = arg.split(',').map(|s| s.to_string()).collect();
+    let tags: Vec<String> = arg.split(',').map(|s| s.to_string()).collect();
+    if tags.iter().any(|tag| tag.is_empty()) {
+        return Err(ValkeyError::Str(error_consts::MISSING_HASHTAG));
+    }
     Ok(tags)
 }
 

@@ -370,14 +370,14 @@ class TestTimeSeriesMgetCluster(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command('TS.MGET', 'WITHLABELS', 'HASHTAG', tags[1], 'FILTER', 'name=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[1]
-        assert {l[0]: l[1] for l in result[0][1]} == {b'name': b'tagged', b'shard': b'1'}
+        assert {label_pair[0]: label_pair[1] for label_pair in result[0][1]} == {b'name': b'tagged', b'shard': b'1'}
 
         # HASHTAG before another option parses the same way.
         result = client.execute_command('TS.MGET', 'HASHTAG', tags[1], 'LATEST', 'SELECTED_LABELS', 'shard',
                                         'FILTER', 'name=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[1]
-        assert {l[0]: l[1] for l in result[0][1]} == {b'shard': b'1'}
+        assert {label_pair[0]: label_pair[1] for label_pair in result[0][1]} == {b'shard': b'1'}
 
     def test_mget_cme_hashtag_on_shard_without_matches(self):
         """A HASHTAG pointing at a shard with no matching series yields an empty reply"""

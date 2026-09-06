@@ -546,7 +546,7 @@ class TestTimeSeriesMRangeClustered(ValkeyTimeSeriesClusterTestCase):
                                         'FILTER', 'sensor=tagged')
         assert len(result) == 1
         assert result[0][0] == keys[2]
-        assert {l[0]: l[1] for l in result[0][1]} == {b'sensor': b'tagged', b'shard': b'2'}
+        assert {label_pair[0]: label_pair[1] for label_pair in result[0][1]} == {b'sensor': b'tagged', b'shard': b'2'}
 
         timestamps = [sample[0] for sample in result[0][2]]
         assert timestamps == [self.start_ts + 90, self.start_ts + 80, self.start_ts + 70]
