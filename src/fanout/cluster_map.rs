@@ -42,16 +42,18 @@ pub enum FanoutTarget {
     /// Select all nodes (both primary and replica)
     All,
     /// Randomly select one node per slot
-    Slots(SmallVec<[u16; 4]>), 
+    Slots(SmallVec<[u16; 4]>),
     /// Select a random node from each of the slots corresponding to the hash tags provided
     HashTags(Vec<String>),
+    /// Select the primary node for each slot corresponding to the hash tags provided
+    HashTagsPrimary(Vec<String>),
 }
 
 impl FanoutTarget {
     pub fn for_slots(slots: &[u16]) -> Self {
         FanoutTarget::Slots(slots.iter().copied().collect())
     }
-    
+
     pub fn for_hash_tags(hash_tags: &[&str]) -> Self {
         let mut slots = SmallVec::<[u16; 4]>::new();
         for tag in hash_tags {
@@ -624,6 +626,18 @@ impl ClusterMap {
                 }
                 self.random_for_slots(&slots)
             }
+            FanoutTarget::HashTagsPrimary(hash_tags) => {
+                let mut targets = HashSet::new();
+                for tag in hash_tags {
+                    let slot = calculate_hash_slot(tag.as_ref());
+                    if let Some(shard) = self.get_shard_by_slot(slot)
+                        && let Some(primary) = shard.primary
+                    {
+                        targets.insert(primary);
+                    }
+                }
+                Arc::new(targets)
+            }
         }
     }
 
@@ -668,7 +682,7 @@ impl ClusterMap {
         }
         Arc::new(targets)
     }
-    
+
     fn random_one_from_slot(&self, slot: u16, targets: &mut HashSet<NodeInfo>) {
         if let Some(shard) = self.get_shard_by_slot(slot) {
             let mut rng_ = rng();

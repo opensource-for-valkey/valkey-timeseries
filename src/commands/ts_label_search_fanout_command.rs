@@ -6,9 +6,12 @@ use crate::commands::fanout_codec::{
     FuzzySearchAlgorithm, LabelSearchResult as FanoutLabelSearchResult, LabelSearchType,
 };
 use crate::commands::label_search_utils::{
-    LabelNameSearchArgs, process_label_search_request, reply_with_label_search_result,
+    LabelNameSearchArgs, label_search_targets, process_label_search_request,
+    reply_with_label_search_result,
 };
-use crate::fanout::{FanoutClientCommand, FanoutCommandResult, FanoutContext, NodeInfo};
+use crate::fanout::{
+    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
+};
 use crate::series::index::{
     FuzzyAlgorithm, LabelSearchResult as IndexLabelSearchResult, SEARCH_RESULT_LIMIT_MAX,
     SearchHints, SearchResultOrdering, apply_search_hints,
@@ -119,6 +122,9 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
                 date_range: req.range.map(Into::into),
                 limit: Some(req.limit as usize),
             },
+            // Tags select target nodes at the coordinator and are not part of
+            // the shard-local query.
+            tags: Vec::new(),
         };
 
         process_label_search_request(ctx, &parsed).map(|results| LabelSearchResponse {
@@ -176,6 +182,10 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             // cardinality is summed correctly before truncation.
             limit: SEARCH_RESULT_LIMIT_MAX as u32,
         }
+    }
+
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        label_search_targets(ctx, &self.args.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

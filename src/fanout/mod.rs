@@ -107,7 +107,10 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
     let stale = take_cluster_map_stale();
     let needs_refresh = !current_map.is_consistent || current_map.is_expired() || stale;
     if !needs_refresh {
-        return (current_map.get_targets(mode), current_map.cluster_slots_fingerprint());
+        return (
+            current_map.get_targets(mode),
+            current_map.cluster_slots_fingerprint(),
+        );
     }
     // Possibly race condition, but only if called concurrently, which is possible but very unlikely.
     // In any case, the worst that can happen is that we refresh more than once.

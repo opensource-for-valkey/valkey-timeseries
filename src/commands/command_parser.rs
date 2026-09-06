@@ -129,7 +129,7 @@ command_arg_tokens! {
     SignificantDigits => "SIGNIFICANT_DIGITS",
     Start => "START",
     Step => "STEP",
-    Tag => "TAG",
+    HashTag => "HASHTAG",
     Timestamp => "TIMESTAMP",
     True => "TRUE",
     Uncompressed => "UNCOMPRESSED",
@@ -1279,12 +1279,12 @@ pub(super) fn parse_filter_by_range_options(
     }
 }
 
-pub(super) fn parse_tags(args: &mut CommandArgIterator) -> ValkeyResult<Vec<String>> {
+pub(super) fn parse_hash_tags(args: &mut CommandArgIterator) -> ValkeyResult<Vec<String>> {
     let Some(arg) = args.peek() else {
-        return Err(ValkeyError::Str(error_consts::MISSING_TAG));
+        return Err(ValkeyError::Str(error_consts::MISSING_HASHTAG));
     };
     if arg.is_empty() {
-        return Err(ValkeyError::Str(error_consts::MISSING_TAG));
+        return Err(ValkeyError::Str(error_consts::MISSING_HASHTAG));
     }
     let arg = arg.to_string_lossy();
     args.next();
@@ -1308,7 +1308,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
         CommandArgToken::GroupBy,
         CommandArgToken::Reduce,
         CommandArgToken::SelectedLabels,
-        CommandArgToken::Tag,
+        CommandArgToken::HashTag,
         CommandArgToken::WithLabels,
     ];
 
@@ -1349,7 +1349,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 }
             }
             CommandArgToken::Filter => {
-                let value = parse_series_selector_list(args, &RANGE_OPTION_ARGS)?;
+                let value = parse_series_selector_list(args, RANGE_OPTION_ARGS)?;
                 if repeated.accept(token) {
                     options.filters = value;
                 }
@@ -1361,7 +1361,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 }
             }
             CommandArgToken::FilterByTs => {
-                let value = parse_timestamp_filter(args, &RANGE_OPTION_ARGS)?;
+                let value = parse_timestamp_filter(args, RANGE_OPTION_ARGS)?;
                 if repeated.accept(token) {
                     options.range.timestamp_filter = Some(value);
                 }
@@ -1392,7 +1392,7 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                 options.range.latest = true;
             }
             CommandArgToken::SelectedLabels => {
-                let value = parse_label_list(args, &RANGE_OPTION_ARGS)?;
+                let value = parse_label_list(args, RANGE_OPTION_ARGS)?;
                 if value.is_empty() {
                     return Err(ValkeyError::Str(error_consts::EMPTY_SELECTED_LABELS));
                 }
@@ -1400,8 +1400,8 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
                     options.selected_labels = value;
                 }
             }
-            CommandArgToken::Tag => {
-                let value = parse_tags(args)?;
+            CommandArgToken::HashTag => {
+                let value = parse_hash_tags(args)?;
                 if repeated.accept(token) {
                     options.tags = value;
                 }
@@ -1615,13 +1615,17 @@ pub(super) fn parse_join_args(
 pub(crate) fn parse_metadata_command_args(
     args: &mut CommandArgIterator,
     require_matchers: bool,
-) -> ValkeyResult<MatchFilterOptions> {
-    const ARG_TOKENS: [CommandArgToken; 2] =
-        [CommandArgToken::FilterByRange, CommandArgToken::Limit];
+) -> ValkeyResult<(MatchFilterOptions, Vec<String>)> {
+    const ARG_TOKENS: [CommandArgToken; 3] = [
+        CommandArgToken::FilterByRange,
+        CommandArgToken::Limit,
+        CommandArgToken::HashTag,
+    ];
 
     let mut matchers = Vec::with_capacity(4);
     let mut limit: Option<usize> = None;
     let mut date_range: Option<MetaDateRangeFilter> = None;
+    let mut tags = Vec::new();
 
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
@@ -1639,6 +1643,9 @@ pub(crate) fn parse_metadata_command_args(
                     .map_err(|_| ValkeyError::Str(error_consts::MISSING_LIMIT_VALUE))?;
                 limit = parse_limit_value(next)?;
             }
+            CommandArgToken::HashTag => {
+                tags = parse_hash_tags(args)?;
+            }
             _ => {
                 let msg = "TSDB: invalid argument";
                 return Err(ValkeyError::Str(msg));
@@ -1650,25 +1657,49 @@ pub(crate) fn parse_metadata_command_args(
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
 
-    Ok(MatchFilterOptions {
-        matchers,
-        limit,
-        date_range,
-    })
+    Ok((
+        MatchFilterOptions {
+            matchers,
+            limit,
+            date_range,
+        },
+        tags,
+    ))
 }
 
+/// Parses `TS.QUERYINDEX [FILTER_BY_RANGE [NOT] <from> <to>] [HASHTAG hash_tag,...] selector [selector ...]`.
+///
+/// Returns the match options plus the hash tags that scope only the cluster fan-out.
+///
+/// Unlike the `FILTER`-keyed metadata commands, `TS.QUERYINDEX` takes bare selectors, so the
+/// leading options are not separable from the selector list by a keyword: both `FILTER_BY_RANGE`
+/// and `HASHTAG` must precede the first selector (in either order) or they would be read as
+/// selector expressions.
 pub(super) fn parse_query_index_command_args(
     args: &mut CommandArgIterator,
-) -> ValkeyResult<MatchFilterOptions> {
-    let mut date_range: Option<MetaDateRangeFilter> = None;
+) -> ValkeyResult<(MatchFilterOptions, Vec<String>)> {
+    const LEADING_TOKENS: [CommandArgToken; 2] =
+        [CommandArgToken::FilterByRange, CommandArgToken::HashTag];
 
-    if let Some(token) = peek_token(args)
-        && token == CommandArgToken::FilterByRange
-    {
-        // FILTER_BY_RANGE [NOT] <from> <to>
-        args.next(); // consume token
-        date_range = Some(parse_filter_by_range_options(args)?);
-    };
+    let mut date_range: Option<MetaDateRangeFilter> = None;
+    let mut tags = Vec::new();
+
+    parse_optional_token_block(
+        args,
+        &LEADING_TOKENS,
+        LEADING_TOKENS.len(),
+        |token, args| {
+            match token {
+                // FILTER_BY_RANGE [NOT] <from> <to>
+                CommandArgToken::FilterByRange => {
+                    date_range = Some(parse_filter_by_range_options(args)?)
+                }
+                CommandArgToken::HashTag => tags = parse_hash_tags(args)?,
+                _ => unreachable!("parse_optional_token_block yields only LEADING_TOKENS"),
+            }
+            Ok(())
+        },
+    )?;
 
     // everything else are filters
 
@@ -1688,11 +1719,14 @@ pub(super) fn parse_query_index_command_args(
 
     validate_selector_list(&matchers)?;
 
-    Ok(MatchFilterOptions {
-        date_range,
-        matchers,
-        limit: None,
-    })
+    Ok((
+        MatchFilterOptions {
+            date_range,
+            matchers,
+            limit: None,
+        },
+        tags,
+    ))
 }
 
 /// Options parsed from the `TS.QUERYLABELS` argument list.
@@ -1731,13 +1765,13 @@ pub(super) fn parse_query_labels_command_args(
     };
 
     let mut tags = Vec::new();
-    
-    // [TAG tag [tag ...]]
+
+    // [HASHTAG hash_tag,...]
     if let Some(token) = peek_token(args)
-        && token == CommandArgToken::Tag
+        && token == CommandArgToken::HashTag
     {
-        args.next(); // consume TAG
-        tags = parse_tags(args)?;
+        args.next(); // consume HASHTAG
+        tags = parse_hash_tags(args)?;
     }
 
     // [FILTER filterExpr [filterExpr ...]]
@@ -1759,7 +1793,11 @@ pub(super) fn parse_query_labels_command_args(
         return Err(ValkeyError::Str(error_consts::QUERY_LABELS_EXPECTED_FILTER));
     }
 
-    Ok(QueryLabelsOptions { label, matchers, tags })
+    Ok(QueryLabelsOptions {
+        label,
+        matchers,
+        tags,
+    })
 }
 
 pub const DEFAULT_STATS_RESULTS_LIMIT: usize = 10;
@@ -1770,12 +1808,14 @@ pub struct LabelStatsOptions {
     pub label: Option<String>,
     pub limit: usize,
     pub filters: Vec<SeriesSelector>,
+    /// Optional hash tags that scope only the cluster fan-out.
+    pub tags: Vec<String>,
 }
 
-/// Parses `TS.LABELSTATS [LABEL <label>] [LIMIT <n>] [FILTER filterExpr [filterExpr ...]]`.
+/// Parses `TS.LABELSTATS [LABEL <label>] [LIMIT <n>] [HASHTAG hash_tag,...] [FILTER filterExpr [filterExpr ...]]`.
 ///
-/// `FILTER` is variadic and so has to come last: it consumes every remaining argument, and a
-/// `LABEL` or `LIMIT` after it would be read as a selector expression (and rejected as one).
+/// `FILTER` is variadic; `HASHTAG` is its sole terminating option so it may also appear after the
+/// filter list. `LABEL` or `LIMIT` after `FILTER` would be read as selector expressions.
 pub(super) fn parse_stats_command_args(
     args: &mut CommandArgIterator,
 ) -> ValkeyResult<LabelStatsOptions> {
@@ -1796,9 +1836,11 @@ pub(super) fn parse_stats_command_args(
                     .map_err(|_| ValkeyError::Str(error_consts::MISSING_LIMIT_VALUE))?;
                 options.limit = parse_limit_value(next)?.unwrap_or(DEFAULT_STATS_RESULTS_LIMIT);
             }
+            CommandArgToken::HashTag => {
+                options.tags = parse_hash_tags(args)?;
+            }
             CommandArgToken::Filter => {
-                // Runs to the end of the argument list, so the loop terminates after this.
-                options.filters = parse_series_selector_list(args, &[])?;
+                options.filters = parse_series_selector_list(args, &[CommandArgToken::HashTag])?;
             }
             _ => {
                 let msg = "TSDB: invalid argument";

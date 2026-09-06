@@ -4,7 +4,9 @@ use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
 use crate::fanout::serialization::{Deserialized, Serializable};
-use crate::fanout::{compute_query_fanout_mode, get_fanout_targets, FanoutResult, FanoutTarget, NodeInfo};
+use crate::fanout::{
+    FanoutResult, FanoutTarget, NodeInfo, compute_query_fanout_mode, get_fanout_targets,
+};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT, ValkeyResult};

@@ -118,7 +118,9 @@ fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
 ///
 /// TS._DEBUG QUERYINDEX <filter> [<filter> ...]
 fn local_query_index(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
-    let options = parse_query_index_command_args(args)?;
+    // HASHTAG is accepted by the shared parser but meaningless here: this path never
+    // fans out, so the tags are discarded.
+    let (options, _tags) = parse_query_index_command_args(args)?;
     let mut keys = series_keys_by_selectors(ctx, &options.matchers, options.date_range)?;
     keys.sort_unstable();
 

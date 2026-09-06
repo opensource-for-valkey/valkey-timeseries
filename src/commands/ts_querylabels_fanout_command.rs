@@ -1,11 +1,13 @@
 use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers_list};
 use super::fanout_codec::{QueryLabelsRequest, QueryLabelsSubtype, StringListResponse};
+use super::utils::get_multi_command_targets;
 use crate::commands::command_parser::QueryLabelsOptions;
-use crate::fanout::{FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo};
+use crate::fanout::{
+    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
+};
 use crate::series::index::query_labels_distinct;
 use std::collections::BTreeSet;
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
-use super::utils::get_multi_command_targets;
 
 /// Cluster-wide `TS.QUERYLABELS`.
 ///
@@ -66,7 +68,7 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {
         get_multi_command_targets(ctx, &self.options.tags)
     }
-    
+
     fn generate_request(&self) -> QueryLabelsRequest {
         let subtype = if self.options.label.is_none() {
             QueryLabelsSubtype::Labels

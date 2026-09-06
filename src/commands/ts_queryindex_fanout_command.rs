@@ -1,6 +1,7 @@
 use super::fanout_codec::{MetaQueryRequest, StringListResponse};
 use super::fanout_codec::{deserialize_match_filter_options, serialize_match_filter_options};
-use crate::fanout::{FanoutClientCommand, NodeInfo};
+use super::utils::get_multi_command_targets;
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::series_keys_by_selectors;
 use crate::series::request_types::MatchFilterOptions;
@@ -10,13 +11,16 @@ use valkey_module::{Context, Status, ValkeyResult};
 #[derive(Clone, Debug, Default)]
 pub struct QueryIndexFanoutCommand {
     options: MatchFilterOptions,
+    /// Optional hash tags that scope only the coordinator's fan-out.
+    tags: Vec<String>,
     keys: BTreeSet<String>,
 }
 
 impl QueryIndexFanoutCommand {
-    pub fn new(options: MatchFilterOptions) -> Self {
+    pub fn new(options: MatchFilterOptions, tags: Vec<String>) -> Self {
         Self {
             options,
+            tags,
             keys: BTreeSet::new(),
         }
     }
@@ -43,6 +47,10 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
     fn generate_request(&self) -> MetaQueryRequest {
         let (range, filters) = serialize_match_filter_options(&self.options);
         MetaQueryRequest { range, filters }
+    }
+
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        get_multi_command_targets(ctx, &self.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

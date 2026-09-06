@@ -2,9 +2,7 @@ use crate::common::replies::ReplyContext;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::serialization::Serializable;
-use crate::fanout::{
-    FanoutCommand, FanoutResult, FanoutTarget, NodeInfo,
-};
+use crate::fanout::{FanoutCommand, FanoutResult, FanoutTarget, NodeInfo};
 use std::sync::{Arc, Mutex};
 use valkey_module::{Context, Status, ValkeyResult, ValkeyValue};
 
@@ -20,9 +18,8 @@ pub trait FanoutClientCommand: Default + Send + 'static {
 
     /// Get the target nodes for the fanout operation, bound to the cluster-map
     /// fingerprint of the snapshot they were selected from.
-    /// By default, it retrieves a random replica per shard.
-    fn get_targets(&self, _ctx: &Context) -> FanoutTarget {
-        FanoutTarget::Random
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        super::compute_query_fanout_mode(ctx)
     }
 
     fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response>;

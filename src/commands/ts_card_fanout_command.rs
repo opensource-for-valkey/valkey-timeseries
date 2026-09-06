@@ -2,7 +2,8 @@ use super::fanout_codec::generated::{CountResponse, MetaQueryRequest};
 use crate::commands::fanout_codec::{
     deserialize_match_filter_options, serialize_match_filter_options,
 };
-use crate::fanout::{FanoutClientCommand, NodeInfo};
+use crate::commands::utils::get_multi_command_targets;
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::count_matched_series;
 use crate::series::request_types::MatchFilterOptions;
@@ -11,12 +12,18 @@ use valkey_module::{Context, Status, ValkeyResult};
 #[derive(Default)]
 pub struct CardFanoutCommand {
     options: MatchFilterOptions,
+    /// Optional hash tags that scope only the coordinator's fan-out.
+    tags: Vec<String>,
     result: usize,
 }
 
 impl CardFanoutCommand {
-    pub fn new(options: MatchFilterOptions) -> Self {
-        Self { options, result: 0 }
+    pub fn new(options: MatchFilterOptions, tags: Vec<String>) -> Self {
+        Self {
+            options,
+            tags,
+            result: 0,
+        }
     }
 }
 
@@ -37,6 +44,10 @@ impl FanoutClientCommand for CardFanoutCommand {
     fn generate_request(&self) -> MetaQueryRequest {
         let (range, filters) = serialize_match_filter_options(&self.options);
         MetaQueryRequest { range, filters }
+    }
+
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        get_multi_command_targets(ctx, &self.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

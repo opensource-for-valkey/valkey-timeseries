@@ -3,8 +3,11 @@ use super::fanout_codec::generated::{PostingStat as MPostingStat, StatsRequest, 
 use crate::commands::DEFAULT_STATS_RESULTS_LIMIT;
 use crate::commands::command_parser::LabelStatsOptions;
 use crate::commands::ts_labelstats::reply_with_postings_stats;
+use crate::commands::utils::get_multi_command_targets;
 use crate::common::threads::join;
-use crate::fanout::{FanoutClientCommand, FanoutCommandResult, FanoutContext, NodeInfo};
+use crate::fanout::{
+    FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
+};
 use crate::series::index::{
     PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap,
     get_timeseries_index, serialize_bitmap,
@@ -93,6 +96,10 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
             filters: serialize_matchers_list(&self.options.filters)
                 .expect("serialize matchers list"),
         }
+    }
+
+    fn get_targets(&self, ctx: &Context) -> FanoutTarget {
+        get_multi_command_targets(ctx, &self.options.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

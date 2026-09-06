@@ -2,9 +2,9 @@ use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serializ
 use crate::commands::fanout_codec::{CountResponse, DateRange, MDelRequest};
 use crate::common::context::is_replica;
 use crate::error_consts;
+use crate::fanout::FanoutTarget;
 use crate::fanout::{FanoutClientCommand, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
-use crate::fanout::{FanoutTargetMode, FanoutTargets, get_fanout_targets};
 use crate::labels::filters::SeriesSelector;
 use crate::series::{TimestampRange, delete_series_by_selectors};
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
@@ -13,11 +13,16 @@ use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
 pub struct MDelFanoutCommand {
     selectors: Vec<SeriesSelector>,
     date_range: Option<DateRange>,
+    tags: Vec<String>,
     total_deleted: usize,
 }
 
 impl MDelFanoutCommand {
-    pub fn new(selectors: Vec<SeriesSelector>, date_range: Option<TimestampRange>) -> Self {
+    pub fn new(
+        selectors: Vec<SeriesSelector>,
+        date_range: Option<TimestampRange>,
+        tags: Vec<String>,
+    ) -> Self {
         let date_range = date_range.map(|dr| {
             let (start, end) = dr.get_timestamps(None);
             DateRange { start, end }
@@ -25,6 +30,7 @@ impl MDelFanoutCommand {
         MDelFanoutCommand {
             selectors,
             date_range,
+            tags,
             total_deleted: 0,
         }
     }
@@ -39,12 +45,16 @@ impl FanoutClientCommand for MDelFanoutCommand {
     }
 
     /// Unlike every other fanout command in this module, `TS.MDEL` is a write. The trait default
-    /// (`FanoutTargetMode::Random`) picks uniformly among each shard's primary *and* its replicas,
+    /// (`FanoutTarget::Random`) picks uniformly among each shard's primary *and* its replicas,
     /// which would delete keys directly on a replica — a write the replica's primary never made,
     /// and one the next full resync silently reverts. A write has exactly one correct target per
     /// shard.
-    fn get_targets(&self, ctx: &Context) -> FanoutTargets {
-        get_fanout_targets(ctx, FanoutTargetMode::Primary)
+    fn get_targets(&self, _ctx: &Context) -> FanoutTarget {
+        if self.tags.is_empty() {
+            FanoutTarget::Primary
+        } else {
+            FanoutTarget::HashTagsPrimary(self.tags.clone())
+        }
     }
 
     fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response> {

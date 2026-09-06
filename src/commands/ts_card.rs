@@ -5,7 +5,7 @@ use crate::series::index::count_matched_series;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 ///
-/// TS.CARD [FILTER_BY_RANGE fromTimestamp toTimestamp] [FILTER filter...]
+/// TS.CARD [FILTER_BY_RANGE fromTimestamp toTimestamp] [HASHTAG hash_tag,...] [FILTER filter...]
 ///
 /// returns the number of unique time series that match a certain label set.
 #[valkey_module_macros::command({
@@ -19,7 +19,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 })]
 pub fn ts_card_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let mut args = args.into_iter().skip(1).peekable();
-    let options = parse_metadata_command_args(&mut args, false)?;
+    let (options, tags) = parse_metadata_command_args(&mut args, false)?;
 
     if is_clustered(ctx) {
         if options.matchers.is_empty() {
@@ -27,7 +27,7 @@ pub fn ts_card_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 "TS.CARD in cluster mode requires at least one matcher",
             ));
         }
-        let operation = CardFanoutCommand::new(options);
+        let operation = CardFanoutCommand::new(options, tags);
         return operation.exec(ctx);
     }
 

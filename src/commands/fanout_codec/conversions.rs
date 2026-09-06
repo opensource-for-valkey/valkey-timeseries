@@ -701,7 +701,7 @@ impl TryFrom<&MultiRangeRequest> for MRangeOptions {
             grouping,
             is_reverse,
             exclude_empty: value.exclude_empty,
-            tags: vec![]
+            tags: vec![],
         })
     }
 }

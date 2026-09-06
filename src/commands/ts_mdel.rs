@@ -1,6 +1,6 @@
 use crate::commands::command_parser::{
-    CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_series_selector_list,
-    parse_timestamp_range_value,
+    CommandArgIterator, CommandArgToken, parse_command_arg_token, parse_hash_tags,
+    parse_series_selector_list, parse_timestamp_range_value,
 };
 use crate::commands::ts_mdel_fanout_command::MDelFanoutCommand;
 use crate::error_consts;
@@ -9,7 +9,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::series::{TimestampRange, delete_series_by_selectors};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
-/// TS.MDEL [fromTimestamp toTimestamp] FILTER label=value [label=value ...]
+/// TS.MDEL [fromTimestamp toTimestamp] [HASHTAG hash_tag,...] FILTER label=value [label=value ...]
 ///
 /// Two modes:
 /// 1. Range deletion: TS.MDEL fromTimestamp toTimestamp FILTER label=value
@@ -29,10 +29,10 @@ pub fn ts_mdel_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let mut args = args.into_iter().skip(1).peekable();
 
     // Check if we have a timestamp range or just FILTER
-    let (date_range, filters) = parse_mdel_args(&mut args)?;
+    let (date_range, tags, filters) = parse_mdel_args(&mut args)?;
 
     if is_clustered(ctx) {
-        let operation = MDelFanoutCommand::new(filters, date_range);
+        let operation = MDelFanoutCommand::new(filters, date_range, tags);
         return operation.exec(ctx);
     }
 
@@ -47,8 +47,8 @@ pub fn ts_mdel_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 fn parse_mdel_args(
     args: &mut CommandArgIterator,
-) -> ValkeyResult<(Option<TimestampRange>, Vec<SeriesSelector>)> {
-    const STOP_TOKENS: [CommandArgToken; 1] = [CommandArgToken::Filter];
+) -> ValkeyResult<(Option<TimestampRange>, Vec<String>, Vec<SeriesSelector>)> {
+    let mut tags = Vec::new();
 
     // Peek at first arg to determine mode
     let first_arg = args
@@ -57,11 +57,25 @@ fn parse_mdel_args(
 
     let token = parse_command_arg_token(first_arg.as_slice());
 
-    if token == Some(CommandArgToken::Filter) {
-        // Series deletion mode: FILTER is first
+    if token == Some(CommandArgToken::HashTag) {
+        args.next(); // consume HASHTAG
+        tags = parse_hash_tags(args)?;
+    }
+
+    if parse_command_arg_token(
+        args.peek()
+            .ok_or(ValkeyError::Str(error_consts::MISSING_FILTER))?
+            .as_slice(),
+    ) == Some(CommandArgToken::Filter)
+    {
+        // Series deletion mode: FILTER is first, or follows HASHTAG.
         args.next(); // consume FILTER token
         let filters = parse_series_selector_list(args, &[])?;
-        return Ok((None, filters));
+        return Ok((None, tags, filters));
+    }
+
+    if !tags.is_empty() {
+        return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
     }
 
     // Range deletion mode: parse timestamps first
@@ -87,6 +101,17 @@ fn parse_mdel_args(
 
     let date_range = TimestampRange::new(start, end)?;
 
+    // HASHTAG is also allowed between the timestamp range and FILTER.
+    if parse_command_arg_token(
+        args.peek()
+            .ok_or(ValkeyError::Str(error_consts::MISSING_FILTER))?
+            .as_slice(),
+    ) == Some(CommandArgToken::HashTag)
+    {
+        args.next(); // consume HASHTAG
+        tags = parse_hash_tags(args)?;
+    }
+
     // Now expect FILTER keyword
     let filter_arg = args
         .next()
@@ -98,5 +123,5 @@ fn parse_mdel_args(
 
     let filters = parse_series_selector_list(args, &[])?;
 
-    Ok((Some(date_range), filters))
+    Ok((Some(date_range), tags, filters))
 }

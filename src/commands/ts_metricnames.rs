@@ -11,6 +11,7 @@ use valkey_module::{Context, ValkeyResult, ValkeyString};
 /// [SORTBY <value|score|cardinality> [ASC|DESC]]
 /// [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp]
 /// [LIMIT limit]
+/// [HASHTAG hash_tag,...]
 /// [FILTER seriesMatcher...]
 #[valkey_module_macros::command({
     name: "ts.metricnames",

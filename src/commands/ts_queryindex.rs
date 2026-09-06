@@ -6,6 +6,14 @@ use crate::series::index::series_keys_by_selectors;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
+/// TS.QUERYINDEX [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp] [HASHTAG hash_tag,...] selector [selector ...]
+///
+/// Returns the keys of the time series matching every supplied selector. Selectors are bare
+/// (there is no `FILTER` keyword), so `FILTER_BY_RANGE` and `HASHTAG` must come before the first
+/// selector; anything after it is parsed as a selector expression.
+///
+/// `HASHTAG` scopes only the cluster fan-out — it selects the nodes that are asked, never the
+/// keys or labels that match — and is accepted and ignored on a standalone server.
 #[valkey_module_macros::command({
     name: "ts.queryindex",
     flags: [ReadOnly],
@@ -21,11 +29,12 @@ pub fn ts_queryindex_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     }
     let mut args = args.into_iter().skip(1).peekable();
 
-    let options = parse_query_index_command_args(&mut args)?;
+    let (options, tags) = parse_query_index_command_args(&mut args)?;
 
     if is_clustered(ctx) {
-        // in cluster mode, we need to send the request to all nodes
-        let operation = QueryIndexFanoutCommand::new(options);
+        // in cluster mode, we need to send the request to all nodes (or, with HASHTAG,
+        // only the nodes owning the given tags)
+        let operation = QueryIndexFanoutCommand::new(options, tags);
         return operation.exec(ctx);
     }
 

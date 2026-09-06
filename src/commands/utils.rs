@@ -6,10 +6,10 @@ use crate::common::replies::{
     reply_with_labels, reply_with_labels_map, reply_with_map, reply_with_multi_samples,
     reply_with_sample_ex, reply_with_samples, reply_with_slice,
 };
+use crate::fanout::{FanoutTarget, compute_query_fanout_mode};
 use crate::labels::Label;
 use crate::series::request_types::{MRangeOptions, MRangeSeriesResult, SeriesResultData};
 use valkey_module::{Context, Status, ValkeyResult, ValkeyValue, raw};
-use crate::fanout::{FanoutTarget, compute_query_fanout_mode};
 
 pub(super) fn reply_with_fanout_label<C: IntoRawCtx>(ctx: C, label: &FanoutLabel) {
     let raw_ctx = ctx.into_raw();

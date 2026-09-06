@@ -164,4 +164,4 @@ pub const UNKNOWN_QUERY_LABELS_SUBTYPE: &str =
     "TSDB: unknown subtype, must be one of LABELS|VALUES";
 pub const QUERY_LABELS_EXPECTED_FILTER: &str = "TSDB: unknown argument, expected FILTER";
 pub const FILTER_WITH_NO_EXPRESSIONS: &str = "TSDB: FILTER given with no filter expressions";
-pub const MISSING_TAG: &str = "TSDB: missing TAG argument";
+pub const MISSING_HASHTAG: &str = "TSDB: missing HASHTAG argument";

@@ -6,9 +6,10 @@ use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::{PostingStat, PostingsStats, get_timeseries_index};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
-/// `TS.LABELSTATS` without a `FILTER` block: the command name plus `LABEL <label>` and
-/// `LIMIT <n>`. `FILTER` is variadic, so only the arguments preceding it are bounded.
-const MAX_FIXED_ARGS: usize = 5;
+/// `TS.LABELSTATS` without a `FILTER` block: the command name plus `LABEL <label>`,
+/// `LIMIT <n>`, and `HASHTAG <hash_tag,...>`. `FILTER` is variadic, so only the arguments
+/// preceding it are bounded.
+const MAX_FIXED_ARGS: usize = 7;
 
 /// https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
 #[valkey_module_macros::command({
