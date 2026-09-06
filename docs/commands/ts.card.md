@@ -4,9 +4,10 @@ counts the number of distinct series.
 
 
 ```
-TS.CARD [START fromTimestamp] [END toTimestamp]
-[FILTER_BY_RANGE [NOT] rangeStart rangeEnd]
-[FILTER filter...]
+TS.CARD
+  [FILTER_BY_RANGE [NOT] rangeStart rangeEnd]
+  [HASHTAG hash_tag,...]
+  [FILTER selector...]
 ```
 returns the number of unique time series that match a certain label set.
 
@@ -26,6 +27,10 @@ Start timestamp, inclusive. Results will only be returned for series which have 
 - toTimestamp
 End timestamp, inclusive.
 
+- HASHTAG hash_tag,...
+In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It has no effect on standalone
+servers and only selects cluster nodes; it does not filter series keys or labels.
+
 #### Return
 
 [Integer number](https://redis.io/docs/reference/protocol-spec#resp-integers) of unique time series.
@@ -40,4 +45,7 @@ Return an error reply in the following cases:
 TODO
 
 #### Examples
-TODO
+
+```
+TS.CARD HASHTAG tenant-a,tenant-b FILTER service=api
+```

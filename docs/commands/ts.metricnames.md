@@ -12,6 +12,7 @@ TS.METRICNAMES
   [SORTBY <value|score|cardinality> [ASC|DESC]]
   [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp]
   [LIMIT limit]
+  [HASHTAG hash_tag,...]
   [FILTER selector ...]
 ```
 
@@ -25,6 +26,8 @@ TS.METRICNAMES
 - `SORTBY` specify the sort order of the results.
 - `FILTER_BY_RANGE` limits results to series with data in the given range. With `NOT`, this filter is inverted.
 - `LIMIT` bounds the number of results returned.
+- `HASHTAG` restricts cluster fan-out to the nodes owning the comma-separated hash tags. It has no effect on standalone
+  servers and only selects cluster nodes; it does not filter metric names or series keys.
 - `FILTER` applies one or more series selectors.
 - In cluster mode this command fans out to all shards and merges results.
 
@@ -41,6 +44,5 @@ Map reply with the following fields:
 ### Example
 
 ```text
-TS.METRICNAMES SEARCH cpu FUZZY_THRESHOLD 0.80 FUZZY_ALGORITHM jarowinkler SORTBY score DESC FILTER env=prod
+TS.METRICNAMES HASHTAG tenant-a SEARCH cpu FUZZY_THRESHOLD 0.80 FUZZY_ALGORITHM jarowinkler SORTBY score DESC FILTER env=prod
 ```
-

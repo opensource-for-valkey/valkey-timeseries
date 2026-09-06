@@ -5,7 +5,7 @@ Returns label cardinality statistics about the timeseries data.
 ## Syntax
 
 ```
-TS.LABELSTATS [LABEL <label-name>] [LIMIT <n>] [FILTER selector [selector ...]]
+TS.LABELSTATS [LABEL <label-name>] [LIMIT <n>] [HASHTAG <hash_tag,...>] [FILTER selector [selector ...]]
 ```
 
 ## Description
@@ -35,6 +35,10 @@ instead of over the whole index.
 
 - `LIMIT <n>`  
   Limits the number of items returned in each top-N section. Higher values may increase runtime.
+
+- `HASHTAG <hash_tag,...>`
+  In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It has no effect on standalone
+  servers and only selects cluster nodes; it does not filter labels or series keys.
 
 - `FILTER <selector> [selector ...]`  
   Restricts the report to the series matching every listed selector. See

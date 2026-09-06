@@ -7,11 +7,16 @@ Return the keys of time series that match one or more label selectors.
 ```
 TS.QUERYINDEX
   [FILTER_BY_RANGE [NOT] start end]
+  [HASHTAG hash_tag,...]
   selector [selector ...]
 ```
 
 Unlike `TS.MRANGE` and related commands, `TS.QUERYINDEX` does not use a
 `FILTER` keyword. Selectors are passed directly after the command.
+
+Because the selector list is bare and variadic, every option must come *before*
+the first selector — `FILTER_BY_RANGE` and `HASHTAG` may appear in either order,
+but anything after the first selector is parsed as another selector.
 
 ## Arguments
 
@@ -23,6 +28,17 @@ the inclusive timestamp range from `start` to `end`.
 With `NOT`, the condition is inverted: series with no samples in the range
 are returned. Timestamps are milliseconds since the Unix epoch. Range values
 may use the usual timestamp forms such as `-` and `+` where supported.
+
+### `HASHTAG hash_tag,...`
+
+In cluster mode, restricts the fan-out to the nodes that own the comma-separated
+hash tags. It selects which nodes are queried; it never filters series keys or
+labels, so a series whose key carries a different hash tag but which lives on a
+selected node is still returned.
+
+Several tags that map to the same node collapse to a single request to that node.
+On a standalone server the option is accepted and ignored: there is no fan-out
+to scope, so the reply is the same as without it.
 
 ### `selector`
 
@@ -59,8 +75,9 @@ no series matches. Reply ordering is not part of the command contract.
 Without `FILTER_BY_RANGE`, `TS.QUERYINDEX` answers from the label index alone
 and never reads sample data. With `FILTER_BY_RANGE`, each candidate series is
 opened and the chunks that overlap the range are checked for a sample.
-In clustered deployments, the query is sent to all shards and the matching
-keys are merged into one reply.
+In clustered deployments, the query is sent to all shards — or, with `HASHTAG`,
+only to the shards owning the given tags — and the matching keys are merged
+into one reply.
 
 ## Examples
 
@@ -115,11 +132,30 @@ Find CPU-indexed series without data in that range:
 TS.QUERYINDEX FILTER_BY_RANGE NOT 1609459200000 1609545600000 name=cpu
 ```
 
+Ask only the shards owning `{tenant-a}` and `{tenant-b}`:
+
+```
+TS.QUERYINDEX HASHTAG tenant-a,tenant-b name=cpu
+```
+
+`HASHTAG` combines with `FILTER_BY_RANGE` in either order, as long as both
+precede the first selector:
+
+```
+TS.QUERYINDEX FILTER_BY_RANGE 1609459200000 1609545600000 HASHTAG tenant-a name=cpu
+TS.QUERYINDEX HASHTAG tenant-a FILTER_BY_RANGE 1609459200000 1609545600000 name=cpu
+```
+
 ## Errors
 
 - `ERR wrong number of arguments` — No selector was provided.
 - `TSDB: please provide at least one matcher` — All selectors are negative or otherwise unbounded.
 - `TSDB: invalid timestamp` — A `FILTER_BY_RANGE` timestamp cannot be parsed.
+- `TSDB: missing HASHTAG argument` — `HASHTAG` was given with no value, or with
+  an empty one. Note that `TS.QUERYINDEX HASHTAG name=cpu` is *not* this error:
+  with no `FILTER` keyword to delimit them, `name=cpu` is consumed as the tag
+  list, leaving no selector, so the query fails with
+  `TSDB: please provide at least one matcher`.
 - A malformed selector produces a series-selector parsing error.
 
 ## Complexity
@@ -128,7 +164,8 @@ O(N), where N is the number of time series matching the selectors.
 `FILTER_BY_RANGE` additionally opens each candidate series and decodes the
 chunks that overlap the range until an in-range sample is found, so its cost
 is O(N + ΣCᵢ), where Cᵢ is the number of chunks of candidate series i that
-overlap the range.
+overlap the range. In cluster mode, `HASHTAG` reduces N to the series held by
+the selected shards.
 
 ## ACL categories
 

@@ -5,7 +5,7 @@ Delete samples from multiple time series matching label filters.
 ## Syntax
 
 ```
-TS.MDEL [fromTimestamp toTimestamp] FILTER ...
+TS.MDEL [fromTimestamp toTimestamp] [HASHTAG hash_tag,...] FILTER ...
 ```
 
 ## Required arguments
@@ -15,6 +15,11 @@ TS.MDEL [fromTimestamp toTimestamp] FILTER ...
 Label filters to select time series. At least one filter is required.
 
 ## Optional arguments
+
+### HASHTAG hash_tag,...
+
+In cluster mode, restricts the fan-out to the primary nodes owning the specified hash tags. `HASHTAG` must appear before
+`FILTER`. It has no effect on standalone servers.
 
 ### fromTimestamp toTimestamp
 

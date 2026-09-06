@@ -12,6 +12,7 @@ TS.LABELVALUES label
   [IGNORE_CASE]
   [SORTBY <value|score|cardinality> [ASC|DESC]]
   [LIMIT limit]
+  [HASHTAG hash_tag,...]
   [FILTER selector ...]
 ```
 
@@ -35,6 +36,11 @@ If specified along with `fromTimestamp`, this limits the result to only labels f
 have data in the date range [`fromTimestamp` .. `toTimestamp`]
 </details>
 
+<details open><summary><code>HASHTAG hash_tag,...</code></summary>
+In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It has no effect on a
+standalone server and does not filter label values or series keys.
+</details>
+
 #### Return
 
 The data section of the JSON response is a list of string label mut values.
@@ -50,7 +56,7 @@ Return an error reply in the following cases:
 
 This example queries for all label mut values for the job label:
 ```
-TS.LABELVALUES job
+TS.LABELVALUES job HASHTAG tenant-a FILTER service=api
 ```
 ```json
 {

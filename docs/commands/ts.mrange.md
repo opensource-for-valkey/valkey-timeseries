@@ -11,6 +11,7 @@ TS.MRANGE fromTimestamp toTimestamp
     [FILTER_BY_VALUE min max]
     [WITHLABELS | SELECTED_LABELS label...]
     [COUNT count]
+    [HASHTAG hash_tag,...]
     [[ALIGN align] AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]]
     FILTER selector...
     [GROUPBY label REDUCE reducer[(op value)]]
@@ -105,6 +106,23 @@ Maximum number of samples to return per series.
 
 ```
 COUNT 100
+```
+
+### HASHTAG hash_tag,...
+
+In cluster mode, restricts the fan-out to nodes that own one or more of the
+given hash tags. Tags are comma-separated; supplying multiple tags queries the
+union of their owning nodes. A braced tag such as `{tenant-a}` is equivalent to
+the bare tag `tenant-a` for slot selection.
+
+`HASHTAG` only controls which cluster nodes are queried. It does not filter series
+by their labels or key names, and has no effect on a standalone server. It may
+appear with the other optional arguments.
+
+**Example:**
+
+```
+TS.MRANGE - + HASHTAG tenant-a,tenant-b FILTER metric_type=temperature
 ```
 
 ### ALIGN align
