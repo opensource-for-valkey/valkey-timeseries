@@ -95,7 +95,7 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
     }
 
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {
-        get_multi_command_targets(ctx, &self.options.tags)
+        compute_hash_tag_fanout_target(ctx, &self.options.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

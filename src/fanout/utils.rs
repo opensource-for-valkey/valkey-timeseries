@@ -51,11 +51,35 @@ pub fn client_allows_replica_fanout(context: &Context) -> bool {
     }
 }
 
-pub fn compute_query_fanout_mode(context: &Context) -> FanoutTarget {
+pub fn compute_query_fanout_target(context: &Context) -> FanoutTarget {
     if client_allows_replica_fanout(context) {
         FanoutTarget::Random
     } else {
         FanoutTarget::Primary
+    }
+}
+
+/// Target selection for a command scoped by an explicit `HASHTAG` clause.
+///
+/// This is the single implementation of the rule shared by the multi-series
+/// commands (`TS.MRANGE`, `TS.MGET`, the metadata commands) and the PromQL
+/// commands: no tags means the command's ordinary target selection, and tags
+/// restrict the fanout to the shards owning them while preserving the
+/// replica/primary read policy the client is entitled to.
+pub fn compute_hash_tag_fanout_target(context: &Context, tags: &[String]) -> FanoutTarget {
+    if tags.is_empty() {
+        return compute_query_fanout_target(context);
+    }
+    hash_tag_fanout_target(tags, client_allows_replica_fanout(context))
+}
+
+/// The tag-scoped half of [`compute_hash_tag_fanout_target`], split out so the
+/// replica/primary decision can be exercised without a live client context.
+fn hash_tag_fanout_target(tags: &[String], allows_replicas: bool) -> FanoutTarget {
+    if allows_replicas {
+        FanoutTarget::HashTags(tags.to_vec())
+    } else {
+        FanoutTarget::HashTagsPrimary(tags.to_vec())
     }
 }
 
@@ -92,6 +116,31 @@ fn get_hash_tag(key: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hash_tag_target_reads_replicas_when_the_client_allows_it() {
+        let tags = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        assert_eq!(
+            hash_tag_fanout_target(&tags, true),
+            FanoutTarget::HashTags(tags.clone())
+        );
+    }
+
+    #[test]
+    fn hash_tag_target_stays_on_primaries_when_replica_reads_are_not_allowed() {
+        let tags = vec!["tenant-a".to_string()];
+        assert_eq!(
+            hash_tag_fanout_target(&tags, false),
+            FanoutTarget::HashTagsPrimary(tags.clone())
+        );
+    }
+
+    /// Braced and bare forms name the same slot, so a scoped command routes to
+    /// the same shard either way.
+    #[test]
+    fn braced_and_bare_tags_select_the_same_slot() {
+        assert_eq!(calculate_hash_slot(b"{tenant-a}"), slot(b"tenant-a"));
+    }
 
     #[test]
     fn test_simple_key() {

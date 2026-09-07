@@ -10,7 +10,7 @@ use crate::promql::{
 use cfg_if::cfg_if;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use valkey_module::Context;
 
 pub static SERIES_SELECTOR: LazyLock<SelectorBatchExecutor> =
@@ -22,6 +22,13 @@ pub struct ValkeySeriesQuerier {
     /// later, often on another thread, where Valkey's context no longer carries
     /// the original client user.
     caller_user: Option<String>,
+    /// Cluster routing scope requested with `HASHTAG`, empty when the command
+    /// did not supply one. One expression can contain many selectors and can
+    /// retry a push-down as an ordinary selector read, and every one of those
+    /// reads must use the same scope, so it is held here — on the reader that
+    /// serves the whole command — rather than passed per call. `Arc<[String]>`
+    /// so the selectors share the immutable list instead of cloning it.
+    hash_tags: Arc<[String]>,
 }
 
 impl QueryReader for ValkeySeriesQuerier {
@@ -32,7 +39,13 @@ impl QueryReader for ValkeySeriesQuerier {
         options: QueryOptions,
     ) -> QueryResult<Vec<InstantSample>> {
         let matchers: Matchers = normalize_selector(selector);
-        match SERIES_SELECTOR.query(matchers, timestamp, options, self.caller_user.clone()) {
+        match SERIES_SELECTOR.query(
+            matchers,
+            timestamp,
+            options,
+            self.caller_user.clone(),
+            self.hash_tags.clone(),
+        ) {
             Ok(QueryValue::Vector(samples)) => Ok(samples),
             Err(e) => Err(e),
             _ => Err(QueryError::Execution(
@@ -55,6 +68,7 @@ impl QueryReader for ValkeySeriesQuerier {
             end_ms,
             options,
             self.caller_user.clone(),
+            self.hash_tags.clone(),
         ) {
             Ok(QueryValue::Matrix(samples)) => Ok(samples),
             Err(e) => Err(e),
@@ -85,6 +99,7 @@ impl QueryReader for ValkeySeriesQuerier {
             aggregation.clone(),
             options,
             self.caller_user.clone(),
+            self.hash_tags.clone(),
         )
     }
 
@@ -98,7 +113,13 @@ impl QueryReader for ValkeySeriesQuerier {
             return Ok(RollupOutcome::Unsupported);
         }
         let matchers: Matchers = normalize_selector(selector);
-        SERIES_SELECTOR.query_rollup(matchers, rollup.clone(), options, self.caller_user.clone())
+        SERIES_SELECTOR.query_rollup(
+            matchers,
+            rollup.clone(),
+            options,
+            self.caller_user.clone(),
+            self.hash_tags.clone(),
+        )
     }
 }
 
@@ -164,14 +185,27 @@ pub(crate) enum ConcreteSeriesQuerier {
 }
 
 impl ConcreteSeriesQuerier {
-    pub fn create(_ctx: &Context) -> Self {
+    /// A querier with no cluster routing scope: it reads the whole keyspace the
+    /// caller can see. This is the default for internal and programmatic
+    /// callers, which have no `HASHTAG` clause to honor.
+    pub fn create(ctx: &Context) -> Self {
+        Self::create_with_hash_tags(ctx, Arc::from([]))
+    }
+
+    /// A querier scoped to the shards owning `hash_tags`, for command handlers
+    /// that parsed a `HASHTAG` clause. An empty list is equivalent to
+    /// [`Self::create`].
+    pub fn create_with_hash_tags(_ctx: &Context, _hash_tags: Arc<[String]>) -> Self {
         cfg_if! {
             if #[cfg(test)] {
                 ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new())
             } else {
                 let user = _ctx.get_current_user().to_string();
                 let caller_user = (!user.is_empty()).then_some(user);
-                ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier { caller_user })
+                ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier {
+                    caller_user,
+                    hash_tags: _hash_tags,
+                })
             }
         }
     }

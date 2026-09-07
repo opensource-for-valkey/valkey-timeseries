@@ -11,6 +11,7 @@ TS.QUERYRANGE query
   [END timestamp]
   [LOOKBACK_DELTA lookback]
   [TIMEOUT duration]
+  [HASHTAG hash_tag,...]
 ```
 
 ---
@@ -81,6 +82,35 @@ The maximum execution time for the query. If the query exceeds this duration, it
 
 </details>
 
+<details open><summary><code>HASHTAG hash_tag,...</code></summary>
+
+In cluster mode, restricts the fan-out to the shards that own the given hash
+tags. Tags are comma-separated; supplying several queries the union of their
+owning shards. A braced tag such as `{tenant-a}` is equivalent to the bare tag
+`tenant-a` for slot selection. If the clause is given more than once, the last
+occurrence wins.
+
+> **Warning:** `HASHTAG` scopes *shards*, not series. It is not a label or
+> key-name filter, and it does not add a predicate to the PromQL expression.
+> Once a shard is selected, **every** series on it that the expression matches
+> is in scope — including series whose key names carry a different hash tag.
+>
+> Scoping a query is an explicit request to evaluate over part of the cluster.
+> Series on the shards you did not select are simply absent from the
+> expression, so aggregations and binary operators are computed from the
+> selected shards only: a scoped `sum(...)` is the sum over those shards, not
+> the cluster-wide sum. An unknown tag still names a valid slot; that slot's
+> shard is queried and may contribute nothing.
+
+On a standalone server the option is accepted and validated but does not
+restrict the query. Expressions with no selectors, such as `1 + 2`, perform no
+fan-out and are unaffected.
+
+A missing or empty value — including an empty comma-separated component — is
+rejected with `TSDB: missing HASHTAG argument`.
+
+</details>
+
 ---
 
 ## Return Value
@@ -94,3 +124,10 @@ TS.QUERYRANGE "rate(http_requests_total[5m])" STEP 1m START -1h END *
 ```
 
 This query calculates the 5-minute rate of HTTP requests for the last hour, with a 1-minute resolution.
+
+```
+TS.QUERYRANGE "rate(http_requests_total[5m])" STEP 1m START -1h END * HASHTAG tenant-a
+```
+
+The same range query restricted to the shard owning `tenant-a`; only that
+shard's series appear in the matrix.

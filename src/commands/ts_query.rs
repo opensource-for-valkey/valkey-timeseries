@@ -1,4 +1,4 @@
-use crate::commands::command_parser::parse_query_command_args;
+use crate::commands::command_parser::{ParsedPromqlQuery, parse_query_command_args};
 use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
@@ -13,6 +13,7 @@ acl_categories!(TS_QUERY, "ts.query", "read timeseries");
 ///         [TIME rfc3339 | unix_timestamp | * | + ]
 ///         [LOOKBACK_DELTA lookback]
 ///         [TIMEOUT duration]
+///         [HASHTAG hash_tag,...]
 ///
 #[valkey_module_macros::command({
     name: "TS.QUERY",
@@ -27,21 +28,25 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let config_guard = PROMQL_CONFIG.read()?;
     let mut args = args.into_iter().skip(1).peekable();
     let promql_config = config_guard.deref();
-    let (eval_stmt, mut opts) = parse_query_command_args(promql_config, &mut args)?;
+    let ParsedPromqlQuery {
+        eval_stmt,
+        mut options,
+        hash_tags,
+    } = parse_query_command_args(promql_config, &mut args)?;
     // Capture the client's selected database from the per-client command context
     // before we move into a background thread. This ensures the query is evaluated
     // against the correct database regardless of what the module-global context
     // happens to have selected at the time the worker thread runs.
-    opts.db = get_current_db(ctx);
+    options.db = get_current_db(ctx);
 
     let blocked_client = create_blocked_client(ctx);
     let eval_ts = eval_stmt.start;
 
-    let querier = get_promql_querier(ctx);
+    let querier = get_promql_querier(ctx, hash_tags);
     std::thread::spawn(move || {
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
 
-        let result = match evaluate_instant(querier, eval_stmt, eval_ts, opts) {
+        let result = match evaluate_instant(querier, eval_stmt, eval_ts, options) {
             Ok(eval_stmt) => eval_stmt,
             Err(err) => {
                 let e = ValkeyError::String(err.to_string());

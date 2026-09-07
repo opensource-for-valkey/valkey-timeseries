@@ -4,7 +4,6 @@ use crate::commands::command_parser::{
 };
 use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::ts_label_search_fanout_command::LabelSearchFanoutCommand;
-use crate::commands::utils::get_multi_command_targets;
 use crate::common::SortDir;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::{get_current_db, is_blocking_denied};
@@ -13,7 +12,9 @@ use crate::common::replies::{
 };
 use crate::common::threads::GilSource;
 use crate::error_consts;
-use crate::fanout::{FanoutClientCommand, FanoutTarget, is_clustered};
+use crate::fanout::{
+    FanoutClientCommand, FanoutTarget, compute_hash_tag_fanout_target, is_clustered,
+};
 use crate::parser::series_selector::parse_series_selector;
 use crate::series::index::{
     DefaultLabelQuerier, FuzzyAlgorithm, FuzzyFilter, LabelNameSearchFilter, LabelQuerier,
@@ -316,7 +317,7 @@ pub(super) fn parse_label_name_search_args(
 }
 
 pub(crate) fn label_search_targets(context: &Context, tags: &[String]) -> FanoutTarget {
-    get_multi_command_targets(context, tags)
+    compute_hash_tag_fanout_target(context, tags)
 }
 
 /// Run a label search against this node's index.

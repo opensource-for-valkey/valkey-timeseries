@@ -1760,8 +1760,10 @@ mod tests {
 
     #[test]
     fn explicit_timeout_replaces_the_default_deadline() {
-        let mut config = PromqlConfig::default();
-        config.max_query_duration = Duration::from_secs(1);
+        let config = PromqlConfig {
+            max_query_duration: Duration::from_secs(1),
+            ..Default::default()
+        };
         let mut options = crate::promql::QueryOptions {
             timeout: Some(Duration::from_secs(30)),
             deadline: Some(i64::MAX),
@@ -1781,8 +1783,10 @@ mod tests {
 
     #[test]
     fn explicit_timeout_is_capped_by_the_configured_maximum() {
-        let mut config = PromqlConfig::default();
-        config.max_query_duration = Duration::from_millis(5);
+        let config = PromqlConfig {
+            max_query_duration: Duration::from_millis(5),
+            ..Default::default()
+        };
         let mut options = crate::promql::QueryOptions::default();
 
         set_query_timeout(&config, &mut options, Duration::from_secs(1));

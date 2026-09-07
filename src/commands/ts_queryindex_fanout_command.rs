@@ -53,7 +53,7 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
     }
 
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {
-        get_multi_command_targets(ctx, &self.tags)
+        compute_hash_tag_fanout_target(ctx, &self.tags)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

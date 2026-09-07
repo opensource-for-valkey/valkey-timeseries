@@ -7,8 +7,11 @@ use promql_parser::parser::value::ValueType;
 use std::sync::Arc;
 use valkey_module::{Context, Status};
 
-pub(super) fn get_promql_querier(ctx: &Context) -> Arc<dyn QueryReader> {
-    let querier = ConcreteSeriesQuerier::create(ctx);
+/// The query reader that serves one PromQL command, scoped to the shards owning
+/// `hash_tags` (empty for an unscoped query). One reader serves every selector
+/// in the expression, so the whole expression is evaluated over one shard set.
+pub(super) fn get_promql_querier(ctx: &Context, hash_tags: Vec<String>) -> Arc<dyn QueryReader> {
+    let querier = ConcreteSeriesQuerier::create_with_hash_tags(ctx, Arc::from(hash_tags));
     Arc::new(querier)
 }
 

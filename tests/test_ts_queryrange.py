@@ -303,3 +303,81 @@ class TestTsQueryRange(ValkeyTimeSeriesTestCaseBase):
         assert qr.result[0].metric.get("status") == "500"
 
         assert len(qr.result[0].values) == 4
+
+    # ── HASHTAG: cluster routing scope, a no-op on a standalone server ────
+
+    def test_queryrange_hashtag_is_accepted_and_ignored_outside_a_cluster(self):
+        """HASHTAG only scopes the cluster fanout, so a standalone server still
+        answers over its whole keyspace.
+
+        Bare, braced and comma-separated forms are all accepted, the token is
+        matched case-insensitively, and the clause composes with STEP, START,
+        END, LOOKBACK_DELTA and TIMEOUT in either order.
+        """
+        self.setup_observability_metrics()
+        query = 'http_requests_total{status="200"}'
+        base = ("TS.QUERYRANGE", query, "STEP", "1000")
+        # The fixture is at timestamps 1000..4000, so every case pins the
+        # window explicitly; the default window is relative to now.
+        window = ("START", "1000", "END", "4000")
+
+        for args in (
+            ("HASHTAG", "anything") + window,
+            ("HASHTAG", "a,b,c") + window,
+            ("HASHTAG", "{braced}") + window,
+            ("hashtag", "lowercase") + window,
+            ("HASHTAG", "x", "START", "1000", "END", "4000"),
+            ("START", "1000", "HASHTAG", "x", "END", "4000"),
+            ("START", "1000", "END", "4000", "HASHTAG", "x"),
+            ("START", "1000", "END", "4000", "LOOKBACK_DELTA", "5m", "HASHTAG", "x"),
+            ("HASHTAG", "x", "LOOKBACK_DELTA", "5m", "START", "1000", "END", "4000"),
+            ("START", "1000", "END", "4000", "TIMEOUT", "5s", "HASHTAG", "x"),
+            ("HASHTAG", "x", "TIMEOUT", "5s", "START", "1000", "END", "4000"),
+        ):
+            qr = QueryResult.from_raw(self.client.execute_command(*base, *args))
+            assert qr.is_matrix(), args
+            instances = sorted(s.metric.get("instance") for s in qr.result)
+            assert instances == ["app1", "app2"], args
+
+    def test_queryrange_hashtag_last_occurrence_wins(self):
+        """Repeating the clause replaces the routing scope rather than widening
+        it. Standalone results are identical either way, so this pins the
+        parse: a repeat must be accepted, not rejected as a duplicate."""
+        self.setup_observability_metrics()
+
+        qr = QueryResult.from_raw(self.client.execute_command(
+            "TS.QUERYRANGE", 'http_requests_total{status="200"}', "STEP", "1000",
+            "HASHTAG", "first", "START", "1000", "END", "4000",
+            "HASHTAG", "second,third"))
+
+        assert qr.is_matrix()
+        assert sorted(s.metric.get("instance") for s in qr.result) == ["app1", "app2"]
+
+    def test_queryrange_hashtag_matches_the_unscoped_result(self):
+        """The scoped and unscoped answers agree exactly on a single node."""
+        self.setup_observability_metrics()
+        query = 'http_requests_total{status="200"}'
+
+        scoped = QueryResult.from_raw(self.client.execute_command(
+            "TS.QUERYRANGE", query, "STEP", "1000", "START", "1000", "END", "4000",
+            "HASHTAG", "tenant-a,tenant-b"))
+        unscoped = QueryResult.from_raw(
+            self.range_query(query, "1000", start=1000, end=4000))
+
+        def by_instance(qr):
+            return {s.metric["instance"]: [v.value for v in s.values] for s in qr.result}
+
+        assert by_instance(scoped) == by_instance(unscoped)
+
+    def test_queryrange_hashtag_requires_a_value(self):
+        """A missing or empty value — including an empty comma-separated
+        component — is rejected rather than read as 'no tags'."""
+        self.setup_observability_metrics()
+        base = ("TS.QUERYRANGE", "http_requests_total", "STEP", "1000")
+
+        for bad in ("", ",a", "a,", "a,,b", ","):
+            with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+                self.client.execute_command(*base, "HASHTAG", bad)
+
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            self.client.execute_command(*base, "HASHTAG")

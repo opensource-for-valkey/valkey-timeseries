@@ -2,8 +2,8 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
-use crate::fanout::{FanoutCommand, is_clustered, with_fanout_user};
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
+use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::query_reader::{
@@ -127,6 +127,11 @@ struct SelectorTask {
     /// background thread. It must accompany every selector read, including
     /// reads that start a cluster fanout.
     caller_user: Option<String>,
+    /// The command's `HASHTAG` routing scope, empty when none was requested.
+    /// A field on the task rather than on each kind: every selector in one
+    /// expression shares the same scope regardless of which task kind carries
+    /// it, and the local execution path ignores it entirely.
+    hash_tags: Arc<[String]>,
     /// responder receives the processed result (Ok) or the error (Err)
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 }
@@ -243,13 +248,14 @@ impl SelectorBatchExecutor {
         timestamp: Timestamp,
         options: QueryOptions,
         caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
     ) -> QueryResult<QueryValue> {
         let command = SelectorTaskKind::Vector(InstantVectorSelectorCommand {
             matchers,
             timestamp,
             options,
         });
-        self.submit_selector_task(command, caller_user)?
+        self.submit_selector_task(command, caller_user, hash_tags)?
             .into_value()
     }
 
@@ -260,6 +266,7 @@ impl SelectorBatchExecutor {
         end: Timestamp,
         options: QueryOptions,
         caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
     ) -> QueryResult<QueryValue> {
         let command = SelectorTaskKind::Range(RangeSelectorCommand {
             matchers,
@@ -267,7 +274,7 @@ impl SelectorBatchExecutor {
             end_timestamp: end,
             options,
         });
-        self.submit_selector_task(command, caller_user)?
+        self.submit_selector_task(command, caller_user, hash_tags)?
             .into_value()
     }
 
@@ -286,6 +293,7 @@ impl SelectorBatchExecutor {
         aggregation: AggregationRequest,
         options: QueryOptions,
         caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
     ) -> QueryResult<AggregationOutcome> {
         let command = SelectorTaskKind::Aggregation(AggregationSelectorCommand {
             matchers,
@@ -293,7 +301,7 @@ impl SelectorBatchExecutor {
             aggregation,
             options,
         });
-        self.submit_selector_task(command, caller_user)?
+        self.submit_selector_task(command, caller_user, hash_tags)?
             .into_aggregation()
     }
 
@@ -310,13 +318,14 @@ impl SelectorBatchExecutor {
         rollup: RollupRequest,
         options: QueryOptions,
         caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
     ) -> QueryResult<RollupOutcome> {
         let command = SelectorTaskKind::Rollup(RollupSelectorCommand {
             matchers,
             rollup,
             options,
         });
-        self.submit_selector_task(command, caller_user)?
+        self.submit_selector_task(command, caller_user, hash_tags)?
             .into_rollup()
     }
 
@@ -324,11 +333,13 @@ impl SelectorBatchExecutor {
         &self,
         command: SelectorTaskKind,
         caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
     ) -> QueryResult<SelectorOutput> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let task = SelectorTask {
             kind: command,
             caller_user,
+            hash_tags,
             responder: result_tx,
         };
 
@@ -389,101 +400,11 @@ impl SelectorBatchExecutor {
     }
 }
 
-#[cfg(test)]
-mod selector_batch_executor_tests {
-    use super::{SelectorTaskQueue, selector_fanout_failure};
-    use crate::fanout::FanoutError;
-    use crate::promql::QueryError;
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::thread;
-
-    #[test]
-    fn enqueue_claims_processor_after_idle_transition() {
-        let mut queue = SelectorTaskQueue::default();
-
-        assert!(queue.enqueue(1));
-        assert_eq!(queue.next_batch(4), Some(vec![1]));
-        assert!(queue.processor_active);
-
-        // This is the processor's final empty observation. Because it flips
-        // `processor_active` under the queue lock, a subsequent enqueue must
-        // claim processor ownership instead of waiting for a departed worker.
-        assert_eq!(queue.next_batch(4), None);
-        assert!(!queue.processor_active);
-        assert!(queue.enqueue(2));
-    }
-
-    #[test]
-    fn one_processor_drains_tasks_submitted_while_it_is_active() {
-        let mut queue = SelectorTaskQueue::default();
-
-        assert!(queue.enqueue(1));
-        assert!(!queue.enqueue(2));
-        assert_eq!(queue.next_batch(1), Some(vec![1]));
-        assert_eq!(queue.next_batch(1), Some(vec![2]));
-        assert_eq!(queue.next_batch(1), None);
-    }
-
-    #[test]
-    fn idle_transition_interleaving_never_leaves_a_task_unowned() {
-        let queue = Arc::new(Mutex::new(SelectorTaskQueue::default()));
-        {
-            let mut queue = queue.lock().unwrap();
-            assert!(queue.enqueue(1));
-            assert_eq!(queue.next_batch(1), Some(vec![1]));
-        }
-
-        // Either the processor observes task 2 before becoming idle, or the
-        // enqueuer claims ownership after the idle transition. Both outcomes
-        // must leave a processor responsible for task 2.
-        let start = Arc::new(Barrier::new(2));
-        let processor_queue = queue.clone();
-        let processor_start = start.clone();
-        let processor = thread::spawn(move || {
-            processor_start.wait();
-            processor_queue.lock().unwrap().next_batch(1)
-        });
-
-        let enqueuer_queue = queue.clone();
-        let enqueuer = thread::spawn(move || {
-            start.wait();
-            enqueuer_queue.lock().unwrap().enqueue(2)
-        });
-
-        let processor_batch = processor.join().unwrap();
-        let enqueuer_claimed_processor = enqueuer.join().unwrap();
-        let mut queue = queue.lock().unwrap();
-
-        if enqueuer_claimed_processor {
-            assert_eq!(processor_batch, None);
-            assert_eq!(queue.next_batch(1), Some(vec![2]));
-        } else {
-            assert_eq!(processor_batch, Some(vec![2]));
-            assert_eq!(queue.next_batch(1), None);
-        }
-    }
-
-    #[test]
-    fn selector_fanout_failure_preserves_timeout() {
-        assert!(matches!(
-            selector_fanout_failure("instant", FanoutError::timeout()),
-            QueryError::Timeout
-        ));
-    }
-
-    #[test]
-    fn selector_fanout_failure_is_not_an_empty_result() {
-        assert!(matches!(
-            selector_fanout_failure("range", FanoutError::custom("shard unavailable")),
-            QueryError::Execution(message) if message.contains("shard unavailable")
-        ));
-    }
-}
-
 fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     let SelectorTask {
         kind,
         caller_user,
+        hash_tags,
         responder,
     } = task;
     let original_db = get_current_db(ctx);
@@ -503,10 +424,14 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
                 SelectorTask {
                     kind,
                     caller_user: None,
+                    hash_tags,
                     responder,
                 },
             );
         } else {
+            // The local index is the whole picture on a single node, so the
+            // routing scope is deliberately ignored here: `HASHTAG` selects
+            // shards, it does not filter keys or labels.
             let result = execute_selector_task_local(ctx, kind);
             deliver_task_result(&responder, result);
         }
@@ -614,6 +539,7 @@ fn selector_fanout_failure(query_kind: &str, error: FanoutError) -> QueryError {
 fn execute_cluster_vector_selector(
     ctx: &Context,
     iqc: InstantVectorSelectorCommand,
+    hash_tags: &[String],
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&iqc.options);
@@ -629,7 +555,7 @@ fn execute_cluster_vector_selector(
     );
 
     let max_series = iqc.options.max_series;
-    let targets = cmd.get_targets(ctx);
+    let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
 
@@ -665,6 +591,7 @@ fn execute_cluster_vector_selector(
 fn execute_cluster_range_selector(
     ctx: &Context,
     rc: RangeSelectorCommand,
+    hash_tags: &[String],
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&rc.options);
@@ -679,7 +606,7 @@ fn execute_cluster_range_selector(
 
     let max_series = rc.options.max_series;
     let max_points_per_series = rc.options.max_points_per_series;
-    let targets = cmd.get_targets(ctx);
+    let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
 
@@ -726,6 +653,7 @@ fn execute_cluster_range_selector(
 fn execute_cluster_aggregation(
     ctx: &Context,
     ac: AggregationSelectorCommand,
+    hash_tags: &[String],
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&ac.options);
@@ -739,7 +667,7 @@ fn execute_cluster_aggregation(
     let cmd = AggregationFanoutCommand::new(vector, ac.aggregation, timeout);
 
     let max_series = ac.options.max_series;
-    let targets = cmd.get_targets(ctx);
+    let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
 
@@ -796,6 +724,7 @@ fn execute_cluster_aggregation(
 fn execute_cluster_rollup(
     ctx: &Context,
     rc: RollupSelectorCommand,
+    hash_tags: &[String],
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
     let timeout = calculate_timeout(&rc.options);
@@ -809,7 +738,7 @@ fn execute_cluster_rollup(
         timeout,
     );
 
-    let targets = cmd.get_targets(ctx);
+    let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
 
@@ -849,18 +778,22 @@ fn execute_cluster_rollup(
 }
 
 fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
+    // Every path below routes through the same scope, including the push-down
+    // ones: a push-down that a peer cannot serve falls back to the ordinary
+    // selector read on the same reader, which carries these same tags.
+    let hash_tags = task.hash_tags;
     match task.kind {
         SelectorTaskKind::Vector(iqc) => {
-            execute_cluster_vector_selector(ctx, iqc, task.responder);
+            execute_cluster_vector_selector(ctx, iqc, &hash_tags, task.responder);
         }
         SelectorTaskKind::Range(rc) => {
-            execute_cluster_range_selector(ctx, rc, task.responder);
+            execute_cluster_range_selector(ctx, rc, &hash_tags, task.responder);
         }
         SelectorTaskKind::Aggregation(ac) => {
-            execute_cluster_aggregation(ctx, ac, task.responder);
+            execute_cluster_aggregation(ctx, ac, &hash_tags, task.responder);
         }
         SelectorTaskKind::Rollup(rc) => {
-            execute_cluster_rollup(ctx, rc, task.responder);
+            execute_cluster_rollup(ctx, rc, &hash_tags, task.responder);
         }
     }
 }
@@ -957,4 +890,95 @@ pub(in crate::promql) fn query_range_local(
     validate_max_series_(ranges.len(), options.max_series)?;
 
     Ok(ranges)
+}
+
+#[cfg(test)]
+mod selector_batch_executor_tests {
+    use super::{SelectorTaskQueue, selector_fanout_failure};
+    use crate::fanout::FanoutError;
+    use crate::promql::QueryError;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    #[test]
+    fn enqueue_claims_processor_after_idle_transition() {
+        let mut queue = SelectorTaskQueue::default();
+
+        assert!(queue.enqueue(1));
+        assert_eq!(queue.next_batch(4), Some(vec![1]));
+        assert!(queue.processor_active);
+
+        // This is the processor's final empty observation. Because it flips
+        // `processor_active` under the queue lock, a subsequent enqueue must
+        // claim processor ownership instead of waiting for a departed worker.
+        assert_eq!(queue.next_batch(4), None);
+        assert!(!queue.processor_active);
+        assert!(queue.enqueue(2));
+    }
+
+    #[test]
+    fn one_processor_drains_tasks_submitted_while_it_is_active() {
+        let mut queue = SelectorTaskQueue::default();
+
+        assert!(queue.enqueue(1));
+        assert!(!queue.enqueue(2));
+        assert_eq!(queue.next_batch(1), Some(vec![1]));
+        assert_eq!(queue.next_batch(1), Some(vec![2]));
+        assert_eq!(queue.next_batch(1), None);
+    }
+
+    #[test]
+    fn idle_transition_interleaving_never_leaves_a_task_unowned() {
+        let queue = Arc::new(Mutex::new(SelectorTaskQueue::default()));
+        {
+            let mut queue = queue.lock().unwrap();
+            assert!(queue.enqueue(1));
+            assert_eq!(queue.next_batch(1), Some(vec![1]));
+        }
+
+        // Either the processor observes task 2 before becoming idle, or the
+        // enqueuer claims ownership after the idle transition. Both outcomes
+        // must leave a processor responsible for task 2.
+        let start = Arc::new(Barrier::new(2));
+        let processor_queue = queue.clone();
+        let processor_start = start.clone();
+        let processor = thread::spawn(move || {
+            processor_start.wait();
+            processor_queue.lock().unwrap().next_batch(1)
+        });
+
+        let enqueuer_queue = queue.clone();
+        let enqueuer = thread::spawn(move || {
+            start.wait();
+            enqueuer_queue.lock().unwrap().enqueue(2)
+        });
+
+        let processor_batch = processor.join().unwrap();
+        let enqueuer_claimed_processor = enqueuer.join().unwrap();
+        let mut queue = queue.lock().unwrap();
+
+        if enqueuer_claimed_processor {
+            assert_eq!(processor_batch, None);
+            assert_eq!(queue.next_batch(1), Some(vec![2]));
+        } else {
+            assert_eq!(processor_batch, Some(vec![2]));
+            assert_eq!(queue.next_batch(1), None);
+        }
+    }
+
+    #[test]
+    fn selector_fanout_failure_preserves_timeout() {
+        assert!(matches!(
+            selector_fanout_failure("instant", FanoutError::timeout()),
+            QueryError::Timeout
+        ));
+    }
+
+    #[test]
+    fn selector_fanout_failure_is_not_an_empty_result() {
+        assert!(matches!(
+            selector_fanout_failure("range", FanoutError::custom("shard unavailable")),
+            QueryError::Execution(message) if message.contains("shard unavailable")
+        ));
+    }
 }

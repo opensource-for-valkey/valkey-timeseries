@@ -535,3 +535,71 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             'sum(increase(http_requests_total{environment="production"}[2m]))', time
         )
         self._assert_single_value(result, 120.0)
+
+    # ── HASHTAG: cluster routing scope, a no-op on a standalone server ────
+
+    def test_query_hashtag_is_accepted_and_ignored_outside_a_cluster(self):
+        """HASHTAG only scopes the cluster fanout, so a standalone server still
+        answers over its whole keyspace.
+
+        Bare, braced and comma-separated forms are all accepted, the token is
+        matched case-insensitively, and the clause composes with every other
+        option in either order.
+        """
+        time = self.setup_http_requests_scenario()
+        query = 'sum(http_requests_total{environment="production"})'
+
+        at = ('TIME', str(time))
+
+        for args in (
+            ('HASHTAG', 'anything') + at,
+            ('HASHTAG', 'a,b,c') + at,
+            ('HASHTAG', '{braced}') + at,
+            ('hashtag', 'lowercase') + at,
+            at + ('HASHTAG', 'x'),
+            at + ('LOOKBACK_DELTA', '5m', 'HASHTAG', 'x'),
+            ('HASHTAG', 'x', 'LOOKBACK_DELTA', '5m') + at,
+            at + ('TIMEOUT', '5s', 'HASHTAG', 'x'),
+            ('HASHTAG', 'x', 'TIMEOUT', '5s') + at,
+        ):
+            result = QueryResult.from_raw(
+                self.client.execute_command('TS.QUERY', query, *args))
+            self._assert_single_value(result, 660.0)
+
+    def test_query_hashtag_last_occurrence_wins(self):
+        """Repeating the clause replaces the routing scope rather than widening
+        it. Standalone results are identical either way, so this pins the
+        parse: a repeat must be accepted, not rejected as a duplicate."""
+        time = self.setup_http_requests_scenario()
+        query = 'sum(http_requests_total{environment="production"})'
+
+        result = QueryResult.from_raw(self.client.execute_command(
+            'TS.QUERY', query, 'HASHTAG', 'first', 'TIME', str(time),
+            'HASHTAG', 'second,third'))
+        self._assert_single_value(result, 660.0)
+
+    def test_query_hashtag_matches_the_unscoped_result(self):
+        """The scoped and unscoped answers agree exactly on a single node."""
+        time = self.setup_http_requests_scenario()
+        query = 'http_requests_total'
+
+        scoped = QueryResult.from_raw(self.client.execute_command(
+            'TS.QUERY', query, 'TIME', str(time), 'HASHTAG', 'tenant-a,tenant-b'))
+        unscoped = self.instant_query(query, time)
+
+        assert (self._vector_values_by_label(scoped, 'server')
+                == self._vector_values_by_label(unscoped, 'server'))
+
+    def test_query_hashtag_requires_a_value(self):
+        """A missing or empty value — including an empty comma-separated
+        component — is rejected rather than read as 'no tags'."""
+        time = self.setup_http_requests_scenario()
+        query = 'http_requests_total'
+
+        for bad in ('', ',a', 'a,', 'a,,b', ','):
+            with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+                self.client.execute_command('TS.QUERY', query, 'TIME', str(time),
+                                            'HASHTAG', bad)
+
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            self.client.execute_command('TS.QUERY', query, 'TIME', str(time), 'HASHTAG')

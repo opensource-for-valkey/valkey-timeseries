@@ -5,15 +5,13 @@ use super::fanout_codec::generated::{
 use crate::aggregators::EmptyFillBounds;
 use crate::aggregators::MultiAggregateIterator;
 use crate::aggregators::{PartialReducer, PartialState};
-use crate::commands::utils::{
-    MRangeReplyShape, get_multi_command_targets, reply_with_mrange_series_results,
-};
+use crate::commands::utils::{MRangeReplyShape, reply_with_mrange_series_results};
 use crate::common::context::key_for_display;
 use crate::common::metrics::fanout as fanout_metrics;
 use crate::common::replies::ReplyContext;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::common::{MultiSample, Sample};
-use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo, compute_hash_tag_fanout_target};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{
     MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer,
@@ -183,7 +181,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 
     fn get_targets(&self, ctx: &Context) -> FanoutTarget {
-        get_multi_command_targets(ctx, &self.options.tags)
+        compute_hash_tag_fanout_target(ctx, &self.options.tags)
     }
 
     fn generate_request(&self) -> MultiRangeRequest {
