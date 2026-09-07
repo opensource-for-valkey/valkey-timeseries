@@ -2,8 +2,7 @@
 
 `TS.QUERY` / `TS.QUERYRANGE` accept `HASHTAG tag,...` as a *routing* hint: the
 coordinator contacts only the shards owning those hash tags, and every selector
-in the expression is evaluated over that same shard set. See
-`docs/plans/promql-hashtag-option-plan.md`.
+in the expression is evaluated over that same shard set.
 
 What that means, and what these tests are for:
 

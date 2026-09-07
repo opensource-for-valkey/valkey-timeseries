@@ -127,6 +127,26 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
                 f"coordinator={coordinator} raised {exc.value!r}"
             )
 
+    def test_restricted_user_query_fails_closed_from_any_coordinator(self):
+        """TS.QUERY must enforce ACCESS on every shard it reads.
+
+        This deliberately uses the same selector as the MGET test above. The
+        PromQL selector is evaluated asynchronously and through a separate
+        fanout implementation, so matching MGET coverage alone does not prove
+        that the caller identity reaches the PromQL shard reads.
+        """
+        cluster = self.new_cluster_client()
+        self._setup_per_shard_data(cluster)
+        self._create_user_on_all_primaries("bob_query", "pw", "+@timeseries", "+@read", PATTERN_SHARD1)
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            bob = self._get_primary_user_client(coordinator, "bob_query", "pw")
+            with pytest.raises(ResponseError) as exc:
+                bob.execute_command("TS.QUERY", '{name="cpu"}', "TIME", "2")
+            assert "permission" in str(exc.value).lower(), (
+                f"coordinator={coordinator} raised {exc.value!r}"
+            )
+
     def test_identity_grants_access_to_authorized_remote_key(self):
         """Identity travels to a remote shard and grants access there.
 
