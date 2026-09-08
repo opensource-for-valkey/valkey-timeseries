@@ -439,16 +439,23 @@ class TestPromQLHashTagCluster(ValkeyTimeSeriesClusterTestCase):
 
     def test_routing_scope_does_not_change_the_caller_identity(self):
         """Scoping picks which shards are contacted; it never changes who is
-        asking. So a restricted user's scoped answer is exactly their unscoped
-        answer narrowed to the selected shards — the same restriction an
-        unrestricted user sees, applied on top of whatever that identity is
-        already entitled to.
+        asking, and it is not a capability the caller can spend.
 
-        Stated this way the test holds regardless of how much per-key ACL the
-        PromQL read path applies, which is deliberately not what is under test
-        here (tests/test_ts_acls_cme.py owns cross-shard identity, and
-        `test_query_preserves_callers_acl_identity` in tests/test_ts_query.py
-        owns the single-node key checks).
+        `TS.QUERY` fails closed on keys the caller may not read — it does not
+        quietly drop them (`test_query_preserves_callers_acl_identity` in
+        tests/test_ts_query.py pins that on a single node, and the fanout
+        carries the caller's identity to every shard, so it holds across the
+        cluster too). A user granted only `~*{h1}` therefore sees:
+
+        * their own shard's ordinary answer when the scope selects only shards
+          whose matching keys are inside the grant, and
+        * the usual key-permission error for every other scope, the unscoped
+          query included — the selector matches `{h0}`/`{h2}` keys there.
+
+        So `HASHTAG` neither widens the caller's reach (naming a shard they
+        cannot read is still denied) nor narrows it (their own shard answers
+        exactly as it does for an unrestricted caller). Cross-shard identity
+        in general belongs to tests/test_ts_acls_cme.py.
 
         There is also no database dimension to test: cluster mode has only
         database 0, so `SELECT` cannot move a scoped query off it. The
@@ -464,16 +471,21 @@ class TestPromQLHashTagCluster(ValkeyTimeSeriesClusterTestCase):
         scoped_user = self.new_client_for_primary(0)
         scoped_user.execute_command('AUTH', 'h1only', 'pw')
 
-        unscoped = self.instants_by_instance(
-            self.instant_query('http_requests_total', client=scoped_user))
+        # The one scope whose matching keys lie entirely inside the grant, and
+        # it is the same answer the unrestricted coordinator client gets.
+        granted = self.instants_by_instance(
+            self.instant_query('http_requests_total', tags='h1', client=scoped_user))
+        assert set(granted) == self.instances_on('h1')
+        assert granted == self.instants_by_instance(
+            self.instant_query('http_requests_total', tags='h1'))
 
-        for tags in ('h1', 'h0', 'h0,h2', 'h0,h1,h2'):
-            selected = set(tags.split(','))
-            scoped = self.instants_by_instance(
-                self.instant_query('http_requests_total', tags=tags, client=scoped_user))
-            expected = {i: v for i, v in unscoped.items()
-                        if REQUEST_SERIES[i][0] in selected}
-            assert scoped == expected, tags
+        # Naming a shard the caller cannot read is a denial, not a smaller
+        # answer -- and `None` here is the unscoped query, denied for the same
+        # reason.
+        for tags in (None, 'h0', 'h2', 'h0,h2', 'h0,h1,h2'):
+            with pytest.raises(ResponseError, match='(?i)permission'):
+                self.instant_query(
+                    'http_requests_total', tags=tags, client=scoped_user)
 
     def test_hashtag_does_not_bypass_command_permissions(self):
         """A caller denied TS.QUERY stays denied with the clause present: the
