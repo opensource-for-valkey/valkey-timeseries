@@ -471,9 +471,9 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "POST")], 3, 40.0),
         ],
         vec![
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 > 15
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]), // 30 > 15
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]), // 40 > 15
+            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 > 15
+            (30.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "GET")]), // 30 > 15
+            (40.0, vec![("__name__", "http_requests_total"), ("env", "staging"), ("method", "POST")]), // 40 > 15
         ]
     )]
     #[case(
@@ -485,8 +485,8 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
         ],
         vec![
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]), // 10 < 25
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 < 25
+            (10.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "GET")]), // 10 < 25
+            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 < 25
         ]
     )]
     #[case(
@@ -498,7 +498,7 @@ mod tests {
             ("http_requests_total", vec![("env", "staging"), ("method", "GET")], 2, 30.0),
         ],
         vec![
-            (1.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 == 20
+            (20.0, vec![("__name__", "http_requests_total"), ("env", "prod"), ("method", "POST")]), // 20 == 20
         ]
     )]
     // Binary Operations - Comparison with bool (vector-scalar and scalar-vector)
@@ -741,8 +741,8 @@ mod tests {
         ],
         vec![
             // Inner + sets drop_name=true, outer > filters to values > 15.
-            // 10+1=11 not > 15 (filtered). 20+1=21 > 15 → returns 1.0. __name__ stripped at top level.
-            (1.0, vec![("env", "prod"), ("method", "POST")]),
+            // 10+1=11 not > 15 (filtered). 20+1=21 > 15 → kept with its value 21. __name__ stripped at top level.
+            (21.0, vec![("env", "prod"), ("method", "POST")]),
         ]
     )]
     // Function-wrapped arithmetic: drop_name propagation through instant-vector functions

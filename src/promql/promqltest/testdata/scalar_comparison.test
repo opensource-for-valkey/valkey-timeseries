@@ -1,0 +1,116 @@
+# Vector-scalar and scalar-vector comparison filtering.
+#
+# Extracted from the upstream operators.test corpus, which is otherwise
+# `ignore`d in this harness. A filtering comparison must keep the original
+# sample value for every sample that passes; only `bool` rewrites to 0/1.
+
+load 5m
+	http_requests_total{job="api-server", instance="0", group="production"}	0+10x10
+	http_requests_total{job="api-server", instance="1", group="production"}	0+20x10
+	http_requests_total{job="api-server", instance="0", group="canary"}	0+30x10
+	http_requests_total{job="api-server", instance="1", group="canary"}	0+40x10
+	http_requests_total{job="app-server", instance="0", group="production"}	0+50x10
+	http_requests_total{job="app-server", instance="1", group="production"}	0+60x10
+	http_requests_total{job="app-server", instance="0", group="canary"}	0+70x10
+	http_requests_total{job="app-server", instance="1", group="canary"}	0+80x10
+
+# Comparisons.
+eval instant at 50m SUM(http_requests_total) BY (job) > 1000
+	{job="app-server"} 2600
+
+eval instant at 50m 1000 < SUM(http_requests_total) BY (job)
+	{job="app-server"} 2600
+
+eval instant at 50m SUM(http_requests_total) BY (job) <= 1000
+	{job="api-server"} 1000
+
+eval instant at 50m SUM(http_requests_total) BY (job) != 1000
+	{job="app-server"} 2600
+
+eval instant at 50m SUM(http_requests_total) BY (job) == 1000
+	{job="api-server"} 1000
+
+eval instant at 50m SUM(http_requests_total) BY (job) == bool 1000
+	{job="api-server"} 1
+	{job="app-server"} 0
+
+eval instant at 50m http_requests_total{job="api-server", instance="0", group="production"} == bool 100
+	{job="api-server", instance="0", group="production"} 1
+
+clear
+
+# Test comparison operations with floats.
+# Upstream has a `stale` marker at step 5; with a 6m step and 5m lookback a
+# plain gap produces the same `_` in every expectation below.
+load 6m
+  left_floats  1 2 _ _ 3 _ 4  5  NaN Inf -Inf
+
+# Vector / scalar combinations with scalar on right side
+eval range from 0 to 60m step 6m left_floats == 3
+  expect no_info
+  left_floats _ _ _ _ 3 _ _ _ _ _ _
+
+eval range from 0 to 60m step 6m left_floats != 3
+  expect no_info
+  left_floats 1 2 _ _ _ _ 4 5 NaN Inf -Inf
+
+eval range from 0 to 60m step 6m left_floats > 3
+  expect no_info
+  left_floats _ _ _ _ _ _ 4 5 _ Inf _
+
+eval range from 0 to 60m step 6m left_floats >= 3
+  expect no_info
+  left_floats _ _ _ _ 3 _ 4 5 _ Inf _
+
+eval range from 0 to 60m step 6m left_floats < 3
+  expect no_info
+  left_floats 1 2 _ _ _ _ _ _ _ _ -Inf
+
+eval range from 0 to 60m step 6m left_floats <= 3
+  expect no_info
+  left_floats 1 2 _ _ 3 _ _ _ _ _ -Inf
+
+eval range from 0 to 60m step 6m left_floats == bool 3
+  expect no_info
+  {} 0 0 _ _ 1 _ 0 0 0 0 0
+
+eval range from 0 to 60m step 6m left_floats == Inf
+  expect no_info
+  left_floats _ _ _ _ _ _ _ _ _ Inf _
+
+eval range from 0 to 60m step 6m left_floats == bool Inf
+  expect no_info
+  {} 0 0 _ _ 0 _ 0 0 0 1 0
+
+eval range from 0 to 60m step 6m left_floats == NaN
+  expect no_info
+  # No results.
+
+eval range from 0 to 60m step 6m left_floats == bool NaN
+  expect no_info
+  {} 0 0 _ _ 0 _ 0 0 0 0 0
+
+# Vector / scalar combinations with scalar on left side
+eval range from 0 to 60m step 6m 3 == left_floats
+  expect no_info
+  left_floats _ _ _ _ 3 _ _ _ _ _ _
+
+eval range from 0 to 60m step 6m 3 != left_floats
+  expect no_info
+  left_floats 1 2 _ _ _ _ 4 5 NaN Inf -Inf
+
+eval range from 0 to 60m step 6m 3 < left_floats
+  expect no_info
+  left_floats _ _ _ _ _ _ 4 5 _ Inf _
+
+eval range from 0 to 60m step 6m 3 <= left_floats
+  expect no_info
+  left_floats _ _ _ _ 3 _ 4 5 _ Inf _
+
+eval range from 0 to 60m step 6m 3 > left_floats
+  expect no_info
+  left_floats 1 2 _ _ _ _ _ _ _ _ -Inf
+
+eval range from 0 to 60m step 6m 3 >= left_floats
+  expect no_info
+  left_floats 1 2 _ _ 3 _ _ _ _ _ -Inf
