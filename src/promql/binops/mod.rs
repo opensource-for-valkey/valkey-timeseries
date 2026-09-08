@@ -19,6 +19,9 @@ pub(in crate::promql) use labels::*;
 #[cfg(feature = "bench")]
 pub use binop_vector_vector::{bench_eval_aligned, bench_eval_unaligned, bench_eval_with_fill};
 
+#[cfg(feature = "bench")]
+pub use binop_vector_scalar::{BenchOp, LabelMode, VectorScalarCase, VectorScalarInput};
+
 pub(crate) fn eval_binary_expr(
     expr: &BinaryExpr,
     lhs: ExprResult,
