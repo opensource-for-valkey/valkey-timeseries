@@ -816,6 +816,16 @@ impl TimeSeries {
             return None;
         }
 
+        // The series head decides the answer whenever it is not past `end`: it is the newest
+        // sample there is, so either it lands in the window or the window is entirely ahead of
+        // the series and nothing matches. That covers the dominant instant-selector shape
+        // (`end` at or after now) without touching a chunk at all.
+        if let Some(last) = self.last_sample
+            && last.timestamp <= end
+        {
+            return (last.timestamp >= start).then_some(last);
+        }
+
         for chunk in self.chunks.iter().rev() {
             if chunk.first_timestamp() > end {
                 continue;
@@ -1490,5 +1500,36 @@ mod tests {
         assert_eq!(find_start_chunk_index(&chunks, 45), 2);
         assert_eq!(find_start_chunk_index(&chunks, 35), 2);
         assert_eq!(find_start_chunk_index(&chunks, 70), 4);
+    }
+
+    #[test]
+    fn last_sample_in_range_uses_the_cached_head() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        fn sample(timestamp: Timestamp) -> Sample {
+            Sample::new(timestamp, timestamp as f64)
+        }
+
+        let ts = TimeSeries::from_chunks(vec![
+            TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                sample(10),
+                sample(20),
+            ])),
+            TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                sample(30),
+                sample(40),
+            ])),
+        ])
+        .unwrap();
+
+        // `end` at or beyond the head returns the head itself.
+        assert_eq!(ts.last_sample_in_range(0, 40), Some(sample(40)));
+        assert_eq!(ts.last_sample_in_range(0, 1_000), Some(sample(40)));
+        assert_eq!(ts.last_sample_in_range(40, 1_000), Some(sample(40)));
+        // A window entirely ahead of the head matches nothing.
+        assert_eq!(ts.last_sample_in_range(41, 1_000), None);
+        // An empty series has no head to short-circuit on.
+        let empty = TimeSeries::from_chunks(vec![]).unwrap();
+        assert_eq!(empty.last_sample_in_range(0, 1_000), None);
     }
 }
