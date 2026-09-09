@@ -78,7 +78,7 @@ inside the argument. A key contributes one value per aggregator it names, and it
 together in the reply in that order.
 
 A [filtered aggregator](./ts.range.md#filtered-aggregators) (`countif`, `sumif`, `all`, `any`,
-`none`, `share`) **requires** an inline condition — `aggregator(op value)`, e.g. `countif(>5)` — and
+`none`, `share`) **requires** an inline condition — `aggregatorop value`, e.g. `countif>5` — and
 `count`/`sum` accept the same form optionally. Conditions are per aggregator, so different keys (and
 different aggregators for one key) can use different ones.
 </details>
@@ -181,7 +181,7 @@ Each timestamp's values are a single flat list — `{sensor}:3`'s `avg`, then it
 Count each key's samples above its own threshold, per minute:
 
 ```
-127.0.0.1:6379> TS.NRANGE 2 {app}:errors {app}:latency - + AGGREGATION countif(>0) countif(>250) 60000
+127.0.0.1:6379> TS.NRANGE 2 {app}:errors {app}:latency - + AGGREGATION countif>0 countif>250 60000
 ```
 
 ### Latest rows only

@@ -139,15 +139,15 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
             assert val > 40  # Sum of two temp sensors should be > 40
 
     def test_mrange_groupby_reduce_with_inline_condition(self):
-        """GROUPBY/REDUCE reducers take the same inline (op value) condition
-        syntax as AGGREGATION, e.g. REDUCE countif(>5)."""
+        """GROUPBY/REDUCE reducers take the same inline op value condition
+        syntax as AGGREGATION, e.g. REDUCE countif>5."""
         self.setup_data()
 
         result = self.client.execute_command(
             'TS.MRANGE', self.start_ts, self.start_ts + 100,
             'FILTER', 'sensor=temp',
             'GROUPBY', 'sensor',
-            'REDUCE', 'countif(>0)')
+            'REDUCE', 'countif>0')
 
         assert len(result) == 1
         for ts, val in result[0][2]:
@@ -168,7 +168,7 @@ class TestTimeSeriesMRange(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command(
                 'TS.MRANGE', self.start_ts, self.start_ts + 100,
                 'FILTER', 'sensor=temp',
-                'GROUPBY', 'sensor', 'REDUCE', 'avg(>0)')
+                'GROUPBY', 'sensor', 'REDUCE', 'avg>0')
 
     def test_mrange_empty(self):
 

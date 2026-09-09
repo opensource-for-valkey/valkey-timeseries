@@ -187,11 +187,11 @@ AGGREGATION avg 1h
 AGGREGATION sum 5m
 ```
 
-#### Inline condition: aggregator(op value)
+#### Inline condition: aggregatorop value
 
 `all`, `any`, `countif`, `sumif`, `share`, and `none` **require** an inline comparison condition —
-`aggregator(op value)`, e.g. `countif(>5)` — with no spaces inside the parentheses since it is a
-single argument token; omitting it is an error. `count` and `sum` accept the same form
+`aggregatorop value`, e.g. `countif>5` — with no separator since `aggregator` and its condition
+form a single argument token; omitting it is an error. `count` and `sum` accept the same form
 *optionally*, to count/sum only matching samples. Any other aggregator (`avg`, `max`, ...) does
 not accept a condition; attaching one is an error.
 
@@ -200,13 +200,13 @@ not accept a condition; attaching one is an error.
 **Example:**
 
 ```
-AGGREGATION share(>20.0) 1h
+AGGREGATION share>20.0 1h
 ```
 
 Different elements of the `aggregator` list can filter on different conditions:
 
 ```
-AGGREGATION countif(>5),sumif(<=2),avg 1h
+AGGREGATION countif>5,sumif<=2,avg 1h
 ```
 
 #### BUCKETTIMESTAMP bt
@@ -249,7 +249,7 @@ GROUPBY region REDUCE sum
 
 Supports all aggregators except `rate` (e.g., `avg`, `sum`, `count`, `max`, `min`, etc.)
 
-#### Inline condition: reducer(op value)
+#### Inline condition: reducerop value
 
 Same inline condition syntax as `AGGREGATION` (see above): required for `countif`/`sumif`/`share`/
 `all`/`any`/`none`, optional for `count`/`sum`, and disallowed for other reducers.
@@ -257,7 +257,7 @@ Same inline condition syntax as `AGGREGATION` (see above): required for `countif
 **Example:**
 
 ```
-GROUPBY region REDUCE countif(>20.0)
+GROUPBY region REDUCE countif>20.0
 ```
 
 ### EXCLUDEEMPTY
@@ -390,7 +390,7 @@ O(n×m×k) where:
 ### Query with aggregation condition and empty buckets
 
 ```bash
-127.0.0.1:6379> TS.MRANGE - + AGGREGATION countif(>23.0) 1h EMPTY FILTER sensor_id=12
+127.0.0.1:6379> TS.MRANGE - + AGGREGATION countif>23.0 1h EMPTY FILTER sensor_id=12
 1) 1) "temperature:sensor:12"
    2) (empty array)
    3) 1) 1) (integer) 1609459200000

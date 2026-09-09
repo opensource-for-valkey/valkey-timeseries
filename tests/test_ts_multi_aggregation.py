@@ -79,8 +79,8 @@ class TestTimeSeriesMultiAggregation(ValkeyTimeSeriesTestCaseBase):
 
         result = self.client.execute_command(
             'TS.RANGE', 'ts1', '-', '+',
-            'AGGREGATION', 'countif(>15),avg', 1000)
-        # bucket [1000,2000): countif(>15)=1 (30), avg=20
+            'AGGREGATION', 'countif>15,avg', 1000)
+        # bucket [1000,2000): countif>15=1 (30), avg=20
         assert result[0] == [1000, b'1', b'20']
 
     def test_multi_aggregation_errors(self):
@@ -106,7 +106,7 @@ class TestTimeSeriesMultiAggregation(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match='does not support a filter'):
             self.client.execute_command(
                 'TS.RANGE', 'ts1', '-', '+',
-                'AGGREGATION', 'avg(>5),max', 1000)
+                'AGGREGATION', 'avg>5,max', 1000)
 
     def test_mrange_multi_aggregation(self):
         self.setup_mrange_data()

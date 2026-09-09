@@ -636,7 +636,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'all_true', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'ALL(>=1)', 5000,
+            'AGGREGATION', 'ALL>=1', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -658,7 +658,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'all_has_zero', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'ALL(!=0)', 5000,
+            'AGGREGATION', 'ALL!=0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -681,7 +681,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'all_multi_bucket', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'ALL(<500)', 2000,
+            'AGGREGATION', 'ALL<500', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -705,7 +705,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'any_true', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'ANY(>=1)', 5000,
+            'AGGREGATION', 'ANY>=1', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -727,7 +727,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'any_false', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'ANY(!=0)', 5000,
+            'AGGREGATION', 'ANY!=0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -753,7 +753,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'any_multi_bucket', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'ANY(>0)', 2000,
+            'AGGREGATION', 'ANY>0', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -777,7 +777,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'sumif_all', 0, 4000,
             'ALIGN', 0,
-            'AGGREGATION', 'SUM(>0)', 4000,
+            'AGGREGATION', 'SUM>0', 4000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -798,7 +798,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'sumif_none', 0, 4000,
             'ALIGN', 0,
-            'AGGREGATION', 'SUMIF(>10)', 4000,
+            'AGGREGATION', 'SUMIF>10', 4000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -820,7 +820,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'sumif_mixed', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'SUM(>5)', 5000,
+            'AGGREGATION', 'SUM>5', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -848,7 +848,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'sumif_multi', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'SUM(>=5)', 2000,
+            'AGGREGATION', 'SUM>=5', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -872,7 +872,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'countif_all', 0, 4000,
             'ALIGN', 0,
-            'AGGREGATION', 'COUNTIF(>0)', 4000,
+            'AGGREGATION', 'COUNTIF>0', 4000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -893,7 +893,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'countif_none', 0, 4000,
             'ALIGN', 0,
-            'AGGREGATION', 'COUNT(>10)', 4000,
+            'AGGREGATION', 'COUNT>10', 4000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -915,7 +915,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'countif_mixed', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'COUNT(<=5)', 5000,
+            'AGGREGATION', 'COUNT<=5', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -944,7 +944,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'countif_multi', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'COUNTIF(>=5)', 2000,
+            'AGGREGATION', 'COUNTIF>=5', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -967,21 +967,21 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         # Test equality
         result_eq = self.client.execute_command(
             'TS.RANGE', 'countif_ops', 0, 4000,
-            'AGGREGATION', 'COUNTIF(==5)', 4000
+            'AGGREGATION', 'COUNTIF==5', 4000
         )
         assert float(result_eq[0][1]) == pytest.approx(2.0)
 
         # Test not equal
         result_neq = self.client.execute_command(
             'TS.RANGE', 'countif_ops', 0, 4000,
-            'AGGREGATION', 'COUNTIF(!=5)', 4000
+            'AGGREGATION', 'COUNTIF!=5', 4000
         )
         assert float(result_neq[0][1]) == pytest.approx(1.0)
 
         # Test less than
         result_lt = self.client.execute_command(
             'TS.RANGE', 'countif_ops', 0, 4000,
-            'AGGREGATION', 'COUNTIF(<10)', 4000
+            'AGGREGATION', 'COUNTIF<10', 4000
         )
         assert float(result_lt[0][1]) == pytest.approx(2.0)
 
@@ -1067,7 +1067,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'none_true', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'NONE(>0)', 5000,
+            'AGGREGATION', 'NONE>0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1089,7 +1089,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'none_false', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'NONE(>=1)', 5000,
+            'AGGREGATION', 'NONE>=1', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1115,7 +1115,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'none_multi_bucket', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'NONE(>0)', 2000,
+            'AGGREGATION', 'NONE>0', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1139,7 +1139,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'share_all', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'SHARE(>0)', 5000,
+            'AGGREGATION', 'SHARE>0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1160,7 +1160,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'share_none', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'SHARE(!=0)', 5000,
+            'AGGREGATION', 'SHARE!=0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1182,7 +1182,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'share_mixed', 0, 5000,
             'ALIGN', 0,
-            'AGGREGATION', 'SHARE(>0)', 5000,
+            'AGGREGATION', 'SHARE>0', 5000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1208,7 +1208,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         result = self.client.execute_command(
             'TS.RANGE', 'share_multi_bucket', 0, 6000,
             'ALIGN', 0,
-            'AGGREGATION', 'SHARE(>0)', 2000,
+            'AGGREGATION', 'SHARE>0', 2000,
             'BUCKETTIMESTAMP', 'START'
         )
 
@@ -1483,7 +1483,7 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('TS.RANGE', 'ts1', '-', '+', 'FILTER_BY_VALUE', 1000, 'b')
 
     def test_aggregation_condition_errors(self):
-        """Filtered aggregators require an inline (op value) condition;
+        """Filtered aggregators require an inline op value condition;
         non-filtered aggregators must not be given one."""
         self.client.execute_command('TS.CREATE', 'ts1')
         self.client.execute_command('TS.ADD', 'ts1', 1000, 10.0)
@@ -1498,10 +1498,10 @@ class TestTimeSeriesRange(ValkeyTimeSeriesTestCaseBase):
         for agg in ['avg', 'min', 'max', 'first', 'last', 'range', 'std.p']:
             with pytest.raises(ResponseError, match="TSDB: aggregation type does not support a filter condition"):
                 self.client.execute_command(
-                    'TS.RANGE', 'ts1', '-', '+', 'AGGREGATION', f'{agg}(>5)', 1000)
+                    'TS.RANGE', 'ts1', '-', '+', 'AGGREGATION', f'{agg}>5', 1000)
 
         # count/sum accept an inline condition optionally
         for agg in ['count', 'sum']:
             result = self.client.execute_command(
-                'TS.RANGE', 'ts1', '-', '+', 'AGGREGATION', f'{agg}(>5)', 1000)
+                'TS.RANGE', 'ts1', '-', '+', 'AGGREGATION', f'{agg}>5', 1000)
             assert len(result) == 1

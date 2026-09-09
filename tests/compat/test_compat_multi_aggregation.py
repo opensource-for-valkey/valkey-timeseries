@@ -549,13 +549,13 @@ class TestDivergences:
         with pytest.raises(ResponseError):
             diff.subject.execute_command(*args)
 
-    @pytest.mark.parametrize("aggregators", ["countif(>15),avg", "avg,rate"])
+    @pytest.mark.parametrize("aggregators", ["countif>15,avg", "avg,rate"])
     def test_extension_list_elements_are_a_superset(self, diff, range_cmd, aggregators):
         """DIV-0038: our list-element grammar accepts names and an inline
-        `name(condition)` form that RTS has no vocabulary for.
+        `nameop value` condition form that RTS has no vocabulary for.
 
-        `rate` is not an RTS aggregator, and the parenthesized per-element
-        condition (`countif(>15)`) has no RTS equivalent — both answer "Unknown
+        `rate` is not an RTS aggregator, and the inline per-element condition
+        (`countif>15`) has no RTS equivalent — both answer "Unknown
         aggregation type". An accepted-input superset, so per-engine.
         """
         mk_populated(diff, "ma:ext", MULTI_SAMPLES)

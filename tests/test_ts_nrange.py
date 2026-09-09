@@ -188,7 +188,7 @@ class TestTimeSeriesNRange(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.MADD', 'b', 1000, 4, 'b', 1100, 6, 'b', 2000, 2)
 
         result = self.client.execute_command(
-            'TS.NRANGE', 2, 'a', 'b', '-', '+', 'AGGREGATION', 'countif(>5)', 'range', 1000)
+            'TS.NRANGE', 2, 'a', 'b', '-', '+', 'AGGREGATION', 'countif>5', 'range', 1000)
 
         assert rows(result) == [
             (1000, [1.0, 2.0]),

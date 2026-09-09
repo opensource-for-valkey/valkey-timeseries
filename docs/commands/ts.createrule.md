@@ -43,11 +43,11 @@ storage and analysis.
     - `var_s` — Sample variance
     - `rate` — Rate of change per second (handles resets)
 - **bucketDuration**: The duration of each aggregation bucket (e.g., `1h`, `30m`, `5000ms`).
-- **(op value)**: Inline comparison condition attached directly to `aggregator`, e.g. `countif(>100)`.
-  `op` is one of `==`, `!=`, `>=`, `<=`, `<`, `>`, with no spaces inside the parentheses since it is
-  a single argument token. **Required** for `all`, `any`, `countif`, `sumif`, `share`, `none` — it
-  is an error to omit it for these. **Optional** for `count` and `sum`. **Not accepted** by any
-  other aggregator (`avg`, `min`, `max`, ...) — attaching one is an error.
+- **op value**: Inline comparison condition attached directly to `aggregator` with no separator,
+  e.g. `countif>100`. `op` is one of `==`, `!=`, `>=`, `<=`, `<`, `>`; `aggregator` and `op value`
+  together form a single argument token. **Required** for `all`, `any`, `countif`, `sumif`,
+  `share`, `none` — it is an error to omit it for these. **Optional** for `count` and `sum`.
+  **Not accepted** by any other aggregator (`avg`, `min`, `max`, ...) — attaching one is an error.
 - **alignTimestamp** (optional): Align bucket boundaries to a specific timestamp (milliseconds since epoch).
 
 ## Constraints
@@ -70,7 +70,7 @@ Returns `OK` on success.
 - `TSDB: invalid aggregator` — Unsupported aggregation function.
 - `TSDB: invalid bucket duration` — Invalid duration format.
 - `TSDB: circular compaction rule` — Creating this rule would form a cycle.
-- `TSDB: missing condition for aggregator` — `all`/`any`/`countif`/`sumif`/`share`/`none` used without an inline `(op value)` condition.
+- `TSDB: missing condition for aggregator` — `all`/`any`/`countif`/`sumif`/`share`/`none` used without an inline `op value` condition.
 - `TSDB: aggregation type does not support a filter condition` — An inline condition was attached to an aggregator that doesn't accept one.
 
 ## Permissions
@@ -88,7 +88,7 @@ TS.CREATERULE myts:1m myts:1h AGGREGATION avg 1h
 Create a rule that counts only samples greater than 100:
 
 ```
-TS.CREATERULE temperature:raw temperature:hourly AGGREGATION countif(>100) 1h
+TS.CREATERULE temperature:raw temperature:hourly AGGREGATION countif>100 1h
 ```
 
 Create a rule with bucket alignment to midnight UTC:

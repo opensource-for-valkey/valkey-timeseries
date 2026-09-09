@@ -184,7 +184,7 @@ Take a page at a time:
 ```
 
 Alert when more than 5% of requests in a one-minute window take longer than 500 ms. A
-[`TS.CREATERULE`](./ts.createrule.md) with `share(>500)` down-samples the raw latency values to
+[`TS.CREATERULE`](./ts.createrule.md) with `share>500` down-samples the raw latency values to
 one fraction per minute; a worker then tails that compacted series, and `CONDITION` does the
 threshold test on the server so the worker is woken only by a breach:
 
@@ -193,11 +193,11 @@ threshold test on the server so the worker is woken only by a breach:
 OK
 > TS.CREATE api:latency:over_500ms:1m
 OK
-> TS.CREATERULE api:latency:raw api:latency:over_500ms:1m AGGREGATION share(>500) 1m 0
+> TS.CREATERULE api:latency:raw api:latency:over_500ms:1m AGGREGATION share>500 1m 0
 OK
 ```
 
-Block until the condition is met. `share(>500)` returns a fraction from `0.0` to `1.0`, so `0.05` represents 5%. 
+Block until the condition is met. `share>500` returns a fraction from `0.0` to `1.0`, so `0.05` represents 5%. 
 ```
 > TS.READ api:latency:over_500ms:1m $ BLOCK 60000 1 CONDITION > 0.05
 ```

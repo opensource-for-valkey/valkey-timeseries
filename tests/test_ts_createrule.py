@@ -125,7 +125,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
 
             result = self.client.execute_command(
                 "TS.CREATERULE", source_key, key,
-                "AGGREGATION", f"{agg}(<100)", "60000"
+                "AGGREGATION", f"{agg}<100", "60000"
             )
 
             assert result == b"OK"
@@ -142,7 +142,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
 
     def test_create_rule_missing_required_condition(self):
         """Filtered aggregators (countif, sumif, all, any, none, share) require
-        an inline (op value) condition; omitting it is an error."""
+        an inline op value condition; omitting it is an error."""
         source_key = "test:source_missing_cond"
         dest_key = "test:dest_missing_cond"
 
@@ -157,7 +157,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
 
     def test_create_rule_disallowed_condition(self):
         """Aggregators that don't support conditions (e.g. avg) must not
-        carry an inline (op value)."""
+        carry an inline op value."""
         source_key = "test:source_bad_cond"
         dest_key = "test:dest_bad_cond"
 
@@ -167,7 +167,7 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError, match="TSDB: aggregation type does not support a filter condition"):
             self.client.execute_command(
                 "TS.CREATERULE", source_key, dest_key,
-                "AGGREGATION", "avg(>5)", "60000"
+                "AGGREGATION", "avg>5", "60000"
             )
 
     def test_disallow_replace_existing(self):

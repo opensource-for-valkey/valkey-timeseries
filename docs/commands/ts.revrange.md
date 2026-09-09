@@ -61,18 +61,18 @@ TS.REVRANGE key fromTimestamp toTimestamp
 
 | Option            | Arguments                   | Description                                                                                                               |
 |-------------------|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `AGGREGATION`     | `aggregator[(operator value)][,aggregator[(operator value)]...] bucketDuration` | Downsample into fixed time buckets of size `bucketDuration` and apply each `aggregator` per bucket. A comma-separated list (up to 16 distinct aggregators) yields one value per aggregator per bucket, in the order specified. |
+| `AGGREGATION`     | `aggregator[operator value][,aggregator[operator value]...] bucketDuration` | Downsample into fixed time buckets of size `bucketDuration` and apply each `aggregator` per bucket. A comma-separated list (up to 16 distinct aggregators) yields one value per aggregator per bucket, in the order specified. |
 | `ALIGN`           | `align`                     | Bucket alignment anchor. May appear before `AGGREGATION` (`ALIGN … AGGREGATION …`) or after it (`AGGREGATION … ALIGN …`). |
 | `BUCKETTIMESTAMP` | `bt`                        | Controls the timestamp emitted for each bucket. Default: `start`.                                                         |
 | `EMPTY`           | (none)                      | Include empty buckets (buckets with no samples).                                                                          |
 
 Each element of the `aggregator` list carries its own inline condition —
-`aggregator(operator value)`, e.g. `countif(>5)` — with no spaces inside the parentheses since it
-is a single argument token. `countif`, `sumif`, `share`, and `all`/`any`/`none` **require** one;
-omitting it is an error. `count` and `sum` accept one *optionally*, to count/sum only matching
-samples. Any other aggregator (`avg`, `max`, ...) does not accept a condition; attaching one is an
-error. Different elements in the same list can use different conditions, e.g.
-`AGGREGATION countif(>5),sumif(<=2) 60000`.
+`aggregatoroperator value`, e.g. `countif>5` — with no separator since `aggregator` and its
+condition form a single argument token. `countif`, `sumif`, `share`, and `all`/`any`/`none`
+**require** one; omitting it is an error. `count` and `sum` accept one *optionally*, to count/sum
+only matching samples. Any other aggregator (`avg`, `max`, ...) does not accept a condition;
+attaching one is an error. Different elements in the same list can use different conditions, e.g.
+`AGGREGATION countif>5,sumif<=2 60000`.
 
 ##### `bucketDuration` format
 
@@ -175,7 +175,7 @@ TS.REVRANGE temperature:office 1700000000000 1700003600000 AGGREGATION max 60000
 Return `1.0` for each 5-minute bucket where any sample exceeds 0.9:
 
 ```plain text
-TS.REVRANGE cpu:utilization 1700000000000 1700003600000 AGGREGATION any(>0.9) 300000
+TS.REVRANGE cpu:utilization 1700000000000 1700003600000 AGGREGATION any>0.9 300000
 ```
 
 ---

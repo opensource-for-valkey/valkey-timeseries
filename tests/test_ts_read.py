@@ -962,7 +962,7 @@ class TestTsReadConditionValidation(TsReadTestBase):
         """A fused `CONDITION >500` is an invalid operator, not wrong-arity.
 
         `TS.READ` has no reason to accept the fused spelling the inline per-aggregator form uses
-        (`countif(>5)`), which exists only because an aggregator name and its condition must share
+        (`countif>5`), which exists only because an aggregator name and its condition must share
         one token. A spaced clause matches every other TS.READ option.
         """
         self.seed("k", [100])
