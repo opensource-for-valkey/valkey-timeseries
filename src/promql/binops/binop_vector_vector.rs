@@ -46,14 +46,10 @@ fn drop_names_if_necessary(
 ) -> (Vec<EvalSample>, Vec<EvalSample>) {
     // Materialize pending __name__ drops before matching
     for sample in left_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.drop_name();
-        }
+        sample.drop_name_if_needed();
     }
     for sample in right_vector.iter_mut() {
-        if sample.drop_name {
-            sample.labels.drop_name();
-        }
+        sample.drop_name_if_needed();
     }
     (left_vector, right_vector)
 }

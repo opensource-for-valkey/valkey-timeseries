@@ -797,6 +797,12 @@ impl EvalSample {
     pub fn fingerprint(&self) -> SeriesFingerprint {
         self.labels.fingerprint()
     }
+
+    pub fn drop_name_if_needed(&mut self) {
+        if self.drop_name {
+            self.remove_metric_group();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -832,6 +838,12 @@ impl EvalSamples {
 
     pub fn fingerprint(&self) -> SeriesFingerprint {
         get_metric_signature(&self.labels, self.drop_name)
+    }
+
+    pub fn drop_name_if_needed(&mut self) {
+        if self.drop_name {
+            self.labels.remove(METRIC_NAME_LABEL);
+        }
     }
 }
 

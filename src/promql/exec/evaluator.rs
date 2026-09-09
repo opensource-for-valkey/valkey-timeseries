@@ -682,16 +682,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         match v {
             ExprResult::RangeVector(mat) => {
                 for v in mat.iter_mut() {
-                    if v.drop_name {
-                        v.labels.drop_name();
-                    }
+                    v.drop_name_if_needed();
                 }
             }
             ExprResult::InstantVector(vec) => {
                 for v in vec.iter_mut() {
-                    if v.drop_name {
-                        v.labels.drop_name();
-                    }
+                    v.drop_name_if_needed();
                 }
 
                 ensure_unique_labelsets(vec)?;
