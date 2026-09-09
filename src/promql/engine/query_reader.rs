@@ -1,4 +1,5 @@
 use crate::common::Timestamp;
+use crate::promql::EvalLabels;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::functions::RollupKind;
@@ -51,10 +52,10 @@ pub struct AggregationRequest {
 /// caller what it still has to do.
 pub enum AggregationOutcome {
     /// The source evaluated the aggregation: this is the final result vector.
-    Aggregated(Vec<InstantSample>),
+    Aggregated(Vec<InstantSample<EvalLabels>>),
     /// The source returned the raw instant vector instead of aggregating it
     /// (nothing to push down to, e.g. a single node): the caller aggregates.
-    Raw(Vec<InstantSample>),
+    Raw(Vec<InstantSample<EvalLabels>>),
     /// The source cannot evaluate pushed-down aggregations: the caller should
     /// select the instant vector itself and aggregate that.
     Unsupported,
@@ -128,8 +129,8 @@ impl RollupRequest {
     pub(in crate::promql) fn reduce_windows(
         &self,
         window_ends: &[Timestamp],
-        series: Vec<RangeSample>,
-    ) -> Vec<RangeSample> {
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> Vec<RangeSample<EvalLabels>> {
         series
             .into_iter()
             .filter_map(|s| {
@@ -151,7 +152,10 @@ impl RollupRequest {
 
     /// Apply this request's fused aggregation to per-series rollup output, or
     /// pass it through when the request carries none.
-    pub(in crate::promql) fn group(&self, reduced: Vec<RangeSample>) -> Vec<RangeSample> {
+    pub(in crate::promql) fn group(
+        &self,
+        reduced: Vec<RangeSample<EvalLabels>>,
+    ) -> Vec<RangeSample<EvalLabels>> {
         let Some(aggregation) = self.aggregation.as_ref() else {
             return reduced;
         };
@@ -167,7 +171,10 @@ impl RollupRequest {
     /// a single node, which has nothing to push down to, or a peer that predates
     /// part of the protocol. It runs the same kernels a shard would, so the
     /// answer does not depend on who did the work.
-    pub(in crate::promql) fn reduce_and_group(&self, series: Vec<RangeSample>) -> Vec<RangeSample> {
+    pub(in crate::promql) fn reduce_and_group(
+        &self,
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> Vec<RangeSample<EvalLabels>> {
         self.group(self.reduce_windows(&self.window_ends(), series))
     }
 }
@@ -216,7 +223,7 @@ pub enum RollupOutcome {
     /// entries are groups rather than series. Each entry holds sparse
     /// `(window end, value)` pairs; a window that held no samples is absent, not
     /// NaN.
-    Rolled(Vec<RangeSample>),
+    Rolled(Vec<RangeSample<EvalLabels>>),
     /// The source reduced the windows but did *not* apply the request's
     /// aggregation: the entries are per-series values and the caller groups
     /// them.
@@ -225,11 +232,11 @@ pub enum RollupOutcome {
     /// mean different things. Without the distinction a source that skipped the
     /// grouping would be taken to have done it, and the query would answer with
     /// ungrouped series — a wrong answer rather than a slow one.
-    Reduced(Vec<RangeSample>),
+    Reduced(Vec<RangeSample<EvalLabels>>),
     /// The source returned the raw windows instead of reducing them (nothing to
     /// push down to, e.g. a single node): the caller reduces them, and groups
     /// them if the request asked for that.
-    Raw(Vec<RangeSample>),
+    Raw(Vec<RangeSample<EvalLabels>>),
     /// The source cannot evaluate pushed-down rollups: the caller should select
     /// the matrix itself and reduce that.
     Unsupported,
@@ -243,7 +250,7 @@ pub trait QueryReader: Send + Sync {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>>;
+    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>>;
 
     /// Query range samples between `start_ms` and `end_ms` with an optional `deadline`.
     fn query_range(
@@ -252,7 +259,7 @@ pub trait QueryReader: Send + Sync {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>>;
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>>;
 
     /// Evaluate `aggregation` over the instant vector `selector` selects at
     /// `timestamp`, at the source.
@@ -297,7 +304,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
+    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
         self.as_ref().query(selector, timestamp, options)
     }
 
@@ -307,7 +314,7 @@ impl QueryReader for Arc<dyn QueryReader> {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
         self.as_ref()
             .query_range(selector, start_ms, end_ms, options)
     }

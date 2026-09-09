@@ -22,7 +22,7 @@
 
 use crate::common::math::kahan_inc;
 use crate::common::{Sample, Timestamp};
-use crate::labels::{HasFingerprint, Labels};
+use crate::labels::HasFingerprint;
 use crate::promql::EvalSample;
 use crate::promql::exec::aggregations::{
     AggregationKind, PushdownStrategy, max_ignore_nan, min_ignore_nan,
@@ -327,10 +327,14 @@ impl SteppedPartialGroups {
     /// which a series produced nothing simply does not contribute to that step's
     /// groups — which is how a group comes to exist at some steps and not
     /// others.
-    pub fn accumulate(&mut self, modifier: Option<&LabelModifier>, series: Vec<RangeSample>) {
+    pub fn accumulate(
+        &mut self,
+        modifier: Option<&LabelModifier>,
+        series: Vec<RangeSample<EvalLabels>>,
+    ) {
         let kind = self.kind;
         for s in series {
-            let labels = EvalLabels::from(s.labels).compute_grouping_labels(modifier);
+            let labels = s.labels.compute_grouping_labels(modifier);
             for point in s.samples {
                 self.steps
                     .entry(point.timestamp)
@@ -363,16 +367,17 @@ impl SteppedPartialGroups {
 
     /// Finalize into one entry per group, each holding its sparse `(step,
     /// value)` points in ascending step order.
-    pub fn finalize(self) -> Vec<RangeSample> {
+    pub fn finalize(self) -> Vec<RangeSample<EvalLabels>> {
         let kind = self.kind;
-        let mut by_group: FingerprintHashMap<(Labels, Vec<Sample>)> = FingerprintHashMap::default();
+        let mut by_group: FingerprintHashMap<(EvalLabels, Vec<Sample>)> =
+            FingerprintHashMap::default();
 
         for (step_ts, groups) in self.steps {
             for (labels, state) in groups.into_partials() {
                 let key = labels.fingerprint();
                 by_group
                     .entry(key)
-                    .or_insert_with(|| (labels.into_labels(), Vec::new()))
+                    .or_insert_with(|| (labels, Vec::new()))
                     .1
                     .push(Sample {
                         timestamp: step_ts,

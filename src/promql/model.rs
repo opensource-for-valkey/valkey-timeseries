@@ -6,8 +6,8 @@
 use crate::common::constants::MILLIS_PER_MIN;
 use crate::common::time::{current_time_millis, system_time_to_millis, valkey_cached_time_millis};
 use crate::common::{Sample, Timestamp};
-use crate::labels::Labels;
-use crate::promql::{EvalSample, EvalSamples, ExprResult, QueryError, QueryResult};
+use crate::labels::{HasFingerprint, Labels};
+use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult, QueryError, QueryResult};
 use promql_parser::parser::EvalStmt;
 use promql_parser::parser::value::ValueType;
 
@@ -259,10 +259,17 @@ impl From<&EvalStmt> for EvalContext {
 /// A single series value at a point in time.
 ///
 /// Returned by instant (point-in-time) PromQL queries.
+///
+/// Generic over how its labels are held. The default, `Labels`, is the
+/// output boundary: owned `String`s, ready to serialize. The `QueryReader`
+/// contract uses `InstantSample<EvalLabels>` instead, so a series' labels can
+/// travel from storage into the evaluator by refcount without a single label
+/// byte being copied; `into_labels()` materializes them only for samples
+/// that survive to the output.
 #[derive(Debug, Clone)]
-pub struct InstantSample {
+pub struct InstantSample<L = Labels> {
     /// The labels identifying this series.
-    pub labels: Labels,
+    pub labels: L,
     /// Timestamp in milliseconds since Unix epoch.
     pub timestamp_ms: i64,
     /// The sample value.
@@ -279,13 +286,34 @@ impl From<EvalSample> for InstantSample {
     }
 }
 
+impl From<EvalSample> for InstantSample<EvalLabels> {
+    fn from(sample: EvalSample) -> Self {
+        Self {
+            labels: sample.labels,
+            value: sample.value,
+            timestamp_ms: sample.timestamp_ms,
+        }
+    }
+}
+
+impl From<InstantSample<EvalLabels>> for InstantSample {
+    fn from(sample: InstantSample<EvalLabels>) -> Self {
+        Self {
+            labels: sample.labels.into_labels(),
+            value: sample.value,
+            timestamp_ms: sample.timestamp_ms,
+        }
+    }
+}
+
 /// A series with values over a time range.
 ///
-/// Returned by range PromQL queries.
+/// Returned by range PromQL queries. See [`InstantSample`] for the label
+/// parameter.
 #[derive(Debug, Clone)]
-pub struct RangeSample {
+pub struct RangeSample<L = Labels> {
     /// The labels identifying this series.
-    pub labels: Labels,
+    pub labels: L,
     /// Samples ordered by timestamp.
     pub samples: Vec<Sample>,
 }
@@ -299,9 +327,33 @@ impl From<EvalSamples> for RangeSample {
     }
 }
 
+impl From<EvalSamples> for RangeSample<EvalLabels> {
+    fn from(samples: EvalSamples) -> Self {
+        Self {
+            labels: samples.labels,
+            samples: samples.values,
+        }
+    }
+}
+
+impl From<RangeSample<EvalLabels>> for RangeSample {
+    fn from(sample: RangeSample<EvalLabels>) -> Self {
+        Self {
+            labels: sample.labels.into_labels(),
+            samples: sample.samples,
+        }
+    }
+}
+
 impl RangeSample {
     pub fn fingerprint(&self) -> u128 {
-        self.labels.signature()
+        self.labels.fingerprint()
+    }
+}
+
+impl RangeSample<EvalLabels> {
+    pub fn fingerprint(&self) -> u128 {
+        self.labels.fingerprint()
     }
 }
 

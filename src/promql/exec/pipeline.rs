@@ -12,6 +12,7 @@
 
 use crate::common::{Sample, Timestamp};
 use crate::promql::engine::QueryReader;
+#[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::{IntoParIter, ParIter};
@@ -291,7 +292,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
             .map(|is| EvalSample {
                 timestamp_ms: is.timestamp_ms,
                 value: is.value,
-                labels: EvalLabels::from(is.labels),
+                labels: is.labels,
                 drop_name: false,
             })
             .collect::<Vec<_>>();
@@ -336,7 +337,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
             let series: Vec<EvalSamples> = raw_range_samples
                 .into_iter()
                 .map(|s| EvalSamples {
-                    labels: EvalLabels::from(s.labels),
+                    labels: s.labels,
                     drop_name: false,
                     range_ms: 0, // overwritten by shape_subquery_results
                     values: s.samples,
@@ -353,7 +354,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
             let series: Vec<EvalSamples> = raw_range_samples
                 .into_iter()
                 .map(|s| EvalSamples {
-                    labels: EvalLabels::from(s.labels),
+                    labels: s.labels,
                     drop_name: false,
                     range_ms: range,
                     values: s.samples,

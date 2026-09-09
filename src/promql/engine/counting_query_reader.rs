@@ -14,6 +14,7 @@
 //! its own `query_range`) does not inflate the counts, which is exactly what
 //! the plan's assertions need.
 
+use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
@@ -88,7 +89,7 @@ impl QueryReader for CountingQueryReader {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
+    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
         self.query_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query(selector, timestamp, options)
     }
@@ -99,7 +100,7 @@ impl QueryReader for CountingQueryReader {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
         self.query_range_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query_range(selector, start_ms, end_ms, options)
     }
@@ -429,7 +430,8 @@ mod tests {
             selector: &promql_parser::parser::VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
+        {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -439,7 +441,8 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
+        {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
         // query_aggregation / query_rollup: trait defaults → Unsupported.
@@ -481,7 +484,8 @@ mod tests {
             selector: &promql_parser::parser::VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::InstantSample<EvalLabels>>>
+        {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -491,7 +495,8 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::model::RangeSample<EvalLabels>>>
+        {
             if end_ms - start_ms > self.max_span_ms {
                 return Err(crate::promql::QueryError::Execution(
                     "span exceeds test limit".to_string(),

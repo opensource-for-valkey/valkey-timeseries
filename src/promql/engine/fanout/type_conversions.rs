@@ -69,14 +69,9 @@ impl From<ProtoInstantSample> for EvalSample {
     }
 }
 
-impl From<ProtoRangeSample> for RangeSample {
+impl From<ProtoRangeSample> for RangeSample<EvalLabels> {
     fn from(proto: ProtoRangeSample) -> Self {
-        let labels = proto
-            .labels
-            .into_iter()
-            .map(|l| l.into())
-            .collect::<Vec<Label>>()
-            .into();
+        let labels = proto_labels_to_eval_labels(proto.labels);
 
         let samples = proto.samples.into_iter().map(|s| s.into()).collect();
 
@@ -407,6 +402,12 @@ impl From<EvalSample> for ProtoInstantSample {
 }
 
 /// Rebuild the label set of a group from the wire.
+impl From<&EvalLabels> for Vec<ProtoLabel> {
+    fn from(labels: &EvalLabels) -> Self {
+        labels.iter().map(ProtoLabel::from).collect()
+    }
+}
+
 pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) -> EvalLabels {
     // Already sorted: the sender derived them from a sorted label set.
     EvalLabels::shared(labels.into_iter().map(Label::from).collect())

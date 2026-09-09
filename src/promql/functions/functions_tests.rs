@@ -1263,7 +1263,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 1970.0);
         assert_eq!(result[0].timestamp_ms, 0);
-        assert_eq!(result[0].labels.as_ref(), Labels::default().as_ref());
+        assert_eq!(result[0].labels.to_label_vec(), Labels::default().as_ref());
         assert!(!result[0].drop_name);
     }
 
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(result[0].value, 12.5);
         assert_eq!(result[0].timestamp_ms, 3000);
         assert_eq!(
-            result[0].labels.as_ref(),
+            result[0].labels.to_label_vec(),
             Labels::from(labels.clone()).as_ref()
         );
     }

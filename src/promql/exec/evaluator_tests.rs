@@ -15,7 +15,9 @@ mod tests {
 
     use crate::commands::parse_metric_name;
     use crate::common::time::system_time_to_millis;
+    use crate::labels::InternedLabel;
     use crate::labels::{Label, Labels};
+    use crate::promql::EvalLabels;
     use crate::promql::engine::query_reader::{
         AggregationOutcome, AggregationParam, AggregationRequest, RollupOutcome, RollupRequest,
     };
@@ -94,7 +96,7 @@ mod tests {
             );
 
             assert_eq!(
-                actual_sample.labels.as_ref(),
+                actual_sample.labels.to_label_vec(),
                 expected_labels.as_ref(),
                 "Sample {i} labels mismatch: got {:?}, expected {:?}",
                 actual_sample.labels,
@@ -1425,10 +1427,10 @@ mod tests {
         for (i, (actual, expected)) in actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
         {
             // Check that the series has the expected labels
-            for Label { name, value } in expected.labels.iter() {
+            for InternedLabel { name, value } in expected.labels.iter() {
                 assert_eq!(
                     actual.labels.get(name),
-                    Some(value.as_str()),
+                    Some(value),
                     "Test '{test_name}': Series {i} missing label {name}={value}"
                 );
             }
@@ -1439,10 +1441,10 @@ mod tests {
                 expected.value
             );
 
-            for Label { name, value } in expected.labels.iter() {
+            for InternedLabel { name, value } in expected.labels.iter() {
                 assert_eq!(
                     actual.labels.get(name),
-                    Some(value.as_str()),
+                    Some(value),
                     "Sample {i} missing label {name}={value}"
                 );
             }
@@ -1610,10 +1612,10 @@ mod tests {
                 actual_sorted.iter().zip(expected_sorted.iter()).enumerate()
             {
                 // Check that the series has the expected labels
-                for Label { name, value } in expected.labels.iter() {
+                for InternedLabel { name, value } in expected.labels.iter() {
                     assert_eq!(
                         actual.labels.get(name),
-                        Some(value.as_str()),
+                        Some(value),
                         "Test '{test_name}': Series {i} missing label {name}={value}"
                     );
                 }
@@ -3802,7 +3804,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.record(selector);
             self.inner.query(selector, timestamp, options)
         }
@@ -3813,7 +3815,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.record(selector);
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
@@ -3950,7 +3952,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -3960,7 +3962,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 
@@ -3979,7 +3981,7 @@ mod tests {
             ));
             Ok(AggregationOutcome::Aggregated(vec![
                 crate::promql::InstantSample {
-                    labels: Labels::from_pairs(&[("pushed", "down")]),
+                    labels: EvalLabels::from_pairs(&[("pushed", "down")]),
                     timestamp_ms: aggregation.eval_timestamp,
                     value: Self::SENTINEL,
                 },
@@ -4332,7 +4334,7 @@ mod tests {
             selector: &VectorSelector,
             timestamp: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::InstantSample<EvalLabels>>> {
             self.inner.query(selector, timestamp, options)
         }
 
@@ -4342,7 +4344,7 @@ mod tests {
             start_ms: i64,
             end_ms: i64,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample>> {
+        ) -> crate::promql::PromqlResult<Vec<crate::promql::RangeSample<EvalLabels>>> {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 

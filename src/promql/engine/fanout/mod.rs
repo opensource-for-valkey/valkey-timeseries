@@ -11,7 +11,9 @@ pub(in crate::promql) use aggregation_fanout_command::{
 pub(in crate::promql) use instant_vector_selector_fanout_command::InstantVectorSelectorFanoutCommand;
 pub(in crate::promql) use range_vector_selector_fanout_command::RangeVectorSelectorFanoutCommand;
 pub(in crate::promql) use rollup_fanout_command::RollupFanoutCommand;
-pub(in crate::promql) use type_conversions::{metric_name_to_proto_labels, proto_labels_to_labels};
+pub(in crate::promql) use type_conversions::{
+    metric_name_to_proto_labels, proto_labels_to_eval_labels,
+};
 use valkey_module::ValkeyResult;
 
 use crate::fanout::{ErrorKind, FanoutError, register_fanout_operation};

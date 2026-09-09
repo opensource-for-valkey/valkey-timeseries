@@ -2,7 +2,7 @@ use crate::common::context::ClientReplyContext;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryReader};
-use crate::promql::{EvalSample, EvalSamples, ExprResult, QueryValue};
+use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult, QueryValue};
 use promql_parser::parser::value::ValueType;
 use std::sync::Arc;
 use valkey_module::{Context, Status};
@@ -23,12 +23,42 @@ pub(super) fn write_samples(ctx: &ClientReplyContext, samples: &[Sample]) -> Sta
     Status::Ok
 }
 
-fn write_metric_hash(ctx: &ClientReplyContext, labels: &[Label]) -> Status {
-    ctx.reply_with_map(labels.len());
-    for label in labels {
-        ctx.reply_with_string_key(&label.name);
-        ctx.reply_with_bulk_string(&label.value);
+/// A label set the reply writer can walk without caring how it is stored:
+/// the evaluator's `EvalLabels` (possibly interned straight from storage) or
+/// the output boundary's owned `[Label]`.
+pub trait ReplyLabels {
+    fn len(&self) -> usize;
+    fn for_each_label(&self, f: impl FnMut(&str, &str));
+}
+
+impl ReplyLabels for EvalLabels {
+    fn len(&self) -> usize {
+        EvalLabels::len(self)
     }
+    fn for_each_label(&self, mut f: impl FnMut(&str, &str)) {
+        for label in self.iter() {
+            f(label.name, label.value);
+        }
+    }
+}
+
+impl ReplyLabels for [Label] {
+    fn len(&self) -> usize {
+        <[Label]>::len(self)
+    }
+    fn for_each_label(&self, mut f: impl FnMut(&str, &str)) {
+        for label in self {
+            f(&label.name, &label.value);
+        }
+    }
+}
+
+fn write_metric_hash(ctx: &ClientReplyContext, labels: &(impl ReplyLabels + ?Sized)) -> Status {
+    ctx.reply_with_map(labels.len());
+    labels.for_each_label(|name, value| {
+        ctx.reply_with_string_key(name);
+        ctx.reply_with_bulk_string(value);
+    });
     Status::Ok
 }
 
@@ -51,7 +81,7 @@ fn write_metric_hash(ctx: &ClientReplyContext, labels: &[Label]) -> Status {
 /// ```
 fn reply_with_range_sample(
     ctx: &ClientReplyContext,
-    metric: &[Label],
+    metric: &(impl ReplyLabels + ?Sized),
     values: &[Sample],
 ) -> Status {
     ctx.reply_with_map(2);
@@ -68,7 +98,7 @@ fn reply_with_range_sample(
 pub(super) fn reply_with_matrix(ctx: &ClientReplyContext, samples: &[EvalSamples]) -> Status {
     ctx.reply_with_array(samples.len());
     for sample in samples {
-        reply_with_range_sample(ctx, sample.labels.as_ref(), &sample.values);
+        reply_with_range_sample(ctx, &sample.labels, &sample.values);
     }
     Status::Ok
 }
@@ -86,7 +116,7 @@ pub(super) fn reply_with_matrix(ctx: &ClientReplyContext, samples: &[EvalSamples
 /// ```
 pub fn reply_with_instant_sample(
     ctx: &ClientReplyContext,
-    metric: &[Label],
+    metric: &(impl ReplyLabels + ?Sized),
     ts: Timestamp,
     value: f64,
 ) -> Status {
@@ -101,7 +131,7 @@ pub fn reply_with_instant_sample(
 pub(super) fn reply_with_instant_vector(ctx: &ClientReplyContext, sample: &[EvalSample]) -> Status {
     ctx.reply_with_array(sample.len());
     for s in sample {
-        reply_with_instant_sample(ctx, s.labels.as_ref(), s.timestamp_ms, s.value);
+        reply_with_instant_sample(ctx, &s.labels, s.timestamp_ms, s.value);
     }
     Status::Ok
 }

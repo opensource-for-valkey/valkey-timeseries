@@ -4,19 +4,18 @@ use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
-use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
+use crate::promql::EvalLabels;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
 };
 use crate::promql::engine::{
     AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
     RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_series_range,
-    instant_lookback_start_ms, proto_labels_to_labels, validate_max_points, validate_max_series,
+    instant_lookback_start_ms, proto_labels_to_eval_labels, validate_max_points,
+    validate_max_series,
 };
-use crate::promql::{
-    InstantSample, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
-};
+use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::series_by_selectors;
 use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
@@ -84,19 +83,32 @@ impl SelectorTaskKind {
 /// aggregation task's richer answer (did the source aggregate, or must the
 /// caller?) needs its own variant rather than a bare [`QueryValue`].
 enum SelectorOutput {
-    Value(QueryValue),
+    /// Instant-vector selector result, labels still by refcount from storage.
+    Vector(Vec<InstantSample<EvalLabels>>),
+    /// Range-vector selector result, labels still by refcount from storage.
+    Matrix(Vec<RangeSample<EvalLabels>>),
     Aggregation(AggregationOutcome),
     Rollup(RollupOutcome),
 }
 
 impl SelectorOutput {
-    /// Unwrap a plain selector result. The variant is chosen by the task kind,
-    /// so a mismatch is a bug in this module rather than a query error.
-    fn into_value(self) -> QueryResult<QueryValue> {
+    /// Unwrap an instant-vector selector result. The variant is chosen by the
+    /// task kind, so a mismatch is a bug in this module rather than a query error.
+    fn into_vector(self) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         match self {
-            SelectorOutput::Value(value) => Ok(value),
+            SelectorOutput::Vector(samples) => Ok(samples),
             _ => Err(QueryError::Execution(
-                "BUG: selector task returned a push-down outcome".to_string(),
+                "BUG: selector task returned a non-vector outcome".to_string(),
+            )),
+        }
+    }
+
+    /// Unwrap a range-vector selector result; see [`Self::into_vector`].
+    fn into_matrix(self) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
+        match self {
+            SelectorOutput::Matrix(series) => Ok(series),
+            _ => Err(QueryError::Execution(
+                "BUG: selector task returned a non-matrix outcome".to_string(),
             )),
         }
     }
@@ -249,14 +261,14 @@ impl SelectorBatchExecutor {
         options: QueryOptions,
         caller_user: Option<String>,
         hash_tags: Arc<[String]>,
-    ) -> QueryResult<QueryValue> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         let command = SelectorTaskKind::Vector(InstantVectorSelectorCommand {
             matchers,
             timestamp,
             options,
         });
         self.submit_selector_task(command, caller_user, hash_tags)?
-            .into_value()
+            .into_vector()
     }
 
     pub fn query_range(
@@ -267,7 +279,7 @@ impl SelectorBatchExecutor {
         options: QueryOptions,
         caller_user: Option<String>,
         hash_tags: Arc<[String]>,
-    ) -> QueryResult<QueryValue> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         let command = SelectorTaskKind::Range(RangeSelectorCommand {
             matchers,
             start_timestamp: start,
@@ -275,7 +287,7 @@ impl SelectorBatchExecutor {
             options,
         });
         self.submit_selector_task(command, caller_user, hash_tags)?
-            .into_value()
+            .into_matrix()
     }
 
     /// Evaluate `aggregation` over the instant vector `matchers` selects at
@@ -458,15 +470,13 @@ fn execute_selector_task_local(
         SelectorTaskKind::Vector(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-            query_instant_local(ctx, selector, timestamp, iqc.options)
-                .map(|samples| SelectorOutput::Value(QueryValue::Vector(samples)))
+            query_instant_local(ctx, selector, timestamp, iqc.options).map(SelectorOutput::Vector)
         }
         SelectorTaskKind::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            query_range_local(ctx, selector, start, end, rc.options)
-                .map(|series| SelectorOutput::Value(QueryValue::Matrix(series)))
+            query_range_local(ctx, selector, start, end, rc.options).map(SelectorOutput::Matrix)
         }
         SelectorTaskKind::Aggregation(ac) => {
             // Single node: there is no shard to push the operator to, so hand
@@ -563,10 +573,11 @@ fn execute_cluster_vector_selector(
         let query_result = match result {
             Ok(()) => {
                 let resp = cmd.get_response();
-                let mut samples: Vec<InstantSample> = Vec::with_capacity(resp.samples.len());
+                let mut samples: Vec<InstantSample<EvalLabels>> =
+                    Vec::with_capacity(resp.samples.len());
 
                 for s in resp.samples {
-                    let labels = proto_labels_to_labels(s.labels);
+                    let labels = proto_labels_to_eval_labels(s.labels);
                     samples.push(InstantSample {
                         labels,
                         timestamp_ms: s.timestamp,
@@ -575,7 +586,7 @@ fn execute_cluster_vector_selector(
                 }
 
                 validate_max_series_(samples.len(), max_series)
-                    .map(|_| SelectorOutput::Value(QueryValue::Vector(samples)))
+                    .map(|_| SelectorOutput::Vector(samples))
             }
             Err(e) => Err(selector_fanout_failure("instant", e)),
         };
@@ -616,7 +627,8 @@ fn execute_cluster_range_selector(
                 let resp = cmd.get_response();
 
                 validate_max_series_(resp.series.len(), max_series).and_then(|_| {
-                    let mut ranges: Vec<RangeSample> = Vec::with_capacity(resp.series.len());
+                    let mut ranges: Vec<RangeSample<EvalLabels>> =
+                        Vec::with_capacity(resp.series.len());
 
                     for rs in resp.series {
                         validate_max_points_per_series(rs.samples.len(), max_points_per_series)?;
@@ -627,11 +639,11 @@ fn execute_cluster_range_selector(
                             .map(|s| Sample::new(s.timestamp, s.value))
                             .collect();
 
-                        let labels = proto_labels_to_labels(rs.labels);
+                        let labels = proto_labels_to_eval_labels(rs.labels);
                         ranges.push(RangeSample { labels, samples });
                     }
 
-                    Ok(SelectorOutput::Value(QueryValue::Matrix(ranges)))
+                    Ok(SelectorOutput::Matrix(ranges))
                 })
             }
             Err(e) => Err(selector_fanout_failure("range", e)),
@@ -683,7 +695,7 @@ fn execute_cluster_aggregation(
                     let samples = samples
                         .into_iter()
                         .map(|s| InstantSample {
-                            labels: s.labels.into_labels(),
+                            labels: s.labels,
                             timestamp_ms: s.timestamp_ms,
                             value: s.value,
                         })
@@ -803,7 +815,7 @@ pub(in crate::promql) fn query_instant_local(
     selector: SeriesSelector,
     timestamp: Timestamp,
     options: QueryOptions,
-) -> QueryResult<Vec<InstantSample>> {
+) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
     if let Some(d) = options.deadline
         && current_time_millis() > d
     {
@@ -828,7 +840,7 @@ pub(in crate::promql) fn query_instant_local(
         .filter_map(|s| {
             let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
 
-            let labels: Labels = (&s.labels).into();
+            let labels = EvalLabels::interned(&s.labels);
             Some(InstantSample {
                 timestamp_ms: sample.timestamp,
                 value: sample.value,
@@ -854,7 +866,7 @@ pub(in crate::promql) fn query_range_local(
     start_time: i64,
     end_time: i64,
     options: QueryOptions,
-) -> QueryResult<Vec<RangeSample>> {
+) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
@@ -875,7 +887,7 @@ pub(in crate::promql) fn query_range_local(
                 return None;
             }
 
-            let labels: Labels = (&s.labels).into();
+            let labels = EvalLabels::interned(&s.labels);
 
             let range = RangeSample { samples, labels };
             Some(Ok(range))

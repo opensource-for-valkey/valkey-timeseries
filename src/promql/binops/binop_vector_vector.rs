@@ -667,8 +667,8 @@ fn build_result_labels(
             let to_copy = one_sample
                 .labels
                 .iter()
-                .filter(|&l| l.name != METRIC_NAME && !many_sample.labels.contains(&l.name))
-                .cloned();
+                .filter(|l| l.name != METRIC_NAME && !many_sample.labels.contains(l.name))
+                .map(|l| crate::Label::new(l.name, l.value));
 
             labels.extend(to_copy);
         }
@@ -681,9 +681,9 @@ fn build_result_labels(
 /// When `drop_name` is true, `__name__` is excluded from the hash to match
 /// the effective output labels.
 #[inline]
-fn result_fingerprint(labels: impl AsRef<[crate::Label]>, drop_name: bool) -> u128 {
+fn result_fingerprint(labels: &EvalLabels, drop_name: bool) -> u128 {
     let mut hasher: xxhash3_128::Hasher = Default::default();
-    for label in labels.as_ref().iter() {
+    for label in labels.iter() {
         if drop_name && label.name == METRIC_NAME {
             continue;
         }

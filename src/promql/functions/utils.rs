@@ -321,7 +321,6 @@ mod absent_label_tests {
         };
         let labels = labels_for_absent(call.args.args.first().map(|a| &**a));
         let rendered = labels
-            .as_ref()
             .iter()
             .map(|l| format!("{}=\"{}\"", l.name, l.value))
             .collect::<Vec<_>>()

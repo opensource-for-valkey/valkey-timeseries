@@ -1,6 +1,7 @@
 use crate::common::{Sample, Timestamp};
 use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
+use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
 use crate::promql::engine::query_reader::rollup_fetch_bounds;
 use crate::promql::engine::{
@@ -116,7 +117,7 @@ pub(super) fn local_rollup_windows(
     range_ms: i64,
     max_series: u64,
     max_points_per_series: u64,
-) -> ValkeyResult<Vec<crate::promql::model::RangeSample>> {
+) -> ValkeyResult<Vec<crate::promql::model::RangeSample<EvalLabels>>> {
     let Some((start_time, end_time)) = rollup_fetch_bounds(window_ends, range_ms) else {
         return Ok(Vec::new());
     };
@@ -133,7 +134,7 @@ pub(super) fn local_rollup_windows(
             // for it as well — matched-but-empty series are the common case for
             // a wide selector over a narrow time range.
             (!samples.is_empty()).then(|| {
-                let labels: Labels = (&s.labels).into();
+                let labels = EvalLabels::interned(&s.labels);
                 crate::promql::model::RangeSample { labels, samples }
             })
         })
@@ -152,10 +153,10 @@ pub(super) fn local_rollup_windows(
 /// range path — which filters first, see [`handle_range_query`] — accepts, so
 /// whether a query succeeded would depend on an internal optimization decision.
 fn bound_windows(
-    candidates: Vec<Option<crate::promql::model::RangeSample>>,
+    candidates: Vec<Option<crate::promql::model::RangeSample<EvalLabels>>>,
     max_series: u64,
     max_points_per_series: u64,
-) -> Result<Vec<crate::promql::model::RangeSample>, String> {
+) -> Result<Vec<crate::promql::model::RangeSample<EvalLabels>>, String> {
     let windows: Vec<_> = candidates.into_iter().flatten().collect();
 
     validate_max_series(windows.len(), max_series as usize)?;
@@ -231,9 +232,9 @@ mod tests {
     }
 
     /// A series the selector matched that holds samples in the queried span.
-    fn filled(name: &str, count: usize) -> Option<RangeSample> {
+    fn filled(name: &str, count: usize) -> Option<RangeSample<EvalLabels>> {
         Some(RangeSample {
-            labels: Labels::from_pairs(&[("__name__", name)]),
+            labels: EvalLabels::from_pairs(&[("__name__", name)]),
             samples: (0..count as i64)
                 .map(|i| sample(1000 + i, i as f64))
                 .collect(),
@@ -241,7 +242,7 @@ mod tests {
     }
 
     /// A series the selector matched whose windows are all empty.
-    fn empty() -> Option<RangeSample> {
+    fn empty() -> Option<RangeSample<EvalLabels>> {
         None
     }
 

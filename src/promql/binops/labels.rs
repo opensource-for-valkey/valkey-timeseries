@@ -1,4 +1,4 @@
-use crate::labels::{HasFingerprint, Label, SeriesFingerprint};
+use crate::labels::{HasFingerprint, SeriesFingerprint, SeriesLabel};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
@@ -31,32 +31,34 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
 /// cases have opposite semantics (aggregation groups everything together; binary ops
 /// match on all labels).
 pub(in crate::promql) fn compute_binary_match_key(
-    labels: impl AsRef<[Label]>,
+    labels: &EvalLabels,
     matching: Option<&LabelModifier>,
 ) -> SeriesFingerprint {
-    let labels = labels.as_ref();
     let mut hasher: xxhash3_128::Hasher = Default::default();
+    let listed = |name: &str, list: &LabelModifier| match list {
+        LabelModifier::Include(l) | LabelModifier::Exclude(l) => l.labels.iter().any(|n| n == name),
+    };
     match matching {
         None => labels
             .iter()
-            .filter(|&k| k.name != METRIC_NAME)
-            .for_each(|label| hash_label(&mut hasher, label)),
-        Some(LabelModifier::Include(label_list)) => labels
+            .filter(|k| k.name != METRIC_NAME)
+            .for_each(|label| hash_label(&mut hasher, &label)),
+        Some(m @ LabelModifier::Include(_)) => labels
             .iter()
-            .filter(|&l| label_list.labels.contains(&l.name))
-            .for_each(|label| hash_label(&mut hasher, label)),
-        Some(LabelModifier::Exclude(label_list)) => labels
+            .filter(|l| listed(l.name, m))
+            .for_each(|label| hash_label(&mut hasher, &label)),
+        Some(m @ LabelModifier::Exclude(_)) => labels
             .iter()
-            .filter(|&l| l.name != METRIC_NAME && !label_list.labels.contains(&l.name))
-            .for_each(|label| hash_label(&mut hasher, label)),
+            .filter(|l| l.name != METRIC_NAME && !listed(l.name, m))
+            .for_each(|label| hash_label(&mut hasher, &label)),
     };
     hasher.finish_128()
 }
 
-fn hash_label(hasher: &mut xxhash3_128::Hasher, label: &Label) {
-    hasher.write(label.name.as_bytes());
+fn hash_label(hasher: &mut xxhash3_128::Hasher, label: &impl SeriesLabel) {
+    hasher.write(label.name().as_bytes());
     hasher.write(b"0xfe");
-    hasher.write(label.value.as_bytes());
+    hasher.write(label.value().as_bytes());
 }
 
 /// Compute the result labels for a vector-vector binary operation.
@@ -83,9 +85,9 @@ pub(super) fn result_metric(
     labels
 }
 
-/// Slice-based variant of `get_metric_signature` for contexts where only a
-/// `&[Label]` is available (e.g., from `EvalLabels::as_ref()`).
-pub(crate) fn get_metric_signature(labels: &[Label], drop_name: bool) -> SeriesFingerprint {
+/// Fingerprint a sample's labels as the output will carry them: with
+/// `__name__` excluded when `drop_name` is set.
+pub(crate) fn get_metric_signature(labels: &EvalLabels, drop_name: bool) -> SeriesFingerprint {
     if !drop_name {
         return labels.fingerprint();
     }
@@ -93,9 +95,9 @@ pub(crate) fn get_metric_signature(labels: &[Label], drop_name: bool) -> SeriesF
 
     labels
         .iter()
-        .filter(|&l| l.name != METRIC_NAME)
+        .filter(|l| l.name != METRIC_NAME)
         .for_each(|label| {
-            hash_label(&mut hasher, label);
+            hash_label(&mut hasher, &label);
         });
 
     hasher.finish_128()
@@ -104,7 +106,7 @@ pub(crate) fn get_metric_signature(labels: &[Label], drop_name: bool) -> SeriesF
 pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
     let mut seen_label_sets = FingerprintHashSet::default();
     for sample in samples {
-        let key = get_metric_signature(sample.labels.as_ref(), sample.drop_name);
+        let key = get_metric_signature(&sample.labels, sample.drop_name);
         if !seen_label_sets.insert(key) {
             return Err(EvaluationError::DuplicateLabelSet);
         }
@@ -218,7 +220,7 @@ pub(in crate::promql) fn can_push_down_common_filters(be: &BinaryExpr) -> bool {
 }
 
 pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec<Matcher> {
-    let mut kv_map: halfbrown::HashMap<&String, AHashSet<&str>> = halfbrown::HashMap::new();
+    let mut kv_map: halfbrown::HashMap<&str, AHashSet<&str>> = halfbrown::HashMap::new();
     for ts in samples.iter() {
         for label in ts.labels.iter() {
             // Never push down __name__: binary-op matching always ignores __name__ by default
@@ -228,7 +230,7 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
             if label.name == METRIC_NAME {
                 continue;
             }
-            kv_map.entry(&label.name).or_default().insert(&label.value);
+            kv_map.entry(label.name).or_default().insert(label.value);
         }
     }
 
@@ -248,12 +250,12 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
         let lf = if values.len() == 1 {
             // Safety: length checked above.
             let val = *values.iter().next().unwrap();
-            Matcher::new(MatchOp::Equal, key.as_str(), val)
+            Matcher::new(MatchOp::Equal, key, val)
         } else {
             let str_value = join_regexp_values(values);
             // Safety: the regex is an alternation generated from the values, so it should be valid.
             let regex = Regex::new(&str_value).unwrap();
-            Matcher::new(MatchOp::Re(regex), key.as_str(), str_value.as_str())
+            Matcher::new(MatchOp::Re(regex), key, str_value.as_str())
         };
 
         lfs.push(lf);

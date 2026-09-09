@@ -2,6 +2,7 @@ use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
+use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
@@ -141,7 +142,7 @@ impl QueryReader for MemorySeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         _options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
+    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
         // Mock querier ignores the deadline for now (cooperative cancellation could be
         // implemented in tests by checking `_deadline`), and behaves like the
         // original implementation.
@@ -152,8 +153,6 @@ impl QueryReader for MemorySeriesQuerier {
         let start_inclusive = timestamp.saturating_sub(lookback_ms).saturating_add(1);
 
         self.select_series(selector, |ts| {
-            let labels: Vec<Label> = metric_name_to_labels(&ts.labels);
-
             // Fetch samples in the inclusive range [start_inclusive, timestamp].
             let samples = ts.get_range(start_inclusive, timestamp);
             if samples.is_empty() {
@@ -164,7 +163,7 @@ impl QueryReader for MemorySeriesQuerier {
             // sample that is <= timestamp and > (timestamp - lookback_delta).
             if let Some(s) = samples.last() {
                 return Ok(Some(InstantSample {
-                    labels: Labels::new(labels),
+                    labels: EvalLabels::interned(&ts.labels),
                     value: s.value,
                     timestamp_ms: s.timestamp,
                 }));
@@ -180,10 +179,10 @@ impl QueryReader for MemorySeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         _options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
         // As with `query`, this mock ignores the deadline and returns the full range.
         self.select_series(selector, |ts| {
-            let labels: Labels = (&ts.labels).into();
+            let labels = EvalLabels::interned(&ts.labels);
             let samples: Vec<Sample> = ts
                 .get_range(start_ms, end_ms)
                 .into_iter()

@@ -238,7 +238,7 @@ mod bench_support {
                     .map(|s| EvalSample {
                         timestamp_ms: s.timestamp_ms,
                         value: s.value,
-                        labels: EvalLabels::shared(s.labels.as_ref().to_vec()),
+                        labels: EvalLabels::shared(s.labels.to_label_vec()),
                         drop_name: s.drop_name,
                     })
                     .collect(),

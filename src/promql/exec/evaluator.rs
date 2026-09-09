@@ -2,7 +2,6 @@ use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, 
 use crate::common::threads::join;
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
-use crate::labels::Labels;
 use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
@@ -334,7 +333,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let series = series
                     .into_iter()
                     .map(|s| PreloadedMatrixSeries {
-                        labels: EvalLabels::from(s.labels),
+                        labels: s.labels,
                         samples: s.samples,
                     })
                     .collect();
@@ -478,7 +477,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 }
                 let values = values.finish();
                 PreloadedRollupSeries {
-                    labels: EvalLabels::from(s.labels),
+                    labels: s.labels,
                     values,
                 }
             })
@@ -602,10 +601,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 });
                 let values = values.finish();
 
-                PreloadedInstantSeries {
-                    labels: labels.into(),
-                    values,
-                }
+                PreloadedInstantSeries { labels, values }
             })
             .collect();
 
@@ -622,7 +618,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         vs: &VectorSelector,
         earliest_ms: i64,
         latest_ms: i64,
-    ) -> EvalResult<Vec<(Labels, Vec<Sample>)>> {
+    ) -> EvalResult<Vec<(EvalLabels, Vec<Sample>)>> {
         let range_samples = self
             .reader
             .query_range(vs, earliest_ms, latest_ms, self.options)?;
@@ -1563,7 +1559,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 Some(EvalSample {
                     timestamp_ms: ctx.evaluation_ts,
                     value: point.value,
-                    labels: EvalLabels::from(group.labels),
+                    labels: group.labels,
                     drop_name,
                 })
             })
@@ -1651,7 +1647,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 Some(EvalSample {
                     timestamp_ms: ctx.evaluation_ts,
                     value: point.value,
-                    labels: EvalLabels::from(s.labels),
+                    labels: s.labels,
                     drop_name: false,
                 })
             })
@@ -1761,13 +1757,13 @@ fn drops_metric_name(call: &Call) -> bool {
         && call.func.arg_types.contains(&ValueType::Matrix)
 }
 
-fn to_eval_samples(samples: Vec<InstantSample>) -> Vec<EvalSample> {
+fn to_eval_samples(samples: Vec<InstantSample<EvalLabels>>) -> Vec<EvalSample> {
     samples
         .into_iter()
         .map(|s| EvalSample {
             timestamp_ms: s.timestamp_ms,
             value: s.value,
-            labels: EvalLabels::from(s.labels),
+            labels: s.labels,
             drop_name: false,
         })
         .collect()

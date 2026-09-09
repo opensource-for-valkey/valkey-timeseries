@@ -1,12 +1,11 @@
+use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
-use crate::promql::{
-    InstantSample, PromqlResult, QueryError, QueryOptions, QueryResult, QueryValue, RangeSample,
-};
+use crate::promql::{InstantSample, PromqlResult, QueryOptions, QueryResult, RangeSample};
 use cfg_if::cfg_if;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
@@ -37,21 +36,15 @@ impl QueryReader for ValkeySeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> QueryResult<Vec<InstantSample>> {
+    ) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
         let matchers: Matchers = normalize_selector(selector);
-        match SERIES_SELECTOR.query(
+        SERIES_SELECTOR.query(
             matchers,
             timestamp,
             options,
             self.caller_user.clone(),
             self.hash_tags.clone(),
-        ) {
-            Ok(QueryValue::Vector(samples)) => Ok(samples),
-            Err(e) => Err(e),
-            _ => Err(QueryError::Execution(
-                "unexpected query result type".to_string(),
-            )),
-        }
+        )
     }
 
     fn query_range(
@@ -60,22 +53,16 @@ impl QueryReader for ValkeySeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> QueryResult<Vec<RangeSample>> {
+    ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         let matchers: Matchers = normalize_selector(selector);
-        match SERIES_SELECTOR.query_range(
+        SERIES_SELECTOR.query_range(
             matchers,
             start_ms,
             end_ms,
             options,
             self.caller_user.clone(),
             self.hash_tags.clone(),
-        ) {
-            Ok(QueryValue::Matrix(samples)) => Ok(samples),
-            Err(e) => Err(e),
-            _ => Err(QueryError::Execution(
-                "unexpected query result type".to_string(),
-            )),
-        }
+        )
     }
 
     fn query_aggregation(
@@ -224,7 +211,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         selector: &VectorSelector,
         timestamp: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<InstantSample>> {
+    ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query(selector, timestamp, options),
             ConcreteSeriesQuerier::Mock(mock) => mock.query(selector, timestamp, options),
@@ -237,7 +224,7 @@ impl QueryReader for ConcreteSeriesQuerier {
         start_ms: i64,
         end_ms: i64,
         options: QueryOptions,
-    ) -> PromqlResult<Vec<RangeSample>> {
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_range(selector, start_ms, end_ms, options)

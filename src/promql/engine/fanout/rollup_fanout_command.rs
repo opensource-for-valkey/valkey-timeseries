@@ -29,9 +29,9 @@ use crate::fanout::{
     log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
+use crate::promql::EvalLabels;
 use crate::promql::engine::fanout::query_utils::local_rollup_windows;
 use crate::promql::engine::fanout::type_conversions::proto_labels_to_eval_labels;
-use crate::promql::engine::proto_labels_to_labels;
 use crate::promql::engine::query_reader::{RollupAggregation, RollupRequest, rollup_window_ends};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
@@ -127,10 +127,10 @@ pub(in crate::promql) struct RollupFanoutCommand {
     timeout: Duration,
     /// Rolled-up series from shards that applied the rollup. Series are
     /// shard-local, so these accumulate by concatenation.
-    rolled: Vec<RangeSample>,
+    rolled: Vec<RangeSample<EvalLabels>>,
     /// Raw windows from a shard that did not apply the rollup
     /// (`applied == false`), reduced by [`Self::into_result`].
-    raw: Vec<RangeSample>,
+    raw: Vec<RangeSample<EvalLabels>>,
     /// Per-`(group, step)` states from shards that also applied the outer
     /// aggregation. `None` when the request is not a fused one.
     partials: Option<SteppedPartialGroups>,
@@ -205,7 +205,7 @@ impl RollupFanoutCommand {
     /// raw windows has them reduced here, and — for a fused request — a peer
     /// that reduced but did not group has its per-series values grouped here.
     /// What comes out is the same either way.
-    pub fn into_result(mut self) -> Vec<RangeSample> {
+    pub fn into_result(mut self) -> Vec<RangeSample<EvalLabels>> {
         let raw = std::mem::take(&mut self.raw);
         let mut rolled = std::mem::take(&mut self.rolled);
 
@@ -408,7 +408,7 @@ impl FanoutCommand for RollupFanoutCommand {
 
         self.rolled
             .extend(resp.series.into_iter().map(|s| RangeSample {
-                labels: proto_labels_to_labels(s.labels),
+                labels: proto_labels_to_eval_labels(s.labels),
                 samples: s.points.into_iter().map(Into::into).collect(),
             }));
         Ok(())
@@ -461,7 +461,7 @@ fn decode_aggregation(req: &RollupQuery) -> Option<RollupAggregation> {
 
 /// A response carrying the unreduced windows, for a shard that could not apply
 /// the requested rollup.
-fn raw_response(series: Vec<RangeSample>) -> RollupQueryResponse {
+fn raw_response(series: Vec<RangeSample<EvalLabels>>) -> RollupQueryResponse {
     RollupQueryResponse {
         partials: Vec::new(),
         aggregated: false,
@@ -494,9 +494,9 @@ mod tests {
         ])
     }
 
-    fn series(instance: &str, points: &[(i64, f64)]) -> RangeSample {
+    fn series(instance: &str, points: &[(i64, f64)]) -> RangeSample<EvalLabels> {
         RangeSample {
-            labels: labels("m", instance),
+            labels: labels("m", instance).into(),
             samples: points
                 .iter()
                 .map(|&(timestamp, value)| Sample { timestamp, value })
@@ -551,7 +551,10 @@ mod tests {
 
     /// One shard's response, produced the way `get_local_response` produces it
     /// once the windows have been read.
-    fn shard_response(rollup: &RollupRequest, windows: Vec<RangeSample>) -> RollupQueryResponse {
+    fn shard_response(
+        rollup: &RollupRequest,
+        windows: Vec<RangeSample<EvalLabels>>,
+    ) -> RollupQueryResponse {
         let ends = rollup.window_ends();
         let reduced = rollup.reduce_windows(&ends, windows);
 
@@ -593,7 +596,7 @@ mod tests {
     /// an older peer that ignored the `agg_*` fields.
     fn unfused_shard_response(
         rollup: &RollupRequest,
-        windows: Vec<RangeSample>,
+        windows: Vec<RangeSample<EvalLabels>>,
     ) -> RollupQueryResponse {
         let bare = RollupRequest {
             aggregation: None,
@@ -604,7 +607,7 @@ mod tests {
 
     /// Results as sorted `(labels, points)` so they compare irrespective of the
     /// order shards answered in.
-    fn rendered(series: Vec<RangeSample>) -> Vec<(String, Vec<(i64, String)>)> {
+    fn rendered(series: Vec<RangeSample<EvalLabels>>) -> Vec<(String, Vec<(i64, String)>)> {
         let mut out: Vec<_> = series
             .into_iter()
             .map(|s| {
@@ -620,7 +623,7 @@ mod tests {
         out
     }
 
-    fn test_shards() -> Vec<Vec<RangeSample>> {
+    fn test_shards() -> Vec<Vec<RangeSample<EvalLabels>>> {
         vec![
             vec![
                 series("0", &[(250_000, 1.0), (260_000, 2.0), (300_000, 3.0)]),
@@ -638,7 +641,7 @@ mod tests {
     #[test]
     fn test_fanout_matches_single_node() {
         let shards = test_shards();
-        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+        let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
 
         for kind in RollupKind::all() {
             for (shape, rollup) in request_shapes(kind) {
@@ -666,7 +669,7 @@ mod tests {
     #[test]
     fn test_unreduced_peer_is_compensated() {
         let shards = test_shards();
-        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+        let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
 
         for kind in RollupKind::all() {
             for (shape, rollup) in request_shapes(kind) {
@@ -910,7 +913,10 @@ mod tests {
     }
 
     /// Reduce and group on one node — what the fused push-down must equal.
-    fn single_node_fused(rollup: &RollupRequest, series: Vec<RangeSample>) -> Vec<RangeSample> {
+    fn single_node_fused(
+        rollup: &RollupRequest,
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> Vec<RangeSample<EvalLabels>> {
         let ends = rollup.window_ends();
         let reduced = rollup.reduce_windows(&ends, series);
         let aggregation = rollup.aggregation.as_ref().expect("fused");
@@ -925,7 +931,7 @@ mod tests {
     #[test]
     fn test_fused_fanout_matches_single_node() {
         let shards = test_shards();
-        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+        let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
 
         for agg in [
             AggregationKind::Sum,
@@ -963,7 +969,7 @@ mod tests {
     #[test]
     fn test_mixed_version_peers_are_compensated() {
         let shards = test_shards();
-        let all: Vec<RangeSample> = shards.iter().flatten().cloned().collect();
+        let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
 
         for agg in [
             AggregationKind::Sum,

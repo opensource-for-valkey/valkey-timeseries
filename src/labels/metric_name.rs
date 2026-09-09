@@ -201,6 +201,12 @@ impl MetricName {
         self.get_value(METRIC_NAME_LABEL).unwrap_or(EMPTY_LABEL)
     }
 
+    /// The stored `name=value` strings, in name order. For callers that hash or
+    /// compare whole labels and need neither half on its own.
+    pub fn raw_entries(&self) -> std::slice::Iter<'_, InternedString> {
+        self.0.iter()
+    }
+
     pub fn iter(&'_ self) -> impl Iterator<Item = InternedLabel<'_>> {
         self.0.iter().filter_map(|x| {
             x.split_pair()

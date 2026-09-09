@@ -1,7 +1,11 @@
 use crate::Label;
 use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::labels::{HasFingerprint, Labels, SeriesFingerprint, fingerprint_labels};
+use crate::common::string_interner::InternedString;
+use crate::labels::{
+    HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, SeriesLabel,
+    fingerprint_labels,
+};
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
@@ -58,14 +62,64 @@ pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 /// Maps from a label key (sorted vector of label pairs) to samples vector
 pub(crate) type SeriesMap = halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState>;
 
+/// One label borrowed from storage: the interned `name=value` string plus the
+/// offset of its `=`, recorded once so `name()` and `value()` are O(1) slices.
+#[derive(Debug, Clone)]
+pub struct SplitLabel {
+    raw: InternedString,
+    sep: u32,
+}
+
+impl SplitLabel {
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.raw[..self.sep as usize]
+    }
+
+    #[inline]
+    pub fn value(&self) -> &str {
+        &self.raw[self.sep as usize + 1..]
+    }
+
+    fn to_label(&self) -> Label {
+        Label::new(self.name(), self.value())
+    }
+}
+
+impl SeriesLabel for SplitLabel {
+    fn name(&self) -> &str {
+        SplitLabel::name(self)
+    }
+    fn value(&self) -> &str {
+        SplitLabel::value(self)
+    }
+}
+
 /// Cheap-to-clone label container for evaluator internals.
 ///
-/// Storage provides labels as `Arc<[Label]>` (sorted). The `Shared` variant
-/// wraps that Arc directly — cloning is an atomic refcount bump. Mutation
-/// (remove/insert/retain) promotes to `Owned`, which copies the vec once.
+/// Storage keeps a series' labels as a [`MetricName`]: one interned
+/// `name=value` string per label. The `Interned` variant borrows those strings
+/// by refcount — no label bytes are copied anywhere on the read path — and
+/// records each separator offset once, so `name`/`value` are O(1) slices and
+/// hashing, lookup and iteration run at slice speed. (Searching for the `=`
+/// on every access instead made per-sample hashing 4× and lookups 5× slower,
+/// which cost range queries 6–25%.) The set sits behind one `Arc`: building
+/// it is one allocation plus a refcount bump per label, once per series per
+/// query; every later clone and drop is a single refcount operation, which is
+/// what keeps a 1000-step range query from paying per-label costs a thousand
+/// times over.
+///
+/// `Shared` wraps an `Arc<[Label]>` for label sets that arrive already owned
+/// (cluster fan-in, test fixtures). Mutation (remove/insert/retain) promotes
+/// either read-only variant to `Owned`, which materializes owned `String`s once.
+///
+/// All three variants compare, order and hash by their `(name, value)`
+/// sequence, so they are interchangeable as map keys.
 #[derive(Debug, Clone)]
-pub(crate) enum EvalLabels {
-    /// Shared immutable labels from storage. Clone = O(1) refcount bump.
+pub enum EvalLabels {
+    /// Labels borrowed from storage via refcount. Clone = O(1) refcount bump.
+    Interned(Arc<[SplitLabel]>),
+    /// Shared immutable labels. Clone = O(1) refcount bump.
     Shared(Arc<[Label]>),
     /// Owned mutable sorted labels, materialized on the first mutation.
     Owned(Vec<Label>),
@@ -80,36 +134,70 @@ impl EvalLabels {
         EvalLabels::Shared(Arc::from(labels))
     }
 
+    /// Borrow a series' labels from storage without copying any label bytes.
+    ///
+    /// `MetricName` keeps its entries in name order by construction, which is
+    /// the order every other variant uses. Its public `sort()` orders the raw
+    /// `name=value` strings instead, and those two orders differ when one name
+    /// is a prefix of another (`a` / `a1`). Nothing on the read path calls
+    /// `sort()`, but a set that is not in name order would compare unequal to
+    /// an identical `Owned` set, so guard it: the check is a linear scan of
+    /// borrowed `&str`s, and the fallback materializes and sorts.
+    pub fn interned(metric_name: &MetricName) -> Self {
+        let split: Vec<SplitLabel> = metric_name
+            .raw_entries()
+            .filter_map(|raw| {
+                // Entries without a separator are malformed; storage never
+                // produces them, and `MetricName::iter` skips them the same way.
+                let sep = raw.find('=')?;
+                Some(SplitLabel {
+                    raw: raw.clone(),
+                    sep: sep as u32,
+                })
+            })
+            .collect();
+        if split.is_sorted_by_key(|l| l.name()) {
+            EvalLabels::Interned(Arc::from(split))
+        } else {
+            let mut vec: Vec<Label> = split.iter().map(SplitLabel::to_label).collect();
+            vec.sort();
+            EvalLabels::Owned(vec)
+        }
+    }
+
     /// Create an empty label set.
     pub(crate) fn empty() -> Self {
         EvalLabels::Owned(Vec::new())
     }
 
-    /// Binary search on the sorted label slice.
+    /// Look up a label value by name (binary search in every variant).
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
-        let slice = self.as_slice();
+        match self {
+            EvalLabels::Interned(split) => split
+                .binary_search_by(|l| l.name().cmp(key))
+                .ok()
+                .map(|i| split[i].value()),
+            EvalLabels::Shared(arc) => Self::get_in_slice(arc, key),
+            EvalLabels::Owned(vec) => Self::get_in_slice(vec, key),
+        }
+    }
+
+    fn get_in_slice<'a>(slice: &'a [Label], key: &str) -> Option<&'a str> {
         slice
             .binary_search_by(|l| l.name.as_str().cmp(key))
             .ok()
             .map(|i| slice[i].value.as_str())
     }
 
-    /// Remove a label by name. Promotes Shared→Owned if needed.
+    /// Remove a label by name. Promotes to `Owned` only if the label exists.
     pub(crate) fn remove(&mut self, key: &str) {
-        match self {
-            EvalLabels::Shared(arc) => {
-                // only promote to Owned if the label exists, otherwise do nothing
-                if let Ok(i) = arc.binary_search_by(|l| l.name.as_str().cmp(key)) {
-                    let mut vec = arc.to_vec();
-                    vec.remove(i);
-                    *self = EvalLabels::Owned(vec);
-                }
+        if let EvalLabels::Owned(vec) = self {
+            if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
+                vec.remove(i);
             }
-            EvalLabels::Owned(vec) => {
-                if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
-                    vec.remove(i);
-                }
-            }
+        } else if self.contains(key) {
+            self.make_owned();
+            self.remove(key);
         }
     }
 
@@ -120,11 +208,11 @@ impl EvalLabels {
         self.get(METRIC_NAME_LABEL).unwrap_or("")
     }
 
-    pub(crate) fn drop_name(&mut self) {
+    pub fn drop_name(&mut self) {
         self.remove(METRIC_NAME_LABEL);
     }
 
-    /// Insert or update a label. Maintains sort order. Promotes Shared→Owned.
+    /// Insert or update a label. Maintains sort order. Promotes to `Owned`.
     pub(crate) fn insert(&mut self, key: String, value: String) {
         self.make_owned();
         if let EvalLabels::Owned(vec) = self {
@@ -144,7 +232,7 @@ impl EvalLabels {
         }
     }
 
-    /// Retain only labels matching the predicate. Promotes Shared→Owned.
+    /// Retain only labels matching the predicate. Promotes to `Owned`.
     pub(crate) fn retain(&mut self, f: impl FnMut(&Label) -> bool) {
         self.make_owned();
         if let EvalLabels::Owned(vec) = self {
@@ -152,16 +240,27 @@ impl EvalLabels {
         }
     }
 
+    /// Number of labels.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            EvalLabels::Interned(split) => split.len(),
+            EvalLabels::Shared(arc) => arc.len(),
+            EvalLabels::Owned(vec) => vec.len(),
+        }
+    }
+
     /// Returns true if there are no labels.
     pub(crate) fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
+        match self {
+            EvalLabels::Interned(split) => split.is_empty(),
+            EvalLabels::Shared(arc) => arc.is_empty(),
+            EvalLabels::Owned(vec) => vec.is_empty(),
+        }
     }
 
     /// Returns true if the label set contains the given key (binary search).
     pub(crate) fn contains(&self, key: &str) -> bool {
-        self.as_slice()
-            .binary_search_by(|l| l.name.as_str().cmp(key))
-            .is_ok()
+        self.get(key).is_some()
     }
 
     /// Insert or update a label by `&str` key (convenience wrapper around
@@ -173,7 +272,8 @@ impl EvalLabels {
     /// Compute grouping labels for aggregation and binary operations.
     ///
     /// Mirrors `Labels::compute_grouping_labels` / `Labels::into_grouping_labels`.
-    /// Clones `self` (O(1) for `Shared`) and removes/retains labels per modifier.
+    /// Clones `self` (cheap for the read-only variants) and removes/retains
+    /// labels per modifier.
     pub(crate) fn compute_grouping_labels(&self, modifier: Option<&LabelModifier>) -> EvalLabels {
         let mut this = self.clone();
         match modifier {
@@ -200,7 +300,7 @@ impl EvalLabels {
     /// 1100-series `sum by (le)` allocated 1100 label sets per step to keep 11.
     ///
     /// Hashing the filtered view instead is allocation-free and yields the
-    /// *same* value: [`HasFingerprint`] for `[Label]` hashes each `(name,
+    /// *same* value: [`HasFingerprint`] for `EvalLabels` hashes each `(name,
     /// value)` pair in order, and filtering preserves order, so this and
     /// `compute_grouping_labels(m).fingerprint()` agree by construction. The
     /// no-modifier case hashes nothing, matching the empty set that
@@ -210,25 +310,49 @@ impl EvalLabels {
         modifier: Option<&LabelModifier>,
     ) -> SeriesFingerprint {
         match modifier {
-            None => fingerprint_labels(std::iter::empty()),
-            Some(LabelModifier::Include(label_list)) => {
-                fingerprint_labels(self.iter().filter(|l| label_list.labels.contains(&l.name)))
-            }
-            Some(LabelModifier::Exclude(label_list)) => {
-                fingerprint_labels(self.iter().filter(|l| !label_list.labels.contains(&l.name)))
-            }
+            None => fingerprint_labels(std::iter::empty::<InternedLabel<'_>>()),
+            Some(LabelModifier::Include(label_list)) => fingerprint_labels(
+                self.iter()
+                    .filter(|l| label_list.labels.iter().any(|n| n == l.name)),
+            ),
+            Some(LabelModifier::Exclude(label_list)) => fingerprint_labels(
+                self.iter()
+                    .filter(|l| !label_list.labels.iter().any(|n| n == l.name)),
+            ),
         }
     }
 
-    /// Iterate over labels (sorted order in both variants).
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &Label> {
-        self.as_slice().iter()
+    /// Iterate over labels as borrowed `(name, value)` views, in name order
+    /// for every variant.
+    pub(crate) fn iter(&self) -> LabelIter<'_> {
+        match self {
+            EvalLabels::Interned(split) => LabelIter::Interned(split.iter()),
+            EvalLabels::Shared(arc) => LabelIter::Slice(arc.iter()),
+            EvalLabels::Owned(vec) => LabelIter::Slice(vec.iter()),
+        }
     }
 
-    /// Convert into `Labels` for the output boundary. Both variants are
+    /// [`HasFingerprint::fingerprint`] for the external Criterion benchmarks,
+    /// which cannot name the crate-private trait.
+    #[cfg(feature = "bench")]
+    pub fn fingerprint_u128(&self) -> u128 {
+        self.fingerprint()
+    }
+
+    /// Materialize as owned `Label`s, in name order.
+    pub(crate) fn to_label_vec(&self) -> Vec<Label> {
+        match self {
+            EvalLabels::Interned(split) => split.iter().map(SplitLabel::to_label).collect(),
+            EvalLabels::Shared(arc) => arc.to_vec(),
+            EvalLabels::Owned(vec) => vec.clone(),
+        }
+    }
+
+    /// Convert into `Labels` for the output boundary. Every variant is
     /// already sorted, so `Labels::new()` does no extra work.
     pub(crate) fn into_labels(self) -> Labels {
         match self {
+            EvalLabels::Interned(split) => Labels(split.iter().map(SplitLabel::to_label).collect()),
             EvalLabels::Shared(arc) => Labels(arc.to_vec()),
             EvalLabels::Owned(vec) => Labels(vec),
         }
@@ -248,23 +372,83 @@ impl EvalLabels {
         EvalLabels::Owned(vec)
     }
 
-    fn as_slice(&self) -> &[Label] {
+    fn make_owned(&mut self) {
+        if !matches!(self, EvalLabels::Owned(_)) {
+            *self = EvalLabels::Owned(self.to_label_vec());
+        }
+    }
+}
+
+/// Borrowed label views over either backing store of [`EvalLabels`].
+///
+/// A plain two-variant enum with a hand-written `next` rather than an
+/// `Option::into_iter().flat_map(..).chain(..)` tower: this iterator sits under
+/// every per-sample fingerprint and match-key computation, and the adapter
+/// tower costs several state checks per element where a slice walk costs one.
+pub(crate) enum LabelIter<'a> {
+    Interned(std::slice::Iter<'a, SplitLabel>),
+    Slice(std::slice::Iter<'a, Label>),
+}
+
+impl<'a> Iterator for LabelIter<'a> {
+    type Item = InternedLabel<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
         match self {
-            EvalLabels::Shared(arc) => arc,
-            EvalLabels::Owned(vec) => vec,
+            LabelIter::Interned(it) => it.next().map(|l| InternedLabel {
+                name: l.name(),
+                value: l.value(),
+            }),
+            LabelIter::Slice(it) => it.next().map(|l| InternedLabel {
+                name: &l.name,
+                value: &l.value,
+            }),
         }
     }
 
-    fn make_owned(&mut self) {
-        if let EvalLabels::Shared(arc) = self {
-            *self = EvalLabels::Owned(arc.to_vec());
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            LabelIter::Interned(it) => (it.len(), Some(it.len())),
+            LabelIter::Slice(it) => (it.len(), Some(it.len())),
+        }
+    }
+}
+
+impl EvalLabels {
+    /// The backing slice, when the labels are held as `Label`s. `None` for
+    /// `Interned`, whose labels only exist as `name=value` strings.
+    #[inline]
+    fn as_label_slice(&self) -> Option<&[Label]> {
+        match self {
+            EvalLabels::Interned(_) => None,
+            EvalLabels::Shared(arc) => Some(arc),
+            EvalLabels::Owned(vec) => Some(vec),
         }
     }
 }
 
 impl PartialEq for EvalLabels {
     fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
+        match (self.as_label_slice(), other.as_label_slice()) {
+            // Both slice-backed: plain slice equality, as before interning.
+            (Some(a), Some(b)) => a == b,
+            (None, None) => {
+                let (EvalLabels::Interned(a), EvalLabels::Interned(b)) = (self, other) else {
+                    unreachable!("only Interned lacks a label slice");
+                };
+                // Interned strings are unique per content, so pointer equality
+                // per label is exact.
+                Arc::ptr_eq(a, b)
+                    || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.raw == y.raw))
+            }
+            // Mixed: compare `(name, value)` views.
+            _ => self
+                .iter()
+                .map(|l| (l.name, l.value))
+                .eq(other.iter().map(|l| (l.name, l.value))),
+        }
     }
 }
 
@@ -277,27 +461,50 @@ impl PartialOrd for EvalLabels {
 }
 
 impl Ord for EvalLabels {
+    /// Lexicographic over `(name, value)` pairs — the order `[Label]` has,
+    /// since `Label: Ord` compares name then value. Slice-backed pairs use the
+    /// slice comparison directly.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.as_slice().cmp(other.as_slice())
+        match (self.as_label_slice(), other.as_label_slice()) {
+            (Some(a), Some(b)) => a.cmp(b),
+            _ => self
+                .iter()
+                .map(|l| (l.name, l.value))
+                .cmp(other.iter().map(|l| (l.name, l.value))),
+        }
     }
 }
 
 impl Hash for EvalLabels {
+    /// Identical byte stream for every variant: the `[Label]` hash — a length
+    /// prefix, then `name`, `0xfe`, `value` per label. Slice-backed variants
+    /// hash the slice directly; `Interned` emits the same bytes from its
+    /// pre-split entries, so an `Owned` set with equal content is the same
+    /// map key.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_slice().hash(state);
+        match self.as_label_slice() {
+            Some(slice) => slice.hash(state),
+            None => {
+                let EvalLabels::Interned(split) = self else {
+                    unreachable!("only Interned lacks a label slice");
+                };
+                state.write_usize(split.len());
+                for l in split.iter() {
+                    state.write(l.name().as_bytes());
+                    state.write_u8(0xfe);
+                    state.write(l.value().as_bytes());
+                }
+            }
+        }
     }
 }
 
 impl HasFingerprint for EvalLabels {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let slice = self.as_slice();
-        slice.fingerprint()
-    }
-}
-
-impl AsRef<[Label]> for EvalLabels {
-    fn as_ref(&self) -> &[Label] {
-        self.as_slice()
+        match self.as_label_slice() {
+            Some(slice) => fingerprint_labels(slice.iter()),
+            None => fingerprint_labels(self.iter()),
+        }
     }
 }
 
@@ -314,7 +521,7 @@ impl Display for EvalLabels {
                 write!(f, ",")?;
             }
             first = false;
-            write!(f, "{}={}", label.name, enquote('"', &label.value))?;
+            write!(f, "{}={}", label.name, enquote('"', label.value))?;
         }
 
         write!(f, "}}")?;
@@ -338,6 +545,18 @@ impl From<Labels> for EvalLabels {
 impl From<Vec<Label>> for EvalLabels {
     fn from(vec: Vec<Label>) -> Self {
         EvalLabels::Owned(vec)
+    }
+}
+
+impl From<MetricName> for EvalLabels {
+    fn from(metric_name: MetricName) -> Self {
+        EvalLabels::interned(&metric_name)
+    }
+}
+
+impl From<&MetricName> for EvalLabels {
+    fn from(metric_name: &MetricName) -> Self {
+        EvalLabels::interned(metric_name)
     }
 }
 
@@ -612,8 +831,7 @@ impl EvalSamples {
     }
 
     pub fn fingerprint(&self) -> SeriesFingerprint {
-        let labels = self.labels.as_ref();
-        get_metric_signature(labels, self.drop_name)
+        get_metric_signature(&self.labels, self.drop_name)
     }
 }
 
