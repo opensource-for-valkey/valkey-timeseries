@@ -150,7 +150,7 @@ ALIGN 1609459200000 AGGREGATION sum 5m
 - Cannot use `start` align with `-` range start timestamp
 - Cannot use `end` align with `+` range end timestamp
 
-### AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration
+### AGGREGATION aggregatorop value[,aggregatorop value...] bucketDuration
 
 Aggregate samples into time buckets using the specified aggregator(s) and bucket size. A
 comma-separated list of up to 16 distinct aggregators produces one row per bucket containing the

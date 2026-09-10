@@ -14,7 +14,7 @@ TS.REVRANGE key fromTimestamp toTimestamp
   [FILTER_BY_VALUE min max]
   [COUNT count]
   [
-      [ALIGN align] AGGREGATION aggregator[(operator value)][,aggregator[(operator value)]...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]
+      [ALIGN align] AGGREGATION aggregatoroperatorvalue[,aggregatoroperatorvalue...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]
   ]
 ```
 
@@ -61,13 +61,13 @@ TS.REVRANGE key fromTimestamp toTimestamp
 
 | Option            | Arguments                   | Description                                                                                                               |
 |-------------------|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
-| `AGGREGATION`     | `aggregator[operator value][,aggregator[operator value]...] bucketDuration` | Downsample into fixed time buckets of size `bucketDuration` and apply each `aggregator` per bucket. A comma-separated list (up to 16 distinct aggregators) yields one value per aggregator per bucket, in the order specified. |
+| `AGGREGATION`     | `aggregatoroperatorvalue[,aggregatoroperatorvalue...] bucketDuration` | Downsample into fixed time buckets of size `bucketDuration` and apply each `aggregator` per bucket. A comma-separated list (up to 16 distinct aggregators) yields one value per aggregator per bucket, in the order specified. |
 | `ALIGN`           | `align`                     | Bucket alignment anchor. May appear before `AGGREGATION` (`ALIGN … AGGREGATION …`) or after it (`AGGREGATION … ALIGN …`). |
 | `BUCKETTIMESTAMP` | `bt`                        | Controls the timestamp emitted for each bucket. Default: `start`.                                                         |
 | `EMPTY`           | (none)                      | Include empty buckets (buckets with no samples).                                                                          |
 
 Each element of the `aggregator` list carries its own inline condition —
-`aggregatoroperator value`, e.g. `countif>5` — with no separator since `aggregator` and its
+`aggregatoroperatorvalue`, e.g. `countif>5` — with no separator since `aggregator` and its
 condition form a single argument token. `countif`, `sumif`, `share`, and `all`/`any`/`none`
 **require** one; omitting it is an error. `count` and `sum` accept one *optionally*, to count/sum
 only matching samples. Any other aggregator (`avg`, `max`, ...) does not accept a condition;
@@ -111,8 +111,8 @@ Supported `aggregator` values for `AGGREGATION`:
 | `increase` | Counter increase over the bucket (handles counter resets).                                             |
 | `rate`     | Counter rate per second over the bucket window (`increase / window_seconds`).                          |
 | `irate`    | Instantaneous per-second rate from the last two samples in the bucket/window (handles counter resets). |
-| `countif`  | Count of samples matching the inline `(operator value)` condition.                                     |
-| `sumif`    | Sum of sample values matching the inline `(operator value)` condition.                                 |
+| `countif`  | Count of samples matching the inline `operatorvalue` condition.                                         |
+| `sumif`    | Sum of sample values matching the inline `operatorvalue` condition.                                   |
 | `share`    | Fraction of samples matching the condition (range `[0..1]`), or empty when no samples.                 |
 | `all`      | `1.0` if all samples match the condition, else `0.0`.                                                  |
 | `any`      | `1.0` if any sample matches the condition, else `0.0`.                                                  |

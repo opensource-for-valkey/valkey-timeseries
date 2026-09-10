@@ -10,7 +10,7 @@ TS.RANGE key fromTimestamp toTimestamp
   [FILTER_BY_TS timestamp ...]
   [FILTER_BY_VALUE min max]
   [COUNT count]
-  [[ALIGN align] AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]]
+  [[ALIGN align] AGGREGATION aggregatorop value[,aggregatorop value...] bucketDuration [BUCKETTIMESTAMP bt] [EMPTY]]
 ```
 
 ---
@@ -49,7 +49,7 @@ Include only samples with values in `[min, max]`. Both bounds are inclusive. App
 Limit output to the first `count` samples or buckets. When used with aggregation, limits bucket
 count (not samples per bucket).
 </details>
-<details open><summary><code>AGGREGATION aggregator[(op value)][,aggregator[(op value)]...] bucketDuration</code></summary>
+<details open><summary><code>AGGREGATION aggregatorop value[,aggregatorop value...] bucketDuration</code></summary>
 Aggregate raw samples into fixed-size time buckets. See [Aggregators](#aggregators) for supported aggregation functions.
 
 `aggregator` may be a comma-separated list of up to 16 distinct aggregators (e.g. `avg,max,count`).
@@ -273,5 +273,4 @@ TS.RANGE cpu:utilization 1609459200000 1609545600000 AGGREGATION countif>90,sumi
 - `TS.MRANGE` — Query multiple time series at once
 - `TS.GET` — Get the latest sample only
 - `TS.ADD` — Add samples to a time series
-
 

@@ -4,7 +4,7 @@
 
 ```
 TS.CREATERULE sourceKey destKey 
-AGGREGATION aggregator[(op value)] bucketDuration [alignTimestamp]
+AGGREGATION aggregatorop value bucketDuration [alignTimestamp]
 ```
 
 ## Description
