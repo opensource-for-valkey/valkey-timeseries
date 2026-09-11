@@ -762,6 +762,42 @@ mod tests {
             (19.0, vec![("env", "prod"), ("method", "POST")]),
         ]
     )]
+    // Unary negation drops __name__, like `-1 * x` would. Prometheus
+    // `evalUnaryExpr` does the same.
+    #[case(
+        "unary_negation_drops_name",
+        "-http_requests_total",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+            ("http_requests_total", vec![("env", "prod"), ("method", "POST")], 1, 20.0),
+        ],
+        vec![
+            (-10.0, vec![("env", "prod"), ("method", "GET")]),
+            (-20.0, vec![("env", "prod"), ("method", "POST")]),
+        ]
+    )]
+    #[case(
+        "unary_negation_nested",
+        "---http_requests_total",
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+        ],
+        vec![
+            (-10.0, vec![("env", "prod"), ("method", "GET")]),
+        ]
+    )]
+    // The drop is recorded, not applied, so the name is still there for
+    // label_replace to read — and preserving it via __name__ cancels the drop.
+    #[case(
+        "unary_negation_name_visible_to_label_replace",
+        r#"label_replace(-http_requests_total, "was", "$1", "__name__", "(.+)")"#,
+        vec![
+            ("http_requests_total", vec![("env", "prod"), ("method", "GET")], 0, 10.0),
+        ],
+        vec![
+            (-10.0, vec![("env", "prod"), ("method", "GET"), ("was", "http_requests_total")]),
+        ]
+    )]
     // Aggregations
     #[case(
         "aggregation_sum",

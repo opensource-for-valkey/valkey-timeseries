@@ -1283,8 +1283,22 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let res = self.evaluate_expr(&expr.expr, ctx, preload_eligible)?;
         match res {
             ExprResult::Scalar(scalar) => Ok(ExprResult::Scalar(-scalar)),
+            // Negation changes what the series measures, so `__name__` goes,
+            // exactly as it does for `-1 * x`. Prometheus does the same in
+            // `evalUnaryExpr`.
+            //
+            // Recorded rather than applied: `drop_name` is materialized once,
+            // at the end of evaluation, by [`Evaluator::cleanup_metric_labels`]
+            // — the same deferral rollups use, and what lets
+            // `label_replace(-m, "__name__", ...)` still see the name. Applying
+            // it here would also split groups that should merge, because
+            // `sum by (__name__) (...)` would see one operand's name already
+            // gone and the other's still present.
             ExprResult::InstantVector(mut samples) => {
-                samples.iter_mut().for_each(|s| s.value = -s.value);
+                samples.iter_mut().for_each(|s| {
+                    s.value = -s.value;
+                    s.drop_name = true;
+                });
                 Ok(ExprResult::InstantVector(samples))
             }
             ExprResult::RangeVector(mut samples) => {
@@ -1292,6 +1306,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     s.values
                         .iter_mut()
                         .for_each(|sample| sample.value = -sample.value);
+                    s.drop_name = true;
                 });
                 Ok(ExprResult::RangeVector(samples))
             }

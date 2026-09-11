@@ -62,9 +62,6 @@ eval instant at 10s metric @ 0 offset -50
   metric{job="1"} 5
   metric{job="2"} 10
 
-# ignoring unary operator (-)
-ignore
-
 eval instant at 10s -metric @ 100
   {job="1"} -10
   {job="2"} -20
@@ -72,8 +69,6 @@ eval instant at 10s -metric @ 100
 eval instant at 10s ---metric @ 100
   {job="1"} -10
   {job="2"} -20
-
-resume
 
 # Millisecond precision.
 eval instant at 100s metric_ms @ 1.234
