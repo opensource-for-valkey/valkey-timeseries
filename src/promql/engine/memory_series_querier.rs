@@ -1,5 +1,6 @@
 use crate::common::Sample;
 use crate::common::hash::IntMap;
+use crate::common::threads::IterIntoParRayon;
 use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::EvalLabels;
@@ -12,7 +13,6 @@ use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
-use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::parser::VectorSelector;
@@ -112,7 +112,7 @@ impl MemorySeriesQuerier {
                     .filter_map(|id| inner.series.get(&id))
                     .collect::<Vec<_>>()
             })
-            .iter_into_par()
+            .iter_into_par_rayon()
             .map(f)
             .into_fallible_result()
             .flat_map(|opt| opt)

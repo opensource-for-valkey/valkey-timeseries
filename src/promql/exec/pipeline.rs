@@ -10,12 +10,13 @@
 //!
 //! The types in this module represent the intermediate artifacts produced by each phase.
 
+use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::engine::QueryReader;
 #[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::ParIter;
 use promql_parser::parser::VectorSelector;
 use std::time::{Duration, Instant};
 
@@ -215,7 +216,7 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
     let subquery_end_ms = plan.sample_end_ms;
 
     let range_vector: Vec<EvalSamples> = series_data
-        .into_par()
+        .into_par_rayon()
         .filter_map(|sample| {
             if sample.values.is_empty() {
                 return None;

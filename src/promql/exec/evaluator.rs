@@ -1,5 +1,6 @@
 use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, eval_aggregation};
 use crate::common::threads::join;
+use crate::common::threads::{IntoParRayon, ParCollectionRayon};
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
 use crate::promql::binops::{
@@ -37,8 +38,7 @@ use crate::promql::{
 };
 use ahash::AHashSet;
 use orx_parallel::ParIter;
-use orx_parallel::ParallelizableCollection;
-use orx_parallel::{IntoParIter, ParIterResult};
+use orx_parallel::ParIterResult;
 use promql_parser::parser::token::T_LAND;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
@@ -154,7 +154,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .collect();
 
         let _: Vec<()> = unique_selectors
-            .par()
+            .par_rayon()
             .map(|&vs| self.preload_vector_selector(vs, grid))
             .into_fallible_result()
             .collect()?;
@@ -213,7 +213,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // rollups must not open one fanout per rollup all at once. The
         // fallible collect stops scheduling after the first error.
         let _: Vec<()> = requests
-            .into_par()
+            .into_par_rayon()
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
             .map(|(key, kind, matrix, param, aggregation)| {
                 self.check_deadline()?;
@@ -292,7 +292,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         drop(rollups);
 
         let _: Vec<()> = targets
-            .into_par()
+            .into_par_rayon()
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
             .map(|(key, matrix)| -> EvalResult<()> {
                 self.check_deadline()?;
@@ -575,7 +575,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
-            .into_par()
+            .into_par_rayon()
             .map(|(labels, samples)| {
                 // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
                 // timestamp; however, when resolving `@ start()` / `@ end()` inside the
@@ -914,7 +914,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     break;
                 }
                 let step_results: Vec<(i64, Vec<EvalSample>)> = batch
-                    .into_par()
+                    .into_par_rayon()
                     .map(|eval_ts| sub.eval_subquery_step(subquery, ctx, eval_ts))
                     .into_fallible_result()
                     .collect()?;

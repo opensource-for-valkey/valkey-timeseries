@@ -1,7 +1,8 @@
 use crate::common::Sample;
+use crate::common::threads::IntoParRayon;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::ParIter;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::promql) enum RateKind {
@@ -45,7 +46,7 @@ fn calculate_rate(
 ) -> EvalResult<ExprResult> {
     let samples = arg.into_range_vector()?;
     let result = samples
-        .into_par()
+        .into_par_rayon()
         .filter_map(|sample_series| {
             let value = extrapolated_rate(&sample_series, kind)?;
             Some(EvalSample {

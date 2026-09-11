@@ -1,3 +1,4 @@
+use crate::common::threads::IterIntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
@@ -12,7 +13,6 @@ use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
 };
 use crate::series::index::series_by_selectors;
-use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use std::ops::Deref;
@@ -123,7 +123,7 @@ pub(super) fn local_rollup_windows(
     let candidates = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par()
+        .iter_into_par_rayon()
         .map(|s| {
             let samples = s.get_range(start_time, end_time);
             // An empty window contributes nothing, so skip the label conversion
@@ -190,7 +190,7 @@ pub(super) fn handle_range_query(
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par()
+        .iter_into_par_rayon()
         .map(|s| {
             // `get_series_range` applies the per-series point limit from the chunk headers
             // first, so a shard rejects an over-wide span before decoding it instead of

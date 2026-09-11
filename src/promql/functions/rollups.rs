@@ -19,11 +19,11 @@
 //! step in one pass over the series, while the local path passes a single window
 //! end. Both go through the same window construction, which is the point.
 
+use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples};
 use num_traits::Zero;
-use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 
 /// Evaluate `rollup_fn` over each series' window, one value per series.
@@ -42,7 +42,7 @@ pub(super) fn eval_rollups(
     rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
 ) -> EvalResult<Vec<EvalSample>> {
     let results = range_vec
-        .into_par()
+        .into_par_rayon()
         .filter_map(|series| exec_series_rollup(ctx, series, optional_param, rollup_fn))
         .collect();
 
@@ -238,7 +238,7 @@ where
     F: Fn(&[Sample]) -> f64 + Sync,
 {
     series_data
-        .into_par()
+        .into_par_rayon()
         .filter_map(|series| {
             let window = window_samples(&series.values, series.range_end_ms, series.range_ms)?;
 

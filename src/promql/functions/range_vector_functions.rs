@@ -1,7 +1,7 @@
 use crate::common::Sample;
+use crate::common::threads::IntoParRayon;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 
 /// Generic aggregator for range vector functions. As opposed to `aggr_over_time`, this operates
@@ -16,7 +16,7 @@ where
     F: Fn(&[Sample]) -> Option<f64> + Send + Sync,
 {
     let res = series
-        .into_par()
+        .into_par_rayon()
         .filter_map(|series| {
             if series.values.is_empty() {
                 return None;
@@ -49,7 +49,7 @@ where
     F: Fn(&[Sample]) -> f64 + Send + Sync,
 {
     let vec = samples
-        .into_par()
+        .into_par_rayon()
         .filter_map(|series| {
             if series.values.is_empty() {
                 None

@@ -1,11 +1,12 @@
 use super::labels::{compute_binary_match_key, get_metric_signature, result_metric};
+use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::labels::SeriesFingerprint;
 use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::HashSetExt;
-use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
+use orx_parallel::ParIter;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
@@ -395,7 +396,7 @@ fn collect_match_keys(
     if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
         samples
             .iter()
-            .iter_into_par()
+            .iter_into_par_rayon()
             .map(|s| compute_binary_match_key(&s.labels, matching))
             .collect()
     } else {
@@ -751,7 +752,7 @@ fn collect_fingerprints(
     let mut kvs: Vec<(SeriesFingerprint, EvalSample)> =
         if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
             samples
-                .into_par()
+                .into_par_rayon()
                 .map(|s| {
                     let key = compute_binary_match_key(&s.labels, ctx.matching);
                     (key, s)

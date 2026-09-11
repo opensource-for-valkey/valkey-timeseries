@@ -1,8 +1,9 @@
 use crate::common::Sample;
+use crate::common::threads::IntoParRayon;
 use crate::promql::common::math::sample_regression;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::ParIter;
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DerivFunction;
@@ -12,7 +13,7 @@ impl PromQLFunction for DerivFunction {
         let series = arg.into_range_vector()?;
 
         let out = series
-            .into_par()
+            .into_par_rayon()
             .filter_map(|series| {
                 let value = rollup_deriv(&series.values)?;
                 Some(EvalSample {

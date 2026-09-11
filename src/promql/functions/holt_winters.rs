@@ -1,10 +1,11 @@
 use crate::common::Sample;
+use crate::common::threads::IntoParRayon;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_exact_arg_count, expect_range_vector, expect_scalar,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::ParIter;
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DoubleExponentialSmoothingFunction;
@@ -72,7 +73,7 @@ fn eval_double_exponential_smoothing(
     }
 
     let out = series
-        .into_par()
+        .into_par_rayon()
         .filter_map(|s| {
             let value = calculate_double_exponential_smoothing_value(
                 &s.values,

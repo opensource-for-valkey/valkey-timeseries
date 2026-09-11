@@ -1,5 +1,6 @@
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
+use crate::common::threads::IterIntoParRayon;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
@@ -17,7 +18,6 @@ use crate::promql::engine::{
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::series_by_selectors;
-use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
@@ -836,7 +836,7 @@ pub(in crate::promql) fn query_instant_local(
     let samples = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par()
+        .iter_into_par_rayon()
         .filter_map(|s| {
             let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
 
@@ -873,7 +873,7 @@ pub(in crate::promql) fn query_range_local(
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par()
+        .iter_into_par_rayon()
         .filter_map(|s| {
             let samples =
                 match get_series_range(s, start_time, end_time, options.max_points_per_series) {

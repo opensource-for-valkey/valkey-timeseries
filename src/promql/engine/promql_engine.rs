@@ -1,3 +1,4 @@
+use crate::common::threads::IntoParRayon;
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
@@ -12,7 +13,7 @@ use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
-use orx_parallel::{IntoParIter, ParIter, ParIterResult};
+use orx_parallel::{ParIter, ParIterResult};
 use promql_parser::parser::{EvalStmt, Expr};
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -253,7 +254,7 @@ pub fn evaluate_range(
         }
 
         let chunk_results: Vec<(Timestamp, ExprResult)> = chunk
-            .into_par()
+            .into_par_rayon()
             .map(eval_step)
             .into_fallible_result()
             .collect()?;
