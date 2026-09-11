@@ -40,11 +40,41 @@ pub(super) fn eval_binop_vector_vector(
     }
 }
 
+/// True when an `on(...)` / `group_x(...)` label list names `__name__`, and a
+/// pending (recorded but unmaterialized) `__name__` drop would therefore be
+/// visible to it.
+fn list_names_metric(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == METRIC_NAME)
+}
+
+/// Same question for a match modifier. `ignoring(...)` and the no-modifier case
+/// never see `__name__` — [`compute_binary_match_key`] filters it out of both —
+/// so only an `on(...)` list naming it counts.
+fn matching_observes_metric_name(matching: Option<&LabelModifier>) -> bool {
+    matches!(matching, Some(LabelModifier::Include(list)) if list_names_metric(&list.labels))
+}
+
+/// Materialize pending `__name__` drops on both operands, when the match key
+/// can actually observe them.
+///
+/// Set operators carry their operands' samples through untouched, so a drop
+/// materialized here is a drop applied *early*. That is visible: Prometheus
+/// defers name removal to the end of evaluation, which is what lets
+/// `sum by (__name__) (metric_total or rate(metric_total[5m]))` put both series
+/// in one group and drop the name once, afterwards. Materializing the rate
+/// side's pending drop up front splits that into two groups instead.
+///
+/// Skipping the pass is also what makes the common case free: it is a 2n walk
+/// that promotes `Shared` label sets to `Owned` on every sample that owes a
+/// drop.
 fn drop_names_if_necessary(
     mut left_vector: Vec<EvalSample>,
     mut right_vector: Vec<EvalSample>,
+    matching: Option<&LabelModifier>,
 ) -> (Vec<EvalSample>, Vec<EvalSample>) {
-    // Materialize pending __name__ drops before matching
+    if !matching_observes_metric_name(matching) {
+        return (left_vector, right_vector);
+    }
     for sample in left_vector.iter_mut() {
         sample.drop_name_if_needed();
     }
@@ -157,6 +187,19 @@ fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
     // output of matched pairs (0/1 instead of filter), while unmatched entries
     // drop out of the result exactly as they do without `bool`.
     ctx.is_one_to_one && ctx.matching.is_none() && !ctx.has_fill
+}
+
+/// True when a *pending* (recorded but unmaterialized) `__name__` drop on an
+/// operand could still change the result.
+///
+/// `compute_binary_match_key` skips `__name__` for the no-modifier and
+/// `ignoring(...)` cases, and `build_result_labels` skips it when copying
+/// labels off the "one" side. That leaves two ways the name can be read: an
+/// `on(...)` list that names it, and a `group_left(...)`/`group_right(...)`
+/// list that names it.
+fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
+    matching_observes_metric_name(ctx.matching)
+        || ctx.group_labels.is_some_and(|labels| list_names_metric(labels))
 }
 
 /// Evaluates arithmetic or comparison operations on two vectors, assuming the operation
@@ -303,13 +346,28 @@ fn eval_arith_ops(
         }
     }
 
-    // Arithmetic (non-comparison) operations always drop `__name__`.
-    if !ctx.is_comparison {
+    // Materialize a *pending* `__name__` drop on the operands, but only when
+    // something downstream can actually observe the name.
+    //
+    // This used to be an unconditional `labels.drop_name()` over both operands
+    // for every non-comparison operator, on the grounds that arithmetic drops
+    // `__name__`. It does — but `result_metric` already strips the name from
+    // matched *results*, so the operand pass changed no output. What it did
+    // cost was a `Shared` -> `Owned` promotion of all 2n operand label sets:
+    // storage hands labels over as an `Arc<[Label]>`, and removing a label
+    // clones the whole set. Timed alone, those promotions were 65-73% of this
+    // path's total at 1000 series or fewer.
+    //
+    // A pending drop can only change a result through the match key or the
+    // grouping copy, and `compute_binary_match_key` already ignores `__name__`
+    // for both the no-modifier and `ignoring(...)` cases — so the pass is
+    // needed only under an `on(...)` or `group_x(...)` list naming `__name__`.
+    if observes_metric_name(&ctx) {
         for sample in left_vector.iter_mut() {
-            sample.labels.drop_name();
+            sample.drop_name_if_needed();
         }
         for sample in right_vector.iter_mut() {
-            sample.labels.drop_name();
+            sample.drop_name_if_needed();
         }
     }
 
@@ -724,7 +782,7 @@ fn eval_set_or(
         return Ok(ExprResult::InstantVector(left_vector));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
 
     // Build a set of match keys from the left side
     let left_keys = get_sample_fingerprints(&left_vector, matching);
@@ -752,7 +810,7 @@ fn eval_set_and(
         return Ok(ExprResult::InstantVector(vec![]));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
 
     // Build a set of match keys from the right side
     let right_keys = get_sample_fingerprints(&right_vector, matching);
@@ -778,7 +836,7 @@ fn eval_set_unless(
         return Ok(ExprResult::InstantVector(left_vector));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector);
+    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
 
     // Build a set of match keys from the right side
     let right_keys = get_sample_fingerprints(&right_vector, matching);
@@ -1369,6 +1427,70 @@ mod tests {
         for s in &result {
             assert!(s.drop_name);
         }
+    }
+
+    // ── name dropping for %, ^ and atan2 ────────────────────────────────────
+
+    /// Prometheus `shouldDropMetricName` covers `%`, `^` and `atan2` alongside
+    /// the four basic arithmetic operators. Asserted here rather than in the
+    /// promqltest suite because a `{...}` expectation there matches whether or
+    /// not `__name__` is present.
+    #[test]
+    fn test_mod_pow_atan2_drop_metric_name() {
+        use promql_parser::parser::token::{T_ATAN2, T_MOD, T_POW};
+
+        for op in [T_MOD, T_POW, T_ATAN2] {
+            let lhs = vec![sample(1000, 8.0, &[("__name__", "a"), ("env", "prod")])];
+            let rhs = vec![sample(1000, 3.0, &[("__name__", "b"), ("env", "prod")])];
+
+            let result = eval_binop_vector_vector(&make_expr(op, None), lhs, rhs)
+                .unwrap()
+                .into_instant_vector()
+                .unwrap();
+
+            assert_eq!(result.len(), 1, "op {op:?} should match one pair");
+            let mut only = result.into_iter().next().unwrap();
+            only.drop_name_if_needed();
+            assert_eq!(
+                only.labels.get("__name__"),
+                None,
+                "op {op:?} must drop __name__"
+            );
+            assert_eq!(only.labels.get("env"), Some("prod"));
+        }
+    }
+
+    /// The basic arithmetic operators, for contrast: same expectation, and the
+    /// case the old eager input pass was really covering.
+    #[test]
+    fn test_arithmetic_drops_metric_name() {
+        let lhs = vec![sample(1000, 8.0, &[("__name__", "a"), ("env", "prod")])];
+        let rhs = vec![sample(1000, 3.0, &[("__name__", "b"), ("env", "prod")])];
+
+        let result = eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+
+        let mut only = result.into_iter().next().unwrap();
+        only.drop_name_if_needed();
+        assert_eq!(only.labels.get("__name__"), None);
+    }
+
+    /// A non-bool comparison keeps the LHS name, including its metric name.
+    #[test]
+    fn test_comparison_keeps_metric_name() {
+        let lhs = vec![sample(1000, 8.0, &[("__name__", "a"), ("env", "prod")])];
+        let rhs = vec![sample(1000, 3.0, &[("__name__", "b"), ("env", "prod")])];
+
+        let result = eval_binop_vector_vector(&make_expr(T_GTR, None), lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+
+        let mut only = result.into_iter().next().unwrap();
+        only.drop_name_if_needed();
+        assert_eq!(only.labels.get("__name__"), Some("a"));
     }
 
     // ── comparison cardinality validation ───────────────────────────────────
