@@ -219,8 +219,8 @@ mod tests {
 
     #[test]
     fn a_nan_anywhere_poisons_the_slope() {
-        // `rollup_deriv` drops the series on a NaN slope, so this is how a
-        // window containing NaN produces no result rather than a wrong one.
+        // `rollup_deriv` returns this NaN as the series' value (matching
+        // Prometheus) rather than dropping the series.
         let (slope, _) = sample_regression(&grid(&[1.0, 2.0, f64::NAN, 4.0])).unwrap();
         assert!(slope.is_nan());
     }

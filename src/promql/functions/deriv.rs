@@ -29,11 +29,13 @@ impl PromQLFunction for DerivFunction {
 }
 
 /// `deriv` over one window: the slope of the simple linear regression through
-/// its samples, or nothing when there are too few samples or the slope is NaN.
+/// its samples, or nothing when there are too few samples. A NaN or infinite
+/// sample in the window poisons the slope to NaN, which is returned as the
+/// series' value rather than dropping the series, matching Prometheus.
 ///
 /// Named rather than inline so the pushed-down path reduces a window with the
 /// very same function the local path runs.
 pub(in crate::promql) fn rollup_deriv(values: &[Sample]) -> Option<f64> {
     let (slope, _intercept) = sample_regression(values)?;
-    (!slope.is_nan()).then_some(slope)
+    Some(slope)
 }
