@@ -62,12 +62,6 @@ pub(in crate::promql) fn variance_kahan(values: &[Sample]) -> f64 {
     (m2 + c_m2) / count
 }
 
-#[inline]
-pub(super) fn change_below_tolerance(v: f64, prev_value: f64) -> bool {
-    let tolerance = 1e-12 * v.abs();
-    (v - prev_value).abs() < tolerance
-}
-
 pub(super) fn exact_arity_error(
     function_name: &str,
     expected_args: usize,
@@ -122,6 +116,10 @@ pub(super) fn expect_min_arg_count(
 
 // Prometheus' current UTF-8 label-name validation only rejects empty names.
 // Rust strings are already guaranteed to be valid UTF-8.
+/// This engine validates label names under Prometheus' UTF-8 naming scheme
+/// (the modern default from Prometheus 3.x's `utf8-names` feature) rather
+/// than the legacy `^[a-zA-Z_][a-zA-Z0-9_]*$` scheme: any non-empty string is
+/// a valid label name, since a Rust `&str` is already guaranteed valid UTF-8.
 pub(super) fn is_valid_label_name(label: &str) -> bool {
     !label.is_empty()
 }

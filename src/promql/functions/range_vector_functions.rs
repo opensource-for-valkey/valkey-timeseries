@@ -1,6 +1,5 @@
 use crate::common::Sample;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
-use crate::promql::functions::utils::change_below_tolerance;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
 use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
@@ -83,6 +82,13 @@ impl PromQLFunction for ResetsFunction {
 
 /// `resets` over one window. Named rather than inline so the pushed-down path
 /// reduces a window with the very same function the local path runs.
+///
+/// Any decrease counts, however small. There is no tolerance here on purpose —
+/// see [`rollup_changes`].
+///
+/// NaN never triggers a reset, because every comparison against NaN is false.
+/// That is Prometheus' behaviour too, and it falls out of the same expression
+/// rather than needing a case.
 pub(in crate::promql) fn rollup_resets(values: &[Sample]) -> Option<f64> {
     if values.is_empty() {
         return Some(0.0);
@@ -90,15 +96,10 @@ pub(in crate::promql) fn rollup_resets(values: &[Sample]) -> Option<f64> {
     let mut n = 0;
     let mut prev_value = values[0].value;
     for sample in values.iter().skip(1) {
-        let val = sample.value;
-        if val < prev_value {
-            if change_below_tolerance(val, prev_value) {
-                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                continue;
-            }
+        if sample.value < prev_value {
             n += 1;
         }
-        prev_value = val;
+        prev_value = sample.value;
     }
 
     Some(n as f64)
@@ -117,6 +118,14 @@ impl PromQLFunction for ChangesFunction {
 
 /// `changes` over one window. Named rather than inline so the pushed-down path
 /// reduces a window with the very same function the local path runs.
+///
+/// Two consecutive samples differ if their `f64` values differ — exactly, with
+/// no tolerance. This module's Gorilla encoding is lossless for `f64`, so a
+/// difference here is always a difference the writer actually put there.
+///
+/// The one exception is NaN following NaN. `NaN != NaN` is true in IEEE 754, so
+/// a run of NaNs would otherwise count as a change at every step; Prometheus
+/// special-cases it and so does this.
 pub(in crate::promql) fn rollup_changes(values: &[Sample]) -> Option<f64> {
     if values.is_empty() {
         return Some(0.0);
@@ -125,12 +134,7 @@ pub(in crate::promql) fn rollup_changes(values: &[Sample]) -> Option<f64> {
     let mut prev_value = values[0].value;
     for sample in values.iter().skip(1) {
         let val = sample.value;
-        if val != prev_value {
-            if change_below_tolerance(val, prev_value) {
-                // This may be a precision error. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/767#issuecomment-1650932203
-                continue;
-            }
-
+        if val != prev_value && !(val.is_nan() && prev_value.is_nan()) {
             n += 1;
         }
         prev_value = val;
