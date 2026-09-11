@@ -275,14 +275,43 @@ impl EvalLabels {
     /// Clones `self` (cheap for the read-only variants) and removes/retains
     /// labels per modifier.
     pub(crate) fn compute_grouping_labels(&self, modifier: Option<&LabelModifier>) -> EvalLabels {
-        let mut this = self.clone();
         match modifier {
             None => EvalLabels::Owned(Vec::new()),
             Some(LabelModifier::Include(label_list)) => {
+                if let EvalLabels::Interned(vec) = &self {
+                    let mut res = Vec::with_capacity(vec.len());
+                    for label in vec.iter() {
+                        if label_list
+                            .labels
+                            .iter()
+                            .find(|&name| name == label.name())
+                            .is_some()
+                        {
+                            res.push(label.clone());
+                        }
+                    }
+                    return EvalLabels::Interned(Arc::from(res));
+                }
+                let mut this = self.clone();
                 this.retain(|k| label_list.labels.contains(&k.name));
                 this
             }
             Some(LabelModifier::Exclude(label_list)) => {
+                if let EvalLabels::Interned(vec) = &self {
+                    let mut res = Vec::with_capacity(vec.len());
+                    for label in vec.iter() {
+                        if label_list
+                            .labels
+                            .iter()
+                            .find(|&name| name == label.name())
+                            .is_none()
+                        {
+                            res.push(label.clone());
+                        }
+                    }
+                    return EvalLabels::Interned(Arc::from(res));
+                }
+                let mut this = self.clone();
                 this.retain(|k| !label_list.labels.contains(&k.name));
                 this
             }
