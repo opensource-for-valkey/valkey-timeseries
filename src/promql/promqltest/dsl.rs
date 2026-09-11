@@ -374,9 +374,33 @@ fn parse_metric(s: &str) -> Result<(String, HashMap<String, String>), String> {
     }
 }
 
+/// Split `s` on `sep`, except where `sep` appears inside a `"..."` quoted
+/// span — label values can themselves contain commas (e.g. `dst="a, b, c"`).
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_quotes = false;
+    let mut start = 0;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' if in_quotes => {
+                chars.next();
+            }
+            c if c == sep && !in_quotes => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 fn parse_labels(labels_str: &str, context: &str) -> Result<HashMap<String, String>, String> {
     let mut labels = HashMap::new();
-    for kv in labels_str.split(',') {
+    for kv in split_top_level(labels_str, ',') {
         let kv = kv.trim();
         if kv.is_empty() {
             continue;
@@ -434,14 +458,22 @@ fn steps_covered(s: &str) -> Result<i64, String> {
             .parse::<i64>()
             .map_err(|_| format!("Invalid repeat count: {s}"));
     }
-    if s.contains('+') && s.contains('x') {
-        let (_, count_str) = s
-            .split_once('x')
-            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
+    if let Some((_, _, _, count_str)) = split_expansion(s) {
         let count: i64 = count_str
             .parse()
             .map_err(|_| format!("Invalid count: {count_str}"))?;
         // Inclusive: `0+10x5` is six samples.
+        return Ok(count + 1);
+    }
+    if let Some((value_str, count_str)) = s
+        .split_once('x')
+        .filter(|(v, c)| !v.is_empty() && !c.is_empty())
+        && value_str.parse::<f64>().is_ok()
+    {
+        // Bare repeat syntax: "0x59" is sixty samples.
+        let count: i64 = count_str
+            .parse()
+            .map_err(|_| format!("Invalid count: {count_str}"))?;
         return Ok(count + 1);
     }
     Ok(1)
@@ -456,24 +488,20 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
         return Ok(Vec::new());
     }
 
-    // Check for expansion syntax: "start+step x count"
+    // Check for expansion syntax: "start+step x count" or "start-step x count".
     // Prometheus promqltest semantics are inclusive:
     // "0+10x5" => 6 samples: [0, 10, 20, 30, 40, 50].
     // Example: "0+10x100" => [0, 10, 20, ..., 1000].
-    if s.contains('+') && s.contains('x') {
-        let (lhs, count_str) = s
-            .split_once('x')
-            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
-        let (start_str, step_str) = lhs
-            .split_once('+')
-            .ok_or_else(|| format!("Invalid expansion syntax: {s}"))?;
-
+    if let Some((start_str, op, step_str, count_str)) = split_expansion(s) {
         let start: f64 = start_str
             .parse()
             .map_err(|_| format!("Invalid start value: {start_str}"))?;
-        let step: f64 = step_str
+        let mut step: f64 = step_str
             .parse()
             .map_err(|_| format!("Invalid step value: {step_str}"))?;
+        if op == '-' {
+            step = -step;
+        }
         let count: usize = count_str
             .parse()
             .map_err(|_| format!("Invalid count: {count_str}"))?;
@@ -481,6 +509,20 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
         Ok((0..=count)
             .map(|i| (i as i64, start + step * i as f64))
             .collect())
+    } else if let Some((value_str, count_str)) = s
+        .split_once('x')
+        .filter(|(v, c)| !v.is_empty() && !c.is_empty())
+    {
+        // Bare repeat syntax: "value x count" with no +/- step, e.g. "0x59" =>
+        // 60 copies of 0. Same inclusive count as the stepped form above.
+        let value: f64 = value_str
+            .parse()
+            .map_err(|_| format!("Invalid value: {value_str}"))?;
+        let count: usize = count_str
+            .parse()
+            .map_err(|_| format!("Invalid count: {count_str}"))?;
+
+        Ok((0..=count).map(|i| (i as i64, value)).collect())
     } else {
         // Space-separated individual values
         s.split_whitespace()
@@ -493,6 +535,33 @@ fn parse_values(s: &str) -> Result<Vec<(i64, f64)>, String> {
             })
             .collect()
     }
+}
+
+fn split_expansion(s: &str) -> Option<(&str, char, &str, &str)> {
+    let (lhs, count_str) = s.split_once('x')?;
+    if count_str.is_empty() {
+        return None;
+    }
+
+    for (idx, op) in lhs.char_indices().skip(1) {
+        if op != '+' && op != '-' {
+            continue;
+        }
+
+        let prev = lhs[..idx].chars().next_back();
+        if matches!(prev, Some('e' | 'E')) {
+            continue;
+        }
+
+        let start_str = &lhs[..idx];
+        let step_str = &lhs[idx + op.len_utf8()..];
+        if start_str.is_empty() || step_str.is_empty() {
+            return None;
+        }
+        return Some((start_str, op, step_str, count_str));
+    }
+
+    None
 }
 
 fn parse_expected(line: &str) -> Result<(RangeSample, bool), String> {
@@ -595,7 +664,7 @@ fn parse_expect_directive(trimmed_line: &str) -> Result<Option<ExpectDirective>,
         return Ok(Some(ExpectDirective::Ordered));
     }
 
-    if trimmed_line == "expect fail" {
+    if trimmed_line == "expect fail" || trimmed_line.starts_with("expect fail msg:") {
         return Ok(Some(ExpectDirective::Fail));
     }
 
@@ -939,6 +1008,46 @@ mod tests {
                 (5, 50.0),
             ]
         );
+    }
+
+    #[test]
+    fn should_parse_negative_step_expansion_syntax() {
+        // given
+        let input = "8000-10x5";
+
+        // when
+        let vals = parse_values(input).unwrap();
+
+        // then
+        assert_eq!(
+            vals,
+            vec![
+                (0, 8000.0),
+                (1, 7990.0),
+                (2, 7980.0),
+                (3, 7970.0),
+                (4, 7960.0),
+                (5, 7950.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn should_parse_expansion_syntax_with_exponents() {
+        // given
+        let input = "1e-3+2e-4x2";
+
+        // when
+        let vals = parse_values(input).unwrap();
+
+        // then
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals[0].0, 0);
+        assert_eq!(vals[1].0, 1);
+        assert_eq!(vals[2].0, 2);
+        assert!((vals[0].1 - 0.001).abs() < f64::EPSILON);
+        assert!((vals[1].1 - 0.0012).abs() < f64::EPSILON);
+        assert!((vals[2].1 - 0.0014).abs() < f64::EPSILON);
     }
 
     #[test]
