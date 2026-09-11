@@ -2,10 +2,10 @@ use super::labels::{compute_binary_match_key, get_metric_signature, result_metri
 use crate::labels::SeriesFingerprint;
 use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
-use crate::promql::hashers::FingerprintHashSet;
+use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::HashSetExt;
-use orx_parallel::{IntoParIter, ParIter};
+use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
@@ -214,8 +214,8 @@ fn duplicate_side_error(side: &str) -> EvaluationError {
 /// cardinality, no on/ignoring label matching, and no fill values.
 /// In this state both sides are matched purely on their full label set
 /// minus `__name__`, and nothing is emitted for an unmatched key on either
-/// side, so [`eval_arith_ops_fast_path`] can do the whole job in one pass
-/// over the two sorted sides.
+/// side, so [`eval_arith_ops_fast_path`] can do the whole job with one hash
+/// probe per sample.
 fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
     // The `bool` modifier needs no special handling here: it only changes the
     // output of matched pairs (0/1 instead of filter), while unmatched entries
@@ -238,89 +238,85 @@ fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
             .is_some_and(|labels| list_names_metric(labels))
 }
 
-/// The no-modifier case: a merge-join of the two sides, each sorted by match
-/// key, emitting one result per matched key.
+/// Sentinel stored in the probe map for an RHS match key seen more than once.
+/// Only an error once an LHS sample actually matches the key; a repeated key
+/// that matches nothing produces nothing and is legal.
+const NO_MATCH: u32 = u32::MAX;
+/// Sentinel stored in the probe map for an RHS match key already paired with
+/// an LHS sample. Catches a repeated LHS key without a second set.
+const CONSUMED: u32 = u32::MAX - 1;
+
+/// The no-modifier case: a hash join, emitting one result per matched key.
 ///
 /// The general path ([`eval_arith_ops_merge_join`]) has to gather each key's
 /// group on both sides, because a group may be many-to-one and an unmatched
 /// group may need a fill. Here a key has at most one partner on each side and
 /// an unmatched key produces nothing, so no group is ever materialized: the
-/// LHS is walked in key order and a single cursor advances through the RHS.
+/// RHS is indexed in a hash map keyed by match key, then the LHS is probed
+/// against it in a single pass, emitting as it goes.
+///
+/// This replaced a sort-merge that sorted both sides by match key and walked
+/// them with a cursor. The two `sort_unstable_by_key` calls were the only
+/// superlinear work in the path, and replacing them with `O(1)` inserts and
+/// probes measured 10-17% faster from 1k to 100k series (M2, release
+/// build, Criterion A/B against the sort version, which was removed once the
+/// hash join won). Emission order is the one behavioural difference: LHS
+/// input order rather than ascending match key — the same order the set
+/// operators emit.
+///
+/// Two sentinels ride in the map value, which otherwise holds an index into
+/// `right_vector`, so the join needs no auxiliary duplicate-key set.
 fn eval_arith_ops_fast_path(
     ctx: &ArithOpContext<'_>,
     left_vector: Vec<EvalSample>,
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
-    let left_sorted = collect_fingerprints(ctx, left_vector);
-    let right_sorted = collect_fingerprints(ctx, right_vector);
     let operator = ctx.operator;
     let apply = ctx.apply;
     let is_comparison = ctx.is_comparison;
     let return_bool = ctx.return_bool;
 
-    // Serial, at every operand size.
-    //
-    // The join used to fan out across threads unconditionally. Measured serial
-    // against parallel on the same build (M2, release, `a + b` and `a > b`,
-    // operands shaped like selector output), serial wins at every size from
-    // 1000 to 100000 series and there is no crossover above it either:
-    //
-    // | series  | serial  | parallel |
-    // |---------|---------|----------|
-    // | 1000    | 1.0 ms  | 3.9 ms   |
-    // | 10000   | 12.9 ms | 34.4 ms  |
-    // | 100000  | 217 ms  | 348 ms   |
-    //
-    // The fan-out has nothing left to amortize. The arithmetic is a handful of
-    // instructions; the real per-sample cost is building the result label set,
-    // which allocates — and allocating on eight threads at once contends far
-    // worse than it parallelizes. On top of that, `flat_map` needs a `Vec` per
-    // LHS sample and a merge, where this needs one output vector and no merge.
-    // Callers are already parallel besides: a range query fans its step loop
-    // out and lands here once per step.
-    let mut result = Vec::with_capacity(left_sorted.len().min(right_sorted.len()));
-    // Cursor into the RHS. The LHS is visited in ascending key order, so the
-    // RHS entry that can match the current LHS key is never behind the one
-    // that matched the previous key: the cursor only moves forward, and the
-    // whole join is one pass over each side.
-    let mut cursor = 0;
-    // Match key of the previous LHS sample. Both sides are sorted by key, so a
-    // repeated key on the LHS shows up as two adjacent entries.
-    let mut prev_fp: Option<SeriesFingerprint> = None;
+    let right_keys = collect_match_keys(&right_vector, ctx.matching);
 
-    for (lhs_fp, mut lhs) in left_sorted {
-        while cursor < right_sorted.len() && right_sorted[cursor].0 < lhs_fp {
-            cursor += 1;
+    // Build the probe side. A repeated key is recorded as NO_MATCH rather
+    // than counted, so the duplicate is only reported if the LHS matches it.
+    let mut index: FingerprintHashMap<u32> =
+        FingerprintHashMap::with_capacity_and_hasher(right_vector.len(), Default::default());
+    for (i, key) in right_keys.into_iter().enumerate() {
+        let slot_i = u32::try_from(i).expect("operand has more than u32::MAX series");
+        let slot = *index.entry(key).or_insert(slot_i);
+        if slot != slot_i {
+            index.insert(key, NO_MATCH);
         }
-        let start = cursor;
-        let matched = start < right_sorted.len() && right_sorted[start].0 == lhs_fp;
-        let lhs_repeats = prev_fp == Some(lhs_fp);
-        prev_fp = Some(lhs_fp);
+    }
 
-        if !matched {
+    let left_keys = collect_match_keys(&left_vector, ctx.matching);
+
+    let mut result = Vec::with_capacity(left_vector.len().min(right_vector.len()));
+    for (mut lhs, key) in left_vector.into_iter().zip(left_keys) {
+        let Some(&slot) = index.get(&key) else {
             continue;
-        }
+        };
 
         // Cardinality. One-to-one means exactly one partner on each side of a
         // matched key. This is the same check the modifier path makes on its
         // match-key groups, and like there it is decided by the grouping
-        // alone — a comparison that would come out false still errors. A key
-        // that matches nothing may repeat freely on either side: it produces
-        // nothing, so there is nothing to be ambiguous about.
+        // alone — a comparison that would come out false still errors.
         //
-        // Without this the fast path emitted one result per RHS partner,
-        // which for `a + {env="prod"}` — a bare selector matching several
-        // metrics — meant several samples with identical labels. At top
-        // level the uniqueness check caught that under a generic message;
+        // Without the RHS check the fast path emitted one result per RHS
+        // partner, which for `a + {env="prod"}` — a bare selector matching
+        // several metrics — meant several samples with identical labels. At
+        // top level the uniqueness check caught that under a generic message;
         // inside an aggregation it was silently summed.
-        if start + 1 < right_sorted.len() && right_sorted[start + 1].0 == lhs_fp {
+        if slot == NO_MATCH {
             return Err(duplicate_side_error(ctx.one_side()));
         }
-        if lhs_repeats {
+        if slot == CONSUMED {
             return Err(duplicate_side_error(ctx.many_side()));
         }
+        index.insert(key, CONSUMED);
 
-        let rhs = &right_sorted[start].1;
+        let rhs = &right_vector[slot as usize];
         let op_value = apply(lhs.value, rhs.value);
 
         // For non-bool comparisons, filter out false results (0.0).
@@ -355,6 +351,31 @@ fn eval_arith_ops_fast_path(
     }
 
     Ok(ExprResult::InstantVector(result))
+}
+
+/// Match keys for a whole operand, spread across threads above
+/// [`PARALLEL_MATCH_KEY_THRESHOLD`] exactly as [`collect_fingerprints`] does.
+///
+/// Kept separate from `collect_fingerprints` because the hash join needs the
+/// samples to stay in place: it maps over a borrow and returns keys alone,
+/// where the merge join consumes its operand into `(key, sample)` pairs so it
+/// can sort them.
+fn collect_match_keys(
+    samples: &[EvalSample],
+    matching: Option<&LabelModifier>,
+) -> Vec<SeriesFingerprint> {
+    if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
+        samples
+            .iter()
+            .iter_into_par()
+            .map(|s| compute_binary_match_key(&s.labels, matching))
+            .collect()
+    } else {
+        samples
+            .iter()
+            .map(|s| compute_binary_match_key(&s.labels, matching))
+            .collect()
+    }
 }
 
 fn build_result_sample(
@@ -936,14 +957,14 @@ mod bench_support {
     /// Which shape of `a + b` to measure.
     ///
     /// The old helpers had an "unaligned" shape that reversed one operand.
-    /// Both operands are sorted by match key before the join, so it measured
-    /// exactly the same path as "aligned" and told nothing.
+    /// The join is keyed on the match key, so operand order does not select a
+    /// different path and it measured exactly the same thing as "aligned".
     #[derive(Clone, Copy)]
     pub enum VectorVectorShape {
         /// Every key has a partner: the fast path, all matched.
         Aligned,
         /// Half the keys on each side have a partner. Exercises the
-        /// unmatched-skip branches, which the aligned shape never reaches.
+        /// probe-miss path, which the aligned shape never reaches.
         HalfOverlap,
         /// Half overlap under `fill_left`/`fill_right`, which forces the
         /// general merge-join and makes both fill branches emit.
