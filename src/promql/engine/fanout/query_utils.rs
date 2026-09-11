@@ -1,5 +1,4 @@
 use crate::common::{Sample, Timestamp};
-use crate::labels::Labels;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
@@ -30,20 +29,18 @@ pub(super) fn handle_instant_query(
     let series = series_by_selectors(ctx, &[selector], None)?;
     let samples = series
         .iter()
-        .map(|(s, k)| {
+        .filter_map(|(s, k)| {
             let series = s.deref();
-            let key = k.to_string();
-            (series, key)
-        })
-        .iter_into_par()
-        .filter_map(|(s, key)| {
+
             // in prometheus, given a timestamp and delta, we select the latest sample in the range
             // (ts - delta, ts], so we need to adjust the timestamp accordingly
             let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
             let end_time = timestamp;
 
-            let sample = s.last_sample_in_range(start_time, end_time)?;
-            let labels = metric_name_to_proto_labels(&s.labels);
+            let sample = series.last_sample_in_range(start_time, end_time)?;
+            let labels = metric_name_to_proto_labels(&series.labels);
+            let key = k.to_string();
+
             Some(InstantSample {
                 labels,
                 value: sample.value,
@@ -78,13 +75,12 @@ pub(super) fn local_instant_eval_samples(
 
     let samples = series
         .iter()
-        .map(|(s, _)| s.deref())
-        .iter_into_par()
         .filter_map(|s| {
-            let sample = s.last_sample_in_range(start_time, timestamp)?;
-            let labels: Labels = (&s.labels).into();
+            let series = s.0.deref();
+            let sample = series.last_sample_in_range(start_time, timestamp)?;
+            let labels = EvalLabels::interned(&series.labels);
             Some(EvalSample {
-                labels: labels.into(),
+                labels,
                 value: sample.value,
                 timestamp_ms: sample.timestamp,
                 drop_name: false,
