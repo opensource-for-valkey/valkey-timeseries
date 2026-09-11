@@ -1,4 +1,4 @@
-use crate::labels::{HasFingerprint, SeriesFingerprint, SeriesLabel};
+use crate::labels::{HasFingerprint, SeriesFingerprint, SeriesLabel, fingerprint_labels};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
@@ -90,22 +90,13 @@ pub(super) fn result_metric(
     labels
 }
 
-/// Fingerprint a sample's labels as the output will carry them: with
-/// `__name__` excluded when `drop_name` is set.
+/// Fingerprint of a sample's *effective* label set: the labels as they will
+/// stand once a pending `__name__` drop is applied.
 pub(crate) fn get_metric_signature(labels: &EvalLabels, drop_name: bool) -> SeriesFingerprint {
     if !drop_name {
         return labels.fingerprint();
     }
-    let mut hasher: xxhash3_128::Hasher = Default::default();
-
-    labels
-        .iter()
-        .filter(|l| l.name != METRIC_NAME)
-        .for_each(|label| {
-            hash_label(&mut hasher, &label);
-        });
-
-    hasher.finish_128()
+    fingerprint_labels(labels.iter().filter(|l| l.name != METRIC_NAME))
 }
 
 pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
@@ -286,6 +277,39 @@ fn join_regexp_values(values: AHashSet<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two samples whose labels are identical once pending `__name__` drops
+    /// are applied are duplicates, whatever their `drop_name` flags say.
+    #[test]
+    fn unique_labelsets_compares_effective_labels_across_drop_name_flags() {
+        let sample = |labels: &[(&str, &str)], drop_name: bool| EvalSample {
+            timestamp_ms: 0,
+            value: 1.0,
+            labels: EvalLabels::from_pairs(labels),
+            drop_name,
+        };
+
+        // Materialized state: the dropping sample has already lost its name.
+        let materialized = [
+            sample(&[("env", "1")], false),
+            sample(&[("env", "1")], true),
+        ];
+        assert!(ensure_unique_labelsets(&materialized).is_err());
+
+        // Pending state: the name is still there but owed.
+        let pending = [
+            sample(&[("env", "1")], false),
+            sample(&[("__name__", "m"), ("env", "1")], true),
+        ];
+        assert!(ensure_unique_labelsets(&pending).is_err());
+
+        // Genuinely distinct.
+        let distinct = [
+            sample(&[("env", "1")], false),
+            sample(&[("__name__", "m"), ("env", "1")], false),
+        ];
+        assert!(ensure_unique_labelsets(&distinct).is_ok());
+    }
 
     /// Parse `query` and return its top-level binary expression.
     fn binary_expr(query: &str) -> BinaryExpr {
