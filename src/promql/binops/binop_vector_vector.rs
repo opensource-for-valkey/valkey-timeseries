@@ -1542,6 +1542,30 @@ mod tests {
         assert_eq!(only.labels.get("__name__"), Some("a"));
     }
 
+    /// A pending `__name__` drop is part of a sample's effective label set:
+    /// under `on(__name__)` the side that owes a drop must not match a side
+    /// that still carries the name.
+    #[test]
+    fn pending_name_drop_is_absent_from_on_name_matching() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::token::T_LAND;
+
+        let modifier = BinModifier::default().with_matching(Some(LabelModifier::Include(
+            ModifierLabels::new(vec!["__name__"]),
+        )));
+        let expr = make_expr(T_LAND, Some(modifier));
+        let mut lhs = sample(1000, 1.0, &[("__name__", "left")]);
+        lhs.drop_name = true;
+        let rhs = sample(1000, 2.0, &[("__name__", "left")]);
+
+        let result = eval_binop_vector_vector(&expr, vec![lhs], vec![rhs])
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+
+        assert!(result.is_empty());
+    }
+
     // ── fast-path cardinality ───────────────────────────────────────────────
     //
     // The no-modifier path must enforce one-to-one exactly as the modifier
