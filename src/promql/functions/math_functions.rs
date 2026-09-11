@@ -9,6 +9,18 @@ fn exec_unary_fn(arg: PromQLArg, f: fn(f64) -> f64) -> EvalResult<ExprResult> {
     map_scalar_or_vector(arg, f)
 }
 
+fn promql_sgn(v: f64) -> f64 {
+    if v.is_nan() {
+        f64::NAN
+    } else if v > 0.0 {
+        1.0
+    } else if v < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 macro_rules! make_unary_function {
     ( $name: ident, $rf: expr ) => {
         #[derive(Copy, Clone, Default)]
@@ -45,7 +57,7 @@ make_unary_function!(LnFunction, f64::ln);
 make_unary_function!(Log10Function, f64::log10);
 make_unary_function!(Log2Function, f64::log2);
 make_unary_function!(RadFunction, f64::to_radians);
-make_unary_function!(SgnFunction, f64::signum);
+make_unary_function!(SgnFunction, promql_sgn);
 make_unary_function!(SinFunction, f64::sin);
 make_unary_function!(SinhFunction, sinh);
 make_unary_function!(SqrtFunction, f64::sqrt);
@@ -264,5 +276,21 @@ impl PromQLFunction for MinOfFunction {
             .expect("validated args.len() == 2")
             .into_scalar()?;
         Ok(ExprResult::Scalar(min_with_nan(a, b)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::promql_sgn;
+
+    #[test]
+    fn should_match_promql_sgn_semantics() {
+        assert_eq!(promql_sgn(f64::NEG_INFINITY), -1.0);
+        assert_eq!(promql_sgn(-50.0), -1.0);
+        assert_eq!(promql_sgn(-0.0), 0.0);
+        assert_eq!(promql_sgn(0.0), 0.0);
+        assert_eq!(promql_sgn(100.0), 1.0);
+        assert_eq!(promql_sgn(f64::INFINITY), 1.0);
+        assert!(promql_sgn(f64::NAN).is_nan());
     }
 }
