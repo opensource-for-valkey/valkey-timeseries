@@ -46,7 +46,7 @@ fn calculate_double_exponential_smoothing_value(
         trend = trend_factor * (level - previous_level) + (1.0 - trend_factor) * trend;
     }
 
-    Some(level + trend)
+    Some(level)
 }
 
 const FUNCTION_NAME: &str = "double_exponential_smoothing_value";
