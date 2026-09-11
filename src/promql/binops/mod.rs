@@ -68,28 +68,40 @@ pub(crate) fn eval_binary_expr(
     }
 }
 
-pub(crate) fn apply_binary_op(op: TokenType, left: f64, right: f64) -> EvalResult<f64> {
-    // Use the token constants with TokenType::new() for clean comparison
-    match op.id() {
-        T_ADD => Ok(left + right),
-        T_SUB => Ok(left - right),
-        T_MUL => Ok(left * right),
+/// The scalar function behind a binary operator, resolved once.
+///
+/// Per-sample loops resolve the operator up front through this and then call
+/// the function, so the one failure mode — a token that is not an arithmetic
+/// or comparison operator, which the parser never produces for a vector
+/// operation — is reported once, before any sample is looked at, instead of
+/// being handled (differently) at every call site.
+pub(crate) fn binary_op_fn(op: TokenType) -> EvalResult<fn(f64, f64) -> f64> {
+    Ok(match op.id() {
+        T_ADD => |l, r| l + r,
+        T_SUB => |l, r| l - r,
+        T_MUL => |l, r| l * r,
         // PromQL arithmetic is IEEE 754 float arithmetic, so division by zero is
         // signed infinity (`1 / 0` is `+Inf`) and only `0 / 0` is NaN. Modulo by
         // zero is NaN, which is what `%` already yields.
-        T_DIV => Ok(left / right),
-        T_MOD => Ok(left % right),
-        T_NEQ => Ok(if left != right { 1.0 } else { 0.0 }),
-        T_LSS => Ok(if left < right { 1.0 } else { 0.0 }),
-        T_GTR => Ok(if left > right { 1.0 } else { 0.0 }),
-        T_LTE => Ok(if left <= right { 1.0 } else { 0.0 }),
-        T_GTE => Ok(if left >= right { 1.0 } else { 0.0 }),
-        T_EQLC => Ok(if left == right { 1.0 } else { 0.0 }),
-        T_POW => Ok(left.powf(right)),
-        T_ATAN2 => Ok(left.atan2(right)),
-        _ => Err(EvaluationError::InternalError(format!(
-            "Binary operator not yet implemented: {:?}",
-            op
-        ))),
-    }
+        T_DIV => |l, r| l / r,
+        T_MOD => |l, r| l % r,
+        T_NEQ => |l, r| if l != r { 1.0 } else { 0.0 },
+        T_LSS => |l, r| if l < r { 1.0 } else { 0.0 },
+        T_GTR => |l, r| if l > r { 1.0 } else { 0.0 },
+        T_LTE => |l, r| if l <= r { 1.0 } else { 0.0 },
+        T_GTE => |l, r| if l >= r { 1.0 } else { 0.0 },
+        T_EQLC => |l, r| if l == r { 1.0 } else { 0.0 },
+        T_POW => f64::powf,
+        T_ATAN2 => f64::atan2,
+        _ => {
+            return Err(EvaluationError::InternalError(format!(
+                "Binary operator not yet implemented: {:?}",
+                op
+            )));
+        }
+    })
+}
+
+pub(crate) fn apply_binary_op(op: TokenType, left: f64, right: f64) -> EvalResult<f64> {
+    Ok(binary_op_fn(op)?(left, right))
 }

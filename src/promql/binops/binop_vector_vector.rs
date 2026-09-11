@@ -1,6 +1,6 @@
 use super::labels::{compute_binary_match_key, get_metric_signature, result_metric};
 use crate::labels::SeriesFingerprint;
-use crate::promql::binops::apply_binary_op;
+use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
@@ -95,9 +95,13 @@ fn drop_names_if_necessary(
 }
 
 struct ArithOpContext<'a> {
-    card: &'a VectorMatchCardinality,
     matching: Option<&'a LabelModifier>,
     operator: TokenType,
+    /// `operator`, resolved to its scalar function once. Every per-sample
+    /// loop calls this rather than re-dispatching on the token, and the one
+    /// way dispatch can fail is reported by [`build_arith_op_context`] before
+    /// any sample is touched.
+    apply: fn(f64, f64) -> f64,
     is_comparison: bool,
     return_bool: bool,
     has_fill: bool,
@@ -148,6 +152,7 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
     };
 
     let operator = expr.op;
+    let apply = binary_op_fn(operator)?;
     let is_comparison = operator.is_comparison_operator();
     let return_bool = expr.return_bool();
     let has_fill = fill_left.is_some() || fill_right.is_some();
@@ -155,9 +160,9 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
     let is_group_right = matches!(card, VectorMatchCardinality::OneToMany(_));
 
     Ok(ArithOpContext {
-        card,
         matching,
         operator,
+        apply,
         is_comparison,
         return_bool,
         has_fill,
@@ -208,9 +213,10 @@ fn duplicate_side_error(side: &str) -> EvaluationError {
 /// Returns `true` when the expression carries no modifier — meaning OneToOne
 /// cardinality, no on/ignoring label matching, and no fill values.
 /// In this state both sides are matched purely on their full label set
-/// minus `__name__`, so a hashmap-free merge-join is safe and correct.
+/// minus `__name__`, and nothing is emitted for an unmatched key on either
+/// side, so [`eval_arith_ops_fast_path`] can do the whole job in one pass
+/// over the two sorted sides.
 fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
-    // One-to-one, no on/ignoring matching, no fill values => safe merge-join.
     // The `bool` modifier needs no special handling here: it only changes the
     // output of matched pairs (0/1 instead of filter), while unmatched entries
     // drop out of the result exactly as they do without `bool`.
@@ -232,9 +238,14 @@ fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
             .is_some_and(|labels| list_names_metric(labels))
 }
 
-/// Evaluates arithmetic or comparison operations on two vectors, assuming the operation
-/// has no modifiers (`fill`, `on`/ `ignoring`, e.t.c).
+/// The no-modifier case: a merge-join of the two sides, each sorted by match
+/// key, emitting one result per matched key.
 ///
+/// The general path ([`eval_arith_ops_merge_join`]) has to gather each key's
+/// group on both sides, because a group may be many-to-one and an unmatched
+/// group may need a fill. Here a key has at most one partner on each side and
+/// an unmatched key produces nothing, so no group is ever materialized: the
+/// LHS is walked in key order and a single cursor advances through the RHS.
 fn eval_arith_ops_fast_path(
     ctx: &ArithOpContext<'_>,
     left_vector: Vec<EvalSample>,
@@ -243,6 +254,7 @@ fn eval_arith_ops_fast_path(
     let left_sorted = collect_fingerprints(ctx, left_vector);
     let right_sorted = collect_fingerprints(ctx, right_vector);
     let operator = ctx.operator;
+    let apply = ctx.apply;
     let is_comparison = ctx.is_comparison;
     let return_bool = ctx.return_bool;
 
@@ -267,12 +279,20 @@ fn eval_arith_ops_fast_path(
     // Callers are already parallel besides: a range query fans its step loop
     // out and lands here once per step.
     let mut result = Vec::with_capacity(left_sorted.len().min(right_sorted.len()));
+    // Cursor into the RHS. The LHS is visited in ascending key order, so the
+    // RHS entry that can match the current LHS key is never behind the one
+    // that matched the previous key: the cursor only moves forward, and the
+    // whole join is one pass over each side.
+    let mut cursor = 0;
     // Match key of the previous LHS sample. Both sides are sorted by key, so a
     // repeated key on the LHS shows up as two adjacent entries.
     let mut prev_fp: Option<SeriesFingerprint> = None;
 
     for (lhs_fp, mut lhs) in left_sorted {
-        let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
+        while cursor < right_sorted.len() && right_sorted[cursor].0 < lhs_fp {
+            cursor += 1;
+        }
+        let start = cursor;
         let matched = start < right_sorted.len() && right_sorted[start].0 == lhs_fp;
         let lhs_repeats = prev_fp == Some(lhs_fp);
         prev_fp = Some(lhs_fp);
@@ -301,10 +321,7 @@ fn eval_arith_ops_fast_path(
         }
 
         let rhs = &right_sorted[start].1;
-
-        let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
-            continue;
-        };
+        let op_value = apply(lhs.value, rhs.value);
 
         // For non-bool comparisons, filter out false results (0.0).
         if is_comparison && !return_bool && op_value == 0.0 {
@@ -357,13 +374,7 @@ fn build_result_sample(
         one_sample.value
     };
 
-    let op_result = match apply_binary_op(ctx.operator, lhs_val, rhs_val) {
-        Ok(v) => v,
-        Err(e) => unreachable!(
-            "binary operator {:?} should not fail on valid f64 inputs: {}",
-            ctx.operator, e
-        ),
-    };
+    let op_result = (ctx.apply)(lhs_val, rhs_val);
 
     // For non-bool comparisons, filter out false results (0.0).
     if ctx.is_comparison && !ctx.return_bool && op_result == 0.0 {
@@ -447,49 +458,6 @@ fn eval_arith_ops(
         return eval_arith_ops_fast_path(&ctx, left_vector, right_vector);
     }
 
-    #[inline]
-    fn handle_match(
-        ctx: &ArithOpContext,
-        many_sample: &EvalSample,
-        one_samples: &[EvalSample],
-    ) -> impl Iterator<Item = EvalSample> {
-        one_samples
-            .iter()
-            .filter_map(move |one_sample| build_result_sample(ctx, many_sample, one_sample))
-    }
-
-    #[inline]
-    fn handle_unmatched_many(
-        ctx: &ArithOpContext,
-        many_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-        many_key: SeriesFingerprint,
-        result: &mut Vec<EvalSample>,
-    ) {
-        if let Some(fill_val) = ctx.fill_for_one {
-            let many_samples = take_group(many_it, many_key);
-            emit_fill_for_one(ctx, many_samples, fill_val, result);
-        } else {
-            skip_group(many_it, many_key);
-        }
-    }
-
-    #[inline]
-    fn handle_unmatched_one(
-        ctx: &ArithOpContext,
-        one_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-        one_key: SeriesFingerprint,
-        result: &mut Vec<EvalSample>,
-    ) -> EvalResult<()> {
-        if let Some(fill_val) = ctx.fill_for_many {
-            let one_samples = take_group(one_it, one_key);
-            emit_fill_for_many(ctx, one_samples, fill_val, result)?;
-        } else {
-            let one_group_len = skip_group_count(one_it, one_key);
-            validate_one_group_len(ctx, one_group_len)?;
-        }
-        Ok(())
-    }
-
     // Determine which side is "one" vs. "many" for matching purposes.
     // For one-to-one mappings, we treat the right-hand side as the "one" side.
     let (one_vec, many_vec) = if ctx.is_group_right {
@@ -498,15 +466,27 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
+    let result = eval_arith_ops_merge_join(&ctx, one_vec, many_vec)?;
+    Ok(ExprResult::InstantVector(result))
+}
+
+/// The general case: every modifier combination the fast path declines.
+///
+/// Both sides become sorted `(match key, sample)` vectors and are zip-merged.
+/// Because both are ordered by key, an unmatched key on either side falls out
+/// of the merge as a run with no partner and is handled inline through the
+/// fill modifiers; there is no separate "unmatched" pass. A matched key's
+/// group is gathered on each side so its cardinality can be checked before
+/// the combinations are emitted.
+fn eval_arith_ops_merge_join(
+    ctx: &ArithOpContext<'_>,
+    one_vec: Vec<EvalSample>,
+    many_vec: Vec<EvalSample>,
+) -> EvalResult<Vec<EvalSample>> {
     let mut result = Vec::with_capacity(many_vec.len());
 
-    // Convert both sides to sorted `(fingerprint, EvalSample)` vectors and run a
-    // zip-merge (merge-join) over the two sorted sequences. Because both sides
-    // are sorted by match key, unmatched items on either side fall out of the
-    // merge naturally and are handled inline via the fill modifiers —
-    // no separate "unmatched" pass is required.
-    let mut many_it = collect_fingerprints(&ctx, many_vec).into_iter().peekable();
-    let mut one_it = collect_fingerprints(&ctx, one_vec).into_iter().peekable();
+    let mut many_it = collect_fingerprints(ctx, many_vec).into_iter().peekable();
+    let mut one_it = collect_fingerprints(ctx, one_vec).into_iter().peekable();
 
     loop {
         match (
@@ -516,19 +496,19 @@ fn eval_arith_ops(
             (None, None) => break,
             // Only "many" entries remain — all unmatched.
             (Some(many_key), None) => {
-                handle_unmatched_many(&ctx, &mut many_it, many_key, &mut result);
+                handle_unmatched_many(ctx, &mut many_it, many_key, &mut result);
             }
             // Only "one" entries remain — all unmatched.
             (None, Some(one_key)) => {
-                handle_unmatched_one(&ctx, &mut one_it, one_key, &mut result)?;
+                handle_unmatched_one(ctx, &mut one_it, one_key, &mut result)?;
             }
             (Some(many_key), Some(one_key)) => {
                 if many_key < one_key {
                     // "many" key has no "one" partner — unmatched.
-                    handle_unmatched_many(&ctx, &mut many_it, many_key, &mut result);
+                    handle_unmatched_many(ctx, &mut many_it, many_key, &mut result);
                 } else if many_key > one_key {
                     // "one" key has no "many" partner — unmatched.
-                    handle_unmatched_one(&ctx, &mut one_it, one_key, &mut result)?;
+                    handle_unmatched_one(ctx, &mut one_it, one_key, &mut result)?;
                 } else {
                     // Matched key on both sides.
                     // Collect groups so we can safely inspect cardinality and then
@@ -552,15 +532,14 @@ fn eval_arith_ops(
                         if iter.next().is_some() {
                             return Err(duplicate_side_error(ctx.many_side()));
                         }
-                        result.extend(handle_match(&ctx, &sample, &one_samples));
+                        result.extend(handle_match(ctx, &sample, &one_samples));
                         continue;
                     }
 
                     // `one_samples` holds exactly one element: the check
-                    // above returns an error for any longer group. A fan-out
-                    // over it was unreachable, so this is a single pass.
+                    // above returns an error for any longer group.
                     for many_sample in many_samples {
-                        result.extend(handle_match(&ctx, &many_sample, &one_samples));
+                        result.extend(handle_match(ctx, &many_sample, &one_samples));
                     }
                 }
             }
@@ -582,7 +561,55 @@ fn eval_arith_ops(
         }
     }
 
-    Ok(ExprResult::InstantVector(result))
+    Ok(result)
+}
+
+/// Every combination of one "many" sample with the "one" group it matched.
+#[inline]
+fn handle_match<'a>(
+    ctx: &'a ArithOpContext<'_>,
+    many_sample: &'a EvalSample,
+    one_samples: &'a [EvalSample],
+) -> impl Iterator<Item = EvalSample> + 'a {
+    one_samples
+        .iter()
+        .filter_map(move |one_sample| build_result_sample(ctx, many_sample, one_sample))
+}
+
+/// A "many"-side run with no "one" partner: filled if the missing side has a
+/// fill value, otherwise skipped.
+#[inline]
+fn handle_unmatched_many(
+    ctx: &ArithOpContext<'_>,
+    many_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
+    many_key: SeriesFingerprint,
+    result: &mut Vec<EvalSample>,
+) {
+    if let Some(fill_val) = ctx.fill_for_one {
+        let many_samples = take_group(many_it, many_key);
+        emit_fill_for_one(ctx, many_samples, fill_val, result);
+    } else {
+        skip_group(many_it, many_key);
+    }
+}
+
+/// A "one"-side run with no "many" partner: filled if the missing side has a
+/// fill value, otherwise skipped — but its cardinality is still checked.
+#[inline]
+fn handle_unmatched_one(
+    ctx: &ArithOpContext<'_>,
+    one_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
+    one_key: SeriesFingerprint,
+    result: &mut Vec<EvalSample>,
+) -> EvalResult<()> {
+    if let Some(fill_val) = ctx.fill_for_many {
+        let one_samples = take_group(one_it, one_key);
+        emit_fill_for_many(ctx, one_samples, fill_val, result)?;
+    } else {
+        let one_group_len = skip_group_count(one_it, one_key);
+        validate_one_group_len(ctx, one_group_len)?;
+    }
+    Ok(())
 }
 
 #[inline]
