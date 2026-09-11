@@ -339,6 +339,32 @@ mod tests {
         }
     }
 
+    /// Prometheus `shouldDropMetricName` covers `%`, `^` and `atan2` as well as
+    /// `+ - * /`, so `metric ^ 2` yields a nameless series. The promqltest case
+    /// for this (`node_cpu ^ 2` in operators.test) cannot catch a regression,
+    /// because a `{...}` expectation matches with or without `__name__`.
+    #[test]
+    fn mod_pow_atan2_drop_metric_name() {
+        use promql_parser::parser::token::{T_ATAN2, T_MOD, T_POW};
+
+        for op in [T_MOD, T_POW, T_ATAN2] {
+            let expr = BinaryExpr {
+                op: TokenType::new(op),
+                lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                modifier: None,
+            };
+            let out = match eval_binop_vector_scalar(&expr, vec![sample(8.0)], 3.0) {
+                Ok(ExprResult::InstantVector(v)) => v,
+                other => panic!("expected InstantVector, got {other:?}"),
+            };
+            assert!(
+                out[0].drop_name,
+                "op {op:?} must mark __name__ for dropping"
+            );
+        }
+    }
+
     /// Prometheus semantics: a filtering comparison keeps the *original* sample
     /// value for every sample that passes; only `bool` rewrites values to 0/1.
     #[test]

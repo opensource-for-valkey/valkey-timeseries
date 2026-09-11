@@ -7,7 +7,8 @@ use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{
-    T_ADD, T_BOTTOMK, T_DIV, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_MUL, T_SUB, T_TOPK, TokenType,
+    T_ADD, T_ATAN2, T_BOTTOMK, T_DIV, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_MOD, T_MUL, T_POW, T_SUB,
+    T_TOPK, TokenType,
 };
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
@@ -16,10 +17,14 @@ use std::borrow::Cow;
 use twox_hash::xxhash3_128;
 
 /// Returns true if the binary operation changes the metric schema, meaning
-/// `__name__` should be dropped from the result. Mirrors Prometheus's `resultMetric`
-/// logic in engine.go.
+/// `__name__` should be dropped from the result. Mirrors Prometheus's
+/// `shouldDropMetricName` in engine.go, which lists `%`, `^` and `atan2`
+/// alongside the four basic arithmetic operators.
 pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
-    matches!(op.id(), T_ADD | T_SUB | T_MUL | T_DIV)
+    matches!(
+        op.id(),
+        T_ADD | T_SUB | T_MUL | T_DIV | T_POW | T_MOD | T_ATAN2
+    )
 }
 
 /// Compute a match signature for a sample's labels per Prometheus binary op semantics.
