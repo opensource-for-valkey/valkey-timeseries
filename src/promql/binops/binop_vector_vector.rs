@@ -447,11 +447,17 @@ fn eval_arith_ops(
     mut left_vector: Vec<EvalSample>,
     mut right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
+    // Resolve the operator before looking at the operands. An unsupported
+    // operator is a property of the expression, not of the data, so it is
+    // reported for an empty operand too — and identically whether one side is
+    // empty or both. Building the context used to sit below the both-empty
+    // return, which made an unsupported operator error for `[] op x` but not
+    // for `[] op []`.
+    let ctx = build_arith_op_context(expr)?;
+
     if left_vector.is_empty() && right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(vec![]));
     }
-
-    let ctx = build_arith_op_context(expr)?;
 
     if left_vector.is_empty() || right_vector.is_empty() {
         // early return if we have no fill modifiers
@@ -1102,6 +1108,38 @@ mod tests {
 
     fn find_sample<'a>(result: &'a [EvalSample], env: &str) -> Option<&'a EvalSample> {
         result.iter().find(|s| s.labels.get("env") == Some(env))
+    }
+
+    // ── operator validation is independent of the operands ────────────────
+
+    /// An operator the evaluator cannot resolve is a property of the
+    /// expression, not of the data, so every operand shape must report it the
+    /// same way. Both operands empty used to return before the operator was
+    /// even looked at.
+    #[test]
+    fn test_unsupported_operator_is_reported_for_every_operand_shape() {
+        use promql_parser::parser::token::T_TOPK;
+
+        // An aggregate token where a binary operator belongs: something
+        // `binary_op_fn` cannot resolve, which the parser would never build.
+        let expr = make_expr(T_TOPK, None);
+        let one = || vec![sample(1000, 1.0, &[("env", "a")])];
+
+        let shapes = [
+            (vec![], vec![]),
+            (one(), vec![]),
+            (vec![], one()),
+            (one(), one()),
+        ];
+
+        for (left, right) in shapes {
+            let err = eval_arith_ops(&expr, left, right)
+                .expect_err("an unsupported operator must be reported");
+            assert!(
+                err.to_string().contains("not yet implemented"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     // ── fill_right: unmatched LHS series gets a fill value for the missing RHS ──
