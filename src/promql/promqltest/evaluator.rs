@@ -2,17 +2,29 @@ use crate::promql::engine::promql_engine::PromqlQuerier;
 use crate::promql::{QueryOptions, QueryValue, RangeSample};
 use std::time::SystemTime;
 
+/// Options for every conformance eval. Mirrors Prometheus' promqltest, which
+/// runs its engine with `EnableExperimentalFunctions = true` so the suite can
+/// exercise every function; this must not depend on the server's default,
+/// which is expected to ship with experimental functions disabled.
+pub(super) fn test_query_options() -> QueryOptions {
+    QueryOptions {
+        enable_experimental_functions: true,
+        ..QueryOptions::default()
+    }
+}
+
 /// Execute instant query and return structured results
 pub(super) fn eval_instant(
     tsdb: &PromqlQuerier,
     time: SystemTime,
     query: &str,
 ) -> Result<QueryValue, String> {
+    let options = test_query_options();
     // Quick debug: attempt to parse the query directly to get a more detailed parser error
     match promql_parser::parser::parse(query) {
         Ok(_) => {
             // parsed OK, proceed
-            tsdb.eval_query(query, Some(time), &QueryOptions::default())
+            tsdb.eval_query(query, Some(time), &options)
                 .map_err(|e| e.to_string())
         }
         Err(e) => {
@@ -31,11 +43,11 @@ pub(super) fn eval_instant(
                     normalized
                 );
                 return tsdb
-                    .eval_query(&normalized, Some(time), &QueryOptions::default())
+                    .eval_query(&normalized, Some(time), &options)
                     .map_err(|e| e.to_string());
             }
             // fall through to attempt evaluation which will return error
-            tsdb.eval_query(query, Some(time), &QueryOptions::default())
+            tsdb.eval_query(query, Some(time), &options)
                 .map_err(|err| err.to_string())
         }
     }
@@ -48,7 +60,7 @@ pub(super) fn eval_range(
     step: std::time::Duration,
     query: &str,
 ) -> Result<Vec<RangeSample>, String> {
-    let options = QueryOptions::default();
+    let options = test_query_options();
     let range = start..=end;
     tsdb.eval_query_range(query, range, step, &options)
         .map_err(|e| e.to_string())

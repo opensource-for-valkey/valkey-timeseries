@@ -2070,8 +2070,6 @@ eval range from 1s to 9s step 2s metric_for_at @ end()
 
 # Tests for min_of() and max_of() scalar functions.
 
-ignore
-
 # min_of(a, b) returns math.Min(a, b).
 # max_of(a, b) returns math.Max(a, b).
 
@@ -2121,5 +2119,3 @@ eval instant at 0s max_of(NaN, 3)
 
 eval instant at 0s max_of(3, NaN)
   NaN
-
-resume
