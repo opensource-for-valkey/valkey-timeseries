@@ -8,35 +8,37 @@ use criterion::BatchSize;
 #[cfg(feature = "bench")]
 // These items are provided by the crate under the `bench` feature.
 use valkey_timeseries::promql::binops::{
-    BenchOp, LabelMode, VectorScalarCase, bench_eval_aligned, bench_eval_unaligned,
-    bench_eval_with_fill,
+    BenchOp, LabelMode, VectorScalarCase, VectorVectorCase, VectorVectorShape,
 };
 
+/// Vector-vector `a + b` by input shape. Operand construction sits in
+/// `iter_batched`'s untimed setup and the result is returned to be freed
+/// untimed: at several heap allocations per sample, both would otherwise
+/// dominate the join being measured. (The old version timed them.)
 #[cfg(feature = "bench")]
 fn bench_paths(c: &mut Criterion) {
+    let shapes = [
+        ("aligned", VectorVectorShape::Aligned),
+        ("half_overlap", VectorVectorShape::HalfOverlap),
+        (
+            "half_overlap_with_fill",
+            VectorVectorShape::HalfOverlapWithFill,
+        ),
+    ];
+
     let mut group = c.benchmark_group("vector_vector_ops");
 
     for &size in &[100usize, 1_000usize, 10_000usize] {
-        group.bench_with_input(BenchmarkId::new("aligned", size), &size, |b, &s| {
-            b.iter(|| {
-                let r = bench_eval_aligned(std::hint::black_box(s));
-                std::hint::black_box(r);
-            })
-        });
-
-        group.bench_with_input(BenchmarkId::new("unaligned", size), &size, |b, &s| {
-            b.iter(|| {
-                let r = bench_eval_unaligned(std::hint::black_box(s));
-                std::hint::black_box(r);
-            })
-        });
-
-        group.bench_with_input(BenchmarkId::new("with_fill", size), &size, |b, &s| {
-            b.iter(|| {
-                let r = bench_eval_with_fill(std::hint::black_box(s));
-                std::hint::black_box(r);
-            })
-        });
+        for (name, shape) in shapes {
+            let case = VectorVectorCase::new(shape, size);
+            group.bench_with_input(BenchmarkId::new(name, size), &size, |b, _| {
+                b.iter_batched(
+                    || case.input(),
+                    |input| case.run(input),
+                    BatchSize::LargeInput,
+                )
+            });
+        }
     }
 
     group.finish();

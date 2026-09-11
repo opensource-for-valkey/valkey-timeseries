@@ -17,7 +17,7 @@ pub(in crate::promql) use labels::*;
 /// Re-exported for the external Criterion benchmark crates (`benches/fast_path.rs`),
 /// which reach these through `promql::binops`.
 #[cfg(feature = "bench")]
-pub use binop_vector_vector::{bench_eval_aligned, bench_eval_unaligned, bench_eval_with_fill};
+pub use binop_vector_vector::{VectorVectorCase, VectorVectorShape};
 
 #[cfg(feature = "bench")]
 pub use binop_vector_scalar::{BenchOp, LabelMode, VectorScalarCase, VectorScalarInput};

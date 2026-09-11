@@ -916,140 +916,138 @@ fn get_sample_fingerprints(
 }
 
 // ------------------------- Benchmark helpers -------------------------------
-// These helpers are compiled only when the `bench` feature is enabled and are
-// intended to be called from external Criterion benchmark crates. They live in
-// this module so they can reuse internal types without duplicating logic.
+// Compiled only under the `bench` feature, for the external Criterion crate
+// (`benches/fast_path.rs`). Follows `binop_vector_scalar::VectorScalarCase`:
+// the case is built once, each iteration gets a fresh input from `input()`
+// inside Criterion's untimed setup, and `run()` returns its result so the
+// output is freed untimed too.
 
 #[cfg(feature = "bench")]
-pub fn bench_eval_aligned(n: usize) -> usize {
-    use promql_parser::parser::token::T_ADD;
-    use promql_parser::parser::{BinaryExpr, Expr, NumberLiteral};
-
-    // build a simple BinaryExpr with no modifier to hit the fast-path
-    let expr = BinaryExpr {
-        op: TokenType::new(T_ADD),
-        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        modifier: None,
-    };
-
-    let mut left = Vec::with_capacity(n);
-    let mut right = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let mut labels = EvalLabels::empty();
-        labels.set("id", i.to_string());
-
-        left.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels: labels.clone(),
-            drop_name: false,
-        });
-
-        right.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels,
-            drop_name: false,
-        });
-    }
-
-    match eval_binop_vector_vector(&expr, left, right) {
-        Ok(ExprResult::InstantVector(v)) => v.len(),
-        _ => 0,
-    }
-}
-
-#[cfg(feature = "bench")]
-pub fn bench_eval_unaligned(n: usize) -> usize {
-    use promql_parser::parser::token::T_ADD;
-    use promql_parser::parser::{BinaryExpr, Expr, NumberLiteral};
-
-    // build a simple BinaryExpr with no modifier to hit the fast-path
-    let expr = BinaryExpr {
-        op: TokenType::new(T_ADD),
-        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        modifier: None,
-    };
-
-    let mut left = Vec::with_capacity(n);
-    let mut right = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let mut labels = EvalLabels::empty();
-        labels.set("id", i.to_string());
-
-        left.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels: labels.clone(),
-            drop_name: false,
-        });
-
-        right.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels,
-            drop_name: false,
-        });
-    }
-
-    // reverse the right vector to force the sort-merge path in the fast-path
-    right.reverse();
-
-    match eval_binop_vector_vector(&expr, left, right) {
-        Ok(ExprResult::InstantVector(v)) => v.len(),
-        _ => 0,
-    }
-}
-
-#[cfg(feature = "bench")]
-pub fn bench_eval_with_fill(n: usize) -> usize {
-    use promql_parser::parser::token::T_ADD;
+mod bench_support {
+    use super::eval_binop_vector_vector;
+    use crate::labels::Label;
+    use crate::promql::exec::types::EvalLabels;
+    use crate::promql::{EvalSample, ExprResult};
+    use promql_parser::parser::token::{T_ADD, TokenType};
     use promql_parser::parser::{
         BinModifier, BinaryExpr, Expr, NumberLiteral, VectorMatchFillValues,
     };
 
-    // build an expression with fill modifiers to force the hashmap-based path
-    let modifier = BinModifier::default()
-        .with_fill_values(VectorMatchFillValues::default().with_lhs(0.0).with_rhs(0.0));
-
-    let expr = BinaryExpr {
-        op: TokenType::new(T_ADD),
-        lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
-        modifier: Some(modifier),
-    };
-
-    let mut left = Vec::with_capacity(n);
-    let mut right = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let mut labels = EvalLabels::empty();
-        labels.set("id", i.to_string());
-
-        left.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels: labels.clone(),
-            drop_name: false,
-        });
-
-        right.push(EvalSample {
-            timestamp_ms: 1,
-            value: i as f64,
-            labels,
-            drop_name: false,
-        });
+    /// Which shape of `a + b` to measure.
+    ///
+    /// The old helpers had an "unaligned" shape that reversed one operand.
+    /// Both operands are sorted by match key before the join, so it measured
+    /// exactly the same path as "aligned" and told nothing.
+    #[derive(Clone, Copy)]
+    pub enum VectorVectorShape {
+        /// Every key has a partner: the fast path, all matched.
+        Aligned,
+        /// Half the keys on each side have a partner. Exercises the
+        /// unmatched-skip branches, which the aligned shape never reaches.
+        HalfOverlap,
+        /// Half overlap under `fill_left`/`fill_right`, which forces the
+        /// general merge-join and makes both fill branches emit.
+        HalfOverlapWithFill,
     }
 
-    match eval_binop_vector_vector(&expr, left, right) {
-        Ok(ExprResult::InstantVector(v)) => v.len(),
-        _ => 0,
+    /// A prepared vector-vector operation.
+    pub struct VectorVectorCase {
+        expr: BinaryExpr,
+        n: usize,
+        rhs_id_offset: usize,
+    }
+
+    impl VectorVectorCase {
+        pub fn new(shape: VectorVectorShape, n: usize) -> Self {
+            let fill = matches!(shape, VectorVectorShape::HalfOverlapWithFill);
+            let expr = BinaryExpr {
+                op: TokenType::new(T_ADD),
+                lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                modifier: fill.then(|| {
+                    BinModifier::default().with_fill_values(VectorMatchFillValues::new(0.0, 0.0))
+                }),
+            };
+            let rhs_id_offset = match shape {
+                VectorVectorShape::Aligned => 0,
+                VectorVectorShape::HalfOverlap | VectorVectorShape::HalfOverlapWithFill => n / 2,
+            };
+            Self {
+                expr,
+                n,
+                rhs_id_offset,
+            }
+        }
+
+        /// Untimed per-iteration setup: fresh operands.
+        ///
+        /// Built new each time rather than cloned, so every label set is a
+        /// sole-owner `Shared` Arc — what an instant selector hands over — and
+        /// the drop inside the join is a real free, not a refcount decrement.
+        pub fn input(&self) -> (Vec<EvalSample>, Vec<EvalSample>) {
+            (series(self.n, 0), series(self.n, self.rhs_id_offset))
+        }
+
+        /// Returns the result vector so Criterion frees it untimed; at a few
+        /// heap allocations per sample the teardown would otherwise dwarf the
+        /// join.
+        pub fn run(&self, (left, right): (Vec<EvalSample>, Vec<EvalSample>)) -> Vec<EvalSample> {
+            match eval_binop_vector_vector(&self.expr, left, right) {
+                Ok(ExprResult::InstantVector(v)) => v,
+                Ok(_) => unreachable!("vector-vector always yields an instant vector"),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    /// `n` series shaped like selector output: `__name__` plus a unique `id`
+    /// and two shared labels, held as a sole-owner `Shared` Arc.
+    fn series(n: usize, id_offset: usize) -> Vec<EvalSample> {
+        (0..n)
+            .map(|i| {
+                let id = i + id_offset;
+                let mut raw = vec![
+                    Label::new("__name__".to_string(), "http_requests_total".to_string()),
+                    Label::new("id".to_string(), id.to_string()),
+                    Label::new("instance".to_string(), format!("10.0.0.{}:9100", id % 50)),
+                    Label::new("job".to_string(), "api".to_string()),
+                ];
+                raw.sort();
+                EvalSample {
+                    timestamp_ms: 1,
+                    value: id as f64,
+                    labels: EvalLabels::shared(raw),
+                    drop_name: false,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Guards the benchmark inputs: each shape must reach the path it
+        /// claims to measure.
+        #[test]
+        fn shapes_match_as_configured() {
+            let n = 1000;
+            let aligned = VectorVectorCase::new(VectorVectorShape::Aligned, n);
+            assert_eq!(aligned.run(aligned.input()).len(), n);
+
+            let half = VectorVectorCase::new(VectorVectorShape::HalfOverlap, n);
+            assert_eq!(half.run(half.input()).len(), n / 2);
+
+            // Fill emits for every unmatched key on both sides, so all keys
+            // from both operands come out: n/2 matched + n/2 + n/2 filled.
+            let filled = VectorVectorCase::new(VectorVectorShape::HalfOverlapWithFill, n);
+            assert_eq!(filled.run(filled.input()).len(), n + n / 2);
+        }
     }
 }
+
+#[cfg(feature = "bench")]
+pub use bench_support::{VectorVectorCase, VectorVectorShape};
 
 #[cfg(test)]
 mod tests {
