@@ -210,7 +210,9 @@ fn can_use_fast_path(ctx: &ArithOpContext<'_>) -> bool {
 /// list that names it.
 fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
     matching_observes_metric_name(ctx.matching)
-        || ctx.group_labels.is_some_and(|labels| list_names_metric(labels))
+        || ctx
+            .group_labels
+            .is_some_and(|labels| list_names_metric(labels))
 }
 
 /// Evaluates arithmetic or comparison operations on two vectors, assuming the operation
