@@ -22,7 +22,7 @@
 
 use crate::common::math::kahan_inc;
 use crate::common::{Sample, Timestamp};
-use crate::labels::HasFingerprint;
+use crate::labels::{HasFingerprint, SeriesFingerprint};
 use crate::promql::EvalSample;
 use crate::promql::exec::aggregations::{
     AggregationKind, PushdownStrategy, max_ignore_nan, min_ignore_nan,
@@ -294,6 +294,21 @@ impl PartialGroups {
             .or_insert_with(|| (labels, AggregationPartial::empty(kind)))
             .1
     }
+
+    /// [`Self::entry`] for a caller that already holds `labels`' fingerprint,
+    /// so the labels are only cloned when the group is first seen.
+    fn entry_keyed(
+        &mut self,
+        key: SeriesFingerprint,
+        labels: &EvalLabels,
+    ) -> &mut AggregationPartial {
+        let kind = self.kind;
+        &mut self
+            .groups
+            .entry(key)
+            .or_insert_with(|| (labels.clone(), AggregationPartial::empty(kind)))
+            .1
+    }
 }
 
 /// Per-`(group, step)` mergeable state, for a rollup fused with an outer
@@ -334,12 +349,15 @@ impl SteppedPartialGroups {
     ) {
         let kind = self.kind;
         for s in series {
+            // One group per series, however many steps it spans: resolve the
+            // group and hash it once, not once per point.
             let labels = s.labels.compute_grouping_labels(modifier);
+            let key = labels.fingerprint();
             for point in s.samples {
                 self.steps
                     .entry(point.timestamp)
                     .or_insert_with(|| PartialGroups::new(kind))
-                    .entry(labels.clone())
+                    .entry_keyed(key, &labels)
                     .update(kind, point.value);
             }
         }

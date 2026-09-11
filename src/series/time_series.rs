@@ -648,11 +648,29 @@ impl TimeSeries {
         };
         let (start_index, end_index) = range;
         let chunks = &self.chunks[start_index..=end_index];
-        let mut samples = get_range_parallel(chunks, start_time, end_time).unwrap_or_default();
-        if chunks.len() > 1 {
-            // If we have multiple chunks, we need to sort the samples by timestamp
-            samples.sort_by_key(|s| s.timestamp);
+        if chunks.len() < PARALLEL_RANGE_MIN_CHUNKS || rayon_core::current_thread_index().is_some()
+        {
+            // Decode on this thread when the range is small, or when the caller
+            // is already a pool worker — a fan-out across series, where a
+            // nested scope per series costs more than it parallelizes (and its
+            // ordered merge frees a medium block per series, which the
+            // allocator hands back to the OS). One presized buffer also
+            // replaces a growth-by-doubling `collect` per chunk plus a
+            // concatenating copy. Chunks are ordered and disjoint, so appending
+            // in chunk order is already sorted.
+            let capacity = chunks
+                .iter()
+                .map(|chunk| estimate_range_len(chunk, start_time, end_time))
+                .sum();
+            let mut samples = Vec::with_capacity(capacity);
+            for chunk in chunks {
+                samples.extend(chunk.range_iter(start_time, end_time));
+            }
+            return samples;
         }
+        let mut samples = get_range_parallel(chunks, start_time, end_time).unwrap_or_default();
+        // If we have multiple chunks, we need to sort the samples by timestamp
+        samples.sort_by_key(|s| s.timestamp);
         samples
     }
 
@@ -1409,6 +1427,30 @@ pub(super) fn find_last_ge_index(chunks: &[TimeSeriesChunk], ts: Timestamp) -> (
             }),
         _ => binary_search_chunks_by_timestamp(chunks, ts),
     }
+}
+
+/// Below this many chunks, `get_range` decodes on the calling thread even
+/// when it is free to fan out.
+const PARALLEL_RANGE_MIN_CHUNKS: usize = 4;
+
+/// How many of `chunk`'s samples `[start, end]` is likely to cover, from the
+/// fraction of the chunk's time span it overlaps. Sizes the buffer a range read
+/// decodes into: exact for a fully covered chunk, and a proportional guess for
+/// a boundary chunk, where `chunk.len()` would over-reserve for every series a
+/// narrow window touches.
+fn estimate_range_len(chunk: &TimeSeriesChunk, start: Timestamp, end: Timestamp) -> usize {
+    let len = chunk.len();
+    let (first, last) = (chunk.first_timestamp(), chunk.last_timestamp());
+    if start <= first && end >= last {
+        return len;
+    }
+    let span = (last - first).max(1) as f64;
+    let overlap = (end.min(last) - start.max(first)).max(0) as f64;
+    // Round up, and keep a floor: an exact or tiny estimate that lands one
+    // short forces a doubling of the whole buffer.
+    ((len as f64 * overlap / span).ceil() as usize)
+        .saturating_add(8)
+        .min(len)
 }
 
 fn get_range_parallel(

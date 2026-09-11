@@ -1,4 +1,5 @@
 use crate::common::Timestamp;
+use crate::common::threads::IntoParRayon;
 use crate::promql::EvalLabels;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
@@ -8,6 +9,7 @@ use crate::promql::{
     model::{InstantSample, RangeSample},
 };
 use crate::series::SeriesRef;
+use orx_parallel::ParIter;
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use std::sync::Arc;
 
@@ -131,8 +133,12 @@ impl RollupRequest {
         window_ends: &[Timestamp],
         series: Vec<RangeSample<EvalLabels>>,
     ) -> Vec<RangeSample<EvalLabels>> {
+        // Series are independent, and on a single node this is the entire
+        // rollup — every series over every step — so it fans out. Sequential,
+        // a 1000-series `rate(m[5m])` at 240 steps ran on one thread while the
+        // pool idled.
         series
-            .into_iter()
+            .into_par_rayon()
             .filter_map(|s| {
                 let points = self.kind.eval_windows(
                     &s.samples,

@@ -28,6 +28,10 @@ pub struct ValkeySeriesQuerier {
     /// serves the whole command — rather than passed per call. `Arc<[String]>`
     /// so the selectors share the immutable list instead of cloning it.
     hash_tags: Arc<[String]>,
+    /// Whether the server runs in cluster mode, read once on the command
+    /// thread: the cluster-only pushdown toggles apply to a fanout, not to the
+    /// same request answered locally.
+    clustered: bool,
 }
 
 impl QueryReader for ValkeySeriesQuerier {
@@ -96,7 +100,14 @@ impl QueryReader for ValkeySeriesQuerier {
         rollup: &RollupRequest,
         options: QueryOptions,
     ) -> QueryResult<RollupOutcome> {
-        if !crate::config::is_fanout_rollup_pushdown_enabled() {
+        // The toggle governs shipping the rollup to *shards*. On a single node
+        // the same request is answered locally (`RollupOutcome::Raw`, reduced
+        // by the caller with the kernels a shard would use), which evaluates
+        // each series' windows once over the whole step grid instead of once
+        // per step — and is the path the in-memory querier gives the PromQL
+        // conformance suite. Leaving it behind the cluster toggle here made a
+        // single node run the per-step path the suite does not cover.
+        if self.clustered && !crate::config::is_fanout_rollup_pushdown_enabled() {
             return Ok(RollupOutcome::Unsupported);
         }
         let matchers: Matchers = normalize_selector(selector);
@@ -192,6 +203,7 @@ impl ConcreteSeriesQuerier {
                 ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier {
                     caller_user,
                     hash_tags: _hash_tags,
+                    clustered: crate::fanout::is_clustered(_ctx),
                 })
             }
         }

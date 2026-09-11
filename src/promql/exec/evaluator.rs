@@ -461,19 +461,24 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         };
 
         // Scatter each series' sparse `(window end, value)` pairs onto the step
-        // grid. With `@`, every step shares one window end and therefore one
-        // value; otherwise the mapping is one to one.
+        // grid. Both are ascending, so one merge walk places every point: with
+        // `@`, every step shares one window end and the cursor stays on that
+        // point; otherwise the mapping is one to one.
         let series = rolled
             .into_iter()
             .map(|s| {
-                let points: ahash::AHashMap<Timestamp, f64> = s
-                    .samples
-                    .iter()
-                    .map(|point| (point.timestamp, point.value))
-                    .collect();
                 let mut values = StepGridBuilder::with_capacity(window_ends.len());
-                for end in &window_ends {
-                    values.push(points.get(end).copied());
+                let mut points = s.samples.iter().peekable();
+                for &end in &window_ends {
+                    while points.peek().is_some_and(|point| point.timestamp < end) {
+                        points.next();
+                    }
+                    values.push(
+                        points
+                            .peek()
+                            .filter(|point| point.timestamp == end)
+                            .map(|point| point.value),
+                    );
                 }
                 let values = values.finish();
                 PreloadedRollupSeries {
