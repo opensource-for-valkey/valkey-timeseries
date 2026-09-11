@@ -1073,6 +1073,42 @@ mod tests {
         assert_eq!(result1[0].labels, result2[0].labels);
     }
 
+    /// A bare selector on one side of a one-to-one operation matches several
+    /// metrics with the same match key. That is an ambiguous match and must
+    /// error, wherever the operation sits. Nested inside an aggregation it
+    /// used to be summed silently; at top level it was caught, but only by
+    /// the end-of-evaluation uniqueness check and under its generic message.
+    #[test]
+    fn should_reject_ambiguous_one_to_one_match_from_bare_selector() {
+        let data: TestSampleData = vec![
+            ("cpu_usage", vec![("env", "prod")], 0, 50.0),
+            ("memory_bytes", vec![("env", "prod")], 1, 100.0),
+            ("disk_bytes", vec![("env", "prod")], 2, 7.0),
+        ];
+        let lookback_delta = Duration::from_secs(300);
+
+        for query in [
+            r#"cpu_usage + {env="prod"}"#,
+            r#"sum(cpu_usage + {env="prod"})"#,
+        ] {
+            let (reader, end_time) = setup_mock_reader(data.clone());
+            let evaluator = Evaluator::new(
+                &reader,
+                QueryOptions {
+                    timeout: None,
+                    ..QueryOptions::default()
+                },
+            );
+            let err = parse_and_evaluate(&evaluator, query, end_time, lookback_delta)
+                .expect_err("ambiguous one-to-one match must error");
+            assert!(
+                err.to_string()
+                    .contains("many-to-many matching not allowed"),
+                "`{query}` gave the wrong error: {err}"
+            );
+        }
+    }
+
     #[test]
     fn should_evaluate_number_literal() {
         // given: create an empty mock reader

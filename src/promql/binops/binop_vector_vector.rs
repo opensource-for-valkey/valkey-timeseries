@@ -1,4 +1,4 @@
-use super::labels::{compute_binary_match_key, result_metric};
+use super::labels::{compute_binary_match_key, get_metric_signature, result_metric};
 use crate::labels::SeriesFingerprint;
 use crate::promql::binops::apply_binary_op;
 use crate::promql::exec::types::EvalLabels;
@@ -11,7 +11,6 @@ use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
 use std::iter::Peekable;
 use std::vec::IntoIter;
-use twox_hash::xxhash3_128;
 
 /// Operand size at which computing match keys is worth spreading across
 /// threads — the one remaining fan-out in this module.
@@ -107,6 +106,24 @@ struct ArithOpContext<'a> {
     group_labels: Option<&'a Vec<String>>,
     fill_for_one: Option<f64>,
     fill_for_many: Option<f64>,
+}
+
+impl ArithOpContext<'_> {
+    /// Which operand is the "one" side: the one that must be unique per match
+    /// key. The right, unless `group_right` makes it the left.
+    ///
+    /// Every duplicate-series error names a side through these two, so the
+    /// mapping is written once. It used to be repeated at four sites, and one
+    /// of them had the branches the wrong way round.
+    fn one_side(&self) -> &'static str {
+        if self.is_group_right { "left" } else { "right" }
+    }
+
+    /// Which operand is the "many" side: the one allowed to repeat a match
+    /// key under `group_left`/`group_right`.
+    fn many_side(&self) -> &'static str {
+        if self.is_group_right { "right" } else { "left" }
+    }
 }
 
 fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
@@ -229,58 +246,6 @@ fn eval_arith_ops_fast_path(
     let is_comparison = ctx.is_comparison;
     let return_bool = ctx.return_bool;
 
-    // Join one LHS sample against the run of RHS samples sharing its match key,
-    // appending to `out`.
-    let join_one = |(lhs_fp, mut lhs): (SeriesFingerprint, EvalSample),
-                    out: &mut Vec<EvalSample>| {
-        let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
-        let mut k = start;
-
-        while k < right_sorted.len() && right_sorted[k].0 == lhs_fp {
-            let (_, rhs) = &right_sorted[k];
-            k += 1;
-
-            let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
-                continue;
-            };
-
-            // For non-bool comparisons, filter out false results (0.0).
-            if is_comparison && !return_bool && op_value == 0.0 {
-                continue;
-            }
-
-            // Output value:
-            // - comparison & not bool: propagate LHS value when true
-            // - comparison & bool: output op_value (1.0 or 0.0)
-            // - arithmetic: output op_value
-            let output_value = if is_comparison && !return_bool {
-                lhs.value
-            } else {
-                op_value
-            };
-
-            let is_last = k == right_sorted.len() || right_sorted[k].0 != lhs_fp;
-
-            // `result_metric` is what strips `__name__` from an arithmetic
-            // result. It is the *only* place that happens now: the pass that
-            // used to strip it from both operands up front is gone, so this
-            // promotes one label set per emitted sample instead of one per
-            // operand sample on both sides.
-            let labels = if is_last {
-                result_metric(std::mem::take(&mut lhs.labels), operator, None)
-            } else {
-                result_metric(lhs.labels.clone(), operator, None)
-            };
-
-            out.push(EvalSample {
-                timestamp_ms: lhs.timestamp_ms,
-                value: output_value,
-                labels,
-                drop_name: lhs.drop_name || return_bool,
-            });
-        }
-    };
-
     // Serial, at every operand size.
     //
     // The join used to fan out across threads unconditionally. Measured serial
@@ -302,8 +267,74 @@ fn eval_arith_ops_fast_path(
     // Callers are already parallel besides: a range query fans its step loop
     // out and lands here once per step.
     let mut result = Vec::with_capacity(left_sorted.len().min(right_sorted.len()));
-    for entry in left_sorted {
-        join_one(entry, &mut result);
+    // Match key of the previous LHS sample. Both sides are sorted by key, so a
+    // repeated key on the LHS shows up as two adjacent entries.
+    let mut prev_fp: Option<SeriesFingerprint> = None;
+
+    for (lhs_fp, mut lhs) in left_sorted {
+        let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
+        let matched = start < right_sorted.len() && right_sorted[start].0 == lhs_fp;
+        let lhs_repeats = prev_fp == Some(lhs_fp);
+        prev_fp = Some(lhs_fp);
+
+        if !matched {
+            continue;
+        }
+
+        // Cardinality. One-to-one means exactly one partner on each side of a
+        // matched key. This is the same check the modifier path makes on its
+        // match-key groups, and like there it is decided by the grouping
+        // alone — a comparison that would come out false still errors. A key
+        // that matches nothing may repeat freely on either side: it produces
+        // nothing, so there is nothing to be ambiguous about.
+        //
+        // Without this the fast path emitted one result per RHS partner,
+        // which for `a + {env="prod"}` — a bare selector matching several
+        // metrics — meant several samples with identical labels. At top
+        // level the uniqueness check caught that under a generic message;
+        // inside an aggregation it was silently summed.
+        if start + 1 < right_sorted.len() && right_sorted[start + 1].0 == lhs_fp {
+            return Err(duplicate_side_error(ctx.one_side()));
+        }
+        if lhs_repeats {
+            return Err(duplicate_side_error(ctx.many_side()));
+        }
+
+        let rhs = &right_sorted[start].1;
+
+        let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
+            continue;
+        };
+
+        // For non-bool comparisons, filter out false results (0.0).
+        if is_comparison && !return_bool && op_value == 0.0 {
+            continue;
+        }
+
+        // Output value:
+        // - comparison & not bool: propagate LHS value when true
+        // - comparison & bool: output op_value (1.0 or 0.0)
+        // - arithmetic: output op_value
+        let output_value = if is_comparison && !return_bool {
+            lhs.value
+        } else {
+            op_value
+        };
+
+        // `result_metric` is what strips `__name__` from an arithmetic
+        // result. It is the *only* place that happens now: the pass that
+        // used to strip it from both operands up front is gone, so this
+        // promotes one label set per emitted sample instead of one per
+        // operand sample on both sides. With exactly one partner per key the
+        // LHS labels are consumed, never cloned.
+        let labels = result_metric(std::mem::take(&mut lhs.labels), operator, None);
+
+        result.push(EvalSample {
+            timestamp_ms: lhs.timestamp_ms,
+            value: output_value,
+            labels,
+            drop_name: lhs.drop_name || return_bool,
+        });
     }
 
     Ok(ExprResult::InstantVector(result))
@@ -459,16 +490,6 @@ fn eval_arith_ops(
         Ok(())
     }
 
-    #[inline]
-    fn duplicate_many_side(ctx: &ArithOpContext) -> &'static str {
-        if ctx.is_group_right { "right" } else { "left" }
-    }
-
-    #[inline]
-    fn duplicate_one_side(ctx: &ArithOpContext) -> &'static str {
-        if ctx.is_group_right { "left" } else { "right" }
-    }
-
     // Determine which side is "one" vs. "many" for matching purposes.
     // For one-to-one mappings, we treat the right-hand side as the "one" side.
     let (one_vec, many_vec) = if ctx.is_group_right {
@@ -523,13 +544,13 @@ fn eval_arith_ops(
                     // ambiguous many-to-one/one-to-many match, exactly like
                     // an arithmetic operator would.
                     if one_samples.len() > 1 {
-                        return Err(duplicate_side_error(duplicate_one_side(&ctx)));
+                        return Err(duplicate_side_error(ctx.one_side()));
                     }
                     if ctx.is_one_to_one {
                         let mut iter = many_samples.into_iter();
                         let sample = iter.next().unwrap();
                         if iter.next().is_some() {
-                            return Err(duplicate_side_error(duplicate_many_side(&ctx)));
+                            return Err(duplicate_side_error(ctx.many_side()));
                         }
                         result.extend(handle_match(&ctx, &sample, &one_samples));
                         continue;
@@ -551,7 +572,7 @@ fn eval_arith_ops(
     if !ctx.is_one_to_one {
         let mut seen = FingerprintHashSet::with_capacity(result.len());
         for sample in &result {
-            let fp = result_fingerprint(&sample.labels, sample.drop_name);
+            let fp = get_metric_signature(&sample.labels, sample.drop_name);
             if !seen.insert(fp) {
                 return Err(EvaluationError::InternalError(
                     "multiple matches for labels: grouping labels must ensure unique matches"
@@ -599,11 +620,7 @@ fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalRes
     // whether the operator is a comparison — see the matched-key branch
     // above for the full rationale.
     if !ctx.is_one_to_one && one_group_len > 1 {
-        return Err(duplicate_side_error(if ctx.is_group_right {
-            "left"
-        } else {
-            "right"
-        }));
+        return Err(duplicate_side_error(ctx.one_side()));
     }
     Ok(())
 }
@@ -659,11 +676,11 @@ fn emit_fill_for_many(
         for (i, sample) in one_samples.into_iter().enumerate() {
             process_one(ctx, &sample, fill_val, result);
             if i == 1 {
-                return Err(duplicate_side_error(if ctx.is_group_right {
-                    "right"
-                } else {
-                    "left"
-                }));
+                // `one_samples` is the "one" side, so a repeat here is a
+                // duplicate on that side. This site used to name the *many*
+                // side — the opposite of what `validate_one_group_len`
+                // reports for the same condition without a fill modifier.
+                return Err(duplicate_side_error(ctx.one_side()));
             }
         }
         return Ok(());
@@ -752,23 +769,6 @@ fn build_result_labels(
     }
 
     labels
-}
-
-/// Compute a fingerprint for duplicate detection in grouped matching results.
-/// When `drop_name` is true, `__name__` is excluded from the hash to match
-/// the effective output labels.
-#[inline]
-fn result_fingerprint(labels: &EvalLabels, drop_name: bool) -> u128 {
-    let mut hasher: xxhash3_128::Hasher = Default::default();
-    for label in labels.iter() {
-        if drop_name && label.name == METRIC_NAME {
-            continue;
-        }
-        hasher.write(label.name.as_bytes());
-        hasher.write(b"0xfe");
-        hasher.write(label.value.as_bytes());
-    }
-    hasher.finish_128()
 }
 
 // ============================================================================
@@ -1515,6 +1515,170 @@ mod tests {
         let mut only = result.into_iter().next().unwrap();
         only.drop_name_if_needed();
         assert_eq!(only.labels.get("__name__"), Some("a"));
+    }
+
+    // ── fast-path cardinality ───────────────────────────────────────────────
+    //
+    // The no-modifier path must enforce one-to-one exactly as the modifier
+    // path does. The realistic trigger is a bare selector matching several
+    // metrics: `a + {env="prod"}` hands the right side one sample per metric,
+    // all with the same match key.
+
+    fn assert_duplicate_on(result: EvalResult<ExprResult>, side: &str) {
+        let err = result.expect_err("ambiguous match must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("on the {side} side")),
+            "expected the {side} side to be named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_fast_path_duplicate_rhs_errors() {
+        let lhs = vec![sample(1000, 1.0, &[("__name__", "a"), ("env", "prod")])];
+        let rhs = vec![
+            sample(1000, 2.0, &[("__name__", "b"), ("env", "prod")]),
+            sample(1000, 3.0, &[("__name__", "c"), ("env", "prod")]),
+        ];
+        assert_duplicate_on(
+            eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs),
+            "right",
+        );
+    }
+
+    #[test]
+    fn test_fast_path_duplicate_lhs_errors() {
+        let lhs = vec![
+            sample(1000, 1.0, &[("__name__", "a"), ("env", "prod")]),
+            sample(1000, 2.0, &[("__name__", "b"), ("env", "prod")]),
+        ];
+        let rhs = vec![sample(1000, 3.0, &[("__name__", "c"), ("env", "prod")])];
+        assert_duplicate_on(
+            eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs),
+            "left",
+        );
+    }
+
+    #[test]
+    fn test_fast_path_duplicate_errors_even_when_comparison_is_false() {
+        // Same shape as the one-to-one modifier-path tests below: the
+        // ambiguity exists independent of any value, so filtering must not
+        // suppress the error.
+        let lhs = vec![sample(1000, 1.0, &[("__name__", "a"), ("env", "prod")])];
+        let rhs = vec![
+            sample(1000, 100.0, &[("__name__", "b"), ("env", "prod")]),
+            sample(1000, 200.0, &[("__name__", "c"), ("env", "prod")]),
+        ];
+        assert_duplicate_on(
+            eval_binop_vector_vector(&make_expr(T_GTR, None), lhs, rhs),
+            "right",
+        );
+    }
+
+    #[test]
+    fn test_fast_path_unmatched_duplicates_are_ignored() {
+        // A repeated key that matches nothing produces nothing, so it is not
+        // ambiguous — on either side.
+        let lhs = vec![
+            sample(1000, 1.0, &[("__name__", "a"), ("env", "prod")]),
+            sample(1000, 2.0, &[("__name__", "b"), ("env", "prod")]),
+            sample(1000, 5.0, &[("env", "staging")]),
+        ];
+        let rhs = vec![
+            sample(1000, 3.0, &[("__name__", "c"), ("env", "dev")]),
+            sample(1000, 4.0, &[("__name__", "d"), ("env", "dev")]),
+            sample(1000, 7.0, &[("env", "staging")]),
+        ];
+        let result = eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 12.0);
+        assert_eq!(result[0].labels.get("env"), Some("staging"));
+    }
+
+    // ── duplicate-series errors name the same side with and without fill ────
+
+    /// Under `group_left` the "one" side is the right. A repeated key there
+    /// with no partner on the left is the same condition whether or not a fill
+    /// modifier is present, and must be reported the same way. The fill path
+    /// used to name the left.
+    #[test]
+    fn test_fill_duplicate_on_one_side_names_that_side() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::{LabelModifier, VectorMatchCardinality};
+
+        let matching = || Some(LabelModifier::Include(ModifierLabels::new(vec!["job"])));
+        let no_labels = || ModifierLabels::new(Vec::<&str>::new());
+
+        // group_left: many = left, one = right. Duplicate on the right.
+        let lhs = vec![sample(1000, 1.0, &[("job", "other")])];
+        let rhs = vec![
+            sample(1000, 2.0, &[("job", "x"), ("inst", "1")]),
+            sample(1000, 3.0, &[("job", "x"), ("inst", "2")]),
+        ];
+        let group_left = || {
+            BinModifier::default()
+                .with_matching(matching())
+                .with_card(VectorMatchCardinality::ManyToOne(no_labels()))
+        };
+        assert_duplicate_on(
+            eval_binop_vector_vector(
+                &make_expr(T_ADD, Some(group_left())),
+                lhs.clone(),
+                rhs.clone(),
+            ),
+            "right",
+        );
+        assert_duplicate_on(
+            eval_binop_vector_vector(
+                &make_expr(
+                    T_ADD,
+                    Some(
+                        group_left()
+                            .with_fill_values(VectorMatchFillValues::default().with_lhs(0.0)),
+                    ),
+                ),
+                lhs,
+                rhs,
+            ),
+            "right",
+        );
+
+        // group_right: mirror image. Duplicate on the left.
+        let lhs = vec![
+            sample(1000, 2.0, &[("job", "x"), ("inst", "1")]),
+            sample(1000, 3.0, &[("job", "x"), ("inst", "2")]),
+        ];
+        let rhs = vec![sample(1000, 1.0, &[("job", "other")])];
+        let group_right = || {
+            BinModifier::default()
+                .with_matching(matching())
+                .with_card(VectorMatchCardinality::OneToMany(no_labels()))
+        };
+        assert_duplicate_on(
+            eval_binop_vector_vector(
+                &make_expr(T_ADD, Some(group_right())),
+                lhs.clone(),
+                rhs.clone(),
+            ),
+            "left",
+        );
+        assert_duplicate_on(
+            eval_binop_vector_vector(
+                &make_expr(
+                    T_ADD,
+                    Some(
+                        group_right()
+                            .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
+                    ),
+                ),
+                lhs,
+                rhs,
+            ),
+            "left",
+        );
     }
 
     // ── comparison cardinality validation ───────────────────────────────────
