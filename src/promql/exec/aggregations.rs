@@ -4,8 +4,6 @@ use crate::labels::HasFingerprint;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
-use orx_parallel::IterIntoParIter;
-use orx_parallel::ParIter;
 use promql_parser::parser::token::{TokenType, *};
 use promql_parser::parser::{AggregateExpr, LabelModifier};
 use std::cmp::Ordering;
@@ -305,11 +303,10 @@ fn eval_top_bottom_k(
         return Ok(select_k_from_group(samples, k, order));
     }
 
+    // Serial: see `eval_reduction_aggregation` for the measurements.
     let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
-        .map(|(_, group)| group.members)
-        .iter_into_par()
-        .flat_map(|group| select_k_from_group(group, k, order))
+        .flat_map(|(_, group)| select_k_from_group(group.members, k, order))
         .collect();
 
     Ok(out)
@@ -343,9 +340,9 @@ fn eval_limit_k(
 
     // For each group take the k samples with the smallest label hashes, then
     // flatten the per-group selections into the output vector.
+    // Serial: see `eval_reduction_aggregation` for the measurements.
     let out: Vec<EvalSample> = group_samples(modifier, samples)
         .into_iter()
-        .iter_into_par()
         .flat_map(|(_, group)| select_limitk(group.members, k))
         .collect();
 
@@ -385,11 +382,10 @@ fn eval_quantile(
     }
     let groups = group_samples(modifier, samples);
 
+    // Serial: see `eval_reduction_aggregation` for the measurements.
     let out: Vec<EvalSample> = groups
         .into_iter()
-        .map(|(_, group)| group)
-        .iter_into_par()
-        .map(|group| {
+        .map(|(_, group)| {
             let value = sample_quantile(&group.members, phi);
             EvalSample {
                 labels: group.labels,
@@ -419,11 +415,32 @@ fn eval_reduction_aggregation(
 ) -> Vec<EvalSample> {
     let groups = group_sample_values(modifier, samples);
 
+    // Serial, like every other per-group step in this file. These four sites
+    // (this one, `eval_quantile`, `eval_top_bottom_k`, `eval_limit_k`) used to
+    // fan the per-group work out with `iter_into_par()`. Measured serial
+    // against parallel on the same build (M2, release), over `groups x
+    // samples-per-group`, parallel never won:
+    //
+    // | op       | 10x11 | 1x22000 | 11x2000 | 2000x11 |
+    // |----------|-------|---------|---------|---------|
+    // | sum      | 2.0x  | 1.06x   | 1.00x   | 1.05x   |
+    // | quantile | 6.7x  | 1.00x   | 4.2x    | 4.4x    |
+    // | topk     | 6.0x  | 1.00x   | 4.2x    | 3.8x    |
+    // | limitk   | 4.5x  | 0.99x   | 3.4x    | 3.1x    |
+    //
+    // (parallel time / serial time; >1 is a loss for parallel.)
+    //
+    // Small inputs lose to the fan-out itself, ~30us against a few
+    // microseconds of work. The large multi-group shapes are the telling
+    // ones: they are the only inputs where a fan-out has anything to split,
+    // and the three selection operators lose 3-4x there. Their groups hold
+    // whole samples, and the samples a group does *not* select are freed
+    // inside the worker — an allocator round-trip on a thread that did not
+    // allocate it, for every dropped sample. `sum` groups hold bare `f64`s,
+    // free nothing, and sit at parity, which is the fan-out's ceiling here.
     groups
         .into_iter()
-        .map(|(_, group)| group)
-        .iter_into_par()
-        .map(|group| {
+        .map(|(_, group)| {
             let value = aggregate_group(kind, &group.members);
             EvalSample {
                 labels: group.labels,
