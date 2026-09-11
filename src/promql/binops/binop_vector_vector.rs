@@ -5,7 +5,7 @@ use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::HashSetExt;
-use orx_parallel::{IntoParIter, ParIter, ParallelizableCollection};
+use orx_parallel::{IntoParIter, ParIter};
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
@@ -13,7 +13,19 @@ use std::iter::Peekable;
 use std::vec::IntoIter;
 use twox_hash::xxhash3_128;
 
-const MATCH_PARALLEL_THRESHOLD: usize = 10;
+/// Operand size at which computing match keys is worth spreading across
+/// threads — the one remaining fan-out in this module.
+///
+/// Below it the fan-out costs more than the hashing it splits: one
+/// `into_par()` call is ~30-35us on an M2 (release, system allocator), against
+/// a match key at ~165ns, so a 100-series operand is ~16us of real work.
+///
+/// Above it the fan-out is close to free but buys little: measured serial
+/// against parallel, 10000 series went 5.3ms -> 4.8ms and 100000 went 75ms ->
+/// 70ms, while 50000 went the other way (33ms -> 38ms). Hashing is the only
+/// part of this path that allocates nothing, which is why it is the only part
+/// left with a fan-out at all; the join beside it is serial at every size.
+const PARALLEL_MATCH_KEY_THRESHOLD: usize = 2048;
 
 // Vector-Vector operations
 pub(super) fn eval_binop_vector_vector(
@@ -68,12 +80,12 @@ fn matching_observes_metric_name(matching: Option<&LabelModifier>) -> bool {
 /// that promotes `Shared` label sets to `Owned` on every sample that owes a
 /// drop.
 fn drop_names_if_necessary(
-    mut left_vector: Vec<EvalSample>,
-    mut right_vector: Vec<EvalSample>,
+    left_vector: &mut [EvalSample],
+    right_vector: &mut [EvalSample],
     matching: Option<&LabelModifier>,
-) -> (Vec<EvalSample>, Vec<EvalSample>) {
+) {
     if !matching_observes_metric_name(matching) {
-        return (left_vector, right_vector);
+        return;
     }
     for sample in left_vector.iter_mut() {
         sample.drop_name_if_needed();
@@ -81,7 +93,6 @@ fn drop_names_if_necessary(
     for sample in right_vector.iter_mut() {
         sample.drop_name_if_needed();
     }
-    (left_vector, right_vector)
 }
 
 struct ArithOpContext<'a> {
@@ -216,55 +227,82 @@ fn eval_arith_ops_fast_path(
     let is_comparison = ctx.is_comparison;
     let return_bool = ctx.return_bool;
 
-    let result: Vec<EvalSample> = left_sorted
-        .into_par()
-        .flat_map(|(lhs_fp, mut lhs)| {
-            let mut sub_res = Vec::new();
-            let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
-            let mut k = start;
+    // Join one LHS sample against the run of RHS samples sharing its match key,
+    // appending to `out`.
+    let join_one = |(lhs_fp, mut lhs): (SeriesFingerprint, EvalSample),
+                    out: &mut Vec<EvalSample>| {
+        let start = right_sorted.partition_point(|x| x.0 < lhs_fp);
+        let mut k = start;
 
-            while k < right_sorted.len() && right_sorted[k].0 == lhs_fp {
-                let (_, rhs) = &right_sorted[k];
-                k += 1;
+        while k < right_sorted.len() && right_sorted[k].0 == lhs_fp {
+            let (_, rhs) = &right_sorted[k];
+            k += 1;
 
-                let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
-                    continue;
-                };
+            let Some(op_value) = apply_binary_op(operator, lhs.value, rhs.value).ok() else {
+                continue;
+            };
 
-                // For non-bool comparisons, filter out false results (0.0).
-                if is_comparison && !return_bool && op_value == 0.0 {
-                    continue;
-                }
-
-                // Output value:
-                // - comparison & not bool: propagate LHS value when true
-                // - comparison & bool: output op_value (1.0 or 0.0)
-                // - arithmetic: output op_value
-                let output_value = if is_comparison && !return_bool {
-                    lhs.value
-                } else {
-                    op_value
-                };
-
-                let is_last = k == right_sorted.len() || right_sorted[k].0 != lhs_fp;
-
-                let labels = if is_last {
-                    result_metric(std::mem::take(&mut lhs.labels), operator, None)
-                } else {
-                    result_metric(lhs.labels.clone(), operator, None)
-                };
-
-                sub_res.push(EvalSample {
-                    timestamp_ms: lhs.timestamp_ms,
-                    value: output_value,
-                    labels,
-                    drop_name: lhs.drop_name || return_bool,
-                });
+            // For non-bool comparisons, filter out false results (0.0).
+            if is_comparison && !return_bool && op_value == 0.0 {
+                continue;
             }
 
-            sub_res
-        })
-        .collect();
+            // Output value:
+            // - comparison & not bool: propagate LHS value when true
+            // - comparison & bool: output op_value (1.0 or 0.0)
+            // - arithmetic: output op_value
+            let output_value = if is_comparison && !return_bool {
+                lhs.value
+            } else {
+                op_value
+            };
+
+            let is_last = k == right_sorted.len() || right_sorted[k].0 != lhs_fp;
+
+            // `result_metric` is what strips `__name__` from an arithmetic
+            // result. It is the *only* place that happens now: the pass that
+            // used to strip it from both operands up front is gone, so this
+            // promotes one label set per emitted sample instead of one per
+            // operand sample on both sides.
+            let labels = if is_last {
+                result_metric(std::mem::take(&mut lhs.labels), operator, None)
+            } else {
+                result_metric(lhs.labels.clone(), operator, None)
+            };
+
+            out.push(EvalSample {
+                timestamp_ms: lhs.timestamp_ms,
+                value: output_value,
+                labels,
+                drop_name: lhs.drop_name || return_bool,
+            });
+        }
+    };
+
+    // Serial, at every operand size.
+    //
+    // The join used to fan out across threads unconditionally. Measured serial
+    // against parallel on the same build (M2, release, `a + b` and `a > b`,
+    // operands shaped like selector output), serial wins at every size from
+    // 1000 to 100000 series and there is no crossover above it either:
+    //
+    // | series  | serial  | parallel |
+    // |---------|---------|----------|
+    // | 1000    | 1.0 ms  | 3.9 ms   |
+    // | 10000   | 12.9 ms | 34.4 ms  |
+    // | 100000  | 217 ms  | 348 ms   |
+    //
+    // The fan-out has nothing left to amortize. The arithmetic is a handful of
+    // instructions; the real per-sample cost is building the result label set,
+    // which allocates — and allocating on eight threads at once contends far
+    // worse than it parallelizes. On top of that, `flat_map` needs a `Vec` per
+    // LHS sample and a merge, where this needs one output vector and no merge.
+    // Callers are already parallel besides: a range query fans its step loop
+    // out and lands here once per step.
+    let mut result = Vec::with_capacity(left_sorted.len().min(right_sorted.len()));
+    for entry in left_sorted {
+        join_one(entry, &mut result);
+    }
 
     Ok(ExprResult::InstantVector(result))
 }
@@ -495,19 +533,11 @@ fn eval_arith_ops(
                         continue;
                     }
 
-                    if one_samples.len() < MATCH_PARALLEL_THRESHOLD {
-                        for many_sample in many_samples {
-                            result.extend(handle_match(&ctx, &many_sample, &one_samples));
-                        }
-                    } else {
-                        for many_sample in many_samples {
-                            result = one_samples
-                                .par()
-                                .filter_map(|one_sample| {
-                                    build_result_sample(&ctx, &many_sample, one_sample)
-                                })
-                                .collect_into(result);
-                        }
+                    // `one_samples` holds exactly one element: the check
+                    // above returns an error for any longer group. A fan-out
+                    // over it was unreachable, so this is a single pass.
+                    for many_sample in many_samples {
+                        result.extend(handle_match(&ctx, &many_sample, &one_samples));
                     }
                 }
             }
@@ -644,21 +674,12 @@ fn emit_fill_for_many(
     Ok(())
 }
 
-/// Operand size at which computing binary-op match keys is worth spreading
-/// across threads. Below it the fan-out costs more than the hashing it
-/// parallelizes — see `collect_fingerprints`.
-const PARALLEL_MATCH_KEY_THRESHOLD: usize = 2048;
-
 fn collect_fingerprints(
     ctx: &ArithOpContext,
     samples: Vec<EvalSample>,
 ) -> Vec<(SeriesFingerprint, EvalSample)> {
-    // Fanning this out costs far more than it saves on ordinary inputs: one
-    // match key is ~165ns, so a 100-series operand is ~16us of real work
-    // against a fan-out that measured ~420us per call — and the range-query
-    // step loop is *already* parallel, so this would be parallelism nested
-    // inside parallelism. Only a genuinely large operand, where the hashing
-    // dominates the fan-out, goes wide.
+    // Only a genuinely large operand, where the per-sample hashing dominates
+    // the fan-out, goes wide. See [`PARALLEL_MATCH_KEY_THRESHOLD`].
     let mut kvs: Vec<(SeriesFingerprint, EvalSample)> =
         if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
             samples
@@ -771,8 +792,8 @@ fn validate_non_fill(expr: &BinaryExpr) -> EvalResult<()> {
 /// `or`: returns all LHS samples, plus any RHS samples whose match key
 /// does not appear on the LHS.
 fn eval_set_or(
-    left_vector: Vec<EvalSample>,
-    right_vector: Vec<EvalSample>,
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
     matching: Option<&LabelModifier>,
 ) -> EvalResult<ExprResult> {
     if left_vector.is_empty() {
@@ -782,86 +803,87 @@ fn eval_set_or(
         return Ok(ExprResult::InstantVector(left_vector));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
+    drop_names_if_necessary(&mut left_vector, &mut right_vector, matching);
 
     // Build a set of match keys from the left side
     let left_keys = get_sample_fingerprints(&left_vector, matching);
 
-    // Append right-side samples whose match key is NOT present on the left
-    let result = right_vector
-        .into_par()
-        .filter(|s| {
-            let key = compute_binary_match_key(&s.labels, matching);
-            !left_keys.contains(&key)
-        })
-        .collect_into(left_vector);
+    // Append right-side samples whose match key is NOT present on the left.
+    // Serial: see `eval_set_and` for why.
+    left_vector.extend(
+        right_vector
+            .into_iter()
+            .filter(|s| !left_keys.contains(&compute_binary_match_key(&s.labels, matching))),
+    );
 
-    Ok(ExprResult::InstantVector(result))
+    Ok(ExprResult::InstantVector(left_vector))
 }
 
 /// `and`: returns LHS samples that have a matching label set on the RHS.
 /// Values always come from the LHS.
 fn eval_set_and(
-    left_vector: Vec<EvalSample>,
-    right_vector: Vec<EvalSample>,
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
     matching: Option<&LabelModifier>,
 ) -> EvalResult<ExprResult> {
     if left_vector.is_empty() || right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(vec![]));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
+    drop_names_if_necessary(&mut left_vector, &mut right_vector, matching);
 
     // Build a set of match keys from the right side
     let right_keys = get_sample_fingerprints(&right_vector, matching);
 
-    let result: Vec<EvalSample> = left_vector
-        .into_par()
-        .filter(|s| {
-            let key = compute_binary_match_key(&s.labels, matching);
-            right_keys.contains(&key)
-        })
-        .collect();
+    // `retain` rather than a parallel `filter().collect()`. The fan-out lost at
+    // every size measured (10 to 10000 series), by 3.3x even at 10000, because
+    // it pays for two things `retain` does not: every *kept* sample is moved
+    // into a freshly allocated vector, and every *dropped* sample is freed on a
+    // worker thread rather than the thread that allocated it. Filtering in
+    // place neither reallocates nor migrates a free.
+    left_vector.retain(|s| right_keys.contains(&compute_binary_match_key(&s.labels, matching)));
 
-    Ok(ExprResult::InstantVector(result))
+    Ok(ExprResult::InstantVector(left_vector))
 }
 
 /// `unless`: returns LHS samples that do NOT have a matching label set on the RHS.
 fn eval_set_unless(
-    left_vector: Vec<EvalSample>,
-    right_vector: Vec<EvalSample>,
+    mut left_vector: Vec<EvalSample>,
+    mut right_vector: Vec<EvalSample>,
     matching: Option<&LabelModifier>,
 ) -> EvalResult<ExprResult> {
     if left_vector.is_empty() || right_vector.is_empty() {
         return Ok(ExprResult::InstantVector(left_vector));
     }
 
-    let (left_vector, right_vector) = drop_names_if_necessary(left_vector, right_vector, matching);
+    drop_names_if_necessary(&mut left_vector, &mut right_vector, matching);
 
     // Build a set of match keys from the right side
     let right_keys = get_sample_fingerprints(&right_vector, matching);
 
-    let result: Vec<EvalSample> = left_vector
-        .into_par()
-        .filter(|s| {
-            let key = compute_binary_match_key(&s.labels, matching);
-            !right_keys.contains(&key)
-        })
-        .collect();
+    // Serial: see `eval_set_and`.
+    left_vector.retain(|s| !right_keys.contains(&compute_binary_match_key(&s.labels, matching)));
 
-    Ok(ExprResult::InstantVector(result))
+    Ok(ExprResult::InstantVector(left_vector))
 }
 
+/// Match keys of every sample, as a set.
+///
+/// Built straight into the set. This used to fan the hashing out into a
+/// `Vec<SeriesFingerprint>` and then collect that into the set, which paid for
+/// a fan-out and an intermediate allocation to save a hash that is a few
+/// hundred nanoseconds.
 fn get_sample_fingerprints(
-    samples: &Vec<EvalSample>,
+    samples: &[EvalSample],
     matching: Option<&LabelModifier>,
 ) -> FingerprintHashSet {
-    let fingerprints: Vec<SeriesFingerprint> = samples
-        .into_par()
-        .map(|s| compute_binary_match_key(&s.labels, matching))
-        .collect();
-    // not sure if I like the extra allocation here :-(
-    fingerprints.into_iter().collect()
+    let mut keys = FingerprintHashSet::with_capacity(samples.len());
+    keys.extend(
+        samples
+            .iter()
+            .map(|s| compute_binary_match_key(&s.labels, matching)),
+    );
+    keys
 }
 
 // ------------------------- Benchmark helpers -------------------------------
