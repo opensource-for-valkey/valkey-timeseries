@@ -211,14 +211,34 @@ fn compare_series_samples(
 
 /// NaN and the infinities are legitimate result values, so each has to compare
 /// equal to itself rather than falling foul of `NaN != NaN` and `inf - inf`.
+///
+/// Uses a relative epsilon (matching upstream Prometheus promqltest's
+/// `almostEqual`) rather than a fixed absolute tolerance, since an absolute
+/// `1e-6` is meaningless noise at the scale of e.g. `1e219` and too strict
+/// near zero.
 fn values_equal(actual: f64, expected: f64) -> bool {
+    const EPSILON: f64 = 1e-6;
+    const MIN_NORMAL: f64 = 2.2250738585072014e-308; // f64::MIN_POSITIVE
+
+    if actual.is_nan() && expected.is_nan() {
+        return true;
+    }
     if actual == expected {
         return true;
     }
     if actual.is_nan() || expected.is_nan() {
-        return actual.is_nan() && expected.is_nan();
+        return false;
     }
-    (actual - expected).abs() <= 1e-6
+
+    let abs_a = actual.abs();
+    let abs_b = expected.abs();
+    let diff = (actual - expected).abs();
+
+    if actual == 0.0 || expected == 0.0 || abs_a + abs_b < MIN_NORMAL {
+        diff < EPSILON * MIN_NORMAL
+    } else {
+        diff / (abs_a + abs_b).min(f64::MAX) < EPSILON
+    }
 }
 
 fn compare_scalar_results(
