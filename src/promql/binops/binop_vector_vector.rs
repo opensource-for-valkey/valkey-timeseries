@@ -206,6 +206,44 @@ fn duplicate_side_error(side: &str) -> EvaluationError {
     ))
 }
 
+/// The scalar outcome of one matched pair: the value to emit and whether the
+/// result still owes a `__name__` drop, or `None` when the pair drops out.
+///
+/// The single home of the rule both joins share, so the hash-join fast path and
+/// the general merge join cannot drift apart on it:
+///
+/// - A non-`bool` comparison is a *filter*, not a rewrite. A false result —
+///   exactly `0.0`, which is what the comparison operators return — removes the
+///   pair; a true one emits the left operand's value rather than the `1.0` the
+///   operator produced.
+/// - Everything else (arithmetic, and any comparison with `bool`) emits the
+///   operator's result.
+/// - `bool` also forces the name drop, as does a pending drop on the "many"
+///   side.
+///
+/// `lhs_value` / `rhs_value` are in operand order; resolving which operand is
+/// which is the caller's job, because the fast path always has the "many" side
+/// on the left while the general path may have it on either.
+#[inline]
+fn pair_result(
+    ctx: &ArithOpContext<'_>,
+    lhs_value: f64,
+    rhs_value: f64,
+    many_drop_name: bool,
+) -> Option<(f64, bool)> {
+    let op_value = (ctx.apply)(lhs_value, rhs_value);
+    let drop_name = many_drop_name || ctx.return_bool;
+
+    if ctx.is_comparison && !ctx.return_bool {
+        if op_value == 0.0 {
+            return None;
+        }
+        return Some((lhs_value, drop_name));
+    }
+
+    Some((op_value, drop_name))
+}
+
 // ============================================================================
 // Fast-path for no-modifier arithmetic / comparison ops
 // ============================================================================
@@ -272,9 +310,6 @@ fn eval_arith_ops_fast_path(
     right_vector: Vec<EvalSample>,
 ) -> EvalResult<ExprResult> {
     let operator = ctx.operator;
-    let apply = ctx.apply;
-    let is_comparison = ctx.is_comparison;
-    let return_bool = ctx.return_bool;
 
     let right_keys = collect_match_keys(&right_vector, ctx.matching);
 
@@ -317,21 +352,14 @@ fn eval_arith_ops_fast_path(
         index.insert(key, CONSUMED);
 
         let rhs = &right_vector[slot as usize];
-        let op_value = apply(lhs.value, rhs.value);
 
-        // For non-bool comparisons, filter out false results (0.0).
-        if is_comparison && !return_bool && op_value == 0.0 {
+        // The shared per-pair rule, so this cannot drift from the general
+        // path's [`build_result_sample`]: a false non-`bool` comparison drops
+        // the pair, a true one keeps the LHS value, and everything else emits
+        // the operator's result.
+        let Some((output_value, drop_name)) = pair_result(ctx, lhs.value, rhs.value, lhs.drop_name)
+        else {
             continue;
-        }
-
-        // Output value:
-        // - comparison & not bool: propagate LHS value when true
-        // - comparison & bool: output op_value (1.0 or 0.0)
-        // - arithmetic: output op_value
-        let output_value = if is_comparison && !return_bool {
-            lhs.value
-        } else {
-            op_value
         };
 
         // `result_metric` is what strips `__name__` from an arithmetic
@@ -346,7 +374,7 @@ fn eval_arith_ops_fast_path(
             timestamp_ms: lhs.timestamp_ms,
             value: output_value,
             labels,
-            drop_name: lhs.drop_name || return_bool,
+            drop_name,
         });
     }
 
@@ -384,31 +412,14 @@ fn build_result_sample(
     one_sample: &EvalSample,
 ) -> Option<EvalSample> {
     // Determine operand order based on grouping, then apply the operator.
-    let lhs_val = if ctx.is_group_right {
-        one_sample.value
+    let (lhs_val, rhs_val) = if ctx.is_group_right {
+        (one_sample.value, many_sample.value)
     } else {
-        many_sample.value
-    };
-    let rhs_val = if ctx.is_group_right {
-        many_sample.value
-    } else {
-        one_sample.value
+        (many_sample.value, one_sample.value)
     };
 
-    let op_result = (ctx.apply)(lhs_val, rhs_val);
-
-    // For non-bool comparisons, filter out false results (0.0).
-    if ctx.is_comparison && !ctx.return_bool && op_result == 0.0 {
-        return None;
-    }
-
-    let output_value = if ctx.is_comparison && !ctx.return_bool {
-        lhs_val
-    } else {
-        op_result
-    };
-
-    let drop_name = many_sample.drop_name || ctx.return_bool;
+    // The shared per-pair value rule; see [`pair_result`].
+    let (output_value, drop_name) = pair_result(ctx, lhs_val, rhs_val, many_sample.drop_name)?;
 
     let result_labels = build_result_labels(
         many_sample,
@@ -537,16 +548,13 @@ fn eval_arith_ops_merge_join(
                     let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
                     let many_samples = take_group(&mut many_it, many_key);
 
-                    // Cardinality validation is determined purely by label
-                    // matching (i.e. by the match-key groups formed above),
-                    // not by whether the operator is a comparison or by the
-                    // truth value of any individual comparison. A comparison
-                    // that would evaluate false must still error on an
-                    // ambiguous many-to-one/one-to-many match, exactly like
-                    // an arithmetic operator would.
-                    if one_samples.len() > 1 {
-                        return Err(duplicate_side_error(ctx.one_side()));
-                    }
+                    // Cardinality is a property of the match-key grouping, not
+                    // of the operator, and not of any individual comparison's
+                    // truth value: a comparison that would come out false must
+                    // still error on an ambiguous match, exactly like an
+                    // arithmetic operator would. See [`validate_one_side`] for
+                    // when the "one" side has to be unique.
+                    validate_one_side(ctx, one_samples.len(), true)?;
                     if ctx.is_one_to_one {
                         let mut iter = many_samples.into_iter();
                         let sample = iter.next().unwrap();
@@ -624,11 +632,15 @@ fn handle_unmatched_one(
     result: &mut Vec<EvalSample>,
 ) -> EvalResult<()> {
     if let Some(fill_val) = ctx.fill_for_many {
-        let one_samples = take_group(one_it, one_key);
-        emit_fill_for_many(ctx, one_samples, fill_val, result)?;
+        // Collected rather than streamed because the group has to be validated
+        // before anything is emitted, and the fill path needs the samples
+        // anyway.
+        let one_samples: Vec<EvalSample> = take_group(one_it, one_key).collect();
+        validate_one_side(ctx, one_samples.len(), false)?;
+        emit_fill_for_many(ctx, one_samples, fill_val, result);
     } else {
         let one_group_len = skip_group_count(one_it, one_key);
-        validate_one_group_len(ctx, one_group_len)?;
+        validate_one_side(ctx, one_group_len, false)?;
     }
     Ok(())
 }
@@ -662,12 +674,24 @@ fn skip_group_count(
     count
 }
 
+/// The one place that decides whether a repeated "one"-side match key is an
+/// error.
+///
+/// The rule is a property of the match-key grouping, not of the operator and
+/// not of any comparison's truth value:
+///
+/// - Under `group_left` / `group_right` the "one" side must be unique per
+///   match key as soon as it is looked at, matched or not, because the grouping
+///   is what keeps the output series identity unique.
+/// - Under one-to-one an *unmatched* key emits nothing, so a repeat there is
+///   harmless; only a matched key is ambiguous. That is the `matched` flag.
+///
+/// The three call sites (a matched key, an unmatched key with a fill, an
+/// unmatched key without one) differ in when they run, not in the rule, so they
+/// ask here rather than each spelling it out.
 #[inline]
-fn validate_one_group_len(ctx: &ArithOpContext, one_group_len: usize) -> EvalResult<()> {
-    // Cardinality is a property of the match-key grouping, independent of
-    // whether the operator is a comparison — see the matched-key branch
-    // above for the full rationale.
-    if !ctx.is_one_to_one && one_group_len > 1 {
+fn validate_one_side(ctx: &ArithOpContext, group_len: usize, matched: bool) -> EvalResult<()> {
+    if group_len > 1 && (matched || !ctx.is_one_to_one) {
         return Err(duplicate_side_error(ctx.one_side()));
     }
     Ok(())
@@ -694,51 +718,22 @@ fn emit_fill_for_one(
 /// Emit results for "one" samples whose match key had no "many" partner.
 /// Synthesizes a phantom "many" sample (using the "one" sample's labels so the
 /// output series identity is preserved) filled with `fill_val`.
+///
+/// Validating the group is the caller's job — it runs [`validate_one_side`]
+/// first — so this only emits.
 #[inline]
 fn emit_fill_for_many(
     ctx: &ArithOpContext,
     one_samples: impl IntoIterator<Item = EvalSample>,
     fill_val: f64,
     result: &mut Vec<EvalSample>,
-) -> EvalResult<()> {
-    // Cardinality is a property of the match-key grouping, independent of
-    // whether the operator is a comparison — see the matched-key branch in
-    // `eval_arith_ops` for the full rationale.
-    let should_check_duplicates = !ctx.is_one_to_one;
-
-    fn process_one(
-        ctx: &ArithOpContext,
-        one_sample: &EvalSample,
-        fill_val: f64,
-        result: &mut Vec<EvalSample>,
-    ) {
-        let fill_many = make_fill_many_sample(one_sample, fill_val);
-        if let Some(sample) = build_result_sample(ctx, &fill_many, one_sample) {
+) {
+    for one_sample in one_samples {
+        let fill_many = make_fill_many_sample(&one_sample, fill_val);
+        if let Some(sample) = build_result_sample(ctx, &fill_many, &one_sample) {
             result.push(sample);
         }
     }
-
-    // Validate that a "one" side group does not contain duplicates when grouped
-    // (non one-to-one) matching is in effect.
-    if should_check_duplicates {
-        for (i, sample) in one_samples.into_iter().enumerate() {
-            process_one(ctx, &sample, fill_val, result);
-            if i == 1 {
-                // `one_samples` is the "one" side, so a repeat here is a
-                // duplicate on that side. This site used to name the *many*
-                // side — the opposite of what `validate_one_group_len`
-                // reports for the same condition without a fill modifier.
-                return Err(duplicate_side_error(ctx.one_side()));
-            }
-        }
-        return Ok(());
-    }
-
-    for one_sample in one_samples {
-        process_one(ctx, &one_sample, fill_val, result);
-    }
-
-    Ok(())
 }
 
 fn collect_fingerprints(
