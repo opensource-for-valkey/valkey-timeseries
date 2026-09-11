@@ -56,25 +56,25 @@ impl PromQLFunction for SortByLabelDescFunction {
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        sort_by_label(args, false)
+        sort_by_label(args, true)
     }
 }
 
 fn sort(arg: PromQLArg, desc: bool) -> EvalResult<ExprResult> {
-    let func_name = if desc { "sort_desc" } else { "sort_by" };
+    let func_name = if desc { "sort_desc" } else { "sort" };
     let mut vector = expect_instant_vector(arg, func_name)?;
     vector.sort_by(|a, b| {
         let a = a.value;
         let b = b.value;
-        // According to Prometheus semantic, NaNs should sort lower
-        let ord = match (a.is_nan(), b.is_nan()) {
+        match (a.is_nan(), b.is_nan()) {
             (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-        };
-
-        if desc { ord.reverse() } else { ord }
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                let ord = a.partial_cmp(&b).unwrap_or(Ordering::Equal);
+                if desc { ord.reverse() } else { ord }
+            }
+        }
     });
     Ok(ExprResult::InstantVector(vector))
 }
@@ -137,4 +137,83 @@ fn sort_by_label(args: Vec<PromQLArg>, desc: bool) -> EvalResult<ExprResult> {
         if desc { tie.reverse() } else { tie }
     });
     Ok(ExprResult::InstantVector(vector))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sort, sort_by_label};
+    use crate::labels::{Label, Labels};
+    use crate::promql::functions::PromQLArg;
+    use crate::promql::{EvalSample, ExprResult};
+
+    fn sample(value: f64, labels: &[(&str, &str)]) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value,
+            labels: Labels::new(
+                labels
+                    .iter()
+                    .map(|(name, value)| Label::new(*name, *value))
+                    .collect(),
+            )
+            .into(),
+            drop_name: false,
+        }
+    }
+
+    fn values(result: ExprResult) -> Vec<f64> {
+        let ExprResult::InstantVector(samples) = result else {
+            panic!("expected instant vector");
+        };
+        samples.into_iter().map(|sample| sample.value).collect()
+    }
+
+    fn label_values(result: ExprResult, label: &str) -> Vec<String> {
+        let ExprResult::InstantVector(samples) = result else {
+            panic!("expected instant vector");
+        };
+        samples
+            .into_iter()
+            .map(|sample| sample.label_value(label).unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn should_sort_nan_last_for_ascending_and_descending() {
+        let input = vec![
+            sample(f64::NAN, &[("id", "nan")]),
+            sample(1.0, &[("id", "one")]),
+            sample(2.0, &[("id", "two")]),
+        ];
+
+        let asc = values(sort(PromQLArg::InstantVector(input.clone()), false).unwrap());
+        assert_eq!(asc[0], 1.0);
+        assert_eq!(asc[1], 2.0);
+        assert!(asc[2].is_nan());
+
+        let desc = values(sort(PromQLArg::InstantVector(input), true).unwrap());
+        assert_eq!(desc[0], 2.0);
+        assert_eq!(desc[1], 1.0);
+        assert!(desc[2].is_nan());
+    }
+
+    #[test]
+    fn should_sort_by_label_descending() {
+        let input = vec![
+            sample(1.0, &[("instance", "1")]),
+            sample(2.0, &[("instance", "2")]),
+            sample(3.0, &[("instance", "10")]),
+        ];
+
+        let result = sort_by_label(
+            vec![
+                PromQLArg::InstantVector(input),
+                PromQLArg::String("instance".to_string()),
+            ],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(label_values(result, "instance"), vec!["10", "2", "1"]);
+    }
 }
