@@ -488,8 +488,9 @@ fn main() {
         }
     }
 
-    // Sort rows by id for stable output
-    rows.sort_by_key(|row| row.0.id());
+    // Sort rows by id for stable output. `id()` formats a fresh `String`, so
+    // cache each key once instead of rebuilding it for every comparison.
+    rows.sort_by_cached_key(|row| row.0.id());
 
     // Write outputs
     let out_csv = PathBuf::from("target/bench-reports/compression.csv");
