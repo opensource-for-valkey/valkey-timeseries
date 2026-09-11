@@ -1311,7 +1311,7 @@ mod tests {
             .map(|(t, v)| Sample::new(t, v))
             .collect::<Vec<_>>();
         EvalSamples {
-            values,
+            values: values.into(),
             labels: EvalLabels::from(labels.into()),
             range_ms: 0,
             range_end_ms: 0,

@@ -798,8 +798,104 @@ pub(in crate::promql) struct PreloadedMatrixData {
 pub(in crate::promql) struct PreloadedMatrixSeries {
     pub(super) labels: EvalLabels,
     /// Sorted ascending by timestamp (the storage invariant); spans every
-    /// window of the step grid.
-    pub(super) samples: Vec<Sample>,
+    /// window of the step grid. Shared so that each step's window is a view
+    /// into it ([`SampleWindow::shared`]) rather than a copy.
+    pub(super) samples: Arc<[Sample]>,
+}
+
+/// The samples of one range-vector element: a window of a series.
+///
+/// Copy-on-write over a shared span. A range query slices the same preloaded
+/// span once per step, and every range-vector function only reads its window,
+/// so a step's window is the span plus two indices; the copy that
+/// `to_vec()` used to make per series per step is deferred to [`Self::to_mut`],
+/// which only the range-vector/scalar binops reach.
+#[derive(Debug, Clone)]
+pub enum SampleWindow {
+    Owned(Vec<Sample>),
+    Shared {
+        span: Arc<[Sample]>,
+        range: std::ops::Range<usize>,
+    },
+}
+
+impl SampleWindow {
+    pub fn shared(span: &Arc<[Sample]>, range: std::ops::Range<usize>) -> Self {
+        debug_assert!(range.end <= span.len());
+        Self::Shared {
+            span: Arc::clone(span),
+            range,
+        }
+    }
+
+    /// The window as a slice.
+    pub fn as_slice(&self) -> &[Sample] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared { span, range } => &span[range.clone()],
+        }
+    }
+
+    /// The window as an owned, mutable vector, copying out of a shared span
+    /// on first use.
+    pub fn to_mut(&mut self) -> &mut Vec<Sample> {
+        if let Self::Shared { span, range } = self {
+            *self = Self::Owned(span[range.clone()].to_vec());
+        }
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared { .. } => unreachable!("converted to Owned above"),
+        }
+    }
+
+    /// The window as an owned vector, copying only if it was shared.
+    pub fn into_vec(self) -> Vec<Sample> {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared { span, range } => span[range].to_vec(),
+        }
+    }
+}
+
+impl Default for SampleWindow {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl PartialEq for SampleWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl std::ops::Deref for SampleWindow {
+    type Target = [Sample];
+
+    fn deref(&self) -> &[Sample] {
+        self.as_slice()
+    }
+}
+
+impl From<Vec<Sample>> for SampleWindow {
+    fn from(values: Vec<Sample>) -> Self {
+        Self::Owned(values)
+    }
+}
+
+impl FromIterator<Sample> for SampleWindow {
+    fn from_iter<I: IntoIterator<Item = Sample>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a SampleWindow {
+    type Item = &'a Sample;
+    type IntoIter = std::slice::Iter<'a, Sample>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -836,7 +932,7 @@ impl EvalSample {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EvalSamples {
-    pub(crate) values: Vec<Sample>,
+    pub(crate) values: SampleWindow,
     pub(crate) labels: EvalLabels,
     /// If true, the `__name__` label should be removed when materializing
     /// result labels. Mirrors `EvalSample.drop_name` behavior for instant

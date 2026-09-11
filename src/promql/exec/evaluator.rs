@@ -18,7 +18,7 @@ use crate::promql::exec::planner::{PlannedQuery, PreloadGrid};
 use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{
     EvalLabels, MatrixPreloadMap, PreloadedMatrixData, PreloadedMatrixSeries, PreloadedRollupData,
-    PreloadedRollupSeries, RollupPreloadMap, SeriesMap, StepGridBuilder,
+    PreloadedRollupSeries, RollupPreloadMap, SampleWindow, SeriesMap, StepGridBuilder,
 };
 use crate::promql::exec::utils::{
     RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
@@ -26,7 +26,7 @@ use crate::promql::exec::utils::{
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{
-    FunctionCallContext, PromQLArg, PromQLFunction, resolve_function, window_samples,
+    FunctionCallContext, PromQLArg, PromQLFunction, resolve_function, window_range,
 };
 use crate::promql::hashers::{AggregationKey, MatrixPreloadKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
@@ -45,7 +45,7 @@ use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, SubqueryExpr, UnaryExpr,
     VectorSelector,
 };
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// How many preload requests may be in flight at once.
@@ -334,7 +334,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .into_iter()
                     .map(|s| PreloadedMatrixSeries {
                         labels: s.labels,
-                        samples: s.samples,
+                        samples: Arc::from(s.samples),
                     })
                     .collect();
                 self.preloaded_matrices
@@ -769,12 +769,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .series
                     .iter()
                     .filter_map(|s| {
-                        let window = window_samples(&s.samples, adjusted_eval_ts, range_ms)?;
+                        let window = window_range(&s.samples, adjusted_eval_ts, range_ms)?;
                         Some(EvalSamples {
                             labels: s.labels.clone(),
                             drop_name: false,
                             range_ms,
-                            values: window.to_vec(),
+                            values: SampleWindow::shared(&s.samples, window),
                             range_end_ms: adjusted_eval_ts,
                         })
                     })
@@ -934,7 +934,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let vector = series_map
             .into_iter()
             .map(|(labels, values)| EvalSamples {
-                values,
+                values: values.into(),
                 labels,
                 range_ms,
                 range_end_ms: subquery_end_ms,
@@ -1309,6 +1309,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             ExprResult::RangeVector(mut samples) => {
                 samples.iter_mut().for_each(|s| {
                     s.values
+                        .to_mut()
                         .iter_mut()
                         .for_each(|sample| sample.value = -sample.value);
                     s.drop_name = true;

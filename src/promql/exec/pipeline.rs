@@ -242,7 +242,7 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
                 None
             } else {
                 Some(EvalSamples {
-                    values: step_samples,
+                    values: step_samples.into(),
                     labels: sample.labels,
                     range_ms,
                     range_end_ms: subquery_end_ms,
@@ -341,7 +341,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
                     labels: s.labels,
                     drop_name: false,
                     range_ms: 0, // overwritten by shape_subquery_results
-                    values: s.samples,
+                    values: s.samples.into(),
                     range_end_ms: plan.sample_end_ms,
                 })
                 .collect();
@@ -358,7 +358,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
                     labels: s.labels,
                     drop_name: false,
                     range_ms: range,
-                    values: s.samples,
+                    values: s.samples.into(),
                     range_end_ms: plan.sample_end_ms,
                 })
                 .collect();
@@ -396,7 +396,7 @@ mod tests {
             labels: EvalLabels::from(crate::labels::Labels::new(labels)),
             drop_name: false,
             range_ms: 0,
-            values: samples,
+            values: samples.into(),
             range_end_ms: 0,
         }
     }

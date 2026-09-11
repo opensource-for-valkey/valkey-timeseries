@@ -53,6 +53,7 @@ where
         result.retain_mut(|series| {
             series
                 .values
+                .to_mut()
                 .retain_mut(|sample| match apply(sample.value) {
                     Ok(0.0) => false,
                     // The sample passed: keep its original value. Only `bool`
@@ -78,7 +79,7 @@ where
             if series.is_empty() {
                 return false;
             }
-            for sample in &mut series.values {
+            for sample in series.values.to_mut() {
                 match apply(sample.value) {
                     Ok(value) => sample.value = value,
                     Err(e) => {

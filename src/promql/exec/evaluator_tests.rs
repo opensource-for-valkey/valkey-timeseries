@@ -1669,7 +1669,7 @@ mod tests {
                     }
                     EvalSamples {
                         labels: labels.into(),
-                        values: samples,
+                        values: samples.into(),
                         drop_name: false,
                         range_end_ms: 0,
                         range_ms: 0,

@@ -22,7 +22,7 @@ pub(crate) mod utils;
 pub(in crate::promql) use date_functions::{DateTimePart, datetime_from_seconds};
 pub(crate) use function_list::*;
 pub use rollup_functions::RollupKind;
-pub(in crate::promql) use rollups::window_samples;
+pub(in crate::promql) use rollups::window_range;
 pub(crate) use types::*;
 
 // Return the concrete `PromQLFunctionImpl` so callers can store the concrete

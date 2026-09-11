@@ -322,7 +322,7 @@ impl From<EvalSamples> for RangeSample {
     fn from(samples: EvalSamples) -> Self {
         Self {
             labels: samples.labels.into_labels(),
-            samples: samples.values,
+            samples: samples.values.into_vec(),
         }
     }
 }
@@ -331,7 +331,7 @@ impl From<EvalSamples> for RangeSample<EvalLabels> {
     fn from(samples: EvalSamples) -> Self {
         Self {
             labels: samples.labels,
-            samples: samples.values,
+            samples: samples.values.into_vec(),
         }
     }
 }

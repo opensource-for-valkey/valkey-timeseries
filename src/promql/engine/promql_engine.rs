@@ -152,7 +152,7 @@ pub fn evaluate_instant(
                 .into_iter()
                 .map(|s| RangeSample {
                     labels: s.labels.into_labels(),
-                    samples: s.values,
+                    samples: s.values.into_vec(),
                 })
                 .collect(),
         )),

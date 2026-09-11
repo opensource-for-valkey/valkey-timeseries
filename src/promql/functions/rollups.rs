@@ -259,10 +259,20 @@ pub(in crate::promql) fn window_samples(
     window_end: Timestamp,
     window_ms: i64,
 ) -> Option<&[Sample]> {
+    window_range(samples, window_end, window_ms).map(|range| &samples[range])
+}
+
+/// The index range of [`window_samples`], for a caller that slices a shared
+/// span by position instead of borrowing it.
+pub(in crate::promql) fn window_range(
+    samples: &[Sample],
+    window_end: Timestamp,
+    window_ms: i64,
+) -> Option<std::ops::Range<usize>> {
     let window_start = window_end - window_ms;
     let i = samples.partition_point(|s| s.timestamp <= window_start);
     let j = samples.partition_point(|s| s.timestamp <= window_end);
-    (i < j).then(|| &samples[i..j])
+    (i < j).then_some(i..j)
 }
 
 #[cfg(test)]
