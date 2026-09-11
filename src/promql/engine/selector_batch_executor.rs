@@ -21,9 +21,8 @@ use crate::series::index::series_by_selectors;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
-use std::collections::VecDeque;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
 
@@ -165,19 +164,29 @@ impl SelectorTask {
 ///
 /// # Design
 ///
-/// Unlike a traditional executor that spawns a dedicated background thread, `SelectorBatchExecutor` uses
-/// **cooperative batching**: enqueueing a task and claiming the idle processor role happen
-/// under one queue lock. The claimed processor drains pending tasks, processes them under a
-/// single `MODULE_CONTEXT` acquisition, and atomically marks the queue idle only after it has
-/// observed no more work. This eliminates the lost-wakeup window where a task could be queued
-/// after the final drain but before the previous processor returned.
+/// One dedicated thread owns the processor role for the life of the module. Submitters only
+/// enqueue a task and wait on its responder; they never take the module lock or touch the
+/// keyspace themselves.
 ///
-/// For local queries, the executor processes the task directly, so processing is essentially serialized.
+/// The evaluator calls in from inside rayon jobs (`preload_grid` fans selectors out on the
+/// pool; rollup reads happen from step chunks), and the processor's own reads fan out on the
+/// same pool (`TimeSeries::get_range` splits across chunks). Two invariants keep that from
+/// deadlocking:
+///
+/// 1. The processor is never a pool worker. The earlier cooperative design let the first
+///    submitter drain the queue; a worker in that role could be handed another submitter's
+///    closure by work-stealing while it waited on its own fan-out, and that closure would
+///    then wait on the processor's own thread forever.
+/// 2. A submitter that *is* a pool worker never parks. [`wait_for_result`] keeps it executing
+///    pool jobs until its answer arrives, so the processor's injected work always finds a
+///    thread even when every worker is waiting on a selector. Parking them instead was
+///    observed to freeze the server: eight workers in `recv`, the processor holding the module
+///    lock waiting for a chunk fan-out nobody could run, and the main thread waiting on the lock.
+///
+/// For local queries, the thread processes the task directly, so processing is serialized.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
 /// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
-///  
-/// This design allows us to achieve good performance without needing multiple background threads for processing queries concurrently.
 ///
 /// # Note
 /// The `SelectorBatchExecutor` is designed for internal use within the PromQL engine and is not intended to be
@@ -203,55 +212,48 @@ impl SelectorTask {
 /// let _ = executor.query(matchers, now, options);
 /// ```
 pub struct SelectorBatchExecutor {
-    queue: Mutex<SelectorTaskQueue<SelectorTask>>,
+    /// Hand-off to the processor thread. Unbounded: a submitter blocks on its
+    /// responder anyway, so back-pressure here would only add a second wait.
+    sender: mpsc::Sender<SelectorTask>,
 }
 
-/// Queue state guarded as one unit so the transition from an active processor
-/// to idle cannot race with task submission.
-struct SelectorTaskQueue<T> {
-    pending: VecDeque<T>,
-    processor_active: bool,
-}
+/// The processor loop: wait for one task, sweep up whatever else is already
+/// queued (bounded by [`MAX_BATCH_SIZE`]), then run the batch under a single
+/// module-lock acquisition. Exits when the executor handle is dropped.
+fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
+    while let Ok(first) = receiver.recv() {
+        let batch = collect_batch(&receiver, first, MAX_BATCH_SIZE);
 
-impl<T> Default for SelectorTaskQueue<T> {
-    fn default() -> Self {
-        Self {
-            pending: VecDeque::new(),
-            processor_active: false,
+        let ctx = MODULE_CONTEXT.lock();
+        for task in batch {
+            execute_selector_task(&ctx, task);
         }
+        // ctx dropped here — MODULE_CONTEXT released
     }
 }
 
-impl<T> SelectorTaskQueue<T> {
-    /// Queue a task and return whether this caller acquired processor ownership.
-    fn enqueue(&mut self, task: T) -> bool {
-        self.pending.push_back(task);
-        if self.processor_active {
-            false
-        } else {
-            self.processor_active = true;
-            true
+/// `first` plus up to `max_batch_size - 1` tasks that are already waiting.
+/// Never blocks: a task that arrives after the sweep starts the next batch.
+fn collect_batch<T>(receiver: &mpsc::Receiver<T>, first: T, max_batch_size: usize) -> Vec<T> {
+    let mut batch = Vec::with_capacity(max_batch_size);
+    batch.push(first);
+    while batch.len() < max_batch_size {
+        match receiver.try_recv() {
+            Ok(task) => batch.push(task),
+            Err(_) => break,
         }
     }
-
-    /// Take the next bounded batch. An empty queue atomically releases
-    /// processor ownership while holding the same lock used by [`Self::enqueue`].
-    fn next_batch(&mut self, max_batch_size: usize) -> Option<Vec<T>> {
-        if self.pending.is_empty() {
-            self.processor_active = false;
-            return None;
-        }
-
-        let len = self.pending.len().min(max_batch_size);
-        Some(self.pending.drain(..len).collect())
-    }
+    batch
 }
 
 impl SelectorBatchExecutor {
     pub fn new() -> Self {
-        Self {
-            queue: Mutex::new(SelectorTaskQueue::default()),
-        }
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("ts-promql-selector".to_string())
+            .spawn(move || run_processor(receiver))
+            .expect("failed to spawn the PromQL selector executor thread");
+        Self { sender }
     }
 
     pub fn query(
@@ -355,23 +357,13 @@ impl SelectorBatchExecutor {
             responder: result_tx,
         };
 
-        // Submission and the idle-to-active transition share one lock. If a
-        // prior processor just observed an empty queue, this caller claims the
-        // processor role before releasing the lock, so its task cannot be left
-        // waiting for a processor that has already exited.
-        let should_process = {
-            let mut queue = self.queue.lock().unwrap_or_else(|poisoned| {
-                log_warning("promql: selector queue lock was poisoned; recovering queue state");
-                poisoned.into_inner()
-            });
-            queue.enqueue(task)
-        };
-
-        if should_process {
-            self.drain_and_execute_batches();
+        if self.sender.send(task).is_err() {
+            return Err(QueryError::Execution(
+                "selector executor thread is not running".to_string(),
+            ));
         }
 
-        match result_rx.recv() {
+        match wait_for_result(&result_rx) {
             Ok(res) => match res {
                 Ok(val) => Ok(val),
                 Err(err) => Err(err),
@@ -382,32 +374,37 @@ impl SelectorBatchExecutor {
             }
         }
     }
+}
 
-    /// Drain batches while this caller owns processor responsibility. The queue
-    /// lock is held only to take work or atomically release that ownership; no
-    /// Valkey operations run while it is held.
-    fn drain_and_execute_batches(&self) {
-        loop {
-            let batch = {
-                let mut queue = self.queue.lock().unwrap_or_else(|poisoned| {
-                    log_warning("promql: selector queue lock was poisoned; recovering queue state");
-                    poisoned.into_inner()
-                });
-                queue.next_batch(MAX_BATCH_SIZE)
-            };
+/// How long a waiting pool worker sleeps when the pool has nothing for it to run. It only
+/// bounds how long an injected job can sit unclaimed while *every* worker is waiting here;
+/// a delivered result wakes the sleeper immediately.
+const WORKER_WAIT_BACKOFF: Duration = Duration::from_micros(250);
 
-            let Some(batch) = batch else {
-                return;
-            };
-
-            let ctx = MODULE_CONTEXT.lock();
-            for req in batch {
-                execute_selector_task(&ctx, req);
-            }
-            // ctx dropped here — MODULE_CONTEXT released
-
-            // Loop back to take tasks that arrived during execution, or
-            // atomically release ownership if the queue is now empty.
+/// Wait for a selector result without starving the rayon pool.
+///
+/// Off the pool this is a plain blocking `recv`. On a pool worker it alternates between
+/// checking the responder and running one pending pool job, so the processor's fan-outs
+/// (and other queries' work) keep making progress on this thread while it waits. A stolen
+/// job may itself submit a selector and wait here again; that nests safely because the
+/// processor is a dedicated thread that answers every task in order.
+fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+    if rayon_core::current_thread_index().is_none() {
+        return rx.recv();
+    }
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if matches!(rayon_core::yield_now(), Some(rayon_core::Yield::Executed)) {
+            continue;
+        }
+        match rx.recv_timeout(WORKER_WAIT_BACKOFF) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
         }
     }
 }
@@ -833,6 +830,9 @@ pub(in crate::promql) fn query_instant_local(
     // TimeSeries::get_range inclusive-lower-bound call behave correctly.
     let lookback_start_ms = instant_lookback_start_ms(timestamp, lookback_delta_ms);
 
+    // Fans out on the rayon pool from the processor thread. Safe only because a
+    // worker waiting on this task keeps running pool jobs (see `wait_for_result`);
+    // the chunk-level fan-out inside `get_range` relies on the same guarantee.
     let samples = series
         .iter()
         .map(|(s, _)| s.deref())
@@ -870,6 +870,7 @@ pub(in crate::promql) fn query_range_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
+    // On the pool for the same reason as in `query_instant_local`.
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
@@ -906,76 +907,74 @@ pub(in crate::promql) fn query_range_local(
 
 #[cfg(test)]
 mod selector_batch_executor_tests {
-    use super::{SelectorTaskQueue, selector_fanout_failure};
+    use super::{collect_batch, selector_fanout_failure, wait_for_result};
     use crate::fanout::FanoutError;
     use crate::promql::QueryError;
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::thread;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
-    fn enqueue_claims_processor_after_idle_transition() {
-        let mut queue = SelectorTaskQueue::default();
-
-        assert!(queue.enqueue(1));
-        assert_eq!(queue.next_batch(4), Some(vec![1]));
-        assert!(queue.processor_active);
-
-        // This is the processor's final empty observation. Because it flips
-        // `processor_active` under the queue lock, a subsequent enqueue must
-        // claim processor ownership instead of waiting for a departed worker.
-        assert_eq!(queue.next_batch(4), None);
-        assert!(!queue.processor_active);
-        assert!(queue.enqueue(2));
+    fn collect_batch_sweeps_only_what_is_already_queued() {
+        let (tx, rx) = mpsc::channel();
+        for i in 2..=3 {
+            tx.send(i).unwrap();
+        }
+        // Nothing else arrives, so the sweep must return without waiting.
+        assert_eq!(collect_batch(&rx, 1, 8), vec![1, 2, 3]);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    fn one_processor_drains_tasks_submitted_while_it_is_active() {
-        let mut queue = SelectorTaskQueue::default();
+    fn collect_batch_is_bounded() {
+        let (tx, rx) = mpsc::channel();
+        for i in 2..=10 {
+            tx.send(i).unwrap();
+        }
+        assert_eq!(collect_batch(&rx, 1, 4), vec![1, 2, 3, 4]);
+        // The remainder stays queued for the next batch, in order.
+        assert_eq!(collect_batch(&rx, rx.recv().unwrap(), 4), vec![5, 6, 7, 8]);
+        assert_eq!(rx.recv().unwrap(), 9);
+    }
 
-        assert!(queue.enqueue(1));
-        assert!(!queue.enqueue(2));
-        assert_eq!(queue.next_batch(1), Some(vec![1]));
-        assert_eq!(queue.next_batch(1), Some(vec![2]));
-        assert_eq!(queue.next_batch(1), None);
+    /// One worker, one job that produces the answer, and the same worker waiting for it.
+    /// A parking wait deadlocks here (the job is in the waiter's own queue); the yielding
+    /// wait runs the job and returns. Mirrors the processor's chunk fan-out landing on a
+    /// pool whose every worker is waiting on the processor.
+    #[test]
+    fn worker_waiting_for_a_result_keeps_running_pool_jobs() {
+        let pool = rayon_core::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = pool.install(|| {
+                let (tx, rx) = mpsc::sync_channel(1);
+                rayon_core::spawn(move || tx.send(42).unwrap());
+                wait_for_result(&rx)
+            });
+            done_tx.send(answer).unwrap();
+        });
+        let answer = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the waiting worker never ran the job that answers it");
+        assert_eq!(answer, Ok(42));
     }
 
     #[test]
-    fn idle_transition_interleaving_never_leaves_a_task_unowned() {
-        let queue = Arc::new(Mutex::new(SelectorTaskQueue::default()));
-        {
-            let mut queue = queue.lock().unwrap();
-            assert!(queue.enqueue(1));
-            assert_eq!(queue.next_batch(1), Some(vec![1]));
-        }
+    fn wait_for_result_off_the_pool_is_a_plain_recv() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send("x").unwrap();
+        assert_eq!(wait_for_result(&rx), Ok("x"));
+        drop(tx);
+        assert!(wait_for_result(&rx).is_err());
+    }
 
-        // Either the processor observes task 2 before becoming idle, or the
-        // enqueuer claims ownership after the idle transition. Both outcomes
-        // must leave a processor responsible for task 2.
-        let start = Arc::new(Barrier::new(2));
-        let processor_queue = queue.clone();
-        let processor_start = start.clone();
-        let processor = thread::spawn(move || {
-            processor_start.wait();
-            processor_queue.lock().unwrap().next_batch(1)
-        });
-
-        let enqueuer_queue = queue.clone();
-        let enqueuer = thread::spawn(move || {
-            start.wait();
-            enqueuer_queue.lock().unwrap().enqueue(2)
-        });
-
-        let processor_batch = processor.join().unwrap();
-        let enqueuer_claimed_processor = enqueuer.join().unwrap();
-        let mut queue = queue.lock().unwrap();
-
-        if enqueuer_claimed_processor {
-            assert_eq!(processor_batch, None);
-            assert_eq!(queue.next_batch(1), Some(vec![2]));
-        } else {
-            assert_eq!(processor_batch, Some(vec![2]));
-            assert_eq!(queue.next_batch(1), None);
-        }
+    #[test]
+    fn collect_batch_tolerates_a_dropped_sender() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        drop(tx);
+        assert_eq!(collect_batch(&rx, 7, 4), vec![7]);
     }
 
     #[test]
