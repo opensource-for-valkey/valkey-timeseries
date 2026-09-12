@@ -12,13 +12,14 @@ use crate::promql::engine::query_reader::{
 };
 use crate::promql::engine::{
     AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
-    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_series_range,
+    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_snapshot_range,
     instant_lookback_start_ms, proto_labels_to_eval_labels, validate_max_points,
     validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::series_by_selectors;
-use orx_parallel::IterIntoParIter;
+use crate::series::{RangeSnapshot, TimeSeries};
+use orx_parallel::IntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
@@ -187,7 +188,12 @@ impl SelectorTask {
 /// A third rule lives with the callers: a pool job must not hold the module lock while it
 /// waits on the pool — see `threads::spawn_background`.
 ///
-/// For local queries, the thread processes the task directly, so processing is serialized.
+/// For local queries the thread does two things per batch. Under the module lock it resolves
+/// each task's series, answers the instant reads (one cached sample per series), and copies
+/// out the compressed chunks a range or rollup read touches ([`RangeSnapshot`]). It then
+/// releases the lock and decodes those chunks on [`MATERIALIZE_POOL`], so the lock is held
+/// for the memcpy rather than for the decode — the main thread serves commands while a
+/// range read materializes.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
 /// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
@@ -228,11 +234,43 @@ fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
     while let Ok(first) = receiver.recv() {
         let batch = collect_batch(&receiver, first, MAX_BATCH_SIZE);
 
-        let ctx = MODULE_CONTEXT.lock();
-        for task in batch {
-            execute_selector_task(&ctx, task);
+        // Under the module lock: resolve series, answer what is cheap to
+        // answer, and copy out the chunks the range reads need. Decoding them
+        // — the bulk of a range read — happens below, with the lock released
+        // and the main thread free to serve commands meanwhile.
+        let deferred: Vec<DeferredRangeDecode> = {
+            let ctx = MODULE_CONTEXT.lock();
+            batch
+                .into_iter()
+                .filter_map(|task| execute_selector_task(&ctx, task))
+                .collect()
+            // ctx dropped here — MODULE_CONTEXT released
+        };
+        for work in deferred {
+            work.finish();
         }
-        // ctx dropped here — MODULE_CONTEXT released
+    }
+}
+
+/// A local range or rollup read whose chunks were copied under the module
+/// lock and still have to be decoded, validated and answered.
+struct DeferredRangeDecode {
+    series: Vec<(EvalLabels, RangeSnapshot)>,
+    options: QueryOptions,
+    rollup: bool,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
+}
+
+impl DeferredRangeDecode {
+    fn finish(self) {
+        let result = decode_range_snapshots(self.series, &self.options).map(|ranges| {
+            if self.rollup {
+                SelectorOutput::Rollup(RollupOutcome::Raw(ranges))
+            } else {
+                SelectorOutput::Matrix(ranges)
+            }
+        });
+        deliver_task_result(&self.responder, result);
     }
 }
 
@@ -398,7 +436,7 @@ fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
     rx.recv()
 }
 
-fn execute_selector_task(ctx: &Context, task: SelectorTask) {
+fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRangeDecode> {
     let SelectorTask {
         kind,
         caller_user,
@@ -413,6 +451,7 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     }
 
     let error_responder = responder.clone();
+    let mut deferred = None;
     let result = with_fanout_user(ctx, caller_user.as_deref(), |ctx| {
         if is_clustered(ctx) {
             // The fanout command captures the authenticated user while this
@@ -430,8 +469,17 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
             // The local index is the whole picture on a single node, so the
             // routing scope is deliberately ignored here: `HASHTAG` selects
             // shards, it does not filter keys or labels.
-            let result = execute_selector_task_local(ctx, kind);
-            deliver_task_result(&responder, result);
+            match execute_selector_task_local(ctx, kind) {
+                LocalOutcome::Answered(result) => deliver_task_result(&responder, result),
+                LocalOutcome::Deferred(series, options, rollup) => {
+                    deferred = Some(DeferredRangeDecode {
+                        series,
+                        options,
+                        rollup,
+                        responder,
+                    });
+                }
+            }
         }
         Ok(())
     });
@@ -446,23 +494,35 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     if target_db != original_db {
         let _ = set_current_db(ctx, original_db);
     }
+    deferred
 }
 
-fn execute_selector_task_local(
-    ctx: &Context,
-    command: SelectorTaskKind,
-) -> QueryResult<SelectorOutput> {
+/// What running a task under the module lock produced: a finished answer, or
+/// — for the range reads — the copied chunks still to decode once the lock is
+/// gone (`series`, the task's options, and whether the answer is a rollup's).
+enum LocalOutcome {
+    Answered(QueryResult<SelectorOutput>),
+    Deferred(Vec<(EvalLabels, RangeSnapshot)>, QueryOptions, bool),
+}
+
+fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> LocalOutcome {
     match command {
         SelectorTaskKind::Vector(iqc) => {
             let timestamp = iqc.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-            query_instant_local(ctx, selector, timestamp, iqc.options).map(SelectorOutput::Vector)
+            LocalOutcome::Answered(
+                query_instant_local(ctx, selector, timestamp, iqc.options)
+                    .map(SelectorOutput::Vector),
+            )
         }
         SelectorTaskKind::Range(rc) => {
             let start = rc.start_timestamp;
             let end = rc.end_timestamp;
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            query_range_local(ctx, selector, start, end, rc.options).map(SelectorOutput::Matrix)
+            match snapshot_range_local(ctx, selector, start, end, &rc.options) {
+                Ok(series) => LocalOutcome::Deferred(series, rc.options, false),
+                Err(err) => LocalOutcome::Answered(Err(err)),
+            }
         }
         SelectorTaskKind::Aggregation(ac) => {
             // Single node: there is no shard to push the operator to, so hand
@@ -470,18 +530,24 @@ fn execute_selector_task_local(
             // module lock.
             let timestamp = ac.timestamp;
             let selector: SeriesSelector = SeriesSelector::from(ac.matchers);
-            query_instant_local(ctx, selector, timestamp, ac.options)
-                .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples)))
+            LocalOutcome::Answered(
+                query_instant_local(ctx, selector, timestamp, ac.options)
+                    .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))),
+            )
         }
         SelectorTaskKind::Rollup(rc) => {
             // Single node: same reasoning as the aggregation task — read the
             // windows and let the caller reduce them outside the module lock.
             let Some((start, end)) = rc.rollup.fetch_bounds() else {
-                return Ok(SelectorOutput::Rollup(RollupOutcome::Raw(Vec::new())));
+                return LocalOutcome::Answered(Ok(SelectorOutput::Rollup(RollupOutcome::Raw(
+                    Vec::new(),
+                ))));
             };
             let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            query_range_local(ctx, selector, start, end, rc.options)
-                .map(|series| SelectorOutput::Rollup(RollupOutcome::Raw(series)))
+            match snapshot_range_local(ctx, selector, start, end, &rc.options) {
+                Ok(series) => LocalOutcome::Deferred(series, rc.options, true),
+                Err(err) => LocalOutcome::Answered(Err(err)),
+            }
         }
     }
 }
@@ -820,12 +886,12 @@ pub(in crate::promql) fn query_instant_local(
     let lookback_start_ms = instant_lookback_start_ms(timestamp, lookback_delta_ms);
 
     // The executor's own pool, never the global one: its workers may all be
-    // waiting on this very task. `get_range` sees a pool worker and decodes
-    // inline, so nothing below reaches the global pool either.
+    // waiting on this very task. From a `Vec` rather than `iter_into_par` —
+    // one cached sample per item is far too little work to pull through a
+    // mutex-wrapped iterator (see `snapshot_range_local`).
+    let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
     let samples = series
-        .iter()
-        .map(|(s, _)| s.deref())
-        .iter_into_par()
+        .into_par()
         .with_pool(RayonPool(&MATERIALIZE_POOL))
         .filter_map(|s| {
             let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
@@ -850,39 +916,62 @@ pub(in crate::promql) fn query_instant_local(
     Ok(samples)
 }
 
-pub(in crate::promql) fn query_range_local(
+/// The under-lock half of a local range read: resolve the series and copy
+/// out the chunks the range touches. Nothing here decodes a sample.
+fn snapshot_range_local(
     ctx: &Context,
     selector: SeriesSelector,
     start_time: i64,
     end_time: i64,
-    options: QueryOptions,
-) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
+    options: &QueryOptions,
+) -> QueryResult<Vec<(EvalLabels, RangeSnapshot)>> {
+    if let Some(d) = options.deadline
+        && current_time_millis() > d
+    {
+        return Err(QueryError::Timeout);
+    }
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
-
-    // The executor's own pool, for the same reason as in `query_instant_local`.
-    let ranges = series
-        .iter()
-        .map(|(s, _)| s.deref())
-        .iter_into_par()
+    // The copy fans out on the executor's pool, as the decode it replaced did:
+    // one thread copying a query's worth of chunks was most of what the
+    // decode had cost, and the lock is held either way. From a `Vec`, not
+    // `iter_into_par`: that wraps the iterator in a mutex, and with work this
+    // small per item the pull lock convoys through the kernel.
+    let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
+    Ok(series
+        .into_par()
         .with_pool(RayonPool(&MATERIALIZE_POOL))
-        .filter_map(|s| {
-            let samples =
-                match get_series_range(s, start_time, end_time, options.max_points_per_series) {
-                    Ok(samples) => samples,
-                    Err(err) => {
-                        log_warning(&err);
-                        return Some(Err(QueryError::Execution(err)));
-                    }
-                };
+        .map(|s| {
+            (
+                EvalLabels::interned(&s.labels),
+                s.snapshot_range(start_time, end_time),
+            )
+        })
+        .collect())
+}
+
+/// The other half, off the lock: decode every snapshot on the executor's own
+/// pool and apply the per-series and series-count limits.
+fn decode_range_snapshots(
+    series: Vec<(EvalLabels, RangeSnapshot)>,
+    options: &QueryOptions,
+) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
+    let max_points = options.max_points_per_series;
+    let ranges = series
+        .into_par()
+        .with_pool(RayonPool(&MATERIALIZE_POOL))
+        .filter_map(|(labels, snapshot)| {
+            let samples = match get_snapshot_range(&snapshot, max_points) {
+                Ok(samples) => samples,
+                Err(err) => {
+                    log_warning(&err);
+                    return Some(Err(QueryError::Execution(err)));
+                }
+            };
             if samples.is_empty() {
                 return None;
             }
-
-            let labels = EvalLabels::interned(&s.labels);
-
-            let range = RangeSample { samples, labels };
-            Some(Ok(range))
+            Some(Ok(RangeSample { samples, labels }))
         })
         .into_fallible_result()
         .collect::<Vec<_>>()?;

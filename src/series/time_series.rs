@@ -822,6 +822,21 @@ impl TimeSeries {
         SeriesSampleIterator::new(self, start, end, false)
     }
 
+    /// Copy the chunks `[start, end]` touches, for decoding after this series
+    /// is no longer borrowed. See [`RangeSnapshot`].
+    pub fn snapshot_range(&self, start: Timestamp, end: Timestamp) -> RangeSnapshot {
+        let start = start.max(self.get_min_timestamp());
+        let chunks = if start > end || self.is_empty() || !self.overlaps(start, end) {
+            Vec::new()
+        } else {
+            match self.get_chunk_index_bounds(start, end) {
+                Some((first, last)) => self.chunks[first..=last].to_vec(),
+                None => Vec::new(),
+            }
+        };
+        RangeSnapshot { start, end, chunks }
+    }
+
     /// Return the latest visible sample in the inclusive range `[start, end]`.
     ///
     /// Instant PromQL selectors need one sample, not a materialized lookback
@@ -1432,6 +1447,44 @@ pub(super) fn find_last_ge_index(chunks: &[TimeSeriesChunk], ts: Timestamp) -> (
 /// Below this many chunks, `get_range` decodes on the calling thread even
 /// when it is free to fan out.
 const PARALLEL_RANGE_MIN_CHUNKS: usize = 4;
+
+/// The compressed chunks a range read needs, copied out of a series so they
+/// can be decoded after the series — and the module lock guarding it — are
+/// released.
+///
+/// A chunk is a few KB of compressed bytes; its decoded samples are several
+/// times that. Copying chunks under the lock and decoding outside it turns a
+/// lock hold proportional to the decode into one proportional to the memcpy.
+/// Only the chunks overlapping the range are copied.
+pub struct RangeSnapshot {
+    /// Already clamped to the series' retention floor, as `range_iter` would.
+    start: Timestamp,
+    end: Timestamp,
+    chunks: Vec<TimeSeriesChunk>,
+}
+
+impl RangeSnapshot {
+    /// The decoded samples in `[start, end]`, ascending. Equivalent to
+    /// [`TimeSeries::get_range`] over the same range at snapshot time.
+    pub fn get_range(&self) -> Vec<Sample> {
+        let capacity = self
+            .chunks
+            .iter()
+            .map(|chunk| estimate_range_len(chunk, self.start, self.end))
+            .sum();
+        let mut samples = Vec::with_capacity(capacity);
+        samples.extend(self.range_iter());
+        samples
+    }
+
+    /// The samples in `[start, end]`, ascending, decoded on demand. Equivalent
+    /// to [`TimeSeries::range_iter`] over the same range at snapshot time.
+    pub fn range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.range_iter(self.start, self.end))
+    }
+}
 
 /// How many of `chunk`'s samples `[start, end]` is likely to cover, from the
 /// fraction of the chunk's time span it overlaps. Sizes the buffer a range read

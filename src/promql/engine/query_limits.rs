@@ -1,5 +1,5 @@
 use crate::common::{Sample, Timestamp};
-use crate::series::TimeSeries;
+use crate::series::{RangeSnapshot, TimeSeries};
 
 pub(crate) const MAX_SERIES_ERROR_MSG: &str =
     "the query returns more than the configured max series limit";
@@ -61,6 +61,27 @@ pub(in crate::promql) fn get_series_range(
         samples.push(sample);
     }
 
+    Ok(samples)
+}
+
+/// [`get_series_range`] over a [`RangeSnapshot`]: the same point limit and
+/// the same streaming rejection, decoding chunks the caller copied out under
+/// the module lock so that this runs without it.
+pub(in crate::promql) fn get_snapshot_range(
+    snapshot: &RangeSnapshot,
+    max_points_per_series: Option<usize>,
+) -> Result<Vec<Sample>, String> {
+    let points_count = match max_points_per_series {
+        Some(count) if count > 0 => count,
+        _ => return Ok(snapshot.get_range()),
+    };
+    let mut samples = Vec::new();
+    for sample in snapshot.range_iter() {
+        if samples.len() >= points_count {
+            validate_max_points(points_count.saturating_add(1), max_points_per_series)?;
+        }
+        samples.push(sample);
+    }
     Ok(samples)
 }
 
