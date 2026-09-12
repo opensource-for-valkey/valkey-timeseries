@@ -68,7 +68,6 @@ fn update_series(
     if let Some(chunk_size) = options.chunk_size
         && chunk_size != series.chunk_size_bytes
     {
-        // todo: recompress the chunks
         series.chunk_size_bytes = chunk_size;
         has_changed = true;
     }
