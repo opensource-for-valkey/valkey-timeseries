@@ -1,6 +1,6 @@
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
-use crate::common::threads::IterIntoParRayon;
+use crate::common::threads::RayonPool;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
@@ -18,11 +18,12 @@ use crate::promql::engine::{
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::series_by_selectors;
+use orx_parallel::IterIntoParIter;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, LazyLock, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
 
@@ -165,23 +166,26 @@ impl SelectorTask {
 /// # Design
 ///
 /// One dedicated thread owns the processor role for the life of the module. Submitters only
-/// enqueue a task and wait on its responder; they never take the module lock or touch the
+/// enqueue a task and block on its responder; they never take the module lock or touch the
 /// keyspace themselves.
 ///
 /// The evaluator calls in from inside rayon jobs (`preload_grid` fans selectors out on the
-/// pool; rollup reads happen from step chunks), and the processor's own reads fan out on the
-/// same pool (`TimeSeries::get_range` splits across chunks). Two invariants keep that from
-/// deadlocking:
+/// pool; rollup reads happen from step chunks), and a submitter may therefore be a pool
+/// worker blocked in `recv`. Two invariants keep that from deadlocking:
 ///
 /// 1. The processor is never a pool worker. The earlier cooperative design let the first
 ///    submitter drain the queue; a worker in that role could be handed another submitter's
 ///    closure by work-stealing while it waited on its own fan-out, and that closure would
 ///    then wait on the processor's own thread forever.
-/// 2. A submitter that *is* a pool worker never parks. [`wait_for_result`] keeps it executing
-///    pool jobs until its answer arrives, so the processor's injected work always finds a
-///    thread even when every worker is waiting on a selector. Parking them instead was
-///    observed to freeze the server: eight workers in `recv`, the processor holding the module
-///    lock waiting for a chunk fan-out nobody could run, and the main thread waiting on the lock.
+/// 2. Nothing the processor does needs the global pool. Its materialization fans out on a
+///    private pool ([`MATERIALIZE_POOL`]), and `TimeSeries::get_range` decodes on the calling
+///    thread when that thread is a pool worker. So every global worker may sit in `recv` at
+///    once and the processor still finishes. (An earlier version instead had waiting workers
+///    keep running pool jobs; that let one worker nest a blocking wait per stolen closure,
+///    which under a burst of subquery steps recursed until the stack overflowed.)
+///
+/// A third rule lives with the callers: a pool job must not hold the module lock while it
+/// waits on the pool — see `threads::spawn_background`.
 ///
 /// For local queries, the thread processes the task directly, so processing is serialized.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
@@ -376,37 +380,22 @@ impl SelectorBatchExecutor {
     }
 }
 
-/// How long a waiting pool worker sleeps when the pool has nothing for it to run. It only
-/// bounds how long an injected job can sit unclaimed while *every* worker is waiting here;
-/// a delivered result wakes the sleeper immediately.
-const WORKER_WAIT_BACKOFF: Duration = Duration::from_micros(250);
+/// The pool the processor materializes on. Private to the executor so that its work never
+/// depends on the global pool, whose workers may all be parked in
+/// [`SelectorBatchExecutor::submit_selector_task`] waiting for exactly this work.
+static MATERIALIZE_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
+    rayon_core::ThreadPoolBuilder::new()
+        .num_threads(crate::config::num_threads())
+        .thread_name(|index| format!("ts-promql-io-{index}"))
+        .build()
+        .expect("failed to build the PromQL materialization pool")
+});
 
-/// Wait for a selector result without starving the rayon pool.
-///
-/// Off the pool this is a plain blocking `recv`. On a pool worker it alternates between
-/// checking the responder and running one pending pool job, so the processor's fan-outs
-/// (and other queries' work) keep making progress on this thread while it waits. A stolen
-/// job may itself submit a selector and wait here again; that nests safely because the
-/// processor is a dedicated thread that answers every task in order.
+/// Wait for a selector result. A plain blocking wait, on a pool worker too: the processor
+/// needs nothing from this thread's pool to answer (see the type-level docs), and a wait
+/// that ran other jobs meanwhile would stack one blocking wait per stolen closure.
 fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
-    if rayon_core::current_thread_index().is_none() {
-        return rx.recv();
-    }
-    loop {
-        match rx.try_recv() {
-            Ok(value) => return Ok(value),
-            Err(mpsc::TryRecvError::Disconnected) => return Err(mpsc::RecvError),
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-        if matches!(rayon_core::yield_now(), Some(rayon_core::Yield::Executed)) {
-            continue;
-        }
-        match rx.recv_timeout(WORKER_WAIT_BACKOFF) {
-            Ok(value) => return Ok(value),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
-        }
-    }
+    rx.recv()
 }
 
 fn execute_selector_task(ctx: &Context, task: SelectorTask) {
@@ -830,13 +819,14 @@ pub(in crate::promql) fn query_instant_local(
     // TimeSeries::get_range inclusive-lower-bound call behave correctly.
     let lookback_start_ms = instant_lookback_start_ms(timestamp, lookback_delta_ms);
 
-    // Fans out on the rayon pool from the processor thread. Safe only because a
-    // worker waiting on this task keeps running pool jobs (see `wait_for_result`);
-    // the chunk-level fan-out inside `get_range` relies on the same guarantee.
+    // The executor's own pool, never the global one: its workers may all be
+    // waiting on this very task. `get_range` sees a pool worker and decodes
+    // inline, so nothing below reaches the global pool either.
     let samples = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par_rayon()
+        .iter_into_par()
+        .with_pool(RayonPool(&MATERIALIZE_POOL))
         .filter_map(|s| {
             let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
 
@@ -870,11 +860,12 @@ pub(in crate::promql) fn query_range_local(
     let series = series_by_selectors(ctx, &[selector], None)
         .map_err(|e| QueryError::Execution(e.to_string()))?;
 
-    // On the pool for the same reason as in `query_instant_local`.
+    // The executor's own pool, for the same reason as in `query_instant_local`.
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
-        .iter_into_par_rayon()
+        .iter_into_par()
+        .with_pool(RayonPool(&MATERIALIZE_POOL))
         .filter_map(|s| {
             let samples =
                 match get_series_range(s, start_time, end_time, options.max_points_per_series) {
@@ -907,9 +898,11 @@ pub(in crate::promql) fn query_range_local(
 
 #[cfg(test)]
 mod selector_batch_executor_tests {
-    use super::{collect_batch, selector_fanout_failure, wait_for_result};
+    use super::{MATERIALIZE_POOL, collect_batch, selector_fanout_failure, wait_for_result};
+    use crate::common::threads::RayonPool;
     use crate::fanout::FanoutError;
     use crate::promql::QueryError;
+    use orx_parallel::{IntoParIter, ParIter};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -936,29 +929,38 @@ mod selector_batch_executor_tests {
         assert_eq!(rx.recv().unwrap(), 9);
     }
 
-    /// One worker, one job that produces the answer, and the same worker waiting for it.
-    /// A parking wait deadlocks here (the job is in the waiter's own queue); the yielding
-    /// wait runs the job and returns. Mirrors the processor's chunk fan-out landing on a
-    /// pool whose every worker is waiting on the processor.
+    /// Every worker of the caller's pool parked in `wait_for_result` while the answer is
+    /// produced by a processor thread that fans out on a pool of its own. This is the
+    /// executor's shape under load; it must complete without any caller-pool worker
+    /// running a job.
     #[test]
-    fn worker_waiting_for_a_result_keeps_running_pool_jobs() {
-        let pool = rayon_core::ThreadPoolBuilder::new()
-            .num_threads(1)
+    fn parked_pool_never_starves_a_processor_with_its_own_pool() {
+        let callers = rayon_core::ThreadPoolBuilder::new()
+            .num_threads(2)
             .build()
             .unwrap();
-        let (done_tx, done_rx) = mpsc::channel();
+        let (task_tx, task_rx) = mpsc::channel::<mpsc::SyncSender<usize>>();
         std::thread::spawn(move || {
-            let answer = pool.install(|| {
-                let (tx, rx) = mpsc::sync_channel(1);
-                rayon_core::spawn(move || tx.send(42).unwrap());
-                wait_for_result(&rx)
-            });
-            done_tx.send(answer).unwrap();
+            for responder in task_rx {
+                let sum: usize = (0..10_000usize)
+                    .into_par()
+                    .with_pool(RayonPool(&MATERIALIZE_POOL))
+                    .sum();
+                responder.send(sum).unwrap();
+            }
         });
-        let answer = done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the waiting worker never ran the job that answers it");
-        assert_eq!(answer, Ok(42));
+        let (done_tx, done_rx) = mpsc::channel();
+        callers.spawn_broadcast(move |_| {
+            let (tx, rx) = mpsc::sync_channel(1);
+            task_tx.send(tx).unwrap();
+            done_tx.send(wait_for_result(&rx)).unwrap();
+        });
+        for _ in 0..2 {
+            let answer = done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a parked caller pool starved the processor");
+            assert_eq!(answer, Ok((0..10_000usize).sum()));
+        }
     }
 
     #[test]
