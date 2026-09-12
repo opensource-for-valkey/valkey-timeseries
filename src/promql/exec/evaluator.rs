@@ -21,7 +21,7 @@ use crate::promql::exec::types::{
     PreloadedRollupSeries, RollupPreloadMap, SampleWindow, SeriesMap, StepGridBuilder,
 };
 use crate::promql::exec::utils::{
-    RollupCandidate, collect_rollup_candidates, collect_vector_selectors,
+    RollupCandidate, collect_rollup_candidates, collect_subqueries, collect_vector_selectors,
     merge_step_into_series_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
@@ -60,36 +60,65 @@ const MAX_CONCURRENT_PRELOAD_REQUESTS: usize = 4;
 /// A [`crate::promql::exec::preloader::Preloader`] constructs this before the
 /// range step loop. Evaluation only reads the three maps, keeping source I/O
 /// and planning out of expression semantics.
+///
+/// The maps are behind `Arc` so that one prepared grid can back many
+/// evaluators at once: every outer step of a range query evaluates a subquery
+/// on an evaluator that shares the subquery's union preload (see
+/// [`Evaluator::with_shared`]). Nothing writes to them after preparation.
+#[derive(Default)]
 pub(crate) struct PreparedQuery {
-    preloaded_instant: PreloadMap,
-    preloaded_rollups: RollupPreloadMap,
-    preloaded_matrices: MatrixPreloadMap,
+    preloaded_instant: Arc<RwLock<PreloadMap>>,
+    preloaded_rollups: Arc<RwLock<RollupPreloadMap>>,
+    preloaded_matrices: Arc<RwLock<MatrixPreloadMap>>,
+    preloaded_subqueries: Arc<RwLock<SubqueryPreloadMap>>,
+}
+
+/// One subquery's evaluator, prepared for the union of every outer step's
+/// inner grid. Keyed by the subquery node (the expression tree outlives the
+/// evaluator) and the resolved step, which is all that distinguishes two
+/// grids of the same subquery within one outer query.
+type SubqueryPreloadMap = ahash::AHashMap<(usize, i64), Arc<PreparedQuery>>;
+
+fn subquery_key(subquery: &SubqueryExpr, step_ms: i64) -> (usize, i64) {
+    (subquery as *const SubqueryExpr as usize, step_ms)
+}
+
+/// The step a subquery runs at, per the PromQL spec: its own `<resolution>`,
+/// else the enclosing evaluation interval, else Prometheus' default global
+/// evaluation interval of one minute.
+/// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery>
+/// and `DefaultGlobalConfig.EvaluationInterval` in prometheus/config/config.go.
+fn subquery_step_ms(subquery: &SubqueryExpr, outer_step_ms: i64) -> i64 {
+    match subquery.step {
+        Some(step) => step.as_millis() as i64,
+        None if outer_step_ms > 0 => outer_step_ms,
+        None => 60_000,
+    }
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
     reader: &'reader R,
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
-    preloaded_instant: RwLock<PreloadMap>,
+    preloaded_instant: Arc<RwLock<PreloadMap>>,
     /// Rollups whose whole step grid was evaluated at the source in one request.
     /// Populated by preload_rollups() before the step loop.
-    preloaded_rollups: RwLock<RollupPreloadMap>,
+    preloaded_rollups: Arc<RwLock<RollupPreloadMap>>,
     /// Raw spans for matrix selectors that no rollup grid covers, so the step
     /// loop slices windows locally instead of re-fetching them per step.
     /// Populated by preload_matrices() before the step loop.
-    preloaded_matrices: RwLock<MatrixPreloadMap>,
+    preloaded_matrices: Arc<RwLock<MatrixPreloadMap>>,
+    /// Each subquery's inner grid, preloaded once for every outer step at once
+    /// rather than once per outer step. Populated by preload_subqueries()
+    /// before the step loop; a subquery absent here prepares its own grid when
+    /// evaluated (an instant query, or a preload that hit a reader limit).
+    preloaded_subqueries: Arc<RwLock<SubqueryPreloadMap>>,
     options: QueryOptions,
 }
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
-        Self {
-            reader,
-            preloaded_instant: RwLock::new(PreloadMap::default()),
-            preloaded_rollups: RwLock::new(RollupPreloadMap::default()),
-            preloaded_matrices: RwLock::new(MatrixPreloadMap::default()),
-            options,
-        }
+        Self::with_prepared(reader, options, PreparedQuery::default())
     }
 
     pub(crate) fn with_prepared(
@@ -99,18 +128,38 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     ) -> Self {
         Self {
             reader,
-            preloaded_instant: RwLock::new(prepared.preloaded_instant),
-            preloaded_rollups: RwLock::new(prepared.preloaded_rollups),
-            preloaded_matrices: RwLock::new(prepared.preloaded_matrices),
+            preloaded_instant: prepared.preloaded_instant,
+            preloaded_rollups: prepared.preloaded_rollups,
+            preloaded_matrices: prepared.preloaded_matrices,
+            preloaded_subqueries: prepared.preloaded_subqueries,
+            options,
+        }
+    }
+
+    /// An evaluator over a prepared grid that other evaluators use too — the
+    /// per-outer-step evaluators of one subquery, all reading its union
+    /// preload. Cheap: the maps are shared, not copied.
+    pub(crate) fn with_shared(
+        reader: &'reader R,
+        options: QueryOptions,
+        prepared: Arc<PreparedQuery>,
+    ) -> Self {
+        Self {
+            reader,
+            preloaded_instant: Arc::clone(&prepared.preloaded_instant),
+            preloaded_rollups: Arc::clone(&prepared.preloaded_rollups),
+            preloaded_matrices: Arc::clone(&prepared.preloaded_matrices),
+            preloaded_subqueries: Arc::clone(&prepared.preloaded_subqueries),
             options,
         }
     }
 
     pub(crate) fn into_prepared(self) -> PreparedQuery {
         PreparedQuery {
-            preloaded_instant: self.preloaded_instant.into_inner().unwrap(),
-            preloaded_rollups: self.preloaded_rollups.into_inner().unwrap(),
-            preloaded_matrices: self.preloaded_matrices.into_inner().unwrap(),
+            preloaded_instant: self.preloaded_instant,
+            preloaded_rollups: self.preloaded_rollups,
+            preloaded_matrices: self.preloaded_matrices,
+            preloaded_subqueries: self.preloaded_subqueries,
         }
     }
 
@@ -161,7 +210,88 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         self.preload_rollups(expr, grid)?;
         self.preload_matrices(expr, grid)?;
+        self.preload_subqueries(expr, grid)?;
 
+        Ok(())
+    }
+
+    /// Prepare each subquery once for the whole outer grid.
+    ///
+    /// Every outer step evaluates the subquery over its own window, and each
+    /// window is a run of the same lattice — the multiples of the subquery
+    /// step — so their union is one grid from the earliest window's start to
+    /// the latest window's end. A sub-evaluator prepared for that union
+    /// answers every outer step by index (`evaluate_vector_selector` and
+    /// `preloaded_rollup_by_key` locate a step from the entry's own
+    /// `eval_start_ms`/`step_ms`), which turns outer_steps fetches of mostly
+    /// the same span into one.
+    ///
+    /// Done here, on the thread driving the range query, rather than lazily by
+    /// the first outer step to need it: the outer steps run as pool jobs, and a
+    /// pool job must not block others on a lock while it waits on the pool.
+    fn preload_subqueries(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
+        if grid.step_ms <= 0 {
+            return Ok(());
+        }
+        for subquery in collect_subqueries(expr) {
+            self.check_deadline()?;
+            let step_ms = subquery_step_ms(subquery, grid.step_ms);
+            if step_ms <= 0 {
+                continue;
+            }
+            let key = subquery_key(subquery, step_ms);
+            if self.preloaded_subqueries.read().unwrap().contains_key(&key) {
+                continue;
+            }
+            // The union of the windows: modifiers shift (or, with `@`,
+            // collapse) every window end the same way, so the extremes of the
+            // shifted outer bounds bound them all.
+            let (Some(first), Some(last)) = (grid.steps().next(), grid.steps().last()) else {
+                continue;
+            };
+            let resolve = |ts: Timestamp| {
+                apply_time_modifiers_ms(
+                    subquery.at.as_ref(),
+                    subquery.offset.as_ref(),
+                    grid.at_start_ms,
+                    grid.at_end_ms,
+                    ts,
+                )
+            };
+            let (first_end, last_end) = (resolve(first), resolve(last));
+            let (earliest_end, latest_end) = (first_end.min(last_end), first_end.max(last_end));
+            let range_ms = subquery.range.as_millis() as i64;
+            let (aligned_start_ms, _, _, _) =
+                compute_subquery_alignment(earliest_end - range_ms, latest_end, step_ms, 0);
+            let union = PreloadGrid {
+                start_ms: aligned_start_ms,
+                end_ms: latest_end,
+                step_ms,
+                at_start_ms: grid.at_start_ms,
+                at_end_ms: grid.at_end_ms,
+                lookback_delta_ms: grid.lookback_delta_ms,
+            };
+            let plan = PlannedQuery::for_grid(&subquery.expr, union);
+            match Preloader::new(self.reader, self.options).prepare(plan) {
+                Ok(prepared) => {
+                    self.preloaded_subqueries
+                        .write()
+                        .unwrap()
+                        .insert(key, Arc::new(prepared));
+                }
+                Err(err) if matches!(err, EvaluationError::Query(QueryError::Timeout)) => {
+                    return Err(err);
+                }
+                Err(err) => {
+                    // Same rule as the per-step preload: a reader limit tripped
+                    // by the union span downgrades to per-step evaluation.
+                    tracing::debug!(
+                        error = %err,
+                        "subquery union preload failed; each outer step will prepare its own grid"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -806,18 +936,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let range_ms = subquery.range.as_millis() as i64;
         let subquery_start_ms = subquery_end_ms - range_ms;
 
-        // Subquery step resolution fallback per PromQL spec:
-        // "<resolution> is optional. Default is the global evaluation interval."
-        // See: https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery
-        let step_ms = if let Some(s) = subquery.step {
-            s.as_millis() as i64
-        } else if ctx.step_ms > 0 {
-            ctx.step_ms
-        } else {
-            // See: https://github.com/prometheus/prometheus/blob/main/config/config.go#L169
-            // DefaultGlobalConfig.EvaluationInterval = 1 * time.Minute
-            60_000
-        };
+        let step_ms = subquery_step_ms(subquery, ctx.step_ms);
 
         // Guard against invalid step
         if step_ms <= 0 {
@@ -877,30 +996,43 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // `collect_vector_selectors` / `collect_rollup_candidates` both stop at
         // `Expr::Subquery`, so this walk covers exactly the nodes evaluated at
         // this grid.
-        let grid = PreloadGrid::for_subquery(aligned_start_ms, subquery_end_ms, step_ms, ctx);
-        let sub_plan = PlannedQuery::for_grid(&subquery.expr, grid);
-        let prepared = match Preloader::new(self.reader, self.options).prepare(sub_plan) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                // A deadline means the query is over; more work cannot help.
-                if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
-                    return Err(err);
-                }
-                // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
-                // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
-                // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
-                tracing::debug!(
-                    error = %err,
-                    "subquery preload failed; falling back to per-step evaluation"
-                );
-                PreparedQuery {
-                    preloaded_instant: PreloadMap::default(),
-                    preloaded_rollups: RollupPreloadMap::default(),
-                    preloaded_matrices: MatrixPreloadMap::default(),
-                }
+        //
+        // For a range query the union of every outer step's grid was prepared
+        // up front (`preload_subqueries`); this step only wraps it. Otherwise —
+        // an instant query, or a union preload that was declined — prepare this
+        // one step's grid here.
+        let union = self
+            .preloaded_subqueries
+            .read()
+            .unwrap()
+            .get(&subquery_key(subquery, step_ms))
+            .cloned();
+        let sub = match union {
+            Some(prepared) => Evaluator::with_shared(self.reader, self.options, prepared),
+            None => {
+                let grid =
+                    PreloadGrid::for_subquery(aligned_start_ms, subquery_end_ms, step_ms, ctx);
+                let sub_plan = PlannedQuery::for_grid(&subquery.expr, grid);
+                let prepared = match Preloader::new(self.reader, self.options).prepare(sub_plan) {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        // A deadline means the query is over; more work cannot help.
+                        if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
+                            return Err(err);
+                        }
+                        // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
+                        // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
+                        // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
+                        tracing::debug!(
+                            error = %err,
+                            "subquery preload failed; falling back to per-step evaluation"
+                        );
+                        PreparedQuery::default()
+                    }
+                };
+                Evaluator::with_prepared(self.reader, self.options, prepared)
             }
         };
-        let sub = Evaluator::with_prepared(self.reader, self.options, prepared);
 
         let mut series_map = SeriesMap::default();
         if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {

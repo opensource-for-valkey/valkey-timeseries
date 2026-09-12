@@ -5252,10 +5252,11 @@ mod tests {
     /// A rollup inside a subquery keeps its own grid: the outer preload must not
     /// claim it, or every subquery step would read the outer query's windows.
     ///
-    /// Since Phase 2 the subquery preloads its grid in a sub-evaluator, so the
-    /// inner rollup is one request *per outer step* — each covering that step's
-    /// subquery grid — rather than one per (outer step × subquery step), and
-    /// never one request over the outer query's own grid.
+    /// The subquery is prepared once, in a sub-evaluator, for the union of
+    /// every outer step's window — all runs of the subquery's own lattice — so
+    /// the inner rollup is one request over that union grid: not one per outer
+    /// step, not one per (outer step × subquery step), and never one over the
+    /// outer query's own grid.
     #[test]
     fn should_preload_a_subquerys_rollup_on_the_subquerys_grid() {
         let query = "max_over_time(sum_over_time(metric[1m])[2m:1m])";
@@ -5263,17 +5264,16 @@ mod tests {
             evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, RollupAnswer::Rolled);
 
         // Outer steps 120s/180s/240s. Each one's subquery is (t-2m, t] at a 1m
-        // resolution, which aligns to {t-1m, t} — so each offer's grid is that
-        // pair, never the outer query's 120s..240s.
-        let mut grids: Vec<(i64, i64)> = offered
+        // resolution, which aligns to {t-1m, t}; their union is 60s..240s on
+        // the 1m lattice — not the outer query's 120s..240s.
+        let grids: Vec<(i64, i64)> = offered
             .iter()
             .map(|o| (o.query_start, o.query_end))
             .collect();
-        grids.sort_unstable();
         assert_eq!(
             grids,
-            vec![(60_000, 120_000), (120_000, 180_000), (180_000, 240_000)],
-            "one request per outer step, over that step's subquery grid"
+            vec![(60_000, 240_000)],
+            "one request, over the union of the outer steps' subquery grids"
         );
         assert!(
             offered.iter().all(|o| o.step_ms == 60_000),

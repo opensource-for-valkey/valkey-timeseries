@@ -1,6 +1,6 @@
 use crate::common::{Sample, Timestamp};
 use crate::promql::exec::types::{EvalSample, SeriesMap};
-use promql_parser::parser::{AggregateExpr, Call, Expr, VectorSelector};
+use promql_parser::parser::{AggregateExpr, Call, Expr, SubqueryExpr, VectorSelector};
 
 /// Append one evaluation step's instant-vector samples into a per-series map,
 /// stamping each sample with the step timestamp.
@@ -51,6 +51,42 @@ fn collect_vector_selectors_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSe
         // Subquery: has own step loop with different step params — not preloaded
         Expr::MatrixSelector(_)
         | Expr::Subquery(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Every subquery evaluated at this grid, outermost first. Stops at a subquery:
+/// what is nested inside one runs at *its* grid, and its own preload covers it.
+pub(in crate::promql) fn collect_subqueries(expr: &Expr) -> Vec<&SubqueryExpr> {
+    let mut out = Vec::new();
+    collect_subqueries_inner(expr, &mut out);
+    out
+}
+
+fn collect_subqueries_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a SubqueryExpr>) {
+    match expr {
+        Expr::Subquery(sq) => out.push(sq),
+        Expr::Aggregate(agg) => {
+            collect_subqueries_inner(&agg.expr, out);
+            if let Some(ref param) = agg.param {
+                collect_subqueries_inner(param, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_subqueries_inner(&b.lhs, out);
+            collect_subqueries_inner(&b.rhs, out);
+        }
+        Expr::Paren(p) => collect_subqueries_inner(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                collect_subqueries_inner(arg, out);
+            }
+        }
+        Expr::Unary(u) => collect_subqueries_inner(&u.expr, out),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::Extension(_) => {}

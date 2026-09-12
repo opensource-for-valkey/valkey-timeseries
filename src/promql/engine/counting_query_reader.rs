@@ -571,10 +571,11 @@ mod tests {
         let (counting, reader) = build_reader();
         // Nested subqueries nest sub-evaluators. The outer [4m:2m] grid has 2
         // aligned steps and nothing of its own to preload (its inner expression
-        // is a subquery, which both collectors stop at). Each of those 2 steps
-        // evaluates the inner [2m:1m] subquery, whose own sub-evaluator
-        // preloads `a` once for its 2-step grid — so 2 fetches total, where
-        // before Phase 2 there were 2 × 2 live `query` calls.
+        // is a subquery, which the selector collectors stop at). Preparing that
+        // grid also prepares the inner [2m:1m] subquery once, for the union of
+        // both outer steps' windows, so `a` is fetched once — where each outer
+        // step used to fetch its own window (2), and before Phase 2 there were
+        // 2 × 2 live `query` calls.
         run_instant(
             reader,
             "max_over_time(max_over_time((a)[2m:1m])[4m:2m])",
@@ -583,24 +584,26 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 2,
+                query_range: 1,
                 ..Default::default()
             }
         );
     }
 
     #[test]
-    fn range_subquery_over_expr_is_one_fetch_per_outer_step() {
+    fn range_subquery_over_expr_is_one_fetch_for_all_outer_steps() {
         let (counting, reader) = build_reader();
-        // The outer range query cannot preload across subquery boundaries — each
-        // outer step's subquery covers a different window — so the request count
-        // is one per outer step rather than the outer_steps × inner_steps
-        // product that plan finding 1.2 describes (5 × 4 = 20 before Phase 2).
+        // Each outer step's subquery covers a different window, but every
+        // window is a run of the same 1m lattice, so the outer preload prepares
+        // the subquery once for their union and the steps read from that: one
+        // fetch, where it used to be one per outer step (`RANGE_STEPS`) and,
+        // before Phase 2, the outer_steps × inner_steps product that plan
+        // finding 1.2 describes (5 × 4 = 20).
         run_range(reader, "max_over_time((a)[4m:1m])");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: RANGE_STEPS,
+                query_range: 1,
                 ..Default::default()
             }
         );
