@@ -4,7 +4,7 @@ use crate::commands::ts_create::parse_series_options;
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, get_timeseries_mut};
+use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, try_get_timeseries_mut};
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
@@ -63,10 +63,9 @@ fn incr_decr(ctx: &Context, args: Vec<ValkeyString>, is_increment: bool) -> Valk
     let delta_arg = args[2].clone();
     let create_options = args[3..].to_vec();
 
-    let outcome = if let Some(mut series) = get_timeseries_mut(
+    let outcome = if let Some(mut series) = try_get_timeseries_mut(
         ctx,
         &key_name,
-        false,
         Some(AclPermissions::UPDATE | AclPermissions::ACCESS),
     )? {
         handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)?

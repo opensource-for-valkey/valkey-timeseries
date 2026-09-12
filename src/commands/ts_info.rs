@@ -36,9 +36,7 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     args.done()?;
-    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), true)?;
-    // must_exist was passed above. Therefore, unwrap is safe here
-    let series = series.unwrap();
+    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
     // The key is what TS.INFO DEBUG reports as `keySelfName`.
     Ok(get_ts_info(ctx, &series, debugging, &key))
 }

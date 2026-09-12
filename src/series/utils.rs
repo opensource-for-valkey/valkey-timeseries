@@ -16,86 +16,97 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+/// Runs `f` against the series stored at `key`, opened read-only.
+///
+/// Errors with `KEY_NOT_FOUND` when the key is missing, `WRONGTYPE` when it holds another
+/// type, and the ACL error when `permissions` is given and the caller lacks it. See
+/// [`try_get_timeseries`] for the ordering of those checks.
 pub fn with_timeseries<R>(
     ctx: &Context,
     key: &ValkeyString,
-    check_acl: bool,
+    permissions: Option<AclPermissions>,
     f: impl FnOnce(&TimeSeries) -> ValkeyResult<R>,
 ) -> ValkeyResult<R> {
-    let redis_key = ctx.open_key(key);
-    // A key holding a non-TSDB value must surface the standard WRONGTYPE error,
-    // not valkey-module-rs's raw "Existing key has wrong Valkey type" — the `?`
-    // shortcut leaked the latter, diverging from RTS (and from TS.RANGE/TS.INFO,
-    // which report WRONGTYPE). A missing key is KEY_NOT_FOUND.
-    match redis_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
-        Ok(Some(series)) => {
-            if check_acl {
-                check_key_permissions(ctx, key, &AclPermissions::ACCESS)?;
-            }
-            f(series)
-        }
-        Ok(None) => Err(invalid_series_key_error()),
-        Err(_) => Err(ValkeyError::WrongType),
-    }
+    let series = get_timeseries(ctx, key, permissions)?;
+    f(&series)
 }
 
+/// Runs `f` against the series stored at `key`, opened for writing.
+///
+/// Same error contract as [`with_timeseries`].
 pub fn with_timeseries_mut<R>(
     ctx: &Context,
     key: &ValkeyString,
     permissions: Option<AclPermissions>,
     f: impl FnOnce(&mut TimeSeries) -> ValkeyResult<R>,
 ) -> ValkeyResult<R> {
-    let perms = permissions.unwrap_or(AclPermissions::UPDATE);
-    // expect should not panic, since must_exist will cause an error if the key is non-existent, and `?` will ensure it propagates
-    let mut series =
-        get_timeseries_mut(ctx, key, true, Some(perms))?.expect("expected key to exist");
+    let mut series = get_timeseries_mut(ctx, key, permissions)?;
     f(&mut series)
 }
 
+/// Opens `key` read-only and returns a guard over the series it holds.
+///
+/// A missing key is `KEY_NOT_FOUND`; use [`try_get_timeseries`] when absence is an
+/// expected outcome rather than an error.
 pub fn get_timeseries<'a>(
     ctx: &'a Context,
     key: &ValkeyString,
     permissions: Option<AclPermissions>,
-    must_exist: bool,
+) -> ValkeyResult<SeriesGuard<'a>> {
+    try_get_timeseries(ctx, key, permissions)?.ok_or_else(invalid_series_key_error)
+}
+
+/// Opens `key` read-only and returns a guard over the series it holds, or `Ok(None)` when
+/// the key does not exist.
+///
+/// When `permissions` is given the ACL check runs *before* the key is looked up, so a
+/// caller without access learns nothing about whether the key exists or what type it
+/// holds — the same order the server applies to its own key-spec checks. A key holding a
+/// non-TSDB value surfaces the standard `WRONGTYPE` error rather than valkey-module-rs's
+/// raw "Existing key has wrong Valkey type", matching RTS.
+pub fn try_get_timeseries<'a>(
+    ctx: &'a Context,
+    key: &ValkeyString,
+    permissions: Option<AclPermissions>,
 ) -> ValkeyResult<Option<SeriesGuard<'a>>> {
     if let Some(permissions) = permissions {
         check_key_permissions(ctx, key, &permissions)?;
     }
     match SeriesGuard::from_key(ctx, key) {
         Ok(guard) => Ok(Some(guard)),
-        Err(e) => match e {
-            ValkeyError::Str(err) if err == error_consts::KEY_NOT_FOUND => {
-                if must_exist {
-                    return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND));
-                }
-                Ok(None)
-            }
-            _ => Err(e),
-        },
+        Err(ValkeyError::Str(err)) if err == error_consts::KEY_NOT_FOUND => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
+/// Opens `key` for writing and returns a mutable guard over the series it holds.
+///
+/// A missing key is `KEY_NOT_FOUND`; use [`try_get_timeseries_mut`] when absence is an
+/// expected outcome (e.g. the auto-create write commands).
 pub fn get_timeseries_mut<'a>(
     ctx: &'a Context,
     key: &ValkeyString,
-    must_exist: bool,
+    permissions: Option<AclPermissions>,
+) -> ValkeyResult<SeriesGuardMut<'a>> {
+    try_get_timeseries_mut(ctx, key, permissions)?.ok_or_else(invalid_series_key_error)
+}
+
+/// Opens `key` for writing and returns a mutable guard over the series it holds, or
+/// `Ok(None)` when the key does not exist.
+///
+/// Same check ordering and error contract as [`try_get_timeseries`].
+pub fn try_get_timeseries_mut<'a>(
+    ctx: &'a Context,
+    key: &ValkeyString,
     permissions: Option<AclPermissions>,
 ) -> ValkeyResult<Option<SeriesGuardMut<'a>>> {
-    let value_key = ctx.open_key_writable(key);
-    match value_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
-        Ok(Some(series)) => {
-            if let Some(permissions) = permissions {
-                check_key_permissions(ctx, key, &permissions)?;
-            }
-            Ok(Some(SeriesGuardMut { series }))
-        }
-        Ok(None) => {
-            if must_exist {
-                return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND));
-            }
-            Ok(None)
-        }
-        Err(_e) => Err(ValkeyError::WrongType),
+    if let Some(permissions) = permissions {
+        check_key_permissions(ctx, key, &permissions)?;
+    }
+    match SeriesGuardMut::from_key(ctx, key) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(ValkeyError::Str(err)) if err == error_consts::KEY_NOT_FOUND => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -185,9 +196,7 @@ pub fn create_and_store_series<'a>(
 ) -> ValkeyResult<SeriesGuardMut<'a>> {
     create_and_store_internal(ctx, key, options, explicit_create, explicit_create)?;
 
-    let Some(mut series) = get_timeseries_mut(ctx, key, true, Some(AclPermissions::INSERT))? else {
-        return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND));
-    };
+    let mut series = get_timeseries_mut(ctx, key, Some(AclPermissions::INSERT))?;
 
     if add_compactions {
         // If compactions are enabled, add the default compaction rules

@@ -20,7 +20,7 @@ use crate::series::index::{
 };
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::remove_all_stale_series_internal;
-use crate::series::{SeriesRef, TimeSeries, get_timeseries, get_timeseries_mut};
+use crate::series::{SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_mut};
 use range_set_blaze::RangeSetBlaze;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -464,7 +464,7 @@ fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
     let new_db = get_current_db(ctx);
     // fetch the series from the new
     let valkey_key = create_key_string(ctx, key);
-    let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
+    let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &valkey_key, None) else {
         logging::log_warning("Failed to load series for key move");
         return;
     };
@@ -482,7 +482,7 @@ fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
 fn handle_key_rename(ctx: &Context, _old_key: &[u8], new_key: &[u8]) {
     let index = get_timeseries_index(ctx);
     let key = create_key_string(ctx, new_key);
-    let Ok(Some(series)) = get_timeseries(ctx, &key, None, false) else {
+    let Ok(Some(series)) = try_get_timeseries(ctx, &key, None) else {
         logging::log_warning("Failed to load series for key rename");
         return;
     };
@@ -521,7 +521,7 @@ fn handle_key_restore(ctx: &Context, key: &[u8]) {
 fn handle_key_copy(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
     let valkey_key = create_key_string(ctx, key);
-    let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
+    let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &valkey_key, None) else {
         return;
     };
     series._db = Some(db);

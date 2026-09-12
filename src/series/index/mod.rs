@@ -17,7 +17,7 @@ use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_warning;
 use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
-use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries_mut};
+use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
 pub use index_key::IndexKey;
 pub use memory::{IndexMemory, index_memory_usage};
 pub use posting_stats::*;
@@ -128,10 +128,12 @@ where
     Ok(())
 }
 
+/// Resolves a series id through the index and opens its key for writing. `Ok(None)` when
+/// the id is unknown (or its key has since disappeared); the ACL and type checks are those
+/// of [`try_get_timeseries_mut`].
 pub fn get_series_by_id(
     ctx: &'_ Context,
     id: SeriesRef,
-    must_exist: bool,
     permissions: Option<AclPermissions>,
 ) -> ValkeyResult<Option<SeriesGuardMut<'_>>> {
     let map = TIMESERIES_INDEX.pin();
@@ -152,7 +154,7 @@ pub fn get_series_by_id(
     let Some(real_key) = real_key else {
         return Ok(None);
     };
-    get_timeseries_mut(ctx, &real_key, must_exist, permissions)
+    try_get_timeseries_mut(ctx, &real_key, permissions)
 }
 
 pub fn get_series_key_by_id(ctx: &Context, id: SeriesRef) -> Option<ValkeyString> {
@@ -182,7 +184,7 @@ pub fn remove_series_from_index(ts: &TimeSeries) {
 pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
     let valkey_key = create_key_string(ctx, key);
-    let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
+    let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &valkey_key, None) else {
         return;
     };
     series._db = Some(db);

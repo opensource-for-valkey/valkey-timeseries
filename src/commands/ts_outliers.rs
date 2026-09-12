@@ -14,7 +14,6 @@ use crate::common::replies::{
     ReplyContext, ThreadSafeReplyContext, block_client, reply_with_sample,
 };
 use crate::common::threads::spawn;
-use crate::error_consts;
 use crate::series::{TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -140,13 +139,10 @@ fn process_request(
     anomaly_direction: AnomalyDirection,
     output_format: OutputFormat,
 ) -> ValkeyResult {
-    let samples = match get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), false) {
-        Ok(Some(series)) => {
-            let (start, end) = date_range.get_series_range(&series, None, false);
-            series.get_range(start, end)
-        }
-        Ok(None) => return Err(ValkeyError::Str(error_consts::KEY_NOT_FOUND)),
-        Err(e) => return Err(e),
+    let samples = {
+        let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
+        let (start, end) = date_range.get_series_range(&series, None, false);
+        series.get_range(start, end)
     };
 
     validate_rcf_options(&options, samples.len())?;

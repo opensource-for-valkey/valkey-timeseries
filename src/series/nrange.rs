@@ -32,11 +32,7 @@ pub(crate) fn process_nrange_query(
     let guards = options
         .keys
         .iter()
-        .map(|key| {
-            // must_exist = true, so the Option is always Some when this returns Ok.
-            get_timeseries(ctx, key, Some(AclPermissions::ACCESS), true)
-                .map(|guard| guard.expect("get_timeseries(must_exist) returned no series"))
-        })
+        .map(|key| get_timeseries(ctx, key, Some(AclPermissions::ACCESS)))
         .collect::<ValkeyResult<Vec<_>>>()?;
 
     let metas: Vec<NRangeSeriesMeta> = guards

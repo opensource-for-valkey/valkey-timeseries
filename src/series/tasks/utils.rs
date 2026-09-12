@@ -1,6 +1,6 @@
 use crate::common::context::create_key_string;
 use crate::series::index::{TIMESERIES_INDEX, get_timeseries_index, with_timeseries_postings};
-use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries_mut};
+use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
 use std::sync::atomic::{AtomicI32, Ordering};
 use valkey_module::Context;
 
@@ -71,7 +71,7 @@ pub(super) fn fetch_series_batch(
     let mut stale_ids = Vec::new();
     let mut result = Vec::with_capacity(SERIES_TRIM_BATCH_SIZE);
     for (id, key) in resolved {
-        let Ok(Some(series)) = get_timeseries_mut(ctx, &key, false, None) else {
+        let Ok(Some(series)) = try_get_timeseries_mut(ctx, &key, None) else {
             stale_ids.push(id);
             continue;
         };
