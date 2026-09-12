@@ -6,6 +6,7 @@ use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::mrange::process_mrange_query;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
+acl_categories!(TS_MRANGE, "ts.mrange", "read timeseries");
 /// TS.MRANGE fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
@@ -30,6 +31,7 @@ pub fn ts_mrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     mrange_internal(ctx, args, false)
 }
 
+acl_categories!(TS_MREVRANGE, "ts.mrevrange", "read timeseries");
 #[valkey_module_macros::command({
     name: "ts.mrevrange",
     flags: [ReadOnly],

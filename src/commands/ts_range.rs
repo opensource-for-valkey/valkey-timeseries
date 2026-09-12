@@ -6,6 +6,7 @@ use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_RANGE, "ts.range", "read timeseries");
 /// TS.RANGE key fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
@@ -29,6 +30,7 @@ pub fn ts_range_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     range_internal(ctx, args, false)
 }
 
+acl_categories!(TS_REVRANGE, "ts.revrange", "read timeseries");
 /// TS.REVRANGE key fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]

@@ -4,6 +4,7 @@ use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::count_matched_series;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_CARD, "ts.card", "read timeseries");
 ///
 /// TS.CARD [FILTER_BY_RANGE fromTimestamp toTimestamp] [HASHTAG hash_tag,...] [FILTER filter...]
 ///

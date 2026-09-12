@@ -15,6 +15,7 @@ use valkey_module::{
     ValkeyString,
 };
 
+acl_categories!(TS_CREATERULE, "ts.createrule", "write timeseries");
 ///
 /// TS.CREATERULE sourceKey destKey AGGREGATION aggregator bucketDuration [alignTimestamp]
 ///

@@ -32,6 +32,7 @@ struct SeriesSamples<'a> {
     samples: Vec<ParsedInput<'a>>,
 }
 
+acl_categories!(TS_MADD, "ts.madd", "fast write timeseries");
 /// TS.MADD key timestamp value [key timestamp value ...]
 ///
 /// The code is a bit involved, but the goal of this implementation is to parallelize the

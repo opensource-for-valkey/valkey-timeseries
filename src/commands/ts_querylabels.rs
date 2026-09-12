@@ -6,6 +6,7 @@ use crate::series::index::query_labels_distinct;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_QUERYLABELS, "ts.querylabels", "read timeseries");
 /// TS.QUERYLABELS <LABELS | VALUES label> [HASHTAG hash_tag,...] [FILTER filterExpr [filterExpr ...]]
 ///
 /// Returns the distinct label names (with `LABELS`) or the distinct values of a single

@@ -390,6 +390,7 @@ fn reply_error(ctx: &ReplyContext, err: &ValkeyError) {
     };
 }
 
+acl_categories!(TS_READ, "ts.read", "read timeseries");
 /// TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count] [CONDITION op value]
 #[valkey_module_macros::command({
     name: "ts.read",

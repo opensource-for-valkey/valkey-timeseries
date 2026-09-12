@@ -6,6 +6,7 @@ use crate::series::index::series_keys_by_selectors;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_QUERYINDEX, "ts.queryindex", "read timeseries");
 /// TS.QUERYINDEX [FILTER_BY_RANGE [NOT] fromTimestamp toTimestamp] [HASHTAG hash_tag,...] selector [selector ...]
 ///
 /// Returns the keys of the time series matching every supplied selector. Selectors are bare

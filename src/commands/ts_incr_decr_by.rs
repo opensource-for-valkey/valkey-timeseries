@@ -9,6 +9,7 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_INCRBY, "ts.incrby", "write timeseries");
 #[valkey_module_macros::command({
     name: "ts.incrby",
     flags: [Write, DenyOOM],
@@ -26,6 +27,7 @@ pub fn ts_incrby_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     incr_decr(ctx, args, true)
 }
 
+acl_categories!(TS_DECRBY, "ts.decrby", "write timeseries");
 #[valkey_module_macros::command({
     name: "ts.decrby",
     flags: [Write, DenyOOM],

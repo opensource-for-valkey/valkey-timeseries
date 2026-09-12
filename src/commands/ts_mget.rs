@@ -11,6 +11,7 @@ use crate::series::request_types::{MGetRequest, MGetSeriesData, MatchFilterOptio
 use crate::series::{get_latest_compaction_sample, get_series_labels};
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
+acl_categories!(TS_MGET, "ts.mget", "fast read timeseries");
 /// TS.MGET
 ///   [LATEST]
 ///   [WITHLABELS | SELECTED_LABELS label...]

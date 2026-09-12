@@ -11,6 +11,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 /// preceding it are bounded.
 const MAX_FIXED_ARGS: usize = 7;
 
+acl_categories!(TS_LABELSTATS, "ts.labelstats", "read timeseries");
 /// https://prometheus.io/docs/prometheus/latest/querying/api/#tsdb-stats
 #[valkey_module_macros::command({
     name: "ts.labelstats",

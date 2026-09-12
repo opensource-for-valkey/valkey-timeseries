@@ -8,6 +8,7 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+acl_categories!(TS_ALTER, "ts.alter", "write timeseries");
 /// Alter a time series
 ///
 /// TS.ALTER key

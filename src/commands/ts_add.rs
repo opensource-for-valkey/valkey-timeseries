@@ -12,6 +12,7 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_ADD, "ts.add", "write timeseries");
 ///
 /// TS.ADD key timestamp value
 ///     [RETENTION duration]

@@ -8,6 +8,7 @@ use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_JOIN, "ts.join", "read timeseries");
 /// TS.JOIN key1 key2 fromTimestamp toTimestamp
 ///   [INNER | FULL | LEFT | RIGHT | ANTI | SEMI | ASOF [PREVIOUS | NEXT | NEAREST] tolerance [ALLOW_EXACT_MATCH [true|false]]]
 ///   [FILTER_BY_TS ts...]

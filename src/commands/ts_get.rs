@@ -4,6 +4,7 @@ use valkey_module::{
     AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_GET, "ts.get", "fast read timeseries");
 /// TS.GET key [LATEST]
 #[valkey_module_macros::command({
     name: "ts.get",

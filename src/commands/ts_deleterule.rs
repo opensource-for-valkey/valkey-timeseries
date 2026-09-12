@@ -4,6 +4,7 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+acl_categories!(TS_DELETERULE, "ts.deleterule", "write timeseries");
 ///
 /// TS.DELETERULE sourceKey destKey
 ///

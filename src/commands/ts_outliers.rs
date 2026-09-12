@@ -54,6 +54,7 @@ enum ZScoreType {
     Smoothed,
 }
 
+acl_categories!(TS_OUTLIERS, "ts.outliers", "fast read timeseries");
 /// TS.OUTLIERS key fromTimestamp toTimestamp
 ///     METHOD <method> [method-specific-options]
 ///     [OUTPUT <full|simple|cleaned>]

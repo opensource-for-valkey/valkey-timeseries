@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{AclPermissions, Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_INFO, "ts.info", "read fast timeseries");
 #[valkey_module_macros::command({
     name: "ts.info",
     flags: [ReadOnly],

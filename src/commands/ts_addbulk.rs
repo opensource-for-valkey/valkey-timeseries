@@ -7,6 +7,7 @@ use crate::series::{
 };
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_ADDBULK, "ts.addbulk", "write timeseries");
 ///
 /// TS.ADDBULK key data
 ///     [RETENTION duration]

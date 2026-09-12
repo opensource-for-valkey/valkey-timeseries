@@ -3,6 +3,7 @@ use crate::common::replies::reply_with_pivot_rows;
 use crate::series::nrange::process_nrange_query;
 use valkey_module::{Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_NRANGE, "ts.nrange", "read timeseries");
 /// TS.NRANGE numkeys key [key ...] fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
@@ -34,6 +35,7 @@ pub fn ts_nrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     nrange_internal(ctx, args, false)
 }
 
+acl_categories!(TS_NREVRANGE, "ts.nrevrange", "read timeseries");
 /// TS.NREVRANGE numkeys key [key ...] fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
