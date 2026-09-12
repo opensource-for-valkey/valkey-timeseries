@@ -191,13 +191,30 @@ impl EvalLabels {
 
     /// Remove a label by name. Promotes to `Owned` only if the label exists.
     pub(crate) fn remove(&mut self, key: &str) {
-        if let EvalLabels::Owned(vec) = self {
-            if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
-                vec.remove(i);
+        match self {
+            EvalLabels::Owned(vec) => {
+                if let Ok(i) = vec.binary_search_by(|l| l.name.as_str().cmp(key)) {
+                    vec.remove(i);
+                }
             }
-        } else if self.contains(key) {
-            self.make_owned();
-            self.remove(key);
+            // Stay interned: the result is the same slice minus one entry, and
+            // each entry is a refcounted pointer. Materializing to `Owned` here
+            // — a `String` per name and per value — was most of the cost of a
+            // vector-vector binop, which drops `__name__` from every sample.
+            EvalLabels::Interned(split) => {
+                if let Ok(i) = split.binary_search_by(|l| l.name().cmp(key)) {
+                    let mut kept = Vec::with_capacity(split.len() - 1);
+                    kept.extend_from_slice(&split[..i]);
+                    kept.extend_from_slice(&split[i + 1..]);
+                    *self = EvalLabels::Interned(Arc::from(kept));
+                }
+            }
+            EvalLabels::Shared(_) => {
+                if self.contains(key) {
+                    self.make_owned();
+                    self.remove(key);
+                }
+            }
         }
     }
 

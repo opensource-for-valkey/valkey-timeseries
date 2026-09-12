@@ -62,7 +62,10 @@ pub const IGNORE_MAX_TIME_DIFF_MAX: i64 = ONE_YEAR_MS * 100; // 100 years
 pub const IGNORE_MAX_VALUE_DIFF_MIN: f64 = 0.0;
 pub const IGNORE_MAX_VALUE_DIFF_MAX: f64 = f64::MAX;
 
-pub const MIN_THREADS: i64 = 1;
+/// `0` means "size to the machine": `available_parallelism`, capped at [`MAX_THREADS`].
+/// An opt-in rather than the default, because the registered default of 4 is a
+/// documented divergence from RTS (DIV-0009) that the compatibility suite pins.
+pub const MIN_THREADS: i64 = 0;
 pub const MAX_THREADS: i64 = 16;
 // Deliberately above RTS's default of 3 (registered divergence DIV-0009):
 // sizes the rayon pool used for parallel query processing.
@@ -320,8 +323,15 @@ pub static CHUNK_SIZE: AtomicI64 = AtomicI64::new(CHUNK_SIZE_DEFAULT);
 /// rather than silently no-op-ing.
 pub static NUM_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_THREADS);
 
+/// The resolved worker count: the configured value, or, for `0`, the number of
+/// CPUs the process may use (capped at [`MAX_THREADS`]).
 pub fn num_threads() -> usize {
-    NUM_THREADS.load(Ordering::Relaxed) as usize
+    match NUM_THREADS.load(Ordering::Relaxed) {
+        0 => std::thread::available_parallelism()
+            .map_or(DEFAULT_THREADS as usize, |n| n.get())
+            .min(MAX_THREADS as usize),
+        n => n as usize,
+    }
 }
 
 /// `ts-promql-max-concurrent-queries`: how many `TS.QUERY` / `TS.QUERYRANGE`
@@ -1182,7 +1192,7 @@ pub static CONFIGS: &[ConfigDesc] = &[
         // Sizes the module's shared compute pool, which cannot be resized once built, so this can
         // only be set at startup; runtime `CONFIG SET` is rejected by the server itself.
         flags: ConfigurationFlags::IMMUTABLE,
-        description: "Number of worker threads for parallel query processing",
+        description: "Number of worker threads for parallel query processing; 0 sizes to the machine's CPUs (max 16)",
         storage: ConfigStorage::I64 {
             cell: || &NUM_THREADS,
             validate: None,
