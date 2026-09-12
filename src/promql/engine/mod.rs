@@ -7,6 +7,7 @@ mod querier;
 mod query_limits;
 pub mod query_reader;
 mod query_stats;
+pub mod query_workers;
 mod selector_batch_executor;
 
 use crate::common::Timestamp;

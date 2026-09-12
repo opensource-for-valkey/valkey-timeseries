@@ -259,6 +259,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-ignore-max-time-diff',
             'ts-ignore-max-val-diff',
             'ts-num-threads',
+            'ts-promql-max-concurrent-queries',
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
             'ts-index-build-max-memory',

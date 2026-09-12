@@ -68,6 +68,13 @@ pub const MAX_THREADS: i64 = 16;
 // sizes the rayon pool used for parallel query processing.
 pub const DEFAULT_THREADS: i64 = 4;
 
+pub const MIN_CONCURRENT_QUERIES: i64 = 1;
+pub const MAX_CONCURRENT_QUERIES: i64 = 256;
+/// Prometheus evaluates up to 20 queries at once (`--query.max-concurrency`); a
+/// query here spends most of its time waiting on the pool and the selector
+/// executor rather than computing, so a handful of evaluators keeps them busy.
+pub const DEFAULT_CONCURRENT_QUERIES: i64 = 8;
+
 pub const RETENTION_POLICY_MIN: i64 = 0;
 pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; // 10 years
 
@@ -315,6 +322,16 @@ pub static NUM_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_THREADS);
 
 pub fn num_threads() -> usize {
     NUM_THREADS.load(Ordering::Relaxed) as usize
+}
+
+/// `ts-promql-max-concurrent-queries`: how many `TS.QUERY` / `TS.QUERYRANGE`
+/// evaluations run at once; further ones queue. Sizes a fixed set of worker
+/// threads built on first use, so it is registered `IMMUTABLE` like
+/// `ts-num-threads`.
+pub static MAX_CONCURRENT_QUERIES_CELL: AtomicI64 = AtomicI64::new(DEFAULT_CONCURRENT_QUERIES);
+
+pub fn max_concurrent_queries() -> usize {
+    MAX_CONCURRENT_QUERIES_CELL.load(Ordering::Relaxed) as usize
 }
 
 pub const DEFAULT_FANOUT_COMMAND_TIMEOUT_MS: u64 = 5000;
@@ -897,6 +914,10 @@ fn read_num_threads() -> ConfigValue {
     ConfigValue::Integer(NUM_THREADS.load(Ordering::Relaxed))
 }
 
+fn read_max_concurrent_queries() -> ConfigValue {
+    ConfigValue::Integer(MAX_CONCURRENT_QUERIES_CELL.load(Ordering::Relaxed))
+}
+
 fn read_fanout_command_timeout() -> ConfigValue {
     ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT.load(Ordering::Relaxed) as i64)
 }
@@ -1164,6 +1185,21 @@ pub static CONFIGS: &[ConfigDesc] = &[
         description: "Number of worker threads for parallel query processing",
         storage: ConfigStorage::I64 {
             cell: || &NUM_THREADS,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-promql-max-concurrent-queries",
+        read: read_max_concurrent_queries,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(DEFAULT_CONCURRENT_QUERIES),
+        min: Some(ConfigValue::Integer(MIN_CONCURRENT_QUERIES)),
+        max: Some(ConfigValue::Integer(MAX_CONCURRENT_QUERIES)),
+        // The query worker threads are created once, on first use.
+        flags: ConfigurationFlags::IMMUTABLE,
+        description: "Number of PromQL queries (TS.QUERY, TS.QUERYRANGE) evaluated concurrently; further queries wait",
+        storage: ConfigStorage::I64 {
+            cell: || &MAX_CONCURRENT_QUERIES_CELL,
             validate: None,
         },
     },
@@ -1605,6 +1641,7 @@ mod tests {
         ("ts-ignore-max-time-diff", "0"),
         ("ts-ignore-max-val-diff", "0"),
         ("ts-num-threads", "4"),
+        ("ts-promql-max-concurrent-queries", "8"),
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
         ("ts-index-build-max-memory", "268435456"),
@@ -2010,14 +2047,16 @@ mod tests {
         store_rounding_strategy(restore);
     }
 
-    /// `ts-num-threads` is the one parameter that cannot change after startup, because rayon's
-    /// global pool cannot be resized once built.
+    /// The two thread-pool sizes are the only parameters that cannot change after startup:
+    /// rayon's global pool cannot be resized once built, and the PromQL query workers are
+    /// created once, on first use.
     #[test]
-    fn only_num_threads_is_immutable() {
+    fn only_thread_pool_sizes_are_immutable() {
+        const IMMUTABLE: [&str; 2] = ["ts-num-threads", "ts-promql-max-concurrent-queries"];
         for desc in CONFIGS {
             assert_eq!(
                 desc.is_mutable(),
-                desc.name != "ts-num-threads",
+                !IMMUTABLE.contains(&desc.name),
                 "{}: unexpected mutability",
                 desc.name
             );

@@ -2,7 +2,9 @@ use crate::commands::command_parser::{ParsedPromqlQuery, parse_query_command_arg
 use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
-use crate::common::time::system_time_to_millis;
+use crate::common::time::{current_time_millis, system_time_to_millis};
+use crate::promql::QueryError;
+use crate::promql::engine::query_workers::submit_query;
 use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -43,8 +45,15 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let eval_ts = eval_stmt.start;
 
     let querier = get_promql_querier(ctx, hash_tags);
-    std::thread::spawn(move || {
+    let queued = submit_query(move || {
         let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
+
+        // The wait for a worker counts against the query's budget: one that
+        // expired in the queue is answered as a timeout, not evaluated.
+        if options.deadline.is_some_and(|d| current_time_millis() > d) {
+            thread_ctx.reply(Err(ValkeyError::String(QueryError::Timeout.to_string())));
+            return;
+        }
 
         let result = match evaluate_instant(querier, eval_stmt, eval_ts, options) {
             Ok(eval_stmt) => eval_stmt,
@@ -58,7 +67,10 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         let ctx = thread_ctx.get_write_context();
         reply_with_query_value(&ctx, result, system_time_to_millis(eval_ts));
     });
+    if !queued {
+        return Err(ValkeyError::Str("TSDB: query workers are not running"));
+    }
 
-    // We will reply later, from the thread
+    // We will reply later, from a query worker
     Ok(ValkeyValue::NoReply)
 }
