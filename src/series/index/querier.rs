@@ -22,7 +22,7 @@
 //! For label-centric exploration and ranking APIs (for example, fuzzy/similarity label
 //! discovery), see `label_querier.rs`, which composes this module and `Postings`.
 
-use super::postings::{EMPTY_BITMAP, KeyType, Postings};
+use super::postings::{EMPTY_BITMAP, Postings};
 use super::{PostingsBitmap, get_db_index, get_timeseries_index};
 use crate::common::Timestamp;
 use crate::common::context::{create_key_string, get_acl_user, get_current_db};
@@ -31,7 +31,7 @@ use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
 use crate::series::acl::{check_key_read_permission, has_all_keys_permissions};
 use crate::series::request_types::MetaDateRangeFilter;
-use crate::series::{SeriesGuard, SeriesRef, TimeSeries, get_timeseries};
+use crate::series::{SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries};
 use blart::AsBytes;
 use orx_parallel::{IterIntoParIter, ParIter};
 use smallvec::SmallVec;
@@ -147,7 +147,7 @@ pub fn query_labels_distinct(
         }
         // No `ACCESS` permission is passed here: the read check above already ran, and
         // passing it would turn an unreadable key into a hard error instead of a skip.
-        let Some(guard) = get_timeseries(ctx, &k, None, false)? else {
+        let Some(guard) = try_get_timeseries(ctx, &k, None)? else {
             stale.push(id);
             continue;
         };
@@ -267,7 +267,7 @@ fn count_series_from_postings(
         let mut count = 0usize;
         for (id, k) in resolved {
             let perms = Some(AclPermissions::ACCESS);
-            if get_timeseries(ctx, &k, perms, false)?.is_some() {
+            if try_get_timeseries(ctx, &k, perms)?.is_some() {
                 count += 1;
             } else {
                 stale.push(id);
@@ -281,7 +281,7 @@ fn count_series_from_postings(
     let mut guards: Vec<SeriesGuard> = Vec::with_capacity(resolved.len());
     for (id, k) in resolved {
         let perms = Some(AclPermissions::ACCESS);
-        if let Some(guard) = get_timeseries(ctx, &k, perms, false)? {
+        if let Some(guard) = try_get_timeseries(ctx, &k, perms)? {
             guards.push(guard);
         } else {
             stale.push(id);
@@ -361,7 +361,7 @@ fn get_multi_series_by_id<'a>(
     let mut result = Vec::with_capacity(resolved.len());
     for (id, k) in resolved {
         let perms = Some(AclPermissions::ACCESS);
-        if let Some(guard) = get_timeseries(ctx, &k, perms, false)? {
+        if let Some(guard) = try_get_timeseries(ctx, &k, perms)? {
             result.push((guard, k));
         } else {
             stale.push(id);
@@ -436,15 +436,6 @@ fn filter_series_by_date_range<'a>(
                 .collect())
         }
     }
-}
-
-pub(super) fn get_guard_from_key<'a>(
-    ctx: &'a Context,
-    key: &KeyType,
-) -> ValkeyResult<Option<SeriesGuard<'a>>> {
-    let real_key = create_key_string(ctx, key.as_bytes());
-    let perms = Some(AclPermissions::ACCESS);
-    get_timeseries(ctx, &real_key, perms, false)
 }
 
 pub fn count_matched_series(

@@ -48,10 +48,6 @@ impl AnomalyDetectionMethodOptions {
             Self::Esd(_) => AnomalyMethod::Esd,
         }
     }
-
-    pub fn for_ewma(alpha: f64) -> Self {
-        AnomalyDetectionMethodOptions::Ewma(Some(alpha))
-    }
 }
 
 /// Options for anomaly detection
@@ -66,10 +62,6 @@ pub struct AnomalyOptions {
 impl AnomalyOptions {
     pub fn method(&self) -> AnomalyMethod {
         self.options.method()
-    }
-
-    pub fn set_seasonal_periods(&mut self, periods: Vec<usize>) {
-        self.seasonality = Some(Seasonality::Periods(periods));
     }
 }
 

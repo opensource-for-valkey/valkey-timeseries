@@ -3,15 +3,6 @@ use enquote::unescape;
 use std::borrow::Cow;
 use std::num::ParseIntError;
 
-#[inline]
-const fn is_first_ident_char(ch: &char) -> bool {
-    matches!(ch, 'A'..='Z' | 'a'..='z' | '_' | ':')
-}
-
-const fn is_ident_char(ch: char) -> bool {
-    matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | ':' | '.')
-}
-
 /// Interprets `token` as a single-quoted, double-quoted, or backquoted
 /// Prometheus query language string literal, returning the string value that `token`
 /// quotes.
@@ -85,26 +76,6 @@ fn handle_unquote(token: &str, quote: char) -> ParseResult<String> {
         }
         Ok(s) => Ok(s),
     }
-}
-
-pub fn escape_ident(s: &str) -> String {
-    let mut dst = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if is_ident_char(ch) {
-            if i == 0 && !is_first_ident_char(&ch) {
-                // hex escape the first char
-                dst.push_str("\\x");
-                dst.push_str(&format!("{:02x}", ch as u8).to_string());
-            } else {
-                dst.push(ch);
-            }
-            continue;
-        } else {
-            // escape the char
-            dst.push(ch.escape_default().next().unwrap());
-        }
-    }
-    dst.to_string()
 }
 
 pub fn unescape_ident(s: &'_ str) -> ParseResult<Cow<'_, str>> {

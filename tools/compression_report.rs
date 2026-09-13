@@ -489,7 +489,7 @@ fn main() {
     }
 
     // Sort rows by id for stable output
-    rows.sort_by(|a, b| a.0.id().cmp(&b.0.id()));
+    rows.sort_by_key(|row| row.0.id());
 
     // Write outputs
     let out_csv = PathBuf::from("target/bench-reports/compression.csv");

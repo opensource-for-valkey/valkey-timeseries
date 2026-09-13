@@ -50,10 +50,6 @@ pub enum FanoutTarget {
 }
 
 impl FanoutTarget {
-    pub fn for_slots(slots: &[u16]) -> Self {
-        FanoutTarget::Slots(slots.iter().copied().collect())
-    }
-
     pub fn for_hash_tags(hash_tags: &[&str]) -> Self {
         let mut slots = SmallVec::<[u16; 4]>::new();
         for tag in hash_tags {
@@ -562,8 +558,6 @@ pub struct ClusterMap {
     expiration_ts: AtomicI64,
     /// is the current map consistent (no collisions/inconsistencies found while building)
     pub is_consistent: bool,
-    /// Whether the cluster map covers all slots consecutively
-    pub is_cluster_map_full: bool,
 }
 
 impl ClusterMap {

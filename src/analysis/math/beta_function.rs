@@ -2,32 +2,10 @@
 // Ported from: https://github.com/AndreyAkinshin/perfolizer
 // License: Apache-2.0
 
-use super::gamma_function::{gamma, log_gamma};
-
-pub fn hyper_geometric_value(a: f64, b: f64, c: f64, z: f64, k: i32) -> f64 {
-    let mut result = 1.0;
-    for n in (0..=k).rev() {
-        result = 1.0
-            + result * (a + n as f64) * (b + n as f64) / (c + n as f64) * z / ((n as f64) + 1.0);
-    }
-    result
-}
-
-pub fn beta_complete_value(a: f64, b: f64) -> f64 {
-    gamma(a) * gamma(b) / gamma(a + b)
-}
+use super::gamma_function::log_gamma;
 
 pub fn beta_complete_log_value(a: f64, b: f64) -> f64 {
     log_gamma(a) + log_gamma(b) - log_gamma(a + b)
-}
-
-pub fn beta_incomplete_value(a: f64, b: f64, x: f64) -> f64 {
-    x.powf(a) / a * hyper_geometric_value(a, 1.0 - b, a + 1.0, x, 20)
-}
-
-/// Natural logarithm of incomplete beta function B(x; a, b)
-pub fn beta_incomplete_log_value(a: f64, b: f64, x: f64) -> f64 {
-    a * x.ln() - a.ln() + hyper_geometric_value(a, 1.0 - b, a + 1.0, x, b.round() as i32).ln()
 }
 
 /// Regularized incomplete beta function Ix(a, b)
@@ -166,24 +144,6 @@ mod tests {
     use super::*;
 
     const EPSILON: f64 = 1e-6;
-
-    #[test]
-    fn test_beta_complete_value() {
-        let b = beta_complete_value(2.0, 3.0);
-        assert!((b - 0.08333333).abs() < EPSILON);
-    }
-
-    #[test]
-    pub fn test_beta_complete_value2() {
-        for a in 1..=20 {
-            for b in 1..=20 {
-                let actual = beta_complete_value(a as f64, b as f64);
-                let expected = factorial((a - 1) as f64) * factorial((b - 1) as f64)
-                    / factorial((a + b - 1) as f64);
-                assert!((expected - actual).abs() < EPSILON);
-            }
-        }
-    }
 
     #[test]
     pub fn test_beta_complete_log_value() {

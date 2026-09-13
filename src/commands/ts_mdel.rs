@@ -9,6 +9,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::series::{TimestampRange, delete_series_by_selectors};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_MDEL, "ts.mdel", "write timeseries");
 /// TS.MDEL [fromTimestamp toTimestamp] [HASHTAG hash_tag,...] FILTER label=value [label=value ...]
 ///
 /// Two modes:

@@ -5,6 +5,7 @@ use valkey_module::{
     ValkeyValue,
 };
 
+acl_categories!(TS_DEL, "ts.del", "write timeseries");
 ///
 /// TS.DEL key fromTimestamp toTimestamp
 ///

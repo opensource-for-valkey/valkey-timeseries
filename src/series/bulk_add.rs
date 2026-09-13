@@ -18,7 +18,6 @@ use simd_json::prelude::ValueObjectAccess;
 use valkey_module::{Context, NotifyEvent, ValkeyError, ValkeyResult};
 
 pub const MAX_SAMPLES_PER_INSERT: usize = 1_000;
-const COMPRESSION_RATIO_CONSERVATIVE: f64 = 2.0;
 const EARLY_CHUNK_CAPACITY_FACTOR: f64 = 0.7;
 const EARLY_CHUNK_SAMPLE_THRESHOLD: usize = 10;
 
@@ -494,9 +493,17 @@ fn notify_added(ctx: &Context, event: &str, ids: &[SeriesRef]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::ingest_normalize::get_min_allowed_timestamp;
     use crate::tests::generators::DataGenerator;
     use std::time::Duration;
+
+    /// The oldest timestamp the series will accept, derived from its retention window.
+    fn get_min_allowed_timestamp(series: &TimeSeries) -> Timestamp {
+        if series.retention.is_zero() {
+            0
+        } else {
+            series.get_min_timestamp()
+        }
+    }
 
     fn generate_random_samples(count: usize) -> Vec<Sample> {
         DataGenerator::builder()

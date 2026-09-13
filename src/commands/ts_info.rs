@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{AclPermissions, Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_INFO, "ts.info", "read fast timeseries");
 #[valkey_module_macros::command({
     name: "ts.info",
     flags: [ReadOnly],
@@ -36,9 +37,7 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     args.done()?;
-    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), true)?;
-    // must_exist was passed above. Therefore, unwrap is safe here
-    let series = series.unwrap();
+    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
     // The key is what TS.INFO DEBUG reports as `keySelfName`.
     Ok(get_ts_info(ctx, &series, debugging, &key))
 }

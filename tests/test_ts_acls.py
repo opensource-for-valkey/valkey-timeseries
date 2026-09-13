@@ -353,42 +353,71 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
         ## We should throw an error if user does not have access to all keys in that case
 
     def test_timeseries_command_acl_categories(self):
-        # List of commands and their acl categories
-        timeseries_commands = [
-            ('TS.ADD', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.CREATE', [b'write', b'denyoom', b'module'], [b'@write', b'@fast', b'@timeseries']),
-            ('TS.MADD', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.INFO', [b'readonly', b'module'], [b'@read', b'@fast', b'@timeseries']),
-            ('TS.CARD', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.ALTER', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.DEL', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@timeseries']),
-            ('TS.RANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.READ', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.REVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.MRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.MREVRANGE', [b'readonly', b'module'], [b'@read', b'@timeseries']),
+        # Expected flags and ACL categories for every command the module registers, keyed by the
+        # lowercase registered name. `ts._debug`/`ts._restore` come from the positional table in
+        # src/lib.rs; the rest from the `acl_categories!` declaration beside each `#[command]`.
+        #
+        # The command set is discovered from the server rather than listed here, and compared
+        # against this dict's keys with set equality, so a new command fails this test until its
+        # categories are declared below. Categories are compared as exact sets, so an extra or
+        # missing category fails too.
+        expected = {
+            'ts._debug': ([b'readonly', b'module'], {b'@read', b'@admin', b'@timeseries'}),
+            'ts._restore': ([b'write', b'denyoom', b'module'], {b'@write', b'@admin', b'@timeseries'}),
+            'ts.add': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.addbulk': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.alter': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.card': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.create': ([b'write', b'denyoom', b'module'], {b'@write', b'@fast', b'@timeseries'}),
+            'ts.createrule': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.decrby': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.del': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.deleterule': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.get': ([b'readonly', b'module', b'fast'], {b'@read', b'@fast', b'@timeseries'}),
+            'ts.incrby': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.info': ([b'readonly', b'module'], {b'@read', b'@fast', b'@timeseries'}),
+            'ts.join': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.labelnames': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.labelstats': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.labelvalues': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.madd': ([b'write', b'denyoom', b'module'], {b'@write', b'@fast', b'@timeseries'}),
+            'ts.mdel': ([b'write', b'denyoom', b'module'], {b'@write', b'@timeseries'}),
+            'ts.metricnames': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.mget': ([b'readonly', b'module', b'fast'], {b'@read', b'@fast', b'@timeseries'}),
+            'ts.mrange': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.mrevrange': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
             # movablekeys comes from the numkeys key spec: the key positions are not fixed.
-            ('TS.NRANGE', [b'readonly', b'module', b'movablekeys'], [b'@read', b'@timeseries']),
-            ('TS.NREVRANGE', [b'readonly', b'module', b'movablekeys'], [b'@read', b'@timeseries']),
-            ('TS.INCRBY', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.DECRBY', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.CREATERULE', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.DELETERULE', [b'write', b'denyoom', b'module'], [b'@write', b'@timeseries']),
-            ('TS.QUERYINDEX', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.LABELSTATS', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.JOIN', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.MGET', [b'readonly', b'module', b'fast'], [b'@read', b'@timeseries']),
-            ('TS.LABELNAMES', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-            ('TS.LABELVALUES', [b'readonly', b'module'], [b'@read', b'@timeseries']),
-        ]
-        for cmd in timeseries_commands:
-            # Get the info of the commands and compare the acl categories
-            cmd_info = self.client.execute_command(f'COMMAND INFO {cmd[0]}')
-            assert cmd_info[0][2] == cmd[
-                1], f"ACL categories for command {cmd[0]} do not match. Expected {cmd[1]}, got {cmd_info[0][2]}"
-            for category in cmd[2]:
-                assert category in cmd_info[0][6], f"Category {category} not found in command {cmd[0]}"
+            'ts.nrange': ([b'readonly', b'module', b'movablekeys'], {b'@read', b'@timeseries'}),
+            'ts.nrevrange': ([b'readonly', b'module', b'movablekeys'], {b'@read', b'@timeseries'}),
+            'ts.outliers': ([b'readonly', b'denyoom', b'module'], {b'@read', b'@fast', b'@timeseries'}),
+            'ts.queryindex': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.querylabels': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.range': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.read': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.revrange': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+        }
+
+        registered = {
+            name.decode().lower()
+            for name in self.client.execute_command('COMMAND LIST FILTERBY MODULE ts')
+        }
+        assert registered == set(expected), (
+            f"module command set changed; declare categories for "
+            f"{sorted(registered - set(expected))} / drop {sorted(set(expected) - registered)}"
+        )
+
+        for name, (flags, categories) in expected.items():
+            info = self.client.execute_command('COMMAND INFO', name)[0]
+            actual_flags, actual_categories = info[2], set(info[6])
+            assert actual_flags == flags, f"{name}: flags {actual_flags} != {flags}"
+            assert actual_categories == categories, (
+                f"{name}: categories {actual_categories} != {categories}"
+            )
+            # The flag decides the read/write category; the two must never disagree, or a
+            # `-@write` user could run a writing command.
+            assert (b'write' in actual_flags) == (b'@write' in actual_categories), name
+            assert (b'readonly' in actual_flags) == (b'@read' in actual_categories), name
+            assert b'@timeseries' in actual_categories, name
 
     def verify_valid_user_permissions(self, client, cmd):
         cmd_name = cmd[0].split()[0]

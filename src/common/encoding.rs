@@ -102,14 +102,6 @@ pub(crate) fn try_read_byte_slice<'a>(buf: &mut &'a [u8]) -> DecodeResult<&'a [u
     Ok(slice)
 }
 
-pub(crate) fn try_read_string(buf: &mut &[u8]) -> DecodeResult<String> {
-    let slice = try_read_byte_slice(buf)?;
-    match std::str::from_utf8(slice) {
-        Ok(s) => Ok(s.to_string()),
-        Err(_) => Err(DecodeError::Overflow), // Invalid UTF-8
-    }
-}
-
 /// Reads an unsigned varint from the buffer
 /// Returns the value and the number of bytes consumed, or None if invalid
 pub(crate) fn try_read_uvarint(buf: &mut &[u8]) -> DecodeResult<u64> {

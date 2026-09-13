@@ -380,34 +380,34 @@ impl Default for SmoothedZScoreOptions {
     }
 }
 
-/// Detects anomalies in a time series using the Smoothed Z-Score algorithm.
-pub(super) fn detect_anomalies_smoothed_zscore(
-    ts: &[f64],
-    options: SmoothedZScoreOptions,
-) -> TimeSeriesAnalysisResult<AnomalyResult> {
-    let SmoothedZScoreOptions {
-        lag,
-        influence,
-        threshold,
-    } = options;
-
-    let n = ts.len();
-    if n < lag {
-        return Err(TimeSeriesAnalysisError::InsufficientData {
-            message: "TSDB: insufficient samples for smoothed z-score lag".to_string(),
-            required: lag,
-            actual: n,
-        });
-    }
-
-    let mut detector = SmoothedZScoreAnomalyDetector::new(influence, threshold, lag)?;
-    detector.train(ts)?;
-    detector.detect(ts)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Detects anomalies in a time series using the Smoothed Z-Score algorithm.
+    fn detect_anomalies_smoothed_zscore(
+        ts: &[f64],
+        options: SmoothedZScoreOptions,
+    ) -> TimeSeriesAnalysisResult<AnomalyResult> {
+        let SmoothedZScoreOptions {
+            lag,
+            influence,
+            threshold,
+        } = options;
+
+        let n = ts.len();
+        if n < lag {
+            return Err(TimeSeriesAnalysisError::InsufficientData {
+                message: "TSDB: insufficient samples for smoothed z-score lag".to_string(),
+                required: lag,
+                actual: n,
+            });
+        }
+
+        let mut detector = SmoothedZScoreAnomalyDetector::new(influence, threshold, lag)?;
+        detector.train(ts)?;
+        detector.detect(ts)
+    }
 
     #[test]
     fn test_peak_detector_initialization() {

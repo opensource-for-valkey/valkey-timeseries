@@ -1,7 +1,8 @@
 pub mod mstl;
 mod periodogram;
 pub mod stl;
-mod test_data;
+#[cfg(test)]
+pub mod test_data;
 
 use crate::analysis::seasonality::mstl::Mstl;
 use crate::analysis::seasonality::stl::Stl;

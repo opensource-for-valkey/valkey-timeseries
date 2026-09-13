@@ -4,8 +4,8 @@ use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
-    PerSeriesSamples, SampleAddResult, SeriesGuardMut, get_timeseries_mut,
-    multi_series_merge_samples,
+    PerSeriesSamples, SampleAddResult, SeriesGuardMut, multi_series_merge_samples,
+    try_get_timeseries_mut,
 };
 use ahash::AHashMap;
 use smallvec::SmallVec;
@@ -32,6 +32,7 @@ struct SeriesSamples<'a> {
     samples: Vec<ParsedInput<'a>>,
 }
 
+acl_categories!(TS_MADD, "ts.madd", "fast write timeseries");
 /// TS.MADD key timestamp value [key timestamp value ...]
 ///
 /// The code is a bit involved, but the goal of this implementation is to parallelize the
@@ -182,7 +183,7 @@ fn parse_args<'a>(
         // Resolve per-series guard once (first time we see a key); cache series-level error.
         if series_samples.samples.is_empty() {
             series_samples.err =
-                match get_timeseries_mut(ctx, key, false, Some(AclPermissions::UPDATE)) {
+                match try_get_timeseries_mut(ctx, key, Some(AclPermissions::UPDATE)) {
                     Ok(Some(guard)) => {
                         series_samples.series = Some(guard);
                         SampleAddResult::Ok(Sample::default())

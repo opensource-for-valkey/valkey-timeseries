@@ -1,7 +1,10 @@
 use crate::series::{get_latest_compaction_sample, with_timeseries};
 use valkey_module::ValkeyError::WrongArity;
-use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{
+    AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
+};
 
+acl_categories!(TS_GET, "ts.get", "fast read timeseries");
 /// TS.GET key [LATEST]
 #[valkey_module_macros::command({
     name: "ts.get",
@@ -31,7 +34,7 @@ pub fn ts_get_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let key = &args[1];
-    let sample = with_timeseries(ctx, key, true, |series| {
+    let sample = with_timeseries(ctx, key, Some(AclPermissions::ACCESS), |series| {
         if latest && let Some(value) = get_latest_compaction_sample(ctx, series) {
             Ok(Some(value))
         } else {

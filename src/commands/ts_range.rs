@@ -6,6 +6,7 @@ use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
+acl_categories!(TS_RANGE, "ts.range", "read timeseries");
 /// TS.RANGE key fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
@@ -29,6 +30,7 @@ pub fn ts_range_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     range_internal(ctx, args, false)
 }
 
+acl_categories!(TS_REVRANGE, "ts.revrange", "read timeseries");
 /// TS.REVRANGE key fromTimestamp toTimestamp
 //   [LATEST]
 //   [FILTER_BY_TS ts...]
@@ -63,9 +65,7 @@ fn range_internal(ctx: &Context, args: Vec<ValkeyString>, is_reverse: bool) -> V
 
     args.done()?;
 
-    // In both cases we pass true for must_exist, meaning that if the series does not exist, we will
-    // propagate an error. Because of this, unwrap is safe to use here.
-    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS), true)?.unwrap();
+    let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
 
     if options.aggregation.as_ref().is_some_and(|a| a.is_multi()) {
         let iter = TimeSeriesRangeRowIterator::new(Some(ctx), &series, &options, is_reverse);

@@ -8,6 +8,7 @@ use valkey_module::{
     AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+acl_categories!(TS_ALTER, "ts.alter", "write timeseries");
 /// Alter a time series
 ///
 /// TS.ALTER key
@@ -68,7 +69,6 @@ fn update_series(
     if let Some(chunk_size) = options.chunk_size
         && chunk_size != series.chunk_size_bytes
     {
-        // todo: recompress the chunks
         series.chunk_size_bytes = chunk_size;
         has_changed = true;
     }

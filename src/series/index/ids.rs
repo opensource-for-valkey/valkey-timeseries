@@ -25,6 +25,7 @@
 //! epoch `0`. A wrap requires exhausting 2^40 (~1.1 trillion) IDs in one
 //! process lifetime; the carried epoch is as uniformly random as a fresh
 //! draw, so wrapping is harmless anyway.
+#[allow(dead_code)]
 use crate::series::TimeseriesId;
 use rand::{RngExt, rng};
 use std::sync::atomic::{AtomicU64, Ordering};

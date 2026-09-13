@@ -2,9 +2,6 @@ use crate::common::Sample;
 use crate::series::chunks::{ChimpChunk, ChunkOps, TimeSeriesChunk, UncompressedChunk};
 use valkey_module::{ValkeyError, ValkeyResult};
 
-// for future compatibility
-const VERSION: u32 = 1;
-
 /// Sample count from which compressing a fan-out payload starts to pay for
 /// itself.
 ///

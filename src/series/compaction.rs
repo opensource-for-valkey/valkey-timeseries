@@ -10,7 +10,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::series::index::{get_series_by_id, get_series_key_by_id, with_timeseries_postings};
 use crate::series::{
-    DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries, get_timeseries,
+    DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries,
 };
 use get_size2::GetSize;
 use orx_parallel::{ParIter, ParallelizableCollectionMut};
@@ -1037,7 +1037,7 @@ pub(super) fn get_destination_series(
     ctx: &'_ Context,
     dest_id: SeriesRef,
 ) -> Option<SeriesGuardMut<'_>> {
-    if let Ok(Some(res)) = get_series_by_id(ctx, dest_id, false, None)
+    if let Ok(Some(res)) = get_series_by_id(ctx, dest_id, None)
         && res.is_compaction()
     {
         return Some(res);
@@ -1256,7 +1256,7 @@ impl TimeSeries {
 
 pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -> Option<Sample> {
     let src_id = series.src_series?;
-    let Ok(Some(parent)) = get_series_by_id(ctx, src_id, false, None) else {
+    let Ok(Some(parent)) = get_series_by_id(ctx, src_id, None) else {
         // No source series or it doesn't exist
         return None;
     };
@@ -1319,7 +1319,7 @@ fn dependency_reaches(
     let Some(key) = get_series_key_by_id(ctx, current_id) else {
         return Ok(false);
     };
-    let Some(series) = get_timeseries(ctx, &key, None, false)? else {
+    let Some(series) = try_get_timeseries(ctx, &key, None)? else {
         return Ok(false);
     };
 

@@ -32,12 +32,18 @@ impl EsdEstimator {
     pub fn is_hybrid(&self) -> bool {
         *self == EsdEstimator::Hybrid
     }
+}
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            EsdEstimator::Hybrid => "hybrid",
-            EsdEstimator::Classic => "classic",
-        }
+impl std::fmt::Display for EsdEstimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                EsdEstimator::Hybrid => "hybrid",
+                EsdEstimator::Classic => "classic",
+            }
+        )
     }
 }
 

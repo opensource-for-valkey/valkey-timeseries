@@ -3,9 +3,9 @@ use crate::common::context::{create_key_string, get_acl_user, is_acl_enforced};
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
-use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
-    CompactionOp, SeriesGuardMut, SeriesRef, TimeSeries, TimestampRange, apply_compaction,
+    CompactionOp, SeriesGuardMut, SeriesRef, TimestampRange, apply_compaction,
+    try_get_timeseries_mut,
 };
 use blart::AsBytes;
 use croaring::bitmap64::Bitmap64Iterator;
@@ -218,7 +218,7 @@ fn fetch_series_batch<'a>(
                 continue;
             }
 
-            match get_timeseries(ctx, &key) {
+            match try_get_timeseries_mut(ctx, &key, None) {
                 Err(_) | Ok(None) => stale_ids.push(id),
                 Ok(Some(series)) => {
                     result.push(series);
@@ -241,16 +241,4 @@ fn fetch_series_batch<'a>(
     }
 
     (result, keys)
-}
-
-fn get_timeseries<'a>(
-    ctx: &'a Context,
-    key: &ValkeyString,
-) -> ValkeyResult<Option<SeriesGuardMut<'a>>> {
-    let value_key = ctx.open_key_writable(key);
-    match value_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) {
-        Ok(Some(series)) => Ok(Some(SeriesGuardMut { series })),
-        Ok(None) => Ok(None),
-        Err(_e) => Err(ValkeyError::WrongType),
-    }
 }

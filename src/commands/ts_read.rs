@@ -12,7 +12,7 @@ use crate::common::replies::{ReplyContext, reply_with_samples};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::request_types::ValueComparisonFilter;
-use crate::series::{TimeSeries, get_timeseries};
+use crate::series::{TimeSeries, try_get_timeseries};
 use valkey_module::raw::KeyType;
 use valkey_module::{
     AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -299,7 +299,7 @@ fn read_current(
     resolved: Option<Cursor>,
     options: &ReadOptions,
 ) -> ValkeyResult<(Cursor, ReadOutcome)> {
-    let guard = get_timeseries(ctx, key, Some(AclPermissions::ACCESS), false)?;
+    let guard = try_get_timeseries(ctx, key, Some(AclPermissions::ACCESS))?;
     let series = guard.as_deref();
 
     // A blocked client keeps the cursor it resolved at block time; a fresh call resolves now.
@@ -390,6 +390,7 @@ fn reply_error(ctx: &ReplyContext, err: &ValkeyError) {
     };
 }
 
+acl_categories!(TS_READ, "ts.read", "read timeseries");
 /// TS.READ key timestamp [BLOCK milliseconds min_count] [MAX_COUNT max_count] [CONDITION op value]
 #[valkey_module_macros::command({
     name: "ts.read",

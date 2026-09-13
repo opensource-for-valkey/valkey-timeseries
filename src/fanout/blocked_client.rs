@@ -76,12 +76,16 @@ where
                 NO_TIMEOUT,
             )
         };
-        Self {
+
+        let mut res = Self {
             inner: bc_ptr,
             time_measurement_ongoing: false,
             data: None,
             is_blocked: true,
-        }
+        };
+
+        res.measure_time_start();
+        res
     }
 
     pub(super) fn set_private_data(&mut self, op: T, result: FanoutResult) {
@@ -162,18 +166,5 @@ extern "C" fn reply_callback<T: FanoutClientCommand>(
         // Cast to the correct type and then dereference once to get &mut ResponseContext<T>
         let mut response_ctx: BlockedClientPrivateData<T> = take_data(op_ptr);
         response_ctx.reply(&ctx) as c_int
-    }
-}
-
-extern "C" fn free_callback<T: FanoutClientCommand>(
-    _ctx: *mut ValkeyModuleCtx,
-    private_data: *mut c_void,
-) {
-    if !private_data.is_null() {
-        unsafe {
-            let boxed: Box<BlockedClientPrivateData<T>> =
-                Box::from_raw(private_data as *mut BlockedClientPrivateData<T>);
-            drop(boxed);
-        }
     }
 }

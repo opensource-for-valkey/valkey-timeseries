@@ -85,17 +85,14 @@ impl<'a> TimeSeriesRangeIterator<'a> {
     }
 }
 
-impl<'a> TimeSeriesRangeIterator<'a> {
-    fn len_hint(&self) -> (usize, Option<usize>) {
-        self.size_hint
-    }
-}
-
 impl<'a> Iterator for TimeSeriesRangeIterator<'a> {
     type Item = Sample;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.size_hint
     }
 }
 
@@ -123,37 +120,6 @@ impl<'a> Iterator for TimeSeriesRangeRowIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
-    }
-}
-
-/// An iterator that yields the latest sample from a compaction series if it exists.
-/// This is used specifically for the "LATEST" option in range queries. This simplifies the logic by
-/// isolating the latest sample retrieval so that the base sample iterator does not need to handle
-/// this special case. We simply `chain` this iterator with others as needed.
-pub(crate) struct CompactionLatestSampleIterator<'a> {
-    context: &'a Context,
-    series: &'a TimeSeries,
-    done: bool,
-}
-
-impl<'a> CompactionLatestSampleIterator<'a> {
-    pub fn new(context: &'a Context, series: &'a TimeSeries) -> Self {
-        Self {
-            context,
-            series,
-            done: false,
-        }
-    }
-}
-impl<'a> Iterator for CompactionLatestSampleIterator<'a> {
-    type Item = Sample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.done {
-            self.done = true;
-            return get_latest_compaction_sample(self.context, self.series);
-        }
-        None
     }
 }
 
@@ -621,7 +587,7 @@ mod tests {
         };
 
         let iter = TimeSeriesRangeIterator::new(None, &series, &options, false);
-        let hint = iter.len_hint();
+        let hint = iter.size_hint;
 
         assert_eq!(hint.0, 0);
         assert_eq!(hint.1, Some(5));
@@ -640,7 +606,7 @@ mod tests {
         };
 
         let iter = TimeSeriesRangeIterator::new(None, &series, &options, false);
-        let hint = iter.len_hint();
+        let hint = iter.size_hint();
 
         assert_eq!(hint.0, 0);
         assert_eq!(hint.1, None);

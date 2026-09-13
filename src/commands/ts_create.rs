@@ -9,6 +9,7 @@ use crate::series::chunks::ChunkEncoding;
 use crate::series::{DuplicatePolicy, TimeSeriesOptions, create_and_store_series};
 use valkey_module::{Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
 
+acl_categories!(TS_CREATE, "ts.create", "write fast timeseries");
 /// Create a new time series
 ///
 /// TS.CREATE key

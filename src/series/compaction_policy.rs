@@ -231,19 +231,6 @@ impl PolicyConfig {
 pub static COMPACTION_POLICY_CONFIG: LazyLock<RwLock<PolicyConfig>> =
     LazyLock::new(|| RwLock::new(PolicyConfig::new()));
 
-fn check_duplicate_policy(
-    policies: &[CompactionPolicy],
-    new_policy: &CompactionPolicy,
-) -> ValkeyResult<()> {
-    for policy in policies {
-        if policy == new_policy {
-            let msg = format!("TSDB: Duplicate compaction policy found: {new_policy}");
-            return Err(ValkeyError::String(msg));
-        }
-    }
-    Ok(())
-}
-
 fn parse_duration(val: &str) -> ValkeyResult<u64> {
     // handle redis styled spec (capital M for minutes, m for milliseconds)
     let Some(last_char) = val.chars().last() else {

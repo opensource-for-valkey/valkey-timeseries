@@ -6,7 +6,6 @@ pub struct FilteredSampleIterator<TIterator: Iterator<Item = Sample>> {
     inner: TIterator,
     value_filter: Option<ValueFilter>,
     ts_filter: Option<TimestampFilter>,
-    ts_index: usize,
     first_ts: Timestamp,
     last_ts: Timestamp,
 }
@@ -29,7 +28,6 @@ impl<TIterator: Iterator<Item = Sample>> FilteredSampleIterator<TIterator> {
             inner,
             value_filter,
             ts_filter,
-            ts_index: 0,
             first_ts,
             last_ts,
         }

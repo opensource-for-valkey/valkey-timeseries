@@ -16,7 +16,6 @@ use crate::series::acl::{clone_permissions, has_all_keys_permissions};
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
-use std::mem::size_of;
 use std::ops::{Bound, ControlFlow, Deref, DerefMut};
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -234,6 +233,11 @@ impl TimeSeriesIndex {
     /// ## Note
     /// If the user does not have permission to access all keys, an error is returned.
     /// Non-user clients (e.g., AOF client) bypass permission checks.
+    ///
+    /// Ids the postings still reference but that no longer map to a key are queued for the
+    /// stale-id sweep (see `Postings::mark_ids_as_stale` in `postings/stale.rs`) and
+    /// omitted from the result. That repair happens even when the call then fails the ACL
+    /// check, so a caller without access still leaves the index healthier than it found it.
     pub fn keys_for_selectors(
         &self,
         ctx: &Context,
@@ -241,7 +245,8 @@ impl TimeSeriesIndex {
         acl_permissions: Option<AclPermissions>,
     ) -> ValkeyResult<Vec<ValkeyString>> {
         let mut keys: Vec<ValkeyString> = Vec::new();
-        let mut missing_keys: Vec<SeriesRef> = Vec::new();
+        let mut dangling_ids: Vec<SeriesRef> = Vec::new();
+        let mut acl_denied = false;
 
         let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
 
@@ -249,90 +254,66 @@ impl TimeSeriesIndex {
         // needs the *write* lock, and `RwLock` is not reentrant: asking for it while this thread
         // still held the read guard deadlocked the server -- and did so on the self-healing path,
         // which only runs once the index is already inconsistent.
-        let expected_count = {
+        {
             let postings = read_lock(&self.inner);
 
-            // get keys from ids
             let ids = postings.postings_for_selectors(filters)?;
-
-            let expected_count = ids.cardinality() as usize;
-            if expected_count == 0 {
+            if ids.is_empty() {
                 return Ok(Vec::new());
             }
-
-            keys.reserve(expected_count);
+            keys.reserve(ids.cardinality() as usize);
 
             let current_user = get_acl_user(ctx);
-            let is_user_client = is_acl_enforced(ctx);
-            let can_access_all_keys = has_all_keys_permissions(ctx, &current_user, acl_permissions);
+            // Per-key checks are only needed for a real user whose ACL rules do not already
+            // grant the requested permission on every key.
+            let per_key_perms = if is_acl_enforced(ctx)
+                && !has_all_keys_permissions(ctx, &current_user, acl_permissions)
+            {
+                cloned_perms.as_ref()
+            } else {
+                None
+            };
 
             for series_ref in ids.iter() {
-                let key = postings.get_key_by_id(series_ref);
-                match key {
-                    Some(key) => {
-                        let real_key = create_key_string(ctx, key.as_ref());
-                        if is_user_client
-                            && !can_access_all_keys
-                            && let Some(perms) = &cloned_perms
-                        {
-                            // check if the user has permission for this key
-                            if ctx
-                                .acl_check_key_permission(&current_user, &real_key, perms)
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        keys.push(real_key);
-                    }
-                    None => {
-                        // this should not happen, but in case it does, we log an error and continue
-                        missing_keys.push(series_ref);
-                    }
+                let Some(key) = postings.get_key_by_id(series_ref) else {
+                    // The postings reference a series whose id -> key mapping is gone. Queue
+                    // it for repair below; it cannot be returned to the caller either way.
+                    dangling_ids.push(series_ref);
+                    continue;
+                };
+                let real_key = create_key_string(ctx, key.as_ref());
+                if let Some(perms) = per_key_perms
+                    && ctx
+                        .acl_check_key_permission(&current_user, &real_key, perms)
+                        .is_err()
+                {
+                    acl_denied = true;
+                    break;
                 }
-            }
-
-            expected_count - missing_keys.len()
-        };
-
-        if keys.len() != expected_count {
-            // User does not have permission to read some keys, or some keys are missing
-            // Customize the error message accordingly
-            match cloned_perms {
-                Some(perms) => {
-                    if perms.contains(AclPermissions::DELETE) {
-                        return Err(ValkeyError::Str(
-                            error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR,
-                        ));
-                    }
-                    if perms.contains(AclPermissions::UPDATE) {
-                        return Err(ValkeyError::Str(
-                            error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR,
-                        ));
-                    }
-                    return Err(ValkeyError::Str(
-                        error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
-                    ));
-                }
-                None => {
-                    // todo: fix the problem here, for now we just log a warning
-                    ctx.log_warning("Index consistency: some keys are missing from the index.");
-                }
+                keys.push(real_key);
             }
         }
 
-        if !missing_keys.is_empty() {
-            let msg = format!(
-                "Index consistency: {} keys are missing from the index.",
-                missing_keys.len()
-            );
-            ctx.log_warning(&msg);
+        if !dangling_ids.is_empty() {
+            ctx.log_warning(&format!(
+                "Index consistency: {} series ids have no key and were queued for removal.",
+                dangling_ids.len()
+            ));
+            write_lock(&self.inner).mark_ids_as_stale(&dangling_ids);
+        }
 
-            let mut postings = write_lock(&self.inner);
-
-            for missing_id in missing_keys {
-                postings.mark_id_as_stale(missing_id);
-            }
+        if acl_denied {
+            // The requested permission decides which "all keys" error the caller sees.
+            let all_keys_error = match cloned_perms {
+                Some(perms)
+                    if perms.contains(AclPermissions::DELETE)
+                        || perms.contains(AclPermissions::UPDATE) =>
+                {
+                    error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
+                }
+                _ => error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
+            };
+            return Err(ValkeyError::Str(all_keys_error));
         }
 
         Ok(keys)
@@ -677,10 +658,6 @@ struct BatchIterator<'a> {
 }
 
 impl<'a> BatchIterator<'a> {
-    fn new(index: &'a TimeSeriesIndex, batch_size: usize) -> Self {
-        Self::restricted(index, batch_size, None)
-    }
-
     /// An iterator reporting the size of each posting list within `matching` only. `matching` must
     /// already have stale ids removed (as everything out of [`Postings::postings_for_selector`]
     /// and friends does), since the intersection is reported as-is.
@@ -773,10 +750,6 @@ impl<'a> BatchIterator<'a> {
     fn is_complete(&self) -> bool {
         self.is_finished
     }
-}
-
-fn get_bitmap_size(bmp: &PostingsBitmap) -> usize {
-    bmp.cardinality() as usize * size_of::<SeriesRef>()
 }
 
 #[cfg(test)]

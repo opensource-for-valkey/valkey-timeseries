@@ -247,7 +247,6 @@ pub enum AtomicSlotMigrationEvent {
 
 pub type AtomicSlotMigrationEventHandler =
     fn(event: AtomicSlotMigrationEvent, slots: RangeSetBlaze<u16>);
-pub type PostMigrationCleanupFn = fn(slots: RangeSetBlaze<u16>);
 
 static EVENT_HANDLER_FN: LazyLock<RwLock<Option<AtomicSlotMigrationEventHandler>>> =
     LazyLock::new(|| RwLock::new(None));

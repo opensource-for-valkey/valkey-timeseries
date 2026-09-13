@@ -27,7 +27,7 @@ use crate::common::logging::{log_debug, log_notice};
 use crate::common::sync::lock;
 use crate::config::index_build_max_memory;
 use crate::labels::InternedLabel;
-use crate::series::get_timeseries_mut;
+use crate::series::try_get_timeseries_mut;
 use blart::AsBytes;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -98,7 +98,7 @@ pub(crate) fn try_buffer_loaded_key(ctx: &Context, db: i32, key: &[u8]) -> bool 
     }
 
     let valkey_key = create_key_string(ctx, key);
-    let Ok(Some(mut series)) = get_timeseries_mut(ctx, &valkey_key, false, None) else {
+    let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &valkey_key, None) else {
         return true;
     };
     series._db = Some(db);

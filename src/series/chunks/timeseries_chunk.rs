@@ -5,7 +5,6 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::iterators::{FilteredSampleIterator, SampleIter};
 use crate::series::chunks::chimp::ChimpChunk;
-use crate::series::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
 use crate::series::types::ValueFilter;
 use crate::series::{
     DuplicatePolicy, SampleAddResult,
@@ -177,32 +176,6 @@ impl TimeSeriesChunk {
         }
 
         Ok(samples)
-    }
-
-    pub(crate) fn get_range_filtered(
-        &self,
-        start_timestamp: Timestamp,
-        end_timestamp: Timestamp,
-        timestamp_filter: &Option<Vec<Timestamp>>,
-        value_filter: Option<ValueFilter>,
-    ) -> Vec<Sample> {
-        let mut samples = if let Some(ts_filter) = timestamp_filter {
-            let filtered_ts = filter_timestamp_slice(ts_filter, start_timestamp, end_timestamp);
-            self.samples_by_timestamps(&filtered_ts)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        } else {
-            self.get_range(start_timestamp, end_timestamp)
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
-
-        if let Some(value_filter) = value_filter {
-            filter_samples_by_value(&mut samples, &value_filter);
-        }
-        samples
     }
 
     /// Merge a range of samples into this chunk.

@@ -1,7 +1,6 @@
 use crate::common::hash::hash_f64;
 use crate::common::rdb::{RdbSerializable, rdb_load_f64};
 use get_size2::GetSize;
-use std::borrow::Borrow;
 use std::hash::Hash;
 use std::ops::{Add, AddAssign};
 use valkey_module::{RedisModuleIO, ValkeyResult, raw};
@@ -123,13 +122,6 @@ pub struct KahanAvg {
 }
 
 impl KahanAvg {
-    pub fn new() -> Self {
-        Self {
-            count: 0,
-            sum: KahanSum::new(),
-        }
-    }
-
     pub fn reset(&mut self) {
         self.count = 0;
         self.sum = KahanSum::new();
@@ -164,29 +156,6 @@ impl RdbSerializable for KahanAvg {
         let sum = KahanSum::rdb_load(rdb)?;
         let count = raw::load_unsigned(rdb)? as u32;
         Ok(Self { count, sum })
-    }
-}
-
-pub trait KahanSummator {
-    /// Computes the Kahan sum of an iterator.
-    /// # Example
-    ///
-    /// ```ignore
-    /// let summands = [10000.0f32, 3.14159, 2.71828];
-    /// let kahan_sum = summands.iter().kahan_sum();
-    /// assert_eq!(10005.86f32, kahan_sum.sum());
-    /// assert_eq!(0.0004813671f32, kahan_sum.err());
-    /// ```
-    fn kahan_sum(self) -> KahanSum;
-}
-
-impl<U, V> KahanSummator for U
-where
-    U: Iterator<Item = V>,
-    V: Borrow<f64>,
-{
-    fn kahan_sum(self) -> KahanSum {
-        self.fold(KahanSum::new(), |sum, item| sum + *item.borrow())
     }
 }
 
@@ -293,16 +262,8 @@ mod tests {
     }
 
     #[test]
-    fn test_iterator_kahan_sum_trait() {
-        let nums = [0.1f64, 0.2, 0.3, 0.4];
-        let k = nums.iter().kahan_sum();
-        let naive: f64 = nums.iter().copied().sum();
-        assert!((k.value() - naive).abs() < 1e-12);
-    }
-
-    #[test]
     fn test_kahan_avg() {
-        let mut avg = KahanAvg::new();
+        let mut avg = KahanAvg::default();
         assert_eq!(avg.value(), None);
 
         avg.add(1.0);

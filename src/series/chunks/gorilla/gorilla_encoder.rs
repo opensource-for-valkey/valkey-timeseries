@@ -1,10 +1,7 @@
 use super::GorillaIterator;
 use super::varbit_xor::write_varbit_xor;
 use crate::common::Sample;
-use crate::common::encoding::{
-    try_read_f64_le, try_read_signed_varint as read_varint, try_read_uvarint, write_f64_le,
-    write_uvarint,
-};
+use crate::common::encoding::{try_read_f64_le, try_read_uvarint, write_f64_le, write_uvarint};
 use crate::common::hash::hash_f64;
 use crate::common::logging::log_warning;
 use crate::common::rdb::{
@@ -302,9 +299,6 @@ impl PartialEq<Self> for GorillaEncoder {
     }
 }
 
-fn read_signed_varint(buf: &mut &[u8]) -> TsdbResult<i64> {
-    read_varint(buf).map_err(|_| TsdbError::ChunkDecoding)
-}
 fn read_unsigned_varint(buf: &mut &[u8]) -> TsdbResult<u64> {
     try_read_uvarint(buf).map_err(|_| TsdbError::ChunkDecoding)
 }

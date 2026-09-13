@@ -1,5 +1,4 @@
 use crate::labels::InternedLabel;
-use enquote::enquote;
 use std::cmp::Ordering;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
@@ -84,27 +83,6 @@ impl SeriesLabel for Label {
 
     fn value(&self) -> &str {
         &self.value
-    }
-}
-
-pub struct BorrowedLabel<'a> {
-    pub name: &'a str,
-    pub value: &'a str,
-}
-
-impl SeriesLabel for BorrowedLabel<'_> {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn value(&self) -> &str {
-        self.value
-    }
-}
-
-impl Display for BorrowedLabel<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}={}", self.name, enquote('"', self.value))
     }
 }
 

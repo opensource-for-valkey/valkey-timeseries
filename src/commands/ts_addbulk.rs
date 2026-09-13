@@ -2,10 +2,12 @@ use crate::commands::ts_create::parse_series_options;
 use crate::common::Sample;
 use crate::common::replies::{reply_with_array, reply_with_integer};
 use crate::series::{
-    IngestedSamples, TimeSeries, bulk_insert_samples, create_and_store_series, get_timeseries_mut,
+    IngestedSamples, TimeSeries, bulk_insert_samples, create_and_store_series,
+    try_get_timeseries_mut,
 };
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString, ValkeyValue};
 
+acl_categories!(TS_ADDBULK, "ts.addbulk", "write timeseries");
 ///
 /// TS.ADDBULK key data
 ///     [RETENTION duration]
@@ -46,7 +48,7 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let options = parse_series_options(args, 4, &[])?;
 
-    if let Some(mut guard) = get_timeseries_mut(ctx, &key, false, Some(AclPermissions::UPDATE))? {
+    if let Some(mut guard) = try_get_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE))? {
         return process_series(ctx, &mut guard, samples);
     }
 

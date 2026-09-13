@@ -47,6 +47,7 @@ impl ReplyContext {
     }
 
     /// Convenience logging helpers
+    #[allow(dead_code)]
     pub fn log_debug(&self, message: &str) {
         self.log(ValkeyLogLevel::Debug, message);
     }

@@ -1,13 +1,13 @@
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_debug;
 use crate::is_shutting_down;
+use crate::series::index::TIMESERIES_INDEX;
 use crate::series::index::persistence::is_loading_active;
-use crate::series::index::{IndexKey, TIMESERIES_INDEX};
 use crate::series::tasks::{
     optimize_indices_for_db, process_series_trim, remove_stale_series_ids_incremental,
 };
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use valkey_module::Context;
 use valkey_module_macros::cron_event_handler;
@@ -16,10 +16,6 @@ const STALE_ID_CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
 const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const INDEX_OPTIMIZE_INTERVAL: Duration = Duration::from_secs(60);
 const DB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
-
-const INDEX_LOCK_POISON_MSG: &str = "Failed to lock INDEX_CURSORS";
-
-type IndexCursorMap = std::collections::HashMap<i32, IndexMeta, BuildNoHashHasher<i32>>;
 
 type DispatchMap = papaya::HashMap<u64, Vec<TaskType>, BuildNoHashHasher<u64>>;
 
@@ -31,18 +27,8 @@ pub enum TaskType {
     TrimUnusedDbs,
 }
 
-#[derive(Debug, Default)]
-struct IndexMeta {
-    stale_id_cursor: Option<IndexKey>,
-    optimize_cursor: Option<IndexKey>,
-}
-
 static CRON_TICKS: AtomicU64 = AtomicU64::new(0);
 static CRON_INTERVAL_MS: AtomicU64 = AtomicU64::new(100);
-
-static INDEX_CURSORS: LazyLock<Mutex<IndexCursorMap>> =
-    LazyLock::new(|| Mutex::new(IndexCursorMap::default()));
-
 static DISPATCH_MAP: LazyLock<DispatchMap> = LazyLock::new(DispatchMap::default);
 
 pub(crate) fn init_background_tasks(ctx: &Context) {
@@ -159,7 +145,7 @@ fn dispatch_background_task(task: TaskType) {
 }
 
 #[cron_event_handler]
-fn cron_event_handler(_ctx: &Context, _hz: u64) {
+fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     if is_shutting_down() || is_loading_active() {
         return;
     }

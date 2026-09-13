@@ -1,4 +1,3 @@
-pub(crate) const VEC_BASE_SIZE: usize = 24;
 /// Mon Dec 31 4192 06:13:20 GMT+0000
 pub const MAX_TIMESTAMP: i64 = i64::MAX;
 pub const METRIC_NAME_LABEL: &str = "__name__";

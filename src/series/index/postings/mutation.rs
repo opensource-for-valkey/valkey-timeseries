@@ -38,6 +38,7 @@ impl Postings {
         false
     }
 
+    #[cfg(test)]
     pub(in crate::series::index) fn add_posting_for_label_value(
         &mut self,
         ts_id: SeriesRef,

@@ -1,9 +1,10 @@
 use crate::error_consts;
-use crate::series::get_timeseries_mut;
+use crate::series::{get_timeseries_mut, try_get_timeseries_mut};
 use valkey_module::{
     AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
 };
 
+acl_categories!(TS_DELETERULE, "ts.deleterule", "write timeseries");
 ///
 /// TS.DELETERULE sourceKey destKey
 ///
@@ -41,22 +42,14 @@ pub fn ts_deleterule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     }
 
     // Get source time series (must exist, writable)
-    let mut source_series = get_timeseries_mut(
-        ctx,
-        source_key,
-        true,
-        Some(AclPermissions::UPDATE),
-    )?
-    .expect(
-        "BUG in delete_rule: should have returned a value before this point (must_exist = true)",
-    );
+    let mut source_series = get_timeseries_mut(ctx, source_key, Some(AclPermissions::UPDATE))?;
 
     // Get the destination series. A destination that does not exist can not be the
     // target of a rule, so it is reported as a missing rule rather than a missing
     // key — matching RTS, which only ever looks the destination up through the
     // source's rule list.
     let Some(mut dest_series) =
-        get_timeseries_mut(ctx, dest_key, false, Some(AclPermissions::UPDATE))?
+        try_get_timeseries_mut(ctx, dest_key, Some(AclPermissions::UPDATE))?
     else {
         return Err(ValkeyError::Str(error_consts::COMPACTION_RULE_NOT_FOUND));
     };

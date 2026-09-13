@@ -2,6 +2,7 @@ use crate::commands::fanout_codec::LabelSearchType;
 use crate::commands::label_search_utils::run_label_search;
 use valkey_module::{Context, ValkeyResult, ValkeyString};
 
+acl_categories!(TS_METRICNAMES, "ts.metricnames", "read timeseries");
 /// TS.METRICNAMES
 /// [SEARCH term [term...]]
 /// [FUZZY_THRESHOLD 0.0..1.0]

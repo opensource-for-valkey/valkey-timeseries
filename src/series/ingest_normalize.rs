@@ -20,15 +20,6 @@ pub(super) struct NormalizedBatch {
     pub(super) results: Vec<SampleAddResult>,
 }
 
-/// The oldest timestamp the series will accept, derived from its retention window.
-pub(super) fn get_min_allowed_timestamp(series: &TimeSeries) -> Timestamp {
-    if series.retention.is_zero() {
-        0
-    } else {
-        series.get_min_timestamp()
-    }
-}
-
 /// Per-input-index mask of samples to reject as `TooOld`, evaluated in input order.
 ///
 /// Mirrors sequential per-item `TS.ADD`: a running max timestamp (seeded from the series' current
