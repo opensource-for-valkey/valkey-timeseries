@@ -242,12 +242,16 @@ via `CONFIG SET`). Only the coordinator consults it; shards obey the request. It
 version skew is handled automatically by the handshake above — but an emergency/diagnostic escape hatch: flipping it
 off reverts every query to coordinator-side aggregation without a module rollback.
 
-PromQL range-vector functions have their own push-down, controlled by `ts-fanout-rollup-pushdown` (default `no`).
-A PromQL series is owned entirely by one shard, so a rollup over that series' window needs no cross-shard merge
-algebra at all: the shard computes the final value and the coordinator concatenates. What crosses the wire is one
-float per series per step instead of the raw window — which, whenever the range exceeds the step, neighbouring steps
-would each have shipped again. It uses the same handshake as aggregation push-down: a shard that does not recognize
-the requested function returns its raw windows with `applied = false` and the coordinator reduces them itself.
+PromQL range queries have their own push-down, controlled by `ts-fanout-rollup-pushdown` (default `yes`). Every
+read of a vector selector over a range query's step grid — a bare `cpu`, a `rate(cpu[5m])`, or either directly under
+a reducing aggregation such as `avg(cpu)` or `sum by (job) (rate(cpu[5m]))` — is one *grid* request per selector:
+the shard runs the per-step stage (the last sample inside the lookback, or the window's reduction) and ships one
+point per series per step, or one partial per group per step, instead of every raw sample in the span. A PromQL
+series is owned entirely by one shard, so the per-series output needs no cross-shard merge; the coordinator
+concatenates it, and merges the fused partials. A series whose raw span is smaller than its grid output (a step finer
+than the sample cadence) travels raw and is stepped on the coordinator. Flipping the toggle off routes the raw span
+back through the ordinary range fanout and evaluates it on the coordinator — the same answer, at the transfer the
+push-down saves.
 
 A range query resolves its rollups *once, for the whole step grid*, before the step loop runs — so `rate(m[5m])` at
 a 15s step over six hours is one fan-out rather than 1440, each of which would have shipped a five-minute window

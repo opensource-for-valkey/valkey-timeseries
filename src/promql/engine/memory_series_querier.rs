@@ -5,9 +5,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
-use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
-};
+use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
 use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
@@ -212,23 +210,6 @@ impl QueryReader for MemorySeriesQuerier {
     ) -> PromqlResult<AggregationOutcome> {
         self.query(selector, timestamp, options)
             .map(AggregationOutcome::Raw)
-    }
-
-    /// As with [`Self::query_aggregation`], there is nothing to push down to in
-    /// memory, but answering `Raw` (rather than leaving the default
-    /// `Unsupported`) routes the evaluator through the push-down path, so the
-    /// whole PromQL test suite exercises it.
-    fn query_rollup(
-        &self,
-        selector: &VectorSelector,
-        rollup: &RollupRequest,
-        options: QueryOptions,
-    ) -> PromqlResult<RollupOutcome> {
-        let Some((start_ms, end_ms)) = rollup.fetch_bounds() else {
-            return Ok(RollupOutcome::Raw(Vec::new()));
-        };
-        self.query_range(selector, start_ms, end_ms, options)
-            .map(RollupOutcome::Raw)
     }
 }
 

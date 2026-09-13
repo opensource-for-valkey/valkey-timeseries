@@ -4,7 +4,9 @@ A PromQL series is owned entirely by one shard, so `rate(m[5m])` over that
 series' window needs no cross-shard merge algebra: the shard computes the final
 value and the coordinator concatenates. `sum by (job) (rate(m[5m]))` goes one
 step further and has the shard accumulate its rolled-up values into per-group
-partials. See `src/promql/engine/fanout/rollup_fanout_command.rs`.
+partials. Both ride the grid query that also serves bare selectors; see
+`src/promql/engine/fanout/grid_fanout_command.rs` and
+`test_ts_query_selector_pushdown_cme.py` for the stepped half.
 
 What this file is for, and what it is not:
 
@@ -19,12 +21,11 @@ What this file is for, and what it is not:
   each other — so a defect introduced anywhere in the shard-side reduction shows
   up as a divergence. (Verified by mutation: shifting the shard's window ends by
   1ms fails 11 tests here, both equivalence tests among them.) What it cannot
-  reach at all is the mixed-version behaviour — the config is consulted only by
-  the coordinator and shards obey the request, so no CONFIG SET makes a peer
-  behave like an older build. That is pinned by the round-trip tests beside
-  `RollupFanoutCommand`.
+  reach is a shard that answers raw under the size rule for one series and
+  staged for another; that mix is pinned by the unit tests beside
+  `GridFanoutCommand`.
 
-Exactness follows §10.2 of `docs/promql-rollup-pushdown-plan.md`: unfused rollup
+Exactness: unfused rollup
 values are compared with `==`, because the same kernel reduces the same window on
 either path. Fused aggregation is the documented exception — merging per-shard
 partials sums in a different order than a single-node reduction — so the fused

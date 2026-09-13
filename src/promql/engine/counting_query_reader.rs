@@ -9,15 +9,14 @@
 //! counts invocations per method.
 //!
 //! Note the counters see only calls the *evaluator* issues. An inner reader
-//! that implements one trait method in terms of another (as
-//! [`super::memory_series_querier::MemorySeriesQuerier::query_rollup`] calls
-//! its own `query_range`) does not inflate the counts, which is exactly what
-//! the plan's assertions need.
+//! that implements one trait method in terms of another (as the default
+//! [`QueryReader::query_grid`] calls the reader's own `query_range`) does not
+//! inflate the counts, which is exactly what the plan's assertions need.
 
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::model::{InstantSample, RangeSample};
 use crate::promql::{PromqlResult, QueryOptions};
@@ -31,13 +30,13 @@ pub struct ReaderCallCounts {
     pub query: usize,
     pub query_range: usize,
     pub query_aggregation: usize,
-    pub query_rollup: usize,
+    pub query_grid: usize,
 }
 
 impl ReaderCallCounts {
     /// Total calls across every method.
     pub fn total(&self) -> usize {
-        self.query + self.query_range + self.query_aggregation + self.query_rollup
+        self.query + self.query_range + self.query_aggregation + self.query_grid
     }
 }
 
@@ -50,7 +49,7 @@ pub struct CountingQueryReader {
     query_calls: AtomicUsize,
     query_range_calls: AtomicUsize,
     query_aggregation_calls: AtomicUsize,
-    query_rollup_calls: AtomicUsize,
+    query_grid_calls: AtomicUsize,
 }
 
 impl CountingQueryReader {
@@ -60,7 +59,7 @@ impl CountingQueryReader {
             query_calls: AtomicUsize::new(0),
             query_range_calls: AtomicUsize::new(0),
             query_aggregation_calls: AtomicUsize::new(0),
-            query_rollup_calls: AtomicUsize::new(0),
+            query_grid_calls: AtomicUsize::new(0),
         }
     }
 
@@ -70,7 +69,7 @@ impl CountingQueryReader {
             query: self.query_calls.load(Ordering::Relaxed),
             query_range: self.query_range_calls.load(Ordering::Relaxed),
             query_aggregation: self.query_aggregation_calls.load(Ordering::Relaxed),
-            query_rollup: self.query_rollup_calls.load(Ordering::Relaxed),
+            query_grid: self.query_grid_calls.load(Ordering::Relaxed),
         }
     }
 
@@ -79,7 +78,7 @@ impl CountingQueryReader {
         self.query_calls.store(0, Ordering::Relaxed);
         self.query_range_calls.store(0, Ordering::Relaxed);
         self.query_aggregation_calls.store(0, Ordering::Relaxed);
-        self.query_rollup_calls.store(0, Ordering::Relaxed);
+        self.query_grid_calls.store(0, Ordering::Relaxed);
     }
 }
 
@@ -117,14 +116,14 @@ impl QueryReader for CountingQueryReader {
             .query_aggregation(selector, timestamp, aggregation, options)
     }
 
-    fn query_rollup(
+    fn query_grid(
         &self,
         selector: &VectorSelector,
-        rollup: &RollupRequest,
+        request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<RollupOutcome> {
-        self.query_rollup_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.query_rollup(selector, rollup, options)
+    ) -> PromqlResult<GridOutcome> {
+        self.query_grid_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.query_grid(selector, request, options)
     }
 }
 
@@ -275,13 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn range_selector_is_preloaded_with_one_fetch() {
+    fn range_selector_is_preloaded_with_one_grid_request() {
         let (counting, reader) = build_reader();
+        // preload_for_range asks the source for the stepped selection over
+        // the whole grid, once — never the raw span, never one read per step.
         run_range(reader, "a");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 1, // preload_for_range fetches the whole span once
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -378,7 +379,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -391,22 +392,56 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 2, // one preload per distinct selector
+                query_grid: 2, // one grid request per distinct selector
                 ..Default::default()
             }
         );
     }
 
     #[test]
-    fn range_grouped_aggregation_over_preloaded_selector_stays_local() {
+    fn range_grouped_aggregation_over_selector_is_one_fused_grid_request() {
         let (counting, reader) = build_reader();
-        // The selector is preloaded, so per-step grouping is pure CPU
-        // (plan finding 2.1) — no aggregation push-down requests.
+        // The aggregation sits directly over a bare selector, so the whole
+        // thing is one fused grid request — groups × steps come back — and the
+        // selector is not preloaded separately on top of it.
         run_range(reader, "sum by (l) (a)");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 1,
+                query_grid: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn range_selector_under_and_beside_an_aggregation_shares_a_raw_answer() {
+        let (counting, reader) = build_reader();
+        // The in-memory source answers the fused `avg(a)` request raw, which
+        // hands over `a`'s whole span: that becomes the selector's stepped
+        // preload, and the bare `a` on the right reads from it rather than
+        // issuing a second request. (A source that folds the fused request
+        // itself makes this two requests — pinned in the evaluator tests.)
+        run_range(reader, "avg(a) / a");
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_grid: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn range_selecting_aggregation_over_selector_preloads_the_selector() {
+        let (counting, reader) = build_reader();
+        // topk has no mergeable partial state, so it is not fused: the
+        // selector is preloaded stepped and the selection runs here per step.
+        run_range(reader, "topk(2, a)");
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -416,12 +451,12 @@ mod tests {
     fn range_pushable_rollup_is_one_grid_request() {
         let (counting, reader) = build_reader();
         // rate ∈ RollupKind: preload_rollups answers the whole step grid with
-        // one query_rollup; the matrix selector is never fetched raw.
+        // one query_grid; the matrix selector is never fetched raw.
         run_range(reader, "rate(a[1m])");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_rollup: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -453,7 +488,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_rollup: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -462,22 +497,22 @@ mod tests {
     #[test]
     fn range_mixed_pushable_and_non_pushable_rollups() {
         let (counting, reader) = build_reader();
-        // rate's grid comes from one query_rollup; predict_linear's raw span
+        // rate's grid comes from one query_grid; predict_linear's raw span
         // from one query_range. Neither call touches the reader per step.
         run_range(reader, "rate(a[1m]) + predict_linear(a[1m], 60)");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
                 query_range: 1,
-                query_rollup: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
     }
 
-    /// A reader that leaves the push-down methods at their `Unsupported`
-    /// defaults — the production single-node shape when
-    /// `ts-fanout-rollup-pushdown` is off (the default config).
+    /// A reader that leaves the push-down methods at their defaults: an
+    /// aggregation is `Unsupported`, and a grid request is answered raw from
+    /// the reader's own `query_range`.
     struct NoPushdownReader {
         inner: Arc<dyn QueryReader>,
     }
@@ -503,29 +538,29 @@ mod tests {
         {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
-        // query_aggregation / query_rollup: trait defaults → Unsupported.
+        // query_aggregation / query_grid: trait defaults.
     }
 
     #[test]
-    fn range_rollup_without_pushdown_support_uses_matrix_preload() {
-        // The default-config cliff of plan finding 1.1: rollup push-down
-        // answers Unsupported, so no rollup grid exists — the matrix preload
-        // must cover the call with one raw-span fetch instead of the step
-        // loop fetching one window per step (which is what this pinned
-        // before Phase 1).
-        let counting = Arc::new(CountingQueryReader::new(Arc::new(NoPushdownReader {
-            inner: build_data(),
-        })));
-        let reader: Arc<dyn QueryReader> = counting.clone();
-        run_range(reader, "rate(a[1m])");
-        assert_eq!(
-            counting.counts(),
-            ReaderCallCounts {
-                query_rollup: 1, // the attempt that answered Unsupported
-                query_range: 1,  // the matrix span fetch that covers the grid
-                ..Default::default()
-            }
-        );
+    fn range_grid_without_pushdown_support_is_one_span_read() {
+        // A reader with no grid evaluation of its own still answers the grid
+        // request: the default reads the span once through `query_range` and
+        // the evaluator runs the per-series stage. The counter sits *inside*
+        // that reader, so what it sees is the one span read the default makes
+        // — never one window per step, and no separate matrix preload.
+        for query in ["rate(a[1m])", "a", "sum by (l) (a)"] {
+            let (counting, inner) = build_reader();
+            let reader: Arc<dyn QueryReader> = Arc::new(NoPushdownReader { inner });
+            run_range(reader, query);
+            assert_eq!(
+                counting.counts(),
+                ReaderCallCounts {
+                    query_range: 1,
+                    ..Default::default()
+                },
+                "{query}"
+            );
+        }
     }
 
     /// A reader whose `query_range` rejects spans wider than `max_span_ms`,
@@ -591,7 +626,7 @@ mod tests {
     fn instant_subquery_over_expr_is_one_grid_request() {
         let (counting, reader) = build_reader();
         // The subquery grid for [4m:1m] ending at t=3_600_000 has 4 aligned
-        // inner steps. Before Phase 2 each one issued its own query_rollup for
+        // inner steps. Before Phase 2 each one issued its own query_grid for
         // the inner rate() (plan finding 1.2); subquery-scoped preloading now
         // covers the whole grid in one request. The outer max_over_time takes a
         // subquery argument, so it is never pushed down itself.
@@ -599,7 +634,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_rollup: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -612,13 +647,13 @@ mod tests {
         // per-step path. The subquery grid for [4m:1m] ending at t=3_600_000
         // has 4 aligned steps, which before Phase 2 meant 4 × 2 live `query`
         // calls — one per selector per inner step. Subquery-scoped preloading
-        // makes it one span fetch per deduplicated selector, and the steps read
-        // from those.
+        // makes it one stepped grid request per deduplicated selector, and the
+        // steps read from those.
         run_instant(reader, "max_over_time((a + b)[4m:1m])", 3_600_000);
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 2,
+                query_grid: 2,
                 ..Default::default()
             }
         );
@@ -642,7 +677,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -661,7 +696,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_range: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );
@@ -687,7 +722,7 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_rollup: 1,
+                query_grid: 1,
                 ..Default::default()
             }
         );

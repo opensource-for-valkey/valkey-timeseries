@@ -232,27 +232,35 @@ impl MatrixPreloadKey {
     }
 }
 
-/// Structural key for a rollup whose whole step grid was evaluated up front.
+/// Structural key for a grid preload: a rollup, or an aggregation over a bare
+/// selector, whose whole step grid was evaluated up front.
 ///
-/// Identifies the call, not just the selector: two rollups over the same series
-/// differ by function and by window width, and each is preloaded separately.
-/// Time modifiers come in through [`PreloadKey`], which already captures them.
+/// Identifies the request, not just the selector: two rollups over the same
+/// series differ by function and by window width, and `sum by (job) (m)` and
+/// `sum by (pod) (m)` read the same series but are different requests — and
+/// neither is the bare `m`, which lives in the instant preload map. Time
+/// modifiers come in through [`PreloadKey`], which already captures them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(in crate::promql) struct GridPreloadKey {
+    selector: PreloadKey,
+    /// The rollup, when the grid is one; `None` for a stepped selection.
+    rollup: Option<RollupKey>,
+    /// The fused outer aggregation, when there is one.
+    aggregation: Option<AggregationKey>,
+}
+
+/// The identity of a rollup call: function, window width and parameter.
 ///
 /// The scalar parameter is part of the key and is required to be a literal —
 /// see `Evaluator::preload_rollup` for why a parameter that varies per step
 /// cannot be pushed down as one grid request.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(in crate::promql) struct RollupPreloadKey {
-    selector: PreloadKey,
+pub(in crate::promql) struct RollupKey {
     kind: RollupKind,
     range_ms: i64,
     /// `f64` has no `Hash`/`Eq`; the bit pattern does, and two parameters that
     /// differ in bits are different requests.
     param_bits: Option<u64>,
-    /// The fused outer aggregation, when there is one. `sum by (job) (rate(m))`
-    /// and `sum by (pod) (rate(m))` read the same series but are different
-    /// requests, and neither is the bare `rate(m)`.
-    aggregation: Option<AggregationKey>,
 }
 
 /// The identity of a fused aggregation: operator plus grouping.
@@ -281,8 +289,9 @@ impl AggregationKey {
     }
 }
 
-impl RollupPreloadKey {
-    pub(crate) fn new(
+impl GridPreloadKey {
+    /// A rollup over `vs`, optionally fused with an outer aggregation.
+    pub(crate) fn rollup(
         vs: &VectorSelector,
         kind: RollupKind,
         range_ms: i64,
@@ -291,10 +300,21 @@ impl RollupPreloadKey {
     ) -> Self {
         Self {
             selector: PreloadKey::from_selector(vs),
-            kind,
-            range_ms,
-            param_bits: param.map(f64::to_bits),
+            rollup: Some(RollupKey {
+                kind,
+                range_ms,
+                param_bits: param.map(f64::to_bits),
+            }),
             aggregation,
+        }
+    }
+
+    /// An aggregation fused onto the stepped selection of `vs`.
+    pub(crate) fn stepped(vs: &VectorSelector, aggregation: AggregationKey) -> Self {
+        Self {
+            selector: PreloadKey::from_selector(vs),
+            rollup: None,
+            aggregation: Some(aggregation),
         }
     }
 }

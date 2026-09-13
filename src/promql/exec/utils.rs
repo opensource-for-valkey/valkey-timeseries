@@ -21,36 +21,97 @@ pub(in crate::promql) fn merge_step_into_series_map(
     }
 }
 
-pub(super) fn collect_vector_selectors(expr: &Expr) -> Vec<&VectorSelector> {
+/// Every vector selector evaluated at this grid, except the operand of an
+/// aggregation `covered` answers true for — one whose whole grid is already
+/// preloaded as a fused request, so its selector must not be fetched again on
+/// its own.
+pub(super) fn collect_vector_selectors<'a>(
+    expr: &'a Expr,
+    covered: &dyn Fn(&AggregateExpr) -> bool,
+) -> Vec<&'a VectorSelector> {
     let mut out = Vec::new();
-    collect_vector_selectors_inner(expr, &mut out);
+    collect_vector_selectors_inner(expr, covered, &mut out);
     out
 }
 
-fn collect_vector_selectors_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
+fn collect_vector_selectors_inner<'a>(
+    expr: &'a Expr,
+    covered: &dyn Fn(&AggregateExpr) -> bool,
+    out: &mut Vec<&'a VectorSelector>,
+) {
     match expr {
         Expr::VectorSelector(vs) => out.push(vs),
         Expr::Aggregate(agg) => {
-            collect_vector_selectors_inner(&agg.expr, out);
+            if !covered(agg) {
+                collect_vector_selectors_inner(&agg.expr, covered, out);
+            }
             if let Some(ref param) = agg.param {
-                collect_vector_selectors_inner(param, out);
+                collect_vector_selectors_inner(param, covered, out);
             }
         }
         Expr::Binary(b) => {
-            collect_vector_selectors_inner(&b.lhs, out);
-            collect_vector_selectors_inner(&b.rhs, out);
+            collect_vector_selectors_inner(&b.lhs, covered, out);
+            collect_vector_selectors_inner(&b.rhs, covered, out);
         }
-        Expr::Paren(p) => collect_vector_selectors_inner(&p.expr, out),
+        Expr::Paren(p) => collect_vector_selectors_inner(&p.expr, covered, out),
         Expr::Call(call) => {
             for arg in &call.args.args {
-                collect_vector_selectors_inner(arg, out);
+                collect_vector_selectors_inner(arg, covered, out);
             }
         }
-        Expr::Unary(u) => collect_vector_selectors_inner(&u.expr, out),
+        Expr::Unary(u) => collect_vector_selectors_inner(&u.expr, covered, out),
         // MatrixSelector: needs sample slices, not latest-value — not preloaded
         // Subquery: has own step loop with different step params — not preloaded
         Expr::MatrixSelector(_)
         | Expr::Subquery(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Every aggregation whose operand is a bare vector selector — `avg(cpu)`,
+/// `sum by (region) ((cpu))` — evaluated at this grid, with that selector.
+///
+/// Only shape is screened here; whether the operator admits fusion is the
+/// caller's decision. Stops at a subquery, for the same reason
+/// [`collect_rollup_candidates`] does.
+pub(in crate::promql) fn collect_stepped_aggregation_candidates(
+    expr: &Expr,
+) -> Vec<(&AggregateExpr, &VectorSelector)> {
+    let mut out = Vec::new();
+    collect_stepped_aggregation_candidates_inner(expr, &mut out);
+    out
+}
+
+fn collect_stepped_aggregation_candidates_inner<'a>(
+    expr: &'a Expr,
+    out: &mut Vec<(&'a AggregateExpr, &'a VectorSelector)>,
+) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            match strip_parens(&agg.expr) {
+                Expr::VectorSelector(vs) => out.push((agg, vs)),
+                inner => collect_stepped_aggregation_candidates_inner(inner, out),
+            }
+            if let Some(ref param) = agg.param {
+                collect_stepped_aggregation_candidates_inner(param, out);
+            }
+        }
+        Expr::Binary(b) => {
+            collect_stepped_aggregation_candidates_inner(&b.lhs, out);
+            collect_stepped_aggregation_candidates_inner(&b.rhs, out);
+        }
+        Expr::Paren(p) => collect_stepped_aggregation_candidates_inner(&p.expr, out),
+        Expr::Call(call) => {
+            for arg in &call.args.args {
+                collect_stepped_aggregation_candidates_inner(arg, out);
+            }
+        }
+        Expr::Unary(u) => collect_stepped_aggregation_candidates_inner(&u.expr, out),
+        Expr::Subquery(_)
+        | Expr::MatrixSelector(_)
+        | Expr::VectorSelector(_)
         | Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::Extension(_) => {}

@@ -1,7 +1,12 @@
 # Stepped selector push-down for PromQL range queries (plan)
 
-**Status:** Proposed 2026-09-13; revised the same day for a pre-release codebase — there is no
-shipped version to stay compatible with, so nothing below exists for version skew.
+**Status:** Implemented 2026-09-13 (work items 1–7; the measurement of item 8 is outstanding).
+Proposed and revised the same day for a pre-release codebase — there is no shipped version to
+stay compatible with, so nothing below exists for version skew. Of §4, the toggle was kept and
+flipped on rather than folded: `ts-fanout-rollup-pushdown` now gates the whole grid push-down
+(off = raw span through the range fanout, evaluated on the coordinator). Of §7, `count_values`/
+`topk` stay unfused (the selector is pushed stepped and the selection runs on the coordinator),
+and the shard refusal text is unchanged.
 **Scope:** cluster mode only. Range queries whose vector selectors are *not* under a
 rollup — `avg(cpu)`, `cpu / on(host) group_left cpu offset 5m`, `sum by (region)(cpu)` —
 and the aggregations directly over them.

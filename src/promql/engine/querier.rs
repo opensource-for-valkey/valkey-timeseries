@@ -2,7 +2,7 @@ use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{InstantSample, PromqlResult, QueryOptions, QueryResult, RangeSample};
@@ -94,26 +94,37 @@ impl QueryReader for ValkeySeriesQuerier {
         )
     }
 
-    fn query_rollup(
+    fn query_grid(
         &self,
         selector: &VectorSelector,
-        rollup: &RollupRequest,
+        request: &GridRequest,
         options: QueryOptions,
-    ) -> QueryResult<RollupOutcome> {
-        // The toggle governs shipping the rollup to *shards*. On a single node
-        // the same request is answered locally (`RollupOutcome::Raw`, reduced
-        // by the caller with the kernels a shard would use), which evaluates
-        // each series' windows once over the whole step grid instead of once
-        // per step — and is the path the in-memory querier gives the PromQL
-        // conformance suite. Leaving it behind the cluster toggle here made a
-        // single node run the per-step path the suite does not cover.
-        if self.clustered && !crate::config::is_fanout_rollup_pushdown_enabled() {
-            return Ok(RollupOutcome::Unsupported);
-        }
+    ) -> QueryResult<GridOutcome> {
         let matchers: Matchers = normalize_selector(selector);
-        SERIES_SELECTOR.query_rollup(
+        // The toggle governs shipping the grid to *shards*: off, the raw span
+        // comes back through the ordinary range fanout and the caller evaluates
+        // it with the kernels a shard would have used — the same answer, at the
+        // transfer the push-down saves. On a single node the request is
+        // answered locally (`GridOutcome::Raw`) either way, which is also the
+        // path the in-memory querier gives the PromQL conformance suite.
+        if self.clustered && !crate::config::is_fanout_rollup_pushdown_enabled() {
+            let Some((start_ms, end_ms)) = request.fetch_bounds() else {
+                return Ok(GridOutcome::Raw(Vec::new()));
+            };
+            return SERIES_SELECTOR
+                .query_range(
+                    matchers,
+                    start_ms,
+                    end_ms,
+                    options,
+                    self.caller_user.clone(),
+                    self.hash_tags.clone(),
+                )
+                .map(GridOutcome::Raw);
+        }
+        SERIES_SELECTOR.query_grid(
             matchers,
-            rollup.clone(),
+            request.clone(),
             options,
             self.caller_user.clone(),
             self.hash_tags.clone(),
@@ -266,15 +277,15 @@ impl QueryReader for ConcreteSeriesQuerier {
         }
     }
 
-    fn query_rollup(
+    fn query_grid(
         &self,
         selector: &VectorSelector,
-        rollup: &RollupRequest,
+        request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<RollupOutcome> {
+    ) -> PromqlResult<GridOutcome> {
         match self {
-            ConcreteSeriesQuerier::Actual(local) => local.query_rollup(selector, rollup, options),
-            ConcreteSeriesQuerier::Mock(mock) => mock.query_rollup(selector, rollup, options),
+            ConcreteSeriesQuerier::Actual(local) => local.query_grid(selector, request, options),
+            ConcreteSeriesQuerier::Mock(mock) => mock.query_grid(selector, request, options),
         }
     }
 }

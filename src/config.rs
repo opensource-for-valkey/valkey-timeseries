@@ -535,13 +535,16 @@ pub fn is_fanout_aggregation_pushdown_enabled() -> bool {
     FANOUT_AGGREGATION_PUSHDOWN.load(Ordering::Relaxed)
 }
 
-/// Runtime toggle for pushing PromQL *rollup* evaluation down to the shards
-/// (`ts-fanout-rollup-pushdown`, default **off**).
+/// Runtime toggle for pushing PromQL *grid* evaluation down to the shards
+/// (`ts-fanout-rollup-pushdown`, default **on**): the per-step stage of every
+/// range-query selector read — stepped instant selection, range-vector
+/// functions, and either fused with a reducing aggregation.
 ///
 /// Like the aggregation toggle above, this is NOT a mixed-version safety
-/// mechanism: the fanout compatibility handshake makes version skew correct on
-/// its own, so no config action is needed across a rolling upgrade.
-pub static FANOUT_ROLLUP_PUSHDOWN: AtomicBool = AtomicBool::new(false);
+/// mechanism and not a semantic one: off, the coordinator reads the raw span
+/// through the ordinary range fanout and runs the same kernels itself. It is
+/// the diagnostic escape hatch for the grid push-down path.
+pub static FANOUT_ROLLUP_PUSHDOWN: AtomicBool = AtomicBool::new(true);
 
 pub fn is_fanout_rollup_pushdown_enabled() -> bool {
     FANOUT_ROLLUP_PUSHDOWN.load(Ordering::Relaxed)
@@ -1283,11 +1286,11 @@ pub static CONFIGS: &[ConfigDesc] = &[
         name: "ts-fanout-rollup-pushdown",
         read: read_fanout_rollup_pushdown,
         kind: ConfigType::Boolean,
-        default: ConfigValue::Boolean(false),
+        default: ConfigValue::Boolean(true),
         min: None,
         max: None,
         flags: ConfigurationFlags::DEFAULT,
-        description: "Push PromQL rollup evaluation down to shards during cluster fanout",
+        description: "Push PromQL grid evaluation (stepped selectors and rollups) down to shards during cluster fanout",
         storage: ConfigStorage::Bool {
             cell: || &FANOUT_ROLLUP_PUSHDOWN,
         },
@@ -1685,14 +1688,14 @@ mod tests {
         ("debug-mode", "no"),
         // PromQL parameters. The duration-valued ones register the millisecond count rather
         // than a human-readable literal, matching `ts-cluster-map-expiration-ms` above.
-        ("ts-fanout-rollup-pushdown", "no"),
+        ("ts-fanout-rollup-pushdown", "yes"),
         ("ts-promql-set-lookback-to-step", "no"),
         ("ts-promql-optimize-queries", "no"),
         ("ts-promql-enable-experimental-functions", "yes"),
         ("ts-promql-max-query-len", "4096"),
         ("ts-promql-max-response-series", "1000"),
         ("ts-promql-max-points-per-timeseries", "0"),
-        ("ts-promql-max-samples-per-query", "500000"),
+        ("ts-promql-max-samples-per-query", "50000000"),
         ("ts-promql-lookback-delta", "300000"),
         ("ts-promql-max-lookback", "0"),
         ("ts-promql-max-query-duration", "30000"),

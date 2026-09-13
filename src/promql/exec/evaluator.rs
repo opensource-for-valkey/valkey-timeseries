@@ -1,14 +1,14 @@
 use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, eval_aggregation};
+use crate::common::Timestamp;
 use crate::common::threads::join;
 use crate::common::threads::{IntoParRayon, ParCollectionRayon};
 use crate::common::time::{current_time_millis, system_time_to_millis};
-use crate::common::{Sample, Timestamp};
 use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationParam, AggregationRequest, RollupAggregation, RollupOutcome,
-    RollupRequest,
+    AggregationOutcome, AggregationParam, AggregationRequest, GridAggregation, GridOutcome,
+    GridRequest, GridRollup,
 };
 use crate::promql::engine::sample_budget::SampleBudget;
 use crate::promql::engine::{QueryOptions, QueryReader};
@@ -18,18 +18,18 @@ use crate::promql::exec::pipeline::{
 use crate::promql::exec::planner::{PlannedQuery, PreloadGrid};
 use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{
-    EvalLabels, MatrixPreloadMap, PreloadedMatrixData, PreloadedMatrixSeries, PreloadedRollupData,
-    PreloadedRollupSeries, RollupPreloadMap, SampleWindow, SeriesMap, StepGridBuilder,
+    EvalLabels, GridPreloadMap, MatrixPreloadMap, PreloadedGridData, PreloadedGridSeries,
+    PreloadedMatrixData, PreloadedMatrixSeries, SampleWindow, SeriesMap, StepGrid, StepGridBuilder,
 };
 use crate::promql::exec::utils::{
-    RollupCandidate, collect_rollup_candidates, collect_subqueries, collect_vector_selectors,
-    merge_step_into_series_map, strip_parens,
+    RollupCandidate, collect_rollup_candidates, collect_stepped_aggregation_candidates,
+    collect_subqueries, collect_vector_selectors, merge_step_into_series_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{
     FunctionCallContext, PromQLArg, PromQLFunction, resolve_function, window_range,
 };
-use crate::promql::hashers::{AggregationKey, MatrixPreloadKey, PreloadKey, RollupPreloadKey};
+use crate::promql::hashers::{AggregationKey, GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::model::RangeSample;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
@@ -70,7 +70,7 @@ const MAX_CONCURRENT_PRELOAD_REQUESTS: usize = 4;
 #[derive(Default)]
 pub(crate) struct PreparedQuery {
     preloaded_instant: Arc<RwLock<PreloadMap>>,
-    preloaded_rollups: Arc<RwLock<RollupPreloadMap>>,
+    preloaded_grids: Arc<RwLock<GridPreloadMap>>,
     preloaded_matrices: Arc<RwLock<MatrixPreloadMap>>,
     preloaded_subqueries: Arc<RwLock<SubqueryPreloadMap>>,
     /// The query's sample budget, shared by the preload phase, the step loop and
@@ -117,9 +117,11 @@ pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
     /// Preloaded per-step instant vector data for range queries.
     /// Populated by preload_for_range() before the step loop.
     preloaded_instant: Arc<RwLock<PreloadMap>>,
-    /// Rollups whose whole step grid was evaluated at the source in one request.
-    /// Populated by preload_rollups() before the step loop.
-    preloaded_rollups: Arc<RwLock<RollupPreloadMap>>,
+    /// Rollups, and aggregations over bare selectors, whose whole step grid
+    /// was evaluated at the source in one request. Populated by
+    /// preload_rollups() and preload_stepped_aggregations() before the step
+    /// loop.
+    preloaded_grids: Arc<RwLock<GridPreloadMap>>,
     /// Raw spans for matrix selectors that no rollup grid covers, so the step
     /// loop slices windows locally instead of re-fetching them per step.
     /// Populated by preload_matrices() before the step loop.
@@ -152,7 +154,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Self {
             reader,
             preloaded_instant: prepared.preloaded_instant,
-            preloaded_rollups: prepared.preloaded_rollups,
+            preloaded_grids: prepared.preloaded_grids,
             preloaded_matrices: prepared.preloaded_matrices,
             preloaded_subqueries: prepared.preloaded_subqueries,
             budget: prepared.budget,
@@ -171,7 +173,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Self {
             reader,
             preloaded_instant: Arc::clone(&prepared.preloaded_instant),
-            preloaded_rollups: Arc::clone(&prepared.preloaded_rollups),
+            preloaded_grids: Arc::clone(&prepared.preloaded_grids),
             preloaded_matrices: Arc::clone(&prepared.preloaded_matrices),
             preloaded_subqueries: Arc::clone(&prepared.preloaded_subqueries),
             budget: Arc::clone(&prepared.budget),
@@ -182,7 +184,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     pub(crate) fn into_prepared(self) -> PreparedQuery {
         PreparedQuery {
             preloaded_instant: self.preloaded_instant,
-            preloaded_rollups: self.preloaded_rollups,
+            preloaded_grids: self.preloaded_grids,
             preloaded_matrices: self.preloaded_matrices,
             preloaded_subqueries: self.preloaded_subqueries,
             budget: self.budget,
@@ -242,12 +244,31 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         expr: &Expr,
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
-        // Deduplicate by PreloadKey, then parallelize the loading
-        let mut seen = AHashSet::new();
-        let unique_selectors: Vec<_> = collect_vector_selectors(expr)
+        // Aggregations directly over a bare selector go first: each is one
+        // fused request, and a selector it covers must not also be preloaded
+        // on its own — that would ship the same series twice, once stepped
+        // and once folded.
+        self.preload_stepped_aggregations(expr, grid)?;
+
+        // Deduplicate by PreloadKey, then parallelize the loading. A selector
+        // the fused pass already cached stepped (a source that answered raw)
+        // is not loaded again.
+        let mut seen: AHashSet<PreloadKey> = self
+            .preloaded_instant
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let unique_selectors: Vec<_> = {
+            let grids = self.preloaded_grids.read().unwrap();
+            collect_vector_selectors(expr, &|aggregate| {
+                stepped_aggregation_key(aggregate).is_some_and(|key| grids.contains_key(&key))
+            })
             .into_iter()
             .filter(|&vs| seen.insert(PreloadKey::from_selector(vs)))
-            .collect();
+            .collect()
+        };
 
         let _: Vec<()> = unique_selectors
             .par_rayon()
@@ -371,7 +392,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
                 RollupCandidate::Rollup(_) => None,
             };
-            let key = RollupPreloadKey::new(
+            let key = GridPreloadKey::rollup(
                 &matrix.vs,
                 kind,
                 matrix_range_ms(matrix),
@@ -407,9 +428,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// Fetch, once, the raw span every remaining matrix selector's windows
     /// cover.
     ///
-    /// This is the fallback grid for rollups that cannot be pushed down —
-    /// `query_rollup` unsupported or disabled, a function outside
-    /// [`RollupKind`], a non-literal parameter. Without it every step
+    /// This is the fallback grid for calls that cannot be pushed down as a
+    /// rollup — a function outside [`RollupKind`], a non-literal parameter,
+    /// a modifier shape the grid request cannot describe. Without it every step
     /// re-fetches its own window, and neighbouring steps re-ship mostly the
     /// same samples (a `[5m]` window at a 15s step is fetched ~20 times over).
     /// With it the span is read in one request and each step slices its window
@@ -428,7 +449,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(());
         }
 
-        let rollups = self.preloaded_rollups.read().unwrap();
+        let grids = self.preloaded_grids.read().unwrap();
         let mut seen = AHashSet::new();
         let mut targets: Vec<(MatrixPreloadKey, &MatrixSelector)> = Vec::new();
         for candidate in collect_rollup_candidates(expr) {
@@ -446,7 +467,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
                     RollupCandidate::Rollup(_) => None,
                 };
-                let key = RollupPreloadKey::new(
+                let key = GridPreloadKey::rollup(
                     &matrix.vs,
                     kind,
                     matrix_range_ms(matrix),
@@ -455,7 +476,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                         .as_ref()
                         .map(|agg| AggregationKey::new(agg.kind, agg.modifier.as_ref())),
                 );
-                if rollups.contains_key(&key) {
+                if grids.contains_key(&key) {
                     continue;
                 }
             }
@@ -468,7 +489,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 }
             }
         }
-        drop(rollups);
+        drop(grids);
 
         let _: Vec<()> = targets
             .into_par_rayon()
@@ -600,98 +621,213 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     #[allow(clippy::too_many_arguments)]
     fn preload_rollup(
         &self,
-        key: RollupPreloadKey,
+        key: GridPreloadKey,
         kind: RollupKind,
         matrix: &MatrixSelector,
         param: Option<f64>,
-        aggregation: Option<RollupAggregation>,
+        aggregation: Option<GridAggregation>,
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
-        // Resolve `@`/`offset` here, per step. The source is told window ends
-        // and never a modifier, so it cannot resolve one differently than the
-        // local path would.
-        let window_ends = self.resolved_window_ends(&matrix.vs, grid);
-        let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
-            return Ok(());
-        };
-
-        let request = RollupRequest {
+        let rollup = GridRollup {
             kind,
-            aggregation,
             range_ms: matrix_range_ms(matrix),
-            lookback_delta_ms: grid.lookback_delta_ms,
-            step_ms: grid.step_ms,
-            query_start: first,
-            query_end: last,
-            range_end_ms: last,
             param,
         };
-
-        // The request describes its windows as a start/end/step progression;
-        // `@` collapses every step onto one window end, and `offset` shifts them
-        // uniformly. Verify the progression the source will derive is exactly
-        // the set of ends resolved above rather than trusting that every
-        // modifier shape reduces to one — an unanticipated one stays local
-        // instead of silently answering for the wrong windows.
-        let mut resolved = window_ends.clone();
-        resolved.dedup();
-        if request.window_ends() != resolved {
+        let Some((request, window_ends)) =
+            self.grid_request(&matrix.vs, grid, Some(rollup), aggregation)
+        else {
             return Ok(());
-        }
+        };
 
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
 
-        let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
-            RollupOutcome::Unsupported => return Ok(()),
-            RollupOutcome::Rolled(series) => series,
-            RollupOutcome::Reduced(series) => request.group(series),
-            RollupOutcome::Raw(series) => {
-                // The raw windows are what was loaded; charge them before the
-                // reduction turns them into one point per step.
-                self.charge_range_samples(&series)?;
-                request.reduce_and_group(series)
-            }
-        };
+        let rolled = self.finish_grid(
+            &request,
+            self.reader.query_grid(&matrix.vs, &request, options)?,
+        )?;
         self.charge_range_samples(&rolled)?;
 
-        // Scatter each series' sparse `(window end, value)` pairs onto the step
-        // grid. Both are ascending, so one merge walk places every point: with
-        // `@`, every step shares one window end and the cursor stays on that
-        // point; otherwise the mapping is one to one.
         let series = rolled
             .into_iter()
-            .map(|s| {
-                let mut values = StepGridBuilder::with_capacity(window_ends.len());
-                let mut points = s.samples.iter().peekable();
-                for &end in &window_ends {
-                    while points.peek().is_some_and(|point| point.timestamp < end) {
-                        points.next();
-                    }
-                    values.push(
-                        points
-                            .peek()
-                            .filter(|point| point.timestamp == end)
-                            .map(|point| point.value),
-                    );
-                }
-                let values = values.finish();
-                PreloadedRollupSeries {
-                    labels: s.labels,
-                    values,
-                }
+            .map(|s| PreloadedGridSeries {
+                labels: s.labels,
+                values: scatter_onto_grid(
+                    &window_ends,
+                    s.samples.iter().map(|p| (p.timestamp, p.value)),
+                ),
             })
             .collect();
 
-        self.preloaded_rollups.write().unwrap().insert(
+        self.cache_preloaded_grid(key, grid, series);
+        Ok(())
+    }
+
+    /// The grid request for `vs` over `grid`, with `@`/`offset` resolved into
+    /// window ends, or `None` when the request cannot describe them.
+    ///
+    /// The request describes its windows as a start/end/step progression;
+    /// `@` collapses every step onto one window end, and `offset` shifts them
+    /// uniformly. The progression the source will derive is verified to be
+    /// exactly the set of ends resolved here rather than trusting that every
+    /// modifier shape reduces to one — an unanticipated one stays local
+    /// instead of silently answering for the wrong windows. Alongside the
+    /// request come the *unreduced* ends, one per step, which is what
+    /// [`scatter_onto_grid`] walks.
+    fn grid_request(
+        &self,
+        vs: &VectorSelector,
+        grid: &PreloadGrid,
+        rollup: Option<GridRollup>,
+        aggregation: Option<GridAggregation>,
+    ) -> Option<(GridRequest, Vec<Timestamp>)> {
+        let window_ends = self.resolved_window_ends(vs, grid);
+        let (&first, &last) = (window_ends.first()?, window_ends.last()?);
+
+        let request = GridRequest {
+            step_ms: grid.step_ms,
+            query_start: first,
+            query_end: last,
+            range_end_ms: last,
+            lookback_delta_ms: grid.lookback_delta_ms,
+            rollup,
+            aggregation,
+        };
+
+        let mut resolved = window_ends.clone();
+        resolved.dedup();
+        (request.window_ends() == resolved).then_some((request, window_ends))
+    }
+
+    /// A rollup or fused request's answer as per-entry `(step, value)` points,
+    /// whoever did the work.
+    ///
+    /// A source that answered raw is compensated with the request's own
+    /// kernels — the same ones a shard runs — after its span is charged to the
+    /// budget. The stepped shape is not an answer to these requests at all.
+    fn finish_grid(
+        &self,
+        request: &GridRequest,
+        outcome: GridOutcome,
+    ) -> EvalResult<Vec<RangeSample<EvalLabels>>> {
+        let outcome = match outcome {
+            GridOutcome::Raw(series) => {
+                // The raw spans are what was loaded; charge them before the
+                // evaluation turns them into one point per step.
+                self.charge_range_samples(&series)?;
+                request.evaluate(series)
+            }
+            other => other,
+        };
+        match (
+            outcome,
+            request.rollup.is_some(),
+            request.aggregation.is_some(),
+        ) {
+            (GridOutcome::Rolled(series), true, false) => Ok(series),
+            (GridOutcome::Reduced(groups), _, true) => Ok(groups),
+            _ => Err(EvaluationError::InternalError(
+                "grid request answered with the wrong shape".to_string(),
+            )),
+        }
+    }
+
+    fn cache_preloaded_grid(
+        &self,
+        key: GridPreloadKey,
+        grid: &PreloadGrid,
+        series: Vec<PreloadedGridSeries>,
+    ) {
+        self.preloaded_grids.write().unwrap().insert(
             key,
-            PreloadedRollupData {
+            PreloadedGridData {
                 eval_start_ms: grid.start_ms,
                 step_ms: grid.step_ms,
                 series,
             },
         );
+    }
 
+    /// Ask the source to fold each aggregation that sits directly over a bare
+    /// vector selector — `avg(cpu)`, `sum by (region) (cpu)` — over the whole
+    /// step grid, once, before the step loop starts.
+    ///
+    /// The shard steps the selector and folds the picks per `(group, step)`,
+    /// so what crosses the wire is groups × steps rather than series × steps —
+    /// and the selector itself is not preloaded separately (see
+    /// [`Self::preload_grid`]).
+    fn preload_stepped_aggregations(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
+        if grid.step_ms <= 0 {
+            return Ok(());
+        }
+
+        let mut seen = AHashSet::new();
+        let mut requests = Vec::new();
+        for (aggregate, vs) in collect_stepped_aggregation_candidates(expr) {
+            let Some(aggregation) = fusable_aggregation(aggregate) else {
+                continue;
+            };
+            let key = GridPreloadKey::stepped(
+                vs,
+                AggregationKey::new(aggregation.kind, aggregation.modifier.as_ref()),
+            );
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            requests.push((key, vs, aggregation));
+        }
+
+        let _: Vec<()> = requests
+            .into_par_rayon()
+            .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
+            .map(|(key, vs, aggregation)| {
+                self.check_deadline()?;
+                self.preload_stepped_aggregation(key, vs, aggregation, grid)
+            })
+            .into_fallible_result()
+            .collect()?;
+
+        Ok(())
+    }
+
+    fn preload_stepped_aggregation(
+        &self,
+        key: GridPreloadKey,
+        vs: &VectorSelector,
+        aggregation: GridAggregation,
+        grid: &PreloadGrid,
+    ) -> EvalResult<()> {
+        let Some((request, window_ends)) = self.grid_request(vs, grid, None, Some(aggregation))
+        else {
+            return Ok(());
+        };
+
+        let mut options = self.options;
+        options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
+
+        let groups = match self.reader.query_grid(vs, &request, options)? {
+            // Nothing was pushed down: the span is here. Grouping it once per
+            // step from a stepped grid — in parallel across steps, as the step
+            // loop does — beats folding every point through one map on this
+            // thread, so this becomes the selector's own stepped preload and
+            // the aggregation runs per step over it, exactly as an unfused one.
+            GridOutcome::Raw(series) => return self.cache_stepped_span(vs, grid, series),
+            outcome => self.finish_grid(&request, outcome)?,
+        };
+        self.charge_range_samples(&groups)?;
+
+        let series = groups
+            .into_iter()
+            .map(|s| PreloadedGridSeries {
+                labels: s.labels,
+                values: scatter_onto_grid(
+                    &window_ends,
+                    s.samples.iter().map(|p| (p.timestamp, p.value)),
+                ),
+            })
+            .collect();
+
+        self.cache_preloaded_grid(key, grid, series);
         Ok(())
     }
 
@@ -699,19 +835,19 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// preloaded and has to be evaluated here.
     fn preloaded_rollup(&self, call: &Call, ctx: &EvalContext) -> Option<ExprResult> {
         let (kind, matrix, param) = self.pushable_rollup(call)?;
-        let key = RollupPreloadKey::new(&matrix.vs, kind, matrix_range_ms(matrix), param, None);
-        self.preloaded_rollup_by_key(&key, ctx, false)
+        let key = GridPreloadKey::rollup(&matrix.vs, kind, matrix_range_ms(matrix), param, None);
+        self.preloaded_grid_by_key(&key, ctx, false)
     }
 
-    /// This step's slice of a preloaded rollup, keyed explicitly so the fused
-    /// form — whose entries are groups rather than series — can share it.
-    fn preloaded_rollup_by_key(
+    /// This step's slice of a preloaded grid, keyed explicitly so the fused
+    /// forms — whose entries are groups rather than series — can share it.
+    fn preloaded_grid_by_key(
         &self,
-        key: &RollupPreloadKey,
+        key: &GridPreloadKey,
         ctx: &EvalContext,
         drop_name: bool,
     ) -> Option<ExprResult> {
-        let guard = self.preloaded_rollups.read().unwrap();
+        let guard = self.preloaded_grids.read().unwrap();
         let preloaded = guard.get(key)?;
         let step_idx = ((ctx.evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
 
@@ -741,42 +877,91 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         self.preload_for_range(&stmt.expr, &ctx)
     }
 
+    /// Preload one vector selector over the whole step grid: at every step,
+    /// the last sample inside the lookback window.
+    ///
+    /// The source is asked for the *stepped* form — one point per series per
+    /// step — rather than the raw span, so a cluster ships the grid and not
+    /// every sample under it. A source that answers raw (a single node) has
+    /// the same bucketing run here.
     fn preload_vector_selector(&self, vs: &VectorSelector, grid: &PreloadGrid) -> EvalResult<()> {
         let eval_start_ms = grid.start_ms;
-        let eval_end_ms = grid.end_ms;
         let step_ms = grid.step_ms;
         let lookback_delta_ms = grid.lookback_delta_ms;
 
-        // Compute fetch range via selector_bounds. The `at_*` pair is what
-        // `@ start()`/`@ end()` mean and the `eval_*` pair is the grid being
-        // covered; they differ for a subquery grid, whose `@` modifiers still
-        // refer to the enclosing query.
-        let (earliest_ms, latest_ms) = selector_bounds(
-            vs.at.as_ref(),
-            vs.offset.as_ref(),
-            grid.at_start_ms,
-            grid.at_end_ms,
-            eval_start_ms,
-            eval_end_ms,
-            lookback_delta_ms,
-        );
+        // One window end per step, `@`/`offset` resolved here so the source
+        // is never handed a modifier. With `@` every step shares one end and
+        // the source answers that one; the scatter below replicates it.
+        let raw_series = match self.grid_request(vs, grid, None, None) {
+            Some((request, window_ends)) => {
+                let mut options = self.options;
+                options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
+                match self.reader.query_grid(vs, &request, options)? {
+                    GridOutcome::Stepped(series) => {
+                        self.charge_samples(series.iter().map(|s| s.points.len()).sum())?;
+                        let preloaded_series = series
+                            .into_iter()
+                            .map(|s| PreloadedInstantSeries {
+                                labels: s.labels,
+                                values: scatter_onto_grid(
+                                    &window_ends,
+                                    s.points.iter().map(|p| (p.step_ts, p.sample)),
+                                ),
+                            })
+                            .collect();
+                        self.cache_preloaded_series(vs, eval_start_ms, step_ms, preloaded_series);
+                        return Ok(());
+                    }
+                    GridOutcome::Raw(series) => series,
+                    GridOutcome::Rolled(_) | GridOutcome::Reduced(_) => {
+                        return Err(EvaluationError::InternalError(
+                            "stepped selection answered with the wrong shape".to_string(),
+                        ));
+                    }
+                }
+            }
+            // A modifier shape the grid request cannot describe: read the
+            // span the selector's bounds cover and bucket it here.
+            None => {
+                let (earliest_ms, latest_ms) = selector_bounds(
+                    vs.at.as_ref(),
+                    vs.offset.as_ref(),
+                    grid.at_start_ms,
+                    grid.at_end_ms,
+                    eval_start_ms,
+                    grid.end_ms,
+                    lookback_delta_ms,
+                );
+                self.reader
+                    .query_range(vs, earliest_ms, latest_ms, self.options)?
+            }
+        };
+        self.cache_stepped_span(vs, grid, raw_series)
+    }
 
-        // Fetch all series + samples for the full time range
-        let series_samples = self.fetch_series_samples(vs, earliest_ms, latest_ms)?;
+    /// Bucket a selector's raw span to one sample per step — the last sample
+    /// inside the lookback window — and cache it for the step loop.
+    fn cache_stepped_span(
+        &self,
+        vs: &VectorSelector,
+        grid: &PreloadGrid,
+        raw_series: Vec<RangeSample<EvalLabels>>,
+    ) -> EvalResult<()> {
+        self.charge_range_samples(&raw_series)?;
 
+        let eval_start_ms = grid.start_ms;
+        let step_ms = grid.step_ms;
+        let lookback_delta_ms = grid.lookback_delta_ms;
         let num_steps = grid.expected_steps();
-
-        // Clone the time-modifier options so they can be captured across parallel tasks.
-        // AtModifier and Offset are small Copy-like enums; cloning is cheap.
         let at_modifier = vs.at.clone();
         let offset_mod = vs.offset.clone();
         let at_start_ms = grid.at_start_ms;
         let at_end_ms = grid.at_end_ms;
 
         // ── Per-series step-bucketing ─────────────────
-        let preloaded_series: Vec<PreloadedInstantSeries> = series_samples
+        let preloaded_series: Vec<PreloadedInstantSeries> = raw_series
             .into_par_rayon()
-            .map(|(labels, samples)| {
+            .map(|RangeSample { labels, samples }| {
                 // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
                 // timestamp; however, when resolving `@ start()` / `@ end()` inside the
                 // preloading phase we must use the enclosing query's bounds so that
@@ -808,25 +993,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         self.cache_preloaded_series(vs, eval_start_ms, step_ms, preloaded_series);
 
         Ok(())
-    }
-
-    /// Fetch raw per-series samples for the given selector and time window.
-    /// Returns one `(Labels, Vec<Sample>)` entry per matching series, with
-    /// samples sorted ascending by timestamp (as guaranteed by `query_range`).
-    fn fetch_series_samples(
-        &self,
-        vs: &VectorSelector,
-        earliest_ms: i64,
-        latest_ms: i64,
-    ) -> EvalResult<Vec<(EvalLabels, Vec<Sample>)>> {
-        let range_samples = self
-            .reader
-            .query_range(vs, earliest_ms, latest_ms, self.options)?;
-        self.charge_range_samples(&range_samples)?;
-        Ok(range_samples
-            .into_iter()
-            .map(|rs| (rs.labels, rs.samples))
-            .collect())
     }
 
     fn cache_preloaded_series(
@@ -1050,7 +1216,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // maps.
         //
         // Without this each inner step reads live: an inner rollup issues a
-        // `query_rollup` per inner step and an inner selector a `query` per
+        // `query_grid` per inner step and an inner selector a `query` per
         // inner step, so a range query over `max_over_time(rate(m[5m])[1h:1m])`
         // costs outer_steps × 60 requests — the worst asymptotic shape in the
         // engine. Preloading collapses the inner dimension to one request per
@@ -1316,7 +1482,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         }
 
         // Ask the data source to evaluate the whole rollup where the data lives
-        // (see `QueryReader::query_rollup`): across a cluster that turns each
+        // (see `QueryReader::query_grid`): across a cluster that turns each
         // series' window into one float per step, instead of shipping the window
         // — which neighbouring steps would each ship again.
         //
@@ -1388,7 +1554,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// `preload_for_range`, so both maps stay empty and pushdown costs nothing.
     fn has_preloaded_data(&self) -> bool {
         !self.preloaded_instant.read().unwrap().is_empty()
-            || !self.preloaded_rollups.read().unwrap().is_empty()
+            || !self.preloaded_grids.read().unwrap().is_empty()
             || !self.preloaded_matrices.read().unwrap().is_empty()
     }
 
@@ -1535,6 +1701,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
+        // A bare selector directly under a reducing aggregation, in a range
+        // query, was folded per (group, step) at the source before the step
+        // loop began: this step is a slice of that grid.
+        if preload_eligible && let Some(result) = self.preloaded_stepped_aggregation(aggregate, ctx)
+        {
+            return Ok(result);
+        }
+
         // A rollup directly under a decomposable aggregation is pushed down as
         // one fused request: the shard reduces each series' windows and then
         // accumulates them into per-group partials, so what crosses the wire is
@@ -1673,6 +1847,19 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Ok(Some(ExprResult::InstantVector(samples)))
     }
 
+    /// This step's slice of a preloaded `aggregate`-over-selector grid, or
+    /// `None` when the aggregation was not preloaded that way and evaluates
+    /// here. The output carries no pending `__name__` drop: the selector's
+    /// samples never owed one.
+    fn preloaded_stepped_aggregation(
+        &self,
+        aggregate: &AggregateExpr,
+        ctx: &EvalContext,
+    ) -> Option<ExprResult> {
+        let key = stepped_aggregation_key(aggregate)?;
+        self.preloaded_grid_by_key(&key, ctx, false)
+    }
+
     /// Whether this selector's samples were already fetched by
     /// [`Self::preload_for_range`].
     fn is_preloaded(&self, selector: &VectorSelector) -> bool {
@@ -1716,7 +1903,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // it. See `drops_metric_name`.
         let drop_name = drops_metric_name(call);
 
-        let key = RollupPreloadKey::new(
+        let key = GridPreloadKey::rollup(
             &matrix.vs,
             kind,
             matrix_range_ms(matrix),
@@ -1732,8 +1919,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // is a sub-evaluator step. The preloaded entry carries its own
         // `eval_start_ms`/`step_ms`, so which grid it is need not be
         // re-derived from `ctx` here.
-        if preload_eligible && let Some(slice) = self.preloaded_rollup_by_key(&key, ctx, drop_name)
-        {
+        if preload_eligible && let Some(slice) = self.preloaded_grid_by_key(&key, ctx, drop_name) {
             return Ok(Some(slice));
         }
 
@@ -1752,32 +1938,27 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             ctx.query_end,
             ctx.evaluation_ts,
         );
-        let request = RollupRequest {
-            kind,
-            aggregation: Some(aggregation),
-            range_ms: matrix_range_ms(matrix),
-            lookback_delta_ms: ctx.lookback_delta_ms,
+        let request = GridRequest {
             step_ms: ctx.step_ms,
             query_start: ctx.query_start,
             query_end: ctx.query_end,
             range_end_ms,
-            param,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            rollup: Some(GridRollup {
+                kind,
+                range_ms: matrix_range_ms(matrix),
+                param,
+            }),
+            aggregation: Some(aggregation),
         };
 
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
 
-        let grouped = match self.reader.query_rollup(&matrix.vs, &request, options)? {
-            RollupOutcome::Unsupported => return Ok(None),
-            RollupOutcome::Rolled(groups) => groups,
-            // Each of these did less than was asked; make up exactly the
-            // difference, with the same kernels a shard would have used.
-            RollupOutcome::Reduced(series) => request.group(series),
-            RollupOutcome::Raw(series) => {
-                self.charge_range_samples(&series)?;
-                request.reduce_and_group(series)
-            }
-        };
+        let grouped = self.finish_grid(
+            &request,
+            self.reader.query_grid(&matrix.vs, &request, options)?,
+        )?;
 
         let samples = grouped
             .into_iter()
@@ -1839,30 +2020,27 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             ctx.evaluation_ts,
         );
 
-        let request = RollupRequest {
-            kind,
-            aggregation,
-            range_ms: matrix.range.as_millis() as i64,
-            lookback_delta_ms: ctx.lookback_delta_ms,
+        let request = GridRequest {
             step_ms: ctx.step_ms,
             query_start: ctx.query_start,
             query_end: ctx.query_end,
             range_end_ms,
-            param,
+            lookback_delta_ms: ctx.lookback_delta_ms,
+            rollup: Some(GridRollup {
+                kind,
+                range_ms: matrix.range.as_millis() as i64,
+                param,
+            }),
+            aggregation,
         };
 
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
 
-        let rolled = match self.reader.query_rollup(&matrix.vs, &request, options)? {
-            RollupOutcome::Unsupported => return Ok(None),
-            // No aggregation was requested, so `Reduced` and `Rolled` say the
-            // same thing here.
-            RollupOutcome::Rolled(series) | RollupOutcome::Reduced(series) => series,
-            // The source read the windows but did not reduce them; finish the
-            // job, with the same kernel a shard would have used.
-            RollupOutcome::Raw(series) => request.reduce_and_group(series),
-        };
+        let rolled = self.finish_grid(
+            &request,
+            self.reader.query_grid(&matrix.vs, &request, options)?,
+        )?;
 
         // A single evaluation yields at most one point per series, stamped with
         // the query's evaluation timestamp rather than the window end — so a
@@ -1940,18 +2118,62 @@ fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {
 /// not), and it must take no parameter — every operator that takes one is in the
 /// group that has no partial state anyway, so a parameter here means the shape
 /// is not fusable.
-fn fusable_aggregation(aggregate: &AggregateExpr) -> Option<RollupAggregation> {
+fn fusable_aggregation(aggregate: &AggregateExpr) -> Option<GridAggregation> {
+    let kind = fusable_kind(aggregate)?;
+    Some(GridAggregation {
+        kind,
+        modifier: aggregate.modifier.clone(),
+    })
+}
+
+/// The operator of `aggregate` when it can be fused; see
+/// [`fusable_aggregation`].
+fn fusable_kind(aggregate: &AggregateExpr) -> Option<AggregationKind> {
     if aggregate.param.is_some() {
         return None;
     }
     let kind = AggregationKind::try_from(aggregate.op).ok()?;
-    if kind.pushdown_strategy() != Some(PushdownStrategy::Reduce) {
+    (kind.pushdown_strategy() == Some(PushdownStrategy::Reduce)).then_some(kind)
+}
+
+/// The grid key under which `aggregate` — a fusable aggregation directly over
+/// a bare vector selector — is preloaded, or `None` when it is not that shape.
+/// Looked up once per step, so it borrows the modifier rather than cloning it.
+fn stepped_aggregation_key(aggregate: &AggregateExpr) -> Option<GridPreloadKey> {
+    let Expr::VectorSelector(vs) = strip_parens(&aggregate.expr) else {
         return None;
+    };
+    let kind = fusable_kind(aggregate)?;
+    Some(GridPreloadKey::stepped(
+        vs,
+        AggregationKey::new(kind, aggregate.modifier.as_ref()),
+    ))
+}
+
+/// Scatter one entry's sparse `(window end, value)` points onto the step
+/// grid.
+///
+/// Both are ascending, so one merge walk places every point: with `@`, every
+/// step shares one window end and the cursor stays on that point; otherwise
+/// the mapping is one to one.
+fn scatter_onto_grid<T: Copy + Default>(
+    window_ends: &[Timestamp],
+    points: impl Iterator<Item = (Timestamp, T)>,
+) -> StepGrid<T> {
+    let mut values = StepGridBuilder::with_capacity(window_ends.len());
+    let mut points = points.peekable();
+    for &end in window_ends {
+        while points.peek().is_some_and(|(ts, _)| *ts < end) {
+            points.next();
+        }
+        values.push(
+            points
+                .peek()
+                .filter(|(ts, _)| *ts == end)
+                .map(|(_, value)| *value),
+        );
     }
-    Some(RollupAggregation {
-        kind,
-        modifier: aggregate.modifier.clone(),
-    })
+    values.finish()
 }
 
 /// Range-vector functions that report a sample of the input series unchanged,

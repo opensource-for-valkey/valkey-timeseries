@@ -8,12 +8,12 @@ use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_us
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::engine::query_reader::{
-    AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
+    AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, validate_max_samples};
 use crate::promql::engine::{
-    AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
-    RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_snapshot_range,
+    AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
+    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand, get_snapshot_range,
     instant_lookback_start_ms, proto_labels_to_eval_labels, validate_max_points,
     validate_max_series,
 };
@@ -55,11 +55,12 @@ struct AggregationSelectorCommand {
     options: QueryOptions,
 }
 
-/// The series to read *and* the rollup to reduce their windows with, so that in
+/// The series to read *and* the step grid to evaluate them over — stepped
+/// selection, a rollup, or either fused with an aggregation — so that in
 /// cluster mode both can be pushed to the shards that hold the data.
-struct RollupSelectorCommand {
+struct GridSelectorCommand {
     matchers: Matchers,
-    rollup: RollupRequest,
+    request: GridRequest,
     options: QueryOptions,
 }
 
@@ -67,7 +68,7 @@ enum SelectorTaskKind {
     Vector(InstantVectorSelectorCommand),
     Range(RangeSelectorCommand),
     Aggregation(AggregationSelectorCommand),
-    Rollup(RollupSelectorCommand),
+    Grid(GridSelectorCommand),
 }
 
 impl SelectorTaskKind {
@@ -76,7 +77,7 @@ impl SelectorTaskKind {
             SelectorTaskKind::Vector(iqc) => iqc.options.db,
             SelectorTaskKind::Range(rc) => rc.options.db,
             SelectorTaskKind::Aggregation(ac) => ac.options.db,
-            SelectorTaskKind::Rollup(rc) => rc.options.db,
+            SelectorTaskKind::Grid(gc) => gc.options.db,
         }
     }
 }
@@ -90,7 +91,7 @@ enum SelectorOutput {
     /// Range-vector selector result, labels still by refcount from storage.
     Matrix(Vec<RangeSample<EvalLabels>>),
     Aggregation(AggregationOutcome),
-    Rollup(RollupOutcome),
+    Grid(GridOutcome),
 }
 
 impl SelectorOutput {
@@ -124,11 +125,11 @@ impl SelectorOutput {
         }
     }
 
-    fn into_rollup(self) -> QueryResult<RollupOutcome> {
+    fn into_grid(self) -> QueryResult<GridOutcome> {
         match self {
-            SelectorOutput::Rollup(outcome) => Ok(outcome),
+            SelectorOutput::Grid(outcome) => Ok(outcome),
             _ => Err(QueryError::Execution(
-                "BUG: rollup task returned a non-rollup result".to_string(),
+                "BUG: grid task returned a non-grid result".to_string(),
             )),
         }
     }
@@ -172,7 +173,7 @@ impl SelectorTask {
 /// keyspace themselves.
 ///
 /// The evaluator calls in from inside rayon jobs (`preload_grid` fans selectors out on the
-/// pool; rollup reads happen from step chunks), and a submitter may therefore be a pool
+/// pool; grid reads happen from step chunks), and a submitter may therefore be a pool
 /// worker blocked in `recv`. Two invariants keep that from deadlocking:
 ///
 /// 1. The processor is never a pool worker. The earlier cooperative design let the first
@@ -191,7 +192,7 @@ impl SelectorTask {
 ///
 /// For local queries the thread does two things per batch. Under the module lock it resolves
 /// each task's series, answers the instant reads (one cached sample per series), and copies
-/// out the compressed chunks a range or rollup read touches ([`RangeSnapshot`]). It then
+/// out the compressed chunks a range or grid read touches ([`RangeSnapshot`]). It then
 /// releases the lock and decodes those chunks on [`MATERIALIZE_POOL`], so the lock is held
 /// for the memcpy rather than for the decode — the main thread serves commands while a
 /// range read materializes.
@@ -253,20 +254,20 @@ fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
     }
 }
 
-/// A local range or rollup read whose chunks were copied under the module
+/// A local range or grid read whose chunks were copied under the module
 /// lock and still have to be decoded, validated and answered.
 struct DeferredRangeDecode {
     series: Vec<(EvalLabels, RangeSnapshot)>,
     options: QueryOptions,
-    rollup: bool,
+    grid: bool,
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 }
 
 impl DeferredRangeDecode {
     fn finish(self) {
         let result = decode_range_snapshots(self.series, &self.options).map(|ranges| {
-            if self.rollup {
-                SelectorOutput::Rollup(RollupOutcome::Raw(ranges))
+            if self.grid {
+                SelectorOutput::Grid(GridOutcome::Raw(ranges))
             } else {
                 SelectorOutput::Matrix(ranges)
             }
@@ -362,28 +363,28 @@ impl SelectorBatchExecutor {
             .into_aggregation()
     }
 
-    /// Reduce the windows `matchers` selects with `rollup`.
+    /// Evaluate `request` over the grid for the series `matchers` selects.
     ///
-    /// In cluster mode the whole rollup is pushed to the shards and only one
-    /// value per series per step comes back. On a single node there is nothing
-    /// to push down to, so the raw windows are returned for the caller to reduce
-    /// — doing it here would hold the module lock for the length of the
-    /// reduction.
-    pub fn query_rollup(
+    /// In cluster mode the whole grid is pushed to the shards and only one
+    /// point per series per step (or one partial per group per step) comes
+    /// back. On a single node there is nothing to push down to, so the raw
+    /// spans are returned for the caller to evaluate — doing it here would
+    /// hold the module lock for the length of the evaluation.
+    pub fn query_grid(
         &self,
         matchers: Matchers,
-        rollup: RollupRequest,
+        request: GridRequest,
         options: QueryOptions,
         caller_user: Option<String>,
         hash_tags: Arc<[String]>,
-    ) -> QueryResult<RollupOutcome> {
-        let command = SelectorTaskKind::Rollup(RollupSelectorCommand {
+    ) -> QueryResult<GridOutcome> {
+        let command = SelectorTaskKind::Grid(GridSelectorCommand {
             matchers,
-            rollup,
+            request,
             options,
         });
         self.submit_selector_task(command, caller_user, hash_tags)?
-            .into_rollup()
+            .into_grid()
     }
 
     fn submit_selector_task(
@@ -472,11 +473,11 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRa
             // shards, it does not filter keys or labels.
             match execute_selector_task_local(ctx, kind) {
                 LocalOutcome::Answered(result) => deliver_task_result(&responder, result),
-                LocalOutcome::Deferred(series, options, rollup) => {
+                LocalOutcome::Deferred(series, options, grid) => {
                     deferred = Some(DeferredRangeDecode {
                         series,
                         options,
-                        rollup,
+                        grid,
                         responder,
                     });
                 }
@@ -500,7 +501,7 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRa
 
 /// What running a task under the module lock produced: a finished answer, or
 /// — for the range reads — the copied chunks still to decode once the lock is
-/// gone (`series`, the task's options, and whether the answer is a rollup's).
+/// gone (`series`, the task's options, and whether the answer is a grid's).
 enum LocalOutcome {
     Answered(QueryResult<SelectorOutput>),
     Deferred(Vec<(EvalLabels, RangeSnapshot)>, QueryOptions, bool),
@@ -536,17 +537,17 @@ fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> Loca
                     .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))),
             )
         }
-        SelectorTaskKind::Rollup(rc) => {
+        SelectorTaskKind::Grid(gc) => {
             // Single node: same reasoning as the aggregation task — read the
-            // windows and let the caller reduce them outside the module lock.
-            let Some((start, end)) = rc.rollup.fetch_bounds() else {
-                return LocalOutcome::Answered(Ok(SelectorOutput::Rollup(RollupOutcome::Raw(
+            // spans and let the caller evaluate them outside the module lock.
+            let Some((start, end)) = gc.request.fetch_bounds() else {
+                return LocalOutcome::Answered(Ok(SelectorOutput::Grid(GridOutcome::Raw(
                     Vec::new(),
                 ))));
             };
-            let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            match snapshot_range_local(ctx, selector, start, end, &rc.options) {
-                Ok(series) => LocalOutcome::Deferred(series, rc.options, true),
+            let selector: SeriesSelector = SeriesSelector::from(gc.matchers);
+            match snapshot_range_local(ctx, selector, start, end, &gc.options) {
+                Ok(series) => LocalOutcome::Deferred(series, gc.options, true),
                 Err(err) => LocalOutcome::Answered(Err(err)),
             }
         }
@@ -784,25 +785,23 @@ fn execute_cluster_aggregation(
     }
 }
 
-/// Push a rollup to the shards and collect their per-series values here.
+/// Push a grid query to the shards and collect their output here.
 ///
-/// A series lives on exactly one shard, so the shards' outputs are disjoint and
-/// the coordinator concatenates rather than merges. As with aggregation, a
-/// cluster that cannot evaluate the rollup (a peer without support) reports
-/// [`RollupOutcome::Unsupported`] and the caller falls back to selecting the raw
-/// matrix, so the query still answers.
-fn execute_cluster_rollup(
+/// A series lives on exactly one shard, so the shards' per-series outputs are
+/// disjoint and the coordinator concatenates rather than merges; a fused
+/// request's per-`(group, step)` partials are merged by the command itself.
+fn execute_cluster_grid(
     ctx: &Context,
-    rc: RollupSelectorCommand,
+    gc: GridSelectorCommand,
     hash_tags: &[String],
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 ) {
-    let timeout = calculate_timeout(&rc.options);
-    let max_series = rc.options.max_series;
-    let max_points_per_series = rc.options.max_points_per_series;
-    let cmd = RollupFanoutCommand::new(
-        rc.matchers,
-        rc.rollup,
+    let timeout = calculate_timeout(&gc.options);
+    let max_series = gc.options.max_series;
+    let max_points_per_series = gc.options.max_points_per_series;
+    let cmd = GridFanoutCommand::new(
+        gc.matchers,
+        gc.request,
         max_series as u64,
         max_points_per_series.unwrap_or(0) as u64,
         timeout,
@@ -812,31 +811,27 @@ fn execute_cluster_rollup(
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
 
-    let handler = move |cmd: RollupFanoutCommand, result: FanoutCommandResult| {
+    let handler = move |cmd: GridFanoutCommand, result: FanoutCommandResult| {
         let query_result = match result {
             Ok(()) => {
-                let series = cmd.into_result();
-                // The rolled-up output, not the input, is what these bound: one
-                // series per input series, one point per step that produced one.
-                validate_max_series_(series.len(), max_series).and_then(|_| {
-                    for s in &series {
-                        validate_max_points_per_series(s.samples.len(), max_points_per_series)?;
+                let outcome = cmd.into_result();
+                // The grid output, not the input, is what these bound: one
+                // entry per series (or group), one point per step that produced
+                // one.
+                let points: Vec<usize> = match &outcome {
+                    GridOutcome::Stepped(series) => series.iter().map(|s| s.points.len()).collect(),
+                    GridOutcome::Rolled(series)
+                    | GridOutcome::Reduced(series)
+                    | GridOutcome::Raw(series) => series.iter().map(|s| s.samples.len()).collect(),
+                };
+                validate_max_series_(points.len(), max_series).and_then(|_| {
+                    for count in points {
+                        validate_max_points_per_series(count, max_points_per_series)?;
                     }
-                    Ok(SelectorOutput::Rollup(RollupOutcome::Rolled(series)))
+                    Ok(SelectorOutput::Grid(outcome))
                 })
             }
-            Err(e) if cmd.peer_unsupported() => {
-                log_warning(format!(
-                    "promql: rollup push-down unsupported by a peer, falling back: {e}"
-                ));
-                Ok(SelectorOutput::Rollup(RollupOutcome::Unsupported))
-            }
-            Err(e) => {
-                log_warning(format!(
-                    "promql: cluster command failed for rollup query: {e}"
-                ));
-                Err(e.into())
-            }
+            Err(e) => Err(selector_fanout_failure("grid", e)),
         };
 
         deliver_task_result(&responder, query_result);
@@ -862,8 +857,8 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
         SelectorTaskKind::Aggregation(ac) => {
             execute_cluster_aggregation(ctx, ac, &hash_tags, task.responder);
         }
-        SelectorTaskKind::Rollup(rc) => {
-            execute_cluster_rollup(ctx, rc, &hash_tags, task.responder);
+        SelectorTaskKind::Grid(gc) => {
+            execute_cluster_grid(ctx, gc, &hash_tags, task.responder);
         }
     }
 }
@@ -994,7 +989,7 @@ fn decode_range_snapshots(
 
     // Bound the series the query returns, not the ones the selector matched:
     // an empty range contributes nothing. This is also the path a single-node
-    // rollup takes, so it must agree with the pushed-down one about which
+    // grid query takes, so it must agree with the pushed-down one about which
     // queries `max_series` rejects.
     validate_max_series_(ranges.len(), options.max_series)?;
 

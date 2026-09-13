@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// PromQL push-down: the shard-side half of instant, range, rollup and
-// aggregation evaluation.
+// PromQL push-down: the shard-side half of instant, range, grid (stepped
+// selection and rollup) and aggregation evaluation.
 //
 // This is the same wire contract as the rest of `proto/v1/` — a PromQL
 // push-down *is* a fanout — so it shares the package, and with it `Label`,
@@ -163,9 +163,9 @@ message AggregationGroupPartial {
 /// window. `absent_over_time` is permanently excluded — its answer depends on
 /// series being absent across the whole cluster, which no single shard can see.
 ///
-/// The list grows by appending. A shard that decodes a number it does not know
-/// answers `applied = false` and ships the raw windows, so a newer coordinator
-/// degrades instead of getting a wrong answer.
+/// The list grows by appending. Every node in a cluster runs the same build, so
+/// a shard that decodes a number it does not know has been handed a corrupt
+/// request and refuses it rather than guessing.
 enum RollupKind {
   ROLLUP_KIND_UNSPECIFIED = 0;
   ROLLUP_KIND_SUM_OVER_TIME = 1;
@@ -194,9 +194,48 @@ enum RollupKind {
   ROLLUP_KIND_CHANGES = 24;
 }
 
-/// A rollup pushed down to a shard: which series to read, which windows to
-/// reduce, and which function to reduce them with.
-message RollupQuery {
+/// The range-vector function half of a grid query: `rate(m[5m])`'s `rate` and
+/// `[5m]`. Its presence is what makes a grid query a rollup rather than a
+/// stepped instant selection.
+message GridRollup {
+  RollupKind kind = 1;
+  /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
+  int64 range_ms = 2;
+  /// Numeric function parameter — `quantile_over_time`'s phi. Absent for the
+  /// parameterless rollups.
+  optional double scalar_param = 3;
+}
+
+/// An outer aggregation fused onto a grid query: the `sum by (job)` of
+/// `sum by (job) (rate(m[5m]))` or of `sum by (job) (m)`. The shard groups
+/// its per-series values as well as computing them, so what crosses the wire is
+/// one partial per group per step rather than one value per *series* per step.
+///
+/// Only the reducing operators appear here; the selecting ones (topk and
+/// friends) need the individual samples and are not fused.
+message GridAggregation {
+  AggregationKind kind = 1;
+  optional AggregationGrouping grouping = 2;
+}
+
+/// One read of a selector over a range query's step grid, pushed down to a
+/// shard: which series to read, which window ends to evaluate at, and what to
+/// evaluate there.
+///
+/// Three shapes share this one request, told apart by the two optional
+/// messages:
+///
+/// * neither — *stepped instant selection*: at every window end, the last
+///   sample at or before it and inside the lookback window, i.e. what a range
+///   query's step loop would have picked for a bare vector selector;
+/// * `rollup` — the function reduced over each window;
+/// * `aggregation` — either of the above, folded per `(group, step)` on the
+///   shard.
+///
+/// Every time-dependent field is *resolved*: `@` and `offset` are applied by
+/// the coordinator before the request is built, so a shard evaluates exactly
+/// the window ends it is told and never re-derives a modifier.
+message GridQuery {
   SeriesSelector selector = 1;
   /// The resolved step grid. `step_ms == 0` means a single evaluation, at
   /// `range_end_ms`; otherwise the windows end at every step from
@@ -204,79 +243,64 @@ message RollupQuery {
   int64 query_start = 2;
   int64 query_end = 3;
   int64 step_ms = 4;
-  /// Window width: the `[5m]` of `rate(m[5m])`. Each window is
-  /// `(end - range_ms, end]`.
-  int64 range_ms = 5;
-  uint64 lookback_delta_ms = 6;
   /// Window end for the single-evaluation case, with `@` and `offset` already
-  /// resolved by the coordinator. A shard must never re-derive modifiers: it
-  /// reduces exactly the windows it is told to.
-  int64 range_end_ms = 7;
-  RollupKind kind = 8;
-  /// Numeric function parameter — `quantile_over_time`'s phi. Absent for the
-  /// parameterless rollups.
-  optional double scalar_param = 9;
-  uint64 max_series = 10;
+  /// resolved by the coordinator.
+  int64 range_end_ms = 5;
+  /// The staleness window for stepped selection (and for the rollups that
+  /// consult it), as the coordinator resolved it.
+  uint64 lookback_delta_ms = 6;
+  uint64 max_series = 7;
   /// Bound on the raw points examined per series, enforced shard-side. The
-  /// coordinator separately bounds the rolled-up points it accepts back.
-  uint64 max_points_per_series = 11;
-  /// An outer aggregation to fuse with the rollup: `sum by (job) (rate(m[5m]))`
-  /// asks the shard to group its rolled-up values as well as compute them, so
-  /// what crosses the wire is one partial per group per step rather than one
-  /// value per *series* per step. Absent when the rollup is not under a
-  /// decomposable aggregation.
-  ///
-  /// Only the reducing operators appear here; the selecting ones (topk and
-  /// friends) need the individual samples and are not fused.
-  optional AggregationKind agg_kind = 12;
-  optional AggregationGrouping agg_grouping = 13;
+  /// coordinator separately bounds the points it accepts back.
+  uint64 max_points_per_series = 8;
+  optional GridRollup rollup = 9;
+  optional GridAggregation aggregation = 10;
 }
 
-/// One `(group, step, shard)` partial for a fused rollup+aggregation: the
-/// group's label set as computed by the request's grouping modifier, the step it
-/// belongs to, and the shard's accumulated state for that pair.
-message RollupGroupPartial {
+/// One point of a series' grid output.
+message GridPoint {
+  /// The window end (step) this point answers for.
+  int64 step_ts = 1;
+  /// For stepped selection, the selected sample's own timestamp — which is what
+  /// `timestamp()` reports, and is not the step's. Unset for rollup output,
+  /// whose value belongs to the window rather than to any one sample.
+  int64 sample_ts = 2;
+  double value = 3;
+}
+
+/// One series' stepped or rolled-up output: sparse points, one per window end
+/// that produced a value.
+///
+/// A window that held no eligible sample is *absent* from `points` — never
+/// present with a NaN value. That distinction is the result, so it has to
+/// survive the wire: NaN is a legitimate rolled-up value.
+message GridSeries {
+  repeated Label labels = 1;
+  repeated GridPoint points = 2;
+}
+
+/// One `(group, step, shard)` partial for a fused grid query: the group's label
+/// set as computed by the request's grouping modifier, the step it belongs to,
+/// and the shard's accumulated state for that pair.
+message GridGroupPartial {
   repeated Label labels = 1;
   int64 step_ts = 2;
   AggregationPartialState state = 3;
 }
 
-/// One series' rolled-up output: sparse `(window end, value)` pairs.
+/// Each series the shard read lands in exactly one of the three lists.
 ///
-/// A window that held no samples is *absent* from `points` — never present with
-/// a NaN value. That distinction is the result, so it has to survive the wire:
-/// NaN is a legitimate rolled-up value.
-message RollupSeries {
-  repeated Label labels = 1;
-  repeated Sample points = 2;
-}
-
-message RollupQueryResponse {
-  /// Set when `applied`: the shard's final per-series rollup values. Because a
-  /// series lives on exactly one shard, the coordinator concatenates these
-  /// rather than merging them.
-  repeated RollupSeries series = 1;
-  /// Set when `applied` is false: the raw windows, for the coordinator to
-  /// reduce itself.
-  repeated RangeSample raw = 2;
-  /// Compatibility handshake: true when the shard applied the requested rollup.
-  /// A shard that does not recognize the requested `kind` (a newer coordinator
-  /// during a rolling upgrade) returns the raw windows in `raw` with `applied`
-  /// false. Absent on a pre-handshake peer (proto3 decodes as false), which is
-  /// exactly the right interpretation.
-  bool applied = 3;
-  /// Set when `aggregated`: one mergeable partial per `(group, step)`.
-  repeated RollupGroupPartial partials = 4;
-  /// Second handshake bit, for the fused form: true when the shard applied the
-  /// outer aggregation as well as the rollup.
-  ///
-  /// It has to be separate from `applied`, because a shard that predates fusion
-  /// silently ignores the `agg_*` fields and answers `applied = true` with
-  /// per-series rollup values. Reading that as "aggregated" would drop the
-  /// grouping entirely; reading `aggregated == false` makes the coordinator
-  /// group those values itself, which is correct at the cost of the transfer
-  /// the fusion would have saved.
-  bool aggregated = 5;
+/// Which list is decided by the request and by size. A fused request answers in
+/// `partials`, everything else in `series` — except that a series whose raw span
+/// is *smaller* than its grid output (`step` finer than the sample cadence)
+/// travels in `raw`, and the coordinator runs the same per-series stage over it
+/// that the shard would have. `series` and `partials` never both appear: a
+/// response that carries per-series values for a fused request, or partials for
+/// an unfused one, is from a corrupt peer.
+message GridQueryResponse {
+  repeated GridSeries series = 1;
+  repeated GridGroupPartial partials = 2;
+  repeated RangeSample raw = 3;
 }
 
 message AggregationQueryResponse {

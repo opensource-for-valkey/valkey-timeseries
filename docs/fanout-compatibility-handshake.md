@@ -68,14 +68,18 @@ The same reasoning covers enums. Enum fields decode to a raw `i32`, so an
 unrecognized value is detectable rather than silently mapped onto a neighbour:
 
 ```rust
-// src/promql/engine/fanout/rollup_fanout_command.rs
-let kind = RollupKind::from(ProtoRollupKind::try_from(req.kind).ok()?);
+// src/promql/engine/fanout/grid_fanout_command.rs
+let kind = ProtoRollupKind::try_from(rollup.kind)
+    .map_err(|_| ...)
+    .and_then(RollupKind::try_from)?;
 ```
 
-`try_from` failing means the coordinator is newer. The shard answers
-`applied = false` and ships its raw windows. **Enum lists therefore grow by
-appending only** — renumbering an existing value would make an old shard confidently
-compute the wrong function.
+`try_from` failing means the request names a function this node does not have.
+The grid command refuses such a request outright (every node runs the same
+build); a push-down that has to survive a rolling upgrade would instead answer
+with its raw data and say so. **Enum lists therefore grow by appending only** —
+renumbering an existing value would make an old shard confidently compute the
+wrong function.
 
 ---
 
@@ -103,30 +107,38 @@ The coordinator always re-applies `COUNT` as the final authority, so
 the reduced result; false and it carries the raw instant vector for the
 coordinator to aggregate. See `src/promql/engine/fanout/aggregation_fanout_command.rs`.
 
-### TS.QUERY / TS.QUERYRANGE — PromQL rollups
+### TS.QUERY / TS.QUERYRANGE — PromQL grid queries
 
-`RollupQueryResponse`: **two independent flags**, because there are two separable
-optimizations in one request.
+`GridQueryResponse` carries no flags: the pre-release codebase has no installed
+base to stay compatible with, so the rollup handshake described in §4 was folded
+into one *grid* request (`GridQuery`) that serves every range-query read of a
+selector — stepped instant selection, rollups, and either fused with a reducing
+aggregation. The response is self-describing by **which list a series lands
+in**:
 
-| `applied` | `aggregated` | Response carries | Coordinator does |
-|---|---|---|---|
-| `false` | `false` | raw windows in `raw` | reduce, then group |
-| `true` | `false` | per-series values in `series` | group |
-| `true` | `true` | per-`(group, step)` partials in `partials` | merge and finalize |
+| List | Holds | Coordinator does |
+|---|---|---|
+| `series` | one point per series per step (stepped or rolled) | concatenate |
+| `partials` | one partial per `(group, step)` for a fused request | merge and finalize |
+| `raw` | a series' raw span, when it is smaller than its grid output | run the same per-series stage, then the above |
 
-`applied` is read first, so the fourth combination (`applied = false`,
-`aggregated = true`) resolves to the top row: the raw windows are taken and the
-stray flag ignored, which is the safe reading. What *is* rejected is a response
-whose payload contradicts its own flags — raw windows alongside `applied`,
-per-series values alongside `aggregated`, or partials without `aggregated` —
-because folding those in would double-count the series they belong to.
+A fused request answers in `partials`, an unfused one in `series`, and any
+series may travel in `raw` under the size rule; `series` and `partials` never
+both appear. A response carrying per-series values for a fused request, or
+partials for an unfused one, is rejected as corrupt rather than folded in twice.
+A shard handed a rollup or aggregation it does not know refuses the request —
+every node runs the same build. See
+`src/promql/engine/fanout/grid_fanout_command.rs` and
+`docs/plans/selector-pushdown-plan.md`.
 
 ---
 
 ## 4. Why the rollup handshake needed a second bit
 
-This is the part worth internalizing before adding a fourth push-down, because
-the wrong choice here is silent.
+The rollup push-down shipped with two flags before it was folded into the grid
+query above. The reasoning is kept because it is the rule for the *next*
+push-down that has to survive a rolling upgrade, and the wrong choice here is
+silent.
 
 `sum by (job) (rate(m[5m]))` asks a shard for two things: reduce each series'
 windows, and fold the results into per-group partials. A shard that implements
@@ -175,8 +187,8 @@ applied" cannot drift into two different answers for the same window.
 ## 6. What the toggles are not
 
 `ts-fanout-aggregation-pushdown` (default `yes`) and `ts-fanout-rollup-pushdown`
-(default `no`) are read **only by the coordinator**. Shards obey whatever the
-request asks for.
+(default `yes`; it governs the whole grid push-down, stepped selectors included)
+are read **only by the coordinator**. Shards obey whatever the request asks for.
 
 They are not mixed-version safety knobs. Version skew is already correct by the
 mechanism above, so a rolling upgrade needs no configuration change in either
@@ -220,8 +232,8 @@ bit instead and let it fail fast.
 - `src/fanout/` — envelope, transport, error kinds
 - `src/commands/ts_mrange_fanout_command.rs` — MRANGE push-down
 - `src/promql/engine/fanout/aggregation_fanout_command.rs` — PromQL aggregation
-- `src/promql/engine/fanout/rollup_fanout_command.rs` — PromQL rollups and fusion
-- `docs/promql-rollup-pushdown-plan.md` — the rollup push-down design in full
+- `src/promql/engine/fanout/grid_fanout_command.rs` — PromQL grid queries: stepped selectors, rollups and fusion
+- `docs/plans/selector-pushdown-plan.md` — the grid push-down design in full
 - `docs/overview.md` — cluster mode and push-down from an operator's view
 
 Adjacent but distinct: a cluster topology change between request and receipt is

@@ -4,7 +4,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
 use crate::promql::engine::PROMQL_CONFIG;
-use crate::promql::engine::query_reader::rollup_fetch_bounds;
+use crate::promql::engine::query_reader::grid_fetch_bounds;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
     get_series_range, instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
@@ -98,25 +98,27 @@ pub(super) fn local_instant_eval_samples(
     Ok(samples)
 }
 
-/// Read the raw windows a pushed-down rollup needs, one entry per series.
+/// Read the raw windows a pushed-down grid query needs, one entry per series.
 ///
 /// The samples returned are exactly those inside the union of the requested
-/// windows — `(first_end - range_ms, last_end]` — so the shard reduces the same
-/// data the coordinator's own matrix selector would have loaded. Series with no
-/// samples in that span are dropped: an empty window contributes nothing.
+/// windows — `(first_end - backward_ms, last_end]`, where `backward_ms` is the
+/// window width for a rollup and the lookback for a stepped selection — so the
+/// shard evaluates the same data the coordinator's own selector would have
+/// loaded. Series with no samples in that span are dropped: an empty window
+/// contributes nothing.
 ///
 /// `max_points_per_series` bounds the *raw* points examined per series, which is
 /// the resource this push-down is trading away; the coordinator separately
-/// bounds the rolled-up points it accepts back.
-pub(super) fn local_rollup_windows(
+/// bounds the points it accepts back.
+pub(super) fn local_grid_windows(
     ctx: &Context,
     selector: SeriesSelector,
     window_ends: &[Timestamp],
-    range_ms: i64,
+    backward_ms: i64,
     max_series: u64,
     max_points_per_series: u64,
 ) -> ValkeyResult<Vec<crate::promql::model::RangeSample<EvalLabels>>> {
-    let Some((start_time, end_time)) = rollup_fetch_bounds(window_ends, range_ms) else {
+    let Some((start_time, end_time)) = grid_fetch_bounds(window_ends, backward_ms) else {
         return Ok(Vec::new());
     };
 

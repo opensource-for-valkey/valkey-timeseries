@@ -19,7 +19,8 @@ mod tests {
     use crate::labels::{Label, Labels};
     use crate::promql::EvalLabels;
     use crate::promql::engine::query_reader::{
-        AggregationOutcome, AggregationParam, AggregationRequest, RollupOutcome, RollupRequest,
+        AggregationOutcome, AggregationParam, AggregationRequest, GridOutcome, GridRequest,
+        GridRollup,
     };
     use crate::promql::engine::test_utils::{
         MemorySeriesQuerier, MockMultiBucketQueryReaderBuilder, MockQueryReaderBuilder,
@@ -4343,20 +4344,21 @@ mod tests {
         assert_eq!(result[0].value, 1.0, "a NaN sample still counts");
     }
 
-    // ── Rollup push-down ────────────────────────────────────────────────
+    // ── Grid push-down ──────────────────────────────────────────────────
     //
-    // The coordinator side of `QueryReader::query_rollup`: which calls are
+    // The coordinator side of `QueryReader::query_grid`: which calls are
     // offered to the source, what the source is told about the window, and that
-    // whichever side reduces, the answer is the same.
+    // whichever side evaluates, the answer is the same.
 
-    /// What the source was told about one offered rollup.
+    /// What the source was told about one offered grid request.
     #[derive(Debug, Clone, PartialEq)]
-    struct OfferedRollup {
-        kind: RollupKind,
-        range_ms: i64,
+    struct OfferedGrid {
+        /// The rollup, when the request is one; `None` for a stepped selection.
+        rollup: Option<GridRollup>,
+        /// The fused aggregation, when the request carries one.
+        aggregation: Option<AggregationKind>,
         step_ms: i64,
         range_end_ms: i64,
-        param: Option<f64>,
         /// The grid the request covers. Recorded so a subquery's rollup can be
         /// shown to run over the *subquery's* grid rather than the enclosing
         /// query's — the two are indistinguishable from `step_ms` alone.
@@ -4364,30 +4366,41 @@ mod tests {
         query_end: i64,
     }
 
-    /// A reader that records every rollup it is offered. `answer` decides
-    /// whether it reduces the windows itself (the cluster's role) or hands them
-    /// back raw (the single-node fallback).
-    struct RollupPushdownReader {
+    impl OfferedGrid {
+        fn kind(&self) -> RollupKind {
+            self.rollup.as_ref().expect("a rollup request").kind
+        }
+
+        fn range_ms(&self) -> i64 {
+            self.rollup.as_ref().expect("a rollup request").range_ms
+        }
+    }
+
+    /// A reader that records every grid request it is offered. `answer` decides
+    /// whether it evaluates the request itself (the cluster's role) or hands the
+    /// spans back raw (the single-node fallback).
+    struct GridPushdownReader {
         inner: MemorySeriesQuerier,
-        answer: RollupAnswer,
-        offered: std::sync::Mutex<Vec<OfferedRollup>>,
+        answer: GridAnswer,
+        offered: std::sync::Mutex<Vec<OfferedGrid>>,
     }
 
-    #[derive(Clone, Copy, PartialEq)]
-    enum RollupAnswer {
-        /// Do everything the request asks — reduce, and group when it carries an
-        /// aggregation — as a current shard would.
-        Rolled,
-        /// Reduce but do not group, as a peer that predates fusion does.
-        Reduced,
-        /// Return the windows unreduced, as a single node does.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum GridAnswer {
+        /// Do everything the request asks — step or reduce, and group when it
+        /// carries an aggregation — as a shard would.
+        Evaluated,
+        /// Return the spans unevaluated, as a single node does.
         Raw,
-        /// Refuse, as a node without push-down does.
-        Unsupported,
+        /// The step-by-step baseline: the range helpers skip the preload phase
+        /// entirely, so every step evaluates live against the inner reader and
+        /// the source is never offered a grid. (A subquery's own preload still
+        /// runs, and is answered raw.)
+        Local,
     }
 
-    impl RollupPushdownReader {
-        fn new(inner: MemorySeriesQuerier, answer: RollupAnswer) -> Self {
+    impl GridPushdownReader {
+        fn new(inner: MemorySeriesQuerier, answer: GridAnswer) -> Self {
             Self {
                 inner,
                 answer,
@@ -4395,12 +4408,12 @@ mod tests {
             }
         }
 
-        fn offered(&self) -> Vec<OfferedRollup> {
+        fn offered(&self) -> Vec<OfferedGrid> {
             self.offered.lock().unwrap().clone()
         }
     }
 
-    impl QueryReader for RollupPushdownReader {
+    impl QueryReader for GridPushdownReader {
         fn query(
             &self,
             selector: &VectorSelector,
@@ -4420,44 +4433,33 @@ mod tests {
             self.inner.query_range(selector, start_ms, end_ms, options)
         }
 
-        fn query_rollup(
+        fn query_grid(
             &self,
             selector: &VectorSelector,
-            rollup: &RollupRequest,
+            request: &GridRequest,
             options: QueryOptions,
-        ) -> crate::promql::PromqlResult<RollupOutcome> {
-            self.offered.lock().unwrap().push(OfferedRollup {
-                kind: rollup.kind,
-                range_ms: rollup.range_ms,
-                step_ms: rollup.step_ms,
-                range_end_ms: rollup.range_end_ms,
-                param: rollup.param,
-                query_start: rollup.query_start,
-                query_end: rollup.query_end,
+        ) -> crate::promql::PromqlResult<GridOutcome> {
+            self.offered.lock().unwrap().push(OfferedGrid {
+                rollup: request.rollup.clone(),
+                aggregation: request.aggregation.as_ref().map(|agg| agg.kind),
+                step_ms: request.step_ms,
+                range_end_ms: request.range_end_ms,
+                query_start: request.query_start,
+                query_end: request.query_end,
             });
 
-            if self.answer == RollupAnswer::Unsupported {
-                return Ok(RollupOutcome::Unsupported);
-            }
-
-            let raw = self.inner.query_rollup(selector, rollup, options)?;
-            let RollupOutcome::Raw(windows) = raw else {
+            let raw = self.inner.query_grid(selector, request, options)?;
+            let GridOutcome::Raw(spans) = raw else {
                 panic!("the in-memory reader always answers Raw");
             };
-            if self.answer == RollupAnswer::Raw {
-                return Ok(RollupOutcome::Raw(windows));
+            if self.answer != GridAnswer::Evaluated {
+                return Ok(GridOutcome::Raw(spans));
             }
 
-            // Reduce here, exactly as a shard does — through the request's own
-            // kernels, so this stands in for the shard rather than imitating it.
-            let reduced = rollup.reduce_windows(&rollup.window_ends(), windows);
-
-            if self.answer == RollupAnswer::Reduced {
-                return Ok(RollupOutcome::Reduced(reduced));
-            }
-
-            // …and group, when the request asks for it.
-            Ok(RollupOutcome::Rolled(rollup.group(reduced)))
+            // Evaluate here, exactly as a shard does — through the request's
+            // own kernels, so this stands in for the shard rather than
+            // imitating it.
+            Ok(request.evaluate(spans))
         }
     }
 
@@ -4466,8 +4468,8 @@ mod tests {
     fn evaluate_rollup_pushdown(
         query: &str,
         at_ms: i64,
-        answer: RollupAnswer,
-    ) -> (Vec<EvalSample>, Vec<OfferedRollup>) {
+        answer: GridAnswer,
+    ) -> (Vec<EvalSample>, Vec<OfferedGrid>) {
         evaluate_rollup_pushdown_on(rollup_reader(), query, at_ms, answer)
     }
 
@@ -4475,9 +4477,9 @@ mod tests {
         inner: MemorySeriesQuerier,
         query: &str,
         at_ms: i64,
-        answer: RollupAnswer,
-    ) -> (Vec<EvalSample>, Vec<OfferedRollup>) {
-        let reader = RollupPushdownReader::new(inner, answer);
+        answer: GridAnswer,
+    ) -> (Vec<EvalSample>, Vec<OfferedGrid>) {
+        let reader = GridPushdownReader::new(inner, answer);
         let evaluator = Evaluator::new(
             &reader,
             QueryOptions {
@@ -4502,19 +4504,23 @@ mod tests {
         // Every kind is offered, with the window and function it names.
         for kind in RollupKind::all() {
             let query = rollup_query(kind, "1m");
-            let (_, offered) = evaluate_rollup_pushdown(&query, 120_000, RollupAnswer::Rolled);
+            let (_, offered) = evaluate_rollup_pushdown(&query, 120_000, GridAnswer::Evaluated);
             assert_eq!(offered.len(), 1, "{query}: offered once");
-            assert_eq!(offered[0].kind, kind, "{query}");
+            assert_eq!(offered[0].kind(), kind, "{query}");
             assert_eq!(
-                offered[0].range_ms, 60_000,
+                offered[0].range_ms(),
+                60_000,
                 "{query}: resolved window width"
             );
             assert_eq!(offered[0].step_ms, 0, "{query}: single evaluation");
         }
 
         // Parentheses around the selector do not change what is reduced.
-        let (_, offered) =
-            evaluate_rollup_pushdown("sum_over_time((metric[1m]))", 120_000, RollupAnswer::Rolled);
+        let (_, offered) = evaluate_rollup_pushdown(
+            "sum_over_time((metric[1m]))",
+            120_000,
+            GridAnswer::Evaluated,
+        );
         assert_eq!(offered.len(), 1, "parenthesized selector is still pushable");
 
         for query in [
@@ -4530,7 +4536,7 @@ mod tests {
             // Not a range-vector function at all.
             "abs(metric)",
         ] {
-            let (_, offered) = evaluate_rollup_pushdown(query, 120_000, RollupAnswer::Rolled);
+            let (_, offered) = evaluate_rollup_pushdown(query, 120_000, GridAnswer::Evaluated);
             assert!(offered.is_empty(), "{query}: must not be pushed down");
         }
     }
@@ -4541,14 +4547,14 @@ mod tests {
     #[test]
     fn should_push_down_a_subquerys_inner_rollup_over_its_own_grid() {
         let query = "max_over_time(sum_over_time(metric[1m])[2m:30s])";
-        let (pushed, offered) = evaluate_rollup_pushdown(query, 120_000, RollupAnswer::Rolled);
+        let (pushed, offered) = evaluate_rollup_pushdown(query, 120_000, GridAnswer::Evaluated);
 
         // Subquery range (0, 2m] at a 30s step aligns to four evaluation points
         // — 30s, 60s, 90s, 120s — and all four are covered by one request whose
         // grid is exactly that progression.
         assert_eq!(offered.len(), 1, "one offer for the whole subquery grid");
-        assert_eq!(offered[0].kind, RollupKind::SumOverTime);
-        assert_eq!(offered[0].range_ms, 60_000, "the inner window width");
+        assert_eq!(offered[0].kind(), RollupKind::SumOverTime);
+        assert_eq!(offered[0].range_ms(), 60_000, "the inner window width");
         assert_eq!(
             offered[0].step_ms, 30_000,
             "the subquery's resolution is the grid step"
@@ -4574,7 +4580,7 @@ mod tests {
     /// check through `RollupKind::from_function_name` directly.
     #[test]
     fn should_accept_a_scalar_parameter_on_either_side_of_the_matrix() {
-        let reader = RollupPushdownReader::new(rollup_reader(), RollupAnswer::Rolled);
+        let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Evaluated);
         let evaluator = Evaluator::new(
             &reader,
             QueryOptions {
@@ -4618,7 +4624,7 @@ mod tests {
             ("sum_over_time(metric[1m] offset 3m)", 120_000),
             ("sum_over_time(metric[1m] @ 120)", 120_000),
         ] {
-            let (_, offered) = evaluate_rollup_pushdown(query, 300_000, RollupAnswer::Rolled);
+            let (_, offered) = evaluate_rollup_pushdown(query, 300_000, GridAnswer::Evaluated);
             assert_eq!(offered.len(), 1, "{query}");
             assert_eq!(offered[0].range_end_ms, want_end, "{query}");
         }
@@ -4635,12 +4641,7 @@ mod tests {
                     let query = rollup_query(kind, range);
                     let local = eval_rollup(&reader(), &query, 120_000);
 
-                    for answer in [
-                        RollupAnswer::Rolled,
-                        RollupAnswer::Reduced,
-                        RollupAnswer::Raw,
-                        RollupAnswer::Unsupported,
-                    ] {
+                    for answer in [GridAnswer::Evaluated, GridAnswer::Raw, GridAnswer::Local] {
                         let (pushed, offered) =
                             evaluate_rollup_pushdown_on(reader(), &query, 120_000, answer);
                         assert_eq!(offered.len(), 1, "{dataset}/{query}: offered once");
@@ -4669,16 +4670,15 @@ mod tests {
                         0,
                         300_000,
                         30_000,
-                        RollupAnswer::Unsupported,
+                        GridAnswer::Local,
                     );
-                    assert_eq!(offered.len(), 1, "{dataset}/{query}: offered once");
+                    assert!(
+                        offered.is_empty(),
+                        "{dataset}/{query}: baseline offers nothing"
+                    );
                     let local = rendered_steps(local);
 
-                    for answer in [
-                        RollupAnswer::Rolled,
-                        RollupAnswer::Reduced,
-                        RollupAnswer::Raw,
-                    ] {
+                    for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
                         let (pushed, _) = evaluate_range_with_pushdown_on(
                             reader(),
                             &query,
@@ -4711,7 +4711,7 @@ mod tests {
                     60_000,
                     240_000,
                     60_000,
-                    RollupAnswer::Unsupported,
+                    GridAnswer::Local,
                 );
                 let (pushed, _) = evaluate_range_with_pushdown_on(
                     rollup_reader(),
@@ -4719,7 +4719,7 @@ mod tests {
                     60_000,
                     240_000,
                     60_000,
-                    RollupAnswer::Rolled,
+                    GridAnswer::Evaluated,
                 );
                 assert_eq!(
                     rendered_steps(local),
@@ -4734,11 +4734,7 @@ mod tests {
     /// rollup drops `__name__` exactly where a local one does.
     #[test]
     fn should_apply_the_label_rule_to_pushed_down_rollups() {
-        for answer in [
-            RollupAnswer::Rolled,
-            RollupAnswer::Reduced,
-            RollupAnswer::Raw,
-        ] {
+        for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
             let (result, _) =
                 evaluate_rollup_pushdown("sum_over_time(metric[1m])", 120_000, answer);
             assert_eq!(result.len(), 1);
@@ -4760,7 +4756,7 @@ mod tests {
     /// later phase, and until then the two paths must not both own the grid.
     #[test]
     fn should_not_push_down_rollups_in_range_queries() {
-        let reader = RollupPushdownReader::new(rollup_reader(), RollupAnswer::Rolled);
+        let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Evaluated);
         let evaluator = Evaluator::new(
             &reader,
             QueryOptions {
@@ -4799,8 +4795,8 @@ mod tests {
         start_ms: i64,
         end_ms: i64,
         step_ms: i64,
-        answer: RollupAnswer,
-    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedRollup>) {
+        answer: GridAnswer,
+    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedGrid>) {
         evaluate_range_with_pushdown_on(rollup_reader(), query, start_ms, end_ms, step_ms, answer)
     }
 
@@ -4810,9 +4806,9 @@ mod tests {
         start_ms: i64,
         end_ms: i64,
         step_ms: i64,
-        answer: RollupAnswer,
-    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedRollup>) {
-        let reader = RollupPushdownReader::new(inner, answer);
+        answer: GridAnswer,
+    ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedGrid>) {
+        let reader = GridPushdownReader::new(inner, answer);
         let evaluator = Evaluator::new(
             &reader,
             QueryOptions {
@@ -4829,9 +4825,12 @@ mod tests {
             lookback_delta_ms: 300_000,
         };
 
-        evaluator
-            .preload_for_range(&expr, &base)
-            .unwrap_or_else(|e| panic!("{query}: preload failed: {e}"));
+        // `Local` is the baseline: no preload, so every step evaluates live.
+        if answer != GridAnswer::Local {
+            evaluator
+                .preload_for_range(&expr, &base)
+                .unwrap_or_else(|e| panic!("{query}: preload failed: {e}"));
+        }
 
         let mut steps = Vec::new();
         for step_ts in (start_ms..=end_ms).step_by(step_ms as usize) {
@@ -4976,14 +4975,14 @@ mod tests {
             0,
             300_000,
             30_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
 
         assert_eq!(steps.len(), 11, "eleven steps evaluated");
         assert_eq!(offered.len(), 1, "one request for all of them");
-        assert_eq!(offered[0].kind, RollupKind::SumOverTime);
+        assert_eq!(offered[0].kind(), RollupKind::SumOverTime);
         assert_eq!(offered[0].step_ms, 30_000, "the grid step is shipped");
-        assert_eq!(offered[0].range_ms, 60_000);
+        assert_eq!(offered[0].range_ms(), 60_000);
     }
 
     /// Two different rollups over the same series are two requests; the same
@@ -4995,7 +4994,7 @@ mod tests {
             0,
             120_000,
             30_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
         assert_eq!(offered.len(), 1, "the same rollup is requested once");
 
@@ -5004,7 +5003,7 @@ mod tests {
             0,
             120_000,
             30_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
         assert_eq!(
             offered.len(),
@@ -5017,7 +5016,7 @@ mod tests {
             0,
             120_000,
             30_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
         assert_eq!(offered.len(), 2, "different windows are different requests");
     }
@@ -5037,13 +5036,13 @@ mod tests {
             // Range narrower than the step: windows have gaps between them.
             "count_over_time(metric[10s])",
         ] {
-            // `Unsupported` is the step-by-step local path.
+            // `Local` is the step-by-step path: nothing is offered.
             let (local, offered) =
-                evaluate_range_with_pushdown(query, 0, 300_000, 30_000, RollupAnswer::Unsupported);
-            assert_eq!(offered.len(), 1, "{query}: offered, then declined");
+                evaluate_range_with_pushdown(query, 0, 300_000, 30_000, GridAnswer::Local);
+            assert!(offered.is_empty(), "{query}: the baseline offers nothing");
             let local = rendered_steps(local);
 
-            for answer in [RollupAnswer::Rolled, RollupAnswer::Raw] {
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
                 let (pushed, _) = evaluate_range_with_pushdown(query, 0, 300_000, 30_000, answer);
                 assert_eq!(
                     local,
@@ -5064,7 +5063,7 @@ mod tests {
             240_000,
             420_000,
             60_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
 
         let present: Vec<i64> = steps
@@ -5084,7 +5083,7 @@ mod tests {
             240_000,
             420_000,
             60_000,
-            RollupAnswer::Unsupported,
+            GridAnswer::Local,
         );
         assert_eq!(rendered_steps(steps), rendered_steps(local));
     }
@@ -5099,7 +5098,7 @@ mod tests {
             120_000,
             240_000,
             60_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
         assert_eq!(offered.len(), 1);
         // Windows end a minute before each step: 60s, 120s, 180s.
@@ -5109,7 +5108,7 @@ mod tests {
             120_000,
             240_000,
             60_000,
-            RollupAnswer::Unsupported,
+            GridAnswer::Local,
         );
         assert_eq!(
             rendered_steps(steps),
@@ -5123,7 +5122,7 @@ mod tests {
             120_000,
             240_000,
             60_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
         assert_eq!(offered.len(), 1);
         assert_eq!(offered[0].range_end_ms, 120_000, "one pinned window");
@@ -5141,7 +5140,7 @@ mod tests {
             120_000,
             240_000,
             60_000,
-            RollupAnswer::Unsupported,
+            GridAnswer::Local,
         );
         assert_eq!(rendered_steps(steps), rendered_steps(local), "@ parity");
     }
@@ -5170,20 +5169,10 @@ mod tests {
         ] {
             let bare = format!("max_over_time(metric{modifiers}[2m:30s])");
             let parened = format!("max_over_time((metric{modifiers})[2m:30s])");
-            let (bare_steps, _) = evaluate_range_with_pushdown(
-                &bare,
-                200_000,
-                260_000,
-                30_000,
-                RollupAnswer::Unsupported,
-            );
-            let (paren_steps, _) = evaluate_range_with_pushdown(
-                &parened,
-                200_000,
-                260_000,
-                30_000,
-                RollupAnswer::Unsupported,
-            );
+            let (bare_steps, _) =
+                evaluate_range_with_pushdown(&bare, 200_000, 260_000, 30_000, GridAnswer::Local);
+            let (paren_steps, _) =
+                evaluate_range_with_pushdown(&parened, 200_000, 260_000, 30_000, GridAnswer::Local);
             assert_eq!(
                 rendered_steps(paren_steps),
                 rendered_steps(bare_steps),
@@ -5212,13 +5201,8 @@ mod tests {
             (" @ end() offset -30s", "29.0"),
         ] {
             let query = format!("max_over_time(metric{modifiers}[2m:30s])");
-            let (steps, _) = evaluate_range_with_pushdown(
-                &query,
-                200_000,
-                260_000,
-                30_000,
-                RollupAnswer::Unsupported,
-            );
+            let (steps, _) =
+                evaluate_range_with_pushdown(&query, 200_000, 260_000, 30_000, GridAnswer::Local);
             let values: Vec<String> = rendered_steps(steps)
                 .into_iter()
                 .map(|(_, _, value)| value)
@@ -5234,13 +5218,8 @@ mod tests {
             (" offset -30s", "21.0"),
         ] {
             let query = format!("max_over_time(metric{modifiers}[2m:30s])");
-            let (steps, _) = evaluate_range_with_pushdown(
-                &query,
-                200_000,
-                200_000,
-                30_000,
-                RollupAnswer::Unsupported,
-            );
+            let (steps, _) =
+                evaluate_range_with_pushdown(&query, 200_000, 200_000, 30_000, GridAnswer::Local);
             let values: Vec<String> = rendered_steps(steps)
                 .into_iter()
                 .map(|(_, _, value)| value)
@@ -5261,7 +5240,7 @@ mod tests {
     fn should_preload_a_subquerys_rollup_on_the_subquerys_grid() {
         let query = "max_over_time(sum_over_time(metric[1m])[2m:1m])";
         let (steps, offered) =
-            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, RollupAnswer::Rolled);
+            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, GridAnswer::Evaluated);
 
         // Outer steps 120s/180s/240s. Each one's subquery is (t-2m, t] at a 1m
         // resolution, which aligns to {t-1m, t}; their union is 60s..240s on
@@ -5281,13 +5260,8 @@ mod tests {
         );
 
         // Whichever side reduced, the answer matches the fully local path.
-        let (local, _) = evaluate_range_with_pushdown(
-            query,
-            120_000,
-            240_000,
-            60_000,
-            RollupAnswer::Unsupported,
-        );
+        let (local, _) =
+            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, GridAnswer::Local);
         assert_eq!(
             rendered_steps(steps),
             rendered_steps(local),
@@ -5340,15 +5314,11 @@ mod tests {
                         0,
                         300_000,
                         30_000,
-                        RollupAnswer::Unsupported,
+                        GridAnswer::Local,
                     );
                     let local = rendered_steps(local);
 
-                    for answer in [
-                        RollupAnswer::Rolled,
-                        RollupAnswer::Reduced,
-                        RollupAnswer::Raw,
-                    ] {
+                    for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
                         let (pushed, _) = evaluate_range_with_pushdown_on(
                             grouped_rollup_reader(),
                             &query,
@@ -5366,11 +5336,7 @@ mod tests {
 
                     // …and the same at an instant.
                     let instant_local = eval_rollup(&grouped_rollup_reader(), &query, 120_000);
-                    for answer in [
-                        RollupAnswer::Rolled,
-                        RollupAnswer::Reduced,
-                        RollupAnswer::Raw,
-                    ] {
+                    for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
                         let (pushed, _) = evaluate_rollup_pushdown_on(
                             grouped_rollup_reader(),
                             &query,
@@ -5404,12 +5370,12 @@ mod tests {
             0,
             300_000,
             30_000,
-            RollupAnswer::Rolled,
+            GridAnswer::Evaluated,
         );
 
         assert_eq!(steps.len(), 11, "eleven steps evaluated");
         assert_eq!(offered.len(), 1, "one fused request for all of them");
-        assert_eq!(offered[0].kind, RollupKind::Rate);
+        assert_eq!(offered[0].kind(), RollupKind::Rate);
         assert_eq!(offered[0].step_ms, 30_000);
 
         // Two jobs, so two groups per step that has data.
@@ -5427,11 +5393,7 @@ mod tests {
     /// name that is about to disappear.
     #[test]
     fn should_carry_the_name_drop_through_fusion() {
-        for answer in [
-            RollupAnswer::Rolled,
-            RollupAnswer::Reduced,
-            RollupAnswer::Raw,
-        ] {
+        for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
             // `rate` drops the name, so the group has none.
             let (pushed, _) = evaluate_rollup_pushdown_on(
                 grouped_rollup_reader(),
@@ -5482,7 +5444,7 @@ mod tests {
                 grouped_rollup_reader(),
                 query,
                 120_000,
-                RollupAnswer::Rolled,
+                GridAnswer::Evaluated,
             );
             assert_eq!(
                 offered.len(),
@@ -5496,6 +5458,342 @@ mod tests {
                 rendered_samples(pushed),
                 "{query}: unfused result must equal the local one"
             );
+        }
+    }
+
+    // ── Stepped selector push-down ──────────────────────────────────────
+    //
+    // A range query reads each bare vector selector over the whole grid as one
+    // stepped request — and an aggregation directly over one as a fused
+    // request. These pin the request count and shape, and parity with the
+    // step-by-step path whoever evaluates.
+
+    /// A range query over bare selectors is one stepped request per distinct
+    /// selector, carrying neither rollup nor aggregation.
+    #[test]
+    fn should_issue_one_stepped_request_per_selector() {
+        let (steps, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            "metric + metric offset 1m",
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        assert_eq!(steps.len(), 11);
+        assert_eq!(offered.len(), 2, "one request per distinct selector");
+        for o in &offered {
+            assert!(o.rollup.is_none() && o.aggregation.is_none(), "{o:?}");
+            assert_eq!(o.step_ms, 30_000);
+        }
+        // Windows end a minute before each step for the offset selector.
+        let mut ends: Vec<i64> = offered.iter().map(|o| o.range_end_ms).collect();
+        ends.sort();
+        assert_eq!(ends, vec![240_000, 300_000]);
+
+        // The same selector written twice is one request.
+        let (_, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            "metric + metric",
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        assert_eq!(offered.len(), 1);
+    }
+
+    /// Whoever steps the selection — the source, or this side over the raw
+    /// span — every step holds the same samples as live per-step evaluation,
+    /// for every modifier shape, including the sample's own timestamp.
+    #[test]
+    fn should_match_step_by_step_evaluation_for_stepped_selectors() {
+        for query in [
+            "metric",
+            "timestamp(metric)",
+            "metric offset 2m",
+            "metric @ 120",
+            "metric @ start()",
+            "metric @ end()",
+            "metric @ end() offset 30s",
+            "metric / on(job, instance) metric offset 1m",
+            "abs(metric) + metric",
+            "topk(1, metric)",
+        ] {
+            let (local, offered) = evaluate_range_with_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                60_000,
+                240_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            assert!(offered.is_empty(), "{query}: baseline offers nothing");
+            let local = rendered_steps(local);
+
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                let (pushed, offered) = evaluate_range_with_pushdown_on(
+                    grouped_rollup_reader(),
+                    query,
+                    60_000,
+                    240_000,
+                    30_000,
+                    answer,
+                );
+                assert!(
+                    offered
+                        .iter()
+                        .all(|o| o.rollup.is_none() && o.aggregation.is_none()),
+                    "{query}: stepped requests only"
+                );
+                assert_eq!(
+                    local,
+                    rendered_steps(pushed),
+                    "{query}: stepped result must equal step-by-step evaluation"
+                );
+            }
+        }
+    }
+
+    /// The stepped form carries the sample's own timestamp, not the step's:
+    /// `timestamp()` reads it.
+    #[test]
+    fn should_carry_sample_timestamps_through_the_stepped_grid() {
+        // rollup_reader(): one sample every 10s. At a 15s step the picked
+        // sample is 5s behind every other step.
+        let (steps, _) = evaluate_range_with_pushdown(
+            "timestamp(metric)",
+            60_000,
+            120_000,
+            15_000,
+            GridAnswer::Evaluated,
+        );
+        let values: Vec<f64> = steps.iter().map(|(_, samples)| samples[0].value).collect();
+        assert_eq!(values, vec![60.0, 70.0, 90.0, 100.0, 120.0]);
+    }
+
+    /// An aggregation directly over a bare selector is one fused request over
+    /// the grid — not a stepped request plus per-step grouping — and its
+    /// answer equals the step-by-step path for every reducing operator and
+    /// grouping, whoever folded it.
+    #[test]
+    fn should_match_local_evaluation_for_fused_stepped_aggregations() {
+        let aggregations = [
+            "sum", "avg", "min", "max", "count", "group", "stddev", "stdvar",
+        ];
+        for agg in aggregations {
+            for grouping in [
+                "",
+                " by (job)",
+                " by (job, instance)",
+                " by (__name__)",
+                " without (instance)",
+            ] {
+                for selector in ["metric", "(metric)", "metric offset 1m", "metric @ 120"] {
+                    let query = format!("{agg}{grouping} ({selector})");
+
+                    let (local, _) = evaluate_range_with_pushdown_on(
+                        grouped_rollup_reader(),
+                        &query,
+                        0,
+                        300_000,
+                        30_000,
+                        GridAnswer::Local,
+                    );
+                    let local = rendered_steps(local);
+
+                    for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                        let (pushed, offered) = evaluate_range_with_pushdown_on(
+                            grouped_rollup_reader(),
+                            &query,
+                            0,
+                            300_000,
+                            30_000,
+                            answer,
+                        );
+                        assert_eq!(offered.len(), 1, "{query}: one fused request");
+                        assert!(offered[0].rollup.is_none(), "{query}");
+                        assert_eq!(
+                            offered[0]
+                                .aggregation
+                                .map(|k| format!("{k:?}").to_lowercase()),
+                            Some(agg.to_string()),
+                            "{query}: the aggregation rides the request"
+                        );
+                        assert_steps_near(
+                            local.clone(),
+                            rendered_steps(pushed),
+                            &format!("{query} (grid)"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A selector under a fused aggregation is covered by that request; the
+    /// same selector elsewhere in the query still needs its own. Neither is
+    /// fetched twice, and the answer is unchanged.
+    #[test]
+    fn should_not_preload_a_selector_covered_by_a_fused_aggregation() {
+        let query = "avg(metric) / metric";
+        let (steps, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            query,
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        assert_eq!(offered.len(), 2);
+        assert_eq!(
+            offered.iter().filter(|o| o.aggregation.is_some()).count(),
+            1,
+            "one fused request for avg(metric)"
+        );
+        assert_eq!(
+            offered.iter().filter(|o| o.aggregation.is_none()).count(),
+            1,
+            "one stepped request for the bare metric"
+        );
+
+        let (local, _) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            query,
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Local,
+        );
+        assert_steps_near(rendered_steps(local), rendered_steps(steps), query);
+
+        // Only the aggregation: the selector is not preloaded on its own.
+        let (_, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            "sum by (job) (metric)",
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        assert_eq!(offered.len(), 1);
+        assert!(offered[0].aggregation.is_some());
+
+        // A source that answers the fused request raw has handed over the
+        // selector's whole span: that becomes the selector's stepped preload,
+        // which the bare `metric` then shares — one request, not two.
+        let (steps, offered) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            query,
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Raw,
+        );
+        assert_eq!(offered.len(), 1, "the raw span serves both uses");
+        assert!(offered[0].aggregation.is_some());
+        let (local, _) = evaluate_range_with_pushdown_on(
+            grouped_rollup_reader(),
+            query,
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Local,
+        );
+        assert_steps_near(rendered_steps(local), rendered_steps(steps), query);
+    }
+
+    /// Only the reducing operators fuse over a selector. A selecting one, a
+    /// parameterized one, or `quantile` leaves the selector to be preloaded
+    /// stepped and runs here.
+    #[test]
+    fn should_not_fuse_unfusable_aggregations_over_a_selector() {
+        for query in [
+            "topk(1, metric)",
+            "bottomk(1, metric)",
+            "quantile(0.9, metric)",
+            "count_values(\"v\", metric)",
+            "limitk(2, metric)",
+        ] {
+            let (pushed, offered) = evaluate_range_with_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Evaluated,
+            );
+            assert_eq!(offered.len(), 1, "{query}: the selector is still preloaded");
+            assert!(
+                offered[0].aggregation.is_none(),
+                "{query}: not as a fused request"
+            );
+
+            let (local, _) = evaluate_range_with_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            assert_eq!(
+                rendered_steps(local),
+                rendered_steps(pushed),
+                "{query}: unfused result must equal the local one"
+            );
+        }
+    }
+
+    /// The stepped grid is sparse: a step with no sample inside the lookback
+    /// is absent, never NaN, whoever stepped it — and the fused form has no
+    /// group at such a step.
+    #[test]
+    fn should_preserve_absence_across_the_stepped_grid() {
+        // gappy_rollup_reader: a gap between 60s and 200s. At a 30s lookback
+        // the steps from 90s (whose window `(60s, 90s]` just misses the 60s
+        // sample) to 180s see nothing.
+        for query in ["metric", "sum(metric)"] {
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw, GridAnswer::Local] {
+                let reader = GridPushdownReader::new(gappy_rollup_reader(), answer);
+                let evaluator = Evaluator::new(
+                    &reader,
+                    QueryOptions {
+                        timeout: None,
+                        ..QueryOptions::default()
+                    },
+                );
+                let expr = promql_parser::parser::parse(query).unwrap();
+                let base = crate::promql::EvalContext {
+                    query_start: 60_000,
+                    query_end: 240_000,
+                    evaluation_ts: 60_000,
+                    step_ms: 30_000,
+                    lookback_delta_ms: 30_000,
+                };
+                if answer != GridAnswer::Local {
+                    evaluator.preload_for_range(&expr, &base).unwrap();
+                }
+                let present: Vec<i64> = (60_000..=240_000)
+                    .step_by(30_000)
+                    .filter(|&step_ts| {
+                        let ctx = crate::promql::EvalContext {
+                            evaluation_ts: step_ts,
+                            ..base
+                        };
+                        !evaluator
+                            .evaluate_with_context(&expr, ctx)
+                            .unwrap()
+                            .expect_instant_vector("vector")
+                            .is_empty()
+                    })
+                    .collect();
+                assert_eq!(
+                    present,
+                    vec![60_000, 210_000, 240_000],
+                    "{query} ({answer:?})"
+                );
+            }
         }
     }
 }

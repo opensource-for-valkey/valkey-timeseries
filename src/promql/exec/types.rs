@@ -9,7 +9,7 @@ use crate::labels::{
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
-use crate::promql::hashers::{MatrixPreloadKey, PreloadKey, RollupPreloadKey};
+use crate::promql::hashers::{GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use ahash::RandomState;
 use enquote::enquote;
 use promql_parser::parser::LabelModifier;
@@ -775,21 +775,24 @@ pub(in crate::promql) struct PreloadedInstantSeries {
     pub(super) values: StepGrid<Sample>,
 }
 
-pub(in crate::promql) type RollupPreloadMap =
-    halfbrown::HashMap<RollupPreloadKey, PreloadedRollupData, RandomState>;
+pub(in crate::promql) type GridPreloadMap =
+    halfbrown::HashMap<GridPreloadKey, PreloadedGridData, RandomState>;
 
-/// A rollup whose whole step grid was evaluated in one go, rather than once per
-/// step. Populated by `Evaluator::preload_rollups` before the step loop.
-pub(in crate::promql) struct PreloadedRollupData {
+/// A rollup, or an aggregation over a bare selector, whose whole step grid was
+/// evaluated in one go, rather than once per step. Populated by
+/// `Evaluator::preload_rollups` / `preload_stepped_aggregations` before the
+/// step loop.
+pub(in crate::promql) struct PreloadedGridData {
     /// Start of the *step* grid — `query_start`, not the window end, which any
     /// `@`/`offset` on the selector will have shifted. Step index is derived
     /// from the step timestamp, so this is the right origin.
     pub eval_start_ms: i64,
     pub step_ms: i64,
-    pub series: Vec<PreloadedRollupSeries>,
+    /// One entry per series, or per group for a fused request.
+    pub series: Vec<PreloadedGridSeries>,
 }
 
-pub(in crate::promql) struct PreloadedRollupSeries {
+pub(in crate::promql) struct PreloadedGridSeries {
     pub(super) labels: EvalLabels,
     /// Indexed by outer step number. A step is present when the window for it
     /// produced a value and absent when it held no samples — which is not the

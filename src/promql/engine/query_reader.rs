@@ -1,8 +1,9 @@
-use crate::common::Timestamp;
 use crate::common::threads::IntoParRayon;
+use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
+use crate::promql::exec::pipeline::for_each_step_sample;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
     ExprResult, PromqlResult, QueryOptions,
@@ -63,37 +64,50 @@ pub enum AggregationOutcome {
     Unsupported,
 }
 
-/// A range-vector function to evaluate over the windows a matrix selector
-/// describes, plus everything needed to reproduce those windows exactly.
-///
-/// Every time-dependent field is *resolved*: `@` and `offset` are applied by the
-/// coordinator before the request is built, so a data source reduces the windows
-/// it is handed and never re-derives a modifier. Paired with the selector passed
-/// alongside it, this is the whole of a `sum_over_time(m[5m] offset 1h)` — which
-/// is what makes it something a source can evaluate close to the data.
-/// An outer aggregation fused onto a rollup: the `sum by (job)` of
-/// `sum by (job) (rate(m[5m]))`.
+/// The range-vector function half of a [`GridRequest`]: `rate(m[5m])`'s `rate`
+/// and `[5m]`. Its presence is what makes a grid request a rollup rather than a
+/// stepped instant selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridRollup {
+    pub kind: RollupKind,
+    /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
+    pub range_ms: i64,
+    /// Numeric function parameter, e.g. `quantile_over_time`'s phi.
+    pub param: Option<f64>,
+}
+
+/// An outer aggregation fused onto a grid request: the `sum by (job)` of
+/// `sum by (job) (rate(m[5m]))` or of `sum by (job) (m)`.
 ///
 /// Only the reducing operators appear here. The selecting ones (`topk` and
-/// friends) need the individual rolled-up samples to choose among, so fusing
-/// them would not reduce what crosses the wire — see
+/// friends) need the individual samples to choose among, so fusing them would
+/// not reduce what crosses the wire — see
 /// [`crate::promql::exec::aggregations::PushdownStrategy`].
 #[derive(Debug, Clone)]
-pub struct RollupAggregation {
+pub struct GridAggregation {
     pub kind: AggregationKind,
     pub modifier: Option<LabelModifier>,
 }
 
+/// One read of a selector over a step grid, plus everything needed to
+/// reproduce that grid exactly.
+///
+/// Three shapes share this one request, told apart by the two optional parts:
+///
+/// * neither — *stepped instant selection*: at every window end, the last
+///   sample at or before it and inside the lookback window, which is what a
+///   range query's step loop picks for a bare vector selector;
+/// * [`Self::rollup`] — the function reduced over each window;
+/// * [`Self::aggregation`] — either of the above, folded per `(group, step)`.
+///
+/// Every time-dependent field is *resolved*: `@` and `offset` are applied by
+/// the coordinator before the request is built, so a data source evaluates the
+/// window ends it is handed and never re-derives a modifier. Paired with the
+/// selector passed alongside it, this is the whole of a
+/// `sum_over_time(m[5m] offset 1h)` — or of a plain `m` over the grid — which
+/// is what makes it something a source can evaluate close to the data.
 #[derive(Debug, Clone)]
-pub struct RollupRequest {
-    pub kind: RollupKind,
-    /// When set, the source groups its rolled-up values as well as computing
-    /// them, and returns one value per group per step instead of one per series
-    /// per step.
-    pub aggregation: Option<RollupAggregation>,
-    /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
-    pub range_ms: i64,
-    pub lookback_delta_ms: i64,
+pub struct GridRequest {
     /// Step grid of the enclosing query. `step_ms == 0` is a single evaluation
     /// at [`Self::range_end_ms`].
     pub step_ms: i64,
@@ -101,14 +115,72 @@ pub struct RollupRequest {
     pub query_end: i64,
     /// Window end for the single-evaluation case, `@`/`offset` resolved.
     pub range_end_ms: i64,
-    /// Numeric function parameter, e.g. `quantile_over_time`'s phi.
-    pub param: Option<f64>,
+    /// The staleness window: a stepped selection picks the last sample in
+    /// `(end - lookback, end]`, and the rollups that consult it see the same
+    /// value.
+    pub lookback_delta_ms: i64,
+    pub rollup: Option<GridRollup>,
+    /// When set, the source groups its per-series values as well as computing
+    /// them, and returns one value per group per step instead of one per series
+    /// per step.
+    pub aggregation: Option<GridAggregation>,
 }
 
-impl RollupRequest {
-    /// The window ends to reduce, in ascending order.
+/// One step's pick of a stepped instant selection: the step it answers for and
+/// the sample chosen for it, whose own timestamp is what `timestamp()` reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SteppedPoint {
+    pub step_ts: Timestamp,
+    pub sample: Sample,
+}
+
+/// One series' stepped instant selection: sparse, one point per step that had
+/// an eligible sample.
+#[derive(Debug, Clone)]
+pub struct SteppedSeries {
+    pub labels: EvalLabels,
+    pub points: Vec<SteppedPoint>,
+}
+
+impl SteppedSeries {
+    /// The points as `(step, value)` samples — the form the per-`(group, step)`
+    /// fold takes, where the sample's own timestamp no longer matters.
+    pub(in crate::promql) fn into_step_values(self) -> RangeSample<EvalLabels> {
+        RangeSample {
+            labels: self.labels,
+            samples: self
+                .points
+                .into_iter()
+                .map(|p| Sample::new(p.step_ts, p.sample.value))
+                .collect(),
+        }
+    }
+}
+
+/// The per-series stage of a [`GridRequest`] applied to raw spans: what a
+/// request produces before any fused aggregation folds it.
+pub enum GridSeries {
+    Stepped(Vec<SteppedSeries>),
+    Rolled(Vec<RangeSample<EvalLabels>>),
+}
+
+impl GridSeries {
+    /// Every entry as sparse `(step, value)` samples, whichever stage made it.
+    pub(in crate::promql) fn into_step_values(self) -> Vec<RangeSample<EvalLabels>> {
+        match self {
+            GridSeries::Stepped(series) => series
+                .into_iter()
+                .map(SteppedSeries::into_step_values)
+                .collect(),
+            GridSeries::Rolled(series) => series,
+        }
+    }
+}
+
+impl GridRequest {
+    /// The window ends to evaluate at, in ascending order.
     pub(in crate::promql) fn window_ends(&self) -> Vec<i64> {
-        rollup_window_ends(
+        grid_window_ends(
             self.step_ms,
             self.query_start,
             self.query_end,
@@ -116,20 +188,73 @@ impl RollupRequest {
         )
     }
 
+    /// How far back of a window end the raw samples it needs reach: the window
+    /// width for a rollup, the lookback for a stepped selection.
+    pub(in crate::promql) fn backward_ms(&self) -> i64 {
+        match &self.rollup {
+            Some(rollup) => rollup.range_ms,
+            None => self.lookback_delta_ms,
+        }
+    }
+
     /// The span of raw samples this request's windows cover, or `None` when it
     /// describes no windows at all.
     pub(in crate::promql) fn fetch_bounds(&self) -> Option<(Timestamp, Timestamp)> {
-        rollup_fetch_bounds(&self.window_ends(), self.range_ms)
+        grid_fetch_bounds(&self.window_ends(), self.backward_ms())
     }
 
-    /// Reduce raw windows with this request's rollup, over window ends the
-    /// caller already has in hand.
+    /// Apply the per-series stage — stepped selection, or the rollup — to raw
+    /// spans, over window ends the caller already has in hand.
     ///
-    /// A series whose every window was empty contributes nothing at all, which
-    /// is not the same as contributing NaN — preserving that distinction is what
-    /// the sparse transport exists for.
-    pub(in crate::promql) fn reduce_windows(
+    /// A series that produced nothing at any window contributes no entry at
+    /// all, which is not the same as contributing NaN — preserving that
+    /// distinction is what the sparse transport exists for.
+    pub(in crate::promql) fn per_series(
         &self,
+        window_ends: &[Timestamp],
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> GridSeries {
+        match &self.rollup {
+            Some(rollup) => GridSeries::Rolled(self.reduce_windows(rollup, window_ends, series)),
+            None => GridSeries::Stepped(self.step_series(window_ends, series)),
+        }
+    }
+
+    /// Stepped instant selection: at each window end, the last sample at or
+    /// before it and after `end - lookback` — the rule the range query's step
+    /// loop applies, run once per series over every step.
+    fn step_series(
+        &self,
+        window_ends: &[Timestamp],
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> Vec<SteppedSeries> {
+        let lookback_delta_ms = self.lookback_delta_ms;
+        series
+            .into_par_rayon()
+            .filter_map(|s| {
+                let mut points = Vec::new();
+                for_each_step_sample(
+                    &s.samples,
+                    window_ends.iter().copied(),
+                    lookback_delta_ms,
+                    |step_ts, latest| {
+                        if let Some(&sample) = latest {
+                            points.push(SteppedPoint { step_ts, sample });
+                        }
+                    },
+                );
+                (!points.is_empty()).then_some(SteppedSeries {
+                    labels: s.labels,
+                    points,
+                })
+            })
+            .collect()
+    }
+
+    /// Reduce raw windows with `rollup`, over the given window ends.
+    fn reduce_windows(
+        &self,
+        rollup: &GridRollup,
         window_ends: &[Timestamp],
         series: Vec<RangeSample<EvalLabels>>,
     ) -> Vec<RangeSample<EvalLabels>> {
@@ -140,13 +265,13 @@ impl RollupRequest {
         series
             .into_par_rayon()
             .filter_map(|s| {
-                let points = self.kind.eval_windows(
+                let points = rollup.kind.eval_windows(
                     &s.samples,
-                    self.range_ms,
+                    rollup.range_ms,
                     self.lookback_delta_ms,
                     self.step_ms,
                     window_ends.iter().copied(),
-                    self.param,
+                    rollup.param,
                 );
                 (!points.is_empty()).then_some(RangeSample {
                     labels: s.labels,
@@ -156,46 +281,47 @@ impl RollupRequest {
             .collect()
     }
 
-    /// Apply this request's fused aggregation to per-series rollup output, or
-    /// pass it through when the request carries none.
+    /// Apply this request's fused aggregation to per-series `(step, value)`
+    /// output, or pass it through when the request carries none.
     pub(in crate::promql) fn group(
-        &self,
-        reduced: Vec<RangeSample<EvalLabels>>,
-    ) -> Vec<RangeSample<EvalLabels>> {
-        let Some(aggregation) = self.aggregation.as_ref() else {
-            return reduced;
-        };
-        let mut partials = SteppedPartialGroups::new(aggregation.kind);
-        partials.accumulate(aggregation.modifier.as_ref(), reduced);
-        partials.finalize()
-    }
-
-    /// Everything this request asks for: reduce the raw windows, and group the
-    /// result when it is a fused request.
-    ///
-    /// This is the compensation path for a source that did less than was asked —
-    /// a single node, which has nothing to push down to, or a peer that predates
-    /// part of the protocol. It runs the same kernels a shard would, so the
-    /// answer does not depend on who did the work.
-    pub(in crate::promql) fn reduce_and_group(
         &self,
         series: Vec<RangeSample<EvalLabels>>,
     ) -> Vec<RangeSample<EvalLabels>> {
-        self.group(self.reduce_windows(&self.window_ends(), series))
+        let Some(aggregation) = self.aggregation.as_ref() else {
+            return series;
+        };
+        let mut partials = SteppedPartialGroups::new(aggregation.kind);
+        partials.accumulate(aggregation.modifier.as_ref(), series);
+        partials.finalize()
+    }
+
+    /// Everything this request asks for, over raw spans: the per-series stage,
+    /// then the fused aggregation when there is one. Never answers
+    /// [`GridOutcome::Raw`].
+    ///
+    /// This is the compensation path for a source that did less than was asked
+    /// — a single node, which has nothing to push down to, or the series a
+    /// shard chose to ship raw. It runs the same kernels a shard would, so the
+    /// answer does not depend on who did the work.
+    pub(in crate::promql) fn evaluate(&self, series: Vec<RangeSample<EvalLabels>>) -> GridOutcome {
+        let per_series = self.per_series(&self.window_ends(), series);
+        if self.aggregation.is_some() {
+            return GridOutcome::Reduced(self.group(per_series.into_step_values()));
+        }
+        match per_series {
+            GridSeries::Stepped(series) => GridOutcome::Stepped(series),
+            GridSeries::Rolled(series) => GridOutcome::Rolled(series),
+        }
     }
 }
 
-/// The window ends a rollup describes, in ascending order.
+/// The window ends a grid request describes, in ascending order.
 ///
 /// Derived from resolved geometry alone — `@` and `offset` are applied before a
 /// request is built — so the coordinator and a shard reading the same request
 /// land on exactly the same windows. `step_ms <= 0` is a single evaluation at
 /// `range_end_ms`.
-///
-/// Taken as loose fields rather than a [`RollupRequest`] because a shard must be
-/// able to derive them for a rollup kind it does not recognize, which is
-/// precisely the case where it has no request to build.
-pub(in crate::promql) fn rollup_window_ends(
+pub(in crate::promql) fn grid_window_ends(
     step_ms: i64,
     query_start: Timestamp,
     query_end: Timestamp,
@@ -208,44 +334,37 @@ pub(in crate::promql) fn rollup_window_ends(
 }
 
 /// The inclusive `[start, end]` span of raw samples `window_ends` covers, for
-/// storage's `get_range`.
+/// storage's `get_range`, reaching `backward_ms` behind the first end.
 ///
-/// Windows are half-open — `(end - range, end]` — and `get_range` takes an
+/// Windows are half-open — `(end - backward, end]` — and `get_range` takes an
 /// inclusive lower bound, so the span starts one millisecond past the first
 /// window's lower bound. `None` when there are no windows to cover.
-pub(in crate::promql) fn rollup_fetch_bounds(
+pub(in crate::promql) fn grid_fetch_bounds(
     window_ends: &[Timestamp],
-    range_ms: i64,
+    backward_ms: i64,
 ) -> Option<(Timestamp, Timestamp)> {
     let (&first, &last) = (window_ends.first()?, window_ends.last()?);
-    Some(((first - range_ms).saturating_add(1), last))
+    Some(((first - backward_ms).saturating_add(1), last))
 }
 
-/// What a data source made of a [`RollupRequest`]. Every variant tells the
+/// What a data source made of a [`GridRequest`]. Every variant tells the
 /// caller what it still has to do.
-pub enum RollupOutcome {
-    /// The source did everything the request asked: it reduced the windows and,
-    /// when the request carried an aggregation, grouped the result — so the
-    /// entries are groups rather than series. Each entry holds sparse
-    /// `(window end, value)` pairs; a window that held no samples is absent, not
-    /// NaN.
+pub enum GridOutcome {
+    /// The source ran a stepped selection (a request with neither rollup nor
+    /// aggregation): one entry per series, sparse over the steps.
+    Stepped(Vec<SteppedSeries>),
+    /// The source reduced the windows of an unfused rollup request: one entry
+    /// per series, holding sparse `(window end, value)` pairs. A window that
+    /// held no samples is absent, not NaN.
     Rolled(Vec<RangeSample<EvalLabels>>),
-    /// The source reduced the windows but did *not* apply the request's
-    /// aggregation: the entries are per-series values and the caller groups
-    /// them.
-    ///
-    /// Distinct from [`Self::Rolled`] because the two carry the same type and
-    /// mean different things. Without the distinction a source that skipped the
-    /// grouping would be taken to have done it, and the query would answer with
-    /// ungrouped series — a wrong answer rather than a slow one.
+    /// The source did everything a fused request asked — the per-series stage
+    /// and the grouping — so the entries are groups rather than series, each
+    /// holding sparse `(step, value)` pairs.
     Reduced(Vec<RangeSample<EvalLabels>>),
-    /// The source returned the raw windows instead of reducing them (nothing to
-    /// push down to, e.g. a single node): the caller reduces them, and groups
-    /// them if the request asked for that.
+    /// The source returned the raw spans instead (nothing to push down to,
+    /// e.g. a single node): the caller runs [`GridRequest::evaluate`] over
+    /// them.
     Raw(Vec<RangeSample<EvalLabels>>),
-    /// The source cannot evaluate pushed-down rollups: the caller should select
-    /// the matrix itself and reduce that.
-    Unsupported,
 }
 
 pub trait QueryReader: Send + Sync {
@@ -285,22 +404,26 @@ pub trait QueryReader: Send + Sync {
         Ok(AggregationOutcome::Unsupported)
     }
 
-    /// Evaluate `rollup` over the windows `selector`'s series contribute, at the
-    /// source.
+    /// Evaluate `request` over the grid for the series `selector` selects, at
+    /// the source.
     ///
     /// Because a series lives entirely on one node, a source that spans several
-    /// can have each compute its own series' final values and return one float
-    /// per series per step instead of the raw — and, when the range exceeds the
-    /// step, heavily overlapping — windows. Sources that cannot do this say so
-    /// and the caller reduces the matrix itself, so implementing this is purely
-    /// an optimization: the default does nothing.
-    fn query_rollup(
+    /// can have each compute its own series' output — one point per series per
+    /// step, or one partial per group per step — instead of shipping the raw
+    /// span for the coordinator to bucket or reduce. A source with nothing to
+    /// push down to answers [`GridOutcome::Raw`] from its range read, which is
+    /// what this default does; the caller then runs the same kernels itself.
+    fn query_grid(
         &self,
-        _selector: &VectorSelector,
-        _rollup: &RollupRequest,
-        _options: QueryOptions,
-    ) -> PromqlResult<RollupOutcome> {
-        Ok(RollupOutcome::Unsupported)
+        selector: &VectorSelector,
+        request: &GridRequest,
+        options: QueryOptions,
+    ) -> PromqlResult<GridOutcome> {
+        let Some((start_ms, end_ms)) = request.fetch_bounds() else {
+            return Ok(GridOutcome::Raw(Vec::new()));
+        };
+        self.query_range(selector, start_ms, end_ms, options)
+            .map(GridOutcome::Raw)
     }
 }
 
@@ -336,13 +459,13 @@ impl QueryReader for Arc<dyn QueryReader> {
             .query_aggregation(selector, timestamp, aggregation, options)
     }
 
-    fn query_rollup(
+    fn query_grid(
         &self,
         selector: &VectorSelector,
-        rollup: &RollupRequest,
+        request: &GridRequest,
         options: QueryOptions,
-    ) -> PromqlResult<RollupOutcome> {
-        self.as_ref().query_rollup(selector, rollup, options)
+    ) -> PromqlResult<GridOutcome> {
+        self.as_ref().query_grid(selector, request, options)
     }
 }
 

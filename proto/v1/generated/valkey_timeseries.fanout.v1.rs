@@ -594,10 +594,54 @@ pub struct AggregationGroupPartial {
     #[prost(message, optional, tag = "2")]
     pub state: ::core::option::Option<AggregationPartialState>,
 }
-/// / A rollup pushed down to a shard: which series to read, which windows to
-/// / reduce, and which function to reduce them with.
+/// / The range-vector function half of a grid query: `rate(m\[5m\])`'s `rate` and
+/// / `\[5m\]`. Its presence is what makes a grid query a rollup rather than a
+/// / stepped instant selection.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GridRollup {
+    #[prost(enumeration = "RollupKind", tag = "1")]
+    pub kind: i32,
+    /// / Window width: the `\[5m\]`. Each window is `(end - range_ms, end]`.
+    #[prost(int64, tag = "2")]
+    pub range_ms: i64,
+    /// / Numeric function parameter — `quantile_over_time`'s phi. Absent for the
+    /// / parameterless rollups.
+    #[prost(double, optional, tag = "3")]
+    pub scalar_param: ::core::option::Option<f64>,
+}
+/// / An outer aggregation fused onto a grid query: the `sum by (job)` of
+/// / `sum by (job) (rate(m\[5m\]))` or of `sum by (job) (m)`. The shard groups
+/// / its per-series values as well as computing them, so what crosses the wire is
+/// / one partial per group per step rather than one value per *series* per step.
+/// /
+/// / Only the reducing operators appear here; the selecting ones (topk and
+/// / friends) need the individual samples and are not fused.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GridAggregation {
+    #[prost(enumeration = "AggregationKind", tag = "1")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "2")]
+    pub grouping: ::core::option::Option<AggregationGrouping>,
+}
+/// / One read of a selector over a range query's step grid, pushed down to a
+/// / shard: which series to read, which window ends to evaluate at, and what to
+/// / evaluate there.
+/// /
+/// / Three shapes share this one request, told apart by the two optional
+/// / messages:
+/// /
+/// / * neither — *stepped instant selection*: at every window end, the last
+/// /   sample at or before it and inside the lookback window, i.e. what a range
+/// /   query's step loop would have picked for a bare vector selector;
+/// / * `rollup` — the function reduced over each window;
+/// / * `aggregation` — either of the above, folded per `(group, step)` on the
+/// /   shard.
+/// /
+/// / Every time-dependent field is *resolved*: `@` and `offset` are applied by
+/// / the coordinator before the request is built, so a shard evaluates exactly
+/// / the window ends it is told and never re-derives a modifier.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RollupQuery {
+pub struct GridQuery {
     #[prost(message, optional, tag = "1")]
     pub selector: ::core::option::Option<SeriesSelector>,
     /// / The resolved step grid. `step_ms == 0` means a single evaluation, at
@@ -609,47 +653,57 @@ pub struct RollupQuery {
     pub query_end: i64,
     #[prost(int64, tag = "4")]
     pub step_ms: i64,
-    /// / Window width: the `\[5m\]` of `rate(m\[5m\])`. Each window is
-    /// / `(end - range_ms, end]`.
+    /// / Window end for the single-evaluation case, with `@` and `offset` already
+    /// / resolved by the coordinator.
     #[prost(int64, tag = "5")]
-    pub range_ms: i64,
+    pub range_end_ms: i64,
+    /// / The staleness window for stepped selection (and for the rollups that
+    /// / consult it), as the coordinator resolved it.
     #[prost(uint64, tag = "6")]
     pub lookback_delta_ms: u64,
-    /// / Window end for the single-evaluation case, with `@` and `offset` already
-    /// / resolved by the coordinator. A shard must never re-derive modifiers: it
-    /// / reduces exactly the windows it is told to.
-    #[prost(int64, tag = "7")]
-    pub range_end_ms: i64,
-    #[prost(enumeration = "RollupKind", tag = "8")]
-    pub kind: i32,
-    /// / Numeric function parameter — `quantile_over_time`'s phi. Absent for the
-    /// / parameterless rollups.
-    #[prost(double, optional, tag = "9")]
-    pub scalar_param: ::core::option::Option<f64>,
-    #[prost(uint64, tag = "10")]
+    #[prost(uint64, tag = "7")]
     pub max_series: u64,
     /// / Bound on the raw points examined per series, enforced shard-side. The
-    /// / coordinator separately bounds the rolled-up points it accepts back.
-    #[prost(uint64, tag = "11")]
+    /// / coordinator separately bounds the points it accepts back.
+    #[prost(uint64, tag = "8")]
     pub max_points_per_series: u64,
-    /// / An outer aggregation to fuse with the rollup: `sum by (job) (rate(m\[5m\]))`
-    /// / asks the shard to group its rolled-up values as well as compute them, so
-    /// / what crosses the wire is one partial per group per step rather than one
-    /// / value per *series* per step. Absent when the rollup is not under a
-    /// / decomposable aggregation.
-    /// /
-    /// / Only the reducing operators appear here; the selecting ones (topk and
-    /// / friends) need the individual samples and are not fused.
-    #[prost(enumeration = "AggregationKind", optional, tag = "12")]
-    pub agg_kind: ::core::option::Option<i32>,
-    #[prost(message, optional, tag = "13")]
-    pub agg_grouping: ::core::option::Option<AggregationGrouping>,
+    #[prost(message, optional, tag = "9")]
+    pub rollup: ::core::option::Option<GridRollup>,
+    #[prost(message, optional, tag = "10")]
+    pub aggregation: ::core::option::Option<GridAggregation>,
 }
-/// / One `(group, step, shard)` partial for a fused rollup+aggregation: the
-/// / group's label set as computed by the request's grouping modifier, the step it
-/// / belongs to, and the shard's accumulated state for that pair.
+/// / One point of a series' grid output.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct GridPoint {
+    /// / The window end (step) this point answers for.
+    #[prost(int64, tag = "1")]
+    pub step_ts: i64,
+    /// / For stepped selection, the selected sample's own timestamp — which is what
+    /// / `timestamp()` reports, and is not the step's. Unset for rollup output,
+    /// / whose value belongs to the window rather than to any one sample.
+    #[prost(int64, tag = "2")]
+    pub sample_ts: i64,
+    #[prost(double, tag = "3")]
+    pub value: f64,
+}
+/// / One series' stepped or rolled-up output: sparse points, one per window end
+/// / that produced a value.
+/// /
+/// / A window that held no eligible sample is *absent* from `points` — never
+/// / present with a NaN value. That distinction is the result, so it has to
+/// / survive the wire: NaN is a legitimate rolled-up value.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RollupGroupPartial {
+pub struct GridSeries {
+    #[prost(message, repeated, tag = "1")]
+    pub labels: ::prost::alloc::vec::Vec<Label>,
+    #[prost(message, repeated, tag = "2")]
+    pub points: ::prost::alloc::vec::Vec<GridPoint>,
+}
+/// / One `(group, step, shard)` partial for a fused grid query: the group's label
+/// / set as computed by the request's grouping modifier, the step it belongs to,
+/// / and the shard's accumulated state for that pair.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GridGroupPartial {
     #[prost(message, repeated, tag = "1")]
     pub labels: ::prost::alloc::vec::Vec<Label>,
     #[prost(int64, tag = "2")]
@@ -657,50 +711,23 @@ pub struct RollupGroupPartial {
     #[prost(message, optional, tag = "3")]
     pub state: ::core::option::Option<AggregationPartialState>,
 }
-/// / One series' rolled-up output: sparse `(window end, value)` pairs.
+/// / Each series the shard read lands in exactly one of the three lists.
 /// /
-/// / A window that held no samples is *absent* from `points` — never present with
-/// / a NaN value. That distinction is the result, so it has to survive the wire:
-/// / NaN is a legitimate rolled-up value.
+/// / Which list is decided by the request and by size. A fused request answers in
+/// / `partials`, everything else in `series` — except that a series whose raw span
+/// / is *smaller* than its grid output (`step` finer than the sample cadence)
+/// / travels in `raw`, and the coordinator runs the same per-series stage over it
+/// / that the shard would have. `series` and `partials` never both appear: a
+/// / response that carries per-series values for a fused request, or partials for
+/// / an unfused one, is from a corrupt peer.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RollupSeries {
+pub struct GridQueryResponse {
     #[prost(message, repeated, tag = "1")]
-    pub labels: ::prost::alloc::vec::Vec<Label>,
+    pub series: ::prost::alloc::vec::Vec<GridSeries>,
     #[prost(message, repeated, tag = "2")]
-    pub points: ::prost::alloc::vec::Vec<Sample>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RollupQueryResponse {
-    /// / Set when `applied`: the shard's final per-series rollup values. Because a
-    /// / series lives on exactly one shard, the coordinator concatenates these
-    /// / rather than merging them.
-    #[prost(message, repeated, tag = "1")]
-    pub series: ::prost::alloc::vec::Vec<RollupSeries>,
-    /// / Set when `applied` is false: the raw windows, for the coordinator to
-    /// / reduce itself.
-    #[prost(message, repeated, tag = "2")]
+    pub partials: ::prost::alloc::vec::Vec<GridGroupPartial>,
+    #[prost(message, repeated, tag = "3")]
     pub raw: ::prost::alloc::vec::Vec<RangeSample>,
-    /// / Compatibility handshake: true when the shard applied the requested rollup.
-    /// / A shard that does not recognize the requested `kind` (a newer coordinator
-    /// / during a rolling upgrade) returns the raw windows in `raw` with `applied`
-    /// / false. Absent on a pre-handshake peer (proto3 decodes as false), which is
-    /// / exactly the right interpretation.
-    #[prost(bool, tag = "3")]
-    pub applied: bool,
-    /// / Set when `aggregated`: one mergeable partial per `(group, step)`.
-    #[prost(message, repeated, tag = "4")]
-    pub partials: ::prost::alloc::vec::Vec<RollupGroupPartial>,
-    /// / Second handshake bit, for the fused form: true when the shard applied the
-    /// / outer aggregation as well as the rollup.
-    /// /
-    /// / It has to be separate from `applied`, because a shard that predates fusion
-    /// / silently ignores the `agg_*` fields and answers `applied = true` with
-    /// / per-series rollup values. Reading that as "aggregated" would drop the
-    /// / grouping entirely; reading `aggregated == false` makes the coordinator
-    /// / group those values itself, which is correct at the cost of the transfer
-    /// / the fusion would have saved.
-    #[prost(bool, tag = "5")]
-    pub aggregated: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregationQueryResponse {
@@ -795,9 +822,9 @@ impl AggregationKind {
 /// / window. `absent_over_time` is permanently excluded — its answer depends on
 /// / series being absent across the whole cluster, which no single shard can see.
 /// /
-/// / The list grows by appending. A shard that decodes a number it does not know
-/// / answers `applied = false` and ships the raw windows, so a newer coordinator
-/// / degrades instead of getting a wrong answer.
+/// / The list grows by appending. Every node in a cluster runs the same build, so
+/// / a shard that decodes a number it does not know has been handed a corrupt
+/// / request and refuses it rather than guessing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum RollupKind {
