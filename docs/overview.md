@@ -284,6 +284,8 @@ discard the series that could never match. With `ts-promql-derived-filter-pushdo
 first asks every shard, per selector under such an operation, which labels every one of its series carries and with
 which values (a `label-profile` fan-out: labels only, no samples), then adds those as matchers to the other operand's
 selectors wherever they provably exclude series, and plans the narrowed tree. Operands with the same label values —
-`cpu - cpu offset 5m` — are left untouched, as are `or`, fill modifiers and label-less aggregations; instant queries
-keep their own, evaluation-time version of the same narrowing. Measured on the three-node harness, the filtered binop
+`cpu - cpu offset 5m` — are left untouched, as are `or`, fill modifiers and label-less aggregations; an operand whose
+selector matches nothing empties the result and spares the other operand's read entirely. Instant queries keep their
+own, evaluation-time version of the same narrowing (a profile round trip is too large a share of a millisecond-scale
+query to pay up front). Measured on the three-node harness, the filtered binop
 above at 60 steps went from ≈18 to ≈11 ms.

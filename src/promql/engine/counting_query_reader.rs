@@ -423,11 +423,37 @@ mod tests {
     #[test]
     fn range_without_a_narrowable_operation_asks_for_no_profile() {
         let (counting, reader) = build_reader();
-        // `sum(a)` offers no labels and `or` keeps both sides: nothing for
-        // the derived push-down to do, so the index is not consulted.
-        run_range(reader.clone(), "sum(a) / sum(b)");
-        run_range(reader, "a or b");
+        // `or` keeps both sides and a lone selector has no operation:
+        // nothing for the derived push-down to do, so the index is not
+        // consulted.
+        run_range(reader.clone(), "a or b");
+        run_range(reader, "sum(a)");
         assert_eq!(counting.counts().label_profile, 0);
+    }
+
+    #[test]
+    fn range_label_less_aggregations_are_still_profiled_for_the_short_circuit() {
+        let (counting, reader) = build_reader();
+        // `sum(a)` offers no labels, but an empty `a` would empty the
+        // quotient, so both selectors are profiled.
+        run_range(reader, "sum(a) / sum(b)");
+        assert_eq!(counting.counts().label_profile, 2);
+    }
+
+    #[test]
+    fn range_empty_operand_short_circuits_the_other_read() {
+        let (counting, reader) = build_reader();
+        // `a{l="nope"}` matches nothing, so `b` is never read: the one grid
+        // request is the empty selector's, shared by both sides.
+        run_range(reader, r#"a{l="nope"} - b"#);
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_grid: 1,
+                label_profile: 2,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -494,6 +520,7 @@ mod tests {
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
+                label_profile: 1, // one selector, one profile (short-circuit candidate)
                 ..Default::default()
             }
         );

@@ -286,7 +286,10 @@ do this, and they differ in where the label values come from:
   no samples read) and adds them to the other operand's selectors only where they
   provably exclude series. Operands whose series carry the same values — `cpu - cpu
   offset 5m` — are left untouched. `or`, fill modifiers and label-less aggregations
-  are never narrowed. This is governed by `ts-promql-derived-filter-pushdown`
+  are never narrowed. An operand whose selector matches no series at all makes the
+  operation's result empty (for every operator but `or`, and for `unless` only on the
+  left), so the other operand is not read either. This is governed by
+  `ts-promql-derived-filter-pushdown`
   (default `yes`); the static optimizer's `ts-promql-optimize-queries` pushes only the
   matchers written in the query, and blindly.
 

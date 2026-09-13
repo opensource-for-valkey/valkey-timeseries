@@ -36,6 +36,8 @@ use crate::promql::{PromqlResult, QueryError};
 use ahash::{AHashMap, AHashSet};
 use orx_parallel::{ParIter, ParIterResult};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
+use promql_parser::parser::token::{T_LOR, T_LUNLESS};
+use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{BinaryExpr, Expr, VectorSelector};
 
 /// Narrow the selectors of `expr`'s binary operations by what the index
@@ -49,12 +51,109 @@ pub fn derive_filters_in_place<R: QueryReader + ?Sized>(
     reader: &R,
     options: QueryOptions,
 ) -> PromqlResult<()> {
-    let leaves = ProfiledLeaves::collect(expr, reader, options)?;
+    let mut leaves = ProfiledLeaves::collect(expr, reader, options)?;
     if leaves.is_empty() {
         return Ok(());
     }
+    short_circuit_empty_operands(expr, &mut leaves);
     pushdown_filters_in_place_with(expr, &leaves);
     Ok(())
+}
+
+/// Where one operand of a binary operation is known to be empty — its
+/// selector matches no series, and the operand's shape passes emptiness
+/// through — the operation's result is empty for every operator but `or`
+/// (and, for `unless`, only when the left side is), so reading the other
+/// operand is wasted work. It is replaced by that empty selector: nothing
+/// more is read, and `empty op empty` is the same empty result.
+fn short_circuit_empty_operands(expr: &mut Expr, leaves: &mut ProfiledLeaves) {
+    match expr {
+        Expr::Binary(be) => {
+            if can_short_circuit(be) {
+                let lhs_empty = empty_selector_of(&be.lhs, leaves).map(|vs| leaves.detach(vs));
+                let rhs_empty = empty_selector_of(&be.rhs, leaves).map(|vs| leaves.detach(vs));
+                match (lhs_empty, rhs_empty) {
+                    (Some(_), Some(_)) | (None, None) => {}
+                    (Some(empty), None) => leaves.replace_with_empty(&mut be.rhs, empty),
+                    (None, Some(empty)) if be.op.id() != T_LUNLESS => {
+                        leaves.replace_with_empty(&mut be.lhs, empty)
+                    }
+                    (None, Some(_)) => {}
+                }
+            }
+            short_circuit_empty_operands(&mut be.lhs, leaves);
+            short_circuit_empty_operands(&mut be.rhs, leaves);
+        }
+        Expr::Aggregate(agg) => {
+            short_circuit_empty_operands(&mut agg.expr, leaves);
+            if let Some(param) = agg.param.as_mut() {
+                short_circuit_empty_operands(param, leaves);
+            }
+        }
+        Expr::Call(call) => {
+            for arg in call.args.args.iter_mut() {
+                short_circuit_empty_operands(arg, leaves);
+            }
+        }
+        Expr::Unary(u) => short_circuit_empty_operands(&mut u.expr, leaves),
+        Expr::Paren(p) => short_circuit_empty_operands(&mut p.expr, leaves),
+        Expr::Subquery(s) => short_circuit_empty_operands(&mut s.expr, leaves),
+        Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => {}
+    }
+}
+
+/// Both operands vectors, no fill (which synthesizes results for unmatched
+/// series), not `or` (which keeps both sides). Looser than the narrowing
+/// guard: a label-less `sum(x)` offers no filters but is empty when `x` is.
+fn can_short_circuit(be: &BinaryExpr) -> bool {
+    let fills = be
+        .modifier
+        .as_ref()
+        .is_some_and(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some());
+    !fills
+        && be.op.id() != T_LOR
+        && be.lhs.value_type() == ValueType::Vector
+        && be.rhs.value_type() == ValueType::Vector
+}
+
+/// The selector that makes `expr`'s result empty, if the profiles prove one:
+/// a selector matching no series, under a shape that yields nothing from
+/// nothing — aggregations, series-to-series functions, rollups, subqueries,
+/// and binary operations other than `or` (both sides) and `unless` (the
+/// right side). `absent`/`absent_over_time` and functions without a vector
+/// argument are the shapes that do not.
+fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a VectorSelector> {
+    let empty = |vs: &'a VectorSelector| leaves.profile(vs).filter(|p| p.series == 0).map(|_| vs);
+    match expr {
+        Expr::VectorSelector(vs) => empty(vs),
+        Expr::MatrixSelector(ms) => empty(&ms.vs),
+        Expr::Paren(p) => empty_selector_of(&p.expr, leaves),
+        Expr::Unary(u) => empty_selector_of(&u.expr, leaves),
+        Expr::Subquery(s) => empty_selector_of(&s.expr, leaves),
+        Expr::Aggregate(agg) => empty_selector_of(&agg.expr, leaves),
+        Expr::Call(call) => {
+            if matches!(call.func.name, "absent" | "absent_over_time") {
+                return None;
+            }
+            let pos = call
+                .func
+                .arg_types
+                .iter()
+                .position(|&arg| arg != ValueType::Scalar && arg != ValueType::String)?;
+            empty_selector_of(call.args.args.get(pos)?, leaves)
+        }
+        Expr::Binary(be) => match be.op.id() {
+            T_LOR => empty_selector_of(&be.lhs, leaves)
+                .filter(|_| empty_selector_of(&be.rhs, leaves).is_some()),
+            T_LUNLESS => empty_selector_of(&be.lhs, leaves),
+            _ => empty_selector_of(&be.lhs, leaves).or_else(|| empty_selector_of(&be.rhs, leaves)),
+        },
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => None,
+    }
 }
 
 /// The profiles of the selectors under the push-down's binary operations,
@@ -120,6 +219,28 @@ impl ProfiledLeaves {
         self.by_node.is_empty()
     }
 
+    /// A profiled selector as a value, with its profile key, ready to be
+    /// planted elsewhere in the tree.
+    fn detach(&self, vs: &VectorSelector) -> (VectorSelector, Option<SelectorKey>) {
+        (vs.clone(), self.by_node.get(&node_id(vs)).copied())
+    }
+
+    /// Put `empty` — a selector known to match nothing — in place of
+    /// `operand`, and register the new node under the empty profile. The
+    /// node is written into the operand's existing box, whose address may
+    /// already be a profiled leaf's (the wide side of `a{nope} - b` is the
+    /// leaf `b`), so the entry is overwritten rather than left to chance.
+    fn replace_with_empty(
+        &mut self,
+        operand: &mut Box<Expr>,
+        (empty, key): (VectorSelector, Option<SelectorKey>),
+    ) {
+        **operand = Expr::VectorSelector(empty);
+        if let (Expr::VectorSelector(vs), Some(key)) = (operand.as_ref(), key) {
+            self.by_node.insert(node_id(vs), key);
+        }
+    }
+
     fn profile(&self, vs: &VectorSelector) -> Option<&LabelProfile> {
         self.by_node
             .get(&node_id(vs))
@@ -183,7 +304,7 @@ fn normalized(vs: &VectorSelector) -> VectorSelector {
 /// Every selector under a binary operation the push-down applies to.
 fn collect_operand_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
     match expr {
-        Expr::Binary(be) if can_push_down_common_filters(be) => {
+        Expr::Binary(be) if can_push_down_common_filters(be) || can_short_circuit(be) => {
             collect_all_selectors(&be.lhs, out);
             collect_all_selectors(&be.rhs, out);
         }
@@ -463,13 +584,15 @@ mod tests {
             ),
             r#"sum by (region) (cpu{region="us"}) / on (region) group_left () count by (region) (cpu{region="us"})"#
         );
-        // A label-less aggregation has nothing to offer and nothing is asked.
+        // A label-less aggregation has nothing to offer: the profiles are
+        // asked for (an empty operand would still short-circuit) but no
+        // filter crosses.
         let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
         assert_eq!(
             rewrite(r#"sum(cpu{region="us"}) / sum(cpu)"#, &reader),
             r#"sum(cpu{region="us"}) / sum(cpu)"#
         );
-        assert!(reader.asked.lock().unwrap().is_empty());
+        assert_eq!(reader.asked.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -561,6 +684,11 @@ mod tests {
             r#"label_replace(cpu{region="us"}, "h", "$1", "host", "(.*)") * on(host) mem"#,
             r#"count_values("v", cpu{region="us"}) * on(v) group_left count_values("v", mem)"#,
             r#"cpu{region="us"} @ 1500 - cpu"#,
+            r#"cpu{region="mars"} - cpu"#,
+            r#"sum(cpu) / count(cpu{region="mars"})"#,
+            r#"cpu unless on(host) mem{region="mars"}"#,
+            r#"cpu{region="mars"} or mem{region="us"}"#,
+            r#"absent(cpu{region="mars"}) * on() group_right mem{region="us"}"#,
         ];
         for query in queries {
             let run = |derived: bool| {
@@ -590,9 +718,64 @@ mod tests {
                 result
             };
             let (with, without) = (run(true), run(false));
-            assert!(!with.is_empty(), "{query}: empty result proves nothing");
             assert_eq!(with, without, "{query}");
+            let empty_by_design = query.contains("mars")
+                && !query.contains("unless")
+                && !query.contains(" or ")
+                && !query.contains("absent");
+            assert_eq!(with.is_empty(), empty_by_design, "{query}: {with:?}");
         }
+    }
+
+    const NOTHING: SeriesTable<'static> = &[];
+
+    #[test]
+    fn an_empty_operand_short_circuits_the_other_side() {
+        let reader = TableReader::new(vec![
+            (r#"cpu{region="mars"}"#, NOTHING),
+            ("cpu", CPU_ALL),
+            ("mem", CPU_ALL),
+        ]);
+        // Arithmetic, comparison and `and`: either side empty empties the
+        // result, so the wide side is not read at all.
+        assert_eq!(
+            rewrite(r#"cpu{region="mars"} - cpu"#, &reader),
+            r#"cpu{region="mars"} - cpu{region="mars"}"#
+        );
+        assert_eq!(
+            rewrite(r#"cpu > bool on(host) cpu{region="mars"}"#, &reader),
+            r#"cpu{region="mars"} > bool on (host) cpu{region="mars"}"#
+        );
+        assert_eq!(
+            rewrite(r#"sum(cpu) / sum(rate(cpu{region="mars"}[5m]))"#, &reader),
+            r#"cpu{region="mars"} / sum(rate(cpu{region="mars"}[5m]))"#
+        );
+        // `unless`: only an empty left side empties the result.
+        assert_eq!(
+            rewrite(r#"cpu{region="mars"} unless mem"#, &reader),
+            r#"cpu{region="mars"} unless cpu{region="mars"}"#
+        );
+        assert_eq!(
+            rewrite(r#"cpu unless on(host) cpu{region="mars"}"#, &reader),
+            r#"cpu unless on (host) cpu{region="mars"}"#
+        );
+        // `or` keeps both sides; `absent` yields something from nothing.
+        assert_eq!(
+            rewrite(r#"cpu{region="mars"} or mem"#, &reader),
+            r#"cpu{region="mars"} or mem"#
+        );
+        assert_eq!(
+            rewrite(
+                r#"absent(cpu{region="mars"}) * on() group_right mem"#,
+                &reader
+            ),
+            r#"absent(cpu{region="mars"}) * on () group_right () mem"#
+        );
+        // A nested `or` is empty only when both its sides are.
+        assert_eq!(
+            rewrite(r#"(cpu{region="mars"} or mem) - cpu"#, &reader),
+            r#"(cpu{region="mars"} or mem) - cpu"#
+        );
     }
 
     #[test]

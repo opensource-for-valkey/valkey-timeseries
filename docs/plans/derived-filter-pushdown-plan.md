@@ -270,10 +270,23 @@ generalization, one for tests, half to measure.
   each leaf's `selector_bounds` would exclude retired series and tighten the filters at no
   extra cost. Left out of v1 to keep the profile independent of time modifiers; worth
   doing if a real dataset shows label drift diluting the value sets.
-- **Empty operand short-circuit.** A profile with `series == 0` on the source side of
-  `*`/`and`/`unless` means the result is empty; the pass could replace the other operand
-  with a never-matching selector instead of reading it. Cheap, but a separate semantic
-  step (it changes what is read, not just how much) — decide after measuring.
-- **Instant queries.** Whether to run the profile pass there too, ahead of the runtime
-  push-down, so the first operand is also narrowed when the second is selective (the
-  runtime path only narrows the second).
+- **Empty operand short-circuit — done (2026-09-13).** `short_circuit_empty_operands`
+  runs before the rewrite: where a profile proves an operand's selector matches no
+  series and the operand's shape passes emptiness through (aggregations,
+  series-to-series functions, rollups, subqueries, nested operations other than `or`;
+  not `absent`/`absent_over_time`), the other operand is replaced by that empty
+  selector for every operator but `or` — and for `unless` only when the left side is
+  empty. Its guard is looser than the narrowing one (`sum(x) / count(y)` qualifies), so
+  label-less aggregations under a binop are profiled too. Cluster, 60 steps:
+  `cpu{region="mars"} - cpu` 9.7–10.6 → 1.0 ms, `sum(cpu) / count(cpu{region="mars"})`
+  8.0–8.7 → 1.1–1.2 ms. The quiet runs also put a number on the profile overhead for a
+  non-narrowable join: `cpu / on(host) group_left cpu offset 5m` 38.1–38.2 → 38.7–39.7
+  ms, i.e. ≈1 ms for one 500-series profile fan-out.
+- **Instant queries — measured and declined (2026-09-13).** Wiring the pass into
+  `evaluate_instant` (two interleaved cluster pairs, p50): `cpu - cpu{region="us"}
+  offset 5m` 2.26 → 1.76 ms (the case it exists for), but `cpu{region="us"} - cpu
+  offset 5m` 1.25 → 1.77 ms, `cpu - cpu offset 5m` 3.6 → 3.9 ms and `cpu and on(region)
+  cpu{region=~"us|eu"}` 2.1 → 3.1 ms. A ≈0.5 ms profile round trip is a large share of a
+  1–4 ms instant query, and the runtime push-down already narrows the operand evaluated
+  second, so the pass only pays when the *first* operand is the wide one. Not wired;
+  instant queries keep the runtime path alone.

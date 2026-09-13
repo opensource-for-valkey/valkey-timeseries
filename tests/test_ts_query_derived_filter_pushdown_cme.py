@@ -22,7 +22,9 @@ What this file is for:
   bounds what a selector read returns: with it set to 4, `mem_usage{job="api"} +
   mem_usage` reads six series for the right operand without the push-down and
   is refused, and reads three with it and succeeds. The same limit refuses
-  `... or mem_usage` either way, because `or` may not be narrowed.
+  `... or mem_usage` either way, because `or` may not be narrowed — and it
+  never fires for `no_such_metric - mem_usage`, whose empty left operand makes
+  the right one's read unnecessary.
 
 The fixture is the stepped selector suite's: six `mem_usage` gauges over two
 jobs, each series on a known primary, both jobs straddling shards.
@@ -215,6 +217,21 @@ class TestPromQLDerivedFilterPushdownLimitsCluster(DerivedFilterPushdownBase):
                     for i in _instances('api')}
         self.assert_steps_exact(got, expected, 'narrowed sum')
 
+    def test_empty_operand_short_circuits_the_wide_read(self):
+        """`no_such_metric` matches nothing, so the result is empty whatever
+        `mem_usage` holds — and `mem_usage` is not read: the six-series
+        limit that refuses it on its own does not fire."""
+        self.setup_fleet()
+        for query in ('no_such_metric - mem_usage',
+                      'sum(mem_usage) / count(no_such_metric)',
+                      'no_such_metric unless on(job) mem_usage'):
+            result = self.range_query(query)
+            assert result.is_matrix() and result.result == [], query
+        # The complement: an empty *right* side of `unless` leaves the left
+        # side to be read in full, and refused.
+        with pytest.raises(ResponseError, match='max series'):
+            self.range_query('mem_usage unless on(job) no_such_metric')
+
     def test_or_still_reads_the_whole_operand(self):
         """The control: `or` may not be narrowed, so the six-series read
         is refused exactly as it is without the push-down."""
@@ -233,3 +250,8 @@ class TestPromQLDerivedFilterPushdownOffLimitsCluster(DerivedFilterPushdownBase)
         self.setup_fleet()
         with pytest.raises(ResponseError, match='max series'):
             self.range_query('mem_usage{job="api"} + mem_usage')
+
+    def test_empty_operand_does_not_spare_the_wide_read(self):
+        self.setup_fleet()
+        with pytest.raises(ResponseError, match='max series'):
+            self.range_query('no_such_metric - mem_usage')
