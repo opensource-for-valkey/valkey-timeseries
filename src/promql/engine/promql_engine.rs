@@ -1,6 +1,7 @@
 use crate::common::threads::IntoParRayon;
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
+use crate::promql::engine::derived_filters::derive_filters_in_place;
 use crate::promql::engine::test_utils::MemorySeriesQuerier;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
@@ -206,6 +207,12 @@ pub fn evaluate_range(
         lookback_delta_ms,
         step_ms,
     };
+    // Before planning, so the tree that is preloaded and the tree that is
+    // stepped over are the same narrowed one: see `derived_filters`.
+    if opts.derived_filter_pushdown {
+        derive_filters_in_place(&mut stmt.expr, reader.as_ref(), opts)?;
+    }
+
     let plan = PlannedQuery::for_range(&stmt.expr, &range_ctx);
     let prepared = Preloader::new(reader.as_ref(), opts)
         .prepare(plan)

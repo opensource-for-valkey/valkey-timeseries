@@ -303,6 +303,39 @@ message GridQueryResponse {
   repeated RangeSample raw = 3;
 }
 
+/// The labels of the series a selector matches on this node, for the
+/// coordinator's derived filter push-down (a range query narrows one operand
+/// of a binary operation by what the other operand's series carry). Labels
+/// only: no sample is read to answer it.
+message LabelProfileQuery {
+  SeriesSelector selector = 1;
+  /// Past this many matching series the node answers `overflow` rather than
+  /// walking further; the coordinator then leaves the selector as written.
+  uint64 max_series = 2;
+}
+
+/// One label over the matched series.
+message LabelValueProfile {
+  string name = 1;
+  /// How many of the matched series carry the label.
+  uint64 carried_by = 2;
+  /// Its distinct values, sorted; complete unless `overflow`.
+  repeated string values = 3;
+  /// More distinct values exist than the coordinator would enumerate;
+  /// `values` holds only the first of them.
+  bool overflow = 4;
+}
+
+message LabelProfileResponse {
+  /// How many series the selector matched on this node.
+  uint64 series = 1;
+  /// One entry per label name any of them carries, `__name__` excluded.
+  repeated LabelValueProfile labels = 2;
+  /// The node matched more series than `max_series`: `series` and `labels`
+  /// are not filled in.
+  bool overflow = 3;
+}
+
 message AggregationQueryResponse {
   /// Set for the reduction operators (sum/avg/min/max/count/group/stddev/
   /// stdvar): one mergeable partial per group the shard saw.

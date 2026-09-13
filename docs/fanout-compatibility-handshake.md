@@ -131,6 +131,24 @@ every node runs the same build. See
 `src/promql/engine/fanout/grid_fanout_command.rs` and
 `docs/plans/selector-pushdown-plan.md`.
 
+### TS.QUERYRANGE — label profiles
+
+`LabelProfileQuery` / `LabelProfileResponse` back the data-derived filter
+push-down (`ts-promql-derived-filter-pushdown`): before a range query with a
+binary operation is planned, the coordinator asks every shard which labels the
+series of each operand's selector carry — per label, how many series and which
+distinct values — and narrows the *other* operand's selectors by what every
+series is known to satisfy. No sample is read for it. The response is
+self-describing in the same sense as the grid's: a shard that matched more
+series than the request's `max_series` answers `overflow` instead of a profile,
+and the coordinator then leaves the selector as written, which is always safe.
+Per-label value lists past the coordinator's cap are marked `overflow` too and
+derive no filter. Counts add across shards (a series lives on one shard), so
+"carried by every series" stays exact after the merge. See
+`src/promql/engine/fanout/label_profile_fanout_command.rs`,
+`src/promql/engine/derived_filters.rs` and
+`docs/plans/derived-filter-pushdown-plan.md`.
+
 ---
 
 ## 4. Why the rollup handshake needed a second bit
@@ -186,9 +204,11 @@ applied" cannot drift into two different answers for the same window.
 
 ## 6. What the toggles are not
 
-`ts-fanout-aggregation-pushdown` (default `yes`) and `ts-fanout-rollup-pushdown`
+`ts-fanout-aggregation-pushdown` (default `yes`), `ts-fanout-rollup-pushdown`
 (default `yes`; it governs the whole grid push-down, stepped selectors included)
-are read **only by the coordinator**. Shards obey whatever the request asks for.
+and `ts-promql-derived-filter-pushdown` (default `yes`; the label-profile round
+before planning) are read **only by the coordinator**. Shards obey whatever the
+request asks for.
 
 They are not mixed-version safety knobs. Version skew is already correct by the
 mechanism above, so a rolling upgrade needs no configuration change in either
@@ -233,7 +253,9 @@ bit instead and let it fail fast.
 - `src/commands/ts_mrange_fanout_command.rs` — MRANGE push-down
 - `src/promql/engine/fanout/aggregation_fanout_command.rs` — PromQL aggregation
 - `src/promql/engine/fanout/grid_fanout_command.rs` — PromQL grid queries: stepped selectors, rollups and fusion
+- `src/promql/engine/fanout/label_profile_fanout_command.rs` — label profiles for the derived filter push-down
 - `docs/plans/selector-pushdown-plan.md` — the grid push-down design in full
+- `docs/plans/derived-filter-pushdown-plan.md` — the derived filter push-down design in full
 - `docs/overview.md` — cluster mode and push-down from an operator's view
 
 Adjacent but distinct: a cluster topology change between request and receipt is

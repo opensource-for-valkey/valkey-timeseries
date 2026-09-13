@@ -1,5 +1,6 @@
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
+use crate::promql::engine::label_profile::LabelProfile;
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
@@ -125,6 +126,20 @@ impl QueryReader for ValkeySeriesQuerier {
         SERIES_SELECTOR.query_grid(
             matchers,
             request.clone(),
+            options,
+            self.caller_user.clone(),
+            self.hash_tags.clone(),
+        )
+    }
+
+    fn label_profile(
+        &self,
+        selector: &VectorSelector,
+        options: QueryOptions,
+    ) -> QueryResult<Option<LabelProfile>> {
+        let matchers: Matchers = normalize_selector(selector);
+        SERIES_SELECTOR.label_profile(
+            matchers,
             options,
             self.caller_user.clone(),
             self.hash_tags.clone(),
@@ -286,6 +301,17 @@ impl QueryReader for ConcreteSeriesQuerier {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query_grid(selector, request, options),
             ConcreteSeriesQuerier::Mock(mock) => mock.query_grid(selector, request, options),
+        }
+    }
+
+    fn label_profile(
+        &self,
+        selector: &VectorSelector,
+        options: QueryOptions,
+    ) -> PromqlResult<Option<LabelProfile>> {
+        match self {
+            ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, options),
+            ConcreteSeriesQuerier::Mock(mock) => mock.label_profile(selector, options),
         }
     }
 }

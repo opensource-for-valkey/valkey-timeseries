@@ -729,6 +729,48 @@ pub struct GridQueryResponse {
     #[prost(message, repeated, tag = "3")]
     pub raw: ::prost::alloc::vec::Vec<RangeSample>,
 }
+/// / The labels of the series a selector matches on this node, for the
+/// / coordinator's derived filter push-down (a range query narrows one operand
+/// / of a binary operation by what the other operand's series carry). Labels
+/// / only: no sample is read to answer it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LabelProfileQuery {
+    #[prost(message, optional, tag = "1")]
+    pub selector: ::core::option::Option<SeriesSelector>,
+    /// / Past this many matching series the node answers `overflow` rather than
+    /// / walking further; the coordinator then leaves the selector as written.
+    #[prost(uint64, tag = "2")]
+    pub max_series: u64,
+}
+/// / One label over the matched series.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LabelValueProfile {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// / How many of the matched series carry the label.
+    #[prost(uint64, tag = "2")]
+    pub carried_by: u64,
+    /// / Its distinct values, sorted; complete unless `overflow`.
+    #[prost(string, repeated, tag = "3")]
+    pub values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// / More distinct values exist than the coordinator would enumerate;
+    /// / `values` holds only the first of them.
+    #[prost(bool, tag = "4")]
+    pub overflow: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LabelProfileResponse {
+    /// / How many series the selector matched on this node.
+    #[prost(uint64, tag = "1")]
+    pub series: u64,
+    /// / One entry per label name any of them carries, `__name__` excluded.
+    #[prost(message, repeated, tag = "2")]
+    pub labels: ::prost::alloc::vec::Vec<LabelValueProfile>,
+    /// / The node matched more series than `max_series`: `series` and `labels`
+    /// / are not filled in.
+    #[prost(bool, tag = "3")]
+    pub overflow: bool,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregationQueryResponse {
     /// / Set for the reduction operators (sum/avg/min/max/count/group/stddev/

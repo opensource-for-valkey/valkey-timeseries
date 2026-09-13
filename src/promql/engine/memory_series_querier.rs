@@ -5,6 +5,9 @@ use crate::labels::filters::SeriesSelector;
 use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
+use crate::promql::engine::label_profile::{
+    LabelProfile, LabelProfileBuilder, profiled_series_cap,
+};
 use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
 use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
@@ -210,6 +213,30 @@ impl QueryReader for MemorySeriesQuerier {
     ) -> PromqlResult<AggregationOutcome> {
         self.query(selector, timestamp, options)
             .map(AggregationOutcome::Raw)
+    }
+
+    fn label_profile(
+        &self,
+        selector: &VectorSelector,
+        options: QueryOptions,
+    ) -> PromqlResult<Option<LabelProfile>> {
+        let inner = self.inner.read().unwrap();
+        let selector: SeriesSelector = SeriesSelector::from(selector);
+        let ids = inner
+            .postings
+            .postings_for_selectors(&[selector])
+            .map_err(|e| QueryError::Execution(e.to_string()))?;
+        let cap = profiled_series_cap(&options);
+        let mut builder = LabelProfileBuilder::new();
+        for id in ids.iter() {
+            if builder.series() as usize >= cap {
+                return Ok(None);
+            }
+            if let Some(series) = inner.series.get(&id) {
+                builder.add_series(series.labels.iter().map(|l| (l.name, l.value)));
+            }
+        }
+        Ok(Some(builder.finish()))
     }
 }
 

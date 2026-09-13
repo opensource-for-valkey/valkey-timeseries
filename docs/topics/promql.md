@@ -269,6 +269,32 @@ separate controls: `ts-fanout-aggregation-pushdown` and
 `ts-fanout-rollup-pushdown` govern where supported work is performed after the query is
 planned.
 
+### Filter push-down across binary operations
+
+Independently of the optimizer, a binary operation such as
+`kube_pod_created{namespace="prod"} * on(uid) group_left kube_pod_info` narrows the
+wider operand by the label values the other operand's series actually carry, so the
+`kube_pod_info` read covers the `prod` namespace rather than every pod. Two mechanisms
+do this, and they differ in where the label values come from:
+
+- **Instant queries** evaluate one operand first and derive the filters from its result
+  before reading the other. This is always on.
+- **Range queries** read every selector over the whole step grid before anything is
+  evaluated, so the filters are derived before planning from the series index instead:
+  for each selector under such an operation, the engine asks which labels every one of
+  its series carries (in a cluster, one `label-profile` fan-out per distinct selector,
+  no samples read) and adds them to the other operand's selectors only where they
+  provably exclude series. Operands whose series carry the same values — `cpu - cpu
+  offset 5m` — are left untouched. `or`, fill modifiers and label-less aggregations
+  are never narrowed. This is governed by `ts-promql-derived-filter-pushdown`
+  (default `yes`); the static optimizer's `ts-promql-optimize-queries` pushes only the
+  matchers written in the query, and blindly.
+
+Both are exact: a filter only ever removes series that could not have matched at any
+step. A selector matching more than 50 000 series (or the query's
+`ts-promql-max-response-series`, whichever is lower) is left as written, as is a label
+with more than 60 distinct values.
+
 ## Configuration and safeguards
 
 PromQL settings are regular module configuration values and can be inspected with
@@ -284,6 +310,7 @@ PromQL settings are regular module configuration values and can be inspected wit
 | `ts-promql-max-query-duration` | 30s | Maximum wall-clock query duration. |
 | `ts-promql-set-lookback-to-step` | no | Use the range query step as the lookback interval. |
 | `ts-promql-optimize-queries` | no | Enable query rewrites and selector push-down. |
+| `ts-promql-derived-filter-pushdown` | yes | Narrow a range query's binary-operation operands by the label values the index holds for the other operand. |
 | `ts-promql-enable-experimental-functions` | yes | Allow functions marked experimental by the parser. |
 
 The per-query `LOOKBACK_DELTA` and `TIMEOUT` options override their corresponding

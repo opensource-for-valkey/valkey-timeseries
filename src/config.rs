@@ -562,6 +562,7 @@ static PROMQL_MAX_SAMPLES_PER_QUERY: AtomicI64 =
     AtomicI64::new(PROMQL_MAX_SAMPLES_PER_QUERY_DEFAULT);
 static PROMQL_SET_LOOKBACK_TO_STEP: AtomicBool = AtomicBool::new(false);
 static PROMQL_OPTIMIZE_QUERIES: AtomicBool = AtomicBool::new(false);
+static PROMQL_DERIVED_FILTER_PUSHDOWN: AtomicBool = AtomicBool::new(true);
 static PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS: AtomicBool = AtomicBool::new(true);
 static PROMQL_LOOKBACK_DELTA_MS: AtomicI64 = AtomicI64::new(PROMQL_LOOKBACK_DELTA_DEFAULT_MS);
 static PROMQL_MAX_LOOKBACK_MS: AtomicI64 = AtomicI64::new(PROMQL_MAX_LOOKBACK_DEFAULT_MS);
@@ -981,6 +982,10 @@ fn read_promql_optimize_queries() -> ConfigValue {
     ConfigValue::Boolean(PROMQL_OPTIMIZE_QUERIES.load(Ordering::Relaxed))
 }
 
+fn read_promql_derived_filter_pushdown() -> ConfigValue {
+    ConfigValue::Boolean(PROMQL_DERIVED_FILTER_PUSHDOWN.load(Ordering::Relaxed))
+}
+
 fn read_promql_enable_experimental_functions() -> ConfigValue {
     ConfigValue::Boolean(PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS.load(Ordering::Relaxed))
 }
@@ -1322,6 +1327,19 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
+        name: "ts-promql-derived-filter-pushdown",
+        read: read_promql_derived_filter_pushdown,
+        kind: ConfigType::Boolean,
+        default: ConfigValue::Boolean(true),
+        min: None,
+        max: None,
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Narrow the selectors of a PromQL range query's binary operations by the label values the series index holds for the other operand",
+        storage: ConfigStorage::Bool {
+            cell: || &PROMQL_DERIVED_FILTER_PUSHDOWN,
+        },
+    },
+    ConfigDesc {
         name: "ts-promql-enable-experimental-functions",
         read: read_promql_enable_experimental_functions,
         kind: ConfigType::Boolean,
@@ -1642,6 +1660,7 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
         cfg.max_samples_per_query = PROMQL_MAX_SAMPLES_PER_QUERY.load(Ordering::Relaxed) as usize;
         cfg.set_lookback_to_step = PROMQL_SET_LOOKBACK_TO_STEP.load(Ordering::Relaxed);
         cfg.optimize_queries = PROMQL_OPTIMIZE_QUERIES.load(Ordering::Relaxed);
+        cfg.derived_filter_pushdown = PROMQL_DERIVED_FILTER_PUSHDOWN.load(Ordering::Relaxed);
         cfg.enable_experimental_functions =
             PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS.load(Ordering::Relaxed);
         cfg.lookback_delta =
@@ -1691,6 +1710,7 @@ mod tests {
         ("ts-fanout-rollup-pushdown", "yes"),
         ("ts-promql-set-lookback-to-step", "no"),
         ("ts-promql-optimize-queries", "no"),
+        ("ts-promql-derived-filter-pushdown", "yes"),
         ("ts-promql-enable-experimental-functions", "yes"),
         ("ts-promql-max-query-len", "4096"),
         ("ts-promql-max-response-series", "1000"),

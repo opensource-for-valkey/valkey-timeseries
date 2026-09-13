@@ -53,6 +53,11 @@ pub struct PromqlConfig {
     /// Whether to optimize the query before execution
     pub optimize_queries: bool,
 
+    /// Whether a range query's binary operations narrow their selectors by
+    /// what the series index knows about the other operand's series
+    /// (`ts-promql-derived-filter-pushdown`).
+    pub derived_filter_pushdown: bool,
+
     /// Whether to enable experimental functions. This may be useful for testing new functions
     /// before they are ready for production use.
     pub enable_experimental_functions: bool,
@@ -84,6 +89,7 @@ impl Default for PromqlConfig {
             set_lookback_to_step: false,
             max_query_duration: Duration::from_secs(30),
             optimize_queries: false,
+            derived_filter_pushdown: true,
             enable_experimental_functions: true, // TODO: set to false before release
         }
     }

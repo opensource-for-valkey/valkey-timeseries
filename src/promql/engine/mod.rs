@@ -1,5 +1,7 @@
 pub mod counting_query_reader;
+pub mod derived_filters;
 mod fanout;
+pub mod label_profile;
 pub mod memory_series_querier;
 pub mod promql_config;
 pub mod promql_engine;
@@ -53,6 +55,10 @@ pub struct QueryOptions {
     /// Whether to optimize the queries by simplify the query plan and pushing down filters to the data source.
     /// This can improve performance but may cause higher memory usage and slower response times for some queries.
     pub optimize_queries: bool,
+    /// Whether a range query's binary operations narrow their selectors by the
+    /// label values the series index holds for the other operand; see
+    /// [`derived_filters`].
+    pub derived_filter_pushdown: bool,
     /// The db in which to execute the query
     pub db: i32,
 }
@@ -79,6 +85,7 @@ impl Default for QueryOptions {
             is_tracing: false,
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,
+            derived_filter_pushdown: config.derived_filter_pushdown,
             db: 0,
         }
     }

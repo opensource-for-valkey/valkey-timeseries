@@ -1,6 +1,7 @@
 use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
+use crate::promql::engine::label_profile::LabelProfile;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::exec::pipeline::for_each_step_sample;
@@ -425,6 +426,19 @@ pub trait QueryReader: Send + Sync {
         self.query_range(selector, start_ms, end_ms, options)
             .map(GridOutcome::Raw)
     }
+
+    /// The labels of the series `selector` matches, from the index rather
+    /// than from a read — see [`LabelProfile`]. `None` when the source cannot
+    /// say (no index, or more series than it will profile), in which case
+    /// the caller treats the selector as it would without a profile. Purely
+    /// an optimization: the default declines.
+    fn label_profile(
+        &self,
+        _selector: &VectorSelector,
+        _options: QueryOptions,
+    ) -> PromqlResult<Option<LabelProfile>> {
+        Ok(None)
+    }
 }
 
 impl QueryReader for Arc<dyn QueryReader> {
@@ -466,6 +480,14 @@ impl QueryReader for Arc<dyn QueryReader> {
         options: QueryOptions,
     ) -> PromqlResult<GridOutcome> {
         self.as_ref().query_grid(selector, request, options)
+    }
+
+    fn label_profile(
+        &self,
+        selector: &VectorSelector,
+        options: QueryOptions,
+    ) -> PromqlResult<Option<LabelProfile>> {
+        self.as_ref().label_profile(selector, options)
     }
 }
 

@@ -15,6 +15,7 @@
 
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
+use crate::promql::engine::label_profile::LabelProfile;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
@@ -31,12 +32,17 @@ pub struct ReaderCallCounts {
     pub query_range: usize,
     pub query_aggregation: usize,
     pub query_grid: usize,
+    pub label_profile: usize,
 }
 
 impl ReaderCallCounts {
     /// Total calls across every method.
     pub fn total(&self) -> usize {
-        self.query + self.query_range + self.query_aggregation + self.query_grid
+        self.query
+            + self.query_range
+            + self.query_aggregation
+            + self.query_grid
+            + self.label_profile
     }
 }
 
@@ -50,6 +56,7 @@ pub struct CountingQueryReader {
     query_range_calls: AtomicUsize,
     query_aggregation_calls: AtomicUsize,
     query_grid_calls: AtomicUsize,
+    label_profile_calls: AtomicUsize,
 }
 
 impl CountingQueryReader {
@@ -60,6 +67,7 @@ impl CountingQueryReader {
             query_range_calls: AtomicUsize::new(0),
             query_aggregation_calls: AtomicUsize::new(0),
             query_grid_calls: AtomicUsize::new(0),
+            label_profile_calls: AtomicUsize::new(0),
         }
     }
 
@@ -70,6 +78,7 @@ impl CountingQueryReader {
             query_range: self.query_range_calls.load(Ordering::Relaxed),
             query_aggregation: self.query_aggregation_calls.load(Ordering::Relaxed),
             query_grid: self.query_grid_calls.load(Ordering::Relaxed),
+            label_profile: self.label_profile_calls.load(Ordering::Relaxed),
         }
     }
 
@@ -79,6 +88,7 @@ impl CountingQueryReader {
         self.query_range_calls.store(0, Ordering::Relaxed);
         self.query_aggregation_calls.store(0, Ordering::Relaxed);
         self.query_grid_calls.store(0, Ordering::Relaxed);
+        self.label_profile_calls.store(0, Ordering::Relaxed);
     }
 }
 
@@ -124,6 +134,15 @@ impl QueryReader for CountingQueryReader {
     ) -> PromqlResult<GridOutcome> {
         self.query_grid_calls.fetch_add(1, Ordering::Relaxed);
         self.inner.query_grid(selector, request, options)
+    }
+
+    fn label_profile(
+        &self,
+        selector: &VectorSelector,
+        options: QueryOptions,
+    ) -> PromqlResult<Option<LabelProfile>> {
+        self.label_profile_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.label_profile(selector, options)
     }
 }
 
@@ -374,12 +393,14 @@ mod tests {
     fn range_duplicate_selectors_are_deduplicated() {
         let (counting, reader) = build_reader();
         // Both operands share one PreloadKey, so one fetch serves both sides
-        // at every step.
+        // at every step — and one label profile, asked before planning,
+        // serves both operands of the binary operation.
         run_range(reader, "a + a");
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
                 query_grid: 1,
+                label_profile: 1,
                 ..Default::default()
             }
         );
@@ -392,10 +413,56 @@ mod tests {
         assert_eq!(
             counting.counts(),
             ReaderCallCounts {
-                query_grid: 2, // one grid request per distinct selector
+                query_grid: 2,    // one grid request per distinct selector
+                label_profile: 2, // and one profile each, before planning
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn range_without_a_narrowable_operation_asks_for_no_profile() {
+        let (counting, reader) = build_reader();
+        // `sum(a)` offers no labels and `or` keeps both sides: nothing for
+        // the derived push-down to do, so the index is not consulted.
+        run_range(reader.clone(), "sum(a) / sum(b)");
+        run_range(reader, "a or b");
+        assert_eq!(counting.counts().label_profile, 0);
+    }
+
+    #[test]
+    fn range_profiles_are_skipped_when_the_pushdown_is_off() {
+        let (counting, reader) = build_reader();
+        let opts = QueryOptions {
+            derived_filter_pushdown: false,
+            ..options()
+        };
+        evaluate_range(
+            reader,
+            EvalStmt {
+                expr: promql_parser::parser::parse("a - b").unwrap(),
+                start: ms(RANGE_START_MS),
+                end: ms(RANGE_END_MS),
+                interval: STEP,
+                lookback_delta: opts.lookback_delta,
+            },
+            opts,
+        )
+        .unwrap();
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_grid: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn instant_join_derives_its_filters_at_evaluation_not_from_the_index() {
+        let (counting, reader) = build_reader();
+        run_instant(reader, "a - b", RANGE_END_MS);
+        assert_eq!(counting.counts().label_profile, 0);
     }
 
     #[test]
@@ -505,6 +572,7 @@ mod tests {
             ReaderCallCounts {
                 query_range: 1,
                 query_grid: 1,
+                label_profile: 1,
                 ..Default::default()
             }
         );

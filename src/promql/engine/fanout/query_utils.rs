@@ -4,6 +4,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
 use crate::promql::engine::PROMQL_CONFIG;
+use crate::promql::engine::label_profile::{LabelProfile, LabelProfileBuilder};
 use crate::promql::engine::query_reader::grid_fetch_bounds;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
@@ -96,6 +97,30 @@ pub(super) fn local_instant_eval_samples(
         .map_err(valkey_module::ValkeyError::String)?;
 
     Ok(samples)
+}
+
+/// The labels of the series `selector` matches on this node: the local half
+/// of [`super::LabelProfileFanoutCommand`], and what a single node answers
+/// `QueryReader::label_profile` with. `None` past `max_series` matches, and
+/// for the same reason the coordinator has: a selector that large is not
+/// worth walking to narrow another.
+///
+/// No sample is read. `series_by_selectors` opens every matched key, as a
+/// read of the same selector would, so the cost is bounded by the cap alone.
+pub(in crate::promql) fn local_label_profile(
+    ctx: &Context,
+    selector: SeriesSelector,
+    max_series: usize,
+) -> ValkeyResult<Option<LabelProfile>> {
+    let series = series_by_selectors(ctx, &[selector], None)?;
+    if max_series > 0 && series.len() > max_series {
+        return Ok(None);
+    }
+    let mut builder = LabelProfileBuilder::new();
+    for (s, _) in series.iter() {
+        builder.add_series(s.deref().labels.iter().map(|l| (l.name, l.value)));
+    }
+    Ok(Some(builder.finish()))
 }
 
 /// Read the raw windows a pushed-down grid query needs, one entry per series.

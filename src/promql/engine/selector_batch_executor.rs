@@ -7,15 +7,16 @@ use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
+use crate::promql::engine::label_profile::{LabelProfile, profiled_series_cap};
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, validate_max_samples};
 use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
-    InstantVectorSelectorFanoutCommand, RangeVectorSelectorFanoutCommand, get_snapshot_range,
-    instant_lookback_start_ms, proto_labels_to_eval_labels, validate_max_points,
-    validate_max_series,
+    InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
+    RangeVectorSelectorFanoutCommand, get_snapshot_range, instant_lookback_start_ms,
+    local_label_profile, proto_labels_to_eval_labels, validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::index::series_by_selectors;
@@ -64,11 +65,19 @@ struct GridSelectorCommand {
     options: QueryOptions,
 }
 
+/// The labels of the series a selector matches, from the index alone: what
+/// the derived filter push-down narrows a range query's operands with.
+struct ProfileSelectorCommand {
+    matchers: Matchers,
+    options: QueryOptions,
+}
+
 enum SelectorTaskKind {
     Vector(InstantVectorSelectorCommand),
     Range(RangeSelectorCommand),
     Aggregation(AggregationSelectorCommand),
     Grid(GridSelectorCommand),
+    Profile(ProfileSelectorCommand),
 }
 
 impl SelectorTaskKind {
@@ -78,6 +87,7 @@ impl SelectorTaskKind {
             SelectorTaskKind::Range(rc) => rc.options.db,
             SelectorTaskKind::Aggregation(ac) => ac.options.db,
             SelectorTaskKind::Grid(gc) => gc.options.db,
+            SelectorTaskKind::Profile(pc) => pc.options.db,
         }
     }
 }
@@ -92,6 +102,8 @@ enum SelectorOutput {
     Matrix(Vec<RangeSample<EvalLabels>>),
     Aggregation(AggregationOutcome),
     Grid(GridOutcome),
+    /// A label profile, or `None` when the source declined to build one.
+    Profile(Option<LabelProfile>),
 }
 
 impl SelectorOutput {
@@ -130,6 +142,15 @@ impl SelectorOutput {
             SelectorOutput::Grid(outcome) => Ok(outcome),
             _ => Err(QueryError::Execution(
                 "BUG: grid task returned a non-grid result".to_string(),
+            )),
+        }
+    }
+
+    fn into_profile(self) -> QueryResult<Option<LabelProfile>> {
+        match self {
+            SelectorOutput::Profile(profile) => Ok(profile),
+            _ => Err(QueryError::Execution(
+                "BUG: profile task returned a non-profile result".to_string(),
             )),
         }
     }
@@ -387,6 +408,22 @@ impl SelectorBatchExecutor {
             .into_grid()
     }
 
+    /// The labels of the series `matchers` select — see
+    /// [`crate::promql::engine::label_profile`]. Answered from the index on
+    /// a single node and by every shard in a cluster; `None` when the
+    /// selector matches more series than the query's cap.
+    pub fn label_profile(
+        &self,
+        matchers: Matchers,
+        options: QueryOptions,
+        caller_user: Option<String>,
+        hash_tags: Arc<[String]>,
+    ) -> QueryResult<Option<LabelProfile>> {
+        let command = SelectorTaskKind::Profile(ProfileSelectorCommand { matchers, options });
+        self.submit_selector_task(command, caller_user, hash_tags)?
+            .into_profile()
+    }
+
     fn submit_selector_task(
         &self,
         command: SelectorTaskKind,
@@ -550,6 +587,15 @@ fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> Loca
                 Ok(series) => LocalOutcome::Deferred(series, gc.options, true),
                 Err(err) => LocalOutcome::Answered(Err(err)),
             }
+        }
+        SelectorTaskKind::Profile(pc) => {
+            let selector: SeriesSelector = SeriesSelector::from(pc.matchers);
+            let cap = profiled_series_cap(&pc.options);
+            LocalOutcome::Answered(
+                local_label_profile(ctx, selector, cap)
+                    .map(SelectorOutput::Profile)
+                    .map_err(|e| QueryError::Execution(e.to_string())),
+            )
         }
     }
 }
@@ -842,6 +888,39 @@ fn execute_cluster_grid(
     }
 }
 
+/// Every shard profiles its own series; the command adds the counts up. The
+/// query's cap is sent along so that no shard walks a selector the
+/// coordinator would decline anyway.
+fn execute_cluster_label_profile(
+    ctx: &Context,
+    pc: ProfileSelectorCommand,
+    hash_tags: &[String],
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
+) {
+    let timeout = calculate_timeout(&pc.options);
+    let cmd = LabelProfileFanoutCommand::new(
+        pc.matchers,
+        profiled_series_cap(&pc.options) as u64,
+        timeout,
+    );
+
+    let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
+    let responder = Arc::new(responder);
+    let cloned_responder = responder.clone();
+
+    let handler = move |cmd: LabelProfileFanoutCommand, result: FanoutCommandResult| {
+        let query_result = match result {
+            Ok(()) => Ok(SelectorOutput::Profile(cmd.into_result())),
+            Err(e) => Err(selector_fanout_failure("label-profile", e)),
+        };
+        deliver_task_result(&responder, query_result);
+    };
+
+    if let Err(e) = exec_command(ctx, cmd, targets, timeout, handler) {
+        deliver_task_result(&cloned_responder, Err(e.into()));
+    }
+}
+
 fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
     // Every path below routes through the same scope, including the push-down
     // ones: a push-down that a peer cannot serve falls back to the ordinary
@@ -859,6 +938,9 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
         }
         SelectorTaskKind::Grid(gc) => {
             execute_cluster_grid(ctx, gc, &hash_tags, task.responder);
+        }
+        SelectorTaskKind::Profile(pc) => {
+            execute_cluster_label_profile(ctx, pc, &hash_tags, task.responder);
         }
     }
 }

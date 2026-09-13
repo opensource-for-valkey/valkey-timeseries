@@ -277,3 +277,13 @@ select on the coordinator.
 The toggle still defaults off — it is new, and the conservative default costs only the optimization. Interaction with
 the aggregation toggle is none: they cover disjoint query shapes (an instant vector's aggregation vs a matrix
 selector's reduction), and each is consulted only by the coordinator evaluating that shape.
+
+A third push-down narrows what those grid requests *ask for*. A range query's binary operation —
+`cpu{region="us"} - cpu offset 5m`, `a * on(uid) group_left info` — would otherwise read the wide operand in full and
+discard the series that could never match. With `ts-promql-derived-filter-pushdown` (default `yes`) the coordinator
+first asks every shard, per selector under such an operation, which labels every one of its series carries and with
+which values (a `label-profile` fan-out: labels only, no samples), then adds those as matchers to the other operand's
+selectors wherever they provably exclude series, and plans the narrowed tree. Operands with the same label values —
+`cpu - cpu offset 5m` — are left untouched, as are `or`, fill modifiers and label-less aggregations; instant queries
+keep their own, evaluation-time version of the same narrowing. Measured on the three-node harness, the filtered binop
+above at 60 steps went from ≈18 to ≈11 ms.

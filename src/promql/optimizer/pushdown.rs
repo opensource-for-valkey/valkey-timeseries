@@ -5,11 +5,47 @@ use ahash::HashSetExt;
 use promql_parser::label::{METRIC_NAME, Matcher, Matchers};
 use promql_parser::parser::token::{T_COUNT_VALUES, T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
-use promql_parser::parser::{AggregateExpr, Expr, LabelModifier, VectorMatchCardinality};
+use promql_parser::parser::{
+    AggregateExpr, BinaryExpr, Expr, LabelModifier, VectorMatchCardinality, VectorSelector,
+};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::vec::Vec;
+
+/// What the filter push-down knows about a selector's series.
+///
+/// Every structural rule of the push-down — which labels survive an
+/// aggregation, a `label_replace`, an `on()`/`ignoring()` — is the same
+/// whatever the source of the leaf facts. The leaf rule is what varies: the
+/// static optimizer knows only the matchers written on a selector, while a
+/// pass with access to the series index knows the label values the selector's
+/// series actually carry (see `engine::derived_filters`).
+pub trait LeafFilters {
+    /// The label filters every series `vs` yields is known to satisfy, never
+    /// including `__name__`.
+    fn common_filters(&self, vs: &VectorSelector) -> Vec<Matcher>;
+
+    /// Drop from `filters` those that would exclude no series `vs` reads.
+    /// The default keeps every filter: a resolver that cannot tell pushes
+    /// them all, as the static optimizer always has.
+    fn retain_pruning(&self, _vs: &VectorSelector, _filters: &mut Vec<Matcher>) {}
+
+    /// Whether the operands of `be` may be narrowed by each other's filters
+    /// at all. The default says yes for every operation.
+    fn narrows(&self, _be: &BinaryExpr) -> bool {
+        true
+    }
+}
+
+/// The static optimizer's leaf rule: the matchers written on the selector.
+pub struct WrittenFilters;
+
+impl LeafFilters for WrittenFilters {
+    fn common_filters(&self, vs: &VectorSelector) -> Vec<Matcher> {
+        get_common_label_filters_without_metric_name(&vs.matchers)
+    }
+}
 
 /// `push_down_filters` optimizes expressions to improve their performance.
 ///
@@ -49,6 +85,11 @@ pub fn can_pushdown_filters(expr: &Expr) -> bool {
 }
 
 pub fn pushdown_filters_in_place(expr: &mut Expr) {
+    pushdown_filters_in_place_with(expr, &WrittenFilters)
+}
+
+/// [`pushdown_filters_in_place`] with the leaf rule supplied by `leaves`.
+pub fn pushdown_filters_in_place_with(expr: &mut Expr, leaves: &dyn LeafFilters) {
     use Expr::*;
 
     match expr {
@@ -64,44 +105,52 @@ pub fn pushdown_filters_in_place(expr: &mut Expr) {
         }
         Call(f) => {
             for arg in f.args.args.iter_mut() {
-                pushdown_filters_in_place(arg);
+                pushdown_filters_in_place_with(arg, leaves);
             }
         }
         Aggregate(agg) => {
-            pushdown_filters_in_place(&mut agg.expr);
+            pushdown_filters_in_place_with(&mut agg.expr, leaves);
             if let Some(param) = agg.param.as_mut() {
-                pushdown_filters_in_place(param);
+                pushdown_filters_in_place_with(param, leaves);
             }
         }
         Binary(be) => {
-            pushdown_filters_in_place(&mut be.lhs);
-            pushdown_filters_in_place(&mut be.rhs);
-            let mut lfs = get_common_label_filters(expr);
-            push_down_binary_op_filters_in_place(expr, &mut lfs);
+            pushdown_filters_in_place_with(&mut be.lhs, leaves);
+            pushdown_filters_in_place_with(&mut be.rhs, leaves);
+            if leaves.narrows(be) {
+                let mut lfs = get_common_label_filters_with(expr, leaves);
+                push_down_binary_op_filters_in_place_with(expr, &mut lfs, leaves);
+            }
         }
-        Unary(unary) => pushdown_filters_in_place(&mut unary.expr),
-        Paren(p) => pushdown_filters_in_place(&mut p.expr),
-        Subquery(s) => pushdown_filters_in_place(&mut s.expr),
+        Unary(unary) => pushdown_filters_in_place_with(&mut unary.expr, leaves),
+        Paren(p) => pushdown_filters_in_place_with(&mut p.expr, leaves),
+        Subquery(s) => pushdown_filters_in_place_with(&mut s.expr, leaves),
         _ => {}
     }
 }
 
 pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
+    get_common_label_filters_with(e, &WrittenFilters)
+}
+
+/// The label filters every series of `e`'s result satisfies, with the leaf
+/// rule supplied by `leaves`.
+pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<Matcher> {
     use Expr::*;
 
     match e {
-        VectorSelector(m) => get_common_label_filters_without_metric_name(&m.matchers),
-        Subquery(s) => get_common_label_filters(&s.expr),
-        MatrixSelector(m) => get_common_label_filters_without_metric_name(&m.vs.matchers),
+        VectorSelector(m) => leaves.common_filters(m),
+        Subquery(s) => get_common_label_filters_with(&s.expr, leaves),
+        MatrixSelector(m) => leaves.common_filters(&m.vs),
         Call(fe) => {
             if let Some(func) = resolve_function(fe.func.name) {
                 let kind = func.kind();
                 return match kind {
                     PromqlFunctionKind::LabelJoin | PromqlFunctionKind::LabelReplace => {
-                        get_common_label_filters_for_label_replace(&fe.args.args)
+                        get_common_label_filters_for_label_replace(&fe.args.args, leaves)
                     }
                     PromqlFunctionKind::CountOverTime => {
-                        get_common_label_filters_for_count_values_over_time(&fe.args.args)
+                        get_common_label_filters_for_count_values_over_time(&fe.args.args, leaves)
                     }
                     _ => {
                         let Some(pos) =
@@ -112,22 +161,22 @@ pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
                             return vec![];
                         };
                         let arg = &fe.args.args[pos];
-                        get_common_label_filters(arg)
+                        get_common_label_filters_with(arg, leaves)
                     }
                 };
             }
             vec![]
         }
         Aggregate(agg) => {
-            let mut filters = get_common_label_filters(&agg.expr);
+            let mut filters = get_common_label_filters_with(&agg.expr, leaves);
             trim_filters_by_aggr_modifier(&mut filters, agg);
             filters
         }
-        Unary(unary) => get_common_label_filters(&unary.expr),
-        Paren(p) => get_common_label_filters(&p.expr),
+        Unary(unary) => get_common_label_filters_with(&unary.expr, leaves),
+        Paren(p) => get_common_label_filters_with(&p.expr, leaves),
         Binary(binary) => {
-            let mut lfs_left = get_common_label_filters(&binary.lhs);
-            let mut lfs_right = get_common_label_filters(&binary.rhs);
+            let mut lfs_left = get_common_label_filters_with(&binary.lhs, leaves);
+            let mut lfs_right = get_common_label_filters_with(&binary.rhs, leaves);
             let card = VectorMatchCardinality::OneToOne;
             let group_modifier: Option<LabelModifier> = None;
 
@@ -204,31 +253,25 @@ pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
     }
 }
 
-fn intersect_label_filters_for_all_args(args: &[Expr]) -> Vec<Matcher> {
-    if args.is_empty() {
-        return vec![];
-    }
-    let mut lfs_a = get_common_label_filters(&args[0]);
-    for arg in &args[1..] {
-        let lfs_next = get_common_label_filters(arg);
-        lfs_a = intersect_label_filters(lfs_a, lfs_next)
-    }
-    lfs_a
-}
-
-fn get_common_label_filters_for_count_values_over_time(args: &[Box<Expr>]) -> Vec<Matcher> {
+fn get_common_label_filters_for_count_values_over_time(
+    args: &[Box<Expr>],
+    leaves: &dyn LeafFilters,
+) -> Vec<Matcher> {
     if args.len() != 2 {
         return vec![];
     }
-    let lfs = get_common_label_filters(&args[1]);
+    let lfs = get_common_label_filters_with(&args[1], leaves);
     drop_label_filters_for_label_name(&lfs, &args[0])
 }
 
-fn get_common_label_filters_for_label_replace(args: &[Box<Expr>]) -> Vec<Matcher> {
+fn get_common_label_filters_for_label_replace(
+    args: &[Box<Expr>],
+    leaves: &dyn LeafFilters,
+) -> Vec<Matcher> {
     if args.len() < 2 {
         return vec![];
     }
-    let lfs = get_common_label_filters(&args[0]);
+    let lfs = get_common_label_filters_with(&args[0], leaves);
     drop_label_filters_for_label_name(&lfs, &args[1])
 }
 
@@ -321,6 +364,22 @@ fn can_pushdown_op_filters(expr: &Expr) -> bool {
         | Unary(_))
 }
 
+/// Append `common_filters` to the selector `vs`, less those `leaves` knows
+/// would prune nothing there.
+fn push_filters_to_selector(
+    vs: &mut VectorSelector,
+    common_filters: &[Matcher],
+    leaves: &dyn LeafFilters,
+) {
+    // Owned: the retained set is this selector's, not the sibling's the
+    // caller's list goes on to.
+    let mut filters = common_filters.to_vec();
+    leaves.retain_pruning(vs, &mut filters);
+    if !filters.is_empty() {
+        push_filters_to_matchers(&mut vs.matchers, &filters);
+    }
+}
+
 fn push_filters_to_matchers(matchers: &mut Matchers, common_filters: &[Matcher]) {
     if !matchers.matchers.is_empty() {
         union_label_filters_internal(&mut matchers.matchers, common_filters);
@@ -340,6 +399,16 @@ fn push_filters_to_matchers(matchers: &mut Matchers, common_filters: &[Matcher])
 }
 
 pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut Vec<Matcher>) {
+    push_down_binary_op_filters_in_place_with(e, common_filters, &WrittenFilters)
+}
+
+/// [`push_down_binary_op_filters_in_place`] with `leaves` deciding, at each
+/// selector, which of the filters are worth adding.
+pub fn push_down_binary_op_filters_in_place_with(
+    e: &mut Expr,
+    common_filters: &mut Vec<Matcher>,
+    leaves: &dyn LeafFilters,
+) {
     use Expr::*;
 
     if common_filters.is_empty() {
@@ -348,15 +417,17 @@ pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut V
 
     match e {
         VectorSelector(me) => {
-            push_filters_to_matchers(&mut me.matchers, common_filters);
+            push_filters_to_selector(me, common_filters, leaves);
         }
         MatrixSelector(me) => {
-            push_filters_to_matchers(&mut me.vs.matchers, common_filters);
+            push_filters_to_selector(&mut me.vs, common_filters, leaves);
         }
-        Subquery(s) => push_down_binary_op_filters_in_place(&mut s.expr, common_filters),
+        Subquery(s) => {
+            push_down_binary_op_filters_in_place_with(&mut s.expr, common_filters, leaves)
+        }
         Call(fe) => match fe.func.name {
             "label_replace" | "label_join" => {
-                pushdown_label_filters_for_label_replace(&mut fe.args.args, common_filters)
+                pushdown_label_filters_for_label_replace(&mut fe.args.args, common_filters, leaves)
             }
             _ => {
                 if fe.func.name == "absent" || fe.func.name == "absent_over_time" {
@@ -369,19 +440,19 @@ pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut V
                     .position(|&arg| arg != ValueType::Scalar && arg != ValueType::String)
                     && let Some(arg) = fe.args.args.get_mut(index)
                 {
-                    push_down_binary_op_filters_in_place(arg, common_filters);
+                    push_down_binary_op_filters_in_place_with(arg, common_filters, leaves);
                 }
             }
         },
         Unary(unary) => {
-            push_down_binary_op_filters_in_place(&mut unary.expr, common_filters);
+            push_down_binary_op_filters_in_place_with(&mut unary.expr, common_filters, leaves);
         }
         Binary(bo) => {
             if let Some(modifier) = &bo.modifier {
                 trim_filters_by_match_modifier(common_filters, &modifier.matching);
             }
-            push_down_binary_op_filters_in_place(&mut bo.lhs, common_filters);
-            push_down_binary_op_filters_in_place(&mut bo.rhs, common_filters);
+            push_down_binary_op_filters_in_place_with(&mut bo.lhs, common_filters, leaves);
+            push_down_binary_op_filters_in_place_with(&mut bo.rhs, common_filters, leaves);
         }
         Aggregate(aggr) => {
             // Grouping labels pass through an aggregation unchanged, so a filter
@@ -395,38 +466,28 @@ pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut V
                 *common_filters = drop_label_filters_for_label_name(common_filters, label_name);
             }
             trim_filters_by_aggr_modifier(common_filters, aggr);
-            push_down_binary_op_filters_in_place(&mut aggr.expr, common_filters);
+            push_down_binary_op_filters_in_place_with(&mut aggr.expr, common_filters, leaves);
             // `aggr.param` is a scalar or string (the `k` of topk, the quantile,
             // the count_values label) — never an operand of the binary op's label
             // matching. Rewriting a selector under it, as in `topk(scalar(x), y)`,
             // would change the parameter's value rather than prune series.
         }
-        Paren(p) => push_down_binary_op_filters_in_place(&mut p.expr, common_filters),
+        Paren(p) => push_down_binary_op_filters_in_place_with(&mut p.expr, common_filters, leaves),
         _ => {}
     }
 }
 
-fn pushdown_label_filters_for_all_args(lfs: &mut Vec<Matcher>, args: &mut [Box<Expr>]) {
-    for arg in args {
-        push_down_binary_op_filters_in_place(arg, lfs)
-    }
-}
-
-fn pushdown_label_filters_for_count_values_over_time(args: &mut [Expr], lfs: &mut Vec<Matcher>) {
-    if args.len() != 2 {
-        return;
-    }
-    *lfs = drop_label_filters_for_label_name(lfs, &args[0]);
-    push_down_binary_op_filters_in_place(&mut args[1], lfs);
-}
-
-fn pushdown_label_filters_for_label_replace(args: &mut [Box<Expr>], lfs: &mut Vec<Matcher>) {
+fn pushdown_label_filters_for_label_replace(
+    args: &mut [Box<Expr>],
+    lfs: &mut Vec<Matcher>,
+    leaves: &dyn LeafFilters,
+) {
     if args.len() < 2 {
         return;
     }
     *lfs = drop_label_filters_for_label_name(lfs, &args[1]);
     if let Some(arg) = args.get_mut(0) {
-        push_down_binary_op_filters_in_place(arg, lfs);
+        push_down_binary_op_filters_in_place_with(arg, lfs, leaves);
     }
 }
 

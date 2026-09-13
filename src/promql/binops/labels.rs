@@ -1,4 +1,7 @@
 use crate::labels::{HasFingerprint, SeriesFingerprint, SeriesLabel, fingerprint_labels};
+use crate::promql::engine::label_profile::{
+    MAX_PUSHDOWN_VALUES, join_regexp_values, regex_matcher,
+};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
@@ -12,7 +15,6 @@ use promql_parser::parser::token::{
 };
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
-use regex::{Regex, escape};
 use std::borrow::Cow;
 use twox_hash::xxhash3_128;
 
@@ -243,7 +245,7 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
             continue;
         }
 
-        if values.len() > 60 {
+        if values.len() > MAX_PUSHDOWN_VALUES {
             // Skip the filter on the given tag, since it needs to enumerate too many unique values.
             // This may slow down the provider for matching time series.
             continue;
@@ -254,34 +256,13 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
             let val = *values.iter().next().unwrap();
             Matcher::new(MatchOp::Equal, key, val)
         } else {
-            let str_value = join_regexp_values(values);
-            // Safety: the regex is an alternation generated from the values, so it should be valid.
-            let regex = Regex::new(&str_value).unwrap();
-            Matcher::new(MatchOp::Re(regex), key, str_value.as_str())
+            regex_matcher(key, join_regexp_values(values))
         };
 
         lfs.push(lf);
     }
 
     lfs
-}
-
-/// The values as a regex alternation, sorted so the same set always yields the
-/// same matcher — the selector it lands in is a cache and fanout key.
-fn join_regexp_values(values: AHashSet<&str>) -> String {
-    let len = values.len();
-    let init_size = values.iter().fold(0, |res, &x| res + x.len() + 3);
-    let mut values: Vec<&str> = values.into_iter().collect();
-    values.sort_unstable();
-    let mut res = String::with_capacity(init_size);
-    for (i, &s) in values.iter().enumerate() {
-        let s_quoted = escape(s);
-        res.push_str(s_quoted.as_str());
-        if i < len - 1 {
-            res.push('|')
-        }
-    }
-    res
 }
 
 #[cfg(test)]
