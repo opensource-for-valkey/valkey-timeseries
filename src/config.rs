@@ -161,6 +161,10 @@ const PROMQL_MAX_RESPONSE_SERIES_DEFAULT: i64 = 1000;
 const PROMQL_MAX_POINTS_PER_TIMESERIES_MIN: i64 = 0;
 const PROMQL_MAX_POINTS_PER_TIMESERIES_MAX: i64 = i64::MAX;
 const PROMQL_MAX_POINTS_PER_TIMESERIES_DEFAULT: i64 = 0; // 0 = unlimited
+const PROMQL_MAX_SAMPLES_PER_QUERY_MIN: i64 = 0;
+const PROMQL_MAX_SAMPLES_PER_QUERY_MAX: i64 = i64::MAX;
+/// Prometheus' `--query.max-samples` default. 0 = unlimited.
+pub const PROMQL_MAX_SAMPLES_PER_QUERY_DEFAULT: i64 = 50_000_000;
 const PROMQL_LOOKBACK_DELTA_MIN_MS: i64 = 0;
 const PROMQL_LOOKBACK_DELTA_MAX_MS: i64 = ONE_YEAR_MS;
 const PROMQL_LOOKBACK_DELTA_DEFAULT_MS: i64 = 5 * 60 * 1000; // 5m
@@ -551,6 +555,8 @@ static PROMQL_MAX_QUERY_LEN: AtomicI64 = AtomicI64::new(PROMQL_MAX_QUERY_LEN_DEF
 static PROMQL_MAX_RESPONSE_SERIES: AtomicI64 = AtomicI64::new(PROMQL_MAX_RESPONSE_SERIES_DEFAULT);
 static PROMQL_MAX_POINTS_PER_TIMESERIES: AtomicI64 =
     AtomicI64::new(PROMQL_MAX_POINTS_PER_TIMESERIES_DEFAULT);
+static PROMQL_MAX_SAMPLES_PER_QUERY: AtomicI64 =
+    AtomicI64::new(PROMQL_MAX_SAMPLES_PER_QUERY_DEFAULT);
 static PROMQL_SET_LOOKBACK_TO_STEP: AtomicBool = AtomicBool::new(false);
 static PROMQL_OPTIMIZE_QUERIES: AtomicBool = AtomicBool::new(false);
 static PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS: AtomicBool = AtomicBool::new(true);
@@ -960,6 +966,10 @@ fn read_promql_max_points_per_timeseries() -> ConfigValue {
     ConfigValue::Integer(PROMQL_MAX_POINTS_PER_TIMESERIES.load(Ordering::Relaxed))
 }
 
+fn read_promql_max_samples_per_query() -> ConfigValue {
+    ConfigValue::Integer(PROMQL_MAX_SAMPLES_PER_QUERY.load(Ordering::Relaxed))
+}
+
 fn read_promql_set_lookback_to_step() -> ConfigValue {
     ConfigValue::Boolean(PROMQL_SET_LOOKBACK_TO_STEP.load(Ordering::Relaxed))
 }
@@ -1364,6 +1374,20 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
+        name: "ts-promql-max-samples-per-query",
+        read: read_promql_max_samples_per_query,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(PROMQL_MAX_SAMPLES_PER_QUERY_DEFAULT),
+        min: Some(ConfigValue::Integer(PROMQL_MAX_SAMPLES_PER_QUERY_MIN)),
+        max: Some(ConfigValue::Integer(PROMQL_MAX_SAMPLES_PER_QUERY_MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Maximum samples one PromQL query may load into memory across all its reads (0 = unlimited)",
+        storage: ConfigStorage::I64 {
+            cell: || &PROMQL_MAX_SAMPLES_PER_QUERY,
+            validate: None,
+        },
+    },
+    ConfigDesc {
         name: "ts-promql-lookback-delta",
         read: read_promql_lookback_delta,
         kind: ConfigType::Duration,
@@ -1612,6 +1636,7 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
         cfg.max_response_series = PROMQL_MAX_RESPONSE_SERIES.load(Ordering::Relaxed) as usize;
         cfg.max_points_per_timeseries =
             PROMQL_MAX_POINTS_PER_TIMESERIES.load(Ordering::Relaxed) as usize;
+        cfg.max_samples_per_query = PROMQL_MAX_SAMPLES_PER_QUERY.load(Ordering::Relaxed) as usize;
         cfg.set_lookback_to_step = PROMQL_SET_LOOKBACK_TO_STEP.load(Ordering::Relaxed);
         cfg.optimize_queries = PROMQL_OPTIMIZE_QUERIES.load(Ordering::Relaxed);
         cfg.enable_experimental_functions =
@@ -1667,6 +1692,7 @@ mod tests {
         ("ts-promql-max-query-len", "4096"),
         ("ts-promql-max-response-series", "1000"),
         ("ts-promql-max-points-per-timeseries", "0"),
+        ("ts-promql-max-samples-per-query", "500000"),
         ("ts-promql-lookback-delta", "300000"),
         ("ts-promql-max-lookback", "0"),
         ("ts-promql-max-query-duration", "30000"),

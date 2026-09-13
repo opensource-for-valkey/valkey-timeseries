@@ -8,6 +8,7 @@ mod query_limits;
 pub mod query_reader;
 mod query_stats;
 pub mod query_workers;
+pub mod sample_budget;
 mod selector_batch_executor;
 
 use crate::common::Timestamp;
@@ -42,6 +43,9 @@ pub struct QueryOptions {
     /// The maximum number of data points to return per series for each series. This is to help guard against
     /// OOMs and accidental self-DOS, especially in cluster mode.
     pub max_points_per_series: Option<usize>,
+    /// The maximum number of samples this query may load into memory across
+    /// all its reads (`ts-promql-max-samples-per-query`). 0 = unlimited.
+    pub max_samples: usize,
     /// Enable tracing for the current request
     pub is_tracing: bool,
     /// Enable experimental functions for the current request
@@ -71,6 +75,7 @@ impl Default for QueryOptions {
             } else {
                 None
             },
+            max_samples: config.max_samples_per_query,
             is_tracing: false,
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,

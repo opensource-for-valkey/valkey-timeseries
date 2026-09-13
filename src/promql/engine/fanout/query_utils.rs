@@ -3,7 +3,9 @@ use crate::common::{Sample, Timestamp};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
+use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::query_reader::rollup_fetch_bounds;
+use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
     get_series_range, instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
     validate_max_series,
@@ -120,24 +122,42 @@ pub(super) fn local_rollup_windows(
 
     let series = series_by_selectors(ctx, &[selector], None)?;
 
+    let budget = SampleBudget::new(local_max_samples());
     let candidates = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par_rayon()
         .map(|s| {
+            if budget.exhausted() {
+                return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
+            }
             let samples = s.get_range(start_time, end_time);
+            budget
+                .charge(samples.len())
+                .map_err(|err| err.to_string())?;
             // An empty window contributes nothing, so skip the label conversion
             // for it as well — matched-but-empty series are the common case for
             // a wide selector over a narrow time range.
-            (!samples.is_empty()).then(|| {
+            Ok((!samples.is_empty()).then(|| {
                 let labels = EvalLabels::interned(&s.labels);
                 crate::promql::model::RangeSample { labels, samples }
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .into_fallible_result()
+        .collect::<Vec<_>>()
+        .map_err(valkey_module::ValkeyError::String)?;
 
     bound_windows(candidates, max_series, max_points_per_series)
         .map_err(valkey_module::ValkeyError::String)
+}
+
+/// This node's `ts-promql-max-samples-per-query`, applied to the reads it
+/// performs on another node's behalf.
+fn local_max_samples() -> usize {
+    PROMQL_CONFIG
+        .read()
+        .map(|config| config.max_samples_per_query)
+        .unwrap_or(0)
 }
 
 /// Drop the matched-but-empty series, then apply the query limits to what is
@@ -187,15 +207,25 @@ pub(super) fn handle_range_query(
 ) -> ValkeyResult<RangeQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
     let max_points = points_limit(max_points_per_series);
+    // This shard's own `ts-promql-max-samples-per-query`: the request does not
+    // carry the coordinator's budget, and one node's share of a query should
+    // not exceed what that node would allow a query of its own.
+    let budget = SampleBudget::new(local_max_samples());
     let ranges = series
         .iter()
         .map(|(s, _)| s.deref())
         .iter_into_par_rayon()
         .map(|s| {
+            if budget.exhausted() {
+                return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
+            }
             // `get_series_range` applies the per-series point limit from the chunk headers
             // first, so a shard rejects an over-wide span before decoding it instead of
             // after materializing the whole thing.
             let series_samples = get_series_range(s, start_time, end_time, max_points)?;
+            budget
+                .charge(series_samples.len())
+                .map_err(|err| err.to_string())?;
             if series_samples.is_empty() {
                 return Ok(None);
             }

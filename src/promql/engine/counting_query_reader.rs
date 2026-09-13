@@ -203,6 +203,64 @@ mod tests {
         evaluate_range(reader, stmt, options()).expect("range query should evaluate");
     }
 
+    /// A range query with an explicit sample budget, returning the result
+    /// rather than expecting success.
+    fn try_range(
+        reader: Arc<dyn QueryReader>,
+        query: &str,
+        max_samples: usize,
+    ) -> Result<(), crate::promql::QueryError> {
+        let expr = promql_parser::parser::parse(query).expect("valid test query");
+        let stmt = EvalStmt {
+            expr,
+            start: ms(RANGE_START_MS),
+            end: ms(RANGE_END_MS),
+            interval: STEP,
+            lookback_delta: options().lookback_delta,
+        };
+        let options = QueryOptions {
+            max_samples,
+            ..options()
+        };
+        evaluate_range(reader, stmt, options).map(|_| ())
+    }
+
+    /// The samples one selector's preload loads for the range window: the
+    /// window plus the 5m lookback, at 10s cadence, over three series.
+    const SAMPLES_PER_SELECTOR: usize =
+        3 * ((RANGE_END_MS - (RANGE_START_MS - 300_000)) / INTERVAL_MS) as usize;
+
+    #[test]
+    fn sample_budget_is_query_wide() {
+        let (_, reader) = build_reader();
+        // One selector fits; two do not: the budget sums every read the query makes,
+        // so `a + b` is refused where `a` alone was accepted.
+        let one = SAMPLES_PER_SELECTOR + 10;
+        try_range(reader.clone(), "a", one).expect("a single selector fits the budget");
+        let err = try_range(reader.clone(), "a + b", one).expect_err("two selectors exceed it");
+        assert!(
+            err.to_string().contains("too many samples"),
+            "budget error should name the cause: {err}"
+        );
+        assert!(
+            err.to_string().contains("ts-promql-max-samples-per-query"),
+            "budget error should name the parameter: {err}"
+        );
+        try_range(reader.clone(), "a + b", 2 * one).expect("doubling the budget admits both");
+        try_range(reader, "a + b", 0).expect("0 is unlimited");
+    }
+
+    #[test]
+    fn sample_budget_covers_a_subquerys_reads() {
+        let (_, reader) = build_reader();
+        // The subquery's union grid is preloaded by a sub-evaluator that shares the
+        // outer query's budget, so its read counts against the same total.
+        let err = try_range(reader.clone(), "max_over_time(a[2m:1m])", 10)
+            .expect_err("the subquery's preload is charged to the query");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+        try_range(reader, "max_over_time(a[2m:1m])", 0).expect("unlimited");
+    }
+
     fn run_instant(reader: Arc<dyn QueryReader>, query: &str, at_ms: i64) {
         let expr = promql_parser::parser::parse(query).expect("valid test query");
         let stmt = EvalStmt {

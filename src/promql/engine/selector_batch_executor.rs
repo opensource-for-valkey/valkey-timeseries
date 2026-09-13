@@ -10,6 +10,7 @@ use crate::promql::EvalLabels;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, RollupOutcome, RollupRequest,
 };
+use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, validate_max_samples};
 use crate::promql::engine::{
     AggregationFanoutCommand, InstantVectorParams, InstantVectorSelectorFanoutCommand,
     RangeVectorSelectorFanoutCommand, RollupFanoutCommand, get_snapshot_range,
@@ -669,6 +670,7 @@ fn execute_cluster_range_selector(
 
     let max_series = rc.options.max_series;
     let max_points_per_series = rc.options.max_points_per_series;
+    let max_samples = rc.options.max_samples;
     let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
     let responder = Arc::new(responder);
     let cloned_responder = responder.clone();
@@ -679,6 +681,10 @@ fn execute_cluster_range_selector(
                 let resp = cmd.get_response();
 
                 validate_max_series_(resp.series.len(), max_series).and_then(|_| {
+                    validate_max_samples(
+                        resp.series.iter().map(|rs| rs.samples.len()).sum(),
+                        max_samples,
+                    )?;
                     let mut ranges: Vec<RangeSample<EvalLabels>> =
                         Vec::with_capacity(resp.series.len());
 
@@ -957,10 +963,17 @@ fn decode_range_snapshots(
     options: &QueryOptions,
 ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
     let max_points = options.max_points_per_series;
+    // Exact accounting for this read against the query's sample budget, and an
+    // early stop: once it is spent, the remaining series are not decoded at all,
+    // so the overshoot is at most one series per pool thread.
+    let budget = SampleBudget::new(options.max_samples);
     let ranges = series
         .into_par()
         .with_pool(RayonPool(&MATERIALIZE_POOL))
         .filter_map(|(labels, snapshot)| {
+            if budget.exhausted() {
+                return Some(Err(too_many_samples(budget.loaded(), budget.limit())));
+            }
             let samples = match get_snapshot_range(&snapshot, max_points) {
                 Ok(samples) => samples,
                 Err(err) => {
@@ -968,6 +981,9 @@ fn decode_range_snapshots(
                     return Some(Err(QueryError::Execution(err)));
                 }
             };
+            if let Err(err) = budget.charge(samples.len()) {
+                return Some(Err(err));
+            }
             if samples.is_empty() {
                 return None;
             }

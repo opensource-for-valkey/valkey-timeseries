@@ -273,6 +273,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-promql-max-query-len',
             'ts-promql-max-response-series',
             'ts-promql-max-points-per-timeseries',
+            'ts-promql-max-samples-per-query',
             'ts-promql-lookback-delta',
             'ts-promql-max-lookback',
             'ts-promql-max-query-duration',

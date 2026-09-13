@@ -10,6 +10,7 @@ use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationParam, AggregationRequest, RollupAggregation, RollupOutcome,
     RollupRequest,
 };
+use crate::promql::engine::sample_budget::SampleBudget;
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::exec::pipeline::{
     QueryPlan, compute_subquery_alignment, execute_selector_pipeline, for_each_step_sample,
@@ -30,6 +31,7 @@ use crate::promql::functions::{
 };
 use crate::promql::hashers::{AggregationKey, MatrixPreloadKey, PreloadKey, RollupPreloadKey};
 use crate::promql::model::EvalContext;
+use crate::promql::model::RangeSample;
 use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
@@ -71,6 +73,20 @@ pub(crate) struct PreparedQuery {
     preloaded_rollups: Arc<RwLock<RollupPreloadMap>>,
     preloaded_matrices: Arc<RwLock<MatrixPreloadMap>>,
     preloaded_subqueries: Arc<RwLock<SubqueryPreloadMap>>,
+    /// The query's sample budget, shared by the preload phase, the step loop and
+    /// every sub-evaluator, so it counts the whole query.
+    budget: Arc<SampleBudget>,
+}
+
+impl PreparedQuery {
+    /// Empty maps that account against an existing budget: what a sub-evaluator
+    /// starts from when its union preload was declined.
+    pub(crate) fn sharing(budget: Arc<SampleBudget>) -> Self {
+        Self {
+            budget,
+            ..Default::default()
+        }
+    }
 }
 
 /// One subquery's evaluator, prepared for the union of every outer step's
@@ -113,12 +129,19 @@ pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
     /// before the step loop; a subquery absent here prepares its own grid when
     /// evaluated (an instant query, or a preload that hit a reader limit).
     preloaded_subqueries: Arc<RwLock<SubqueryPreloadMap>>,
+    /// Samples loaded so far on behalf of the whole query; see
+    /// [`crate::promql::engine::sample_budget`].
+    budget: Arc<SampleBudget>,
     options: QueryOptions,
 }
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     pub(crate) fn new(reader: &'reader R, options: QueryOptions) -> Self {
-        Self::with_prepared(reader, options, PreparedQuery::default())
+        Self::with_prepared(
+            reader,
+            options,
+            PreparedQuery::sharing(Arc::new(SampleBudget::new(options.max_samples))),
+        )
     }
 
     pub(crate) fn with_prepared(
@@ -132,6 +155,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_rollups: prepared.preloaded_rollups,
             preloaded_matrices: prepared.preloaded_matrices,
             preloaded_subqueries: prepared.preloaded_subqueries,
+            budget: prepared.budget,
             options,
         }
     }
@@ -150,6 +174,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_rollups: Arc::clone(&prepared.preloaded_rollups),
             preloaded_matrices: Arc::clone(&prepared.preloaded_matrices),
             preloaded_subqueries: Arc::clone(&prepared.preloaded_subqueries),
+            budget: Arc::clone(&prepared.budget),
             options,
         }
     }
@@ -160,6 +185,28 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_rollups: self.preloaded_rollups,
             preloaded_matrices: self.preloaded_matrices,
             preloaded_subqueries: self.preloaded_subqueries,
+            budget: self.budget,
+        }
+    }
+
+    /// Count `samples` against the query's budget; fails the query once the
+    /// total it has loaded passes `ts-promql-max-samples-per-query`.
+    fn charge_samples(&self, samples: usize) -> EvalResult<()> {
+        Ok(self.budget.charge(samples)?)
+    }
+
+    fn charge_range_samples(&self, series: &[RangeSample<EvalLabels>]) -> EvalResult<()> {
+        self.charge_samples(series.iter().map(|s| s.samples.len()).sum())
+    }
+
+    /// Charge what a live (non-preloaded) selector read materialized.
+    fn charge_result(&self, result: &ExprResult) -> EvalResult<()> {
+        match result {
+            ExprResult::InstantVector(samples) => self.charge_samples(samples.len()),
+            ExprResult::RangeVector(series) => {
+                self.charge_samples(series.iter().map(|s| s.values.len()).sum())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -272,7 +319,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 lookback_delta_ms: grid.lookback_delta_ms,
             };
             let plan = PlannedQuery::for_grid(&subquery.expr, union);
-            match Preloader::new(self.reader, self.options).prepare(plan) {
+            match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
+                .prepare(plan)
+            {
                 Ok(prepared) => {
                     self.preloaded_subqueries
                         .write()
@@ -426,8 +475,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
             .map(|(key, matrix)| -> EvalResult<()> {
                 self.check_deadline()?;
-                self.preload_matrix(key, matrix, grid);
-                Ok(())
+                self.preload_matrix(key, matrix, grid)
             })
             .into_fallible_result()
             .collect()?;
@@ -443,10 +491,15 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// unpreloaded behavior exactly, including its per-window limit checks. A
     /// span that exceeds the reader's limits therefore downgrades the query to
     /// the per-step path instead of failing it.
-    fn preload_matrix(&self, key: MatrixPreloadKey, matrix: &MatrixSelector, grid: &PreloadGrid) {
+    fn preload_matrix(
+        &self,
+        key: MatrixPreloadKey,
+        matrix: &MatrixSelector,
+        grid: &PreloadGrid,
+    ) -> EvalResult<()> {
         let window_ends = self.resolved_window_ends(&matrix.vs, grid);
         let (Some(&first), Some(&last)) = (window_ends.first(), window_ends.last()) else {
-            return;
+            return Ok(());
         };
         let range_ms = matrix_range_ms(matrix);
         // Windows are half-open — `(end - range, end]` — against an
@@ -460,6 +513,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .query_range(&matrix.vs, start_ms, last, self.options)
         {
             Ok(series) => {
+                // Over budget is a query failure, not a declined preload: the
+                // budget is query-wide and already exceeded, so per-step reads
+                // would only be refused one by one.
+                self.charge_range_samples(&series)?;
                 let series = series
                     .into_iter()
                     .map(|s| PreloadedMatrixSeries {
@@ -472,6 +529,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .unwrap()
                     .insert(key, PreloadedMatrixData { series });
             }
+            Err(err @ QueryError::TooManySamples { .. }) => return Err(err.into()),
             Err(err) => {
                 tracing::debug!(
                     error = %err,
@@ -479,6 +537,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 );
             }
         }
+        Ok(())
     }
 
     /// The window ends of `grid` for `vs` — one per step, in step order, with
@@ -587,8 +646,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             RollupOutcome::Unsupported => return Ok(()),
             RollupOutcome::Rolled(series) => series,
             RollupOutcome::Reduced(series) => request.group(series),
-            RollupOutcome::Raw(series) => request.reduce_and_group(series),
+            RollupOutcome::Raw(series) => {
+                // The raw windows are what was loaded; charge them before the
+                // reduction turns them into one point per step.
+                self.charge_range_samples(&series)?;
+                request.reduce_and_group(series)
+            }
         };
+        self.charge_range_samples(&rolled)?;
 
         // Scatter each series' sparse `(window end, value)` pairs onto the step
         // grid. Both are ascending, so one merge walk places every point: with
@@ -757,6 +822,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let range_samples = self
             .reader
             .query_range(vs, earliest_ms, latest_ms, self.options)?;
+        self.charge_range_samples(&range_samples)?;
         Ok(range_samples
             .into_iter()
             .map(|rs| (rs.labels, rs.samples))
@@ -915,7 +981,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         let plan = QueryPlan::for_matrix(adjusted_eval_ts, range_ms);
 
-        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
+        let result = execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)?;
+        self.charge_result(&result)?;
+        Ok(result)
     }
 
     pub(super) fn evaluate_subquery(
@@ -1013,23 +1081,26 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let grid =
                     PreloadGrid::for_subquery(aligned_start_ms, subquery_end_ms, step_ms, ctx);
                 let sub_plan = PlannedQuery::for_grid(&subquery.expr, grid);
-                let prepared = match Preloader::new(self.reader, self.options).prepare(sub_plan) {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        // A deadline means the query is over; more work cannot help.
-                        if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
-                            return Err(err);
+                let prepared =
+                    match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
+                        .prepare(sub_plan)
+                    {
+                        Ok(prepared) => prepared,
+                        Err(err) => {
+                            // A deadline means the query is over; more work cannot help.
+                            if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
+                                return Err(err);
+                            }
+                            // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
+                            // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
+                            // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
+                            tracing::debug!(
+                                error = %err,
+                                "subquery preload failed; falling back to per-step evaluation"
+                            );
+                            PreparedQuery::sharing(Arc::clone(&self.budget))
                         }
-                        // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
-                        // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
-                        // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
-                        tracing::debug!(
-                            error = %err,
-                            "subquery preload failed; falling back to per-step evaluation"
-                        );
-                        PreparedQuery::default()
-                    }
-                };
+                    };
                 Evaluator::with_prepared(self.reader, self.options, prepared)
             }
         };
@@ -1096,7 +1167,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             step_ms,
             lookback_delta_ms,
         );
-        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
+        let result = execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)?;
+        self.charge_result(&result)?;
+        Ok(result)
     }
 
     pub(super) fn evaluate_vector_selector(
@@ -1147,7 +1220,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // onto the options before calling QueryReader::query.
         let plan = QueryPlan::for_instant_vector(adjusted_eval_ts, ctx.lookback_delta_ms);
 
-        execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)
+        let result = execute_selector_pipeline(self.reader, &plan, vector_selector, self.options)?;
+        self.charge_result(&result)?;
+        Ok(result)
     }
 
     /// Evaluate the subquery's inner expression at one of its steps.
@@ -1698,7 +1773,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // Each of these did less than was asked; make up exactly the
             // difference, with the same kernels a shard would have used.
             RollupOutcome::Reduced(series) => request.group(series),
-            RollupOutcome::Raw(series) => request.reduce_and_group(series),
+            RollupOutcome::Raw(series) => {
+                self.charge_range_samples(&series)?;
+                request.reduce_and_group(series)
+            }
         };
 
         let samples = grouped

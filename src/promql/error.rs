@@ -21,6 +21,15 @@ pub enum QueryError {
     /// An error occurred during query execution.
     #[error("execution error: {0}")]
     Execution(String),
+
+    /// The query would load more samples than `ts-promql-max-samples-per-query`
+    /// allows. Its own variant so that a preload can tell it from a reader
+    /// limit that legitimately degrades to per-step reads: this one is
+    /// query-wide and already exceeded, so the query fails at once.
+    #[error(
+        "query processing would load too many samples into memory: {loaded} > {limit} (ts-promql-max-samples-per-query)"
+    )]
+    TooManySamples { loaded: usize, limit: usize },
 }
 
 impl From<EvaluationError> for QueryError {

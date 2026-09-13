@@ -26,6 +26,10 @@ pub struct PromqlConfig {
     /// The maximum number of points that a query can generate.
     pub max_points_per_timeseries: usize,
 
+    /// The maximum number of samples one query may load across all its reads
+    /// (Prometheus' `--query.max-samples`). 0 = unlimited.
+    pub max_samples_per_query: usize,
+
     /// The maximum number of unique time series to be returned from instant or range queries
     /// This option allows limiting memory usage
     pub max_response_series: usize,
@@ -74,6 +78,7 @@ impl Default for PromqlConfig {
             lookback_delta: Duration::from_millis(DEFAULT_LOOKBACK_DELTA_MS),
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             max_points_per_timeseries: 0,
+            max_samples_per_query: crate::config::PROMQL_MAX_SAMPLES_PER_QUERY_DEFAULT as usize,
             max_response_series: DEFAULT_MAX_UNIQUE_TIMESERIES,
             max_lookback: Duration::ZERO,
             set_lookback_to_step: false,
