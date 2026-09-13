@@ -1,458 +1,151 @@
-# AGENTS: Guidance for AI coding agents
+# AGENTS.md
 
-Purpose
+Instructions for AI coding agents working in this repo. Keep this file concise — it's loaded into
+every session, so prune anything an agent can discover by reading the code, and keep the "gotchas"
+that would otherwise cost a wasted turn.
 
-- Short, focused instructions to help an AI model become productive in this codebase quickly.
-
-## ⚠️ Clean-room rule (read before touching compatibility work)
+## IMPORTANT: clean-room rule
 
 This repo is Apache-2.0. RedisTimeSeries — **including its test suite** — is RSALv2/SSPLv1/AGPLv3,
-which is incompatible with that license.
+incompatible with that license.
 
-**Do not consult, fetch, vendor, copy, or port RedisTimeSeries source or test code**, and do not
-reproduce it from memory. Compatibility behavior must be derived only from public command
-documentation and black-box observation of a running reference server. Running the pinned
-`redis:8.10` image as a test target is fine; its source is off-limits. See
-[tests/compat/README.md](tests/compat/README.md).
+**You MUST NOT consult, fetch, vendor, copy, or port RedisTimeSeries source or test code**, and must
+not reproduce it from memory. Derive compatibility behavior only from public command documentation
+and black-box observation of a running reference server. Running the pinned `redis:8.10` image as a
+test target is fine; its source is off-limits. Details: [tests/compat/README.md](tests/compat/README.md).
 
-Quick start (commands you can run)
+## Common commands
 
-- Prerequisites: a Rust toolchain, and nothing else. In particular **`protoc` is not required**:
-  `build.rs` parses `proto/v1/*.proto` with [`protox`](https://docs.rs/protox), a pure-Rust
-  protobuf compiler, precisely so the build needs no external toolchain. This holds for
-  regeneration too (`VALKEY_TS_PROTO_REGEN=1`), which goes through the same path. No CI job
-  installs a protobuf compiler — if you find yourself adding one to fix a build, the problem is
-  something else.
-- If `build.rs` fails saying the generated file `is missing` or `is out of date`, that is a
-  *schema drift* error, not a missing-toolchain error: the fix is
-  `VALKEY_TS_PROTO_REGEN=1 cargo build` plus committing the result. Installing `protoc` will not
-  help. See the protobuf-codegen note under "Quick tips for code changes".
-- Editing a `.proto` does mean one external tool, but only in CI: `buf lint` runs against the
-  `proto/` module (`buf.yaml`, `STANDARD` minus `PACKAGE_DIRECTORY_MATCH`). Install
-  [`buf`](https://buf.build) to check it locally; a lint failure there is separate from the
-  codegen-drift failure above.
-- Build + checks (mirrors CI):
-  `cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release`
-- Local dev script (recommended):
-    - `SERVER_VERSION=unstable ./build.sh`  # builds module, builds valkey-server, runs unit & integration tests
-      (`tests/compat` is excluded — see below)
-    - To run ASAN integration pass: `ASAN_BUILD=true SERVER_VERSION=unstable ./build.sh`
-    - Run a subset of Python integration tests: `TEST_PATTERN="test_ts_add" SERVER_VERSION=unstable ./build.sh`
-    - Include the compatibility suite: `RTS_COMPAT=1 SERVER_VERSION=unstable ./build.sh`
-    - Run the integration tests in parallel: `SERVER_VERSION=unstable ./build.sh --parallel`
-      (or `-j8` for a fixed worker count). Serial is the default.
-- Benchmarks: `cargo bench --features enable-system-alloc` (see Benchmarks below — the feature is mandatory).
-- Compression report: `tools/compression_report.sh` (add `--check` to fail on regressions against a saved baseline).
-- Latency report: `tools/latency_report.sh`. Wire-payload report: `tools/wire_report.sh` (see Benchmarks below).
-- Compatibility fuzzer: `./fuzz.sh` (installs deps, builds, starts both servers, runs the fuzzer;
-  `--help` for options — see Fuzzing below).
+Prerequisites: a Rust toolchain (edition 2024, MSRV 1.96) and nothing else — `protoc` is **not**
+required (`build.rs` uses the pure-Rust [`protox`](https://docs.rs/protox) compiler, including for
+regeneration via `VALKEY_TS_PROTO_REGEN=1`). If a `.proto` edit needs `buf lint` locally, install
+[`buf`](https://buf.build); that's a separate, CI-only check from codegen drift.
 
-Key ENV and behavior (from `./build.sh`)
+```sh
+# Build + lint (mirrors CI)
+cargo fmt --check && cargo clippy --profile release --all-targets -- -D clippy::all \
+  && RUSTFLAGS="-D warnings" cargo build --all --all-targets --release
 
-- `SERVER_VERSION` (required): controls which valkey-server is cloned/built and stored at
-  `tests/build/binaries/$SERVER_VERSION/valkey-server`. Defaults to `unstable` if not set, which tracks the latest main or branch.
-- `ASAN_BUILD`: when set runs tests with LeakSanitizer checks and fails on leaks.
-- `TEST_PATTERN`: passed to pytest `-k` to select tests.
-- `PARALLEL_WORKERS` (equivalently `--parallel[=N]` / `-j[=N]`): number of pytest-xdist workers for the
-  integration phase. `auto` means one per core capped at 32; `0` and `1` both mean serial, which is the
-  default. Each worker gets its own port band and its own `test-data/<worker>` directory
-  (`tests/conftest.py`), so tests do not need to know they are sharing a machine. Two phases ignore this
-  knob on purpose: the compatibility suite always runs serially because its fixtures share one reference
-  server on a fixed port, and the ASAN job stays serial because its leak attribution depends on ordered
-  pytest output. See `docs/plans/parallel-integration-tests-plan.md`.
-- `CLUSTER_MEET_TIMEOUT`: seconds to wait for cluster formation in cluster tests (default 60). Raise it on a
-  slow or heavily loaded runner rather than lowering the worker count.
-- `RTS_COMPAT=1` / `COMPAT_REFERENCE_URL` (or the `./build.sh compat` argument): any of them adds a second
-  pytest phase that runs the differential compatibility suite. Unset (the default), `build.sh` never collects
-  `tests/compat`, because those tests need a live RedisTimeSeries reference server. In compat mode `build.sh`
-  provisions, starts and *validates* the reference itself before pytest (`tests/reference_server.sh`), so a
-  missing tool or a pin mismatch fails the build instead of reaching conftest's skip path.
-  `ASAN_BUILD` and compat mode are rejected in combination. See
-  `docs/rts-compat-build-integration-plan.md`.
-- `MODULE_PATH` exported after build: `target/release/libvalkey_timeseries{.so,.dylib}` depending on OS.
+# Local dev flow (recommended) — builds module + valkey-server, runs unit & integration tests
+SERVER_VERSION=unstable ./build.sh
+TEST_PATTERN="test_ts_add" SERVER_VERSION=unstable ./build.sh   # subset
+RTS_COMPAT=1 SERVER_VERSION=unstable ./build.sh                 # + compat suite
+ASAN_BUILD=true SERVER_VERSION=unstable ./build.sh              # ASAN pass
+SERVER_VERSION=unstable ./build.sh --parallel=auto              # parallel integration tests (serial default)
 
-Setup & Environment Notes
+# Unit / doc tests
+cargo test --features enable-system-alloc
+cargo test --doc --features enable-system-alloc
 
-- Rust: edition 2024, minimum supported version `1.96`.
-- **After pulling or switching branches, always rebuild the module.** The module binary
-  (`target/release/libvalkey_timeseries.{so,dylib}`) is not tracked in git and can be stale
-  after source changes — e.g. new config parameters or commands won't be registered, causing
-  opaque failures like `CONFIG GET` returning empty or `fuzz.sh` reporting
-  "could not set ts-compatibility-mode=strict (is the module loaded?)". Run
-  `cargo build --release` or `./build.sh` after any checkout that pulls new commits.
-- Python tests: Integration tests use Python. Dependencies are in `requirements.txt` (or via `uv sync`). The `build.sh`
-  script handles this, but if running `pytest` manually, ensure packages are installed.
-- Running manually: To manually start a server with the module loaded, run
-  `valkey-server --loadmodule ./target/release/libvalkey_timeseries.so` (requires building the module first).
+# Benchmarks & reports (--help on each script for flags)
+cargo bench --features enable-system-alloc
+tools/compression_report.sh [--check|--save-baseline]
+tools/latency_report.sh
+tools/wire_report.sh
 
-High-level architecture (big picture)
+# Compatibility fuzzer (needs Docker; strict mode required for a soak — see Warnings below)
+./fuzz.sh --examples 20000 --duration 20m --stats
+```
 
-- This is a Valkey module (Rust crate) exposing TS.* commands to the Valkey server via the `valkey_module!` macro (
-  `src/lib.rs`).
-- Command implementations live in `src/commands/*` and are registered in `src/lib.rs` with a one-to-one mapping to
-  Valkey commands. Example:
-    - `["TS.ADD", commands::ts_add_cmd, "write deny-oom", 1, 1, 1, "write timeseries"]`
-- Time-series core lives under `src/series` (storage, chunk encodings, compaction, background tasks, indexes,
-  serialization). Init helpers invoked from `src/lib.rs`: `init_croaring_allocator()`, `init_thread_pool()`,
-  `init_background_tasks()`, and `init_fanout()` when clustered.
-  - `src/series/chunks/` implements three encoding formats: **Chimp** (ELF-on-Chimp, default),
-    **Gorilla**, **Uncompressed**. The default is controlled by `DEFAULT_CHUNK_ENCODING` in `src/config.rs`.
-    Storage encoding is the user's choice; the encoding used for cluster *wire* payloads is a separate, internal policy —
-    see "Wire encoding policy" under conventions below.
-  - ACL filtering per series: `src/series/acl.rs`.
-- Cross-node fanout / clustering patterns: `src/fanout` and `src/commands/*_fanout_command.rs` use the protobuf wire
-  contract in `proto/v1/` and explicit fanout registration (`register_fanout_operations`) to implement
-  cluster-wide queries.
-- Beyond the RedisTimeSeries surface, the module ships extensions: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` and the
-  statistical machinery behind it (`src/analysis/` — outliers, seasonality, quantile estimators; see
-  `src/analysis/README.md`), `TS.ADDBULK`, `TS.LABELSTATS`, `TS.METRICNAMES`, `TS.MDEL`, and Prometheus-style
-  selector syntax (`src/parser/`, `docs/topics/filter-syntax.md`).
-- Outlier detection: `src/analysis/outliers/` — multiple algorithms (ESD, CUSUM, EWMA, IQR, MAD, modified z-score, RCF
-  variants) exposed via the `TS.OUTLIERS` command.
-- Aggregation: `src/aggregators/` — aggregation handlers and iterators used by range queries.
-- Supporting subsystems (all referenced from `src/lib.rs`):
-  - `src/common/` — shared utilities: encoding, logging, thread pool, RDB helpers, string interning.
-  - `src/labels/` — `Label` type, label filter evaluation, regex helpers.
-  - `src/parser/` — Prometheus-compatible filter syntax, metric name, timestamp, and duration parsing.
-  - `src/iterators/` — sample and row iterators consumed by range and multi-range queries.
-  - `src/join/` — ASOF join logic backing `TS.JOIN`.
+Key `./build.sh` env vars: `SERVER_VERSION` (required: `unstable`/`8.0`/`8.1`), `ASAN_BUILD`,
+`TEST_PATTERN` (pytest `-k`), `PARALLEL_WORKERS`/`--parallel[=N]` (integration phase only — the
+compat suite and ASAN job always run serially), `CLUSTER_MEET_TIMEOUT`, `RTS_COMPAT=1` (adds the
+compat phase; mutually exclusive with `ASAN_BUILD`). `MODULE_PATH` is exported after build.
 
-Project-specific conventions and patterns
+## Architecture
 
-- All Valkey commands are declared in the `valkey_module!` macro in `src/lib.rs`; change there to add/remove commands.
-- Command files follow `ts_<command>.rs` naming and export `ts_<command>_cmd` functions (see `src/commands/mod.rs`).
-- Fanout pattern: synchronous local implementation + `*_fanout_command.rs` files which marshal/unmarshal protobuf
-  messages for cluster aggregation. Seven operations are currently registered (see `register_fanout_operations` in
-  `src/commands/mod.rs`): `LabelStatsFanoutCommand`, `CardFanoutCommand`, `LabelSearchFanoutCommand`,
-  `MDelFanoutCommand`, `MGetFanoutCommand`, `MRangeFanoutCommand`, `QueryIndexFanoutCommand`.
-- Wire encoding policy: `samples_to_chunk` / `samples_to_chunk_lossless` in `src/series/chunks/serialization.rs` are the
-  **single** decision point for how samples are encoded onto the cluster wire. Two tiers, keyed on sample count:
-  below `WIRE_COMPRESSION_MIN_SAMPLES` (16) an `UncompressedChunk`, at or above it a `ChimpChunk`. Do not add a third
-  tier or hand-roll an encoding at a call site — both were true before and neither survived measurement (see the wire
-  report below): Chimp is smaller than Gorilla from ~12 samples up and cheaper to decode from ~16, so Gorilla has no
-  window where it wins, and below ~12 every compressed encoding can produce a payload *larger* than the raw samples.
-  Two things about this are easy to get wrong:
-    - **Only data that actually crosses the network is compressed.** `handle_grouping` in `src/series/mrange.rs` runs
-      solely on the node answering the client (`process_mrange` returns early when clustered), so it builds uncompressed
-      chunks; compressing there would only be undone by the reply serializer. The clustered branch of
-      `handle_non_grouped`, and `serialize_rows` in `src/commands/fanout_codec/chunks.rs`, are the paths that do compress.
-    - **`max_size` is advisory on this path.** Neither `ChimpChunk` nor `GorillaChunk` enforces it in `add_sample` (the
-      check is commented out in `gorilla_chunk.rs`), and the fan-out path never calls `is_full()`, so passing a
-      `with_max_size(...)` budget there truncates nothing — it only widens the uvarint `max_size` occupies on the wire.
-      Use `default()`.
-  Chimp encoding is ~1.4x slower than Gorilla but decodes ~12% faster, which is the right way round for fan-out: shards
-  encode their own slice in parallel while the coordinator decodes every shard's response serially.
-- Initialization sequence (inside `initialize()` in `src/lib.rs`): `init_croaring_allocator` → `register_config` →
-  `init_fanout` + `register_fanout_operations` (cluster only) → `register_server_events` → `init_thread_pool` →
-  `init_background_tasks`.
-- Minimum supported Valkey server version: `[8, 0, 0]` (enforced in `preload()` via
-  `config::TIMESERIES_MIN_SUPPORTED_VERSION`).
+Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src/lib.rs`.
 
-- Allocator in tests: always pass `--features enable-system-alloc` when running anything that links the crate outside a
-  live server (unit tests, doc tests, benches, `tools/` binaries). The `get_allocator!` macro in `src/lib.rs` is gated on
-  `#[cfg(not(all(test, doctest)))]`, which does **not** fire for an ordinary `cargo test`, so without the feature the
-  binary aborts at startup with `Critical error: the Valkey Allocator isn't available`. `build.sh` passes it for you.
+- `src/commands/` — one `ts_<name>.rs` file per command, exporting `ts_<name>_cmd`. Almost all are
+  registered via `#[valkey_module_macros::command({...})]` on the handler, picked up by
+  `register_commands`. Only `ts._debug` and `ts._restore` (internal/admin, undocumented) sit in the
+  positional `commands:` table in `src/lib.rs` instead — see Conventions below for why.
+- `src/series/` — storage, chunk encodings, compaction, background tasks, indexes, serialization.
+  - `chunks/`: three encodings — **Chimp** (default), **Gorilla**, **Uncompressed**
+    (`DEFAULT_CHUNK_ENCODING` in `src/config.rs`). Storage encoding is a user choice; cluster *wire*
+    encoding is a separate, internal policy (see Conventions below).
+  - Per-series ACL filtering: `acl.rs`.
+- `src/fanout/` + `src/commands/*_fanout_command.rs` — cluster fanout over the protobuf contract in
+  `proto/v1/`, registered via `register_fanout_operations` (8 ops: LabelStats, Card, LabelSearch,
+  MDel, MGet, MRange, QueryIndex, QueryLabels).
+  - `cluster_migrations.rs` — atomic slot migration (ASM, Valkey 9.0+) tracking. During an ASM the
+    source node's forked `aof_rewrite` child can't take the module GIL, so it serializes via
+    `rdb_save` and emits the internal `TS._RESTORE key <blob>` command instead of `DUMP`/normal
+    commands; the destination replays it like a replication feed (`src/commands/ts_restore.rs`).
+    Indexing is deferred mid-import (`src/series/index/server_events.rs`).
+- Other command surfaces beyond RTS: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` + statistical machinery
+  (`src/analysis/` — ESD/CUSUM/EWMA/IQR/MAD/z-score/RCF), `TS.ADDBULK`, `TS.LABELSTATS`,
+  `TS.METRICNAMES`, `TS.MDEL`, Prometheus-style selectors (`src/parser/`).
+- Supporting: `src/aggregators/` (range-query aggregation), `src/common/` (encoding, logging, thread
+  pools, RDB, interning), `src/labels/`, `src/iterators/`, `src/server_events.rs` (keyspace event →
+  index sync for FLUSHDB/SWAPDB/RENAME/RESTORE/load).
 
-Cargo features
+## Conventions
 
-- `default` = `min-valkey-compatibility-version-8-0` + `croaring/alloc`.
-- `enable-system-alloc` — see the allocator note above; required for tests, benches and `tools/` binaries.
-- `min-valkey-compatibility-version-8-0` — forwarded to `valkey-module`.
-- `use-redismodule-api` — empty on purpose; the Redis module API is not supported.
-- `test-utils` — compiles `src/tests/` (data generators, chunk helpers) into the library so benches and
-  `tools/` binaries can use the same fixtures as unit tests. It is enabled automatically for dev targets by a
-  **self dev-dependency** (`valkey-timeseries = { path = ".", features = ["test-utils"] }` in `[dev-dependencies]`),
-  so `cargo test`, `cargo bench` and any `--all-targets` build get it without extra flags. A `[[bin]]` does not pull in
-  dev-dependencies, so `cargo run --bin compression_report` must name the feature explicitly — cargo otherwise refuses
-  with `target requires the features: test-utils`. Note that in an `--all-targets` build the feature is unified into the
-  library build too, so the `.so`/`.dylib` produced by `build.sh` contains the (unreachable) fixture code; a plain
-  `cargo build --release` does not.
+- Commit messages follow Conventional Commits: `type(scope): summary` (e.g. `refactor(threads): ...`,
+  `fix(series): ...`).
+- **Command registration is two-part and both parts are enforced at compile/test time.** A handler
+  gets `#[valkey_module_macros::command({...})]`, but that attribute sets no ACL categories — so each
+  handler also needs an `acl_categories!(IDENT, "ts.name", "cats")` declaration immediately above it
+  (`src/commands/mod.rs`). These feed a `linkme::distributed_slice` (`COMMAND_ACL_CATEGORIES`) that
+  `assign_command_acl_categories` applies at load time, **aborting the module load** on an unknown
+  name/category. A test (`every_annotated_command_declares_acl_categories`) pins the two counts to
+  match, so a handler missing its declaration fails `cargo test`. `ts._debug`/`ts._restore` are the
+  only exceptions — registered positionally in `valkey_module!`, which sets their categories directly.
+- Wire encoding for cluster fan-out is decided in exactly one place — `samples_to_chunk[_lossless]`
+  in `src/series/chunks/serialization.rs` (below `WIRE_COMPRESSION_MIN_SAMPLES`=16 samples:
+  uncompressed; at/above: Chimp). Don't hand-roll encoding at a call site or add a third tier —
+  both were tried and didn't survive measurement (see `tools/wire_report.sh`). `max_size` is
+  advisory on this path (neither chunk type enforces it in `add_sample`, and fan-out never checks
+  `is_full()`) — use `default()`.
+- After editing a `.proto`: run `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file
+  under `proto/v1/generated/` — a normal build fails loudly if they disagree, so drift can't land
+  silently.
+- Behavior changes on the shared RTS surface: check against `tests/compat`, and if the difference is
+  deliberate, record it in [COMPATIBILITY.md](COMPATIBILITY.md) and/or `tests/compat/divergences.yml`
+  (behavior-kind entries need explicit PR sign-off).
+- When adding/changing a command, update `docs/COMMANDS.md`, `docs/commands/`, `docs/overview.md`,
+  and `README.md` (skip this for `TS._DEBUG`/`TS._RESTORE` — intentionally undocumented internals).
 
-Compatibility with RedisTimeSeries
+## Testing
 
-- [COMPATIBILITY.md](COMPATIBILITY.md) is the contract: what is expected to match RTS 8.10, what is an intentional
-  divergence, and what is explicitly a non-goal (RDB/AOF/replication byte formats, error message text, performance,
-  internals). Read it before "fixing" a behavior difference — some are deliberate.
-  [docs/topics/redistimeseries-migration.md](docs/topics/redistimeseries-migration.md) is the end-user-facing
-  digest of the same material (what carries over, what to change, the migration checklist); keep the two in sync
-  when the contract moves — the contract is the source of truth, the topic doc is derived.
-- [docs/plans/rts-compatibility-test-plan.md](docs/plans/rts-compatibility-test-plan.md) is the plan the harness implements;
-  its section numbers (§5.1 normalization, §5.2 error policy, §5.3 registry, §6 matrix, §7 operational parity)
-  are referenced throughout the test code.
-- `tests/compat/` is the differential harness. Each test uses a `diff` fixture that sends every command to both the
-  subject (valkey-server + this module) and the reference (pinned `redis:8.10`), normalizes both replies, and asserts
-  equality — automatically parametrized over RESP2 and RESP3.
-- Intentional mismatches go in `tests/compat/divergences.yml` and report as XFAIL-DIVERGENT rather than failing.
-  "Reference errors, subject succeeds" always hard-fails and cannot be registered away. Stale entries hide
-  regressions — remove entries that stop firing.
-- The reference server lifecycle lives in one place: [tests/reference_server.sh](tests/reference_server.sh),
-  sourced by both `build.sh` and `fuzz.sh`. It exposes `compat_reference_provision` / `_start` / `_stop`,
-  installs **no traps** (the caller owns teardown and reads `COMPAT_REFERENCE_OWNED` to know what it started),
-  and validates on every start that the reference reports the pinned `redis_version` and `timeseries` module
-  version — a mismatch aborts rather than silently reinterpreting the registry.
-- The digest-pinned `redis:8.10` image is the canonical reference artifact. A secondary native-binary mode
-  (`COMPAT_REFERENCE_MODE=binary`, Linux-only, pinned deb + SHA256 table in the helper) exists but is **not**
-  selected by `auto` until an equivalence run against the image is recorded in
-  [docs/plans/rts-reference-bumps.md](docs/plans/rts-reference-bumps.md). Bump the image digest and the binary pin in the
-  same reviewed change. Design and rationale: `docs/rts-compat-build-integration-plan.md`.
-- Docker is still required for the whole suite even in binary mode: `test_compat_replication.py` starts its
-  reference replica with `docker run` regardless of how the primary was obtained, and skips when it cannot.
-  `COMPAT_STRICT_SKIPS=1` (set by `./build.sh compat`) turns that skip into a failure so replication coverage
-  cannot vanish silently.
+- Unit/doc tests: `cargo test [--doc] --features enable-system-alloc`. Use `DataGenerator`
+  (`crate::tests::generators`) for fixtures rather than hand-rolled loops.
+- Integration: Python pytest under `tests/` (`test_ts_*.py`, `*_cme.py` = cluster-mode variants),
+  driven by `./build.sh`.
+- Compatibility harness (`tests/compat/`): diffs every reply against a pinned `redis:8.10` reference
+  server, RESP2 + RESP3. Excluded from a plain `./build.sh`; opt in with `RTS_COMPAT=1` or
+  `./build.sh compat`. Intentional mismatches go in `divergences.yml` as XFAIL-DIVERGENT — "reference
+  errors, subject succeeds" always hard-fails and can't be registered away.
+- Fuzzer (`tests/compat/test_compat_fuzz.py`, Hypothesis-driven): opt-in, not in the PR gate. Prefer
+  `./fuzz.sh`; promote any shrunk failure into `tests/compat/corpus/<slug>.json` so it becomes a
+  deterministic regression test (`test_compat_corpus.py`) in the same change as the fix.
 
-Testing & debugging notes
+## Warnings / gotchas
 
-- Unit tests: `cargo test --features enable-system-alloc`.
-- Doc tests: `cargo test --doc --features enable-system-alloc`.
-- Test fixtures: build sample data with `DataGenerator` (`src/tests/generators/`, imported as
-  `crate::tests::generators::{DataGenerator, ValueWorkload, TimestampModel}`) rather than hand-rolling loops:
-  `DataGenerator::builder().start(ts).samples(n).seed(s).algorithm(ValueWorkload::Drift).build().generate()`.
-  `ValueWorkload` covers the four range-bounded random generators (`Uniform`, `StdNorm`, `MackeyGlass`, `Deriv`, which
-  honour `.values(range)`) plus twelve absolute-valued shapes (`Constant`, `ConstantInt`, `Drift`, `Periodic`, `Noisy`,
-  `Bursty`, `Counter`, `Discrete`, and the decimal-quantized variants `DriftQuantized`, `PeriodicQuantized`,
-  `NoisyQuantized`, `BurstyQuantized` — same seeded values rounded to two decimals, see `quantized()`/`is_quantized()`;
-  all of them ignore the range — see `is_workload()`). `TimestampModel` controls spacing
-  (`Regular`, `Jitter`, `Irregular`). `DataGenerator::dataset(workload, model, samples, seed)` is the one-line form used
-  by the benchmark matrix.
-- Integration tests: Python pytest under `tests/` (`test_ts_*.py` per command; `*_cme.py` are cluster-mode-enabled
-  variants) relying on a built `valkey-server` and the `tests/valkeytestframework` helpers (populated by `./build.sh`).
-- To reproduce integration runs locally: run `SERVER_VERSION=unstable ./build.sh` — this will clone/build Valkey and
-  copy the server binary to `tests/build/binaries/`.
-- `build.sh` is Bash (`set -euo pipefail`), derives its root from the script path rather than `pwd`, and rejects
-  unknown positional arguments — it takes `clean`, `compat`, or nothing. In compat mode it runs pytest in **two
-  phases**: `tests/` with `--ignore=tests/compat` first, then `tests/compat` alone with the reference up. With
-  `TEST_PATTERN` set, a phase that collects nothing (pytest exit 5) is tolerated, but a pattern that matches
-  nothing in *either* phase fails the build rather than passing green having run zero tests.
-- Compat tests need a reference server, so a plain `./build.sh` excludes `tests/compat` (`--ignore`, which also
-  avoids importing that directory's `conftest.py` and its PyYAML/`compat_diff` imports). `./build.sh compat`
-  runs them as a separate second phase with a reference it starts, validates and stops itself — provisioning
-  failures, port conflicts and pin mismatches fail the build instead of reaching conftest's skip path.
-  `ASAN_BUILD` plus compat is rejected outright. Or run them explicitly:
-  `RTS_COMPAT=1 python3 -m pytest tests/compat -v` (harness manages the container), or
-  `docker compose -f docker-compose.compat.yml up -d reference` plus
-  `COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 python3 -m pytest tests/compat -v`.
-  Without either var a direct `pytest tests/compat` run still collects but skips every test.
-  The opt-in Hypothesis fuzzer needs `COMPAT_FUZZ=1` and is easiest to run via `./fuzz.sh`
-  (see "Fuzzing" below). Full env var table in `tests/compat/README.md`.
-- pytest markers: `rts_compat` (needs a live reference server), `skip_for_asan`.
-- Leak detection: when `ASAN_BUILD` is set, the build script scans pytest output for LeakSanitizer output and fails if
-  leaks are detected.
-- CI (`.github/workflows/ci.yml`): ubuntu + macos build/lint/unit, ubuntu integration tests across
-  `unstable`/`8.1`, an ASAN leak job, and a `compat-smoke` job that diffs the smoke subset against the pinned
-  reference (RESP3 only). The integration and ASAN jobs pass `--ignore=tests/compat` (same as `build.sh`);
-  `compat-smoke` is the only job that runs the compat suite, and it starts the reference container first.
-  `compat-smoke` is currently `continue-on-error: true` — non-blocking until the first-run divergences are triaged.
+- **`enable-system-alloc` is mandatory** for anything linking the crate outside a live server (tests,
+  doctests, benches, `tools/` binaries) — without it the binary SIGABRTs at startup
+  (`Critical error: the Valkey Allocator isn't available`). `build.sh` passes it for you.
+- **Rebuild after every pull/branch switch.** The module binary isn't tracked in git; a stale build
+  causes opaque failures like empty `CONFIG GET` or `fuzz.sh` reporting the module isn't loaded.
+- A `build.rs` failure saying the generated proto file "is missing/out of date" is **schema drift**,
+  not a missing-toolchain problem — fix with `VALKEY_TS_PROTO_REGEN=1 cargo build`, not by installing
+  `protoc`.
+- **Never run the fuzzer against `extended` compat mode for a soak.** The subject defaults to
+  `extended`, so gated divergences fail it as new bugs and Hypothesis stops in ~30s. `fuzz.sh` sets
+  strict mode for you; driving pytest directly means doing it yourself
+  (`CONFIG SET ts.ts-compatibility-mode strict`).
+- `ASAN_BUILD` and compat mode (`RTS_COMPAT=1`) are mutually exclusive in `build.sh`.
+- A `[[bin]]` target (e.g. `compression_report`) doesn't pull in dev-dependencies, so
+  `cargo run --bin compression_report` needs `--features enable-system-alloc,test-utils` named
+  explicitly, even though `cargo test`/`cargo bench` get `test-utils` automatically via the
+  self dev-dependency.
 
-Benchmarks
+## Where to look first
 
-- Criterion benches live in `benches/` and are registered in `Cargo.toml` with `harness = false`: `encode`, `decode`,
-  `query_scan`.
-- **`--features enable-system-alloc` is required.** Bench and tool binaries link the crate's global allocator
-  (`AlignedValkeyAlloc`), which needs a loaded Valkey runtime; without the feature every one of them aborts at startup
-  with `Critical error: the Valkey Allocator isn't available` (SIGABRT). Same constraint as `cargo test`.
-- Commands:
-    - All benches: `cargo bench --features enable-system-alloc`
-    - One target: `cargo bench --features enable-system-alloc --bench decode`
-    - Filter by name: `cargo bench --features enable-system-alloc --bench decode -- gorilla`
-    - Smoke run (executes each case once, no measurement — fast way to confirm benches still build and run):
-      `cargo bench --features enable-system-alloc --bench decode -- --test`
-- Groups: `encode_bulk` / `encode_append`, `decode_full` / `decode_materialize`, `scan` / `scan_filtered`. Bench ids are
-  `encoding/workload/timestamp_model/chunk_size`.
-- Shared fixtures live in the crate itself (`src/tests/`, exposed to dev targets by the `test-utils` feature) and are
-  re-exported through `benches/support/mod.rs`, so benches, unit tests and the `tools/` report binaries all generate data
-  through the same `DataGenerator`. `DatasetRegistry` builds 16 datasets of 64k samples from fixed seeds
-  (the 12 `ValueWorkload` shapes at regular timestamps, plus drift/noisy at jitter and irregular timestamps), so results
-  are comparable across runs, machines, and commits. The matrix is defined in `src/tests/generators/dataset.rs`
-  (`benchmark_dataset_keys`, `DatasetKey`, `DATASET_SAMPLES`, `dataset_seed`); chunk sizes are 1k / 4k
-  (`DEFAULT_CHUNK_SIZE_BYTES`) / 64k.
-- `encode`, `decode` and `query_scan` all pass `-- --test`.
-- Compression report (not a criterion bench): run it with `tools/compression_report.sh`, which wraps
-  `cargo run --release --features "enable-system-alloc,test-utils" --bin compression_report` (both features must be
-  named explicitly for a `[[bin]]`; see Cargo features above). It writes
-  `target/bench-reports/compression.csv` and `.md` (84 rows: encoding × workload × timestamp model × chunk size —
-  28 rows for each of the 3 encodings listed in `encodings()`).
-  The `data_size`, `bytes_per_sample` and `ratio` columns come from `chunk_utils::encoded_size`, the bytes the encoder
-  actually wrote. Do **not** switch them to `ChunkOps::size()`: gorilla and chimp report a `get_size()`
-  heap footprint there (buffer *capacity*, which doubles), while uncompressed reports bytes in use, so a ratio
-  built on it compares allocator slack instead of compression. The separate `size` column is the full heap footprint,
-  including unused capacity.
-  Script flags: `--check` fails if any compression ratio drops more than 5% below the baseline, `--save-baseline`
-  records the run just made as the baseline, `--baseline <path>` overrides the default
-  `benches/baselines/compression_baseline.csv`. `--check` exits 2 when that file is missing. Datasets are built from
-  fixed seeds, so a re-run reproduces the baseline exactly; regenerate it with `--save-baseline` after any intentional
-  encoder or dataset change, and review the diff rather than saving blind. `dataset_seed` hashes the dataset key
-  (`workload/ts_model`) rather than its position in the matrix, so adding or reordering workloads leaves every other
-  dataset — and its baseline row — byte-for-byte identical.
-- `--by-workload [metric]` additionally writes a pivoted view —
-  `target/bench-reports/compression_by_workload_<metric>.{csv,md}` — with one table per chunk size, one row per
-  workload/timestamp model, and one column per encoding. `metric` is `ratio` (default), `bytes-per-sample`, or
-  `capacity`; in the Markdown the best encoding per row is bold, with `uncompressed` excluded as the baseline. This is
-  the layout to reach for when comparing encodings against each other; the flat `compression.csv` stays the source of
-  truth for `--check`.
-- Latency report (also not a criterion bench): `tools/latency_report.sh` wraps the `latency_report` binary
-  (`tools/latency_report.rs`, same two required features). It answers "how fast" where the compression report answers
-  "how small": for each encoding it times `set_data`, per-sample `add_sample`, a full `iter()` scan, `get_range` over the
-  whole chunk, and a 10% mid-chunk `range_iter`, then writes `target/bench-reports/latency.{csv,md}` and prints the
-  table. Every cell is the median of `--iterations` runs (default 200, after `--warmup` 20) of the *whole* operation, in
-  µs. Parameterize with `--samples` (default 1000), `--encodings`/`--workloads`/`--ts-models` (comma lists or `all`),
-  `--chunk-size` (default 1 MiB so nothing fills up), `--seed`, `--out-csv`/`--out-md`, `--quiet`. There is no baseline
-  gate: these are wall-clock numbers, so compare rows within one run rather than across machines or commits. Note that
-  `set_data` bulk-loads past the chunk budget while `add_sample` stops at `is_full()`, so a small `--chunk-size` makes
-  the two encode columns cover different sample counts — the tool warns and records `append_len` in the CSV when that
-  happens.
-- Wire-payload report (also not a criterion bench): `tools/wire_report.sh` wraps the `wire_report` binary
-  (`tools/wire_report.rs`, same two required features). It exists because neither of the other two answers the question
-  the clustered fan-out path asks — `compression_report` fills chunks to capacity and `latency_report` uses a single
-  fixed sample count, while the encoding threshold lives at small `n`. Each row replays the real round trip from
-  `src/commands/fanout_codec/chunks.rs` (shard: `set_data` + `Chunk::serialize`; coordinator: `deserialize` +
-  `iter().collect()`) and reports `wire_bytes` — the exact `SampleData::data` payload, not `encoded_size` — plus encode
-  and decode medians, swept across `--sample-counts`. This is the tool to re-run when changing
-  `WIRE_COMPRESSION_MIN_SAMPLES` or the wire encoding; it writes `target/bench-reports/wire.{csv,md}`.
-  Two features carry the analysis:
-    - **A correctness gate runs before any measurement.** Every encoding is put through adversarial payloads (NaN,
-      infinities, `-0.0`, subnormals, `f64::MIN/MAX`, timestamp extremes, duplicate timestamps) and must round-trip
-      bit-exactly. This is not academic: the grouped/aggregated path back-fills empty buckets with NaN, so an encoding
-      that cannot carry one is unusable on the wire whatever it scores on size.
-    - **`break_even` is a link speed in Gbit/s**, not a ratio: the bandwidth below which the bytes an encoding saves take
-      longer to transmit than the extra CPU takes to spend. Compare it against the interconnect — an encoding pays off on
-      any link *slower* than its figure, and `--link-gbps` (default 10) sets what the threshold summary is judged
-      against. Worth knowing before optimizing this path: Chimp's whole-round-trip break-even is ~1.2–1.7 Gbps
-      (~4–5 Gbps counting coordinator decode only), so on a 10–25 Gbps in-rack interconnect wire compression is a net
-      latency *loss* at every sample count. It is a bandwidth-and-egress-cost measure, not a latency optimization; treat
-      claims to the contrary as unmeasured.
-  Other flags mirror the latency report: `--encodings`/`--workloads`/`--ts-models` (comma lists or `all`; `uncompressed`
-  is always kept, since it is the baseline every delta is measured against), `--iterations`/`--warmup`, `--seed`,
-  `--out-csv`/`--out-md`, `--quiet`. Wall-clock again, so no baseline gate — compare rows within one run.
-- `build.sh` does not run benches or any of the three report tools; they are manual.
+`build.sh`, `Cargo.toml`, `src/lib.rs`, `src/commands/*`, `src/series/*`, `tests/`,
+[COMPATIBILITY.md](COMPATIBILITY.md), [tests/compat/README.md](tests/compat/README.md),
+`docs/COMMANDS.md`, `docs/overview.md`.
 
-Fuzzing (Tier C differential fuzzer, plan §4.3)
-
-- There is no `cargo-fuzz`/libFuzzer target. The only fuzzer is `tests/compat/test_compat_fuzz.py`: Hypothesis
-  generates valid-by-construction command sequences (`tests/compat/fuzz_strategies.py`) over a small key/label
-  universe and replays each through the same `diff` client the rest of `tests/compat` uses, so every reply is
-  checked against the pinned `redis:8.10` reference. It therefore needs a reference server just like the other
-  compat tests, plus `hypothesis` installed (`requirements.txt` / `uv sync`).
-- It is opt-in and not part of the PR gate — a time-budgeted nightly-style job. It is currently not wired into
-  `.github/workflows/ci.yml`; run it by hand.
-- **Preferred entry point: `./fuzz.sh`.** It installs the Python deps if missing, builds the module
-  and `valkey-server` if missing, starts the reference (via the shared `tests/reference_server.sh`) and a subject
-  server, puts the subject in `ts-compatibility-mode strict`, runs the fuzzer in rounds, and tears down whatever
-  it started — a reference someone else left running is used and left up:
-
-  ```sh
-  ./fuzz.sh                                  # 150 examples/protocol
-  ./fuzz.sh --examples 20000 --duration 20m --stats   # soak
-  ./fuzz.sh --protocol resp3 --derandomize --seed 4 -v  # reproduce
-  ./fuzz.sh --suite corpus                   # replay the corpus only
-  ./fuzz.sh --reference-url redis://127.0.0.1:16379 \
-                --subject-url   redis://127.0.0.1:16390   # reuse servers
-  ./fuzz.sh --dry-run                        # print the plan, run nothing
-  ```
-
-  Other options: `--rounds`, `--filter` (extra pytest `-k`), `--compat-mode strict|extended|keep`,
-  `--reference-port`, `--keep-reference`, `--server-version`, `--skip-build`, `--rebuild`, `--skip-install`,
-  `--python`, `--report`; everything after `--` goes to pytest. Exit status is pytest's (0 clean, 1 divergence,
-  5 nothing collected). Full list: `--help`.
-- **Strict mode is not optional for a soak.** The subject defaults to `extended`, where we knowingly diverge, so
-  gated divergences (e.g. DIV-0023) fail the fuzzer as if they were new bugs and Hypothesis stops at the first
-  failure — a "soak" then dies in ~30s. `fuzz.sh` sets `CONFIG SET ts.ts-compatibility-mode strict` for you
-  (module configs carry the `ts.` prefix, DIV-0008); driving pytest directly means doing it yourself, as the
-  `strict_subject` fixture in `test_compat_compaction.py` does.
-- Running pytest directly (what the script wraps), when you need full control:
-
-  ```sh
-  # harness manages the reference container (needs Docker)
-  RTS_COMPAT=1 COMPAT_FUZZ=1 python3 -m pytest tests/compat/test_compat_fuzz.py -q
-
-  # or against an already-running reference
-  docker compose -f docker-compose.compat.yml up -d reference
-  COMPAT_FUZZ=1 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 \
-    python3 -m pytest tests/compat/test_compat_fuzz.py -q
-  ```
-
-  This path builds nothing: build the module and `valkey-server` first
-  (`SERVER_VERSION=unstable ./build.sh`) or point `COMPAT_SUBJECT_URL` at a running instance.
-- Fuzzer knobs (on top of the usual `COMPAT_*` vars): `COMPAT_FUZZ=1` enables it at all (without it the module
-  skips), `COMPAT_FUZZ_MAX_EXAMPLES=N` sets examples per protocol (default 150 — raise it for a longer soak),
-  `COMPAT_FUZZ_DERANDOMIZE=1` pins a fixed seed for reproducible debugging. `fuzz.sh` exposes these as
-  `--examples` / `--derandomize`, and adds `--seed N` (Hypothesis's own `--hypothesis-seed`).
-- Throughput is roughly 55-60 examples/sec/protocol, so a 20-minute budget is ~70k examples — but a run ends at
-  the first unregistered divergence regardless of the cap, which is why `--duration` restarts rounds rather than
-  handing Hypothesis one enormous `max_examples`.
-- Triage a finding before treating it as a bug: grep the command in `tests/compat/divergences.yml` (it may
-  already be registered) and re-run the shrunk sequence under `--compat-mode strict` vs `extended` to see whether
-  it is gated, known behavior.
-- When it finds a divergence, Hypothesis shrinks it to a minimal reproducer. Promote that command list into
-  `tests/compat/corpus/<slug>.json` (schema in `tests/compat/corpus/README.md`) so it becomes a deterministic
-  golden test; `test_compat_corpus.py` replays the whole corpus under RESP2 and RESP3 and runs as part of the
-  normal (non-opt-in) compat suite. Fixing the bug and adding the corpus case go in the same change.
-- Verify a promoted case with
-  `COMPAT_REFERENCE_URL=... python3 -m pytest tests/compat/test_compat_corpus.py -k <slug>`.
-- The generators deliberately stay inside the input space both engines accept, so a failure means a *reply*
-  divergence, not an input-rejection-boundary difference (that boundary is the §6 matrix's job). If a fuzzer
-  finding is an intentional divergence, register it in `divergences.yml` rather than weakening the generator.
-- Writing new strategies is clean-room work: derive them from public RTS documentation and black-box observation
-  only — never from RedisTimeSeries source or test code.
-
-Where to look first (key files & directories)
-
-- `src/lib.rs` — module entrypoint, command registration, lifecycle (preload/init/deinit), config.
-- `src/commands/` — implementations and command parsing utilities (`command_parser.rs`).
-- `src/series/` — core storage, chunk encodings, compaction, indexes, background tasks, serialization.
-- `src/fanout/` — cluster communication primitives (cluster map, RPC, blocked clients, migrations).
-- `src/analysis/` — outlier detection algorithms (`src/analysis/outliers/`).
-- `src/aggregators/` — aggregation handlers for range queries.
-- `src/common/` — shared utilities (encoding, logging, thread pool, RDB, string interning).
-- `src/labels/` — label types and filter evaluation.
-- `src/parser/` — selector/duration/timestamp parsing for the filter syntax.
-- `src/iterators/` — sample and row iterators.
-- `src/join/` — ASOF join for TS.JOIN.
-- `src/tests/` — shared test/bench support, compiled under `cfg(test)` or the `test-utils` feature:
-    - `generators/rand.rs` — `DataGenerator` (bon builder) and `ValueWorkload`.
-    - `generators/workload.rs` — the shape functions (drift/periodic/noisy/bursty/counter/discrete) and `TimestampModel`.
-    - `generators/generator.rs`, `generators/mackey_glass.rs` — the range-bounded iterator generators.
-    - `generators/dataset.rs` — `DatasetKey`, `DatasetRegistry`, and the benchmark dataset matrix.
-    - `chunk_utils.rs` — `build_chunk`, `build_chunk_until_full`, `filled_prefix(_len)`, `encoded_size`, `CHUNK_SIZE_*`.
-- `benches/` — criterion benchmarks; `benches/support/mod.rs` just re-exports `src/tests/` so benches, unit tests and the
-  `tools/` report binaries share one implementation.
-- `tools/` — the three report binaries, each with a `.sh` wrapper that builds and runs it with the right features:
-    - `compression_report.rs` — encoding size/ratio matrix at chunk capacity, with baseline checking ("how small").
-    - `latency_report.rs` — encode/decode/scan timings at a fixed sample count ("how fast").
-    - `wire_report.rs` — serialized payload bytes and round-trip cost swept across sample counts, plus the correctness
-      gate; the tool behind `WIRE_COMPRESSION_MIN_SAMPLES` ("is shipping this compressed worth it").
-- `build.sh` — canonical developer flow for formatting, linting, building, and running tests.
-- `README.md` and `docs/commands/` — human-facing command descriptions and examples.
-- `docs/topics/` — deep-dive topics: `filter-syntax.md`, `label-discovery.md`, `filter-dos-audit.md`,
-  `encodings.md`, `redistimeseries-migration.md` (user-facing digest of `COMPATIBILITY.md`).
-- `COMPATIBILITY.md`, `tests/compat/` — the RTS compatibility contract and its harness.
-
-Quick tips for code changes
-
-- Add new commands: create `src/commands/ts_<name>.rs`, add function `ts_<name>_cmd`, then register in `valkey_module!`
-  in `src/lib.rs`. Currently registered commands: TS.CREATE, TS.ALTER, TS.ADD, TS.ADDBULK, TS.GET, TS.MGET, TS.MADD,
-  TS.DEL, TS.DECRBY, TS.INCRBY, TS.JOIN, TS.MDEL, TS.MRANGE, TS.MREVRANGE, TS.NRANGE, TS.NREVRANGE, TS.RANGE, TS.READ, TS.REVRANGE, TS.INFO,
-  TS.QUERYINDEX, TS.QUERYLABELS, TS.CARD, TS.LABELNAMES, TS.LABELVALUES, TS.METRICNAMES, TS.LABELSTATS, TS.CREATERULE,
-  TS.DELETERULE, TS.OUTLIERS, TS._DEBUG (hidden admin command, no user-facing docs needed).
-- Documentation: When adding or modifying commands, remember to update the human-facing docs in `docs/commands/` and the
-  supported list in `README.md`. TS._DEBUG is intentionally undocumented.
-- When making cluster changes, search for `*_fanout_command.rs` to copy the fanout pattern and add protobuf messages in
-  `proto/v1/`.
-- Protobuf codegen is **checked in** at `proto/v1/generated/valkey_timeseries.fanout.v1.rs`. After editing any `.proto`, run
-  `VALKEY_TS_PROTO_REGEN=1 cargo build` and commit the regenerated file; a normal build fails with instructions if the
-  two disagree, so drift cannot land silently. Local↔wire conversions live beside it in `src/commands/fanout_codec/`
-  (named `fanout_codec` rather than `fanout` so it does not collide with the `src/fanout/` transport layer).
-  Every build still parses the schema — `build.rs` compiles all four of `proto/v1/{common,filters,request,response}.proto`
-  with `protox` and diffs the result against the checked-in file — so the generated code is verified, not merely trusted.
-  No `protoc` is involved on either path; see Prerequisites above.
-- Behavior changes on the shared RTS surface should be checked against `tests/compat` and, if the difference is
-  deliberate, recorded in `COMPATIBILITY.md` and/or `divergences.yml` (`behavior`-kind entries need explicit
-  sign-off in the PR that introduces them).
-
-Limitations of this document
-
-- Focused on discoverable, executable patterns. It does not cover domain rationale beyond what is visible in
-  source/docs. `docs/` also carries in-flight design and investigation notes that may run ahead of the code.
-
-If you need more context, inspect:
-
-- `build.sh`, `Cargo.toml`, `src/lib.rs`, `src/commands/*`, `src/series/*`, `src/analysis/*`, and `tests/`.
+This file favors discoverable, executable facts over domain rationale — `docs/` (including
+in-progress `docs/plans/`) carries the deeper design and investigation notes.
