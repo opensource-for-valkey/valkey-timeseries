@@ -300,11 +300,11 @@ impl AnomalyResult {
     /// Get outlier percentage.
     #[allow(dead_code)]
     pub fn outlier_percentage(&self) -> f64 {
-        let count = self.scores.len();
-        if count == 0 {
+        let total = self.scores.len();
+        if total == 0 {
             0.0
         } else {
-            100.0 * count as f64 / self.scores.len() as f64
+            100.0 * self.anomalies.len() as f64 / total as f64
         }
     }
 }
