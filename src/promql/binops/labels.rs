@@ -216,7 +216,11 @@ pub(in crate::promql) fn can_push_down_common_filters(be: &BinaryExpr) -> bool {
 }
 
 pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec<Matcher> {
-    let mut kv_map: halfbrown::HashMap<&str, AHashSet<&str>> = halfbrown::HashMap::new();
+    // Per label: how many series carry it, and the distinct values they carry.
+    // The two are separate counts — a label every series shares with one value
+    // (`namespace="prod"` on every pod) is the case this exists for, and it has
+    // one distinct value however many series there are.
+    let mut kv_map: halfbrown::HashMap<&str, (usize, AHashSet<&str>)> = halfbrown::HashMap::new();
     for ts in samples.iter() {
         for label in ts.labels.iter() {
             // Never push down __name__: binary-op matching always ignores __name__ by default
@@ -226,13 +230,15 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
             if label.name == METRIC_NAME {
                 continue;
             }
-            kv_map.entry(label.name).or_default().insert(label.value);
+            let entry = kv_map.entry(label.name).or_default();
+            entry.0 += 1;
+            entry.1.insert(label.value);
         }
     }
 
     let mut lfs: Vec<Matcher> = Vec::with_capacity(kv_map.len());
-    for (key, values) in kv_map {
-        if values.len() != samples.len() {
+    for (key, (carried_by, values)) in kv_map {
+        if carried_by != samples.len() {
             // Skip the tag, since it doesn't belong to all the time series.
             continue;
         }
@@ -260,9 +266,13 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
     lfs
 }
 
+/// The values as a regex alternation, sorted so the same set always yields the
+/// same matcher — the selector it lands in is a cache and fanout key.
 fn join_regexp_values(values: AHashSet<&str>) -> String {
     let len = values.len();
     let init_size = values.iter().fold(0, |res, &x| res + x.len() + 3);
+    let mut values: Vec<&str> = values.into_iter().collect();
+    values.sort_unstable();
     let mut res = String::with_capacity(init_size);
     for (i, &s) in values.iter().enumerate() {
         let s_quoted = escape(s);
@@ -309,6 +319,62 @@ mod tests {
             sample(&[("__name__", "m"), ("env", "1")], false),
         ];
         assert!(ensure_unique_labelsets(&distinct).is_ok());
+    }
+
+    /// The filters derived from `samples`, as `name op value` strings, sorted.
+    fn derived(samples: &[EvalSample]) -> Vec<String> {
+        let mut out: Vec<String> = get_common_label_filters(samples)
+            .into_iter()
+            .map(|m| format!("{}{}{}", m.name, m.op, m.value))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn labelled(labels: &[(&str, &str)]) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value: 1.0,
+            labels: EvalLabels::from_pairs(labels),
+            drop_name: false,
+        }
+    }
+
+    /// A label every series carries becomes a filter: an equality when the
+    /// value is shared, an alternation when it varies. A label some series
+    /// lack, or `__name__`, never does. The shared-value case is the one the
+    /// push-down exists for (`namespace="prod"` on every pod), and it must not
+    /// depend on how many series there are.
+    #[test]
+    fn common_label_filters_come_from_labels_every_series_carries() {
+        let samples = [
+            labelled(&[
+                ("__name__", "m"),
+                ("region", "us"),
+                ("host", "a"),
+                ("rack", "1"),
+            ]),
+            labelled(&[("__name__", "m"), ("region", "us"), ("host", "b")]),
+            labelled(&[
+                ("__name__", "m"),
+                ("region", "us"),
+                ("host", "c"),
+                ("rack", "2"),
+            ]),
+        ];
+        assert_eq!(derived(&samples), vec!["host=~a|b|c", "region=us"]);
+
+        // One series: the same rule.
+        assert_eq!(
+            derived(&samples[..1]),
+            vec!["host=a", "rack=1", "region=us"]
+        );
+
+        // Too many distinct values to enumerate: the label is left out.
+        let many: Vec<EvalSample> = (0..61)
+            .map(|i| labelled(&[("region", "us"), ("host", &format!("h{i}"))]))
+            .collect();
+        assert_eq!(derived(&many), vec!["region=us"]);
     }
 
     /// Parse `query` and return its top-level binary expression.
