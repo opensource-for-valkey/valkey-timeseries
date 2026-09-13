@@ -1,11 +1,8 @@
 use crate::fanout::FanoutTarget;
-use std::sync::atomic::AtomicBool;
 use valkey_module::{Context, ContextFlags, ValkeyResult};
 pub(crate) const SLOT_SIZE: u16 = 16384;
 
 const VALKEYMODULE_CLIENT_INFO_FLAG_READONLY: u64 = 1 << 6; /* Valkey 9 */
-
-pub static FORCE_REPLICAS_READONLY: AtomicBool = AtomicBool::new(false);
 
 pub fn is_client_read_only(ctx: &Context) -> ValkeyResult<bool> {
     let info = ctx.get_client_info()?;
@@ -55,12 +52,6 @@ pub fn client_allows_replica_fanout(context: &Context) -> bool {
 }
 
 pub fn compute_query_fanout_mode(context: &Context) -> FanoutTarget {
-    #[cfg(test)]
-    if FORCE_REPLICAS_READONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        // Testing only
-        return FanoutTarget::ReplicasOnly;
-    }
-
     if client_allows_replica_fanout(context) {
         FanoutTarget::Random
     } else {

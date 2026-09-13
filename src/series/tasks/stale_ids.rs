@@ -119,10 +119,6 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
     context.cursor = None;
 }
 
-pub(in crate::series) fn remove_all_stale_series() {
-    std::thread::spawn(remove_all_stale_series_internal);
-}
-
 pub(crate) fn remove_stale_series_ids_incremental() {
     std::thread::spawn(remove_stale_series_internal);
 }

@@ -65,17 +65,6 @@ pub fn reply_with_bulk_string<C: IntoRawCtx>(ctx: C, s: &str) -> Status {
     raw::reply_with_string_buffer(raw_ctx, s.as_ptr().cast::<c_char>(), s.len())
 }
 
-pub fn reply_with_string_iter<C: IntoRawCtx>(ctx: C, v: impl Iterator<Item = String>) {
-    let raw_ctx = ctx.into_raw();
-    reply_with_postponed_array(raw_ctx);
-    let mut len = 0;
-    for s in v {
-        reply_with_bulk_string(raw_ctx, &s);
-        len += 1;
-    }
-    reply_with_array_len(raw_ctx, len);
-}
-
 pub fn reply_label_ex<C: IntoRawCtx>(ctx: C, label: &str, value: Option<&str>) {
     let raw_ctx = ctx.into_raw();
     reply_with_array(raw_ctx, 2);

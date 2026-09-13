@@ -37,11 +37,6 @@ use valkey_module::{NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
 pub const MAX_TS_VALUES_FILTER: usize = 128;
 
-// Kept because these are referenced directly in the parsing logic below.
-const CMD_ARG_AGGREGATION: &str = "AGGREGATION";
-const CMD_ARG_COUNT: &str = "COUNT";
-const CMD_ARG_REDUCE: &str = "REDUCE";
-
 macro_rules! command_arg_tokens {
     ( $( $variant:ident => $lit:literal ),+ $(,)? ) => {
         #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default, EnumIter)]
@@ -489,14 +484,6 @@ pub(crate) fn advance_if_next_token_one_of(
 
 pub(super) fn peek_token(args: &mut CommandArgIterator) -> Option<CommandArgToken> {
     args.peek().and_then(|next| parse_command_arg_token(next))
-}
-
-fn next_token(args: &mut CommandArgIterator) -> ValkeyResult<Option<CommandArgToken>> {
-    let arg = match args.next_str() {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
-    };
-    Ok(parse_command_arg_token(arg.as_bytes()))
 }
 
 pub(super) fn parse_optional_token_block(

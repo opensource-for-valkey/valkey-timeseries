@@ -7,9 +7,6 @@ use std::io;
 use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
-pub(in crate::series::chunks) const ZERO: bool = false;
-pub(in crate::series::chunks) const ONE: bool = true;
-
 /// A stream of bits for writing.
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq, GetSize)]
 pub struct BitStream {
@@ -48,11 +45,6 @@ impl BitStream {
     pub fn reset(&mut self, stream: Vec<u8>) {
         self.stream = stream;
         self.count = 0;
-    }
-
-    /// Hydrate a stream from bytes and bit position.
-    pub(crate) fn hydrate(stream: Vec<u8>, count: u8) -> Self {
-        Self { stream, count }
     }
 
     pub(crate) fn serialize(&self, dest: &mut Vec<u8>) {

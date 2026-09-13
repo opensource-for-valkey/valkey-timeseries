@@ -29,15 +29,6 @@ pub(crate) const fn op_neq(left: f64, right: f64) -> bool {
 }
 
 #[inline]
-pub(crate) const fn op_and(left: f64, right: f64) -> f64 {
-    if left.is_nan() || right.is_nan() {
-        f64::NAN
-    } else {
-        left
-    }
-}
-
-#[inline]
 pub(crate) const fn op_coalesce(left: f64, right: f64) -> f64 {
     if !left.is_nan() {
         return left;

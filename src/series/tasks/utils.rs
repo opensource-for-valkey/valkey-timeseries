@@ -1,30 +1,7 @@
 use crate::common::context::create_key_string;
 use crate::series::index::{TIMESERIES_INDEX, get_timeseries_index, with_timeseries_postings};
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
-use std::sync::atomic::{AtomicI32, Ordering};
 use valkey_module::Context;
-
-pub(super) fn get_used_dbs() -> Vec<i32> {
-    let index = TIMESERIES_INDEX.pin();
-    let mut keys: Vec<i32> = index.keys().copied().collect();
-    keys.sort_unstable();
-    keys
-}
-
-pub(super) fn advance_db(cursor: &AtomicI32) -> i32 {
-    let used_dbs = get_used_dbs();
-    let current = cursor.load(Ordering::Relaxed);
-
-    let next = used_dbs
-        .iter()
-        .find(|&&d| d > current)
-        .copied()
-        .or_else(|| used_dbs.first().copied())
-        .unwrap_or(0);
-
-    cursor.store(next, Ordering::Relaxed);
-    next
-}
 
 pub(super) fn find_next_db(current: i32) -> Option<i32> {
     let index = TIMESERIES_INDEX.pin();

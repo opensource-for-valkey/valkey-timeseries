@@ -16,7 +16,6 @@ use crate::series::acl::{clone_permissions, has_all_keys_permissions};
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
-use std::mem::size_of;
 use std::ops::{Bound, ControlFlow, Deref, DerefMut};
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -659,10 +658,6 @@ struct BatchIterator<'a> {
 }
 
 impl<'a> BatchIterator<'a> {
-    fn new(index: &'a TimeSeriesIndex, batch_size: usize) -> Self {
-        Self::restricted(index, batch_size, None)
-    }
-
     /// An iterator reporting the size of each posting list within `matching` only. `matching` must
     /// already have stale ids removed (as everything out of [`Postings::postings_for_selector`]
     /// and friends does), since the intersection is reported as-is.
@@ -755,10 +750,6 @@ impl<'a> BatchIterator<'a> {
     fn is_complete(&self) -> bool {
         self.is_finished
     }
-}
-
-fn get_bitmap_size(bmp: &PostingsBitmap) -> usize {
-    bmp.cardinality() as usize * size_of::<SeriesRef>()
 }
 
 #[cfg(test)]

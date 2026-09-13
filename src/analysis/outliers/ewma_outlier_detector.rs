@@ -121,17 +121,6 @@ impl EwmaOutlierDetector {
     }
 }
 
-/// EWMA anomaly detection
-pub(super) fn detect_anomalies_spc_ewma(
-    ts: &[f64],
-    alpha: Option<f64>,
-) -> TimeSeriesAnalysisResult<AnomalyResult> {
-    // Ewma control chart implementation
-    let alpha = alpha.unwrap_or(EWMA_DEFAULT_ALPHA);
-    let detector = EwmaOutlierDetector::from_series(ts, alpha);
-    detector.detect(ts)
-}
-
 /// EWMA implements only [`AnomalyDetector`], not [`PointDetector`]. It tests the
 /// smoothed average against control limits that widen with the observation
 /// index, so both the statistic and the limits depend on position in the series.
@@ -156,6 +145,17 @@ impl AnomalyDetector for EwmaOutlierDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EWMA anomaly detection
+    fn detect_anomalies_spc_ewma(
+        ts: &[f64],
+        alpha: Option<f64>,
+    ) -> TimeSeriesAnalysisResult<AnomalyResult> {
+        // Ewma control chart implementation
+        let alpha = alpha.unwrap_or(EWMA_DEFAULT_ALPHA);
+        let detector = EwmaOutlierDetector::from_series(ts, alpha);
+        detector.detect(ts)
+    }
 
     #[test]
     fn test_ewma_basic_anomaly_detection() {

@@ -15,7 +15,6 @@ use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
 pub const MAX_UNCOMPRESSED_SAMPLES: usize = 256;
 const FLAG_SERIALIZE_UNCOMPRESSED: u8 = 0b00000001;
-const FLAG_SERIALIZE_GORILLA: u8 = 0b00000010;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UncompressedChunk {
@@ -129,11 +128,6 @@ impl UncompressedChunk {
 
     fn get_sample_index(&self, ts: Timestamp) -> (usize, bool) {
         get_sample_index(&self.samples, ts)
-    }
-
-    pub(crate) fn get_sample(&self, ts: Timestamp) -> Option<Sample> {
-        let (idx, found) = self.get_sample_index(ts);
-        if found { Some(self.samples[idx]) } else { None }
     }
 
     fn get_range_slice(&self, start_ts: Timestamp, end_ts: Timestamp) -> Vec<Sample> {

@@ -144,13 +144,6 @@ fn fit_baseline(ts: &[f64]) -> (f64, f64) {
     calculate_mean_std_dev(&ts[0..training_size])
 }
 
-/// Statistical Process Control (Spc) cusum anomaly detection
-pub(super) fn detect_anomalies_spc_cusum(ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
-    let mut detector = CusumOutlierDetector::from_series(ts);
-    detector.train(ts)?;
-    detector.detect(ts)
-}
-
 /// CUSUM implements only [`AnomalyDetector`], not [`PointDetector`]. Its whole
 /// purpose is to accumulate small deviations until they add up, so a point is
 /// flagged because of the drift preceding it — a per-point test would answer a
@@ -158,10 +151,6 @@ pub(super) fn detect_anomalies_spc_cusum(ts: &[f64]) -> TimeSeriesAnalysisResult
 impl AnomalyDetector for CusumOutlierDetector {
     fn method(&self) -> AnomalyMethod {
         AnomalyMethod::Cusum
-    }
-
-    fn model_info(&self) -> Option<MethodInfo> {
-        Some(CusumOutlierDetector::method_info(self))
     }
 
     fn train(&mut self, data: &[f64]) -> TimeSeriesAnalysisResult<()> {
@@ -174,6 +163,10 @@ impl AnomalyDetector for CusumOutlierDetector {
         Ok(())
     }
 
+    fn model_info(&self) -> Option<MethodInfo> {
+        Some(CusumOutlierDetector::method_info(self))
+    }
+
     fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
         CusumOutlierDetector::detect(self, ts)
     }
@@ -182,6 +175,13 @@ impl AnomalyDetector for CusumOutlierDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Statistical Process Control (Spc) cusum anomaly detection
+    fn detect_anomalies_spc_cusum(ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {
+        let mut detector = CusumOutlierDetector::from_series(ts);
+        detector.train(ts)?;
+        detector.detect(ts)
+    }
 
     #[test]
     fn test_detect_empty_series() {

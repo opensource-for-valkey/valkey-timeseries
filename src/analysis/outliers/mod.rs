@@ -249,6 +249,7 @@ pub struct Anomaly {
 }
 
 impl Anomaly {
+    #[allow(dead_code)]
     pub fn is_anomaly(&self) -> bool {
         self.signal.is_anomaly()
     }
@@ -296,14 +297,10 @@ pub struct AnomalyResult {
 }
 
 impl AnomalyResult {
-    /// Count the number of detected anomalies
-    pub fn count_anomalies(&self) -> usize {
-        self.anomalies.len()
-    }
-
     /// Get outlier percentage.
+    #[allow(dead_code)]
     pub fn outlier_percentage(&self) -> f64 {
-        let count = self.count_anomalies();
+        let count = self.scores.len();
         if count == 0 {
             0.0
         } else {
@@ -327,13 +324,19 @@ impl AnomalyMADEstimator {
             AnomalyMADEstimator::Invariant => "Invariant",
         }
     }
+}
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AnomalyMADEstimator::Simple => "simple",
-            AnomalyMADEstimator::HarrellDavis => "harrelldavis",
-            AnomalyMADEstimator::Invariant => "invariant",
-        }
+impl Display for AnomalyMADEstimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                AnomalyMADEstimator::Simple => "simple",
+                AnomalyMADEstimator::HarrellDavis => "harrelldavis",
+                AnomalyMADEstimator::Invariant => "invariant",
+            }
+        )
     }
 }
 

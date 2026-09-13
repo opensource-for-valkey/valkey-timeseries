@@ -134,21 +134,22 @@ impl PointDetector for ZScoreOutlierDetector {
     }
 }
 
-/// Z-score based analysis detection using sample standard deviation
-pub(super) fn detect_anomalies_zscore(
-    ts: &[f64],
-    threshold: Option<f64>,
-) -> TimeSeriesAnalysisResult<AnomalyResult> {
-    let mut detector =
-        ZScoreOutlierDetector::new(threshold.unwrap_or(ZScoreOutlierDetector::DEFAULT_THRESHOLD));
-    detector.train(ts)?;
-    detector.detect(ts)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::outliers::{AnomalyOptions, detect_anomalies};
+
+    /// Z-score based analysis detection using sample standard deviation
+    fn detect_anomalies_zscore(
+        ts: &[f64],
+        threshold: Option<f64>,
+    ) -> TimeSeriesAnalysisResult<AnomalyResult> {
+        let mut detector = ZScoreOutlierDetector::new(
+            threshold.unwrap_or(ZScoreOutlierDetector::DEFAULT_THRESHOLD),
+        );
+        detector.train(ts)?;
+        detector.detect(ts)
+    }
 
     /// A negative threshold inverts the fences. Before `deviation_and_boundary`
     /// mapped a negative fence distance to NaN, this flagged essentially every

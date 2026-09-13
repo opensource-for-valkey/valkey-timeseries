@@ -352,11 +352,6 @@ pub(crate) fn is_in_asm_slot_import() -> bool {
     IN_SLOT_IMPORT.load(Ordering::Relaxed)
 }
 
-pub(crate) fn is_persisting() -> bool {
-    let value = IS_PERSISTING.load(Ordering::Relaxed);
-    value > 0
-}
-
 pub(crate) fn slot_migration_event_handler(
     event: AtomicSlotMigrationEvent,
     slots: RangeSetBlaze<u16>,
@@ -372,10 +367,7 @@ pub(crate) fn slot_migration_event_handler(
         }
         AtomicSlotMigrationEvent::ImportCompleted => {
             IN_SLOT_IMPORT.store(false, Ordering::Relaxed);
-            let persistence_depth = IS_PERSISTING.load(Ordering::Relaxed);
-            log_debug(format!(
-                "ASM ImportCompleted received; triggering delayed indexing drain (persistence_depth={persistence_depth})"
-            ));
+            log_debug("ASM ImportCompleted received; triggering delayed indexing");
             process_delayed_indexing();
         }
         AtomicSlotMigrationEvent::ImportAborted => {
@@ -389,7 +381,7 @@ pub(crate) fn slot_migration_event_handler(
 }
 
 #[persistence_event_handler]
-fn persistence_event_handler(ctx: &Context, persistence_event: PersistenceSubevent) {
+fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSubevent) {
     fn increment() {
         IS_PERSISTING.fetch_add(1, Ordering::SeqCst);
     }
@@ -435,7 +427,7 @@ fn persistence_event_handler(ctx: &Context, persistence_event: PersistenceSubeve
 /// the loaded count; after a failed load, the preloaded state cannot be trusted, so drop it and
 /// let the natural indexing paths rebuild.
 #[loading_event_handler]
-fn loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
+fn __loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
     match loading_event {
         LoadingSubevent::RdbStarted | LoadingSubevent::ReplStarted => {
             on_loading_started();

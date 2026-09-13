@@ -1,5 +1,5 @@
-#![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(dead_code)]
 extern crate enum_dispatch;
 extern crate get_size2;
 #[cfg(test)]
@@ -204,7 +204,7 @@ fn deinitialize(ctx: &Context) -> Status {
 }
 
 #[shutdown_event_handler]
-fn shutdown_event_handler(ctx: &Context, _event: u64) {
+fn __shutdown_event_handler(ctx: &Context, _event: u64) {
     ctx.log_notice("Server shutdown callback event ...");
     IS_SHUTTING_DOWN.store(true, Ordering::Relaxed);
 }

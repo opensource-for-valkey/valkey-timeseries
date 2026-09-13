@@ -41,53 +41,6 @@ pub fn find_last_ge_index<T: Ord>(arr: &[T], val: &T) -> usize {
         .unwrap_or_else(|x| x.saturating_sub(1))
 }
 
-/// Finds the start and end indices (inclusive) of a range within a sorted slice.
-///
-/// #### Parameters
-///
-/// * `values`: A slice of ordered elements to search within.
-/// * `start`: The lower bound of the range to search for.
-/// * `end`: The upper bound of the range to search for.
-///
-/// #### Returns
-///
-/// Returns `Option<(usize, usize)>`:
-/// * `Some((start_idx, end_idx))` if valid indices are found within the range.
-/// * `None` if the `values` slice is empty, if all samples are less than `start`,
-///   or if `start` and `end` are equal and greater than the sample at the found index.
-///
-/// Used to get an inclusive bound for the slice (all elements in slice[start_index...=end_index]
-/// satisfy the condition x >= start && <= end).
-pub(crate) fn get_index_bounds<T: Ord>(values: &[T], start: &T, end: &T) -> Option<(usize, usize)> {
-    if values.is_empty() {
-        return None;
-    }
-
-    let len = values.len();
-
-    let start_idx = find_first_ge_index(values, start);
-    if start_idx >= len {
-        return None;
-    }
-
-    let right = &values[start_idx..];
-    let idx = find_last_ge_index(right, end);
-    let end_idx = start_idx + idx;
-
-    // imagine this scenario:
-    // samples = &[10, 20, 30, 40]
-    // start = 25, end = 25
-    // we have a situation where start_index == end_index (2), yet samples[2] is greater than end,
-    if start_idx == end_idx {
-        // todo: get_unchecked
-        if values[start_idx] > *end {
-            return None;
-        }
-    }
-
-    Some((start_idx, end_idx))
-}
-
 // https://en.wikipedia.org/wiki/Exponential_search
 // Use if you expect matches to be close by. Otherwise, use binary search.
 pub trait ExponentialSearch<T> {

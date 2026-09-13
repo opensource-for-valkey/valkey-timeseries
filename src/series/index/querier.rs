@@ -22,7 +22,7 @@
 //! For label-centric exploration and ranking APIs (for example, fuzzy/similarity label
 //! discovery), see `label_querier.rs`, which composes this module and `Postings`.
 
-use super::postings::{EMPTY_BITMAP, KeyType, Postings};
+use super::postings::{EMPTY_BITMAP, Postings};
 use super::{PostingsBitmap, get_db_index, get_timeseries_index};
 use crate::common::Timestamp;
 use crate::common::context::{create_key_string, get_acl_user, get_current_db};
@@ -436,15 +436,6 @@ fn filter_series_by_date_range<'a>(
                 .collect())
         }
     }
-}
-
-pub(super) fn get_guard_from_key<'a>(
-    ctx: &'a Context,
-    key: &KeyType,
-) -> ValkeyResult<Option<SeriesGuard<'a>>> {
-    let real_key = create_key_string(ctx, key.as_bytes());
-    let perms = Some(AclPermissions::ACCESS);
-    try_get_timeseries(ctx, &real_key, perms)
 }
 
 pub fn count_matched_series(

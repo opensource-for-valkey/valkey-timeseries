@@ -432,8 +432,6 @@ struct GroupData {
     series: Vec<MRangeSeriesResult>,
 }
 
-type GroupMap = BTreeMap<String, GroupData>;
-
 /// Apply GROUPBY/REDUCE to the series coming from remote nodes
 fn handle_grouping(
     series: Vec<SeriesRangeResponse>,

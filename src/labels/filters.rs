@@ -16,7 +16,6 @@ use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::{Deref, DerefMut};
 
-const EMPTY_TEXT: &str = "";
 const MATCH_ALL_REGEX_TEXT: &str = ".*";
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]

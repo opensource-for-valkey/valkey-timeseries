@@ -36,6 +36,7 @@ impl Postings {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::series::index) fn postings_for_label_value<'a>(
         &'a self,
         name: &str,

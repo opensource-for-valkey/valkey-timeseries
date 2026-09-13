@@ -1,53 +1,3 @@
-/// Online mean/variance via Welford's method
-/// Tracks distribution of m_t so we can z-score it.
-#[derive(Debug, Clone)]
-pub struct RunningStats {
-    n: usize,
-    mean: f64,
-    mean_sq: f64, // sum of squares of deviations from the mean
-}
-
-impl RunningStats {
-    pub fn new() -> Self {
-        Self {
-            n: 0,
-            mean: 0.0,
-            mean_sq: 0.0,
-        }
-    }
-
-    pub fn update(&mut self, x: f64) {
-        if x.is_nan() {
-            return;
-        }
-        self.n += 1;
-        let delta = x - self.mean;
-        self.mean += delta / self.n as f64;
-        let delta2 = x - self.mean;
-        self.mean_sq += delta * delta2;
-    }
-
-    pub fn count(&self) -> usize {
-        self.n
-    }
-
-    pub fn mean(&self) -> f64 {
-        self.mean
-    }
-
-    pub fn variance(&self) -> f64 {
-        if self.n > 1 {
-            self.mean_sq / (self.n as f64 - 1.0)
-        } else {
-            0.0
-        }
-    }
-
-    pub fn std(&self) -> f64 {
-        self.variance().sqrt()
-    }
-}
-
 fn sum_and_count_finite(data: &[f64]) -> (f64, usize) {
     data.iter().fold((0.0f64, 0usize), |(s, c), &x| {
         if x.is_finite() {
@@ -94,17 +44,6 @@ pub fn calculate_variance(values: &[f64]) -> f64 {
     }
     let mean = finite.iter().sum::<f64>() / (n as f64);
     finite.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((n - 1) as f64)
-}
-
-pub fn calculate_median(data: &[f64]) -> f64 {
-    // Filter out NaN and infinities; keep existing sentinel behavior (0.0) for no valid data.
-    let mut finite: Vec<f64> = data.iter().copied().filter(|x| x.is_finite()).collect();
-    if finite.is_empty() {
-        return 0.0;
-    }
-    // Safe to unwrap partial_cmp because all values are finite
-    finite.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    calculate_median_sorted(&finite)
 }
 
 pub fn calculate_median_sorted(sorted: &[f64]) -> f64 {
@@ -166,18 +105,6 @@ pub fn quantile_sorted(sorted_data: &[f64], q: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn median_ignores_nan_and_inf() {
-        let v = vec![1.0, 2.0, f64::NAN, f64::INFINITY, -f64::INFINITY, 3.0];
-        assert_eq!(calculate_median(&v), 2.0);
-    }
-
-    #[test]
-    fn median_only_nan_returns_zero() {
-        let v = vec![f64::NAN, f64::NAN];
-        assert_eq!(calculate_median(&v), 0.0);
-    }
 
     #[test]
     fn quantile_basic_and_interpolate() {

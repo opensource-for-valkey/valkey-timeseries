@@ -16,7 +16,6 @@ pub struct IQROutlierDetector {
     /// quartile by the same `T * IQR`, so they sit symmetrically about this
     /// point — which makes it the center evidence is measured from.
     center: f64,
-    iqr: f64,
     threshold: f64,
 }
 
@@ -41,7 +40,6 @@ impl IQROutlierDetector {
             lower_fence,
             upper_fence,
             center: (q1 + q3) / 2.0,
-            iqr,
             threshold,
         }
     }
@@ -111,21 +109,20 @@ impl PointDetector for IQROutlierDetector {
     }
 }
 
-/// Interquartile Range (IQR) anomaly detection
-pub(super) fn detect_anomalies_iqr(
-    ts: &[f64],
-    threshold: Option<f64>,
-) -> TimeSeriesAnalysisResult<AnomalyResult> {
-    let mut detector: IQROutlierDetector =
-        IQROutlierDetector::new(ts, threshold.unwrap_or(IQR_DEFAULT_THRESHOLD));
-    detector.detect(ts)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::outliers::MethodInfo;
-    use crate::analysis::outliers::iqr_outlier_detector::detect_anomalies_iqr;
+
+    /// Interquartile Range (IQR) anomaly detection
+    fn detect_anomalies_iqr(
+        ts: &[f64],
+        threshold: Option<f64>,
+    ) -> TimeSeriesAnalysisResult<AnomalyResult> {
+        let mut detector: IQROutlierDetector =
+            IQROutlierDetector::new(ts, threshold.unwrap_or(IQR_DEFAULT_THRESHOLD));
+        detector.detect(ts)
+    }
 
     /// A negative threshold inverts the fences. Before `deviation_and_boundary`
     /// mapped a negative fence distance to NaN, this flagged essentially every

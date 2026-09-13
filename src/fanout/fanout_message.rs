@@ -71,6 +71,7 @@ pub(super) struct FanoutMessageHeader {
 }
 
 impl FanoutMessageHeader {
+    #[cfg(test)]
     pub fn serialize(&self, buf: &mut Vec<u8>) {
         write_message_header(
             buf,
