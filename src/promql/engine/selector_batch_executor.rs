@@ -16,8 +16,7 @@ use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
     RangeVectorSelectorFanoutCommand, WireRangeSeries, get_snapshot_range,
-    instant_lookback_start_ms, local_label_profile,
-    validate_max_points, validate_max_series,
+    instant_lookback_start_ms, local_label_profile, validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::chunks::ChunkOps;

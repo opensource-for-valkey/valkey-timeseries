@@ -76,19 +76,34 @@ mod tests {
     /// across shards and used as map keys, so they cannot drift.
     #[test]
     fn raw_hashers_match_allocating_hashers() {
-        let inputs: [&[u8]; 4] = [b"", b"host", b"__name__=cpu,host=h1,region=us", &[7u8; 1024]];
+        let inputs: [&[u8]; 4] = [
+            b"",
+            b"host",
+            b"__name__=cpu,host=h1,region=us",
+            &[7u8; 1024],
+        ];
         for input in inputs {
             let mut seeded = create_hasher();
             seeded.write(input);
             let mut boxed = xxhash3_128::Hasher::with_seed(HASH_SEED);
             boxed.write(input);
-            assert_eq!(seeded.finish_128(), boxed.finish_128(), "seeded, {} bytes", input.len());
+            assert_eq!(
+                seeded.finish_128(),
+                boxed.finish_128(),
+                "seeded, {} bytes",
+                input.len()
+            );
 
             let mut unseeded = create_unseeded_hasher();
             unseeded.write(input);
             let mut boxed = xxhash3_128::Hasher::new();
             boxed.write(input);
-            assert_eq!(unseeded.finish_128(), boxed.finish_128(), "unseeded, {} bytes", input.len());
+            assert_eq!(
+                unseeded.finish_128(),
+                boxed.finish_128(),
+                "unseeded, {} bytes",
+                input.len()
+            );
         }
     }
 }

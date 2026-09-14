@@ -227,7 +227,9 @@ fn lookup<'t, T: SymbolTableRefs>(
 }
 
 /// The two ref arrays of an element, or `None` when it carries no refs.
-fn take_ref_pairs<T: SymbolTableRefs>(element: &mut T) -> ValkeyResult<Option<(Vec<u32>, Vec<u32>)>> {
+fn take_ref_pairs<T: SymbolTableRefs>(
+    element: &mut T,
+) -> ValkeyResult<Option<(Vec<u32>, Vec<u32>)>> {
     let (names, values) = element.take_label_refs();
     if names.is_empty() && values.is_empty() {
         return Ok(None);
@@ -303,7 +305,11 @@ impl<'a> EvalLabelResolver<'a> {
     /// inline labels when it has none).
     pub fn resolve<T: SymbolTableRefs>(&mut self, s: &mut T) -> ValkeyResult<EvalLabels> {
         let Some((names, values)) = take_ref_pairs(s)? else {
-            let labels = s.take_labels().into_iter().map(crate::Label::from).collect();
+            let labels = s
+                .take_labels()
+                .into_iter()
+                .map(crate::Label::from)
+                .collect();
             return Ok(EvalLabels::shared(labels));
         };
         // Check every ref first so the fill below cannot fail: an infallible
@@ -520,8 +526,14 @@ mod tests {
     #[test]
     fn eval_label_resolver_matches_owned_resolution() {
         let mut samples = vec![
-            instant(0, vec![("__name__", "cpu"), ("host", "h1"), ("region", "us")]),
-            instant(1, vec![("__name__", "cpu"), ("host", "h2"), ("region", "us")]),
+            instant(
+                0,
+                vec![("__name__", "cpu"), ("host", "h1"), ("region", "us")],
+            ),
+            instant(
+                1,
+                vec![("__name__", "cpu"), ("host", "h2"), ("region", "us")],
+            ),
             instant(2, vec![]),
         ];
         let expected: Vec<EvalLabels> = samples
@@ -576,7 +588,10 @@ mod tests {
                 .resolve_sample(sample)
                 .expect_err("malformed refs must be rejected");
             let msg = err.to_string();
-            assert!(msg.contains("instant sample at 42") && msg.contains(needle), "{msg}");
+            assert!(
+                msg.contains("instant sample at 42") && msg.contains(needle),
+                "{msg}"
+            );
         }
     }
 
@@ -614,8 +629,9 @@ mod tests {
             label_value_refs: rb.1,
             ..instant(1, vec![])
         };
-        let got = EvalLabelResolver::new(&table).resolve(&mut sample).expect("resolve");
+        let got = EvalLabelResolver::new(&table)
+            .resolve(&mut sample)
+            .expect("resolve");
         assert_eq!(got, EvalLabels::interned(&b));
     }
-
 }
