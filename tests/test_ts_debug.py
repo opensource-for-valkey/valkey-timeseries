@@ -269,6 +269,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'debug-mode',
             'ts-promql-set-lookback-to-step',
             'ts-promql-optimize-queries',
+            'ts-promql-derived-filter-pushdown',
             'ts-promql-enable-experimental-functions',
             'ts-promql-max-query-len',
             'ts-promql-max-response-series',
