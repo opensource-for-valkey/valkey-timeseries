@@ -72,6 +72,20 @@ pub struct Label {
     #[prost(string, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SymbolTableRef {
+    #[prost(uint32, tag = "1")]
+    pub name: u32,
+    #[prost(uint32, tag = "2")]
+    pub value: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SymbolTable {
+    #[prost(string, repeated, tag = "1")]
+    pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "2")]
+    pub values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Sample {
     #[prost(int64, tag = "1")]
@@ -1272,18 +1286,15 @@ pub struct SeriesRangeResponse {
     pub labels: ::prost::alloc::vec::Vec<Label>,
     #[prost(message, repeated, tag = "4")]
     pub columns: ::prost::alloc::vec::Vec<SampleData>,
-    /// Label storage, used in place of `labels`: parallel arrays, one entry per
-    /// label, indexing into `MultiRangeResponse.symbol_table_names` /
-    /// `symbol_table_values`. Interning is unconditional, so there is no
-    /// `applied_*` flag; non-empty ref arrays are themselves the signal.
+    /// Label storage, used in place of `labels`: one entry per label, indexing
+    /// into `MultiRangeResponse.symbol_table`. Interning is unconditional, so
+    /// there is no `applied_*` flag; non-empty refs are themselves the signal.
     ///
-    /// Both arrays empty means there is nothing to resolve — either the series has
+    /// An empty ref list means there is nothing to resolve — either the series has
     /// no labels, or it carries them in `labels` directly. A decoder must leave
     /// `labels` alone in that case rather than overwriting it.
-    #[prost(uint32, repeated, tag = "5")]
-    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
-    #[prost(uint32, repeated, tag = "6")]
-    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(message, repeated, tag = "5")]
+    pub label_refs: ::prost::alloc::vec::Vec<SymbolTableRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiGetResponse {
@@ -1333,13 +1344,11 @@ pub struct MultiRangeResponse {
     pub applied_group_reduce: bool,
     #[prost(bool, tag = "5")]
     pub applied_count: bool,
-    /// Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
-    /// index into. Label interning is unconditional, so these are populated
+    /// Dictionary `SeriesRangeResponse.label_refs` indexes into. Label interning
+    /// is unconditional, so this is populated
     /// whenever `series` carries any labels; empty otherwise.
-    #[prost(string, repeated, tag = "6")]
-    pub symbol_table_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "7")]
-    pub symbol_table_values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub symbol_table: ::core::option::Option<SymbolTable>,
 }
 /// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

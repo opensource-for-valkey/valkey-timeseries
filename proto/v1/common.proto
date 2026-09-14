@@ -113,6 +113,21 @@ message Label {
   string value = 2;
 }
 
+/// An interned reference to a symbol in the symbol table.
+/// Both `name` and `value` are indices into the corresponding arrays in `SymbolTable`.
+message SymbolTableRef {
+  uint32 name = 1;
+  uint32 value = 2;
+}
+
+/// A symbol table holds the unique set of label names and values used across series. It is used
+/// to intern strings, so that the same string is only stored once.
+/// Labels can then refer to these symbols via `SymbolTableRef` to save space.
+message SymbolTable {
+  repeated string names = 1;
+  repeated string values = 2;
+}
+
 message Sample {
   int64 timestamp = 1;
   double value = 2;
