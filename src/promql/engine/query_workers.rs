@@ -15,6 +15,7 @@
 
 use crate::common::logging::log_warning;
 use crate::config::max_concurrent_queries;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -36,7 +37,7 @@ static QUERY_WORKERS: LazyLock<QueryWorkers> = LazyLock::new(|| {
                     // Hold the queue lock only to take a job, never while running one.
                     let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                     match job {
-                        Ok(job) => job(),
+                        Ok(job) => run_job(index, job),
                         Err(_) => return,
                     }
                 }
@@ -50,9 +51,59 @@ static QUERY_WORKERS: LazyLock<QueryWorkers> = LazyLock::new(|| {
     QueryWorkers { sender }
 });
 
+/// Run one job, surviving its panic. A panic that unwound through the worker
+/// would end its loop and shrink the pool by one for the life of the process;
+/// after `max_concurrent_queries` such panics every query would be refused.
+/// The client is still answered: the job's captured blocked client is dropped
+/// during the unwind, which unblocks it.
+fn run_job(worker: usize, job: Job) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
+        let reason = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        log_warning(format!(
+            "PromQL query worker {worker}: evaluation panicked: {reason}"
+        ));
+    }
+}
+
 /// Queue `job` for one of the query workers. Returns `false` if no worker will
 /// ever run it (the workers are gone), in which case the caller still owns
 /// the reply.
 pub(crate) fn submit_query<F: FnOnce() + Send + 'static>(job: F) -> bool {
     QUERY_WORKERS.sender.send(Box::new(job)).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::submit_query;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn a_panicking_job_does_not_take_its_worker_down() {
+        // Saturate the pool with panicking jobs so every worker sees one, then
+        // check that the same number of ordinary jobs still get served.
+        let workers = crate::config::max_concurrent_queries();
+        for _ in 0..workers {
+            assert!(submit_query(|| panic!("evaluation blew up")));
+        }
+        let (tx, rx) = mpsc::channel();
+        for i in 0..workers {
+            let tx = tx.clone();
+            assert!(submit_query(move || tx.send(i).unwrap()));
+        }
+        drop(tx);
+        let mut served: Vec<usize> = rx.iter().collect();
+        served.sort_unstable();
+        assert_eq!(served, (0..workers).collect::<Vec<_>>());
+
+        // And the pool is still alive for a later submission.
+        let (tx, rx) = mpsc::channel();
+        assert!(submit_query(move || tx.send(()).unwrap()));
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("a worker should still be running");
+    }
 }
