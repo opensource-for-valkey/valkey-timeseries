@@ -6,7 +6,7 @@ use valkey_module::{
     ValkeyModuleServerInfoData, ValkeyResult, ValkeyString, raw,
 };
 
-use crate::fanout::{FANOUT_ACL_USER, fanout_acl_scope_active, is_clustered};
+use crate::fanout::{FANOUT_ACL_USER, is_clustered};
 
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
@@ -95,7 +95,12 @@ pub fn is_acl_enforced(ctx: &Context) -> bool {
     // `RedisModule_GetModuleUserFromUserName` and crashing the server. `is_real_user_client`
     // already excludes client_id == 0 (internal/module contexts), the AOF sentinel,
     // and the REPLICATED flag.
-    is_real_user_client(ctx) || fanout_acl_scope_active()
+    //
+    // Fan-out request handlers run on the detached `MODULE_CONTEXT`, whose client is a
+    // real (fake-flagged) client with a non-zero id and no REPLICATED flag, so they are
+    // enforced by this same test; the fan-out ACL scope only supplies *which* user to
+    // check (see `get_acl_user`), never *whether* to check.
+    is_real_user_client(ctx)
 }
 
 pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
