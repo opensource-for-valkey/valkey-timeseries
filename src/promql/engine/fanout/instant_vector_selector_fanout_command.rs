@@ -1,3 +1,4 @@
+use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
 use crate::labels::HasFingerprint;
@@ -67,6 +68,7 @@ impl InstantVectorSelectorFanoutCommand {
     pub fn get_response(self) -> InstantQueryResponse {
         InstantQueryResponse {
             samples: self.results,
+            labels: None,
         }
     }
 }
@@ -82,7 +84,10 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
     fn get_local_response(ctx: &Context, req: InstantQuery) -> ValkeyResult<InstantQueryResponse> {
         let Some(selector) = req.selector else {
             ctx.log_warning("Received instant query with no selector, returning empty response");
-            return Ok(InstantQueryResponse { samples: vec![] });
+            return Ok(InstantQueryResponse {
+                samples: vec![],
+                labels: Some(Default::default()),
+            });
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
         handle_instant_query(
@@ -111,6 +116,8 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
     }
 
     fn on_response(&mut self, mut resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
+        let symbol_table = resp.labels.unwrap_or_default();
+        symbol_table::resolve_labels(&mut resp.samples, &symbol_table)?;
         for s in resp.samples.iter() {
             let fingerprint = s.labels.fingerprint();
             if !self.seen.insert(fingerprint) {

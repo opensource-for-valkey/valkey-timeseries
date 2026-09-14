@@ -18,6 +18,7 @@
 //!   single-node aggregation over the concatenated input; see
 //!   [`crate::promql::exec::partial_aggregation`] for the per-operator argument.
 
+use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
 use crate::fanout::{
     FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
@@ -266,6 +267,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                         .collect(),
                     samples: Vec::new(),
                     applied: true,
+                    labels: None,
                 })
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
@@ -273,11 +275,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                 let aggregated =
                     apply_aggregation(kind, modifier.as_ref(), param, samples, req.eval_timestamp)
                         .map_err(|e| ValkeyError::String(e.to_string()))?;
-                Ok(AggregationQueryResponse {
-                    partials: Vec::new(),
-                    samples: aggregated.into_iter().map(Into::into).collect(),
-                    applied: true,
-                })
+                Ok(samples_response(aggregated, true))
             }
         }
     }
@@ -311,7 +309,9 @@ impl FanoutCommand for AggregationFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, mut resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
+        let labels = resp.labels.unwrap_or_default();
+        symbol_table::resolve_labels(&mut resp.samples, &labels)?;
         if !resp.applied {
             // Self-describing response from a peer that did not aggregate.
             self.raw
@@ -362,10 +362,17 @@ impl FanoutCommand for AggregationFanoutCommand {
 /// A response carrying the unaggregated instant vector, for a shard that could
 /// not apply the requested operator.
 fn raw_response(samples: Vec<EvalSample>) -> AggregationQueryResponse {
+    samples_response(samples, false)
+}
+
+fn samples_response(samples: Vec<EvalSample>, applied: bool) -> AggregationQueryResponse {
+    let mut samples: Vec<ProtoInstantSample> = samples.into_iter().map(Into::into).collect();
+    let labels = symbol_table::intern_labels(&mut samples);
     AggregationQueryResponse {
         partials: Vec::new(),
-        samples: samples.into_iter().map(ProtoInstantSample::from).collect(),
-        applied: false,
+        samples,
+        applied,
+        labels: Some(labels),
     }
 }
 
@@ -446,6 +453,7 @@ mod tests {
                         .collect(),
                     samples: Vec::new(),
                     applied: true,
+                    labels: None,
                 }
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
@@ -455,11 +463,7 @@ mod tests {
                     .map(AggregationParam::to_expr_result);
                 let aggregated =
                     apply_aggregation(kind, modifier, param, samples, EVAL_TS).unwrap();
-                AggregationQueryResponse {
-                    partials: Vec::new(),
-                    samples: aggregated.into_iter().map(Into::into).collect(),
-                    applied: true,
-                }
+                samples_response(aggregated, true)
             }
         }
     }
@@ -709,6 +713,7 @@ mod tests {
             partials: Vec::new(),
             samples: vec![sample(&[("job", "a")], 1.0).into()],
             applied: true,
+            labels: None,
         };
         assert!(cmd.on_response(stray, &node(7000)).is_err());
 
@@ -723,6 +728,7 @@ mod tests {
             partials: vec![AggregationGroupPartial::default()],
             samples: Vec::new(),
             applied: true,
+            labels: None,
         };
         assert!(cmd.on_response(stray, &node(7000)).is_err());
     }

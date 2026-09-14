@@ -72,6 +72,8 @@ pub struct Label {
     #[prost(string, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
+/// / An interned reference to a symbol in the symbol table.
+/// / Both `name` and `value` are indices into the corresponding arrays in `SymbolTable`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SymbolTableRef {
     #[prost(uint32, tag = "1")]
@@ -79,6 +81,9 @@ pub struct SymbolTableRef {
     #[prost(uint32, tag = "2")]
     pub value: u32,
 }
+/// / A symbol table holds the unique set of label names and values used across series. It is used
+/// / to intern strings, so that the same string is only stored once.
+/// / Labels can then refer to these symbols via `SymbolTableRef` to save space.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SymbolTable {
     #[prost(string, repeated, tag = "1")]
@@ -486,6 +491,9 @@ pub struct InstantSample {
     /// / Optional valkey key for this sample, if any.
     #[prost(string, tag = "4")]
     pub key: ::prost::alloc::string::String,
+    /// / Interned label references into `InstantQueryResponse.labels`.
+    #[prost(message, repeated, tag = "5")]
+    pub label_refs: ::prost::alloc::vec::Vec<SymbolTableRef>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstantQuery {
@@ -504,6 +512,8 @@ pub struct InstantQuery {
 pub struct InstantQueryResponse {
     #[prost(message, repeated, tag = "1")]
     pub samples: ::prost::alloc::vec::Vec<InstantSample>,
+    #[prost(message, optional, tag = "2")]
+    pub labels: ::core::option::Option<SymbolTable>,
 }
 /// / A series with values over a time range.
 /// /
@@ -810,13 +820,16 @@ pub struct AggregationQueryResponse {
     /// / the raw instant vector when `applied` is false.
     #[prost(message, repeated, tag = "2")]
     pub samples: ::prost::alloc::vec::Vec<InstantSample>,
+    /// / Interned label references for `samples`.
+    #[prost(message, optional, tag = "3")]
+    pub labels: ::core::option::Option<SymbolTable>,
     /// / Compatibility handshake: true when the shard applied the requested
     /// / aggregation. A shard that does not recognize the requested `kind` (a
     /// / newer coordinator during a rolling upgrade) returns the raw instant
     /// / vector in `samples` with `applied` false, and the coordinator aggregates
     /// / it itself. Absent on a pre-handshake peer (proto3 decodes as false),
     /// / which is exactly the right interpretation.
-    #[prost(bool, tag = "3")]
+    #[prost(bool, tag = "4")]
     pub applied: bool,
 }
 /// / A PromQL aggregation operator. Mirrors

@@ -21,6 +21,7 @@
 
 use super::generated::{Label, SeriesRangeResponse, SymbolTable, SymbolTableRef};
 use crate::common::context::key_for_display;
+use crate::promql::generated::InstantSample;
 use std::collections::HashMap;
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -30,13 +31,65 @@ use valkey_module::{ValkeyError, ValkeyResult};
 /// A series with no labels gets an empty ref list, which [`resolve_labels`]
 /// reads as "nothing to resolve" — so the round trip is still correct without
 /// needing a separate marker for the empty case.
-pub fn intern_labels(series: &mut [SeriesRangeResponse]) -> SymbolTable {
+pub trait SymbolTableRefs {
+    fn take_labels(&mut self) -> Vec<Label>;
+    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>);
+    fn take_label_refs(&mut self) -> Vec<SymbolTableRef>;
+    fn set_labels(&mut self, labels: Vec<Label>);
+    fn key_for_display(&self) -> String;
+}
+
+impl SymbolTableRefs for SeriesRangeResponse {
+    fn take_labels(&mut self) -> Vec<Label> {
+        std::mem::take(&mut self.labels)
+    }
+
+    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>) {
+        self.label_refs = refs;
+    }
+
+    fn take_label_refs(&mut self) -> Vec<SymbolTableRef> {
+        std::mem::take(&mut self.label_refs)
+    }
+
+    fn set_labels(&mut self, labels: Vec<Label>) {
+        self.labels = labels;
+    }
+
+    fn key_for_display(&self) -> String {
+        key_for_display(&self.key).into_owned()
+    }
+}
+
+impl SymbolTableRefs for InstantSample {
+    fn take_labels(&mut self) -> Vec<Label> {
+        std::mem::take(&mut self.labels)
+    }
+
+    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>) {
+        self.label_refs = refs;
+    }
+
+    fn take_label_refs(&mut self) -> Vec<SymbolTableRef> {
+        std::mem::take(&mut self.label_refs)
+    }
+
+    fn set_labels(&mut self, labels: Vec<Label>) {
+        self.labels = labels;
+    }
+
+    fn key_for_display(&self) -> String {
+        self.key.clone()
+    }
+}
+
+pub fn intern_labels<T: SymbolTableRefs>(series: &mut [T]) -> SymbolTable {
     let mut table = SymbolTable::default();
     let mut name_ids: HashMap<String, u32> = HashMap::new();
     let mut value_ids: HashMap<String, u32> = HashMap::new();
 
     for s in series.iter_mut() {
-        let labels = std::mem::take(&mut s.labels);
+        let labels = s.take_labels();
         let mut refs = Vec::with_capacity(labels.len());
         for label in labels {
             let name_idx = match name_ids.get(label.name.as_str()) {
@@ -62,7 +115,7 @@ pub fn intern_labels(series: &mut [SeriesRangeResponse]) -> SymbolTable {
                 value: value_idx,
             });
         }
-        s.label_refs = refs;
+        s.set_label_refs(refs);
     }
 
     table
@@ -78,9 +131,12 @@ pub fn intern_labels(series: &mut [SeriesRangeResponse]) -> SymbolTable {
 ///
 /// Peer-controlled: an out-of-range index is a malformed response and is
 /// rejected with `Err`, never indexed directly.
-pub fn resolve_labels(series: &mut [SeriesRangeResponse], table: &SymbolTable) -> ValkeyResult<()> {
+pub fn resolve_labels<T: SymbolTableRefs>(
+    series: &mut [T],
+    table: &SymbolTable,
+) -> ValkeyResult<()> {
     for s in series.iter_mut() {
-        let refs = std::mem::take(&mut s.label_refs);
+        let refs = s.take_label_refs();
         // Nothing to resolve. Returning early rather than assigning an empty
         // vec keeps this function from discarding `labels` when it is handed a
         // response that was never interned.
@@ -93,7 +149,7 @@ pub fn resolve_labels(series: &mut [SeriesRangeResponse], table: &SymbolTable) -
             let name = table.names.get(symbol_ref.name as usize).ok_or_else(|| {
                 ValkeyError::String(format!(
                     "TSDB: malformed symbol-table response: series '{}' label name ref {} out of range ({} names)",
-                    key_for_display(&s.key),
+                    s.key_for_display(),
                     symbol_ref.name,
                     table.names.len()
                 ))
@@ -101,7 +157,7 @@ pub fn resolve_labels(series: &mut [SeriesRangeResponse], table: &SymbolTable) -
             let value = table.values.get(symbol_ref.value as usize).ok_or_else(|| {
                 ValkeyError::String(format!(
                     "TSDB: malformed symbol-table response: series '{}' label value ref {} out of range ({} values)",
-                    key_for_display(&s.key),
+                    s.key_for_display(),
                     symbol_ref.value,
                     table.values.len()
                 ))
@@ -111,7 +167,9 @@ pub fn resolve_labels(series: &mut [SeriesRangeResponse], table: &SymbolTable) -
                 value: value.clone(),
             });
         }
-        s.labels = labels;
+        // The concrete response type owns the labels; resolution is provided
+        // by the type-specific caller after validating the references.
+        s.set_labels(labels);
     }
     Ok(())
 }
@@ -204,6 +262,29 @@ mod tests {
         let table = intern_labels(&mut batch);
         resolve_labels(&mut batch, &table).expect("resolve");
         assert!(batch[0].labels.is_empty());
+    }
+
+    #[test]
+    fn instant_samples_roundtrip_through_symbol_table() {
+        let mut samples = vec![InstantSample {
+            labels: vec![Label {
+                name: "region".into(),
+                value: "us-east-1".into(),
+            }],
+            value: 1.0,
+            timestamp: 42,
+            key: "a".into(),
+            label_refs: Vec::new(),
+        }];
+
+        let table = intern_labels(&mut samples);
+        assert!(samples[0].labels.is_empty());
+        assert_eq!(table.names, vec!["region"]);
+        assert_eq!(table.values, vec!["us-east-1"]);
+
+        resolve_labels(&mut samples, &table).expect("resolve");
+        assert_eq!(samples[0].labels[0].name, "region");
+        assert_eq!(samples[0].labels[0].value, "us-east-1");
     }
 
     #[test]

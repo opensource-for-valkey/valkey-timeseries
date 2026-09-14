@@ -41,6 +41,8 @@ message InstantSample {
   int64 timestamp = 3;
   /// Optional valkey key for this sample, if any.
   string key = 4;
+  /// Interned label references into `InstantQueryResponse.labels`.
+  repeated SymbolTableRef label_refs = 5;
 }
 
 message InstantQuery {
@@ -53,6 +55,7 @@ message InstantQuery {
 
 message InstantQueryResponse {
   repeated InstantSample samples = 1;
+  SymbolTable labels = 2;
 }
 
 /// A series with values over a time range.
@@ -359,11 +362,13 @@ message AggregationQueryResponse {
   /// count_values: the shard's locally selected/counted samples. Also carries
   /// the raw instant vector when `applied` is false.
   repeated InstantSample samples = 2;
+  /// Interned label references for `samples`.
+  SymbolTable labels = 3;
   /// Compatibility handshake: true when the shard applied the requested
   /// aggregation. A shard that does not recognize the requested `kind` (a
   /// newer coordinator during a rolling upgrade) returns the raw instant
   /// vector in `samples` with `applied` false, and the coordinator aggregates
   /// it itself. Absent on a pre-handshake peer (proto3 decodes as false),
   /// which is exactly the right interpretation.
-  bool applied = 3;
+  bool applied = 4;
 }

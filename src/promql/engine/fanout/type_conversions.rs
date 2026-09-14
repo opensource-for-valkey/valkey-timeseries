@@ -444,6 +444,7 @@ impl From<EvalSample> for ProtoInstantSample {
             timestamp: sample.timestamp_ms,
             // Aggregated output does not belong to a single key.
             key: String::new(),
+            label_refs: Vec::new(),
         }
     }
 }

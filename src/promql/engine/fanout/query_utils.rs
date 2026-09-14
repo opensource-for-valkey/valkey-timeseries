@@ -1,4 +1,5 @@
 use crate::commands::fanout_codec::chunks::serialize_chunk;
+use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
 use crate::common::threads::IterIntoParRayon;
 use crate::labels::filters::SeriesSelector;
@@ -50,6 +51,7 @@ pub(super) fn handle_instant_query(
                 value: sample.value,
                 timestamp: sample.timestamp,
                 key,
+                label_refs: Vec::new(),
             })
         })
         .collect::<Vec<_>>();
@@ -57,7 +59,12 @@ pub(super) fn handle_instant_query(
     validate_max_series(samples.len(), max_series as usize)
         .map_err(valkey_module::ValkeyError::String)?;
 
-    Ok(InstantQueryResponse { samples })
+    let mut samples = samples;
+    let symbol_table = symbol_table::intern_labels(&mut samples);
+    Ok(InstantQueryResponse {
+        samples,
+        labels: Some(symbol_table),
+    })
 }
 
 /// Local instant-vector evaluation for the aggregation push-down.
