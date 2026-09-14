@@ -409,9 +409,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 kind,
                 matrix_range_ms(matrix),
                 param,
-                aggregation
-                    .as_ref()
-                    .map(|agg| AggregationKey::new(agg.kind, agg.modifier.as_ref())),
+                aggregation.as_ref().map(AggregationKey::of),
             );
             if !seen.insert(key.clone()) {
                 continue;
@@ -484,9 +482,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     kind,
                     matrix_range_ms(matrix),
                     param,
-                    aggregation
-                        .as_ref()
-                        .map(|agg| AggregationKey::new(agg.kind, agg.modifier.as_ref())),
+                    aggregation.as_ref().map(AggregationKey::of),
                 );
                 if grids.contains_key(&key) {
                     continue;
@@ -728,7 +724,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 // The raw spans are what was loaded; charge them before the
                 // evaluation turns them into one point per step.
                 self.charge_range_samples(&series)?;
-                request.evaluate(series)
+                request.evaluate(series)?
             }
             other => other,
         };
@@ -780,10 +776,13 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             let Some(aggregation) = fusable_aggregation(aggregate) else {
                 continue;
             };
-            let key = GridPreloadKey::stepped(
-                vs,
-                AggregationKey::new(aggregation.kind, aggregation.modifier.as_ref()),
-            );
+            // A selecting operator's output keeps its picks' own timestamps,
+            // which the fused form stamps with the step; only `timestamp()`
+            // can tell, and when it is in the query the selection runs here.
+            if grid.sample_timestamps && aggregation.strategy() == PushdownStrategy::Select {
+                continue;
+            }
+            let key = GridPreloadKey::stepped(vs, AggregationKey::of(&aggregation));
             if !seen.insert(key.clone()) {
                 continue;
             }
@@ -1921,10 +1920,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             kind,
             matrix_range_ms(matrix),
             param,
-            Some(AggregationKey::new(
-                aggregation.kind,
-                aggregation.modifier.as_ref(),
-            )),
+            Some(AggregationKey::of(&aggregation)),
         );
 
         // A grid resolved before the step loop answers this step from its
@@ -2127,43 +2123,41 @@ fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {
     matrix.range.as_millis() as i64
 }
 
-/// The aggregation of `aggregate` as something a shard can fold a rollup into,
+/// The aggregation of `aggregate` as something a shard can fold a grid into,
 /// or `None` when it cannot be fused.
 ///
-/// Two conditions, both about the operator rather than the data: it must have a
-/// mergeable partial state (the reductions do; `topk` and `count_values` do
-/// not), and it must take no parameter — every operator that takes one is in the
-/// group that has no partial state anyway, so a parameter here means the shape
-/// is not fusable.
+/// Two conditions, both about the operator rather than the data: it must have
+/// a push-down form — a mergeable partial state for the reductions, a
+/// re-selectable output for `topk`/`bottomk`/`limitk`/`limit_ratio`, addable
+/// counts for `count_values`; `quantile` has none — and its parameter, where
+/// it takes one, must be a literal the request can carry. `topk(scalar(x), y)`
+/// is evaluated here.
 fn fusable_aggregation(aggregate: &AggregateExpr) -> Option<GridAggregation> {
-    let kind = fusable_kind(aggregate)?;
+    let kind = AggregationKind::try_from(aggregate.op).ok()?;
+    kind.pushdown_strategy()?;
+    let param = match aggregate.param.as_deref() {
+        None => None,
+        Some(Expr::NumberLiteral(n)) => Some(AggregationParam::Scalar(n.val)),
+        Some(Expr::StringLiteral(s)) => Some(AggregationParam::Label(s.val.clone())),
+        Some(_) => return None,
+    };
     Some(GridAggregation {
         kind,
         modifier: aggregate.modifier.clone(),
+        param,
     })
-}
-
-/// The operator of `aggregate` when it can be fused; see
-/// [`fusable_aggregation`].
-fn fusable_kind(aggregate: &AggregateExpr) -> Option<AggregationKind> {
-    if aggregate.param.is_some() {
-        return None;
-    }
-    let kind = AggregationKind::try_from(aggregate.op).ok()?;
-    (kind.pushdown_strategy() == Some(PushdownStrategy::Reduce)).then_some(kind)
 }
 
 /// The grid key under which `aggregate` — a fusable aggregation directly over
 /// a bare vector selector — is preloaded, or `None` when it is not that shape.
-/// Looked up once per step, so it borrows the modifier rather than cloning it.
 fn stepped_aggregation_key(aggregate: &AggregateExpr) -> Option<GridPreloadKey> {
     let Expr::VectorSelector(vs) = strip_parens(&aggregate.expr) else {
         return None;
     };
-    let kind = fusable_kind(aggregate)?;
+    let aggregation = fusable_aggregation(aggregate)?;
     Some(GridPreloadKey::stepped(
         vs,
-        AggregationKey::new(kind, aggregate.modifier.as_ref()),
+        AggregationKey::of(&aggregation),
     ))
 }
 

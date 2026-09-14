@@ -527,10 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn range_selecting_aggregation_over_selector_preloads_the_selector() {
+    fn range_selecting_aggregation_over_selector_is_one_fused_grid_request() {
         let (counting, reader) = build_reader();
-        // topk has no mergeable partial state, so it is not fused: the
-        // selector is preloaded stepped and the selection runs here per step.
+        // topk fuses like a reduction: one grid request carries the selector
+        // and the operator, and the source's per-step picks come back.
         run_range(reader, "topk(2, a)");
         assert_eq!(
             counting.counts(),

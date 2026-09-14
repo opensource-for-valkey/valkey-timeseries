@@ -40,11 +40,11 @@ use crate::promql::engine::fanout::type_conversions::{
     proto_labels_to_eval_labels, range_sample_to_proto,
 };
 use crate::promql::engine::query_reader::{
-    GridAggregation, GridOutcome, GridRequest, GridRollup, GridSeries as GridStage, SteppedPoint,
-    SteppedSeries, grid_window_ends,
+    AggregationParam, GridAggregation, GridOutcome, GridRequest, GridRollup,
+    GridSeries as GridStage, SteppedPoint, SteppedSeries, grid_window_ends,
 };
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
-use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
+use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, GridAggregation as ProtoGridAggregation,
@@ -145,9 +145,12 @@ pub(in crate::promql) struct GridFanoutCommand {
     /// Raw spans a shard chose to ship instead, run through the per-series
     /// stage by [`Self::into_result`].
     raw: Vec<RangeSample<EvalLabels>>,
-    /// Per-`(group, step)` states from the shards. `None` when the request is
-    /// not a fused one.
+    /// Per-`(group, step)` states from the shards, for a request fused with a
+    /// reduction. `None` otherwise.
     partials: Option<SteppedPartialGroups>,
+    /// Per-step candidates from the shards, for a request fused with a
+    /// selecting or counting operator. `None` otherwise.
+    selection: Option<SteppedSelection>,
 }
 
 impl Default for GridFanoutCommand {
@@ -181,10 +184,13 @@ impl GridFanoutCommand {
         max_points_per_series: u64,
         timeout: Duration,
     ) -> Self {
-        let partials = request
-            .aggregation
-            .as_ref()
-            .map(|agg| SteppedPartialGroups::new(agg.kind));
+        let (partials, selection) = match request.aggregation.as_ref() {
+            Some(agg) if agg.strategy() == PushdownStrategy::Reduce => {
+                (Some(SteppedPartialGroups::new(agg.kind)), None)
+            }
+            Some(agg) => (None, Some(SteppedSelection::new(agg.clone()))),
+            None => (None, None),
+        };
         let window_ends = request.window_ends();
         Self {
             matchers,
@@ -197,6 +203,7 @@ impl GridFanoutCommand {
             rolled: Vec::new(),
             raw: Vec::new(),
             partials,
+            selection,
         }
     }
 
@@ -204,8 +211,9 @@ impl GridFanoutCommand {
     ///
     /// Whatever arrived raw is run through the per-series stage here, over the
     /// same window ends a shard used, and — for a fused request — folded into
-    /// the partials the shards sent. What comes out is the same either way.
-    pub fn into_result(mut self) -> GridOutcome {
+    /// the partials or candidates the shards sent. What comes out is the same
+    /// either way.
+    pub fn into_result(mut self) -> Result<GridOutcome, FanoutError> {
         let raw = std::mem::take(&mut self.raw);
         let mut stepped = std::mem::take(&mut self.stepped);
         let mut rolled = std::mem::take(&mut self.rolled);
@@ -217,7 +225,28 @@ impl GridFanoutCommand {
             }
         }
 
-        match self.partials.take() {
+        if let Some(mut selection) = self.selection.take() {
+            // Fused with a selecting or counting operator: the shards'
+            // outputs are candidates; whatever arrived raw or un-selected is
+            // run through the operator here and joins them.
+            let unselected = if self.request.rollup.is_some() {
+                GridStage::Rolled(rolled)
+            } else {
+                GridStage::Stepped(stepped)
+            }
+            .into_step_values();
+            if !unselected.is_empty() {
+                selection
+                    .apply(unselected)
+                    .map_err(|e| FanoutError::custom(e.to_string()))?;
+            }
+            return selection
+                .finalize()
+                .map(GridOutcome::Reduced)
+                .map_err(|e| FanoutError::custom(e.to_string()));
+        }
+
+        Ok(match self.partials.take() {
             // Fused: fold in whatever arrived un-grouped, then finalize every
             // (group, step).
             Some(mut partials) => {
@@ -239,7 +268,7 @@ impl GridFanoutCommand {
             }
             None if self.request.rollup.is_some() => GridOutcome::Rolled(rolled),
             None => GridOutcome::Stepped(stepped),
-        }
+        })
     }
 }
 
@@ -297,22 +326,29 @@ impl FanoutCommand for GridFanoutCommand {
                 range_ms: rollup.range_ms,
                 scalar_param: rollup.param,
             }),
-            aggregation: self
-                .request
-                .aggregation
-                .as_ref()
-                .map(|agg| ProtoGridAggregation {
+            aggregation: self.request.aggregation.as_ref().map(|agg| {
+                let (scalar_param, label_param) = match &agg.param {
+                    Some(AggregationParam::Scalar(value)) => (Some(*value), None),
+                    Some(AggregationParam::Label(label)) => (None, Some(label.clone())),
+                    None => (None, None),
+                };
+                ProtoGridAggregation {
                     kind: ProtoAggregationKind::from(agg.kind) as i32,
                     grouping: agg.modifier.as_ref().map(Into::into),
-                }),
+                    scalar_param,
+                    label_param,
+                }
+            }),
             sample_timestamps: self.request.sample_timestamps,
         }
     }
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
-        // Corrupt-peer defenses. A fused request is answered in partials and a
-        // plain one in series; a response that carries the other list would be
-        // folded in twice — or grouped when the query asked for series.
+        // Corrupt-peer defenses. A request fused with a reduction is answered
+        // in partials; every other request in series — a fused selection's
+        // series are the shard's per-step picks or counts. A response carrying
+        // the wrong list would be folded in twice, or grouped when the query
+        // asked for series.
         match self.partials.as_mut() {
             Some(partials) => {
                 if !resp.series.is_empty() {
@@ -337,6 +373,7 @@ impl FanoutCommand for GridFanoutCommand {
                         target.socket_address,
                     )));
                 }
+                let mut candidates = Vec::new();
                 for series in resp.series {
                     let points: Vec<(i64, i64, f64)> = decode_columns(&self.window_ends, &series)
                         .map_err(|why| {
@@ -347,7 +384,15 @@ impl FanoutCommand for GridFanoutCommand {
                         })?
                         .collect();
                     let labels = proto_labels_to_eval_labels(series.labels);
-                    if self.request.rollup.is_some() {
+                    if self.selection.is_some() {
+                        candidates.push(RangeSample {
+                            labels,
+                            samples: points
+                                .into_iter()
+                                .map(|(step_ts, _, value)| Sample::new(step_ts, value))
+                                .collect(),
+                        });
+                    } else if self.request.rollup.is_some() {
                         self.rolled.push(RangeSample {
                             labels,
                             samples: points
@@ -367,6 +412,9 @@ impl FanoutCommand for GridFanoutCommand {
                                 .collect(),
                         });
                     }
+                }
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.merge(candidates);
                 }
             }
         }
@@ -419,16 +467,22 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
             let kind = ProtoAggregationKind::try_from(agg.kind)
                 .ok()
                 .and_then(|kind| AggregationKind::try_from(kind).ok())
-                .filter(|kind| kind.pushdown_strategy() == Some(PushdownStrategy::Reduce))
+                .filter(|kind| kind.pushdown_strategy().is_some())
                 .ok_or_else(|| {
                     ValkeyError::String(format!(
                         "TSDB: aggregation kind {} cannot be fused onto a grid push-down request",
                         agg.kind
                     ))
                 })?;
+            let param = match (agg.scalar_param, agg.label_param.clone()) {
+                (Some(value), _) => Some(AggregationParam::Scalar(value)),
+                (None, Some(label)) => Some(AggregationParam::Label(label)),
+                (None, None) => None,
+            };
             Ok::<_, ValkeyError>(GridAggregation {
                 kind,
                 modifier: agg.grouping.clone().map(LabelModifier::from),
+                param,
             })
         })
         .transpose()?;
@@ -549,6 +603,24 @@ fn shard_response(
         .map(range_sample_to_proto)
         .collect::<ValkeyResult<Vec<_>>>()?;
 
+    if let Some(aggregation) = request.aggregation.as_ref()
+        && aggregation.strategy() != PushdownStrategy::Reduce
+    {
+        // A selecting or counting operator: run it per step over this
+        // shard's series and ship its output as candidates — k series per
+        // step, or one count per value — rather than every series.
+        let mut selection = SteppedSelection::new(aggregation.clone());
+        return selection
+            .apply(staged.into_step_values())
+            .and_then(|()| selection.finalize())
+            .map_err(|e| ValkeyError::String(e.to_string()))
+            .map(|selected| GridQueryResponse {
+                series: columnar_series(window_ends, selected),
+                partials: Vec::new(),
+                raw,
+            });
+    }
+
     if let Some(aggregation) = request.aggregation.as_ref() {
         let mut groups = SteppedPartialGroups::new(aggregation.kind);
         groups.accumulate(aggregation.modifier.as_ref(), staged.into_step_values());
@@ -585,24 +657,7 @@ fn shard_response(
                 }
             })
             .collect(),
-        GridStage::Rolled(series) => series
-            .into_iter()
-            .map(|s| {
-                let (presence, values, sample_lag) = encode_columns(
-                    window_ends,
-                    s.samples
-                        .iter()
-                        .map(|p| (p.timestamp, p.timestamp, p.value)),
-                    false,
-                );
-                GridSeries {
-                    labels: (&s.labels).into(),
-                    presence,
-                    values,
-                    sample_lag,
-                }
-            })
-            .collect(),
+        GridStage::Rolled(series) => columnar_series(window_ends, series),
     };
 
     Ok(GridQueryResponse {
@@ -610,6 +665,30 @@ fn shard_response(
         partials: Vec::new(),
         raw,
     })
+}
+
+/// Per-entry `(step, value)` points as columnar series: rollup output, or a
+/// fused selection's per-step picks and counts. No lag column — a value here
+/// belongs to its window.
+fn columnar_series(window_ends: &[i64], series: Vec<RangeSample<EvalLabels>>) -> Vec<GridSeries> {
+    series
+        .into_iter()
+        .map(|s| {
+            let (presence, values, sample_lag) = encode_columns(
+                window_ends,
+                s.samples
+                    .iter()
+                    .map(|p| (p.timestamp, p.timestamp, p.value)),
+                false,
+            );
+            GridSeries {
+                labels: (&s.labels).into(),
+                presence,
+                values,
+                sample_lag,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -689,12 +768,22 @@ mod tests {
     }
 
     fn fused(base: GridRequest, agg: AggregationKind, by: &[&str]) -> GridRequest {
+        fused_with(base, agg, by, None)
+    }
+
+    fn fused_with(
+        base: GridRequest,
+        agg: AggregationKind,
+        by: &[&str],
+        param: Option<AggregationParam>,
+    ) -> GridRequest {
         GridRequest {
             aggregation: Some(GridAggregation {
                 kind: agg,
                 modifier: (!by.is_empty()).then(|| {
                     LabelModifier::Include(promql_parser::label::Labels::new(by.to_vec()))
                 }),
+                param,
             }),
             ..base
         }
@@ -823,6 +912,81 @@ mod tests {
                 "stepped/fused avg".to_string(),
                 fused(stepped_grid_request(), AggregationKind::Avg, &[]),
             ),
+            // The selecting and counting operators: k is larger than any one
+            // shard's share, so the coordinator's re-selection has to choose
+            // across shards.
+            (
+                "stepped/fused topk 1".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::Topk,
+                    &[],
+                    Some(AggregationParam::Scalar(1.0)),
+                ),
+            ),
+            (
+                "stepped/fused topk 3".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::Topk,
+                    &[],
+                    Some(AggregationParam::Scalar(3.0)),
+                ),
+            ),
+            (
+                "stepped/fused bottomk by".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::Bottomk,
+                    &["__name__"],
+                    Some(AggregationParam::Scalar(2.0)),
+                ),
+            ),
+            (
+                "stepped/fused limitk".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::Limitk,
+                    &[],
+                    Some(AggregationParam::Scalar(2.0)),
+                ),
+            ),
+            (
+                "stepped/fused limit_ratio".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::LimitRatio,
+                    &[],
+                    Some(AggregationParam::Scalar(0.5)),
+                ),
+            ),
+            (
+                "stepped/fused count_values".to_string(),
+                fused_with(
+                    stepped_grid_request(),
+                    AggregationKind::CountValues,
+                    &[],
+                    Some(AggregationParam::Label("v".into())),
+                ),
+            ),
+            (
+                "rate/fused topk".to_string(),
+                fused_with(
+                    rollup_grid_request(RollupKind::Rate),
+                    AggregationKind::Topk,
+                    &[],
+                    Some(AggregationParam::Scalar(2.0)),
+                ),
+            ),
+            (
+                "sum_over_time/fused count_values by".to_string(),
+                fused_with(
+                    rollup_grid_request(RollupKind::SumOverTime),
+                    AggregationKind::CountValues,
+                    &["__name__"],
+                    Some(AggregationParam::Label("v".into())),
+                ),
+            ),
         ];
         for kind in RollupKind::all() {
             shapes.push((format!("{kind:?}/instant"), rollup_request(kind)));
@@ -846,7 +1010,7 @@ mod tests {
             cmd.on_response(response(request, shard.clone()), &node(7000 + index as u16))
                 .expect("shard response accepted");
         }
-        cmd.into_result()
+        cmd.into_result().unwrap()
     }
 
     /// The push-down contract: evaluating at the shards and combining equals
@@ -857,7 +1021,7 @@ mod tests {
         for shards in [test_shards(), dense_shards()] {
             let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
             for (shape, request) in request_shapes() {
-                let want = rendered(request.evaluate(all.clone()));
+                let want = rendered(request.evaluate(all.clone()).unwrap());
 
                 assert_eq!(want, rendered(fan_out(&request, &shards)), "{shape}");
 
@@ -867,7 +1031,11 @@ mod tests {
                     cmd.on_response(raw_response(shard.clone()), &node(7000 + index as u16))
                         .unwrap();
                 }
-                assert_eq!(want, rendered(cmd.into_result()), "{shape} (all raw)");
+                assert_eq!(
+                    want,
+                    rendered(cmd.into_result().unwrap()),
+                    "{shape} (all raw)"
+                );
 
                 // And a mix: one staged shard, the rest raw.
                 let mut cmd = command(request.clone());
@@ -877,7 +1045,11 @@ mod tests {
                     cmd.on_response(raw_response(shard.clone()), &node(7000 + index as u16))
                         .unwrap();
                 }
-                assert_eq!(want, rendered(cmd.into_result()), "{shape} (mixed)");
+                assert_eq!(
+                    want,
+                    rendered(cmd.into_result().unwrap()),
+                    "{shape} (mixed)"
+                );
             }
         }
     }
@@ -920,7 +1092,7 @@ mod tests {
             ]
         );
 
-        let got = rendered(request.evaluate(vec![input]));
+        let got = rendered(request.evaluate(vec![input]).unwrap());
         assert_eq!(got, vec![("m{instance=\"0\"}".to_string(), want)]);
     }
 
@@ -962,7 +1134,7 @@ mod tests {
     }
 
     fn request_points(request: &GridRequest, input: RangeSample<EvalLabels>) -> Vec<Point> {
-        rendered(request.evaluate(vec![input]))
+        rendered(request.evaluate(vec![input]).unwrap())
             .pop()
             .map(|(_, points)| points)
             .unwrap_or_default()
@@ -990,8 +1162,12 @@ mod tests {
         let mut cmd = command(request.clone());
         cmd.on_response(resp, &node(7000)).unwrap();
         assert_eq!(
-            rendered(cmd.into_result()),
-            rendered(request.evaluate(vec![sparse.clone(), dense.clone()])),
+            rendered(cmd.into_result().unwrap()),
+            rendered(
+                request
+                    .evaluate(vec![sparse.clone(), dense.clone()])
+                    .unwrap()
+            ),
         );
 
         // Fused: the raw series is folded into the partials on the coordinator.
@@ -1003,8 +1179,8 @@ mod tests {
         let mut cmd = command(fused.clone());
         cmd.on_response(resp, &node(7000)).unwrap();
         assert_eq!(
-            rendered(cmd.into_result()),
-            rendered(fused.evaluate(vec![sparse, dense])),
+            rendered(cmd.into_result().unwrap()),
+            rendered(fused.evaluate(vec![sparse, dense]).unwrap()),
         );
     }
 
@@ -1033,7 +1209,7 @@ mod tests {
 
         let mut cmd = command(request.clone());
         cmd.on_response(raw_response(gappy), &node(7000)).unwrap();
-        let GridOutcome::Rolled(fallback) = cmd.into_result() else {
+        let GridOutcome::Rolled(fallback) = cmd.into_result().unwrap() else {
             panic!("a rollup request answers Rolled");
         };
         assert_eq!(fallback.len(), 1);
@@ -1057,7 +1233,7 @@ mod tests {
         let mut cmd = command(request.clone());
         cmd.on_response(raw_response(outside), &node(7000)).unwrap();
         assert!(
-            rendered(cmd.into_result()).is_empty(),
+            rendered(cmd.into_result().unwrap()).is_empty(),
             "a series with no samples in the window must not be reported"
         );
 
@@ -1066,7 +1242,7 @@ mod tests {
         let mut cmd = command(request.clone());
         cmd.on_response(raw_response(nan_series), &node(7000))
             .unwrap();
-        let GridOutcome::Rolled(rolled) = cmd.into_result() else {
+        let GridOutcome::Rolled(rolled) = cmd.into_result().unwrap() else {
             panic!("a rollup request answers Rolled");
         };
         assert_eq!(rolled.len(), 1, "the NaN result is a result");
@@ -1167,7 +1343,7 @@ mod tests {
 
         let mut cmd = command(request.clone());
         cmd.on_response(resp, &node(7000)).unwrap();
-        let GridOutcome::Stepped(stepped) = cmd.into_result() else {
+        let GridOutcome::Stepped(stepped) = cmd.into_result().unwrap() else {
             panic!("a stepped request answers Stepped");
         };
         assert!(
@@ -1199,7 +1375,7 @@ mod tests {
         let mut cmd = command(asking.clone());
         cmd.on_response(response(&asking, vec![dense()]), &node(7000))
             .unwrap();
-        let GridOutcome::Stepped(stepped) = cmd.into_result() else {
+        let GridOutcome::Stepped(stepped) = cmd.into_result().unwrap() else {
             panic!()
         };
         assert!(
@@ -1332,15 +1508,39 @@ mod tests {
         ))
         .generate_request();
         assert!(decode_request(&req).is_ok());
-        req.aggregation.as_mut().unwrap().kind = ProtoAggregationKind::Topk as i32;
+        req.aggregation.as_mut().unwrap().kind = ProtoAggregationKind::Unspecified as i32;
         assert!(
             decode_request(&req).is_err(),
-            "topk has no partial state and must not be fused"
+            "an unspecified operator cannot be fused"
         );
         req.aggregation.as_mut().unwrap().kind = 99;
         assert!(decode_request(&req).is_err());
-        req.aggregation.as_mut().unwrap().kind = 0;
-        assert!(decode_request(&req).is_err());
+
+        // A selecting operator decodes with its parameter.
+        let req = command(fused_with(
+            stepped_grid_request(),
+            AggregationKind::Topk,
+            &["job"],
+            Some(AggregationParam::Scalar(3.0)),
+        ))
+        .generate_request();
+        let decoded = decode_request(&req).unwrap();
+        assert!(matches!(
+            decoded.aggregation.as_ref().and_then(|a| a.param.as_ref()),
+            Some(AggregationParam::Scalar(k)) if *k == 3.0
+        ));
+        let req = command(fused_with(
+            stepped_grid_request(),
+            AggregationKind::CountValues,
+            &[],
+            Some(AggregationParam::Label("v".into())),
+        ))
+        .generate_request();
+        let decoded = decode_request(&req).unwrap();
+        assert!(matches!(
+            decoded.aggregation.as_ref().and_then(|a| a.param.as_ref()),
+            Some(AggregationParam::Label(l)) if l == "v"
+        ));
     }
 
     /// A response whose lists contradict the request is rejected instead of

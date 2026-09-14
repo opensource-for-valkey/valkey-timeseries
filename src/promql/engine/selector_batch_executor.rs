@@ -867,9 +867,8 @@ fn execute_cluster_grid(
     let cloned_responder = responder.clone();
 
     let handler = move |cmd: GridFanoutCommand, result: FanoutCommandResult| {
-        let query_result = match result {
-            Ok(()) => {
-                let outcome = cmd.into_result();
+        let query_result = match result.and_then(|()| cmd.into_result()) {
+            Ok(outcome) => {
                 // The grid output, not the input, is what these bound: one
                 // entry per series (or group), one point per step that produced
                 // one.

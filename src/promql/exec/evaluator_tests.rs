@@ -4459,7 +4459,7 @@ mod tests {
             // Evaluate here, exactly as a shard does — through the request's
             // own kernels, so this stands in for the shard rather than
             // imitating it.
-            Ok(request.evaluate(spans))
+            request.evaluate(spans)
         }
     }
 
@@ -5518,7 +5518,7 @@ mod tests {
             "metric @ end() offset 30s",
             "metric / on(job, instance) metric offset 1m",
             "abs(metric) + metric",
-            "topk(1, metric)",
+            "topk(scalar(metric{job=\"db\",instance=\"0\"} > bool 0), metric)",
         ] {
             let (local, offered) = evaluate_range_with_pushdown_on(
                 grouped_rollup_reader(),
@@ -5703,17 +5703,67 @@ mod tests {
         assert_steps_near(rendered_steps(local), rendered_steps(steps), query);
     }
 
-    /// Only the reducing operators fuse over a selector. A selecting one, a
-    /// parameterized one, or `quantile` leaves the selector to be preloaded
-    /// stepped and runs here.
+    /// The selecting and counting operators fuse over a selector too: the
+    /// source ships its per-step picks or counts as candidates and the
+    /// selection is finished here. Whoever did the work, the answer is the
+    /// step-by-step one — for every grouping, and with the selection's k
+    /// larger than any one party's share.
+    #[test]
+    fn should_match_local_evaluation_for_fused_selections() {
+        for query in [
+            "topk(1, metric)",
+            "topk(2, metric)",
+            "topk(5, metric)",
+            "bottomk(1, metric)",
+            "topk(1, metric) by (job)",
+            "bottomk(2, metric) without (instance)",
+            "limitk(2, metric)",
+            "limit_ratio(0.5, metric)",
+            "limit_ratio(-0.5, metric)",
+            "count_values(\"v\", metric)",
+            "count_values(\"v\", metric) by (job)",
+            "topk(2, rate(metric[1m]))",
+            "count_values(\"v\", sum_over_time(metric[1m])) by (job)",
+        ] {
+            let (local, _) = evaluate_range_with_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                let (pushed, offered) = evaluate_range_with_pushdown_on(
+                    grouped_rollup_reader(),
+                    query,
+                    0,
+                    300_000,
+                    30_000,
+                    answer,
+                );
+                assert_eq!(offered.len(), 1, "{query}: one fused request");
+                assert!(offered[0].aggregation.is_some(), "{query}: fused");
+                assert_eq!(
+                    rendered_steps(local.clone()),
+                    rendered_steps(pushed),
+                    "{query}: fused result must equal the local one"
+                );
+            }
+        }
+    }
+
+    /// What does not fuse over a selector: `quantile` (no partial form), a
+    /// parameter that is not a literal, and — because a selecting operator's
+    /// output keeps its picks' own timestamps — a selection the query reads
+    /// with `timestamp()`. The selector is preloaded stepped and the operator
+    /// runs here.
     #[test]
     fn should_not_fuse_unfusable_aggregations_over_a_selector() {
         for query in [
-            "topk(1, metric)",
-            "bottomk(1, metric)",
             "quantile(0.9, metric)",
-            "count_values(\"v\", metric)",
-            "limitk(2, metric)",
+            "topk(scalar(metric{job=\"db\",instance=\"0\"} > bool 0), metric)",
+            "timestamp(topk(1, metric))",
         ] {
             let (pushed, offered) = evaluate_range_with_pushdown_on(
                 grouped_rollup_reader(),
@@ -5723,9 +5773,12 @@ mod tests {
                 30_000,
                 GridAnswer::Evaluated,
             );
-            assert_eq!(offered.len(), 1, "{query}: the selector is still preloaded");
             assert!(
-                offered[0].aggregation.is_none(),
+                !offered.is_empty(),
+                "{query}: the selector is still preloaded"
+            );
+            assert!(
+                offered.iter().all(|o| o.aggregation.is_none()),
                 "{query}: not as a fused request"
             );
 

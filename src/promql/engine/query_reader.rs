@@ -2,12 +2,12 @@ use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
 use crate::promql::engine::label_profile::LabelProfile;
-use crate::promql::exec::aggregations::AggregationKind;
-use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
+use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
+use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::exec::pipeline::for_each_step_sample;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
-    ExprResult, PromqlResult, QueryOptions,
+    ExprResult, PromqlResult, QueryError, QueryOptions,
     model::{InstantSample, RangeSample},
 };
 use crate::series::SeriesRef;
@@ -88,6 +88,20 @@ pub struct GridRollup {
 pub struct GridAggregation {
     pub kind: AggregationKind,
     pub modifier: Option<LabelModifier>,
+    /// The operator's parameter where it takes one: `k` for the selecting
+    /// operators, the destination label for `count_values`.
+    pub param: Option<AggregationParam>,
+}
+
+impl GridAggregation {
+    /// How the source folds this operator over a grid; see
+    /// [`AggregationKind::pushdown_strategy`]. Never `None` for an
+    /// aggregation that reached a request — the caller checks first.
+    pub(in crate::promql) fn strategy(&self) -> PushdownStrategy {
+        self.kind
+            .pushdown_strategy()
+            .expect("a fused aggregation has a push-down strategy")
+    }
 }
 
 /// One read of a selector over a step grid, plus everything needed to
@@ -292,13 +306,24 @@ impl GridRequest {
     pub(in crate::promql) fn group(
         &self,
         series: Vec<RangeSample<EvalLabels>>,
-    ) -> Vec<RangeSample<EvalLabels>> {
+    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
         let Some(aggregation) = self.aggregation.as_ref() else {
-            return series;
+            return Ok(series);
         };
-        let mut partials = SteppedPartialGroups::new(aggregation.kind);
-        partials.accumulate(aggregation.modifier.as_ref(), series);
-        partials.finalize()
+        match aggregation.strategy() {
+            PushdownStrategy::Reduce => {
+                let mut partials = SteppedPartialGroups::new(aggregation.kind);
+                partials.accumulate(aggregation.modifier.as_ref(), series);
+                Ok(partials.finalize())
+            }
+            PushdownStrategy::Select | PushdownStrategy::CountValues => {
+                let mut selection = SteppedSelection::new(aggregation.clone());
+                selection
+                    .apply(series)
+                    .and_then(|()| selection.finalize())
+                    .map_err(|e| QueryError::Execution(e.to_string()))
+            }
+        }
     }
 
     /// Everything this request asks for, over raw spans: the per-series stage,
@@ -309,15 +334,20 @@ impl GridRequest {
     /// — a single node, which has nothing to push down to, or the series a
     /// shard chose to ship raw. It runs the same kernels a shard would, so the
     /// answer does not depend on who did the work.
-    pub(in crate::promql) fn evaluate(&self, series: Vec<RangeSample<EvalLabels>>) -> GridOutcome {
+    pub(in crate::promql) fn evaluate(
+        &self,
+        series: Vec<RangeSample<EvalLabels>>,
+    ) -> PromqlResult<GridOutcome> {
         let per_series = self.per_series(&self.window_ends(), series);
         if self.aggregation.is_some() {
-            return GridOutcome::Reduced(self.group(per_series.into_step_values()));
+            return self
+                .group(per_series.into_step_values())
+                .map(GridOutcome::Reduced);
         }
-        match per_series {
+        Ok(match per_series {
             GridSeries::Stepped(series) => GridOutcome::Stepped(series),
             GridSeries::Rolled(series) => GridOutcome::Rolled(series),
-        }
+        })
     }
 }
 

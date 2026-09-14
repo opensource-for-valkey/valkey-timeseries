@@ -1,5 +1,6 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{HasFingerprint, SeriesFingerprint, create_hasher, hash_key_value};
+use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::Label as ProtoLabel;
@@ -263,18 +264,27 @@ pub(in crate::promql) struct RollupKey {
     param_bits: Option<u64>,
 }
 
-/// The identity of a fused aggregation: operator plus grouping.
+/// The identity of a fused aggregation: operator, grouping and parameter.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::promql) struct AggregationKey {
     kind: AggregationKind,
     without: bool,
     /// Sorted, so `by (a, b)` and `by (b, a)` are one request.
     labels: Vec<String>,
+    /// `topk(5, x)` and `topk(3, x)` are different requests.
+    param: Option<AggregationParamKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum AggregationParamKey {
+    /// The bit pattern: `f64` has no `Hash`/`Eq`.
+    Scalar(u64),
+    Label(String),
 }
 
 impl AggregationKey {
-    pub(crate) fn new(kind: AggregationKind, modifier: Option<&LabelModifier>) -> Self {
-        let (without, mut labels) = match modifier {
+    pub(crate) fn of(aggregation: &GridAggregation) -> Self {
+        let (without, mut labels) = match aggregation.modifier.as_ref() {
             Some(LabelModifier::Include(l)) => (false, l.labels.clone()),
             Some(LabelModifier::Exclude(l)) => (true, l.labels.clone()),
             None => (false, Vec::new()),
@@ -282,9 +292,13 @@ impl AggregationKey {
         labels.sort();
         labels.dedup();
         Self {
-            kind,
+            kind: aggregation.kind,
             without,
             labels,
+            param: aggregation.param.as_ref().map(|param| match param {
+                AggregationParam::Scalar(value) => AggregationParamKey::Scalar(value.to_bits()),
+                AggregationParam::Label(label) => AggregationParamKey::Label(label.clone()),
+            }),
         }
     }
 }

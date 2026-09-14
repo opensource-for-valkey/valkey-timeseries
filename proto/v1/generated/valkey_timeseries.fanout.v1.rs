@@ -618,12 +618,19 @@ pub struct GridRollup {
 /// /
 /// / Only the reducing operators appear here; the selecting ones (topk and
 /// / friends) need the individual samples and are not fused.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GridAggregation {
     #[prost(enumeration = "AggregationKind", tag = "1")]
     pub kind: i32,
     #[prost(message, optional, tag = "2")]
     pub grouping: ::core::option::Option<AggregationGrouping>,
+    /// / Numeric operator parameter: K for topk/bottomk/limitk, the ratio for
+    /// / limit_ratio. Absent for the parameterless operators.
+    #[prost(double, optional, tag = "3")]
+    pub scalar_param: ::core::option::Option<f64>,
+    /// / String operator parameter: the destination label for count_values.
+    #[prost(string, optional, tag = "4")]
+    pub label_param: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// / One read of a selector over a range query's step grid, pushed down to a
 /// / shard: which series to read, which window ends to evaluate at, and what to

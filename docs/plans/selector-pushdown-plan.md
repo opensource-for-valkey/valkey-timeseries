@@ -174,7 +174,10 @@ the stepped branch itself is small once the grid command exists.
 ## 7. Open questions
 
 - Whether `count_values`/`topk` (`PushdownStrategy::Select`/`CountValues`) join the fused
-  path; follow the instant aggregation push-down's table.
+  path; follow the instant aggregation push-down's table. **Done 2026-09-13**: they fuse
+  as per-step candidates (`SteppedSelection`), cutting `topk(5, cpu)`'s transfer by 97 %;
+  on the loopback harness that costs 1–3 ms per query, since the selection now runs
+  sequentially on each shard where the coordinator's step loop ran it in parallel.
 - Whether the shard's refusal text should be fixed in the same change (a shard's sample
   budget refusal currently reaches the client as "Internal error in fanout operation");
   it will be this path's most common failure, so probably yes.

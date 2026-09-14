@@ -23,13 +23,14 @@
 use crate::common::math::kahan_inc;
 use crate::common::{Sample, Timestamp};
 use crate::labels::{HasFingerprint, SeriesFingerprint};
-use crate::promql::EvalSample;
+use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
 use crate::promql::exec::aggregations::{
-    AggregationKind, PushdownStrategy, max_ignore_nan, min_ignore_nan,
+    AggregationKind, PushdownStrategy, apply_aggregation, max_ignore_nan, min_ignore_nan,
 };
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::model::RangeSample;
+use crate::promql::{EvalResult, EvalSample};
 use promql_parser::parser::LabelModifier;
 use std::collections::BTreeMap;
 
@@ -408,6 +409,131 @@ impl SteppedPartialGroups {
             .into_iter()
             .map(|(_, (labels, samples))| RangeSample { labels, samples })
             .collect()
+    }
+}
+
+/// The stepped form of an operator that *selects* or *counts* rather than
+/// reduces — `topk`, `bottomk`, `limitk`, `limit_ratio`, `count_values` —
+/// which is what lets them fuse onto a grid request too.
+///
+/// A reduction ships a partial state per group; these ship their *output*,
+/// which is what makes them mergeable: the top-k of a union lies within the
+/// union of the parts' top-k's, so a shard's per-step selection is a
+/// candidate set the coordinator re-selects from (`limit_ratio` picks each
+/// series by a hash of its own labels, so it is exact the same way), and a
+/// shard's per-value counts add. Steps never interact, so the fold is one
+/// [`Self::step`] per step, kept ordered so the output is chronological
+/// without a sort.
+pub(in crate::promql) struct SteppedSelection {
+    aggregation: GridAggregation,
+    /// Per step: the candidates so far — the operator's output from whoever
+    /// ran it (a shard, or [`Self::apply`] here).
+    steps: BTreeMap<Timestamp, Vec<EvalSample>>,
+}
+
+impl SteppedSelection {
+    pub fn new(aggregation: GridAggregation) -> Self {
+        Self {
+            aggregation,
+            steps: BTreeMap::new(),
+        }
+    }
+
+    fn strategy(&self) -> PushdownStrategy {
+        self.aggregation.strategy()
+    }
+
+    /// Run the operator over per-series step values — a shard's own series,
+    /// or the ones the coordinator was handed raw — and keep its output as
+    /// candidates.
+    pub fn apply(&mut self, series: Vec<RangeSample<EvalLabels>>) -> EvalResult<()> {
+        let mut by_step: BTreeMap<Timestamp, Vec<EvalSample>> = BTreeMap::new();
+        Self::transpose(series, &mut by_step);
+        // Sequential on purpose: a step's selection is a few microseconds,
+        // and fanning 240 of them out to the pool measured five times slower
+        // than running them in a row.
+        for (step_ts, samples) in by_step {
+            let output = Self::run_with(&self.aggregation, samples, step_ts)?;
+            self.steps.entry(step_ts).or_default().extend(output);
+        }
+        Ok(())
+    }
+
+    /// Fold in another party's output — a shard's per-step selection or
+    /// counts — as candidates.
+    pub fn merge(&mut self, series: Vec<RangeSample<EvalLabels>>) {
+        Self::transpose(series, &mut self.steps);
+    }
+
+    /// One entry per output label set, each holding its sparse `(step,
+    /// value)` points in ascending step order.
+    pub fn finalize(self) -> EvalResult<Vec<RangeSample<EvalLabels>>> {
+        let strategy = self.strategy();
+        let aggregation = &self.aggregation;
+        let mut by_labels: FingerprintHashMap<(EvalLabels, Vec<Sample>)> =
+            FingerprintHashMap::default();
+        // The steps come out ascending, so the per-label points need no sort.
+        for (step_ts, candidates) in self.steps {
+            let output = match strategy {
+                // Selecting is idempotent: the answer is the selection over
+                // the union of what every party selected.
+                PushdownStrategy::Select => Self::run_with(aggregation, candidates, step_ts)?,
+                // Counts from different parties add.
+                PushdownStrategy::CountValues => merge_count_values(candidates),
+                PushdownStrategy::Reduce => unreachable!("a reduction folds as partial states"),
+            };
+            for sample in output {
+                let key = sample.labels.fingerprint();
+                by_labels
+                    .entry(key)
+                    .or_insert_with(|| (sample.labels, Vec::new()))
+                    .1
+                    .push(Sample {
+                        timestamp: step_ts,
+                        value: sample.value,
+                    });
+            }
+        }
+        Ok(by_labels
+            .into_iter()
+            .map(|(_, (labels, samples))| RangeSample { labels, samples })
+            .collect())
+    }
+
+    fn run_with(
+        aggregation: &GridAggregation,
+        samples: Vec<EvalSample>,
+        step_ts: Timestamp,
+    ) -> EvalResult<Vec<EvalSample>> {
+        apply_aggregation(
+            aggregation.kind,
+            aggregation.modifier.as_ref(),
+            aggregation
+                .param
+                .as_ref()
+                .map(AggregationParam::to_expr_result),
+            samples,
+            step_ts,
+        )
+    }
+
+    /// Per-series sparse points into per-step sample lists. A point is
+    /// stamped with its step: what a selecting operator's output would carry
+    /// after the step loop anyway.
+    fn transpose(
+        series: Vec<RangeSample<EvalLabels>>,
+        into: &mut BTreeMap<Timestamp, Vec<EvalSample>>,
+    ) {
+        for s in series {
+            for point in s.samples {
+                into.entry(point.timestamp).or_default().push(EvalSample {
+                    labels: s.labels.clone(),
+                    value: point.value,
+                    timestamp_ms: point.timestamp,
+                    drop_name: false,
+                });
+            }
+        }
     }
 }
 

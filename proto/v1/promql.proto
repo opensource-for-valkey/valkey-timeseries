@@ -221,6 +221,11 @@ message GridRollup {
 message GridAggregation {
   AggregationKind kind = 1;
   optional AggregationGrouping grouping = 2;
+  /// Numeric operator parameter: K for topk/bottomk/limitk, the ratio for
+  /// limit_ratio. Absent for the parameterless operators.
+  optional double scalar_param = 3;
+  /// String operator parameter: the destination label for count_values.
+  optional string label_param = 4;
 }
 
 /// One read of a selector over a range query's step grid, pushed down to a

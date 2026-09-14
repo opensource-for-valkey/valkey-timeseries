@@ -122,7 +122,11 @@ in**:
 | `partials` | one partial per `(group, step)` for a fused request | merge and finalize |
 | `raw` | a series' raw span, when it is smaller than its grid output — as a chunk (`SampleData`, the `TS.MRANGE` codec) | decode, run the same per-series stage, then the above |
 
-A fused request answers in `partials`, an unfused one in `series`, and any
+A request fused with a reduction answers in `partials`; every other request
+in `series` — for a request fused with a selecting or counting operator
+(`topk`, `bottomk`, `limitk`, `limit_ratio`, `count_values`; the request
+carries the operator's parameter) the series are the shard's per-step picks or
+per-value counts, which the coordinator re-selects or adds across shards. Any
 series may travel in `raw` under the size rule; `series` and `partials` never
 both appear. The `series` form is columnar because both sides already hold the
 window ends: addressing a point by index instead of by timestamp takes a

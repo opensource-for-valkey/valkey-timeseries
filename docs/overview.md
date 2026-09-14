@@ -269,10 +269,15 @@ the query's evaluation timestamp, which `@`/`offset` divorce from the window end
 
 A rollup directly under a reducing aggregation is fused into the same request: `sum by (job) (rate(m[5m]))` has the
 shard reduce each series' windows *and* accumulate them into per-`(group, step)` partials, so a job with a thousand
-pods ships one value per step rather than a thousand. The response carries a second handshake bit — a shard that
-predates fusion returns per-series values with `aggregated = false`, and the coordinator groups them itself. Only the
-reducing operators fuse; `topk` and `count_values` need the individual samples, so they keep the rollup push-down and
-select on the coordinator.
+pods ships one value per step rather than a thousand. The selecting and counting operators — `topk`, `bottomk`,
+`limitk`, `limit_ratio`, `count_values` — fuse too, over a bare selector or a rollup: each shard runs the operator per
+step over its own series and ships its picks (or per-value counts) as candidates, and the coordinator selects across
+them (the top-k of a union lies within the union of the parts' top-k's; counts add). `topk(5, cpu)` over 500 series at
+240 steps thus ships 15 series' worth of points per step instead of 500. Only `quantile` has no such form and stays
+on the coordinator, as does a selection the query reads with `timestamp()`, whose picks keep their own timestamps.
+The trade is CPU for bytes: the shard's per-step selection is sequential (fanning the steps out to a pool measured
+several times slower), so on a single-machine loopback cluster the fused shapes cost 1–3 ms more per query while
+moving 97 % less data; over a real link the transfer saved dominates.
 
 The toggle still defaults off — it is new, and the conservative default costs only the optimization. Interaction with
 the aggregation toggle is none: they cover disjoint query shapes (an instant vector's aggregation vs a matrix

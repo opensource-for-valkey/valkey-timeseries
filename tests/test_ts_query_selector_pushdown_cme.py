@@ -447,9 +447,11 @@ class TestPromQLSelectorPushdownCluster(SelectorPushdownClusterBase):
             want = [(T0 + i, _job_sum(job, i // 30)) for i in range(0, 121, 10)]
             assert got[job] == want, job
 
-    def test_selecting_aggregations_are_not_fused(self):
-        """topk and friends need the individual samples: the selector is
-        pushed stepped and the selection runs on the coordinator."""
+    def test_selecting_aggregations_are_fused_per_step(self):
+        """topk and friends fuse too: each shard ships its own per-step
+        picks and the coordinator selects across them, so what crosses the
+        wire is k series per shard per step rather than every series. The
+        answers are the ones the coordinator-side selection gave."""
         self.setup_fleet()
         result = self.range_query('topk(1, mem_usage)')
         got = self.points_by_label(result, 'instance')
@@ -479,6 +481,14 @@ class TestPromQLSelectorPushdownCluster(SelectorPushdownClusterBase):
         'mem_usage / on(job, instance) mem_usage offset 60s',
         'abs(mem_usage) + mem_usage',
         'topk(2, mem_usage)',
+        'topk(1, mem_usage) by (job)',
+        'bottomk(4, mem_usage)',
+        'limitk(2, mem_usage)',
+        'limit_ratio(0.5, mem_usage)',
+        'count_values("v", mem_usage)',
+        'count_values("v", mem_usage) by (job)',
+        'topk(2, sum_over_time(mem_usage[60s]))',
+        'timestamp(topk(1, mem_usage))',
         'sparse_metric',
         'no_such_metric',
         'mem_usage{job="api"} and on(job) mem_usage{instance="api-2"}',
