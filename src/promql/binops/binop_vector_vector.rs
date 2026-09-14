@@ -294,15 +294,6 @@ const CONSUMED: u32 = u32::MAX - 1;
 /// RHS is indexed in a hash map keyed by match key, then the LHS is probed
 /// against it in a single pass, emitting as it goes.
 ///
-/// This replaced a sort-merge that sorted both sides by match key and walked
-/// them with a cursor. The two `sort_unstable_by_key` calls were the only
-/// superlinear work in the path, and replacing them with `O(1)` inserts and
-/// probes measured 10-17% faster from 1k to 100k series (M2, release
-/// build, Criterion A/B against the sort version, which was removed once the
-/// hash join won). Emission order is the one behavioural difference: LHS
-/// input order rather than ascending match key — the same order the set
-/// operators emit.
-///
 /// Two sentinels ride in the map value, which otherwise holds an index into
 /// `right_vector`, so the join needs no auxiliary duplicate-key set.
 fn eval_arith_ops_fast_path(
@@ -364,8 +355,7 @@ fn eval_arith_ops_fast_path(
         };
 
         // `result_metric` is what strips `__name__` from an arithmetic
-        // result. It is the *only* place that happens now: the pass that
-        // used to strip it from both operands up front is gone, so this
+        // result. It is the *only* place that happens: this
         // promotes one label set per emitted sample instead of one per
         // operand sample on both sides. With exactly one partner per key the
         // LHS labels are consumed, never cloned.
