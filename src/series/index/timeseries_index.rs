@@ -6,13 +6,13 @@ use std::sync::{RwLock, RwLockReadGuard};
 use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
 use super::postings::{Postings, PostingsBitmap};
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{create_key_string, get_acl_user, is_acl_enforced};
+use crate::common::context::create_key_string;
 use crate::common::hash::DeterministicHasher;
 use crate::common::sync::{read_lock, write_lock};
 use crate::error_consts;
 use crate::labels::filters::{LabelFilter, SeriesSelector};
 use crate::labels::{Label, SeriesLabel};
-use crate::series::acl::{clone_permissions, has_all_keys_permissions};
+use crate::series::acl::{KeyAccess, clone_permissions};
 use crate::series::index::IndexKey;
 use crate::series::{SeriesRef, TimeSeries};
 use croaring::Bitmap64;
@@ -249,6 +249,7 @@ impl TimeSeriesIndex {
         let mut acl_denied = false;
 
         let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
+        let access = acl_permissions.map(|perms| KeyAccess::new(ctx, perms));
 
         // The read guard is confined to this block. Recording the dangling ids collected below
         // needs the *write* lock, and `RwLock` is not reentrant: asking for it while this thread
@@ -263,17 +264,6 @@ impl TimeSeriesIndex {
             }
             keys.reserve(ids.cardinality() as usize);
 
-            let current_user = get_acl_user(ctx);
-            // Per-key checks are only needed for a real user whose ACL rules do not already
-            // grant the requested permission on every key.
-            let per_key_perms = if is_acl_enforced(ctx)
-                && !has_all_keys_permissions(ctx, &current_user, acl_permissions)
-            {
-                cloned_perms.as_ref()
-            } else {
-                None
-            };
-
             for series_ref in ids.iter() {
                 let Some(key) = postings.get_key_by_id(series_ref) else {
                     // The postings reference a series whose id -> key mapping is gone. Queue
@@ -282,10 +272,8 @@ impl TimeSeriesIndex {
                     continue;
                 };
                 let real_key = create_key_string(ctx, key.as_ref());
-                if let Some(perms) = per_key_perms
-                    && ctx
-                        .acl_check_key_permission(&current_user, &real_key, perms)
-                        .is_err()
+                if let Some(access) = &access
+                    && !access.allows(&real_key)
                 {
                     acl_denied = true;
                     break;
