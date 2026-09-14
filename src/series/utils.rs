@@ -2,7 +2,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::{create_key_string, get_current_db};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label};
-use crate::series::acl::check_key_permissions;
+use crate::series::acl::{KeyAccess, check_key_permissions};
 use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
@@ -72,6 +72,21 @@ pub fn try_get_timeseries<'a>(
     if let Some(permissions) = permissions {
         check_key_permissions(ctx, key, &permissions)?;
     }
+    open_timeseries(ctx, key)
+}
+
+/// [`try_get_timeseries`] for a loop over many keys: the caller's identity is
+/// resolved once into `access` and each key costs one permission check.
+pub fn try_get_timeseries_as<'a>(
+    ctx: &'a Context,
+    key: &ValkeyString,
+    access: &KeyAccess,
+) -> ValkeyResult<Option<SeriesGuard<'a>>> {
+    access.check(key)?;
+    open_timeseries(ctx, key)
+}
+
+fn open_timeseries<'a>(ctx: &'a Context, key: &ValkeyString) -> ValkeyResult<Option<SeriesGuard<'a>>> {
     match SeriesGuard::from_key(ctx, key) {
         Ok(guard) => Ok(Some(guard)),
         Err(ValkeyError::Str(err)) if err == error_consts::KEY_NOT_FOUND => Ok(None),

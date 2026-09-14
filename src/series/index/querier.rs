@@ -29,9 +29,9 @@ use crate::common::context::{create_key_string, get_acl_user, get_current_db};
 use crate::common::hash::IntMap;
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
-use crate::series::acl::{check_key_read_permission, has_all_keys_permissions};
+use crate::series::acl::{KeyAccess, has_all_keys_permissions};
 use crate::series::request_types::MetaDateRangeFilter;
-use crate::series::{SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries};
+use crate::series::{SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as};
 use blart::AsBytes;
 use orx_parallel::{IterIntoParIter, ParIter};
 use smallvec::SmallVec;
@@ -138,11 +138,12 @@ pub fn query_labels_distinct(
     };
 
     let mut result: BTreeSet<String> = BTreeSet::new();
+    let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
     for (id, k) in resolved {
         // TS.QUERYLABELS contract: silently omit series the caller may not read rather
         // than erroring on the first unreadable match (that is the coarse gate the
         // label-search commands use, and it is deliberately not applied here).
-        if !check_key_read_permission(ctx, &k) {
+        if !access.allows(&k) {
             continue;
         }
         // No `ACCESS` permission is passed here: the read check above already ran, and
@@ -263,11 +264,11 @@ fn count_series_from_postings(
 ) -> ValkeyResult<usize> {
     // Without a date range, nothing about the series contents matters: open each key just long
     // enough to confirm it still exists and the caller may read it.
+    let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
     let Some(date_range) = date_range else {
         let mut count = 0usize;
         for (id, k) in resolved {
-            let perms = Some(AclPermissions::ACCESS);
-            if try_get_timeseries(ctx, &k, perms)?.is_some() {
+            if try_get_timeseries_as(ctx, &k, &access)?.is_some() {
                 count += 1;
             } else {
                 stale.push(id);
@@ -280,8 +281,7 @@ fn count_series_from_postings(
     // per-key `ValkeyString` retained) long enough to evaluate the predicate.
     let mut guards: Vec<SeriesGuard> = Vec::with_capacity(resolved.len());
     for (id, k) in resolved {
-        let perms = Some(AclPermissions::ACCESS);
-        if let Some(guard) = try_get_timeseries(ctx, &k, perms)? {
+        if let Some(guard) = try_get_timeseries_as(ctx, &k, &access)? {
             guards.push(guard);
         } else {
             stale.push(id);
@@ -359,9 +359,9 @@ fn get_multi_series_by_id<'a>(
     stale: &mut StaleIds,
 ) -> ValkeyResult<Vec<(SeriesGuard<'a>, ValkeyString)>> {
     let mut result = Vec::with_capacity(resolved.len());
+    let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
     for (id, k) in resolved {
-        let perms = Some(AclPermissions::ACCESS);
-        if let Some(guard) = try_get_timeseries(ctx, &k, perms)? {
+        if let Some(guard) = try_get_timeseries_as(ctx, &k, &access)? {
             result.push((guard, k));
         } else {
             stale.push(id);
