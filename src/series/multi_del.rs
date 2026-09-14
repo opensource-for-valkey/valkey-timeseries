@@ -1,7 +1,8 @@
 use crate::common::Timestamp;
-use crate::common::context::{create_key_string, get_acl_user, is_acl_enforced};
+use crate::common::context::create_key_string;
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
+use crate::series::acl::KeyAccess;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
 use crate::series::{
     CompactionOp, SeriesGuardMut, SeriesRef, TimestampRange, apply_compaction,
@@ -166,14 +167,10 @@ fn fetch_series_batch<'a>(
     cursor: &mut Bitmap64Iterator<'_>,
     batch_size: usize,
 ) -> (Vec<SeriesGuardMut<'a>>, Vec<ValkeyString>) {
-    let user = get_acl_user(ctx);
-    let is_user_client = is_acl_enforced(ctx);
-    let has_all_keys_permission = if !is_user_client {
-        true
-    } else {
-        ctx.acl_check_key_permission(&user, &ctx.create_string("*"), &AclPermissions::DELETE)
-            .is_ok()
-    };
+    // Resolves the caller's identity once (reusing a fan-out request's already-resolved
+    // handle, when there is one) and precomputes whether it can reach every key, instead
+    // of re-resolving the ACL user by name on every `acl_check_key_permission` call below.
+    let access = KeyAccess::new(ctx, AclPermissions::DELETE);
 
     let index = get_timeseries_index(ctx);
 
@@ -209,12 +206,7 @@ fn fetch_series_batch<'a>(
         let exhausted = resolved.len() < wanted;
 
         for (id, key) in resolved {
-            if is_user_client
-                && !has_all_keys_permission
-                && ctx
-                    .acl_check_key_permission(&user, &key, &AclPermissions::DELETE)
-                    .is_err()
-            {
+            if !access.allows(&key) {
                 continue;
             }
 
