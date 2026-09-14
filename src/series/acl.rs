@@ -36,6 +36,38 @@ impl ModuleUser {
     }
 }
 
+/// The second all-keys probe: 33 bytes alternating `\x01` / `\xff`. Together with
+/// `*` it admits only patterns that match everything in practice (`*`, `?*`,
+/// `[\x01-\xff]*`, …): `~?`, `~[*]` or `~\*` match the one-character key `*` but
+/// not this; a prefix or suffix pattern matches at most one of the two.
+const ALL_KEYS_PROBE: [u8; 33] = {
+    let mut probe = [0x01u8; 33];
+    let mut i = 1;
+    while i < 33 {
+        probe[i] = 0xff;
+        i += 2;
+    }
+    probe
+};
+
+impl ModuleUser {
+    /// Whether the user's rules grant `permissions` on every key, so a loop
+    /// over keys need not check each one.
+    ///
+    /// The module API exposes no "all keys" flag, so this asks the glob
+    /// matcher about two keys no sane non-universal pattern matches both of
+    /// (see [`ALL_KEYS_PROBE`]). A pattern crafted to pass both — a character
+    /// class holding `*`, `\x01` and `\xff` followed by `*` — would be
+    /// treated as universal; it also grants nearly everything.
+    fn allows_all_keys(&self, ctx: &Context, permissions: &AclPermissions) -> bool {
+        let star = ctx.create_string("*");
+        self.allows(&star, permissions) && {
+            let probe = ValkeyString::create_from_slice(ctx.ctx, &ALL_KEYS_PROBE);
+            self.allows(&probe, permissions)
+        }
+    }
+}
+
 impl Drop for ModuleUser {
     fn drop(&mut self) {
         // SAFETY: obtained from `RM_GetModuleUserFromUserName` and freed once.
@@ -44,8 +76,9 @@ impl Drop for ModuleUser {
 }
 
 enum Identity {
-    /// Nothing to enforce for this context (replication or AOF apply, an
-    /// internal context): every key passes.
+    /// Nothing to check per key: no enforcement for this context (replication
+    /// or AOF apply, an internal context), or the user's rules already grant
+    /// the permission on every key.
     Unrestricted,
     User(ModuleUser),
     /// Enforced, but the user could not be resolved (deleted or disabled while
@@ -55,7 +88,10 @@ enum Identity {
 }
 
 /// The caller's ACL identity for one set of permissions, resolved once so a
-/// loop over many keys costs one `RM_ACLCheckKeyPermissions` call per key.
+/// loop over many keys costs one `RM_ACLCheckKeyPermissions` call per key —
+/// or nothing per key when the user may reach every key anyway (the `default`
+/// user, and any deployment without key-scoped rules), which two probes
+/// establish up front.
 ///
 /// Resolving by name — the only entry point valkey-module-rs offers — builds
 /// a `ValkeyString` for the user name, looks the user up and allocates a
@@ -72,6 +108,7 @@ impl KeyAccess {
             Identity::Unrestricted
         } else {
             match ModuleUser::from_name(&get_acl_user(ctx)) {
+                Some(user) if user.allows_all_keys(ctx, &permissions) => Identity::Unrestricted,
                 Some(user) => Identity::User(user),
                 None => Identity::Unknown,
             }
@@ -131,11 +168,10 @@ pub fn has_all_keys_permissions(
     if !is_acl_enforced(ctx) {
         return true;
     }
-    let all_keys = ctx.create_string("*");
-    match &permissions {
-        Some(perms) => ctx.acl_check_key_permission(user, &all_keys, perms).is_ok(),
-        None => true,
-    }
+    let Some(perms) = &permissions else {
+        return true;
+    };
+    ModuleUser::from_name(user).is_some_and(|user| user.allows_all_keys(ctx, perms))
 }
 
 /// One key's check. A loop should build a [`KeyAccess`] once instead.
