@@ -86,7 +86,10 @@ pub fn try_get_timeseries_as<'a>(
     open_timeseries(ctx, key)
 }
 
-fn open_timeseries<'a>(ctx: &'a Context, key: &ValkeyString) -> ValkeyResult<Option<SeriesGuard<'a>>> {
+fn open_timeseries<'a>(
+    ctx: &'a Context,
+    key: &ValkeyString,
+) -> ValkeyResult<Option<SeriesGuard<'a>>> {
     match SeriesGuard::from_key(ctx, key) {
         Ok(guard) => Ok(Some(guard)),
         Err(ValkeyError::Str(err)) if err == error_consts::KEY_NOT_FOUND => Ok(None),

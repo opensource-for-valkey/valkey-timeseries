@@ -31,7 +31,9 @@ use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
 use crate::series::acl::{KeyAccess, has_all_keys_permissions};
 use crate::series::request_types::MetaDateRangeFilter;
-use crate::series::{SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as};
+use crate::series::{
+    SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as,
+};
 use blart::AsBytes;
 use orx_parallel::{IterIntoParIter, ParIter};
 use smallvec::SmallVec;
