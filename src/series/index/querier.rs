@@ -25,11 +25,11 @@
 use super::postings::{EMPTY_BITMAP, Postings};
 use super::{PostingsBitmap, get_db_index, get_timeseries_index};
 use crate::common::Timestamp;
-use crate::common::context::{create_key_string, get_acl_user, get_current_db};
+use crate::common::context::{create_key_string, get_current_db};
 use crate::common::hash::IntMap;
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
-use crate::series::acl::{KeyAccess, has_all_keys_permissions};
+use crate::series::acl::KeyAccess;
 use crate::series::request_types::MetaDateRangeFilter;
 use crate::series::{
     SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as,
@@ -448,11 +448,11 @@ pub fn count_matched_series(
     let count = match (date_range, matchers.is_empty()) {
         (None, true) => {
             // check to see if the user can read all keys, otherwise error
-            // a bare TS.CARD is a request for the cardinality of the entire index
-            let current_user = get_acl_user(ctx);
-            let can_access_all_keys =
-                has_all_keys_permissions(ctx, &current_user, Some(AclPermissions::ACCESS));
-            if !can_access_all_keys {
+            // a bare TS.CARD is a request for the cardinality of the entire index. Reuses a
+            // fan-out request's already-resolved identity, when there is one, instead of
+            // resolving the ACL user by name here.
+            let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
+            if !access.is_unrestricted() {
                 return Err(ValkeyError::Str(
                     error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
                 ));

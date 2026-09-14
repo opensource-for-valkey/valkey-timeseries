@@ -115,7 +115,7 @@ impl KeyAccess {
         } else {
             // Reuse the handle a fan-out request handler already resolved (an `Rc`
             // clone, no FFI call) rather than resolving the name again here.
-            let user = fanout_module_user(ctx)
+            let user = fanout_module_user()
                 .or_else(|| ModuleUser::from_name(&ctx.get_current_user()).map(Rc::new));
             match user {
                 Some(user) if user.allows_all_keys(ctx, &permissions) => Identity::Unrestricted,
@@ -153,6 +153,10 @@ impl KeyAccess {
             return Err(ValkeyError::Str(error_consts::KEY_WRITE_PERMISSION_ERROR));
         }
         Err(ValkeyError::Str(error_consts::PERMISSION_DENIED))
+    }
+
+    pub fn is_unrestricted(&self) -> bool {
+        matches!(self.identity, Identity::Unrestricted)
     }
 }
 
