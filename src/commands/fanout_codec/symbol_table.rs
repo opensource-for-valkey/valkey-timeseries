@@ -31,6 +31,7 @@ use crate::labels::MetricName;
 use crate::promql::generated::InstantSample;
 use crate::promql::{EvalLabels, EvalSample, SplitLabel};
 use std::collections::HashMap;
+use std::sync::Arc;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 /// A labelled wire element: owned `labels`, or two parallel ref arrays into
@@ -305,21 +306,33 @@ impl<'a> EvalLabelResolver<'a> {
             let labels = s.take_labels().into_iter().map(crate::Label::from).collect();
             return Ok(EvalLabels::shared(labels));
         };
-        let mut split = Vec::with_capacity(names.len());
-        for (name_ref, value_ref) in names.into_iter().zip(values) {
-            let key = (u64::from(name_ref) << 32) | u64::from(value_ref);
-            let label = match self.pairs.get(&key) {
-                Some(label) => label.clone(),
-                None => {
-                    let (name, value) = lookup(self.table, s, name_ref, value_ref)?;
-                    let label = SplitLabel::new(name, value);
-                    self.pairs.insert(key, label.clone());
-                    label
-                }
-            };
-            split.push(label);
+        // Check every ref first so the fill below cannot fail: an infallible
+        // `TrustedLen` iterator collects straight into the `Arc<[_]>`, one
+        // allocation per series, instead of through a scratch `Vec`.
+        for (&name_ref, &value_ref) in names.iter().zip(&values) {
+            lookup(self.table, s, name_ref, value_ref)?;
         }
-        Ok(EvalLabels::from_split(split))
+        let split: Arc<[SplitLabel]> = names
+            .into_iter()
+            .zip(values)
+            .map(|(name_ref, value_ref)| self.pair(name_ref, value_ref))
+            .collect();
+        Ok(EvalLabels::from_split_shared(split))
+    }
+
+    /// The interned label for one validated ref pair, created on first sight.
+    #[inline]
+    fn pair(&mut self, name_ref: u32, value_ref: u32) -> SplitLabel {
+        let table = self.table;
+        self.pairs
+            .entry((u64::from(name_ref) << 32) | u64::from(value_ref))
+            .or_insert_with(|| {
+                SplitLabel::new(
+                    &table.names[name_ref as usize],
+                    &table.values[value_ref as usize],
+                )
+            })
+            .clone()
     }
 
     /// [`Self::resolve`] for an instant sample, producing the evaluator sample.

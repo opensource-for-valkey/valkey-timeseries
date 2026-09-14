@@ -1,4 +1,7 @@
-use crate::labels::{HasFingerprint, SeriesFingerprint, SeriesLabel, fingerprint_labels};
+use crate::labels::{
+    HasFingerprint, LabelHasher, SeriesFingerprint, SeriesLabel, create_unseeded_hasher,
+    fingerprint_labels,
+};
 use crate::promql::engine::label_profile::{
     MAX_PUSHDOWN_VALUES, join_regexp_values, regex_matcher,
 };
@@ -16,7 +19,6 @@ use promql_parser::parser::token::{
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{AggregateExpr, BinaryExpr, Expr, LabelModifier};
 use std::borrow::Cow;
-use twox_hash::xxhash3_128;
 
 /// Returns true if the binary operation changes the metric schema, meaning
 /// `__name__` should be dropped from the result. Mirrors Prometheus's
@@ -41,7 +43,7 @@ pub(in crate::promql) fn compute_binary_match_key(
     labels: &EvalLabels,
     matching: Option<&LabelModifier>,
 ) -> SeriesFingerprint {
-    let mut hasher: xxhash3_128::Hasher = Default::default();
+    let mut hasher = create_unseeded_hasher();
     let listed = |name: &str, list: &LabelModifier| match list {
         LabelModifier::Include(l) | LabelModifier::Exclude(l) => l.labels.iter().any(|n| n == name),
     };
@@ -62,7 +64,7 @@ pub(in crate::promql) fn compute_binary_match_key(
     hasher.finish_128()
 }
 
-fn hash_label(hasher: &mut xxhash3_128::Hasher, label: &impl SeriesLabel) {
+fn hash_label(hasher: &mut LabelHasher, label: &impl SeriesLabel) {
     hasher.write(label.name().as_bytes());
     hasher.write(b"0xfe");
     hasher.write(label.value().as_bytes());

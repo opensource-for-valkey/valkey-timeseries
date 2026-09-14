@@ -1,5 +1,8 @@
 use crate::common::time::system_time_to_millis;
-use crate::labels::{HasFingerprint, SeriesFingerprint, create_hasher, hash_key_value};
+use crate::labels::{
+    HasFingerprint, LabelHasher, SeriesFingerprint, create_hasher, create_unseeded_hasher,
+    hash_key_value,
+};
 use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
@@ -10,7 +13,6 @@ use smallvec::{SmallVec, smallvec};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
-use twox_hash::xxhash3_128;
 
 /// Hashable representation of Offset
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -74,9 +76,9 @@ impl HasFingerprint for Matcher {
 
 pub(in crate::promql) fn update_hasher_for_vector_selector(
     vs: &VectorSelector,
-    hasher: &mut xxhash3_128::Hasher,
+    hasher: &mut LabelHasher,
 ) {
-    fn update_list(list: &Vec<Matcher>, hasher: &mut xxhash3_128::Hasher) {
+    fn update_list(list: &Vec<Matcher>, hasher: &mut LabelHasher) {
         let mut keys: SmallVec<[&Matcher; 6]> = smallvec![];
         for m in list {
             keys.push(m);
@@ -120,7 +122,7 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(
     }
 }
 
-fn update_hash_for_matcher(m: &Matcher, hasher: &mut xxhash3_128::Hasher) {
+fn update_hash_for_matcher(m: &Matcher, hasher: &mut LabelHasher) {
     hash_key_value(hasher, &m.name, &m.value);
     match &m.op {
         MatchOp::Equal => {
@@ -335,7 +337,7 @@ impl GridPreloadKey {
 
 impl HasFingerprint for PreloadKey {
     fn fingerprint(&self) -> SeriesFingerprint {
-        let mut hasher = xxhash3_128::Hasher::new();
+        let mut hasher = create_unseeded_hasher();
         hasher.write(self.selector.0.to_le_bytes().as_ref());
         if let Some(offset) = &self.offset {
             match offset {

@@ -178,8 +178,13 @@ impl EvalLabels {
     /// does: a set in name order is shared as is, anything else is
     /// materialized and sorted.
     pub(crate) fn from_split(split: Vec<SplitLabel>) -> Self {
+        Self::from_split_shared(Arc::from(split))
+    }
+
+    /// [`Self::from_split`] for labels already in their shared allocation.
+    pub(crate) fn from_split_shared(split: Arc<[SplitLabel]>) -> Self {
         if split.is_sorted_by_key(|l| l.name()) {
-            EvalLabels::Interned(Arc::from(split))
+            EvalLabels::Interned(split)
         } else {
             let mut vec: Vec<Label> = split.iter().map(SplitLabel::to_label).collect();
             vec.sort();
