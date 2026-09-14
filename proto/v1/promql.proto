@@ -255,28 +255,33 @@ message GridQuery {
   uint64 max_points_per_series = 8;
   optional GridRollup rollup = 9;
   optional GridAggregation aggregation = 10;
+  /// Whether a stepped selection must carry each pick's own timestamp
+  /// (`GridSeries.sample_lag`). Only `timestamp()` observes it; every other
+  /// consumer stamps a value with its step, so the column is left out unless
+  /// the query asks.
+  bool sample_timestamps = 11;
 }
 
-/// One point of a series' grid output.
-message GridPoint {
-  /// The window end (step) this point answers for.
-  int64 step_ts = 1;
-  /// For stepped selection, the selected sample's own timestamp — which is what
-  /// `timestamp()` reports, and is not the step's. Unset for rollup output,
-  /// whose value belongs to the window rather than to any one sample.
-  int64 sample_ts = 2;
-  double value = 3;
-}
-
-/// One series' stepped or rolled-up output: sparse points, one per window end
-/// that produced a value.
+/// One series' stepped or rolled-up output, in columns.
 ///
-/// A window that held no eligible sample is *absent* from `points` — never
-/// present with a NaN value. That distinction is the result, so it has to
-/// survive the wire: NaN is a legitimate rolled-up value.
+/// Both sides know the request's window ends, so a point is addressed by its
+/// *index* into them rather than by its timestamp: `presence` is a bitmap over
+/// the window ends (bit `i` of byte `i / 8` set when window `i` produced a
+/// value), and `values` holds one entry per set bit, in index order. A 240-step
+/// grid costs 30 bytes of bitmap and eight bytes per value, against the
+/// twenty-odd bytes per point that a timestamped message form carried.
+///
+/// A window that held no eligible sample is *absent* — its bit is clear —
+/// never present with a NaN value. That distinction is the result, so it has
+/// to survive the wire: NaN is a legitimate rolled-up value.
 message GridSeries {
   repeated Label labels = 1;
-  repeated GridPoint points = 2;
+  bytes presence = 2;
+  repeated double values = 3;
+  /// For a stepped selection asked for `sample_timestamps`: how far before its
+  /// window end each pick's own timestamp lies (`step_ts - sample_ts`, never
+  /// negative), one per value. Empty otherwise, and for rollup output.
+  repeated int64 sample_lag = 4;
 }
 
 /// One `(group, step, shard)` partial for a fused grid query: the group's label

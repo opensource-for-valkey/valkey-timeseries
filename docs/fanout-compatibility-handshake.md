@@ -118,13 +118,17 @@ in**:
 
 | List | Holds | Coordinator does |
 |---|---|---|
-| `series` | one point per series per step (stepped or rolled) | concatenate |
+| `series` | per series, a presence bitmap over the request's window ends plus one packed value per set bit (and, only when the query calls `timestamp()`, each pick's lag behind its window end) | index into its own window ends; concatenate |
 | `partials` | one partial per `(group, step)` for a fused request | merge and finalize |
 | `raw` | a series' raw span, when it is smaller than its grid output | run the same per-series stage, then the above |
 
 A fused request answers in `partials`, an unfused one in `series`, and any
 series may travel in `raw` under the size rule; `series` and `partials` never
-both appear. A response carrying per-series values for a fused request, or
+both appear. The `series` form is columnar because both sides already hold the
+window ends: addressing a point by index instead of by timestamp takes a
+500-series × 60-step selection from 26 to 9.3 bytes per point (11 with the
+lag column). A bitmap that reaches past the grid, or a value count that
+disagrees with it, is rejected as a corrupt response. A response carrying per-series values for a fused request, or
 partials for an unfused one, is rejected as corrupt rather than folded in twice.
 A shard handed a rollup or aggregation it does not know refuses the request —
 every node runs the same build. See

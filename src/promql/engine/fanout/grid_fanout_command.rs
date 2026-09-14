@@ -46,8 +46,8 @@ use crate::promql::exec::partial_aggregation::SteppedPartialGroups;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, GridAggregation as ProtoGridAggregation,
-    GridGroupPartial, GridPoint, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup,
-    GridSeries, RangeSample as ProtoRangeSample, RollupKind as ProtoRollupKind,
+    GridGroupPartial, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup, GridSeries,
+    RangeSample as ProtoRangeSample, RollupKind as ProtoRollupKind,
     SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::model::RangeSample;
@@ -131,6 +131,8 @@ impl TryFrom<ProtoRollupKind> for RollupKind {
 pub(in crate::promql) struct GridFanoutCommand {
     matchers: Matchers,
     request: GridRequest,
+    /// The request's window ends, which the columnar responses index into.
+    window_ends: Vec<i64>,
     max_series: u64,
     max_points_per_series: u64,
     timeout: Duration,
@@ -161,6 +163,7 @@ impl Default for GridFanoutCommand {
                 lookback_delta_ms: 0,
                 rollup: None,
                 aggregation: None,
+                sample_timestamps: false,
             },
             0,
             0,
@@ -181,9 +184,11 @@ impl GridFanoutCommand {
             .aggregation
             .as_ref()
             .map(|agg| SteppedPartialGroups::new(agg.kind));
+        let window_ends = request.window_ends();
         Self {
             matchers,
             request,
+            window_ends,
             max_series,
             max_points_per_series,
             timeout,
@@ -205,8 +210,7 @@ impl GridFanoutCommand {
         let mut rolled = std::mem::take(&mut self.rolled);
 
         if !raw.is_empty() {
-            let window_ends = self.request.window_ends();
-            match self.request.per_series(&window_ends, raw) {
+            match self.request.per_series(&self.window_ends, raw) {
                 GridStage::Stepped(series) => stepped.extend(series),
                 GridStage::Rolled(series) => rolled.extend(series),
             }
@@ -300,6 +304,7 @@ impl FanoutCommand for GridFanoutCommand {
                     kind: ProtoAggregationKind::from(agg.kind) as i32,
                     grouping: agg.modifier.as_ref().map(Into::into),
                 }),
+            sample_timestamps: self.request.sample_timestamps,
         }
     }
 
@@ -331,31 +336,36 @@ impl FanoutCommand for GridFanoutCommand {
                         target.socket_address,
                     )));
                 }
-                if self.request.rollup.is_some() {
-                    self.rolled.extend(resp.series.into_iter().map(|s| {
-                        RangeSample {
-                            labels: proto_labels_to_eval_labels(s.labels),
-                            samples: s
-                                .points
+                for series in resp.series {
+                    let points: Vec<(i64, i64, f64)> = decode_columns(&self.window_ends, &series)
+                        .map_err(|why| {
+                            FanoutError::custom(format!(
+                                "TSDB: peer {} returned a malformed grid series: {why}",
+                                target.socket_address,
+                            ))
+                        })?
+                        .collect();
+                    let labels = proto_labels_to_eval_labels(series.labels);
+                    if self.request.rollup.is_some() {
+                        self.rolled.push(RangeSample {
+                            labels,
+                            samples: points
                                 .into_iter()
-                                .map(|p| Sample::new(p.step_ts, p.value))
+                                .map(|(step_ts, _, value)| Sample::new(step_ts, value))
                                 .collect(),
-                        }
-                    }));
-                } else {
-                    self.stepped.extend(resp.series.into_iter().map(|s| {
-                        SteppedSeries {
-                            labels: proto_labels_to_eval_labels(s.labels),
-                            points: s
-                                .points
+                        });
+                    } else {
+                        self.stepped.push(SteppedSeries {
+                            labels,
+                            points: points
                                 .into_iter()
-                                .map(|p| SteppedPoint {
-                                    step_ts: p.step_ts,
-                                    sample: Sample::new(p.sample_ts, p.value),
+                                .map(|(step_ts, sample_ts, value)| SteppedPoint {
+                                    step_ts,
+                                    sample: Sample::new(sample_ts, value),
                                 })
                                 .collect(),
-                        }
-                    }));
+                        });
+                    }
                 }
             }
         }
@@ -421,7 +431,87 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
         lookback_delta_ms: req.lookback_delta_ms as i64,
         rollup,
         aggregation,
+        sample_timestamps: req.sample_timestamps,
     })
+}
+
+/// A series' points as the wire's columns: a presence bitmap over
+/// `window_ends`, the values of the present windows in order, and — when the
+/// request asked for them — each pick's lag behind its window end.
+///
+/// `points` must arrive in window order, as the per-series stage produces
+/// them; a point whose step is not a window end is dropped (it cannot be
+/// addressed), which never happens for a stage run over these ends.
+fn encode_columns(
+    window_ends: &[i64],
+    points: impl Iterator<Item = (i64, i64, f64)>,
+    with_lag: bool,
+) -> (Vec<u8>, Vec<f64>, Vec<i64>) {
+    let mut presence = vec![0u8; window_ends.len().div_ceil(8)];
+    let mut values = Vec::new();
+    let mut lags = Vec::new();
+    let mut cursor = 0usize;
+    for (step_ts, sample_ts, value) in points {
+        while cursor < window_ends.len() && window_ends[cursor] < step_ts {
+            cursor += 1;
+        }
+        if cursor >= window_ends.len() || window_ends[cursor] != step_ts {
+            debug_assert!(false, "grid point {step_ts} is not a window end");
+            continue;
+        }
+        presence[cursor / 8] |= 1 << (cursor % 8);
+        values.push(value);
+        if with_lag {
+            lags.push(step_ts - sample_ts);
+        }
+        cursor += 1;
+    }
+    (presence, values, lags)
+}
+
+/// The inverse of [`encode_columns`]: `(step_ts, sample_ts, value)` per
+/// present window. A bitmap that reaches past the grid, or a value count that
+/// disagrees with the bitmap, is a corrupt response rather than a short one.
+fn decode_columns<'a>(
+    window_ends: &'a [i64],
+    series: &'a GridSeries,
+) -> Result<impl Iterator<Item = (i64, i64, f64)> + 'a, String> {
+    let present: Vec<usize> = series
+        .presence
+        .iter()
+        .enumerate()
+        .flat_map(|(byte, bits)| {
+            (0..8)
+                .filter(move |bit| bits & (1 << bit) != 0)
+                .map(move |bit| byte * 8 + bit)
+        })
+        .collect();
+    if present.last().is_some_and(|&i| i >= window_ends.len()) {
+        return Err(format!(
+            "presence bitmap addresses window {} of {}",
+            present.last().unwrap(),
+            window_ends.len()
+        ));
+    }
+    if present.len() != series.values.len() {
+        return Err(format!(
+            "{} present windows but {} values",
+            present.len(),
+            series.values.len()
+        ));
+    }
+    if !series.sample_lag.is_empty() && series.sample_lag.len() != series.values.len() {
+        return Err(format!(
+            "{} values but {} sample lags",
+            series.values.len(),
+            series.sample_lag.len()
+        ));
+    }
+    Ok(present.into_iter().enumerate().map(move |(k, i)| {
+        let step_ts = window_ends[i];
+        let lag = series.sample_lag.get(k).copied().unwrap_or(0);
+        (step_ts, step_ts - lag, series.values[k])
+    }))
 }
 
 /// Whether a series is smaller as its raw span than as one point per window
@@ -474,32 +564,38 @@ fn shard_response(
     let series = match staged {
         GridStage::Stepped(series) => series
             .into_iter()
-            .map(|s| GridSeries {
-                labels: (&s.labels).into(),
-                points: s
-                    .points
-                    .into_iter()
-                    .map(|p| GridPoint {
-                        step_ts: p.step_ts,
-                        sample_ts: p.sample.timestamp,
-                        value: p.sample.value,
-                    })
-                    .collect(),
+            .map(|s| {
+                let (presence, values, sample_lag) = encode_columns(
+                    window_ends,
+                    s.points
+                        .iter()
+                        .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
+                    request.sample_timestamps,
+                );
+                GridSeries {
+                    labels: (&s.labels).into(),
+                    presence,
+                    values,
+                    sample_lag,
+                }
             })
             .collect(),
         GridStage::Rolled(series) => series
             .into_iter()
-            .map(|s| GridSeries {
-                labels: (&s.labels).into(),
-                points: s
-                    .samples
-                    .into_iter()
-                    .map(|p| GridPoint {
-                        step_ts: p.timestamp,
-                        sample_ts: 0,
-                        value: p.value,
-                    })
-                    .collect(),
+            .map(|s| {
+                let (presence, values, sample_lag) = encode_columns(
+                    window_ends,
+                    s.samples
+                        .iter()
+                        .map(|p| (p.timestamp, p.timestamp, p.value)),
+                    false,
+                );
+                GridSeries {
+                    labels: (&s.labels).into(),
+                    presence,
+                    values,
+                    sample_lag,
+                }
             })
             .collect(),
     };
@@ -539,7 +635,9 @@ mod tests {
         }
     }
 
-    /// A single-evaluation stepped request at `EVAL_TS`.
+    /// A single-evaluation stepped request at `EVAL_TS`, asking for the
+    /// picks' own timestamps so the fan-out can be compared point for point
+    /// with the single-node stage.
     fn stepped_request() -> GridRequest {
         GridRequest {
             step_ms: 0,
@@ -549,6 +647,7 @@ mod tests {
             lookback_delta_ms: LOOKBACK_MS,
             rollup: None,
             aggregation: None,
+            sample_timestamps: true,
         }
     }
 
@@ -922,7 +1021,10 @@ mod tests {
 
         let staged = response(&request, gappy.clone());
         assert_eq!(staged.series.len(), 1);
-        let steps: Vec<i64> = staged.series[0].points.iter().map(|p| p.step_ts).collect();
+        let steps: Vec<i64> = decode_columns(&request.window_ends(), &staged.series[0])
+            .unwrap()
+            .map(|(step_ts, _, _)| step_ts)
+            .collect();
         // Windows are `(end - 60s, end]`, so the early samples are reported at
         // steps 0s..=60s (the 90s window starts just past t=30s) and the late
         // ones at 270s and 300s. Nothing between.
@@ -972,6 +1074,187 @@ mod tests {
 
     /// The request carries the resolved grid, rollup and aggregation, and
     /// survives a proto round trip into exactly what the coordinator asked.
+    /// The columnar form addresses a point by its window index: a bitmap of
+    /// the windows that produced a value, and the values in that order. What
+    /// comes out of the decoder is what went into the encoder, over gaps and
+    /// across byte boundaries of the bitmap.
+    #[test]
+    fn test_columns_round_trip() {
+        let window_ends: Vec<i64> = (0..=20).map(|i| i * 30_000).collect();
+        // Present at windows 0, 7, 8 (a byte boundary), 15 and 20 only.
+        let points: Vec<(i64, i64, f64)> = [0usize, 7, 8, 15, 20]
+            .iter()
+            .map(|&i| {
+                (
+                    window_ends[i],
+                    window_ends[i] - 1_234 * i as i64,
+                    i as f64 * 0.5,
+                )
+            })
+            .collect();
+
+        let (presence, values, sample_lag) =
+            encode_columns(&window_ends, points.iter().copied(), true);
+        assert_eq!(presence, vec![0b1000_0001, 0b1000_0001, 0b0001_0000]);
+        assert_eq!(values.len(), 5);
+        assert_eq!(
+            sample_lag,
+            vec![0, 1_234 * 7, 1_234 * 8, 1_234 * 15, 1_234 * 20]
+        );
+        let series = GridSeries {
+            labels: Vec::new(),
+            presence,
+            values,
+            sample_lag,
+        };
+        let decoded: Vec<(i64, i64, f64)> =
+            decode_columns(&window_ends, &series).unwrap().collect();
+        assert_eq!(decoded, points);
+
+        // Without the lag column a pick is stamped with its window end.
+        let (presence, values, sample_lag) =
+            encode_columns(&window_ends, points.iter().copied(), false);
+        assert!(sample_lag.is_empty());
+        let series = GridSeries {
+            labels: Vec::new(),
+            presence,
+            values,
+            sample_lag,
+        };
+        let decoded: Vec<(i64, i64, f64)> =
+            decode_columns(&window_ends, &series).unwrap().collect();
+        let stamped: Vec<(i64, i64, f64)> = points.iter().map(|&(s, _, v)| (s, s, v)).collect();
+        assert_eq!(decoded, stamped);
+
+        // Nothing present: an empty bitmap, no values.
+        let (presence, values, _) = encode_columns(&window_ends, std::iter::empty(), true);
+        assert_eq!(presence, vec![0, 0, 0]);
+        assert!(values.is_empty());
+    }
+
+    /// A stepped request that does not ask for sample timestamps ships no
+    /// lag column and stamps each pick with its step, which is what every
+    /// consumer but `timestamp()` sees anyway.
+    #[test]
+    fn test_sample_timestamps_travel_only_on_request() {
+        let request = GridRequest {
+            sample_timestamps: false,
+            ..stepped_grid_request()
+        };
+        let dense = || {
+            series(
+                "0",
+                &[
+                    (5_000, 1.0),
+                    (65_000, 2.0),
+                    (125_000, 3.0),
+                    (185_000, 4.0),
+                    (245_000, 5.0),
+                    (305_000, 6.0),
+                    (365_000, 7.0),
+                    (425_000, 8.0),
+                    (485_000, 9.0),
+                    (545_000, 10.0),
+                    (595_000, 11.0),
+                    (599_000, 12.0),
+                ],
+            )
+        };
+        let resp = response(&request, vec![dense()]);
+        assert_eq!(resp.series.len(), 1);
+        assert!(resp.series[0].sample_lag.is_empty());
+
+        let mut cmd = command(request.clone());
+        cmd.on_response(resp, &node(7000)).unwrap();
+        let GridOutcome::Stepped(stepped) = cmd.into_result() else {
+            panic!("a stepped request answers Stepped");
+        };
+        assert!(
+            stepped[0]
+                .points
+                .iter()
+                .all(|p| p.sample.timestamp == p.step_ts)
+        );
+
+        // The values are the ones the single-node stage picks; only the
+        // timestamps differ.
+        let GridStage::Stepped(local) = request.per_series(&request.window_ends(), vec![dense()])
+        else {
+            panic!()
+        };
+        let values = |s: &[SteppedSeries]| -> Vec<(i64, f64)> {
+            s[0].points
+                .iter()
+                .map(|p| (p.step_ts, p.sample.value))
+                .collect()
+        };
+        assert_eq!(values(&stepped), values(&local));
+
+        // Asked for, the lags travel and the picks' own timestamps come back.
+        let asking = GridRequest {
+            sample_timestamps: true,
+            ..request
+        };
+        let mut cmd = command(asking.clone());
+        cmd.on_response(response(&asking, vec![dense()]), &node(7000))
+            .unwrap();
+        let GridOutcome::Stepped(stepped) = cmd.into_result() else {
+            panic!()
+        };
+        assert!(
+            stepped[0]
+                .points
+                .iter()
+                .any(|p| p.sample.timestamp != p.step_ts)
+        );
+    }
+
+    /// Columns that disagree with each other or with the grid are a corrupt
+    /// response, not a short one.
+    #[test]
+    fn test_malformed_columns_are_rejected() {
+        let request = stepped_grid_request();
+        let windows = request.window_ends().len();
+        let malformed = [
+            // A bit past the last window.
+            GridSeries {
+                presence: {
+                    let mut p = vec![0u8; windows.div_ceil(8)];
+                    p[windows / 8] |= 1 << (windows % 8);
+                    p
+                },
+                values: vec![1.0],
+                ..Default::default()
+            },
+            // Two windows present, one value.
+            GridSeries {
+                presence: vec![0b11],
+                values: vec![1.0],
+                ..Default::default()
+            },
+            // A lag column shorter than the values.
+            GridSeries {
+                presence: vec![0b11],
+                values: vec![1.0, 2.0],
+                sample_lag: vec![0],
+                ..Default::default()
+            },
+        ];
+        for series in malformed {
+            let mut cmd = command(request.clone());
+            let err = cmd
+                .on_response(
+                    GridQueryResponse {
+                        series: vec![series],
+                        ..Default::default()
+                    },
+                    &node(7000),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("malformed grid series"), "{err}");
+        }
+    }
+
     #[test]
     fn test_request_round_trip() {
         use crate::fanout::serialization::{Deserialized, Serialized};

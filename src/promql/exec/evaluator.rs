@@ -22,8 +22,9 @@ use crate::promql::exec::types::{
     PreloadedMatrixData, PreloadedMatrixSeries, SampleWindow, SeriesMap, StepGrid, StepGridBuilder,
 };
 use crate::promql::exec::utils::{
-    RollupCandidate, collect_rollup_candidates, collect_stepped_aggregation_candidates,
-    collect_subqueries, collect_vector_selectors, merge_step_into_series_map, strip_parens,
+    RollupCandidate, calls_function, collect_rollup_candidates,
+    collect_stepped_aggregation_candidates, collect_subqueries, collect_vector_selectors,
+    merge_step_into_series_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{
@@ -244,6 +245,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         expr: &Expr,
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
+        // A stepped selection ships each pick's own timestamp only when
+        // something can observe it: `timestamp()` is the one function that
+        // reports a sample's time rather than its step's.
+        let grid = &PreloadGrid {
+            sample_timestamps: calls_function(expr, "timestamp"),
+            ..*grid
+        };
+
         // Aggregations directly over a bare selector go first: each is one
         // fused request, and a selector it covers must not also be preloaded
         // on its own — that would ship the same series twice, once stepped
@@ -338,6 +347,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 at_start_ms: grid.at_start_ms,
                 at_end_ms: grid.at_end_ms,
                 lookback_delta_ms: grid.lookback_delta_ms,
+                // The sub-evaluator's preload decides this from the inner
+                // expression itself.
+                sample_timestamps: false,
             };
             let plan = PlannedQuery::for_grid(&subquery.expr, union);
             match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
@@ -692,6 +704,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             lookback_delta_ms: grid.lookback_delta_ms,
             rollup,
             aggregation,
+            sample_timestamps: grid.sample_timestamps,
         };
 
         let mut resolved = window_ends.clone();
@@ -1950,6 +1963,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 param,
             }),
             aggregation: Some(aggregation),
+            // A rollup's value belongs to its window, not to any one sample.
+            sample_timestamps: false,
         };
 
         let mut options = self.options;
@@ -2032,6 +2047,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 param,
             }),
             aggregation,
+            // A rollup's value belongs to its window, not to any one sample.
+            sample_timestamps: false,
         };
 
         let mut options = self.options;

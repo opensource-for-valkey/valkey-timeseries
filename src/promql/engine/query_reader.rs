@@ -125,6 +125,11 @@ pub struct GridRequest {
     /// them, and returns one value per group per step instead of one per series
     /// per step.
     pub aggregation: Option<GridAggregation>,
+    /// Whether a stepped selection must report each pick's own timestamp.
+    /// Only `timestamp()` observes it — every other consumer stamps a value
+    /// with its step — so a source may leave it out (answering the step
+    /// itself) unless this is set.
+    pub sample_timestamps: bool,
 }
 
 /// One step's pick of a stepped instant selection: the step it answers for and

@@ -16,6 +16,10 @@ pub(crate) struct PreloadGrid {
     pub(crate) at_start_ms: Timestamp,
     pub(crate) at_end_ms: Timestamp,
     pub(crate) lookback_delta_ms: i64,
+    /// Whether stepped selections over this grid must carry each pick's own
+    /// timestamp (the expression calls `timestamp()`). Set by the preload
+    /// from the expression; a grid built from a context alone says no.
+    pub(crate) sample_timestamps: bool,
 }
 
 impl PreloadGrid {
@@ -27,6 +31,7 @@ impl PreloadGrid {
             at_start_ms: ctx.query_start,
             at_end_ms: ctx.query_end,
             lookback_delta_ms: ctx.lookback_delta_ms,
+            sample_timestamps: false,
         }
     }
 
@@ -43,6 +48,7 @@ impl PreloadGrid {
             at_start_ms: ctx.query_start,
             at_end_ms: ctx.query_end,
             lookback_delta_ms: ctx.lookback_delta_ms,
+            sample_timestamps: false,
         }
     }
 

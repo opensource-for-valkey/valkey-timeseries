@@ -231,6 +231,31 @@ fn collect_rollup_candidates_inner<'a>(expr: &'a Expr, out: &mut Vec<RollupCandi
     }
 }
 
+/// Whether `expr` calls the function `name` anywhere, subqueries included.
+pub(in crate::promql) fn calls_function(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Call(call) => {
+            call.func.name == name || call.args.args.iter().any(|arg| calls_function(arg, name))
+        }
+        Expr::Aggregate(agg) => {
+            calls_function(&agg.expr, name)
+                || agg
+                    .param
+                    .as_deref()
+                    .is_some_and(|p| calls_function(p, name))
+        }
+        Expr::Binary(b) => calls_function(&b.lhs, name) || calls_function(&b.rhs, name),
+        Expr::Paren(p) => calls_function(&p.expr, name),
+        Expr::Unary(u) => calls_function(&u.expr, name),
+        Expr::Subquery(s) => calls_function(&s.expr, name),
+        Expr::MatrixSelector(_)
+        | Expr::VectorSelector(_)
+        | Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::Extension(_) => false,
+    }
+}
+
 /// Look through parentheses: `sum((metric))` aggregates a selector just as
 /// `sum(metric)` does.
 pub(in crate::promql) fn strip_parens(expr: &Expr) -> &Expr {

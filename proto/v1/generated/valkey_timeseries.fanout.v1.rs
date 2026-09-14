@@ -671,33 +671,38 @@ pub struct GridQuery {
     pub rollup: ::core::option::Option<GridRollup>,
     #[prost(message, optional, tag = "10")]
     pub aggregation: ::core::option::Option<GridAggregation>,
+    /// / Whether a stepped selection must carry each pick's own timestamp
+    /// / (`GridSeries.sample_lag`). Only `timestamp()` observes it; every other
+    /// / consumer stamps a value with its step, so the column is left out unless
+    /// / the query asks.
+    #[prost(bool, tag = "11")]
+    pub sample_timestamps: bool,
 }
-/// / One point of a series' grid output.
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct GridPoint {
-    /// / The window end (step) this point answers for.
-    #[prost(int64, tag = "1")]
-    pub step_ts: i64,
-    /// / For stepped selection, the selected sample's own timestamp — which is what
-    /// / `timestamp()` reports, and is not the step's. Unset for rollup output,
-    /// / whose value belongs to the window rather than to any one sample.
-    #[prost(int64, tag = "2")]
-    pub sample_ts: i64,
-    #[prost(double, tag = "3")]
-    pub value: f64,
-}
-/// / One series' stepped or rolled-up output: sparse points, one per window end
-/// / that produced a value.
+/// / One series' stepped or rolled-up output, in columns.
 /// /
-/// / A window that held no eligible sample is *absent* from `points` — never
-/// / present with a NaN value. That distinction is the result, so it has to
-/// / survive the wire: NaN is a legitimate rolled-up value.
+/// / Both sides know the request's window ends, so a point is addressed by its
+/// / *index* into them rather than by its timestamp: `presence` is a bitmap over
+/// / the window ends (bit `i` of byte `i / 8` set when window `i` produced a
+/// / value), and `values` holds one entry per set bit, in index order. A 240-step
+/// / grid costs 30 bytes of bitmap and eight bytes per value, against the
+/// / twenty-odd bytes per point that a timestamped message form carried.
+/// /
+/// / A window that held no eligible sample is *absent* — its bit is clear —
+/// / never present with a NaN value. That distinction is the result, so it has
+/// / to survive the wire: NaN is a legitimate rolled-up value.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GridSeries {
     #[prost(message, repeated, tag = "1")]
     pub labels: ::prost::alloc::vec::Vec<Label>,
-    #[prost(message, repeated, tag = "2")]
-    pub points: ::prost::alloc::vec::Vec<GridPoint>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub presence: ::prost::alloc::vec::Vec<u8>,
+    #[prost(double, repeated, tag = "3")]
+    pub values: ::prost::alloc::vec::Vec<f64>,
+    /// / For a stepped selection asked for `sample_timestamps`: how far before its
+    /// / window end each pick's own timestamp lies (`step_ts - sample_ts`, never
+    /// / negative), one per value. Empty otherwise, and for rollup output.
+    #[prost(int64, repeated, tag = "4")]
+    pub sample_lag: ::prost::alloc::vec::Vec<i64>,
 }
 /// / One `(group, step, shard)` partial for a fused grid query: the group's label
 /// / set as computed by the request's grouping modifier, the step it belongs to,
