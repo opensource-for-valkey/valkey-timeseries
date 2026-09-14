@@ -1,3 +1,4 @@
+use crate::commands::fanout_codec::chunks::{deserialize_chunk, serialize_chunk};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::filters::{
     FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
@@ -13,9 +14,10 @@ use crate::promql::generated::{
     Label as ProtoLabel, RangeSample as ProtoRangeSample, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::{EvalSample, RangeSample};
+use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use promql_parser::label::{Labels as ModifierLabels, Matcher, Matchers};
 use promql_parser::parser::{LabelModifier, VectorSelector};
-use valkey_module::ValkeyError;
+use valkey_module::{ValkeyError, ValkeyResult};
 
 impl From<InternedLabel<'_>> for ProtoLabel {
     fn from(label: InternedLabel) -> Self {
@@ -69,14 +71,59 @@ impl From<ProtoInstantSample> for EvalSample {
     }
 }
 
-impl From<ProtoRangeSample> for RangeSample<EvalLabels> {
-    fn from(proto: ProtoRangeSample) -> Self {
-        let labels = proto_labels_to_eval_labels(proto.labels);
+/// A series as it crosses the wire: labels, and its samples still in the
+/// chunk a shard packed them into. Decoding is the caller's, so a limit can
+/// be checked against [`TimeSeriesChunk::len`] before any sample is
+/// materialized.
+pub(in crate::promql) struct WireRangeSeries {
+    pub labels: EvalLabels,
+    pub chunk: TimeSeriesChunk,
+}
 
-        let samples = proto.samples.into_iter().map(|s| s.into()).collect();
-
-        RangeSample { labels, samples }
+impl WireRangeSeries {
+    pub fn decode(self) -> RangeSample<EvalLabels> {
+        RangeSample {
+            labels: self.labels,
+            samples: self.chunk.iter().collect(),
+        }
     }
+}
+
+impl TryFrom<ProtoRangeSample> for WireRangeSeries {
+    type Error = ValkeyError;
+
+    fn try_from(proto: ProtoRangeSample) -> Result<Self, Self::Error> {
+        let chunk = match proto.data {
+            Some(data) => deserialize_chunk(&data)?,
+            // A series with no chunk has no samples.
+            None => TimeSeriesChunk::Uncompressed(UncompressedChunk::default()),
+        };
+        Ok(WireRangeSeries {
+            labels: proto_labels_to_eval_labels(proto.labels),
+            chunk,
+        })
+    }
+}
+
+impl TryFrom<ProtoRangeSample> for RangeSample<EvalLabels> {
+    type Error = ValkeyError;
+
+    fn try_from(proto: ProtoRangeSample) -> Result<Self, Self::Error> {
+        WireRangeSeries::try_from(proto).map(WireRangeSeries::decode)
+    }
+}
+
+/// The wire form of a series' samples: packed with the chunk codec the
+/// `TS.MRANGE` fan-out uses, so both push-downs ship the same bytes.
+pub(in crate::promql) fn range_sample_to_proto(
+    series: RangeSample<EvalLabels>,
+) -> ValkeyResult<ProtoRangeSample> {
+    let RangeSample { labels, samples } = series;
+    Ok(ProtoRangeSample {
+        labels: (&labels).into(),
+        key: String::new(),
+        data: Some(serialize_chunk(samples_to_chunk_lossless(samples))?),
+    })
 }
 
 impl From<Matcher> for LabelFilter {
@@ -416,8 +463,87 @@ pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::Sample;
+    use crate::series::chunks::ChunkOps;
     use promql_parser::label::{MatchOp as PromMatchOp, Matcher, Matchers};
     use promql_parser::parser::VectorSelector;
+    use prost::Message;
+
+    fn series(samples: Vec<Sample>) -> RangeSample<EvalLabels> {
+        RangeSample {
+            labels: EvalLabels::from_pairs(&[("__name__", "cpu"), ("host", "a")]),
+            samples,
+        }
+    }
+
+    /// A raw series crosses the wire as a chunk and comes back sample for
+    /// sample — below the compression threshold (uncompressed), above it
+    /// (Chimp), with NaN, and empty.
+    #[test]
+    fn range_sample_round_trips_through_its_chunk() {
+        let shapes: Vec<Vec<Sample>> = vec![
+            Vec::new(),
+            (0..5).map(|i| Sample::new(i * 1000, i as f64)).collect(),
+            (0..3600)
+                .map(|i| Sample::new(1_700_000_000_000 + i * 1000, (i as f64).sin() * 100.0))
+                .collect(),
+            vec![
+                Sample::new(0, f64::NAN),
+                Sample::new(1000, 1.0),
+                Sample::new(2000, f64::NAN),
+            ],
+        ];
+        for samples in shapes {
+            let proto = range_sample_to_proto(series(samples.clone())).unwrap();
+            let back = RangeSample::<EvalLabels>::try_from(proto).unwrap();
+            assert_eq!(
+                back.labels.to_string(),
+                series(Vec::new()).labels.to_string()
+            );
+            assert_eq!(back.samples.len(), samples.len());
+            for (a, b) in back.samples.iter().zip(&samples) {
+                assert_eq!(a.timestamp, b.timestamp);
+                assert!(a.value == b.value || (a.value.is_nan() && b.value.is_nan()));
+            }
+        }
+    }
+
+    /// The point of shipping chunks: an hour of 1 s telemetry is a fraction
+    /// of the 18 bytes per sample the message form cost. The length is
+    /// known before decoding, which is what the limit checks rely on.
+    #[test]
+    fn a_chunked_series_is_small_and_knows_its_length() {
+        let samples: Vec<Sample> = (0..3600)
+            .map(|i| {
+                Sample::new(
+                    1_700_000_000_000 + i * 1000,
+                    40.0 + ((i % 60) as f64) * 0.25,
+                )
+            })
+            .collect();
+        let proto = range_sample_to_proto(series(samples)).unwrap();
+        let bytes_per_sample = proto.encoded_len() as f64 / 3600.0;
+        assert!(bytes_per_sample < 6.0, "{bytes_per_sample:.2} B/sample");
+        let wire = WireRangeSeries::try_from(proto).unwrap();
+        assert_eq!(wire.chunk.len(), 3600);
+    }
+
+    /// A chunk that does not decode is an error, not an empty series.
+    #[test]
+    fn a_corrupt_chunk_is_refused() {
+        let proto = ProtoRangeSample {
+            data: Some(crate::promql::generated::SampleData {
+                version: 1,
+                compression: 2,
+                data: vec![0xFF, 0x00, 0x13],
+            }),
+            ..Default::default()
+        };
+        assert!(RangeSample::<EvalLabels>::try_from(proto).is_err());
+        // No chunk at all is a series with no samples.
+        let empty = RangeSample::<EvalLabels>::try_from(ProtoRangeSample::default()).unwrap();
+        assert!(empty.samples.is_empty());
+    }
 
     /// A PromQL selector now rides the shared `filters.proto` encoding rather
     /// than a four-operator message of its own. This pins the composition: what

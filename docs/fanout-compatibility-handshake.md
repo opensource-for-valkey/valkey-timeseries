@@ -120,7 +120,7 @@ in**:
 |---|---|---|
 | `series` | per series, a presence bitmap over the request's window ends plus one packed value per set bit (and, only when the query calls `timestamp()`, each pick's lag behind its window end) | index into its own window ends; concatenate |
 | `partials` | one partial per `(group, step)` for a fused request | merge and finalize |
-| `raw` | a series' raw span, when it is smaller than its grid output | run the same per-series stage, then the above |
+| `raw` | a series' raw span, when it is smaller than its grid output — as a chunk (`SampleData`, the `TS.MRANGE` codec) | decode, run the same per-series stage, then the above |
 
 A fused request answers in `partials`, an unfused one in `series`, and any
 series may travel in `raw` under the size rule; `series` and `partials` never
@@ -134,6 +134,21 @@ A shard handed a rollup or aggregation it does not know refuses the request —
 every node runs the same build. See
 `src/promql/engine/fanout/grid_fanout_command.rs` and
 `docs/plans/selector-pushdown-plan.md`.
+
+### TS.QUERY / TS.QUERYRANGE — raw range reads
+
+`RangeQueryResponse` (the `query-range` fan-out: the grid toggle off, rollups
+the shard cannot evaluate such as `predict_linear`, matrix selectors under
+other functions) and the grid's `raw` list carry each series' samples as a
+chunk — `SampleData`, packed with the same policy as `TS.MRANGE`: Chimp from
+`WIRE_COMPRESSION_MIN_SAMPLES` samples up, uncompressed below. That is 2–5
+bytes per sample on ordinary telemetry against the 18 the one-message-per-
+sample form cost. A chunk knows its length without being decoded, so the
+coordinator checks `max_series`, `max_points_per_series` and the sample
+budget first and decodes only what passed — and it decodes on the selector
+executor's pool, off the main thread, rather than in the fan-out callback.
+A chunk that does not decode is a corrupt response. See
+`src/promql/engine/fanout/type_conversions.rs` (`WireRangeSeries`).
 
 ### TS.QUERYRANGE — label profiles
 

@@ -1,5 +1,6 @@
+use crate::commands::fanout_codec::chunks::serialize_chunk;
+use crate::common::Timestamp;
 use crate::common::threads::IterIntoParRayon;
-use crate::common::{Sample, Timestamp};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
@@ -11,10 +12,10 @@ use crate::promql::engine::{
     get_series_range, instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
     validate_max_series,
 };
-use crate::promql::generated::Sample as PromSample;
 use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
 };
+use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::series_by_selectors;
 use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
@@ -256,12 +257,13 @@ pub(super) fn handle_range_query(
             if series_samples.is_empty() {
                 return Ok(None);
             }
-            let samples: Vec<PromSample> = series_samples.into_iter().map(Sample::into).collect();
             let labels = metric_name_to_proto_labels(&s.labels);
+            let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
+                .map_err(|e| e.to_string())?;
             Ok(Some(RangeSample {
                 labels,
-                samples,
                 key: "".to_string(),
+                data: Some(data),
             }))
         })
         .into_fallible_result()
@@ -278,6 +280,7 @@ pub(super) fn handle_range_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::Sample;
     use crate::promql::model::RangeSample;
 
     fn sample(timestamp: Timestamp, value: f64) -> Sample {

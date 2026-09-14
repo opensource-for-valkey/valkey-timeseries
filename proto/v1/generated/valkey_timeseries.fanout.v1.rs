@@ -499,12 +499,14 @@ pub struct RangeSample {
     /// / The labels identifying this series.
     #[prost(message, repeated, tag = "1")]
     pub labels: ::prost::alloc::vec::Vec<Label>,
-    /// / The samples in this series.
-    #[prost(message, repeated, tag = "2")]
-    pub samples: ::prost::alloc::vec::Vec<Sample>,
     /// / Optional valkey key for this series, if any.
     #[prost(string, tag = "3")]
     pub key: ::prost::alloc::string::String,
+    /// / The samples, as the chunk codec `TS.MRANGE` fans out with: Chimp from
+    /// / `WIRE_COMPRESSION_MIN_SAMPLES` up, uncompressed below it. Around 5-6
+    /// / bytes per sample on typical telemetry.
+    #[prost(message, optional, tag = "4")]
+    pub data: ::core::option::Option<SampleData>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeQuery {

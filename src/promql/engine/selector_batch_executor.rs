@@ -1,8 +1,8 @@
+use crate::common::Timestamp;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
 use crate::common::threads::RayonPool;
 use crate::common::time::current_time_millis;
-use crate::common::{Sample, Timestamp};
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
 use crate::labels::filters::SeriesSelector;
@@ -15,10 +15,12 @@ use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, valid
 use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
-    RangeVectorSelectorFanoutCommand, get_snapshot_range, instant_lookback_start_ms,
-    local_label_profile, proto_labels_to_eval_labels, validate_max_points, validate_max_series,
+    RangeVectorSelectorFanoutCommand, WireRangeSeries, get_snapshot_range,
+    instant_lookback_start_ms, local_label_profile, proto_labels_to_eval_labels,
+    validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
+use crate::series::chunks::ChunkOps;
 use crate::series::index::series_by_selectors;
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::IntoParIter;
@@ -100,6 +102,10 @@ enum SelectorOutput {
     Vector(Vec<InstantSample<EvalLabels>>),
     /// Range-vector selector result, labels still by refcount from storage.
     Matrix(Vec<RangeSample<EvalLabels>>),
+    /// A cluster range read, each series still in the chunk its shard packed
+    /// it into. Decoded by the requester on the executor's pool rather than
+    /// in the fanout callback, which runs on the main thread and serially.
+    WireMatrix(Vec<WireRangeSeries>),
     Aggregation(AggregationOutcome),
     Grid(GridOutcome),
     /// A label profile, or `None` when the source declined to build one.
@@ -122,6 +128,11 @@ impl SelectorOutput {
     fn into_matrix(self) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         match self {
             SelectorOutput::Matrix(series) => Ok(series),
+            SelectorOutput::WireMatrix(series) => Ok(series
+                .into_par()
+                .with_pool(RayonPool(&MATERIALIZE_POOL))
+                .map(WireRangeSeries::decode)
+                .collect()),
             _ => Err(QueryError::Execution(
                 "BUG: selector task returned a non-matrix outcome".to_string(),
             )),
@@ -728,27 +739,25 @@ fn execute_cluster_range_selector(
                 let resp = cmd.get_response();
 
                 validate_max_series_(resp.series.len(), max_series).and_then(|_| {
-                    validate_max_samples(
-                        resp.series.iter().map(|rs| rs.samples.len()).sum(),
-                        max_samples,
-                    )?;
-                    let mut ranges: Vec<RangeSample<EvalLabels>> =
-                        Vec::with_capacity(resp.series.len());
-
-                    for rs in resp.series {
-                        validate_max_points_per_series(rs.samples.len(), max_points_per_series)?;
-
-                        let samples: Vec<Sample> = rs
-                            .samples
-                            .into_iter()
-                            .map(|s| Sample::new(s.timestamp, s.value))
-                            .collect();
-
-                        let labels = proto_labels_to_eval_labels(rs.labels);
-                        ranges.push(RangeSample { labels, samples });
+                    // The chunks know their length without being decoded, so
+                    // the limits are checked before any sample is materialized.
+                    let series = resp
+                        .series
+                        .into_iter()
+                        .map(|rs| {
+                            WireRangeSeries::try_from(rs).map_err(|e| {
+                                QueryError::Execution(format!(
+                                    "undecodable range series in cluster response: {e}"
+                                ))
+                            })
+                        })
+                        .collect::<QueryResult<Vec<_>>>()?;
+                    validate_max_samples(series.iter().map(|s| s.chunk.len()).sum(), max_samples)?;
+                    for s in &series {
+                        validate_max_points_per_series(s.chunk.len(), max_points_per_series)?;
                     }
-
-                    Ok(SelectorOutput::Matrix(ranges))
+                    // Still packed: the requester decodes them in parallel.
+                    Ok(SelectorOutput::WireMatrix(series))
                 })
             }
             Err(e) => Err(selector_fanout_failure("range", e)),

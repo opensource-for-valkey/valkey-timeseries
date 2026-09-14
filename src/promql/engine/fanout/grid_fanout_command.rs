@@ -36,7 +36,9 @@ use crate::fanout::{
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
-use crate::promql::engine::fanout::type_conversions::proto_labels_to_eval_labels;
+use crate::promql::engine::fanout::type_conversions::{
+    proto_labels_to_eval_labels, range_sample_to_proto,
+};
 use crate::promql::engine::query_reader::{
     GridAggregation, GridOutcome, GridRequest, GridRollup, GridSeries as GridStage, SteppedPoint,
     SteppedSeries, grid_window_ends,
@@ -47,8 +49,7 @@ use crate::promql::functions::RollupKind;
 use crate::promql::generated::{
     AggregationKind as ProtoAggregationKind, GridAggregation as ProtoGridAggregation,
     GridGroupPartial, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup, GridSeries,
-    RangeSample as ProtoRangeSample, RollupKind as ProtoRollupKind,
-    SeriesSelector as ProtoSeriesSelector,
+    RollupKind as ProtoRollupKind, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::model::RangeSample;
 use promql_parser::label::Matchers;
@@ -274,7 +275,7 @@ impl FanoutCommand for GridFanoutCommand {
             req.max_points_per_series,
         )?;
 
-        Ok(shard_response(&request, &window_ends, windows))
+        shard_response(&request, &window_ends, windows)
     }
 
     fn get_timeout(&self) -> Duration {
@@ -370,7 +371,15 @@ impl FanoutCommand for GridFanoutCommand {
             }
         }
 
-        self.raw.extend(resp.raw.into_iter().map(RangeSample::from));
+        for raw in resp.raw {
+            let series = RangeSample::try_from(raw).map_err(|why| {
+                FanoutError::custom(format!(
+                    "TSDB: peer {} returned an undecodable raw series: {why}",
+                    target.socket_address,
+                ))
+            })?;
+            self.raw.push(series);
+        }
         Ok(())
     }
 
@@ -529,7 +538,7 @@ fn shard_response(
     request: &GridRequest,
     window_ends: &[i64],
     windows: Vec<RangeSample<EvalLabels>>,
-) -> GridQueryResponse {
+) -> ValkeyResult<GridQueryResponse> {
     let (raw, staged): (Vec<_>, Vec<_>) = windows
         .into_iter()
         .partition(|series| ships_raw(window_ends, series));
@@ -537,17 +546,13 @@ fn shard_response(
 
     let raw = raw
         .into_iter()
-        .map(|s| ProtoRangeSample {
-            labels: (&s.labels).into(),
-            samples: s.samples.into_iter().map(Into::into).collect(),
-            key: String::new(),
-        })
-        .collect();
+        .map(range_sample_to_proto)
+        .collect::<ValkeyResult<Vec<_>>>()?;
 
     if let Some(aggregation) = request.aggregation.as_ref() {
         let mut groups = SteppedPartialGroups::new(aggregation.kind);
         groups.accumulate(aggregation.modifier.as_ref(), staged.into_step_values());
-        return GridQueryResponse {
+        return Ok(GridQueryResponse {
             series: Vec::new(),
             partials: groups
                 .into_partials()
@@ -558,7 +563,7 @@ fn shard_response(
                 })
                 .collect(),
             raw,
-        };
+        });
     }
 
     let series = match staged {
@@ -600,11 +605,11 @@ fn shard_response(
             .collect(),
     };
 
-    GridQueryResponse {
+    Ok(GridQueryResponse {
         series,
         partials: Vec::new(),
         raw,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -711,7 +716,7 @@ mod tests {
     /// One shard's response, produced the way `get_local_response` produces it
     /// once the windows have been read.
     fn response(request: &GridRequest, windows: Vec<RangeSample<EvalLabels>>) -> GridQueryResponse {
-        shard_response(request, &request.window_ends(), windows)
+        shard_response(request, &request.window_ends(), windows).unwrap()
     }
 
     /// A response carrying every series raw, whatever its size.
@@ -721,11 +726,7 @@ mod tests {
             partials: Vec::new(),
             raw: windows
                 .into_iter()
-                .map(|s| ProtoRangeSample {
-                    labels: (&s.labels).into(),
-                    samples: s.samples.into_iter().map(Into::into).collect(),
-                    key: String::new(),
-                })
+                .map(|s| range_sample_to_proto(s).unwrap())
                 .collect(),
         }
     }
@@ -1372,9 +1373,25 @@ mod tests {
         let mixed = GridQueryResponse {
             series: vec![GridSeries::default()],
             partials: Vec::new(),
-            raw: vec![ProtoRangeSample::default()],
+            raw: vec![range_sample_to_proto(series("0", &[(EVAL_TS, 1.0)])).unwrap()],
         };
         assert!(cmd.on_response(mixed, &node(7000)).is_ok());
+
+        // A raw series whose chunk does not decode is a corrupt response.
+        let mut cmd = command(stepped_grid_request());
+        let garbage = GridQueryResponse {
+            raw: vec![crate::promql::generated::RangeSample {
+                data: Some(crate::promql::generated::SampleData {
+                    version: 1,
+                    compression: 2,
+                    data: vec![0xFF, 0x00, 0x13],
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = cmd.on_response(garbage, &node(7000)).unwrap_err();
+        assert!(err.to_string().contains("undecodable raw series"), "{err}");
     }
 
     /// The geometry a request describes, which both sides derive through the

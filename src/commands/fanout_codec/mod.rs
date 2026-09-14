@@ -1,6 +1,6 @@
 /// This module exists to perform conversions between local types and the
 /// generated protobuf types.
-mod chunks;
+pub(crate) mod chunks;
 mod conversions;
 pub(crate) mod filters;
 #[cfg(test)]
