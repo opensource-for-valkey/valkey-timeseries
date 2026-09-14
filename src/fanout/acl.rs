@@ -1,8 +1,23 @@
+use crate::series::acl::ModuleUser;
 use std::cell::RefCell;
+use std::rc::Rc;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
+/// The ACL identity attached to the current thread's fan-out request.
+///
+/// `user` is the [`ModuleUser`] handle [`with_fanout_user`] resolves once via
+/// `RM_GetModuleUserFromUserName` and keeps for the life of the request, so
+/// [`crate::series::acl::KeyAccess::new`] can reuse it directly instead of
+/// resolving the same name again for every `KeyAccess` built during the
+/// request. It is `None` only for [`FanoutAclScope::enter_with_user`]'s
+/// name-only test path, which has no live server to resolve against.
+pub(crate) struct FanoutIdentity {
+    pub(crate) name: String,
+    pub(crate) user: Option<Rc<ModuleUser>>,
+}
+
 thread_local! {
-    pub(crate) static FANOUT_ACL_USER: RefCell<Option<String>> = const { RefCell::new(None) };
+    pub(crate) static FANOUT_ACL_USER: RefCell<Option<Rc<FanoutIdentity>>> = const { RefCell::new(None) };
 }
 
 /// RAII marker for fanout ACL checks in detached contexts.
@@ -13,9 +28,20 @@ thread_local! {
 pub struct FanoutAclScope;
 
 impl FanoutAclScope {
+    /// Attach a user name without a resolved [`ModuleUser`] handle. Exists for tests
+    /// that only need to exercise the thread-local scope, not ACL resolution.
+    /// Production code enters through [`with_fanout_user`], which resolves the
+    /// handle once and keeps it.
     pub fn enter_with_user(user: &str) -> Self {
+        Self::enter(FanoutIdentity {
+            name: user.to_owned(),
+            user: None,
+        })
+    }
+
+    fn enter(identity: FanoutIdentity) -> Self {
         FANOUT_ACL_USER.with(|u| {
-            u.replace(Some(user.to_owned()));
+            u.replace(Some(Rc::new(identity)));
         });
         Self
     }
@@ -31,10 +57,7 @@ impl Drop for FanoutAclScope {
 
 #[inline]
 pub fn fanout_acl_scope_active() -> bool {
-    FANOUT_ACL_USER.with(|u| {
-        let u = u.borrow();
-        u.as_ref().is_some_and(|v| !v.is_empty())
-    })
+    FANOUT_ACL_USER.with(|u| u.borrow().as_ref().is_some_and(|id| !id.name.is_empty()))
 }
 
 pub fn with_fanout_user<T, F>(ctx: &Context, user: Option<&str>, f: F) -> ValkeyResult<T>
@@ -46,12 +69,13 @@ where
     };
 
     let user_name = ctx.create_string(user);
-    let _user_scope = ctx.authenticate_user(&user_name).map_err(|err| {
-        ValkeyError::String(format!(
-            "ACL user '{user}' does not exist or is disabled: {err}"
-        ))
+    let module_user = ModuleUser::from_name(&user_name).ok_or_else(|| {
+        ValkeyError::String(format!("ACL user '{user}' does not exist or is disabled"))
     })?;
-    let _acl_scope = FanoutAclScope::enter_with_user(user);
+    let _acl_scope = FanoutAclScope::enter(FanoutIdentity {
+        name: user.to_owned(),
+        user: Some(Rc::new(module_user)),
+    });
 
     f(ctx)
 }
@@ -62,6 +86,20 @@ pub(super) fn get_fanout_user(ctx: &Context) -> Option<String> {
         return None;
     }
     Some(user)
+}
+
+/// The [`ModuleUser`] handle [`with_fanout_user`] already resolved for the current
+/// thread's fan-out request, if any. Cloning the result is an `Rc` refcount bump,
+/// never a fresh `RM_GetModuleUserFromUserName` call.
+///
+/// Gated on `is_clustered` to match [`crate::common::context::get_acl_user`]: a
+/// non-clustered deployment never runs a fan-out request, so the thread-local is
+/// always empty there and the flag check is skipped rather than paid for nothing.
+pub(crate) fn fanout_module_user(ctx: &Context) -> Option<Rc<ModuleUser>> {
+    if !super::is_clustered(ctx) {
+        return None;
+    }
+    FANOUT_ACL_USER.with(|u| u.borrow().as_ref().and_then(|id| id.user.clone()))
 }
 
 #[cfg(test)]

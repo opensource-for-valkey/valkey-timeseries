@@ -1,6 +1,8 @@
-use crate::common::context::{get_acl_user, is_acl_enforced};
+use crate::common::context::is_acl_enforced;
 use crate::error_consts;
+use crate::fanout::acl::fanout_module_user;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, raw};
 
 /// A server user handle, as `RM_GetModuleUserFromUserName` returns it.
@@ -11,10 +13,14 @@ use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeySt
 /// thread, or a fan-out request handler under `MODULE_CONTEXT` — for the
 /// whole of the check loop, which is why [`KeyAccess`] is built per request
 /// and never stored.
-struct ModuleUser(NonNull<raw::RedisModuleUser>);
+///
+/// A fan-out request handler resolves this once, in `with_fanout_user`, and
+/// shares it (as an `Rc`) with every `KeyAccess` the request builds via
+/// [`fanout_module_user`] — never re-resolving the name.
+pub(crate) struct ModuleUser(NonNull<raw::RedisModuleUser>);
 
 impl ModuleUser {
-    fn from_name(name: &ValkeyString) -> Option<Self> {
+    pub(crate) fn from_name(name: &ValkeyString) -> Option<Self> {
         // SAFETY: `name` is a live module string; the API returns null for an
         // unknown or disabled user rather than failing.
         let user = unsafe { raw::RedisModule_GetModuleUserFromUserName.unwrap()(name.inner) };
@@ -80,7 +86,7 @@ enum Identity {
     /// or AOF apply, an internal context), or the user's rules already grant
     /// the permission on every key.
     Unrestricted,
-    User(ModuleUser),
+    User(Rc<ModuleUser>),
     /// Enforced, but the user could not be resolved (deleted or disabled while
     /// the connection was open): every key is denied, as the name-based API
     /// would have denied it.
@@ -107,7 +113,11 @@ impl KeyAccess {
         let identity = if !is_acl_enforced(ctx) {
             Identity::Unrestricted
         } else {
-            match ModuleUser::from_name(&get_acl_user(ctx)) {
+            // Reuse the handle a fan-out request handler already resolved (an `Rc`
+            // clone, no FFI call) rather than resolving the name again here.
+            let user = fanout_module_user(ctx)
+                .or_else(|| ModuleUser::from_name(&ctx.get_current_user()).map(Rc::new));
+            match user {
                 Some(user) if user.allows_all_keys(ctx, &permissions) => Identity::Unrestricted,
                 Some(user) => Identity::User(user),
                 None => Identity::Unknown,

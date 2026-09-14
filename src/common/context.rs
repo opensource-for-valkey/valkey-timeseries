@@ -105,9 +105,9 @@ pub fn is_acl_enforced(ctx: &Context) -> bool {
 
 pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
     if is_clustered(ctx) {
-        let fanout_user = FANOUT_ACL_USER.with(|u| u.borrow().clone());
-        if let Some(user) = fanout_user {
-            return ctx.create_string(user.as_str());
+        let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
+        if let Some(identity) = fanout_identity {
+            return ctx.create_string(identity.name.as_str());
         }
     }
     ctx.get_current_user()
