@@ -390,7 +390,10 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
             'ts.nrange': ([b'readonly', b'module', b'movablekeys'], {b'@read', b'@timeseries'}),
             'ts.nrevrange': ([b'readonly', b'module', b'movablekeys'], {b'@read', b'@timeseries'}),
             'ts.outliers': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            # PromQL entry points: keys come from the label matchers, so there is no key spec.
+            'ts.query': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
             'ts.queryindex': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
+            'ts.queryrange': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
             'ts.querylabels': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
             'ts.range': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
             'ts.read': ([b'readonly', b'module'], {b'@read', b'@timeseries'}),
