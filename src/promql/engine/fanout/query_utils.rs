@@ -32,35 +32,34 @@ pub(super) fn handle_instant_query(
     _max_points_per_series: u64,
 ) -> ValkeyResult<InstantQueryResponse> {
     let series = series_by_selectors(ctx, &[selector], None)?;
+    // in prometheus, given a timestamp and delta, we select the latest sample in the range
+    // (ts - delta, ts], so we need to adjust the timestamp accordingly
+    let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
+    let end_time = timestamp;
+
+    // Labels go straight from storage into the response's symbol table by
+    // identity; no owned label strings are built per series.
+    let mut symbol_table = symbol_table::SymbolTableBuilder::default();
     let samples = series
         .iter()
-        .filter_map(|(s, k)| {
+        .filter_map(|(s, _)| {
             let series = s.deref();
-
-            // in prometheus, given a timestamp and delta, we select the latest sample in the range
-            // (ts - delta, ts], so we need to adjust the timestamp accordingly
-            let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
-            let end_time = timestamp;
-
             let sample = series.last_sample_in_range(start_time, end_time)?;
-            let labels = metric_name_to_proto_labels(&series.labels);
-            let key = k.to_string();
-
+            let (label_name_refs, label_value_refs) = symbol_table.intern(&series.labels);
             Some(InstantSample {
-                labels,
+                labels: Vec::new(),
                 value: sample.value,
                 timestamp: sample.timestamp,
-                key,
-                label_refs: Vec::new(),
+                label_name_refs,
+                label_value_refs,
             })
         })
         .collect::<Vec<_>>();
+    let symbol_table = symbol_table.finish();
 
     validate_max_series(samples.len(), max_series as usize)
         .map_err(valkey_module::ValkeyError::String)?;
 
-    let mut samples = samples;
-    let symbol_table = symbol_table::intern_labels(&mut samples);
     Ok(InstantQueryResponse {
         samples,
         labels: Some(symbol_table),
@@ -269,7 +268,6 @@ pub(super) fn handle_range_query(
                 .map_err(|e| e.to_string())?;
             Ok(Some(RangeSample {
                 labels,
-                key: "".to_string(),
                 data: Some(data),
             }))
         })

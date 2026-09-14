@@ -1,44 +1,47 @@
-//! Response-level label interning for MRANGE cluster fanout.
+//! Response-level label interning for cluster fanout.
 //!
-//! Real `TS.MRANGE` responses repeat a small universe of label names (and
-//! often values) across every matched series. [`intern_labels`] rewrites each
-//! series' `labels: Vec<Label>` into `SymbolTableRef` entries against two
-//! dictionaries shared by
-//! the whole `MultiRangeResponse`; [`resolve_labels`] is the coordinator-side
-//! inverse.
+//! Real `TS.MRANGE` and PromQL fan-out responses repeat a small universe of
+//! label names (and often values) across every matched series. Each labelled
+//! element carries its labels as two parallel packed `u32` arrays indexing a
+//! per-response [`SymbolTable`] instead of inline `name`/`value` strings.
 //!
-//! [`resolve_labels`] is safe to call on any response without the caller first
-//! establishing that it was interned. It rewrites `labels` only for series that
-//! actually carry refs, so a series that has none passes through untouched instead
-//! of being emptied. Note that within one response version that guard changes no
-//! outcome (a label-less series interns to empty refs and its `labels` is already empty);
-//! it is there so the function cannot be misused into silently discarding labels.
+//! Three ways to produce the refs, one to consume them:
 //!
-//! `resolve_labels` runs on peer-controlled input, so it returns `Err` on any
-//! malformed index rather than panicking (see the
-//! `rdb_load_len` rationale in `src/common/rdb.rs` for why fanout/RDB input is
-//! treated as untrusted throughout this crate).
+//! - [`intern_labels`] rewrites owned `labels: Vec<Label>` in place (MRANGE and
+//!   the aggregated PromQL outputs, which are built as owned labels anyway).
+//! - [`SymbolTableBuilder`] interns straight from a series' [`MetricName`] by
+//!   the identity of its interned `name=value` entries: a hit is one integer
+//!   lookup, and no owned strings are built for a label already in the table.
+//!   This is what the shard's instant-query handler uses.
+//! - [`resolve_labels`] is the coordinator-side inverse for consumers that
+//!   want owned `Label`s back (MRANGE); [`EvalLabelResolver`] goes straight to
+//!   evaluator labels for the PromQL paths.
+//!
+//! Both resolvers are safe to call on any response without the caller first
+//! establishing that it was interned: an element whose ref arrays are empty
+//! keeps its inline `labels` rather than being emptied. They run on
+//! peer-controlled input, so a malformed index or ragged pair of arrays is an
+//! `Err`, never a panic (see the `rdb_load_len` rationale in
+//! `src/common/rdb.rs` for why fanout/RDB input is treated as untrusted
+//! throughout this crate).
 
-use super::generated::{Label, SeriesRangeResponse, SymbolTable, SymbolTableRef};
+use super::generated::{Label, SeriesRangeResponse, SymbolTable};
 use crate::common::context::key_for_display;
-
+use crate::labels::MetricName;
 use crate::promql::generated::InstantSample;
 use crate::promql::{EvalLabels, EvalSample, SplitLabel};
 use std::collections::HashMap;
 use valkey_module::{ValkeyError, ValkeyResult};
 
-/// Rewrites every series' `labels` into indices against a per-response
-/// [`SymbolTable`], clearing `labels` in the process.
-///
-/// A series with no labels gets an empty ref list, which [`resolve_labels`]
-/// reads as "nothing to resolve" — so the round trip is still correct without
-/// needing a separate marker for the empty case.
+/// A labelled wire element: owned `labels`, or two parallel ref arrays into
+/// the response's [`SymbolTable`].
 pub trait SymbolTableRefs {
     fn take_labels(&mut self) -> Vec<Label>;
-    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>);
-    fn take_label_refs(&mut self) -> Vec<SymbolTableRef>;
+    fn set_label_refs(&mut self, names: Vec<u32>, values: Vec<u32>);
+    fn take_label_refs(&mut self) -> (Vec<u32>, Vec<u32>);
     fn set_labels(&mut self, labels: Vec<Label>);
-    fn key_for_display(&self) -> String;
+    /// How the element is named in a malformed-response error.
+    fn describe(&self) -> String;
 }
 
 impl SymbolTableRefs for SeriesRangeResponse {
@@ -46,20 +49,24 @@ impl SymbolTableRefs for SeriesRangeResponse {
         std::mem::take(&mut self.labels)
     }
 
-    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>) {
-        self.label_refs = refs;
+    fn set_label_refs(&mut self, names: Vec<u32>, values: Vec<u32>) {
+        self.label_name_refs = names;
+        self.label_value_refs = values;
     }
 
-    fn take_label_refs(&mut self) -> Vec<SymbolTableRef> {
-        std::mem::take(&mut self.label_refs)
+    fn take_label_refs(&mut self) -> (Vec<u32>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.label_name_refs),
+            std::mem::take(&mut self.label_value_refs),
+        )
     }
 
     fn set_labels(&mut self, labels: Vec<Label>) {
         self.labels = labels;
     }
 
-    fn key_for_display(&self) -> String {
-        key_for_display(&self.key).into_owned()
+    fn describe(&self) -> String {
+        format!("series '{}'", key_for_display(&self.key))
     }
 }
 
@@ -68,109 +75,199 @@ impl SymbolTableRefs for InstantSample {
         std::mem::take(&mut self.labels)
     }
 
-    fn set_label_refs(&mut self, refs: Vec<SymbolTableRef>) {
-        self.label_refs = refs;
+    fn set_label_refs(&mut self, names: Vec<u32>, values: Vec<u32>) {
+        self.label_name_refs = names;
+        self.label_value_refs = values;
     }
 
-    fn take_label_refs(&mut self) -> Vec<SymbolTableRef> {
-        std::mem::take(&mut self.label_refs)
+    fn take_label_refs(&mut self) -> (Vec<u32>, Vec<u32>) {
+        (
+            std::mem::take(&mut self.label_name_refs),
+            std::mem::take(&mut self.label_value_refs),
+        )
     }
 
     fn set_labels(&mut self, labels: Vec<Label>) {
         self.labels = labels;
     }
 
-    fn key_for_display(&self) -> String {
-        self.key.clone()
+    fn describe(&self) -> String {
+        format!("instant sample at {}", self.timestamp)
     }
 }
 
+/// Builds a response's [`SymbolTable`] from series labels as they are read
+/// from storage.
+///
+/// Storage keeps every label as one interned `name=value` string, and the
+/// interner guarantees one allocation per distinct string while it is alive,
+/// so a label's address identifies it: the pair cache is keyed by that
+/// address and a hit costs one integer lookup. Only the first sight of a
+/// label splits it and copies its two halves into the table. The borrowed
+/// keys tie the builder to the series it reads from; [`Self::finish`]
+/// releases them.
+#[derive(Default)]
+pub struct SymbolTableBuilder<'a> {
+    table: SymbolTable,
+    name_ids: HashMap<&'a str, u32, ahash::RandomState>,
+    value_ids: HashMap<&'a str, u32, ahash::RandomState>,
+    /// `name=value` address → (name ref, value ref).
+    pairs: HashMap<usize, (u32, u32), ahash::RandomState>,
+}
+
+impl<'a> SymbolTableBuilder<'a> {
+    /// The ref arrays for one series' labels, in storage (name) order.
+    /// Entries without a separator are malformed; storage never produces
+    /// them, and `MetricName::iter` skips them the same way.
+    pub fn intern(&mut self, labels: &'a MetricName) -> (Vec<u32>, Vec<u32>) {
+        let mut names = Vec::with_capacity(labels.len());
+        let mut values = Vec::with_capacity(labels.len());
+        for raw in labels.raw_entries() {
+            let key = raw.as_bytes().as_ptr() as usize;
+            let (name_ref, value_ref) = match self.pairs.get(&key) {
+                Some(&refs) => refs,
+                None => {
+                    let Some((name, value)) = raw.split_once('=') else {
+                        continue;
+                    };
+                    let refs = (
+                        Self::id(&mut self.name_ids, &mut self.table.names, name),
+                        Self::id(&mut self.value_ids, &mut self.table.values, value),
+                    );
+                    self.pairs.insert(key, refs);
+                    refs
+                }
+            };
+            names.push(name_ref);
+            values.push(value_ref);
+        }
+        (names, values)
+    }
+
+    fn id(
+        ids: &mut HashMap<&'a str, u32, ahash::RandomState>,
+        symbols: &mut Vec<String>,
+        symbol: &'a str,
+    ) -> u32 {
+        *ids.entry(symbol).or_insert_with(|| {
+            symbols.push(symbol.to_owned());
+            (symbols.len() - 1) as u32
+        })
+    }
+
+    pub fn finish(self) -> SymbolTable {
+        self.table
+    }
+}
+
+/// Rewrites every element's owned `labels` into refs against a per-response
+/// [`SymbolTable`], clearing `labels` in the process.
+///
+/// An element with no labels gets empty ref arrays, which the resolvers read
+/// as "nothing to resolve" — so the round trip is still correct without
+/// needing a separate marker for the empty case.
 pub fn intern_labels<T: SymbolTableRefs>(series: &mut [T]) -> SymbolTable {
     let mut table = SymbolTable::default();
-    let mut name_ids: HashMap<String, u32> = HashMap::new();
-    let mut value_ids: HashMap<String, u32> = HashMap::new();
+    let mut name_ids: HashMap<String, u32, ahash::RandomState> = HashMap::default();
+    let mut value_ids: HashMap<String, u32, ahash::RandomState> = HashMap::default();
 
     for s in series.iter_mut() {
         let labels = s.take_labels();
-        let mut refs = Vec::with_capacity(labels.len());
+        let mut names = Vec::with_capacity(labels.len());
+        let mut values = Vec::with_capacity(labels.len());
         for label in labels {
-            let name_idx = match name_ids.get(label.name.as_str()) {
-                Some(&idx) => idx,
-                None => {
-                    let idx = table.names.len() as u32;
-                    name_ids.insert(label.name.clone(), idx);
-                    table.names.push(label.name);
-                    idx
-                }
-            };
-            let value_idx = match value_ids.get(label.value.as_str()) {
-                Some(&idx) => idx,
-                None => {
-                    let idx = table.values.len() as u32;
-                    value_ids.insert(label.value.clone(), idx);
-                    table.values.push(label.value);
-                    idx
-                }
-            };
-            refs.push(SymbolTableRef {
-                name: name_idx,
-                value: value_idx,
-            });
+            names.push(owned_id(&mut name_ids, &mut table.names, label.name));
+            values.push(owned_id(&mut value_ids, &mut table.values, label.value));
         }
-        s.set_label_refs(refs);
+        s.set_label_refs(names, values);
     }
 
     table
 }
 
-/// Inverse of [`intern_labels`]: resolves each series' `label_refs` against the
-/// response-level dictionaries back into a
-/// concrete `labels: Vec<Label>`, clearing the ref arrays in the process.
+fn owned_id(
+    ids: &mut HashMap<String, u32, ahash::RandomState>,
+    symbols: &mut Vec<String>,
+    symbol: String,
+) -> u32 {
+    if let Some(&idx) = ids.get(symbol.as_str()) {
+        return idx;
+    }
+    let idx = symbols.len() as u32;
+    symbols.push(symbol.clone());
+    ids.insert(symbol, idx);
+    idx
+}
+
+/// Looks up one ref pair, rejecting anything the table cannot answer.
+fn lookup<'t, T: SymbolTableRefs>(
+    table: &'t SymbolTable,
+    element: &T,
+    name_ref: u32,
+    value_ref: u32,
+) -> ValkeyResult<(&'t str, &'t str)> {
+    let name = table.names.get(name_ref as usize).ok_or_else(|| {
+        ValkeyError::String(format!(
+            "TSDB: malformed symbol-table response: {} label name ref {} out of range ({} names)",
+            element.describe(),
+            name_ref,
+            table.names.len()
+        ))
+    })?;
+    let value = table.values.get(value_ref as usize).ok_or_else(|| {
+        ValkeyError::String(format!(
+            "TSDB: malformed symbol-table response: {} label value ref {} out of range ({} values)",
+            element.describe(),
+            value_ref,
+            table.values.len()
+        ))
+    })?;
+    Ok((name, value))
+}
+
+/// The two ref arrays of an element, or `None` when it carries no refs.
+fn take_ref_pairs<T: SymbolTableRefs>(element: &mut T) -> ValkeyResult<Option<(Vec<u32>, Vec<u32>)>> {
+    let (names, values) = element.take_label_refs();
+    if names.is_empty() && values.is_empty() {
+        return Ok(None);
+    }
+    if names.len() != values.len() {
+        return Err(ValkeyError::String(format!(
+            "TSDB: malformed symbol-table response: {} has {} label name refs but {} value refs",
+            element.describe(),
+            names.len(),
+            values.len()
+        )));
+    }
+    Ok(Some((names, values)))
+}
+
+/// Inverse of [`intern_labels`]: resolves each element's refs against the
+/// response-level dictionaries back into owned `labels: Vec<Label>`,
+/// clearing the ref arrays in the process.
 ///
 /// Total: safe to call on any response without first checking whether it was
-/// interned. A series whose ref arrays are both empty is left exactly as
+/// interned. An element whose ref arrays are both empty is left exactly as
 /// received, `labels` included, rather than being emptied.
-///
-/// Peer-controlled: an out-of-range index is a malformed response and is
-/// rejected with `Err`, never indexed directly.
 pub fn resolve_labels<T: SymbolTableRefs>(
     series: &mut [T],
     table: &SymbolTable,
 ) -> ValkeyResult<()> {
     for s in series.iter_mut() {
-        let refs = s.take_label_refs();
         // Nothing to resolve. Returning early rather than assigning an empty
         // vec keeps this function from discarding `labels` when it is handed a
         // response that was never interned.
-        if refs.is_empty() {
+        let Some((names, values)) = take_ref_pairs(s)? else {
             continue;
-        }
-
-        let mut labels = Vec::with_capacity(refs.len());
-        for symbol_ref in refs {
-            let name = table.names.get(symbol_ref.name as usize).ok_or_else(|| {
-                ValkeyError::String(format!(
-                    "TSDB: malformed symbol-table response: series '{}' label name ref {} out of range ({} names)",
-                    s.key_for_display(),
-                    symbol_ref.name,
-                    table.names.len()
-                ))
-            })?;
-            let value = table.values.get(symbol_ref.value as usize).ok_or_else(|| {
-                ValkeyError::String(format!(
-                    "TSDB: malformed symbol-table response: series '{}' label value ref {} out of range ({} values)",
-                    s.key_for_display(),
-                    symbol_ref.value,
-                    table.values.len()
-                ))
-            })?;
+        };
+        let mut labels = Vec::with_capacity(names.len());
+        for (name_ref, value_ref) in names.into_iter().zip(values) {
+            let (name, value) = lookup(table, s, name_ref, value_ref)?;
             labels.push(Label {
-                name: name.clone(),
-                value: value.clone(),
+                name: name.to_owned(),
+                value: value.to_owned(),
             });
         }
-        // The concrete response type owns the labels; resolution is provided
-        // by the type-specific caller after validating the references.
         s.set_labels(labels);
     }
     Ok(())
@@ -185,9 +282,6 @@ pub fn resolve_labels<T: SymbolTableRefs>(
 /// ~500 interned strings instead of 4 000 `String` clones. A sample that
 /// carries inline labels instead of refs (a peer that did not intern) goes
 /// through the ordinary owned conversion.
-///
-/// Peer-controlled input: an out-of-range ref is rejected with `Err`, never
-/// indexed directly, exactly as in [`resolve_labels`].
 pub struct EvalLabelResolver<'a> {
     table: &'a SymbolTable,
     pairs: HashMap<u64, SplitLabel, ahash::RandomState>,
@@ -204,36 +298,20 @@ impl<'a> EvalLabelResolver<'a> {
         }
     }
 
-    /// The evaluator labels for one interned element, consuming its refs (or
-    /// its inline labels when it has none).
+    /// The evaluator labels for one element, consuming its refs (or its
+    /// inline labels when it has none).
     pub fn resolve<T: SymbolTableRefs>(&mut self, s: &mut T) -> ValkeyResult<EvalLabels> {
-        let refs = s.take_label_refs();
-        if refs.is_empty() {
+        let Some((names, values)) = take_ref_pairs(s)? else {
             let labels = s.take_labels().into_iter().map(crate::Label::from).collect();
             return Ok(EvalLabels::shared(labels));
-        }
-        let mut split = Vec::with_capacity(refs.len());
-        for symbol_ref in refs {
-            let key = (u64::from(symbol_ref.name) << 32) | u64::from(symbol_ref.value);
+        };
+        let mut split = Vec::with_capacity(names.len());
+        for (name_ref, value_ref) in names.into_iter().zip(values) {
+            let key = (u64::from(name_ref) << 32) | u64::from(value_ref);
             let label = match self.pairs.get(&key) {
                 Some(label) => label.clone(),
                 None => {
-                    let name = self.table.names.get(symbol_ref.name as usize).ok_or_else(|| {
-                        ValkeyError::String(format!(
-                            "TSDB: malformed symbol-table response: series '{}' label name ref {} out of range ({} names)",
-                            s.key_for_display(),
-                            symbol_ref.name,
-                            self.table.names.len()
-                        ))
-                    })?;
-                    let value = self.table.values.get(symbol_ref.value as usize).ok_or_else(|| {
-                        ValkeyError::String(format!(
-                            "TSDB: malformed symbol-table response: series '{}' label value ref {} out of range ({} values)",
-                            s.key_for_display(),
-                            symbol_ref.value,
-                            self.table.values.len()
-                        ))
-                    })?;
+                    let (name, value) = lookup(self.table, s, name_ref, value_ref)?;
                     let label = SplitLabel::new(name, value);
                     self.pairs.insert(key, label.clone());
                     label
@@ -273,7 +351,8 @@ mod tests {
                 })
                 .collect(),
             columns: Vec::new(),
-            label_refs: Vec::new(),
+            label_name_refs: Vec::new(),
+            label_value_refs: Vec::new(),
         }
     }
 
@@ -310,7 +389,7 @@ mod tests {
                 "series '{}'",
                 key_for_display(&want.key)
             );
-            assert!(got.label_refs.is_empty());
+            assert!(got.label_name_refs.is_empty() && got.label_value_refs.is_empty());
         }
     }
 
@@ -356,8 +435,8 @@ mod tests {
             }],
             value: 1.0,
             timestamp: 42,
-            key: "a".into(),
-            label_refs: Vec::new(),
+            label_name_refs: Vec::new(),
+            label_value_refs: Vec::new(),
         }];
 
         let table = intern_labels(&mut samples);
@@ -373,7 +452,8 @@ mod tests {
     #[test]
     fn out_of_range_name_ref_rejected() {
         let mut batch = vec![SeriesRangeResponse {
-            label_refs: vec![SymbolTableRef { name: 5, value: 0 }],
+            label_name_refs: vec![5],
+            label_value_refs: vec![0],
             ..series("a", vec![])
         }];
         let err = resolve_labels(
@@ -392,7 +472,8 @@ mod tests {
     #[test]
     fn out_of_range_value_ref_rejected() {
         let mut batch = vec![SeriesRangeResponse {
-            label_refs: vec![SymbolTableRef { name: 0, value: 7 }],
+            label_name_refs: vec![0],
+            label_value_refs: vec![7],
             ..series("a", vec![])
         }];
         let err = resolve_labels(
@@ -407,7 +488,7 @@ mod tests {
         assert!(msg.contains("series 'a'"), "{msg}");
         assert!(msg.contains("value ref 7"), "{msg}");
     }
-    fn instant(key: &str, labels: Vec<(&str, &str)>) -> InstantSample {
+    fn instant(id: u32, labels: Vec<(&str, &str)>) -> InstantSample {
         InstantSample {
             labels: labels
                 .into_iter()
@@ -417,18 +498,18 @@ mod tests {
                 })
                 .collect(),
             value: 1.0,
-            timestamp: 42,
-            key: key.into(),
-            label_refs: Vec::new(),
+            timestamp: 42 + i64::from(id),
+            label_name_refs: Vec::new(),
+            label_value_refs: Vec::new(),
         }
     }
 
     #[test]
     fn eval_label_resolver_matches_owned_resolution() {
         let mut samples = vec![
-            instant("a", vec![("__name__", "cpu"), ("host", "h1"), ("region", "us")]),
-            instant("b", vec![("__name__", "cpu"), ("host", "h2"), ("region", "us")]),
-            instant("c", vec![]),
+            instant(0, vec![("__name__", "cpu"), ("host", "h1"), ("region", "us")]),
+            instant(1, vec![("__name__", "cpu"), ("host", "h2"), ("region", "us")]),
+            instant(2, vec![]),
         ];
         let expected: Vec<EvalLabels> = samples
             .iter()
@@ -455,7 +536,7 @@ mod tests {
     #[test]
     fn eval_label_resolver_accepts_inline_labels() {
         // A peer that did not intern ships `labels` and no refs.
-        let sample = instant("a", vec![("region", "us")]);
+        let sample = instant(0, vec![("region", "us")]);
         let table = SymbolTable::default();
         let mut resolver = EvalLabelResolver::new(&table);
         let got = resolver.resolve_sample(sample).expect("resolve");
@@ -468,17 +549,60 @@ mod tests {
             names: vec!["region".into()],
             values: vec!["us".into()],
         };
-        for (name, value, needle) in [(3u32, 0u32, "name ref 3"), (0, 9, "value ref 9")] {
+        for (names, values, needle) in [
+            (vec![3u32], vec![0u32], "name ref 3"),
+            (vec![0], vec![9], "value ref 9"),
+            (vec![0, 0], vec![0], "2 label name refs but 1 value refs"),
+        ] {
             let sample = InstantSample {
-                label_refs: vec![SymbolTableRef { name, value }],
-                ..instant("a", vec![])
+                label_name_refs: names,
+                label_value_refs: values,
+                ..instant(0, vec![])
             };
             let err = EvalLabelResolver::new(&table)
                 .resolve_sample(sample)
-                .expect_err("out-of-range ref must be rejected");
+                .expect_err("malformed refs must be rejected");
             let msg = err.to_string();
-            assert!(msg.contains("series 'a'") && msg.contains(needle), "{msg}");
+            assert!(msg.contains("instant sample at 42") && msg.contains(needle), "{msg}");
         }
+    }
+
+    #[test]
+    fn builder_interns_by_identity_and_matches_owned_interning() {
+        use crate::labels::MetricName;
+        let metric = |pairs: &[(&str, &str)]| {
+            let mut m = MetricName::default();
+            for (name, value) in pairs {
+                m.add_label(name, value);
+            }
+            m
+        };
+        let a = metric(&[("__name__", "cpu"), ("host", "h1"), ("region", "us")]);
+        let b = metric(&[("__name__", "cpu"), ("host", "h2"), ("region", "us")]);
+        let c = MetricName::default();
+        let mut builder = SymbolTableBuilder::default();
+        let ra = builder.intern(&a);
+        let rb = builder.intern(&b);
+        let rc = builder.intern(&c);
+        // Second sight of `__name__=cpu` and `region=us` hit the address cache:
+        // four distinct pairs across two series.
+        assert_eq!(builder.pairs.len(), 4);
+        let table = builder.finish();
+        assert_eq!(table.names, vec!["__name__", "host", "region"]);
+        assert_eq!(table.values, vec!["cpu", "h1", "us", "h2"]);
+        assert_eq!(ra, (vec![0, 1, 2], vec![0, 1, 2]));
+        assert_eq!(rb, (vec![0, 1, 2], vec![0, 3, 2]));
+        assert_eq!(rc, (vec![], vec![]));
+
+        // Resolving through the table gives the same labels the owned path
+        // would have shipped.
+        let mut sample = InstantSample {
+            label_name_refs: rb.0,
+            label_value_refs: rb.1,
+            ..instant(1, vec![])
+        };
+        let got = EvalLabelResolver::new(&table).resolve(&mut sample).expect("resolve");
+        assert_eq!(got, EvalLabels::interned(&b));
     }
 
 }

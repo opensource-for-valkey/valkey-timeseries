@@ -72,18 +72,14 @@ pub struct Label {
     #[prost(string, tag = "2")]
     pub value: ::prost::alloc::string::String,
 }
-/// / An interned reference to a symbol in the symbol table.
-/// / Both `name` and `value` are indices into the corresponding arrays in `SymbolTable`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SymbolTableRef {
-    #[prost(uint32, tag = "1")]
-    pub name: u32,
-    #[prost(uint32, tag = "2")]
-    pub value: u32,
-}
 /// / A symbol table holds the unique set of label names and values used across series. It is used
 /// / to intern strings, so that the same string is only stored once.
-/// / Labels can then refer to these symbols via `SymbolTableRef` to save space.
+/// /
+/// / A labelled element refers to these symbols through two parallel packed
+/// / arrays, `label_name_refs` and `label_value_refs`: entry `i` of each is the
+/// / index of the `i`-th label's name and value here. Packed varints cost about
+/// / two bytes per label; a nested ref message costs six and a length-delimited
+/// / decode each.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SymbolTable {
     #[prost(string, repeated, tag = "1")]
@@ -488,12 +484,13 @@ pub struct InstantSample {
     /// / Timestamp in milliseconds since Unix epoch.
     #[prost(int64, tag = "3")]
     pub timestamp: i64,
-    /// / Optional valkey key for this sample, if any.
-    #[prost(string, tag = "4")]
-    pub key: ::prost::alloc::string::String,
-    /// / Interned label references into `InstantQueryResponse.labels`.
-    #[prost(message, repeated, tag = "5")]
-    pub label_refs: ::prost::alloc::vec::Vec<SymbolTableRef>,
+    /// / Interned label references into `InstantQueryResponse.labels`: parallel
+    /// / packed arrays, one entry per label (see `SymbolTable`). Empty means the
+    /// / labels travel inline in `labels`.
+    #[prost(uint32, repeated, tag = "4")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "5")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstantQuery {
@@ -523,13 +520,10 @@ pub struct RangeSample {
     /// / The labels identifying this series.
     #[prost(message, repeated, tag = "1")]
     pub labels: ::prost::alloc::vec::Vec<Label>,
-    /// / Optional valkey key for this series, if any.
-    #[prost(string, tag = "3")]
-    pub key: ::prost::alloc::string::String,
     /// / The samples, as the chunk codec `TS.MRANGE` fans out with: Chimp from
     /// / `WIRE_COMPRESSION_MIN_SAMPLES` up, uncompressed below it. Around 5-6
     /// / bytes per sample on typical telemetry.
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<SampleData>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1299,15 +1293,18 @@ pub struct SeriesRangeResponse {
     pub labels: ::prost::alloc::vec::Vec<Label>,
     #[prost(message, repeated, tag = "4")]
     pub columns: ::prost::alloc::vec::Vec<SampleData>,
-    /// Label storage, used in place of `labels`: one entry per label, indexing
-    /// into `MultiRangeResponse.symbol_table`. Interning is unconditional, so
-    /// there is no `applied_*` flag; non-empty refs are themselves the signal.
+    /// Label storage, used in place of `labels`: parallel packed arrays, one
+    /// entry per label, indexing into `MultiRangeResponse.symbol_table` (see
+    /// `SymbolTable`). Interning is unconditional, so there is no `applied_*`
+    /// flag; non-empty refs are themselves the signal.
     ///
-    /// An empty ref list means there is nothing to resolve — either the series has
+    /// Empty ref arrays mean there is nothing to resolve — either the series has
     /// no labels, or it carries them in `labels` directly. A decoder must leave
     /// `labels` alone in that case rather than overwriting it.
-    #[prost(message, repeated, tag = "5")]
-    pub label_refs: ::prost::alloc::vec::Vec<SymbolTableRef>,
+    #[prost(uint32, repeated, tag = "5")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "6")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiGetResponse {

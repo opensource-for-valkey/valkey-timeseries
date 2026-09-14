@@ -121,7 +121,6 @@ pub(in crate::promql) fn range_sample_to_proto(
     let RangeSample { labels, samples } = series;
     Ok(ProtoRangeSample {
         labels: (&labels).into(),
-        key: String::new(),
         data: Some(serialize_chunk(samples_to_chunk_lossless(samples))?),
     })
 }
@@ -442,9 +441,8 @@ impl From<EvalSample> for ProtoInstantSample {
             labels: sample.labels.iter().map(ProtoLabel::from).collect(),
             value: sample.value,
             timestamp: sample.timestamp_ms,
-            // Aggregated output does not belong to a single key.
-            key: String::new(),
-            label_refs: Vec::new(),
+            label_name_refs: Vec::new(),
+            label_value_refs: Vec::new(),
         }
     }
 }

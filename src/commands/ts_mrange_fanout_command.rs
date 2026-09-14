@@ -2406,10 +2406,8 @@ mod tests {
                 group_label_value: String::new(),
                 labels: Vec::new(),
                 columns: Vec::new(),
-                label_refs: vec![super::fanout_codec::generated::SymbolTableRef {
-                    name: 7,
-                    value: 0,
-                }],
+                label_name_refs: vec![7],
+                label_value_refs: vec![0],
             }],
             group_partials: Vec::new(),
             applied_aggregation: false,

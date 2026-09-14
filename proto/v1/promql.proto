@@ -39,10 +39,11 @@ message InstantSample {
   double value = 2;
   /// Timestamp in milliseconds since Unix epoch.
   int64 timestamp = 3;
-  /// Optional valkey key for this sample, if any.
-  string key = 4;
-  /// Interned label references into `InstantQueryResponse.labels`.
-  repeated SymbolTableRef label_refs = 5;
+  /// Interned label references into `InstantQueryResponse.labels`: parallel
+  /// packed arrays, one entry per label (see `SymbolTable`). Empty means the
+  /// labels travel inline in `labels`.
+  repeated uint32 label_name_refs = 4;
+  repeated uint32 label_value_refs = 5;
 }
 
 message InstantQuery {
@@ -64,15 +65,10 @@ message InstantQueryResponse {
 message RangeSample {
   /// The labels identifying this series.
   repeated Label labels = 1;
-  /// Field 2 carried the samples as one `Sample` message each — about 18
-  /// bytes per sample. They now travel as a chunk (field 4).
-  reserved 2;
-  /// Optional valkey key for this series, if any.
-  string key = 3;
   /// The samples, as the chunk codec `TS.MRANGE` fans out with: Chimp from
   /// `WIRE_COMPRESSION_MIN_SAMPLES` up, uncompressed below it. Around 5-6
   /// bytes per sample on typical telemetry.
-  SampleData data = 4;
+  SampleData data = 2;
 }
 
 message RangeQuery {
