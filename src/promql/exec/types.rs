@@ -84,6 +84,21 @@ impl SplitLabel {
     fn to_label(&self) -> Label {
         Label::new(self.name(), self.value())
     }
+
+    /// A label that arrived over the wire, interned in the same `name=value`
+    /// form storage uses so a series assembled from a fan-out response shares
+    /// one allocation per distinct pair with every other series in the reply
+    /// (and with local series carrying the same label).
+    pub(crate) fn new(name: &str, value: &str) -> Self {
+        let mut raw = String::with_capacity(name.len() + 1 + value.len());
+        raw.push_str(name);
+        raw.push('=');
+        raw.push_str(value);
+        SplitLabel {
+            raw: InternedString::new(&raw),
+            sep: name.len() as u32,
+        }
+    }
 }
 
 impl SeriesLabel for SplitLabel {
@@ -156,6 +171,13 @@ impl EvalLabels {
                 })
             })
             .collect();
+        Self::from_split(split)
+    }
+
+    /// Wrap already-split labels, guarding name order as [`Self::interned`]
+    /// does: a set in name order is shared as is, anything else is
+    /// materialized and sorted.
+    pub(crate) fn from_split(split: Vec<SplitLabel>) -> Self {
         if split.is_sorted_by_key(|l| l.name()) {
             EvalLabels::Interned(Arc::from(split))
         } else {

@@ -6,9 +6,10 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
 use crate::promql::generated::{
-    InstantQuery, InstantQueryResponse, InstantSample, SeriesSelector as ProtoSeriesSelector,
+    InstantQuery, InstantQueryResponse, SeriesSelector as ProtoSeriesSelector,
 };
 use crate::promql::hashers::FingerprintHashSet;
+use crate::promql::{EvalLabels, InstantSample};
 use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::{Context, ValkeyResult};
@@ -19,7 +20,9 @@ pub struct InstantVectorSelectorFanoutCommand {
     lookback_delta: u64,
     max_series: u64,
     max_points_per_series: u64,
-    results: Vec<InstantSample>,
+    /// Samples already in evaluator form: each response is resolved against
+    /// its symbol table as it arrives (see `on_response`).
+    results: Vec<InstantSample<EvalLabels>>,
     timeout: Duration,
     seen: FingerprintHashSet,
 }
@@ -64,12 +67,9 @@ impl InstantVectorSelectorFanoutCommand {
         }
     }
 
-    /// Consume the accumulated selector results into the final response.
-    pub fn get_response(self) -> InstantQueryResponse {
-        InstantQueryResponse {
-            samples: self.results,
-            labels: None,
-        }
+    /// Consume the accumulated selector results.
+    pub fn into_samples(self) -> Vec<InstantSample<EvalLabels>> {
+        self.results
     }
 }
 
@@ -115,22 +115,28 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, mut resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
         let symbol_table = resp.labels.unwrap_or_default();
-        symbol_table::resolve_labels(&mut resp.samples, &symbol_table)?;
-        for s in resp.samples.iter() {
-            let fingerprint = s.labels.fingerprint();
+        let mut resolver = symbol_table::EvalLabelResolver::new(&symbol_table);
+        self.results.reserve(resp.samples.len());
+        for mut s in resp.samples {
+            let labels = resolver.resolve(&mut s)?;
+            let fingerprint = labels.fingerprint();
             if !self.seen.insert(fingerprint) {
                 // error. we have a duplicate
                 // Using prometheus semantics, series should have unique label-value pairs..
                 return Err(format!(
-                    "TSDB: received duplicate sample with labels {:?} in instant query response",
-                    s.labels
+                    "TSDB: received duplicate sample with labels {} in instant query response",
+                    labels
                 )
                 .into());
             }
+            self.results.push(InstantSample {
+                labels,
+                timestamp_ms: s.timestamp,
+                value: s.value,
+            });
         }
-        self.results.append(&mut resp.samples);
         Ok(())
     }
 }

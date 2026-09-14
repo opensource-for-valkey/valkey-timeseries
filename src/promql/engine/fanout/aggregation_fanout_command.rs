@@ -311,11 +311,14 @@ impl FanoutCommand for AggregationFanoutCommand {
 
     fn on_response(&mut self, mut resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
         let labels = resp.labels.unwrap_or_default();
-        symbol_table::resolve_labels(&mut resp.samples, &labels)?;
+        let mut resolver = symbol_table::EvalLabelResolver::new(&labels);
+        let samples = std::mem::take(&mut resp.samples)
+            .into_iter()
+            .map(|s| resolver.resolve_sample(s))
+            .collect::<ValkeyResult<Vec<EvalSample>>>()?;
         if !resp.applied {
             // Self-describing response from a peer that did not aggregate.
-            self.raw
-                .extend(resp.samples.into_iter().map(EvalSample::from));
+            self.raw.extend(samples);
             return Ok(());
         }
 
@@ -324,11 +327,11 @@ impl FanoutCommand for AggregationFanoutCommand {
                 // Corrupt-peer defense: a reduction response carries partials
                 // only. Aggregating stray samples as if they were reduced
                 // values would silently double-count.
-                if !resp.samples.is_empty() {
+                if !samples.is_empty() {
                     return Err(FanoutError::custom(format!(
                         "TSDB: peer {} returned {} samples for a pushed-down {:?} reduction, which ships partial states",
                         target.socket_address,
-                        resp.samples.len(),
+                        samples.len(),
                         self.aggregation.kind,
                     )));
                 }
@@ -343,8 +346,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                         self.aggregation.kind,
                     )));
                 }
-                self.samples
-                    .extend(resp.samples.into_iter().map(EvalSample::from));
+                self.samples.extend(samples);
             }
         }
         Ok(())

@@ -16,7 +16,7 @@ use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
     RangeVectorSelectorFanoutCommand, WireRangeSeries, get_snapshot_range,
-    instant_lookback_start_ms, local_label_profile, proto_labels_to_eval_labels,
+    instant_lookback_start_ms, local_label_profile,
     validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
@@ -683,19 +683,7 @@ fn execute_cluster_vector_selector(
     let handler = move |cmd: InstantVectorSelectorFanoutCommand, result: FanoutCommandResult| {
         let query_result = match result {
             Ok(()) => {
-                let resp = cmd.get_response();
-                let mut samples: Vec<InstantSample<EvalLabels>> =
-                    Vec::with_capacity(resp.samples.len());
-
-                for s in resp.samples {
-                    let labels = proto_labels_to_eval_labels(s.labels);
-                    samples.push(InstantSample {
-                        labels,
-                        timestamp_ms: s.timestamp,
-                        value: s.value,
-                    });
-                }
-
+                let samples = cmd.into_samples();
                 validate_max_series_(samples.len(), max_series)
                     .map(|_| SelectorOutput::Vector(samples))
             }

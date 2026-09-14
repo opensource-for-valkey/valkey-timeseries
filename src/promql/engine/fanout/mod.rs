@@ -15,7 +15,7 @@ pub(in crate::promql) use label_profile_fanout_command::LabelProfileFanoutComman
 pub(in crate::promql) use query_utils::local_label_profile;
 pub(in crate::promql) use range_vector_selector_fanout_command::RangeVectorSelectorFanoutCommand;
 pub(in crate::promql) use type_conversions::{
-    WireRangeSeries, metric_name_to_proto_labels, proto_labels_to_eval_labels,
+    WireRangeSeries, metric_name_to_proto_labels,
 };
 use valkey_module::ValkeyResult;
 
