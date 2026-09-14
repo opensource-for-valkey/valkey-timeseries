@@ -92,13 +92,11 @@ pub(super) fn get_fanout_user(ctx: &Context) -> Option<String> {
 /// thread's fan-out request, if any. Cloning the result is an `Rc` refcount bump,
 /// never a fresh `RM_GetModuleUserFromUserName` call.
 ///
-/// Gated on `is_clustered` to match [`crate::common::context::get_acl_user`]: a
-/// non-clustered deployment never runs a fan-out request, so the thread-local is
-/// always empty there and the flag check is skipped rather than paid for nothing.
-pub(crate) fn fanout_module_user(ctx: &Context) -> Option<Rc<ModuleUser>> {
-    if !super::is_clustered(ctx) {
-        return None;
-    }
+/// No `is_clustered` gate, matching [`crate::common::context::get_acl_user`]: the
+/// thread-local read is cheaper than the `RM_GetContextFlags` call the gate would
+/// cost, and the thread-local can only be populated inside a fan-out ACL scope,
+/// which only ever runs during cluster fanout.
+pub(crate) fn fanout_module_user() -> Option<Rc<ModuleUser>> {
     FANOUT_ACL_USER.with(|u| u.borrow().as_ref().and_then(|id| id.user.clone()))
 }
 

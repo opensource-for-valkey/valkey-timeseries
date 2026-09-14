@@ -6,7 +6,7 @@ use valkey_module::{
     ValkeyModuleServerInfoData, ValkeyResult, ValkeyString, raw,
 };
 
-use crate::fanout::{FANOUT_ACL_USER, is_clustered};
+use crate::fanout::FANOUT_ACL_USER;
 
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
@@ -104,11 +104,9 @@ pub fn is_acl_enforced(ctx: &Context) -> bool {
 }
 
 pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
-    if is_clustered(ctx) {
-        let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
-        if let Some(identity) = fanout_identity {
-            return ctx.create_string(identity.name.as_str());
-        }
+    let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
+    if let Some(identity) = fanout_identity {
+        return ctx.create_string(identity.name.as_str());
     }
     ctx.get_current_user()
 }
