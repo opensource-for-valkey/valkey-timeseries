@@ -67,8 +67,8 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         let ctx = thread_ctx.get_write_context();
         reply_with_query_value(&ctx, result, system_time_to_millis(eval_ts));
     });
-    if !queued {
-        return Err(ValkeyError::Str("TSDB: query workers are not running"));
+    if let Err(err) = queued {
+        return Err(ValkeyError::String(format!("TSDB: {err}")));
     }
 
     // We will reply later, from a query worker

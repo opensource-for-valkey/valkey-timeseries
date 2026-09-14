@@ -78,6 +78,13 @@ pub const MAX_CONCURRENT_QUERIES: i64 = 256;
 /// executor rather than computing, so a handful of evaluators keeps them busy.
 pub const DEFAULT_CONCURRENT_QUERIES: i64 = 8;
 
+pub const MIN_QUEUED_QUERIES: i64 = 0;
+pub const MAX_QUEUED_QUERIES: i64 = 1 << 16;
+/// Enough to absorb a dashboard refresh (tens of panels for a handful of
+/// viewers) at once while still refusing a runaway burst on arrival instead
+/// of after each query's `TIMEOUT` expires in the queue. 0 = unbounded.
+pub const DEFAULT_QUEUED_QUERIES: i64 = 128;
+
 pub const RETENTION_POLICY_MIN: i64 = 0;
 pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; // 10 years
 
@@ -346,6 +353,15 @@ pub static MAX_CONCURRENT_QUERIES_CELL: AtomicI64 = AtomicI64::new(DEFAULT_CONCU
 
 pub fn max_concurrent_queries() -> usize {
     MAX_CONCURRENT_QUERIES_CELL.load(Ordering::Relaxed) as usize
+}
+
+/// `ts-promql-max-queued-queries`: how many `TS.QUERY` / `TS.QUERYRANGE`
+/// evaluations may wait for a free worker before further ones are refused on
+/// arrival. 0 = unbounded. Read on every submission, so it can change at runtime.
+pub static MAX_QUEUED_QUERIES_CELL: AtomicI64 = AtomicI64::new(DEFAULT_QUEUED_QUERIES);
+
+pub fn max_queued_queries() -> usize {
+    MAX_QUEUED_QUERIES_CELL.load(Ordering::Relaxed) as usize
 }
 
 pub const DEFAULT_FANOUT_COMMAND_TIMEOUT_MS: u64 = 5000;
@@ -938,6 +954,10 @@ fn read_max_concurrent_queries() -> ConfigValue {
     ConfigValue::Integer(MAX_CONCURRENT_QUERIES_CELL.load(Ordering::Relaxed))
 }
 
+fn read_max_queued_queries() -> ConfigValue {
+    ConfigValue::Integer(MAX_QUEUED_QUERIES_CELL.load(Ordering::Relaxed))
+}
+
 fn read_fanout_command_timeout() -> ConfigValue {
     ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT.load(Ordering::Relaxed) as i64)
 }
@@ -1228,6 +1248,20 @@ pub static CONFIGS: &[ConfigDesc] = &[
         description: "Number of PromQL queries (TS.QUERY, TS.QUERYRANGE) evaluated concurrently; further queries wait",
         storage: ConfigStorage::I64 {
             cell: || &MAX_CONCURRENT_QUERIES_CELL,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-promql-max-queued-queries",
+        read: read_max_queued_queries,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(DEFAULT_QUEUED_QUERIES),
+        min: Some(ConfigValue::Integer(MIN_QUEUED_QUERIES)),
+        max: Some(ConfigValue::Integer(MAX_QUEUED_QUERIES)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Number of PromQL queries that may wait for a free worker; further queries are refused at once (0 = unbounded)",
+        storage: ConfigStorage::I64 {
+            cell: || &MAX_QUEUED_QUERIES_CELL,
             validate: None,
         },
     },
@@ -1699,6 +1733,7 @@ mod tests {
         ("ts-ignore-max-val-diff", "0"),
         ("ts-num-threads", "4"),
         ("ts-promql-max-concurrent-queries", "8"),
+        ("ts-promql-max-queued-queries", "128"),
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
         ("ts-index-build-max-memory", "268435456"),

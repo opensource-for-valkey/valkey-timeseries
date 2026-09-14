@@ -305,6 +305,8 @@ PromQL settings are regular module configuration values and can be inspected wit
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
+| `ts-promql-max-concurrent-queries` | 8 | Evaluations running at once; further queries wait for a free worker. Immutable after startup. |
+| `ts-promql-max-queued-queries` | 128 | Queries that may wait for a worker; further ones are refused on arrival with an error. `0` means unbounded. |
 | `ts-promql-max-query-len` | 4096 bytes | Maximum query string length. |
 | `ts-promql-max-response-series` | 1000 | Maximum returned series; `0` means unlimited. |
 | `ts-promql-max-points-per-timeseries` | 0 | Maximum generated points per series; `0` means unlimited. |
@@ -319,6 +321,13 @@ PromQL settings are regular module configuration values and can be inspected wit
 The per-query `LOOKBACK_DELTA` and `TIMEOUT` options override their corresponding
 defaults. Limits are particularly important for broad selectors and long range queries,
 which can otherwise materialize many series and points.
+
+A query that is admitted to the queue keeps its `TIMEOUT` budget while it waits: one that
+expires before a worker takes it is answered with a timeout error without being evaluated.
+Refusing on arrival once the backlog reaches `ts-promql-max-queued-queries` reports an
+overrun immediately instead of after every waiting query has timed out. `INFO ts_promql`
+shows the pool's state as `ts_queries_running`, `ts_queries_queued` and the cumulative
+`ts_queries_rejected`.
 
 ## Testing and compatibility
 
