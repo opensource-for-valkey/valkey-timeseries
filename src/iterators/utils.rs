@@ -500,6 +500,48 @@ impl SampleOutput<'_> {
     }
 }
 
+/// The pipeline `create_range_iterator` builds after its base reader, for a base
+/// that is not a live series: `base` must already be in the direction the
+/// query iterates (descending for a non-aggregated reverse query), `latest` and
+/// `empty_fill` must have been derived from the series beforehand (see
+/// [`range_empty_fill_bounds`]). Used by the deferred TS.MRANGE path, whose base is a
+/// [`crate::series::RangeSnapshot`] decoded off the main thread. `FILTER_BY_TS` is not
+/// supported here (its base reader needs the series), and the base covers the whole
+/// window, so there is no read floor and no counter baseline.
+pub(crate) fn create_range_iterator_from_base<'a, I>(
+    base: I,
+    options: &RangeOptions,
+    latest_sample: Option<Sample>,
+    is_reverse: bool,
+    empty_fill: EmptyFillBounds,
+) -> Box<dyn Iterator<Item = Sample> + 'a>
+where
+    I: Iterator<Item = Sample> + 'a,
+{
+    debug_assert!(options.timestamp_filter.is_none());
+    let has_aggregation = options.aggregation.is_some();
+    let should_reverse_iter = !has_aggregation && is_reverse;
+    let output = SampleOutput {
+        options,
+        is_reverse: has_aggregation && is_reverse,
+        empty_fill,
+        baseline: None,
+    };
+    output.chain_latest(base, latest_sample, should_reverse_iter)
+}
+
+/// The [`EmptyFillBounds`] [`create_range_iterator`] derives for `series` when the
+/// reply runs in the query's own order, for a caller that builds the pipeline from a
+/// base it read separately ([`create_range_iterator_from_base`]).
+pub(crate) fn range_empty_fill_bounds(
+    series: &TimeSeries,
+    options: &RangeOptions,
+    is_reverse: bool,
+) -> EmptyFillBounds {
+    let tail_limit = options.count.filter(|_| is_reverse);
+    empty_fill_bounds(series, options, is_reverse, tail_limit)
+}
+
 /// Pre-aggregation composition for one series: base reader (ts-filter variant
 /// when FILTER_BY_TS is present) + LATEST chaining + value filter. The output
 /// is always ascending — multi-aggregation consumes ascending input and
