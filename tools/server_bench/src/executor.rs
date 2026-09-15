@@ -80,19 +80,240 @@ fn sample_pair(v: &Value) -> Option<(i64, f64)> {
     Some((as_i64(&pair[0])?, as_f64(&pair[1])?))
 }
 
-/// Number of samples the reply carries, or why it is wrong.
-pub fn check_reply(expect: &Expect, v: &Value) -> Result<u64, String> {
+/// Relative tolerance for order-dependent aggregates (`sum`, `avg`). Anything
+/// within it still counts as a deviation and is reported; beyond it is an
+/// error that invalidates the pair. Never widened to hide a divergence.
+pub const AGGREGATE_REL_TOLERANCE: f64 = 1e-9;
+
+/// What a validated reply contributed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Checked {
+    /// Samples, buckets, keys or entries carried by the reply.
+    pub samples: u64,
+    /// Values that differed from the oracle within tolerance.
+    pub deviations: u64,
+    /// Largest relative deviation seen.
+    pub max_rel_dev: f64,
+}
+
+impl Checked {
+    fn exact(samples: u64) -> Result<Self, String> {
+        Ok(Self {
+            samples,
+            ..Self::default()
+        })
+    }
+}
+
+fn rel_dev(want: f64, got: f64) -> f64 {
+    if want == got {
+        0.0
+    } else if want == 0.0 {
+        got.abs()
+    } else {
+        ((got - want) / want).abs()
+    }
+}
+
+/// Entries of a multi-series reply as `(name, samples)`: RESP2 arrays of
+/// `[name, labels, ..., samples]` or RESP3 maps of `name -> [labels, ..., samples]`.
+fn multi_entries(v: &Value) -> Result<Vec<(String, &Value)>, String> {
+    let mut out = Vec::new();
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                let Value::Array(parts) = item else {
+                    return Err(format!("expected a series entry, got {item:?}"));
+                };
+                let (Some(name), Some(samples)) = (parts.first(), parts.last()) else {
+                    return Err("empty series entry".to_string());
+                };
+                let name = as_text(name).map_err(|e| e.to_string())?;
+                out.push((name, samples));
+            }
+        }
+        Value::Map(entries) => {
+            for (k, val) in entries {
+                let name = as_text(k).map_err(|e| e.to_string())?;
+                let samples = match val {
+                    Value::Array(parts) => parts.last().unwrap_or(val),
+                    other => other,
+                };
+                out.push((name, samples));
+            }
+        }
+        other => return Err(format!("expected a multi-series reply, got {other:?}")),
+    }
+    Ok(out)
+}
+
+fn sample_list(v: &Value) -> Result<Vec<(i64, f64)>, String> {
+    let Value::Array(items) = v else {
+        return Err(format!("expected a sample list, got {v:?}"));
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            sample_pair(item).ok_or_else(|| format!("sample {i}: malformed entry {item:?}"))
+        })
+        .collect()
+}
+
+/// What the reply contributed, or why it is wrong.
+pub fn check_reply(expect: &Expect, v: &Value) -> Result<Checked, String> {
     if let Value::ServerError(e) = v {
         return Err(format!("server error: {e}"));
     }
     match expect {
+        Expect::Buckets {
+            buckets,
+            exact,
+            reverse,
+        } => {
+            let got = sample_list(v)?;
+            if got.len() != buckets.len() {
+                return Err(format!(
+                    "expected {} buckets, got {}",
+                    buckets.len(),
+                    got.len()
+                ));
+            }
+            let mut checked = Checked {
+                samples: got.len() as u64,
+                ..Checked::default()
+            };
+            let ordered: Box<dyn Iterator<Item = &(i64, f64)>> = if *reverse {
+                Box::new(buckets.iter().rev())
+            } else {
+                Box::new(buckets.iter())
+            };
+            for (i, ((wts, wval), (gts, gval))) in ordered.zip(got.iter()).enumerate() {
+                if wts != gts {
+                    return Err(format!("bucket {i}: timestamp {gts}, expected {wts}"));
+                }
+                let dev = rel_dev(*wval, *gval);
+                if dev > 0.0 {
+                    if *exact || dev > AGGREGATE_REL_TOLERANCE {
+                        return Err(format!("bucket {i} @{gts}: value {gval}, expected {wval}"));
+                    }
+                    checked.deviations += 1;
+                    checked.max_rel_dev = checked.max_rel_dev.max(dev);
+                }
+            }
+            Ok(checked)
+        }
+        Expect::Keys(want) => {
+            let items = match v {
+                Value::Array(a) | Value::Set(a) => a,
+                other => return Err(format!("expected a key list, got {other:?}")),
+            };
+            let mut got: Vec<String> = items
+                .iter()
+                .map(|k| as_text(k).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            got.sort();
+            if got != *want {
+                return Err(format!(
+                    "expected {} key(s) [{}..], got {} [{}..]",
+                    want.len(),
+                    want.first().map(String::as_str).unwrap_or(""),
+                    got.len(),
+                    got.first().map(String::as_str).unwrap_or("")
+                ));
+            }
+            Checked::exact(got.len() as u64)
+        }
+        Expect::LastSamples(want) => {
+            let mut got: Vec<(String, i64, f64)> = multi_entries(v)?
+                .into_iter()
+                .map(|(name, s)| {
+                    sample_pair(s)
+                        .map(|(ts, val)| (name.clone(), ts, val))
+                        .ok_or_else(|| format!("{name}: malformed last sample {s:?}"))
+                })
+                .collect::<Result<_, _>>()?;
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            if got.len() != want.len() {
+                return Err(format!(
+                    "expected {} entries, got {}",
+                    want.len(),
+                    got.len()
+                ));
+            }
+            for (w, g) in want.iter().zip(&got) {
+                if w.0 != g.0 {
+                    return Err(format!("expected key {}, got {}", w.0, g.0));
+                }
+                if w.1 != g.1 || w.2 != g.2 {
+                    return Err(format!(
+                        "{}: last sample [{}, {}], expected [{}, {}]",
+                        g.0, g.1, g.2, w.1, w.2
+                    ));
+                }
+            }
+            Checked::exact(got.len() as u64)
+        }
+        Expect::MultiSeries(want) => {
+            let mut got = multi_entries(v)?;
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            if got.len() != want.len() {
+                return Err(format!("expected {} series, got {}", want.len(), got.len()));
+            }
+            let mut total = 0u64;
+            for ((wkey, wcount, from, to), (gkey, samples)) in want.iter().zip(&got) {
+                if wkey != gkey {
+                    return Err(format!("expected series {wkey}, got {gkey}"));
+                }
+                let list = sample_list(samples).map_err(|e| format!("{gkey}: {e}"))?;
+                if list.len() != *wcount {
+                    return Err(format!(
+                        "{gkey}: expected {wcount} samples, got {}",
+                        list.len()
+                    ));
+                }
+                if let Some((ts, _)) = list.iter().find(|(ts, _)| ts < from || ts > to) {
+                    return Err(format!("{gkey}: timestamp {ts} outside [{from}, {to}]"));
+                }
+                total += list.len() as u64;
+            }
+            Checked::exact(total)
+        }
+        Expect::Groups(want) => {
+            let mut got = multi_entries(v)?;
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            if got.len() != want.len() {
+                return Err(format!(
+                    "expected {} group(s) [{}..], got {} [{}..]",
+                    want.len(),
+                    want.first().map(|g| g.0.as_str()).unwrap_or(""),
+                    got.len(),
+                    got.first().map(|g| g.0.as_str()).unwrap_or("")
+                ));
+            }
+            let mut total = 0u64;
+            for ((wname, wcount), (gname, samples)) in want.iter().zip(&got) {
+                if wname != gname {
+                    return Err(format!("expected group {wname}, got {gname}"));
+                }
+                let list = sample_list(samples).map_err(|e| format!("{gname}: {e}"))?;
+                if list.len() != *wcount {
+                    return Err(format!(
+                        "{gname}: expected {wcount} buckets, got {}",
+                        list.len()
+                    ));
+                }
+                total += list.len() as u64;
+            }
+            Checked::exact(total)
+        }
         Expect::Ok => match v {
-            Value::Okay => Ok(0),
-            Value::SimpleString(s) if s == "OK" => Ok(0),
+            Value::Okay => Checked::exact(0),
+            Value::SimpleString(s) if s == "OK" => Checked::exact(0),
             other => Err(format!("expected OK, got {other:?}")),
         },
         Expect::Int(want) => match as_i64(v) {
-            Some(got) if got == *want => Ok(1),
+            Some(got) if got == *want => Checked::exact(1),
             _ => Err(format!("expected integer {want}, got {v:?}")),
         },
         Expect::Ints(want) => {
@@ -114,10 +335,10 @@ pub fn check_reply(expect: &Expect, v: &Value) -> Result<u64, String> {
                     return Err(format!("entry {i}: expected {w}, got {got:?}"));
                 }
             }
-            Ok(want.len() as u64)
+            Checked::exact(want.len() as u64)
         }
         Expect::Sample { timestamp, value } => match sample_pair(v) {
-            Some((ts, val)) if ts == *timestamp && val == *value => Ok(1),
+            Some((ts, val)) if ts == *timestamp && val == *value => Checked::exact(1),
             Some((ts, val)) => Err(format!(
                 "expected [{timestamp}, {value}], got [{ts}, {val}]"
             )),
@@ -139,7 +360,7 @@ pub fn check_reply(expect: &Expect, v: &Value) -> Result<u64, String> {
                     None => return Err(format!("sample {i}: malformed entry {item:?}")),
                 }
             }
-            Ok(*count as u64)
+            Checked::exact(*count as u64)
         }
     }
 }
@@ -171,7 +392,8 @@ fn replay_validated(con: &mut Connection, frames: &[Frame], what: &str) -> Resul
                 .recv_response()
                 .with_context(|| format!("{what}: reading reply {i}"))?;
             samples += check_reply(&f.expect, &v)
-                .map_err(|e| anyhow!("{what}: frame {i} of batch: {e}"))?;
+                .map_err(|e| anyhow!("{what}: frame {i} of batch: {e}"))?
+                .samples;
         }
     }
     Ok(samples)
@@ -322,6 +544,8 @@ struct WorkerOut {
     hist: Histogram<u64>,
     requests: u64,
     samples: u64,
+    deviations: u64,
+    max_rel_dev: f64,
     errors: u64,
     timeouts: u64,
     error_samples: Vec<String>,
@@ -348,6 +572,8 @@ fn worker(
         hist: new_histogram(),
         requests: 0,
         samples: 0,
+        deviations: 0,
+        max_rel_dev: 0.0,
         errors: 0,
         timeouts: 0,
         error_samples: Vec::new(),
@@ -408,9 +634,11 @@ fn worker(
                 Ok(v) => {
                     let now = Instant::now();
                     match check_reply(&f.expect, &v) {
-                        Ok(n) => {
+                        Ok(c) => {
                             if timed {
-                                out.samples += n;
+                                out.samples += c.samples;
+                                out.deviations += c.deviations;
+                                out.max_rel_dev = out.max_rel_dev.max(c.max_rel_dev);
                             }
                         }
                         Err(e) => {
@@ -486,6 +714,8 @@ fn incomplete(engine: Engine, reason: String) -> TrialResult {
         cycles_completed: 0.0,
         state_verified: None,
         under_calibrated: false,
+        value_deviations: 0,
+        max_rel_deviation: 0.0,
     }
 }
 
@@ -585,6 +815,8 @@ fn run_trial_inner(
     let mut hist = new_histogram();
     let mut requests = 0;
     let mut samples = 0;
+    let mut deviations = 0;
+    let mut max_rel_dev = 0.0f64;
     let mut errors = 0;
     let mut timeouts = 0;
     let mut error_samples = Vec::new();
@@ -597,6 +829,8 @@ fn run_trial_inner(
         hist.add(&o.hist).context("merging histograms")?;
         requests += o.requests;
         samples += o.samples;
+        deviations += o.deviations;
+        max_rel_dev = max_rel_dev.max(o.max_rel_dev);
         errors += o.errors;
         timeouts += o.timeouts;
         for e in &o.error_samples {
@@ -645,7 +879,7 @@ fn run_trial_inner(
         ctx.case.kind.is_write() && duration_s < ctx.scenario.min_write_seconds as f64;
 
     log(&format!(
-        "{} requests, {} samples, {} errors, {} timeouts in {:.2} s (p50 {:.0} µs, p99 {:.0} µs){}",
+        "{} requests, {} samples, {} errors, {} timeouts in {:.2} s (p50 {:.0} µs, p99 {:.0} µs){}{}",
         requests,
         samples,
         errors,
@@ -653,6 +887,11 @@ fn run_trial_inner(
         duration_s,
         hist.value_at_quantile(0.5) as f64 / 1000.0,
         hist.value_at_quantile(0.99) as f64 / 1000.0,
+        if deviations > 0 {
+            format!(" [{deviations} value deviations, max rel {max_rel_dev:.2e}]")
+        } else {
+            String::new()
+        },
         if complete { "" } else { " — INCOMPLETE" }
     ));
 
@@ -672,6 +911,8 @@ fn run_trial_inner(
         cycles_completed,
         state_verified,
         under_calibrated,
+        value_deviations: deviations,
+        max_rel_deviation: max_rel_dev,
     })
 }
 
@@ -890,6 +1131,11 @@ pub fn family(kind: &CaseKind) -> &'static str {
         CaseKind::Get { .. } => "get",
         CaseKind::Range { .. } => "range",
         CaseKind::Memory {} => "memory",
+        CaseKind::Aggregate { .. } => "aggregate",
+        CaseKind::QueryIndex { .. } => "queryindex",
+        CaseKind::Mget { .. } => "mget",
+        CaseKind::Mrange { .. } => "mrange",
+        CaseKind::GroupBy { .. } => "groupby",
     }
 }
 
@@ -918,9 +1164,12 @@ mod tests {
 
     #[test]
     fn ok_and_int_replies() {
-        assert_eq!(check_reply(&Expect::Ok, &Value::Okay), Ok(0));
+        assert_eq!(check_reply(&Expect::Ok, &Value::Okay), Checked::exact(0));
         assert!(check_reply(&Expect::Ok, &Value::Int(1)).is_err());
-        assert_eq!(check_reply(&Expect::Int(7), &Value::Int(7)), Ok(1));
+        assert_eq!(
+            check_reply(&Expect::Int(7), &Value::Int(7)),
+            Checked::exact(1)
+        );
         assert!(check_reply(&Expect::Int(7), &Value::Int(8)).is_err());
     }
 
@@ -932,7 +1181,7 @@ mod tests {
                 &want,
                 &Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
             ),
-            Ok(3)
+            Checked::exact(3)
         );
         let short = Value::Array(vec![Value::Int(1), Value::Int(2)]);
         assert!(
@@ -952,8 +1201,8 @@ mod tests {
         };
         let resp2 = Value::Array(vec![Value::Int(5), bulk("1.5")]);
         let resp3 = Value::Array(vec![Value::Int(5), Value::Double(1.5)]);
-        assert_eq!(check_reply(&want, &resp2), Ok(1));
-        assert_eq!(check_reply(&want, &resp3), Ok(1));
+        assert_eq!(check_reply(&want, &resp2), Checked::exact(1));
+        assert_eq!(check_reply(&want, &resp3), Checked::exact(1));
         assert!(check_reply(&want, &Value::Array(vec![])).is_err());
         assert!(
             check_reply(&want, &Value::Array(vec![Value::Int(5), bulk("1.6")]))
@@ -973,7 +1222,7 @@ mod tests {
             Value::Array(vec![Value::Int(10), bulk("1")]),
             Value::Array(vec![Value::Int(20), bulk("2")]),
         ]);
-        assert_eq!(check_reply(&want, &ok), Ok(2));
+        assert_eq!(check_reply(&want, &ok), Checked::exact(2));
         let outside = Value::Array(vec![
             Value::Array(vec![Value::Int(10), bulk("1")]),
             Value::Array(vec![Value::Int(21), bulk("2")]),
@@ -988,6 +1237,143 @@ mod tests {
             check_reply(&want, &fewer)
                 .unwrap_err()
                 .contains("expected 2 samples, got 1")
+        );
+    }
+
+    #[test]
+    fn buckets_count_deviations_and_reject_exact_mismatches() {
+        let want = Expect::Buckets {
+            buckets: vec![(0, 10.0), (1000, 20.0)],
+            exact: false,
+            reverse: false,
+        };
+        let close = Value::Array(vec![
+            Value::Array(vec![Value::Int(0), bulk("10.000000000001")]),
+            Value::Array(vec![Value::Int(1000), bulk("20")]),
+        ]);
+        let c = check_reply(&want, &close).unwrap();
+        assert_eq!(c.samples, 2);
+        assert_eq!(c.deviations, 1);
+        assert!(c.max_rel_dev > 0.0 && c.max_rel_dev < 1e-9);
+
+        let far = Value::Array(vec![
+            Value::Array(vec![Value::Int(0), bulk("10.001")]),
+            Value::Array(vec![Value::Int(1000), bulk("20")]),
+        ]);
+        assert!(check_reply(&want, &far).unwrap_err().contains("bucket 0"));
+
+        let exact = Expect::Buckets {
+            buckets: vec![(0, 10.0), (1000, 20.0)],
+            exact: true,
+            reverse: false,
+        };
+        assert!(check_reply(&exact, &close).is_err());
+
+        let rev = Expect::Buckets {
+            buckets: vec![(0, 10.0), (1000, 20.0)],
+            exact: true,
+            reverse: true,
+        };
+        let reversed = Value::Array(vec![
+            Value::Array(vec![Value::Int(1000), bulk("20")]),
+            Value::Array(vec![Value::Int(0), bulk("10")]),
+        ]);
+        assert_eq!(check_reply(&rev, &reversed), Checked::exact(2));
+        let wrong_ts = Value::Array(vec![
+            Value::Array(vec![Value::Int(0), bulk("10")]),
+            Value::Array(vec![Value::Int(999), bulk("20")]),
+        ]);
+        assert!(
+            check_reply(&want, &wrong_ts)
+                .unwrap_err()
+                .contains("timestamp 999")
+        );
+    }
+
+    #[test]
+    fn key_sets_ignore_order_but_not_membership() {
+        let want = Expect::Keys(vec!["a".into(), "b".into()]);
+        assert_eq!(
+            check_reply(&want, &Value::Array(vec![bulk("b"), bulk("a")])),
+            Checked::exact(2)
+        );
+        assert!(
+            check_reply(&want, &Value::Array(vec![bulk("a")]))
+                .unwrap_err()
+                .contains("expected 2 key(s)")
+        );
+        assert!(check_reply(&want, &Value::Array(vec![bulk("a"), bulk("c")])).is_err());
+    }
+
+    #[test]
+    fn multi_series_replies_in_both_protocols() {
+        let entry = |key: &str, ts: i64| {
+            Value::Array(vec![
+                bulk(key),
+                Value::Array(vec![]),
+                Value::Array(vec![Value::Int(ts), bulk("1.5")]),
+            ])
+        };
+        let want = Expect::LastSamples(vec![("a".into(), 5, 1.5), ("b".into(), 5, 1.5)]);
+        let resp2 = Value::Array(vec![entry("b", 5), entry("a", 5)]);
+        assert_eq!(check_reply(&want, &resp2), Checked::exact(2));
+        let resp3 = Value::Map(vec![
+            (
+                bulk("a"),
+                Value::Array(vec![
+                    Value::Map(vec![]),
+                    Value::Array(vec![Value::Int(5), Value::Double(1.5)]),
+                ]),
+            ),
+            (
+                bulk("b"),
+                Value::Array(vec![
+                    Value::Map(vec![]),
+                    Value::Array(vec![Value::Int(5), Value::Double(1.5)]),
+                ]),
+            ),
+        ]);
+        assert_eq!(check_reply(&want, &resp3), Checked::exact(2));
+        let stale = Value::Array(vec![entry("a", 5), entry("b", 4)]);
+        assert!(
+            check_reply(&want, &stale)
+                .unwrap_err()
+                .contains("b: last sample")
+        );
+
+        let series = |key: &str, n: i64| {
+            Value::Array(vec![
+                bulk(key),
+                Value::Array(vec![]),
+                Value::Array(
+                    (0..n)
+                        .map(|i| Value::Array(vec![Value::Int(10 + i), bulk("1")]))
+                        .collect(),
+                ),
+            ])
+        };
+        let want = Expect::MultiSeries(vec![("a".into(), 3, 10, 12), ("b".into(), 3, 10, 12)]);
+        assert_eq!(
+            check_reply(&want, &Value::Array(vec![series("a", 3), series("b", 3)])),
+            Checked::exact(6)
+        );
+        assert!(
+            check_reply(&want, &Value::Array(vec![series("a", 3), series("b", 2)]))
+                .unwrap_err()
+                .contains("b: expected 3 samples")
+        );
+        let want = Expect::Groups(vec![("l1=v0".into(), 3), ("l1=v1".into(), 3)]);
+        assert_eq!(
+            check_reply(
+                &want,
+                &Value::Array(vec![series("l1=v1", 3), series("l1=v0", 3)])
+            ),
+            Checked::exact(6)
+        );
+        assert!(
+            check_reply(&want, &Value::Array(vec![series("l1=v0", 3)]))
+                .unwrap_err()
+                .contains("expected 2 group(s)")
         );
     }
 

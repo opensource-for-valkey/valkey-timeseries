@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "name": "core-gorilla",
+  "description": "Diagnostic encoding profile: subject GORILLA vs reference COMPRESSED; otherwise identical to core.",
+  "fixture": {
+    "series": 1000,
+    "samples_per_series": 1000,
+    "workload": "drift",
+    "timestamp_model": "regular",
+    "label_cardinality": [
+      1,
+      10,
+      100
+    ],
+    "label_value_len": 8,
+    "key_prefix": "bench",
+    "interval_ms": 1000
+  },
+  "series": {
+    "chunk_size": 4096,
+    "duplicate_policy": "BLOCK",
+    "encoding": {
+      "subject": "gorilla",
+      "reference": "compressed"
+    }
+  },
+  "protocol": "resp2",
+  "trials": 5,
+  "warmup_seconds": 5,
+  "read_duration_seconds": 30,
+  "read_cycle_requests": 100000,
+  "min_write_seconds": 30,
+  "settle_seconds": 3,
+  "cases": [
+    {
+      "id": "add_c1_p1",
+      "kind": "add",
+      "connections": 1,
+      "pipeline": 1
+    },
+    {
+      "id": "add_c8_p16",
+      "kind": "add",
+      "connections": 8,
+      "pipeline": 16
+    },
+    {
+      "id": "madd16_c8_p1",
+      "kind": "madd",
+      "batch": 16,
+      "connections": 8,
+      "pipeline": 1
+    },
+    {
+      "id": "madd128_c8_p1",
+      "kind": "madd",
+      "batch": 128,
+      "connections": 8,
+      "pipeline": 1
+    },
+    {
+      "id": "get_uniform_c8",
+      "kind": "get",
+      "distribution": {
+        "type": "uniform"
+      },
+      "connections": 8
+    },
+    {
+      "id": "get_hot_c8",
+      "kind": "get",
+      "distribution": {
+        "type": "hot",
+        "keys": 10,
+        "share_percent": 90
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_recent100_c8",
+      "kind": "range",
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_middle10_c8",
+      "kind": "range",
+      "window": {
+        "type": "middle",
+        "percent": 10
+      },
+      "connections": 8
+    },
+    {
+      "id": "range_full_c8",
+      "kind": "range",
+      "window": {
+        "type": "full"
+      },
+      "connections": 8
+    },
+    {
+      "id": "revrange_recent100_c8",
+      "kind": "range",
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "reverse": true,
+      "connections": 8
+    },
+    {
+      "id": "memory",
+      "kind": "memory"
+    }
+  ]
+}

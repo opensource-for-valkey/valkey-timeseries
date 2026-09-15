@@ -66,6 +66,12 @@ pub struct TrialResult {
     /// Write-case only: the state check after the trial.
     pub state_verified: Option<bool>,
     pub under_calibrated: bool,
+    /// Aggregate values that differed from the oracle within tolerance
+    /// (order-dependent `sum`/`avg`); kept visible, never hidden.
+    #[serde(default)]
+    pub value_deviations: u64,
+    #[serde(default)]
+    pub max_rel_deviation: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

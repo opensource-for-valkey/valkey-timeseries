@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "name": "query",
+  "description": "Query-breadth profile (plan step 3): 1,000 series x 1,000 samples; aggregated ranges (min/max/count/sum/avg at ~100 and ~1,000 buckets), label queries at 1 %/10 %/100 % selectivity (TS.QUERYINDEX, TS.MGET, bounded TS.MRANGE), and GROUPBY/REDUCE with 10 and 100 groups. Plan defaults: 5 trials, 5 s warm-up, 30 s reads.",
+  "fixture": {
+    "series": 1000,
+    "samples_per_series": 1000,
+    "workload": "drift",
+    "timestamp_model": "regular",
+    "label_cardinality": [
+      1,
+      10,
+      100
+    ],
+    "label_value_len": 8,
+    "key_prefix": "bench",
+    "interval_ms": 1000
+  },
+  "series": {
+    "chunk_size": 4096,
+    "duplicate_policy": "BLOCK",
+    "encoding": {
+      "subject": "chimp",
+      "reference": "compressed"
+    }
+  },
+  "protocol": "resp2",
+  "trials": 5,
+  "warmup_seconds": 5,
+  "read_duration_seconds": 30,
+  "read_cycle_requests": 100000,
+  "min_write_seconds": 30,
+  "settle_seconds": 3,
+  "cases": [
+    {
+      "id": "agg_min100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "min",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_max100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "max",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_count100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "count",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_sum100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "sum",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_avg100_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "connections": 8
+    },
+    {
+      "id": "agg_avg1000_c8",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 1000,
+      "connections": 8
+    },
+    {
+      "id": "queryindex_1pct_c8",
+      "kind": "queryindex",
+      "label": 2,
+      "connections": 8
+    },
+    {
+      "id": "queryindex_10pct_c8",
+      "kind": "queryindex",
+      "label": 1,
+      "connections": 8
+    },
+    {
+      "id": "queryindex_100pct_c8",
+      "kind": "queryindex",
+      "label": 0,
+      "connections": 8
+    },
+    {
+      "id": "mget_1pct_c8",
+      "kind": "mget",
+      "label": 2,
+      "connections": 8
+    },
+    {
+      "id": "mget_10pct_c8",
+      "kind": "mget",
+      "label": 1,
+      "connections": 8
+    },
+    {
+      "id": "mget_100pct_c8",
+      "kind": "mget",
+      "label": 0,
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_1pct_c8",
+      "kind": "mrange",
+      "label": 2,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "mrange_recent100_10pct_c8",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
+      "id": "groupby_10groups_c8",
+      "kind": "groupby",
+      "label": 0,
+      "group_label": 1,
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "reducer": "sum",
+      "connections": 8
+    },
+    {
+      "id": "groupby_100groups_c8",
+      "kind": "groupby",
+      "label": 0,
+      "group_label": 2,
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "reducer": "sum",
+      "connections": 8
+    }
+  ]
+}

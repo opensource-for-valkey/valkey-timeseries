@@ -1,13 +1,17 @@
 {
   "schema_version": 1,
   "name": "smoke",
-  "description": "Harness smoke profile: 10 series x 1,000 samples, one case per first-comparison family. Verifies the pipeline end to end; the numbers it produces are not publishable.",
+  "description": "Harness smoke profile: 10 series x 1,000 samples, one case per family (ingest, point/range reads, aggregation, label queries, grouping, memory). Verifies the pipeline end to end; the numbers it produces are not publishable.",
   "fixture": {
     "series": 10,
     "samples_per_series": 1000,
     "workload": "drift",
     "timestamp_model": "regular",
-    "label_cardinality": [1, 10, 100],
+    "label_cardinality": [
+      1,
+      10,
+      100
+    ],
     "label_value_len": 8,
     "key_prefix": "bench",
     "interval_ms": 1000
@@ -15,7 +19,10 @@
   "series": {
     "chunk_size": 4096,
     "duplicate_policy": "BLOCK",
-    "encoding": { "subject": "chimp", "reference": "compressed" }
+    "encoding": {
+      "subject": "chimp",
+      "reference": "compressed"
+    }
   },
   "protocol": "resp2",
   "trials": 1,
@@ -25,14 +32,128 @@
   "min_write_seconds": 1,
   "settle_seconds": 1,
   "cases": [
-    { "id": "add_c1_p1", "kind": "add", "connections": 1, "pipeline": 1 },
-    { "id": "add_c4_p16", "kind": "add", "connections": 4, "pipeline": 16 },
-    { "id": "madd16_c1_p1", "kind": "madd", "batch": 16, "connections": 1, "pipeline": 1 },
-    { "id": "get_uniform_c4", "kind": "get", "distribution": { "type": "uniform" }, "connections": 4 },
-    { "id": "get_hot_c4", "kind": "get", "distribution": { "type": "hot", "keys": 2, "share_percent": 90 }, "connections": 4 },
-    { "id": "range_recent100_c4", "kind": "range", "window": { "type": "recent", "points": 100 }, "connections": 4 },
-    { "id": "range_middle10_c4", "kind": "range", "window": { "type": "middle", "percent": 10 }, "connections": 4 },
-    { "id": "revrange_full_c1", "kind": "range", "window": { "type": "full" }, "reverse": true, "connections": 1 },
-    { "id": "memory", "kind": "memory" }
+    {
+      "id": "add_c1_p1",
+      "kind": "add",
+      "connections": 1,
+      "pipeline": 1
+    },
+    {
+      "id": "add_c4_p16",
+      "kind": "add",
+      "connections": 4,
+      "pipeline": 16
+    },
+    {
+      "id": "madd16_c1_p1",
+      "kind": "madd",
+      "batch": 16,
+      "connections": 1,
+      "pipeline": 1
+    },
+    {
+      "id": "get_uniform_c4",
+      "kind": "get",
+      "distribution": {
+        "type": "uniform"
+      },
+      "connections": 4
+    },
+    {
+      "id": "get_hot_c4",
+      "kind": "get",
+      "distribution": {
+        "type": "hot",
+        "keys": 2,
+        "share_percent": 90
+      },
+      "connections": 4
+    },
+    {
+      "id": "range_recent100_c4",
+      "kind": "range",
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 4
+    },
+    {
+      "id": "range_middle10_c4",
+      "kind": "range",
+      "window": {
+        "type": "middle",
+        "percent": 10
+      },
+      "connections": 4
+    },
+    {
+      "id": "revrange_full_c1",
+      "kind": "range",
+      "window": {
+        "type": "full"
+      },
+      "reverse": true,
+      "connections": 1
+    },
+    {
+      "id": "agg_avg100_c4",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "connections": 4
+    },
+    {
+      "id": "agg_count100_c4",
+      "kind": "aggregate",
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "count",
+      "buckets": 100,
+      "connections": 4
+    },
+    {
+      "id": "queryindex_l1_c4",
+      "kind": "queryindex",
+      "label": 1,
+      "connections": 4
+    },
+    {
+      "id": "mget_l1_c4",
+      "kind": "mget",
+      "label": 1,
+      "connections": 4
+    },
+    {
+      "id": "mrange_recent100_l1_c4",
+      "kind": "mrange",
+      "label": 1,
+      "window": {
+        "type": "recent",
+        "points": 100
+      },
+      "connections": 4
+    },
+    {
+      "id": "groupby_l0_by_l1_c4",
+      "kind": "groupby",
+      "label": 0,
+      "group_label": 1,
+      "window": {
+        "type": "full"
+      },
+      "aggregator": "avg",
+      "buckets": 100,
+      "reducer": "sum",
+      "connections": 4
+    },
+    {
+      "id": "memory",
+      "kind": "memory"
+    }
   ]
 }

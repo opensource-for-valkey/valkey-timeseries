@@ -8,7 +8,7 @@ reference is a black-box target reached only over the wire.
 
 ## Status
 
-Implementation sequence steps 1 and 2 are in place:
+Implementation sequence steps 1–3 are in place:
 
 | Piece | Where | State |
 | --- | --- | --- |
@@ -21,7 +21,8 @@ Implementation sequence steps 1 and 2 are in place:
 | Timed execution: ADD, MADD, GET, RANGE/REVRANGE, memory; reply validation; histograms | `src/executor.rs` | done |
 | Raw results, CSV and Markdown reports, paired bootstrap CI | `src/results.rs`, `src/report.rs` | done |
 | Orchestration | `tools/server_bench.sh` | done |
-| Aggregations, label queries, grouping, encoding/dataset sweeps | — | step 3, not started |
+| Aggregated ranges, label queries (QUERYINDEX / MGET / bounded MRANGE), GROUPBY/REDUCE; exact cardinality checks; visible numerical deviations | `src/trace.rs` (oracles), `src/executor.rs` (checks) | done |
+| Encoding and dataset sweeps: `core-gorilla`, `core-uncompressed`, `core-counter`, `core-noisy`, `core-jitter`, `core-shallow`, `core-deep` profiles; `server_bench compare` groups runs by equivalent scenario and budget | `scenarios/`, `src/report.rs` | done (profiles written, not yet run) |
 | Updates, retention, compaction, open-loop mixed traffic | — | step 4, not started |
 | Disposable-data warm-up for write trials; automatic write-trace calibration | — | not started: write trials replay the fixed trace once and are flagged ⚠ when shorter than `min_write_seconds` |
 | Fresh server process per memory trial | — | not started: memory trials run on the servers the wrapper started; `fresh_process` is recorded and RSS is only comparable when true |
@@ -85,13 +86,31 @@ malformed selectors are rejected. A scenario names:
   engine (`subject`: chimp/gorilla/uncompressed, `reference`: compressed/uncompressed);
 - `protocol` (resp2 default), `trials`, `warmup_seconds`, `read_duration_seconds`,
   `read_cycle_requests`;
-- `cases`: `add`, `madd {batch}`, `get {distribution}`, `range {window, reverse}`,
-  `memory`, each with `connections` and `pipeline`. Selectors are objects:
-  `{"type": "uniform"}`, `{"type": "hot", "keys": N, "share_percent": P}`,
-  `{"type": "recent", "points": N}`, `{"type": "middle", "percent": P}`, `{"type": "full"}`.
+- `cases`, each with `connections` and `pipeline`:
+  - `add`, `madd {batch}` — ingestion into precreated series;
+  - `get {distribution}`, `range {window, reverse}` — point and raw range reads;
+  - `aggregate {window, aggregator, buckets, reverse}` — `ALIGN start AGGREGATION
+    <min|max|count|sum|avg> <bucket>` with the bucket sized to yield about `buckets` points;
+  - `queryindex {label}`, `mget {label}`, `mrange {label, window}` — label queries on
+    `l<label>=<value>`; the value cycles deterministically, and selectivity follows the
+    label's cardinality (100 → 1 %, 10 → 10 %, 1 → 100 %);
+  - `groupby {label, group_label, window, aggregator, buckets, reducer}` — `TS.MRANGE ...
+    GROUPBY l<group_label> REDUCE <reducer>`; output cardinality is the number of distinct
+    group values among the matched series;
+  - `memory`.
 
-Aggregation, label and grouped query families are step 3 and will be new
-variants.
+  Selectors are objects: `{"type": "uniform"}`, `{"type": "hot", "keys": N,
+  "share_percent": P}`, `{"type": "recent", "points": N}`, `{"type": "middle",
+  "percent": P}`, `{"type": "full"}`.
+
+Profiles: `smoke` (10 × 1,000, one case per family), `core` (1,000 × 1,000, ingest /
+point / range / memory), `query` (aggregations, label queries at 1/10/100 % selectivity,
+10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the
+dataset/shape variants `core-counter`, `core-noisy`, `core-jitter`, `core-shallow`
+(100,000 × 10) and `core-deep` (1 × 1,000,000). Run several and put them side by side with
+`server_bench compare --run-dir A --run-dir B ...`, which groups runs by deployment,
+limits, fixture shape/dataset, protocol and trial budget — only runs in one group are
+comparable — and lists each run's ratios as a column labelled by its encoding pair.
 
 ## Fixtures
 
@@ -128,6 +147,19 @@ retried. Write trials replay the fixed trace once and are followed by a
 `TS.INFO` state check on every series; read trials warm up untimed for
 `warmup_seconds` and then loop over the fixed request cycle for
 `read_duration_seconds`. Afterwards only the fixture's keys are deleted.
+
+Every query reply is checked against an oracle computed from the fixture: aggregated
+buckets must match in count and timestamps (`ALIGN start`, buckets from the window
+start, empty buckets omitted); `count`, `min` and `max` values must match exactly;
+`sum` and `avg` are compared with a relative tolerance of 1e-9, and every value that
+differs at all is counted and listed under "Numerical differences" in the report —
+the summation-order divergences stay visible and never become a pass/fail lever.
+`TS.QUERYINDEX` must return exactly the expected key set, `TS.MGET` exactly the last
+sample of every matched series, raw `TS.MRANGE` the exact per-series sample count
+inside the window, and GROUPBY exactly the expected groups with the expected bucket
+count each (reducer values are not compared: they depend on summation order across
+series). `ALIGN start` requires explicit bounds on both products, so aggregated cases
+never use the `-`/`+` shorthand.
 
 Latency is measured per command from the submission of its batch to the full
 consumption of its reply. With pipelining that is still a per-command figure —

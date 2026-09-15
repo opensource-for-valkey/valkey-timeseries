@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::fixture::{Fixture, hex};
-use crate::scenario::{Case, CaseKind, KeyDistribution, RangeWindow, Scenario, SeriesSpec};
+use crate::scenario::{
+    Aggregator, Case, CaseKind, KeyDistribution, RangeWindow, Reducer, Scenario, SeriesSpec,
+};
 
 /// Which product a setup stream targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,6 +56,27 @@ pub enum Expect {
     /// An array of exactly `count` `[timestamp, value]` pairs whose timestamps
     /// fall within `[from, to]`.
     Samples { count: usize, from: i64, to: i64 },
+    /// Aggregated buckets: exactly these `(timestamp, value)` pairs in this
+    /// order (or reversed). `exact` buckets must match bit for bit; otherwise
+    /// values are compared with a relative tolerance and every deviation is
+    /// counted so summation-order differences stay visible.
+    Buckets {
+        buckets: Vec<(i64, f64)>,
+        exact: bool,
+        reverse: bool,
+    },
+    /// Exactly this set of keys, in any order (`TS.QUERYINDEX`).
+    Keys(Vec<String>),
+    /// One `[key, labels, [timestamp, value]]` entry per key, in any order,
+    /// each carrying exactly that key's last sample (`TS.MGET`).
+    LastSamples(Vec<(String, i64, f64)>),
+    /// One entry per key, in any order, each with exactly `count` samples
+    /// inside `[from, to]` (raw `TS.MRANGE`).
+    MultiSeries(Vec<(String, usize, i64, i64)>),
+    /// One entry per group name, in any order, each with exactly this many
+    /// buckets (`TS.MRANGE ... GROUPBY ... REDUCE`). Values are not checked:
+    /// reducer results depend on summation order across series.
+    Groups(Vec<(String, usize)>),
 }
 
 #[derive(Debug, Clone)]
@@ -403,10 +426,7 @@ fn range_streams(
         let i = rng.below(fixture.series.len());
         let s = &fixture.series[i];
         let (from, to, count) = window_bounds(&s.samples, window);
-        let (from_arg, to_arg) = match window {
-            RangeWindow::Full {} => ("-".to_string(), "+".to_string()),
-            _ => (from.to_string(), to.to_string()),
-        };
+        let (from_arg, to_arg) = window_args(window, from, to);
         streams[n % connections].frames.push(Frame::new(
             &[
                 cmd,
@@ -415,6 +435,316 @@ fn range_streams(
                 to_arg.as_bytes(),
             ],
             Expect::Samples { count, from, to },
+        ));
+    }
+    streams
+}
+
+fn window_args(window: &RangeWindow, from: i64, to: i64) -> (String, String) {
+    match window {
+        RangeWindow::Full {} => ("-".to_string(), "+".to_string()),
+        _ => (from.to_string(), to.to_string()),
+    }
+}
+
+/// Bucket width that yields about `buckets` buckets over `[from, to]`.
+pub fn bucket_ms(from: i64, to: i64, buckets: usize) -> i64 {
+    let span = (to - from + 1).max(1);
+    (span as f64 / buckets as f64).ceil().max(1.0) as i64
+}
+
+/// The oracle for `ALIGN start AGGREGATION <agg> <bucket>` over one series'
+/// samples within `[from, to]`: buckets start at `from`, empty buckets are
+/// omitted, the bucket timestamp is its start. Sum and avg are accumulated in
+/// timestamp order; an engine that sums differently shows up as a counted
+/// deviation, never as a silent pass.
+pub fn aggregate(
+    samples: &[crate::fixture::SampleText],
+    from: i64,
+    to: i64,
+    bucket: i64,
+    agg: Aggregator,
+) -> Vec<(i64, f64)> {
+    let mut out: Vec<(i64, f64)> = Vec::new();
+    let mut current: Option<(i64, f64, f64, f64, u64)> = None; // (start, min, max, sum, count)
+    let flush = |c: Option<(i64, f64, f64, f64, u64)>, out: &mut Vec<(i64, f64)>| {
+        if let Some((start, min, max, sum, count)) = c {
+            let v = match agg {
+                Aggregator::Min => min,
+                Aggregator::Max => max,
+                Aggregator::Count => count as f64,
+                Aggregator::Sum => sum,
+                Aggregator::Avg => sum / count as f64,
+            };
+            out.push((start, v));
+        }
+    };
+    for s in samples {
+        if s.timestamp < from || s.timestamp > to {
+            continue;
+        }
+        let start = from + ((s.timestamp - from) / bucket) * bucket;
+        match current {
+            Some((cs, min, max, sum, count)) if cs == start => {
+                current = Some((
+                    cs,
+                    min.min(s.value),
+                    max.max(s.value),
+                    sum + s.value,
+                    count + 1,
+                ));
+            }
+            other => {
+                flush(other, &mut out);
+                current = Some((start, s.value, s.value, s.value, 1));
+            }
+        }
+    }
+    flush(current, &mut out);
+    out
+}
+
+fn aggregate_streams(
+    fixture: &Fixture,
+    case: &Case,
+    window: &RangeWindow,
+    aggregator: Aggregator,
+    buckets: usize,
+    reverse: bool,
+    cycle: usize,
+) -> Vec<Stream> {
+    let connections = case.connections as usize;
+    let mut rng = Rng::for_case(&case.id);
+    let mut streams = vec![Stream::default(); connections];
+    let cmd: &[u8] = if reverse { b"TS.REVRANGE" } else { b"TS.RANGE" };
+    for n in 0..cycle {
+        let i = rng.below(fixture.series.len());
+        let s = &fixture.series[i];
+        let (from, to, _) = window_bounds(&s.samples, window);
+        // `ALIGN start` needs an explicit start timestamp on both products, so
+        // aggregated windows never use the `-`/`+` shorthand.
+        let (from_arg, to_arg) = (from.to_string(), to.to_string());
+        let bucket = bucket_ms(from, to, buckets);
+        let bucket_arg = bucket.to_string();
+        let expected = aggregate(&s.samples, from, to, bucket, aggregator);
+        streams[n % connections].frames.push(Frame::new(
+            &[
+                cmd,
+                s.key.as_bytes(),
+                from_arg.as_bytes(),
+                to_arg.as_bytes(),
+                b"ALIGN",
+                b"start",
+                b"AGGREGATION",
+                aggregator.as_arg().as_bytes(),
+                bucket_arg.as_bytes(),
+            ],
+            Expect::Buckets {
+                buckets: expected,
+                exact: aggregator.is_exact(),
+                reverse,
+            },
+        ));
+    }
+    streams
+}
+
+/// Series indices carrying each value of label `l<label>`, indexed by value.
+fn label_index(fixture: &Fixture, label: usize) -> Vec<(String, Vec<usize>)> {
+    let name = &fixture.manifest.labels.definitions[label].name;
+    let mut by_value: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, s) in fixture.series.iter().enumerate() {
+        let value = s
+            .labels
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .expect("fixture series carries every label");
+        match by_value.iter_mut().find(|(v, _)| *v == value) {
+            Some((_, idx)) => idx.push(i),
+            None => by_value.push((value, vec![i])),
+        }
+    }
+    by_value
+}
+
+fn filter_arg(fixture: &Fixture, label: usize, value: &str) -> String {
+    format!(
+        "{}={}",
+        fixture.manifest.labels.definitions[label].name, value
+    )
+}
+
+fn queryindex_streams(fixture: &Fixture, case: &Case, label: usize, cycle: usize) -> Vec<Stream> {
+    let connections = case.connections as usize;
+    let index = label_index(fixture, label);
+    let mut rng = Rng::for_case(&case.id);
+    let mut streams = vec![Stream::default(); connections];
+    for n in 0..cycle {
+        let (value, matched) = &index[rng.below(index.len())];
+        let filter = filter_arg(fixture, label, value);
+        let mut keys: Vec<String> = matched
+            .iter()
+            .map(|&i| fixture.series[i].key.clone())
+            .collect();
+        keys.sort();
+        streams[n % connections].frames.push(Frame::new(
+            &[b"TS.QUERYINDEX", filter.as_bytes()],
+            Expect::Keys(keys),
+        ));
+    }
+    streams
+}
+
+fn mget_streams(fixture: &Fixture, case: &Case, label: usize, cycle: usize) -> Vec<Stream> {
+    let connections = case.connections as usize;
+    let index = label_index(fixture, label);
+    let mut rng = Rng::for_case(&case.id);
+    let mut streams = vec![Stream::default(); connections];
+    for n in 0..cycle {
+        let (value, matched) = &index[rng.below(index.len())];
+        let filter = filter_arg(fixture, label, value);
+        let mut expected: Vec<(String, i64, f64)> = matched
+            .iter()
+            .map(|&i| {
+                let s = &fixture.series[i];
+                let last = s.samples.last().expect("series has samples");
+                (s.key.clone(), last.timestamp, last.value)
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        streams[n % connections].frames.push(Frame::new(
+            &[b"TS.MGET", b"FILTER", filter.as_bytes()],
+            Expect::LastSamples(expected),
+        ));
+    }
+    streams
+}
+
+fn mrange_streams(
+    fixture: &Fixture,
+    case: &Case,
+    label: usize,
+    window: &RangeWindow,
+    cycle: usize,
+) -> Vec<Stream> {
+    let connections = case.connections as usize;
+    let index = label_index(fixture, label);
+    let mut rng = Rng::for_case(&case.id);
+    let mut streams = vec![Stream::default(); connections];
+    for n in 0..cycle {
+        let (value, matched) = &index[rng.below(index.len())];
+        let filter = filter_arg(fixture, label, value);
+        // The window is taken from the first matched series and applied to
+        // all of them; each series' expected count is computed from its own
+        // timestamps, so jittered fixtures still get exact expectations.
+        let first = &fixture.series[matched[0]];
+        let (from, to, _) = window_bounds(&first.samples, window);
+        let (from_arg, to_arg) = window_args(window, from, to);
+        let mut expected: Vec<(String, usize, i64, i64)> = matched
+            .iter()
+            .map(|&i| {
+                let s = &fixture.series[i];
+                let (f, t) = match window {
+                    RangeWindow::Full {} => (i64::MIN, i64::MAX),
+                    _ => (from, to),
+                };
+                let count = s
+                    .samples
+                    .iter()
+                    .filter(|x| x.timestamp >= f && x.timestamp <= t)
+                    .count();
+                (s.key.clone(), count, f, t)
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        streams[n % connections].frames.push(Frame::new(
+            &[
+                b"TS.MRANGE",
+                from_arg.as_bytes(),
+                to_arg.as_bytes(),
+                b"FILTER",
+                filter.as_bytes(),
+            ],
+            Expect::MultiSeries(expected),
+        ));
+    }
+    streams
+}
+
+#[allow(clippy::too_many_arguments)]
+fn groupby_streams(
+    fixture: &Fixture,
+    case: &Case,
+    label: usize,
+    group_label: usize,
+    window: &RangeWindow,
+    aggregator: Aggregator,
+    buckets: usize,
+    reducer: Reducer,
+    cycle: usize,
+) -> Vec<Stream> {
+    let connections = case.connections as usize;
+    let index = label_index(fixture, label);
+    let group_name = &fixture.manifest.labels.definitions[group_label].name;
+    let mut rng = Rng::for_case(&case.id);
+    let mut streams = vec![Stream::default(); connections];
+    for n in 0..cycle {
+        let (value, matched) = &index[rng.below(index.len())];
+        let filter = filter_arg(fixture, label, value);
+        let first = &fixture.series[matched[0]];
+        let (from, to, _) = window_bounds(&first.samples, window);
+        // Explicit bounds: `ALIGN start` rejects the `-` shorthand.
+        let (from_arg, to_arg) = (from.to_string(), to.to_string());
+        let bucket = bucket_ms(from, to, buckets);
+        let bucket_arg = bucket.to_string();
+        // Group -> union of its members' non-empty buckets.
+        let mut groups: Vec<(String, Vec<i64>)> = Vec::new();
+        for &i in matched {
+            let s = &fixture.series[i];
+            let gv = s
+                .labels
+                .iter()
+                .find(|(k, _)| k == group_name)
+                .map(|(_, v)| v.clone())
+                .expect("fixture series carries every label");
+            let starts: Vec<i64> = aggregate(&s.samples, from, to, bucket, aggregator)
+                .into_iter()
+                .map(|(ts, _)| ts)
+                .collect();
+            let name = format!("{group_name}={gv}");
+            match groups.iter_mut().find(|(g, _)| *g == name) {
+                Some((_, all)) => all.extend(starts),
+                None => groups.push((name, starts)),
+            }
+        }
+        let mut expected: Vec<(String, usize)> = groups
+            .into_iter()
+            .map(|(name, mut starts)| {
+                starts.sort_unstable();
+                starts.dedup();
+                (name, starts.len())
+            })
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        streams[n % connections].frames.push(Frame::new(
+            &[
+                b"TS.MRANGE",
+                from_arg.as_bytes(),
+                to_arg.as_bytes(),
+                b"ALIGN",
+                b"start",
+                b"AGGREGATION",
+                aggregator.as_arg().as_bytes(),
+                bucket_arg.as_bytes(),
+                b"FILTER",
+                filter.as_bytes(),
+                b"GROUPBY",
+                group_name.as_bytes(),
+                b"REDUCE",
+                reducer.as_arg().as_bytes(),
+            ],
+            Expect::Groups(expected),
         ));
     }
     streams
@@ -462,6 +792,66 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
             total,
         ),
         CaseKind::Memory {} => (preload_stream(fixture), Vec::new(), 0, total),
+        CaseKind::Aggregate {
+            window,
+            aggregator,
+            buckets,
+            reverse,
+        } => (
+            preload_stream(fixture),
+            aggregate_streams(
+                fixture,
+                case,
+                window,
+                *aggregator,
+                *buckets,
+                *reverse,
+                scenario.read_cycle_requests,
+            ),
+            0,
+            total,
+        ),
+        CaseKind::QueryIndex { label } => (
+            preload_stream(fixture),
+            queryindex_streams(fixture, case, *label, scenario.read_cycle_requests),
+            0,
+            total,
+        ),
+        CaseKind::Mget { label } => (
+            preload_stream(fixture),
+            mget_streams(fixture, case, *label, scenario.read_cycle_requests),
+            0,
+            total,
+        ),
+        CaseKind::Mrange { label, window } => (
+            preload_stream(fixture),
+            mrange_streams(fixture, case, *label, window, scenario.read_cycle_requests),
+            0,
+            total,
+        ),
+        CaseKind::GroupBy {
+            label,
+            group_label,
+            window,
+            aggregator,
+            buckets,
+            reducer,
+        } => (
+            preload_stream(fixture),
+            groupby_streams(
+                fixture,
+                case,
+                *label,
+                *group_label,
+                window,
+                *aggregator,
+                *buckets,
+                *reducer,
+                scenario.read_cycle_requests,
+            ),
+            0,
+            total,
+        ),
     };
 
     CaseTrace {
@@ -675,6 +1065,87 @@ mod tests {
         let text = String::from_utf8(t.workload[0].frames[0].bytes.clone()).unwrap();
         assert!(text.starts_with("*4\r\n$11\r\nTS.REVRANGE\r\n"), "{text}");
         assert!(text.ends_with("$1\r\n-\r\n$1\r\n+\r\n"), "{text}");
+    }
+
+    #[test]
+    fn aggregation_oracle_buckets_from_the_window_start() {
+        let samples: Vec<crate::fixture::SampleText> = (0..10)
+            .map(|j| crate::fixture::SampleText {
+                timestamp: 1000 + j * 1000,
+                value_text: String::new(),
+                value: j as f64,
+            })
+            .collect();
+        // 4 s buckets over [1000, 10000]: {0,1,2,3} {4,5,6,7} {8,9}
+        let sum = aggregate(&samples, 1000, 10000, 4000, Aggregator::Sum);
+        assert_eq!(sum, vec![(1000, 6.0), (5000, 22.0), (9000, 17.0)]);
+        let count = aggregate(&samples, 1000, 10000, 4000, Aggregator::Count);
+        assert_eq!(count, vec![(1000, 4.0), (5000, 4.0), (9000, 2.0)]);
+        let avg = aggregate(&samples, 2000, 9000, 4000, Aggregator::Avg);
+        assert_eq!(avg, vec![(2000, 2.5), (6000, 6.5)]);
+        let max = aggregate(&samples, 1000, 10000, 100_000, Aggregator::Max);
+        assert_eq!(max, vec![(1000, 9.0)]);
+        assert_eq!(bucket_ms(1000, 10000, 3), 3001); // span of 9001 ms, inclusive
+        assert_eq!(bucket_ms(0, 0, 10), 1);
+    }
+
+    #[test]
+    fn label_queries_carry_exact_expected_sets() {
+        // write_fixture: l0 = v0000000 on every series, l1 = v<i % 10>.
+        let f = fixture("labels", 25, 3);
+        let s = scenario(
+            serde_json::json!([
+                {"id": "qi", "kind": "queryindex", "label": 1},
+                {"id": "mg", "kind": "mget", "label": 0},
+                {"id": "mr", "kind": "mrange", "label": 1, "window": {"type": "recent", "points": 2}},
+                {"id": "gb", "kind": "groupby", "label": 0, "group_label": 1, "window": {"type": "full"},
+                 "aggregator": "avg", "buckets": 2, "reducer": "sum"}
+            ]),
+            25,
+            3,
+        );
+        let qi = build_case(&s, &f, &s.cases[0]);
+        let Expect::Keys(keys) = &qi.workload[0].frames[0].expect else {
+            panic!()
+        };
+        // Values v0000000..v0000004 match 3 series each, v0000005..v0000009 match 2.
+        assert!(keys.len() == 2 || keys.len() == 3, "{keys:?}");
+        let text = String::from_utf8(qi.workload[0].frames[0].bytes.clone()).unwrap();
+        assert!(
+            text.starts_with("*2\r\n$13\r\nTS.QUERYINDEX\r\n$11\r\nl1=v"),
+            "{text}"
+        );
+
+        let mg = build_case(&s, &f, &s.cases[1]);
+        let Expect::LastSamples(entries) = &mg.workload[0].frames[0].expect else {
+            panic!()
+        };
+        assert_eq!(entries.len(), 25);
+        assert_eq!(entries[0].1, 1_700_000_000_000 + 2000);
+
+        let mr = build_case(&s, &f, &s.cases[2]);
+        let Expect::MultiSeries(entries) = &mr.workload[0].frames[0].expect else {
+            panic!()
+        };
+        assert!(entries.iter().all(|(_, count, _, _)| *count == 2));
+
+        let gb = build_case(&s, &f, &s.cases[3]);
+        let text = String::from_utf8(gb.workload[0].frames[0].bytes.clone()).unwrap();
+        assert!(
+            text.starts_with("*14\r\n$9\r\nTS.MRANGE\r\n$13\r\n1700000000000\r\n$13\r\n1700000002000\r\n$5\r\nALIGN\r\n$5\r\nstart\r\n"),
+            "aggregated windows must carry explicit bounds: {text}"
+        );
+        let Expect::Groups(groups) = &gb.workload[0].frames[0].expect else {
+            panic!()
+        };
+        assert_eq!(groups.len(), 10, "one group per l1 value");
+        assert!(groups.iter().all(|(_, n)| *n == 2), "{groups:?}");
+        assert_eq!(groups[0].0, "l1=v0000000");
+        let text = String::from_utf8(gb.workload[0].frames[0].bytes.clone()).unwrap();
+        assert!(
+            text.contains("GROUPBY\r\n$2\r\nl1\r\n$6\r\nREDUCE\r\n$3\r\nsum\r\n"),
+            "{text}"
+        );
     }
 
     #[test]

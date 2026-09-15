@@ -68,6 +68,16 @@ enum Cmd {
         #[arg(long)]
         scenario: PathBuf,
     },
+    /// Put several runs side by side, grouped by equivalent scenario and
+    /// resource budget (encoding and dataset sweeps).
+    Compare {
+        /// Run directories (each holding manifest.json and results.json).
+        #[arg(long = "run-dir", required = true)]
+        run_dirs: Vec<PathBuf>,
+        /// Output Markdown file (default: print to stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Clone)]
@@ -124,6 +134,9 @@ fn main() -> ExitCode {
         Cmd::Run(args) => run_cmd(&args),
         Cmd::Report { run_dir } => report_cmd(&run_dir),
         Cmd::FixtureArgs { scenario } => fixture_args_cmd(&scenario).map(|_| ExitCode::SUCCESS),
+        Cmd::Compare { run_dirs, out } => {
+            compare_cmd(&run_dirs, out.as_deref()).map(|_| ExitCode::SUCCESS)
+        }
     };
     match result {
         Ok(code) => code,
@@ -302,10 +315,8 @@ fn estimate_frames(
                 .sum();
             (f.series, 0, per_conn, None)
         }
-        CaseKind::Get { .. } | CaseKind::Range { .. } => {
-            (f.series, preload, scenario.read_cycle_requests, None)
-        }
         CaseKind::Memory {} => (f.series, preload, 0, None),
+        _ => (f.series, preload, scenario.read_cycle_requests, None),
     }
 }
 
@@ -620,4 +631,20 @@ fn report_cmd(run_dir: &Path) -> Result<ExitCode> {
     report::write_reports(run_dir)?;
     println!("{}", run_dir.join("report.md").display());
     Ok(ExitCode::SUCCESS)
+}
+
+fn compare_cmd(run_dirs: &[PathBuf], out: Option<&Path>) -> Result<()> {
+    let runs: Vec<report::LoadedRun> = run_dirs
+        .iter()
+        .map(|d| report::load_run(d))
+        .collect::<Result<_>>()?;
+    let md = report::compare(&runs);
+    match out {
+        Some(path) => {
+            fs::write(path, md).with_context(|| format!("writing {}", path.display()))?;
+            println!("{}", path.display());
+        }
+        None => print!("{md}"),
+    }
+    Ok(())
 }

@@ -1,11 +1,13 @@
 # Comparative benchmarks against RedisTimeSeries
 
-Status: implementation sequence steps 1 (reproducible foundation) and 2 (first useful
-comparison: ADD, MADD, GET, raw RANGE, memory, reports) landed 2026-09-14 —
-`tools/server_bench.sh`, `tools/server_bench/`, `tools/benchmark_dataset.rs`,
-`docker-compose.bench.yml`, and the `tests/reference_server.sh` overrides. Steps 3–5 are
-not started. Only exploratory (non-publishable) runs exist so far; see
-`tools/server_bench/README.md` for what runs today and its known gaps.
+Status: implementation sequence steps 1 (reproducible foundation), 2 (first useful
+comparison: ADD, MADD, GET, raw RANGE, memory, reports) and 3 (query breadth: aggregated
+ranges, label queries, grouping, encoding/dataset sweep profiles and cross-run `compare`)
+landed 2026-09-14/15 — `tools/server_bench.sh`, `tools/server_bench/`,
+`tools/benchmark_dataset.rs`, `docker-compose.bench.yml`, and the
+`tests/reference_server.sh` overrides. Steps 4–5 are not started. Only exploratory
+(non-publishable) runs exist so far; see `tools/server_bench/README.md` for what runs
+today and its known gaps.
 
 ## Objective and scope
 

@@ -19,6 +19,7 @@ use crate::results::{CaseResults, MemoryPair, RunResults, TrialPair, TrialResult
 
 const BOOTSTRAP_ROUNDS: usize = 2000;
 const MIN_PAIRS_FOR_CI: usize = 3;
+const AGG_TOL: f64 = crate::executor::AGGREGATE_REL_TOLERANCE;
 
 pub fn write_reports(run_dir: &Path) -> Result<()> {
     let results: RunResults = serde_json::from_str(
@@ -438,7 +439,8 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
     let _ = writeln!(
         md,
         "⚠ = under-calibrated write trial: the faster engine finished in under `min_write_seconds`; \
-         enlarge the fixture before trusting the ratio. Samples/s counts samples written (writes) or returned (range reads)."
+         enlarge the fixture before trusting the ratio. Samples/s counts samples written (writes), samples or buckets \
+         returned (range, aggregate, mrange, groupby), keys returned (queryindex) or entries returned (mget)."
     );
     let _ = writeln!(md);
 
@@ -557,11 +559,11 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
     let _ = writeln!(md);
     let _ = writeln!(
         md,
-        "| case | trial | order | engine | requests | samples | duration s | cmd/s | p50 | p95 | p99 | p99.9 | max | errors | timeouts | cycles | net in | net out | cpu s | ok |"
+        "| case | trial | order | engine | requests | samples | duration s | cmd/s | p50 | p95 | p99 | p99.9 | max | errors | timeouts | deviations | cycles | net in | net out | cpu s | ok |"
     );
     let _ = writeln!(
         md,
-        "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+        "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
     );
     for case in results.cases.iter().filter(|c| c.family != "memory") {
         for p in &case.trials {
@@ -571,7 +573,7 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
                     d.get("used_cpu_sys").unwrap_or(&0.0) + d.get("used_cpu_user").unwrap_or(&0.0);
                 let _ = writeln!(
                     md,
-                    "| {} | {} | {}→{} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.2} | {} |",
+                    "| {} | {} | {}→{} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.2} | {} |",
                     case.case_id,
                     p.trial + 1,
                     p.order[0].name(),
@@ -588,6 +590,7 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
                     fmt_num(t.latency.max_us),
                     t.errors,
                     t.timeouts,
+                    t.value_deviations,
                     t.cycles_completed,
                     fmt_num(*d.get("total_net_input_bytes").unwrap_or(&0.0)),
                     fmt_num(*d.get("total_net_output_bytes").unwrap_or(&0.0)),
@@ -610,6 +613,48 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
         }
     }
     let _ = writeln!(md);
+
+    // Numerical differences: order-dependent aggregates that matched only
+    // within tolerance. Reported, never hidden, and never a pass/fail lever.
+    let mut differences = Vec::new();
+    for case in results.cases.iter().filter(|c| c.family != "memory") {
+        for p in &case.trials {
+            for t in [&p.subject, &p.reference] {
+                if t.value_deviations > 0 {
+                    differences.push(format!(
+                        "| {} | {} | {} | {} | {} | {:.2e} |",
+                        case.case_id,
+                        p.trial + 1,
+                        t.engine.name(),
+                        fmt_num(t.value_deviations as f64),
+                        fmt_num(t.samples as f64),
+                        t.max_rel_deviation
+                    ));
+                }
+            }
+        }
+    }
+    if !differences.is_empty() {
+        let _ = writeln!(md, "## Numerical differences");
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "`sum`/`avg` buckets whose value differed from the driver's sequential-summation oracle by \
+             less than the relative tolerance ({AGG_TOL:e}). These are the summation-order divergences \
+             the compatibility contract documents; they remain visible here and are not part of any ratio. \
+             `count`, `min` and `max` are compared exactly; reducer values under GROUPBY are not compared."
+        );
+        let _ = writeln!(md);
+        let _ = writeln!(
+            md,
+            "| case | trial | engine | deviating values | values checked | max relative deviation |"
+        );
+        let _ = writeln!(md, "| --- | ---: | --- | ---: | ---: | ---: |");
+        for d in &differences {
+            let _ = writeln!(md, "{d}");
+        }
+        let _ = writeln!(md);
+    }
 
     // Problems
     let problems: Vec<String> = results
@@ -723,7 +768,7 @@ fn json_cell(v: &Json) -> String {
 pub fn csv(results: &RunResults) -> String {
     let mut out = String::new();
     out.push_str(
-        "case,family,connections,pipeline,trial,order,engine,complete,requests,samples,duration_s,commands_per_s,samples_per_s,p50_us,p95_us,p99_us,p999_us,max_us,mean_us,observations,errors,timeouts,cycles,net_in_bytes,net_out_bytes,cpu_s,state_verified,under_calibrated,incomplete_reason\n",
+        "case,family,connections,pipeline,trial,order,engine,complete,requests,samples,duration_s,commands_per_s,samples_per_s,p50_us,p95_us,p99_us,p999_us,max_us,mean_us,observations,errors,timeouts,cycles,net_in_bytes,net_out_bytes,cpu_s,state_verified,under_calibrated,value_deviations,max_rel_deviation,incomplete_reason\n",
     );
     for case in &results.cases {
         for p in &case.trials {
@@ -731,7 +776,7 @@ pub fn csv(results: &RunResults) -> String {
                 let d = &t.server_deltas;
                 let _ = writeln!(
                     out,
-                    "{},{},{},{},{},{}>{},{},{},{},{},{:.6},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.3},{},{},{:.4},{},{},{}",
+                    "{},{},{},{},{},{}>{},{},{},{},{},{:.6},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{},{},{},{:.3},{},{},{:.4},{},{},{},{:.3e},{}",
                     case.case_id,
                     case.family,
                     case.connections,
@@ -761,6 +806,8 @@ pub fn csv(results: &RunResults) -> String {
                     d.get("used_cpu_sys").unwrap_or(&0.0) + d.get("used_cpu_user").unwrap_or(&0.0),
                     t.state_verified.map(|b| b.to_string()).unwrap_or_default(),
                     t.under_calibrated,
+                    t.value_deviations,
+                    t.max_rel_deviation,
                     csv_escape(t.incomplete_reason.as_deref().unwrap_or(""))
                 );
             }
@@ -799,6 +846,199 @@ pub fn csv(results: &RunResults) -> String {
         }
     }
     out
+}
+
+// -------- cross-run comparison --------
+
+/// One loaded run directory.
+pub struct LoadedRun {
+    pub dir: String,
+    pub results: RunResults,
+    pub manifest: Json,
+}
+
+pub fn load_run(run_dir: &Path) -> Result<LoadedRun> {
+    let results: RunResults = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("results.json"))
+            .with_context(|| format!("{}: reading results.json", run_dir.display()))?,
+    )
+    .with_context(|| format!("{}: parsing results.json", run_dir.display()))?;
+    let manifest: Json = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("manifest.json"))
+            .with_context(|| format!("{}: reading manifest.json", run_dir.display()))?,
+    )
+    .with_context(|| format!("{}: parsing manifest.json", run_dir.display()))?;
+    Ok(LoadedRun {
+        dir: run_dir.display().to_string(),
+        results,
+        manifest,
+    })
+}
+
+/// Runs are only comparable side by side when they measured the same thing
+/// under the same budget: deployment kind and container limits, fixture
+/// shape and dataset, protocol, trial count and read duration. The encoding
+/// pair is what varies *within* a group (the encoding sweep); the dataset
+/// varies *across* groups (the dataset sweep).
+fn group_key(m: &Json) -> String {
+    let fx = &m["fixture"]["manifest"];
+    let sc = &m["scenario"]["body"];
+    format!(
+        "{} · {} · {}×{} {} · {} · {} trial(s) × {} s",
+        json_str(m, &["notes", "deployment.kind"]),
+        if json_str(m, &["notes", "deployment.compose_limits"]).is_empty() {
+            "no limits"
+        } else {
+            json_str(m, &["notes", "deployment.compose_limits"])
+        },
+        fx["shape"]["series"],
+        fx["shape"]["samples_per_series"],
+        json_str(fx, &["generator", "dataset_key"]),
+        json_str(sc, &["protocol"]),
+        sc["trials"],
+        sc["read_duration_seconds"]
+    )
+}
+
+fn encoding_label(m: &Json) -> String {
+    let sc = &m["scenario"]["body"];
+    format!(
+        "{}/{}",
+        json_str(sc, &["series", "encoding", "subject"]),
+        json_str(sc, &["series", "encoding", "reference"])
+    )
+}
+
+pub fn compare(runs: &[LoadedRun]) -> String {
+    let mut md = String::new();
+    let _ = writeln!(md, "# Cross-run comparison");
+    let _ = writeln!(md);
+    let _ = writeln!(
+        md,
+        "Runs are grouped by deployment, container limits, fixture shape and dataset, protocol and trial budget; \
+         only runs inside one group are comparable with each other. Within a group each column is one run, \
+         labelled by its subject/reference encoding pair. Cells are the run's own ratios: throughput subject/reference, \
+         p50 and p99 latency reference/subject (all > 1 favour the subject), computed over that run's valid pairs."
+    );
+    let _ = writeln!(md);
+
+    let mut groups: Vec<(String, Vec<&LoadedRun>)> = Vec::new();
+    for r in runs {
+        let key = group_key(&r.manifest);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(r),
+            None => groups.push((key, vec![r])),
+        }
+    }
+
+    for (key, members) in &groups {
+        let _ = writeln!(md, "## {key}");
+        let _ = writeln!(md);
+        let exploratory = members.iter().any(|r| {
+            json_str(&r.manifest, &["notes", "deployment.kind"]) != "containers-equal-limits"
+                || json_str(&r.manifest, &["preflight", "comparison"]) == "self_check"
+        });
+        if exploratory {
+            let _ = writeln!(md, "> Exploratory deployment: not publishable.");
+            let _ = writeln!(md);
+        }
+        for r in members {
+            let _ = writeln!(
+                md,
+                "- `{}`: run `{}`, {} ({}), created {}",
+                encoding_label(&r.manifest),
+                r.results.run_id,
+                json_str(&r.manifest, &["scenario", "name"]),
+                r.dir,
+                json_str(&r.manifest, &["created_at"])
+            );
+        }
+        let _ = writeln!(md);
+
+        let mut case_ids: Vec<&str> = Vec::new();
+        for r in members {
+            for c in &r.results.cases {
+                if c.family != "memory" && !case_ids.contains(&c.case_id.as_str()) {
+                    case_ids.push(&c.case_id);
+                }
+            }
+        }
+        let mut head = String::from("| case |");
+        let mut rule = String::from("| --- |");
+        for r in members {
+            let _ = write!(
+                head,
+                " {} tput | p50 | p99 | pairs |",
+                encoding_label(&r.manifest)
+            );
+            rule.push_str(" ---: | ---: | ---: | ---: |");
+        }
+        let _ = writeln!(md, "{head}");
+        let _ = writeln!(md, "{rule}");
+        for id in &case_ids {
+            let mut row = format!("| {id} |");
+            for r in members {
+                match r.results.cases.iter().find(|c| c.case_id == *id) {
+                    Some(c) => {
+                        let s = summarize(c);
+                        let _ = write!(
+                            row,
+                            " {}{} | {} | {} | {}/{} |",
+                            fmt_ratio(&s.subject_tput, &s.reference_tput),
+                            if s.under_calibrated { " ⚠" } else { "" },
+                            fmt_ratio(&s.reference_p[0], &s.subject_p[0]),
+                            fmt_ratio(&s.reference_p[2], &s.subject_p[2]),
+                            s.valid_pairs,
+                            s.total_pairs
+                        );
+                    }
+                    None => row.push_str(" — | — | — | — |"),
+                }
+            }
+            let _ = writeln!(md, "{row}");
+        }
+        let _ = writeln!(md);
+
+        // Memory: bytes/sample per run.
+        let mut mem_rows = Vec::new();
+        for r in members {
+            for c in r.results.cases.iter().filter(|c| c.family == "memory") {
+                let s_bps: Vec<f64> = c
+                    .memory
+                    .iter()
+                    .filter(|p| p.subject.complete && p.reference.complete)
+                    .filter_map(|p| p.subject.bytes_per_sample())
+                    .collect();
+                let r_bps: Vec<f64> = c
+                    .memory
+                    .iter()
+                    .filter(|p| p.subject.complete && p.reference.complete)
+                    .filter_map(|p| p.reference.bytes_per_sample())
+                    .collect();
+                mem_rows.push(format!(
+                    "| {} | {} | {} | {} | {} | {} |",
+                    encoding_label(&r.manifest),
+                    r.results.run_id,
+                    c.case_id,
+                    fmt_median_spread(&s_bps),
+                    fmt_median_spread(&r_bps),
+                    fmt_ratio(&r_bps, &s_bps)
+                ));
+            }
+        }
+        if !mem_rows.is_empty() {
+            let _ = writeln!(
+                md,
+                "| encoding | run | case | subject B/sample | reference B/sample | ratio ref/subj |"
+            );
+            let _ = writeln!(md, "| --- | --- | --- | ---: | ---: | ---: |");
+            for row in mem_rows {
+                let _ = writeln!(md, "{row}");
+            }
+            let _ = writeln!(md);
+        }
+    }
+    md
 }
 
 fn csv_escape(s: &str) -> String {
@@ -841,6 +1081,8 @@ mod tests {
             cycles_completed: 1.0,
             state_verified: Some(true),
             under_calibrated: false,
+            value_deviations: 0,
+            max_rel_deviation: 0.0,
         }
     }
 

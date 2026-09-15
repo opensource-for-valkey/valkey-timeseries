@@ -224,6 +224,87 @@ pub enum CaseKind {
     },
     /// Memory accounting of empty and loaded series; no timed workload.
     Memory {},
+    /// `TS.RANGE ... ALIGN start AGGREGATION <aggregator> <bucket>` over a
+    /// window, with the bucket sized to yield about `buckets` points.
+    Aggregate {
+        window: RangeWindow,
+        aggregator: Aggregator,
+        buckets: usize,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// `TS.QUERYINDEX l<label>=<value>`; the value cycles deterministically, so
+    /// the expected key set is exact for every request.
+    #[serde(rename = "queryindex")]
+    QueryIndex { label: usize },
+    /// `TS.MGET FILTER l<label>=<value>`: last sample of every matched series.
+    Mget { label: usize },
+    /// `TS.MRANGE <window> FILTER l<label>=<value>` — raw samples of every
+    /// matched series over the window.
+    Mrange { label: usize, window: RangeWindow },
+    /// `TS.MRANGE <window> AGGREGATION ... FILTER l<label>=<value> GROUPBY
+    /// l<group_label> REDUCE <reducer>`; output cardinality is the number of
+    /// distinct `l<group_label>` values among the matched series.
+    #[serde(rename = "groupby")]
+    GroupBy {
+        label: usize,
+        group_label: usize,
+        window: RangeWindow,
+        aggregator: Aggregator,
+        buckets: usize,
+        reducer: Reducer,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Aggregator {
+    Min,
+    Max,
+    Count,
+    Sum,
+    Avg,
+}
+
+impl Aggregator {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+        }
+    }
+
+    /// `count`, `min` and `max` are order-independent and exact on both
+    /// engines; `sum` and `avg` depend on summation order and are compared
+    /// with a tolerance while every deviation is counted and reported.
+    pub fn is_exact(self) -> bool {
+        matches!(self, Self::Min | Self::Max | Self::Count)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reducer {
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Count,
+}
+
+impl Reducer {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+            Self::Count => "count",
+        }
+    }
 }
 
 impl CaseKind {
@@ -234,7 +315,7 @@ impl CaseKind {
 
     /// True for cases whose timed phase is a duration-bounded read loop.
     pub fn is_read(&self) -> bool {
-        matches!(self, Self::Get { .. } | Self::Range { .. })
+        !self.is_write() && !matches!(self, Self::Memory {})
     }
 
     /// Every server command the case sends, for `COMMAND INFO` support checks.
@@ -244,11 +325,14 @@ impl CaseKind {
             Self::Add {} => cmds.push("TS.ADD"),
             Self::Madd { .. } => cmds.push("TS.MADD"),
             Self::Get { .. } => cmds.extend(["TS.MADD", "TS.GET"]),
-            Self::Range { reverse, .. } => {
+            Self::Range { reverse, .. } | Self::Aggregate { reverse, .. } => {
                 cmds.push("TS.MADD");
                 cmds.push(if *reverse { "TS.REVRANGE" } else { "TS.RANGE" });
             }
             Self::Memory {} => cmds.push("TS.MADD"),
+            Self::QueryIndex { .. } => cmds.extend(["TS.MADD", "TS.QUERYINDEX"]),
+            Self::Mget { .. } => cmds.extend(["TS.MADD", "TS.MGET"]),
+            Self::Mrange { .. } | Self::GroupBy { .. } => cmds.extend(["TS.MADD", "TS.MRANGE"]),
         }
         cmds
     }
@@ -279,6 +363,29 @@ pub enum RangeWindow {
     Middle { percent: u8 },
     /// `- +`.
     Full {},
+}
+
+fn check_window(case_id: &str, window: &RangeWindow, samples: usize) -> Result<()> {
+    match window {
+        RangeWindow::Recent { points } => ensure!(
+            *points >= 1 && *points <= samples,
+            "case {case_id}: recent points must be within 1..={samples}"
+        ),
+        RangeWindow::Middle { percent } => ensure!(
+            (1..=100).contains(percent),
+            "case {case_id}: middle percent must be within 1..=100"
+        ),
+        RangeWindow::Full {} => {}
+    }
+    Ok(())
+}
+
+fn check_label(case_id: &str, label: usize, labels: usize) -> Result<()> {
+    ensure!(
+        label < labels,
+        "case {case_id}: label index {label} is out of range (fixture has {labels} label(s))"
+    );
+    Ok(())
 }
 
 impl Scenario {
@@ -388,24 +495,44 @@ impl Scenario {
                         case.id
                     );
                 }
-                CaseKind::Range {
-                    window: RangeWindow::Recent { points },
-                    ..
+                CaseKind::Range { window, .. } => {
+                    check_window(&case.id, window, f.samples_per_series)?;
+                }
+                CaseKind::Aggregate {
+                    window, buckets, ..
                 } => {
+                    check_window(&case.id, window, f.samples_per_series)?;
                     ensure!(
-                        *points >= 1 && *points <= f.samples_per_series,
-                        "case {}: recent points must be within 1..={}",
-                        case.id,
-                        f.samples_per_series
+                        *buckets >= 1,
+                        "case {}: buckets must be at least 1",
+                        case.id
                     );
                 }
-                CaseKind::Range {
-                    window: RangeWindow::Middle { percent },
+                CaseKind::QueryIndex { label } | CaseKind::Mget { label } => {
+                    check_label(&case.id, *label, f.label_cardinality.len())?;
+                }
+                CaseKind::Mrange { label, window } => {
+                    check_label(&case.id, *label, f.label_cardinality.len())?;
+                    check_window(&case.id, window, f.samples_per_series)?;
+                }
+                CaseKind::GroupBy {
+                    label,
+                    group_label,
+                    window,
+                    buckets,
                     ..
                 } => {
+                    check_label(&case.id, *label, f.label_cardinality.len())?;
+                    check_label(&case.id, *group_label, f.label_cardinality.len())?;
                     ensure!(
-                        (1..=100).contains(percent),
-                        "case {}: middle percent must be within 1..=100",
+                        label != group_label,
+                        "case {}: group_label must differ from the filter label",
+                        case.id
+                    );
+                    check_window(&case.id, window, f.samples_per_series)?;
+                    ensure!(
+                        *buckets >= 1,
+                        "case {}: buckets must be at least 1",
                         case.id
                     );
                 }
@@ -475,6 +602,50 @@ mod tests {
     fn unknown_field_is_refused() {
         let mut v = minimal();
         v["cases"][0]["pipelien"] = 16.into();
+        assert!(parse(v).is_err());
+    }
+
+    #[test]
+    fn query_breadth_kinds_parse_and_validate() {
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "agg", "kind": "aggregate", "window": {"type": "full"}, "aggregator": "avg", "buckets": 10},
+            {"id": "qi", "kind": "queryindex", "label": 1},
+            {"id": "mg", "kind": "mget", "label": 2},
+            {"id": "mr", "kind": "mrange", "label": 1, "window": {"type": "recent", "points": 5}},
+            {"id": "gb", "kind": "groupby", "label": 0, "group_label": 1, "window": {"type": "full"},
+             "aggregator": "sum", "buckets": 4, "reducer": "sum"}
+        ]);
+        let s = parse(v).unwrap();
+        assert!(s.cases.iter().all(|c| c.kind.is_read()));
+        assert_eq!(
+            s.commands(),
+            vec![
+                "TS.CREATE",
+                "TS.INFO",
+                "TS.MADD",
+                "TS.MGET",
+                "TS.MRANGE",
+                "TS.QUERYINDEX",
+                "TS.RANGE"
+            ]
+        );
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([{"id": "qi", "kind": "queryindex", "label": 3}]);
+        assert!(parse(v).unwrap_err().to_string().contains("out of range"));
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "gb", "kind": "groupby", "label": 1, "group_label": 1, "window": {"type": "full"},
+             "aggregator": "sum", "buckets": 4, "reducer": "sum"}
+        ]);
+        assert!(parse(v).unwrap_err().to_string().contains("must differ"));
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "agg", "kind": "aggregate", "window": {"type": "full"}, "aggregator": "median", "buckets": 10}
+        ]);
         assert!(parse(v).is_err());
     }
 
