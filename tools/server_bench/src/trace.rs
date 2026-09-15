@@ -414,6 +414,10 @@ fn window_bounds(
                 n - start,
             )
         }
+        RangeWindow::Head { points } => {
+            let end = points.min(&n) - 1;
+            (samples[0].timestamp, samples[end].timestamp, end + 1)
+        }
         RangeWindow::Middle { percent } => {
             let span = (n * *percent as usize).div_ceil(100).clamp(1, n);
             let start = (n - span) / 2;
@@ -1095,6 +1099,10 @@ mod tests {
         assert_eq!(
             window_bounds(&samples, &RangeWindow::Recent { points: 3 }),
             (1049, 1063, 3)
+        );
+        assert_eq!(
+            window_bounds(&samples, &RangeWindow::Head { points: 3 }),
+            (samples[0].timestamp, samples[2].timestamp, 3)
         );
         assert_eq!(
             window_bounds(&samples, &RangeWindow::Full {}),

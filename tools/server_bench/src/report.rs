@@ -131,6 +131,28 @@ fn samples_per_s(t: &TrialResult) -> f64 {
     }
 }
 
+/// Server CPU (user + sys, from INFO deltas) spent per command, in µs. Zero when
+/// the deltas are unavailable (e.g. a server the driver could not sample).
+fn cpu_us_per_command(t: &TrialResult) -> f64 {
+    let d = &t.server_deltas;
+    let cpu = d.get("used_cpu_sys").unwrap_or(&0.0) + d.get("used_cpu_user").unwrap_or(&0.0);
+    if t.requests > 0 {
+        cpu * 1e6 / t.requests as f64
+    } else {
+        0.0
+    }
+}
+
+/// Bytes the server wrote to clients per command (INFO `total_net_output_bytes`).
+fn net_out_per_command(t: &TrialResult) -> f64 {
+    let out = *t.server_deltas.get("total_net_output_bytes").unwrap_or(&0.0);
+    if t.requests > 0 {
+        out / t.requests as f64
+    } else {
+        0.0
+    }
+}
+
 fn trial_valid(t: &TrialResult) -> bool {
     t.complete
         && t.errors == 0
@@ -181,6 +203,10 @@ struct Summary {
     reference_tput: Vec<f64>,
     subject_sps: Vec<f64>,
     reference_sps: Vec<f64>,
+    subject_cpu: Vec<f64>,
+    reference_cpu: Vec<f64>,
+    subject_out: Vec<f64>,
+    reference_out: Vec<f64>,
     subject_p: [Vec<f64>; 3],
     reference_p: [Vec<f64>; 3],
     subject_obs: u64,
@@ -197,6 +223,10 @@ fn summarize(case: &CaseResults) -> Summary {
         reference_tput: vec![],
         subject_sps: vec![],
         reference_sps: vec![],
+        subject_cpu: vec![],
+        reference_cpu: vec![],
+        subject_out: vec![],
+        reference_out: vec![],
         subject_p: [vec![], vec![], vec![]],
         reference_p: [vec![], vec![], vec![]],
         subject_obs: 0,
@@ -217,6 +247,10 @@ fn summarize(case: &CaseResults) -> Summary {
         s.reference_tput.push(throughput(&p.reference));
         s.subject_sps.push(samples_per_s(&p.subject));
         s.reference_sps.push(samples_per_s(&p.reference));
+        s.subject_cpu.push(cpu_us_per_command(&p.subject));
+        s.reference_cpu.push(cpu_us_per_command(&p.reference));
+        s.subject_out.push(net_out_per_command(&p.subject));
+        s.reference_out.push(net_out_per_command(&p.reference));
         for (i, get) in [
             |t: &TrialResult| t.latency.p50_us,
             |t: &TrialResult| t.latency.p95_us,
@@ -442,6 +476,45 @@ pub fn markdown(results: &RunResults, manifest: &Json) -> String {
          enlarge the fixture before trusting the ratio. Samples/s counts samples written (writes), samples or buckets \
          returned (range, aggregate, mrange, groupby), keys returned (queryindex) or entries returned (mget)."
     );
+    let _ = writeln!(md);
+
+    // Server cost per command
+    let _ = writeln!(md, "## Server cost per command");
+    let _ = writeln!(md);
+    let _ = writeln!(
+        md,
+        "Server CPU (user + sys from `INFO` deltas) and bytes written to clients, divided by the \
+         commands the trial completed; median over valid pairs (min–max). Ratios are reference/subject, \
+         so > 1 favours the subject. CPU per command is the stable signal when throughput trials are \
+         noisy: it does not depend on how much of the server's CPU budget the clients managed to load."
+    );
+    let _ = writeln!(md);
+    let _ = writeln!(
+        md,
+        "| case | subject CPU µs/cmd | reference CPU µs/cmd | ratio | subject bytes out/cmd | reference bytes out/cmd | ratio |"
+    );
+    let _ = writeln!(md, "| --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+    for case in results.cases.iter().filter(|c| c.family != "memory") {
+        let s = summarize(case);
+        let cpu_pairs: Vec<(f64, f64)> = s
+            .reference_cpu
+            .iter()
+            .cloned()
+            .zip(s.subject_cpu.iter().cloned())
+            .collect();
+        let _ = writeln!(
+            md,
+            "| {} | {} | {} | {}{} | {} | {} | {} |",
+            case.case_id,
+            fmt_median_spread(&s.subject_cpu),
+            fmt_median_spread(&s.reference_cpu),
+            fmt_ratio(&s.reference_cpu, &s.subject_cpu),
+            fmt_ci(&cpu_pairs),
+            fmt_median_spread(&s.subject_out),
+            fmt_median_spread(&s.reference_out),
+            fmt_ratio(&s.reference_out, &s.subject_out),
+        );
+    }
     let _ = writeln!(md);
 
     // Latency
@@ -918,7 +991,8 @@ pub fn compare(runs: &[LoadedRun]) -> String {
         "Runs are grouped by deployment, container limits, fixture shape and dataset, protocol and trial budget; \
          only runs inside one group are comparable with each other. Within a group each column is one run, \
          labelled by its subject/reference encoding pair. Cells are the run's own ratios: throughput subject/reference, \
-         p50 and p99 latency reference/subject (all > 1 favour the subject), computed over that run's valid pairs."
+         p50 and p99 latency reference/subject and server CPU per command reference/subject (all > 1 favour \
+         the subject), computed over that run's valid pairs."
     );
     let _ = writeln!(md);
 
@@ -968,10 +1042,10 @@ pub fn compare(runs: &[LoadedRun]) -> String {
         for r in members {
             let _ = write!(
                 head,
-                " {} tput | p50 | p99 | pairs |",
+                " {} tput | p50 | p99 | cpu | pairs |",
                 encoding_label(&r.manifest)
             );
-            rule.push_str(" ---: | ---: | ---: | ---: |");
+            rule.push_str(" ---: | ---: | ---: | ---: | ---: |");
         }
         let _ = writeln!(md, "{head}");
         let _ = writeln!(md, "{rule}");
@@ -983,16 +1057,17 @@ pub fn compare(runs: &[LoadedRun]) -> String {
                         let s = summarize(c);
                         let _ = write!(
                             row,
-                            " {}{} | {} | {} | {}/{} |",
+                            " {}{} | {} | {} | {} | {}/{} |",
                             fmt_ratio(&s.subject_tput, &s.reference_tput),
                             if s.under_calibrated { " ⚠" } else { "" },
                             fmt_ratio(&s.reference_p[0], &s.subject_p[0]),
                             fmt_ratio(&s.reference_p[2], &s.subject_p[2]),
+                            fmt_ratio(&s.reference_cpu, &s.subject_cpu),
                             s.valid_pairs,
                             s.total_pairs
                         );
                     }
-                    None => row.push_str(" — | — | — | — |"),
+                    None => row.push_str(" — | — | — | — | — |"),
                 }
             }
             let _ = writeln!(md, "{row}");

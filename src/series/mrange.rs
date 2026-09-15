@@ -787,6 +787,107 @@ fn group_series_by_label<'a>(
     grouped
 }
 
+// -------- deferred (off-main-thread) MRANGE --------
+
+/// One matched series with everything the deferred decode needs, gathered on
+/// the main thread while the series guard is held: the copied chunks, the
+/// `LATEST` sample, the EMPTY fill bounds (both need the live series), the
+/// reply key and labels.
+pub struct SnapshotSeries {
+    pub key: Vec<u8>,
+    pub labels: Vec<Label>,
+    pub snapshot: RangeSnapshot,
+    pub latest: Option<Sample>,
+    pub empty_fill: EmptyFillBounds,
+}
+
+/// Whether the non-clustered path can answer `options` from snapshots:
+/// grouping needs the reducer pass, multi-aggregation yields rows, and
+/// `FILTER_BY_TS` needs the series-backed base reader.
+pub fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
+    options.grouping.is_none()
+        && options.range.timestamp_filter.is_none()
+        && !options
+            .range
+            .aggregation
+            .as_ref()
+            .is_some_and(|a| a.is_multi())
+}
+
+/// The main-thread half of a deferred TS.MRANGE: resolve and ACL-check the
+/// series, then copy out what the decode needs. Returns the snapshots and the
+/// total compressed bytes copied.
+pub fn snapshot_mrange_query(
+    ctx: &Context,
+    options: &MRangeOptions,
+) -> ValkeyResult<(Vec<SnapshotSeries>, usize)> {
+    if options.filters.is_empty() {
+        return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
+    }
+    let series_guards = series_by_selectors(ctx, &options.filters, None)?;
+    let (start, end) = options.range.get_timestamp_range();
+    let mut copied = 0usize;
+    let series = series_guards
+        .iter()
+        .map(|(guard, key)| {
+            let snapshot = guard.snapshot_range(start, end);
+            copied += snapshot.compressed_bytes();
+            SnapshotSeries {
+                key: key.as_slice().to_vec(),
+                labels: convert_labels(guard, options.with_labels, &options.selected_labels),
+                snapshot,
+                latest: get_latest(&options.range, ctx, guard),
+                empty_fill: range_empty_fill_bounds(guard, &options.range, options.is_reverse),
+            }
+        })
+        .collect();
+    Ok((series, copied))
+}
+
+/// The off-thread half: decode every snapshot through the same pipeline
+/// `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key.
+pub(crate) fn decode_snapshot_series(
+    series: Vec<SnapshotSeries>,
+    options: &MRangeOptions,
+) -> Vec<MRangeSeriesResult> {
+    let has_aggregation = options.range.aggregation.is_some();
+    let should_reverse_iter = !has_aggregation && options.is_reverse;
+    let mut items: Vec<MRangeSeriesResult> = series
+        .into_iter()
+        .map(|s| {
+            // The snapshot decodes ascending; a non-aggregated reverse query
+            // wants the base descending, as `SeriesSampleIterator` would give it.
+            let mut base: Vec<Sample> = Vec::with_capacity(s.snapshot.capacity_hint());
+            base.extend(s.snapshot.range_iter());
+            if should_reverse_iter {
+                base.reverse();
+            }
+            let samples: Vec<Sample> = create_range_iterator_from_base(
+                base.into_iter(),
+                &options.range,
+                s.latest,
+                options.is_reverse,
+                s.empty_fill,
+            )
+            .collect();
+            MRangeSeriesResult {
+                group_label_value: None,
+                key: s.key,
+                labels: s.labels,
+                sources: Vec::new(),
+                data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
+                    UncompressedChunk::from_vec(samples),
+                )),
+            }
+        })
+        .collect();
+    if options.exclude_empty {
+        items.retain(|item| !item.data.is_empty());
+    }
+    sort_mrange_results(&mut items, false);
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,105 +1137,4 @@ mod tests {
         assert_eq!(rows[0].timestamp, 200);
         assert_eq!(rows[1].timestamp, 100);
     }
-}
-
-// -------- deferred (off-main-thread) MRANGE --------
-
-/// One matched series with everything the deferred decode needs, gathered on
-/// the main thread while the series guard is held: the copied chunks, the
-/// `LATEST` sample, the EMPTY fill bounds (both need the live series), the
-/// reply key and labels.
-pub struct SnapshotSeries {
-    pub key: Vec<u8>,
-    pub labels: Vec<Label>,
-    pub snapshot: RangeSnapshot,
-    pub latest: Option<Sample>,
-    pub empty_fill: EmptyFillBounds,
-}
-
-/// Whether the non-clustered path can answer `options` from snapshots:
-/// grouping needs the reducer pass, multi-aggregation yields rows, and
-/// `FILTER_BY_TS` needs the series-backed base reader.
-pub fn is_snapshot_answerable(options: &MRangeOptions) -> bool {
-    options.grouping.is_none()
-        && options.range.timestamp_filter.is_none()
-        && !options
-            .range
-            .aggregation
-            .as_ref()
-            .is_some_and(|a| a.is_multi())
-}
-
-/// The main-thread half of a deferred TS.MRANGE: resolve and ACL-check the
-/// series, then copy out what the decode needs. Returns the snapshots and the
-/// total compressed bytes copied.
-pub fn snapshot_mrange_query(
-    ctx: &Context,
-    options: &MRangeOptions,
-) -> ValkeyResult<(Vec<SnapshotSeries>, usize)> {
-    if options.filters.is_empty() {
-        return Err(ValkeyError::Str(error_consts::MISSING_FILTER));
-    }
-    let series_guards = series_by_selectors(ctx, &options.filters, None)?;
-    let (start, end) = options.range.get_timestamp_range();
-    let mut copied = 0usize;
-    let series = series_guards
-        .iter()
-        .map(|(guard, key)| {
-            let snapshot = guard.snapshot_range(start, end);
-            copied += snapshot.compressed_bytes();
-            SnapshotSeries {
-                key: key.as_slice().to_vec(),
-                labels: convert_labels(guard, options.with_labels, &options.selected_labels),
-                snapshot,
-                latest: get_latest(&options.range, ctx, guard),
-                empty_fill: range_empty_fill_bounds(guard, &options.range, options.is_reverse),
-            }
-        })
-        .collect();
-    Ok((series, copied))
-}
-
-/// The off-thread half: decode every snapshot through the same pipeline
-/// `handle_non_grouped` uses, apply EXCLUDEEMPTY, sort by key.
-pub(crate) fn decode_snapshot_series(
-    series: Vec<SnapshotSeries>,
-    options: &MRangeOptions,
-) -> Vec<MRangeSeriesResult> {
-    let has_aggregation = options.range.aggregation.is_some();
-    let should_reverse_iter = !has_aggregation && options.is_reverse;
-    let mut items: Vec<MRangeSeriesResult> = series
-        .into_iter()
-        .map(|s| {
-            // The snapshot decodes ascending; a non-aggregated reverse query
-            // wants the base descending, as `SeriesSampleIterator` would give it.
-            let mut base: Vec<Sample> = Vec::with_capacity(s.snapshot.capacity_hint());
-            base.extend(s.snapshot.range_iter());
-            if should_reverse_iter {
-                base.reverse();
-            }
-            let samples: Vec<Sample> = create_range_iterator_from_base(
-                base.into_iter(),
-                &options.range,
-                s.latest,
-                options.is_reverse,
-                s.empty_fill,
-            )
-            .collect();
-            MRangeSeriesResult {
-                group_label_value: None,
-                key: s.key,
-                labels: s.labels,
-                sources: Vec::new(),
-                data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(
-                    UncompressedChunk::from_vec(samples),
-                )),
-            }
-        })
-        .collect();
-    if options.exclude_empty {
-        items.retain(|item| !item.data.is_empty());
-    }
-    sort_mrange_results(&mut items, false);
-    items
 }

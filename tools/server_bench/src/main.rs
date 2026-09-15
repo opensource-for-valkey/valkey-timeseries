@@ -231,7 +231,7 @@ fn dry_run(scenario_path: &Path, fixture_dir: Option<&Path>) -> Result<()> {
         let (phase, secs) = phase_budget(&scenario, &case.kind);
         budget_s += secs;
         println!(
-            "{:<24} {:>6} {:>6} {:>12} {:>12} {:>10}  {}{}",
+            "{:<24} {:>6} {:>6} {:>12} {:>12} {:>10}  {}{}{}",
             case.id,
             case.connections,
             case.pipeline,
@@ -241,6 +241,9 @@ fn dry_run(scenario_path: &Path, fixture_dir: Option<&Path>) -> Result<()> {
             phase,
             bytes
                 .map(|b| format!(" (~{} on the wire)", human_bytes(b)))
+                .unwrap_or_default(),
+            case.protocol
+                .map(|p| format!(" [{p:?}]"))
                 .unwrap_or_default()
         );
     }

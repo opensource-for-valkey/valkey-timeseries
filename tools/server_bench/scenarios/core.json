@@ -102,6 +102,15 @@
       "connections": 8
     },
     {
+      "id": "range_head100_c8",
+      "kind": "range",
+      "window": {
+        "type": "head",
+        "points": 100
+      },
+      "connections": 8
+    },
+    {
       "id": "range_middle10_c8",
       "kind": "range",
       "window": {

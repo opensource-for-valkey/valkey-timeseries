@@ -255,7 +255,13 @@ start_subject_process() {  # $1=label
     port="$(free_port)"
     workdir="$(mktemp -d "${TMPDIR:-/tmp}/server-bench-$1.XXXXXX")"
     OWNED_WORKDIRS+=("$workdir")
-    "$SERVER_PATH_RESOLVED" \
+    # TZ=UTC0: with TZ unset (or naming a zoneinfo *file*, such as UTC or
+    # GMT0), macOS libc re-reads the file in every localtime_r, and the server
+    # calls that once per event-loop iteration (updateCachedTime); it was half
+    # of all main-thread samples in local profiles. A POSIX TZ string with no
+    # file behind it is parsed once and cached. glibc caches either way, so the
+    # containers are unaffected.
+    TZ=UTC0 "$SERVER_PATH_RESOLVED" \
         --port "$port" \
         --dir "$workdir" \
         --logfile "$workdir/server.log" \

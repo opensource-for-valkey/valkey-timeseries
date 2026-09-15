@@ -368,7 +368,12 @@ pub fn check_reply(expect: &Expect, v: &Value) -> Result<Checked, String> {
 // -------- transport --------
 
 fn connect(target: &Target) -> Result<Connection> {
-    let client = redis::Client::open(url_with_protocol(&target.url, target.protocol).as_str())?;
+    connect_with(target, target.protocol)
+}
+
+/// As [`connect`], on `protocol` (a case's override of the scenario's).
+fn connect_with(target: &Target, protocol: Protocol) -> Result<Connection> {
+    let client = redis::Client::open(url_with_protocol(&target.url, protocol).as_str())?;
     let con = client.get_connection_with_timeout(Duration::from_secs(5))?;
     con.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     con.set_write_timeout(Some(REQUEST_TIMEOUT))?;
@@ -772,9 +777,10 @@ fn run_trial_inner(
 
     let connections = ctx.case.connections as usize;
     let pipeline = ctx.case.pipeline as usize;
+    let protocol = ctx.case.protocol(target.protocol);
     let mut cons = Vec::with_capacity(connections);
     for _ in 0..connections {
-        cons.push(connect(target).context("opening workload connection")?);
+        cons.push(connect_with(target, protocol).context("opening workload connection")?);
     }
 
     let mode = if ctx.case.kind.is_read() {
@@ -797,7 +803,13 @@ fn run_trial_inner(
         Mode::Once
     };
 
-    let before = server_counters(control)?;
+    // Server counters bracket the timed phase only: for a read trial the
+    // snapshot is taken once the workers' warm-up deadline has passed, so
+    // per-command CPU and bytes are not diluted by warm-up traffic.
+    let before = match mode {
+        Mode::Once => Some(server_counters(control)?),
+        Mode::Loop { .. } => None,
+    };
     let handles: Vec<_> = cons
         .into_iter()
         .enumerate()
@@ -806,6 +818,14 @@ fn run_trial_inner(
             thread::spawn(move || worker(con, trace, i, pipeline, mode))
         })
         .collect();
+    let before = match (before, mode) {
+        (Some(b), _) => b,
+        (None, Mode::Loop { warmup_until, .. }) => {
+            thread::sleep(warmup_until.saturating_duration_since(Instant::now()));
+            server_counters(control)?
+        }
+        (None, Mode::Once) => unreachable!("Once takes its snapshot before spawning"),
+    };
     let mut outs = Vec::with_capacity(connections);
     for h in handles {
         outs.push(h.join().map_err(|_| anyhow!("worker thread panicked"))?);

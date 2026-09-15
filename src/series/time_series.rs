@@ -1435,6 +1435,40 @@ fn get_range_parallel(
     }
 }
 
+/// The compressed chunks a range read needs, copied out of a series so they
+/// can be decoded after the series — and whatever guards it — are released.
+///
+/// A chunk is a few KB of compressed bytes; its decoded samples are several
+/// times that. Copying chunks on the main thread and decoding elsewhere turns
+/// main-thread time proportional to the decode into time proportional to the
+/// memcpy. Only the chunks overlapping the range are copied.
+pub struct RangeSnapshot {
+    /// Already clamped to the series' retention floor, as `range_iter` would.
+    start: Timestamp,
+    end: Timestamp,
+    chunks: Vec<TimeSeriesChunk>,
+}
+
+impl RangeSnapshot {
+    /// Upper bound on the samples the snapshot can yield.
+    pub fn capacity_hint(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
+
+    /// Bytes copied out of the series.
+    pub fn compressed_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.size()).sum()
+    }
+
+    /// The samples in `[start, end]`, ascending, decoded on demand. Equivalent
+    /// to [`TimeSeries::range_iter`] over the same range at snapshot time.
+    pub fn range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.range_iter(self.start, self.end))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,39 +1541,5 @@ mod tests {
         assert_eq!(find_start_chunk_index(&chunks, 45), 2);
         assert_eq!(find_start_chunk_index(&chunks, 35), 2);
         assert_eq!(find_start_chunk_index(&chunks, 70), 4);
-    }
-}
-
-/// The compressed chunks a range read needs, copied out of a series so they
-/// can be decoded after the series — and whatever guards it — are released.
-///
-/// A chunk is a few KB of compressed bytes; its decoded samples are several
-/// times that. Copying chunks on the main thread and decoding elsewhere turns
-/// main-thread time proportional to the decode into time proportional to the
-/// memcpy. Only the chunks overlapping the range are copied.
-pub struct RangeSnapshot {
-    /// Already clamped to the series' retention floor, as `range_iter` would.
-    start: Timestamp,
-    end: Timestamp,
-    chunks: Vec<TimeSeriesChunk>,
-}
-
-impl RangeSnapshot {
-    /// Upper bound on the samples the snapshot can yield.
-    pub fn capacity_hint(&self) -> usize {
-        self.chunks.iter().map(|c| c.len()).sum()
-    }
-
-    /// Bytes copied out of the series.
-    pub fn compressed_bytes(&self) -> usize {
-        self.chunks.iter().map(|c| c.size()).sum()
-    }
-
-    /// The samples in `[start, end]`, ascending, decoded on demand. Equivalent
-    /// to [`TimeSeries::range_iter`] over the same range at snapshot time.
-    pub fn range_iter(&self) -> impl Iterator<Item = Sample> + '_ {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.range_iter(self.start, self.end))
     }
 }

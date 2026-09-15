@@ -194,6 +194,17 @@ pub struct Case {
     pub connections: u32,
     #[serde(default = "one")]
     pub pipeline: u32,
+    /// Overrides the scenario's protocol for this case's workload connections.
+    /// Lets one scenario carry RESP2/RESP3 twins of a case, so the wire-format
+    /// share of a gap can be read off the same run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Protocol>,
+}
+
+impl Case {
+    pub fn protocol(&self, scenario: Protocol) -> Protocol {
+        self.protocol.unwrap_or(scenario)
+    }
 }
 
 fn one() -> u32 {
@@ -370,6 +381,11 @@ pub enum KeyDistribution {
 pub enum RangeWindow {
     /// The last `points` samples of a series.
     Recent { points: usize },
+    /// The first `points` samples of a series. The dual of `recent`: the same
+    /// reply size, but a read that starts at the first chunk's first sample, so
+    /// `recent − head` on one engine is what it spends decoding samples the
+    /// window discards.
+    Head { points: usize },
     /// `percent` of the series, centred on its midpoint.
     Middle { percent: u8 },
     /// `- +`.
@@ -381,6 +397,10 @@ fn check_window(case_id: &str, window: &RangeWindow, samples: usize) -> Result<(
         RangeWindow::Recent { points } => ensure!(
             *points >= 1 && *points <= samples,
             "case {case_id}: recent points must be within 1..={samples}"
+        ),
+        RangeWindow::Head { points } => ensure!(
+            *points >= 1 && *points <= samples,
+            "case {case_id}: head points must be within 1..={samples}"
         ),
         RangeWindow::Middle { percent } => ensure!(
             (1..=100).contains(percent),

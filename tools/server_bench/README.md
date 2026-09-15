@@ -101,12 +101,22 @@ malformed selectors are rejected. A scenario names:
   - `memory`.
 
   Selectors are objects: `{"type": "uniform"}`, `{"type": "hot", "keys": N,
-  "share_percent": P}`, `{"type": "recent", "points": N}`, `{"type": "middle",
-  "percent": P}`, `{"type": "full"}`.
+  "share_percent": P}`, `{"type": "recent", "points": N}`, `{"type": "head",
+  "points": N}` (the first N samples: the same reply as `recent` from a read that
+  starts at the series' first sample, so `recent − head` is what an engine spends
+  decoding samples the window discards), `{"type": "middle", "percent": P}`,
+  `{"type": "full"}`.
+
+  A case may carry `"protocol": "resp3"` (or `"resp2"`) to override the scenario's
+  protocol for its workload connections, so one run can hold RESP2/RESP3 twins of a
+  case; both engines emit identical bytes under RESP3, which makes the RESP2 − RESP3
+  spread the wire-format share of a gap.
 
 Profiles: `smoke` (10 × 1,000, one case per family), `core` (1,000 × 1,000, ingest /
-point / range / memory), `query` (aggregations, label queries at 1/10/100 % selectivity,
-10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the
+point / range / memory), `range` (the core fixture; raw RANGE windows with RESP3 twins,
+`head100`, GET as a control — the profile behind
+`docs/plans/range-performance-plan.md`), `query` (aggregations, label queries at
+1/10/100 % selectivity, 10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the
 dataset/shape variants `core-counter`, `core-noisy`, `core-jitter`, `core-shallow`
 (100,000 × 10) and `core-deep` (1 × 1,000,000). Run several and put them side by side with
 `server_bench compare --run-dir A --run-dir B ...`, which groups runs by deployment,
@@ -167,7 +177,18 @@ consumption of its reply. With pipelining that is still a per-command figure —
 each reply is matched to the batch it belongs to — and the report labels it
 "closed-loop, pipelined depth N". These are closed-loop numbers; they do not
 describe latency at a fixed arrival rate. `INFO stats`/`INFO cpu` deltas over
-the timed phase give server-side bytes in/out, commands and CPU seconds.
+the timed phase (the warm-up excluded) give server-side bytes in/out, commands
+and CPU seconds; the report's "Server cost per command" table divides them by
+the commands completed, with reference/subject ratios. CPU per command is the
+figure to trust when throughput trials are noisy — it does not depend on how
+much of the server the clients managed to load.
+
+Local subject processes run with `TZ=UTC0`: with `TZ` unset — or naming a
+zoneinfo file such as `UTC` — macOS libc re-reads the file inside every
+`localtime_r`, which the server calls once per event-loop iteration: half of all
+main-thread samples in a profile. A POSIX string with no file behind it (`UTC0`)
+is parsed once and cached. glibc caches either way, so containers are unaffected.
+Set it when profiling by hand too.
 
 Memory trials snapshot `INFO memory` and `DBSIZE` before setup, after
 `TS.CREATE` (settled), and after preload (settled), plus `TS.INFO memoryUsage`
