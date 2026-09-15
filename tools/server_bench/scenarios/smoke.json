@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "smoke",
+  "description": "Harness smoke profile: 10 series x 1,000 samples, one case per first-comparison family. Verifies the pipeline end to end; the numbers it produces are not publishable.",
+  "fixture": {
+    "series": 10,
+    "samples_per_series": 1000,
+    "workload": "drift",
+    "timestamp_model": "regular",
+    "label_cardinality": [1, 10, 100],
+    "label_value_len": 8,
+    "key_prefix": "bench",
+    "interval_ms": 1000
+  },
+  "series": {
+    "chunk_size": 4096,
+    "duplicate_policy": "BLOCK",
+    "encoding": { "subject": "chimp", "reference": "compressed" }
+  },
+  "protocol": "resp2",
+  "trials": 1,
+  "warmup_seconds": 1,
+  "read_duration_seconds": 3,
+  "read_cycle_requests": 10000,
+  "min_write_seconds": 1,
+  "settle_seconds": 1,
+  "cases": [
+    { "id": "add_c1_p1", "kind": "add", "connections": 1, "pipeline": 1 },
+    { "id": "add_c4_p16", "kind": "add", "connections": 4, "pipeline": 16 },
+    { "id": "madd16_c1_p1", "kind": "madd", "batch": 16, "connections": 1, "pipeline": 1 },
+    { "id": "get_uniform_c4", "kind": "get", "distribution": { "type": "uniform" }, "connections": 4 },
+    { "id": "get_hot_c4", "kind": "get", "distribution": { "type": "hot", "keys": 2, "share_percent": 90 }, "connections": 4 },
+    { "id": "range_recent100_c4", "kind": "range", "window": { "type": "recent", "points": 100 }, "connections": 4 },
+    { "id": "range_middle10_c4", "kind": "range", "window": { "type": "middle", "percent": 10 }, "connections": 4 },
+    { "id": "revrange_full_c1", "kind": "range", "window": { "type": "full" }, "reverse": true, "connections": 1 },
+    { "id": "memory", "kind": "memory" }
+  ]
+}

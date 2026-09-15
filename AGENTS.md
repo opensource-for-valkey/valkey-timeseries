@@ -47,6 +47,10 @@ tools/fleet_loader.sh [-p PORT] [--preset small|medium|large] [--flush]      # f
 
 # Compatibility fuzzer (needs Docker; strict mode required for a soak — see Warnings below)
 ./fuzz.sh --examples 20000 --duration 20m --stats
+
+# Comparative server benchmarks vs the pinned RedisTimeSeries reference (needs Docker)
+tools/server_bench.sh --profile smoke --dry-run   # counts and budget, no servers
+tools/server_bench.sh --profile smoke --self-check # two subject builds: harness check only
 ```
 
 Key `./build.sh` env vars: `SERVER_VERSION` (`unstable` (default) or `8.1`, the versions CI tests), `ASAN_BUILD`,
@@ -126,6 +130,15 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
 - Fuzzer (`tests/compat/test_compat_fuzz.py`, Hypothesis-driven): opt-in, not in the PR gate. Prefer
   `./fuzz.sh`; promote any shrunk failure into `tests/compat/corpus/<slug>.json` so it becomes a
   deterministic regression test (`test_compat_corpus.py`) in the same change as the fix.
+- Reference server lifecycle: `tests/reference_server.sh` (sourced by `build.sh`, `fuzz.sh`,
+  `tools/server_bench.sh`; no traps of its own). `COMPAT_REFERENCE_COMPOSE_FILE/PROJECT` point it at
+  another compose file/project; `tests/test_reference_server_lifecycle.py` pins ownership and signal
+  cleanup with a fake `docker`, no Docker needed.
+- Server benchmarks (`tools/server_bench/`, own workspace + committed lockfile; `tools/benchmark_dataset.rs`
+  exports fixtures; `docker-compose.bench.yml` extends the compat reference pin): only a
+  `containers-equal-limits` run (`--subject-docker` with a Linux `.so`) is publishable — the report
+  banners everything else. Plan: `docs/plans/rts-comparative-benchmarks-plan.md`; details:
+  `tools/server_bench/README.md`. Aggregate `sum`/`avg` deviations are reported, never tolerated away.
 
 ## Warnings / gotchas
 

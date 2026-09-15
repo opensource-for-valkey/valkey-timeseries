@@ -1,6 +1,11 @@
 # Comparative benchmarks against RedisTimeSeries
 
-Status: proposed; no benchmark implementation or measurements yet.
+Status: implementation sequence steps 1 (reproducible foundation) and 2 (first useful
+comparison: ADD, MADD, GET, raw RANGE, memory, reports) landed 2026-09-14 —
+`tools/server_bench.sh`, `tools/server_bench/`, `tools/benchmark_dataset.rs`,
+`docker-compose.bench.yml`, and the `tests/reference_server.sh` overrides. Steps 3–5 are
+not started. Only exploratory (non-publishable) runs exist so far; see
+`tools/server_bench/README.md` for what runs today and its known gaps.
 
 ## Objective and scope
 
@@ -207,7 +212,7 @@ supports the same cross-shard commands; single-node results cannot establish thi
 Module-only commands such as `TS.ADDBULK`, `TS.JOIN`, and `TS.OUTLIERS` belong in separate
 extension reports with explicit application-level baselines.
 
-Proposed CLI (not implemented):
+CLI:
 
 ```sh
 tools/server_bench.sh --profile smoke --dry-run

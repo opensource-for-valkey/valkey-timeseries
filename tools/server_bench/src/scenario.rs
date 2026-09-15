@@ -1,0 +1,536 @@
+//! Versioned workload profiles (`scenarios/*.json`).
+//!
+//! A scenario is explicit about everything that shapes a measurement — fixture
+//! shape, series settings on *each* engine, protocol, connection/pipeline
+//! depth, trial counts — so a report can be reproduced from the scenario file
+//! and the run manifest alone. Unknown fields and unknown case kinds are
+//! rejected rather than ignored: a typo must not silently turn into a default.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+
+/// Bumped whenever a field changes meaning. Older files are refused, never
+/// reinterpreted.
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scenario {
+    pub schema_version: u32,
+    pub name: String,
+    pub description: String,
+    pub fixture: FixtureSpec,
+    pub series: SeriesSpec,
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// Paired trials per case; AB/BA order alternates between trials.
+    pub trials: u32,
+    /// Untimed warm-up before each timed read trial.
+    pub warmup_seconds: u64,
+    /// Length of each timed read trial.
+    pub read_duration_seconds: u64,
+    /// Number of requests in a read case's replayed cycle. The trial loops over
+    /// the cycle for `read_duration_seconds`; calibration (step 2) may raise it.
+    #[serde(default = "default_read_cycle")]
+    pub read_cycle_requests: usize,
+    /// A write trial whose faster engine finished sooner than this is reported
+    /// as under-calibrated: enlarge the fixture rather than trust the ratio.
+    #[serde(default = "default_min_write_seconds")]
+    pub min_write_seconds: u64,
+    /// Pause before each memory snapshot.
+    #[serde(default = "default_settle_seconds")]
+    pub settle_seconds: u64,
+    pub cases: Vec<Case>,
+}
+
+fn default_read_cycle() -> usize {
+    100_000
+}
+fn default_min_write_seconds() -> u64 {
+    30
+}
+fn default_settle_seconds() -> u64 {
+    2
+}
+
+/// What `tools/benchmark_dataset.rs` must be asked for. Workload and timestamp
+/// model ids are passed through verbatim; the exporter owns the list of valid
+/// ids, so the driver never duplicates it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureSpec {
+    pub series: usize,
+    pub samples_per_series: usize,
+    pub workload: String,
+    pub timestamp_model: String,
+    #[serde(default = "default_label_cardinality")]
+    pub label_cardinality: Vec<usize>,
+    #[serde(default = "default_label_value_len")]
+    pub label_value_len: usize,
+    #[serde(default = "default_key_prefix")]
+    pub key_prefix: String,
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_label_cardinality() -> Vec<usize> {
+    vec![1, 10, 100]
+}
+fn default_label_value_len() -> usize {
+    8
+}
+fn default_key_prefix() -> String {
+    "bench".to_string()
+}
+fn default_interval_ms() -> u64 {
+    1000
+}
+
+impl FixtureSpec {
+    pub fn total_samples(&self) -> usize {
+        self.series * self.samples_per_series
+    }
+}
+
+/// Series settings sent with every `TS.CREATE`. Encodings are named per engine
+/// because the two products do not share an encoding vocabulary; the report
+/// prints exactly what was sent (plan: "Name actual settings").
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesSpec {
+    pub chunk_size: u32,
+    pub duplicate_policy: DuplicatePolicy,
+    pub encoding: EncodingPair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DuplicatePolicy {
+    Block,
+    First,
+    Last,
+    Min,
+    Max,
+    Sum,
+}
+
+impl DuplicatePolicy {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Block => "BLOCK",
+            Self::First => "FIRST",
+            Self::Last => "LAST",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::Sum => "SUM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncodingPair {
+    pub subject: SubjectEncoding,
+    pub reference: ReferenceEncoding,
+}
+
+/// `ENCODING` values accepted by this module's `TS.CREATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubjectEncoding {
+    Chimp,
+    Gorilla,
+    Uncompressed,
+}
+
+impl SubjectEncoding {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Chimp => "CHIMP",
+            Self::Gorilla => "GORILLA",
+            Self::Uncompressed => "UNCOMPRESSED",
+        }
+    }
+}
+
+/// `ENCODING` values documented for the reference's `TS.CREATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReferenceEncoding {
+    Compressed,
+    Uncompressed,
+}
+
+impl ReferenceEncoding {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            Self::Compressed => "COMPRESSED",
+            Self::Uncompressed => "UNCOMPRESSED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    Resp2,
+    Resp3,
+}
+
+// No `deny_unknown_fields` here: serde does not support it next to `flatten`.
+// Unknown keys still fail, because they fall through to the flattened
+// `CaseKind`, whose variants do deny them (covered by a test).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Case {
+    pub id: String,
+    #[serde(flatten)]
+    pub kind: CaseKind,
+    #[serde(default = "one")]
+    pub connections: u32,
+    #[serde(default = "one")]
+    pub pipeline: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// Case families. Only the first-comparison set (plan, sequence step 2) exists
+/// so far; aggregation, label and grouped queries are step 3 and will be added
+/// here as new variants, never as loosely typed parameters.
+// Every variant is a struct variant, empty ones included: serde only enforces
+// `deny_unknown_fields` on struct variants, so `Add {}` refuses a stray key
+// where a unit `Add` would silently accept it.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaseKind {
+    /// Ordered `TS.ADD` into precreated series. Each connection owns a disjoint
+    /// set of series and writes them as monotonic timestamp streams.
+    Add {},
+    /// `TS.MADD` with `batch` samples per command, same ownership rules.
+    Madd { batch: usize },
+    /// `TS.GET` over loaded series.
+    Get { distribution: KeyDistribution },
+    /// `TS.RANGE` / `TS.REVRANGE` over loaded series.
+    Range {
+        window: RangeWindow,
+        #[serde(default)]
+        reverse: bool,
+    },
+    /// Memory accounting of empty and loaded series; no timed workload.
+    Memory {},
+}
+
+impl CaseKind {
+    /// True for cases whose timed phase replays a fixed-length write trace.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Add {} | Self::Madd { .. })
+    }
+
+    /// True for cases whose timed phase is a duration-bounded read loop.
+    pub fn is_read(&self) -> bool {
+        matches!(self, Self::Get { .. } | Self::Range { .. })
+    }
+
+    /// Every server command the case sends, for `COMMAND INFO` support checks.
+    pub fn commands(&self) -> Vec<&'static str> {
+        let mut cmds = vec!["TS.CREATE", "TS.INFO"];
+        match self {
+            Self::Add {} => cmds.push("TS.ADD"),
+            Self::Madd { .. } => cmds.push("TS.MADD"),
+            Self::Get { .. } => cmds.extend(["TS.MADD", "TS.GET"]),
+            Self::Range { reverse, .. } => {
+                cmds.push("TS.MADD");
+                cmds.push(if *reverse { "TS.REVRANGE" } else { "TS.RANGE" });
+            }
+            Self::Memory {} => cmds.push("TS.MADD"),
+        }
+        cmds
+    }
+}
+
+/// Written as an object: `{"type": "uniform"}` or
+/// `{"type": "hot", "keys": 10, "share_percent": 90}`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KeyDistribution {
+    Uniform {},
+    /// `share_percent` of requests go to the first `keys` series; the rest are
+    /// uniform over all series.
+    Hot {
+        keys: usize,
+        share_percent: u8,
+    },
+}
+
+/// Written as an object: `{"type": "recent", "points": 100}`,
+/// `{"type": "middle", "percent": 10}` or `{"type": "full"}`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RangeWindow {
+    /// The last `points` samples of a series.
+    Recent { points: usize },
+    /// `percent` of the series, centred on its midpoint.
+    Middle { percent: u8 },
+    /// `- +`.
+    Full {},
+}
+
+impl Scenario {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading scenario {}", path.display()))?;
+        let scenario: Scenario = serde_json::from_str(&text)
+            .with_context(|| format!("parsing scenario {}", path.display()))?;
+        scenario
+            .validate()
+            .with_context(|| format!("invalid scenario {}", path.display()))?;
+        Ok(scenario)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema_version == SCHEMA_VERSION,
+            "schema_version {} is not supported (this driver understands {SCHEMA_VERSION})",
+            self.schema_version
+        );
+        ensure!(!self.name.is_empty(), "name must not be empty");
+        ensure!(self.trials >= 1, "trials must be at least 1");
+        ensure!(
+            self.read_duration_seconds >= 1,
+            "read_duration_seconds must be at least 1"
+        );
+        ensure!(
+            self.read_cycle_requests >= 1,
+            "read_cycle_requests must be at least 1"
+        );
+        ensure!(!self.cases.is_empty(), "at least one case is required");
+
+        let f = &self.fixture;
+        ensure!(f.series >= 1, "fixture.series must be at least 1");
+        ensure!(
+            f.samples_per_series >= 1,
+            "fixture.samples_per_series must be at least 1"
+        );
+        ensure!(f.interval_ms >= 1, "fixture.interval_ms must be at least 1");
+        ensure!(!f.workload.is_empty(), "fixture.workload must not be empty");
+        ensure!(
+            !f.timestamp_model.is_empty(),
+            "fixture.timestamp_model must not be empty"
+        );
+        ensure!(
+            !f.key_prefix.is_empty() && !f.key_prefix.contains([' ', ':', '\t', '\n']),
+            "fixture.key_prefix must be non-empty and free of whitespace and ':'"
+        );
+        ensure!(
+            f.label_cardinality.iter().all(|&c| c >= 1),
+            "fixture.label_cardinality entries must be at least 1"
+        );
+        ensure!(
+            self.series.chunk_size >= 64,
+            "series.chunk_size must be at least 64 bytes"
+        );
+
+        let mut ids = HashSet::new();
+        for case in &self.cases {
+            ensure!(!case.id.is_empty(), "case id must not be empty");
+            ensure!(
+                case.id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "case id {:?} must be [A-Za-z0-9_-]",
+                case.id
+            );
+            ensure!(
+                ids.insert(case.id.as_str()),
+                "duplicate case id {:?}",
+                case.id
+            );
+            ensure!(
+                case.connections >= 1,
+                "case {}: connections must be at least 1",
+                case.id
+            );
+            ensure!(
+                case.pipeline >= 1,
+                "case {}: pipeline must be at least 1",
+                case.id
+            );
+            match &case.kind {
+                CaseKind::Madd { batch } => {
+                    ensure!(
+                        *batch >= 1,
+                        "case {}: madd batch must be at least 1",
+                        case.id
+                    );
+                }
+                CaseKind::Get {
+                    distribution:
+                        KeyDistribution::Hot {
+                            keys,
+                            share_percent,
+                        },
+                } => {
+                    ensure!(
+                        *keys >= 1 && *keys <= f.series,
+                        "case {}: hot keys must be within 1..={}",
+                        case.id,
+                        f.series
+                    );
+                    ensure!(
+                        *share_percent <= 100,
+                        "case {}: share_percent must be at most 100",
+                        case.id
+                    );
+                }
+                CaseKind::Range {
+                    window: RangeWindow::Recent { points },
+                    ..
+                } => {
+                    ensure!(
+                        *points >= 1 && *points <= f.samples_per_series,
+                        "case {}: recent points must be within 1..={}",
+                        case.id,
+                        f.samples_per_series
+                    );
+                }
+                CaseKind::Range {
+                    window: RangeWindow::Middle { percent },
+                    ..
+                } => {
+                    ensure!(
+                        (1..=100).contains(percent),
+                        "case {}: middle percent must be within 1..=100",
+                        case.id
+                    );
+                }
+                CaseKind::Memory {} if case.connections != 1 || case.pipeline != 1 => {
+                    bail!(
+                        "case {}: memory cases take no connections/pipeline settings",
+                        case.id
+                    );
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Union of commands over all cases, sorted, for support checks.
+    pub fn commands(&self) -> Vec<&'static str> {
+        let mut set: Vec<&'static str> =
+            self.cases.iter().flat_map(|c| c.kind.commands()).collect();
+        set.sort_unstable();
+        set.dedup();
+        set
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "name": "t",
+            "description": "",
+            "fixture": {"series": 4, "samples_per_series": 10, "workload": "drift", "timestamp_model": "regular"},
+            "series": {"chunk_size": 4096, "duplicate_policy": "BLOCK",
+                       "encoding": {"subject": "chimp", "reference": "compressed"}},
+            "trials": 1, "warmup_seconds": 0, "read_duration_seconds": 1,
+            "cases": [{"id": "add", "kind": "add"}]
+        })
+    }
+
+    fn parse(v: serde_json::Value) -> Result<Scenario> {
+        let s: Scenario = serde_json::from_value(v)?;
+        s.validate()?;
+        Ok(s)
+    }
+
+    #[test]
+    fn minimal_scenario_parses_with_defaults() {
+        let s = parse(minimal()).unwrap();
+        assert_eq!(s.protocol, Protocol::Resp2);
+        assert_eq!(s.fixture.label_cardinality, vec![1, 10, 100]);
+        assert_eq!(s.cases[0].connections, 1);
+        assert_eq!(s.commands(), vec!["TS.ADD", "TS.CREATE", "TS.INFO"]);
+    }
+
+    #[test]
+    fn wrong_schema_version_is_refused() {
+        let mut v = minimal();
+        v["schema_version"] = 2.into();
+        let err = parse(v).unwrap_err().to_string();
+        assert!(err.contains("schema_version 2"), "{err}");
+    }
+
+    #[test]
+    fn unknown_field_is_refused() {
+        let mut v = minimal();
+        v["cases"][0]["pipelien"] = 16.into();
+        assert!(parse(v).is_err());
+    }
+
+    #[test]
+    fn unknown_nested_field_is_refused() {
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "g", "kind": "get", "distribution": {"type": "uniform", "keys": 1}}
+        ]);
+        assert!(parse(v).is_err());
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([{"id": "m", "kind": "memory", "batch": 1}]);
+        assert!(parse(v).is_err());
+    }
+
+    #[test]
+    fn unknown_case_kind_is_refused() {
+        let mut v = minimal();
+        v["cases"][0]["kind"] = "outliers".into();
+        assert!(parse(v).is_err());
+    }
+
+    #[test]
+    fn duplicate_case_ids_are_refused() {
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([{"id": "a", "kind": "add"}, {"id": "a", "kind": "memory"}]);
+        assert!(
+            parse(v)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate case id")
+        );
+    }
+
+    #[test]
+    fn tagged_parameters_are_checked() {
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "g", "kind": "get", "distribution": {"type": "hot", "keys": 99, "share_percent": 90}}
+        ]);
+        assert!(parse(v).unwrap_err().to_string().contains("hot keys"));
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "r", "kind": "range", "window": {"type": "recent", "points": 11}}
+        ]);
+        assert!(parse(v).unwrap_err().to_string().contains("recent points"));
+
+        let mut v = minimal();
+        v["cases"] = serde_json::json!([
+            {"id": "r", "kind": "range", "window": {"type": "middle", "percent": 10}, "reverse": true}
+        ]);
+        let s = parse(v).unwrap();
+        assert_eq!(
+            s.commands(),
+            vec!["TS.CREATE", "TS.INFO", "TS.MADD", "TS.REVRANGE"]
+        );
+    }
+}

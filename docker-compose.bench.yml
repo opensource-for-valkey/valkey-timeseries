@@ -1,0 +1,90 @@
+# Comparative benchmark deployment — see docs/plans/rts-comparative-benchmarks-plan.md.
+#
+# Both engines run here as containers with *equal* resource limits so the results
+# compare the two server/module stacks and nothing else. The reference service
+# `extends` the canonical one in docker-compose.compat.yml, so there is exactly one
+# RedisTimeSeries image pin in this repository (that file's digest); bumping it there
+# bumps it here. Only the runtime shape differs from the compat harness:
+#
+#   * keyspace notifications off, DEBUG on (needed for `MEMORY` diagnostics only);
+#   * no persistence, no eviction, no replicas (already the compat defaults);
+#   * a CPU set, a CPU quota and a memory limit, identical for both services.
+#
+# Run this file under its own compose project so it never touches the compat harness
+# containers or their ports; tools/server_bench.sh does that via the
+# COMPAT_REFERENCE_COMPOSE_FILE / COMPAT_REFERENCE_COMPOSE_PROJECT overrides of
+# tests/reference_server.sh:
+#
+#   COMPAT_REFERENCE_COMPOSE_FILE=docker-compose.bench.yml \
+#   COMPAT_REFERENCE_COMPOSE_PROJECT=valkey-ts-bench \
+#   COMPAT_REFERENCE_PORT=16479 docker compose -f docker-compose.bench.yml -p valkey-ts-bench up -d --wait reference
+#
+# Publishable runs (plan, "Comparable environments") need both images pinned by digest
+# and native-architecture containers on a dedicated Linux host. The subject image tag
+# below is the same one the compat harness uses; set BENCH_VALKEY_IMAGE to a
+# `valkey/valkey:9.1@sha256:...` digest for a publishable run — the driver records the
+# digest actually running (`docker inspect`) in the run manifest either way, and marks
+# tag-only pins as exploratory.
+#
+# Licensing note: as in the compat harness, the reference image is a black-box target.
+
+x-bench-limits: &bench-limits
+  # One CPU per server by default (plan: "Start with one CPU per server"). Set
+  # BENCH_CPUSET to pin the servers to specific cores and keep the driver elsewhere.
+  cpus: "${BENCH_CPUS:-1.0}"
+  cpuset: "${BENCH_CPUSET:-}"
+  mem_limit: "${BENCH_MEM_LIMIT:-4g}"
+  memswap_limit: "${BENCH_MEM_LIMIT:-4g}"
+  pids_limit: 512
+
+services:
+  reference:
+    extends:
+      file: docker-compose.compat.yml
+      service: reference
+    <<: *bench-limits
+    # `command` replaces the extended one wholesale (sequences of this key are not
+    # merged), so restate every flag we keep. Only notify-keyspace-events differs.
+    command:
+      - redis-server
+      - --enable-debug-command
+      - "yes"
+      - --notify-keyspace-events
+      - ""
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --io-threads
+      - "${BENCH_IO_THREADS:-1}"
+
+  subject:
+    image: "${BENCH_VALKEY_IMAGE:-valkey/valkey:9.1}"
+    <<: *bench-limits
+    volumes:
+      - "${BENCH_MODULE_PATH:-./target/release/libvalkey_timeseries.so}:/opt/module/libvalkey_timeseries.so:ro"
+    command:
+      - valkey-server
+      - --loadmodule
+      - /opt/module/libvalkey_timeseries.so
+      - --enable-debug-command
+      - "yes"
+      - --notify-keyspace-events
+      - ""
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --io-threads
+      - "${BENCH_IO_THREADS:-1}"
+    ports:
+      - "${BENCH_SUBJECT_PORT:-16480}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "6379", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
