@@ -87,7 +87,8 @@ malformed selectors are rejected. A scenario names:
 - `protocol` (resp2 default), `trials`, `warmup_seconds`, `read_duration_seconds`,
   `read_cycle_requests`;
 - `cases`, each with `connections` and `pipeline`:
-  - `add`, `madd {batch}` — ingestion into precreated series;
+  - `add`, `madd {batch, samples_per_series}` — ingestion into precreated series; `samples_per_series` (default 1)
+    is how many consecutive samples of one series a batch carries (1 = per-tick fan-in, `batch` = per-series buffering);
   - `get {distribution}`, `range {window, reverse}` — point and raw range reads;
   - `aggregate {window, aggregator, buckets, reverse}` — `ALIGN start AGGREGATION
     <min|max|count|sum|avg> <bucket>` with the bucket sized to yield about `buckets` points;

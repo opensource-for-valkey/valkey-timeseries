@@ -7,7 +7,7 @@
 use crate::common::block_on_keys::signal_timeseries_ready;
 #[cfg(not(test))]
 use crate::common::context::{create_key_string, notify_keyspace_event};
-use crate::common::threads::{IterIntoParRayon, ParCollectionRayon};
+use crate::common::threads::{IterIntoParRayon, ParCollectionRayon, request_par_threads};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::chunks::{ChunkOps, MIN_SAMPLES_FOR_BPS_ESTIMATE, TimeSeriesChunk};
@@ -468,15 +468,30 @@ pub(super) fn merge_samples_into_series(
         let chunk_refs =
             disjoint_get_many_mut_with_pos(series.chunks.as_mut_slice(), &chunk_indices);
 
-        let existing_results: Vec<(usize, Vec<SampleAddResult>)> = chunk_refs
-            .into_iter()
-            .zip(existing_groups.iter())
-            .iter_into_par_rayon()
-            .map(|(chunk, &(group_pos, _, samples))| {
-                let res = exec_merge(chunk, samples, resolved_policy);
-                (group_pos, res)
-            })
-            .collect();
+        // A MADD group is a handful of samples into one chunk; the parallel path
+        // is for bulk loads spanning many chunks.
+        let work: usize = existing_groups.iter().map(|(_, _, s)| s.len()).sum();
+        let threads = request_par_threads(existing_groups.len(), work);
+        let existing_results: Vec<(usize, Vec<SampleAddResult>)> = if threads == 1 {
+            chunk_refs
+                .into_iter()
+                .zip(existing_groups.iter())
+                .map(|(chunk, &(group_pos, _, samples))| {
+                    (group_pos, exec_merge(chunk, samples, resolved_policy))
+                })
+                .collect()
+        } else {
+            chunk_refs
+                .into_iter()
+                .zip(existing_groups.iter())
+                .iter_into_par_rayon()
+                .num_threads(threads)
+                .map(|(chunk, &(group_pos, _, samples))| {
+                    let res = exec_merge(chunk, samples, resolved_policy);
+                    (group_pos, res)
+                })
+                .collect()
+        };
 
         for (group_pos, res) in existing_results {
             group_results[group_pos] = Some(res);
@@ -487,18 +502,26 @@ pub(super) fn merge_samples_into_series(
     if !new_groups.is_empty() {
         let encoding = series.chunk_encoding;
         let chunk_size = series.chunk_size_bytes;
-        let new_results: Vec<(usize, TimeSeriesChunk, Vec<SampleAddResult>)> = new_groups
-            .par_rayon()
-            .map(|&(group_pos, samples)| {
-                let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
-                let res = exec_merge(&mut chunk, samples, resolved_policy);
-                // This group's samples are all this chunk will ever hold: the sort below places
-                // it among chunks that already own every neighbouring timestamp. (The one that
-                // lands last does become the new append target and will regrow once.)
-                seal_chunk(&mut chunk);
-                (group_pos, chunk, res)
-            })
-            .collect::<Vec<_>>();
+        let work: usize = new_groups.iter().map(|(_, s)| s.len()).sum();
+        let threads = request_par_threads(new_groups.len(), work);
+        let build = |&(group_pos, samples): &(usize, &[Sample])| {
+            let mut chunk = TimeSeriesChunk::new(encoding, chunk_size);
+            let res = exec_merge(&mut chunk, samples, resolved_policy);
+            // This group's samples are all this chunk will ever hold: the sort below places
+            // it among chunks that already own every neighbouring timestamp. (The one that
+            // lands last does become the new append target and will regrow once.)
+            seal_chunk(&mut chunk);
+            (group_pos, chunk, res)
+        };
+        let new_results: Vec<(usize, TimeSeriesChunk, Vec<SampleAddResult>)> = if threads == 1 {
+            new_groups.iter().map(build).collect()
+        } else {
+            new_groups
+                .par_rayon()
+                .num_threads(threads)
+                .map(build)
+                .collect::<Vec<_>>()
+        };
 
         let chunk_count_before = series.chunks.len();
 

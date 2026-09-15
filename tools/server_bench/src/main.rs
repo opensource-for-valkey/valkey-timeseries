@@ -306,7 +306,7 @@ fn estimate_frames(
     let preload = total.div_ceil(128);
     match &case.kind {
         CaseKind::Add {} => (f.series, 0, total, None),
-        CaseKind::Madd { batch } => {
+        CaseKind::Madd { batch, .. } => {
             let per_conn: usize = (0..conns)
                 .map(|c| {
                     ((f.series.saturating_sub(c)).div_ceil(conns) * f.samples_per_series)

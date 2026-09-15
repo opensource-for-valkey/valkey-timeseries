@@ -1,6 +1,6 @@
 use crate::common::context::key_for_display;
 use crate::common::logging::log_warning;
-use crate::common::threads::ParMutRayon;
+use crate::common::threads::{ParMutRayon, request_par_threads};
 use crate::common::{Sample, Timestamp};
 use crate::series::bulk_add::merge_samples_into_series;
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries};
@@ -105,6 +105,12 @@ pub(super) fn merge_samples(
     results
 }
 
+/// Sample-equivalents one appended sample is worth in the dispatch decision
+/// (see `common::threads::PARALLEL_MIN_WORK`): with this weight a batch goes
+/// parallel from about 256 samples across at least two series. Settled by a
+/// paired A/B of TS.MADD at 16, 128 and 1,024 samples per command.
+const MADD_SAMPLE_WORK: usize = 16;
+
 /// Merges samples across multiple series, supporting parallel processing when applicable.
 ///
 /// The merge phase may run on worker threads, but compaction propagation runs afterwards,
@@ -132,17 +138,22 @@ pub fn multi_series_merge_samples(
     }
     let mut groups = groups;
 
-    // Always parallel past one group: unlike a range read, each group carries tens
-    // of microseconds of work (guard bookkeeping, dedup, chunk append), and a paired
-    // A/B showed a sequential 16-sample MADD 16 % *slower* in wall time. The pool is
-    // what matters here: dispatching to it costs no thread creation, where the
-    // default runner spawned one OS thread per group on every command — the source
-    // of MADD's outsized server CPU per command.
-    let res = if groups.len() == 1 {
-        add_samples_internal(&mut groups[0])
+    // Dispatch to the pool only when the batch carries real work. An append costs
+    // more than decoding a sample (normalisation, duplicate handling, chunk
+    // encode), hence the weight; below the threshold a plain loop on the calling
+    // thread avoids the pool round trip *and* orx's per-call runner construction.
+    let total_samples: usize = groups.iter().map(|g| g.samples.len()).sum();
+    let threads = request_par_threads(groups.len(), total_samples * MADD_SAMPLE_WORK);
+    let res = if threads == 1 {
+        let mut acc: SmallVec<[(usize, SampleAddResult); 8]> = SmallVec::new();
+        for group in groups.iter_mut() {
+            acc.extend(add_samples_internal(group));
+        }
+        acc
     } else {
         groups
             .par_mut_rayon()
+            .num_threads(threads)
             .map(add_samples_internal)
             .reduce(|mut acc, item| {
                 acc.extend(item);

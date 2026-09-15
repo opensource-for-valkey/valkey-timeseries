@@ -52,6 +52,14 @@
       "pipeline": 1
     },
     {
+      "id": "madd16_4ps_c1_p1",
+      "kind": "madd",
+      "batch": 16,
+      "samples_per_series": 4,
+      "connections": 1,
+      "pipeline": 1
+    },
+    {
       "id": "get_uniform_c4",
       "kind": "get",
       "distribution": {

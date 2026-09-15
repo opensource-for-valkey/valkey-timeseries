@@ -287,14 +287,27 @@ fn owned_series(series: usize, connections: usize, conn: usize) -> Vec<usize> {
 /// over its own series, so every per-series stream is monotonic and the
 /// interleaving looks like concurrent ingestion rather than a series-by-series
 /// bulk load.
-fn writer_order(owned: &[usize], samples: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
-    (0..samples).flat_map(move |j| owned.iter().map(move |&i| (i, j)))
+fn writer_order(
+    owned: &[usize],
+    samples: usize,
+    run: usize,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    // Blocks of `run` consecutive samples per series, cycling over the writer's
+    // series: `run == 1` is timestamp-major (per-tick fan-in), `run == batch`
+    // makes each MADD carry one series' buffered samples. Per-series streams
+    // stay monotonic either way.
+    let run = run.max(1);
+    (0..samples).step_by(run).flat_map(move |j| {
+        owned
+            .iter()
+            .flat_map(move |&i| (j..(j + run).min(samples)).map(move |jj| (i, jj)))
+    })
 }
 
 fn add_stream(fixture: &Fixture, owned: &[usize]) -> Stream {
     let samples = fixture.manifest.shape.samples_per_series;
     let mut frames = Vec::with_capacity(owned.len() * samples);
-    for (i, j) in writer_order(owned, samples) {
+    for (i, j) in writer_order(owned, samples, 1) {
         let s = &fixture.series[i];
         let sample = &s.samples[j];
         let ts = sample.timestamp.to_string();
@@ -311,10 +324,10 @@ fn add_stream(fixture: &Fixture, owned: &[usize]) -> Stream {
     Stream { frames }
 }
 
-fn madd_stream(fixture: &Fixture, owned: &[usize], batch: usize) -> Stream {
+fn madd_stream(fixture: &Fixture, owned: &[usize], batch: usize, run: usize) -> Stream {
     let samples = fixture.manifest.shape.samples_per_series;
     let mut frames = Vec::with_capacity((owned.len() * samples).div_ceil(batch));
-    let order: Vec<(usize, usize)> = writer_order(owned, samples).collect();
+    let order: Vec<(usize, usize)> = writer_order(owned, samples, run).collect();
     for chunk in order.chunks(batch) {
         let mut owned_args: Vec<Vec<u8>> = Vec::with_capacity(chunk.len() * 3);
         let mut expect = Vec::with_capacity(chunk.len());
@@ -341,7 +354,7 @@ const PRELOAD_BATCH: usize = 128;
 
 fn preload_stream(fixture: &Fixture) -> Stream {
     let all: Vec<usize> = (0..fixture.series.len()).collect();
-    madd_stream(fixture, &all, PRELOAD_BATCH)
+    madd_stream(fixture, &all, PRELOAD_BATCH, 1)
 }
 
 fn pick_series(rng: &mut Rng, distribution: &KeyDistribution, series: usize) -> usize {
@@ -767,9 +780,19 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
                 .collect();
             (Stream::default(), workload, total, 0)
         }
-        CaseKind::Madd { batch } => {
+        CaseKind::Madd {
+            batch,
+            samples_per_series,
+        } => {
             let workload = (0..connections)
-                .map(|c| madd_stream(fixture, &owned_series(series, connections, c), *batch))
+                .map(|c| {
+                    madd_stream(
+                        fixture,
+                        &owned_series(series, connections, c),
+                        *batch,
+                        *samples_per_series,
+                    )
+                })
                 .collect();
             (Stream::default(), workload, total, 0)
         }
@@ -978,6 +1001,44 @@ mod tests {
         };
         assert_eq!(e.len(), 2);
         assert!(frames[0].bytes.starts_with(b"*16\r\n$7\r\nTS.MADD\r\n"));
+    }
+
+    #[test]
+    fn madd_runs_group_consecutive_samples_per_series() {
+        let f = fixture("maddrun", 3, 8);
+        let s = scenario(
+            serde_json::json!([{"id": "m", "kind": "madd", "batch": 8, "samples_per_series": 4}]),
+            3,
+            8,
+        );
+        let t = build_case(&s, &f, &s.cases[0]);
+        // 3 series x 8 samples = 24 samples, 8 per command = 3 commands.
+        let frames = &t.workload[0].frames;
+        assert_eq!(frames.len(), 3);
+        let keys_of = |fr: &Frame| -> Vec<String> {
+            String::from_utf8(fr.bytes.clone())
+                .unwrap()
+                .split("\r\n")
+                .filter(|p| p.starts_with("bench:"))
+                .map(str::to_string)
+                .collect()
+        };
+        // First command: series 0 samples 0..4, then series 1 samples 0..4.
+        let mut want: Vec<String> = vec!["bench:0".into(); 4];
+        want.extend(vec!["bench:1".to_string(); 4]);
+        assert_eq!(keys_of(&frames[0]), want);
+        // Per-series streams stay monotonic across commands.
+        let mut last = std::collections::HashMap::<String, i64>::new();
+        for fr in frames {
+            let Expect::Ints(ts) = &fr.expect else {
+                panic!()
+            };
+            for (k, t) in keys_of(fr).into_iter().zip(ts) {
+                let e = last.entry(k).or_insert(i64::MIN);
+                assert!(*t > *e);
+                *e = *t;
+            }
+        }
     }
 
     #[test]

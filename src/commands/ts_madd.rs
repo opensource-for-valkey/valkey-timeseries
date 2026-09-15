@@ -1,4 +1,5 @@
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
+use crate::common::acl::KeyAccess;
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::notify_keyspace_event;
 use crate::common::time::current_time_millis;
@@ -30,7 +31,18 @@ struct ParsedInput<'a> {
 struct SeriesSamples<'a> {
     series: Option<SeriesGuardMut<'a>>,
     err: SampleAddResult,
-    samples: Vec<ParsedInput<'a>>,
+    /// Indices into the command's `all_inputs`, in argument order.
+    samples: SmallVec<[usize; 4]>,
+}
+
+/// Everything parsed from the arguments, in argument order, plus the per-key
+/// groups that reference it by index.
+struct ParsedCommand<'a> {
+    input_map: AHashMap<&'a ValkeyString, SeriesSamples<'a>>,
+    all_inputs: Vec<ParsedInput<'a>>,
+    /// True when some `*` timestamp was resolved to a concrete time: the
+    /// replica must then see the resolved arguments, not the original ones.
+    rewrote_args: bool,
 }
 
 acl_categories!(TS_MADD, "ts.madd", "write timeseries");
@@ -68,12 +80,16 @@ pub fn ts_madd_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let current_ts = ctx.create_string(now.to_string());
 
     // Parse once, keep inputs already in original order (no regroup+sort later)
-    let (mut input_map, all_inputs) = parse_args(ctx, &args[1..], &current_ts)?;
+    let ParsedCommand {
+        mut input_map,
+        all_inputs,
+        rewrote_args,
+    } = parse_args(ctx, &args[1..], &current_ts)?;
 
     // Results aligned by original input order
     let results = handle_update(ctx, &mut input_map, &all_inputs, sample_count)?;
 
-    handle_replication(ctx, &all_inputs);
+    handle_replication(ctx, &all_inputs, rewrote_args);
 
     Ok(ValkeyValue::Array(
         results.into_iter().map(ValkeyValue::from).collect(),
@@ -103,8 +119,8 @@ fn handle_update(
         let res = samples.err;
         if !res.is_ok() {
             // Series-level error applies to every sample in that series
-            for input in samples.samples.iter() {
-                results[input.index] = res;
+            for &idx in samples.samples.iter() {
+                results[idx] = res;
             }
             continue;
         }
@@ -116,9 +132,10 @@ fn handle_update(
         counts_before.push((*key, series.total_samples));
 
         let mut s = PerSeriesSamples::new(series.deref_mut());
-        for input in samples.samples.iter() {
+        for &idx in samples.samples.iter() {
+            let input = &all_inputs[idx];
             if input.res.is_ok() {
-                s.add_sample(Sample::new(input.timestamp, input.value), input.index);
+                s.add_sample(Sample::new(input.timestamp, input.value), idx);
             }
             // parse errors are already in `results` from initialization above
         }
@@ -157,15 +174,16 @@ fn parse_args<'a>(
     ctx: &'a Context,
     args: &'a [ValkeyString],
     current_ts: &'a ValkeyString,
-) -> ValkeyResult<(
-    AHashMap<&'a ValkeyString, SeriesSamples<'a>>,
-    Vec<ParsedInput<'a>>,
-)> {
+) -> ValkeyResult<ParsedCommand<'a>> {
     let sample_count = args.len() / 3;
 
     let mut input_map: AHashMap<&ValkeyString, SeriesSamples> =
         AHashMap::with_capacity(sample_count);
     let mut all_inputs: Vec<ParsedInput<'a>> = Vec::with_capacity(sample_count);
+    let mut rewrote_args = false;
+    // The caller's identity is resolved once for the command; each key then
+    // costs one permission check (or none when the user may reach every key).
+    let access = KeyAccess::new(ctx, AclPermissions::UPDATE);
 
     for (sample_index, chunk) in args.chunks_exact(3).enumerate() {
         let key = &chunk[0];
@@ -177,6 +195,7 @@ fn parse_args<'a>(
         let (raw_timestamp, timestamp_str) = {
             let s = raw_timestamp_in.try_as_str()?;
             if s == "*" {
+                rewrote_args = true;
                 (current_ts, "*")
             } else {
                 (raw_timestamp_in, s)
@@ -187,23 +206,25 @@ fn parse_args<'a>(
 
         // Resolve per-series guard once (first time we see a key); cache series-level error.
         if series_samples.samples.is_empty() {
-            series_samples.err =
-                match try_get_timeseries_mut(ctx, key, Some(AclPermissions::UPDATE)) {
-                    Ok(Some(guard)) => {
-                        series_samples.series = Some(guard);
-                        SampleAddResult::Ok(Sample::default())
-                    }
-                    // Unlike TS.ADD, TS.MADD does not create the series: a missing
-                    // key is a per-item error and the keyspace is left alone
-                    // (RedisTimeSeries parity — a mistyped key in a batch must not
-                    // silently materialize a series).
-                    Ok(None) => SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY),
-                    Err(ValkeyError::WrongType) => {
-                        SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY)
-                    }
-                    Err(ValkeyError::Str(err)) => SampleAddResult::Error(err),
-                    Err(_) => SampleAddResult::Error(error_consts::PERMISSION_DENIED),
-                };
+            series_samples.err = match access
+                .check(key)
+                .and_then(|()| try_get_timeseries_mut(ctx, key, None))
+            {
+                Ok(Some(guard)) => {
+                    series_samples.series = Some(guard);
+                    SampleAddResult::Ok(Sample::default())
+                }
+                // Unlike TS.ADD, TS.MADD does not create the series: a missing
+                // key is a per-item error and the keyspace is left alone
+                // (RedisTimeSeries parity — a mistyped key in a batch must not
+                // silently materialize a series).
+                Ok(None) => SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY),
+                Err(ValkeyError::WrongType) => {
+                    SampleAddResult::Error(error_consts::INVALID_TIMESERIES_KEY)
+                }
+                Err(ValkeyError::Str(err)) => SampleAddResult::Error(err),
+                Err(_) => SampleAddResult::Error(error_consts::PERMISSION_DENIED),
+            };
         }
 
         // Parse timestamp/value only if the series is usable.
@@ -234,7 +255,8 @@ fn parse_args<'a>(
             (ts, v)
         };
 
-        let input = ParsedInput {
+        series_samples.samples.push(sample_index);
+        all_inputs.push(ParsedInput {
             key,
             raw_timestamp,
             raw_value,
@@ -242,40 +264,37 @@ fn parse_args<'a>(
             value,
             index: sample_index,
             res,
-        };
-
-        let second = ParsedInput {
-            key,
-            raw_timestamp,
-            raw_value,
-            timestamp,
-            value,
-            index: sample_index,
-            res,
-        };
-
-        // Keep both collections in input order (same struct, duplicated storage).
-        series_samples.samples.push(input);
-        all_inputs.push(second);
+        });
     }
 
-    Ok((input_map, all_inputs))
+    Ok(ParsedCommand {
+        input_map,
+        all_inputs,
+        rewrote_args,
+    })
 }
 
-fn handle_replication(ctx: &Context, inputs: &[ParsedInput]) {
-    let mut replication_args: SmallVec<[_; 24]> = SmallVec::new();
-    for input in inputs.iter() {
-        if input.res.is_ok() {
+fn handle_replication(ctx: &Context, inputs: &[ParsedInput], rewrote_args: bool) {
+    let ok_count = inputs.iter().filter(|i| i.res.is_ok()).count();
+    if ok_count == 0 {
+        return;
+    }
+
+    if ok_count == inputs.len() && !rewrote_args {
+        // Every item was accepted as given: replicate the command as the client
+        // sent it instead of re-marshalling every argument.
+        ctx.replicate_verbatim();
+    } else {
+        let mut replication_args: SmallVec<[_; 24]> = SmallVec::new();
+        for input in inputs.iter().filter(|i| i.res.is_ok()) {
             replication_args.push(input.key);
             replication_args.push(input.raw_timestamp);
             replication_args.push(input.raw_value);
         }
+        ctx.replicate("TS.MADD", &*replication_args);
     }
 
-    if !replication_args.is_empty() {
-        ctx.replicate("TS.MADD", &*replication_args);
-        for key in replication_args.into_iter().step_by(3) {
-            notify_keyspace_event(ctx, c"ts.add", key);
-        }
+    for input in inputs.iter().filter(|i| i.res.is_ok()) {
+        notify_keyspace_event(ctx, c"ts.add", input.key);
     }
 }

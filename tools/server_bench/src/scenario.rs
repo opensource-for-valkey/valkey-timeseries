@@ -199,6 +199,9 @@ pub struct Case {
 fn one() -> u32 {
     1
 }
+fn one_usize() -> usize {
+    1
+}
 
 /// Case families. Only the first-comparison set (plan, sequence step 2) exists
 /// so far; aggregation, label and grouped queries are step 3 and will be added
@@ -213,7 +216,15 @@ pub enum CaseKind {
     /// set of series and writes them as monotonic timestamp streams.
     Add {},
     /// `TS.MADD` with `batch` samples per command, same ownership rules.
-    Madd { batch: usize },
+    /// `samples_per_series` is how many consecutive samples of one series a
+    /// batch carries: 1 is per-tick fan-in (one sample for each of `batch`
+    /// series), `batch` is per-series buffering. The two shapes take different
+    /// paths in the module, so both are worth measuring.
+    Madd {
+        batch: usize,
+        #[serde(default = "one_usize")]
+        samples_per_series: usize,
+    },
     /// `TS.GET` over loaded series.
     Get { distribution: KeyDistribution },
     /// `TS.RANGE` / `TS.REVRANGE` over loaded series.
@@ -469,10 +480,23 @@ impl Scenario {
                 case.id
             );
             match &case.kind {
-                CaseKind::Madd { batch } => {
+                CaseKind::Madd {
+                    batch,
+                    samples_per_series,
+                } => {
                     ensure!(
                         *batch >= 1,
                         "case {}: madd batch must be at least 1",
+                        case.id
+                    );
+                    ensure!(
+                        *samples_per_series >= 1 && *samples_per_series <= *batch,
+                        "case {}: samples_per_series must be within 1..=batch",
+                        case.id
+                    );
+                    ensure!(
+                        *samples_per_series <= f.samples_per_series,
+                        "case {}: samples_per_series exceeds the fixture's samples per series",
                         case.id
                     );
                 }

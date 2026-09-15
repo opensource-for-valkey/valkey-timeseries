@@ -120,6 +120,9 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   adapters with `.num_threads(request_par_threads(items, work))` (see `series/mrange.rs`,
   `sample_merge.rs`): below the threshold a pool round trip costs more than the work. When the
   threshold says sequential, use a plain loop.
+- Commands that touch many keys resolve the caller once with `series::acl::KeyAccess` and check each key
+  through it (`TS.MADD`, `TS.MDEL`, the querier); never cache one across commands. `TS.MADD` replicates
+  verbatim when every item was accepted and no `*` timestamp was rewritten.
 
 ## Testing
 

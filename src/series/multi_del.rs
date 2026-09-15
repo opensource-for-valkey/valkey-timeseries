@@ -1,7 +1,7 @@
 use crate::common::Timestamp;
 use crate::common::acl::KeyAccess;
 use crate::common::context::{create_key_string, notify_keyspace_event};
-use crate::common::threads::ParMutRayon;
+use crate::common::threads::{ParMutRayon, request_par_threads};
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
@@ -122,8 +122,10 @@ fn delete_range_batch(
     let start_arg = ctx.create_string(start_ts.to_string());
     let end_arg = ctx.create_string(end_ts.to_string());
     let mut series = series;
+    let threads = request_par_threads(series.len(), series.iter().map(|g| g.total_samples).sum());
     let res = series
         .par_mut_rayon()
+        .num_threads(threads)
         .map(|guard| guard.remove_range(start_ts, end_ts))
         .collect::<Vec<_>>();
 
