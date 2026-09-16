@@ -445,3 +445,71 @@ fn test_beats_gorilla_on_decimal_data() {
         "chimp used {chimp_bytes} bytes vs gorilla's {gorilla_bytes} on 3-decimal-digit data",
     );
 }
+
+mod allocation {
+    use super::*;
+    use get_size2::GetSize;
+
+    /// A sealed chunk's allocation stays within `max_size` plus a few bytes of slack, and
+    /// filling it is still geometric. See the Gorilla twin of this test for the history.
+    #[test]
+    fn sealed_chunk_allocation_is_capped_at_max_size() {
+        for max_size in [1024usize, 4096, 16384] {
+            let mut chunk = ChimpChunk::with_max_size(max_size);
+            let samples = generate_samples(max_size * 2);
+            let mut reallocations = 0;
+            let mut cap = 0;
+            for sample in samples.iter() {
+                if chunk.is_full() {
+                    break;
+                }
+                chunk.add_sample(sample).unwrap();
+                let c = chunk.encoder.get_heap_size();
+                if c != cap {
+                    reallocations += 1;
+                    cap = c;
+                }
+            }
+            assert!(
+                chunk.is_full(),
+                "{max_size}: not full after {} samples",
+                samples.len()
+            );
+            let heap = chunk.encoder.get_heap_size();
+            assert!(
+                heap <= max_size + 32,
+                "{max_size}-byte chunk holds a {heap}-byte allocation"
+            );
+            assert!(heap >= chunk.data_size());
+            assert!(
+                reallocations <= 16,
+                "{max_size}-byte chunk reallocated {reallocations} times"
+            );
+        }
+    }
+
+    /// The cap survives a serialize/deserialize round trip and a rebuild (split).
+    #[test]
+    fn loaded_and_rebuilt_chunks_keep_the_cap() {
+        let max_size = 1024;
+        let mut chunk = ChimpChunk::with_max_size(max_size);
+        for sample in generate_samples(40).iter() {
+            chunk.add_sample(sample).unwrap();
+        }
+        let mut buf = Vec::new();
+        chunk.serialize(&mut buf);
+        let mut loaded = ChimpChunk::deserialize(&buf).unwrap();
+        for sample in generate_samples(8000).iter().skip(40) {
+            if loaded.is_full() {
+                break;
+            }
+            loaded.add_sample(sample).unwrap();
+        }
+        assert!(loaded.is_full());
+        assert!(loaded.encoder.get_heap_size() <= max_size + 32);
+
+        let right = loaded.split().unwrap();
+        assert!(loaded.encoder.get_heap_size() <= max_size + 32);
+        assert!(right.encoder.get_heap_size() <= max_size + 32);
+    }
+}

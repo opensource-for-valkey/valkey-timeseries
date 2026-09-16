@@ -37,13 +37,13 @@ impl Default for ChimpChunk {
 impl ChimpChunk {
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
-            encoder: ChimpCompressor::new(),
+            encoder: ChimpCompressor::with_soft_cap(max_size),
             max_size,
         }
     }
 
     fn compress(&mut self, samples: &[Sample]) -> TsdbResult {
-        let mut encoder = ChimpCompressor::new();
+        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
         for sample in samples {
             push_sample(&mut encoder, sample)?;
         }
@@ -142,7 +142,7 @@ impl ChunkOps for ChimpChunk {
             return Ok(0);
         }
 
-        let mut new_encoder = ChimpCompressor::new();
+        let mut new_encoder = ChimpCompressor::with_soft_cap(self.max_size);
         let saved_count = self.len();
 
         for value in self.encoder.iter() {
@@ -177,7 +177,7 @@ impl ChunkOps for ChimpChunk {
             return Ok(1);
         }
 
-        let mut encoder = ChimpCompressor::new();
+        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
         let mut iter = self.encoder.iter();
 
         if ts < self.first_timestamp() {
@@ -233,7 +233,7 @@ impl ChunkOps for ChimpChunk {
             return append_samples(self, samples);
         }
 
-        let mut encoder = ChimpCompressor::new();
+        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
         let result = merge_chunk_samples(self.iter(), samples, dp_policy, |sample| {
             push_sample(&mut encoder, &sample)
         })?;
@@ -276,7 +276,7 @@ impl Chunk for ChimpChunk {
             return Ok(self.clone());
         }
 
-        let mut left = ChimpCompressor::new();
+        let mut left = ChimpCompressor::with_soft_cap(self.max_size);
         let mut right = ChimpChunk::with_max_size(self.max_size);
 
         let mid = self.len() / 2;
@@ -300,7 +300,8 @@ impl Chunk for ChimpChunk {
 
     fn load_rdb(rdb: *mut RedisModuleIO, _enc_ver: i32) -> ValkeyResult<Self> {
         let max_size = rdb_load_usize(rdb)?;
-        let encoder = ChimpCompressor::rdb_load(rdb)?;
+        let mut encoder = ChimpCompressor::rdb_load(rdb)?;
+        encoder.set_soft_cap(max_size);
         Ok(ChimpChunk { encoder, max_size })
     }
 
@@ -312,7 +313,8 @@ impl Chunk for ChimpChunk {
     fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
         let mut buf = buf;
         let max_size = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
-        let encoder = ChimpCompressor::deserialize(buf)?;
+        let mut encoder = ChimpCompressor::deserialize(buf)?;
+        encoder.set_soft_cap(max_size as usize);
         Ok(ChimpChunk {
             encoder,
             max_size: max_size as usize,
