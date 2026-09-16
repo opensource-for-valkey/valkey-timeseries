@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::fixture::{Fixture, hex};
 use crate::scenario::{
     Aggregator, Case, CaseKind, KeyDistribution, RangeWindow, Reducer, Scenario, SeriesSpec,
+    ValueBand,
 };
 
 /// Which product a setup stream targets.
@@ -433,26 +434,39 @@ fn range_streams(
     case: &Case,
     window: &RangeWindow,
     reverse: bool,
+    band: Option<ValueBand>,
     cycle: usize,
 ) -> Vec<Stream> {
     let connections = case.connections as usize;
     let mut rng = Rng::for_case(&case.id);
     let mut streams = vec![Stream::default(); connections];
     let cmd: &[u8] = if reverse { b"TS.REVRANGE" } else { b"TS.RANGE" };
+    let band_args = band.map(|b| (b.min.to_string(), b.max.to_string()));
     for n in 0..cycle {
         let i = rng.below(fixture.series.len());
         let s = &fixture.series[i];
         let (from, to, count) = window_bounds(&s.samples, window);
+        let count = match band {
+            Some(b) => s
+                .samples
+                .iter()
+                .filter(|x| x.timestamp >= from && x.timestamp <= to && b.contains(x.value))
+                .count(),
+            None => count,
+        };
         let (from_arg, to_arg) = window_args(window, from, to);
-        streams[n % connections].frames.push(Frame::new(
-            &[
-                cmd,
-                s.key.as_bytes(),
-                from_arg.as_bytes(),
-                to_arg.as_bytes(),
-            ],
-            Expect::Samples { count, from, to },
-        ));
+        let mut args: Vec<&[u8]> = vec![
+            cmd,
+            s.key.as_bytes(),
+            from_arg.as_bytes(),
+            to_arg.as_bytes(),
+        ];
+        if let Some((min, max)) = &band_args {
+            args.extend([&b"FILTER_BY_VALUE"[..], min.as_bytes(), max.as_bytes()]);
+        }
+        streams[n % connections]
+            .frames
+            .push(Frame::new(&args, Expect::Samples { count, from, to }));
     }
     streams
 }
@@ -528,12 +542,14 @@ fn aggregate_streams(
     aggregator: Aggregator,
     buckets: usize,
     reverse: bool,
+    band: Option<ValueBand>,
     cycle: usize,
 ) -> Vec<Stream> {
     let connections = case.connections as usize;
     let mut rng = Rng::for_case(&case.id);
     let mut streams = vec![Stream::default(); connections];
     let cmd: &[u8] = if reverse { b"TS.REVRANGE" } else { b"TS.RANGE" };
+    let band_args = band.map(|b| (b.min.to_string(), b.max.to_string()));
     for n in 0..cycle {
         let i = rng.below(fixture.series.len());
         let s = &fixture.series[i];
@@ -543,19 +559,36 @@ fn aggregate_streams(
         let (from_arg, to_arg) = (from.to_string(), to.to_string());
         let bucket = bucket_ms(from, to, buckets);
         let bucket_arg = bucket.to_string();
-        let expected = aggregate(&s.samples, from, to, bucket, aggregator);
+        let expected = match band {
+            Some(b) => {
+                let passing: Vec<_> = s
+                    .samples
+                    .iter()
+                    .filter(|x| b.contains(x.value))
+                    .cloned()
+                    .collect();
+                aggregate(&passing, from, to, bucket, aggregator)
+            }
+            None => aggregate(&s.samples, from, to, bucket, aggregator),
+        };
+        let mut args: Vec<&[u8]> = vec![
+            cmd,
+            s.key.as_bytes(),
+            from_arg.as_bytes(),
+            to_arg.as_bytes(),
+        ];
+        if let Some((min, max)) = &band_args {
+            args.extend([&b"FILTER_BY_VALUE"[..], min.as_bytes(), max.as_bytes()]);
+        }
+        args.extend([
+            &b"ALIGN"[..],
+            b"start",
+            b"AGGREGATION",
+            aggregator.as_arg().as_bytes(),
+            bucket_arg.as_bytes(),
+        ]);
         streams[n % connections].frames.push(Frame::new(
-            &[
-                cmd,
-                s.key.as_bytes(),
-                from_arg.as_bytes(),
-                to_arg.as_bytes(),
-                b"ALIGN",
-                b"start",
-                b"AGGREGATION",
-                aggregator.as_arg().as_bytes(),
-                bucket_arg.as_bytes(),
-            ],
+            &args,
             Expect::Buckets {
                 buckets: expected,
                 exact: aggregator.is_exact(),
@@ -806,13 +839,18 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
             0,
             total,
         ),
-        CaseKind::Range { window, reverse } => (
+        CaseKind::Range {
+            window,
+            reverse,
+            filter_by_value,
+        } => (
             preload_stream(fixture),
             range_streams(
                 fixture,
                 case,
                 window,
                 *reverse,
+                *filter_by_value,
                 scenario.read_cycle_requests,
             ),
             0,
@@ -824,6 +862,7 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
             aggregator,
             buckets,
             reverse,
+            filter_by_value,
         } => (
             preload_stream(fixture),
             aggregate_streams(
@@ -833,6 +872,7 @@ pub fn build_case(scenario: &Scenario, fixture: &Fixture, case: &Case) -> CaseTr
                 *aggregator,
                 *buckets,
                 *reverse,
+                *filter_by_value,
                 scenario.read_cycle_requests,
             ),
             0,

@@ -89,8 +89,10 @@ malformed selectors are rejected. A scenario names:
 - `cases`, each with `connections` and `pipeline`:
   - `add`, `madd {batch, samples_per_series}` — ingestion into precreated series; `samples_per_series` (default 1)
     is how many consecutive samples of one series a batch carries (1 = per-tick fan-in, `batch` = per-series buffering);
-  - `get {distribution}`, `range {window, reverse}` — point and raw range reads;
-  - `aggregate {window, aggregator, buckets, reverse}` — `ALIGN start AGGREGATION
+  - `get {distribution}`, `range {window, reverse, filter_by_value}` — point and raw range
+    reads; `filter_by_value: {min, max}` adds `FILTER_BY_VALUE` (a band no value falls in,
+    `{1e300, 1e301}`, makes the command a scan with no output: the decode cost alone);
+  - `aggregate {window, aggregator, buckets, reverse, filter_by_value}` — `ALIGN start AGGREGATION
     <min|max|count|sum|avg> <bucket>` with the bucket sized to yield about `buckets` points;
   - `queryindex {label}`, `mget {label}`, `mrange {label, window}` — label queries on
     `l<label>=<value>`; the value cycles deterministically, and selectivity follows the
@@ -113,7 +115,9 @@ malformed selectors are rejected. A scenario names:
   spread the wire-format share of a gap.
 
 Profiles: `smoke` (10 × 1,000, one case per family), `core` (1,000 × 1,000, ingest /
-point / range / memory), `range` (the core fixture; raw RANGE windows with RESP3 twins,
+point / range / memory), `agg` (the core fixture; scan-only probe, count/min/sum/avg at
+100 buckets, avg at 1,000, GROUPBY at 10 and 100 groups — the profile behind
+`docs/plans/aggregation-performance-plan.md`), `range` (the core fixture; raw RANGE windows with RESP3 twins,
 `head100`, GET as a control — the profile behind
 `docs/plans/range-performance-plan.md`), `query` (aggregations, label queries at
 1/10/100 % selectivity, 10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the

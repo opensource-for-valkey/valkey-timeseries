@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "query",
-  "description": "Query-breadth profile (plan step 3): 1,000 series x 1,000 samples; aggregated ranges (min/max/count/sum/avg at ~100 and ~1,000 buckets), label queries at 1 %/10 %/100 % selectivity (TS.QUERYINDEX, TS.MGET, bounded TS.MRANGE), and GROUPBY/REDUCE with 10 and 100 groups. Plan defaults: 5 trials, 5 s warm-up, 30 s reads.",
+  "description": "Query-breadth profile (plan step 3): 1,000 series x 1,000 samples; aggregated ranges (min/max/count/sum/avg at ~100 and ~1,000 buckets), label queries at 1 %/10 %/100 % selectivity (TS.QUERYINDEX, TS.MGET, bounded TS.MRANGE), and GROUPBY/REDUCE with 10 and 100 groups. Plan defaults: 5 trials, 5 s warm-up, 30 s reads. `range_full_nomatch` scans every sample and returns none (FILTER_BY_VALUE on an empty band): with `agg_count100` it separates scan, bucketing and emission per engine.",
   "fixture": {
     "series": 1000,
     "samples_per_series": 1000,
@@ -32,6 +32,18 @@
   "min_write_seconds": 30,
   "settle_seconds": 3,
   "cases": [
+    {
+      "id": "range_full_nomatch_c8",
+      "kind": "range",
+      "window": {
+        "type": "full"
+      },
+      "filter_by_value": {
+        "min": 1e+300,
+        "max": 1e+301
+      },
+      "connections": 8
+    },
     {
       "id": "agg_min100_c8",
       "kind": "aggregate",

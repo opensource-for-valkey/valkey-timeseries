@@ -145,7 +145,10 @@ fn cpu_us_per_command(t: &TrialResult) -> f64 {
 
 /// Bytes the server wrote to clients per command (INFO `total_net_output_bytes`).
 fn net_out_per_command(t: &TrialResult) -> f64 {
-    let out = *t.server_deltas.get("total_net_output_bytes").unwrap_or(&0.0);
+    let out = *t
+        .server_deltas
+        .get("total_net_output_bytes")
+        .unwrap_or(&0.0);
     if t.requests > 0 {
         out / t.requests as f64
     } else {

@@ -243,6 +243,11 @@ pub enum CaseKind {
         window: RangeWindow,
         #[serde(default)]
         reverse: bool,
+        /// `FILTER_BY_VALUE min max`. A band no fixture value falls in (say
+        /// `1e300..1e301`) makes the command a scan with no output — the
+        /// decode cost on its own, on both engines.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_by_value: Option<ValueBand>,
     },
     /// Memory accounting of empty and loaded series; no timed workload.
     Memory {},
@@ -254,6 +259,9 @@ pub enum CaseKind {
         buckets: usize,
         #[serde(default)]
         reverse: bool,
+        /// As for `range`; the bucket oracle sees only the passing samples.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter_by_value: Option<ValueBand>,
     },
     /// `TS.QUERYINDEX l<label>=<value>`; the value cycles deterministically, so
     /// the expected key set is exact for every request.
@@ -276,6 +284,20 @@ pub enum CaseKind {
         buckets: usize,
         reducer: Reducer,
     },
+}
+
+/// `FILTER_BY_VALUE min max`, inclusive on both ends as both products define it.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValueBand {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl ValueBand {
+    pub fn contains(&self, value: f64) -> bool {
+        value >= self.min && value <= self.max
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -411,6 +433,16 @@ fn check_window(case_id: &str, window: &RangeWindow, samples: usize) -> Result<(
     Ok(())
 }
 
+fn check_band(case_id: &str, band: &Option<ValueBand>) -> Result<()> {
+    if let Some(b) = band {
+        ensure!(
+            b.min.is_finite() && b.max.is_finite() && b.min <= b.max,
+            "case {case_id}: filter_by_value needs finite min <= max"
+        );
+    }
+    Ok(())
+}
+
 fn check_label(case_id: &str, label: usize, labels: usize) -> Result<()> {
     ensure!(
         label < labels,
@@ -539,13 +571,22 @@ impl Scenario {
                         case.id
                     );
                 }
-                CaseKind::Range { window, .. } => {
-                    check_window(&case.id, window, f.samples_per_series)?;
-                }
-                CaseKind::Aggregate {
-                    window, buckets, ..
+                CaseKind::Range {
+                    window,
+                    filter_by_value,
+                    ..
                 } => {
                     check_window(&case.id, window, f.samples_per_series)?;
+                    check_band(&case.id, filter_by_value)?;
+                }
+                CaseKind::Aggregate {
+                    window,
+                    buckets,
+                    filter_by_value,
+                    ..
+                } => {
+                    check_window(&case.id, window, f.samples_per_series)?;
+                    check_band(&case.id, filter_by_value)?;
                     ensure!(
                         *buckets >= 1,
                         "case {}: buckets must be at least 1",
