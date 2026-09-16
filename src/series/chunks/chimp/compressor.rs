@@ -132,6 +132,19 @@ impl ChimpCompressor {
         }
     }
 
+    /// An empty compressor whose bit stream will not allocate past `max_size` (plus a few
+    /// bytes of slack) while it is within budget; see `BitStream::set_soft_cap`.
+    pub fn with_soft_cap(max_size: usize) -> Self {
+        let mut c = Self::new();
+        c.writer.set_soft_cap(max_size);
+        c
+    }
+
+    /// See `BitStream::set_soft_cap`. A loaded chunk calls this once it knows its budget.
+    pub fn set_soft_cap(&mut self, max_size: usize) {
+        self.writer.set_soft_cap(max_size);
+    }
+
     /// Number of samples added so far.
     pub fn count(&self) -> u64 {
         self.count
@@ -317,8 +330,8 @@ impl ChimpCompressor {
     /// Comparison is on the bit pattern, so `-0.0` never counts as a repeat of
     /// `0.0` and a NaN repeats only itself.
     fn write_repeat(&mut self) -> io::Result<()> {
-        self.writer.write_bit(false);
-        self.chimp.add_repeat(&mut self.writer)
+        // Elf case `0` folded into the Chimp flag write: one 3-bit write.
+        self.chimp.add_repeat_prefixed(&mut self.writer, 0, 1)
     }
 
     fn write_value(&mut self, v: f64) -> io::Result<()> {
@@ -332,8 +345,8 @@ impl ChimpCompressor {
             // Zero, the infinities and NaN: Elf case `10`, bit pattern stored
             // verbatim. ELF erasure is defined in terms of decimal
             // significant digits, which none of these have.
-            self.writer.write_bits(2, 0b10)?;
-            self.chimp.add_value(&mut self.writer, v_long)?;
+            self.chimp
+                .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
         } else {
             // Normal or subnormal: attempt ELF erasure.
             match get_alpha_and_beta_star(v, self.last_beta_star) {
@@ -342,8 +355,8 @@ impl ChimpCompressor {
                         // Negative alpha can arise from the significant-count
                         // "bug cap" (beta = 17) for large magnitudes; such
                         // values cannot be erased reversibly, so store raw.
-                        self.writer.write_bits(2, 0b10)?;
-                        self.chimp.add_value(&mut self.writer, v_long)?;
+                        self.chimp
+                            .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
                     } else {
                         let e = ((v_long >> 52) & 0x7ff) as i32;
                         let g_alpha = get_f_alpha(alpha) + e - 1023;
@@ -366,28 +379,42 @@ impl ChimpCompressor {
                                     // not one — a distinct `v` can erase onto the
                                     // previous raw bit pattern. Store it raw so
                                     // the decoder cannot misread it as a repeat.
-                                    self.writer.write_bits(2, 0b10)?;
-                                    self.chimp.add_value(&mut self.writer, v_long)?;
+                                    self.chimp.add_value_prefixed(
+                                        &mut self.writer,
+                                        0b10,
+                                        2,
+                                        v_long,
+                                    )?;
                                     return Ok(());
                                 }
-                                self.writer.write_bit(false); // case `0`
+                                // case `0`
+                                self.chimp.add_value_prefixed(
+                                    &mut self.writer,
+                                    0,
+                                    1,
+                                    v_prime_long,
+                                )?;
                             } else {
                                 // case `11` + 4-bit beta_star
-                                self.writer.write_bits(6, (beta_star as u64) | 0x30)?;
                                 self.last_beta_star = beta_star;
+                                self.chimp.add_value_prefixed(
+                                    &mut self.writer,
+                                    (beta_star as u64) | 0x30,
+                                    6,
+                                    v_prime_long,
+                                )?;
                             }
-                            self.chimp.add_value(&mut self.writer, v_prime_long)?;
                         } else {
-                            self.writer.write_bits(2, 0b10)?;
-                            self.chimp.add_value(&mut self.writer, v_long)?;
+                            self.chimp
+                                .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
                         }
                     }
                 }
                 Err(()) => {
                     // Unsupported magnitude (the reference would throw):
                     // store raw, losslessly.
-                    self.writer.write_bits(2, 0b10)?;
-                    self.chimp.add_value(&mut self.writer, v_long)?;
+                    self.chimp
+                        .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
                 }
             }
         }
@@ -570,6 +597,7 @@ impl<'a> ChimpDecompressor<'a> {
 
 /// Exact mirror of `AbstractElfDecompressor.recoverVByBetaStar`, but returns
 /// `Err` instead of throwing for unsupported recovery cases.
+#[inline(always)]
 fn recover(v_prime_bits: u64, beta_star: i32) -> io::Result<f64> {
     let v_prime = f64::from_bits(v_prime_bits);
     let sp = get_sp(v_prime.abs());

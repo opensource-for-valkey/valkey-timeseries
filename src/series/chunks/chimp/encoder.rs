@@ -82,12 +82,33 @@ impl ChimpEnc {
     }
 
     pub fn add_value(&mut self, out: &mut BitStream, value: u64) -> io::Result<()> {
+        self.add_value_prefixed(out, 0, 0, value)
+    }
+
+    /// [`add_value`](Self::add_value) with `prefix_len` bits of `prefix` written
+    /// immediately before the value's own header, in the same writer call.
+    ///
+    /// The ELF layer owns the 1–6-bit case marker that precedes every Chimp value;
+    /// handing it in here lets marker, Chimp flag, leading-zero code and width go
+    /// out as one write, and for most values the payload too. The bit layout is
+    /// exactly what the separate writes produced.
+    #[inline]
+    pub fn add_value_prefixed(
+        &mut self,
+        out: &mut BitStream,
+        prefix: u64,
+        prefix_len: u32,
+        value: u64,
+    ) -> io::Result<()> {
         if self.first {
             self.first = false;
             self.stored_val = value;
+            if prefix_len > 0 {
+                out.write_bits(prefix_len, prefix)?;
+            }
             out.write_bits(64, value)?;
         } else {
-            self.compress_value(out, value)?;
+            self.compress_value(out, prefix, prefix_len, value)?;
         }
         Ok(())
     }
@@ -99,16 +120,53 @@ impl ChimpEnc {
     /// recognises repeats before erasure, so it no longer knows which bit
     /// pattern (raw or erased) was last fed in here.
     pub fn add_repeat(&mut self, out: &mut BitStream) -> io::Result<()> {
+        self.add_repeat_prefixed(out, 0, 0)
+    }
+
+    /// [`add_repeat`](Self::add_repeat) with a caller prefix, as
+    /// [`add_value_prefixed`](Self::add_value_prefixed).
+    #[inline]
+    pub fn add_repeat_prefixed(
+        &mut self,
+        out: &mut BitStream,
+        prefix: u64,
+        prefix_len: u32,
+    ) -> io::Result<()> {
         debug_assert!(!self.first, "a repeat needs a preceding value");
-        out.write_bits(2, 0b00)?;
+        out.write_bits(prefix_len + 2, prefix << 2)?;
         self.stored_lz = 65;
         Ok(())
     }
 
-    fn compress_value(&mut self, out: &mut BitStream, value: u64) -> io::Result<()> {
+    /// Write `header` (`header_len` bits, prefix already folded in) followed by the
+    /// `sig`-bit `payload`, as one write when both fit in 64 bits.
+    #[inline(always)]
+    fn emit(
+        out: &mut BitStream,
+        header: u64,
+        header_len: u32,
+        payload: u64,
+        sig: u32,
+    ) -> io::Result<()> {
+        if header_len + sig <= 64 {
+            out.write_bits(header_len + sig, (header << sig) | payload)
+        } else {
+            out.write_bits(header_len, header)?;
+            out.write_bits(sig, payload)
+        }
+    }
+
+    #[inline]
+    fn compress_value(
+        &mut self,
+        out: &mut BitStream,
+        prefix: u64,
+        prefix_len: u32,
+        value: u64,
+    ) -> io::Result<()> {
         let xor = self.stored_val ^ value;
         if xor == 0 {
-            out.write_bits(2, 0b00)?;
+            out.write_bits(prefix_len + 2, prefix << 2)?;
             self.stored_lz = 65;
         } else {
             let nlz = xor.leading_zeros() as i32; // 0..=63 for xor != 0
@@ -116,22 +174,25 @@ impl ChimpEnc {
             let tz = xor.trailing_zeros() as i32;
 
             if tz > THRESHOLD {
-                let sig = 64 - lz - tz;
-                out.write_bits(2, 0b01)?;
-                out.write_bits(3, LEADING_REPR_ENC[lz as usize])?;
-                out.write_bits(6, sig as u64)?;
-                out.write_bits(sig as u32, xor >> tz)?;
+                // flag `01`, 3-bit leading code, 6-bit width, then `sig` bits.
+                let sig = (64 - lz - tz) as u32;
+                let header = (prefix << 11)
+                    | (0b01 << 9)
+                    | (LEADING_REPR_ENC[lz as usize] << 6)
+                    | sig as u64;
+                Self::emit(out, header, prefix_len + 11, xor >> tz, sig)?;
                 self.stored_lz = 65;
             } else if lz == self.stored_lz {
-                let sig = 64 - lz;
-                out.write_bits(2, 0b10)?;
-                out.write_bits(sig as u32, xor)?;
+                // flag `10`, then 64 - lz bits.
+                let sig = (64 - lz) as u32;
+                let header = (prefix << 2) | 0b10;
+                Self::emit(out, header, prefix_len + 2, xor, sig)?;
             } else {
+                // flag `11`, 3-bit leading code, then 64 - lz bits.
                 self.stored_lz = lz;
-                let sig = 64 - lz;
-                out.write_bits(2, 0b11)?;
-                out.write_bits(3, LEADING_REPR_ENC[lz as usize])?;
-                out.write_bits(sig as u32, xor)?;
+                let sig = (64 - lz) as u32;
+                let header = (prefix << 5) | (0b11 << 3) | LEADING_REPR_ENC[lz as usize];
+                Self::emit(out, header, prefix_len + 5, xor, sig)?;
             }
         }
         self.stored_val = value;
@@ -170,6 +231,7 @@ impl ChimpDec {
 
     /// Reads the next raw value, or `Err(UnexpectedEof)` if the bit stream
     /// runs out.
+    #[inline(always)]
     pub fn read_value(&mut self, inp: &mut BitStreamReader) -> io::Result<u64> {
         self.next(inp)?;
         Ok(self.stored_val)
@@ -178,11 +240,13 @@ impl ChimpDec {
     /// [`read_value`](Self::read_value), also reporting whether the value was
     /// unchanged (the `xor == 0` case). The Elf layer needs that flag to tell a
     /// repeat apart from a value that merely shares the previous `beta_star`.
+    #[inline(always)]
     pub fn read_value_flagged(&mut self, inp: &mut BitStreamReader) -> io::Result<(u64, bool)> {
         let repeat = self.next(inp)?;
         Ok((self.stored_val, repeat))
     }
 
+    #[inline(always)]
     fn next(&mut self, inp: &mut BitStreamReader) -> io::Result<bool> {
         if self.first {
             self.first = false;
@@ -194,6 +258,7 @@ impl ChimpDec {
     }
 
     /// Returns `true` when the encoded XOR was zero, i.e. the value repeats.
+    #[inline(always)]
     fn next_value(&mut self, inp: &mut BitStreamReader) -> io::Result<bool> {
         let flag = inp.read_bits(2)? as i32;
         match flag {

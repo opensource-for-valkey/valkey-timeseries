@@ -104,7 +104,7 @@ impl<'a> BitStreamReader<'a> {
     }
 
     /// Reads a single bit and returns it as a boolean.
-    #[inline]
+    #[inline(always)]
     pub fn read_bit(&mut self) -> io::Result<bool> {
         if self.valid == 0 {
             self.refill();
@@ -117,7 +117,11 @@ impl<'a> BitStreamReader<'a> {
     }
 
     /// Reads the specified number of bits and returns them as a u64.
-    #[inline]
+    ///
+    /// `inline(always)`, like `refill`: the decoders call this two or three
+    /// times per sample and LLVM was leaving it out of line in the Chimp value
+    /// loop, where the call and the `Result` return cost more than the read.
+    #[inline(always)]
     pub fn read_bits(&mut self, nbits: u8) -> io::Result<u64> {
         if nbits > self.valid {
             if nbits > 64 {
@@ -161,7 +165,7 @@ impl<'a> BitStreamReader<'a> {
     /// be read; missing bits past the end of the stream read as zero. A
     /// decoder peeks a variable-length header in one go, then [`skip`]s the
     /// length it turned out to have.
-    #[inline]
+    #[inline(always)]
     pub fn peek_upto(&mut self, nbits: u8) -> u64 {
         debug_assert!(nbits <= 32);
         if nbits > self.valid {
@@ -176,7 +180,7 @@ impl<'a> BitStreamReader<'a> {
     }
 
     /// Consumes `nbits` bits, which must have been [`peek_upto`]ed.
-    #[inline]
+    #[inline(always)]
     pub fn skip(&mut self, nbits: u8) -> io::Result<()> {
         if nbits > self.valid {
             return Err(eof());

@@ -245,7 +245,12 @@ impl BitStream {
     /// new partial byte, its unused low bits already zero. This replaced a loop
     /// of one `push` per whole byte plus one call per remaining bit, which was
     /// two thirds of Gorilla encode time. Output is bit-identical.
-    #[inline]
+    ///
+    /// `inline(always)`: the codecs are the only callers and they issue two or
+    /// three of these per sample; left to itself LLVM stopped inlining the
+    /// function once it grew the whole-byte path, and a Chimp repeat (three
+    /// writes of 1–2 bits) nearly doubled in cost from the calls alone.
+    #[inline(always)]
     pub fn write_bits(&mut self, bits: u32, value: u64) -> io::Result<()> {
         let mut nbits = bits.min(64) as usize;
         if nbits == 0 {
@@ -271,9 +276,15 @@ impl BitStream {
             }
         }
 
+        // Always store the full 8-byte word and then cut the length back: a
+        // variable-length `extend_from_slice(&bytes[..nbytes])` compiles to a
+        // libc `memcpy` call, which was ~17 % of Chimp encode; a fixed 8-byte
+        // copy is a single store. `truncate` on `u8` is just a length write.
         let nbytes = nbits.div_ceil(8);
-        self.ensure_spare(nbytes);
-        self.stream.extend_from_slice(&u.to_be_bytes()[..nbytes]);
+        self.ensure_spare(8);
+        let len = self.stream.len();
+        self.stream.extend_from_slice(&u.to_be_bytes());
+        self.stream.truncate(len + nbytes);
         let rem = nbits % 8;
         if rem != 0 {
             self.count = (8 - rem) as u8;
