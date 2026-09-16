@@ -30,13 +30,13 @@ impl Default for GorillaChunk {
 impl GorillaChunk {
     pub fn with_max_size(max_size: usize) -> Self {
         Self {
-            encoder: GorillaEncoder::new(),
+            encoder: GorillaEncoder::with_soft_cap(max_size),
             max_size,
         }
     }
 
     fn compress(&mut self, samples: &[Sample]) -> TsdbResult {
-        let mut encoder = GorillaEncoder::new();
+        let mut encoder = GorillaEncoder::with_soft_cap(self.max_size);
         for sample in samples {
             push_sample(&mut encoder, sample)?;
         }
@@ -89,6 +89,26 @@ impl GorillaChunk {
         size_of::<Self>() + self.get_heap_size()
     }
 
+    /// How many of this chunk's samples fall in `[start, end]`, assuming they are spread
+    /// evenly over its span. Exact for a window that covers the chunk; an estimate for a
+    /// partial one, and never more than `len`.
+    fn estimate_samples_in(&self, start: Timestamp, end: Timestamp) -> usize {
+        let len = self.len();
+        let first = self.first_timestamp();
+        let last = self.last_timestamp();
+        if start <= first && end >= last {
+            return len;
+        }
+        let lo = start.max(first);
+        let hi = end.min(last);
+        if lo > hi {
+            return 0;
+        }
+        let span = last.saturating_sub(first).max(1) as u128;
+        let part = (hi - lo) as u128 + 1;
+        ((len as u128 * part / span) as usize + 1).min(len)
+    }
+
     pub fn iter(&'_ self) -> SampleIter<'_> {
         self.range_iter(i64::MIN, i64::MAX)
     }
@@ -126,7 +146,7 @@ impl ChunkOps for GorillaChunk {
             return Ok(0);
         }
 
-        let mut new_encoder = GorillaEncoder::new();
+        let mut new_encoder = GorillaEncoder::with_soft_cap(self.max_size);
         let saved_count = self.len();
 
         for value in self.encoder.iter() {
@@ -153,7 +173,10 @@ impl ChunkOps for GorillaChunk {
             return Ok(vec![]);
         }
 
-        let samples = self.range_iter(start, end).collect();
+        // Size the result from the requested window's share of the chunk's span, so a
+        // full-chunk read allocates exactly once instead of regrowing ~10 times.
+        let mut samples = Vec::with_capacity(self.estimate_samples_in(start, end));
+        samples.extend(self.range_iter(start, end));
         Ok(samples)
     }
 
@@ -165,7 +188,7 @@ impl ChunkOps for GorillaChunk {
             self.add_sample(&sample)?;
             return Ok(1);
         }
-        let mut xor_encoder = GorillaEncoder::new();
+        let mut xor_encoder = GorillaEncoder::with_soft_cap(self.max_size);
         let mut iter = self.encoder.iter();
         if ts < self.first_timestamp() {
             // add a sample to the beginning
@@ -224,7 +247,7 @@ impl ChunkOps for GorillaChunk {
             return append_samples(self, samples);
         }
 
-        let mut encoder = GorillaEncoder::new();
+        let mut encoder = GorillaEncoder::with_soft_cap(self.max_size);
         let result = merge_chunk_samples(self.iter(), samples, dp_policy, |sample| {
             push_sample(&mut encoder, &sample)
         })?;
@@ -269,7 +292,7 @@ impl Chunk for GorillaChunk {
     where
         Self: Sized,
     {
-        let mut left_chunk = GorillaEncoder::new();
+        let mut left_chunk = GorillaEncoder::with_soft_cap(self.max_size);
         // `with_max_size`, not `default()`: the upper half has to inherit the budget the series
         // was created with. `default()` stamps `DEFAULT_CHUNK_SIZE_BYTES` on it, silently
         // discarding the user's `CHUNK_SIZE` -- and `save_rdb` writes `max_size` out, so the
@@ -301,7 +324,8 @@ impl Chunk for GorillaChunk {
 
     fn load_rdb(rdb: *mut RedisModuleIO, _enc_ver: i32) -> ValkeyResult<Self> {
         let max_size = rdb_load_usize(rdb)?;
-        let encoder = GorillaEncoder::rdb_load(rdb)?;
+        let mut encoder = GorillaEncoder::rdb_load(rdb)?;
+        encoder.set_soft_cap(max_size);
         let chunk = GorillaChunk { encoder, max_size };
         Ok(chunk)
     }
@@ -314,7 +338,8 @@ impl Chunk for GorillaChunk {
     fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
         let mut buf = buf;
         let max_size = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
-        let encoder = GorillaEncoder::deserialize(buf)?;
+        let mut encoder = GorillaEncoder::deserialize(buf)?;
+        encoder.set_soft_cap(max_size as usize);
         Ok(GorillaChunk {
             encoder,
             max_size: max_size as usize,
@@ -405,6 +430,7 @@ mod tests {
     use crate::series::chunks::chunk::Chunk;
     use crate::series::chunks::gorilla::gorilla_chunk::GorillaChunk;
     use crate::tests::generators::DataGenerator;
+    use get_size2::GetSize;
     use std::time::Duration;
 
     fn generate_samples(count: usize) -> Vec<Sample> {
@@ -504,6 +530,91 @@ mod tests {
         );
         let all: Vec<Sample> = chunk.iter().chain(right.iter()).collect();
         assert_eq!(all, vec![sample]);
+    }
+
+    /// A sealed chunk's allocation stays within `max_size` plus a few bytes of slack.
+    ///
+    /// Plain `Vec` doubling used to leave every full chunk at ~2x its data: a 4096-byte
+    /// chunk crossed `max_size` on its last append and jumped to an 8192-byte allocation,
+    /// which `memory_usage` (and so `TS.INFO memoryUsage`) then reported. Growth is still
+    /// geometric below the cap, so filling is not quadratic.
+    #[test]
+    fn test_sealed_chunk_allocation_is_capped_at_max_size() {
+        for max_size in [1024usize, 4096, 16384] {
+            let mut chunk = GorillaChunk::with_max_size(max_size);
+            let samples = generate_samples(max_size); // more than enough to fill it
+            let mut reallocations = 0;
+            let mut cap = 0;
+            for sample in samples.iter() {
+                if chunk.is_full() {
+                    break;
+                }
+                chunk.add_sample(sample).unwrap();
+                let c = chunk.encoder.get_heap_size();
+                if c != cap {
+                    reallocations += 1;
+                    cap = c;
+                }
+            }
+            assert!(chunk.is_full());
+            let heap = chunk.encoder.get_heap_size();
+            assert!(
+                heap <= max_size + 32,
+                "{max_size}-byte chunk holds a {heap}-byte allocation"
+            );
+            assert!(heap >= chunk.data_size());
+            // 8, 16, 32, ... doubles up to the cap: well under a reallocation per sample.
+            assert!(
+                reallocations <= 16,
+                "{max_size}-byte chunk reallocated {reallocations} times"
+            );
+        }
+    }
+
+    /// Appending past `max_size` (a merge can) keeps doubling rather than reallocating on
+    /// every sample.
+    #[test]
+    fn test_growth_past_max_size_stays_geometric() {
+        let mut chunk = GorillaChunk::with_max_size(256);
+        let samples = generate_samples(2000);
+        let mut reallocations = 0;
+        let mut cap = 0;
+        for sample in samples.iter() {
+            chunk.add_sample(sample).unwrap();
+            let c = chunk.encoder.get_heap_size();
+            if c != cap {
+                reallocations += 1;
+                cap = c;
+            }
+        }
+        assert!(chunk.data_size() > 4 * 256);
+        assert!(reallocations <= 24, "reallocated {reallocations} times");
+    }
+
+    /// The cap survives a serialize/deserialize round trip and a rebuild (split), so a
+    /// chunk that came off the wire or out of an RDB is budgeted like a fresh one.
+    #[test]
+    fn test_loaded_and_rebuilt_chunks_keep_the_cap() {
+        let max_size = 1024;
+        let mut chunk = GorillaChunk::with_max_size(max_size);
+        for sample in generate_samples(40).iter() {
+            chunk.add_sample(sample).unwrap();
+        }
+        let mut buf = Vec::new();
+        chunk.serialize(&mut buf);
+        let mut loaded = GorillaChunk::deserialize(&buf).unwrap();
+        for sample in generate_samples(4000).iter().skip(40) {
+            if loaded.is_full() {
+                break;
+            }
+            loaded.add_sample(sample).unwrap();
+        }
+        assert!(loaded.is_full());
+        assert!(loaded.encoder.get_heap_size() <= max_size + 32);
+
+        let right = loaded.split().unwrap();
+        assert!(loaded.encoder.get_heap_size() <= max_size + 32);
+        assert!(right.encoder.get_heap_size() <= max_size + 32);
     }
 
     fn decompress(chunk: &GorillaChunk) -> Vec<Sample> {

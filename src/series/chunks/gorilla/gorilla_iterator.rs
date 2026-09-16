@@ -19,6 +19,12 @@ pub struct GorillaIterator<'a> {
     last_idx: usize,
 }
 
+#[cold]
+#[inline(never)]
+fn decoding_error(what: &str) -> TsdbError {
+    TsdbError::DecodingError(what.to_string())
+}
+
 impl GorillaIterator<'_> {
     pub fn new(encoder: &'_ GorillaEncoder) -> GorillaIterator<'_> {
         let buf = encoder.buf();
@@ -53,12 +59,12 @@ impl GorillaIterator<'_> {
         let timestamp = self
             .reader
             .read_varint()
-            .map_err(|_| TsdbError::DecodingError("Error decoding timestamp".to_string()))?;
+            .map_err(|_| decoding_error("Error decoding timestamp"))?;
 
         let value = self
             .reader
             .read_f64()
-            .map_err(|_| TsdbError::DecodingError("Error decoding value".to_string()))?;
+            .map_err(|_| decoding_error("Error decoding value"))?;
 
         self.timestamp = timestamp;
         self.value = value;
@@ -74,12 +80,12 @@ impl GorillaIterator<'_> {
         let timestamp_delta = self
             .reader
             .read_uvarint()
-            .map_err(|_| TsdbError::DecodingError("Eof reading delta-of-delta".to_string()))?;
+            .map_err(|_| decoding_error("Eof reading delta-of-delta"))?;
 
         let (value, leading_bits, trailing_bits) = self.read_value()?;
 
         self.timestamp += i64::try_from(timestamp_delta)
-            .map_err(|_| TsdbError::DecodingError("Timestamp delta too large".to_string()))?;
+            .map_err(|_| decoding_error("Timestamp delta too large"))?;
 
         self.value = value;
         self.leading_bits = leading_bits;
@@ -97,8 +103,8 @@ impl GorillaIterator<'_> {
         let prev_timestamp = self.timestamp;
         let prev_timestamp_delta = self.timestamp_delta;
 
-        let timestamp_delta_of_delta = read_varbit_int(&mut self.reader)
-            .map_err(|_| TsdbError::DecodingError("XOR encoder".to_string()))?;
+        let timestamp_delta_of_delta =
+            read_varbit_int(&mut self.reader).map_err(|_| decoding_error("XOR encoder"))?;
 
         let (value, leading_bits, trailing_bits) = self.read_value()?;
 
@@ -132,7 +138,7 @@ impl GorillaIterator<'_> {
             self.leading_bits,
             self.trailing_bits,
         )
-        .map_err(|_| TsdbError::DecodingError("Error reading value".to_string()))
+        .map_err(|_| decoding_error("Error reading value"))
     }
 }
 
@@ -158,5 +164,6 @@ impl ExactSizeIterator for GorillaIterator<'_> {
         self.num_samples - self.idx
     }
 }
+
 #[cfg(test)]
 mod tests {}

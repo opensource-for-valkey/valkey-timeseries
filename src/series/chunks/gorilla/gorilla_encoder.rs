@@ -86,6 +86,19 @@ impl GorillaEncoder {
         self.first_ts = 0;
     }
 
+    /// An empty encoder whose bit stream will not allocate past `max_size` (plus a few
+    /// bytes of slack) while it is within budget; see `BitStream::set_soft_cap`.
+    pub fn with_soft_cap(max_size: usize) -> GorillaEncoder {
+        let mut encoder = Self::new();
+        encoder.writer.set_soft_cap(max_size);
+        encoder
+    }
+
+    /// See `BitStream::set_soft_cap`. A loaded chunk calls this once it knows its budget.
+    pub fn set_soft_cap(&mut self, max_size: usize) {
+        self.writer.set_soft_cap(max_size);
+    }
+
     pub fn add_sample(&mut self, sample: &Sample) -> std::io::Result<()> {
         match self.num_samples {
             0 => self.write_first_sample(sample),
@@ -173,6 +186,19 @@ impl GorillaEncoder {
 
     pub(crate) fn buf(&self) -> &[u8] {
         self.writer.get_ref()
+    }
+
+    /// Bits written so far, counting the partial trailing byte exactly.
+    #[cfg(test)]
+    pub(crate) fn stream_bit_len(&self) -> usize {
+        self.writer.len() * 8 - self.writer.count as usize
+    }
+
+    /// `(leading_bits, trailing_bits, timestamp_delta)`: the rolling state the next append
+    /// starts from.
+    #[cfg(test)]
+    pub(crate) fn window_state(&self) -> (u8, u8, i64) {
+        (self.leading_bits, self.trailing_bits, self.timestamp_delta)
     }
 
     pub(crate) fn shrink_to_fit(&mut self) {
