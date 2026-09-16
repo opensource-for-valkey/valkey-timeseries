@@ -6,6 +6,7 @@ use crate::common::{MultiSample, Sample, Timestamp};
 use crate::iterators::TimestampFilterIterator;
 use crate::series::request_types::{AggregationOptions, RangeOptions};
 use crate::series::{SeriesSampleIterator, TimeSeries, ValueFilter};
+use itertools::Either;
 use smallvec::SmallVec;
 
 macro_rules! apply_iter_limit {
@@ -687,19 +688,25 @@ fn sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
         .map(|f| TimestampFilter::new(f));
     let val_filter = options.value_filter;
 
-    let filtered = base_iter.filter(move |sample| {
-        if let Some(ts) = &ts_filter
-            && !ts.matches(sample.timestamp)
-        {
-            return false;
-        }
-        if let Some(val) = &val_filter
-            && !val.is_match(sample.value)
-        {
-            return false;
-        }
-        true
-    });
+    // An unfiltered query (the common one) gets the base iterator itself rather than a
+    // `Filter` adapter whose closure tests two `None`s per sample.
+    let filtered: Either<T, _> = if ts_filter.is_none() && val_filter.is_none() {
+        Either::Left(base_iter)
+    } else {
+        Either::Right(base_iter.filter(move |sample| {
+            if let Some(ts) = &ts_filter
+                && !ts.matches(sample.timestamp)
+            {
+                return false;
+            }
+            if let Some(val) = &val_filter
+                && !val.is_match(sample.value)
+            {
+                return false;
+            }
+            true
+        }))
+    };
 
     let count = options.count;
 
