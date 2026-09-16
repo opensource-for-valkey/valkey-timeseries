@@ -1,10 +1,13 @@
 use crate::aggregators::{
-    EmptyFillBounds, PartialReducer, PartialRowReducer, PartialSampleReducer, PartialState,
+    AggregationHandler, Aggregator, EmptyFillBounds, PartialReducer, PartialRowReducer,
+    PartialSampleReducer, PartialState, bucket_start_for,
 };
 use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::{REDUCER_KEY, SOURCE_KEY};
 use crate::common::context::key_for_display;
-use crate::common::threads::{IntoParRayon, IterIntoParRayon, request_par_threads};
+use crate::common::threads::{
+    IntoParRayon, IterIntoParRayon, ParCollectionRayon, request_par_threads,
+};
 use crate::common::{MultiSample, Sample, Timestamp};
 use crate::error_consts;
 use crate::iterators::{
@@ -515,14 +518,65 @@ fn handle_grouping(
     let count = options.range.count;
     options.range.count = None;
 
-    let threads = request_par_threads(
-        grouped_series_map.len(),
-        grouped_series_map
-            .values()
-            .map(|g| estimated_work(&g.series, &options.range))
-            .sum(),
-    );
-    let items = grouped_series_map
+    let total_work: usize = grouped_series_map
+        .values()
+        .map(|g| estimated_work(&g.series, &options.range))
+        .sum();
+    let threads = request_par_threads(grouped_series_map.len(), total_work);
+
+    let is_multi = options
+        .range
+        .aggregation
+        .as_ref()
+        .is_some_and(|a| a.is_multi());
+
+    // Aggregated single-column GROUPBY: decode and bucket every member series of every
+    // group in parallel over *series* (not groups, so one big group still uses the pool),
+    // then fold each group's rows into its bucket table in series order — the same order
+    // the k-way merge yields, so the reduce is bit-identical to it. Groups the grid
+    // cannot serve fall through to the merge below.
+    let mut dense: Vec<(String, GroupedSeriesData, BucketGrid)> = Vec::new();
+    let mut merged: Vec<(String, GroupedSeriesData)> = Vec::new();
+    for (label_value, group_data) in grouped_series_map {
+        match (!is_multi)
+            .then(|| BucketGrid::for_query(&options.range, &group_data.series))
+            .flatten()
+        {
+            Some(grid) => dense.push((label_value, group_data, grid)),
+            None => merged.push((label_value, group_data)),
+        }
+    }
+
+    let mut items: Vec<MRangeSeriesResult> = Vec::with_capacity(dense.len() + merged.len());
+    if !dense.is_empty() {
+        let grouping = options
+            .grouping
+            .as_ref()
+            .expect("Grouping options should be present");
+        let template = grouping.aggregation.create_aggregator();
+        let series_refs: Vec<&MRangeSeriesMeta> =
+            dense.iter().flat_map(|(_, g, _)| g.series.iter()).collect();
+        let series_threads = request_par_threads(series_refs.len(), total_work);
+        let mut rows: Vec<Vec<Sample>> = series_refs
+            .par_rayon()
+            .num_threads(series_threads)
+            .map(|meta| series_bucket_rows(meta, &options.range))
+            .collect();
+        let mut rows = rows.drain(..);
+        for (label_value, group_data, grid) in dense {
+            let group_rows: Vec<Vec<Sample>> =
+                rows.by_ref().take(group_data.series.len()).collect();
+            match fold_group_rows(&grid, &template, &group_rows) {
+                Some(samples) => {
+                    let samples = collect_samples(samples.into_iter(), options.is_reverse, count);
+                    items.push(grouped_result(label_value, group_data, grouping, samples));
+                }
+                None => merged.push((label_value, group_data)),
+            }
+        }
+    }
+
+    let merged_items = merged
         .into_iter()
         .iter_into_par_rayon()
         .num_threads(threads)
@@ -531,11 +585,6 @@ fn handle_grouping(
                 .grouping
                 .as_ref()
                 .expect("Grouping options should be present");
-            let is_multi = options
-                .range
-                .aggregation
-                .as_ref()
-                .is_some_and(|a| a.is_multi());
             let data = if is_multi {
                 let rows = get_grouped_rows(&group_data.series, &options, grouping, count);
                 SeriesResultData::Rows(rows)
@@ -560,8 +609,217 @@ fn handle_grouping(
             }
         })
         .collect::<Vec<_>>();
+    items.extend(merged_items);
 
     Ok(items)
+}
+
+/// One reduced group as a result row, its samples as an uncompressed chunk (grouping only
+/// runs on the node answering the client, so they never cross the network).
+fn grouped_result(
+    label_value: String,
+    group_data: GroupedSeriesData,
+    grouping: &RangeGroupingOptions,
+    samples: Vec<Sample>,
+) -> MRangeSeriesResult {
+    MRangeSeriesResult {
+        key: format!("{}={}", grouping.group_label, label_value).into_bytes(),
+        group_label_value: Some(label_value),
+        labels: group_data.labels,
+        sources: group_data.source_keys,
+        data: SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
+            samples,
+        ))),
+    }
+}
+
+/// The bucket grid an aggregated GROUPBY reduces on: every member series is bucketed with
+/// the same `ALIGN` and bucket duration, so a row's timestamp identifies its bucket and the
+/// group's reduce is a fold into a table indexed by bucket, not a merge of sorted streams.
+struct BucketGrid {
+    /// True start of the bucket the query window opens in; slot 0.
+    origin: Timestamp,
+    align: Timestamp,
+    duration: u64,
+    slots: usize,
+}
+
+/// More buckets than this and the table is not worth its memory against the merge
+/// (a `-`/`+` window over a sparse series with a one-millisecond bucket is legal).
+const DENSE_GROUP_MAX_SLOTS: usize = 1 << 20;
+
+impl BucketGrid {
+    /// `None` when the query does not aggregate, when a bucket could start before 0 (the
+    /// reported timestamp is clamped there, which folds distinct buckets onto one
+    /// timestamp — the merge already treats those as one, but a table cannot address them),
+    /// or when the window spans more buckets than the cap.
+    fn for_query(range: &RangeOptions, members: &[MRangeSeriesMeta]) -> Option<Self> {
+        let agg = range.aggregation.as_ref()?;
+        let (start, end) = range.get_timestamp_range();
+        // The grid is aligned on the query window, as every member's own iterator aligns it;
+        // the table only needs to span the data, so an open `-`/`+` window is clipped to the
+        // group's extent (a chained LATEST sample can lie past a series' last stored one).
+        let align = agg.alignment.get_aligned_timestamp(start, end);
+        let duration = agg.bucket_duration;
+        if duration == 0 || members.is_empty() {
+            return None;
+        }
+        let mut data_start = Timestamp::MAX;
+        let mut data_end = Timestamp::MIN;
+        for meta in members {
+            if meta.series.is_empty() {
+                continue;
+            }
+            data_start = data_start.min(meta.series.first_timestamp);
+            data_end = data_end.max(meta.series.last_timestamp());
+            if let Some(latest) = meta.latest {
+                data_start = data_start.min(latest.timestamp);
+                data_end = data_end.max(latest.timestamp);
+            }
+        }
+        if data_start > data_end {
+            return None;
+        }
+        let start = start.max(data_start);
+        let end = end.min(data_end);
+        if start > end {
+            return None;
+        }
+        let origin = bucket_start_for(start, align, duration);
+        if origin < 0 {
+            return None;
+        }
+        let last = bucket_start_for(end, align, duration);
+        // One slot past the last bucket: BUCKETTIMESTAMP `end` reports a bucket at its
+        // upper edge, which `bucket_start_for` maps to the bucket after it.
+        let slots = ((last - origin) as u64 / duration) as usize + 2;
+        (slots <= DENSE_GROUP_MAX_SLOTS).then_some(Self {
+            origin,
+            align,
+            duration,
+            slots,
+        })
+    }
+
+    /// Slot of a reported bucket timestamp, or `None` for one the grid cannot hold.
+    #[inline]
+    fn slot(&self, ts: Timestamp) -> Option<usize> {
+        let start = bucket_start_for(ts, self.align, self.duration);
+        if start < self.origin {
+            return None;
+        }
+        let slot = ((start - self.origin) as u64 / self.duration) as usize;
+        (slot < self.slots).then_some(slot)
+    }
+
+    /// The timestamp a slot reports: the first row that landed in it decides, so the
+    /// table reproduces the merge's output exactly (including `BUCKETTIMESTAMP` mid/end
+    /// and a clamped edge) rather than re-deriving it from the slot index.
+    fn empty_table(&self, template: &Aggregator) -> DenseGroupTable {
+        DenseGroupTable {
+            slots: vec![None; self.slots],
+            template: template.clone(),
+        }
+    }
+}
+
+/// One reduced bucket in the making: the reducer's state plus whether it accepted
+/// anything — the same pair `SampleReducer` keeps per timestamp group.
+#[derive(Clone)]
+struct DenseSlot {
+    timestamp: Timestamp,
+    aggregator: Aggregator,
+    has_samples: bool,
+}
+
+struct DenseGroupTable {
+    slots: Vec<Option<DenseSlot>>,
+    template: Aggregator,
+}
+
+impl DenseGroupTable {
+    /// Folds one series' rows in. Rows arrive ascending per series and series are folded in
+    /// group order, so each slot sees its contributions in exactly the order the k-way merge
+    /// would have yielded them (timestamp, then series) — the reduce is bit-identical.
+    /// Returns `false` for a row the grid cannot address; the caller then falls back.
+    fn fold(&mut self, grid: &BucketGrid, rows: impl Iterator<Item = Sample>) -> bool {
+        for row in rows {
+            let Some(slot) = grid.slot(row.timestamp) else {
+                return false;
+            };
+            let entry = self.slots[slot].get_or_insert_with(|| DenseSlot {
+                timestamp: row.timestamp,
+                aggregator: self.template.clone(),
+                has_samples: false,
+            });
+            if entry.timestamp != row.timestamp {
+                // Two reported timestamps in one bucket: not a grid the table can serve.
+                return false;
+            }
+            if entry.aggregator.update(row.timestamp, row.value) {
+                entry.has_samples = true;
+            }
+        }
+        true
+    }
+
+    fn into_samples(self) -> Vec<Sample> {
+        self.slots
+            .into_iter()
+            .flatten()
+            .map(|mut slot| {
+                let value = if slot.has_samples {
+                    AggregationHandler::finalize(&mut slot.aggregator)
+                } else {
+                    slot.aggregator.empty_group_value()
+                };
+                Sample {
+                    timestamp: slot.timestamp,
+                    value,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The bucket rows of one member series, ascending — what the merge would have pulled from
+/// its iterator, materialised so the decode can run on any thread while the fold keeps
+/// series order.
+fn series_bucket_rows(meta: &MRangeSeriesMeta, range: &RangeOptions) -> Vec<Sample> {
+    create_range_iterator(meta.series, range, meta.latest, false).collect()
+}
+
+/// Folds one group's per-series rows into a table; `None` when a row falls outside the grid
+/// (the caller then runs the merge for that group).
+fn fold_group_rows(
+    grid: &BucketGrid,
+    template: &Aggregator,
+    rows_per_series: &[Vec<Sample>],
+) -> Option<Vec<Sample>> {
+    let mut table = grid.empty_table(template);
+    for rows in rows_per_series {
+        if !table.fold(grid, rows.iter().copied()) {
+            return None;
+        }
+    }
+    Some(table.into_samples())
+}
+
+/// Aggregated GROUPBY without the merge: per-series bucket rows folded straight into a
+/// bucket table. `None` when the query is not one the table can serve (see
+/// [`BucketGrid::for_query`]) — the caller then runs the merge.
+fn get_grouped_samples_dense(
+    series_metas: &[MRangeSeriesMeta],
+    options: &MRangeOptions,
+    grouping_options: &RangeGroupingOptions,
+) -> Option<Vec<Sample>> {
+    let grid = BucketGrid::for_query(&options.range, series_metas)?;
+    let template = grouping_options.aggregation.create_aggregator();
+    let rows: Vec<Vec<Sample>> = series_metas
+        .iter()
+        .map(|meta| series_bucket_rows(meta, &options.range))
+        .collect();
+    fold_group_rows(&grid, &template, &rows)
 }
 
 fn get_grouped_samples(
@@ -574,6 +832,10 @@ fn get_grouped_samples(
     // reducer across the samples.
     // todo: choose approach based on data size and available memory?
     let is_reverse = options.is_reverse;
+
+    if let Some(samples) = get_grouped_samples_dense(series_metas, options, grouping_options) {
+        return collect_samples(samples.into_iter(), is_reverse, count);
+    }
 
     // todo(perf): with sufficient memory, we could parallel load all samples into memory first,
     // and construct the KWayMerge from those. In low memory, we could use the code
