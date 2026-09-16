@@ -100,12 +100,16 @@ impl BitStream {
         let cap = self.stream.capacity();
         let floor = len + need;
         let doubled = cap.saturating_mul(2).max(8);
-        let target = if len >= self.soft_cap {
-            doubled.max(floor)
+        let capped = self.soft_cap.saturating_add(SOFT_CAP_SLACK);
+        // Within budget (slack included) the allocation stops at the cap. Only
+        // once the data itself needs more than that does doubling resume. The
+        // test is on `floor`, not `len`: a stream that lands exactly on the cap
+        // with a full trailing byte grows for its next single bit, and that
+        // must not read as "past the budget" and double.
+        let target = if floor <= capped {
+            doubled.min(capped).max(floor)
         } else {
-            doubled
-                .min(self.soft_cap.saturating_add(SOFT_CAP_SLACK))
-                .max(floor)
+            doubled.max(floor)
         };
         self.stream.reserve_exact(target - len);
     }
@@ -380,6 +384,41 @@ impl RdbSerializable for BitStream {
 mod tests {
     use super::{BitStream, validate_rdb_state};
     use crate::common::encoding::write_uvarint;
+
+    /// Landing exactly on the cap with a full trailing byte, then writing one more bit,
+    /// must grow into the slack rather than double. This is the byte-boundary case a
+    /// randomised chunk-fill test hit about one run in four.
+    #[test]
+    fn growth_at_the_exact_cap_uses_the_slack() {
+        let mut bs = BitStream::new();
+        bs.set_soft_cap(64);
+        for _ in 0..(64 * 8) {
+            bs.write_bit(false);
+        }
+        assert_eq!(bs.len(), 64);
+        assert_eq!(bs.count, 0);
+        bs.write_bit(true);
+        assert!(
+            bs.stream.capacity() <= 64 + super::SOFT_CAP_SLACK,
+            "capacity {} after crossing the cap by one bit",
+            bs.stream.capacity()
+        );
+        // And an 8-byte write from the same position.
+        let mut bs = BitStream::new();
+        bs.set_soft_cap(64);
+        for _ in 0..8 {
+            bs.write_bits(64, u64::MAX).unwrap();
+        }
+        assert_eq!(bs.len(), 64);
+        bs.write_bits(64, 1).unwrap();
+        assert!(bs.stream.capacity() <= 64 + super::SOFT_CAP_SLACK);
+        // Well past the budget, growth is geometric again.
+        for _ in 0..64 {
+            bs.write_bits(64, 1).unwrap();
+        }
+        assert!(bs.stream.capacity() >= bs.len());
+        assert!(bs.stream.capacity() > 64 + super::SOFT_CAP_SLACK);
+    }
 
     #[test]
     fn rdb_load_rejects_nonzero_count_with_empty_stream() {
