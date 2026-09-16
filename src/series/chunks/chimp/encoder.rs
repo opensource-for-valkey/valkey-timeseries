@@ -258,28 +258,37 @@ impl ChimpDec {
     }
 
     /// Returns `true` when the encoded XOR was zero, i.e. the value repeats.
+    ///
+    /// The header — a 2-bit flag, then for two of the cases a 3-bit leading-zero
+    /// index and for one of those a 6-bit significant-bit count — is read with a
+    /// single 11-bit peek and one `skip`, so a value costs one header read plus
+    /// the payload read instead of up to three.
     #[inline(always)]
     fn next_value(&mut self, inp: &mut BitStreamReader) -> io::Result<bool> {
-        let flag = inp.read_bits(2)? as i32;
+        let head = inp.peek_upto(11);
+        let flag = (head >> 9) as i32;
         match flag {
             3 => {
-                // New leading zeros.
-                self.stored_lz = LEADING_REPR_DEC[inp.read_bits(3)? as usize];
+                // New leading zeros: flag(2) + lz(3), then 64 − lz payload bits.
+                self.stored_lz = LEADING_REPR_DEC[((head >> 6) & 7) as usize];
+                inp.skip(5)?;
                 let value = inp.read_bits((64 - self.stored_lz) as u8)?;
                 self.stored_val ^= value;
             }
             2 => {
                 // Reuse stored leading zeros.
+                inp.skip(2)?;
                 let value = inp.read_bits((64 - self.stored_lz) as u8)?;
                 self.stored_val ^= value;
             }
             1 => {
-                // Trailing-zeros case.
-                self.stored_lz = LEADING_REPR_DEC[inp.read_bits(3)? as usize];
-                let mut sig = inp.read_bits(6)? as i32;
+                // Trailing-zeros case: flag(2) + lz(3) + sig(6), then the significant bits.
+                self.stored_lz = LEADING_REPR_DEC[((head >> 6) & 7) as usize];
+                let mut sig = (head & 63) as i32;
                 if sig == 0 {
                     sig = 64;
                 }
+                inp.skip(11)?;
                 self.stored_tz = 64 - sig - self.stored_lz;
                 let mut value = inp.read_bits((64 - self.stored_lz - self.stored_tz) as u8)?;
                 value <<= self.stored_tz as u8;
@@ -287,6 +296,7 @@ impl ChimpDec {
             }
             _ => {
                 // flag == 0: xor was zero, value unchanged.
+                inp.skip(2)?;
                 return Ok(true);
             }
         }
