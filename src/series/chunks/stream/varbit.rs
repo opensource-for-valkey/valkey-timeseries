@@ -42,46 +42,24 @@ use std::io::{self};
 /// values, but it appears quite certain that we would end up far below 10%,
 /// which would maybe convince us to invest the increased coding/decoding cost.
 pub(crate) fn write_varbit<W: BitWrite>(writer: &mut W, value: i64) -> io::Result<()> {
+    // Prefix and payload go out in one write: every bucket but the last fits in 64 bits.
+    // Same bit layout as the two-write form this replaced.
+    let v = value as u64;
     match value {
         0 => writer.write_bit(false)?, // Precisely 0, needs 1 bit.
-        // -3 <= val <= 4, needs 5 bits.
-        -3..=3 => {
-            writer.write_out::<2, u8>(0b10)?;
-            writer.write_out::<5, u64>(value as u64 & 0x1F)?;
-        }
-        // -31 <= val <= 32, 9 bits.
-        -31..=31 => {
-            writer.write_out::<3, u8>(0b110)?;
-            writer.write_out::<9, u64>(value as u64 & 0x1FF)?;
-        }
-        // -255 <= val <= 256, 13 bits.
-        -255..=255 => {
-            writer.write_out::<4, u8>(0b1110)?;
-            writer.write_out::<13, u64>(value as u64 & 0x1FFF)?;
-        }
-        // -2047 <= val <= 2048, 17 bits.
-        -2047..=2047 => {
-            writer.write_out::<5, u8>(0b11110)?;
-            writer.write_out::<17, u64>(value as u64 & 0x1FFFF)?;
-        }
-        // -131071 <= val <= 131072, 3 bytes.
-        -131071..=131071 => {
-            writer.write_out::<6, u8>(0b111110)?;
-            writer.write_out::<24, u64>(value as u64 & 0x0FFFFFF)?;
-        }
-        // -16777215 <= val <= 16777215, 4 bytes.
-        -16777215..=16777215 => {
-            writer.write_out::<7, u8>(0b1111110)?;
-            writer.write_out::<32, u64>(value as u64 & 0x0FFFFFFFF)?;
-        }
-        // -36028797018963967 <= val <= 36028797018963968, 8 bytes.
+        -3..=3 => writer.write(7, (0b10u64 << 5) | (v & 0x1F))?,
+        -31..=31 => writer.write(12, (0b110u64 << 9) | (v & 0x1FF))?,
+        -255..=255 => writer.write(17, (0b1110u64 << 13) | (v & 0x1FFF))?,
+        -2047..=2047 => writer.write(22, (0b11110u64 << 17) | (v & 0x1FFFF))?,
+        -131071..=131071 => writer.write(30, (0b111110u64 << 24) | (v & 0x0FF_FFFF))?,
+        -16777215..=16777215 => writer.write(39, (0b1111110u64 << 32) | (v & 0xFFFF_FFFF))?,
         -36028797018963967..=36028797018963967 => {
-            writer.write_out::<8, u8>(0b11111110)?;
-            writer.write_out::<56, u64>(value as u64 & 0xFFFFFFFFFFFFFF)?;
+            writer.write(64, (0b11111110u64 << 56) | (v & 0x00FF_FFFF_FFFF_FFFF))?
         }
         _ => {
-            writer.write_out::<8, u8>(0b11111111)?; // The worst case, needs 9 bytes.
-            writer.write_out::<64, u64>(value as u64)?; // ??? test this !!!
+            // The worst case, 72 bits: the only bucket that needs two writes.
+            writer.write(8, 0b11111111u64)?;
+            writer.write(64, v)?;
         }
     }
     Ok(())

@@ -8,12 +8,39 @@ use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyError, ValkeyResult, raw};
 
 /// A stream of bits for writing.
-#[derive(Clone, Debug, Default, Hash, PartialEq, Eq, GetSize)]
+#[derive(Clone, Debug, GetSize)]
 pub struct BitStream {
     /// The data stream.
     pub(in crate::series::chunks) stream: Vec<u8>,
     /// How many right-most bits are available for writing in the current byte.
     pub(in crate::series::chunks) count: u8,
+    /// Allocation budget, see [`set_soft_cap`](Self::set_soft_cap). Not part of the
+    /// stream's identity: equality, hashing and persistence ignore it.
+    soft_cap: usize,
+}
+
+/// Bytes the allocation may run past `soft_cap`: enough for the append that crosses it.
+const SOFT_CAP_SLACK: usize = 32;
+
+impl Default for BitStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for BitStream {
+    fn eq(&self, other: &Self) -> bool {
+        self.count == other.count && self.stream == other.stream
+    }
+}
+
+impl Eq for BitStream {}
+
+impl std::hash::Hash for BitStream {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.stream.hash(state);
+        self.count.hash(state);
+    }
 }
 
 fn validate_rdb_state(bytes: &[u8], count: u64) -> ValkeyResult<u8> {
@@ -38,13 +65,49 @@ impl BitStream {
         Self {
             stream: Vec::new(),
             count: 0,
+            soft_cap: usize::MAX,
         }
+    }
+
+    /// Cap the allocation at `cap` plus a few bytes of slack while the stream is within
+    /// `cap`. Growth stays geometric below the cap, and goes back to doubling above it.
+    ///
+    /// Plain `Vec` doubling left every sealed chunk holding up to twice its data: a 4 KiB
+    /// chunk crosses `max_size` on its last append and jumps to an 8 KiB allocation it
+    /// never uses, which `memory_usage` then reports. A chunk passes its `max_size` here.
+    pub fn set_soft_cap(&mut self, cap: usize) {
+        self.soft_cap = cap;
     }
 
     /// Reset the stream around the provided byte slice.
     pub fn reset(&mut self, stream: Vec<u8>) {
         self.stream = stream;
         self.count = 0;
+    }
+
+    /// Room for `need` more bytes; the growth policy lives in the cold half.
+    #[inline(always)]
+    fn ensure_spare(&mut self, need: usize) {
+        if self.stream.capacity() - self.stream.len() < need {
+            self.grow(need);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, need: usize) {
+        let len = self.stream.len();
+        let cap = self.stream.capacity();
+        let floor = len + need;
+        let doubled = cap.saturating_mul(2).max(8);
+        let target = if len >= self.soft_cap {
+            doubled.max(floor)
+        } else {
+            doubled
+                .min(self.soft_cap.saturating_add(SOFT_CAP_SLACK))
+                .max(floor)
+        };
+        self.stream.reserve_exact(target - len);
     }
 
     pub(crate) fn serialize(&self, dest: &mut Vec<u8>) {
@@ -85,6 +148,7 @@ impl BitStream {
         Ok(Self {
             stream,
             count: count as u8,
+            soft_cap: usize::MAX,
         })
     }
 
@@ -132,6 +196,7 @@ impl BitStream {
     /// Write a single bit to the stream.
     pub fn write_bit_raw(&mut self, bit: bool) {
         if self.count == 0 {
+            self.ensure_spare(1);
             self.stream.push(0);
             self.count = 8;
         }
@@ -152,6 +217,7 @@ impl BitStream {
 
     /// Write a single byte to the stream.
     pub(in crate::series::chunks) fn write_byte_raw(&mut self, byte: u8) {
+        self.ensure_spare(1);
         if self.count == 0 {
             self.stream.push(byte);
             return;
@@ -172,30 +238,22 @@ impl BitStream {
     }
 
     /// Write the right-most `bits` bits of `value` in left-to-right order.
+    ///
+    /// One pass: whatever fits in the partial trailing byte goes there with a
+    /// single OR, and the rest lands with one `extend_from_slice` of the
+    /// big-endian bytes of the shifted value -- the final byte of which is the
+    /// new partial byte, its unused low bits already zero. This replaced a loop
+    /// of one `push` per whole byte plus one call per remaining bit, which was
+    /// two thirds of Gorilla encode time. Output is bit-identical.
+    #[inline]
     pub fn write_bits(&mut self, bits: u32, value: u64) -> io::Result<()> {
         let mut nbits = bits.min(64) as usize;
+        if nbits == 0 {
+            return Ok(());
+        }
+        // Left-align: bit `nbits - 1` of `value` becomes bit 63, and every bit
+        // below the payload is zero.
         let mut u = value << (64 - nbits);
-
-        while nbits >= 8 {
-            let byte = (u >> 56) as u8;
-            self.write_byte_raw(byte);
-            u <<= 8;
-            nbits -= 8;
-        }
-
-        while nbits > 0 {
-            self.write_bit_raw((u >> 63) == 1);
-            u <<= 1;
-            nbits -= 1;
-        }
-
-        Ok(())
-    }
-
-    /// Like write_bits but handles the partial last byte inline for fewer calls.
-    pub fn write_bits_fast(&mut self, mut u: u64, mut nbits: usize) {
-        nbits = nbits.min(64);
-        u <<= 64 - nbits;
 
         if self.count > 0 {
             let free = self.count as usize;
@@ -203,23 +261,24 @@ impl BitStream {
             self.stream[last] |= (u >> (64 - free)) as u8;
             if nbits < free {
                 self.count = (free - nbits) as u8;
-                return;
+                return Ok(());
             }
             u <<= free;
             nbits -= free;
             self.count = 0;
+            if nbits == 0 {
+                return Ok(());
+            }
         }
 
-        while nbits >= 8 {
-            self.stream.push((u >> 56) as u8);
-            u <<= 8;
-            nbits -= 8;
+        let nbytes = nbits.div_ceil(8);
+        self.ensure_spare(nbytes);
+        self.stream.extend_from_slice(&u.to_be_bytes()[..nbytes]);
+        let rem = nbits % 8;
+        if rem != 0 {
+            self.count = (8 - rem) as u8;
         }
-
-        if nbits > 0 {
-            self.stream.push((u >> 56) as u8);
-            self.count = (8 - nbits) as u8;
-        }
+        Ok(())
     }
 
     pub(in crate::series::chunks) fn write_unsigned_int(&mut self, mut n: u64) {
@@ -301,6 +360,7 @@ impl RdbSerializable for BitStream {
         Ok(Self {
             stream: bytes,
             count: count as u8,
+            soft_cap: usize::MAX,
         })
     }
 }

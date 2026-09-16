@@ -20,7 +20,6 @@ pub fn write_varbit_xor<W: BitWrite>(
         bit_writer.write_bit(false)?;
         return Ok((previous_leading_bits_count, previous_trailing_bits_count));
     }
-    bit_writer.write_bit(true)?;
 
     let mut new_leading = delta.leading_zeros() as u8;
     let new_trailing = delta.trailing_zeros() as u8;
@@ -30,29 +29,38 @@ pub fn write_varbit_xor<W: BitWrite>(
         new_leading = 31;
     }
 
-    // If we reuse the previous leading and trailing bit counts
+    // If we reuse the previous leading and trailing bit counts: control bits `10` then the
+    // payload, fused into one write when they fit in 64 bits.
     if previous_leading_bits_count != 0xff
         && new_leading >= previous_leading_bits_count
         && new_trailing >= previous_trailing_bits_count
     {
-        let significant_digits = 64 - previous_leading_bits_count - previous_trailing_bits_count;
-        bit_writer.write_bit(false)?;
-        bit_writer.write(
-            significant_digits as u32,
-            delta >> previous_trailing_bits_count,
-        )?;
+        let sig = (64 - previous_leading_bits_count - previous_trailing_bits_count) as u32;
+        let payload = delta >> previous_trailing_bits_count;
+        if sig <= 62 {
+            bit_writer.write(2 + sig, (0b10u64 << sig) | payload)?;
+        } else {
+            bit_writer.write(2, 0b10u64)?;
+            bit_writer.write(sig, payload)?;
+        }
         return Ok((previous_leading_bits_count, previous_trailing_bits_count));
     }
 
-    bit_writer.write_bit(true)?;
-    bit_writer.write(5, new_leading)?;
+    // New window: control bits `11`, 5-bit leading count, 6-bit width, then the payload.
     let sig_bits = (64_u64 - new_leading as u64) - new_trailing as u64;
     // Overflow 64 to 0 is fine because if 0 sig_bits, we would have written a "same number"
     // bit a bit earlier.
     // The reason is that only 6 bits are available, and the maximum value is 63.
     let encoded_sig_bits = if sig_bits > 63 { 0 } else { sig_bits };
-    bit_writer.write(6, encoded_sig_bits)?;
-    bit_writer.write(sig_bits as u32, delta >> new_trailing)?;
+    let header = (0b11u64 << 11) | ((new_leading as u64) << 6) | encoded_sig_bits;
+    let sig = sig_bits as u32;
+    let payload = delta >> new_trailing;
+    if sig <= 51 {
+        bit_writer.write(13 + sig, (header << sig) | payload)?;
+    } else {
+        bit_writer.write(13, header)?;
+        bit_writer.write(sig, payload)?;
+    }
 
     Ok((new_leading, new_trailing))
 }
