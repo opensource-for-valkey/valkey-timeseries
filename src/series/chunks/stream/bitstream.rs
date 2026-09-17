@@ -293,10 +293,18 @@ impl BitStream {
         // libc `memcpy` call, which was ~17 % of Chimp encode; a fixed 8-byte
         // copy is a single store. `truncate` on `u8` is just a length write.
         let nbytes = nbits.div_ceil(8);
-        self.ensure_spare(8);
         let len = self.stream.len();
-        self.stream.extend_from_slice(&u.to_be_bytes());
-        self.stream.truncate(len + nbytes);
+        let bytes = u.to_be_bytes();
+        if nbytes < 8 && len.saturating_add(8) > self.soft_cap.saturating_add(SOFT_CAP_SLACK) {
+            // A short write near the cap must not reserve the temporary eight-byte
+            // copy: that would make `grow` double even when the committed write fits.
+            self.ensure_spare(nbytes);
+            self.stream.extend_from_slice(&bytes[..nbytes]);
+        } else {
+            self.ensure_spare(8);
+            self.stream.extend_from_slice(&bytes);
+            self.stream.truncate(len + nbytes);
+        }
         let rem = nbits % 8;
         if rem != 0 {
             self.count = (8 - rem) as u8;
@@ -426,6 +434,22 @@ mod tests {
         }
         assert!(bs.stream.capacity() >= bs.len());
         assert!(bs.stream.capacity() > 64 + super::SOFT_CAP_SLACK);
+    }
+
+    #[test]
+    fn short_write_near_cap_does_not_reserve_temporary_bytes() {
+        let mut bs = BitStream::new();
+        bs.set_soft_cap(64);
+        for _ in 0..90 {
+            bs.write_bits(8, 0).unwrap();
+        }
+        assert_eq!(bs.len(), 90);
+        assert_eq!(bs.stream.capacity(), 64 + super::SOFT_CAP_SLACK);
+
+        bs.write_bits(1, 1).unwrap();
+
+        assert_eq!(bs.len(), 91);
+        assert!(bs.stream.capacity() <= 64 + super::SOFT_CAP_SLACK);
     }
 
     #[test]
