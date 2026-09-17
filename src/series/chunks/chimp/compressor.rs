@@ -30,6 +30,7 @@
 //! `write_value`.
 
 use super::chimp_iterator::ChimpIterator;
+use super::elf64::{get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up};
 use super::encoder::{ChimpDec, ChimpEnc, ChimpEncState};
 use crate::common::encoding::{
     try_read_f64_le, try_read_signed_varint, try_read_uvarint, write_f64_le, write_signed_varint,
@@ -41,9 +42,6 @@ use crate::common::rdb::{
 };
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
-use super::elf64::{
-    get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up,
-};
 use crate::series::chunks::stream::bitstream::BitStream;
 use crate::series::chunks::stream::bitstream_reader::BitStreamReader;
 use get_size2::{GetSize, GetSizeTracker};
