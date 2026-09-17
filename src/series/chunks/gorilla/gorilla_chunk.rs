@@ -175,7 +175,18 @@ impl ChunkOps for GorillaChunk {
 
         // Size the result from the requested window's share of the chunk's span, so a
         // full-chunk read allocates exactly once instead of regrowing ~10 times.
-        let mut samples = Vec::with_capacity(self.estimate_samples_in(start, end));
+        //
+        // `num_samples` is persisted, so a corrupt RDB or serialized chunk can carry an
+        // absurd count. `Vec::with_capacity` aborts the process on capacity overflow or
+        // allocation failure; `try_reserve_exact` turns both into a decoding error that
+        // `load_rdb`, `deserialize` and the range readers already propagate.
+        let estimate = self.estimate_samples_in(start, end);
+        let mut samples = Vec::new();
+        samples.try_reserve_exact(estimate).map_err(|e| {
+            TsdbError::DecodingError(format!(
+                "cannot reserve {estimate} samples for gorilla chunk range: {e}"
+            ))
+        })?;
         samples.extend(self.range_iter(start, end));
         Ok(samples)
     }
@@ -425,6 +436,7 @@ impl Iterator for GorillaChunkIterator<'_> {
 #[cfg(test)]
 mod tests {
     use crate::common::Sample;
+    use crate::error::TsdbError;
     use crate::series::DuplicatePolicy;
     use crate::series::chunks::ChunkOps;
     use crate::series::chunks::chunk::Chunk;
@@ -500,6 +512,36 @@ mod tests {
         assert_eq!(chunk.range_iter(i64::MIN, i64::MAX).count(), 0);
         assert_eq!(chunk.range_iter(0, 1000).count(), 0);
         assert_eq!(chunk.get_range(0, 1000).unwrap(), vec![]);
+    }
+
+    /// A corrupt persisted sample count must surface as an error, not an abort.
+    ///
+    /// `get_range` sizes its result from `num_samples`, which comes straight out of the RDB
+    /// or serialized stream. `Vec::with_capacity(usize::MAX)` aborts the process on
+    /// capacity overflow (and a merely huge count aborts on allocation failure); the
+    /// fallible reserve turns both into a `DecodingError` the caller can report.
+    #[test]
+    fn test_get_range_with_a_corrupt_sample_count_is_an_error_not_an_abort() {
+        let mut chunk = GorillaChunk::with_max_size(1024);
+        for sample in generate_samples(10).iter() {
+            chunk.add_sample(sample).unwrap();
+        }
+        chunk.encoder.num_samples = usize::MAX;
+
+        // Direct read, and a read after the count has round-tripped through `deserialize`.
+        let mut buf = Vec::new();
+        chunk.serialize(&mut buf);
+        let loaded = GorillaChunk::deserialize(&buf).unwrap();
+        assert_eq!(loaded.len(), usize::MAX);
+
+        for (label, chunk) in [("in-memory", &chunk), ("deserialized", &loaded)] {
+            match chunk.get_range(i64::MIN, i64::MAX) {
+                Err(TsdbError::DecodingError(msg)) => {
+                    assert!(msg.contains("cannot reserve"), "{label}: {msg}")
+                }
+                other => panic!("{label}: expected a decoding error, got {other:?}"),
+            }
+        }
     }
 
     /// Splitting a single-sample chunk leaves one half empty, and callers iterate both.
