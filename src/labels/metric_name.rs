@@ -366,8 +366,10 @@ mod tests {
     }
 
     /// Interning on a realistic fleet: every `key=value` pair the fleet repeats is held once,
-    /// and the per-holder accounting sums back to the pool's footprint. Bounds are loose
-    /// because the pool is process-global and other tests intern concurrently.
+    /// and the per-holder accounting sums back to the pool's footprint. The entry count is read
+    /// off the fleet's own `MetricName`s rather than the process-global pool, but the pool-wide
+    /// figures (`memory_saved_pct`, the shared allocations behind `amortized_size`) still see
+    /// whatever other tests intern concurrently, so those bounds stay loose.
     #[test]
     fn fleet_labels_intern_to_unique_pairs() {
         use crate::common::string_interner::InternedString;
@@ -386,14 +388,20 @@ mod tests {
             unique.len()
         );
 
-        let before = InternedString::interned_count();
         let names: Vec<MetricName> = fleet.iter().map(|s| MetricName::new(&s.labels)).collect();
         let stats = InternedString::get_stats();
 
-        let added = stats.total_stats.count - before;
+        
+        // Attribute the pool's growth to `names` itself: one entry per distinct interned string
+        // it holds. Diffing two process-global pool snapshots (`interned_count` before vs.
+        // `stats.total_stats.count` after) instead tied the assertion to unrelated interner
+        // traffic and left the `usize` subtraction able to underflow if the pool shrank between
+        // the two reads.
+        let retained: HashSet<&InternedString> = names.iter().flat_map(|mn| mn.0.iter()).collect();
+        let retained_count = retained.len();
         assert!(
-            added <= unique.len() && added + 64 >= unique.len(),
-            "pool grew by {added} for {} unique pairs",
+            retained_count <= unique.len() && retained_count + 64 >= unique.len(),
+            "names retain {retained_count} pool entries for {} unique pairs",
             unique.len()
         );
         assert!(stats.memory_saved_pct > 95.0, "{}", stats.memory_saved_pct);
