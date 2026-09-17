@@ -93,6 +93,10 @@ fn parse_args() -> Config {
                     eprintln!("{arg} expects an integer, got '{raw}'");
                     usage()
                 });
+                if arg == "--clusters" && n == 0 {
+                    eprintln!("--clusters must be at least 1");
+                    usage()
+                }
                 overrides.push((arg.clone(), n));
             }
             "--emit-commands" => {
