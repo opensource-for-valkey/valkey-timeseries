@@ -391,7 +391,6 @@ mod tests {
         let names: Vec<MetricName> = fleet.iter().map(|s| MetricName::new(&s.labels)).collect();
         let stats = InternedString::get_stats();
 
-        
         // Attribute the pool's growth to `names` itself: one entry per distinct interned string
         // it holds. Diffing two process-global pool snapshots (`interned_count` before vs.
         // `stats.total_stats.count` after) instead tied the assertion to unrelated interner
