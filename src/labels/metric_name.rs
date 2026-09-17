@@ -364,4 +364,55 @@ mod tests {
             assert_eq!(mn.get_heap_size(), per_holder);
         }
     }
+
+    /// Interning on a realistic fleet: every `key=value` pair the fleet repeats is held once,
+    /// and the per-holder accounting sums back to the pool's footprint. Bounds are loose
+    /// because the pool is process-global and other tests intern concurrently.
+    #[test]
+    fn fleet_labels_intern_to_unique_pairs() {
+        use crate::common::string_interner::InternedString;
+        use crate::tests::generators::{FleetPreset, FleetTopology};
+        use std::collections::HashSet;
+
+        let fleet = FleetTopology::preset(FleetPreset::Small).generate();
+        let unique: HashSet<String> = fleet
+            .iter()
+            .flat_map(|s| s.labels.iter().map(|l| format!("{}={}", l.name, l.value)))
+            .collect();
+        let pairs: usize = fleet.iter().map(|s| s.labels.len()).sum();
+        assert!(
+            unique.len() * 50 < pairs,
+            "fleet does not repeat labels: {} / {pairs}",
+            unique.len()
+        );
+
+        let before = InternedString::interned_count();
+        let names: Vec<MetricName> = fleet.iter().map(|s| MetricName::new(&s.labels)).collect();
+        let stats = InternedString::get_stats();
+
+        let added = stats.total_stats.count - before;
+        assert!(
+            added <= unique.len() && added + 64 >= unique.len(),
+            "pool grew by {added} for {} unique pairs",
+            unique.len()
+        );
+        assert!(stats.memory_saved_pct > 95.0, "{}", stats.memory_saved_pct);
+
+        // `amortized_size` splits each shared allocation across its holders, so the per-series
+        // string bytes sum to (about) what the pool holds for the fleet.
+        let pool_bytes: usize = unique
+            .iter()
+            .map(|p| p.len() + 2 * size_of::<usize>())
+            .sum();
+        let amortized: usize = names
+            .iter()
+            .map(|mn| mn.get_heap_size() - mn.0.capacity() * size_of::<InternedString>())
+            .sum();
+        // div_ceil rounds each share up, so the sum overshoots by at most one byte per pair.
+        assert!(
+            amortized >= pool_bytes && amortized <= pool_bytes + pairs,
+            "{amortized} vs {pool_bytes}"
+        );
+        drop(names);
+    }
 }

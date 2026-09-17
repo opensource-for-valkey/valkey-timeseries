@@ -1,5 +1,6 @@
 mod dataset;
 mod generator;
+mod labels;
 mod mackey_glass;
 mod rand;
 mod workload;
@@ -8,6 +9,7 @@ use ::rand::prelude::StdRng;
 use ::rand::{SeedableRng, rng};
 
 pub use dataset::*;
+pub use labels::*;
 pub use rand::*;
 pub use workload::*;
 

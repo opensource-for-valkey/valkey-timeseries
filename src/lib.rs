@@ -32,7 +32,7 @@ mod labels;
 mod parser;
 pub mod series;
 
-pub use labels::Label;
+pub use labels::{Label, MetricName};
 
 /// Data generators and chunk helpers shared by unit tests, benchmarks and the
 /// `compression_report` tool. Not part of the module's runtime surface.

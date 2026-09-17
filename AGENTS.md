@@ -42,6 +42,7 @@ cargo bench --features enable-system-alloc
 tools/compression_report.sh [--check|--save-baseline]
 tools/latency_report.sh
 tools/wire_report.sh
+tools/interning_report.sh [--preset small|medium|large] [--emit-commands f]   # label-interning savings on a realistic fleet
 
 # Compatibility fuzzer (needs Docker; strict mode required for a soak — see Warnings below)
 ./fuzz.sh --examples 20000 --duration 20m --stats
