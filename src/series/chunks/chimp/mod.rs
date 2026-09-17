@@ -7,6 +7,7 @@
 mod chimp_chunk;
 mod chimp_iterator;
 mod compressor;
+mod elf64;
 mod encoder;
 
 #[cfg(test)]

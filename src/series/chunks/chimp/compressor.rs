@@ -41,7 +41,7 @@ use crate::common::rdb::{
 };
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
-use crate::series::chunks::elf64::{
+use super::elf64::{
     get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up,
 };
 use crate::series::chunks::stream::bitstream::BitStream;

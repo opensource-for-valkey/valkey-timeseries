@@ -1,6 +1,5 @@
 mod chimp;
 mod chunk;
-mod elf64;
 mod gorilla;
 mod merge;
 #[cfg(test)]
