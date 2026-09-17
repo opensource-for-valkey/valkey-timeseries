@@ -11,6 +11,10 @@
 #   tools/interning_report.sh --clusters 2 --hosts 50 --namespaces 12 --pods 400 --routes 6
 #   tools/interning_report.sh --emit-commands /tmp/fleet.txt
 #
+# Overrides are checked against the generator's limits before anything is
+# built: --hosts must be at least 1 whenever --clusters is, and --routes is
+# capped at the 32 distinct routes a service can expose.
+#
 # --emit-commands writes one inline `TS.CREATE ... LABELS ...` per series, so
 # the same fleet can be loaded into a running server and read back with
 # `TS._DEBUG STRINGPOOLSTATS` / `INFO ts_memory`:
@@ -31,7 +35,7 @@ cd "$REPO_ROOT"
 FEATURES="enable-system-alloc,test-utils"
 
 usage() {
-    sed -n '3,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 REPORT_ARGS=()

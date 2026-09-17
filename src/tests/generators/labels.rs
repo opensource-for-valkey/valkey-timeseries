@@ -27,6 +27,7 @@ use crate::tests::generators::create_rng;
 use rand::RngExt;
 use rand::prelude::{IndexedRandom, StdRng};
 use rand_distr::{Distribution, Zipf};
+use std::fmt;
 
 /// A series as `TS.CREATE` would receive it: a key and its labels, `__name__` included.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,40 @@ impl FleetPreset {
 /// Base seed for the fleet presets. Distinct from [`super::DEFAULT_SEED`] so a preset never
 /// shares a stream with the sample-value datasets.
 pub const DEFAULT_FLEET_SEED: u64 = 0x1ABE_15ED_F1EE;
+
+/// The most distinct `/api/v1/...` routes an HTTP service can expose: every [`RESOURCES`] entry
+/// in its collection form and its `{id}` form. `http_surface` draws routes until it has
+/// `routes_per_service` distinct ones, so asking for more than this would never finish.
+pub const MAX_ROUTES_PER_SERVICE: usize = RESOURCES.len() * 2;
+
+/// Why a [`FleetTopology`] cannot be generated. Checked by [`FleetTopology::validate`] before
+/// any series is built, so a bad knob is a usage error rather than a hang or a panic deep in
+/// the builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopologyError {
+    /// `clusters > 0` with `hosts_per_cluster == 0`: every pod is scheduled onto one of the
+    /// cluster's hosts, so a hostless cluster has nowhere to run anything.
+    HostlessClusters { clusters: usize },
+    /// `routes_per_service` exceeds [`MAX_ROUTES_PER_SERVICE`], the route vocabulary.
+    TooManyRoutes { requested: usize, max: usize },
+}
+
+impl fmt::Display for TopologyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostlessClusters { clusters } => write!(
+                f,
+                "{clusters} cluster(s) with hosts_per_cluster = 0: every cluster needs at least one host"
+            ),
+            Self::TooManyRoutes { requested, max } => write!(
+                f,
+                "routes_per_service = {requested} exceeds the {max} distinct routes a service can expose"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TopologyError {}
 
 /// The knobs that shape a fleet. Every count is a target the generator hits exactly except
 /// `pods_per_cluster`, which it fills replica-set by replica-set and may overshoot by one
@@ -122,14 +157,43 @@ impl FleetTopology {
         self
     }
 
+    /// Check the knobs against what the builder can actually produce. `clusters == 0` is a
+    /// valid, empty fleet; the other counts are clamped or filled by the builder as documented
+    /// on the fields, so only the two combinations that would hang or panic are rejected.
+    pub fn validate(&self) -> Result<(), TopologyError> {
+        if self.clusters > 0 && self.hosts_per_cluster == 0 {
+            return Err(TopologyError::HostlessClusters {
+                clusters: self.clusters,
+            });
+        }
+        if self.routes_per_service > MAX_ROUTES_PER_SERVICE {
+            return Err(TopologyError::TooManyRoutes {
+                requested: self.routes_per_service,
+                max: MAX_ROUTES_PER_SERVICE,
+            });
+        }
+        Ok(())
+    }
+
     /// Generate every series in the fleet. Keys are `ts:<n>` in generation order.
+    ///
+    /// Panics if the topology fails [`validate`](Self::validate); callers that take knobs from
+    /// outside (the report tool's overrides) should use [`try_generate`](Self::try_generate)
+    /// or validate first and report the error themselves.
     pub fn generate(&self) -> Vec<SeriesSpec> {
+        self.try_generate()
+            .unwrap_or_else(|e| panic!("invalid fleet topology: {e}"))
+    }
+
+    /// [`generate`](Self::generate), returning the validation error instead of panicking.
+    pub fn try_generate(&self) -> Result<Vec<SeriesSpec>, TopologyError> {
+        self.validate()?;
         let mut rng = create_rng(Some(self.seed));
         let mut fleet = FleetBuilder::new(self, &mut rng);
         for cluster_idx in 0..self.clusters {
             fleet.cluster(cluster_idx);
         }
-        fleet.series
+        Ok(fleet.series)
     }
 }
 
@@ -1061,5 +1125,61 @@ mod tests {
     fn presets_scale_as_documented() {
         let small = small().len();
         assert!((5_000..20_000).contains(&small), "small preset: {small}");
+    }
+
+    #[test]
+    fn presets_validate() {
+        for preset in FleetPreset::all() {
+            assert_eq!(FleetTopology::preset(*preset).validate(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn hostless_clusters_are_rejected() {
+        let mut topology = FleetTopology::preset(FleetPreset::Small);
+        topology.hosts_per_cluster = 0;
+        assert_eq!(
+            topology.validate(),
+            Err(TopologyError::HostlessClusters { clusters: 1 })
+        );
+        assert!(topology.try_generate().is_err());
+
+        // No clusters means no pods to schedule, so no hosts is fine: an empty fleet.
+        topology.clusters = 0;
+        assert_eq!(topology.try_generate(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn routes_are_capped_by_the_vocabulary() {
+        let mut topology = FleetTopology::preset(FleetPreset::Small);
+        topology.routes_per_service = MAX_ROUTES_PER_SERVICE + 1;
+        assert_eq!(
+            topology.validate(),
+            Err(TopologyError::TooManyRoutes {
+                requested: MAX_ROUTES_PER_SERVICE + 1,
+                max: MAX_ROUTES_PER_SERVICE,
+            })
+        );
+
+        // The cap itself is reachable: every route in the vocabulary gets drawn.
+        topology.routes_per_service = MAX_ROUTES_PER_SERVICE;
+        assert_eq!(topology.validate(), Ok(()));
+        let fleet = topology.try_generate().expect("cap is generatable");
+        let routes: HashSet<&str> = fleet
+            .iter()
+            .flat_map(|s| s.labels.iter())
+            .filter(|l| l.name == "route")
+            .map(|l| l.value.as_str())
+            .collect();
+        // The two probe routes on top of the API vocabulary.
+        assert_eq!(routes.len(), MAX_ROUTES_PER_SERVICE + 2, "{routes:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid fleet topology")]
+    fn generate_panics_on_invalid_topology() {
+        let mut topology = FleetTopology::preset(FleetPreset::Small);
+        topology.hosts_per_cluster = 0;
+        topology.generate();
     }
 }

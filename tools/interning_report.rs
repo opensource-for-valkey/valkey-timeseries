@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use valkey_timeseries::common::string_interner::{InternedString, Stats};
 use valkey_timeseries::tests::generators::{
-    DEFAULT_FLEET_SEED, FleetPreset, FleetTopology, SeriesSpec,
+    DEFAULT_FLEET_SEED, FleetPreset, FleetTopology, MAX_ROUTES_PER_SERVICE, SeriesSpec,
 };
 use valkey_timeseries::{Label, MetricName};
 
@@ -39,7 +39,9 @@ fn usage() -> ! {
     eprintln!(
         "usage: interning_report [--preset small|medium|large] [--seed N] [--top K]\n\
          \x20                       [--clusters N] [--hosts N] [--namespaces N] [--pods N] [--routes N]\n\
-         \x20                       [--emit-commands PATH]"
+         \x20                       [--emit-commands PATH]\n\
+         \n\
+         --hosts must be at least 1 when --clusters is; --routes is capped at {MAX_ROUTES_PER_SERVICE}."
     );
     std::process::exit(2)
 }
@@ -117,6 +119,12 @@ fn parse_args() -> Config {
     }
     if !overrides.is_empty() {
         preset = None;
+    }
+    // Overrides go through the generator's own limits, so a hostless cluster or a route count
+    // past the vocabulary is a usage error here rather than a hang or panic inside `generate`.
+    if let Err(e) = topology.validate() {
+        eprintln!("invalid topology: {e}");
+        usage()
     }
     Config {
         topology,
@@ -431,7 +439,10 @@ fn main() {
     let cfg = parse_args();
 
     let started = Instant::now();
-    let fleet = cfg.topology.generate();
+    let fleet = cfg.topology.try_generate().unwrap_or_else(|e| {
+        eprintln!("invalid topology: {e}");
+        usage()
+    });
     let generated = started.elapsed();
 
     let pool_before = InternedString::interned_count();
