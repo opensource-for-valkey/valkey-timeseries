@@ -205,6 +205,13 @@ impl GorillaEncoder {
         self.writer.shrink_to_fit()
     }
 
+    /// Keeps only the first `len` bytes of the stream while leaving `num_samples` and the
+    /// last-sample metadata as they were: a stream that claims more than it holds.
+    #[cfg(test)]
+    pub(crate) fn truncate_stream_for_test(&mut self, len: usize) {
+        self.writer.truncate(len);
+    }
+
     pub fn rdb_save(&self, rdb: *mut raw::RedisModuleIO) {
         rdb_save_usize(rdb, self.num_samples);
         rdb_save_timestamp(rdb, self.first_ts);

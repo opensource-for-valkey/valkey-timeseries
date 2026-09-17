@@ -179,6 +179,14 @@ impl BitStream {
         self.stream.len()
     }
 
+    /// Cuts the stream to its first `len` bytes, as a truncated load would; the partial-byte
+    /// count is reset because the byte it described is gone.
+    #[cfg(test)]
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.stream.truncate(len);
+        self.count = 0;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.stream.is_empty()
     }
