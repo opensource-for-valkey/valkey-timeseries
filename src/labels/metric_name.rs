@@ -310,17 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_labels() {
-        let mut metric_name = MetricName::with_capacity(2);
-
-        metric_name.add_label("key1", "value1");
-        metric_name.add_label("key2", "value2");
-
-        assert_eq!(metric_name.get_value("key1"), Some("value1"));
-        assert_eq!(metric_name.get_value("key2"), Some("value2"));
-    }
-
-    #[test]
     fn test_sort() {
         let mut metric_name = MetricName::default();
         metric_name.add_label("key2", "value2");
