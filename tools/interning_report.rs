@@ -315,9 +315,21 @@ fn print_report(cfg: &Config, dataset: &DatasetCost, stats: &Stats, build: std::
         pool.allocated as f64 / dataset.series as f64
     );
     println!(
-        "  memory_saved_bytes: {}   memory_saved_pct: {:.1}%   (vs. one Arc<[u8]> per pair, no pool)",
+        "  memory_saved_bytes: {}   memory_saved_pct: {:.1}%   (pool only, vs. one allocation per holder)",
         bytes(stats.memory_saved_bytes),
         stats.memory_saved_pct
+    );
+    // The pool-only percentage ignores the slot every holder keeps either way, which is most of
+    // what labels cost once the pool is deduplicating well. Printing both stops the high number
+    // from being read as the label-memory saving; the layout table below is the same comparison
+    // with the per-series slice header the pool cannot see.
+    println!(
+        "  holders: {}   slots: {} ({} B each)   total storage: {}   storage_saved_pct: {:.1}%",
+        commas(stats.holder_count),
+        bytes(stats.holder_slot_bytes),
+        INTERNED_SLOT,
+        bytes(stats.total_storage_bytes),
+        stats.storage_saved_pct
     );
     if pool.count != dataset.unique_pairs {
         println!(

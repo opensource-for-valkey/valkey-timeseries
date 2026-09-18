@@ -88,11 +88,24 @@ fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
     }
 
     // Reply[3] -> MemorySavings
-    reply_with_array(ctx, 4);
+    //
+    // `memorySavedPct` compares the pool against one allocation per reference and nothing else,
+    // so it reads near 100% on any label set worth interning. The holder slot is what a
+    // reference costs whether or not the bytes behind it are shared, so the four fields after
+    // it restate the same saving against total string storage; see `Stats` for the split.
+    reply_with_array(ctx, 12);
     reply_with_str(ctx, "memorySavedBytes");
     reply_with_usize(ctx, stats.memory_saved_bytes);
     reply_with_str(ctx, "memorySavedPct");
     reply_with_double(ctx.ctx, stats.memory_saved_pct);
+    reply_with_str(ctx, "holders");
+    reply_with_usize(ctx, stats.holder_count);
+    reply_with_str(ctx, "holderSlotBytes");
+    reply_with_usize(ctx, stats.holder_slot_bytes);
+    reply_with_str(ctx, "totalStorageBytes");
+    reply_with_usize(ctx, stats.total_storage_bytes);
+    reply_with_str(ctx, "storageSavedPct");
+    reply_with_double(ctx.ctx, stats.storage_saved_pct);
 
     if k > 0 {
         // Reply[4] -> TopK by RefCount

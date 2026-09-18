@@ -470,6 +470,30 @@ mod tests {
             unique.len()
         );
         assert!(stats.memory_saved_pct > 95.0, "{}", stats.memory_saved_pct);
+        // The pool-only figure above is what `TS._DEBUG STRINGPOOLSTATS` has always reported,
+        // and on a fleet-shaped label set it says 99% however much the labels actually cost:
+        // both sides of its ratio count heap allocations only. `storage_saved_pct` adds the
+        // slot each holder keeps either way, so it lands materially lower (~82% here) and is
+        // the figure to quote for label memory. It cannot go the other way.
+        assert!(
+            stats.storage_saved_pct < stats.memory_saved_pct,
+            "storage {} should trail pool-only {}",
+            stats.storage_saved_pct,
+            stats.memory_saved_pct
+        );
+        assert!(
+            stats.storage_saved_pct > 50.0,
+            "interning should still pay on a fleet: {}",
+            stats.storage_saved_pct
+        );
+        // The slots are real memory the pool never sees: a fleet holds far more label
+        // occurrences than distinct pairs, so they outweigh the pool itself.
+        assert!(
+            stats.holder_slot_bytes > stats.total_stats.allocated,
+            "slots {} should outweigh the pool {} on a repetitive fleet",
+            stats.holder_slot_bytes,
+            stats.total_stats.allocated
+        );
 
         // `amortized_size` splits each shared allocation across its holders, so the per-series
         // string bytes sum to (about) what the pool holds for the fleet.

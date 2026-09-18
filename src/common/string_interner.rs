@@ -461,9 +461,38 @@ pub struct Stats {
     pub top_k_by_ref: Vec<TopKEntry>,
     /// Bytes saved by interning: sum of `allocated * (ref_count - 1)` over all pool entries.
     pub memory_saved_bytes: usize,
-    /// Percentage of memory saved relative to the hypothetical uninterned cost.
-    /// `memory_saved_bytes / (memory_saved_bytes + total_stats.allocated) * 100`
+    /// Share of the *pool's* hypothetical uninterned cost that interning avoids:
+    /// `memory_saved_bytes / (memory_saved_bytes + total_stats.allocated) * 100`.
+    ///
+    /// This is a pool-efficiency figure, not a label-memory one, and it runs high (99 %+ on a
+    /// fleet-shaped label set) because both sides of the ratio count only heap allocations. A
+    /// holder pays for a [`InternedString`] slot as well, and pays for it either way, so the
+    /// slot cancels out of the numerator but belongs in the denominator of any claim about
+    /// what interning saves overall. [`Self::storage_saved_pct`] is that claim; prefer it when
+    /// the question is "how much memory do labels cost", and use this one when the question is
+    /// "how well is the pool deduplicating".
     pub memory_saved_pct: f64,
+    /// Live holders across the whole pool: `Σ ref_count`, so one per outstanding
+    /// [`InternedString`] value. Equivalently, the number of label occurrences when every
+    /// holder is a label in a series.
+    pub holder_count: usize,
+    /// What those holders spend on slots: `holder_count * size_of::<InternedString>()`.
+    /// Unaffected by interning — an uninterned layout with one allocation per holder pays the
+    /// same slot, only pointing somewhere else.
+    pub holder_slot_bytes: usize,
+    /// What interned strings actually cost right now: `total_stats.allocated +
+    /// holder_slot_bytes`. On a fleet-shaped label set the slots dominate, which is the point
+    /// of reporting them.
+    pub total_storage_bytes: usize,
+    /// Share of total string storage that interning avoids, counting holder slots on both
+    /// sides: `memory_saved_bytes / (total_storage_bytes + memory_saved_bytes) * 100`.
+    ///
+    /// The honest whole-storage figure, and always at or below [`Self::memory_saved_pct`].
+    /// Still a slight over-statement of what a *series* saves: the pool cannot see the
+    /// per-series container that holds the slots (`MetricName`'s `Arc<[InternedString]>`
+    /// header), and it counts transient holders — a clone on the stack — alongside stored
+    /// ones.
+    pub storage_saved_pct: f64,
 }
 
 /// A pointer to an interned, reference-counted, and immutable string object.
@@ -682,6 +711,10 @@ impl InternedString {
             stats.total_stats.bytes += bytes;
             stats.total_stats.allocated += allocated;
 
+            // One slot per holder, interned or not: it is the denominator's share of the cost
+            // that dedup never touches.
+            stats.holder_count += ref_count;
+
             // Each duplicate reference that shares this allocation is a saved copy.
             // ref_count includes the pool's own ref, so duplicates = ref_count - 1.
             // (strings with ref_count == 1 have no duplicates → zero saving)
@@ -736,6 +769,18 @@ impl InternedString {
             0.0
         } else {
             stats.memory_saved_bytes as f64 / total_uninterned as f64 * 100.0
+        };
+
+        // The same saving against everything the strings cost, slots included. The slot is in
+        // both layouts, so it enters the denominator only, which is exactly why this figure
+        // sits below `memory_saved_pct` instead of alongside it.
+        stats.holder_slot_bytes = stats.holder_count * size_of::<InternedString>();
+        stats.total_storage_bytes = stats.total_stats.allocated + stats.holder_slot_bytes;
+        let storage_uninterned = stats.total_storage_bytes + stats.memory_saved_bytes;
+        stats.storage_saved_pct = if storage_uninterned == 0 {
+            0.0
+        } else {
+            stats.memory_saved_bytes as f64 / storage_uninterned as f64 * 100.0
         };
 
         stats
@@ -1589,6 +1634,83 @@ mod tests {
         assert!(stats.top_k_by_size.is_empty());
         assert!(stats.top_k_by_ref.is_empty());
         assert_eq!(stats.total_stats.count, 1);
+    }
+
+    /// `memory_saved_pct` weighs the pool against one allocation per holder and stops there, so
+    /// it climbs towards 100% as sharing improves however much the holders themselves cost.
+    /// `storage_saved_pct` restates the same saving over total storage, where the slot each
+    /// holder keeps either way sits in the denominator alone. The two are checked against hand
+    /// arithmetic here because the gap between them is the whole point of reporting both.
+    #[test]
+    #[serial]
+    fn storage_saving_counts_the_slot_every_holder_keeps() {
+        reset_memory_tracking();
+
+        const HOLDERS: usize = 8;
+        // 48 bytes of payload, so every figure below is exact in binary.
+        let payload = "storage-saving-fixture".to_string() + &"x".repeat(26);
+        assert_eq!(payload.len(), 48);
+
+        let first = InternedString::new(&payload);
+        let _clones: Vec<InternedString> = (1..HOLDERS).map(|_| first.clone()).collect();
+
+        let stats = InternedString::get_stats();
+        assert_eq!(stats.total_stats.count, 1, "fixture is the only live entry");
+
+        let allocated = super::HEADER_SIZE + payload.len();
+        assert_eq!(stats.total_stats.allocated, allocated);
+
+        // One holder per outstanding `InternedString`, each paying for its own slot.
+        assert_eq!(stats.holder_count, HOLDERS);
+        assert_eq!(
+            stats.holder_slot_bytes,
+            HOLDERS * size_of::<InternedString>()
+        );
+        assert_eq!(
+            stats.total_storage_bytes,
+            allocated + stats.holder_slot_bytes
+        );
+
+        // Seven allocations avoided, out of the eight an uninterned layout would make.
+        let saved = allocated * (HOLDERS - 1);
+        assert_eq!(stats.memory_saved_bytes, saved);
+        assert_eq!(
+            stats.memory_saved_pct,
+            saved as f64 / (saved + allocated) as f64 * 100.0
+        );
+        assert_eq!(
+            stats.storage_saved_pct,
+            saved as f64 / (saved + stats.total_storage_bytes) as f64 * 100.0
+        );
+
+        // 87.5% against the pool alone, 77.8% against everything the strings cost.
+        assert!(
+            stats.storage_saved_pct < stats.memory_saved_pct,
+            "slots belong in the denominator: {} vs {}",
+            stats.storage_saved_pct,
+            stats.memory_saved_pct
+        );
+    }
+
+    /// The slot is the whole difference between the two percentages, so a pool whose strings
+    /// are shared by exactly one holder each saves nothing under either measure.
+    #[test]
+    #[serial]
+    fn unshared_strings_save_nothing_under_either_measure() {
+        reset_memory_tracking();
+
+        let _a = InternedString::new("unshared-alpha");
+        let _b = InternedString::new("unshared-beta");
+
+        let stats = InternedString::get_stats();
+        assert_eq!(stats.holder_count, 2);
+        assert_eq!(stats.memory_saved_bytes, 0);
+        assert_eq!(stats.memory_saved_pct, 0.0);
+        assert_eq!(stats.storage_saved_pct, 0.0);
+        assert_eq!(
+            stats.total_storage_bytes,
+            stats.total_stats.allocated + 2 * size_of::<InternedString>()
+        );
     }
 
     #[test]

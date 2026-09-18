@@ -517,14 +517,27 @@ class TestStringPoolStatsTopK(ValkeyTimeSeriesTestCaseDebugMode):
         assert all(isinstance(v, str) for v in by_ref_values | by_size_values)
 
 
+def _parse_bucket_stats(bucket: list) -> dict:
+    """Parse a flat 12-element BucketStats array into a dict."""
+    assert len(bucket) == 12, f"Expected 12 elements in BucketStats, got {len(bucket)}: {bucket}"
+    floats = {"avgSize", "avgAllocated"}
+    parsed = {}
+    for i in range(0, len(bucket), 2):
+        key = bucket[i].decode() if isinstance(bucket[i], bytes) else bucket[i]
+        parsed[key] = float(bucket[i + 1]) if key in floats else int(bucket[i + 1])
+    return parsed
+
+
 def _parse_memory_savings(result: list) -> dict:
-    """Parse the flat 4-element MemorySavings array (result[3]) into a dict."""
+    """Parse the flat 12-element MemorySavings array (result[3]) into a dict."""
     savings = result[3]
-    assert len(savings) == 4, f"Expected 4 elements in MemorySavings, got {len(savings)}"
-    return {
-        savings[0].decode(): int(savings[1]),  # memorySavedBytes -> int
-        savings[2].decode(): float(savings[3]),  # memorySavedPct   -> float
-    }
+    assert len(savings) == 12, f"Expected 12 elements in MemorySavings, got {len(savings)}"
+    floats = {"memorySavedPct", "storageSavedPct"}
+    parsed = {}
+    for i in range(0, len(savings), 2):
+        key = savings[i].decode()
+        parsed[key] = float(savings[i + 1]) if key in floats else int(savings[i + 1])
+    return parsed
 
 
 class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
@@ -645,8 +658,48 @@ class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
         self._setup_large_pool()
         result = self._stats(self.K)
         savings = _parse_memory_savings(result)
-        assert set(savings.keys()) == {"memorySavedBytes", "memorySavedPct"}, (
-            f"Unexpected keys: {savings.keys()}"
+        assert set(savings.keys()) == {
+            "memorySavedBytes",
+            "memorySavedPct",
+            "holders",
+            "holderSlotBytes",
+            "totalStorageBytes",
+            "storageSavedPct",
+        }, f"Unexpected keys: {savings.keys()}"
+
+    def test_holder_slots_are_eight_bytes_each(self):
+        """Every live reference pays for one pointer-sized slot, shared bytes or not."""
+        self._setup_large_pool()
+        result = self._stats(self.K)
+        savings = _parse_memory_savings(result)
+        assert savings["holders"] > 0, "Expected live holders after creating series"
+        assert savings["holderSlotBytes"] == savings["holders"] * 8, (
+            f"holderSlotBytes {savings['holderSlotBytes']} != 8 bytes x "
+            f"{savings['holders']} holders"
+        )
+
+    def test_total_storage_is_pool_plus_slots(self):
+        """totalStorageBytes must account for the slots as well as the pool."""
+        self._setup_large_pool()
+        result = self._stats(self.K)
+        savings = _parse_memory_savings(result)
+        pool_allocated = _parse_bucket_stats(result[0])["allocated"]
+        assert savings["totalStorageBytes"] == pool_allocated + savings["holderSlotBytes"], (
+            f"totalStorageBytes {savings['totalStorageBytes']} != pool {pool_allocated} + "
+            f"slots {savings['holderSlotBytes']}"
+        )
+
+    def test_storage_saved_pct_trails_pool_only_pct(self):
+        """
+        The slot each holder keeps either way is in the denominator of storageSavedPct and
+        not in memorySavedPct, so the honest figure can never be the higher of the two.
+        """
+        self._setup_large_pool()
+        result = self._stats(self.K)
+        savings = _parse_memory_savings(result)
+        assert 0.0 <= savings["storageSavedPct"] <= savings["memorySavedPct"], (
+            f"storageSavedPct {savings['storageSavedPct']:.1f}% should trail "
+            f"memorySavedPct {savings['memorySavedPct']:.1f}%"
         )
 
     def test_memory_savings_positive_when_labels_shared(self):
