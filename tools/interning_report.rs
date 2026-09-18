@@ -21,10 +21,13 @@ use valkey_timeseries::tests::generators::{
 };
 use valkey_timeseries::{Label, MetricName};
 
-/// The `Arc<[u8]>` control block: strong and weak counts.
+/// The control block in front of every heap string: the interner's header (count, length,
+/// separator) and an `Arc<[u8]>`'s (strong and weak counts) are both two words.
 const ARC_HEADER: usize = 2 * size_of::<usize>();
-/// A `MetricName` entry: `Arc<[u8]>` is a fat pointer.
+/// A `MetricName` entry: one thin pointer.
 const INTERNED_SLOT: usize = size_of::<InternedString>();
+/// The `Arc` counts in front of a `MetricName`'s shared label slice, once per series.
+const SLICE_HEADER: usize = 2 * size_of::<usize>();
 /// A `Label` in a `Vec<Label>`: two `String`s inline.
 const LABEL_SLOT: usize = size_of::<Label>();
 
@@ -156,9 +159,9 @@ struct DatasetCost {
     pairs: usize,
     unique_pairs: usize,
     duplicate_label_sets: usize,
-    /// `Vec<InternedString>` slots + one pool allocation per unique pair.
+    /// `Arc<[InternedString]>` per series + one pool allocation per unique pair.
     interned: usize,
-    /// `Vec<InternedString>` slots + one allocation per occurrence, no pool.
+    /// The same slots + one allocation per occurrence, no pool.
     arc_per_pair: usize,
     /// `Vec<Label>` slots + two heap `String`s per occurrence.
     string_labels: usize,
@@ -177,7 +180,7 @@ fn cost_dataset(fleet: &[SeriesSpec]) -> DatasetCost {
 
     for series in fleet {
         pairs += series.labels.len();
-        slots_interned += series.labels.len() * INTERNED_SLOT;
+        slots_interned += SLICE_HEADER + series.labels.len() * INTERNED_SLOT;
         string_labels += series.labels.len() * LABEL_SLOT;
         let mut sorted: Vec<(String, String)> = Vec::with_capacity(series.labels.len());
         for label in &series.labels {
@@ -331,8 +334,8 @@ fn print_report(cfg: &Config, dataset: &DatasetCost, stats: &Stats, build: std::
         "layout", "total", "per series", "saved"
     );
     let rows = [
-        ("MetricName: Vec<InternedString> + pool", dataset.interned),
-        ("Vec<Arc<[u8]>> per pair, no dedup", dataset.arc_per_pair),
+        ("MetricName: Arc<[InternedString]> + pool", dataset.interned),
+        ("Arc<[u8]> per pair, no dedup", dataset.arc_per_pair),
         (
             "Vec<Label>: String key + String value",
             dataset.string_labels,

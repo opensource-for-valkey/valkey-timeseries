@@ -9,9 +9,9 @@ use get_size2::{GetSize, GetSizeTracker};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
+use std::sync::Arc;
 use valkey_module::{ValkeyResult, ValkeyValue, raw};
 
-const VALUE_SEPARATOR: &str = "=";
 const EMPTY_LABEL: &str = "";
 
 // Real series never come close to this many labels; it only rejects a corrupt/hostile
@@ -49,12 +49,15 @@ impl SeriesLabel for InternedLabel<'_> {
 /// meaning that only a single allocation is made per unique pair, irrespective of the number of
 /// series it occurs in.
 ///
-/// We choose to store the label/value pair as a single interned string in the format "key=value". This reduces
-/// the memory overhead associated with storing separate strings for keys and values (8 bytes vs 16 bytes on 64-bit systems).
+/// Each pair is one interned `name=value` string ([`InternedString`], a single pointer), and the
+/// set is one shared, immutable slice: cloning a `MetricName` or handing a query the labels of a
+/// series is a reference-count bump, never an allocation. Mutation rebuilds the slice, which is
+/// fine for how rarely labels change (`TS.ALTER`, load).
 ///
-/// The labels are stored in a sorted order to allow for efficient comparison and retrieval.
+/// The labels are kept in name order so that lookups are binary searches and two sets with the
+/// same pairs compare equal.
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq)]
-pub struct MetricName(Vec<InternedString>);
+pub struct MetricName(Arc<[InternedString]>);
 
 impl GetSize for MetricName {
     /// `get_heap_size_with_tracker` is the extension point a containing type's derived `GetSize`
@@ -67,69 +70,108 @@ impl GetSize for MetricName {
     /// label the whole keyspace shares and the rest nothing. [`InternedString::amortized_size`]
     /// splits it evenly instead, so per-key numbers add up across the keyspace.
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
-        // The spare capacity is real: `add_label` inserts into the middle of the vector.
-        let vec_bytes = self.0.capacity() * size_of::<InternedString>();
         let string_bytes: usize = self.0.iter().map(InternedString::amortized_size).sum();
-        (vec_bytes + string_bytes, tracker)
+        (self.slice_bytes() + string_bytes, tracker)
     }
 }
 
 impl MetricName {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self(Vec::with_capacity(capacity))
+    /// An empty set. Kept for callers that build incrementally with [`Self::add_label`];
+    /// the capacity is irrelevant to the shared slice.
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::default()
     }
 
     pub fn new(labels: &[Label]) -> Self {
-        let mut metric_name = Self::with_capacity(labels.len());
+        let mut entries = Vec::with_capacity(labels.len());
         for label in labels {
-            metric_name.add_label(label.name(), label.value());
+            Self::insert_pair(&mut entries, label.name(), label.value());
         }
-        metric_name.shrink_to_fit();
-        metric_name
+        Self(Arc::from(entries))
+    }
+
+    /// Build from `(name, value)` pairs; a repeated name keeps the last value.
+    pub fn from_pairs<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut entries = Vec::new();
+        for (name, value) in pairs {
+            Self::insert_pair(&mut entries, name, value);
+        }
+        Self(Arc::from(entries))
+    }
+
+    /// The pairs as one shared slice, for holders that outlive the borrow (a query's copy of a
+    /// series' labels). A reference-count bump.
+    pub fn shared(&self) -> Arc<[InternedString]> {
+        Arc::clone(&self.0)
+    }
+
+    /// The stored `name=value` strings, in name order. For callers that hash or
+    /// compare whole labels and need neither half on its own.
+    pub fn raw_entries(&self) -> std::slice::Iter<'_, InternedString> {
+        self.0.iter()
+    }
+
+    /// Heap bytes of the slice itself: the `Arc` counts plus one pointer per label.
+    fn slice_bytes(&self) -> usize {
+        if self.0.is_empty() {
+            // `Arc<[T]>::from(Vec::new())` still allocates the counts.
+            2 * size_of::<usize>()
+        } else {
+            2 * size_of::<usize>() + self.0.len() * size_of::<InternedString>()
+        }
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    fn split_kv(tag: &InternedString) -> Option<(&str, &str)> {
-        tag.split_once(VALUE_SEPARATOR)
+        self.0 = Arc::from(Vec::new());
     }
 
     fn key_of(tag: &InternedString) -> &str {
-        Self::split_kv(tag).map(|(k, _)| k).unwrap_or(EMPTY_LABEL)
+        tag.name()
     }
 
     fn find_index(&self, key: &str) -> Result<usize, usize> {
         self.0.binary_search_by_key(&key, Self::key_of)
     }
 
+    /// Insert into a name-ordered vector, replacing an existing value for the name.
+    fn insert_pair(entries: &mut Vec<InternedString>, key: &str, value: &str) {
+        let interned_value = InternedString::new_pair(key, value);
+        match entries.binary_search_by_key(&key, Self::key_of) {
+            Ok(idx) => entries[idx] = interned_value,
+            Err(idx) => entries.insert(idx, interned_value),
+        }
+    }
+
+    /// Rebuild the slice through a vector edit. Every entry is retained once
+    /// for the copy and released once with the old slice; rare, see the type docs.
+    fn edit(&mut self, f: impl FnOnce(&mut Vec<InternedString>)) {
+        let mut entries: Vec<InternedString> = self.0.to_vec();
+        f(&mut entries);
+        self.0 = Arc::from(entries);
+    }
+
     /// adds a new label to mn with the given key and value.
     pub fn add_label(&mut self, key: &str, value: &str) {
-        let full_label = format!("{key}{VALUE_SEPARATOR}{value}");
-        let interned_value = InternedString::new(&full_label);
-
-        match self.find_index(key) {
-            Ok(idx) => self.0[idx] = interned_value,
-            Err(idx) => self.0.insert(idx, interned_value),
-        }
+        self.edit(|entries| Self::insert_pair(entries, key, value));
     }
 
     pub fn get_tag(&'_ self, key: &str) -> Option<InternedLabel<'_>> {
         let idx = self.find_index(key).ok()?;
-        let (name, value) = Self::split_kv(&self.0[idx])?;
+        let (name, value) = self.0[idx].split_pair()?;
         Some(InternedLabel { name, value })
     }
 
     pub fn get_value(&self, key: &str) -> Option<&str> {
         let idx = self.find_index(key).ok()?;
-        let (_, value) = Self::split_kv(&self.0[idx])?;
+        let (_, value) = self.0[idx].split_pair()?;
         Some(value)
     }
 
     pub fn remove_label(&mut self, key: &str) {
         if let Ok(idx) = self.find_index(key) {
-            self.0.remove(idx);
+            self.edit(|entries| {
+                entries.remove(idx);
+            });
         }
     }
 
@@ -142,9 +184,10 @@ impl MetricName {
     }
 
     pub fn iter(&'_ self) -> impl Iterator<Item = InternedLabel<'_>> {
-        self.0
-            .iter()
-            .filter_map(|x| Self::split_kv(x).map(|(name, value)| InternedLabel { name, value }))
+        self.0.iter().filter_map(|x| {
+            x.split_pair()
+                .map(|(name, value)| InternedLabel { name, value })
+        })
     }
 
     pub fn to_label_vec(&self) -> Vec<Label> {
@@ -153,8 +196,14 @@ impl MetricName {
             .collect()
     }
 
+    /// Restore name order. Every constructor and mutator keeps it, so this is
+    /// only for a set assembled some other way; it orders by label *name*, not
+    /// by the raw `name=value` string (those differ when one name prefixes
+    /// another: `a1=…` sorts before `a=…` as strings).
     pub fn sort(&mut self) {
-        self.0.sort();
+        if !self.0.is_sorted_by_key(Self::key_of) {
+            self.edit(|entries| entries.sort_by(|a, b| a.name().cmp(b.name())));
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -175,27 +224,22 @@ impl MetricName {
 
     pub fn from_rdb(rdb: *mut raw::RedisModuleIO) -> ValkeyResult<Self> {
         let count = rdb_load_len(rdb, MAX_LABELS_PER_SERIES)?;
-        let mut result = Self::with_capacity(count);
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let name = rdb_load_string(rdb)?;
             let value = rdb_load_string(rdb)?;
-            result.add_label(&name, &value);
+            Self::insert_pair(&mut entries, &name, &value);
         }
-        Ok(result)
+        Ok(Self(Arc::from(entries)))
     }
 
-    pub fn shrink_to_fit(&mut self) {
-        self.0.shrink_to_fit();
-    }
+    /// The shared slice is always exactly sized; kept for API compatibility.
+    pub fn shrink_to_fit(&mut self) {}
 }
 
 impl From<HashMap<String, String>> for MetricName {
     fn from(map: HashMap<String, String>) -> Self {
-        let mut metric_name = MetricName::with_capacity(map.len());
-        for (key, value) in map {
-            metric_name.add_label(&key, &value);
-        }
-        metric_name
+        Self::from_pairs(map.iter().map(|(k, v)| (k.as_str(), v.as_str())))
     }
 }
 
@@ -286,6 +330,38 @@ mod tests {
         let sorted_labels: Vec<_> = metric_name.iter().collect();
         assert_eq!(sorted_labels[0].name, "key1");
         assert_eq!(sorted_labels[1].name, "key2");
+    }
+
+    #[test]
+    fn labels_are_kept_in_name_order_not_raw_order() {
+        // "a1=x" < "a=x" as strings ('1' < '='), but `a` < `a1` as names.
+        let mn = MetricName::from_pairs([("a1", "x"), ("a", "x"), ("__name__", "m")]);
+        let names: Vec<&str> = mn.iter().map(|l| l.name).collect();
+        assert_eq!(names, ["__name__", "a", "a1"]);
+        assert_eq!(mn.get_value("a"), Some("x"));
+        assert_eq!(mn.get_value("a1"), Some("x"));
+
+        let mut sorted = mn.clone();
+        sorted.sort();
+        assert_eq!(sorted, mn);
+    }
+
+    #[test]
+    fn clone_and_shared_are_the_same_allocation() {
+        let mn: MetricName = r#"m{a="1",b="2"}"#.parse().unwrap();
+        let shared = mn.shared();
+        assert!(Arc::ptr_eq(&shared, &mn.clone().0));
+        assert_eq!(shared.len(), 3);
+        assert_eq!(shared[1].split_pair(), Some(("a", "1")));
+
+        let mut altered = mn.clone();
+        altered.add_label("c", "3");
+        assert!(!Arc::ptr_eq(&altered.0, &mn.0));
+        assert_eq!(mn.len(), 3);
+        assert_eq!(altered.len(), 4);
+        altered.remove_label("a");
+        assert_eq!(altered.get_value("a"), None);
+        assert_eq!(altered.len(), 3);
     }
 
     #[test]
@@ -396,7 +472,8 @@ mod tests {
         // `stats.total_stats.count` after) instead tied the assertion to unrelated interner
         // traffic and left the `usize` subtraction able to underflow if the pool shrank between
         // the two reads.
-        let retained: HashSet<&InternedString> = names.iter().flat_map(|mn| mn.0.iter()).collect();
+        let retained: HashSet<&InternedString> =
+            names.iter().flat_map(|mn| mn.raw_entries()).collect();
         let retained_count = retained.len();
         assert!(
             retained_count <= unique.len() && retained_count + 64 >= unique.len(),
@@ -413,7 +490,7 @@ mod tests {
             .sum();
         let amortized: usize = names
             .iter()
-            .map(|mn| mn.get_heap_size() - mn.0.capacity() * size_of::<InternedString>())
+            .map(|mn| mn.get_heap_size() - mn.slice_bytes())
             .sum();
         // div_ceil rounds each share up, so the sum overshoots by at most one byte per pair.
         assert!(
