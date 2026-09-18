@@ -850,9 +850,15 @@ impl From<String> for InternedString {
 }
 
 impl From<&[u8]> for InternedString {
-    /// The bytes must be valid UTF-8: every read goes through `as_str`.
+    /// Panics if `s` is not valid UTF-8.
+    ///
+    /// Every `InternedString` exposes its bytes as `str`; validate before
+    /// storing them so `as_str` can safely use `from_utf8_unchecked`.
     fn from(s: &[u8]) -> Self {
-        debug_assert!(std::str::from_utf8(s).is_ok());
+        assert!(
+            std::str::from_utf8(s).is_ok(),
+            "InternedString bytes must be valid UTF-8"
+        );
         Self::intern(s)
     }
 }
@@ -1193,6 +1199,13 @@ mod tests {
         assert_eq!(unicode1, unicode2);
         assert_ne!(unicode1, different);
         assert_eq!(unicode1.deref(), "🦀 Rust");
+    }
+
+    #[test]
+    #[serial]
+    #[should_panic(expected = "InternedString bytes must be valid UTF-8")]
+    fn byte_slice_constructor_rejects_invalid_utf8() {
+        let _ = InternedString::from(&[0xff][..]);
     }
 
     #[test]
