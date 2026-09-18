@@ -27,9 +27,10 @@
 
 use super::generated::{Label, SeriesRangeResponse, SymbolTable};
 use crate::common::context::key_for_display;
+use crate::common::string_interner::InternedString;
 use crate::labels::MetricName;
 use crate::promql::generated::InstantSample;
-use crate::promql::{EvalLabels, EvalSample, SplitLabel};
+use crate::promql::{EvalLabels, EvalSample};
 use std::collections::HashMap;
 use std::sync::Arc;
 use valkey_module::{ValkeyError, ValkeyResult};
@@ -280,14 +281,14 @@ pub fn resolve_labels<T: SymbolTableRefs>(
 /// labels, skipping the owned `Label` strings [`resolve_labels`] rebuilds.
 ///
 /// Each distinct `(name, value)` pair is interned once per response as a
-/// [`SplitLabel`] (the form local series already carry) and every sample that
+/// `name=value` [`InternedString`] (the form local series already carry) and every sample that
 /// references it takes a refcount bump, so a 500-series instant response costs
 /// ~500 interned strings instead of 4 000 `String` clones. A sample that
 /// carries inline labels instead of refs (a peer that did not intern) goes
 /// through the ordinary owned conversion.
 pub struct EvalLabelResolver<'a> {
     table: &'a SymbolTable,
-    pairs: HashMap<u64, SplitLabel, ahash::RandomState>,
+    pairs: HashMap<u64, InternedString, ahash::RandomState>,
 }
 
 impl<'a> EvalLabelResolver<'a> {
@@ -318,22 +319,22 @@ impl<'a> EvalLabelResolver<'a> {
         for (&name_ref, &value_ref) in names.iter().zip(&values) {
             lookup(self.table, s, name_ref, value_ref)?;
         }
-        let split: Arc<[SplitLabel]> = names
+        let labels: Arc<[InternedString]> = names
             .into_iter()
             .zip(values)
             .map(|(name_ref, value_ref)| self.pair(name_ref, value_ref))
             .collect();
-        Ok(EvalLabels::from_split_shared(split))
+        Ok(EvalLabels::from_interned_shared(labels))
     }
 
     /// The interned label for one validated ref pair, created on first sight.
     #[inline]
-    fn pair(&mut self, name_ref: u32, value_ref: u32) -> SplitLabel {
+    fn pair(&mut self, name_ref: u32, value_ref: u32) -> InternedString {
         let table = self.table;
         self.pairs
             .entry((u64::from(name_ref) << 32) | u64::from(value_ref))
             .or_insert_with(|| {
-                SplitLabel::new(
+                InternedString::new_pair(
                     &table.names[name_ref as usize],
                     &table.values[value_ref as usize],
                 )

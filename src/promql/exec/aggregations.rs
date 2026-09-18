@@ -438,6 +438,19 @@ fn eval_reduction_aggregation(
     // inside the worker — an allocator round-trip on a thread that did not
     // allocate it, for every dropped sample. `sum` groups hold bare `f64`s,
     // free nothing, and sit at parity, which is the fan-out's ceiling here.
+    //
+    // That table was taken on orx-parallel's default runner, which spawned OS
+    // threads per call. Re-measured 2026-09-18 on the persistent rayon pool
+    // (`iter_into_par_rayon`, interleaved in one binary): the runner was not
+    // the reason. quantile/topk/limitk still lost 1.4-5.4x at every shape up
+    // to 100x2000 and 11x20000, `sum` was 1.0x at every large shape, and a
+    // chunked parallel *grouping* lost 3x at 22k samples. What the fan-out
+    // was spreading across threads was the per-sample drop of a label set
+    // allocated per series per query (~40-65 ns, about half of this
+    // function's ~90 ns/sample), which contends on shared interned-string
+    // counters. `EvalLabels::interned` now shares the series' own slice
+    // instead, which removed that cost outright (group_samples 22k-sample
+    // shapes -26..-37%); the fan-out has even less to split than before.
     groups
         .into_iter()
         .map(|(_, group)| {

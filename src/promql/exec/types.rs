@@ -3,8 +3,7 @@ use crate::common::Sample;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::string_interner::InternedString;
 use crate::labels::{
-    HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, SeriesLabel,
-    fingerprint_labels,
+    HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, fingerprint_labels,
 };
 use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
@@ -62,52 +61,10 @@ pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 /// Maps from a label key (sorted vector of label pairs) to samples vector
 pub(crate) type SeriesMap = halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState>;
 
-/// One label borrowed from storage: the interned `name=value` string plus the
-/// offset of its `=`, recorded once so `name()` and `value()` are O(1) slices.
-#[derive(Debug, Clone)]
-pub struct SplitLabel {
-    raw: InternedString,
-    sep: u32,
-}
-
-impl SplitLabel {
-    #[inline]
-    pub fn name(&self) -> &str {
-        &self.raw[..self.sep as usize]
-    }
-
-    #[inline]
-    pub fn value(&self) -> &str {
-        &self.raw[self.sep as usize + 1..]
-    }
-
-    fn to_label(&self) -> Label {
-        Label::new(self.name(), self.value())
-    }
-
-    /// A label that arrived over the wire, interned in the same `name=value`
-    /// form storage uses so a series assembled from a fan-out response shares
-    /// one allocation per distinct pair with every other series in the reply
-    /// (and with local series carrying the same label).
-    pub(crate) fn new(name: &str, value: &str) -> Self {
-        let mut raw = String::with_capacity(name.len() + 1 + value.len());
-        raw.push_str(name);
-        raw.push('=');
-        raw.push_str(value);
-        SplitLabel {
-            raw: InternedString::new(&raw),
-            sep: name.len() as u32,
-        }
-    }
-}
-
-impl SeriesLabel for SplitLabel {
-    fn name(&self) -> &str {
-        SplitLabel::name(self)
-    }
-    fn value(&self) -> &str {
-        SplitLabel::value(self)
-    }
+/// An owned `Label` from an interned `name=value` entry.
+#[inline]
+fn label_of(raw: &InternedString) -> Label {
+    Label::new(raw.name(), raw.value())
 }
 
 /// Cheap-to-clone label container for evaluator internals.
@@ -133,7 +90,7 @@ impl SeriesLabel for SplitLabel {
 #[derive(Debug, Clone)]
 pub enum EvalLabels {
     /// Labels borrowed from storage via refcount. Clone = O(1) refcount bump.
-    Interned(Arc<[SplitLabel]>),
+    Interned(Arc<[InternedString]>),
     /// Shared immutable labels. Clone = O(1) refcount bump.
     Shared(Arc<[Label]>),
     /// Owned mutable sorted labels, materialized on the first mutation.
@@ -149,44 +106,26 @@ impl EvalLabels {
         EvalLabels::Shared(Arc::from(labels))
     }
 
-    /// Borrow a series' labels from storage without copying any label bytes.
+    /// Share a series' labels from storage: one refcount bump, no copy.
     ///
-    /// `MetricName` keeps its entries in name order by construction, which is
-    /// the order every other variant uses. Its public `sort()` orders the raw
-    /// `name=value` strings instead, and those two orders differ when one name
-    /// is a prefix of another (`a` / `a1`). Nothing on the read path calls
-    /// `sort()`, but a set that is not in name order would compare unequal to
-    /// an identical `Owned` set, so guard it: the check is a linear scan of
-    /// borrowed `&str`s, and the fallback materializes and sorts.
+    /// `MetricName` keeps its entries in name order by construction
+    /// (`insert_pair` places by name and `sort()` orders by name), which is
+    /// the order every other variant uses, so the slice needs no guard. This
+    /// used to allocate a split copy per series and free it per sample, and
+    /// that free was about half of an aggregation's per-sample cost (see
+    /// `eval_reduction_aggregation`).
     pub fn interned(metric_name: &MetricName) -> Self {
-        let split: Vec<SplitLabel> = metric_name
-            .raw_entries()
-            .filter_map(|raw| {
-                // Entries without a separator are malformed; storage never
-                // produces them, and `MetricName::iter` skips them the same way.
-                let sep = raw.find('=')?;
-                Some(SplitLabel {
-                    raw: raw.clone(),
-                    sep: sep as u32,
-                })
-            })
-            .collect();
-        Self::from_split(split)
+        EvalLabels::Interned(metric_name.shared())
     }
 
-    /// Wrap already-split labels, guarding name order as [`Self::interned`]
-    /// does: a set in name order is shared as is, anything else is
-    /// materialized and sorted.
-    pub(crate) fn from_split(split: Vec<SplitLabel>) -> Self {
-        Self::from_split_shared(Arc::from(split))
-    }
-
-    /// [`Self::from_split`] for labels already in their shared allocation.
-    pub(crate) fn from_split_shared(split: Arc<[SplitLabel]>) -> Self {
-        if split.is_sorted_by_key(|l| l.name()) {
-            EvalLabels::Interned(split)
+    /// Wrap interned `name=value` labels that did not come from a
+    /// [`MetricName`] (a fan-out response), guarding name order: a set in
+    /// name order is shared as is, anything else is materialized and sorted.
+    pub(crate) fn from_interned_shared(labels: Arc<[InternedString]>) -> Self {
+        if labels.is_sorted_by_key(|l| l.name()) {
+            EvalLabels::Interned(labels)
         } else {
-            let mut vec: Vec<Label> = split.iter().map(SplitLabel::to_label).collect();
+            let mut vec: Vec<Label> = labels.iter().map(label_of).collect();
             vec.sort();
             EvalLabels::Owned(vec)
         }
@@ -415,7 +354,7 @@ impl EvalLabels {
     /// Materialize as owned `Label`s, in name order.
     pub(crate) fn to_label_vec(&self) -> Vec<Label> {
         match self {
-            EvalLabels::Interned(split) => split.iter().map(SplitLabel::to_label).collect(),
+            EvalLabels::Interned(split) => split.iter().map(label_of).collect(),
             EvalLabels::Shared(arc) => arc.to_vec(),
             EvalLabels::Owned(vec) => vec.clone(),
         }
@@ -425,7 +364,7 @@ impl EvalLabels {
     /// already sorted, so `Labels::new()` does no extra work.
     pub(crate) fn into_labels(self) -> Labels {
         match self {
-            EvalLabels::Interned(split) => Labels(split.iter().map(SplitLabel::to_label).collect()),
+            EvalLabels::Interned(split) => Labels(split.iter().map(label_of).collect()),
             EvalLabels::Shared(arc) => Labels(arc.to_vec()),
             EvalLabels::Owned(vec) => Labels(vec),
         }
@@ -459,7 +398,7 @@ impl EvalLabels {
 /// every per-sample fingerprint and match-key computation, and the adapter
 /// tower costs several state checks per element where a slice walk costs one.
 pub(crate) enum LabelIter<'a> {
-    Interned(std::slice::Iter<'a, SplitLabel>),
+    Interned(std::slice::Iter<'a, InternedString>),
     Slice(std::slice::Iter<'a, Label>),
 }
 
@@ -514,7 +453,7 @@ impl PartialEq for EvalLabels {
                 // Interned strings are unique per content, so pointer equality
                 // per label is exact.
                 Arc::ptr_eq(a, b)
-                    || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.raw == y.raw))
+                    || (a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x == y))
             }
             // Mixed: compare `(name, value)` views.
             _ => self
