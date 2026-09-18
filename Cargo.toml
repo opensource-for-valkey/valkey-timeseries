@@ -29,8 +29,6 @@ num-traits = "0.2"
 joinkit = "0.2.0"
 krcf = "0.4"
 papaya = "0.2"
-# `seize::Collector` names the reclaimer signature the string pool hands to papaya's guards.
-seize = "0.5"
 prost = "0.14"
 rand = { version = "0.10" }
 rand_distr = "0.6"

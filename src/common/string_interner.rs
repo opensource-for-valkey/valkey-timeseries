@@ -49,7 +49,6 @@ use ahash::RandomState;
 use get_size2::GetSize;
 use min_max_heap::MinMaxHeap;
 use papaya::{Guard, HashMap};
-use seize::Collector;
 use smallvec::SmallVec;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::borrow::Borrow;
@@ -76,6 +75,11 @@ static STRING_MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
 
 /// Marker in [`Header::name_len`] for a string with no `=`.
 const NO_SEPARATOR: u32 = u32::MAX;
+
+/// Largest supported strong-reference count. Keeping the count below the
+/// signed pointer range matches the limit used by shared-pointer types such
+/// as `Arc` and leaves no path for a count increment to wrap.
+const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 /// Bytes between the start of an allocation and its payload.
 const HEADER_SIZE: usize = size_of::<Header>();
@@ -128,6 +132,11 @@ impl Header {
 /// Every site that accounts for pool memory goes through here so the counters agree.
 fn allocated_size(len: usize) -> usize {
     HEADER_SIZE + len
+}
+
+#[inline]
+fn increment_refcount(current: usize) -> Option<usize> {
+    current.checked_add(1).filter(|&next| next <= MAX_REFCOUNT)
 }
 
 /// One allocation: header immediately followed by `len` payload bytes.
@@ -206,7 +215,20 @@ impl Node {
         // Relaxed is enough for an increment: the holder cloning from already
         // owns a reference, so the count cannot reach zero underneath us
         // (same reasoning as `Arc::clone`).
-        self.strong().fetch_add(1, Ordering::Relaxed);
+        let strong = self.strong();
+        let mut current = strong.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = increment_refcount(current) else {
+                // Continuing would make a safe `clone` wrap the count and
+                // eventually allow a live allocation to be freed.
+                std::process::abort();
+            };
+            match strong.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(seen) => current = seen,
+            }
+        }
     }
 
     /// Take one reference to a node found through the pool, unless the entry
@@ -220,12 +242,12 @@ impl Node {
             if current < 2 {
                 return false;
             }
-            match strong.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            let Some(next) = increment_refcount(current) else {
+                // See `retain`: refcount overflow would invalidate the
+                // ownership protocol, so it cannot be allowed to continue.
+                std::process::abort();
+            };
+            match strong.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return true,
                 Err(seen) => current = seen,
             }
@@ -252,22 +274,12 @@ impl Node {
     }
 }
 
-/// [`Guard::defer_retire`] reclaimer: release the pool's reference to a node
-/// whose entry has been removed from the map. Runs once no pinned thread can
-/// still reach the node through the map.
-///
-/// # Safety
-///
-/// `ptr` must be a node the pool held a reference to, removed from the map
-/// before it was retired.
-unsafe fn release_pool_reference(ptr: *mut Header, _collector: &Collector) {
-    // SAFETY: `ptr` came from a live `Node` (non-null by construction).
-    Node(unsafe { NonNull::new_unchecked(ptr) }).release();
-}
-
 /// Retire `node`'s pool entry if it is dead — still in the map, and with the
-/// pool's reference as its only one — and release that reference once every
-/// pinned thread has moved on. Returns whether this call did the removal.
+/// pool's reference as its only one. Returns whether this call did the removal.
+///
+/// The entry owns that reference, so Papaya releases it by dropping the key
+/// only after the entry is unreachable from every table involved in an
+/// incremental resize.
 ///
 /// Both the last holder and an interner that finds a dead entry call this;
 /// `remove_if` makes exactly one of them succeed, and the pointer check keeps
@@ -282,11 +294,6 @@ fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
         return false;
     }
     STRING_MEMORY_USED.fetch_sub(allocated_size(node.len()), Ordering::SeqCst);
-    // SAFETY: the entry is out of the map, so no thread pinning from now on can
-    // reach `node`; threads already pinned are what the deferral waits for. The
-    // node stays valid for the reclaimer because the pool's reference — the one
-    // it releases — is still counted until then.
-    unsafe { guard.defer_retire(node.0.as_ptr(), release_pool_reference) };
     true
 }
 
@@ -299,10 +306,9 @@ unsafe impl Sync for Node {}
 /// map can be probed with the bytes of a candidate string before anything is
 /// allocated for it.
 ///
-/// It owns nothing: the pool's reference is released by whoever removes the
-/// entry ([`retire_if_dead`]), not by dropping the key — papaya drops keys at
-/// times of its own choosing (a losing insert, reclamation), which is too late
-/// for the protocol on [`Header`].
+/// It owns the pool's reference to the node. Papaya may keep this key reachable
+/// from an older table while incrementally resizing, so releasing the reference
+/// in [`Drop`] ensures the node outlives every such lookup.
 struct PoolEntry(Node);
 
 impl PoolEntry {
@@ -330,6 +336,12 @@ impl Eq for PoolEntry {}
 impl Borrow<[u8]> for PoolEntry {
     fn borrow(&self) -> &[u8] {
         self.as_bytes()
+    }
+}
+
+impl Drop for PoolEntry {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -523,11 +535,11 @@ impl InternedString {
                     return InternedString(node);
                 }
                 Err(_) => {
-                    // Another thread inserted the same bytes first. Nothing
-                    // but this frame ever saw `node`, so both of its
-                    // references are ours to discard; the winner is acquired
-                    // on the next pass.
-                    node.dealloc();
+                    // Another thread inserted the same bytes first. The
+                    // rejected temporary `PoolEntry` has dropped and released
+                    // its pool reference, leaving this prospective holder
+                    // reference for us to release.
+                    node.release();
                 }
             }
         }
@@ -898,14 +910,32 @@ impl Ord for InternedString {
 
 #[cfg(test)]
 mod tests {
-    use super::{InternedString, STRING_MEMORY_USED};
+    use super::{
+        InternedString, MAX_REFCOUNT, Node, PoolEntry, STRING_MEMORY_USED, increment_refcount,
+    };
     use ahash::{HashSet, HashSetExt};
     use serial_test::serial;
     use std::collections::HashMap;
     use std::ops::Deref;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
     // Tests are run serially to avoid interference via the global string pool and memory tracker.
+
+    #[test]
+    fn refcount_increment_stops_at_the_limit() {
+        assert_eq!(increment_refcount(MAX_REFCOUNT - 1), Some(MAX_REFCOUNT));
+        assert_eq!(increment_refcount(MAX_REFCOUNT), None);
+        assert_eq!(increment_refcount(usize::MAX), None);
+    }
+
+    #[test]
+    fn pool_entry_owns_one_reference() {
+        let node = Node::allocate(b"pool-entry", 2);
+        drop(PoolEntry(node));
+        assert_eq!(node.strong().load(Ordering::Acquire), 1);
+        node.release();
+    }
 
     // Test basic functionality.
     #[test]
