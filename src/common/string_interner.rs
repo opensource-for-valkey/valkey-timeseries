@@ -1768,6 +1768,7 @@ mod tests {
     // ── thin representation ────────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn interned_string_is_one_pointer() {
         assert_eq!(size_of::<InternedString>(), size_of::<usize>());
         assert_eq!(size_of::<Option<InternedString>>(), size_of::<usize>());
