@@ -67,6 +67,24 @@ fn label_of(raw: &InternedString) -> Label {
     Label::new(raw.name(), raw.value())
 }
 
+/// A borrowed view of an interned `name=value` entry.
+#[inline]
+fn view_interned(raw: &InternedString) -> InternedLabel<'_> {
+    InternedLabel {
+        name: raw.name(),
+        value: raw.value(),
+    }
+}
+
+/// A borrowed view of an owned label.
+#[inline]
+fn view_label(l: &Label) -> InternedLabel<'_> {
+    InternedLabel {
+        name: &l.name,
+        value: &l.value,
+    }
+}
+
 /// Cheap-to-clone label container for evaluator internals.
 ///
 /// Storage keeps a series' labels as a [`MetricName`]: one interned
@@ -82,8 +100,10 @@ fn label_of(raw: &InternedString) -> Label {
 /// times over.
 ///
 /// `Shared` wraps an `Arc<[Label]>` for label sets that arrive already owned
-/// (cluster fan-in, test fixtures). Mutation (remove/insert/retain) promotes
-/// either read-only variant to `Owned`, which materializes owned `String`s once.
+/// (cluster fan-in, test fixtures). `insert`/`extend` promote either read-only
+/// variant to `Owned`, which materializes owned `String`s once. `remove` and
+/// `retain` keep an `Interned` set interned (the survivors are refcount bumps)
+/// and only touch a `Shared` set when something is actually dropped.
 ///
 /// All three variants compare, order and hash by their `(name, value)`
 /// sequence, so they are interchangeable as map keys.
@@ -215,11 +235,44 @@ impl EvalLabels {
         }
     }
 
-    /// Retain only labels matching the predicate. Promotes to `Owned`.
-    pub(crate) fn retain(&mut self, f: impl FnMut(&Label) -> bool) {
-        self.make_owned();
-        if let EvalLabels::Owned(vec) = self {
-            vec.retain(f);
+    /// Retain only labels matching the predicate.
+    ///
+    /// The predicate sees each label exactly once, in order. An `Interned`
+    /// set stays interned — the survivors are copied as refcounted pointers,
+    /// never as strings — and a set the predicate keeps whole is left
+    /// untouched. A `Shared` set is only materialized when something is
+    /// dropped, and then only the survivors are cloned.
+    pub(crate) fn retain(&mut self, mut f: impl FnMut(InternedLabel<'_>) -> bool) {
+        match self {
+            EvalLabels::Owned(vec) => vec.retain(|l| f(view_label(l))),
+            EvalLabels::Interned(split) => {
+                let Some(first) = split.iter().position(|l| !f(view_interned(l))) else {
+                    return;
+                };
+                let mut kept = Vec::with_capacity(split.len() - 1);
+                kept.extend_from_slice(&split[..first]);
+                kept.extend(
+                    split[first + 1..]
+                        .iter()
+                        .filter(|l| f(view_interned(l)))
+                        .cloned(),
+                );
+                *self = EvalLabels::Interned(Arc::from(kept));
+            }
+            EvalLabels::Shared(arc) => {
+                let Some(first) = arc.iter().position(|l| !f(view_label(l))) else {
+                    return;
+                };
+                let mut kept = Vec::with_capacity(arc.len() - 1);
+                kept.extend_from_slice(&arc[..first]);
+                kept.extend(
+                    arc[first + 1..]
+                        .iter()
+                        .filter(|l| f(view_label(l)))
+                        .cloned(),
+                );
+                *self = EvalLabels::Owned(kept);
+            }
         }
     }
 
@@ -261,41 +314,13 @@ impl EvalLabels {
         match modifier {
             None => EvalLabels::Owned(Vec::new()),
             Some(LabelModifier::Include(label_list)) => {
-                if let EvalLabels::Interned(vec) = &self {
-                    let mut res = Vec::with_capacity(vec.len());
-                    for label in vec.iter() {
-                        if label_list
-                            .labels
-                            .iter()
-                            .find(|&name| name == label.name())
-                            .is_some()
-                        {
-                            res.push(label.clone());
-                        }
-                    }
-                    return EvalLabels::Interned(Arc::from(res));
-                }
                 let mut this = self.clone();
-                this.retain(|k| label_list.labels.contains(&k.name));
+                this.retain(|k| label_list.labels.iter().any(|n| n == k.name));
                 this
             }
             Some(LabelModifier::Exclude(label_list)) => {
-                if let EvalLabels::Interned(vec) = &self {
-                    let mut res = Vec::with_capacity(vec.len());
-                    for label in vec.iter() {
-                        if label_list
-                            .labels
-                            .iter()
-                            .find(|&name| name == label.name())
-                            .is_none()
-                        {
-                            res.push(label.clone());
-                        }
-                    }
-                    return EvalLabels::Interned(Arc::from(res));
-                }
                 let mut this = self.clone();
-                this.retain(|k| !label_list.labels.contains(&k.name));
+                this.retain(|k| !label_list.labels.iter().any(|n| n == k.name));
                 this
             }
         }
@@ -408,14 +433,8 @@ impl<'a> Iterator for LabelIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            LabelIter::Interned(it) => it.next().map(|l| InternedLabel {
-                name: l.name(),
-                value: l.value(),
-            }),
-            LabelIter::Slice(it) => it.next().map(|l| InternedLabel {
-                name: &l.name,
-                value: &l.value,
-            }),
+            LabelIter::Interned(it) => it.next().map(view_interned),
+            LabelIter::Slice(it) => it.next().map(view_label),
         }
     }
 

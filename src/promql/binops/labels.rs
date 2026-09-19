@@ -84,10 +84,10 @@ pub(super) fn result_metric(
     }
     match matching {
         Some(LabelModifier::Include(label_list)) => {
-            labels.retain(|k| label_list.labels.contains(&k.name));
+            labels.retain(|k| label_list.labels.iter().any(|n| n == k.name));
         }
         Some(LabelModifier::Exclude(label_list)) => {
-            labels.retain(|k| !label_list.labels.contains(&k.name));
+            labels.retain(|k| !label_list.labels.iter().any(|n| n == k.name));
         }
         None => {}
     }
