@@ -1,4 +1,4 @@
-use super::labels::{compute_binary_match_key, get_metric_signature, result_metric};
+use super::labels::{compute_binary_match_key, get_metric_signature};
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::labels::SeriesFingerprint;
 use crate::promql::binops::binary_op_fn;
@@ -808,6 +808,30 @@ fn build_result_labels(
         }
     }
 
+    labels
+}
+
+/// Compute the result labels for a vector-vector binary operation.
+/// Mirrors Prometheus's `resultMetric` (engine.go L3062-3104):
+/// 1. Arithmetic ops always drop `__name__`
+/// 2. `on()` keeps only listed labels; `ignoring()` removes listed labels
+fn result_metric(
+    mut labels: EvalLabels,
+    op: TokenType,
+    matching: Option<&LabelModifier>,
+) -> EvalLabels {
+    if super::changes_metric_schema(op) {
+        labels.drop_name();
+    }
+    match matching {
+        Some(LabelModifier::Include(label_list)) => {
+            labels.retain(|k| label_list.labels.iter().any(|n| n == k.name));
+        }
+        Some(LabelModifier::Exclude(label_list)) => {
+            labels.retain(|k| !label_list.labels.iter().any(|n| n == k.name));
+        }
+        None => {}
+    }
     labels
 }
 
