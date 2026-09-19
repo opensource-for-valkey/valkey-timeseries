@@ -291,7 +291,6 @@ fn bench_range_query(c: &mut Criterion) {
     let cases = range_query_cases();
 
     let start = SystemTime::UNIX_EPOCH + Duration::from_secs((num_intervals - 10000) as u64 * 10);
-    // let end = SystemTime::UNIX_EPOCH + Duration::from_secs((num_intervals) as u64 * 10);
     let step = Duration::from_secs(10);
 
     let mut group = c.benchmark_group("range_query");
@@ -306,9 +305,8 @@ fn bench_range_query(c: &mut Criterion) {
     };
 
     for (expr, steps) in cases {
-        // Adjust end time based on steps
-        let actual_end =
-            SystemTime::UNIX_EPOCH + Duration::from_secs((num_intervals - steps) as u64 * 10);
+        // Range bounds are inclusive: `steps` points need `steps - 1` intervals.
+        let actual_end = start + step * (steps - 1) as u32;
         let id = format!("expr={},steps={}", expr, steps);
         let ast = parse(&expr).expect("valid range benchmark query");
 
