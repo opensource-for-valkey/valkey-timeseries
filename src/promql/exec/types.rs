@@ -226,7 +226,15 @@ impl EvalLabels {
         }
     }
 
+    /// Add labels from `other`, keeping sort order and dropping duplicate
+    /// names. Promotes to `Owned` only when `other` yields something: the
+    /// usual one-to-one join has nothing to copy, and materializing owned
+    /// `String`s for it would undo what `retain` just avoided.
     pub(crate) fn extend(&mut self, other: impl Iterator<Item = Label>) {
+        let mut other = other.peekable();
+        if other.peek().is_none() {
+            return;
+        }
         self.make_owned();
         if let EvalLabels::Owned(vec) = self {
             vec.extend(other);
@@ -588,6 +596,18 @@ impl From<MetricName> for EvalLabels {
 impl From<&MetricName> for EvalLabels {
     fn from(metric_name: &MetricName) -> Self {
         EvalLabels::interned(metric_name)
+    }
+}
+
+impl From<&[InternedString]> for EvalLabels {
+    fn from(labels: &[InternedString]) -> Self {
+        Self::from_interned_shared(Arc::from(labels))
+    }
+}
+
+impl From<Vec<InternedString>> for EvalLabels {
+    fn from(vec: Vec<InternedString>) -> Self {
+        EvalLabels::from_interned_shared(Arc::from(vec))
     }
 }
 

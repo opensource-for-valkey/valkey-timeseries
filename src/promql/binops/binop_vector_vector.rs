@@ -796,6 +796,33 @@ fn build_result_labels(
             }
         }
         _ => {
+            match (&one_sample.labels, &many_sample.labels) {
+                (EvalLabels::Interned(one), EvalLabels::Interned(many)) => {
+                    if let EvalLabels::Interned(ref labels_interned) = labels {
+                        // Handle interned labels case if needed
+                        let mut filtered = one
+                            .iter()
+                            .filter_map(|l| {
+                                let name = l.name();
+                                if name != METRIC_NAME && !many.iter().any(|l| l.name() == name) {
+                                    Some(l.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        if !filtered.is_empty() {
+                            for item in labels_interned.iter() {
+                                filtered.push(item.clone());
+                            }
+                            return EvalLabels::from(filtered);
+                        }
+                    }
+                }
+                (_one, _many) => {
+                    // fall through to the generic handling below.
+                }
+            }
             // Copy labels from "one" side not already present on "many" side.
             // Uses binary search via EvalLabels::contains — no heap allocation.
             let to_copy = one_sample
