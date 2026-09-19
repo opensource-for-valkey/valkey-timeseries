@@ -1,6 +1,6 @@
-use super::labels::{compute_binary_match_key, get_metric_signature};
+use super::labels::get_metric_signature;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
-use crate::labels::SeriesFingerprint;
+use crate::labels::{LabelHasher, SeriesFingerprint, SeriesLabel, create_unseeded_hasher};
 use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
@@ -761,6 +761,45 @@ fn collect_fingerprints(
     kvs.sort_unstable_by_key(|(key, _sample)| *key);
 
     kvs
+}
+
+/// Compute a match signature for a sample's labels per Prometheus binary op semantics.
+/// - No modifier: match on ALL labels except `__name__`
+/// - `on(l1, l2)` (Include): match only on listed labels
+/// - `ignoring(l1, l2)` (Exclude): match on all labels except listed ones and `__name__`
+///
+/// This is intentionally separated from `compute_grouping_labels` because their `None`
+/// cases have opposite semantics (aggregation groups everything together; binary ops
+/// match on all labels).
+fn compute_binary_match_key(
+    labels: &EvalLabels,
+    matching: Option<&LabelModifier>,
+) -> SeriesFingerprint {
+    let mut hasher = create_unseeded_hasher();
+    let listed = |name: &str, list: &LabelModifier| match list {
+        LabelModifier::Include(l) | LabelModifier::Exclude(l) => l.labels.iter().any(|n| n == name),
+    };
+    match matching {
+        None => labels
+            .iter()
+            .filter(|k| k.name != METRIC_NAME)
+            .for_each(|label| hash_label(&mut hasher, &label)),
+        Some(m @ LabelModifier::Include(_)) => labels
+            .iter()
+            .filter(|l| listed(l.name, m))
+            .for_each(|label| hash_label(&mut hasher, &label)),
+        Some(m @ LabelModifier::Exclude(_)) => labels
+            .iter()
+            .filter(|l| l.name != METRIC_NAME && !listed(l.name, m))
+            .for_each(|label| hash_label(&mut hasher, &label)),
+    };
+    hasher.finish_128()
+}
+
+fn hash_label(hasher: &mut LabelHasher, label: &impl SeriesLabel) {
+    hasher.write(label.name().as_bytes());
+    hasher.write(b"0xfe");
+    hasher.write(label.value().as_bytes());
 }
 
 /// Build the result label set for a matched pair.
