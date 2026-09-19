@@ -33,6 +33,7 @@ use crate::fanout::{
     FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
     log_fanout_failure,
 };
+use crate::labels::InternedLabel;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
@@ -51,7 +52,9 @@ use crate::promql::generated::{
     GridGroupPartial, GridQuery, GridQueryResponse, GridRollup as ProtoGridRollup, GridSeries,
     RollupKind as ProtoRollupKind, SeriesSelector as ProtoSeriesSelector,
 };
+use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::model::RangeSample;
+use crate::series::chunks::WIRE_COMPRESSION_MIN_SAMPLES;
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
@@ -581,21 +584,223 @@ fn decode_columns<'a>(
 /// end — `step` finer than the sample cadence — in which case shipping the
 /// span and letting the coordinator run the per-series stage is the cheaper
 /// transfer.
+///
+/// This is the whole rule for a request answered in series. A request fused
+/// with a reduction answers in per-`(group, step)` partials, whose size does
+/// not depend on how many series fed a group, so there the unit of decision
+/// is the group: see [`transport_plan`].
 fn ships_raw(window_ends: &[i64], series: &RangeSample<EvalLabels>) -> bool {
     window_ends.len() > series.samples.len()
 }
 
-/// One shard's response: the per-series stage over every series whose grid
-/// output is the smaller form, the rest shipped raw, and — for a fused request
+/// Wire-size estimates behind the transport decision, from the message
+/// layout in `promql.proto`: what a raw span and a `(group, step)` partial
+/// cost on the cluster bus. They steer a heuristic, so they need to be right
+/// to within the factor that separates the two forms at the boundary, not to
+/// the byte.
+mod wire {
+    /// A `Label` message: its own tag and length, plus a tag and a length
+    /// for each of its two strings.
+    pub const LABEL_OVERHEAD: u64 = 6;
+    /// A raw `RangeSample` less its labels and samples: the message envelope
+    /// and the `SampleData` header.
+    pub const RAW_SERIES_OVERHEAD: u64 = 12;
+    /// A sample in an uncompressed chunk — what a span shorter than
+    /// `WIRE_COMPRESSION_MIN_SAMPLES` travels as: timestamp and value.
+    pub const RAW_SAMPLE_UNCOMPRESSED: u64 = 16;
+    /// A sample in a Chimp chunk on typical telemetry, the codec's own
+    /// figure (see `samples_to_chunk`).
+    pub const RAW_SAMPLE_COMPRESSED: u64 = 6;
+    /// A `GridGroupPartial` less its labels and accumulators: the message
+    /// envelope, the step as a varint, and the state's envelope and count.
+    pub const PARTIAL_OVERHEAD: u64 = 16;
+    /// One `double` accumulator of the state: tag and eight bytes.
+    pub const ACCUMULATOR: u64 = 9;
+}
+
+/// Estimated wire bytes of `labels` as proto3 `Label` messages.
+fn labels_wire_bytes<'a>(labels: impl Iterator<Item = InternedLabel<'a>>) -> u64 {
+    labels
+        .map(|l| wire::LABEL_OVERHEAD + l.name.len() as u64 + l.value.len() as u64)
+        .sum()
+}
+
+/// Estimated wire bytes of a series shipped raw: its labels once, then its
+/// samples in whichever chunk codec their count selects.
+fn raw_wire_bytes(series: &RangeSample<EvalLabels>) -> u64 {
+    let per_sample = if series.samples.len() >= WIRE_COMPRESSION_MIN_SAMPLES {
+        wire::RAW_SAMPLE_COMPRESSED
+    } else {
+        wire::RAW_SAMPLE_UNCOMPRESSED
+    };
+    wire::RAW_SERIES_OVERHEAD
+        + labels_wire_bytes(series.labels.iter())
+        + (series.samples.len() as u64).saturating_mul(per_sample)
+}
+
+/// How many `double` accumulators a `(group, step)` partial for `kind`
+/// carries on the wire: the fields [`AggregationPartial`] sets for it, since
+/// proto3 omits the ones left at zero.
+///
+/// [`AggregationPartial`]: crate::promql::exec::partial_aggregation::AggregationPartial
+fn partial_accumulators(kind: AggregationKind) -> u64 {
+    match kind {
+        AggregationKind::Count | AggregationKind::Group => 0,
+        AggregationKind::Min | AggregationKind::Max => 1,
+        AggregationKind::Sum => 2,
+        AggregationKind::Avg | AggregationKind::Stddev | AggregationKind::Stdvar => 3,
+        _ => unreachable!("BUG: a fused reduction is one of the eight reductions"),
+    }
+}
+
+/// The most windows one sample can land in. A sample at `t` is picked by
+/// every window ending in `[t, t + backward)` — the lookback for a stepped
+/// selection, the range for a rollup — and a grid at `step` has at most
+/// `ceil(backward / step)` ends in that half-open span. One for a single
+/// evaluation.
+fn windows_per_sample(request: &GridRequest) -> u64 {
+    if request.step_ms <= 0 {
+        return 1;
+    }
+    let backward = request.backward_ms().max(0) as u64;
+    backward.div_ceil(request.step_ms as u64).max(1)
+}
+
+/// What one aggregation group of a shard's read would cost each way, from
+/// labels and counts alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupEstimate {
+    /// One `(group, step)` partial of this group.
+    partial_bytes: u64,
+    /// The members the per-series rule would ship raw, as raw spans.
+    raw_bytes: u64,
+    /// Their sample count: what bounds the partials they would add.
+    raw_samples: u64,
+    /// Whether a member stages under the per-series rule, so the group's
+    /// partials are being shipped regardless.
+    staged: bool,
+}
+
+impl GroupEstimate {
+    fn new(partial_bytes: u64) -> Self {
+        Self {
+            partial_bytes,
+            raw_bytes: 0,
+            raw_samples: 0,
+            staged: false,
+        }
+    }
+
+    /// Whether the members that would travel raw are better folded into the
+    /// group's partials instead.
+    ///
+    /// Folded, they add at most one partial per step, and at most `spread`
+    /// per sample; promote when that is no more on the wire than their raw
+    /// spans. A tie goes to the partials: the same bytes, and the staging and
+    /// the fold stay on the shard instead of landing on the coordinator. A
+    /// group that ships partials anyway (a staged member) is promoted
+    /// outright — its raw members' partials land on steps it is already
+    /// paying for, so they can only replace bytes, never add them.
+    fn promotes(&self, steps: u64, spread: u64) -> bool {
+        if self.staged {
+            return true;
+        }
+        let partials = steps.min(self.raw_samples.saturating_mul(spread));
+        partials.saturating_mul(self.partial_bytes) <= self.raw_bytes
+    }
+}
+
+/// Which of a shard's series travel raw: `true` at the index of each one.
+///
+/// For a request answered in series — unfused, or fused with a selecting or
+/// counting operator — this is [`ships_raw`] per series. Fused with a
+/// reduction, the response is per-`(group, step)` partials, whose count is
+/// bounded by the grid and never grows with the series that fed a group, so
+/// the decision is made per group. Per series, `sum by (job) (rate(m[5m]))`
+/// over thousands of sparse series shipped every one of them raw and had the
+/// coordinator stage and fold them all, one at a time, into the same handful
+/// of groups the shard could have answered in a few partials per step.
+///
+/// So a reduction's groups are sized both ways — see
+/// [`GroupEstimate::promotes`] — and a group's raw members are promoted to
+/// its partials when that is the smaller form. Members that stage under the
+/// per-series rule are never demoted: their span is the larger form by
+/// itself. The estimate reads labels and counts only, never a sample, and
+/// a read with nothing to promote costs one pass over the flags.
+fn transport_plan(
+    request: &GridRequest,
+    window_ends: &[i64],
+    windows: &[RangeSample<EvalLabels>],
+) -> Vec<bool> {
+    let mut raw: Vec<bool> = windows
+        .iter()
+        .map(|series| ships_raw(window_ends, series))
+        .collect();
+    let Some(aggregation) = request
+        .aggregation
+        .as_ref()
+        .filter(|agg| agg.strategy() == PushdownStrategy::Reduce)
+    else {
+        return raw;
+    };
+    if !raw.iter().any(|&ships_raw| ships_raw) {
+        return raw;
+    }
+
+    let modifier = aggregation.modifier.as_ref();
+    let steps = window_ends.len() as u64;
+    let spread = windows_per_sample(request);
+    let partial_overhead =
+        wire::PARTIAL_OVERHEAD + wire::ACCUMULATOR * partial_accumulators(aggregation.kind);
+
+    // One pass to size every group, remembering each series' group so the
+    // second pass need not hash its labels again.
+    let mut groups: FingerprintHashMap<GroupEstimate> = FingerprintHashMap::default();
+    let mut keys = Vec::with_capacity(windows.len());
+    for (series, &ships_raw) in windows.iter().zip(&raw) {
+        let key = series.labels.compute_grouping_key(modifier);
+        keys.push(key);
+        let group = groups.entry(key).or_insert_with(|| {
+            GroupEstimate::new(
+                partial_overhead + labels_wire_bytes(series.labels.grouping_labels(modifier)),
+            )
+        });
+        if ships_raw {
+            group.raw_bytes = group.raw_bytes.saturating_add(raw_wire_bytes(series));
+            group.raw_samples = group
+                .raw_samples
+                .saturating_add(series.samples.len() as u64);
+        } else {
+            group.staged = true;
+        }
+    }
+
+    for (ships_raw, key) in raw.iter_mut().zip(keys) {
+        if *ships_raw && groups[&key].promotes(steps, spread) {
+            *ships_raw = false;
+        }
+    }
+    raw
+}
+
+/// One shard's response: the per-series stage over every series that
+/// [`transport_plan`] keeps, the rest shipped raw, and — for a fused request
 /// — the staged series folded into per-`(group, step)` partials.
 fn shard_response(
     request: &GridRequest,
     window_ends: &[i64],
     windows: Vec<RangeSample<EvalLabels>>,
 ) -> ValkeyResult<GridQueryResponse> {
-    let (raw, staged): (Vec<_>, Vec<_>) = windows
-        .into_iter()
-        .partition(|series| ships_raw(window_ends, series));
+    let plan = transport_plan(request, window_ends, &windows);
+    let mut raw = Vec::new();
+    let mut staged = Vec::with_capacity(windows.len());
+    for (series, ships_raw) in windows.into_iter().zip(plan) {
+        if ships_raw {
+            raw.push(series);
+        } else {
+            staged.push(series);
+        }
+    }
     let staged = request.per_series(window_ends, staged);
 
     let raw = raw
@@ -1170,10 +1375,16 @@ mod tests {
             ),
         );
 
-        // Fused: the raw series is folded into the partials on the coordinator.
+        // Fused with a reduction, the two share a group, and the dense series
+        // stages: the group's partials are shipped regardless, so the sparse
+        // series is folded into them on the shard rather than sent raw for
+        // the coordinator to fold.
         let fused = fused(request, AggregationKind::Sum, &["__name__"]);
         let resp = response(&fused, vec![sparse.clone(), dense.clone()]);
-        assert_eq!(resp.raw.len(), 1);
+        assert!(
+            resp.raw.is_empty(),
+            "the sparse series joins its group's partials"
+        );
         assert!(resp.series.is_empty());
         assert!(!resp.partials.is_empty());
         let mut cmd = command(fused.clone());
@@ -1182,6 +1393,468 @@ mod tests {
             rendered(cmd.into_result().unwrap()),
             rendered(fused.evaluate(vec![sparse, dense]).unwrap()),
         );
+    }
+
+    fn series_with(pairs: &[(&str, &str)], points: &[(i64, f64)]) -> RangeSample<EvalLabels> {
+        RangeSample {
+            labels: EvalLabels::from_pairs(pairs),
+            samples: points
+                .iter()
+                .map(|&(timestamp, value)| Sample { timestamp, value })
+                .collect(),
+        }
+    }
+
+    fn by(labels: &[&str]) -> LabelModifier {
+        LabelModifier::Include(promql_parser::label::Labels::new(labels.to_vec()))
+    }
+
+    fn without(labels: &[&str]) -> LabelModifier {
+        LabelModifier::Exclude(promql_parser::label::Labels::new(labels.to_vec()))
+    }
+
+    fn fused_modifier(
+        base: GridRequest,
+        agg: AggregationKind,
+        modifier: Option<LabelModifier>,
+    ) -> GridRequest {
+        GridRequest {
+            aggregation: Some(GridAggregation {
+                kind: agg,
+                modifier,
+                param: None,
+            }),
+            ..base
+        }
+    }
+
+    /// `count` sparse series of one sample each in `job`, spread over the
+    /// 300s span so their samples land on different steps.
+    fn sparse_job(job: &str, count: usize) -> Vec<RangeSample<EvalLabels>> {
+        (0..count)
+            .map(|i| {
+                let instance = format!("{job}-{i}");
+                series_with(
+                    &[("__name__", "m"), ("job", job), ("instance", &instance)],
+                    &[((i as i64 * 7_919) % 300_001, (i % 13) as f64 + 1.0)],
+                )
+            })
+            .collect()
+    }
+
+    /// Rendered results compared with the fused-aggregation tolerance: labels
+    /// and steps exactly, values to a relative 1e-9 — partials merged across
+    /// shards sum in a different order than a single-node fold.
+    fn assert_rendered_close(
+        want: &[(String, Vec<Point>)],
+        got: &[(String, Vec<Point>)],
+        what: &str,
+    ) {
+        assert_eq!(want.len(), got.len(), "{what}: series count");
+        for ((w_labels, w_points), (g_labels, g_points)) in want.iter().zip(got) {
+            assert_eq!(w_labels, g_labels, "{what}: labels");
+            assert_eq!(
+                w_points.len(),
+                g_points.len(),
+                "{what}: {w_labels} step count"
+            );
+            for (w, g) in w_points.iter().zip(g_points) {
+                assert_eq!((w.0, w.1), (g.0, g.1), "{what}: {w_labels} step");
+                let (w, g): (f64, f64) = (w.2.parse().unwrap(), g.2.parse().unwrap());
+                if w.is_nan() || g.is_nan() {
+                    assert_eq!(w.is_nan(), g.is_nan(), "{what}: {w_labels} NaN-ness");
+                    continue;
+                }
+                let tolerance = 1e-9 * w.abs().max(1.0);
+                assert!((w - g).abs() <= tolerance, "{what}: {w_labels} {w} != {g}");
+            }
+        }
+    }
+
+    /// The reduction-aware rule: a group of series that would each travel raw
+    /// under the per-series rule is answered in partials instead when those
+    /// are the smaller form. `sum by (job) (rate(m[1m]))` over two hundred
+    /// one-sample series is eleven partials per group, not two hundred spans
+    /// for the coordinator to stage and fold one at a time.
+    #[test]
+    fn test_reduction_folds_a_sparse_group() {
+        let base = rollup_grid_request(RollupKind::Rate); // 11 window ends
+        let windows: Vec<_> = sparse_job("api", 200)
+            .into_iter()
+            .chain(sparse_job("web", 200))
+            .collect();
+        let ends = base.window_ends();
+        assert!(
+            windows.iter().all(|s| ships_raw(&ends, s)),
+            "every series is raw under the per-series rule"
+        );
+
+        for (what, request) in [
+            (
+                "sum by (job)",
+                fused_modifier(base.clone(), AggregationKind::Sum, Some(by(&["job"]))),
+            ),
+            (
+                "sum",
+                fused_modifier(base.clone(), AggregationKind::Sum, None),
+            ),
+            (
+                "sum without (instance)",
+                fused_modifier(
+                    base.clone(),
+                    AggregationKind::Sum,
+                    Some(without(&["instance"])),
+                ),
+            ),
+        ] {
+            let plan = transport_plan(&request, &ends, &windows);
+            assert!(
+                plan.iter().all(|&raw| !raw),
+                "{what}: every series is promoted"
+            );
+
+            let resp = response(&request, windows.clone());
+            assert!(resp.raw.is_empty(), "{what}: nothing travels raw");
+            assert!(resp.series.is_empty(), "{what}");
+            assert!(
+                resp.partials.len() <= 2 * ends.len(),
+                "{what}: at most one partial per (group, step), got {}",
+                resp.partials.len()
+            );
+
+            let mut cmd = command(request.clone());
+            cmd.on_response(resp, &node(7000)).unwrap();
+            assert_eq!(
+                rendered(cmd.into_result().unwrap()),
+                rendered(request.evaluate(windows.clone()).unwrap()),
+                "{what}"
+            );
+        }
+    }
+
+    /// A group whose raw spans are smaller than its partials keeps shipping
+    /// raw: one series with one sample is a span of one sample, against a
+    /// partial per window that sample reaches.
+    #[test]
+    fn test_reduction_keeps_a_lone_sparse_series_raw() {
+        let lone = series("only", &[(150_000, 1.0)]);
+        for (what, base) in [
+            ("stepped", stepped_grid_request()),
+            ("rate", rollup_grid_request(RollupKind::Rate)),
+        ] {
+            let request = fused(base, AggregationKind::Sum, &["__name__"]);
+            let ends = request.window_ends();
+            assert_eq!(
+                transport_plan(&request, &ends, std::slice::from_ref(&lone)),
+                vec![true],
+                "{what}"
+            );
+
+            let resp = response(&request, vec![lone.clone()]);
+            assert_eq!(resp.raw.len(), 1, "{what}: the lone series travels raw");
+            assert!(resp.partials.is_empty(), "{what}");
+
+            let mut cmd = command(request.clone());
+            cmd.on_response(resp, &node(7000)).unwrap();
+            assert_eq!(
+                rendered(cmd.into_result().unwrap()),
+                rendered(request.evaluate(vec![lone.clone()]).unwrap()),
+                "{what}"
+            );
+        }
+    }
+
+    /// Groups decide independently, in one response: a group with a staged
+    /// member folds its sparse mates in, a crowded sparse group is promoted
+    /// on size, and a lone sparse series in a group of its own stays raw.
+    /// The coordinator lands on the single-node answer over the mixture.
+    #[test]
+    fn test_groups_decide_independently() {
+        let request = fused_modifier(
+            stepped_grid_request(),
+            AggregationKind::Sum,
+            Some(by(&["job"])),
+        );
+        let ends = request.window_ends();
+
+        let dense = series_with(
+            &[("__name__", "m"), ("job", "staged"), ("instance", "0")],
+            &(0..=30).map(|i| (i * 10_000, i as f64)).collect::<Vec<_>>(),
+        );
+        let mate = series_with(
+            &[("__name__", "m"), ("job", "staged"), ("instance", "1")],
+            &[(20_000, 5.0)],
+        );
+        let lone = series_with(
+            &[("__name__", "m"), ("job", "lone"), ("instance", "2")],
+            &[(150_000, 1.0)],
+        );
+        let crowd = sparse_job("crowd", 100);
+
+        let mut windows = vec![dense.clone(), lone.clone(), mate.clone()];
+        windows.extend(crowd.iter().cloned());
+
+        let plan = transport_plan(&request, &ends, &windows);
+        assert_eq!(&plan[..3], &[false, true, false], "dense, lone, mate");
+        assert!(plan[3..].iter().all(|&raw| !raw), "the crowd is promoted");
+
+        let resp = response(&request, windows.clone());
+        assert_eq!(resp.raw.len(), 1, "only the lone series travels raw");
+        assert!(resp.series.is_empty());
+        let mut groups: Vec<String> = resp
+            .partials
+            .iter()
+            .map(|p| {
+                p.labels
+                    .iter()
+                    .map(|l| format!("{}={}", l.name, l.value))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        groups.sort();
+        groups.dedup();
+        assert_eq!(groups, vec!["job=crowd", "job=staged"]);
+
+        let mut cmd = command(request.clone());
+        cmd.on_response(resp, &node(7000)).unwrap();
+        assert_eq!(
+            rendered(cmd.into_result().unwrap()),
+            rendered(request.evaluate(windows).unwrap()),
+        );
+    }
+
+    /// Only a reduction answers in partials. Unfused, or fused with a
+    /// selecting or counting operator, the response is per series and the
+    /// per-series rule stands, however many sparse series share a group.
+    #[test]
+    fn test_only_reductions_decide_per_group() {
+        let base = stepped_grid_request();
+        let windows = sparse_job("api", 50);
+        let ends = base.window_ends();
+        let per_series: Vec<bool> = windows.iter().map(|s| ships_raw(&ends, s)).collect();
+        assert!(per_series.iter().all(|&raw| raw));
+
+        for (what, request) in [
+            ("unfused", base.clone()),
+            (
+                "topk",
+                fused_with(
+                    base.clone(),
+                    AggregationKind::Topk,
+                    &["job"],
+                    Some(AggregationParam::Scalar(2.0)),
+                ),
+            ),
+            (
+                "count_values",
+                fused_with(
+                    base.clone(),
+                    AggregationKind::CountValues,
+                    &["job"],
+                    Some(AggregationParam::Label("v".into())),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                transport_plan(&request, &ends, &windows),
+                per_series,
+                "{what}"
+            );
+        }
+
+        // The same series under a reduction: promoted.
+        let reduced = fused(base, AggregationKind::Sum, &["job"]);
+        assert!(
+            transport_plan(&reduced, &ends, &windows)
+                .iter()
+                .all(|&raw| !raw)
+        );
+    }
+
+    /// Every reduction, every modifier shape, both stages: sparse groups
+    /// split across shards fold on the shards and the coordinator's merge
+    /// lands on the single-node answer.
+    #[test]
+    fn test_every_reduction_folds_sparse_groups_like_single_node() {
+        const REDUCTIONS: [AggregationKind; 8] = [
+            AggregationKind::Sum,
+            AggregationKind::Avg,
+            AggregationKind::Min,
+            AggregationKind::Max,
+            AggregationKind::Count,
+            AggregationKind::Group,
+            AggregationKind::Stddev,
+            AggregationKind::Stdvar,
+        ];
+        // Three shards; both jobs straddle all of them.
+        let shards: Vec<Vec<RangeSample<EvalLabels>>> = (0..3)
+            .map(|shard| {
+                sparse_job("api", 60)
+                    .into_iter()
+                    .chain(sparse_job("web", 60))
+                    .enumerate()
+                    .filter(|(i, _)| i % 3 == shard)
+                    .map(|(_, s)| s)
+                    .collect()
+            })
+            .collect();
+        let all: Vec<RangeSample<EvalLabels>> = shards.iter().flatten().cloned().collect();
+
+        for base in [
+            stepped_grid_request(),
+            rollup_grid_request(RollupKind::SumOverTime),
+        ] {
+            for kind in REDUCTIONS {
+                for modifier in [
+                    None,
+                    Some(by(&["job"])),
+                    Some(by(&["__name__", "job"])),
+                    Some(by(&["missing"])),
+                    Some(without(&["instance"])),
+                ] {
+                    let what = format!(
+                        "{kind:?} modifier={modifier:?} rollup={:?}",
+                        base.rollup.as_ref().map(|r| r.kind)
+                    );
+                    let request = fused_modifier(base.clone(), kind, modifier);
+                    let want = rendered(request.evaluate(all.clone()).unwrap());
+
+                    let mut cmd = command(request.clone());
+                    for (index, shard) in shards.iter().enumerate() {
+                        let resp = response(&request, shard.clone());
+                        assert!(
+                            resp.raw.is_empty(),
+                            "{what}: shard {index} folded its groups"
+                        );
+                        cmd.on_response(resp, &node(7000 + index as u16)).unwrap();
+                    }
+                    assert_rendered_close(&want, &rendered(cmd.into_result().unwrap()), &what);
+                }
+            }
+        }
+    }
+
+    /// The promotion rule at its boundaries: a tie goes to the partials, a
+    /// staged member promotes unconditionally, the partials are bounded by
+    /// the grid, and synthetic counts do not overflow.
+    #[test]
+    fn test_group_estimate_boundaries() {
+        let group = |raw_bytes, raw_samples, staged| GroupEstimate {
+            partial_bytes: 50,
+            raw_bytes,
+            raw_samples,
+            staged,
+        };
+
+        // Ten samples reaching two windows each: 20 partials at 50 bytes.
+        assert!(group(1000, 10, false).promotes(100, 2), "a tie folds");
+        assert!(group(1001, 10, false).promotes(100, 2));
+        assert!(!group(999, 10, false).promotes(100, 2));
+
+        // The grid bounds the partials: 10 000 samples reaching 20 windows
+        // each is still at most 100 partials.
+        assert!(group(5_001, 10_000, false).promotes(100, 20));
+        assert!(!group(4_999, 10_000, false).promotes(100, 20));
+
+        // A staged member: promoted whatever the sizes.
+        assert!(group(1, 1, true).promotes(100, 20));
+
+        // Saturating, not wrapping.
+        assert!(!group(u64::MAX - 1, u64::MAX, false).promotes(u64::MAX, u64::MAX));
+        assert!(group(u64::MAX, u64::MAX, false).promotes(u64::MAX, u64::MAX));
+        assert!(
+            group(0, 0, false).promotes(0, 1),
+            "an empty grid has nothing to ship"
+        );
+    }
+
+    /// A sample reaches every window ending within `backward` of it, which a
+    /// grid at `step` has `ceil(backward / step)` of.
+    #[test]
+    fn test_windows_per_sample() {
+        assert_eq!(
+            windows_per_sample(&stepped_request()),
+            1,
+            "single evaluation"
+        );
+        // Lookback 300s at a 30s step.
+        assert_eq!(windows_per_sample(&stepped_grid_request()), 10);
+        // Range 60s at a 30s step.
+        assert_eq!(
+            windows_per_sample(&rollup_grid_request(RollupKind::Rate)),
+            2
+        );
+        let coarse = GridRequest {
+            step_ms: 3_600_000,
+            ..rollup_grid_request(RollupKind::Rate)
+        };
+        assert_eq!(
+            windows_per_sample(&coarse),
+            1,
+            "a step wider than the range"
+        );
+        let odd = GridRequest {
+            rollup: Some(GridRollup {
+                kind: RollupKind::Rate,
+                range_ms: 45_000,
+                param: None,
+            }),
+            ..rollup_grid_request(RollupKind::Rate)
+        };
+        assert_eq!(windows_per_sample(&odd), 2, "rounds up");
+        let none = GridRequest {
+            lookback_delta_ms: 0,
+            ..stepped_grid_request()
+        };
+        assert_eq!(windows_per_sample(&none), 1, "never zero");
+    }
+
+    /// The wire estimates track the proto layout: a raw span is its labels
+    /// once plus its samples, a partial is the group's labels every time
+    /// plus the accumulators its operator sets.
+    #[test]
+    fn test_wire_estimates() {
+        let one = series("0", &[(0, 1.0)]);
+        let labels = labels_wire_bytes(one.labels.iter());
+        // `__name__="m"` and `instance="0"`.
+        assert_eq!(labels, 2 * wire::LABEL_OVERHEAD + 8 + 1 + 8 + 1);
+        assert_eq!(
+            raw_wire_bytes(&one),
+            wire::RAW_SERIES_OVERHEAD + labels + wire::RAW_SAMPLE_UNCOMPRESSED
+        );
+
+        let many = series(
+            "0",
+            &(0..WIRE_COMPRESSION_MIN_SAMPLES as i64)
+                .map(|i| (i, 1.0))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            raw_wire_bytes(&many),
+            wire::RAW_SERIES_OVERHEAD
+                + labels
+                + WIRE_COMPRESSION_MIN_SAMPLES as u64 * wire::RAW_SAMPLE_COMPRESSED,
+            "a span at the codec threshold is estimated compressed"
+        );
+
+        // Grouping labels: what the modifier keeps, and nothing for `sum(...)`.
+        assert_eq!(labels_wire_bytes(one.labels.grouping_labels(None)), 0);
+        let by_name = by(&["__name__"]);
+        assert_eq!(
+            labels_wire_bytes(one.labels.grouping_labels(Some(&by_name))),
+            wire::LABEL_OVERHEAD + 8 + 1
+        );
+        let without_name = without(&["__name__"]);
+        assert_eq!(
+            labels_wire_bytes(one.labels.grouping_labels(Some(&without_name))),
+            wire::LABEL_OVERHEAD + 8 + 1
+        );
+
+        assert_eq!(partial_accumulators(AggregationKind::Count), 0);
+        assert_eq!(partial_accumulators(AggregationKind::Max), 1);
+        assert_eq!(partial_accumulators(AggregationKind::Sum), 2);
+        assert_eq!(partial_accumulators(AggregationKind::Stddev), 3);
     }
 
     /// Over a grid, a series contributes only the steps whose window held

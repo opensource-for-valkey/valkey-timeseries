@@ -308,9 +308,14 @@ message GridGroupPartial {
 /// `partials`, everything else in `series` — except that a series whose raw span
 /// is *smaller* than its grid output (`step` finer than the sample cadence)
 /// travels in `raw`, and the coordinator runs the same per-series stage over it
-/// that the shard would have. `series` and `partials` never both appear: a
-/// response that carries per-series values for a fused request, or partials for
-/// an unfused one, is from a corrupt peer.
+/// that the shard would have. Under a fused reduction the shard sizes that per
+/// group rather than per series — partials are one per `(group, step)` however
+/// many series fed the group — so a group of sparse series may fold into
+/// `partials` and only a group whose spans are smaller still travels in `raw`.
+/// The coordinator accepts any mix; which the shard chose is its own business.
+/// `series` and `partials` never both appear: a response that carries
+/// per-series values for a fused request, or partials for an unfused one, is
+/// from a corrupt peer.
 message GridQueryResponse {
   repeated GridSeries series = 1;
   repeated GridGroupPartial partials = 2;

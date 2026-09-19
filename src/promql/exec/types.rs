@@ -367,6 +367,26 @@ impl EvalLabels {
         }
     }
 
+    /// The labels [`Self::compute_grouping_labels`] would keep, as borrowed
+    /// views and without building the set: the same filter
+    /// [`Self::compute_grouping_key`] hashes, for a caller that wants to
+    /// *measure* a group's labels (a shard sizing the partials it would ship)
+    /// rather than key by them.
+    pub(crate) fn grouping_labels<'a>(
+        &'a self,
+        modifier: Option<&'a LabelModifier>,
+    ) -> impl Iterator<Item = InternedLabel<'a>> + 'a {
+        self.iter().filter(move |l| match modifier {
+            None => false,
+            Some(LabelModifier::Include(label_list)) => {
+                label_list.labels.iter().any(|n| n == l.name)
+            }
+            Some(LabelModifier::Exclude(label_list)) => {
+                !label_list.labels.iter().any(|n| n == l.name)
+            }
+        })
+    }
+
     /// Iterate over labels as borrowed `(name, value)` views, in name order
     /// for every variant.
     pub(crate) fn iter(&self) -> LabelIter<'_> {

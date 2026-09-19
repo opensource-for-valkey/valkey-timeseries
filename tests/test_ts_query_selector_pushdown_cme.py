@@ -24,7 +24,9 @@ What this file is for, and what it is not:
   as a divergence.
 * The size rule (a series whose span is smaller than its grid output travels
   raw) is exercised by querying at a step finer than the sample cadence; the
-  answer must not depend on which form travelled.
+  answer must not depend on which form travelled. Under a fused reduction the
+  shard sizes per *group* instead — see `test_sparse_groups_fold_on_the_shards`
+  in the rollup suite for the fixture that triggers that.
 
 Exactness: stepped values are the stored samples, so unfused comparisons are
 `==`. Fused aggregation merges per-shard partials in a different order than a

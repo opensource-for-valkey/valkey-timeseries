@@ -21,9 +21,12 @@ What this file is for, and what it is not:
   each other — so a defect introduced anywhere in the shard-side reduction shows
   up as a divergence. (Verified by mutation: shifting the shard's window ends by
   1ms fails 11 tests here, both equivalence tests among them.) What it cannot
-  reach is a shard that answers raw under the size rule for one series and
-  staged for another; that mix is pinned by the unit tests beside
-  `GridFanoutCommand`.
+  reach is *which form* a shard chose — raw under the per-series size rule,
+  staged, or a sparse group folded into partials because the reduction makes
+  that the smaller form; those choices are pinned by the unit tests beside
+  `GridFanoutCommand`. `test_sparse_groups_fold_on_the_shards` puts the fixture
+  that triggers the group-level choice through the on/off comparison so the
+  answer is proven whichever way it travelled.
 
 Exactness: unfused rollup
 values are compared with `==`, because the same kernel reduces the same window on
@@ -90,6 +93,15 @@ SPARSE_KEY = 'sparse:only:{h1}'
 SPARSE_VALUE = 42
 
 
+# The sparse-group fixture: many one-sample series per job, spread across all
+# three shards and across the span, so that under a fused reduction every group
+# is answered in per-step partials rather than one raw span per series (the
+# per-series size rule alone would ship each of these raw — one sample against
+# a nine-step grid — and have the coordinator stage and fold every one).
+SPARSE_GROUP_JOBS = ('api', 'web')
+SPARSE_GROUP_SIZE = 30
+
+
 def _rfc3339(epoch_seconds: int) -> str:
     return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime(
         '%Y-%m-%dT%H:%M:%SZ')
@@ -125,6 +137,22 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             'TS.CREATE', SPARSE_KEY, 'METRIC', 'sparse_metric{instance="only"}')
         cluster_client.execute_command(
             'TS.ADD', SPARSE_KEY, _rfc3339(T0), SPARSE_VALUE)
+
+    def setup_sparse_groups(self):
+        """Create the sparse-group fixture (see `SPARSE_GROUP_JOBS`) and
+        enable push-down. Instance `i` of a job lands on primary `i % 3` and
+        carries one sample at `T0 + 30 * (i % 5)` seconds."""
+        self.set_pushdown('yes')
+        cluster_client: ValkeyCluster = self.new_cluster_client()
+
+        for job in SPARSE_GROUP_JOBS:
+            for i in range(SPARSE_GROUP_SIZE):
+                tag = TAG_BY_NODE[i % len(TAG_BY_NODE)]
+                key = f'sg:{job}:{i}:{{{tag}}}'
+                metric = f'sparse_group{{job="{job}",instance="{job}-{i}"}}'
+                cluster_client.execute_command('TS.CREATE', key, 'METRIC', metric)
+                cluster_client.execute_command(
+                    'TS.ADD', key, _rfc3339(T0 + SAMPLE_OFFSETS[i % 5]), i + 1)
 
     def coordinator(self):
         """A plain (non-cluster-aware) client to the node that fans out."""
@@ -1077,3 +1105,66 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             self.assert_steps_near(
                 self.matrix_by_labelset(a), self.matrix_by_labelset(b),
                 context=f'fused range mismatch for `{query}`')
+
+    # Fused reductions over the sparse-group fixture: every reduction, every
+    # modifier shape, over a bare selector and over a rollup. A 15s step over
+    # the 2-minute span is nine steps against one sample per series, which is
+    # what makes each series raw under the per-series rule and each group
+    # partials under the reduction-aware one.
+    SPARSE_GROUP_QUERIES = [
+        'sum by (job) (sparse_group)',
+        'sum(sparse_group)',
+        'sum without (instance) (sparse_group)',
+        'avg by (job) (sparse_group)',
+        'min by (job) (sparse_group)',
+        'max by (job) (sparse_group)',
+        'count by (job) (sparse_group)',
+        'group by (job) (sparse_group)',
+        'stddev by (job) (sparse_group)',
+        'stdvar by (job) (sparse_group)',
+        'sum by (job) (sum_over_time(sparse_group[1m]))',
+        'sum by (job) (count_over_time(sparse_group[30s]))',
+        'avg by (job) (last_over_time(sparse_group[1m]))',
+        'count without (instance) (count_over_time(sparse_group[1m]))',
+        'sum by (job, instance) (sparse_group)',
+        # a selection stays per series — the control for the rule above
+        'topk(3, sparse_group)',
+        'count_values by (job) ("v", sparse_group)',
+    ]
+
+    def test_sparse_groups_fold_on_the_shards(self):
+        """Many one-sample series per group, the groups spanning shards: the
+        shard answers each group in partials rather than shipping every span
+        raw, and the answer equals the coordinator-side reduction the toggle
+        falls back to. Shape exactly, values to a relative 1e-12."""
+        self.setup_sparse_groups()
+
+        on_instant = [self.instant_query(q) for q in self.SPARSE_GROUP_QUERIES]
+        on_range = [self.range_query(q, step='15s')
+                    for q in self.SPARSE_GROUP_QUERIES]
+        with self.pushdown_disabled():
+            off_instant = [self.instant_query(q)
+                           for q in self.SPARSE_GROUP_QUERIES]
+            off_range = [self.range_query(q, step='15s')
+                         for q in self.SPARSE_GROUP_QUERIES]
+
+        for query, a, b in zip(self.SPARSE_GROUP_QUERIES, on_instant, off_instant):
+            self.assert_steps_near(
+                {k: [v] for k, v in self.vector_by_labelset(a).items()},
+                {k: [v] for k, v in self.vector_by_labelset(b).items()},
+                context=f'sparse-group instant mismatch for `{query}`')
+
+        for query, a, b in zip(self.SPARSE_GROUP_QUERIES, on_range, off_range):
+            self.assert_steps_near(
+                self.matrix_by_labelset(a), self.matrix_by_labelset(b),
+                context=f'sparse-group range mismatch for `{query}`')
+
+        # And the groups really did straddle shards, and are not trivially
+        # empty: the lookback keeps every sample in view at EVAL.
+        by_job = self.values_by_label(
+            self.instant_query('count by (job) (sparse_group)'), 'job')
+        assert by_job == {job: SPARSE_GROUP_SIZE for job in SPARSE_GROUP_JOBS}, by_job
+        for node in TAG_BY_NODE:
+            keys = self.new_client_for_primary(node).execute_command('KEYS', 'sg:*')
+            assert len(keys) == len(SPARSE_GROUP_JOBS) * SPARSE_GROUP_SIZE // 3, \
+                f"primary {node} holds {len(keys)} sparse-group keys"

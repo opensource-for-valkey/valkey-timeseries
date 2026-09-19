@@ -120,7 +120,7 @@ in**:
 |---|---|---|
 | `series` | per series, a presence bitmap over the request's window ends plus one packed value per set bit (and, only when the query calls `timestamp()`, each pick's lag behind its window end) | index into its own window ends; concatenate |
 | `partials` | one partial per `(group, step)` for a fused request | merge and finalize |
-| `raw` | a series' raw span, when it is smaller than its grid output — as a chunk (`SampleData`, the `TS.MRANGE` codec) | decode, run the same per-series stage, then the above |
+| `raw` | a series' raw span, when it is smaller than its grid output — or, under a fused reduction, when its whole group's spans are smaller than the group's partials — as a chunk (`SampleData`, the `TS.MRANGE` codec) | decode, run the same per-series stage, then the above |
 
 A request fused with a reduction answers in `partials`; every other request
 in `series` — for a request fused with a selecting or counting operator

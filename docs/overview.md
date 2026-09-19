@@ -249,9 +249,12 @@ the shard runs the per-step stage (the last sample inside the lookback, or the w
 point per series per step, or one partial per group per step, instead of every raw sample in the span. A PromQL
 series is owned entirely by one shard, so the per-series output needs no cross-shard merge; the coordinator
 concatenates it, and merges the fused partials. A series whose raw span is smaller than its grid output (a step finer
-than the sample cadence) travels raw and is stepped on the coordinator. Flipping the toggle off routes the raw span
-back through the ordinary range fanout and evaluates it on the coordinator — the same answer, at the transfer the
-push-down saves.
+than the sample cadence) travels raw and is stepped on the coordinator — except under a fused reduction, where the
+unit of that decision is the group rather than the series: partials are one per `(group, step)` however many series
+fed the group, so a group of sparse series is folded on the shard when its partials are the smaller form, and only a
+group whose raw spans are smaller still (a lone sparse series) travels raw. Flipping the toggle off routes the raw
+span back through the ordinary range fanout and evaluates it on the coordinator — the same answer, at the transfer
+the push-down saves.
 
 A range query resolves its rollups *once, for the whole step grid*, before the step loop runs — so `rate(m[5m])` at
 a 15s step over six hours is one fan-out rather than 1440, each of which would have shipped a five-minute window
