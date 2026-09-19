@@ -120,7 +120,7 @@ pub(super) fn expect_min_arg_count(
 /// (the modern default from Prometheus 3.x's `utf8-names` feature) rather
 /// than the legacy `^[a-zA-Z_][a-zA-Z0-9_]*$` scheme: any non-empty string is
 /// a valid label name, since a Rust `&str` is already guaranteed valid UTF-8.
-pub(super) fn is_valid_label_name(label: &str) -> bool {
+pub(in crate::promql) fn is_valid_label_name(label: &str) -> bool {
     !label.is_empty()
 }
 

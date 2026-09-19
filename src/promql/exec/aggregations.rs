@@ -1,13 +1,15 @@
 use crate::common::Timestamp;
+use crate::common::hash::IntMap;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
-use crate::labels::HasFingerprint;
+use crate::labels::{HasFingerprint, SeriesFingerprint};
 use crate::promql::exec::types::EvalLabels;
+use crate::promql::functions::utils::is_valid_label_name;
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use promql_parser::parser::token::{TokenType, *};
 use promql_parser::parser::{AggregateExpr, LabelModifier};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BinaryHeap;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum KAggregationOrder {
@@ -196,26 +198,138 @@ fn eval_count_values(
     timestamp_ms: Timestamp,
 ) -> EvalResult<Vec<EvalSample>> {
     let label_name = get_param_as_string(param, "count_values")?;
-    let groups = group_sample_values(modifier, samples);
-    let mut out = Vec::new();
-    for (_, group) in groups {
-        let mut counts = BTreeMap::new();
-        for value in group.members {
-            *counts.entry(sample_value_label(value)).or_insert(0usize) += 1;
-        }
+    if !is_valid_label_name(&label_name) {
+        return Err(EvaluationError::InternalError(format!(
+            "invalid label name {label_name:?}"
+        )));
+    }
 
-        for (value_label, count) in counts {
-            let mut labels = group.labels.clone();
-            labels.set(&label_name, value_label);
-            out.push(EvalSample {
-                labels,
-                timestamp_ms,
-                value: count as f64,
-                drop_name: group.drop_name,
-            });
-        }
+    // Prometheus sets the value label on every sample *before* grouping, so a
+    // value label that reuses an input label's name replaces it for grouping
+    // too: `count_values without (instance) ("job", m)` groups by
+    // `(group, job="<value>")`, merging `job="api-server"` and
+    // `job="app-server"` samples that share a value. Grouping first and
+    // setting the label afterwards emitted one series per original group and
+    // tripped the duplicate-label-set check.
+    //
+    // Partitioning by the modifier with the value label's name taken out,
+    // then by the value, is that same partition: the value label's value is
+    // a function of the sample value alone.
+    let adjusted = count_values_grouping(modifier, &label_name);
+    let grouping = adjusted.as_ref().or(modifier);
+
+    // Counts are keyed by the value's bit pattern and rendered once per
+    // distinct value when its output series is built, rather than rendered
+    // per input sample and keyed by the string. Rendering was the largest
+    // single cost of the operator, and inputs usually repeat a few values.
+    struct Bucket {
+        labels: EvalLabels,
+        value_key: u64,
+        drop_name: bool,
+        count: usize,
+    }
+    let mut buckets: IntMap<u64, Bucket> = IntMap::default();
+    for sample in samples {
+        let value_key = count_values_key(sample.value);
+        let key = count_values_bucket_key(sample.labels.compute_grouping_key(grouping), value_key);
+        let bucket = buckets.entry(key).or_insert_with(|| Bucket {
+            labels: sample.labels.compute_grouping_labels(grouping),
+            value_key,
+            drop_name: false,
+            count: 0,
+        });
+        bucket.drop_name |= sample.drop_name;
+        bucket.count += 1;
+    }
+
+    let mut out = Vec::with_capacity(buckets.len());
+    for bucket in buckets.into_values() {
+        let mut labels = bucket.labels;
+        labels.set(
+            &label_name,
+            sample_value_label(f64::from_bits(bucket.value_key)),
+        );
+        out.push(EvalSample {
+            labels,
+            timestamp_ms,
+            value: bucket.count as f64,
+            drop_name: bucket.drop_name,
+        });
     }
     Ok(out)
+}
+
+/// The grouping `count_values` partitions by before its value label is set,
+/// when that differs from `modifier`: `by` with the value label's name taken
+/// out of the list, `without` with it added. `None` means `modifier` already
+/// serves — it never names the value label (`by`), already excludes it
+/// (`without`), or is absent (group by nothing, then set the label).
+fn count_values_grouping(
+    modifier: Option<&LabelModifier>,
+    label_name: &str,
+) -> Option<LabelModifier> {
+    use promql_parser::label::Labels as List;
+    match modifier {
+        None => None,
+        Some(LabelModifier::Include(list)) => {
+            let named = list.labels.iter().any(|name| name == label_name);
+            named.then(|| {
+                let labels = list
+                    .labels
+                    .iter()
+                    .filter(|name| *name != label_name)
+                    .cloned()
+                    .collect();
+                LabelModifier::Include(List { labels })
+            })
+        }
+        Some(LabelModifier::Exclude(list)) => {
+            let named = list.labels.iter().any(|name| name == label_name);
+            (!named).then(|| {
+                let mut labels = list.labels.clone();
+                labels.push(label_name.to_string());
+                LabelModifier::Exclude(List { labels })
+            })
+        }
+    }
+}
+
+/// One map key for a `(group, value)` pair, identifying the pair by a 64-bit
+/// hash the way group fingerprints identify groups everywhere else.
+///
+/// The map does no hashing of its own, so this has to mix: float bit
+/// patterns of nearby values share their high bits, which is where hashbrown
+/// takes its tag byte from, and the fingerprint alone must not decide the
+/// bucket. The finalizer is MurmurHash3's `fmix64`.
+#[inline]
+fn count_values_bucket_key(group: SeriesFingerprint, value_key: u64) -> u64 {
+    // Fold the 128-bit fingerprint as `FingerprintHasher::write_u128` does.
+    let group = (group as u64) ^ ((group >> 64) as u64).rotate_left(32);
+    let mut x = group ^ value_key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^ (x >> 33)
+}
+
+/// The `count_values` key of a sample value: its bit pattern, with every NaN
+/// folded onto one pattern.
+///
+/// Two values share a key exactly when [`sample_value_label`] renders them
+/// the same. Distinct finite values render distinctly (shortest round-trip
+/// formatting), `-0` and `0` render differently and have different bits, and
+/// the two infinities are single patterns. Only NaN has many bit patterns
+/// behind one rendering, so it is the one case that needs folding; without
+/// it a group holding two NaN payloads would emit two series with the same
+/// label set.
+#[inline]
+fn count_values_key(value: f64) -> u64 {
+    if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -821,5 +935,176 @@ mod limit_selection_tests {
         // A zero ratio selects nothing; NaN is rejected.
         assert!(select_limit_ratio(samples.clone(), 0.0).unwrap().is_empty());
         assert!(select_limit_ratio(samples, f64::NAN).is_err());
+    }
+}
+
+#[cfg(test)]
+mod count_values_tests {
+    use super::*;
+    use crate::labels::Labels;
+    use std::collections::BTreeMap;
+
+    fn sample(value: f64) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value,
+            labels: EvalLabels::from(Labels::from_pairs(&[("__name__", "m")]).0),
+            drop_name: false,
+        }
+    }
+
+    /// `count_values` output as `rendered value -> count`, asserting along the
+    /// way that no two output series share a label set.
+    fn counts(values: &[f64]) -> BTreeMap<String, f64> {
+        let out = eval_count_values(
+            None,
+            Some(ExprResult::String("v".to_string())),
+            values.iter().copied().map(sample).collect(),
+            0,
+        )
+        .unwrap();
+        let mut by_label = BTreeMap::new();
+        for s in out {
+            let v = s.labels.get("v").unwrap().to_string();
+            assert!(
+                by_label.insert(v.clone(), s.value).is_none(),
+                "duplicate output series for value {v}"
+            );
+        }
+        by_label
+    }
+
+    /// Keys are bit patterns, so what must be shown is that they merge and
+    /// split exactly as the rendered strings do.
+    #[test]
+    fn keys_agree_with_the_rendering() {
+        let nan_with_payload = f64::from_bits(f64::NAN.to_bits() | 0x1234);
+        assert!(nan_with_payload.is_nan());
+        assert_ne!(nan_with_payload.to_bits(), f64::NAN.to_bits());
+
+        let got = counts(&[
+            1.5,
+            1.5,
+            2.0,
+            f64::NAN,
+            nan_with_payload,
+            -f64::NAN,
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.1 + 0.2,
+        ]);
+        let want: BTreeMap<String, f64> = [
+            ("1.5", 2.0),
+            ("2", 1.0),
+            ("NaN", 3.0),
+            ("-0", 1.0),
+            ("0", 1.0),
+            ("+Inf", 1.0),
+            ("-Inf", 1.0),
+            ("0.30000000000000004", 1.0),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    fn labeled(pairs: &[(&str, &str)], value: f64) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 0,
+            value,
+            labels: EvalLabels::from(Labels::from_pairs(pairs).0),
+            drop_name: false,
+        }
+    }
+
+    /// Output as sorted `(label set, count)` strings.
+    fn run(modifier: Option<&LabelModifier>, label: &str, samples: Vec<EvalSample>) -> Vec<String> {
+        let mut out: Vec<String> = eval_count_values(
+            modifier,
+            Some(ExprResult::String(label.to_string())),
+            samples,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| format!("{} {}", s.labels, s.value))
+        .collect();
+        out.sort();
+        out
+    }
+
+    fn fleet() -> Vec<EvalSample> {
+        vec![
+            labeled(&[("job", "api"), ("instance", "0"), ("group", "prod")], 6.0),
+            labeled(&[("job", "api"), ("instance", "1"), ("group", "prod")], 6.0),
+            labeled(
+                &[("job", "api"), ("instance", "0"), ("group", "canary")],
+                8.0,
+            ),
+            labeled(&[("job", "app"), ("instance", "0"), ("group", "prod")], 6.0),
+            labeled(
+                &[("job", "app"), ("instance", "0"), ("group", "canary")],
+                7.0,
+            ),
+        ]
+    }
+
+    /// A value label that reuses an input label's name replaces it before
+    /// grouping, as in Prometheus, so groups that differed only by that label
+    /// merge instead of emitting duplicate label sets.
+    #[test]
+    fn value_label_overrides_a_grouping_label() {
+        use promql_parser::label::Labels as List;
+
+        let without_instance = LabelModifier::Exclude(List::new(vec!["instance"]));
+        assert_eq!(
+            run(Some(&without_instance), "job", fleet()),
+            vec![
+                "{group=\"canary\",job=\"7\"} 1",
+                "{group=\"canary\",job=\"8\"} 1",
+                "{group=\"prod\",job=\"6\"} 3",
+            ]
+        );
+
+        let by_job_group = LabelModifier::Include(List::new(vec!["job", "group"]));
+        assert_eq!(
+            run(Some(&by_job_group), "job", fleet()),
+            vec![
+                "{group=\"canary\",job=\"7\"} 1",
+                "{group=\"canary\",job=\"8\"} 1",
+                "{group=\"prod\",job=\"6\"} 3",
+            ]
+        );
+
+        // A fresh label name leaves the modifier's grouping untouched.
+        assert_eq!(
+            run(Some(&without_instance), "version", fleet()),
+            vec![
+                "{group=\"canary\",job=\"api\",version=\"8\"} 1",
+                "{group=\"canary\",job=\"app\",version=\"7\"} 1",
+                "{group=\"prod\",job=\"api\",version=\"6\"} 2",
+                "{group=\"prod\",job=\"app\",version=\"6\"} 1",
+            ]
+        );
+        assert_eq!(
+            run(None, "version", fleet()),
+            vec![
+                "{version=\"6\"} 3",
+                "{version=\"7\"} 1",
+                "{version=\"8\"} 1",
+            ]
+        );
+    }
+
+    /// The key folds only NaN; every other value keeps its own bits.
+    #[test]
+    fn key_folds_nan_only() {
+        assert_eq!(count_values_key(f64::NAN), count_values_key(-f64::NAN));
+        assert_ne!(count_values_key(0.0), count_values_key(-0.0));
+        assert_ne!(count_values_key(1.0), count_values_key(1.0 + f64::EPSILON));
+        assert_eq!(count_values_key(2.5), 2.5f64.to_bits());
     }
 }
