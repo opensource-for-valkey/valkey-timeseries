@@ -175,7 +175,10 @@ mod tests {
 
     #[test]
     fn non_finite_anywhere_is_nan_and_short_windows_are_absent() {
-        assert_eq!(calculate_double_exponential_smoothing_value(&[], 0.3, 0.3), None);
+        assert_eq!(
+            calculate_double_exponential_smoothing_value(&[], 0.3, 0.3),
+            None
+        );
         assert_eq!(
             calculate_double_exponential_smoothing_value(&window(&[1.0]), 0.3, 0.3),
             None
