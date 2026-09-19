@@ -251,6 +251,9 @@ fn range_query_cases() -> Vec<(String, usize)> {
         ),
         ("histogram_quantile(0.9, rate(h_X[5m]))", 0),
         ("a_X + on(l) group_right a_one", 0),
+        // One-to-one `on()` join: the only binop shape whose result labels go
+        // through `result_metric` → `EvalLabels::retain` with a modifier.
+        ("a_X + on(l) b_X", 0),
         ("count({__name__!=\"\"})", 1),
         ("count({__name__!=\"\",l=\"\"})", 1),
         ("timestamp(a_X)", 0),
