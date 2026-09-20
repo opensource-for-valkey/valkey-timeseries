@@ -53,7 +53,7 @@ impl InFlightRequest {
     fn rpc_done(&self) -> Result<u64, u64> {
         // Decrement outstanding only when it's greater than 0 to avoid underflow.
         self.outstanding
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |curr| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |curr| {
                 if curr > 0 { Some(curr - 1) } else { None }
             })
     }
@@ -101,7 +101,19 @@ type InFlightRequestMap = HashMap<u64, InFlightRequest, BuildNoHashHasher<u64>>;
 
 static INFLIGHT_REQUESTS: LazyLock<InFlightRequestMap> = LazyLock::new(InFlightRequestMap::default);
 
-static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
+/// Per-node request id counter, seeded once on first use (see [`initial_request_id`]).
+static REQUEST_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(initial_request_id()));
+
+/// The first request id this process hands out.
+///
+/// Ids only need to be unique per node, but a node that restarts must not reuse
+/// the ids of requests its previous incarnation still had in flight, or a
+/// late response from a peer could be matched to the wrong request. Seeding
+/// from a randomly keyed hash of the node id makes each incarnation start at a
+/// different, unpredictable point in the id space.
+fn initial_request_id() -> u64 {
+    RandomState::new().hash_one(CURRENT_NODE_ID.as_bytes())
+}
 
 /// Generate a unique request ID
 ///
@@ -117,36 +129,7 @@ static REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 /// - Two different nodes can safely use the same ID simultaneously for different requests
 ///
 fn generate_id() -> u64 {
-    loop {
-        // Fast path: counter already initialized, just increment and return the previous value.
-        let current = REQUEST_ID.load(Ordering::Acquire);
-        if current != 0 {
-            return REQUEST_ID.fetch_add(1, Ordering::AcqRel);
-        }
-        // Slow path: initialize the counter exactly once based on the current node ID.
-
-        let curr_id = *CURRENT_NODE_ID;
-        let hasher = RandomState::new();
-        // Seed the first request ID from a hash of the node ID, while avoiding races between threads.
-        let initial_id = hasher.hash_one(curr_id.as_bytes());
-        // Set the counter to the next value after `initial_id` so future calls
-        // get unique IDs strictly greater than the first one we return here.
-        match REQUEST_ID.compare_exchange(
-            0,
-            initial_id.wrapping_add(1),
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                // We won the race to initialize; return the first ID.
-                return initial_id;
-            }
-            Err(_) => {
-                // Another thread initialized `REQUEST_ID` first; retry and take the fast path.
-                continue;
-            }
-        }
-    }
+    REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 fn on_request_timeout(ctx: &Context, id: u64) {
