@@ -1,4 +1,4 @@
-use crate::fanout::FanoutContext;
+use crate::common::replies::ReplyContext;
 use crate::fanout::{FanoutClientCommand, FanoutResult};
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -30,7 +30,7 @@ where
             result,
         }
     }
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         match self.result.as_ref() {
             Ok(_) => self.op.reply(ctx),
             Err(err) => {
@@ -158,7 +158,7 @@ extern "C" fn reply_callback<T: FanoutClientCommand>(
     _argc: c_int,
 ) -> c_int {
     let op_ptr = unsafe { ValkeyModule_GetBlockedClientPrivateData.unwrap()(ctx) };
-    let ctx = FanoutContext::new(ctx as *mut raw::RedisModuleCtx);
+    let ctx = ReplyContext::new(ctx as *mut raw::RedisModuleCtx);
     if op_ptr.is_null() {
         // this means that there was an error in setting up RPC, so we should reply with an error.
         ctx.reply_error_string("No reply data") as c_int

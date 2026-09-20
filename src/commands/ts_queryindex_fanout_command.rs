@@ -1,6 +1,7 @@
 use super::fanout_codec::{MetaQueryRequest, StringListResponse};
 use super::fanout_codec::{deserialize_match_filter_options, serialize_match_filter_options};
 use super::utils::get_multi_command_targets;
+use crate::common::replies::ReplyContext;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::series_keys_by_selectors;
@@ -35,12 +36,16 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: MetaQueryRequest,
     ) -> ValkeyResult<StringListResponse> {
         let options = deserialize_match_filter_options(req.range, Some(req.filters))?;
-        let keys = series_keys_by_selectors(ctx, &options.matchers, options.date_range)?;
-        let keys = keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        // The keys come back as `ValkeyString`s; convert them before releasing the lock.
+        let keys = {
+            let ctx = ctx.lock()?;
+            let keys = series_keys_by_selectors(&ctx, &options.matchers, options.date_range)?;
+            keys.into_iter().map(|k| k.to_string()).collect::<Vec<_>>()
+        };
         Ok(StringListResponse { values: keys })
     }
 
@@ -60,7 +65,7 @@ impl FanoutClientCommand for QueryIndexFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         ctx.reply_with_array(self.keys.len());
         for key in self.keys.iter() {
             ctx.reply_with_string(key);

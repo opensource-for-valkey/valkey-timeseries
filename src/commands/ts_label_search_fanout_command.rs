@@ -9,6 +9,7 @@ use crate::commands::label_search_utils::{
     LabelNameSearchArgs, label_search_targets, process_label_search_request,
     reply_with_label_search_result,
 };
+use crate::common::replies::ReplyContext;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
@@ -49,7 +50,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: LabelSearchRequest,
     ) -> ValkeyResult<LabelSearchResponse> {
         if req.fuzz_threshold > 1.0 {
@@ -127,7 +128,12 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             tags: Vec::new(),
         };
 
-        process_label_search_request(ctx, &parsed).map(|results| LabelSearchResponse {
+        let results = {
+            let ctx = ctx.lock()?;
+            process_label_search_request(&ctx, &parsed)?
+        };
+
+        Ok(LabelSearchResponse {
             has_more: results.has_more,
             results: results
                 .into_iter()
@@ -209,7 +215,7 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         let map = std::mem::take(&mut self.result_map);
         let values = map.into_values().collect::<Vec<_>>();
 

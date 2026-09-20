@@ -6,16 +6,17 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::pool::get_pooled_buffer;
-use crate::common::threads::spawn_with_context;
+use crate::common::threads::spawn;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
 use crate::fanout::acl::get_fanout_user;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
 use crate::fanout::fanout_command::FanoutResponseCallback;
+use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::registry::{RequestHandlerCallback, get_fanout_request_handler};
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{
     FanoutResult, NodeInfo, get_cluster_map, get_or_refresh_cluster_map, mark_cluster_map_stale,
-    refresh_cluster_map, with_fanout_user,
+    refresh_cluster_map,
 };
 use ahash::HashSet;
 use core::time::Duration;
@@ -26,7 +27,7 @@ use std::os::raw::{c_char, c_int, c_uchar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use valkey_module::{
-    Context, RedisModuleCtx, Status, VALKEYMODULE_OK, ValkeyError,
+    Context, DetachedContext, MODULE_CONTEXT, RedisModuleCtx, Status, VALKEYMODULE_OK, ValkeyError,
     ValkeyModule_RegisterClusterMessageReceiver, ValkeyModule_SendClusterMessage,
     ValkeyModuleClusterMessageReceiver, ValkeyModuleCtx, ValkeyResult,
 };
@@ -364,14 +365,15 @@ fn alloc_db_if_needed(ctx: &Context, db: i32) {
 /// cluster topology.
 ///
 /// A fingerprint of `0` means the sender had no map when it built the request,
-/// so the check is skipped. Otherwise we compare against a fresh local map: if
+/// so the check is skipped. Otherwise, we compare against a fresh local map: if
 /// they disagree, our map may merely be stale, so we force a single refresh and
 /// re-compare before declaring a mismatch. Building the map issues
 /// `CLUSTER NODES` (not `CLUSTER SLOTS`), whose reply does not depend on a
-/// client, so this is safe on the worker thread that runs it.
+/// client, so this is safe on the worker thread that runs it; the GIL is taken
+/// only for that call, and the reply is parsed with it released.
 ///
 /// Returns `true` when the topologies agree (request accepted).
-fn cluster_fingerprint_matches(ctx: &Context, expected: u64) -> bool {
+fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
     if expected == 0 {
         return true;
     }
@@ -387,30 +389,36 @@ fn cluster_fingerprint_matches(ctx: &Context, expected: u64) -> bool {
 }
 
 /// Processes a valid request by executing the command and sending back the response.
+///
+/// Runs on a worker thread. The GIL is taken twice here — to validate the
+/// request's database and to send the reply — and otherwise only by the
+/// cluster-map check (for `CLUSTER NODES`) and the handler itself, for as long
+/// as its keyspace/index work needs (see `FanoutCommand::get_local_response`).
+/// Request decoding and response encoding to happen with the GIL released.
 fn process_request_message(
-    ctx: &Context,
     header: FanoutMessageHeader,
     handler: RequestHandlerCallback,
     request_buf: &[u8],
     sender_id: NodeId,
 ) {
     let request_id = header.request_id;
-    let db = header.db;
 
     // Reject the request if the cluster topology changed between the requester
     // generating it and us receiving it. This runs on the worker thread (not the
-    // cluster-message callback) so the potential `CLUSTER NODES` refresh stays
-    // off the main thread. The aggregate result would otherwise be built from
-    // inconsistent per-node views.
-    if !cluster_fingerprint_matches(ctx, header.cluster_fingerprint) {
+    // cluster-message callback), so the potential `CLUSTER NODES` refresh stays
+    // off the main thread, and outside the lock below so the refresh holds the
+    // GIL only for the call itself. The aggregate result would otherwise be
+    // built from inconsistent per-node views.
+    if !cluster_fingerprint_matches(&MODULE_CONTEXT, header.cluster_fingerprint) {
+        let ctx = MODULE_CONTEXT.lock();
         let msg = format!(
             "cluster rpc: rejecting request {request_id} from node {sender_id}: cluster-map fingerprint mismatch"
         );
         ctx.log_warning(&msg);
         send_error_response(
-            ctx,
+            &ctx,
             request_id,
-            db,
+            header.db,
             sender_id.raw_ptr(),
             FanoutError::cluster_map_mismatch(),
         );
@@ -419,45 +427,32 @@ fn process_request_message(
 
     let mut dest = get_pooled_buffer(FANOUT_RPC_RESPONSE_BUFFER_SIZE);
 
-    // don't proceed if we can't set the current db
-    if set_current_db(ctx, db) == Status::Err {
-        let msg = format!(
-            "cluster rpc: rejecting request {request_id} from node {sender_id}: failed to set current db to {db}"
-        );
-        ctx.log_warning(&msg);
-        send_error_response(
-            ctx,
-            request_id,
-            db,
-            sender_id.raw_ptr(),
-            FanoutError::invalid_db(),
-        );
-        return;
-    }
-
-    let user = header.user.as_deref();
-    let res = with_fanout_user(ctx, user, |ctx| {
-        handler(ctx, request_buf, &mut dest).map_err(ValkeyError::from)
-    });
-
-    if let Err(e) = res {
-        let msg = e.to_string();
-        send_error_response(ctx, request_id, db, sender_id.raw_ptr(), e.into());
-        ctx.log_warning(&msg);
-        return;
-    };
-
-    if send_response_message(
-        ctx,
-        request_id,
-        db,
-        sender_id.raw_ptr(),
-        &header.handler,
-        &dest,
-    ) == Status::Err
-    {
-        let msg = format!("Failed to send response message to node {sender_id:?}");
-        ctx.log_warning(&msg);
+    // The handler re-selects `db` and resolves `user` on every GIL acquisition
+    // (`FanoutContext::lock`); the context tells it which ones.
+    let fanout_ctx = FanoutContext::new(header.user, header.db);
+    match handler(&fanout_ctx, request_buf, &mut dest) {
+        Ok(()) => {
+            let ctx = MODULE_CONTEXT.lock();
+            if send_response_message(
+                &ctx,
+                request_id,
+                header.db,
+                sender_id.raw_ptr(),
+                &header.handler,
+                &dest,
+            ) == Status::Err
+            {
+                let msg = format!("Failed to send response message to node {sender_id:?}");
+                // send error ???
+                ctx.log_warning(&msg);
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            MODULE_CONTEXT.log_warning(&msg);
+            let ctx = MODULE_CONTEXT.lock();
+            send_error_response(&ctx, request_id, header.db, sender_id.raw_ptr(), e);
+        }
     }
 }
 
@@ -552,8 +547,8 @@ extern "C" fn on_request_received(
 
     alloc_db_if_needed(&ctx, message.db);
 
-    spawn_with_context(move |ctx| {
-        process_request_message(ctx, header, handler, &buf, sender);
+    spawn(move || {
+        process_request_message(header, handler, &buf, sender);
     });
 }
 
@@ -592,7 +587,7 @@ extern "C" fn on_response_received(
     with_inflight_request(&ctx, message.request_id, |ctx, request| {
         let _ = set_current_db(ctx, message.db);
         // Feature gate: a newer peer's response may demand envelope features
-        // (e.g. a payload encoding) we cannot decode; fail this node's slice
+        // (e.g., a payload encoding) we cannot decode; fail this node's slice
         // of the request instead of misinterpreting the payload.
         if has_unsupported_features(message.required_features) {
             let err = FanoutError::unsupported_features();

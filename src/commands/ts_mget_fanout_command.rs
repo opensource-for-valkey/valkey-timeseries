@@ -3,6 +3,7 @@ use crate::commands::fanout_codec::filters::{deserialize_matchers_list, serializ
 use crate::commands::process_mget_request;
 use crate::commands::utils::{get_multi_command_targets, reply_with_mget_values};
 use crate::common::logging::log_error;
+use crate::common::replies::ReplyContext;
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -36,7 +37,10 @@ impl FanoutClientCommand for MGetFanoutCommand {
         get_multi_command_targets(ctx, &self.options.tags)
     }
 
-    fn get_local_response(ctx: &Context, req: MultiGetRequest) -> ValkeyResult<MultiGetResponse> {
+    fn get_local_response(
+        ctx: &FanoutContext,
+        req: MultiGetRequest,
+    ) -> ValkeyResult<MultiGetResponse> {
         let filters = deserialize_matchers_list(Some(req.filters))
             .map_err(|_e| ValkeyError::Str(error_consts::COMMAND_DESERIALIZATION_ERROR))?;
 
@@ -48,9 +52,13 @@ impl FanoutClientCommand for MGetFanoutCommand {
             tags: vec![],
         };
 
-        let results = process_mget_request(ctx, mreq)?;
-
-        let values: Vec<MGetValue> = results.into_iter().map(|resp| resp.into()).collect();
+        // The per-series results carry the key as a `ValkeyString`, so convert
+        // them before releasing the lock.
+        let values: Vec<MGetValue> = {
+            let ctx = ctx.lock()?;
+            let results = process_mget_request(&ctx, mreq)?;
+            results.into_iter().map(|resp| resp.into()).collect()
+        };
 
         Ok(MultiGetResponse { values })
     }
@@ -71,7 +79,7 @@ impl FanoutClientCommand for MGetFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         match reply_with_mget_values(ctx, &self.series) {
             Ok(_) => Status::Ok,
             Err(e) => {

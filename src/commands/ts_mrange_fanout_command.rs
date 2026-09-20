@@ -9,6 +9,7 @@ use crate::commands::utils::{
     MRangeReplyShape, get_multi_command_targets, reply_with_mrange_series_results,
 };
 use crate::common::context::key_for_display;
+use crate::common::replies::ReplyContext;
 use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -94,7 +95,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: MultiRangeRequest,
     ) -> ValkeyResult<MultiRangeResponse> {
         let apply_aggregation = req.apply_aggregation;
@@ -126,7 +127,10 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             // GROUPBY/REDUCE push-down: pre-reduce local group members per
             // bucket (per-series aggregation included when present) and ship
             // partial states instead of per-series samples.
-            let partials = process_mrange_group_partials(ctx, options, limit)?;
+            let partials = {
+                let ctx = ctx.lock()?;
+                process_mrange_group_partials(&ctx, options, limit)?
+            };
             return Ok(MultiRangeResponse {
                 series: Vec::new(),
                 group_partials: partials.into_iter().map(Into::into).collect(),
@@ -146,8 +150,12 @@ impl FanoutClientCommand for MRangeFanoutCommand {
             options.range.aggregation = None;
         }
 
-        // Process the MRange query locally
-        let series = process_mrange_query(ctx, options, true, limit)?;
+        // Process the MRange query locally. The results are owned, so the
+        // encoding below (including label interning) runs with the GIL released.
+        let series = {
+            let ctx = ctx.lock()?;
+            process_mrange_query(&ctx, options, true, limit)?
+        };
 
         // Convert MRangeSeriesResult to SeriesResponse
         let mut serialized: Vec<SeriesRangeResponse> = series
@@ -187,7 +195,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         self.ingest_response(resp).map_err(Into::into)
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         self.options.range.latest = false;
         self.options.range.timestamp_filter = None;
         self.options.range.value_filter = None;

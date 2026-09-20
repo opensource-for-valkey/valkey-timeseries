@@ -18,9 +18,38 @@ use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use valkey_module::logging::{log_notice, log_warning};
 use valkey_module::{
-    CallOptionsBuilder, CallReply, CallResult, Context, VALKEYMODULE_NODE_ID_LEN,
+    CallOptionsBuilder, CallReply, CallResult, Context, DetachedContext, VALKEYMODULE_NODE_ID_LEN,
     ValkeyModule_GetMyClusterID,
 };
+
+/// Where [`ClusterMap::create`] gets its `CLUSTER NODES` reply from.
+///
+/// The call needs the GIL; parsing the reply does not. A [`DetachedContext`]
+/// takes the lock for the call alone, so a worker thread rebuilding the map
+/// holds the GIL only for as long as the server needs to render the reply. A
+/// [`Context`] is already locked (a command handler or callback on the main
+/// thread) and issues the call directly.
+pub trait ClusterNodesSource {
+    /// The raw `CLUSTER NODES` reply, or `None` when the call did not produce a
+    /// usable string.
+    fn cluster_nodes(&self) -> Option<String>;
+}
+
+impl ClusterNodesSource for Context {
+    fn cluster_nodes(&self) -> Option<String> {
+        let call_options = CallOptionsBuilder::new().errors_as_replies().build();
+        let res: CallResult = self.call_ext::<_, CallResult>("CLUSTER", &call_options, &["NODES"]);
+        // The reply is freed here, while the lock is still held.
+        reply_as_string(res)
+    }
+}
+
+impl ClusterNodesSource for DetachedContext {
+    fn cluster_nodes(&self) -> Option<String> {
+        let ctx = self.lock();
+        ctx.cluster_nodes()
+    }
+}
 
 // Constants
 pub const NUM_SLOTS: u16 = 16384;
@@ -741,18 +770,18 @@ impl ClusterMap {
     /// preferred endpoint against the current client, which crashes the server
     /// when invoked without a real client context (e.g. from a background
     /// thread or the cluster-message callback). Parsing `CLUSTER NODES` lets us
-    /// refresh the map safely from any context that holds the module lock.
+    /// refresh the map safely from any context that can take the module lock.
+    ///
+    /// Only the call itself runs under the GIL (see [`ClusterNodesSource`]);
+    /// the reply is parsed after it is released, so a [`DetachedContext`]
+    /// caller holds the lock for the call alone.
     /// Returns `None` when the `CLUSTER NODES` call fails to produce a usable
     /// reply, so callers can distinguish a build failure from a successfully
     /// built (possibly inconsistent) map and avoid clobbering a good map.
-    pub fn create(ctx: &Context) -> Option<Self> {
-        let call_options = CallOptionsBuilder::new().errors_as_replies().build();
-
+    pub fn create(ctx: &impl ClusterNodesSource) -> Option<Self> {
         log_notice("Calling CLUSTER NODES...");
 
-        let res: CallResult = ctx.call_ext::<_, CallResult>("CLUSTER", &call_options, &["NODES"]);
-
-        let Some(text) = reply_as_string(res) else {
+        let Some(text) = ctx.cluster_nodes() else {
             log_warning("CLUSTER NODES did not return a usable string reply");
             return None;
         };

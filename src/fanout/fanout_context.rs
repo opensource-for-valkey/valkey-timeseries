@@ -1,51 +1,135 @@
-use crate::common::replies::{
-    reply, reply_error_string, reply_with_bulk_string, reply_with_key, reply_with_simple_string,
-};
-use crate::series::index::{TimeSeriesIndexGuard, get_db_index};
+use crate::common::context::set_current_db;
+use crate::fanout::{FanoutAclScope, FanoutIdentity};
+use crate::series::acl::ModuleUser;
 use std::ops::Deref;
-use std::os::raw::c_long;
+use std::rc::Rc;
 use valkey_module::logging::ValkeyLogLevel;
-use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{
-    Context, RedisModule_GetSelectedDb, RedisModule_SelectDb, Status,
-    VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, raw,
+    Context, DetachedContext, DetachedContextGuard, MODULE_CONTEXT, Status, ValkeyError,
+    ValkeyResult,
 };
 
-/// Fanout reply context
+/// The GIL, held for one step of a shard-local fan-out request.
 ///
-/// A thin wrapper around the underlying `RedisModuleCtx` that provides convenience
-/// helpers for generating replies and managing the selected database while handling
-/// fanout responses.
+/// Dereferences to [`Context`]. While it is alive, the request's database is
+/// selected, and its ACL identity is active on this thread; both are torn down
+/// when it drops, before the GIL is released. Like [`DetachedContextGuard`],
+/// it has no client behind it and must not be used to send replies.
+pub struct FanoutContextGuard {
+    // Declared first so the resolved `ModuleUser` handle is freed under the lock.
+    _acl: Option<FanoutAclScope>,
+    db: i32,
+    ctx: DetachedContextGuard,
+}
+
+impl FanoutContextGuard {
+    /// Access the underlying detached context guard.
+    pub fn context(&self) -> &DetachedContextGuard {
+        &self.ctx
+    }
+
+    /// The database selected for the duration of this lock.
+    pub fn db(&self) -> i32 {
+        self.db
+    }
+}
+
+impl Deref for FanoutContextGuard {
+    type Target = Context;
+
+    fn deref(&self) -> &Context {
+        &self.ctx
+    }
+}
+
+/// The shard-local side of one fan-out request: the ACL user it executes as,
+/// the database it targets, and the module's detached context used to take
+/// the GIL.
 ///
-/// This struct restores the original selected DB when dropped if it changed during
-/// the lifetime of the `FanoutContext`.
+/// Built by the two fan-out entry points (the coordinator's own shard and the
+/// cluster RPC receiver) and handed to `FanoutCommand::get_local_response`,
+/// which runs on a worker thread with the GIL *not* held. [`FanoutContext::lock`]
+/// is the only way that code should take it: the detached context is shared by
+/// every worker, so the request's database has to be re-selected on each
+/// acquisition, and the [`ModuleUser`] handle the ACL checks rely on is only
+/// valid while the lock that resolved it is held.
 ///
 /// # Invariant
-/// The `FanoutContext` must ALWAYS be created and used from the Valkey main thread.
-/// In the codebase this is guaranteed because the only way to get a `FanoutContext`
-/// is from a callback invoked by `exec_command`, which executes on the main thread.
+/// The ACL identity a lock installs is thread-local, so a request must take
+/// every GIL it needs on the thread that owns the `FanoutContext`.
 pub struct FanoutContext {
-    save_db: Option<i32>,
-    ctx: Context,
-    raw_ctx: *mut raw::RedisModuleCtx,
+    user: Option<String>,
+    db: i32,
+    ctx: &'static DetachedContext,
 }
 
 impl FanoutContext {
-    pub(crate) fn new(ctx: *mut raw::RedisModuleCtx) -> Self {
+    /// `user` is the coordinator-side client's ACL name (`None`/empty = no
+    /// enforcement), `db` the database the request runs against.
+    pub fn new(user: Option<String>, db: i32) -> Self {
+        let user = user.filter(|name| !name.is_empty());
         Self {
-            save_db: None,
-            ctx: Context { ctx },
-            raw_ctx: ctx,
+            user,
+            db,
+            ctx: &MODULE_CONTEXT,
         }
     }
 
-    /// Log a message at the specified `level` using the underlying context.
-    pub fn log(&self, level: ValkeyLogLevel, message: &str) {
-        let context = Context { ctx: self.raw_ctx };
-        context.log(level, message);
+    /// The ACL user the request executes as, if enforcement applies.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
-    /// Convenience logging helpers
+    /// The database the request runs against.
+    pub fn db(&self) -> i32 {
+        self.db
+    }
+
+    /// Take the GIL for a step of this request.
+    ///
+    /// Keep the guard's scope as small as the work allows — decode the request
+    /// before locking and encode the response after releasing, so the server
+    /// stays responsive while the shard-local reply is materialized.
+    ///
+    /// Fails when the request's database cannot be selected or its ACL user no
+    /// longer exists, so a request cannot silently run against the wrong
+    /// database or without enforcement.
+    pub fn lock(&self) -> ValkeyResult<FanoutContextGuard> {
+        let ctx = self.ctx.lock();
+
+        if set_current_db(&ctx, self.db) == Status::Err {
+            return Err(ValkeyError::String(format!(
+                "failed to select database {}",
+                self.db
+            )));
+        }
+
+        let acl = match &self.user {
+            Some(user) => {
+                let user_name = ctx.create_string(user.as_str());
+                let module_user = ModuleUser::from_name(&user_name).ok_or_else(|| {
+                    ValkeyError::String(format!("ACL user '{user}' does not exist or is disabled"))
+                })?;
+                Some(FanoutAclScope::enter(FanoutIdentity {
+                    name: user.clone(),
+                    user: Some(Rc::new(module_user)),
+                }))
+            }
+            None => None,
+        };
+
+        Ok(FanoutContextGuard {
+            _acl: acl,
+            db: self.db,
+            ctx,
+        })
+    }
+
+    /// Log a message at the specified `level` without taking the GIL.
+    pub fn log(&self, level: ValkeyLogLevel, message: &str) {
+        self.ctx.log(level, message);
+    }
+
     pub fn log_debug(&self, message: &str) {
         self.log(ValkeyLogLevel::Debug, message);
     }
@@ -54,110 +138,26 @@ impl FanoutContext {
         self.log(ValkeyLogLevel::Notice, message);
     }
 
-    pub fn log_verbose(&self, message: &str) {
-        self.log(ValkeyLogLevel::Verbose, message);
-    }
-
     pub fn log_warning(&self, message: &str) {
         self.log(ValkeyLogLevel::Warning, message);
     }
-
-    /// Switch the selected DB for this context. The original DB is saved on first
-    /// switch so it can be restored when the `FanoutContext` is dropped.
-    pub fn set_current_db(&mut self, db: i32) {
-        if self.save_db.is_none() {
-            self.save_db = Some(self.get_current_db());
-        }
-        unsafe {
-            RedisModule_SelectDb.unwrap()(self.raw_ctx, db);
-        }
-    }
-
-    /// Return the currently selected DB index from the underlying context.
-    pub fn get_current_db(&self) -> i32 {
-        unsafe { RedisModule_GetSelectedDb.unwrap()(self.raw_ctx) }
-    }
-
-    /// Reply with a 64-bit integer value.
-    pub fn reply_with_i64(&self, value: i64) -> Status {
-        raw::reply_with_long_long(self.raw_ctx, value)
-    }
-
-    /// Reply with a double-precision floating point value.
-    pub fn reply_with_f64(&self, value: f64) -> Status {
-        raw::reply_with_double(self.raw_ctx, value)
-    }
-
-    /// Reply with a boolean value.
-    pub fn reply_with_bool(&self, value: bool) -> Status {
-        raw::reply_with_bool(self.raw_ctx, value.into())
-    }
-
-    /// Reply with a simple string.
-    pub fn reply_with_simple_string(&self, s: &str) -> Status {
-        reply_with_simple_string(self.raw_ctx, s)
-    }
-
-    /// Reply with an error string.
-    pub fn reply_error_string(&self, s: &str) -> Status {
-        reply_error_string(self.raw_ctx, s)
-    }
-
-    /// Reply with a bulk string.
-    pub fn reply_with_bulk_string(&self, value: &str) -> Status {
-        reply_with_bulk_string(self.raw_ctx, value)
-    }
-
-    /// Reply with a NULL value.
-    pub fn reply_with_null(&self) -> Status {
-        raw::reply_with_null(self.raw_ctx)
-    }
-
-    /// Start an array reply with the given length.
-    pub fn reply_with_array(&self, len: usize) -> Status {
-        raw::reply_with_array(self.raw_ctx, len as c_long)
-    }
-
-    /// Start a map reply with the given length.
-    pub fn reply_with_map(&self, len: usize) -> Status {
-        raw::reply_with_map(self.raw_ctx, len as c_long)
-    }
-
-    /// Start a postponed-length array reply.
-    pub fn reply_with_postponed_array(&self) -> Status {
-        raw::reply_with_array(self.raw_ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long)
-    }
-
-    /// Reply with a `ValkeyValueKey` (integer/string/bulk/etc.).
-    pub fn reply_with_key(&self, result: ValkeyValueKey) -> Status {
-        reply_with_key(self.raw_ctx, result)
-    }
-
-    /// Forward a `ValkeyResult` to the reply machinery.
-    #[allow(clippy::must_use_candidate)]
-    pub fn reply(&self, result: ValkeyResult) -> Status {
-        reply(self.raw_ctx, result)
-    }
-
-    /// Get the index guard for the currently selected DB.
-    pub fn get_db_index(&self) -> TimeSeriesIndexGuard<'_> {
-        let db = self.get_current_db();
-        get_db_index(db)
-    }
 }
 
-impl Drop for FanoutContext {
-    fn drop(&mut self) {
-        if let Some(db) = self.save_db {
-            self.set_current_db(db);
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fanout_context_keeps_user_and_db() {
+        let ctx = FanoutContext::new(Some("alice".to_owned()), 3);
+        assert_eq!(ctx.user(), Some("alice"));
+        assert_eq!(ctx.db(), 3);
     }
-}
 
-impl Deref for FanoutContext {
-    type Target = Context;
-
-    fn deref(&self) -> &Self::Target {
-        &self.ctx
+    #[test]
+    fn test_fanout_context_collapses_empty_user() {
+        let ctx = FanoutContext::new(Some(String::new()), 0);
+        assert!(ctx.user().is_none());
+        assert_eq!(ctx.db(), 0);
     }
 }

@@ -5,6 +5,7 @@ pub(crate) mod cluster_migrations;
 mod cluster_rpc;
 mod fanout_client_command;
 mod fanout_command;
+mod fanout_context;
 mod fanout_error;
 mod fanout_message;
 mod registry;
@@ -17,15 +18,17 @@ use arc_swap::{ArcSwap, Guard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use valkey_module::Context;
+use valkey_module::logging::{log_notice, log_warning};
 
 use super::fanout::cluster_rpc::register_cluster_message_handlers;
 pub use acl::*;
 pub use fanout_client_command::*;
 pub use fanout_command::*;
+pub use fanout_context::FanoutContext;
 pub use fanout_error::*;
 pub use utils::*;
 
-pub use cluster_map::{ClusterMap, FanoutTarget, NodeInfo};
+pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};
 pub use registry::register_fanout_operation;
 
 pub(crate) fn init_fanout(ctx: &Context) {
@@ -126,8 +129,12 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
 // preserves the lazily-computed target caches and the allocations shared by
 // in-flight readers. If building the new map fails, the previous map is kept
 // in place and a warning is logged so subsequent calls will retry the refresh.
-pub fn refresh_cluster_map(ctx: &Context) {
-    ctx.log_notice("Refreshing cluster map...");
+//
+// `ctx` is a `Context` on the main thread or a `DetachedContext` on a worker;
+// the latter holds the GIL only for the `CLUSTER NODES` call (see
+// `ClusterNodesSource`).
+pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) {
+    log_notice("Refreshing cluster map...");
     match ClusterMap::create(ctx) {
         Some(new_map) => {
             let current_map = CLUSTER_MAP.load();
@@ -136,24 +143,22 @@ pub fn refresh_cluster_map(ctx: &Context) {
                 && new_map.same_topology(&current_map)
             {
                 current_map.extend_expiration(grow_refresh_interval());
-                ctx.log_notice("Cluster map unchanged; extended expiration");
+                log_notice("Cluster map unchanged; extended expiration");
             } else {
                 drop(current_map);
                 reset_refresh_interval();
                 update_cluster_map(new_map);
-                ctx.log_notice("Cluster map refreshed");
+                log_notice("Cluster map refreshed");
             }
         }
         None => {
             reset_refresh_interval();
-            ctx.log_warning(
-                "Failed to build cluster map; keeping the previous map and retrying later",
-            );
+            log_warning("Failed to build cluster map; keeping the previous map and retrying later");
         }
     }
 }
 
-pub fn get_or_refresh_cluster_map(ctx: &Context) -> Arc<ClusterMap> {
+pub fn get_or_refresh_cluster_map(ctx: &impl ClusterNodesSource) -> Arc<ClusterMap> {
     let current_map = get_cluster_map();
     let stale = take_cluster_map_stale();
 

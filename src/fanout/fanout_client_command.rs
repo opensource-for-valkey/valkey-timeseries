@@ -2,11 +2,9 @@ use crate::common::replies::ReplyContext;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::serialization::Serializable;
-use crate::fanout::{FanoutCommand, FanoutResult, FanoutTarget, NodeInfo};
+use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use std::sync::{Arc, Mutex};
 use valkey_module::{Context, Status, ValkeyResult, ValkeyValue};
-
-pub type FanoutContext = ReplyContext;
 
 /// A trait for cluster-mode commands which send results back to clients after receiving responses from other nodes.
 /// This is a higher-level abstraction over `FanoutCommand` that includes client response handling logic.
@@ -22,15 +20,17 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         super::compute_query_fanout_mode(ctx)
     }
 
-    fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response>;
+    /// Handle a local request on the current node. See
+    /// [`FanoutCommand::get_local_response`] for the locking contract.
+    fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
 
     fn generate_request(&self) -> Self::Request;
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult;
 
-    /// NOTE: Use the provided `FanoutContext` reply helpers. This is already
+    /// NOTE: Use the provided `ReplyContext` reply helpers. This is already
     /// running on the main thread and does not require locking.
-    fn reply(&mut self, ctx: &FanoutContext) -> Status;
+    fn reply(&mut self, ctx: &ReplyContext) -> Status;
 
     /// Execute the fanout operation across cluster nodes.
     /// The `where Self: FanoutCommand` bound is always satisfied via the blanket impl below.
@@ -78,7 +78,7 @@ impl<T: FanoutClientCommand> FanoutCommand for T {
         T::name()
     }
 
-    fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response> {
+    fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response> {
         T::get_local_response(ctx, req)
     }
 

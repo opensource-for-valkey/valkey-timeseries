@@ -3,6 +3,7 @@ use crate::commands::fanout_codec::{
     deserialize_match_filter_options, serialize_match_filter_options,
 };
 use crate::commands::utils::get_multi_command_targets;
+use crate::common::replies::ReplyContext;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::count_matched_series;
@@ -35,9 +36,13 @@ impl FanoutClientCommand for CardFanoutCommand {
         "card"
     }
 
-    fn get_local_response(ctx: &Context, req: MetaQueryRequest) -> ValkeyResult<CountResponse> {
+    fn get_local_response(
+        ctx: &FanoutContext,
+        req: MetaQueryRequest,
+    ) -> ValkeyResult<CountResponse> {
         let options = deserialize_match_filter_options(req.range, Some(req.filters))?;
-        let count = count_matched_series(ctx, options.date_range, &options.matchers)? as u64;
+        let ctx = ctx.lock()?;
+        let count = count_matched_series(&ctx, options.date_range, &options.matchers)? as u64;
         Ok(CountResponse { count })
     }
 
@@ -55,7 +60,7 @@ impl FanoutClientCommand for CardFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         ctx.reply_with_integer(self.result as i64)
     }
 }

@@ -4,6 +4,7 @@ use crate::commands::DEFAULT_STATS_RESULTS_LIMIT;
 use crate::commands::command_parser::LabelStatsOptions;
 use crate::commands::ts_labelstats::reply_with_postings_stats;
 use crate::commands::utils::get_multi_command_targets;
+use crate::common::replies::ReplyContext;
 use crate::common::threads::join;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
@@ -64,23 +65,27 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
         "label_stats"
     }
 
-    fn get_local_response(ctx: &Context, req: StatsRequest) -> ValkeyResult<StatsResponse> {
+    fn get_local_response(ctx: &FanoutContext, req: StatsRequest) -> ValkeyResult<StatsResponse> {
         let limit = req.limit as usize;
-        let index_guard = get_timeseries_index(ctx);
-        let index = index_guard.deref();
         let label = req.selected_label.as_deref().unwrap_or("");
-
-        // Resolve the filter once: the counts and the label fingerprints have to be taken over
-        // the same set of series, or the coordinator's distinct totals would cover series that
-        // contributed nothing to the counts.
         let matchers = deserialize_matchers_list(Some(req.filters))?;
-        let matching = index.matching_postings(&matchers)?;
-        let matching = matching.as_ref();
 
-        let (stats, (labels_bitmap, label_value_pairs_bitmap)) = join(
-            || index.stats_restricted(matching, label, limit),
-            || index.label_bitmaps_restricted(matching),
-        );
+        let (stats, (labels_bitmap, label_value_pairs_bitmap)) = {
+            let ctx = ctx.lock()?;
+            let index_guard = get_timeseries_index(&ctx);
+            let index = index_guard.deref();
+
+            // Resolve the filter once: the counts and the label fingerprints have to be taken over
+            // the same set of series, or the coordinator's distinct totals would cover series that
+            // contributed nothing to the counts.
+            let matching = index.matching_postings(&matchers)?;
+            let matching = matching.as_ref();
+
+            join(
+                || index.stats_restricted(matching, label, limit),
+                || index.label_bitmaps_restricted(matching),
+            )
+        };
 
         let mut response: StatsResponse = stats.into();
         response.labels_bitmap = serialize_bitmap(&labels_bitmap);
@@ -128,7 +133,7 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         let limit = self.options.limit;
         let state = std::mem::take(&mut self.state);
 

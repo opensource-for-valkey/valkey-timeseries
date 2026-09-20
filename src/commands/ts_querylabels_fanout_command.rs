@@ -2,6 +2,7 @@ use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers
 use super::fanout_codec::{QueryLabelsRequest, QueryLabelsSubtype, StringListResponse};
 use super::utils::get_multi_command_targets;
 use crate::commands::command_parser::QueryLabelsOptions;
+use crate::common::replies::ReplyContext;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
@@ -40,7 +41,7 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: QueryLabelsRequest,
     ) -> ValkeyResult<StringListResponse> {
         let subtype = QueryLabelsSubtype::try_from(req.subtype).map_err(|_| invalid_subtype())?;
@@ -54,11 +55,13 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
             Some(req.label)
         };
 
+        let ctx = ctx.lock()?;
         let values = match subtype {
-            QueryLabelsSubtype::Labels => query_labels_distinct(ctx, &matchers, None)?,
-            QueryLabelsSubtype::Values => query_labels_distinct(ctx, &matchers, label.as_deref())?,
+            QueryLabelsSubtype::Labels => query_labels_distinct(&ctx, &matchers, None)?,
+            QueryLabelsSubtype::Values => query_labels_distinct(&ctx, &matchers, label.as_deref())?,
             QueryLabelsSubtype::Unspecified => return Err(invalid_subtype()),
         };
+        drop(ctx);
 
         Ok(StringListResponse {
             values: values.into_iter().collect(),
@@ -90,7 +93,7 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
         Ok(())
     }
 
-    fn reply(&mut self, ctx: &FanoutContext) -> Status {
+    fn reply(&mut self, ctx: &ReplyContext) -> Status {
         let values: Vec<String> = std::mem::take(&mut self.values).into_iter().collect();
         ctx.reply_with_set(values.len());
         for value in values.iter() {

@@ -976,10 +976,10 @@ mod tests {
         }
     }
 
-    /// An empty user field decodes to `None`, which `with_fanout_user` treats as
+    /// An empty user field decodes to `None`, which `FanoutContext` treats as
     /// "run without ACL enforcement". Pinning this makes the collapse explicit:
     /// a peer cannot smuggle a distinct zero-length ACL identity through, and
-    /// conversely an empty name is never passed to `authenticate_user`.
+    /// conversely an empty name is never resolved via `ModuleUser::from_name`.
     #[test]
     fn test_deserialize_empty_user_collapses_to_none() {
         let from_wire = RawHeader {

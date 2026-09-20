@@ -14,9 +14,10 @@ use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeySt
 /// whole of the check loop, which is why [`KeyAccess`] is built per request
 /// and never stored.
 ///
-/// A fan-out request handler resolves this once, in `with_fanout_user`, and
-/// shares it (as an `Rc`) with every `KeyAccess` the request builds via
-/// [`fanout_module_user`] — never re-resolving the name.
+/// A fan-out request handler resolves this once per GIL acquisition, in
+/// `FanoutContext::lock`, and shares it (as an `Rc`) with every `KeyAccess`
+/// built under that lock via [`fanout_module_user`] — never re-resolving the
+/// name. The handle is dropped before the lock is released.
 pub(crate) struct ModuleUser(NonNull<raw::RedisModuleUser>);
 
 impl ModuleUser {

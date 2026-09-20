@@ -1,15 +1,17 @@
-use super::acl::{get_fanout_user, with_fanout_user};
+use super::acl::get_fanout_user;
 use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
+use crate::common::context::get_current_db;
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
+use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::serialization::{Deserialized, Serializable};
 use crate::fanout::{
     FanoutResult, FanoutTarget, NodeInfo, compute_query_fanout_mode, get_fanout_targets,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use valkey_module::{Context, MODULE_CONTEXT, ValkeyResult};
+use valkey_module::{Context, ValkeyResult};
 
 pub(super) type FanoutResponseCallback = Box<dyn Fn(FanoutResult<&[u8]>, &NodeInfo) + Send + Sync>;
 
@@ -28,7 +30,14 @@ pub trait FanoutCommand: Default + Send + 'static {
     fn name() -> &'static str;
 
     /// Handle a local request on the current node, returning the response or an error.
-    fn get_local_response(ctx: &Context, req: Self::Request) -> ValkeyResult<Self::Response>;
+    ///
+    /// Runs on a worker thread with the GIL *not* held. Implementations take it
+    /// with [`FanoutContext::lock`], which selects the request's database and
+    /// installs its ACL identity for the duration of the lock, and only around
+    /// the work that touches the keyspace or index: decode the request before
+    /// locking and build the response after releasing, so the server stays
+    /// responsive while the shard-local reply is materialized.
+    fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
 
     /// Return the timeout duration for the entire fanout operation.
     /// This timeout applies to the overall operation, not individual RPC calls.
@@ -109,20 +118,22 @@ where
     let req = op.generate_request();
     let outstanding = targets.len();
     let fanout_user = get_fanout_user(ctx);
+    let db = get_current_db(ctx);
 
     let local_node = targets.iter().find(|x| x.is_local());
 
     let state = Arc::new(FanoutState::new(op, outstanding, f));
 
     if let Some(local) = local_node {
-        // when there are multiple outstanding requests, push the local request to the thread pool to avoid blocking.
+        // The local share always goes through the thread pool: `get_local_response`
+        // takes the GIL itself, which this thread already holds, and the pool keeps
+        // the main thread free while the shard-local reply is materialized.
+        let local_state = state.clone();
         if outstanding > 1 {
-            // push to the thread pool
             let req_local = lock(&state.inner).operation.generate_request();
-            let local_state = state.clone();
-            spawn_local_request(local_state, req_local, *local, fanout_user.clone());
+            spawn_local_request(local_state, req_local, *local, fanout_user, db);
         } else {
-            state.handle_local_request(ctx, req, local);
+            spawn_local_request(local_state, req, *local, fanout_user, db);
             return Ok(());
         }
     }
@@ -363,21 +374,19 @@ where
         let mut inner = lock(&self.inner);
         inner.on_response(resp, target);
     }
-
-    fn handle_local_request(&self, ctx: &Context, request: OP::Request, target: &NodeInfo) {
-        match OP::get_local_response(ctx, request) {
-            Ok(response) => self.on_response(response, target),
-            Err(err) => self.on_error(err.into(), target),
-        }
-    }
 }
 
 /// Spawn a local request handler in a separate thread.
+///
+/// `user` and `db` are the coordinator-side client's ACL identity and selected
+/// database; the [`FanoutContext`] built from them applies both each time
+/// `get_local_response` takes the GIL.
 fn spawn_local_request<OP, F>(
     state: Arc<FanoutState<OP, F>>,
     req: OP::Request,
     target: NodeInfo,
     user: Option<String>,
+    db: i32,
 ) where
     OP: FanoutCommand,
     OP::Request: Send + 'static,
@@ -385,14 +394,8 @@ fn spawn_local_request<OP, F>(
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     spawn(move || {
-        // Minimize the scope of GIL locking, avoiding re-entering the GIL which is non-reentrant.
-        let result = {
-            let ctx = MODULE_CONTEXT.lock();
-            with_fanout_user(&ctx, user.as_deref(), |ctx| {
-                OP::get_local_response(ctx, req)
-            })
-        };
-        match result {
+        let fanout_ctx = FanoutContext::new(user, db);
+        match OP::get_local_response(&fanout_ctx, req) {
             Ok(response) => state.on_response(response, &target),
             Err(err) => state.on_error(err.into(), &target),
         }
