@@ -21,8 +21,8 @@
 use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
 use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
-    log_fanout_failure,
+    FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
+    get_cluster_command_timeout, log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
@@ -40,7 +40,7 @@ use crate::promql::{EvalResult, EvalSample, ExprResult};
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyError, ValkeyResult};
+use valkey_module::{ValkeyError, ValkeyResult};
 
 /// The instant-vector half of the request: what to select, and when.
 #[derive(Debug, Clone)]
@@ -217,7 +217,7 @@ impl FanoutCommand for AggregationFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: AggregationQuery,
     ) -> ValkeyResult<AggregationQueryResponse> {
         let Some(query) = req.query else {
@@ -233,13 +233,16 @@ impl FanoutCommand for AggregationFanoutCommand {
             return Ok(AggregationQueryResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
-        let samples = local_instant_eval_samples(
-            ctx,
-            series_selector,
-            query.timestamp,
-            query.lookback_delta,
-            query.max_series,
-        )?;
+        let samples = {
+            let ctx = ctx.lock()?;
+            local_instant_eval_samples(
+                &ctx,
+                series_selector,
+                query.timestamp,
+                query.lookback_delta,
+                query.max_series,
+            )?
+        };
 
         // An unrecognized operator means the coordinator is newer than this
         // node. Ship the raw instant vector and let it aggregate: correct, at

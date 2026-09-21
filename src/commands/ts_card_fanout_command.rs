@@ -2,8 +2,8 @@ use super::fanout_codec::generated::{CountResponse, MetaQueryRequest};
 use crate::commands::fanout_codec::{
     deserialize_match_filter_options, serialize_match_filter_options,
 };
-use crate::commands::utils::get_multi_command_targets;
 use crate::common::replies::ReplyContext;
+use crate::fanout::compute_hash_tag_fanout_target;
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::count_matched_series;

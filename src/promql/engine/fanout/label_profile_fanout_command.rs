@@ -13,8 +13,8 @@
 //! coordinator leaves the selector as written, which is always safe.
 
 use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
-    log_fanout_failure,
+    FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
+    get_cluster_command_timeout, log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_label_profile;
@@ -25,7 +25,7 @@ use crate::promql::generated::{
 };
 use promql_parser::label::Matchers;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 pub struct LabelProfileFanoutCommand {
     matchers: Matchers,
@@ -110,7 +110,7 @@ impl FanoutCommand for LabelProfileFanoutCommand {
     }
 
     fn get_local_response(
-        ctx: &Context,
+        ctx: &FanoutContext,
         req: LabelProfileQuery,
     ) -> ValkeyResult<LabelProfileResponse> {
         let Some(selector) = req.selector else {
@@ -120,8 +120,9 @@ impl FanoutCommand for LabelProfileFanoutCommand {
             return Ok(LabelProfileResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
+        let ctx = ctx.lock()?;
         Ok(
-            match local_label_profile(ctx, series_selector, req.max_series as usize)? {
+            match local_label_profile(&ctx, series_selector, req.max_series as usize)? {
                 Some(profile) => profile.into(),
                 None => LabelProfileResponse {
                     overflow: true,

@@ -1,6 +1,6 @@
 use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
-use crate::fanout::{FanoutCommand, FanoutCommandResult, NodeInfo};
+use crate::fanout::{FanoutCommand, FanoutCommandResult, FanoutContext, NodeInfo};
 use crate::labels::HasFingerprint;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
@@ -12,7 +12,7 @@ use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalLabels, InstantSample};
 use promql_parser::label::Matchers;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 pub struct InstantVectorSelectorFanoutCommand {
     matchers: Matchers,
@@ -81,7 +81,10 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
         "query"
     }
 
-    fn get_local_response(ctx: &Context, req: InstantQuery) -> ValkeyResult<InstantQueryResponse> {
+    fn get_local_response(
+        ctx: &FanoutContext,
+        req: InstantQuery,
+    ) -> ValkeyResult<InstantQueryResponse> {
         let Some(selector) = req.selector else {
             ctx.log_warning("Received instant query with no selector, returning empty response");
             return Ok(InstantQueryResponse {
@@ -90,8 +93,9 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             });
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
+        let ctx = ctx.lock()?;
         handle_instant_query(
-            ctx,
+            &ctx,
             series_selector,
             req.timestamp,
             req.lookback_delta,

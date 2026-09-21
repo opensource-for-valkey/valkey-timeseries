@@ -2,6 +2,7 @@ use super::fanout_codec::filters::{deserialize_matchers_list, serialize_matchers
 use super::fanout_codec::{QueryLabelsRequest, QueryLabelsSubtype, StringListResponse};
 use crate::commands::command_parser::QueryLabelsOptions;
 use crate::common::replies::ReplyContext;
+use crate::fanout::compute_hash_tag_fanout_target;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };

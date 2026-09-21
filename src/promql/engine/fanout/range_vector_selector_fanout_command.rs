@@ -1,6 +1,7 @@
 use crate::common::Timestamp;
 use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
+    FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
+    get_cluster_command_timeout,
 };
 use crate::labels::{HasFingerprint, filters::SeriesSelector};
 use crate::promql::engine::fanout::query_utils::handle_range_query;
@@ -11,7 +12,7 @@ use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
 use promql_parser::label::Matchers;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 pub struct RangeVectorSelectorFanoutCommand {
     matchers: Matchers,
@@ -76,15 +77,19 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
         "query-range"
     }
 
-    fn get_local_response(ctx: &Context, req: RangeQuery) -> ValkeyResult<RangeQueryResponse> {
+    fn get_local_response(
+        ctx: &FanoutContext,
+        req: RangeQuery,
+    ) -> ValkeyResult<RangeQueryResponse> {
         let Some(selector) = req.selector else {
             // todo: return error
             ctx.log_warning("Received range query with no selector, returning empty response");
             return Ok(RangeQueryResponse { series: vec![] });
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
+        let ctx = ctx.lock()?;
         handle_range_query(
-            ctx,
+            &ctx,
             series_selector,
             req.start_time,
             req.end_time,

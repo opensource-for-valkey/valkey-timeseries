@@ -30,8 +30,8 @@
 
 use crate::common::Sample;
 use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutError, NodeInfo, get_cluster_command_timeout,
-    log_fanout_failure,
+    FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
+    get_cluster_command_timeout, log_fanout_failure,
 };
 use crate::labels::InternedLabel;
 use crate::labels::filters::SeriesSelector;
@@ -58,7 +58,7 @@ use crate::series::chunks::WIRE_COMPRESSION_MIN_SAMPLES;
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
-use valkey_module::{Context, ValkeyError, ValkeyResult};
+use valkey_module::{ValkeyError, ValkeyResult};
 
 impl From<RollupKind> for ProtoRollupKind {
     fn from(kind: RollupKind) -> Self {
@@ -283,7 +283,7 @@ impl FanoutCommand for GridFanoutCommand {
         "query-grid"
     }
 
-    fn get_local_response(ctx: &Context, req: GridQuery) -> ValkeyResult<GridQueryResponse> {
+    fn get_local_response(ctx: &FanoutContext, req: GridQuery) -> ValkeyResult<GridQueryResponse> {
         let Some(selector) = req.selector.clone() else {
             ctx.log_warning("Received grid query with no selector, returning empty response");
             return Ok(GridQueryResponse::default());
@@ -298,14 +298,17 @@ impl FanoutCommand for GridFanoutCommand {
             req.range_end_ms,
         );
 
-        let windows = local_grid_windows(
-            ctx,
-            series_selector,
-            &window_ends,
-            request.backward_ms(),
-            req.max_series,
-            req.max_points_per_series,
-        )?;
+        let windows = {
+            let ctx = ctx.lock()?;
+            local_grid_windows(
+                &ctx,
+                series_selector,
+                &window_ends,
+                request.backward_ms(),
+                req.max_series,
+                req.max_points_per_series,
+            )?
+        };
 
         shard_response(&request, &window_ends, windows)
     }
