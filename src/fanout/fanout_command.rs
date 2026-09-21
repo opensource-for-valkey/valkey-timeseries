@@ -120,35 +120,37 @@ where
     let fanout_user = get_fanout_user(ctx);
     let db = get_current_db(ctx);
 
-    let local_node = targets.iter().find(|x| x.is_local());
+    let local_node = targets.iter().find(|x| x.is_local()).copied();
+
+    // The local share always goes through the thread pool: `get_local_response`
+    // takes the GIL itself, which this thread already holds, and the pool keeps
+    // the main thread free while the shard-local reply is materialized.
+    let local_req = match local_node {
+        // Local-only fanout: there is no RPC to set up, so the local share is
+        // the whole operation.
+        Some(local) if outstanding == 1 => {
+            let state = Arc::new(FanoutState::new(op, outstanding, f));
+            spawn_local_request(state, req, local, fanout_user, db);
+            return Ok(());
+        }
+        Some(_) => Some(op.generate_request()),
+        None => None,
+    };
 
     let state = Arc::new(FanoutState::new(op, outstanding, f));
 
-    if let Some(local) = local_node {
-        // The local share always goes through the thread pool: `get_local_response`
-        // takes the GIL itself, which this thread already holds, and the pool keeps
-        // the main thread free while the shard-local reply is materialized.
-        let local_state = state.clone();
-        if outstanding > 1 {
-            let req_local = lock(&state.inner).operation.generate_request();
-            spawn_local_request(local_state, req_local, *local, fanout_user, db);
-        } else {
-            spawn_local_request(local_state, req, *local, fanout_user, db);
-            return Ok(());
-        }
-    }
-
+    let rpc_state = state.clone();
     let response_handler = move |res: Result<&[u8], FanoutError>, target: &NodeInfo| {
         let Ok(buf) = res else {
-            state.on_error(res.err().unwrap(), target);
+            rpc_state.on_error(res.err().unwrap(), target);
             return;
         };
         match OP::Response::deserialize(buf) {
-            Ok(resp) => state.on_response(resp, target),
+            Ok(resp) => rpc_state.on_response(resp, target),
             Err(e) => {
                 let err =
                     FanoutError::serialization(format!("Failed to deserialize response: {e}"));
-                state.on_error(err, target);
+                rpc_state.on_error(err, target);
             }
         }
     };
@@ -162,8 +164,22 @@ where
         Box::new(response_handler),
         timeout,
     ) {
-        // RPC invocation failed before the fanout could be set up.
+        // RPC invocation failed before the fanout could be set up. The local
+        // share has deliberately not been spawned yet, so no callback can run
+        // and the state's lifecycle is still `Pending`: dropping `state` (and
+        // the handler's clone, released by `invoke_rpc`) discards the completion
+        // callback without invoking it, which releases whatever it retains —
+        // for client commands, the blocked client — so the caller can reply
+        // with this error right away instead of waiting on a local response
+        // that would complete the fanout with a partial result.
         return Err(FanoutError::from(e));
+    }
+
+    // Only now that the remote side is in flight is it safe to spawn the local
+    // share: from here on the fanout completes through the normal
+    // response/timeout path.
+    if let Some((local, req_local)) = local_node.zip(local_req) {
+        spawn_local_request(state, req_local, local, fanout_user, db);
     }
 
     Ok(())
