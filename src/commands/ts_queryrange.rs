@@ -1,8 +1,9 @@
 use crate::commands::command_parser::{ParsedPromqlQuery, parse_query_range_command_args};
 use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
-use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
+use crate::common::context::{ClientThreadSafeContext, create_blocked_client, is_blocking_denied};
 use crate::common::time::current_time_millis;
+use crate::error_consts;
 use crate::promql::QueryError;
 use crate::promql::QueryValue;
 use crate::promql::engine::query_workers::{run_evaluation, submit_query};
@@ -47,6 +48,13 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // happens to have selected at the time the worker thread runs.
     options.db = get_current_db(ctx);
 
+    // Checked before blocking: the server asserts on a blocked deny-blocking
+    // client (a module `RM_Call` without the K flag) and aborts, and inside
+    // MULTI or a script the client would get the server's own error while the
+    // query still ran with nobody to answer.
+    if is_blocking_denied(ctx) {
+        return Err(ValkeyError::Str(error_consts::PROMQL_BLOCKING_NOT_ALLOWED));
+    }
     let blocked_client = create_blocked_client(ctx);
     let querier = get_promql_querier(ctx, hash_tags);
 

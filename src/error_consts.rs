@@ -171,6 +171,10 @@ pub const READ_BLOCK_MS_MUST_BE_NON_NEGATIVE: &str =
     "TSDB: BLOCK milliseconds must be a non-negative integer";
 pub const READ_MIN_COUNT_EXCEEDS_MAX_COUNT: &str = "TSDB: BLOCK min_count must be <= MAX_COUNT";
 pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK) is not allowed inside MULTI, EVAL, or a deny-blocking context";
+/// TS.QUERY / TS.QUERYRANGE always reply from a query worker, so they block the
+/// client, and they cannot evaluate inline instead: the evaluation waits on
+/// selector reads that need the module lock the calling thread already holds.
+pub const PROMQL_BLOCKING_NOT_ALLOWED: &str = "TSDB: TS.QUERY and TS.QUERYRANGE are not allowed inside MULTI, EVAL, or a deny-blocking context";
 // CONDITION is an additive extension with no reference text to match; the wording follows the
 // clause-named style of the probed constants above. A bad operator reuses
 // INVALID_COMPARISON_OPERATOR, which `ComparisonOperator::try_from` already returns.

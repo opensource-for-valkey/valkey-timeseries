@@ -1,7 +1,7 @@
 use crate::common::Timestamp;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
-use crate::common::threads::RayonPool;
+use crate::common::threads::{RayonPool, panic_message};
 use crate::common::time::current_time_millis;
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
@@ -27,6 +27,7 @@ use orx_parallel::ParIter;
 use orx_parallel::ParIterResult;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, LazyLock, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
@@ -275,12 +276,36 @@ fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
             let ctx = MODULE_CONTEXT.lock();
             batch
                 .into_iter()
-                .filter_map(|task| execute_selector_task(&ctx, task))
+                .filter_map(|task| {
+                    isolate_panic("selector task", || execute_selector_task(&ctx, task)).flatten()
+                })
                 .collect()
             // ctx dropped here — MODULE_CONTEXT released
         };
         for work in deferred {
-            work.finish();
+            isolate_panic("range decode", || work.finish());
+        }
+    }
+}
+
+/// Run one task of the processor, surviving its panic.
+///
+/// The processor is one thread for the whole process: a panic that unwound
+/// through [`run_processor`] ended it, and every later `TS.QUERY` failed with
+/// "selector executor thread is not running" until a restart. Caught here, a
+/// panic fails only the task that raised it — its responder is dropped during
+/// the unwind, so its caller gets an error rather than waiting — and the rest
+/// of the batch is still served. The tasks only read, so no state is left
+/// half-written by the unwind.
+fn isolate_panic<T>(what: &str, task: impl FnOnce() -> T) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(task)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            log_warning(format!(
+                "PromQL selector executor: {what} panicked: {}",
+                panic_message(payload.as_ref())
+            ));
+            None
         }
     }
 }
@@ -1147,6 +1172,28 @@ mod selector_batch_executor_tests {
         assert_eq!(wait_for_result(&rx), Ok("x"));
         drop(tx);
         assert!(wait_for_result(&rx).is_err());
+    }
+
+    #[test]
+    fn a_panicking_task_fails_alone() {
+        // The processor's loop shape: several tasks, each owning a responder.
+        // A panic drops the panicking task's responder, so its caller sees an
+        // error instead of waiting, and the tasks after it are still served.
+        let (first_tx, first_rx) = mpsc::sync_channel::<u32>(1);
+        let (second_tx, second_rx) = mpsc::sync_channel::<u32>(1);
+        for (panics, responder) in [(true, first_tx), (false, second_tx)] {
+            super::isolate_panic("test task", move || {
+                if panics {
+                    panic!("boom");
+                }
+                responder.send(7).unwrap();
+            });
+        }
+        assert!(
+            first_rx.recv().is_err(),
+            "the panicking task's caller is told"
+        );
+        assert_eq!(second_rx.recv(), Ok(7), "the next task still runs");
     }
 
     #[test]

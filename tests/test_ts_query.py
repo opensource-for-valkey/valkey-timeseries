@@ -152,6 +152,29 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command('ACL', 'DELUSER', 'promql_alice')
             self.client.execute_command('ACL', 'DELUSER', 'promql_bob')
 
+    def test_query_refused_where_blocking_is_denied(self):
+        """TS.QUERY and TS.QUERYRANGE reply from a query worker, so they block the
+        client. Inside MULTI or a script that is not allowed: the server would
+        answer with its own error while the query still ran, and a module call
+        without the K flag would abort the server. Both commands refuse instead."""
+        self.setup_simple_series()
+        commands = [
+            ("TS.QUERY", "http_requests"),
+            ("TS.QUERYRANGE", "http_requests", "STEP", "1000", "START", "1000", "END", "5000"),
+        ]
+        for command in commands:
+            pipe = self.client.pipeline(transaction=True)
+            pipe.execute_command(*command)
+            with pytest.raises(ResponseError, match="not allowed inside MULTI"):
+                pipe.execute()
+
+            script = "return redis.call(" + ", ".join(f"'{a}'" for a in command) + ")"
+            with pytest.raises(ResponseError, match="not allowed inside MULTI"):
+                self.client.execute_command("EVAL", script, 0)
+
+        # Outside those contexts the same commands still answer.
+        assert self.client.execute_command("TS.QUERY", "http_requests") is not None
+
     def test_query_basic_metric_name(self):
         """Test basic TS.QUERY with just a metric name."""
         self.setup_simple_series()
