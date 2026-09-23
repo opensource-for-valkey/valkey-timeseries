@@ -97,6 +97,16 @@ impl PreparedQuery {
 /// grids of the same subquery within one outer query.
 type SubqueryPreloadMap = ahash::AHashMap<(usize, i64), Arc<PreparedQuery>>;
 
+/// Errors that end the query rather than downgrade a best-effort preload: a
+/// passed deadline, or a sample budget already spent (it only grows, so every
+/// later read would be refused too).
+fn is_query_ending(err: &EvaluationError) -> bool {
+    matches!(
+        err,
+        EvaluationError::Query(QueryError::Timeout | QueryError::TooManySamples { .. })
+    )
+}
+
 fn subquery_key(subquery: &SubqueryExpr, step_ms: i64) -> (usize, i64) {
     (subquery as *const SubqueryExpr as usize, step_ms)
 }
@@ -367,9 +377,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                         .unwrap()
                         .insert(key, Arc::new(prepared));
                 }
-                Err(err) if matches!(err, EvaluationError::Query(QueryError::Timeout)) => {
-                    return Err(err);
-                }
+                Err(err) if is_query_ending(&err) => return Err(err),
                 Err(err) => {
                     // Same rule as the per-step preload: a reader limit tripped
                     // by the union span downgrades to per-step evaluation.
@@ -660,7 +668,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             &request,
             self.reader.query_grid(&matrix.vs, &request, options)?,
         )?;
-        self.charge_range_samples(&rolled)?;
 
         let series = rolled
             .into_iter()
@@ -725,12 +732,23 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         request: &GridRequest,
         outcome: GridOutcome,
     ) -> EvalResult<Vec<RangeSample<EvalLabels>>> {
+        // Charged here, whatever the answer's shape, so every caller pays the
+        // same for the same request: a raw span for what was decoded (before
+        // the evaluation turns it into one point per step), a pushed-down
+        // answer for the points that arrived — its source charged the span
+        // against its own budget.
         let outcome = match outcome {
             GridOutcome::Raw(series) => {
-                // The raw spans are what was loaded; charge them before the
-                // evaluation turns them into one point per step.
                 self.charge_range_samples(&series)?;
                 request.evaluate(series)?
+            }
+            GridOutcome::Rolled(series) => {
+                self.charge_range_samples(&series)?;
+                GridOutcome::Rolled(series)
+            }
+            GridOutcome::Reduced(groups) => {
+                self.charge_range_samples(&groups)?;
+                GridOutcome::Reduced(groups)
             }
             other => other,
         };
@@ -832,7 +850,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             GridOutcome::Raw(series) => return self.cache_stepped_span(vs, grid, series),
             outcome => self.finish_grid(&request, outcome)?,
         };
-        self.charge_range_samples(&groups)?;
 
         let series = groups
             .into_iter()
@@ -1197,7 +1214,20 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             ));
         }
 
+        // The union of every outer step's grid, prepared up front for a range
+        // query (`preload_subqueries`); see the per-step preload below.
+        let union = self
+            .preloaded_subqueries
+            .read()
+            .unwrap()
+            .get(&subquery_key(subquery, step_ms))
+            .cloned();
+
         // Fast path: if inner expression is a pure VectorSelector, evaluate over range once.
+        //
+        // Only without a prepared union: that one read already covers every
+        // outer step's window, where this path would re-read a whole window
+        // per outer step.
         //
         // Only for a selector with no time modifiers of its own.
         // `evaluate_subquery_vector_selector` derives its whole grid from the
@@ -1208,7 +1238,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // `apply_time_modifiers_ms` — and which subquery-scoped preloading now
         // serves from one span fetch rather than one read per step, so the
         // detour is no longer expensive.
-        if let Expr::VectorSelector(ref selector) = *subquery.expr
+        if union.is_none()
+            && let Expr::VectorSelector(ref selector) = *subquery.expr
             && selector.at.is_none()
             && selector.offset.is_none()
         {
@@ -1253,12 +1284,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // up front (`preload_subqueries`); this step only wraps it. Otherwise —
         // an instant query, or a union preload that was declined — prepare this
         // one step's grid here.
-        let union = self
-            .preloaded_subqueries
-            .read()
-            .unwrap()
-            .get(&subquery_key(subquery, step_ms))
-            .cloned();
         let sub = match union {
             Some(prepared) => Evaluator::with_shared(self.reader, self.options, prepared),
             None => {
@@ -1271,8 +1296,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     {
                         Ok(prepared) => prepared,
                         Err(err) => {
-                            // A deadline means the query is over; more work cannot help.
-                            if matches!(err, EvaluationError::Query(QueryError::Timeout)) {
+                            // A deadline or a spent sample budget means the query is
+                            // over: the budget only grows, so per-step reads would
+                            // be refused one by one.
+                            if is_query_ending(&err) {
                                 return Err(err);
                             }
                             // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
@@ -1574,6 +1601,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         !self.preloaded_instant.read().unwrap().is_empty()
             || !self.preloaded_grids.read().unwrap().is_empty()
             || !self.preloaded_matrices.read().unwrap().is_empty()
+            // Subquery preloads are keyed by node address, so a pushed-down
+            // copy of a subquery would miss its prepared union too.
+            || !self.preloaded_subqueries.read().unwrap().is_empty()
     }
 
     fn evaluate_binary_expr(

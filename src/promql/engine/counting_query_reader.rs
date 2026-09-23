@@ -798,6 +798,122 @@ mod tests {
     }
 
     #[test]
+    fn range_bare_selector_subquery_reads_its_union_preload() {
+        let (counting, reader) = build_reader();
+        // A bare selector used to take the subquery fast path, which re-read a
+        // whole window per outer step while the union prepared for it went
+        // unused: one grid request plus `RANGE_STEPS` range reads.
+        run_range(reader, "max_over_time(a[4m:1m])");
+        assert_eq!(
+            counting.counts(),
+            ReaderCallCounts {
+                query_grid: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn range_subqueries_under_a_binary_op_keep_their_preloads() {
+        let (counting, reader) = build_reader();
+        // The per-step filter push-down rewrites a copy of an operand, and the
+        // subquery preloads are keyed by node address: the copy missed its
+        // union and every outer step prepared its own grid again.
+        run_range(
+            reader,
+            "max_over_time((a)[4m:1m]) / max_over_time((b)[4m:1m])",
+        );
+        let counts = counting.counts();
+        assert_eq!(counts.query_grid, 2, "one union per subquery: {counts:?}");
+        assert_eq!(counts.query + counts.query_range, 0, "{counts:?}");
+    }
+
+    /// Refuses, as a shard over its own per-read limit would, any grid
+    /// request spanning more than `max_span_ms`: the union of a subquery's
+    /// windows is refused while each outer step's own window is answered.
+    struct RefusesWideGrids {
+        inner: Arc<dyn QueryReader>,
+        max_span_ms: i64,
+    }
+
+    impl QueryReader for RefusesWideGrids {
+        fn query(
+            &self,
+            selector: &VectorSelector,
+            timestamp: i64,
+            options: QueryOptions,
+        ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
+            self.inner.query(selector, timestamp, options)
+        }
+
+        fn query_range(
+            &self,
+            selector: &VectorSelector,
+            start_ms: i64,
+            end_ms: i64,
+            options: QueryOptions,
+        ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
+            self.inner.query_range(selector, start_ms, end_ms, options)
+        }
+
+        fn query_aggregation(
+            &self,
+            selector: &VectorSelector,
+            timestamp: i64,
+            aggregation: &AggregationRequest,
+            options: QueryOptions,
+        ) -> PromqlResult<AggregationOutcome> {
+            self.inner
+                .query_aggregation(selector, timestamp, aggregation, options)
+        }
+
+        fn query_grid(
+            &self,
+            selector: &VectorSelector,
+            request: &GridRequest,
+            options: QueryOptions,
+        ) -> PromqlResult<GridOutcome> {
+            if request.query_end - request.query_start > self.max_span_ms {
+                return Err(crate::promql::engine::sample_budget::too_many_samples(1, 1));
+            }
+            self.inner.query_grid(selector, request, options)
+        }
+
+        fn label_profile(
+            &self,
+            selector: &VectorSelector,
+            options: QueryOptions,
+        ) -> PromqlResult<Option<LabelProfile>> {
+            self.inner.label_profile(selector, options)
+        }
+    }
+
+    #[test]
+    fn a_refused_subquery_union_fails_the_query() {
+        // Too many samples ends the query. It used to be treated like any
+        // declined preload: each outer step then read its own narrower window,
+        // which the source accepted, and the query succeeded after all.
+        let reader: Arc<dyn QueryReader> = Arc::new(RefusesWideGrids {
+            inner: build_data(),
+            max_span_ms: 300_000,
+        });
+        let err = try_range(reader, "max_over_time((a)[4m:1m])", 0)
+            .expect_err("the union read was refused for too many samples");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+    }
+
+    #[test]
+    fn a_raw_rollup_answer_is_charged_once() {
+        let (_, reader) = build_reader();
+        // `rate(a[1m])` over the 5 steps reads (2_940_000, 3_240_000] raw: 30
+        // samples per series, 90 in all. That span is what was loaded; the 15
+        // rolled points computed from it used to be charged on top.
+        const RAW: usize = 3 * 30;
+        try_range(reader.clone(), "rate(a[1m])", RAW).expect("the raw span fits the budget");
+        try_range(reader, "rate(a[1m])", RAW - 1).expect_err("one sample short of the span");
+    }
+
+    #[test]
     fn instant_aggregation_is_one_pushdown_request() {
         let (counting, reader) = build_reader();
         run_instant(reader, "sum(a)", 3_600_000);
