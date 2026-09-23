@@ -250,14 +250,16 @@ impl TryFrom<&str> for AsOfJoinStrategy {
     type Error = ValkeyError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let strategy = hashify::tiny_map_ignore_case! {
+        let strategy = hashify::map_ignore_case!(
             value.as_bytes(),
+            AsOfJoinStrategy,
             "forward" => AsOfJoinStrategy::Forward,
             "next" => AsOfJoinStrategy::Forward,
             "previous" => AsOfJoinStrategy::Backward,
             "backward" => AsOfJoinStrategy::Backward,
             "nearest" => AsOfJoinStrategy::Nearest,
-        };
+        )
+        .copied();
 
         match strategy {
             Some(strategy) => Ok(strategy),

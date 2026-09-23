@@ -236,15 +236,17 @@ impl Display for ComparisonOperator {
 impl TryFrom<&str> for ComparisonOperator {
     type Error = ValkeyError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let condition = hashify::tiny_map_ignore_case! {
+        let condition = hashify::map_ignore_case!(
             value.as_bytes(),
+            ComparisonOperator,
             "==" => ComparisonOperator::Equal,
             "!=" => ComparisonOperator::NotEqual,
             ">" => ComparisonOperator::GreaterThan,
             ">=" => ComparisonOperator::GreaterThanOrEqual,
             "<" => ComparisonOperator::LessThan,
             "<=" => ComparisonOperator::LessThanOrEqual,
-        };
+        )
+        .copied();
         match condition {
             Some(cond) => Ok(cond),
             None => Err(ValkeyError::Str("TSDB: invalid comparison operator")),

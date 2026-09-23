@@ -81,13 +81,16 @@ impl TryFrom<String> for ChunkEncoding {
 }
 
 fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
-    hashify::tiny_map_ignore_case! {
+    // `fnc_map` rather than `map`: `map` keeps its values in a `static`, and the default
+    // encoding comes from a (non-const) `Default` impl.
+    hashify::fnc_map_ignore_case!(
         encoding.as_bytes(),
-        "compressed" => ChunkEncoding::default(),
-        "uncompressed" => ChunkEncoding::Uncompressed,
-        "gorilla" => ChunkEncoding::Gorilla,
-        "chimp" => ChunkEncoding::Chimp,
-    }
+        "compressed" => Some(ChunkEncoding::default()),
+        "uncompressed" => Some(ChunkEncoding::Uncompressed),
+        "gorilla" => Some(ChunkEncoding::Gorilla),
+        "chimp" => Some(ChunkEncoding::Chimp),
+        _ => None
+    )
 }
 
 /// Core chunk operations that can be auto-dispatched via `enum_dispatch`.

@@ -38,15 +38,17 @@ impl BucketTimestamp {
 impl TryFrom<&str> for BucketTimestamp {
     type Error = ValkeyError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let ts = hashify::tiny_map_ignore_case! {
+        let ts = hashify::map_ignore_case!(
             value.as_bytes(),
+            BucketTimestamp,
             "-" => BucketTimestamp::Start,
             "+" => BucketTimestamp::End,
             "~" => BucketTimestamp::Mid,
             "start" => BucketTimestamp::Start,
             "end" => BucketTimestamp::End,
             "mid" => BucketTimestamp::Mid,
-        };
+        )
+        .copied();
         match ts {
             Some(ts) => Ok(ts),
             None => Err(ValkeyError::Str(
@@ -86,13 +88,15 @@ impl BucketAlignment {
 impl TryFrom<&str> for BucketAlignment {
     type Error = ValkeyError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let alignment = hashify::tiny_map_ignore_case! {
+        let alignment = hashify::map_ignore_case!(
             value.as_bytes(),
+            BucketAlignment,
             "start" => BucketAlignment::Start,
             "end" => BucketAlignment::End,
             "-" => BucketAlignment::Start,
             "+" => BucketAlignment::End,
-        };
+        )
+        .copied();
         match alignment {
             Some(alignment) => Ok(alignment),
             None => {
@@ -280,8 +284,9 @@ impl Display for AggregationType {
 impl TryFrom<&str> for AggregationType {
     type Error = ValkeyError;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let value = hashify::tiny_map_ignore_case! {
+        let value = hashify::map_ignore_case!(
             value.as_bytes(),
+            AggregationType,
             "all" => AggregationType::All,
             "any" => AggregationType::Any,
             "avg" => AggregationType::Avg,
@@ -305,7 +310,8 @@ impl TryFrom<&str> for AggregationType {
             "sumif" => AggregationType::SumIf,
             "var.s" => AggregationType::VarS,
             "var.p" => AggregationType::VarP,
-        };
+        )
+        .copied();
 
         match value {
             Some(agg) => Ok(agg),

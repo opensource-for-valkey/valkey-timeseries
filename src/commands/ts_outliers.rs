@@ -47,7 +47,7 @@ enum OutputFormat {
     Cleaned,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ZScoreType {
     Standard,
     Modified,
@@ -329,11 +329,14 @@ fn parse_zscore_options(args: &mut CommandArgIterator) -> ValkeyResult<AnomalyOp
     let mut zscore_type: Option<ZScoreType> = None;
 
     if let Some(arg) = args.peek() {
-        zscore_type = hashify::tiny_map_ignore_case!(arg.as_slice(),
+        zscore_type = hashify::map_ignore_case!(
+            arg.as_slice(),
+            ZScoreType,
             "STANDARD" => ZScoreType::Standard,
             "MODIFIED" => ZScoreType::Modified,
             "SMOOTHED" => ZScoreType::Smoothed
-        );
+        )
+        .copied();
         if zscore_type.is_some() {
             args.next();
         }

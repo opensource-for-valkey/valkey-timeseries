@@ -61,12 +61,13 @@ macro_rules! command_arg_tokens {
         }
 
         pub(crate) fn parse_command_arg_token(arg: &[u8]) -> Option<CommandArgToken> {
-            hashify::tiny_map_ignore_case! {
+            hashify::map_ignore_case!(
                 arg,
+                CommandArgToken,
                 $(
                     $lit => CommandArgToken::$variant,
                 )+
-            }
+            ).copied()
         }
     };
 }

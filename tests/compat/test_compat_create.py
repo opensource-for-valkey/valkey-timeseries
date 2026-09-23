@@ -358,3 +358,18 @@ class TestParserDivergences:
         args = ("TS.CREATE", "c:div:lbl2", "LABELS", "CHUNK_SIZE", "x")
         assert _errors(diff.reference, *args)
         assert diff.subject.execute_command(*args) == b"OK"
+
+    def test_key_named_labels_is_not_a_label_list(self, diff):
+        """DIV-0043, the positional half: RTS finds LABELS among the positional
+        arguments too, so `TS.ADD labels 1 2` — a key named `labels` — stores the
+        label `1=2`. Here only the option region is searched: no labels."""
+        args = ("TS.ADD", "labels", 1, 2)
+        assert diff.reference.execute_command(*args) == 1
+        assert diff.subject.execute_command(*args) == 1
+
+        def labels(client):
+            raw = _info(client, "labels")[b"labels"]
+            return dict(raw) if isinstance(raw, dict) else {k: v for k, v in raw}
+
+        assert labels(diff.reference) == {b"1": b"2"}
+        assert labels(diff.subject) == {}

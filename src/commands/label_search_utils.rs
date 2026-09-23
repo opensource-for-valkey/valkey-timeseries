@@ -103,8 +103,9 @@ enum LabelNameSearchToken {
 }
 
 fn parse_label_name_search_token(value: &[u8]) -> Option<LabelNameSearchToken> {
-    hashify::tiny_map_ignore_case! {
+    hashify::map_ignore_case!(
         value,
+        LabelNameSearchToken,
         "search" => LabelNameSearchToken::Search,
         "fuzzy_threshold" => LabelNameSearchToken::FuzzyThreshold,
         "fuzzy_algo" => LabelNameSearchToken::FuzzyAlgorithm,
@@ -116,7 +117,8 @@ fn parse_label_name_search_token(value: &[u8]) -> Option<LabelNameSearchToken> {
         "filter" => LabelNameSearchToken::Filter,
         "filter_by_range" => LabelNameSearchToken::FilterByRange,
         "hashtag" => LabelNameSearchToken::HashTag,
-    }
+    )
+    .copied()
 }
 
 fn resolve_label_search_ordering(

@@ -96,22 +96,22 @@ impl FromStr for AnomalyMethod {
     type Err = ValkeyError;
 
     fn from_str(s: &str) -> ValkeyResult<Self> {
-        let res = hashify::tiny_map_ignore_case! {
+        let res = hashify::map_ignore_case!(
             s.as_bytes(),
-            "esd" => Ok(AnomalyMethod::Esd),
-            "ewma" => Ok(AnomalyMethod::Ewma),
-            "cusum" => Ok(AnomalyMethod::Cusum),
-            "zscore" => Ok(AnomalyMethod::ZScore),
-            "modified-zscore" => Ok(AnomalyMethod::ModifiedZScore),
-            "smoothed-zscore" => Ok(AnomalyMethod::SmoothedZScore),
-            "mad" => Ok(AnomalyMethod::Mad),
-            "double-mad" => Ok(AnomalyMethod::DoubleMAD),
-            "iqr" => Ok(AnomalyMethod::InterquartileRange),
-            "rcf" => Ok(AnomalyMethod::RandomCutForest),
-        };
-        res.unwrap_or(Err(ValkeyError::Str(
-            "TSDB: unknown anomaly detection method",
-        )))
+            AnomalyMethod,
+            "esd" => AnomalyMethod::Esd,
+            "ewma" => AnomalyMethod::Ewma,
+            "cusum" => AnomalyMethod::Cusum,
+            "zscore" => AnomalyMethod::ZScore,
+            "modified-zscore" => AnomalyMethod::ModifiedZScore,
+            "smoothed-zscore" => AnomalyMethod::SmoothedZScore,
+            "mad" => AnomalyMethod::Mad,
+            "double-mad" => AnomalyMethod::DoubleMAD,
+            "iqr" => AnomalyMethod::InterquartileRange,
+            "rcf" => AnomalyMethod::RandomCutForest,
+        )
+        .copied();
+        res.ok_or(ValkeyError::Str("TSDB: unknown anomaly detection method"))
     }
 }
 
@@ -150,14 +150,16 @@ impl FromStr for AnomalyDirection {
     type Err = ValkeyError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let res = hashify::tiny_map_ignore_case! {
+        let res = hashify::map_ignore_case!(
             s.as_bytes(),
+            AnomalyDirection,
             "+" => AnomalyDirection::Positive,
             "-" => AnomalyDirection::Negative,
             "both" => AnomalyDirection::Both,
             "positive" => AnomalyDirection::Positive,
             "negative" => AnomalyDirection::Negative
-        };
+        )
+        .copied();
         match res {
             Some(direction) => Ok(direction),
             None => {
@@ -344,14 +346,16 @@ impl FromStr for AnomalyMADEstimator {
     type Err = ValkeyError;
 
     fn from_str(s: &str) -> ValkeyResult<Self> {
-        let res = hashify::tiny_map_ignore_case! {
+        let res = hashify::map_ignore_case!(
             s.as_bytes(),
+            AnomalyMADEstimator,
             "simple" => AnomalyMADEstimator::Simple,
             "harrell-davis" => AnomalyMADEstimator::HarrellDavis,
             "harrelldavis" => AnomalyMADEstimator::HarrellDavis,
             "hd" => AnomalyMADEstimator::HarrellDavis,
             "invariant" => AnomalyMADEstimator::Invariant,
-        };
+        )
+        .copied();
         match res {
             Some(estimator) => Ok(estimator),
             None => {

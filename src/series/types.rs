@@ -174,15 +174,17 @@ impl DuplicatePolicy {
 
 fn get_policy_from_bytes(bytes: &[u8]) -> Option<DuplicatePolicy> {
     use DuplicatePolicy::*;
-    hashify::tiny_map_ignore_case! {
+    hashify::map_ignore_case!(
         bytes,
+        DuplicatePolicy,
         "block" => Block,
         "first"  => KeepFirst,
         "last"   => KeepLast,
         "min"    => Min,
         "max"    => Max,
         "sum"    => Sum,
-    }
+    )
+    .copied()
 }
 
 impl FromStr for DuplicatePolicy {

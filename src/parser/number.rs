@@ -102,8 +102,9 @@ pub fn parse_number(str: &str) -> ParseResult<f64> {
 type SuffixValue = (&'static str, usize);
 
 fn get_suffix_value(s: &str) -> Option<SuffixValue> {
-    hashify::tiny_map_ignore_case! {
+    hashify::map_ignore_case!(
         s.as_bytes(),
+        SuffixValue,
         "kib" => ("kib", 1024),
         "ki" => ("ki", 1024),
         "kb" => ("kb", 1000),
@@ -120,7 +121,8 @@ fn get_suffix_value(s: &str) -> Option<SuffixValue> {
         "ti" => ("ti", 1024 * 1024 * 1024 * 1024),
         "tb" => ("tb", 1000 * 1000 * 1000 * 1000),
         "t" => ("t", 1000 * 1000 * 1000 * 1000)
-    }
+    )
+    .copied()
 }
 
 // Note: must match above

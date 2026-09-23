@@ -33,8 +33,9 @@ pub enum JoinReducer {
 }
 
 fn join_reducer_get(key: &str) -> Option<JoinReducer> {
-    hashify::tiny_map_ignore_case! {
+    hashify::map_ignore_case!(
         key.as_bytes(),
+        JoinReducer,
         "abs_diff" => JoinReducer::AbsDiff,
         "cmp" => JoinReducer::Cmp,
         "coalesce" => JoinReducer::Coalesce,
@@ -56,7 +57,8 @@ fn join_reducer_get(key: &str) -> Option<JoinReducer> {
         "avg" => JoinReducer::Avg,
         "max" => JoinReducer::Max,
         "min" => JoinReducer::Min,
-    }
+    )
+    .copied()
 }
 
 impl JoinReducer {

@@ -12,13 +12,15 @@ pub enum FuzzyAlgorithm {
 impl TryFrom<&str> for FuzzyAlgorithm {
     type Error = String;
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let algo = hashify::tiny_map_ignore_case!(
+        let algo = hashify::map_ignore_case!(
             value.as_bytes(),
+            FuzzyAlgorithm,
             "jarowinkler" => FuzzyAlgorithm::JaroWinkler,
             "jaro-winkler" => FuzzyAlgorithm::JaroWinkler,
             "subsequence" => FuzzyAlgorithm::Subsequence,
             "noop" => FuzzyAlgorithm::NoOp,
-        );
+        )
+        .copied();
         if let Some(algo) = algo {
             Ok(algo)
         } else {
