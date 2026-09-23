@@ -93,8 +93,12 @@ impl RdbSerializable for CompactionRule {
 
     fn rdb_load(rdb: *mut raw::RedisModuleIO) -> ValkeyResult<Self> {
         let dest_id = raw::load_unsigned(rdb)? as SeriesRef;
-        let aggregator = Aggregator::rdb_load(rdb)?;
+        let mut aggregator = Aggregator::rdb_load(rdb)?;
         let bucket_duration = raw::load_unsigned(rdb)?;
+        // `rate` persists its window in whole seconds; the rule's bucket duration is exact.
+        if let Aggregator::Rate(r) = &mut aggregator {
+            r.set_window_ms(bucket_duration);
+        }
         let align_timestamp = rdb_load_timestamp(rdb)?;
         let start_ts = rdb_load_timestamp(rdb)?;
         let has_samples = rdb_load_bool(rdb)?;

@@ -845,7 +845,9 @@ impl RdbSerializable for IncreaseAggregator {
 
 #[derive(Debug, Default, Clone, Hash, PartialEq, GetSize)]
 pub struct RateAggregatorState {
-    window: u64,
+    /// The bucket length in milliseconds. Whole seconds truncated it: a 1500 ms bucket was
+    /// divided by 1 s, and anything under a second by 0 (reported as no value).
+    window_ms: u64,
     counter: CounterAggregatorState,
 }
 
@@ -867,15 +869,14 @@ impl RateAggregator {
             last_value: None,
         };
         let state = Box::new(RateAggregatorState {
-            window: window.as_secs(),
+            window_ms: window.as_millis() as u64,
             counter,
         });
         Self(state)
     }
 
     pub fn set_window_ms(&mut self, window: u64) {
-        let secs = window / 1000;
-        self.0.window = secs;
+        self.0.window_ms = window;
     }
 
     fn clear(&mut self) {
@@ -885,7 +886,10 @@ impl RateAggregator {
 
 impl RdbSerializable for RateAggregator {
     fn rdb_save(&self, rdb: *mut RedisModuleIO) {
-        rdb_save_usize(rdb, self.0.window as usize);
+        // The format stores whole seconds. The field is informational only: a compaction rule
+        // (the one place this is persisted) re-derives the window from its bucket duration on
+        // load, which is the only way sub-second windows survive a reload.
+        rdb_save_usize(rdb, (self.0.window_ms / 1000) as usize);
         self.0.counter.rdb_save(rdb);
     }
 
@@ -893,9 +897,12 @@ impl RdbSerializable for RateAggregator {
     where
         Self: Sized,
     {
-        let window = rdb_load_usize(rdb)? as u64;
+        let window_secs = rdb_load_usize(rdb)? as u64;
         let counter = CounterAggregatorState::rdb_load(rdb)?;
-        let state = Box::new(RateAggregatorState { window, counter });
+        let state = Box::new(RateAggregatorState {
+            window_ms: window_secs.saturating_mul(1000),
+            counter,
+        });
 
         Ok(Self(state))
     }
@@ -911,8 +918,8 @@ impl AggregationHandler for RateAggregator {
     fn current(&self) -> Option<Value> {
         let state = &self.0;
         state.counter.last_value?;
-        if state.window > 0 {
-            Some(state.counter.sum_deltas / state.window as f64)
+        if state.window_ms > 0 {
+            Some(state.counter.sum_deltas / (state.window_ms as f64 / 1000.0))
         } else {
             None
         }

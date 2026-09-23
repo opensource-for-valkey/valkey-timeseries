@@ -64,7 +64,14 @@ impl ConditionalCountState {
         self.has_samples = false;
     }
 
+    // NaN is skipped, as every other aggregator skips it (and as the cluster push-down's
+    // partial reducer does). Passing it to the filter let `!=` match it, so `sumif` over
+    // [1, NaN] returned NaN and `countif` counted it — and a push-down GROUPBY of the same
+    // query answered 1.
     fn update_sum(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         if self.filter.compare(value) {
             self.has_samples = true;
             self.sum += value;
@@ -73,6 +80,9 @@ impl ConditionalCountState {
     }
 
     fn update_count(&mut self, value: f64) -> bool {
+        if value.is_nan() {
+            return false;
+        }
         if self.filter.compare(value) {
             self.has_samples = true;
             self.sum += 1.0;
@@ -484,3 +494,36 @@ impl_conditional_aggregator!(SumIfAggregator, ConditionalCountState);
 impl_conditional_aggregator!(AllAggregator, AllNoneAggregatorState);
 impl_conditional_aggregator!(NoneAggregator, AllNoneAggregatorState);
 impl_conditional_aggregator!(AnyAggregator, AllNoneAggregatorState);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_equal_5() -> Box<ConditionalCountState> {
+        Box::new(ConditionalCountState::new(
+            ComparisonOperator::NotEqual,
+            5.0,
+        ))
+    }
+
+    #[test]
+    fn test_sumif_and_countif_skip_nan() {
+        // `NaN != 5` is true, so NaN used to pass the filter: `sumif` returned NaN and
+        // `countif` counted it.
+        let mut sum_if = SumIfAggregator(not_equal_5());
+        let mut count_if = CountIfAggregator(not_equal_5());
+        for value in [1.0, f64::NAN, 5.0, 2.0] {
+            sum_if.update(0, value);
+            count_if.update(0, value);
+        }
+        assert_eq!(sum_if.current(), Some(3.0));
+        assert_eq!(count_if.current(), Some(2.0));
+    }
+
+    #[test]
+    fn test_sumif_nan_is_not_a_sample() {
+        let mut sum_if = SumIfAggregator(not_equal_5());
+        assert!(!sum_if.update(0, f64::NAN));
+        assert_eq!(sum_if.current(), None);
+    }
+}

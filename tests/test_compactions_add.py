@@ -519,3 +519,19 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         batch = c.execute_command("TS.RANGE", "bf:batch:dst", "-", "+")
         assert seq == [[0, b"3"]]
         assert batch == seq
+
+    def test_rate_rule_with_sub_second_buckets_survives_reload(self):
+        """`rate` kept its window in whole seconds, so a 500ms bucket divided by zero and
+        published nothing; after a reload the window must come back from the rule."""
+        c = self.client
+        c.execute_command("TS.CREATE", "rate:src")
+        c.execute_command("TS.CREATE", "rate:dst")
+        c.execute_command("TS.CREATERULE", "rate:src", "rate:dst", "AGGREGATION", "rate", 500)
+        for ts, value in ((0, 0), (400, 5), (600, 10)):
+            c.execute_command("TS.ADD", "rate:src", ts, value)
+        assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"]]
+
+        c.execute_command("DEBUG", "RELOAD")
+        for ts, value in ((900, 15), (1100, 20)):
+            c.execute_command("TS.ADD", "rate:src", ts, value)
+        assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"], [500, b"10"]]
