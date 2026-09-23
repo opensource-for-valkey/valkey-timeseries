@@ -3,7 +3,7 @@ use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::context::get_current_db;
 use crate::common::sync::lock;
-use crate::common::threads::spawn;
+use crate::common::threads::spawn_background;
 use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::serialization::{Deserialized, Serializable};
 use crate::fanout::{
@@ -122,9 +122,9 @@ where
 
     let local_node = targets.iter().find(|x| x.is_local()).copied();
 
-    // The local share always goes through the thread pool: `get_local_response`
-    // takes the GIL itself, which this thread already holds, and the pool keeps
-    // the main thread free while the shard-local reply is materialized.
+    // The local share always runs off the main thread: `get_local_response`
+    // takes the GIL itself, which this thread already holds, and running it on
+    // its own thread keeps the main thread free while the reply is materialized.
     let local_req = match local_node {
         // Local-only fanout: there is no RPC to set up, so the local share is
         // the whole operation.
@@ -409,7 +409,8 @@ fn spawn_local_request<OP, F>(
     OP::Response: Send + 'static,
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
-    spawn(move || {
+    // Off the pool: `get_local_response` takes the module lock (see `spawn_background`).
+    spawn_background("ts-fanout-local", move || {
         let fanout_ctx = FanoutContext::new(user, db);
         match OP::get_local_response(&fanout_ctx, req) {
             Ok(response) => state.on_response(response, &target),

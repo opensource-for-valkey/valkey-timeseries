@@ -6,7 +6,7 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::pool::get_pooled_buffer;
-use crate::common::threads::spawn;
+use crate::common::threads::spawn_background;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
 use crate::fanout::acl::get_fanout_user;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
@@ -59,6 +59,14 @@ impl InFlightRequest {
             })
     }
 
+    /// Stop the pending timeout timer. Only for a timer that has *not* fired:
+    /// the firing timer is consumed by `on_request_timeout` itself, and stopping
+    /// it from inside its own callback double-frees its data (see there).
+    ///
+    /// `stop_timer::<u64>` reclaims the callback data with `u64`'s layout. That
+    /// is exact here because the timer was created with a fn item (a ZST) as
+    /// the callback, so the wrapper's `CallbackData` is one `u64`; a closure
+    /// with captures would make this free with the wrong layout.
     fn cancel_timer(&self, ctx: &Context) {
         let _ = ctx.stop_timer::<u64>(self.timer_id);
     }
@@ -78,23 +86,40 @@ impl InFlightRequest {
             ctx.log_warning(&msg);
 
             let resp = Err(FanoutError::custom(msg));
-
-            let node_info = NodeInfo {
-                id: Default::default(),
-                shard_id: Default::default(),
-                socket_address: SocketAddress {
-                    port: 0,
-                    primary_endpoint: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                },
-                role: NodeRole::Primary,
-                location: Default::default(),
-            };
-
-            (self.response_handler)(resp, &node_info);
+            (self.response_handler)(resp, &placeholder_node());
             return;
         };
 
         (self.response_handler)(resp, target_node);
+    }
+
+    /// Deliver the fanout deadline to the response handler.
+    ///
+    /// Bypasses the sender lookup in [`Self::handle_response`]: the timeout has no
+    /// sender, and attributing it to the local node turned it into an
+    /// "unknown sender" `Custom` error whenever the local node was not itself a
+    /// target (random/replica routing, a READONLY replica coordinator, a HASHTAG
+    /// owned by another shard) — which counted as one shard error instead of
+    /// ending the fanout, so the client got a generic error or waited out the
+    /// blocked-client timeout. A timeout ends the whole fanout regardless of the
+    /// node it is reported against.
+    fn deliver_timeout(&self) {
+        (self.response_handler)(Err(FanoutError::timeout()), &placeholder_node());
+    }
+}
+
+/// Stand-in target for a callback that has no real sender (an unknown sender, or
+/// the fanout deadline).
+fn placeholder_node() -> NodeInfo {
+    NodeInfo {
+        id: Default::default(),
+        shard_id: Default::default(),
+        socket_address: SocketAddress {
+            port: 0,
+            primary_endpoint: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        },
+        role: NodeRole::Primary,
+        location: Default::default(),
     }
 }
 
@@ -133,7 +158,18 @@ fn generate_id() -> u64 {
     REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn on_request_timeout(ctx: &Context, id: u64) {
+/// The timeout timer's callback. Runs on the main thread inside
+/// `moduleTimerHandler`, for a timer that is in the middle of firing.
+///
+/// It must not stop that timer. The module-API wrapper has already reclaimed
+/// and freed the timer's callback data before calling in here, and on the
+/// server side the timer is still registered while its callback runs — so
+/// `stop_timer` would succeed, hand back the same freed pointer, and free it
+/// again (`free_tiny_botch` → abort, taking the coordinator and its quorum
+/// with it; observed on the first fanout timeout of a large cluster range
+/// read). The server removes and frees the firing timer itself once this
+/// returns.
+fn on_request_timeout(_ctx: &Context, id: u64) {
     let map = INFLIGHT_REQUESTS.pin();
     if let Some(request) = map.get(&id) {
         // Timeout can race with responses; only one path should complete the request.
@@ -141,10 +177,7 @@ fn on_request_timeout(ctx: &Context, id: u64) {
             return;
         }
 
-        request.cancel_timer(ctx);
-
-        let local_node_id = CURRENT_NODE_ID.raw_ptr();
-        request.handle_response(ctx, Err(FanoutError::timeout()), local_node_id);
+        request.deliver_timeout();
 
         map.remove(&id);
     }
@@ -161,6 +194,8 @@ fn finish_inflight_request(ctx: &Context, request: &InFlightRequest) {
     if let Ok(v) = request.rpc_done()
         && v == 1
     {
+        // Every shard answered before the deadline: the timer is still pending
+        // and this is the one place it is stopped.
         request.cancel_timer(ctx);
         let map = INFLIGHT_REQUESTS.pin();
         map.remove(&request.id);
@@ -547,7 +582,8 @@ extern "C" fn on_request_received(
 
     alloc_db_if_needed(&ctx, message.db);
 
-    spawn(move || {
+    // Off the pool: the handler takes the module lock (see `spawn_background`).
+    spawn_background("ts-fanout-request", move || {
         process_request_message(header, handler, &buf, sender);
     });
 }

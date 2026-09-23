@@ -1,10 +1,14 @@
+use crate::common::context::is_blocking_denied;
 use crate::common::replies::ReplyContext;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
 use std::sync::{Arc, Mutex};
-use valkey_module::{Context, Status, ValkeyResult, ValkeyValue};
+use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
+
+/// Same text as the remote path's `validate_cluster_exec` refusal.
+const FANOUT_BLOCKING_DENIED: &str = "Cannot execute in MULTI or Lua context";
 
 /// A trait for cluster-mode commands which send results back to clients after receiving responses from other nodes.
 /// This is a higher-level abstraction over `FanoutCommand` that includes client response handling logic.
@@ -38,6 +42,15 @@ pub trait FanoutClientCommand: Default + Send + 'static {
     where
         Self: FanoutCommand,
     {
+        // A fan-out completes asynchronously, so it has to block the client — which the server
+        // refuses inside MULTI, a script, or a module call without the `K` flag (and asserts on
+        // for the last). Refuse up front, before anything runs: the local share of a
+        // local-only fan-out (a single-shard cluster, a HASHTAG owned by this node) used to be
+        // executed anyway, so TS.MDEL deleted keys after the client had already been told the
+        // command failed, outside the transaction it was queued in.
+        if is_blocking_denied(ctx) {
+            return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
+        }
         let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx)));
         let bc_for_closure = Arc::clone(&blocked_client);
 
