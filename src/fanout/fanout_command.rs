@@ -123,6 +123,11 @@ pub fn exec_command<OP: FanoutCommand, F>(
 where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
+    // Validate up front (cluster mode enabled, not in MULTI/Lua) so we fail early
+    // with a clear error before setting up any fanout machinery or dispatching
+    // local/remote requests.
+    validate_cluster_exec(ctx)?;
+
     let op = command;
     let started = Instant::now();
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);

@@ -74,3 +74,25 @@ class TestTsMDelCluster(ValkeyTimeSeriesClusterTestCase):
         client = self.new_client_for_primary(0)
         with pytest.raises(ResponseError):
             client.execute_command("TS.MDEL", 1, 2)
+
+    def test_mdel_refused_in_multi_and_lua_cme(self):
+        # Inside MULTI or Lua the server cannot block the client, so the fanout
+        # must be refused outright; before this check it still ran and deleted
+        # on every shard while the client saw only a "blocking command" error.
+        cluster: ValkeyCluster = self.new_cluster_client()
+        client = self.new_client_for_primary(0)
+
+        self._create_series()
+
+        pipe = client.pipeline(transaction=True)
+        pipe.execute_command("TS.MDEL", "FILTER", "name=cpu")
+        with pytest.raises(ResponseError, match="MULTI or Lua"):
+            pipe.execute()
+
+        with pytest.raises(ResponseError, match="MULTI or Lua"):
+            client.execute_command(
+                "EVAL", "return redis.call('TS.MDEL', 'FILTER', 'name=cpu')", 0
+            )
+
+        for ts in (TS1, TS2, TS3):
+            assert cluster.execute_command("EXISTS", ts) == 1
