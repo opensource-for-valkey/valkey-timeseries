@@ -327,7 +327,7 @@ at startup.
 | `ts-promql-set-lookback-to-step` | no | Use the range query step as the lookback interval. |
 | `ts-promql-optimize-queries` | no | Enable query rewrites and selector push-down. |
 | `ts-promql-derived-filter-pushdown` | yes | Narrow a range query's binary-operation operands by the label values the index holds for the other operand. |
-| `ts-promql-enable-experimental-functions` | yes | Allow functions marked experimental by the parser. |
+| `ts-promql-enable-experimental-functions` | no | Allow functions marked experimental by the parser (as Prometheus' `--enable-feature=promql-experimental-functions`). |
 
 The per-query `LOOKBACK_DELTA` and `TIMEOUT` options override their corresponding
 defaults. Limits are particularly important for broad selectors and long range queries,

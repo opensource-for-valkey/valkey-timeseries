@@ -579,7 +579,7 @@ static PROMQL_MAX_SAMPLES_PER_QUERY: AtomicI64 =
 static PROMQL_SET_LOOKBACK_TO_STEP: AtomicBool = AtomicBool::new(false);
 static PROMQL_OPTIMIZE_QUERIES: AtomicBool = AtomicBool::new(false);
 static PROMQL_DERIVED_FILTER_PUSHDOWN: AtomicBool = AtomicBool::new(true);
-static PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS: AtomicBool = AtomicBool::new(true);
+static PROMQL_ENABLE_EXPERIMENTAL_FUNCTIONS: AtomicBool = AtomicBool::new(false);
 static PROMQL_LOOKBACK_DELTA_MS: AtomicI64 = AtomicI64::new(PROMQL_LOOKBACK_DELTA_DEFAULT_MS);
 static PROMQL_MAX_LOOKBACK_MS: AtomicI64 = AtomicI64::new(PROMQL_MAX_LOOKBACK_DEFAULT_MS);
 static PROMQL_MAX_QUERY_DURATION_MS: AtomicI64 =
@@ -1377,7 +1377,7 @@ pub static CONFIGS: &[ConfigDesc] = &[
         name: "ts-promql-enable-experimental-functions",
         read: read_promql_enable_experimental_functions,
         kind: ConfigType::Boolean,
-        default: ConfigValue::Boolean(true),
+        default: ConfigValue::Boolean(false),
         min: None,
         max: None,
         flags: ConfigurationFlags::DEFAULT,
@@ -1781,7 +1781,7 @@ mod tests {
         ("ts-promql-set-lookback-to-step", "no"),
         ("ts-promql-optimize-queries", "no"),
         ("ts-promql-derived-filter-pushdown", "yes"),
-        ("ts-promql-enable-experimental-functions", "yes"),
+        ("ts-promql-enable-experimental-functions", "no"),
         ("ts-promql-max-query-len", "4096"),
         ("ts-promql-max-response-series", "1000"),
         ("ts-promql-max-points-per-timeseries", "0"),

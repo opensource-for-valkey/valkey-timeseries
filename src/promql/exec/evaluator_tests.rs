@@ -4315,14 +4315,19 @@ mod tests {
         builder.build()
     }
 
+    /// Options for the rollup tests, which cover every `RollupKind` —
+    /// including the experimental ones (`first_over_time`, `ts_of_*_over_time`,
+    /// `mad_over_time`), which are off by default as in Prometheus.
+    fn rollup_test_options() -> QueryOptions {
+        QueryOptions {
+            timeout: None,
+            enable_experimental_functions: true,
+            ..QueryOptions::default()
+        }
+    }
+
     fn eval_rollup(reader: &MemorySeriesQuerier, query: &str, at_ms: i64) -> Vec<EvalSample> {
-        let evaluator = Evaluator::new(
-            reader,
-            QueryOptions {
-                timeout: None,
-                ..QueryOptions::default()
-            },
-        );
+        let evaluator = Evaluator::new(reader, rollup_test_options());
         parse_and_evaluate(
             &evaluator,
             query,
@@ -4620,13 +4625,7 @@ mod tests {
         answer: GridAnswer,
     ) -> (Vec<EvalSample>, Vec<OfferedGrid>) {
         let reader = GridPushdownReader::new(inner, answer);
-        let evaluator = Evaluator::new(
-            &reader,
-            QueryOptions {
-                timeout: None,
-                ..QueryOptions::default()
-            },
-        );
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
         let result = parse_and_evaluate(
             &evaluator,
             query,
@@ -4949,13 +4948,7 @@ mod tests {
         answer: GridAnswer,
     ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedGrid>) {
         let reader = GridPushdownReader::new(inner, answer);
-        let evaluator = Evaluator::new(
-            &reader,
-            QueryOptions {
-                timeout: None,
-                ..QueryOptions::default()
-            },
-        );
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
         let expr = promql_parser::parser::parse(query).unwrap();
         let base = crate::promql::EvalContext {
             query_start: start_ms,

@@ -39,7 +39,10 @@ import math
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from valkey import ValkeyCluster
+from typing import List
+
+import pytest
+from valkey import ResponseError, ValkeyCluster
 from valkeytestframework.conftest import resource_port_tracker
 
 from query_result import QueryResult
@@ -109,6 +112,15 @@ def _rfc3339(epoch_seconds: int) -> str:
 
 class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
     """PromQL rollup push-down over a real 3-shard cluster."""
+
+    def get_config_file_lines(self, test_dir, port) -> List[str]:
+        # Every rollup kind is covered, the experimental ones included
+        # (`first_over_time`, `mad_over_time`, `ts_of_*_over_time`,
+        # `double_exponential_smoothing`), and those are off by default.
+        lines = super().get_config_file_lines(test_dir, port)
+        return [f'{line} ts-promql-enable-experimental-functions yes'
+                if line.startswith('loadmodule ') else line
+                for line in lines]
 
     # ── fixtures & helpers ────────────────────────────────────────────
 
@@ -878,27 +890,25 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             f'double_exponential_smoothing(mem_usage[{RANGE}], 0.5, 0.5)')
         assert set(self.values_by_instance(result)) == set(GAUGE_SERIES)
 
-    def test_experimental_functions_run_when_enabled(self):
+    def test_experimental_functions_are_gated_by_the_coordinator(self):
         """`ts_of_*_over_time` is experimental *and* pushable, so it is the one
         function where the coordinator's authority over experimental gating and
-        the rollup preload path meet.
-
-        Only the enabled direction is asserted. The disabled direction is not
-        testable from here: `ts-promql-enable-experimental-functions` is cached
-        into `PROMQL_CONFIG` at startup and only refreshed by a config-changed
-        event handler that never fires for module configs, so `CONFIG SET`
-        reports OK, `CONFIG GET` reports the new value, and queries keep using
-        the old one. That is a config-plumbing gap, not a push-down one — the
-        gate itself is covered by the evaluator's unit tests. (The push-down
-        toggle is unaffected: it is read straight from the atomic the config
-        framework writes, which test_pushdown_config_is_registered and the
-        equivalence tests exercise.)"""
+        the rollup preload path meet: enabled, it runs pushed down; disabled on
+        the coordinator, it is refused before anything is sent to a shard."""
         self.setup_fleet()
 
         assert self.instant_query(
             f'ts_of_last_over_time(mem_usage[{RANGE}])').result
         assert self.instant_query(
             f'sum by (job) (ts_of_last_over_time(mem_usage[{RANGE}]))').result
+
+        name = 'ts.ts-promql-enable-experimental-functions'
+        self.coordinator().execute_command('CONFIG', 'SET', name, 'no')
+        try:
+            with pytest.raises(ResponseError, match='not enabled'):
+                self.instant_query(f'ts_of_last_over_time(mem_usage[{RANGE}])')
+        finally:
+            self.coordinator().execute_command('CONFIG', 'SET', name, 'yes')
 
     # ── selectors ─────────────────────────────────────────────────────
 

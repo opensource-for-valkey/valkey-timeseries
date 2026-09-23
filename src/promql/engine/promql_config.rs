@@ -90,7 +90,8 @@ impl Default for PromqlConfig {
             max_query_duration: Duration::from_secs(30),
             optimize_queries: false,
             derived_filter_pushdown: true,
-            enable_experimental_functions: true, // TODO: set to false before release
+            // Off, as in Prometheus (`--enable-feature=promql-experimental-functions`).
+            enable_experimental_functions: false,
         }
     }
 }
