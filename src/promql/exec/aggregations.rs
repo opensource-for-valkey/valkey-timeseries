@@ -151,6 +151,26 @@ pub(in crate::promql) fn apply_aggregation(
     eval_time: Timestamp,
 ) -> EvalResult<Vec<EvalSample>> {
     if samples.is_empty() {
+        // Prometheus checks a selection operator's parameter before it looks at
+        // the input, so `topk(NaN, absent_metric)` is an error, not an empty
+        // result. A coordinator re-applying selection passes no parameter.
+        if param.is_some() {
+            match kind {
+                AggregationKind::Topk => {
+                    get_k_param(param, 0, "topk")?;
+                }
+                AggregationKind::Bottomk => {
+                    get_k_param(param, 0, "bottomk")?;
+                }
+                AggregationKind::Limitk => {
+                    get_k_param(param, 0, "limitk")?;
+                }
+                AggregationKind::LimitRatio => {
+                    select_limit_ratio(Vec::new(), get_param_as_scalar(param, "limit_ratio")?)?;
+                }
+                _ => {}
+            }
+        }
         return Ok(Vec::new());
     }
 
@@ -487,13 +507,9 @@ fn eval_quantile(
     samples: Vec<EvalSample>,
     eval_time: Timestamp,
 ) -> EvalResult<Vec<EvalSample>> {
+    // Out-of-range phi is not an error: `quantile` answers -Inf below 0, +Inf
+    // above 1 and NaN for NaN, as Prometheus does.
     let phi = get_param_as_scalar(param, "quantile")?;
-    // make sure it's in range
-    if !(0.0..=1.0).contains(&phi) {
-        return Err(EvaluationError::ArgumentError(
-            "quantile must be between 0.0 and 1.0".to_string(),
-        ));
-    }
     let groups = group_samples(modifier, samples);
 
     // Serial: see `eval_reduction_aggregation` for the measurements.

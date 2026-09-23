@@ -162,6 +162,7 @@ impl PromQLFunction for ClampMaxFunction {
         let max = second_arg.into_scalar()?;
         for sample in &mut samples {
             sample.value = min_with_nan(sample.value, max);
+            sample.drop_name = true;
         }
         Ok(ExprResult::InstantVector(samples))
     }
@@ -188,6 +189,7 @@ impl PromQLFunction for ClampMinFunction {
         let min = second_arg.into_scalar()?;
         for sample in &mut samples {
             sample.value = max_with_nan(sample.value, min);
+            sample.drop_name = true;
         }
         Ok(ExprResult::InstantVector(samples))
     }
@@ -220,6 +222,7 @@ impl PromQLFunction for ClampFunction {
 
         for sample in &mut samples {
             sample.value = max_with_nan(min_with_nan(sample.value, max), min);
+            sample.drop_name = true;
         }
         Ok(ExprResult::InstantVector(samples))
     }

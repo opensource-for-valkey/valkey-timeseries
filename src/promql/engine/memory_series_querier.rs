@@ -85,7 +85,13 @@ impl MemorySeriesQuerier {
         // postings, then put it back.
         if let Some(mut ts) = inner.series.remove(&id) {
             // update the timeseries
-            ts.add(sample.timestamp, sample.value, None);
+            // Last write wins, as when a promqltest `load` lists one series
+            // twice: the later line's value is the one Prometheus keeps.
+            ts.add(
+                sample.timestamp,
+                sample.value,
+                Some(crate::series::DuplicatePolicy::KeepLast),
+            );
 
             // update postings using the owned `ts` reference
             let key = format!("ts:{id}");

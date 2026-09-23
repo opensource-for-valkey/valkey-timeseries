@@ -187,9 +187,13 @@ impl Parser {
         lines: &[&str],
         line_idx: &mut usize,
     ) -> Result<Option<Command>, String> {
-        let rest = match line.strip_prefix("eval instant at ") {
-            Some(r) => r,
-            None => return Ok(None),
+        // `eval_fail` is the older spelling of an `expect fail` line.
+        let (rest, fail_directive) = match line.strip_prefix("eval instant at ") {
+            Some(r) => (r, false),
+            None => match line.strip_prefix("eval_fail instant at ") {
+                Some(r) => (r, true),
+                None => return Ok(None),
+            },
         };
 
         let line_number = *line_idx;
@@ -198,6 +202,7 @@ impl Parser {
         let time = parse_time(&time_str)?;
 
         let (expected, expect_ordered, expect_fail) = parse_expectations(lines, line_idx)?;
+        let expect_fail = expect_fail || fail_directive;
 
         Ok(Some(Command::EvalInstant(EvalInstantCmd {
             time,

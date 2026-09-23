@@ -1015,6 +1015,115 @@ mod tests {
         assert_results_match(&result, &expected_samples);
     }
 
+    /// Exact output label sets, checked against Prometheus's results. The
+    /// `.test` conformance files cannot prove a label is *absent* — their
+    /// `{...}` expectations ignore extra labels — so these live here.
+    #[rstest]
+    #[case(
+        "without_drops_metric_name",
+        r#"sum without (instance) ({__name__=~"wa|wb"})"#,
+        vec![
+            ("wa", vec![("job", "x"), ("instance", "1")], 0, 1.0),
+            ("wb", vec![("job", "x"), ("instance", "2")], 0, 2.0),
+        ],
+        vec![(3.0, vec![("job", "x")])]
+    )]
+    #[case(
+        "without_groups_across_names_for_topk",
+        r#"topk without (instance) (1, {__name__=~"wa|wb"})"#,
+        vec![
+            ("wa", vec![("job", "x"), ("instance", "1")], 0, 1.0),
+            ("wb", vec![("job", "x"), ("instance", "2")], 0, 2.0),
+        ],
+        vec![(2.0, vec![("__name__", "wb"), ("instance", "2"), ("job", "x")])]
+    )]
+    #[case(
+        "by_keeps_a_listed_metric_name",
+        r#"sum by (__name__) ({__name__=~"wa|wb"})"#,
+        vec![
+            ("wa", vec![("instance", "1")], 0, 1.0),
+            ("wb", vec![("instance", "2")], 0, 2.0),
+        ],
+        vec![(1.0, vec![("__name__", "wa")]), (2.0, vec![("__name__", "wb")])]
+    )]
+    #[case(
+        "one_to_one_on_copies_nothing_from_the_right",
+        "la + on(job) lb",
+        vec![
+            ("la", vec![("job", "x"), ("instance", "1")], 0, 2.0),
+            ("lb", vec![("job", "x"), ("env", "prod")], 0, 3.0),
+        ],
+        vec![(5.0, vec![("job", "x")])]
+    )]
+    #[case(
+        "one_to_one_ignoring_copies_nothing_from_the_right",
+        "la + ignoring(instance, env) lb",
+        vec![
+            ("la", vec![("job", "x"), ("instance", "1")], 0, 2.0),
+            ("lb", vec![("job", "x"), ("env", "prod")], 0, 3.0),
+        ],
+        vec![(5.0, vec![("job", "x")])]
+    )]
+    #[case(
+        "bare_group_left_copies_nothing_from_the_one_side",
+        "la * on(job) group_left lb",
+        vec![
+            ("la", vec![("job", "x"), ("instance", "1")], 0, 2.0),
+            ("lb", vec![("job", "x"), ("env", "prod")], 0, 3.0),
+        ],
+        vec![(6.0, vec![("instance", "1"), ("job", "x")])]
+    )]
+    #[case(
+        "group_left_copies_only_listed_labels",
+        "la * on(job) group_left(env) lb",
+        vec![
+            ("la", vec![("job", "x"), ("instance", "1")], 0, 2.0),
+            ("lb", vec![("job", "x"), ("env", "prod"), ("zone", "a")], 0, 3.0),
+        ],
+        vec![(6.0, vec![("env", "prod"), ("instance", "1"), ("job", "x")])]
+    )]
+    #[case(
+        "group_right_deletes_a_listed_label_the_one_side_lacks",
+        "one * on(job) group_right(instance) many",
+        vec![
+            ("one", vec![("job", "x")], 0, 2.0),
+            ("many", vec![("job", "x"), ("instance", "1")], 0, 3.0),
+        ],
+        vec![(6.0, vec![("job", "x")])]
+    )]
+    #[case(
+        "clamp_max_drops_metric_name",
+        r#"clamp_max(cm{a="1"}, 5)"#,
+        vec![("cm", vec![("a", "1")], 0, 7.0)],
+        vec![(5.0, vec![("a", "1")])]
+    )]
+    #[case(
+        "clamp_min_drops_metric_name",
+        r#"clamp_min(cm{a="1"}, 9)"#,
+        vec![("cm", vec![("a", "1")], 0, 7.0)],
+        vec![(9.0, vec![("a", "1")])]
+    )]
+    #[case(
+        "clamp_drops_metric_name",
+        r#"clamp(cm{a="1"}, 0, 5)"#,
+        vec![("cm", vec![("a", "1")], 0, 7.0)],
+        vec![(5.0, vec![("a", "1")])]
+    )]
+    #[test]
+    fn should_produce_prometheus_label_sets(
+        #[case] _name: &str,
+        #[case] query: &str,
+        #[case] test_data: TestSampleData,
+        #[case] expected_samples: Vec<(f64, Vec<(&str, &str)>)>,
+    ) {
+        let (reader, end_time) = setup_mock_reader(test_data);
+        let evaluator = Evaluator::new(&reader, QueryOptions::default());
+        let result = parse_and_evaluate(&evaluator, query, end_time, Duration::from_secs(300))
+            .unwrap_or_else(|e| panic!("{query} should evaluate: {e}"));
+
+        assert_results_match(&result, &expected_samples);
+    }
+
     #[test]
     fn should_return_identical_results_across_evaluations() {
         // given: mock reader with data in specific bucket
@@ -1842,9 +1951,9 @@ mod tests {
         assert_results_match(
             &clamp_result,
             &[
-                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
-                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
-                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+                (-25.0, vec![("src", "clamp-a")]),
+                (0.0, vec![("src", "clamp-b")]),
+                (75.0, vec![("src", "clamp-c")]),
             ],
         );
 
@@ -1858,9 +1967,9 @@ mod tests {
         assert_results_match(
             &clamp_min_result,
             &[
-                (-25.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
-                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
-                (100.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+                (-25.0, vec![("src", "clamp-a")]),
+                (0.0, vec![("src", "clamp-b")]),
+                (100.0, vec![("src", "clamp-c")]),
             ],
         );
 
@@ -1874,9 +1983,9 @@ mod tests {
         assert_results_match(
             &clamp_max_result,
             &[
-                (-50.0, vec![("__name__", "test_clamp"), ("src", "clamp-a")]),
-                (0.0, vec![("__name__", "test_clamp"), ("src", "clamp-b")]),
-                (75.0, vec![("__name__", "test_clamp"), ("src", "clamp-c")]),
+                (-50.0, vec![("src", "clamp-a")]),
+                (0.0, vec![("src", "clamp-b")]),
+                (75.0, vec![("src", "clamp-c")]),
             ],
         );
     }
@@ -2999,7 +3108,7 @@ mod tests {
 
     #[test]
     fn should_evaluate_group_right_with_extra_labels() {
-        // given: group_right(region) copies "region" label from the one (left) side
+        // given: group_right(region) takes "region" from the one (left) side
         // For group_right, left is one (unique), right is many
         let test_data: TestSampleData = vec![
             ("cpu_usage", vec![("env", "prod")], 0, 50.0),
@@ -3029,19 +3138,14 @@ mod tests {
         )
         .expect("group_right with extra labels should evaluate successfully");
 
-        // then: result has many-side labels plus the extra "region" from one (left) side
-        // Since cpu_usage doesn't have a "region" label, the region from memory_bytes is preserved
+        // then: result has the many-side labels, with "region" taken from the one
+        // (left) side. cpu_usage has no "region", so it is deleted, as Prometheus
+        // does for a listed label the one side lacks — in either direction.
         assert_results_match(
             &result,
             &[
-                (
-                    150.0,
-                    vec![("env", "prod"), ("instance", "i1"), ("region", "us-east")],
-                ),
-                (
-                    250.0,
-                    vec![("env", "prod"), ("instance", "i2"), ("region", "eu-west")],
-                ),
+                (150.0, vec![("env", "prod"), ("instance", "i1")]),
+                (250.0, vec![("env", "prod"), ("instance", "i2")]),
             ],
         );
     }

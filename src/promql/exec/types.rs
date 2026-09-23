@@ -117,6 +117,21 @@ pub enum EvalLabels {
     Owned(Vec<Label>),
 }
 
+/// Whether an aggregation grouped by `modifier` keeps the label `name`.
+///
+/// `without` always drops `__name__` as well as the listed labels, as in
+/// Prometheus: an aggregate is no longer the metric it was computed from, so
+/// `sum without (instance) ({__name__=~"a|b"})` is one group, not one per name.
+/// `by` keeps exactly what it lists, `__name__` included.
+fn grouping_keeps(modifier: &LabelModifier, name: &str) -> bool {
+    match modifier {
+        LabelModifier::Include(list) => list.labels.iter().any(|n| n == name),
+        LabelModifier::Exclude(list) => {
+            name != METRIC_NAME_LABEL && !list.labels.iter().any(|n| n == name)
+        }
+    }
+}
+
 impl EvalLabels {
     pub fn owned(labels: Vec<Label>) -> Self {
         EvalLabels::Owned(labels)
@@ -313,7 +328,7 @@ impl EvalLabels {
         self.insert(key.to_string(), value);
     }
 
-    /// Compute grouping labels for aggregation and binary operations.
+    /// Compute grouping labels for aggregations.
     ///
     /// Mirrors `Labels::compute_grouping_labels` / `Labels::into_grouping_labels`.
     /// Clones `self` (cheap for the read-only variants) and removes/retains
@@ -321,14 +336,9 @@ impl EvalLabels {
     pub(crate) fn compute_grouping_labels(&self, modifier: Option<&LabelModifier>) -> EvalLabels {
         match modifier {
             None => EvalLabels::Owned(Vec::new()),
-            Some(LabelModifier::Include(label_list)) => {
+            Some(modifier) => {
                 let mut this = self.clone();
-                this.retain(|k| label_list.labels.iter().any(|n| n == k.name));
-                this
-            }
-            Some(LabelModifier::Exclude(label_list)) => {
-                let mut this = self.clone();
-                this.retain(|k| !label_list.labels.iter().any(|n| n == k.name));
+                this.retain(|k| grouping_keeps(modifier, k.name));
                 this
             }
         }
@@ -356,14 +366,9 @@ impl EvalLabels {
     ) -> SeriesFingerprint {
         match modifier {
             None => fingerprint_labels(std::iter::empty::<InternedLabel<'_>>()),
-            Some(LabelModifier::Include(label_list)) => fingerprint_labels(
-                self.iter()
-                    .filter(|l| label_list.labels.iter().any(|n| n == l.name)),
-            ),
-            Some(LabelModifier::Exclude(label_list)) => fingerprint_labels(
-                self.iter()
-                    .filter(|l| !label_list.labels.iter().any(|n| n == l.name)),
-            ),
+            Some(modifier) => {
+                fingerprint_labels(self.iter().filter(|l| grouping_keeps(modifier, l.name)))
+            }
         }
     }
 
@@ -376,15 +381,8 @@ impl EvalLabels {
         &'a self,
         modifier: Option<&'a LabelModifier>,
     ) -> impl Iterator<Item = InternedLabel<'a>> + 'a {
-        self.iter().filter(move |l| match modifier {
-            None => false,
-            Some(LabelModifier::Include(label_list)) => {
-                label_list.labels.iter().any(|n| n == l.name)
-            }
-            Some(LabelModifier::Exclude(label_list)) => {
-                !label_list.labels.iter().any(|n| n == l.name)
-            }
-        })
+        self.iter()
+            .filter(move |l| modifier.is_some_and(|m| grouping_keeps(m, l.name)))
     }
 
     /// Iterate over labels as borrowed `(name, value)` views, in name order

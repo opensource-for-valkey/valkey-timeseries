@@ -422,7 +422,6 @@ fn build_result_sample(
             None
         },
         ctx.group_labels,
-        ctx.is_group_right,
     );
 
     Some(EvalSample {
@@ -804,73 +803,27 @@ fn hash_label(hasher: &mut LabelHasher, label: &impl SeriesLabel) {
 
 /// Build the result label set for a matched pair.
 ///
-/// Handles `group_left(<labels>)` / `group_right(<labels>)` semantics:
-/// - Explicit labels: copy from "one" side, or remove if absent (set-or-remove).
-/// - No explicit labels: copy labels from "one" side that are absent on "many" side.
+/// The "many" side's labels per [`result_metric`], plus the labels listed by
+/// `group_left(<labels>)` / `group_right(<labels>)` taken from the "one" side.
 fn build_result_labels(
     many_sample: &EvalSample,
     one_sample: &EvalSample,
     operator: TokenType,
     matching: Option<&LabelModifier>,
     group_labels: Option<&Vec<String>>,
-    is_group_right: bool,
 ) -> EvalLabels {
     let mut labels = result_metric(many_sample.labels.clone(), operator, matching);
 
-    match group_labels {
-        Some(extra) if !extra.is_empty() => {
-            for name in extra {
-                match one_sample.labels.get(name) {
-                    Some(v) => {
-                        labels.set(name, v.to_string());
-                    }
-                    None if !is_group_right => {
-                        // group_left: right is "one" side — remove if absent.
-                        labels.remove(name);
-                    }
-                    _ => {
-                        // group_right: left is "one" side — preserve many-side label.
-                    }
-                }
+    // Only the labels a `group_left(...)` / `group_right(...)` modifier lists
+    // come from the "one" side: set to its value, or deleted when it has none.
+    // Nothing else is copied across, for one-to-one or many-to-one matching
+    // alike — as in Prometheus's `resultMetric`.
+    for name in group_labels.into_iter().flatten() {
+        match one_sample.labels.get(name) {
+            Some(value) => labels.set(name, value.to_string()),
+            None => {
+                labels.remove(name);
             }
-        }
-        _ => {
-            match (&one_sample.labels, &many_sample.labels) {
-                (EvalLabels::Interned(one), EvalLabels::Interned(many)) => {
-                    if let EvalLabels::Interned(ref labels_interned) = labels {
-                        // Handle interned labels case if needed
-                        let mut filtered = one
-                            .iter()
-                            .filter_map(|l| {
-                                let name = l.name();
-                                if name != METRIC_NAME && !many.iter().any(|l| l.name() == name) {
-                                    Some(l.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        if !filtered.is_empty() {
-                            for item in labels_interned.iter() {
-                                filtered.push(item.clone());
-                            }
-                            return EvalLabels::from(filtered);
-                        }
-                    }
-                }
-                (_one, _many) => {
-                    // fall through to the generic handling below.
-                }
-            }
-            // Copy labels from "one" side not already present on "many" side.
-            // Uses binary search via EvalLabels::contains — no heap allocation.
-            let to_copy = one_sample
-                .labels
-                .iter()
-                .filter(|l| l.name != METRIC_NAME && !many_sample.labels.contains(l.name))
-                .map(|l| crate::Label::new(l.name, l.value));
-
-            labels.extend(to_copy);
         }
     }
 

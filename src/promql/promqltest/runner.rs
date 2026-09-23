@@ -81,6 +81,19 @@ where
     let (mut tsdb, mut storage) = storage_factory();
     let mut eval_count = 0;
     let mut ignoring = false;
+    // Triage aid: with `PROMQLTEST_KEEP_GOING=1`, report every failing eval in
+    // the file instead of stopping at the first.
+    let keep_going = std::env::var_os("PROMQLTEST_KEEP_GOING").is_some();
+    let mut failures: Vec<String> = Vec::new();
+    let mut record = |outcome: Result<(), String>| -> Result<(), String> {
+        match outcome {
+            Err(e) if keep_going => {
+                failures.push(e);
+                Ok(())
+            }
+            other => other,
+        }
+    };
 
     for cmd in commands {
         match cmd {
@@ -116,31 +129,32 @@ where
                         &eval_cmd.query,
                     );
 
-                    if eval_cmd.expect_fail {
-                        if result.is_ok() {
-                            return Err(format!(
+                    let outcome = if eval_cmd.expect_fail {
+                        match result {
+                            Ok(_) => Err(format!(
                                 "expected eval to fail in {}: eval {} ({})",
                                 name, eval_count, eval_cmd.query
-                            ));
+                            )),
+                            Err(_) => Ok(()),
                         }
-                        continue;
-                    }
-
-                    let result = QueryValue::Matrix(result?);
-                    let expected = eval_cmd.expected.clone();
-                    let grid = StepGrid {
-                        start_ms: system_time_to_millis(eval_cmd.start),
-                        step_ms: eval_cmd.step.as_millis() as i64,
+                    } else {
+                        result.and_then(|result| {
+                            let grid = StepGrid {
+                                start_ms: system_time_to_millis(eval_cmd.start),
+                                step_ms: eval_cmd.step.as_millis() as i64,
+                            };
+                            assert_results_on_grid(
+                                QueryValue::Matrix(result),
+                                eval_cmd.expected.clone(),
+                                false,
+                                name,
+                                eval_count,
+                                &eval_cmd.query,
+                                Some(grid),
+                            )
+                        })
                     };
-                    assert_results_on_grid(
-                        result,
-                        expected,
-                        false,
-                        name,
-                        eval_count,
-                        &eval_cmd.query,
-                        Some(grid),
-                    )?;
+                    record(outcome)?;
                 }
             }
 
@@ -149,33 +163,41 @@ where
                     eval_count += 1;
                     let result = eval_instant(&tsdb, eval_cmd.time, &eval_cmd.query);
 
-                    if eval_cmd.expect_fail {
-                        if result.is_ok() {
-                            return Err(format!(
+                    let outcome = if eval_cmd.expect_fail {
+                        match result {
+                            Ok(_) => Err(format!(
                                 "expected eval to fail in {}: eval {} ({})",
                                 name, eval_count, eval_cmd.query
-                            ));
+                            )),
+                            Err(_) => Ok(()),
                         }
-                        continue;
-                    }
-
-                    let result = result?;
-
-                    let expected = eval_cmd.expected.clone();
-                    assert_results(
-                        result,
-                        expected,
-                        eval_cmd.expect_ordered,
-                        name,
-                        eval_count,
-                        &eval_cmd.query,
-                    )?;
+                    } else {
+                        result.and_then(|result| {
+                            assert_results(
+                                result,
+                                eval_cmd.expected.clone(),
+                                eval_cmd.expect_ordered,
+                                name,
+                                eval_count,
+                                &eval_cmd.query,
+                            )
+                        })
+                    };
+                    record(outcome)?;
                 }
             }
         }
     }
 
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} failing eval(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        ))
+    }
 }
 
 // ============================================================================

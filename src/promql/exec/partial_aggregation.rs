@@ -179,15 +179,8 @@ impl AggregationPartial {
             AggregationKind::Count => n,
             AggregationKind::Group => 1.0,
             AggregationKind::Stdvar => self.variance(n),
-            AggregationKind::Stddev => {
-                // `kahan_std_dev` short-circuits a single value to 0.0 without
-                // looking at it, so a lone NaN sample yields 0.0 there too.
-                if self.count == 1 {
-                    0.0
-                } else {
-                    self.variance(n).sqrt()
-                }
-            }
+            // As `kahan_std_dev`: 0 for one finite value, NaN for one NaN or ±Inf.
+            AggregationKind::Stddev => self.variance(n).sqrt(),
             _ => unreachable!("BUG: non-reduction aggregation kind reached AggregationPartial"),
         }
     }

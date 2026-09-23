@@ -12,10 +12,6 @@ load 5m
   foo{job="api-server", instance="0", region="europe"} 0+90x10
   foo{job="api-server"} 0+100x10
 
-ignore
-# Ignore reason: upstream aggregator baseline currently diverges in multiple places
-# (rounding/details around mixed aggregation semantics).
-# Unignore when: this whole block matches Prometheus outputs end-to-end.
 
 # Simple sum.
 eval instant at 50m SUM BY (group) (http_requests{job="api-server"})
@@ -200,7 +196,6 @@ eval instant at 50m stdvar by (instance)(http_requests)
   {instance="0"} 50000
   {instance="1"} 50000
 
-resume
 
 # Float precision test for standard deviation and variance
 clear
@@ -210,10 +205,6 @@ load 5m
   http_requests{job="api-server", instance="0", group="canary"} 0+1.33x10
 
 
-ignore
-# Ignore reason: stddev/stdvar exact precision behavior for repeated decimals
-# is not aligned with Prometheus in this fixture.
-# Unignore when: stddev/stdvar for this 1.33 dataset is parity-verified.
 
 eval instant at 50m stddev(http_requests)
   {} 0.0
@@ -223,12 +214,7 @@ eval instant at 50m stdvar(http_requests)
 
 # Regression test for missing separator byte in labelsToGroupingKey.
 
-resume
 
-ignore
-# Ignore reason: regression case for grouping-key encoding separator is not
-# validated in current implementation.
-# Unignore when: labelsToGroupingKey separator-byte regression is fixed and covered.
 clear
 load 5m
   label_grouping_test{a="aa", b="bb"} 0+10x10
@@ -238,7 +224,6 @@ eval instant at 50m sum(label_grouping_test) by (a, b)
   {a="a", b="abb"} 200
   {a="aa", b="bb"} 100
 
-resume
 
 # Tests for min/max.
 clear
@@ -248,16 +233,8 @@ load 5m
   http_requests{job="api-server", instance="0", group="canary"}		NaN
   http_requests{job="api-server", instance="1", group="canary"}		3
   http_requests{job="api-server", instance="2", group="canary"}		4
-ignore
-# Ignore reason: histogram literals in this load block are not fully supported.
-# Unignore when: histogram sample ingestion in promqltest loader is implemented.
-  http_requests_histogram{job="api-server", instance="3", group="canary"} {{schema:2 count:4 sum:10 buckets:[1 0 0 0 1 0 0 1 1]}}
-resume
+  # Skipped (native histogram not supported): http_requests_histogram{job="api-server", instance="3", group="canary"} {{schema:2 count:4 sum:10 buckets:[1 0 0 0 1 0 0 1 1]}}
 
-ignore
-# Ignore reason: this block checks info/warn annotation semantics with mixed
-# float+histogram inputs for min/max, which are not implemented yet.
-# Unignore when: histogram-aware min/max annotations match Prometheus behavior.
 eval instant at 0m max(http_requests)
   expect no_info
   {} 4
@@ -268,8 +245,11 @@ eval instant at 0m max({job="api-server"})
   {} 4
 
 # The histogram is ignored here so there is no result but it has an info annotation now.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m max(http_requests_histogram)
   expect info
+resume
 
 eval instant at 0m min(http_requests)
   expect no_info
@@ -281,8 +261,11 @@ eval instant at 0m min({job="api-server"})
   {} 1
 
 # The histogram is ignored here so there is no result but it has an info annotation now.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m min(http_requests_histogram)
   expect info
+resume
 
 eval instant at 0m max by (group) (http_requests)
   expect no_info
@@ -294,7 +277,6 @@ eval instant at 0m min by (group) (http_requests)
   {group="production"} 1
   {group="canary"} 3
 
-resume
 
 clear
 
@@ -312,13 +294,9 @@ load 5m
 load 5m
 	foo 1+1x9 3
 
-ignore
-# Ignore reason: histogram fixture for k-aggregations is unsupported in loader.
-# Unignore when: histogram literal ingestion for this fixture is supported.
 load 5m
-	http_requests_histogram{job="app-server", instance="2", group="canary"}		{{schema:0 sum:10 count:10}}x11
-	http_requests_histogram{job="api-server", instance="3", group="production"}	{{schema:0 sum:20 count:20}}x11
-resume
+	# Skipped (native histogram not supported): http_requests_histogram{job="app-server", instance="2", group="canary"}		{{schema:0 sum:10 count:10}}x11
+	# Skipped (native histogram not supported): http_requests_histogram{job="api-server", instance="3", group="production"}	{{schema:0 sum:20 count:20}}x11
 
 # Supported float-only k-aggregation checks are intentionally active below.
 # Keep focused ignore blocks only around unsupported subcases.
@@ -397,12 +375,6 @@ eval instant at 50m topk(scalar(foo), http_requests)
 	http_requests{group="canary", instance="0", job="app-server"} 700
 	http_requests{group="production", instance="1", job="app-server"} 600
 
-ignore
-# Ignore reason: the promqltest DSL currently parses `eval instant ...` only;
-# `eval range ...` is not recognized yet. Remaining checks below also cover
-# unsupported histogram/limit* k-aggregation behavior.
-# Unignore when: `eval range` parsing and remaining k-aggregation parity cases
-# are implemented.
 # Bug #15971.
 eval range from 0m to 50m step 5m count(topk(scalar(foo), http_requests))
 			{} 1 2 3 4 5 6 7 8 9 9 3
@@ -411,13 +383,19 @@ eval range from 0m to 50m step 5m count(bottomk(scalar(foo), http_requests))
 	{} 1 2 3 4 5 6 7 8 9 9 3
 
 # Tests for histogram: should ignore histograms.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 50m topk(100, http_requests_histogram)
     expect info
     #empty
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval range from 0 to 50m step 5m topk(100, http_requests_histogram)
     expect info
     #empty
+resume
 
 eval instant at 50m topk(1, {__name__=~"http_requests(_histogram)?"})
     expect info
@@ -437,13 +415,19 @@ eval instant at 50m topk by (instance) (1, {__name__=~"http_requests(_histogram)
     {__name__="http_requests", group="canary", instance="1", job="app-server"} 800
     {__name__="http_requests", group="production", instance="2", job="api-server"} NaN
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 50m bottomk(100, http_requests_histogram)
     expect info
     #empty
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval range from 0 to 50m step 5m bottomk(100, http_requests_histogram)
     expect info
     #empty
+resume
 
 eval instant at 50m bottomk(1, {__name__=~"http_requests(_histogram)?"})
     expect info
@@ -472,14 +456,9 @@ eval instant at 50m limitk(NaN, non_existent)
 eval instant at 50m limit_ratio(NaN, non_existent)
     expect fail msg: Ratio value is NaN
 
-resume
 clear
 
-ignore
 # Tests for count_values.
-# Ignore reason: count_values (especially histogram-to-string rendering and
-# related edge cases) is not implemented.
-# Unignore when: count_values behavior and formatting match Prometheus tests.
 load 5m
 	version{job="api-server", instance="0", group="production"}	6
 	version{job="api-server", instance="1", group="production"}	6
@@ -490,47 +469,64 @@ load 5m
 	version{job="app-server", instance="1", group="production"}	6
 	version{job="app-server", instance="0", group="canary"}		7
 	version{job="app-server", instance="1", group="canary"}		7
-	version{job="app-server", instance="2", group="canary"}		{{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2 buckets:[1 2] n_buckets:[1 2]}}
-	version{job="app-server", instance="3", group="canary"}		{{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2 buckets:[1 2] n_buckets:[1 2]}}
+	# Skipped (native histogram not supported): version{job="app-server", instance="2", group="canary"}		{{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2 buckets:[1 2] n_buckets:[1 2]}}
+	# Skipped (native histogram not supported): version{job="app-server", instance="3", group="canary"}		{{schema:0 sum:10 count:20 z_bucket_w:0.001 z_bucket:2 buckets:[1 2] n_buckets:[1 2]}}
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m count_values("version", version)
 	{version="6"} 5
 	{version="7"} 2
 	{version="8"} 2
     {version="{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, (0.5,1]:1, (1,2]:2}"} 2
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m count_values(((("version"))), version)
     {version="6"} 5
     {version="7"} 2
     {version="8"} 2
     {version="{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, (0.5,1]:1, (1,2]:2}"} 2
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m count_values without (instance)("version", version)
 	{job="api-server", group="production", version="6"} 3
 	{job="api-server", group="canary", version="8"} 2
 	{job="app-server", group="production", version="6"} 2
 	{job="app-server", group="canary", version="7"} 2
     {job="app-server", group="canary", version="{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, (0.5,1]:1, (1,2]:2}"} 2
+resume
 
 # Overwrite label with output. Don't do this.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m count_values without (instance)("job", version)
 	{job="6", group="production"} 5
 	{job="8", group="canary"} 2
 	{job="7", group="canary"} 2
     {job="{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, (0.5,1]:1, (1,2]:2}", group="canary"} 2
+resume
 
 # Overwrite label with output. Don't do this.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m count_values by (job, group)("job", version)
 	{job="6", group="production"} 5
 	{job="8", group="canary"} 2
 	{job="7", group="canary"} 2
     {job="{count:20, sum:10, [-2,-1):2, [-1,-0.5):1, [-0.001,0.001]:2, (0.5,1]:1, (1,2]:2}", group="canary"} 2
+resume
 
 # Test an invalid label value.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0 count_values("a\xc5z", version)
   expect fail msg:invalid label name "a\xc5z"
-
 resume
+
 
 # The same count_values cases over float samples only, so they run while the
 # native-histogram rendering above stays ignored.
@@ -587,10 +583,6 @@ clear
 # Tests for quantile.
 clear
 
-ignore
-# Ignore reason: quantile aggregator + warning/info behavior for NaN/histogram
-# cases is not yet feature-complete.
-# Unignore when: quantile parity (including warn/info annotations) is achieved.
 
 load 10s
 	data{test="two samples",point="a"} 0
@@ -604,7 +596,7 @@ load 10s
 	data{test="NaN sample",point="a"} 0
 	data{test="NaN sample",point="b"} 1
 	data{test="NaN sample",point="c"} NaN
-	data_histogram{test="histogram sample", point="c"} {{schema:2 count:4 sum:10 buckets:[1 0 0 0 1 0 0 1 1]}}
+	# Skipped (native histogram not supported): data_histogram{test="histogram sample", point="c"} {{schema:2 count:4 sum:10 buckets:[1 0 0 0 1 0 0 1 1]}}
 	foo 0 1 0 1 0 1 0.8
 
 # 80th percentile.
@@ -633,8 +625,11 @@ eval instant at 1m quantile without(point)(0.8, {__name__=~"data(_histogram)?"})
 	{test="NaN sample"} 0.6
 
 # The histogram is ignored here so there is no result but it has an info annotation now.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m quantile(0.8, data_histogram)
   expect info
+resume
 
 # Bug #5276.
 eval instant at 1m quantile without(point)(scalar(foo), data)
@@ -663,7 +658,6 @@ eval range from 0m to 1m step 10s quantile without(point) (scalar(foo), data)
 	{test="uneven samples"} 0 4 0 4 0 4 2.8
 	{test="NaN sample"} NaN 1 NaN 1 NaN 1 0.6
 
-resume
 
 # Tests for group.
 clear
@@ -680,22 +674,20 @@ load 10s
 	data{test="uneven samples",point="c"} 4
 	foo .8
 
-ignore
-# Ignore reason: group() behavior with histogram samples in this fixture is not
-# supported yet.
-# Unignore when: group aggregation handles mixed float/histogram inputs.
 load 10s
-	data{test="histogram sample",point="c"} {{schema:0 sum:0 count:0}}
+	# Skipped (native histogram not supported): data{test="histogram sample",point="c"} {{schema:0 sum:0 count:0}}
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 1m group without(point)(data)
 	{test="two samples"} 1
 	{test="three samples"} 1
 	{test="uneven samples"} 1
     {test="histogram sample"} 1
+resume
 
 eval instant at 1m group(foo)
 	{} 1
-resume
 
 # Tests for avg.
 clear
@@ -743,10 +735,6 @@ load 10s
 	data{test="bigzero",point="d"} 9.988465674311579e+307
 	data{test="value is nan"} NaN
 
-ignore
-# Ignore reason: avg edge-case semantics (Inf/NaN/very large values) are not
-# fully aligned with Prometheus right now.
-# Unignore when: avg passes this entire parity fixture.
 eval instant at 1m avg(data{test="ten"})
 	{} 10
 
@@ -784,7 +772,6 @@ eval instant at 1m avg(data{test="bigzero"})
 eval instant at 1m avg(data)
 	{} NaN
 
-resume
 
 # Test summing and averaging extreme values.
 clear
@@ -809,10 +796,6 @@ load 10s
 	data{test="nan",group="2",point="a"} 2
 	data{test="nan",group="2",point="b"} NaN
 
-ignore
-# Ignore reason: extreme-value sum/avg semantics (precision and Inf/NaN combos)
-# still diverge from expected Prometheus behavior.
-# Unignore when: numeric edge cases in this block match upstream exactly.
 eval instant at 1m sum(data{test="ten"})
 	{} 10
 
@@ -854,7 +837,6 @@ eval instant at 1m avg by (group) (data{test="nan"})
 	{group="1"} NaN
 	{group="2"} NaN
 
-resume
 clear
 
 # Demonstrate robustness of direct mean calculation vs. incremental mean calculation.
@@ -876,10 +858,6 @@ load 5m
   foo{idx="10"} 52
   foo{idx="11"} 52
 
-ignore
-# Ignore reason: these checks rely on exact floating-point equality and are
-# currently flaky/non-portable across runtimes.
-# Unignore when: deterministic equality behavior is guaranteed for this fixture.
 eval instant at 0 avg(foo) - 52
   {} 0
 
@@ -916,7 +894,6 @@ eval instant at 0 avg(topk(9, foo)) == 52
 eval instant at 0 avg(topk(8, foo)) == 52
   {} 52
 
-resume
 clear
 
 # Test that aggregations are deterministic.
@@ -930,25 +907,27 @@ clear
 
 clear
 
-ignore
-# Ignore reason: stddev/stdvar with histogram samples + info annotations are not
-# fully implemented.
-# Unignore when: histogram-aware stddev/stdvar semantics match Prometheus.
 
 # Test stddev produces consistent results regardless the order the data is loaded in.
 load 5m
 	series{label="a"} 1
 	series{label="b"} 2
-	series{label="c"} {{schema:1 sum:15 count:10 buckets:[3 2 5 7 9]}}
+	# Skipped (native histogram not supported): series{label="c"} {{schema:1 sum:15 count:10 buckets:[3 2 5 7 9]}}
 
 # The histogram is ignored here so the result doesn't change but it has an info annotation now.
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stddev(series)
 	expect info
 	{} 0.5
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stdvar(series)
 	expect info
 	{} 0.25
+resume
 
 # The histogram is ignored here so there is no result but it has an info annotation now.
 eval instant at 0m stddev({label="c"})
@@ -957,47 +936,60 @@ eval instant at 0m stddev({label="c"})
 eval instant at 0m stdvar({label="c"})
   expect info
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stddev by (label) (series)
 	expect info
 	{label="a"} 0
 	{label="b"} 0
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stdvar by (label) (series)
 	expect info
 	{label="a"} 0
 	{label="b"} 0
-
 resume
+
 
 clear
 
-ignore
-# Ignore reason: additional stddev/stdvar histogram ordering/position cases are
-# still unsupported.
-# Unignore when: all histogram permutations in this block are implemented.
 
 load 5m
-	series{label="a"} {{schema:1 sum:15 count:10 buckets:[3 2 5 7 9]}}
+	# Skipped (native histogram not supported): series{label="a"} {{schema:1 sum:15 count:10 buckets:[3 2 5 7 9]}}
 	series{label="b"} 1
 	series{label="c"} 2
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stddev(series)
 	expect info
 	{} 0.5
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stdvar(series)
 	expect info
 	{} 0.25
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stddev by (label) (series)
 	expect info
 	{label="b"} 0
 	{label="c"} 0
+resume
 
+# Skipped: native histogram not supported.
+ignore
 eval instant at 0m stdvar by (label) (series)
 	expect info
 	{label="b"} 0
 	{label="c"} 0
+resume
 
 clear
 
@@ -1010,8 +1002,7 @@ eval instant at 0m stddev(series)
 	{} NaN
 
 eval instant at 0m stdvar(series)
-	{} NaN
-
+		{} NaN
 eval instant at 0m stddev by (label) (series)
 	{label="a"} 0
 	{label="b"} 0
@@ -1112,5 +1103,3 @@ eval instant at 0m stddev(series)
 
 eval instant at 0m stdvar(series)
 	{} NaN
-
-resume

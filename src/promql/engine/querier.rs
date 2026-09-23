@@ -7,7 +7,6 @@ use crate::promql::engine::query_reader::{
 };
 use crate::promql::engine::selector_batch_executor::SelectorBatchExecutor;
 use crate::promql::{InstantSample, PromqlResult, QueryOptions, QueryResult, RangeSample};
-use cfg_if::cfg_if;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher, Matchers};
 use promql_parser::parser::VectorSelector;
 use std::sync::{Arc, LazyLock};
@@ -220,10 +219,9 @@ impl ConcreteSeriesQuerier {
     /// that parsed a `HASHTAG` clause. An empty list is equivalent to
     /// [`Self::create`].
     pub fn create_with_hash_tags(_ctx: &Context, _hash_tags: Arc<[String]>) -> Self {
-        cfg_if! {
-            if #[cfg(test)] {
-                ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new())
-            } else {
+        cfg_select! {
+            test => { ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new()) }
+            _ => {
                 let user = _ctx.get_current_user().to_string();
                 let caller_user = (!user.is_empty()).then_some(user);
                 ConcreteSeriesQuerier::Actual(ValkeySeriesQuerier {

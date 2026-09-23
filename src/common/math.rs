@@ -134,12 +134,10 @@ pub(crate) fn kahan_variance(values: &[f64]) -> f64 {
     (m2 + c_m2) / count
 }
 
+/// No single-value shortcut: `kahan_variance` is already 0 for one finite
+/// value, and NaN for one NaN or ±Inf, which is what Prometheus returns.
 pub(crate) fn kahan_std_dev(values: &[f64]) -> f64 {
-    if values.len() == 1 {
-        return 0.0;
-    }
-    let variance = kahan_variance(values);
-    variance.sqrt()
+    kahan_variance(values).sqrt()
 }
 
 pub fn quantile(values: &mut [f64], phi: f64) -> f64 {
@@ -156,20 +154,11 @@ pub fn quantile(values: &mut [f64], phi: f64) -> f64 {
         return f64::INFINITY;
     }
 
-    values.sort_by(|a, b| a.total_cmp(b));
-    if values.len() == 1 {
-        return values[0];
-    }
-
-    let rank = phi * (values.len() - 1) as f64;
-    let lower = rank.floor() as usize;
-    let upper = rank.ceil() as usize;
-    if lower == upper {
-        return values[lower];
-    }
-
-    let weight = rank - lower as f64;
-    values[lower] + (values[upper] - values[lower]) * weight
+    // NaN sorts first, as Go orders floats: Prometheus's `quantile` and
+    // `quantile_over_time` sort that way, so a NaN input shifts the rank of
+    // every other value. `total_cmp` alone would put a positive NaN last.
+    values.sort_by(|a, b| b.is_nan().cmp(&a.is_nan()).then(a.total_cmp(b)));
+    quantile_sorted(phi, values)
 }
 
 /// quantile_sorted calculates the given quantile over a sorted list of values.
