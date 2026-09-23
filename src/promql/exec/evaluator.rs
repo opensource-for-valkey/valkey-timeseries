@@ -19,12 +19,13 @@ use crate::promql::exec::planner::{PlannedQuery, PreloadGrid};
 use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{
     EvalLabels, GridPreloadMap, MatrixPreloadMap, PreloadedGridData, PreloadedGridSeries,
-    PreloadedMatrixData, PreloadedMatrixSeries, SampleWindow, SeriesMap, StepGrid, StepGridBuilder,
+    PreloadedMatrixData, PreloadedMatrixSeries, SampleWindow, StepGrid, StepGridBuilder,
+    SubquerySeriesMap,
 };
 use crate::promql::exec::utils::{
     RollupCandidate, calls_function, collect_rollup_candidates,
     collect_stepped_aggregation_candidates, collect_subqueries, collect_vector_selectors,
-    merge_step_into_series_map, strip_parens,
+    merge_step_into_subquery_map, strip_parens,
 };
 use crate::promql::functions::RollupKind;
 use crate::promql::functions::{
@@ -101,16 +102,21 @@ fn subquery_key(subquery: &SubqueryExpr, step_ms: i64) -> (usize, i64) {
 }
 
 /// The step a subquery runs at, per the PromQL spec: its own `<resolution>`,
-/// else the enclosing evaluation interval, else Prometheus' default global
-/// evaluation interval of one minute.
+/// else the global evaluation interval — Prometheus' default of one minute.
+///
+/// Never the step of the query it sits in: that would make `m[5m:]` sample
+/// every 15s inside a `step=15s` range query but every minute in an instant
+/// query at the same timestamp, so `count_over_time(m[5m:])` would answer 20
+/// in one and 5 in the other.
 /// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery>
 /// and `DefaultGlobalConfig.EvaluationInterval` in prometheus/config/config.go.
-fn subquery_step_ms(subquery: &SubqueryExpr, outer_step_ms: i64) -> i64 {
-    match subquery.step {
-        Some(step) => step.as_millis() as i64,
-        None if outer_step_ms > 0 => outer_step_ms,
-        None => 60_000,
-    }
+fn subquery_step_ms(subquery: &SubqueryExpr) -> i64 {
+    const DEFAULT_EVALUATION_INTERVAL_MS: i64 = 60_000;
+    subquery
+        .step
+        .map_or(DEFAULT_EVALUATION_INTERVAL_MS, |step| {
+            step.as_millis() as i64
+        })
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
@@ -312,7 +318,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         }
         for subquery in collect_subqueries(expr) {
             self.check_deadline()?;
-            let step_ms = subquery_step_ms(subquery, grid.step_ms);
+            let step_ms = subquery_step_ms(subquery);
             if step_ms <= 0 {
                 continue;
             }
@@ -1182,7 +1188,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let range_ms = subquery.range.as_millis() as i64;
         let subquery_start_ms = subquery_end_ms - range_ms;
 
-        let step_ms = subquery_step_ms(subquery, ctx.step_ms);
+        let step_ms = subquery_step_ms(subquery);
 
         // Guard against invalid step
         if step_ms <= 0 {
@@ -1283,12 +1289,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             }
         };
 
-        let mut series_map = SeriesMap::default();
+        let mut series_map = SubquerySeriesMap::default();
         if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
             for current_time_ms in steps {
                 let (current_time_ms, samples) =
                     sub.eval_subquery_step(subquery, ctx, current_time_ms)?;
-                merge_step_into_series_map(&mut series_map, current_time_ms, samples);
+                merge_step_into_subquery_map(&mut series_map, current_time_ms, samples);
             }
         } else {
             // Evaluate in bounded batches. Collecting every inner step before
@@ -1307,19 +1313,19 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 // Parallel collection preserves batch input order, and batches
                 // are consumed chronologically, so series values stay sorted.
                 for (current_time_ms, samples) in step_results {
-                    merge_step_into_series_map(&mut series_map, current_time_ms, samples);
+                    merge_step_into_subquery_map(&mut series_map, current_time_ms, samples);
                 }
             }
         }
 
         let vector = series_map
             .into_iter()
-            .map(|(labels, values)| EvalSamples {
+            .map(|(labels, (values, drop_name))| EvalSamples {
                 values: values.into(),
                 labels,
                 range_ms,
                 range_end_ms: subquery_end_ms,
-                drop_name: false,
+                drop_name,
             })
             .collect();
 

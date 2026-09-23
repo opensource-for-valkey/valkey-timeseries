@@ -1,13 +1,14 @@
 use crate::common::{Sample, Timestamp};
-use crate::promql::exec::types::{EvalSample, SeriesMap};
+use crate::promql::exec::types::{EvalSample, SeriesMap, SubquerySeriesMap};
 use promql_parser::parser::{AggregateExpr, Call, Expr, SubqueryExpr, VectorSelector};
 
 /// Append one evaluation step's instant-vector samples into a per-series map,
 /// stamping each sample with the step timestamp.
 ///
-/// Shared by the range-query step merge (`evaluate_range`) and the subquery
-/// step merge (`evaluate_subquery`). Callers must feed steps in ascending
-/// timestamp order so the per-series sample vectors stay chronologically sorted.
+/// For the range-query step merge (`evaluate_range`), whose steps have already
+/// had their pending `__name__` drops applied. Callers must feed steps in
+/// ascending timestamp order so the per-series sample vectors stay
+/// chronologically sorted.
 pub(in crate::promql) fn merge_step_into_series_map(
     series_map: &mut SeriesMap,
     step_ts: Timestamp,
@@ -18,6 +19,23 @@ pub(in crate::promql) fn merge_step_into_series_map(
             .entry(sample.labels)
             .or_default()
             .push(Sample::new(step_ts, sample.value));
+    }
+}
+
+/// [`merge_step_into_series_map`] for a subquery's inner steps, whose samples
+/// may still carry a pending `__name__` drop: `abs(m)` keeps `m`'s name until
+/// the query's result is rendered. The drop is kept per series (set if any
+/// step's sample carries it) so the subquery's output series still drop the
+/// name, as Prometheus's do: `last_over_time(abs(m)[10m:])` has no `__name__`.
+pub(in crate::promql) fn merge_step_into_subquery_map(
+    series_map: &mut SubquerySeriesMap,
+    step_ts: Timestamp,
+    samples: Vec<EvalSample>,
+) {
+    for sample in samples {
+        let (values, drop_name) = series_map.entry(sample.labels).or_default();
+        values.push(Sample::new(step_ts, sample.value));
+        *drop_name |= sample.drop_name;
     }
 }
 

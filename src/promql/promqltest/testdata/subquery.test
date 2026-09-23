@@ -116,15 +116,6 @@ load 7s
 eval instant at 80s rate(metric_total[1m])
   {} 2.517857143
 
-# TODO(OpenData): Counter extrapolation toward zero not yet fully implemented.
-# Expected: 2.360655737704918 (extrapolated toward zero/counter origin: (144 - 0) / 61)
-# Got: 2.3666666666666667 (extrapolated to range start: (144 - 2) / 60)
-# Prometheus extrapolates counters toward zero (counter origin) for better accuracy,
-# assuming linear behavior consistent with counter semantics.
-# See: https://github.com/prometheus/prometheus/blob/main/promql/functions.go (extrapolatedRate)
-# Issue: rate() needs to implement counter-origin extrapolation
-ignore
-
 # Extrapolated to range start for counter, [2@20, 144@80]: (144 - 2) / (80 - 20)
 eval instant at 80s rate(metric_total[1m500ms:10s])
   {} 2.3666666666666667
@@ -133,8 +124,6 @@ eval instant at 80s rate(metric_total[1m500ms:10s])
 # Extrapolated to zero value for counter, [2@20, 144@80]: (144 - 0) / 61
 eval instant at 80s rate(metric_total[1m1s:10s])
   {} 2.360655737704918
-
-resume
 
 
 # Only one value between 10s and 20s, 2@14
@@ -145,18 +134,8 @@ eval instant at 20s min_over_time(metric_total[10s])
 eval instant at 20s min_over_time(metric_total[15s:10s])
   {} 1
 
-# TODO(OpenData): Nested subquery with rate() shows ~5x difference due to extrapolation issues.
-# Expected: 0.12119047619047618, Got: 0.5892857142857143
-# This is caused by incomplete counter boundary extrapolation in rate(), which becomes
-# amplified when nested inside a subquery. The Fibonacci sequence data (exponentially
-# growing, non-constant slope) magnifies the discrepancy. Errors compound across
-# multiple subquery evaluation points.
-# See: https://prometheus.io/docs/prometheus/latest/querying/functions/#rate
-# Issue: rate() boundary extrapolation needs to match Prometheus exactly
-ignore
 eval instant at 20m min_over_time(rate(metric_total[5m])[20m:1m])
   {} 0.12119047619047618
-resume
 
 clear
 
@@ -188,3 +167,16 @@ eval instant at 12m min_over_time((topk(1, foo))[1m:5m])
 	expect no_info
 	expect no_warn
 	#empty
+clear
+
+# A subquery without a resolution runs at the global evaluation interval (1m),
+# never at the step of the range query around it: the range query must give
+# the instant query's answer at every step.
+load 15s
+  stepless 1+0x80
+
+eval instant at 10m count_over_time(stepless[5m:])
+  {} 5
+
+eval range from 10m to 11m step 15s count_over_time(stepless[5m:])
+  {} 5 5 5 5 5

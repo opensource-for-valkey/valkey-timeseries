@@ -1108,6 +1108,26 @@ mod tests {
         )]
     )]
     #[case(
+        // `abs` drops the name only when the result is rendered; the subquery
+        // must carry that pending drop onto the series it returns.
+        "subquery_keeps_a_pending_name_drop",
+        r#"last_over_time(abs(m{env="1"})[10m:])"#,
+        vec![
+            ("m", vec![("env", "1")], 0, -3.0),
+            ("m", vec![("env", "1")], 60_000, -4.0),
+        ],
+        vec![(3.0, vec![("env", "1")])]
+    )]
+    #[case(
+        "subquery_of_a_bare_selector_keeps_the_name",
+        r#"last_over_time(m{env="1"}[10m:])"#,
+        vec![
+            ("m", vec![("env", "1")], 0, -3.0),
+            ("m", vec![("env", "1")], 60_000, -4.0),
+        ],
+        vec![(-3.0, vec![("__name__", "m"), ("env", "1")])]
+    )]
+    #[case(
         "clamp_max_drops_metric_name",
         r#"clamp_max(cm{a="1"}, 5)"#,
         vec![("cm", vec![("a", "1")], 0, 7.0)],

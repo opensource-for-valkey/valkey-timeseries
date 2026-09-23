@@ -61,6 +61,11 @@ pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 /// Maps from a label key (sorted vector of label pairs) to samples vector
 pub(crate) type SeriesMap = halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState>;
 
+/// [`SeriesMap`] plus each series' pending `__name__` drop, for merging a
+/// subquery's inner steps.
+pub(crate) type SubquerySeriesMap =
+    halfbrown::HashMap<EvalLabels, (Vec<Sample>, bool), RandomState>;
+
 /// An owned `Label` from an interned `name=value` entry.
 #[inline]
 fn label_of(raw: &InternedString) -> Label {
