@@ -3,6 +3,7 @@ use crate::commands::parse_stats_command_args;
 use crate::commands::ts_labelstats_fanout_command::LabelStatsFanoutCommand;
 use crate::common::replies::ReplyContext;
 use crate::fanout::{FanoutClientCommand, is_clustered};
+use crate::series::acl::check_metadata_permissions;
 use crate::series::index::{PostingStat, PostingsStats, get_timeseries_index};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -33,6 +34,10 @@ pub fn ts_labelstats_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
 
     let mut args = args.into_iter().skip(1).peekable();
     let options = parse_stats_command_args(&mut args)?;
+
+    // Label statistics expose every label name and value in the keyspace, so they take
+    // the same all-keys gate as TS.LABELNAMES / TS.LABELVALUES.
+    check_metadata_permissions(ctx)?;
 
     if is_clustered(ctx) {
         let operation = LabelStatsFanoutCommand::new(options);

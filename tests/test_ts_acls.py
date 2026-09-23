@@ -431,3 +431,25 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
                 assert result == cmd[1], f"{cmd_name} should work for default user"
         except Exception as e:
             assert False, f"user should be able to execute {cmd_name}: {str(e)}"
+
+    def test_labelstats_requires_read_access_to_all_keys(self):
+        """TS.LABELSTATS reports every label and value in the keyspace, so it takes the same
+        all-keys gate as TS.LABELNAMES; it used to have no ACL check at all."""
+        self.client.execute_command("TS.CREATE", "abc:1", "LABELS", "team", "eng")
+        self.client.execute_command("TS.CREATE", "hr:1", "LABELS", "salary", "yes")
+        self.create_test_user("scoped_stats", "pw", ["+@all", "~abc*"])
+        scoped = self.get_user_client("scoped_stats", "pw")
+        with pytest.raises(ResponseError, match="read permission"):
+            scoped.execute_command("TS.LABELSTATS")
+        assert self.client.execute_command("TS.LABELSTATS") is not None
+
+    @pytest.mark.parametrize("pattern", ["~?", "~[*]", "~\\*"])
+    def test_metadata_gate_needs_every_key_not_just_star(self, pattern):
+        """The metadata gate used to probe only the literal key `*`, which these patterns match."""
+        self.client.execute_command("TS.CREATE", "meta:1", "LABELS", "secret", "yes")
+        self.create_test_user("star_only", "pw", ["+@all", pattern])
+        client = self.get_user_client("star_only", "pw")
+        with pytest.raises(ResponseError):
+            client.execute_command("TS.LABELNAMES")
+        with pytest.raises(ResponseError):
+            client.execute_command("TS.LABELSTATS")

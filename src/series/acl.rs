@@ -199,9 +199,19 @@ pub fn check_key_permissions(
     KeyAccess::new(ctx, clone_permissions(permissions)).check(key)
 }
 
+/// Gate for commands that report on the whole keyspace's metadata (label names and
+/// values, label statistics) rather than on keys the caller names: the caller must be
+/// able to read every key.
+///
+/// Uses the two-probe [`ModuleUser::allows_all_keys`] test. Checking only the literal
+/// key `*` admitted users whose rules match that one key — `~?`, `~[*]`, `~\*` — and
+/// handed them every label in the keyspace.
 pub fn check_metadata_permissions(ctx: &Context) -> ValkeyResult<()> {
-    let perms = AclPermissions::ACCESS;
-    let key = ctx.create_string("*");
-    check_key_permissions(ctx, &key, &perms)
-        .map_err(|_| ValkeyError::Str(error_consts::ALL_KEYS_READ_PERMISSION_ERROR))
+    if KeyAccess::new(ctx, AclPermissions::ACCESS).is_unrestricted() {
+        Ok(())
+    } else {
+        Err(ValkeyError::Str(
+            error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
+        ))
+    }
 }

@@ -9,6 +9,7 @@ use crate::common::threads::join;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
+use crate::series::acl::check_metadata_permissions;
 use crate::series::index::{
     PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap,
     get_timeseries_index, serialize_bitmap,
@@ -72,6 +73,8 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
 
         let (stats, (labels_bitmap, label_value_pairs_bitmap)) = {
             let ctx = ctx.lock()?;
+            // The coordinator checked its own node; each shard enforces its own ACL rules.
+            check_metadata_permissions(&ctx)?;
             let index_guard = get_timeseries_index(&ctx);
             let index = index_guard.deref();
 
