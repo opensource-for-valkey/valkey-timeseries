@@ -1,4 +1,5 @@
 use crate::labels::HasFingerprint;
+use crate::promql::binops::can_push_down_common_filters;
 use crate::promql::functions::{PromqlFunctionKind, resolve_function};
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
@@ -45,6 +46,22 @@ impl LeafFilters for WrittenFilters {
     fn common_filters(&self, vs: &VectorSelector) -> Vec<Matcher> {
         get_common_label_filters_without_metric_name(&vs.matchers)
     }
+
+    /// The same guard as the runtime push-down: no `fill()` (it keeps
+    /// unmatched series a filter would drop), no `or`, and both operands
+    /// label-carrying vectors.
+    fn narrows(&self, be: &BinaryExpr) -> bool {
+        can_push_down_common_filters(be)
+    }
+}
+
+/// Whether `e`'s value carries series labels. A scalar or string — a literal,
+/// `time()`, `scalar(x)`, `2 * scalar(x)` — has none: it matches every series
+/// on the other side of a binary operation, so it neither contributes filters
+/// nor can be narrowed by them. Pushing a filter into the selector under
+/// `scalar(x)` would change the value it yields, not prune series.
+fn carries_labels(e: &Expr) -> bool {
+    matches!(e.value_type(), ValueType::Vector | ValueType::Matrix)
 }
 
 /// `push_down_filters` optimizes expressions to improve their performance.
@@ -138,6 +155,10 @@ pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
 pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<Matcher> {
     use Expr::*;
 
+    if !carries_labels(e) {
+        return vec![];
+    }
+
     match e {
         VectorSelector(m) => leaves.common_filters(m),
         Subquery(s) => get_common_label_filters_with(&s.expr, leaves),
@@ -185,6 +206,18 @@ pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<
             } else {
                 (&group_modifier, &card)
             };
+
+            // `fill()` emits a series from either side alone, like `or`: only
+            // filters true of both sides hold for every output series.
+            let fills = binary
+                .modifier
+                .as_ref()
+                .is_some_and(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some());
+            if fills {
+                let mut common = intersect_label_filters(lfs_left, lfs_right);
+                trim_filters_by_match_modifier(&mut common, group_modifier);
+                return common;
+            }
 
             match binary.op.id() {
                 T_LOR => {
@@ -411,7 +444,7 @@ pub fn push_down_binary_op_filters_in_place_with(
 ) {
     use Expr::*;
 
-    if common_filters.is_empty() {
+    if common_filters.is_empty() || !carries_labels(e) {
         return;
     }
 

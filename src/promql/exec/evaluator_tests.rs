@@ -1092,6 +1092,22 @@ mod tests {
         vec![(6.0, vec![("job", "x")])]
     )]
     #[case(
+        // The rhs's `job="node"` must not be pushed into `ratio`, which has no
+        // `job`: `scalar()` of the narrowed, empty selector would be NaN and
+        // the comparison would drop every series.
+        "pushdown_leaves_scalar_arguments_alone",
+        "node_fs_avail > node_fs_size * scalar(ratio)",
+        vec![
+            ("node_fs_avail", vec![("job", "node"), ("dev", "a")], 0, 50.0),
+            ("node_fs_size", vec![("job", "node"), ("dev", "a")], 0, 100.0),
+            ("ratio", vec![], 0, 0.1),
+        ],
+        vec![(
+            50.0,
+            vec![("__name__", "node_fs_avail"), ("dev", "a"), ("job", "node")]
+        )]
+    )]
+    #[case(
         "clamp_max_drops_metric_name",
         r#"clamp_max(cm{a="1"}, 5)"#,
         vec![("cm", vec![("a", "1")], 0, 7.0)],

@@ -110,22 +110,26 @@ fn short_circuit_empty_operands(expr: &mut Expr, leaves: &mut ProfiledLeaves) {
 /// series), not `or` (which keeps both sides). Looser than the narrowing
 /// guard: a label-less `sum(x)` offers no filters but is empty when `x` is.
 fn can_short_circuit(be: &BinaryExpr) -> bool {
-    let fills = be
-        .modifier
-        .as_ref()
-        .is_some_and(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some());
-    !fills
+    !has_fill(be)
         && be.op.id() != T_LOR
         && be.lhs.value_type() == ValueType::Vector
         && be.rhs.value_type() == ValueType::Vector
+}
+
+fn has_fill(be: &BinaryExpr) -> bool {
+    be.modifier
+        .as_ref()
+        .is_some_and(|m| m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some())
 }
 
 /// The selector that makes `expr`'s result empty, if the profiles prove one:
 /// a selector matching no series, under a shape that yields nothing from
 /// nothing — aggregations, series-to-series functions, rollups, subqueries,
 /// and binary operations other than `or` (both sides) and `unless` (the
-/// right side). `absent`/`absent_over_time` and functions without a vector
-/// argument are the shapes that do not.
+/// right side). `absent`/`absent_over_time`, functions that do not return a
+/// vector (`scalar()` of nothing is NaN, not empty), functions without a
+/// vector argument and `fill()` operations (they synthesize the missing side)
+/// are the shapes that do not.
 fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a VectorSelector> {
     let empty = |vs: &'a VectorSelector| leaves.profile(vs).filter(|p| p.series == 0).map(|_| vs);
     match expr {
@@ -136,7 +140,9 @@ fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a 
         Expr::Subquery(s) => empty_selector_of(&s.expr, leaves),
         Expr::Aggregate(agg) => empty_selector_of(&agg.expr, leaves),
         Expr::Call(call) => {
-            if matches!(call.func.name, "absent" | "absent_over_time") {
+            if call.func.return_type != ValueType::Vector
+                || matches!(call.func.name, "absent" | "absent_over_time")
+            {
                 return None;
             }
             let pos = call
@@ -146,6 +152,7 @@ fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a 
                 .position(|&arg| arg != ValueType::Scalar && arg != ValueType::String)?;
             empty_selector_of(call.args.args.get(pos)?, leaves)
         }
+        Expr::Binary(be) if has_fill(be) => None,
         Expr::Binary(be) => match be.op.id() {
             T_LOR => empty_selector_of(&be.lhs, leaves)
                 .filter(|_| empty_selector_of(&be.rhs, leaves).is_some()),
@@ -531,6 +538,25 @@ mod tests {
     }
 
     #[test]
+    fn a_scalar_argument_is_never_narrowed() {
+        const RATIO: SeriesTable<'static> = &[&[("__name__", "ratio")]];
+        let reader = TableReader::new(vec![
+            (r#"cpu{region="us"}"#, CPU_US),
+            ("cpu", CPU_ALL),
+            ("ratio", RATIO),
+        ]);
+        // `cpu offset 5m` is narrowed; `ratio` has no `region` and must keep
+        // every series, or `scalar()` would turn into NaN.
+        assert_eq!(
+            rewrite(
+                r#"cpu{region="us"} > cpu offset 5m * scalar(ratio)"#,
+                &reader
+            ),
+            r#"cpu{region="us"} > cpu{host=~"a|b",region="us"} offset 5m * scalar(ratio)"#
+        );
+    }
+
+    #[test]
     fn or_and_fill_are_never_narrowed() {
         let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
         assert_eq!(
@@ -775,6 +801,17 @@ mod tests {
         assert_eq!(
             rewrite(r#"(cpu{region="mars"} or mem) - cpu"#, &reader),
             r#"(cpu{region="mars"} or mem) - cpu"#
+        );
+        // `scalar()` of nothing is NaN, not empty: `mem * NaN` still has
+        // series, so neither side of the outer operation may be dropped.
+        assert_eq!(
+            rewrite(r#"cpu - (mem * scalar(cpu{region="mars"}))"#, &reader),
+            r#"cpu - (mem * scalar(cpu{region="mars"}))"#
+        );
+        // A nested `fill()` produces series for the side that has none.
+        assert_eq!(
+            rewrite(r#"cpu - (mem + fill(0) cpu{region="mars"})"#, &reader),
+            r#"cpu - (mem + fill (0) cpu{region="mars"})"#
         );
     }
 

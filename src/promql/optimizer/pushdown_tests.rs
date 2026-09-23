@@ -64,9 +64,11 @@ mod tests {
         r#"a{a="b", c=~"foo|bar"} / sum(x)"#
     )]
     #[case(
+        // `scalar(foo)` has no labels to narrow: filtering `foo` would change
+        // the scalar's value, not prune series.
         r#"scalar(foo)+bar"#,
         r#"{a="b"}"#,
-        r#"scalar(foo{a="b"}) + bar{a="b"}"#
+        r#"scalar(foo) + bar{a="b"}"#
     )]
     #[case(
         r#"{a="b"} + on() group_left() {c="d"}"#,
@@ -160,6 +162,11 @@ mod tests {
     #[case(r#"{a="b"} unless on(c) {c="d"}"#, "")]
     #[case(r#"{a="b"} unless on(a,c) {c="d"}"#, r#"{a="b"}"#)]
     #[case(r#"{a="b"} Unless on(x) {c="d"}"#, "")]
+    // A scalar-valued operand carries no labels, whatever its argument matches.
+    #[case(r#"scalar(c{x="1"})"#, "")]
+    #[case(r#"a{y="2"} * scalar(c{x="1"})"#, r#"{y="2"}"#)]
+    // `fill()` emits series from either side alone: only shared filters hold.
+    #[case(r#"a{x="1",z="3"} + fill(0) b{y="2",z="3"}"#, r#"{z="3"}"#)]
     // common filters for 'or' filters
     #[case(r#"{a="b" or c="d",a="b"}"#, r#"{a="b"}"#)]
     #[case(r#"{a="b",c="d" or c="d",a="b"}"#, r#"{a="b",c="d"}"#)]
@@ -600,8 +607,16 @@ mod tests {
     #[case(r#"foo / bar{baz="a"} * 100"#, r#"foo{baz="a"} / bar{baz="a"} * 100"#)]
     #[case(
         r#"scalar(x) * foo / bar{baz="a"}"#,
-        r#"scalar(x{baz="a"}) * foo{baz="a"} / bar{baz="a"}"#
+        r#"scalar(x) * foo{baz="a"} / bar{baz="a"}"#
     )]
+    // Nothing is pushed into or derived from `scalar(...)`, at any depth.
+    #[case(
+        r#"a{job="node"} > b * scalar(ratio)"#,
+        r#"a{job="node"} > b{job="node"} * scalar(ratio)"#
+    )]
+    #[case(r#"a * scalar(m{x="1"})"#, r#"a * scalar(m{x="1"})"#)]
+    // `fill()` keeps unmatched series, which a pushed filter would drop.
+    #[case(r#"a + fill(0) b{x="1"}"#, r#"a + fill(0) b{x="1"}"#)]
     fn test_optimize_binop_with_consts_or_scalars(#[case] q: &str, #[case] result_expected: &str) {
         validate_optimized(q, result_expected);
     }
