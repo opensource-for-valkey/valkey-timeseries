@@ -221,3 +221,24 @@ class TestTimeSeriesIngest(ValkeyTimeSeriesTestCaseBase):
         assert self.get_sample(l3, 0) == [0, b"100"]
         assert self.get_sample(l3, 800) == [800, b"100"]
         assert self.client.execute_command("TS.GET", l3, "LATEST") == [900, b"50"]
+
+    def test_creation_options_are_applied(self):
+        """Options after the payload used to be read from one argument too far along, so every
+        option but LABELS was rejected."""
+        payload = '{"values":[1,2],"timestamps":[1000,2000]}'
+        assert self.client.execute_command(
+            "TS.ADDBULK", "bulk:opts", payload,
+            "RETENTION", 100, "DUPLICATE_POLICY", "LAST", "LABELS", "a", "b",
+        ) == [2, 2]
+        info = self.ts_info("bulk:opts")
+        assert info["retentionTime"] == 100
+        assert info["duplicatePolicy"] == "last"
+        assert info["labels"] == {"a": "b"}
+
+    def test_on_duplicate_overrides_the_series_policy(self):
+        self.client.execute_command("TS.CREATE", "bulk:ondup", "DUPLICATE_POLICY", "BLOCK")
+        self.client.execute_command("TS.ADD", "bulk:ondup", 1000, 5)
+        assert self.client.execute_command(
+            "TS.ADDBULK", "bulk:ondup", '{"values":[3],"timestamps":[1000]}', "ON_DUPLICATE", "SUM",
+        ) == [1, 1]
+        assert float(self.client.execute_command("TS.GET", "bulk:ondup")[1]) == 8.0

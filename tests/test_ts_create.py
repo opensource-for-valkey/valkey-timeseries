@@ -179,3 +179,16 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
 
         # Verify count in database
         assert client.execute_command("DBSIZE") == 10
+
+    def test_create_label_named_or_valued_labels(self):
+        """The label list starts at the first LABELS keyword; a later `labels` is label data."""
+        self.client.execute_command("TS.CREATE", "lbl:value", "LABELS", "type", "labels")
+        assert self.ts_info("lbl:value")["labels"] == {"type": "labels"}
+
+        self.client.execute_command("TS.CREATE", "lbl:name", "LABELS", "labels", "x")
+        assert self.ts_info("lbl:name")["labels"] == {"labels": "x"}
+
+    def test_add_key_named_labels_is_not_a_label_list(self):
+        """`TS.ADD labels <ts> <v>` names a key; it must not start a label list."""
+        self.client.execute_command("TS.ADD", "labels", 1, 2)
+        assert self.ts_info("labels")["labels"] == {}

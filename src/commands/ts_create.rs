@@ -92,8 +92,16 @@ pub fn parse_series_options_onto(
 
     let mut options = base;
 
-    // Labels are variadic, so we handle them first to make parsing easier.
-    let pos = args.iter().rposition(|x| x.eq_ignore_ascii_case(b"labels"));
+    // Labels are variadic, so we handle them first to make parsing easier. LABELS ends
+    // the option list (DIV-0043), so the list starts at the *first* LABELS token in the
+    // option region. Searching the whole vector from the end took a label named or
+    // valued `labels` (`LABELS type labels`) for the keyword, and a key named `labels`
+    // in `TS.ADD labels <ts> <v>` for the start of an empty-keyed label list.
+    let pos = args
+        .iter()
+        .skip(args_to_skip)
+        .position(|x| x.eq_ignore_ascii_case(b"labels"))
+        .map(|pos| pos + args_to_skip);
 
     // Extract and process labels if they exist
     let args = if let Some(pos) = pos {

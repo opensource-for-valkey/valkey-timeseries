@@ -2,7 +2,7 @@ use crate::commands::ts_create::parse_series_options;
 use crate::common::Sample;
 use crate::common::replies::{reply_with_array, reply_with_integer};
 use crate::series::{
-    IngestedSamples, TimeSeries, bulk_insert_samples, create_and_store_series,
+    DuplicatePolicy, IngestedSamples, TimeSeries, bulk_insert_samples, create_and_store_series,
     try_get_timeseries_mut,
 };
 use valkey_module::{AclPermissions, Context, ValkeyResult, ValkeyString, ValkeyValue};
@@ -46,22 +46,29 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         sample_data.samples
     };
 
-    let options = parse_series_options(args, 4, &[])?;
+    // `TS.ADDBULK key data [options]`: options start at index 3.
+    let options = parse_series_options(args, 3, &[])?;
+    let on_duplicate = options.on_duplicate;
 
     if let Some(mut guard) = try_get_timeseries_mut(ctx, &key, Some(AclPermissions::UPDATE))? {
-        return process_series(ctx, &mut guard, samples);
+        return process_series(ctx, &mut guard, samples, on_duplicate);
     }
 
     // Auto-create: no ts.create event and no replication from the create
     // helper — consistent with the TS.ADD family; this command replicates
     // itself.
     let mut series = create_and_store_series(ctx, &key, options, false, true)?;
-    process_series(ctx, &mut series, samples)
+    process_series(ctx, &mut series, samples, on_duplicate)
 }
 
 #[inline]
-fn process_series(ctx: &Context, series: &mut TimeSeries, samples: Vec<Sample>) -> ValkeyResult {
-    match handle_ingest(ctx, series, samples) {
+fn process_series(
+    ctx: &Context,
+    series: &mut TimeSeries,
+    samples: Vec<Sample>,
+    on_duplicate: Option<DuplicatePolicy>,
+) -> ValkeyResult {
+    match handle_ingest(ctx, series, samples, on_duplicate) {
         Ok(val) => {
             ctx.replicate_verbatim();
             Ok(val)
@@ -70,9 +77,14 @@ fn process_series(ctx: &Context, series: &mut TimeSeries, samples: Vec<Sample>) 
     }
 }
 
-fn handle_ingest(ctx: &Context, series: &mut TimeSeries, samples: Vec<Sample>) -> ValkeyResult {
+fn handle_ingest(
+    ctx: &Context,
+    series: &mut TimeSeries,
+    samples: Vec<Sample>,
+    on_duplicate: Option<DuplicatePolicy>,
+) -> ValkeyResult {
     let sample_count = samples.len();
-    let duplicate_policy = series.sample_duplicates.resolve_policy(None);
+    let duplicate_policy = series.sample_duplicates.resolve_policy(on_duplicate);
 
     let results = bulk_insert_samples(ctx, series, &samples, Some(duplicate_policy));
 

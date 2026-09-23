@@ -115,10 +115,27 @@ fn create_series_and_update(
     handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)
 }
 
+/// Index of the first creation option: `TS.INCRBY key delta [options]`.
+const FIRST_OPTION_INDEX: usize = 3;
+
+/// Strip the `TIMESTAMP <ts>` option from `args` and parse it.
+///
+/// `TIMESTAMP` is only an option in the option region — after `key delta` and before
+/// the variadic `LABELS` list, which runs to the end. Scanning the whole vector took a
+/// key named `timestamp` for the option (removing the key and delta, then indexing past
+/// the end: a panic, which aborts the server) and a `timestamp` label for the option
+/// too. The first occurrence wins, and its operand is the next argument even when that
+/// is `LABELS` (the reference then rejects it as an invalid timestamp).
 fn handle_parse_timestamp(args: &mut Vec<ValkeyString>) -> ValkeyResult<Option<Timestamp>> {
-    if let Some(index) = args
+    let options = args.get(FIRST_OPTION_INDEX..).unwrap_or_default();
+    let options_end = options
+        .iter()
+        .position(|x| x.eq_ignore_ascii_case(b"labels"))
+        .unwrap_or(options.len());
+    if let Some(index) = options[..options_end]
         .iter()
         .position(|x| x.eq_ignore_ascii_case(b"timestamp"))
+        .map(|pos| pos + FIRST_OPTION_INDEX)
     {
         return if index < args.len() - 1 {
             args.remove(index);

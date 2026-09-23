@@ -225,3 +225,26 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         sample = self.client.execute_command('TS.GET', 'ts_nan_sample')
         assert sample[0] == 1000
         assert sample[1].lower() == b'nan'
+
+    def test_incrby_key_named_timestamp(self):
+        """A key named `timestamp` is a key, not the TIMESTAMP option. Scanning the whole
+        argument vector for the option used to strip the key and delta and then index past
+        the end — a panic that aborted the server."""
+        assert self.client.execute_command("TS.INCRBY", "timestamp", 5, "TIMESTAMP", 1000) == 1000
+        assert self.client.ping()
+        assert self.client.execute_command("TS.INCRBY", "timestamp", 2, "TIMESTAMP", 2000) == 2000
+        assert float(self.client.execute_command("TS.GET", "timestamp")[1]) == 7.0
+
+        # With no options at all: the shape that used to take the server down.
+        self.client.execute_command("TS.INCRBY", "timestamp", 1)
+        assert float(self.client.execute_command("TS.GET", "timestamp")[1]) == 8.0
+
+    def test_incrby_timestamp_inside_labels_is_a_label(self):
+        """LABELS runs to the end of the command: a `timestamp` pair after it is a label."""
+        self.client.execute_command("TS.INCRBY", "incr:lbl", 5, "LABELS", "timestamp", "7")
+        assert self.ts_info("incr:lbl")["labels"] == {"timestamp": "7"}
+        assert self.client.execute_command("TS.GET", "incr:lbl")[0] != 7
+
+        assert self.client.execute_command(
+            "TS.INCRBY", "incr:lbl2", 5, "TIMESTAMP", 10, "LABELS", "a", "b") == 10
+        assert self.ts_info("incr:lbl2")["labels"] == {"a": "b"}
