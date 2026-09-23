@@ -90,9 +90,7 @@ impl ChimpChunk {
         if self.len() == 0 {
             return 0;
         }
-        // A flat series costs well under a byte per sample, at which point the
-        // integer ratio floors to zero.
-        self.remaining_capacity() / self.bytes_per_sample().max(1)
+        self.remaining_capacity() / self.bytes_per_sample()
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -257,7 +255,10 @@ impl ChunkOps for ChimpChunk {
         if count < MIN_SAMPLES_FOR_BPS_ESTIMATE {
             return size_of::<Sample>() / 2;
         }
-        self.data_size() / count
+        // At least one byte: a flat series compresses to well under a byte per sample, and a
+        // ratio floored to zero made every capacity estimate zero — so each MADD/ADDBULK batch
+        // on such a series opened a chunk of its own.
+        (self.data_size() / count).max(1)
     }
 
     fn clear(&mut self) {

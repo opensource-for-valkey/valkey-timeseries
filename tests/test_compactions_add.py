@@ -484,3 +484,38 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         # aggregator, which would instead compute avg(10,20,30,100) = 40.
         dest_samples = self.get_samples(dest, 0, 19)
         assert dest_samples == [[0, b"60"]]
+
+    def test_aligned_rule_recalculates_the_clamped_first_bucket(self):
+        """With ALIGN 500 and 1000ms buckets the first bucket is [0, 500). An upsert into it
+        used to recalculate [0, 1000), folding the next bucket's samples in as well."""
+        c = self.client
+        c.execute_command("TS.CREATE", "algn:src")
+        c.execute_command("TS.CREATE", "algn:dst")
+        c.execute_command("TS.CREATERULE", "algn:src", "algn:dst", "AGGREGATION", "sum", 1000, 500)
+        c.execute_command("TS.ADD", "algn:src", 100, 1)
+        c.execute_command("TS.ADD", "algn:src", 700, 10)  # closes [0, 500)
+        assert c.execute_command("TS.RANGE", "algn:dst", "-", "+") == [[0, b"1"]]
+
+        c.execute_command("TS.ADD", "algn:src", 50, 100)  # back-fill into [0, 500)
+        assert c.execute_command("TS.RANGE", "algn:dst", "-", "+") == [[0, b"101"]]
+
+    def test_batch_backfill_uses_the_retention_floor_of_its_last_write(self):
+        """TS.MADD must publish what the same writes do one TS.ADD at a time. A bucket
+        back-filled after the batch's high-water mark rose must drop samples retention has
+        since evicted; the batch path used the floor of an earlier back-fill instead."""
+        c = self.client
+        for key in ("bf:seq", "bf:batch"):
+            c.execute_command("TS.CREATE", key, "RETENTION", 1000)
+            c.execute_command("TS.CREATE", f"{key}:dst")
+            c.execute_command("TS.CREATERULE", key, f"{key}:dst", "AGGREGATION", "sum", 1000)
+            c.execute_command("TS.ADD", key, 50, 1)
+            c.execute_command("TS.ADD", key, 950, 1)
+
+        for ts in (900, 1400, 600):
+            c.execute_command("TS.ADD", "bf:seq", ts, 1)
+        c.execute_command("TS.MADD", "bf:batch", 900, 1, "bf:batch", 1400, 1, "bf:batch", 600, 1)
+
+        seq = c.execute_command("TS.RANGE", "bf:seq:dst", "-", "+")
+        batch = c.execute_command("TS.RANGE", "bf:batch:dst", "-", "+")
+        assert seq == [[0, b"3"]]
+        assert batch == seq

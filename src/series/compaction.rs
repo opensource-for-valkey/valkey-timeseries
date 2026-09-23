@@ -51,10 +51,21 @@ impl CompactionRule {
         calc_bucket_start(ts, self.align_timestamp, self.bucket_duration)
     }
 
+    /// Exclusive end of the bucket that starts at `bucket_start` (a [`Self::calc_bucket_start`]
+    /// result).
+    ///
+    /// Not `bucket_start + bucket_duration`: with a non-zero align timestamp the first bucket's
+    /// true start is negative and `calc_bucket_start` clamps it to 0, so that bucket is shorter
+    /// than a full duration — `[0, align % duration)`. Adding a whole duration to it swept the
+    /// next bucket's samples into its recomputation, double-counting them. The start of the
+    /// bucket one duration on is the end in both cases.
+    pub(crate) fn bucket_end(&self, bucket_start: Timestamp) -> Timestamp {
+        self.calc_bucket_start(bucket_start.saturating_add_unsigned(self.bucket_duration))
+    }
+
     pub(super) fn get_bucket_range(&self, ts: Timestamp) -> (Timestamp, Timestamp) {
         let start = self.calc_bucket_start(ts);
-        let end = start.saturating_add_unsigned(self.bucket_duration);
-        (start, end)
+        (start, self.bucket_end(start))
     }
 
     pub(super) fn reset(&mut self) {
@@ -336,10 +347,19 @@ fn handle_batch_compaction(
             }
         }
     }
-    // Later entries win: a bucket back-filled more than once settles at the floor of the last
-    // recalculation, and the replay above is already in input order.
+    // Later entries win: a timestamp back-filled more than once settles at the floor of its
+    // last recalculation. The high-water mark only rises in input order, so that is the
+    // largest one — keep the max rather than whichever entry the sort left first (which was
+    // the earliest, lowest floor).
     backfilled.sort_by_key(|(ts, _)| *ts);
-    backfilled.dedup_by_key(|(ts, _)| *ts);
+    backfilled.dedup_by(|dup, kept| {
+        if dup.0 == kept.0 {
+            kept.1 = kept.1.max(dup.1);
+            true
+        } else {
+            false
+        }
+    });
 
     let floor_at = |last_ts: Timestamp| {
         if retention.is_zero() {
@@ -374,9 +394,11 @@ fn handle_batch_compaction(
     // all back-fills to that bucket. When an append between two back-fills advances the
     // retention window past earlier samples (e.g. MADD 0 v 1001 v 2 v with a retention that
     // evicts timestamp 0 after 1001 arrives), the first back-fill's floor sees the earlier
-    // samples while the second back-fill's floor does not. Processing in reverse timestamp
-    // order keeps the later (higher) floor, which matches the source state that survives
-    // retention after the batch is complete.
+    // samples while the second back-fill's floor does not; the last one the sequential path
+    // would run is the one with the highest floor, which matches the source state that
+    // survives retention after the batch is complete. That floor is not tied to the bucket's
+    // highest timestamp — a lower timestamp can be back-filled later in the batch, after the
+    // high-water mark has risen — so it is taken as the max over the whole bucket.
     //
     // A bucket only reaches the destination when it closes, so `recalculate_bucket` (which
     // writes) is for buckets the rule has already moved past. When the rule has no open bucket
@@ -385,25 +407,24 @@ fn handle_batch_compaction(
     // A batch reaches that state whenever a timestamp appears twice in the caller's order: the
     // repeat reads as a back-fill, `samples` carries the timestamp once, so it is classified as
     // an upsert and never streams through the append path that would have opened the bucket.
-    let mut prev_bucket: Option<Timestamp> = None;
-    for (sample, min_ts) in upserts.iter().rev() {
+    //
+    // Buckets are processed newest first, so when this batch opens the rule's bucket it opens
+    // the latest one.
+    let mut buckets: SmallVec<[(Timestamp, Timestamp); TEMP_VEC_LEN]> = SmallVec::new();
+    for (sample, min_ts) in &upserts {
         let bucket_start = ctx.rule.calc_bucket_start(sample.timestamp);
-        if prev_bucket == Some(bucket_start) {
-            continue;
+        match buckets.last_mut() {
+            Some((start, floor)) if *start == bucket_start => *floor = (*floor).max(*min_ts),
+            _ => buckets.push((bucket_start, *min_ts)),
         }
-        prev_bucket = Some(bucket_start);
+    }
 
-        if ctx.rule.bucket_start.is_none() {
-            let bucket_end = bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
-            recalculate_current_bucket(ctx, bucket_start, bucket_end, *min_ts)?;
-            continue;
-        }
-
-        let bucket_end = bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
-        if ctx.rule.bucket_start == Some(bucket_start) {
-            recalculate_current_bucket(ctx, bucket_start, bucket_end, *min_ts)?;
+    for &(bucket_start, min_ts) in buckets.iter().rev() {
+        let bucket_end = ctx.rule.bucket_end(bucket_start);
+        if ctx.rule.bucket_start.is_none() || ctx.rule.bucket_start == Some(bucket_start) {
+            recalculate_current_bucket(ctx, bucket_start, bucket_end, min_ts)?;
         } else {
-            recalculate_bucket(ctx, bucket_start, bucket_end, *min_ts, null_ts_filter)?;
+            recalculate_bucket(ctx, bucket_start, bucket_end, min_ts, null_ts_filter)?;
         }
     }
 
@@ -509,7 +530,7 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
             finalize_current_bucket(ctx, sample, sample_bucket_start)?;
         }
         Ordering::Less => {
-            let bucket_end = sample_bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+            let bucket_end = ctx.rule.bucket_end(sample_bucket_start);
             // Sample is in an older bucket (shouldn't happen for new samples, but handle gracefully)
             recalculate_bucket(
                 ctx,
@@ -567,8 +588,7 @@ fn handle_compaction_upsert(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
         return Ok(());
     };
 
-    let duration = ctx.rule.bucket_duration;
-    let bucket_end = current_bucket_start.saturating_add_unsigned(duration);
+    let bucket_end = ctx.rule.bucket_end(current_bucket_start);
 
     if bucket_start == current_bucket_start {
         // This sample belongs to the current aggregation bucket
@@ -586,7 +606,7 @@ fn handle_compaction_upsert(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
     // The recompute range must be that bucket's own span; `bucket_end` above
     // belongs to the *current* open bucket, and using it here would fold every
     // sample between the historical bucket and the open one into the recompute.
-    let historical_bucket_end = bucket_start.saturating_add_unsigned(duration);
+    let historical_bucket_end = ctx.rule.bucket_end(bucket_start);
     let min_ts = ctx.parent.get_min_timestamp();
     recalculate_bucket(
         ctx,
@@ -692,7 +712,7 @@ fn handle_compaction_range_removal(
     remove_or_recalculate_bucket(ctx, first_bucket_start, start, end)?;
 
     if last_bucket_start != first_bucket_start {
-        let middle_start = first_bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+        let middle_start = ctx.rule.bucket_end(first_bucket_start);
         if middle_start < last_bucket_start && !ctx.dest.is_empty() {
             // Buckets tile the range, so the fully covered middle is exactly
             // [middle_start, last_bucket_start).
@@ -725,7 +745,7 @@ fn remove_or_recalculate_bucket(
         return Ok(());
     }
 
-    let bucket_end = bucket_start.saturating_add_unsigned(ctx.rule.bucket_duration);
+    let bucket_end = ctx.rule.bucket_end(bucket_start);
 
     if start <= bucket_start && end >= bucket_end {
         if !ctx.dest.is_empty() {

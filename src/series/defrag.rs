@@ -26,8 +26,14 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
             continue;
         }
 
-        // while the previous block has capacity merge into it
-        while merge_by_capacity(prev_chunk, chunk, min_timestamp, duplicate_policy)?.is_some() {
+        // Pull chunks into `prev_chunk` while each one drains into it completely. A partial
+        // merge fills `prev_chunk` and leaves `chunk` holding the upper part of its range, so
+        // `chunk` becomes the next destination: pulling a later chunk into `prev_chunk` past
+        // it (as this loop used to) put newer samples ahead of older ones and left the chunks
+        // overlapping, breaking the binary search, upsert routing and range reads.
+        while merge_by_capacity(prev_chunk, chunk, min_timestamp, duplicate_policy)?.is_some()
+            && chunk.is_empty()
+        {
             let Some(next_chunk) = iter.next() else {
                 break;
             };
@@ -75,7 +81,7 @@ pub fn defrag_series(series: &mut TimeSeries) -> TsdbResult {
 mod tests {
     use super::*;
     use crate::common::Sample;
-    use crate::series::chunks::{ChunkOps, GorillaChunk, TimeSeriesChunk};
+    use crate::series::chunks::{ChimpChunk, ChunkOps, GorillaChunk, TimeSeriesChunk};
     use std::time::Duration;
 
     /// A chunk holding `count` samples starting at `start`, with room to spare so the
@@ -181,5 +187,63 @@ mod tests {
         defrag_series(&mut series).unwrap();
         assert_eq!(series.chunks.len(), 1);
         assert_eq!(series.total_samples, 3);
+    }
+
+    /// A `max_size`-byte chunk holding up to `count` samples from `start` (fewer if it fills).
+    fn sized_chunk(chimp: bool, max_size: usize, start: i64, count: i64) -> TimeSeriesChunk {
+        let mut chunk = if chimp {
+            TimeSeriesChunk::Chimp(ChimpChunk::with_max_size(max_size))
+        } else {
+            TimeSeriesChunk::Gorilla(GorillaChunk::with_max_size(max_size))
+        };
+        for i in 0..count {
+            let timestamp = start + i * 10;
+            // Varying values so the chunks compress to realistic, uneven sizes.
+            let value = ((timestamp * 7919) % 1000) as f64 / 7.0;
+            if chunk.add_sample(&Sample { timestamp, value }).is_err() {
+                break;
+            }
+        }
+        chunk
+    }
+
+    #[test]
+    fn test_defrag_keeps_chunks_ordered_through_partial_merges() {
+        // A partial merge leaves the source chunk holding the upper part of its range; the
+        // loop used to keep pulling later chunks into the destination past it, leaving the
+        // chunks out of order.
+        let counts = [3i64, 12, 40, 90, 200];
+        for chimp in [false, true] {
+            for max_size in [64usize, 128, 256] {
+                for &a in &counts {
+                    for &b in &counts {
+                        for &c in &counts {
+                            let chunks = vec![
+                                sized_chunk(chimp, max_size, 0, a),
+                                sized_chunk(chimp, max_size, 100_000, b),
+                                sized_chunk(chimp, max_size, 200_000, c),
+                                sized_chunk(chimp, max_size, 300_000, 5),
+                            ];
+                            let mut series = series_from(chunks);
+                            let before = all_samples(&series);
+
+                            defrag_series(&mut series).unwrap();
+
+                            let after = all_samples(&series);
+                            assert_eq!(
+                                after, before,
+                                "samples changed (chimp={chimp}, max_size={max_size}, counts={a},{b},{c})"
+                            );
+                            for pair in series.chunks.windows(2) {
+                                assert!(
+                                    pair[0].last_timestamp() < pair[1].first_timestamp(),
+                                    "chunks overlap (chimp={chimp}, max_size={max_size}, counts={a},{b},{c})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

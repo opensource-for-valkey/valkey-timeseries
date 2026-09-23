@@ -1221,9 +1221,13 @@ pub(super) fn find_start_chunk_index(arr: &[TimeSeriesChunk], ts: Timestamp) -> 
     match arr {
         [] => 0,
         [first, ..] if ts <= first.first_timestamp() => 0,
+        // The first chunk whose range reaches `ts`, as the binary search below finds it.
+        // Testing `ts >= first_timestamp` instead matched chunk 0 every time (the arm above
+        // has already established `ts > chunks[0].first_timestamp()`), so ranged reads of a
+        // short series decoded every chunk from the start.
         _ if arr.len() <= LINEAR_SCAN_MAX => arr
             .iter()
-            .position(|x| ts >= x.first_timestamp())
+            .position(|x| x.last_timestamp() >= ts)
             .unwrap_or(arr.len()),
         _ => {
             let (pos, _) = binary_search_chunks_by_timestamp(arr, ts);
@@ -1326,5 +1330,36 @@ mod tests {
 
         assert!(ts.get_chunk_index_bounds(40, 20).is_none());
         assert!(!ts.has_samples_in_range(40, 20));
+    }
+
+    #[test]
+    fn test_find_start_chunk_index_linear_scan_agrees_with_binary_search() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        // Chunks covering [0,9], [20,29], [40,49], [60,69].
+        let chunks: Vec<TimeSeriesChunk> = (0..4)
+            .map(|c| {
+                let samples: Vec<Sample> = (0..10)
+                    .map(|i| Sample {
+                        timestamp: c * 20 + i,
+                        value: i as f64,
+                    })
+                    .collect();
+                TimeSeriesChunk::Uncompressed(UncompressedChunk::new(1024, &samples))
+            })
+            .collect();
+        assert!(chunks.len() <= LINEAR_SCAN_MAX);
+
+        for ts in -5..80 {
+            let expected = if ts <= chunks[0].first_timestamp() {
+                0
+            } else {
+                binary_search_chunks_by_timestamp(&chunks, ts).0
+            };
+            assert_eq!(find_start_chunk_index(&chunks, ts), expected, "ts={ts}");
+        }
+        assert_eq!(find_start_chunk_index(&chunks, 45), 2);
+        assert_eq!(find_start_chunk_index(&chunks, 35), 2);
+        assert_eq!(find_start_chunk_index(&chunks, 70), 4);
     }
 }

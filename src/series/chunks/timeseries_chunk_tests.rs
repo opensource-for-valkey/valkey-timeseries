@@ -2831,4 +2831,29 @@ mod tests {
             assert_eq!(original_samples, deserialized_samples);
         }
     }
+
+    #[test]
+    fn test_flat_series_keeps_a_nonzero_capacity_estimate() {
+        // A constant series compresses to well under a byte per sample; the integer
+        // bytes-per-sample ratio used to floor to zero, making the remaining capacity zero and
+        // sending every MADD/ADDBULK batch to a fresh chunk.
+        for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(encoding, 4096);
+            for i in 0..500 {
+                chunk
+                    .add_sample(&Sample {
+                        timestamp: 1000 + i * 1000,
+                        value: 42.0,
+                    })
+                    .unwrap();
+            }
+            assert!(chunk.bytes_per_sample() >= 1, "{encoding:?}");
+            assert!(
+                chunk.estimate_remaining_sample_capacity() > 0,
+                "{encoding:?}: size {} of {}",
+                chunk.size(),
+                chunk.max_size()
+            );
+        }
+    }
 }

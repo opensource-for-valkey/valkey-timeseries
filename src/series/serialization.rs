@@ -1,5 +1,5 @@
-use crate::common::Sample;
 use crate::common::rdb::*;
+use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use crate::series::compaction::CompactionRule;
@@ -62,19 +62,24 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let chunks_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
     let mut chunks = Vec::with_capacity(chunks_len);
     let mut total_samples: usize = 0;
-    let mut first_timestamp = 0;
+    // `None` until the first non-empty chunk, not `0`: 0 is a valid timestamp, and using it
+    // as the "unset" marker took chunk 1's first timestamp for a series whose data starts at
+    // ts 0 — with no retention that value is the read floor, so everything in chunk 0 went
+    // missing from ranges after a reload, RESTORE or slot migration.
+    let mut first_timestamp: Option<Timestamp> = None;
 
     let mut last_sample: Option<Sample> = None;
 
     for _ in 0..chunks_len {
         let chunk = TimeSeriesChunk::load_rdb(rdb, enc_ver)?;
         total_samples += chunk.len();
-        if first_timestamp == 0 {
-            first_timestamp = chunk.first_timestamp();
+        if first_timestamp.is_none() && !chunk.is_empty() {
+            first_timestamp = Some(chunk.first_timestamp());
         }
         last_sample = chunk.last_sample();
         chunks.push(chunk);
     }
+    let first_timestamp = first_timestamp.unwrap_or_default();
 
     // rule related
     let src_id = raw::load_unsigned(rdb)? as TimeseriesId;

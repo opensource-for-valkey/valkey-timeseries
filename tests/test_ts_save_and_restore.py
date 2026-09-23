@@ -490,3 +490,21 @@ class TestTimeseriesSaveRestore(ValkeyTimeSeriesTestCaseBase):
         for key in keys:
             restored_digest = client.execute_command('DEBUG DIGEST-VALUE', key)
             assert restored_digest == original_object_digests[key]
+
+    def test_series_starting_at_timestamp_zero_survives_reload(self):
+        """The loader used 0 as its "first timestamp not set" marker, so a series whose data
+        starts at 0 took chunk 1's first timestamp — the read floor without retention — and
+        lost chunk 0's samples from every range after a reload."""
+        client = self.server.get_new_client()
+        client.execute_command("TS.CREATE", "zero:ts", "ENCODING", "UNCOMPRESSED", "CHUNK_SIZE", 128)
+        for ts in range(40):
+            client.execute_command("TS.ADD", "zero:ts", ts, ts)
+        before = client.execute_command("TS.RANGE", "zero:ts", "-", "+")
+        assert len(before) == 40
+
+        client.execute_command("DEBUG", "RELOAD")
+
+        assert client.execute_command("TS.RANGE", "zero:ts", "-", "+") == before
+        info = self.ts_info("zero:ts")
+        assert info["firstTimestamp"] == 0
+        assert info["totalSamples"] == 40

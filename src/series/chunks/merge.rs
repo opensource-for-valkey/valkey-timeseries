@@ -99,7 +99,6 @@ pub(crate) fn append_samples<C: ChunkOps>(
     Ok(results)
 }
 
-#[allow(dead_code)]
 pub(crate) fn merge_by_capacity(
     dest: &mut TimeSeriesChunk,
     src: &mut TimeSeriesChunk,
@@ -129,7 +128,8 @@ pub(crate) fn merge_by_capacity(
     } else if remaining_capacity > count / 4 {
         // do a partial merge
         let samples = src.get_range(first_ts, src.last_timestamp())?;
-        let (left, right) = samples.split_at(remaining_capacity);
+        // `samples` can be shorter than `count` when `min_timestamp` clips the front.
+        let (left, right) = samples.split_at(remaining_capacity.min(samples.len()));
         let res = dest.merge_samples(left, duplicate_policy)?;
         src.set_data(right)?;
         let count = res.iter().filter(|s| s.is_ok()).count();
