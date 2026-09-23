@@ -4,10 +4,11 @@ use std::rc::Rc;
 use crate::labels::HasFingerprint;
 use crate::parser::number::parse_number;
 use crate::promql::functions::utils::{
-    exact_arity_error, expect_instant_vector, expect_scalar, expect_string, is_inf,
+    exact_arity_error, expect_instant_vector, expect_scalar, is_inf,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::hashers::FingerprintHashMap;
+use crate::promql::model::is_stale_nan;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashMap;
 
@@ -328,130 +329,195 @@ fn histogram_fraction(args: Vec<PromQLArg>) -> EvalResult<ExprResult> {
 }
 
 pub(super) fn histogram_quantile(args: Vec<PromQLArg>) -> EvalResult<ExprResult> {
-    let arg_len = args.len();
-
-    if arg_len != 2 {
+    if args.len() != 2 {
         return Err(exact_arity_error("histogram_quantile", 2, args.len()));
     }
 
     let mut arg_iter = args.into_iter();
-    let phi_arg = arg_iter.next().unwrap();
-    let phi_arg = expect_scalar(phi_arg, "histogram_quantile", "phi")?;
+    let phi = expect_scalar(arg_iter.next().unwrap(), "histogram_quantile", "phi")?;
+    let series = expect_instant_vector(arg_iter.next().unwrap(), "histogram_quantile")?;
 
-    let series_arg = arg_iter.next().unwrap();
-    // Convert buckets with `vmrange` labels to buckets with `le` labels.
-    let series = expect_instant_vector(series_arg, "histogram_quantile")?;
+    // VictoriaMetrics `vmrange` buckets become `le` buckets; Prometheus-format
+    // buckets pass through unchanged.
+    let tss = vmrange_buckets_to_le(series);
 
-    let mut tss = vmrange_buckets_to_le(series);
-
-    // Parse bounds_label. See https://github.com/prometheus/prometheus/issues/5706 for details.
-    let bounds_label = if let Some(bound_arg) = arg_iter.next() {
-        expect_string(bound_arg, "histogram_quantile", "bounds_label")?
-    } else {
-        "".to_string()
-    };
-
-    // Group metrics by all tags excluding "le"
-    let mut m = group_le_timeseries(&mut tss);
-
-    // Calculate quantile for each group in m
-    let last_non_inf = |_i: usize, xss: &[LeTimeseries]| -> f64 {
-        if let Some(v) = xss.iter().rev().find(|x| x.le.is_finite()) {
-            v.le
-        } else {
-            f64::NAN
-        }
-    };
-
-    let quantile = |phi: f64, xss: &mut Vec<LeTimeseries>| -> (f64, f64, f64) {
-        if phi.is_nan() {
-            return (f64::NAN, f64::NAN, f64::NAN);
-        }
-        fix_broken_buckets(xss);
-        let mut v_last: f64 = 0.0;
-        if !xss.is_empty() {
-            v_last = xss[xss.len() - 1].ts.value
-        }
-        if v_last == 0.0 {
-            return (f64::NAN, f64::NAN, f64::NAN);
-        }
-        if phi < 0.0 {
-            return (f64::NEG_INFINITY, f64::NEG_INFINITY, xss[0].ts.value);
-        }
-        if phi > 1.0 {
-            return (f64::INFINITY, v_last, f64::INFINITY);
-        }
-        let v_req = v_last * phi;
-        let mut v_prev: f64 = 0.0;
-        let mut le_prev: f64 = 0.0;
-        for xs in xss.iter() {
-            let v = xs.ts.value;
-            let le = xs.le;
-            if v <= 0.0 {
-                // Skip zero buckets.
-                le_prev = le;
-                continue;
-            }
-            if v < v_req {
-                v_prev = v;
-                le_prev = le;
-                continue;
-            }
-            if is_inf(le, 0) {
-                break;
-            }
-            if v == v_prev {
-                return (le_prev, le_prev, v);
-            }
-            let vv = le_prev + (le - le_prev) * (v_req - v_prev) / (v - v_prev);
-            return (vv, le_prev, le);
-        }
-        let vv = last_non_inf(0, xss);
-        (vv, vv, f64::INFINITY)
-    };
-
-    let mut rvs: Vec<EvalSample> = Vec::with_capacity(m.len());
-    for (_, xss) in m.iter_mut() {
-        xss.sort_by(|a, b| a.le.total_cmp(&b.le));
-
-        let mut xss = merge_same_le(xss);
-
-        if xss.is_empty() {
+    // One histogram per label set without `le`, the metric name included, as
+    // Prometheus groups them: the name's drop is pending until the result is
+    // rendered, so `a_bucket` and `b_bucket` stay separate histograms. A
+    // series whose `le` does not parse as a float is not a bucket.
+    let mut histograms: FingerprintHashMap<(EvalSample, Vec<ClassicBucket>)> =
+        FingerprintHashMap::default();
+    for mut ts in tss {
+        let Some(upper_bound) = ts.labels.get(LE).and_then(|le| le.parse::<f64>().ok()) else {
             continue;
-        }
-
-        let (mut ts_lower, mut ts_upper) = if !bounds_label.is_empty() {
-            let mut ts_lower = xss[0].ts.clone(); // todo: use take and clone instead of 2 clones ?
-            ts_lower.labels.set(&bounds_label, "lower".to_string());
-
-            let mut ts_upper = xss[0].ts.clone();
-            ts_upper.labels.set(&bounds_label, "upper".to_string());
-            (ts_lower, ts_upper)
-        } else {
-            (EvalSample::default(), EvalSample::default())
         };
-
-        let (v, lower, upper) = quantile(phi_arg, &mut xss);
-        xss[0].ts.value = v;
-        if !bounds_label.is_empty() {
-            ts_lower.value = lower;
-            ts_upper.value = upper;
-        }
-
-        let mut dst: LeTimeseries = if xss.len() == 1 {
-            xss.remove(0)
-        } else {
-            xss.swap_remove(0)
+        ts.labels.remove(LE);
+        let bucket = ClassicBucket {
+            upper_bound,
+            count: ts.value,
         };
-
-        rvs.push(std::mem::take(&mut dst.ts));
-        if !bounds_label.is_empty() {
-            rvs.push(ts_lower);
-            rvs.push(ts_upper);
-        }
+        histograms
+            .entry(ts.labels.fingerprint())
+            .or_insert_with(|| (ts, Vec::new()))
+            .1
+            .push(bucket);
     }
 
+    let rvs = histograms
+        .into_iter()
+        .map(|(_, (mut sample, mut buckets))| {
+            sample.value = bucket_quantile(phi, &mut buckets);
+            sample.drop_name = true;
+            sample
+        })
+        .collect();
+
     Ok(ExprResult::InstantVector(rvs))
+}
+
+/// One bucket of a classic histogram: its `le` and its cumulative count.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ClassicBucket {
+    pub upper_bound: f64,
+    pub count: f64,
+}
+
+/// Relative differences between adjacent bucket counts below this are taken
+/// for floating-point noise and ignored (Prometheus' `smallDeltaTolerance`).
+const SMALL_DELTA_TOLERANCE: f64 = 1e-12;
+
+/// The `q` quantile of a classic histogram, as Prometheus' `BucketQuantile`
+/// (promql/quantile.go) computes it:
+///
+/// - `q` NaN is NaN, below 0 is -Inf, above 1 is +Inf — before the buckets are
+///   looked at, so even an empty or incomplete histogram answers.
+/// - Without a `+Inf` bucket, with fewer than two buckets or with no
+///   observations, the answer is NaN.
+/// - Buckets with the same bound are merged, and counts are made monotonic
+///   (see [`ensure_monotonic_and_ignore_small_deltas`]).
+/// - A rank in the `+Inf` bucket answers the highest finite bound. A rank in
+///   a lowest bucket whose bound is at most 0 answers that bound. Otherwise
+///   the value is interpolated linearly within the bucket, from the previous
+///   bound — or from 0 for a lowest bucket above 0.
+pub(super) fn bucket_quantile(q: f64, buckets: &mut Vec<ClassicBucket>) -> f64 {
+    if q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    buckets.sort_by(|a, b| a.upper_bound.total_cmp(&b.upper_bound));
+    if !buckets
+        .last()
+        .is_some_and(|b| b.upper_bound == f64::INFINITY)
+    {
+        return f64::NAN;
+    }
+
+    coalesce_buckets(buckets);
+    ensure_monotonic_and_ignore_small_deltas(buckets, SMALL_DELTA_TOLERANCE);
+
+    let n = buckets.len();
+    if n < 2 {
+        return f64::NAN;
+    }
+    let observations = buckets[n - 1].count;
+    if observations == 0.0 {
+        return f64::NAN;
+    }
+    let mut rank = q * observations;
+    let b = go_sort_search(n - 1, |i| buckets[i].count >= rank);
+
+    if b == n - 1 {
+        return buckets[n - 2].upper_bound;
+    }
+    if b == 0 && buckets[0].upper_bound <= 0.0 {
+        return buckets[0].upper_bound;
+    }
+    let bucket_end = buckets[b].upper_bound;
+    let mut bucket_start = 0.0;
+    let mut count = buckets[b].count;
+    if b > 0 {
+        bucket_start = buckets[b - 1].upper_bound;
+        count -= buckets[b - 1].count;
+        rank -= buckets[b - 1].count;
+    }
+    bucket_start + (bucket_end - bucket_start) * (rank / count)
+}
+
+/// Go's `sort.Search`: the smallest `i` in `[0, n)` for which `f(i)` holds,
+/// or `n`, found by the same bisection. Kept exact rather than replaced with
+/// a linear scan so a NaN count — which makes `f` non-monotonic — lands on
+/// the same bucket as in Prometheus.
+fn go_sort_search(n: usize, f: impl Fn(usize) -> bool) -> usize {
+    let (mut i, mut j) = (0, n);
+    while i < j {
+        let h = (i + j) / 2;
+        if !f(h) {
+            i = h + 1;
+        } else {
+            j = h;
+        }
+    }
+    i
+}
+
+/// Merge adjacent buckets with the same upper bound, summing their counts.
+/// `buckets` must be sorted by bound.
+fn coalesce_buckets(buckets: &mut Vec<ClassicBucket>) {
+    buckets.dedup_by(|next, kept| {
+        if next.upper_bound == kept.upper_bound {
+            kept.count += next.count;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Make counts non-decreasing with the bound, as a cumulative histogram's
+/// must be. A difference within `tolerance` (relative) is floating-point noise
+/// and is flattened in either direction; any other decrease is lifted to the
+/// previous count. Neither moves the running reference count.
+fn ensure_monotonic_and_ignore_small_deltas(buckets: &mut [ClassicBucket], tolerance: f64) {
+    let Some(first) = buckets.first() else {
+        return;
+    };
+    let mut prev = first.count;
+    for bucket in buckets.iter_mut().skip(1) {
+        let curr = bucket.count;
+        if curr == prev {
+            continue;
+        }
+        if almost_equal(prev, curr, tolerance) || curr < prev {
+            bucket.count = prev;
+            continue;
+        }
+        prev = curr;
+    }
+}
+
+/// Prometheus' `almost.Equal`: equality within a relative `epsilon`, with two
+/// NaNs equal and the stale marker equal only to itself.
+fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
+    if is_stale_nan(a) || is_stale_nan(b) {
+        return is_stale_nan(a) && is_stale_nan(b);
+    }
+    if a.is_nan() && b.is_nan() {
+        return true;
+    }
+    if a == b {
+        return true;
+    }
+    let abs_sum = a.abs() + b.abs();
+    let diff = (a - b).abs();
+    if a == 0.0 || b == 0.0 || abs_sum < f64::MIN_POSITIVE {
+        return diff < epsilon * f64::MIN_POSITIVE;
+    }
+    diff / abs_sum.min(f64::MAX) < epsilon
 }
 
 #[derive(Default)]
@@ -534,4 +600,106 @@ fn merge_same_le(xss: &mut [LeTimeseries]) -> Vec<LeTimeseries> {
         }
     }
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::labels::Labels;
+
+    fn buckets(pairs: &[(f64, f64)]) -> Vec<ClassicBucket> {
+        pairs
+            .iter()
+            .map(|&(upper_bound, count)| ClassicBucket { upper_bound, count })
+            .collect()
+    }
+
+    const INF: f64 = f64::INFINITY;
+
+    #[test]
+    fn out_of_range_phi_answers_before_the_buckets_are_read() {
+        // Even a histogram with no observations, or no buckets at all.
+        let mut empty = buckets(&[(1.0, 0.0), (INF, 0.0)]);
+        assert_eq!(bucket_quantile(1.5, &mut empty), INF);
+        assert_eq!(bucket_quantile(-0.5, &mut Vec::new()), f64::NEG_INFINITY);
+        assert!(bucket_quantile(f64::NAN, &mut empty).is_nan());
+    }
+
+    #[test]
+    fn incomplete_or_empty_histograms_are_nan() {
+        // No +Inf bucket.
+        assert!(bucket_quantile(0.5, &mut buckets(&[(1.0, 5.0), (2.0, 10.0)])).is_nan());
+        // Only the +Inf bucket.
+        assert!(bucket_quantile(0.5, &mut buckets(&[(INF, 10.0)])).is_nan());
+        // No observations.
+        assert!(bucket_quantile(0.5, &mut buckets(&[(1.0, 0.0), (INF, 0.0)])).is_nan());
+    }
+
+    #[test]
+    fn interpolates_within_the_bucket_holding_the_rank() {
+        let mut h = buckets(&[(INF, 10.0), (1.0, 2.0), (2.0, 6.0)]); // unsorted on purpose
+        // rank 4 falls in (1, 2], two of its four observations in.
+        assert_eq!(bucket_quantile(0.4, &mut h), 1.5);
+        // The lowest bucket interpolates from 0 when its bound is above 0.
+        assert_eq!(bucket_quantile(0.1, &mut h), 0.5);
+        // A rank in the +Inf bucket answers the highest finite bound.
+        assert_eq!(bucket_quantile(0.9, &mut h), 2.0);
+    }
+
+    #[test]
+    fn a_lowest_bucket_at_or_below_zero_answers_its_bound() {
+        let mut h = buckets(&[(-1.0, 5.0), (INF, 10.0)]);
+        assert_eq!(bucket_quantile(0.25, &mut h), -1.0);
+    }
+
+    #[test]
+    fn same_bound_buckets_merge_and_counts_are_made_monotonic() {
+        // Two `le="1"` series sum to 4; the dip at le=2 is lifted to 4.
+        let mut h = buckets(&[(1.0, 1.0), (1.0, 3.0), (2.0, 3.0), (INF, 8.0)]);
+        // rank 4 is reached at le=1 exactly.
+        assert_eq!(bucket_quantile(0.5, &mut h), 1.0);
+    }
+
+    fn bucket(name: &str, le: &str, value: f64) -> EvalSample {
+        EvalSample {
+            timestamp_ms: 1000,
+            value,
+            labels: Labels::from_pairs(&[("__name__", name), ("job", "x"), ("le", le)]).into(),
+            drop_name: false,
+        }
+    }
+
+    #[test]
+    fn histograms_are_grouped_by_name_too_and_bad_le_is_skipped() {
+        let series = vec![
+            bucket("a_bucket", "1", 2.0),
+            bucket("a_bucket", "+Inf", 4.0),
+            bucket("b_bucket", "1", 1.0),
+            bucket("b_bucket", "+Inf", 4.0),
+            // Not a float: not a bucket.
+            bucket("a_bucket", "1kb", 100.0),
+        ];
+        let result = histogram_quantile(vec![
+            PromQLArg::Scalar(0.25),
+            PromQLArg::InstantVector(series),
+        ])
+        .unwrap();
+        let ExprResult::InstantVector(mut samples) = result else {
+            panic!("expected an instant vector");
+        };
+        samples.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(samples.len(), 2, "one result per histogram");
+        // a: rank 1 of (0, 1] holding 2 → 0.5; b: rank 1 of (0, 1] holding 1 → 1.
+        assert_eq!(samples[0].labels.get("__name__"), Some("a_bucket"));
+        assert_eq!(samples[0].value, 0.5);
+        assert_eq!(samples[1].labels.get("__name__"), Some("b_bucket"));
+        assert_eq!(samples[1].value, 1.0);
+        for s in &samples {
+            assert!(
+                s.drop_name,
+                "the name is dropped when the result is rendered"
+            );
+            assert_eq!(s.labels.get("le"), None);
+        }
+    }
 }
