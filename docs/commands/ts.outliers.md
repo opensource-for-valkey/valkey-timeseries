@@ -128,8 +128,9 @@ threshold you picked — which makes ESD the method to reach for when you do not
 already known to be clean apart from the outliers being sought; on a series where the outliers are large, the mean and
 standard deviation are inflated by those same outliers and the test loses power against them (the masking effect).
 
-One caveat specific to `HYBRID`: when more than half the samples in the range share a single value, the MAD is zero,
-the test statistic is undefined, and no outliers are reported. Use `CLASSIC` on such series.
+When more than half the samples in the range share a single value, the MAD is zero. `HYBRID` then uses the mean
+absolute deviation from the median, scaled by `1.253314`, as its scale, so a lone spike on a flat series is still
+reported. A perfectly constant series has nothing to report.
 
 ESD reports no `method_info` in `FULL` output — it fits no fences or control limits.
 
@@ -191,7 +192,9 @@ METHOD MODIFIED-ZSCORE [THRESHOLD threshold]
 
 * `THRESHOLD` - Modified Z-score threshold. Default: `3.5`. More robust to outliers than standard Z-score.
 
-Uses `0.6745 × (value - median) / MAD` for scoring.
+Uses `0.6745 × (value - median) / MAD` for scoring. When more than half the samples equal the median (so the MAD is
+`0`, as in a flat series with a single spike), the mean absolute deviation, scaled by `1.253314`, is used in place of
+`MAD / 0.6745`. A perfectly constant series has nothing to flag.
 
 ---
 
@@ -269,6 +272,8 @@ METHOD RCF [NUM_TREES trees]
 Either `THRESHOLD` or `CONTAMINATION` must be specified to determine the cutoff for anomaly scores. `THRESHOLD` sets a
 fixed score
 threshold, while `CONTAMINATION` determines the threshold based on the expected proportion of anomalies in the data.
+
+The forest is built with a fixed random seed, so the same query over the same data always returns the same scores.
 
 </details>
 
@@ -513,7 +518,7 @@ Detect pattern-based anomalies using a sliding window:
 ## Notes
 
 * **Minimum data requirements:**
-    * At least 3 data points required for analysis
+    * At least 3 data points required for analysis (not counting NaN or infinite values)
     * For `SEASONALITY`: requires at least `2 × max(period)` samples
 * **Seasonality constraints:**
     * Maximum 4 periods allowed
@@ -524,6 +529,9 @@ Detect pattern-based anomalies using a sliding window:
     * Higher scores indicate stronger anomalies
     * `0.5` is the detection boundary for every method — see [Anomaly scores](#anomaly-scores)
     * With `SEASONALITY`, scores describe the seasonally adjusted residual, not the original value
+* **NaN and infinite values:**
+    * Left out of the analysis: they are neither scored nor flagged, and do not affect how the other samples are
+      scored. In `FULL` output they appear with a `nan` score and a `0` signal.
 * **Timestamp preservation:**
     * Output timestamps match original series timestamps
 * **Performance tips:**
