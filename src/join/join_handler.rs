@@ -49,6 +49,10 @@ where
 
     let join_iter = create_join_iter(left, right, options.join_type);
 
+    // COUNT limits the rows (or, with AGGREGATION, the buckets) the join returns. It is applied
+    // to the output only: truncating each input to COUNT samples beforehand dropped matches
+    // that lay past the first COUNT samples of either side (an INNER join of [10,20,30,40]
+    // with [30,40] under COUNT 2 returned nothing).
     let count = options.count.unwrap_or(usize::MAX);
     if let Some(op) = options.reducer {
         let transform = op.get_handler();
@@ -64,7 +68,7 @@ where
             return Ok(JoinResultType::Samples(result));
         }
 
-        return Ok(JoinResultType::Samples(iter.collect()));
+        return Ok(JoinResultType::Samples(iter.take(count).collect()));
     } else if options.join_type == JoinType::Semi || options.join_type == JoinType::Anti {
         // note that ANTI and SEMI joins return single values per timestamp, so we can use aggregation
         if let Some(aggr_options) = &options.aggregation {
@@ -95,14 +99,10 @@ pub(super) fn transform_join_value_to_sample(item: &JoinValue, f: BinopFunc) -> 
 
 fn fetch_samples(ts: &TimeSeries, options: &JoinOptions) -> Vec<Sample> {
     let (start, end) = options.date_range.get_series_range(ts, None, true);
-    let mut samples = ts.get_range_filtered(
+    ts.get_range_filtered(
         start,
         end,
         options.timestamp_filter.as_deref(),
         options.value_filter,
-    );
-    if let Some(count) = &options.count {
-        samples.truncate(*count);
-    }
-    samples
+    )
 }

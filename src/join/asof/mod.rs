@@ -163,6 +163,12 @@ impl AsOfJoinState for AsOfJoinNearestState {
             if let Some(scan_right_val) = right(self.scan_offset) {
                 if lt_allow_eq(scan_right_val.timestamp, left_val.timestamp, self.allow_eq) {
                     self.best_bound = Some(self.scan_offset);
+                } else if !self.allow_eq && scan_right_val.timestamp == left_val.timestamp {
+                    // An exact match is excluded for this left sample, but it remains a
+                    // candidate for every later one, so look past it without consuming it.
+                    // Letting it into the distance comparison below picked it every time
+                    // (a distance of zero always wins).
+                    return self.nearest_past_exact(left_val, right, n_right);
                 } else {
                     // Now we must compute a difference to see if scan_right_val
                     // is closer than our current best bound.
@@ -190,7 +196,10 @@ impl AsOfJoinState for AsOfJoinNearestState {
                         let best_diff = left_ts.abs_diff(best_right_val.timestamp);
                         let scan_diff = left_ts.abs_diff(scan_right_val.timestamp);
 
-                        lt_allow_eq(scan_diff, best_diff, self.allow_eq)
+                        // Ties go to the later sample ("the last row ... nearest"). This used
+                        // to borrow `allow_eq`, which is about exact timestamp matches, and so
+                        // broke ties the other way whenever exact matches were disallowed.
+                        scan_diff <= best_diff
                     } else {
                         true
                     };
@@ -222,6 +231,43 @@ impl AsOfJoinState for AsOfJoinNearestState {
         }
 
         self.best_bound
+    }
+}
+
+impl AsOfJoinNearestState {
+    /// The nearest match for `left_val` when `right(self.scan_offset)` is an excluded exact
+    /// match: the better of the current best bound (the last sample before it) and the first
+    /// sample after the run of equal timestamps. Leaves the scan state untouched, so later left
+    /// samples still see the equal-timestamp run.
+    fn nearest_past_exact<F: FnMut(IdxSize) -> Option<Sample>>(
+        &self,
+        left_val: &Sample,
+        mut right: F,
+        n_right: IdxSize,
+    ) -> Option<IdxSize> {
+        let left_ts = left_val.timestamp;
+        let mut ahead = self.scan_offset + 1;
+        while ahead < n_right && right(ahead).is_some_and(|r| r.timestamp == left_ts) {
+            ahead += 1;
+        }
+        let later = (ahead < n_right)
+            .then(|| right(ahead).map(|r| (ahead, r.timestamp)))
+            .flatten();
+        let earlier = self
+            .best_bound
+            .and_then(|idx| right(idx).map(|r| (idx, r.timestamp)));
+        match (earlier, later) {
+            (Some((e_idx, e_ts)), Some((l_idx, l_ts))) => {
+                // Ties go to the later sample, as in `next`.
+                if left_ts.abs_diff(l_ts) <= left_ts.abs_diff(e_ts) {
+                    Some(l_idx)
+                } else {
+                    Some(e_idx)
+                }
+            }
+            (Some((idx, _)), None) | (None, Some((idx, _))) => Some(idx),
+            (None, None) => None,
+        }
     }
 }
 

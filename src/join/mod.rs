@@ -116,7 +116,8 @@ impl From<EitherOrBoth<Sample, Sample>> for JoinValue {
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub struct AsOfJoinOptions {
     pub strategy: AsOfJoinStrategy,
-    pub tolerance: Duration,
+    /// Maximum distance to a match; `None` for no limit.
+    pub tolerance: Option<Duration>,
     pub allow_exact_match: bool,
 }
 
@@ -155,8 +156,8 @@ impl Display for JoinType {
             }
             JoinType::AsOf(options) => {
                 write!(f, "ASOF JOIN {}", options.strategy)?;
-                if !options.tolerance.is_zero() {
-                    write!(f, " TOLERANCE {}", humanize_duration(&options.tolerance))?;
+                if let Some(tolerance) = &options.tolerance {
+                    write!(f, " TOLERANCE {}", humanize_duration(tolerance))?;
                 }
                 if options.allow_exact_match {
                     write!(f, " ALLOW EXACT MATCH")?;

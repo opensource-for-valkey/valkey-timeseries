@@ -2,7 +2,7 @@
 
 ```
 TS.JOIN leftKey rightKey fromTimestamp toTimestamp
-    [[INNER] | [FULL] | [LEFT] | [RIGHT] | [ANTI] | [SEMI] | [ASOF [PREVIOUS | NEXT | NEAREST] [tolerance] ALLOW_EXACT_MATCH]]
+    [[INNER] | [FULL] | [LEFT] | [RIGHT] | [ANTI] | [SEMI] | [ASOF [PREVIOUS | NEXT | NEAREST] [tolerance] [ALLOW_EXACT_MATCH [true|false]]]]
     [FILTER_BY_TS ts...]
     [FILTER_BY_VALUE min max]
     [COUNT count]
@@ -87,7 +87,7 @@ there are no matching rows for the sample in the right series.
 
 </details>
 
-<details open><summary><code>ASOF [PREVIOUS | NEXT | NEAREST] tolerance [ALLOW_EXACT_MATCH [true|false]]</code></summary>
+<details open><summary><code>ASOF [PREVIOUS | NEXT | NEAREST] [tolerance] [ALLOW_EXACT_MATCH [true|false]]</code></summary>
 
 `ASOF` joins match each sample in the left series with the closest preceding or following sample in the right series based on 
 timestamps. They are particularly useful for analyzing time-series data where records from different sources may not have 
@@ -95,9 +95,12 @@ perfectly aligned timestamps. ASOF joins solve the problem of finding the value 
 
 #### How It Works
 For each sample in the left table, the join finds the closest matching value from the right table.
-- `PREVIOUS` selects the last row in the right series whose timeseries is less than or equal to the left’s timestamp.
-- `NEXT` (default) selects the first row in the right series whose timestamp is greater than or equal to the left’s timestamp.
-- `NEAREST` selects the last row in the right series whose timestamp is nearest to the left’s timestamp.
+- `PREVIOUS` (default) selects the last row in the right series whose timestamp is less than or equal to the left’s timestamp.
+- `NEXT` selects the first row in the right series whose timestamp is greater than or equal to the left’s timestamp.
+- `NEAREST` selects the row in the right series whose timestamp is nearest to the left’s timestamp. When two rows are
+  equally near, the later one is selected.
+
+A left sample with no match is omitted from the result.
 
 `tolerance` sets a limit on how far apart the timestamps can be while still considering them a match. 
 The tolerance can be specified as:
@@ -105,10 +108,14 @@ The tolerance can be specified as:
  - A duration specified as a string, e.g. 2m
 
 `ALLOW_EXACT_MATCH` is a boolean flag that determines whether to allow exact matches between the left and right series.
+It defaults to `true`. With `false`, a right sample at exactly the left sample's timestamp is never selected for that left
+sample; `PREVIOUS` then looks strictly before it, `NEXT` strictly after it, and `NEAREST` at the nearest sample on
+either side.
 
 
 If not specified, there is no tolerance limit (equivalent to an infinite tolerance). When set, JOIN ASOF will only match 
-keys within the specified tolerance range. Any potential matches outside this range will be treated as no match.
+keys within the specified tolerance range. Any potential matches outside this range will be treated as no match, so a
+tolerance of `0` matches exact timestamps only.
 
 The tolerance works in conjunction with the 'direction' parameter. 
  - For example, with strategy = `PREVIOUS` (the default), it looks for the nearest timestamp within the tolerance range that is less 
@@ -124,7 +131,7 @@ TS.JOIN trades:buy trades:sell -1hr * ASOF NEAREST 2ms REDUCE sub
 
 The result has all samples from the `buy` series joined with samples from the `sell` series. For each timestamp from the 
 `buy` series, the query looks for a timestamp that nearest to it from the `sell` series, within a tolerance of
-2 milliseconds. If no matching timestamp is found, NULL is inserted.
+2 milliseconds. A `buy` sample with no `sell` sample within that tolerance is omitted from the result.
 
 The `sub` transform function is then supplied to subtract the `sell` value from the `buy` value for each sample returned.
 
@@ -137,8 +144,8 @@ It helps prevent incorrect matches that might occur if the nearest available dat
 
 <details open><summary><code>COUNT count</code></summary>
 
-the maximum number of samples to return. 
-TODO: if used with aggregation, this specifies the number of returned buckets as opposed to the number of samples
+The maximum number of rows to return; with `AGGREGATION`, the maximum number of buckets. The limit applies to the
+joined result, not to the samples read from each series.
 
 </details>
 

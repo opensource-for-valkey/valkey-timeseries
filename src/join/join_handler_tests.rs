@@ -2,11 +2,16 @@
 mod tests {
     use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
     use crate::common::Sample;
-    use crate::join::join_handler::join_internal;
-    use crate::join::{JoinOptions, JoinReducer, JoinResultType, JoinType, JoinValue};
+    use crate::join::join_handler::{join_internal, process_join};
+    use crate::join::{
+        AsOfJoinOptions, AsOfJoinStrategy, JoinOptions, JoinReducer, JoinResultType, JoinType,
+        JoinValue,
+    };
+    use crate::series::TimeSeries;
     use crate::series::request_types::AggregationOptions;
     use joinkit::EitherOrBoth;
     use std::ops::Deref;
+    use std::time::Duration;
 
     fn create_basic_samples() -> (Vec<Sample>, Vec<Sample>) {
         let left = vec![
@@ -925,6 +930,125 @@ mod tests {
             }
         } else {
             panic!("Expected Values result type");
+        }
+    }
+
+    fn samples(timestamps: &[i64]) -> Vec<Sample> {
+        timestamps
+            .iter()
+            .map(|&ts| Sample::new(ts, ts as f64))
+            .collect()
+    }
+
+    fn asof_options(
+        strategy: AsOfJoinStrategy,
+        tolerance: Option<Duration>,
+        allow_exact_match: bool,
+    ) -> JoinOptions {
+        let mut options = create_basic_options();
+        options.join_type = JoinType::AsOf(AsOfJoinOptions {
+            strategy,
+            tolerance,
+            allow_exact_match,
+        });
+        options
+    }
+
+    /// The (left, right) timestamp pairs an ASOF join matched.
+    fn asof_pairs(left: &[i64], right: &[i64], options: &JoinOptions) -> Vec<(i64, i64)> {
+        match join_internal(samples(left), samples(right), options).unwrap() {
+            JoinResultType::Values(values) => values
+                .iter()
+                .map(|v| {
+                    let (l, r) = get_both_samples(v);
+                    (l.timestamp, r.timestamp)
+                })
+                .collect(),
+            JoinResultType::Samples(_) => panic!("Expected Values result type"),
+        }
+    }
+
+    #[test]
+    fn test_join_count_limits_output_not_inputs() {
+        // COUNT used to truncate each input to COUNT samples before joining, so matches past
+        // the first COUNT samples of either side were never considered.
+        let mut left = TimeSeries::new();
+        let mut right = TimeSeries::new();
+        for ts in [10, 20, 30, 40] {
+            assert!(left.add(ts, ts as f64, None).is_ok());
+        }
+        for ts in [30, 40] {
+            assert!(right.add(ts, ts as f64, None).is_ok());
+        }
+        let mut options = create_basic_options();
+        options.count = Some(2);
+
+        let JoinResultType::Values(values) = process_join(&left, &right, &options).unwrap() else {
+            panic!("Expected Values result type");
+        };
+        let timestamps: Vec<i64> = values
+            .iter()
+            .map(|v| get_both_samples(v).0.timestamp)
+            .collect();
+        assert_eq!(timestamps, vec![30, 40]);
+
+        options.count = Some(1);
+        let JoinResultType::Values(values) = process_join(&left, &right, &options).unwrap() else {
+            panic!("Expected Values result type");
+        };
+        assert_eq!(values.len(), 1);
+    }
+
+    #[test]
+    fn test_asof_without_tolerance_is_unlimited() {
+        // An omitted TOLERANCE used to mean 0 — exact matches only.
+        let options = asof_options(AsOfJoinStrategy::Backward, None, true);
+        assert_eq!(
+            asof_pairs(&[10, 20], &[5, 15], &options),
+            vec![(10, 5), (20, 15)]
+        );
+
+        let options = asof_options(AsOfJoinStrategy::Backward, Some(Duration::ZERO), true);
+        assert_eq!(asof_pairs(&[10, 20], &[5, 15], &options), vec![]);
+
+        let options = asof_options(
+            AsOfJoinStrategy::Backward,
+            Some(Duration::from_millis(5)),
+            true,
+        );
+        assert_eq!(
+            asof_pairs(&[10, 20], &[5, 16], &options),
+            vec![(10, 5), (20, 16)]
+        );
+        assert_eq!(asof_pairs(&[10, 20], &[4, 16], &options), vec![(20, 16)]);
+    }
+
+    #[test]
+    fn test_asof_nearest_honours_allow_exact_match_false() {
+        let options = asof_options(AsOfJoinStrategy::Nearest, None, false);
+        // The exact match at 10 is excluded; 12 is the nearest remaining.
+        assert_eq!(asof_pairs(&[10], &[10, 12], &options), vec![(10, 12)]);
+        // Excluded for the left sample at 10, but still the nearest for the one at 12.
+        assert_eq!(
+            asof_pairs(&[10, 12], &[10, 15], &options),
+            vec![(10, 15), (12, 10)]
+        );
+        // Nothing but the exact match: no row.
+        assert_eq!(asof_pairs(&[10], &[10], &options), vec![]);
+
+        let options = asof_options(AsOfJoinStrategy::Nearest, None, true);
+        assert_eq!(asof_pairs(&[10], &[10, 12], &options), vec![(10, 10)]);
+    }
+
+    #[test]
+    fn test_asof_nearest_breaks_ties_towards_the_later_sample() {
+        for allow_exact_match in [true, false] {
+            let options = asof_options(AsOfJoinStrategy::Nearest, None, allow_exact_match);
+            assert_eq!(
+                asof_pairs(&[10], &[8, 12], &options),
+                vec![(10, 12)],
+                "allow_exact_match={allow_exact_match}"
+            );
         }
     }
 }

@@ -1435,8 +1435,9 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
 fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinType> {
     use CommandArgToken::*;
 
-    // ASOF already seen
-    let mut tolerance = Duration::default();
+    // ASOF already seen. No tolerance means no limit on the distance to a match; an explicit
+    // `0` means exact timestamps only.
+    let mut tolerance: Option<Duration> = None;
     let mut strategy = AsOfJoinStrategy::Backward;
 
     // ASOF [PREVIOUS | NEXT | NEAREST] [tolerance] [ALLOW_EXACT_MATCH [true|false]]
@@ -1469,7 +1470,7 @@ fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinTy
                 if tolerance_ms < 0 {
                     return Err(ValkeyError::Str(error_consts::INVALID_ASOF_TOLERANCE));
                 }
-                tolerance = Duration::from_millis(tolerance_ms as u64);
+                tolerance = Some(Duration::from_millis(tolerance_ms as u64));
                 let _ = args.next_arg()?;
             }
         }

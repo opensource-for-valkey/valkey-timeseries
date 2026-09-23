@@ -12,7 +12,7 @@ where
     left: L,
     right: R,
     strategy: AsOfJoinStrategy,
-    tolerance: Duration,
+    tolerance: Option<Duration>,
     allow_eq: bool,
     items: Vec<(Sample, Sample)>,
     idx: usize,
@@ -27,7 +27,7 @@ where
         left: IL,
         right: IR,
         strategy: AsOfJoinStrategy,
-        tolerance: Duration,
+        tolerance: Option<Duration>,
         allow_eq: bool,
     ) -> Self
     where
@@ -48,11 +48,12 @@ where
 
     fn init(&mut self) {
         self.is_init = true;
-        let tolerance = self.tolerance.as_millis() as i64;
+        // Always passing `Some` made an omitted TOLERANCE a tolerance of 0 — exact matches
+        // only — where the documented default is no limit.
+        let tolerance = self.tolerance.map(|t| t.as_millis() as i64);
         let left: Vec<Sample> = self.left.by_ref().collect();
         let right: Vec<Sample> = self.right.by_ref().collect();
-        self.items =
-            join_asof_samples(&left, &right, self.strategy, Some(tolerance), self.allow_eq);
+        self.items = join_asof_samples(&left, &right, self.strategy, tolerance, self.allow_eq);
     }
 }
 

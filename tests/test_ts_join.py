@@ -863,3 +863,25 @@ class TestTSJoin(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command(
                 f"TS.JOIN {self.ts1} {self.ts2} {self.now} {self.now + 15000} ANTI REDUCE sum"
             )
+
+    def test_count_limits_joined_rows_not_inputs(self):
+        """COUNT used to truncate each input first, so an INNER join whose matches lie past
+        the first COUNT samples of the left series returned nothing."""
+        self.setup_data()
+        # ts1 covers 1000..10000, ts2 6000..15000: the first matches are at 6000 and 7000.
+        result = self.client.execute_command("TS.JOIN", self.ts1, self.ts2, "-", "+", "COUNT", 2)
+        # Each row is [left sample, right sample].
+        assert [row[0][0] for row in result] == [6000, 7000]
+
+    def test_asof_without_tolerance_is_unlimited(self):
+        """An omitted TOLERANCE is documented as no limit; it used to mean exact matches only."""
+        self.client.execute_command("TS.ADD", "asof:l", 10, 1)
+        self.client.execute_command("TS.ADD", "asof:l", 20, 2)
+        self.client.execute_command("TS.ADD", "asof:r", 5, 10)
+        self.client.execute_command("TS.ADD", "asof:r", 15, 20)
+        result = self.client.execute_command("TS.JOIN", "asof:l", "asof:r", "-", "+", "ASOF", "PREVIOUS")
+        assert [(row[0][0], row[1][0]) for row in result] == [(10, 5), (20, 15)]
+
+        exact_only = self.client.execute_command(
+            "TS.JOIN", "asof:l", "asof:r", "-", "+", "ASOF", "PREVIOUS", 0)
+        assert exact_only == []
