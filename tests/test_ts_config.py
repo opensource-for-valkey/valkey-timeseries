@@ -5,6 +5,7 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from query_result import QueryResult
 
 DEFAULT_CHUNK_SIZE = 4096
 DEFAULT_DUPLICATE_POLICY = "block"

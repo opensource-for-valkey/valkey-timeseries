@@ -308,7 +308,10 @@ with more than 60 distinct values.
 ## Configuration and safeguards
 
 PromQL settings are regular module configuration values and can be inspected with
-`CONFIG GET` or changed with `CONFIG SET`:
+`CONFIG GET` or changed with `CONFIG SET`. A change applies to queries that start after it;
+a query already running keeps the values it started with.
+`ts-promql-max-concurrent-queries` is the exception: it sizes the worker pool and is fixed
+at startup.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
@@ -317,6 +320,7 @@ PromQL settings are regular module configuration values and can be inspected wit
 | `ts-promql-max-query-len` | 4096 bytes | Maximum query string length. |
 | `ts-promql-max-response-series` | 1000 | Maximum returned series; `0` means unlimited. |
 | `ts-promql-max-points-per-timeseries` | 0 | Maximum generated points per series; `0` means unlimited. |
+| `ts-promql-max-samples-per-query` | 50000000 | Maximum samples one query may load across all its reads (Prometheus' `--query.max-samples`); `0` means unlimited. In a cluster each shard applies its own value to what it reads. |
 | `ts-promql-lookback-delta` | 5m | Default sample lookback interval. |
 | `ts-promql-max-lookback` | 0 | Optional upper bound on lookback; `0` uses the lookback delta. |
 | `ts-promql-max-query-duration` | 30s | Maximum wall-clock query duration. |

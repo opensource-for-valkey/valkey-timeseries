@@ -1565,7 +1565,7 @@ fn register_string_param(
                   val: &'static ValkeyGILGuard<ValkeyString>| {
                 let raw = val.get(config_ctx).to_string_lossy();
                 apply(&raw)?;
-                log_config_set(name, &raw);
+                after_config_set(name, &raw);
                 Ok(())
             },
         )),
@@ -1612,7 +1612,7 @@ fn register_i64_param(
                 if let Some(validate) = validate {
                     validate(value)?;
                 }
-                log_config_set(name, &value.to_string());
+                after_config_set(name, &value.to_string());
                 Ok(())
             },
         )),
@@ -1641,7 +1641,7 @@ fn register_bool_param(
         None,
         Some(Box::new(
             move |config_ctx: &ConfigurationContext, name: &str, val: &'static AtomicBool| {
-                log_config_set(name, if val.get(config_ctx) { "yes" } else { "no" });
+                after_config_set(name, if val.get(config_ctx) { "yes" } else { "no" });
                 Ok(())
             },
         )),
@@ -1682,7 +1682,17 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
 
     // Seed the PromQL engine from the freshly resolved startup configuration. `RedisModule_LoadConfigs`
     // above has already run every parameter's set path, so the stores read here hold the values from
-    // `valkey.conf` / `MODULE LOAD` args, or the registered defaults.
+    // `valkey.conf` / `MODULE LOAD` args, or the registered defaults. Later changes re-sync from
+    // each parameter's set callback (see `after_config_set`).
+    sync_promql_config();
+
+    Ok(())
+}
+
+/// Copy every PromQL parameter from its store into `PROMQL_CONFIG`, the snapshot the engine
+/// reads. Run once the startup configuration is resolved, and again after every accepted
+/// change to one of them, so `CONFIG SET ts-promql-*` takes effect for the next query.
+fn sync_promql_config() {
     update_prom_config(|cfg| {
         // Query stats and tracing follow `debug-mode`.
         cfg.stats_enabled = is_debug_mode_enabled();
@@ -1704,13 +1714,38 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
         cfg.max_query_duration =
             Duration::from_millis(PROMQL_MAX_QUERY_DURATION_MS.load(Ordering::Relaxed) as u64);
     });
+}
 
-    Ok(())
+/// Whether a change to parameter `name` must re-sync the PromQL engine's snapshot: every
+/// `ts-promql-*` parameter, and `debug-mode`, which query stats and tracing follow.
+fn feeds_promql_config(name: &str) -> bool {
+    name.get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ts-promql-"))
+        || name.eq_ignore_ascii_case("debug-mode")
+}
+
+/// Everything that follows an accepted configuration change, for every parameter type.
+fn after_config_set(name: &str, value: &str) {
+    log_config_set(name, value);
+    if feeds_promql_config(name) {
+        sync_promql_config();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promql_parameters_and_debug_mode_resync_the_engine_snapshot() {
+        for name in CONFIGS.iter().map(|desc| desc.name) {
+            let expected = name.starts_with("ts-promql-") || name == "debug-mode";
+            assert_eq!(feeds_promql_config(name), expected, "{name}");
+        }
+        // The server matches parameter names case-insensitively.
+        assert!(feeds_promql_config("TS-PROMQL-MAX-QUERY-LEN"));
+        assert!(!feeds_promql_config("ts-promql"));
+    }
 
     /// The exact default string each parameter is registered with. Registration defaults are
     /// user-visible (`CONFIG GET` reports them on a fresh server), so the registry must

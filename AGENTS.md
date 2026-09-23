@@ -159,8 +159,9 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   `cargo run --bin compression_report` needs `--features enable-system-alloc,test-utils` named
   explicitly, even though `cargo test`/`cargo bench` get `test-utils` automatically via the
   self dev-dependency.
-- `CONFIG SET` is not live for `ts-promql-*` params — they're seeded once at startup from
-  `PROMQL_CONFIG`; there is no config-changed handler for them.
+- The PromQL engine reads `ts-promql-*` params from the `PROMQL_CONFIG` snapshot, which
+  `sync_promql_config` (`src/config.rs`) refreshes after every accepted `CONFIG SET`. A new
+  PromQL param must be copied there too, or `CONFIG SET` accepts it and no query sees it.
 
 ## Where to look first
 
