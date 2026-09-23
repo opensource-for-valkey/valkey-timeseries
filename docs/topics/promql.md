@@ -203,6 +203,13 @@ The following differences are intentional or are limitations of the current impl
   accept scalar and instant-vector roots for range queries and reject range-vector roots.
   `TS.QUERYRANGE` also rejects string roots; strings remain available as instant-query
   results where the expression produces one.
+- **An unmatched duplicate on the "one" side is not an error.** In one-to-one vector
+  matching, Prometheus rejects a match key that repeats on the right-hand side even when
+  nothing on the left matches it. Valkey TimeSeries reports a repeated key only when it
+  is matched, because filter push-down usually never reads the unmatched series; the
+  stricter rule would make the same query fail or succeed depending on the data and the
+  push-down settings. A comparison over an ambiguous *matched* key errors as in
+  Prometheus, even where the comparison would have filtered the pair out.
 - **Operational behavior is different.** Query limits, timeouts, cluster fan-out,
   ordering, and the `HASHTAG` scope are Valkey TimeSeries behavior. They can affect which
   series are read or returned without changing the PromQL grammar.

@@ -279,7 +279,9 @@ fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
 
 /// Sentinel stored in the probe map for an RHS match key seen more than once.
 /// Only an error once an LHS sample actually matches the key; a repeated key
-/// that matches nothing produces nothing and is legal.
+/// that matches nothing produces nothing and is legal. (Prometheus rejects it
+/// while indexing the right-hand side; see [`validate_one_side`] for why this
+/// engine does not.)
 const NO_MATCH: u32 = u32::MAX;
 /// Sentinel stored in the probe map for an RHS match key already paired with
 /// an LHS sample. Catches a repeated LHS key without a second set.
@@ -681,6 +683,13 @@ fn skip_group_count(
 ///   is what keeps the output series identity unique.
 /// - Under one-to-one an *unmatched* key emits nothing, so a repeat there is
 ///   harmless; only a matched key is ambiguous. That is the `matched` flag.
+///
+///   Prometheus is stricter: it rejects any repeat on the one side while
+///   indexing it, matched or not. Here filter push-down reads each operand
+///   narrowed by the other's labels, so an unmatched repeat is often never
+///   read at all; erroring on it would make a query fail or succeed depending
+///   on the data and the push-down settings. Tolerating it keeps the result
+///   the same either way.
 ///
 /// The three call sites (a matched key, an unmatched key with a fill, an
 /// unmatched key without one) differ in when they run, not in the rule, so they
