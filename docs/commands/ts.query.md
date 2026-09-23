@@ -94,6 +94,11 @@ rejected with `TSDB: missing HASHTAG argument`.
 
 The command returns the result of the PromQL evaluation. The format depends on the query result type (scalar or vector).
 
+The query is evaluated on a background worker, so `TS.QUERY` blocks the calling client until the
+result is ready. It is therefore rejected inside `MULTI`/`EXEC`, inside a script (`EVAL`,
+`FCALL`), and from a module call that cannot block, with
+`TSDB: TS.QUERY and TS.QUERYRANGE are not allowed inside MULTI, EVAL, or a deny-blocking context`.
+
 ### Example
 
 ```
