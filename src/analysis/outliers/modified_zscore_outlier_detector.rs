@@ -1,6 +1,6 @@
 use super::utils::{deviation_and_fence_distance, normalize_evidence, normalize_value};
 use crate::analysis::TimeSeriesAnalysisResult;
-use crate::analysis::math::calculate_median_sorted;
+use crate::analysis::math::{calculate_median_sorted, robust_scale_from_sorted_abs_devs};
 use crate::analysis::outliers::{
     AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal, MethodInfo, PointDetector,
     detect_pointwise,
@@ -117,9 +117,10 @@ impl AnomalyDetector for ModifiedZScoreOutlierDetector {
 
         let mad = calculate_median_sorted(&abs_deviations);
 
-        // Scale Mad for consistency with normal distribution
-        let mad_scaled = mad / 0.6745;
-        self.mad_scaled = mad_scaled;
+        // Scale MAD for consistency with the normal distribution (MAD / 0.6745), falling back
+        // to the mean absolute deviation when the MAD is zero — see
+        // `robust_scale_from_sorted_abs_devs`.
+        self.mad_scaled = robust_scale_from_sorted_abs_devs(&abs_deviations);
         self.median = median;
         self.mad = mad;
         self.is_trained = true;

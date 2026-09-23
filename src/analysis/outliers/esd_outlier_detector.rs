@@ -1,4 +1,4 @@
-use crate::analysis::math::calculate_median_sorted;
+use crate::analysis::math::{calculate_median_sorted, robust_scale_from_sorted_abs_devs};
 use crate::analysis::outliers::utils::normalize_evidence;
 use crate::analysis::outliers::{
     Anomaly, AnomalyDetector, AnomalyMethod, AnomalyResult, AnomalySignal,
@@ -394,9 +394,10 @@ fn loc_and_scale(values: &[(usize, f64)], estimator: EsdEstimator) -> Option<(f6
             let loc = median_values(values);
             let mut abs_devs: Vec<f64> = values.iter().map(|(_, x)| (x - loc).abs()).collect();
             abs_devs.sort_by(f64::total_cmp);
-            let mad = calculate_median_sorted(&abs_devs);
-            // MAD * 1.4826 is a consistent estimator for the standard deviation of a normal distribution
-            Some((loc, mad * 1.4826))
+            // MAD * 1.4826 is a consistent estimator for the standard deviation of a normal
+            // distribution; with a zero MAD this falls back to the mean absolute deviation, or
+            // a flat series with one spike could never reject anything.
+            Some((loc, robust_scale_from_sorted_abs_devs(&abs_devs)))
         }
     }
 }

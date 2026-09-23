@@ -46,6 +46,23 @@ pub fn calculate_variance(values: &[f64]) -> f64 {
     finite.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((n - 1) as f64)
 }
 
+/// Normal-consistent robust scale from absolute deviations about the median, sorted
+/// ascending: 1.4826 × MAD.
+///
+/// When more than half the points sit exactly on the median the MAD is 0 — a flat series
+/// with a single spike is the common case — and a detector dividing by it can never flag
+/// anything. There the mean absolute deviation stands in, scaled by 1.253314 to be
+/// normal-consistent (Iglewicz & Hoaglin's fallback for the modified z-score). Only a
+/// perfectly constant input still has a zero scale.
+pub fn robust_scale_from_sorted_abs_devs(sorted_abs_devs: &[f64]) -> f64 {
+    let mad = calculate_median_sorted(sorted_abs_devs);
+    if mad > 0.0 || sorted_abs_devs.is_empty() {
+        return mad * 1.4826;
+    }
+    let mean_abs_dev = sorted_abs_devs.iter().sum::<f64>() / sorted_abs_devs.len() as f64;
+    mean_abs_dev * 1.253314
+}
+
 pub fn calculate_median_sorted(sorted: &[f64]) -> f64 {
     let n = sorted.len();
     if n == 0 {
