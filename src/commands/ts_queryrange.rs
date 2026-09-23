@@ -5,7 +5,7 @@ use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::current_time_millis;
 use crate::promql::QueryError;
 use crate::promql::QueryValue;
-use crate::promql::engine::query_workers::submit_query;
+use crate::promql::engine::query_workers::{run_evaluation, submit_query};
 use crate::promql::engine::{PROMQL_CONFIG, evaluate_range};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -60,7 +60,7 @@ pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
             return;
         }
 
-        let result = match evaluate_range(querier, eval_stmt, options) {
+        let result = match run_evaluation(|| evaluate_range(querier, eval_stmt, options)) {
             Ok(res) => res,
             Err(err) => {
                 let e = ValkeyError::String(err.to_string());

@@ -17,9 +17,12 @@
 //! blocks steals other jobs while it waits (see
 //! `SelectorBatchExecutor`'s design notes for what that did). A plain thread
 //! waits without stealing.
+//!
+//! An evaluation's own parallel work runs on [`EVAL_POOL`], never the global
+//! rayon pool: see [`run_evaluation`].
 
 use crate::common::logging::log_warning;
-use crate::config::{max_concurrent_queries, max_queued_queries};
+use crate::config::{max_concurrent_queries, max_queued_queries, num_threads};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -89,6 +92,38 @@ fn run_job(worker: usize, job: Job) {
     }
 }
 
+/// The rayon pool PromQL evaluations fan out on, sized like the global pool
+/// (`ts-num-threads`).
+///
+/// An evaluation's parallel jobs block: they ask the selector executor for data
+/// and wait, and the executor needs the module GIL to answer. On the global pool
+/// those parked jobs could occupy every worker while a GIL holder — `TS.RANGE`
+/// over enough chunks, `TS.MRANGE`, the trim cron, a shard's local fan-out
+/// handler — waits on that same pool for its own parallel decode: the holder
+/// waits on the pool, the pool waits on the executor, the executor waits on the
+/// holder, and the server freezes. Here the parked jobs can only exhaust this
+/// pool, which no GIL holder ever waits on, so the global pool always drains.
+static EVAL_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
+    rayon_core::ThreadPoolBuilder::new()
+        .num_threads(num_threads())
+        .thread_name(|index| format!("ts-promql-eval-{index}"))
+        .build()
+        .expect("failed to build the PromQL evaluation pool")
+});
+
+/// Run a PromQL evaluation on [`EVAL_POOL`].
+///
+/// Every parallel entry point the evaluation reaches — the `*_rayon` iterators,
+/// `threads::join`, `threads::spawn` — resolves to the pool of the worker that
+/// calls it, so installing the evaluation here moves all of its nested work off
+/// the global pool without touching those call sites.
+///
+/// Wrap only the evaluation, never the reply: replying takes the GIL, and a GIL
+/// holder must not run on a pool that parks on the executor.
+pub(crate) fn run_evaluation<R: Send>(evaluate: impl FnOnce() -> R + Send) -> R {
+    EVAL_POOL.install(evaluate)
+}
+
 /// Why [`submit_query`] did not queue a job. In every case the caller still
 /// owns the reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +186,13 @@ pub(crate) fn stats() -> QueryWorkerStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{REJECTED, SubmitError, stats, submit_query};
-    use crate::config::{DEFAULT_QUEUED_QUERIES, MAX_QUEUED_QUERIES_CELL, max_concurrent_queries};
-    use std::sync::atomic::Ordering;
+    use super::{REJECTED, SubmitError, run_evaluation, stats, submit_query};
+    use crate::common::threads::IntoParRayon;
+    use crate::config::{
+        DEFAULT_QUEUED_QUERIES, MAX_QUEUED_QUERIES_CELL, max_concurrent_queries, num_threads,
+    };
+    use orx_parallel::ParIter;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;
 
@@ -254,6 +293,73 @@ mod tests {
         let mut served: Vec<usize> = rx.iter().collect();
         served.sort_unstable();
         assert_eq!(served, (0..LIMIT).collect::<Vec<_>>());
+    }
+
+    /// The freeze [`EVAL_POOL`](super::EVAL_POOL) exists to prevent: evaluation
+    /// jobs parked on a processor that needs the GIL (a mutex here), while the
+    /// GIL holder waits on the global pool for its own parallel work. With the
+    /// evaluation on the global pool, the parked jobs hold every global worker
+    /// and the holder's fan-out never runs.
+    #[test]
+    fn parked_evaluations_never_starve_a_gil_holder_on_the_global_pool() {
+        let gil = Arc::new(Mutex::new(()));
+        let held = gil.lock().unwrap();
+
+        let (task_tx, task_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
+        let processor_gil = Arc::clone(&gil);
+        std::thread::spawn(move || {
+            for responder in task_rx {
+                let _gil = processor_gil.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = responder.send(());
+            }
+        });
+
+        // Enough parking jobs to occupy every worker of either pool.
+        let eval_workers = num_threads();
+        let jobs = 2 * eval_workers.max(rayon_core::current_num_threads());
+        let parked = Arc::new(AtomicUsize::new(0));
+        let off_eval_pool = Arc::new(AtomicUsize::new(0));
+        let evaluation = {
+            let (parked, off_eval_pool) = (Arc::clone(&parked), Arc::clone(&off_eval_pool));
+            std::thread::spawn(move || {
+                run_evaluation(|| {
+                    (0..jobs).into_par_rayon().for_each(|_| {
+                        let on_eval_pool = std::thread::current()
+                            .name()
+                            .is_some_and(|name| name.starts_with("ts-promql-eval-"));
+                        if !on_eval_pool {
+                            off_eval_pool.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let (tx, rx) = mpsc::sync_channel(1);
+                        task_tx.send(tx).unwrap();
+                        parked.fetch_add(1, Ordering::AcqRel);
+                        rx.recv().unwrap();
+                    })
+                })
+            })
+        };
+        let parked_by = std::time::Instant::now() + Duration::from_secs(10);
+        while parked.load(Ordering::Acquire) < eval_workers {
+            assert!(
+                std::time::Instant::now() < parked_by,
+                "evaluation jobs never parked"
+            );
+            std::thread::yield_now();
+        }
+
+        // The GIL holder's own fan-out, on the global pool.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send((0..10_000usize).into_par_rayon().sum::<usize>());
+        });
+        let sum = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("parked evaluation jobs starved the global pool");
+        assert_eq!(sum, (0..10_000usize).sum::<usize>());
+
+        drop(held);
+        evaluation.join().unwrap();
+        assert_eq!(off_eval_pool.load(Ordering::Relaxed), 0);
     }
 
     #[test]

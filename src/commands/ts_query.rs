@@ -4,7 +4,7 @@ use crate::common::context::get_current_db;
 use crate::common::context::{ClientThreadSafeContext, create_blocked_client};
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::promql::QueryError;
-use crate::promql::engine::query_workers::submit_query;
+use crate::promql::engine::query_workers::{run_evaluation, submit_query};
 use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -55,7 +55,8 @@ pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             return;
         }
 
-        let result = match evaluate_instant(querier, eval_stmt, eval_ts, options) {
+        let result = match run_evaluation(|| evaluate_instant(querier, eval_stmt, eval_ts, options))
+        {
             Ok(eval_stmt) => eval_stmt,
             Err(err) => {
                 let e = ValkeyError::String(err.to_string());
