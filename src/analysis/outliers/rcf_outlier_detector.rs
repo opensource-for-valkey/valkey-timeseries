@@ -176,10 +176,18 @@ impl From<RCFOptions> for RandomCutForestOptions {
             output_after: options.output_after,
             parallel_execution_enabled,
             internal_shingling,
+            // Fixed so the same query over the same data scores the same way every time.
+            // Without it the forest seeds itself from the thread RNG, and two identical
+            // TS.OUTLIERS calls disagreed on most scores (335 of 400 in one measurement).
+            random_seed: Some(RCF_RANDOM_SEED),
             ..Default::default()
         }
     }
 }
+
+/// Seed for the forest's random cuts. Any constant works; it only has to be the same on
+/// every call (and every node).
+const RCF_RANDOM_SEED: u64 = 0x005E_ED0F_7153;
 
 /// Outlier detector backed by a Random Cut Forest (Rcf).
 #[derive(Debug, Clone)]
@@ -1153,5 +1161,36 @@ mod tests {
             "Should not detect too many anomalies, got {}",
             result.anomalies.len()
         );
+    }
+
+    #[test]
+    fn rcf_scores_are_reproducible() {
+        // The forest used to seed itself from the thread RNG, so identical calls disagreed.
+        let data: Vec<f64> = (0..400)
+            .map(|i| 100.0 + ((i * 7919) % 97) as f64 / 10.0 + if i == 300 { 50.0 } else { 0.0 })
+            .collect();
+        let scores = |parallel_enabled: Option<bool>| -> Vec<u64> {
+            let mut detector = RcfOutlierDetector::new(RCFOptions {
+                num_trees: Some(100),
+                sample_size: Some(256),
+                threshold: None,
+                time_decay: None,
+                shingle_size: Some(4),
+                output_after: None,
+                parallel_enabled,
+            })
+            .unwrap();
+            detector.train(&data).unwrap();
+            let result = detector.detect(&data).unwrap();
+            // Compare bit patterns so NaN scores compare equal.
+            result.scores.iter().map(|s| s.to_bits()).collect()
+        };
+        for parallel_enabled in [Some(false), None] {
+            assert_eq!(
+                scores(parallel_enabled),
+                scores(parallel_enabled),
+                "parallel_enabled={parallel_enabled:?}"
+            );
+        }
     }
 }
