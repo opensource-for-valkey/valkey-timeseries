@@ -404,6 +404,12 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
 
     match (&options.aggregation, grouping) {
         (Some(agg), Some(grp)) => {
+            // Only valid when `base_iter` is a single series: this buckets the whole stream
+            // and then reduces one value per bucket. A multi-series group has to bucket each
+            // series on its own before reducing across them (`get_grouped_samples`,
+            // `reduce_aggregated_group`); bucketing their merged samples here gave the reducer
+            // one value per bucket instead of one per series.
+            //
             // No carry here: the group reducer combines across series, so a gap in one
             // series is not a gap in the reduced bucket.
             let aggr_iter = create_aggregate_iterator(filtered, options, agg, empty_fill);

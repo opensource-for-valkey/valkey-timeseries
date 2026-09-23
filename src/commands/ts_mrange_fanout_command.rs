@@ -14,12 +14,13 @@ use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::iterators::{
-    MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, create_sample_iterator_adapter,
+    MultiSeriesRowIter, MultiSeriesSampleIter, RowReducer, SampleReducer,
+    create_sample_iterator_adapter,
 };
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 use crate::series::mrange::{
-    SampleLimit, build_mrange_grouped_labels, collect_rows, process_mrange_group_partials,
-    process_mrange_query, sort_mrange_results,
+    SampleLimit, build_mrange_grouped_labels, collect_rows, collect_samples,
+    process_mrange_group_partials, process_mrange_query, sort_mrange_results,
 };
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
@@ -700,6 +701,13 @@ fn process_group(
             options.is_reverse,
             options.range.count,
         ))
+    } else if options.range.aggregation.is_some() {
+        // The shards sent raw samples (no aggregation push-down): bucket each series first,
+        // then reduce across series.
+        let samples = reduce_aggregated_group(&data.series, options, group_options);
+        SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
+            samples,
+        )))
     } else {
         let samples = process_series_list(&data.series, options);
         SeriesResultData::Chunk(TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
@@ -728,6 +736,40 @@ fn process_group(
         sources: data.keys.to_vec(),
         data: result_data,
     }
+}
+
+/// GROUPBY … REDUCE over raw samples with AGGREGATION: aggregate each series on its own,
+/// k-way merge the per-series buckets, then reduce across series — as the single-node path
+/// (`get_grouped_samples`) does.
+///
+/// Routing this through `process_series_list` merged the raw samples of every series and
+/// bucketed the merged stream, so the reducer saw one value per bucket rather than one per
+/// series: `AGGREGATION max 10` + `REDUCE sum` over A={1,1} and B={2,2} gave 2, not 3.
+///
+/// Each series runs ascending with COUNT withheld; COUNT and the requested order apply to
+/// the reduced stream.
+fn reduce_aggregated_group(
+    series: &[MRangeSeriesResult],
+    options: &MRangeOptions,
+    group_options: &RangeGroupingOptions,
+) -> Vec<Sample> {
+    let mut range = options.range.clone();
+    let count = range.count.take();
+    let per_series = series
+        .iter()
+        .map(|s| {
+            create_sample_iterator_adapter(
+                s.data.sample_iter(),
+                &range,
+                &None,
+                false,
+                EmptyFillBounds::default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let merged = MultiSeriesSampleIter::new(per_series);
+    let reducer = SampleReducer::new(merged, group_options.aggregation.create_aggregator());
+    collect_samples(reducer, options.is_reverse, count)
 }
 
 fn process_series_samples(
@@ -1005,6 +1047,71 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].labels.is_empty());
         assert_eq!(results[0].key, "region=us".as_bytes());
+    }
+
+    /// GROUPBY + REDUCE with AGGREGATION when the shards did not aggregate (push-down off):
+    /// the coordinator must bucket each series before reducing across series, and so agree
+    /// with the push-down result. It used to bucket the merged stream of the whole group.
+    #[test]
+    fn test_grouped_aggregation_without_pushdown_reduces_per_series_buckets() {
+        let raw_a = samples(&[(0, 1.0), (1, 1.0), (10, 4.0), (25, 1.0)]);
+        let raw_b = samples(&[(0, 2.0), (1, 2.0), (12, 3.0), (27, 6.0)]);
+        let responses = |a: Vec<Sample>, b: Vec<Sample>| {
+            vec![
+                to_response(series_result("a", Some("us"), a)),
+                to_response(series_result("b", Some("us"), b)),
+            ]
+        };
+
+        for (is_reverse, count) in [
+            (false, None),
+            (true, None),
+            (false, Some(2)),
+            (true, Some(2)),
+        ] {
+            let mut options = mrange_options(0, 1000);
+            let mut aggregation = avg_aggregation(10);
+            aggregation.aggregations =
+                smallvec::smallvec![AggregatorConfig::new(AggregationType::Max, None).unwrap()];
+            options.range.aggregation = Some(aggregation);
+            options.range.count = count;
+            options.is_reverse = is_reverse;
+            options.grouping = Some(RangeGroupingOptions {
+                aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+                group_label: "region".into(),
+            });
+
+            let raw = handle_grouping(responses(raw_a.clone(), raw_b.clone()), &options).unwrap();
+
+            // Push-down: each shard buckets its series ascending with COUNT stripped, and the
+            // coordinator runs with aggregation cleared.
+            let mut shard_options = options.clone();
+            shard_options.range.count = None;
+            shard_options.is_reverse = false;
+            let mut coord_options = options.clone();
+            coord_options.range.aggregation = None;
+            let pushed = handle_grouping(
+                responses(
+                    shard_aggregate(raw_a.clone(), &shard_options),
+                    shard_aggregate(raw_b.clone(), &shard_options),
+                ),
+                &coord_options,
+            )
+            .unwrap();
+
+            assert_eq!(
+                result_samples(&raw[0]),
+                result_samples(&pushed[0]),
+                "reverse={is_reverse} count={count:?}"
+            );
+            if !is_reverse && count.is_none() {
+                // max per series per 10ms bucket, summed across the two series.
+                assert_eq!(
+                    result_samples(&raw[0]),
+                    samples(&[(0, 3.0), (10, 7.0), (20, 7.0)])
+                );
+            }
+        }
     }
 
     /// The request flag mirrors the latched push-down decision.
