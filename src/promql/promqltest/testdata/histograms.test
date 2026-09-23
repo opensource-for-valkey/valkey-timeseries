@@ -278,12 +278,9 @@ load 5m
 # - Bucket [-3, -2]: contributes 12-10 = 2.0 observations (full bucket).
 # Total: 2.0 / 100.0 = 0.02
 
-# Skipped: histogram_fraction() does not yet follow Prometheus for this case.
-ignore
 eval instant at 50m histogram_fraction(-4, -2, negative_buckets_lower_falls_in_the_first_bucket_bucket)
 	expect no_warn
 	{} 0.02
-resume
 
 # Skipped: native histogram not supported.
 ignore
@@ -305,12 +302,9 @@ load 5m
 # - Bucket [-2, -1]: contributes (-1.5-(-2))/(-1-(-2)) * (15-12) = 0.5 * 3 = 1.5 observations.
 # Total: (10.0 + 2.0 + 1.5) / 100.0 = 0.135
 
-# Skipped: histogram_fraction() does not yet follow Prometheus for this case.
-ignore
 eval instant at 50m histogram_fraction(-Inf, -1.5, lower_is_negative_Inf_bucket)
 	expect no_warn
 	{} 0.135
-resume
 
 # Skipped: native histogram not supported.
 ignore
@@ -460,12 +454,9 @@ load 5m
 
 # No observations can be captured in a zero-width range.
 
-# Skipped: histogram_fraction() does not yet follow Prometheus for this case.
-ignore
 eval instant at 50m histogram_fraction(2, 2, lower_equals_upper_bucket)
 	expect no_warn
 	{} 0.0
-resume
 
 # Skipped: native histogram not supported.
 ignore
@@ -482,12 +473,9 @@ load 5m
 	lower_greater_than_upper_bucket{le="3"}	 6+0x10
 	lower_greater_than_upper_bucket{le="+Inf"} 100+0x10
 
-# Skipped: histogram_fraction() does not yet follow Prometheus for this case.
-ignore
 eval instant at 50m histogram_fraction(3, 2, lower_greater_than_upper_bucket)
 	expect no_warn
 	{} 0.0
-resume
 
 # Skipped: native histogram not supported.
 ignore
@@ -638,12 +626,9 @@ load 5m
 # - Bucket [0, 1]: 20-15 = 5.0 observations (full bucket).
 # Total: (5.0 + 5.0) / 100.0 = 0.1
 
-# Skipped: histogram_fraction() does not yet follow Prometheus for this case.
-ignore
 eval instant at 50m histogram_fraction(-1, 1, range_crosses_zero_bucket)
 	expect no_warn
 	{} 0.1
-resume
 
 # Skipped: native histogram not supported.
 ignore

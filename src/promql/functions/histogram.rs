@@ -2,14 +2,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::labels::HasFingerprint;
-use crate::parser::number::parse_number;
 use crate::promql::functions::utils::{
     exact_arity_error, expect_instant_vector, expect_scalar, is_inf,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::model::is_stale_nan;
-use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
+use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
 use ahash::AHashMap;
 
 static ELLIPSIS: &str = "...";
@@ -245,86 +244,27 @@ fn vmrange_buckets_to_le(tss: Vec<EvalSample>) -> Vec<EvalSample> {
     rvs
 }
 
-// histogram_fraction is a shortcut for `histogram_share(upperLe, buckets) - histogram_share(lowerLe, buckets)`;
-// histogram_fraction(x, y) = histogram_fraction(-Inf, y) - histogram_fraction(-Inf, x) = histogram_share(y) - histogram_share(x).
-// This function is supported by PromQL.
+/// `histogram_fraction(lower, upper, buckets)`: the estimated fraction of each
+/// classic histogram's observations between `lower` and `upper`, as
+/// Prometheus' `funcHistogramFraction` computes it (see [`bucket_fraction`]).
 fn histogram_fraction(args: Vec<PromQLArg>) -> EvalResult<ExprResult> {
     if args.len() != 3 {
         return Err(exact_arity_error("histogram_fraction", 3, args.len()));
     }
 
     let mut arg_iter = args.into_iter();
-    let lower_bound = arg_iter.next().unwrap();
-    let upper_bound = arg_iter.next().unwrap();
-    let vector = arg_iter.next().unwrap();
+    let lower = expect_scalar(arg_iter.next().unwrap(), "histogram_fraction", "lower")?;
+    let upper = expect_scalar(arg_iter.next().unwrap(), "histogram_fraction", "upper")?;
+    let series = expect_instant_vector(arg_iter.next().unwrap(), "histogram_fraction")?;
 
-    let lower = expect_scalar(lower_bound, "histogram_fraction", "lower")?;
-    let upper = expect_scalar(upper_bound, "histogram_fraction", "upper")?;
-    if lower >= upper {
-        return Err(EvaluationError::ArgumentError(format!(
-            "lower le cannot be greater than upper le; got lower le: {lower}, upper le: {upper}"
-        )));
-    }
+    let rvs = classic_histograms(series)
+        .map(|(mut sample, mut buckets)| {
+            sample.value = bucket_fraction(lower, upper, &mut buckets);
+            sample.drop_name = true;
+            sample
+        })
+        .collect();
 
-    let series = expect_instant_vector(vector, "histogram_fraction")?;
-
-    // Convert buckets with `vmrange` labels to buckets with `le` labels.
-    let mut tss = vmrange_buckets_to_le(series);
-
-    // Group metrics by all tags excluding "le"
-    let m = group_le_timeseries(&mut tss);
-
-    let fraction = |lower_le: f64, upper_le: f64, xss: &mut [LeTimeseries]| -> f64 {
-        if lower_le.is_nan() || upper_le.is_nan() || xss.is_empty() {
-            return f64::NAN;
-        }
-        fix_broken_buckets(xss);
-        let v_last: f64 = xss[xss.len() - 1].ts.value;
-        // Define `share` as a small function that operates on the provided slice
-        // to avoid capturing `xss` by the closure, which would make it FnOnce
-        // and prohibit calling it multiple times.
-        fn share_fn(le_req: f64, xss: &mut [LeTimeseries], v_last: f64) -> f64 {
-            if le_req < 0.0 {
-                return 0.0;
-            }
-            if le_req.is_infinite() && le_req.is_sign_positive() {
-                return 1.0;
-            }
-            let mut v_prev: f64 = 0.0;
-            let mut le_prev: f64 = 0.0;
-            for xs in xss.iter() {
-                let v = xs.ts.value;
-                let le = xs.le;
-                if le_req >= le {
-                    v_prev = v;
-                    le_prev = le;
-                    continue;
-                }
-                // precondition: le_prev <= le_req < le
-                let lower = v_prev / v_last;
-                if le.is_infinite() && le.is_sign_positive() {
-                    return lower;
-                }
-                if le_prev == le_req {
-                    return lower;
-                }
-                let q = lower + (v - v_prev) / v_last * (le_req - le_prev) / (le - le_prev);
-                return q;
-            }
-            1.0
-        }
-        share_fn(upper_le, xss, v_last) - share_fn(lower_le, xss, v_last)
-    };
-
-    let mut rvs: Vec<EvalSample> = Vec::with_capacity(m.len());
-    for (_, mut xss) in m.into_iter() {
-        xss.sort_by(|a, b| a.le.total_cmp(&b.le));
-
-        xss = merge_same_le(&mut xss);
-        let mut dst = xss[0].ts.clone();
-        dst.value = fraction(lower, upper, &mut xss);
-        rvs.push(dst);
-    }
     Ok(ExprResult::InstantVector(rvs))
 }
 
@@ -337,17 +277,32 @@ pub(super) fn histogram_quantile(args: Vec<PromQLArg>) -> EvalResult<ExprResult>
     let phi = expect_scalar(arg_iter.next().unwrap(), "histogram_quantile", "phi")?;
     let series = expect_instant_vector(arg_iter.next().unwrap(), "histogram_quantile")?;
 
-    // VictoriaMetrics `vmrange` buckets become `le` buckets; Prometheus-format
-    // buckets pass through unchanged.
-    let tss = vmrange_buckets_to_le(series);
+    let rvs = classic_histograms(series)
+        .map(|(mut sample, mut buckets)| {
+            sample.value = bucket_quantile(phi, &mut buckets);
+            sample.drop_name = true;
+            sample
+        })
+        .collect();
 
-    // One histogram per label set without `le`, the metric name included, as
-    // Prometheus groups them: the name's drop is pending until the result is
-    // rendered, so `a_bucket` and `b_bucket` stay separate histograms. A
-    // series whose `le` does not parse as a float is not a bucket.
+    Ok(ExprResult::InstantVector(rvs))
+}
+
+/// The classic histograms in `series`, each as its output sample (the first
+/// bucket's, without `le`) and its buckets.
+///
+/// One histogram per label set without `le`, the metric name included, as
+/// Prometheus groups them: the name's drop is pending until the result is
+/// rendered, so `a_bucket` and `b_bucket` stay separate histograms. A series
+/// whose `le` does not parse as a float is not a bucket. VictoriaMetrics
+/// `vmrange` buckets are converted to `le` buckets first; Prometheus-format
+/// buckets pass through unchanged.
+fn classic_histograms(
+    series: Vec<EvalSample>,
+) -> impl Iterator<Item = (EvalSample, Vec<ClassicBucket>)> {
     let mut histograms: FingerprintHashMap<(EvalSample, Vec<ClassicBucket>)> =
         FingerprintHashMap::default();
-    for mut ts in tss {
+    for mut ts in vmrange_buckets_to_le(series) {
         let Some(upper_bound) = ts.labels.get(LE).and_then(|le| le.parse::<f64>().ok()) else {
             continue;
         };
@@ -362,17 +317,7 @@ pub(super) fn histogram_quantile(args: Vec<PromQLArg>) -> EvalResult<ExprResult>
             .1
             .push(bucket);
     }
-
-    let rvs = histograms
-        .into_iter()
-        .map(|(_, (mut sample, mut buckets))| {
-            sample.value = bucket_quantile(phi, &mut buckets);
-            sample.drop_name = true;
-            sample
-        })
-        .collect();
-
-    Ok(ExprResult::InstantVector(rvs))
+    histograms.into_iter().map(|(_, histogram)| histogram)
 }
 
 /// One bucket of a classic histogram: its `le` and its cumulative count.
@@ -520,86 +465,94 @@ fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
     diff / abs_sum.min(f64::MAX) < epsilon
 }
 
-#[derive(Default)]
-pub(super) struct LeTimeseries {
-    pub le: f64,
-    pub ts: EvalSample,
-}
+/// The estimated fraction of a classic histogram's observations in
+/// `[lower, upper]`, as Prometheus' `BucketFraction` (promql/quantile.go)
+/// computes it:
+///
+/// - Without a `+Inf` bucket, with no observations, or with a NaN bound, NaN.
+///   `lower >= upper` is 0, not an error.
+/// - Buckets with the same bound are merged; counts are *not* made monotonic.
+/// - Observations are assumed spread linearly within a bucket. The lowest
+///   bucket starts at 0 when its bound is above 0 and at -Inf otherwise, and
+///   an infinite-width bucket (the first when it starts at -Inf, and `+Inf`)
+///   contributes nothing by interpolation: a bound inside it counts the whole
+///   bucket, or none of it.
+pub(super) fn bucket_fraction(lower: f64, upper: f64, buckets: &mut Vec<ClassicBucket>) -> f64 {
+    buckets.sort_by(|a, b| a.upper_bound.total_cmp(&b.upper_bound));
+    if !buckets
+        .last()
+        .is_some_and(|b| b.upper_bound == f64::INFINITY)
+    {
+        return f64::NAN;
+    }
+    coalesce_buckets(buckets);
 
-fn group_le_timeseries(tss: &mut [EvalSample]) -> FingerprintHashMap<Vec<LeTimeseries>> {
-    let mut m: FingerprintHashMap<Vec<LeTimeseries>> = FingerprintHashMap::default();
+    let count = buckets[buckets.len() - 1].count;
+    if count == 0.0 || lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
 
-    for ts in tss.iter_mut() {
-        if let Some(tag_value) = ts.labels.get(LE) {
-            if tag_value.is_empty() {
-                continue;
+    let mut rank = 0.0;
+    let (mut lower_rank, mut upper_rank) = (0.0, 0.0);
+    let (mut lower_set, mut upper_set) = (false, false);
+
+    let mut lower_bound = if buckets[0].upper_bound <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        0.0
+    };
+
+    for (i, b) in buckets.iter().enumerate() {
+        if i > 0 {
+            lower_bound = buckets[i - 1].upper_bound;
+        }
+        let upper_bound = b.upper_bound;
+
+        // `v` is finite. An infinite-width bucket is not interpolated: for a
+        // +Inf upper bound the second term is 0 and the rank stays at the
+        // previous bucket's, and a -Inf lower bound takes the whole bucket.
+        let interpolate_linearly = |v: f64| -> f64 {
+            if lower_bound == f64::NEG_INFINITY {
+                return b.count;
             }
+            rank + (b.count - rank) * (v - lower_bound) / (upper_bound - lower_bound)
+        };
 
-            if let Ok(le) = parse_number(tag_value) {
-                ts.labels.drop_name();
-                ts.labels.remove("le");
-                let key = ts.labels.fingerprint();
-
-                m.entry(key).or_default().push(LeTimeseries {
-                    le,
-                    ts: std::mem::take(ts),
-                });
-            }
+        if !lower_set && lower_bound >= lower {
+            lower_rank = rank;
+            lower_set = true;
         }
-    }
-
-    m
-}
-
-pub(super) fn fix_broken_buckets(xss: &mut [LeTimeseries]) {
-    // Buckets are already sorted by le, so their values must be in ascending order,
-    // since the next bucket includes all the previous buckets.
-    // If the next bucket has a lower value than the current bucket,
-    // then the current bucket must be substituted with the next bucket value.
-    // See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2819
-    if xss.len() < 2 {
-        return;
-    }
-
-    // Substitute upper bucket values with lower bucket values if the upper values are NaN
-    // or are bigger than the lower bucket values.
-    let mut v_next = xss[0].ts.value; // todo: check i to avoid panic
-    for lts in xss.iter_mut().skip(1) {
-        let v = lts.ts.value;
-        if v.is_nan() || v_next > v {
-            lts.ts.value = v_next;
-        } else {
-            v_next = v;
+        if !upper_set && lower_bound >= upper {
+            upper_rank = rank;
+            upper_set = true;
         }
-    }
-}
-
-fn merge_same_le(xss: &mut [LeTimeseries]) -> Vec<LeTimeseries> {
-    // Merge buckets with identical le values.
-    // See https://github.com/VictoriaMetrics/VictoriaMetrics/pull/3225
-    let mut prev_le = xss[0].le;
-    let mut dst = Vec::with_capacity(xss.len());
-    let mut iter = xss.iter_mut();
-    let first = iter.next();
-    if first.is_none() {
-        return dst;
-    }
-    dst.push(std::mem::take(first.unwrap()));
-    let mut dst_index = 0;
-
-    for xs in iter {
-        if xs.le != prev_le {
-            prev_le = xs.le;
-            dst.push(std::mem::take(xs));
-            dst_index = dst.len() - 1;
-            continue;
+        if lower_set && upper_set {
+            break;
         }
-
-        if let Some(dst) = dst.get_mut(dst_index) {
-            dst.ts.value += xs.ts.value;
+        if !lower_set && lower_bound < lower && upper_bound > lower {
+            lower_rank = interpolate_linearly(lower);
+            lower_set = true;
         }
+        if !upper_set && lower_bound < upper && upper_bound > upper {
+            upper_rank = interpolate_linearly(upper);
+            upper_set = true;
+        }
+        if lower_set && upper_set {
+            break;
+        }
+        rank = b.count;
     }
-    dst
+    if !lower_set || lower_rank > count {
+        lower_rank = count;
+    }
+    if !upper_set || upper_rank > count {
+        upper_rank = count;
+    }
+
+    (upper_rank - lower_rank) / count
 }
 
 #[cfg(test)]
@@ -658,6 +611,36 @@ mod tests {
         let mut h = buckets(&[(1.0, 1.0), (1.0, 3.0), (2.0, 3.0), (INF, 8.0)]);
         // rank 4 is reached at le=1 exactly.
         assert_eq!(bucket_quantile(0.5, &mut h), 1.0);
+    }
+
+    #[test]
+    fn fraction_edge_cases_follow_prometheus() {
+        let h = || buckets(&[(1.0, 2.0), (2.0, 6.0), (INF, 10.0)]);
+        // lower >= upper is an empty range, not an error.
+        assert_eq!(bucket_fraction(2.0, 2.0, &mut h()), 0.0);
+        assert_eq!(bucket_fraction(3.0, 2.0, &mut h()), 0.0);
+        // NaN bounds, no +Inf bucket, or no observations are NaN.
+        assert!(bucket_fraction(f64::NAN, 1.0, &mut h()).is_nan());
+        assert!(bucket_fraction(0.0, 1.0, &mut buckets(&[(1.0, 2.0), (2.0, 6.0)])).is_nan());
+        assert!(bucket_fraction(0.0, 1.0, &mut buckets(&[(1.0, 0.0), (INF, 0.0)])).is_nan());
+        // Linear within a bucket: (1, 2] holds 4 of 10; half of it is 0.2.
+        assert_eq!(bucket_fraction(1.0, 1.5, &mut h()), 0.2);
+        // The lowest bucket starts at 0 when its bound is above 0.
+        assert_eq!(bucket_fraction(0.0, 0.5, &mut h()), 0.1);
+        // The +Inf bucket is not interpolated: nothing above 2 is counted
+        // for an upper bound inside it, all of it for +Inf itself.
+        assert_eq!(bucket_fraction(2.0, 100.0, &mut h()), 0.0);
+        assert_eq!(bucket_fraction(2.0, INF, &mut h()), 0.4);
+    }
+
+    #[test]
+    fn a_lowest_bucket_at_or_below_zero_starts_at_minus_infinity() {
+        // (-Inf, -1] holds 5 of 10 and is not interpolated: any bound inside
+        // it takes the whole bucket.
+        let h = || buckets(&[(-1.0, 5.0), (1.0, 8.0), (INF, 10.0)]);
+        assert_eq!(bucket_fraction(f64::NEG_INFINITY, -2.0, &mut h()), 0.5);
+        // (-1, 1] holds 3; from 0 to 1 is half of it.
+        assert_eq!(bucket_fraction(0.0, 1.0, &mut h()), 0.15);
     }
 
     fn bucket(name: &str, le: &str, value: f64) -> EvalSample {
