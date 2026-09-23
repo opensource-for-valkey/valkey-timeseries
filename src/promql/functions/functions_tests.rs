@@ -1282,6 +1282,25 @@ mod tests {
     }
 
     #[test]
+    fn days_in_month_handles_december_of_the_last_representable_year() {
+        // 8210265408000 s falls in December of chrono's last year: the old
+        // implementation built the 1st of the next month, which does not
+        // exist, and panicked. 2023-12-15 is an ordinary December.
+        let result = call_apply(
+            "days_in_month",
+            PromQLArg::InstantVector(vec![
+                create_sample(8210265408000.0),
+                create_sample(1702598400.0),
+            ]),
+            1000,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].value, 31.0);
+        assert_eq!(result[1].value, 31.0);
+    }
+
+    #[test]
     fn should_truncate_date_time_function_inputs_to_whole_seconds() {
         let result = call_apply(
             "year",

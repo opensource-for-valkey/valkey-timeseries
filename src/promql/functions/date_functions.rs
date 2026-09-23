@@ -2,7 +2,7 @@ use crate::promql::exec::types::EvalLabels;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{exact_arity_error, max_arity_error};
 use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use std::default::Default;
 
 #[derive(Copy, Clone)]
@@ -65,18 +65,11 @@ fn datetime_from_millis(value: i64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(value / 1000, 0)
 }
 
+/// The length of `dt`'s month. Not the distance to the 1st of the next month:
+/// for a December in chrono's last representable year that date does not
+/// exist, and `days_in_month(vector(8210265408000))` panicked the server.
 pub(in crate::promql) fn days_in_month(dt: DateTime<Utc>) -> u32 {
-    let start_of_month =
-        NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1).expect("valid start of month");
-    let start_of_next_month = if dt.month() == 12 {
-        NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1).expect("valid start of next month")
-    } else {
-        NaiveDate::from_ymd_opt(dt.year(), dt.month() + 1, 1).expect("valid start of next month")
-    };
-
-    start_of_next_month
-        .signed_duration_since(start_of_month)
-        .num_days() as u32
+    u32::from(dt.num_days_in_month())
 }
 
 pub(in crate::promql) fn eval_datetime_function(
