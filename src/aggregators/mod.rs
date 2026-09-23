@@ -122,32 +122,36 @@ impl From<Timestamp> for BucketAlignment {
     }
 }
 
+/// The discriminants are persisted: compaction rules write them to RDB (`Aggregator::rdb_save`)
+/// and read them back through `TryFrom<u8>`. They are pinned explicitly so reordering or
+/// inserting a variant cannot silently change the on-disk meaning — new variants take new
+/// numbers.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 #[repr(u8)]
 pub enum AggregationType {
-    All,
-    Any,
-    Avg,
-    Count,
-    CountAll,
-    CountIf,
-    CountNan,
-    First,
-    Increase,
-    IRate,
-    Last,
-    Max,
-    Min,
-    None,
-    Range,
-    Rate,
-    Share,
-    StdP,
-    StdS,
-    Sum,
-    SumIf,
-    VarP,
-    VarS,
+    All = 0,
+    Any = 1,
+    Avg = 2,
+    Count = 3,
+    CountAll = 4,
+    CountIf = 5,
+    CountNan = 6,
+    First = 7,
+    Increase = 8,
+    IRate = 9,
+    Last = 10,
+    Max = 11,
+    Min = 12,
+    None = 13,
+    Range = 14,
+    Rate = 15,
+    Share = 16,
+    StdP = 17,
+    StdS = 18,
+    Sum = 19,
+    SumIf = 20,
+    VarP = 21,
+    VarS = 22,
 }
 
 impl AggregationType {
@@ -362,32 +366,10 @@ impl TryFrom<u8> for AggregationType {
 }
 
 impl From<AggregationType> for u8 {
+    /// The persisted discriminant — the inverse of `TryFrom<u8>`. A hand-written table here
+    /// used to disagree with that for `Sum`, `SumIf`, `StdP` and `StdS`.
     fn from(value: AggregationType) -> Self {
-        match value {
-            AggregationType::All => 0,
-            AggregationType::Any => 1,
-            AggregationType::Avg => 2,
-            AggregationType::Count => 3,
-            AggregationType::CountAll => 4,
-            AggregationType::CountIf => 5,
-            AggregationType::CountNan => 6,
-            AggregationType::First => 7,
-            AggregationType::Increase => 8,
-            AggregationType::IRate => 9,
-            AggregationType::Last => 10,
-            AggregationType::Max => 11,
-            AggregationType::Min => 12,
-            AggregationType::None => 13,
-            AggregationType::Range => 14,
-            AggregationType::Rate => 15,
-            AggregationType::Share => 16,
-            AggregationType::Sum => 17,
-            AggregationType::SumIf => 18,
-            AggregationType::StdP => 19,
-            AggregationType::StdS => 20,
-            AggregationType::VarP => 21,
-            AggregationType::VarS => 22,
-        }
+        value as u8
     }
 }
 
@@ -642,31 +624,40 @@ mod tests {
         assert!(AggregationType::try_from("invalid").is_err());
     }
 
+    const ALL_AGGREGATION_TYPES: [AggregationType; 23] = [
+        AggregationType::All,
+        AggregationType::Any,
+        AggregationType::Avg,
+        AggregationType::Count,
+        AggregationType::CountAll,
+        AggregationType::CountIf,
+        AggregationType::CountNan,
+        AggregationType::First,
+        AggregationType::Increase,
+        AggregationType::IRate,
+        AggregationType::Last,
+        AggregationType::Max,
+        AggregationType::Min,
+        AggregationType::None,
+        AggregationType::Range,
+        AggregationType::Rate,
+        AggregationType::Share,
+        AggregationType::StdP,
+        AggregationType::StdS,
+        AggregationType::Sum,
+        AggregationType::SumIf,
+        AggregationType::VarP,
+        AggregationType::VarS,
+    ];
+
     #[test]
-    fn aggregation_type_to_u8_conversion() {
-        assert_eq!(u8::from(AggregationType::All), 0);
-        assert_eq!(u8::from(AggregationType::Any), 1);
-        assert_eq!(u8::from(AggregationType::Avg), 2);
-        assert_eq!(u8::from(AggregationType::Count), 3);
-        assert_eq!(u8::from(AggregationType::CountAll), 4);
-        assert_eq!(u8::from(AggregationType::CountIf), 5);
-        assert_eq!(u8::from(AggregationType::CountNan), 6);
-        assert_eq!(u8::from(AggregationType::First), 7);
-        assert_eq!(u8::from(AggregationType::Increase), 8);
-        assert_eq!(u8::from(AggregationType::IRate), 9);
-        assert_eq!(u8::from(AggregationType::Last), 10);
-        assert_eq!(u8::from(AggregationType::Max), 11);
-        assert_eq!(u8::from(AggregationType::Min), 12);
-        assert_eq!(u8::from(AggregationType::None), 13);
-        assert_eq!(u8::from(AggregationType::Range), 14);
-        assert_eq!(u8::from(AggregationType::Rate), 15);
-        assert_eq!(u8::from(AggregationType::Share), 16);
-        assert_eq!(u8::from(AggregationType::Sum), 17);
-        assert_eq!(u8::from(AggregationType::SumIf), 18);
-        assert_eq!(u8::from(AggregationType::StdP), 19);
-        assert_eq!(u8::from(AggregationType::StdS), 20);
-        assert_eq!(u8::from(AggregationType::VarP), 21);
-        assert_eq!(u8::from(AggregationType::VarS), 22);
+    fn aggregation_type_u8_round_trips() {
+        for (discriminant, aggregation) in ALL_AGGREGATION_TYPES.iter().enumerate() {
+            let byte = u8::from(*aggregation);
+            // The persisted values: declaration order, pinned by explicit discriminants.
+            assert_eq!(byte as usize, discriminant, "{aggregation:?}");
+            assert_eq!(AggregationType::try_from(byte).unwrap(), *aggregation);
+        }
     }
 
     #[test]
