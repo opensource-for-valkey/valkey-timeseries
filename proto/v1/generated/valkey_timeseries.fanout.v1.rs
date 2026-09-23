@@ -1359,11 +1359,17 @@ pub struct MultiRangeResponse {
     pub applied_group_reduce: bool,
     #[prost(bool, tag = "5")]
     pub applied_count: bool,
-    /// Dictionary `SeriesRangeResponse.label_refs` indexes into. Label interning
-    /// is unconditional, so this is populated
+    /// Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
+    /// index into. Label interning is unconditional, so these are populated
     /// whenever `series` carries any labels; empty otherwise.
-    #[prost(message, optional, tag = "6")]
-    pub symbol_table: ::core::option::Option<SymbolTable>,
+    ///
+    /// Deliberately not a `SymbolTable` message, although it holds the same two
+    /// lists: these are the field numbers and types released nodes decode, and
+    /// changing either breaks TS.MRANGE fan-out in a mixed-version cluster.
+    #[prost(string, repeated, tag = "6")]
+    pub symbol_table_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "7")]
+    pub symbol_table_values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

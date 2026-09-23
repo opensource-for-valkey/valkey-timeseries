@@ -61,10 +61,15 @@ message MultiRangeResponse {
   bool applied_aggregation = 3;
   bool applied_group_reduce = 4;
   bool applied_count = 5;
-  // Dictionary `SeriesRangeResponse.label_refs` indexes into. Label interning
-  // is unconditional, so this is populated
+  // Dictionaries `SeriesRangeResponse.label_name_refs`/`label_value_refs`
+  // index into. Label interning is unconditional, so these are populated
   // whenever `series` carries any labels; empty otherwise.
-  SymbolTable symbol_table = 6;
+  //
+  // Deliberately not a `SymbolTable` message, although it holds the same two
+  // lists: these are the field numbers and types released nodes decode, and
+  // changing either breaks TS.MRANGE fan-out in a mixed-version cluster.
+  repeated string symbol_table_names = 6;
+  repeated string symbol_table_values = 7;
 }
 
 // QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.
