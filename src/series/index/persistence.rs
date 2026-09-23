@@ -279,9 +279,13 @@ pub(crate) fn on_loading_started() {
 }
 
 /// Loading `Ended`: close the load window and kick off reconciliation of preloaded dbs.
-pub(crate) fn on_loading_ended() {
+///
+/// `keys_expired` is the server's count of keys the load discarded as already expired
+/// (`rdb_last_load_keys_expired`); any at all forces the sweep (see
+/// [`reconcile_preloaded_indexes`]).
+pub(crate) fn on_loading_ended(keys_expired: u64) {
     LOADING_ACTIVE.store(false, Ordering::SeqCst);
-    reconcile_preloaded_indexes();
+    reconcile_preloaded_indexes(keys_expired > 0);
 }
 
 /// Loading `Failed`: close the load window and drop preloaded state (see
@@ -318,6 +322,13 @@ pub(crate) fn check_required_module_apis() -> Result<(), &'static str> {
     }
     if unsafe { raw::RedisModule_GetKeyNameFromIO }.is_none() {
         return Err("RedisModule_GetKeyNameFromIO");
+    }
+    // The type's `unlink2` callback reads the db and key from its key context.
+    if unsafe { raw::RedisModule_GetDbIdFromOptCtx }.is_none() {
+        return Err("RedisModule_GetDbIdFromOptCtx");
+    }
+    if unsafe { raw::RedisModule_GetKeyNameFromOptCtx }.is_none() {
+        return Err("RedisModule_GetKeyNameFromOptCtx");
     }
     Ok(())
 }
@@ -399,8 +410,8 @@ fn take_preloaded_dbs() -> Vec<i32> {
 // ---------------------------------------------------------------------------
 
 /// Runs after a successful load (`LoadingSubevent::Ended`). A preloaded index can contain
-/// "dangling" ids whose key never made it into the keyspace (e.g. its `rdb_load` was skipped
-/// because its TTL had already elapsed); nothing in the query path stale-marks those, because
+/// "dangling" ids whose key never made it into the keyspace (e.g. its TTL had already elapsed
+/// when the RDB was loaded); nothing in the query path stale-marks those, because
 /// a dangling id's `id_to_key` entry is intact — that entry is exactly what was serialized —
 /// so `get_key_by_id` still answers `Some`. The index-only commands (`TS.CARD` and
 /// `TS.QUERYINDEX` without a date filter, the label commands) never open a key and so never
@@ -422,19 +433,26 @@ fn take_preloaded_dbs() -> Vec<i32> {
 /// Runtime traffic between load end and the digest can skew either side (a `DEL` unindexes a
 /// key, a `TS.CREATE` adds an id the loader never saw). That costs a spurious sweep, which is
 /// safe and bounded — never a spurious skip, since any such change alters the digest.
-fn reconcile_preloaded_indexes() {
+///
+/// The one drift the digest cannot see is a key the server discards *after* deserializing it:
+/// a primary loading an RDB calls `rdb_load` (which counts the series into [`LoadStats`]) and
+/// only then drops the key if its TTL has passed. Such a series is in the loaded digest and in
+/// the preloaded index but not in the keyspace, so the two digests agree on a dangling id.
+/// `force_sweep` — set whenever the server reports expired keys for the load — skips the
+/// digest shortcut. The server's count covers every key type, so this can sweep when no
+/// series expired; that is the safe direction.
+fn reconcile_preloaded_indexes(force_sweep: bool) {
     let dbs: Vec<i32> = take_preloaded_dbs();
     if dbs.is_empty() {
         return;
     }
     let stats = take_loaded_stats();
 
-    // Off the main thread: the sweep opens every indexed key once. Runs on the module's
-    // thread pool (not a detached `std::thread`) so it participates in the same thread
-    // lifecycle as every other background job, and checks `is_shutting_down()` between
-    // batches — an aborted sweep is safe, since ids it never reached are either valid or
-    // will be stale-marked by the query path's self-heal.
-    crate::common::threads::spawn(move || {
+    // Off the main thread: the sweep opens every indexed key once. On its own thread
+    // rather than the pool because it takes the module lock (see `spawn_background`), and
+    // checks `is_shutting_down()` between batches — an aborted sweep is safe, since ids it
+    // never reached are either valid or will be stale-marked by the query path's self-heal.
+    crate::common::threads::spawn_background("ts-index-sweep", move || {
         for db in dbs {
             if crate::is_shutting_down() {
                 return;
@@ -450,7 +468,7 @@ fn reconcile_preloaded_indexes() {
                 .unwrap_or_default();
 
             let indexed = read_indexed_stats(db);
-            if !loaded.incomplete && indexed == loaded {
+            if !force_sweep && !loaded.incomplete && indexed == loaded {
                 // Notice rather than debug: this is the once-per-db outcome that says the
                 // sweep was skipped, and it is the only externally visible evidence that the
                 // digest fast path is working.
@@ -467,6 +485,8 @@ fn reconcile_preloaded_indexes() {
                 loaded.count,
                 if loaded.incomplete {
                     ", digest unavailable"
+                } else if force_sweep {
+                    ", keys expired during load"
                 } else {
                     ""
                 }

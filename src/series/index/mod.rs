@@ -167,31 +167,57 @@ pub fn get_series_key_by_id(ctx: &Context, id: SeriesRef) -> Option<ValkeyString
     })
 }
 
-pub fn remove_series_from_index(ts: &TimeSeries) {
-    let Some(db) = ts._db else {
-        log_warning(format!(
-            "Skipping index removal for series id {} because _db is unassigned",
-            ts.id
-        ));
-        return;
-    };
-    let guard = get_db_index(db);
-    guard.remove_timeseries(ts);
-}
-
 /// Index a timeseries by its key. Looks up the series from the key, assigns the current
 /// database, and inserts it into the index if not already present.
 pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
     let valkey_key = create_key_string(ctx, key);
+    // Open the key before taking the index lock: opening runs lazy expiry, which can reach
+    // the `unlink` callback and its write lock on this same thread.
     let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &valkey_key, None) else {
         return;
     };
     series._db = Some(db);
     let index = get_db_index(db);
-    if !index.has_id(series.id) {
-        index.index_timeseries(&series, key);
+    let mut postings = index.get_postings_mut();
+    index_loaded_series(&mut postings, &mut series, key);
+}
+
+/// Index a series that entered the keyspace carrying a serialized id (RESTORE, `TS._RESTORE`,
+/// a slot import), unless it is already indexed under `key` (an RDB load whose index was
+/// preloaded from the aux payload).
+///
+/// A serialized id is not guaranteed to be free. `RESTORE b <DUMP a>` with `a` still live
+/// brings back `a`'s id verbatim; skipping it as "already indexed" left `b` unqueryable, and
+/// indexing it anyway would merge the two series' postings. Such a series is a new series
+/// that happens to share bytes with another, so it gets a fresh id and — like `COPY` — drops
+/// its compaction linkage, which refers to other series by id and still belongs to the
+/// original.
+pub(crate) fn index_loaded_series(postings: &mut Postings, series: &mut TimeSeries, key: &[u8]) {
+    let collides = match postings.get_key_by_id(series.id) {
+        Some(owner) if owner.as_ref() == key => return,
+        Some(_) => true,
+        None => false,
+    };
+    if collides {
+        let old_id = series.id;
+        series.id = next_timeseries_id();
+        let dropped_rules = series.rules.len();
+        let had_source = series.src_series.take().is_some();
+        series.rules.clear();
+        log_warning(format!(
+            "series id {old_id} for key {} is already in use by another key; reassigned id {} \
+             (dropped {dropped_rules} compaction rule(s){})",
+            String::from_utf8_lossy(key),
+            series.id,
+            if had_source {
+                " and its source link"
+            } else {
+                ""
+            }
+        ));
     }
+    postings.index_timeseries(series, key);
 }
 
 /// Drops the index for a single database. Takes the db explicitly: the only caller is the

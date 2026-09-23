@@ -85,6 +85,27 @@ class TestIndexPersistenceBasic(ValkeyTimeSeriesTestCaseBase):
         for key in keys:
             assert client.execute_command("EXISTS", key) == 1
 
+    def test_key_expired_at_load_does_not_stay_indexed(self):
+        """A primary loading an RDB deserializes a key before discarding it as expired, so the
+        load digest counts it and matches the preloaded index. The sweep must still run, or
+        the expired series stays in TS.QUERYINDEX / TS.CARD indefinitely."""
+        client = self.server.get_new_client()
+        client.execute_command("TS.CREATE", "exp:keep", "LABELS", "exp", "yes")
+        client.execute_command("TS.CREATE", "exp:gone", "LABELS", "exp", "yes")
+        client.execute_command("PEXPIRE", "exp:gone", 1000)
+
+        client.execute_command("SAVE")
+        # The RDB still holds the key; once it has expired here, its deadline has passed.
+        wait_for_true(lambda: client.execute_command("PTTL", "exp:gone") < 0)
+        # Reload that RDB as-is: `restart()` saves a final snapshot on the way down, which
+        # would no longer contain the expired key.
+        client.execute_command("DEBUG", "RELOAD", "NOSAVE")
+
+        assert self.server.verify_string_in_logfile(PRELOADED_LOG)
+        wait_for_log(self.server, DANGLING_LOG)
+        assert client.execute_command("TS.QUERYINDEX", "exp=yes") == [b"exp:keep"]
+        assert client.execute_command("TS.CARD", "FILTER", "exp=yes") == 1
+
     def test_index_preloaded_with_many_series_and_labels(self):
         """Larger/more varied index still preloads to an exactly correct state."""
         client = self.server.get_new_client()

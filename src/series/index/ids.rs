@@ -6,9 +6,10 @@
 //! plain atomic increment. This gives:
 //!
 //! - **Cluster-wide uniqueness (probabilistic)**: two nodes collide only if
-//!   they draw the same 24-bit epoch. Collisions are detected and remapped
-//!   at the single point where two ID spaces merge — slot import (see
-//!   `reindex.rs`) — so uniqueness only needs to be rare-failure, not
+//!   they draw the same 24-bit epoch. A series that arrives carrying a
+//!   serialized id (slot import, `RESTORE`, `TS._RESTORE`) is checked against
+//!   the index as it is indexed and remapped on a collision (see
+//!   `index_loaded_series`), so uniqueness only needs to be rare-failure, not
 //!   absolute.
 //! - **Dense postings bitmaps**: all IDs minted by one process share their
 //!   high 24 bits and increment in the low bits, so roaring containers in

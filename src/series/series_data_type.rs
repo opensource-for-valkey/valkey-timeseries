@@ -42,12 +42,13 @@ pub static VK_TIME_SERIES_TYPE: ValkeyType = ValkeyType::new(
         aux_save: None,
         aux_save_triggers: REDISMODULE_AUX_BEFORE_RDB as i32,
         free_effort: Some(free_effort),
-        unlink: Some(unlink),
+        // Superseded by `unlink2`, which the server prefers when both are set.
+        unlink: None,
         copy: Some(copy),
         defrag: Some(defrag),
         mem_usage2: None,
         free_effort2: None,
-        unlink2: None,
+        unlink2: Some(unlink2),
         copy2: None,
         aux_save2: Some(aux_save),
     },
@@ -72,23 +73,6 @@ fn flushed_event_handler(_ctx: &Context, flush_event: FlushSubevent) {
 #[inline]
 pub fn is_flushing_in_process() -> bool {
     IS_FLUSHING.load(Ordering::Relaxed)
-}
-
-fn remove_series_from_index(ts: &TimeSeries) {
-    // if we are in the middle of a flush, we don't want to remove the series from the index
-    // since the entire index will be cleared by the flush operation.
-    if is_flushing_in_process() {
-        return;
-    }
-    let Some(db) = ts._db else {
-        log_debug(format!(
-            "Skipping index removal for series id {} because _db is unassigned",
-            ts.id
-        ));
-        return;
-    };
-    let index = get_db_index(db);
-    index.remove_timeseries(ts);
 }
 
 unsafe extern "C" fn rdb_save(rdb: *mut RedisModuleIO, value: *mut c_void) {
@@ -211,12 +195,41 @@ unsafe extern "C" fn copy(
 
 /// Retire the series from the index. This is the *only* place that happens for a single key --
 /// see `free` for why, and for the paths the server guarantees reach here first.
-unsafe extern "C" fn unlink(_key: *mut RedisModuleString, value: *const c_void) {
+///
+/// Registered as `unlink2` rather than `unlink` for the key context: the db and key name come
+/// from the server, not from the series. The cached `series._db` goes stale on `SWAPDB` (the
+/// indexes are swapped, the series are not touched), which sent the removal to the wrong db's
+/// index and left a phantom entry behind; and removing by id alone, without the key, let
+/// deleting a `RESTORE`d copy strip the original from the index.
+unsafe extern "C" fn unlink2(ctx: *mut raw::RedisModuleKeyOptCtx, value: *const c_void) {
     if value.is_null() {
         return;
     }
+    // In the middle of a flush the whole index is cleared at once by the flush handler.
+    if is_flushing_in_process() {
+        return;
+    }
     let series = unsafe { &*value.cast::<TimeSeries>() };
-    remove_series_from_index(series);
+    // Presence of both accessors is a load-time invariant (`check_required_module_apis`).
+    // SAFETY: `ctx` is the live key context the server passes to this callback; the key name
+    // it returns is owned by the server and valid for the duration of the call.
+    let (db, key) = unsafe {
+        let db = raw::RedisModule_GetDbIdFromOptCtx.unwrap()(ctx);
+        let key = raw::RedisModule_GetKeyNameFromOptCtx.unwrap()(ctx);
+        let mut len = 0usize;
+        let ptr = raw::string_ptr_len(key.cast_mut(), &mut len);
+        if ptr.is_null() {
+            return;
+        }
+        (db, std::slice::from_raw_parts(ptr.cast::<u8>(), len))
+    };
+    let index = get_db_index(db);
+    if !index.remove_timeseries_for_key(series, key) {
+        log_debug(format!(
+            "unlink: series id {} was not indexed under its key in db {db}",
+            series.id
+        ));
+    }
 }
 
 unsafe extern "C" fn defrag(

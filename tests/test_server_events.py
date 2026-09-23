@@ -145,3 +145,17 @@ class TestServerEvents(ValkeyTimeSeriesTestCaseBase):
         assert len(result) == 1
         assert result[0][0] == self.start_ts + 1
         self.client.select(0)
+
+    def test_restore_copy_of_a_live_key(self):
+        """`RESTORE b <DUMP a>` with `a` still live brings back `a`'s series id. The copy has to
+        be indexed under a fresh id — it used to be skipped as "already indexed" — and deleting
+        it must not strip `a` from the index."""
+        self.client.execute_command("TS.CREATE", "live:a", "LABELS", "name", "dup")
+        self.client.execute_command("TS.ADD", "live:a", 1000, 1)
+        self.client.restore("live:b", 0, self.client.dump("live:a"))
+
+        assert sorted(self.client.execute_command("TS.QUERYINDEX", "name=dup")) == [b"live:a", b"live:b"]
+
+        self.client.delete("live:b")
+        assert self.client.execute_command("TS.QUERYINDEX", "name=dup") == [b"live:a"]
+        assert self.client.execute_command("TS.CARD", "FILTER", "name=dup") == 1

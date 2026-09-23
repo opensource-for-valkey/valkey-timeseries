@@ -125,15 +125,23 @@ impl TimeSeriesIndex {
         inner.index_timeseries(ts, key);
     }
 
-    pub fn reindex_timeseries(&self, series: &TimeSeries, key: &[u8]) {
+    /// Move `series` from `old_key` to `new_key` (RENAME). The `unlink` callback has usually
+    /// retired `old_key` already, in which case only the insert is left to do.
+    pub fn reindex_timeseries(&self, series: &TimeSeries, old_key: &[u8], new_key: &[u8]) {
         let mut inner = write_lock(&self.inner);
-        inner.remove_timeseries(series);
-        inner.index_timeseries(series, key);
+        inner.remove_timeseries_for_key(series, old_key);
+        inner.index_timeseries(series, new_key);
     }
 
     pub fn remove_timeseries(&self, series: &TimeSeries) {
         let mut inner = write_lock(&self.inner);
         inner.remove_timeseries(series);
+    }
+
+    /// See [`Postings::remove_timeseries_for_key`].
+    pub fn remove_timeseries_for_key(&self, series: &TimeSeries, key: &[u8]) -> bool {
+        let mut inner = write_lock(&self.inner);
+        inner.remove_timeseries_for_key(series, key)
     }
 
     pub fn has_id(&self, id: SeriesRef) -> bool {

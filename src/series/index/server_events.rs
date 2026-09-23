@@ -16,7 +16,7 @@ use crate::series::index::persistence::{
 };
 use crate::series::index::{
     TIMESERIES_INDEX, clear_all_timeseries_indexes, clear_timeseries_index, get_db_index,
-    get_timeseries_index, get_timeseries_index_for_db, index_series_by_key,
+    get_timeseries_index, get_timeseries_index_for_db, index_loaded_series, index_series_by_key,
 };
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::remove_all_stale_series_internal;
@@ -85,19 +85,34 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
     let save_db = get_current_db(&ctx);
     set_current_db(&ctx, db);
 
+    // Open every key *before* taking the postings write lock. Opening a key runs lazy
+    // expiry, which reaps an expired series through the `unlink` callback — and that takes
+    // the same write lock on this thread, so opening under the lock would hang the server
+    // with the GIL held (see `get_series_by_id`).
+    let opened: Vec<_> = batch
+        .iter()
+        .map(|key_name| {
+            let valkey_key = create_key_string(&ctx, key_name.as_ref());
+            let writeable_key = ctx.open_key_writable(&valkey_key);
+            (key_name, writeable_key)
+        })
+        .collect();
+
     let index = get_db_index(db);
     let mut postings = write_lock(&index.inner);
 
-    for key_name in batch.iter() {
-        let valkey_key = create_key_string(&ctx, key_name.as_ref());
-        let writeable_key = ctx.open_key_writable(&valkey_key);
+    for (key_name, writeable_key) in opened.iter() {
         let Ok(Some(series)) = writeable_key.get_value::<TimeSeries>(&VK_TIME_SERIES_TYPE) else {
             skipped += 1;
             continue;
         };
         series._db = Some(db);
-        postings.index_timeseries(series, valkey_key.as_slice());
+        // Imported ids come from another node's id space: remap a collision rather than
+        // merging two series' postings.
+        index_loaded_series(&mut postings, series, key_name.as_ref());
     }
+    drop(postings);
+    drop(opened);
 
     set_current_db(&ctx, save_db);
     skipped
@@ -182,11 +197,11 @@ pub(super) fn process_delayed_indexing() {
         total_keys
     ));
 
-    // Runs on the module's rayon pool (not a detached `std::thread`) so it participates in the
-    // same thread lifecycle as every other background job, and checks `is_shutting_down()`
-    // between dbs — an aborted drain leaves the remaining dbs' keys un-indexed, which is fine on
-    // shutdown (see `process_delayed_keys_for_db`) but must not happen otherwise.
-    crate::common::threads::spawn(move || {
+    // On its own thread rather than the pool because it takes the module lock (see
+    // `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain
+    // leaves the remaining dbs' keys un-indexed, which is fine on shutdown (see
+    // `process_delayed_keys_for_db`) but must not happen otherwise.
+    crate::common::threads::spawn_background("ts-delayed-indexing", move || {
         for db in dbs {
             if crate::is_shutting_down() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
@@ -318,8 +333,8 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
     ));
 
     // Spawn a background task so we don't block the main thread; this can take a while if there are
-    // a lot of keys to clean up.
-    crate::common::threads::spawn(move || {
+    // a lot of keys to clean up. Off the pool: it takes the module lock (see `spawn_background`).
+    crate::common::threads::spawn_background("ts-asm-cleanup", move || {
         let index = TIMESERIES_INDEX.pin();
         let mut dbs: Vec<i32> = index.keys().copied().collect();
         dbs.sort_unstable();
@@ -427,7 +442,7 @@ fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSube
 /// the loaded count; after a failed load, the preloaded state cannot be trusted, so drop it and
 /// let the natural indexing paths rebuild.
 #[loading_event_handler]
-fn __loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
+fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
     match loading_event {
         LoadingSubevent::RdbStarted | LoadingSubevent::ReplStarted => {
             on_loading_started();
@@ -443,13 +458,22 @@ fn __loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
             // before serving resumes); the aux-preload reconciliation sweep then runs in the
             // background for dbs that took the preload fast path instead.
             bulk_build::on_load_ended();
-            on_loading_ended();
+            on_loading_ended(load_keys_expired(ctx));
         }
         LoadingSubevent::Failed => {
             bulk_build::on_load_failed();
             on_loading_failed();
         }
     }
+}
+
+/// Keys the load that just ended discarded as already expired (`rdb_last_load_keys_expired`).
+/// Unreadable counts as zero: the reconciliation digest still guards every other drift.
+fn load_keys_expired(ctx: &Context) -> u64 {
+    ctx.server_info("persistence")
+        .field_c("rdb_last_load_keys_expired")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
@@ -461,24 +485,26 @@ fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
         return;
     };
 
-    // remove the series from the old db index
+    // MOVE deletes the source key, so `unlink` has normally retired it from the old db's
+    // index already; the key-checked removal makes this a quiet no-op then.
     let old_index = get_db_index(old_db);
-    old_index.remove_timeseries(&series);
+    old_index.remove_timeseries_for_key(&series, key);
 
     // add the series to the new db index
     series._db = Some(new_db);
     let new_index = get_db_index(new_db);
-    new_index.index_timeseries(&series, key);
+    let mut postings = new_index.get_postings_mut();
+    index_loaded_series(&mut postings, &mut series, key);
 }
 
-fn handle_key_rename(ctx: &Context, _old_key: &[u8], new_key: &[u8]) {
+fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
     let index = get_timeseries_index(ctx);
     let key = create_key_string(ctx, new_key);
     let Ok(Some(series)) = try_get_timeseries(ctx, &key, None) else {
         logging::log_warning("Failed to load series for key rename");
         return;
     };
-    index.reindex_timeseries(&series, new_key);
+    index.reindex_timeseries(&series, old_key, new_key);
 }
 
 /// Handle the "restore" event, which is triggered for each key restored from disk during server startup
@@ -518,9 +544,8 @@ fn handle_key_copy(ctx: &Context, key: &[u8]) {
     };
     series._db = Some(db);
     let index = get_db_index(db);
-    if !index.has_id(series.id) {
-        index.index_timeseries(&series, key);
-    }
+    let mut postings = index.get_postings_mut();
+    index_loaded_series(&mut postings, &mut series, key);
 }
 
 static RENAME_FROM_KEY: Mutex<Vec<u8>> = Mutex::new(vec![]);

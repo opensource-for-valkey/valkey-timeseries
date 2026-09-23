@@ -3,7 +3,9 @@ mod tests {
     use crate::common::constants::METRIC_NAME_LABEL;
     use crate::labels::Label;
     use crate::labels::filters::{LabelFilter, SeriesSelector};
-    use crate::series::index::{PostingStat, TimeSeriesIndex, next_timeseries_id};
+    use crate::series::index::{
+        PostingStat, TimeSeriesIndex, index_loaded_series, next_timeseries_id,
+    };
     use crate::series::time_series::TimeSeries;
 
     fn create_series_from_metric_name(prometheus_name: &str) -> TimeSeries {
@@ -34,7 +36,7 @@ mod tests {
         ts.labels.add_label("service", "web");
         ts.labels.add_label("pod", "pod-1");
 
-        index.reindex_timeseries(&ts, b"time-series-1");
+        index.reindex_timeseries(&ts, b"time-series-1", b"time-series-1");
 
         assert_eq!(index.count(), 1);
         assert_eq!(index.label_count(), 5); // metric_name + region + env
@@ -660,5 +662,52 @@ mod tests {
             .expect("expected focus label values for host");
         assert_eq!(count_of(&focus, "a"), 0);
         assert_eq!(count_of(&focus, "b"), 1);
+    }
+
+    #[test]
+    fn test_index_loaded_series_remaps_an_id_owned_by_another_key() {
+        // `RESTORE b <DUMP a>` with `a` live: the copy arrives with `a`'s id.
+        let index = TimeSeriesIndex::new();
+        let original = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&original, b"a");
+
+        let mut copy = original.clone();
+        copy.src_series = Some(next_timeseries_id());
+        {
+            let mut postings = index.get_postings_mut();
+            index_loaded_series(&mut postings, &mut copy, b"b");
+        }
+
+        assert_ne!(copy.id, original.id, "the copy must get a fresh id");
+        assert!(
+            copy.src_series.is_none(),
+            "compaction linkage belongs to the original"
+        );
+        assert_eq!(index.count(), 2);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(original.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            postings.get_key_by_id(copy.id).map(|k| k.as_ref()),
+            Some(&b"b"[..])
+        );
+    }
+
+    #[test]
+    fn test_index_loaded_series_keeps_an_id_already_indexed_under_the_same_key() {
+        // A preloaded index (RDB aux payload) already holds the series under its key.
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&series, b"a");
+        let id = series.id;
+
+        let mut postings = index.get_postings_mut();
+        index_loaded_series(&mut postings, &mut series, b"a");
+        drop(postings);
+
+        assert_eq!(series.id, id);
+        assert_eq!(index.count(), 1);
     }
 }

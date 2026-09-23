@@ -232,3 +232,19 @@ class TestTsSwapDB(ValkeyTimeSeriesTestCaseBase):
         range_result1_after = r.execute_command("TS.RANGE", ts_key1, 0, 3000)
         assert len(range_result1_after) == 2
         assert [point[1] for point in range_result1_after] == [b'100.5', b'200.5']
+
+    def test_del_after_swapdb_leaves_no_phantom(self):
+        """SWAPDB swaps the indexes but not the series, whose cached db went stale: a DEL
+        afterwards removed the id from the wrong db's index and left a phantom entry."""
+        r = self.client
+        r.select(0)
+        key = self.generate_unique_key("swapdel")
+        r.execute_command("TS.CREATE", key, "LABELS", "swapdel", "yes")
+        r.execute_command("SWAPDB", 0, 1)
+
+        r.select(1)
+        assert r.execute_command("TS.QUERYINDEX", "swapdel=yes") == [key.encode()]
+        r.delete(key)
+        assert r.execute_command("TS.QUERYINDEX", "swapdel=yes") == []
+        r.select(0)
+        assert r.execute_command("TS.QUERYINDEX", "swapdel=yes") == []

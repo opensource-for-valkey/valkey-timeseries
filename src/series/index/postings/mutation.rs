@@ -156,6 +156,25 @@ impl Postings {
         self.set_timeseries_key(id, key);
     }
 
+    /// Remove `series` only if the index maps its id to `key`.
+    ///
+    /// For callers that know which key is going away (the type's `unlink` callback, a
+    /// RENAME/MOVE source). Removing by id alone trusted the id to be unique to one key, and
+    /// a series restored from a `DUMP` of a live key used to carry the original's id — so
+    /// deleting the copy stripped the original from the index. An id that is absent or owned
+    /// by another key is left alone, quietly: `unlink` has usually retired it already when a
+    /// RENAME/MOVE handler gets here.
+    pub fn remove_timeseries_for_key(&mut self, series: &TimeSeries, key: &[u8]) -> bool {
+        if self
+            .id_to_key
+            .get(&series.id)
+            .is_none_or(|owner| owner.as_ref() != key)
+        {
+            return false;
+        }
+        self.remove_timeseries(series)
+    }
+
     pub fn remove_timeseries(&mut self, series: &TimeSeries) -> bool {
         let id = series.id;
         if self.id_to_key.remove(&id).is_none() {
@@ -321,6 +340,34 @@ mod tests {
                 .postings_for_label_value("label2", "value2")
                 .is_empty()
         );
+        assert!(postings.all_postings.is_empty());
+    }
+    #[test]
+    fn test_remove_timeseries_for_key_leaves_another_keys_id_alone() {
+        // A `RESTORE`d copy used to carry the original's id: unlinking the copy must not strip
+        // the original, which the index has under a different key.
+        let mut postings = Postings::default();
+        let original = make_series(7, &[("name", "x")]);
+        postings.index_timeseries(&original, b"a");
+
+        assert!(!postings.remove_timeseries_for_key(&original, b"b"));
+        assert_eq!(
+            postings.get_key_by_id(7).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert!(postings.postings_for_label_value("name", "x").contains(7));
+
+        assert!(postings.remove_timeseries_for_key(&original, b"a"));
+        assert!(postings.get_key_by_id(7).is_none());
+        assert!(postings.postings_for_label_value("name", "x").is_empty());
+        assert!(postings.all_postings.is_empty());
+    }
+
+    #[test]
+    fn test_remove_timeseries_for_key_of_unindexed_id_is_a_noop() {
+        let mut postings = Postings::default();
+        let series = make_series(9, &[("name", "y")]);
+        assert!(!postings.remove_timeseries_for_key(&series, b"k"));
         assert!(postings.all_postings.is_empty());
     }
 }

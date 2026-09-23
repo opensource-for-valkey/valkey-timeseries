@@ -979,7 +979,7 @@ mod tests {
 
         // Now rename the series
         let new_key = b"ts:cpu_usage:new";
-        index.reindex_timeseries(&ts, new_key);
+        index.reindex_timeseries(&ts, old_key, new_key);
 
         // Verify the same queries still work after rename
         let result_after = index.posting_by_labels(&labels).unwrap();
