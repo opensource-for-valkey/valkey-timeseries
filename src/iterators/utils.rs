@@ -324,11 +324,11 @@ pub(crate) fn finalize_row_iterator<'a, I: Iterator<Item = MultiSample> + 'a>(
 ) -> Box<dyn Iterator<Item = MultiSample> + 'a> {
     match (is_reverse, carry) {
         (true, Some(mask)) => {
-            let rev = ReverseIter::new(CarryLastEmpty::new(iter, mask, carry_seed));
+            let rev = reverse_limited(CarryLastEmpty::new(iter, mask, carry_seed), count);
             apply_iter_limit!(rev, count)
         }
         (true, None) => {
-            let rev = ReverseIter::new(iter);
+            let rev = reverse_limited(iter, count);
             apply_iter_limit!(rev, count)
         }
         (false, Some(mask)) => {
@@ -387,11 +387,11 @@ pub fn create_sample_iterator_adapter<'a, T: Iterator<Item = Sample> + 'a>(
     ) -> Box<dyn Iterator<Item = Sample> + 'a> {
         match (is_reverse, carry) {
             (true, Some(mask)) => {
-                let rev = ReverseIter::new(CarryLastEmpty::new(iter, mask, carry_seed));
+                let rev = reverse_limited(CarryLastEmpty::new(iter, mask, carry_seed), count);
                 apply_iter_limit!(rev, count)
             }
             (true, None) => {
-                let rev = ReverseIter::new(iter);
+                let rev = reverse_limited(iter, count);
                 apply_iter_limit!(rev, count)
             }
             (false, Some(mask)) => {
@@ -515,6 +515,24 @@ pub(crate) fn last_carry_mask(options: &AggregationOptions) -> Option<SmallVec<[
         .map(|a| matches!(a.aggregation_type(), AggregationType::Last))
         .collect();
     mask.iter().any(|c| *c).then_some(mask)
+}
+
+/// Reverses `iter`, buffering only the items a COUNT limit can reach.
+///
+/// A reverse query is served by aggregating forward and reversing, so without a limit the
+/// whole forward stream is buffered. With COUNT only its last `count` items can be returned,
+/// and a ring buffer of that size ([`TailIter`]) is all that must be held — rather than every
+/// bucket of the range (for `EMPTY` over a long range, every *empty* bucket too) — before the
+/// first one is emitted. The forward pass itself still runs to the end.
+fn reverse_limited<'a, I>(iter: I, count: Option<usize>) -> Box<dyn Iterator<Item = I::Item> + 'a>
+where
+    I: Iterator + 'a,
+    I::Item: 'a,
+{
+    match count {
+        Some(count) => Box::new(ReverseIter::new(TailIter::new(iter, count))),
+        None => Box::new(ReverseIter::new(iter)),
+    }
 }
 
 /// Buffers the inner iterator and yields its items in reverse order.
@@ -647,5 +665,29 @@ mod tests {
         // degenerate cases
         assert_eq!(tail(0, &[1, 2, 3]), Vec::<i32>::new());
         assert_eq!(tail(3, &[]), Vec::<i32>::new());
+    }
+
+    #[test]
+    fn test_reverse_limited_matches_reverse_then_count() {
+        // The bounded reversal must return exactly what reversing everything and then taking
+        // COUNT would, while buffering at most COUNT items.
+        let items: Vec<i32> = (0..50).collect();
+        for count in [None, Some(0), Some(1), Some(7), Some(50), Some(80)] {
+            let expected: Vec<i32> = {
+                let rev = items.iter().rev().copied();
+                match count {
+                    Some(n) => rev.take(n).collect(),
+                    None => rev.collect(),
+                }
+            };
+            let got: Vec<i32> = {
+                let rev = super::reverse_limited(items.iter().copied(), count);
+                match count {
+                    Some(n) => rev.take(n).collect(),
+                    None => rev.collect(),
+                }
+            };
+            assert_eq!(got, expected, "count={count:?}");
+        }
     }
 }

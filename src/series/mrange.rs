@@ -500,13 +500,18 @@ pub(crate) fn collect_rows<I: Iterator<Item = MultiSample>>(
     is_reverse: bool,
     count: Option<usize>,
 ) -> Vec<MultiSample> {
-    let mut rows: Vec<MultiSample> = iter.collect();
-    if is_reverse {
-        rows.reverse();
+    if !is_reverse {
+        return match count {
+            Some(count) => iter.take(count).collect(),
+            None => iter.collect(),
+        };
     }
-    if let Some(count) = count {
-        rows.truncate(count);
-    }
+    // Reverse: only the last `count` rows can be returned, so hold no more than that.
+    let mut rows: Vec<MultiSample> = match count {
+        Some(count) => TailIter::new(iter, count).collect(),
+        None => iter.collect(),
+    };
+    rows.reverse();
     rows
 }
 
@@ -527,11 +532,12 @@ pub(crate) fn collect_samples<I: Iterator<Item = Sample>>(
         };
     }
 
-    let mut samples: Vec<Sample> = iter.collect();
+    // Only the last `count` samples can be returned, so hold no more than that.
+    let mut samples: Vec<Sample> = match count {
+        Some(count) => TailIter::new(iter, count).collect(),
+        None => iter.collect(),
+    };
     samples.reverse();
-    if let Some(count) = count {
-        samples.truncate(count);
-    }
     samples
 }
 
