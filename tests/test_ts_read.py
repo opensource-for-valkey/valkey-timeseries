@@ -606,7 +606,7 @@ class TestTsReadWakeupPaths(TsReadTestBase):
         finally:
             reader.close(self.client)
 
-    @pytest.mark.parametrize("command", ["TS.ADD", "TS.MADD", "TS.INCRBY"])
+    @pytest.mark.parametrize("command", ["TS.ADD", "TS.MADD", "TS.INCRBY", "TS.ADDBULK"])
     def test_append_to_a_series_at_its_retention_limit(self, command):
         """Each append past the retention window also expires a sample, so the series' size
         stays flat. The insert must still wake the reader: the wake-up used to compare sample
@@ -622,6 +622,9 @@ class TestTsReadWakeupPaths(TsReadTestBase):
                 self.client.execute_command("TS.ADD", "k", 111, 1.0)
             elif command == "TS.MADD":
                 self.client.execute_command("TS.MADD", "k", 111, 1.0)
+            elif command == "TS.ADDBULK":
+                payload = json.dumps({"timestamps": [111], "values": [1.0]})
+                self.client.execute_command("TS.ADDBULK", "k", payload)
             else:
                 self.client.execute_command("TS.INCRBY", "k", 1, "TIMESTAMP", 111)
             # Well inside the BLOCK: a missed wake-up would still return [111], at the timeout.

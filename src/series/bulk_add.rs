@@ -414,7 +414,8 @@ pub(super) fn merge_samples_into_series(
 }
 
 /// Bulk insert for `TS.ADDBULK`: runs the shared merge core, then performs post-merge
-/// maintenance (chunk splitting), keyspace notification and compaction propagation.
+/// maintenance (chunk splitting), keyspace notification, compaction propagation and the
+/// retention trim.
 pub fn bulk_insert_samples(
     ctx: &Context,
     series: &mut TimeSeries,
@@ -477,6 +478,11 @@ pub fn bulk_insert_samples(
             ))
         }
     }
+
+    // Last, as in TS.ADD / TS.MADD: after the sample-count check above, which a trim could
+    // defeat by dropping more than the batch added, and after compaction, which must see the
+    // pre-trim series (see `TimeSeries::apply_retention`).
+    series.apply_retention();
 
     results
 }
