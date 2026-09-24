@@ -1,4 +1,5 @@
 import pytest
+from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 from valkeytestframework.conftest import resource_port_tracker
@@ -125,3 +126,38 @@ class TestTsDel(ValkeyTimeSeriesTestCaseBase):
         assert len(result) == 4
         timestamps = [entry[0] for entry in result]
         assert 1020 not in timestamps
+
+    def test_del_propagates_resolved_bounds(self):
+        """TS.DEL propagates the bounds it resolved, not the ones it was given: `-`, `+`,
+        `*` and relative bounds re-resolved on a replica or an AOF replay against a
+        different clock or series would delete a different window."""
+        import glob
+        import os
+
+        c = self.client
+        c.config_set("appendonly", "yes")
+        c.config_set("appendfsync", "always")
+        wait_for_equal(lambda: c.info("persistence")["aof_rewrite_in_progress"], 0, timeout=30)
+        for ts in (1000, 2000, 3000):
+            c.execute_command("TS.ADD", "del:resolved", ts, 1)
+        assert c.execute_command("TS.DEL", "del:resolved", "-", "+") == 3
+
+        aof_dir = os.path.join(c.config_get("dir")["dir"], c.config_get("appenddirname")["appenddirname"])
+        expected = b"*4\r\n$6\r\nTS.DEL\r\n$12\r\ndel:resolved\r\n$4\r\n1000\r\n$4\r\n3000\r\n"
+
+        def aof_bytes():
+            data = b""
+            for path in glob.glob(os.path.join(aof_dir, "*.incr.aof")):
+                with open(path, "rb") as f:
+                    data += f.read()
+            return data
+
+        wait_for_true(lambda: expected in aof_bytes())
+
+    def test_del_requires_exactly_two_bounds(self):
+        c = self.client
+        c.execute_command("TS.ADD", "del:arity", 1000, 1)
+        for args in (("del:arity", 1000), ("del:arity", "-", "+", "garbage")):
+            with pytest.raises(ResponseError, match="wrong number of arguments"):
+                c.execute_command("TS.DEL", *args)
+        assert c.execute_command("TS.RANGE", "del:arity", "-", "+") == [[1000, b"1"]]
