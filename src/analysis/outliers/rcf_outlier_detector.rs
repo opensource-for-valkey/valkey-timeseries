@@ -219,7 +219,9 @@ impl RcfOutlierDetector {
     pub fn set_data(&mut self, data: &[f64]) {
         for &value in data {
             if let Err(e) = self.forest.update(&[value as f32]) {
-                log::error!("Failed to update Rcf with value {}: {:?}", value, e);
+                // The module's own logger: nothing installs a `log` crate backend, so
+                // `log::error!` here was silently discarded.
+                log_warning(format!("Failed to update RCF with value {value}: {e:?}"));
             }
         }
     }
@@ -227,7 +229,7 @@ impl RcfOutlierDetector {
     /// Return the Rcf anomaly score for a single scalar value.
     pub fn score(&self, value: f64) -> f64 {
         self.forest.score(&[value as f32]).unwrap_or_else(|e| {
-            log::error!("{:?}", e);
+            log_warning(format!("Failed to score RCF value {value}: {e:?}"));
             f64::NAN
         })
     }
