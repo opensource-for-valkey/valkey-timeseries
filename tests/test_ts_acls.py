@@ -453,3 +453,31 @@ class TestTimeSeriesACL(ValkeyTimeSeriesTestCaseBase):
             client.execute_command("TS.LABELNAMES")
         with pytest.raises(ResponseError):
             client.execute_command("TS.LABELSTATS")
+
+    def test_metadata_gate_rejects_pattern_matching_the_old_probes(self):
+        """The gate once probed `*` and a 33-byte \\x01/\\xff key; this pattern matches both
+        but not `meta:1`, and used to be handed every label and every series.
+        The two-probe test is gone; only a literal `*` grant counts."""
+        self.client.execute_command("TS.CREATE", "meta:1", "LABELS", "secret", "yes")
+        self.create_test_user("probe_match", "pw", ["+@all", b"~[*\x01]*"])
+        client = self.get_user_client("probe_match", "pw")
+        for cmd in (["TS.LABELNAMES"], ["TS.LABELSTATS"], ["TS.CARD"]):
+            with pytest.raises(ResponseError):
+                client.execute_command(*cmd)
+        # The same test gates per-key checks: it used to skip them for this user.
+        with pytest.raises(ResponseError, match="read permission"):
+            client.execute_command("TS.MGET", "FILTER", "secret=yes")
+
+    @pytest.mark.parametrize("rules", [
+        ["+@all", "%R~*"],
+        ["+@all", "~abc*", "(%R~* +@all)"],
+    ])
+    def test_metadata_gate_admits_read_all_grants(self, rules):
+        self.client.execute_command("TS.CREATE", "meta:1", "LABELS", "secret", "yes")
+        self.create_test_user("read_all", "pw", rules)
+        client = self.get_user_client("read_all", "pw")
+        assert client.execute_command("TS.LABELNAMES")[1] == [b"secret"]
+        # A rule change must not be answered from the cached grant.
+        self.client.execute_command("ACL", "SETUSER", "read_all", "clearselectors", "resetkeys", "~abc*")
+        with pytest.raises(ResponseError):
+            client.execute_command("TS.LABELNAMES")
