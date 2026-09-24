@@ -6,6 +6,7 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::pool::get_pooled_buffer;
+use crate::common::sync::lock;
 use crate::common::threads::spawn_background;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
 use crate::fanout::acl::get_fanout_user;
@@ -25,7 +26,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use valkey_module::{
     Context, DetachedContext, MODULE_CONTEXT, RedisModuleCtx, Status, VALKEYMODULE_OK, ValkeyError,
     ValkeyModule_RegisterClusterMessageReceiver, ValkeyModule_SendClusterMessage,
@@ -48,6 +49,10 @@ struct InFlightRequest {
     outstanding: AtomicU64,
     timer_id: u64,
     timed_out: AtomicBool,
+    /// Remote targets that have answered (a response, an error, or a send failure). A target
+    /// answers once: anything more from it, or anything from a node that is not a remote
+    /// target, is dropped rather than counted.
+    responded: Mutex<HashSet<NodeId>>,
 }
 
 impl InFlightRequest {
@@ -76,21 +81,41 @@ impl InFlightRequest {
         self.targets.get(&sender)
     }
 
-    fn handle_response(&self, ctx: &Context, resp: FanoutResult<&[u8]>, sender_id: *const c_char) {
-        let Some(target_node) = self.get_target_node_opt(sender_id) else {
-            let sender = NodeId::from_raw(sender_id);
-            let msg = format!(
-                "cluster rpc: received response for request {} from unknown sender {}",
-                self.id, sender
-            );
-            ctx.log_warning(&msg);
-
-            let resp = Err(FanoutError::custom(msg));
-            (self.response_handler)(resp, &placeholder_node());
-            return;
+    /// Delivers one remote target's answer to the fan-out. Returns whether it was accepted, i.e.
+    /// whether it counts toward completing the request.
+    ///
+    /// Only the first answer from each remote target counts. A message from a node that is not
+    /// a remote target, or a second one from a target that already answered, used to be
+    /// delivered too — the former as a `Custom` error — and so counted as a shard's reply in both
+    /// this request's and the fan-out's bookkeeping, completing the fan-out while real shards
+    /// were still outstanding.
+    fn handle_response(
+        &self,
+        ctx: &Context,
+        resp: FanoutResult<&[u8]>,
+        sender_id: *const c_char,
+    ) -> bool {
+        let sender = NodeId::from_raw(sender_id);
+        let Some(target_node) = self
+            .get_target_node_opt(sender_id)
+            .filter(|node| !node.is_local())
+        else {
+            ctx.log_warning(&format!(
+                "cluster rpc: ignoring response for request {} from unknown sender {sender}",
+                self.id
+            ));
+            return false;
         };
+        if !lock(&self.responded).insert(sender) {
+            ctx.log_warning(&format!(
+                "cluster rpc: ignoring duplicate response for request {} from {sender}",
+                self.id
+            ));
+            return false;
+        }
 
         (self.response_handler)(resp, target_node);
+        true
     }
 
     /// Deliver the fanout deadline to the response handler.
@@ -186,7 +211,7 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
 fn dispatch_send_failure(ctx: &Context, request_id: u64, target_node_id: *const c_char) {
     with_inflight_request(ctx, request_id, |ctx, request| {
         let err = FanoutError::custom("Failed to send fanout request to target node");
-        request.handle_response(ctx, Err(err), target_node_id);
+        request.handle_response(ctx, Err(err), target_node_id)
     });
 }
 
@@ -287,6 +312,7 @@ pub(super) fn send_cluster_request(
         outstanding: AtomicU64::new(node_count as u64),
         timed_out: AtomicBool::new(false),
         targets: targets.clone(),
+        responded: Mutex::new(HashSet::default()),
     };
 
     {
@@ -588,9 +614,12 @@ extern "C" fn on_request_received(
     });
 }
 
+/// Runs `f` against an in-flight request. `f` reports whether it delivered an answer that
+/// counts (see [`InFlightRequest::handle_response`]); only then is the request's outstanding
+/// count decremented.
 fn with_inflight_request<F>(ctx: &Context, request_id: u64, f: F)
 where
-    F: FnOnce(&Context, &InFlightRequest),
+    F: FnOnce(&Context, &InFlightRequest) -> bool,
 {
     let map = INFLIGHT_REQUESTS.pin();
     let Some(request) = map.get(&request_id) else {
@@ -600,8 +629,9 @@ where
         return;
     };
 
-    f(ctx, request);
-    finish_inflight_request(ctx, request);
+    if f(ctx, request) {
+        finish_inflight_request(ctx, request);
+    }
 }
 
 /// Handles responses from other nodes in the cluster. The receiver is the original sender of
@@ -627,10 +657,9 @@ extern "C" fn on_response_received(
         // of the request instead of misinterpreting the payload.
         if has_unsupported_features(message.required_features) {
             let err = FanoutError::unsupported_features();
-            request.handle_response(ctx, Err(err), sender_id);
-            return;
+            return request.handle_response(ctx, Err(err), sender_id);
         }
-        request.handle_response(ctx, Ok(message.buf), sender_id);
+        request.handle_response(ctx, Ok(message.buf), sender_id)
     });
 }
 
@@ -655,8 +684,7 @@ extern "C" fn on_error_received(
         // decode per the demanded features still fails this node's slice.
         if has_unsupported_features(message.required_features) {
             let err = FanoutError::unsupported_features();
-            request.handle_response(ctx, Err(err), sender_id);
-            return;
+            return request.handle_response(ctx, Err(err), sender_id);
         }
 
         match FanoutError::deserialize(message.buf) {
@@ -672,7 +700,7 @@ extern "C" fn on_error_received(
             Err(_) => {
                 ctx.log_warning("Failed to deserialize error response");
                 let err = FanoutError::invalid_message();
-                request.handle_response(ctx, Err(err), sender_id);
+                request.handle_response(ctx, Err(err), sender_id)
             }
         }
     });
