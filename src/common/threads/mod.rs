@@ -1,3 +1,7 @@
+mod executor;
+
+pub use executor::{BoundedExecutor, ExecutorBusy};
+
 use crate::common::context::{get_current_db, set_current_db};
 use crate::is_main_thread;
 use rayon_core::{Scope, ThreadPoolBuilder};
@@ -40,6 +44,10 @@ pub fn spawn<F: FnOnce() + Send + 'static>(job: F) {
 /// (TS.JOIN) never gets a worker back. Either way the server freezes. A
 /// detached thread waits on the pool without stealing, so a GIL holder here
 /// can never pick up such a job.
+///
+/// One thread per call, so only for jobs with a bounded number of callers (one-shot
+/// work, or a periodic task guarded against overlapping runs). Per-request work goes
+/// to a [`BoundedExecutor`] instead.
 pub fn spawn_background<F: FnOnce() + Send + 'static>(name: &str, job: F) {
     if let Err(err) = std::thread::Builder::new()
         .name(name.to_string())

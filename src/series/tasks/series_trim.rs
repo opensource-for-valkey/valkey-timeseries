@@ -6,6 +6,7 @@ use crate::is_shutting_down;
 use crate::series::tasks::utils::{fetch_series_batch, find_next_db};
 use orx_parallel::Par;
 use orx_parallel::ParCollectionMut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use valkey_module::{Context, MODULE_CONTEXT, Status};
 
@@ -22,12 +23,41 @@ struct TrimContext {
 static SERIES_TRIM_CURSORS: LazyLock<Mutex<TrimContext>> =
     LazyLock::new(|| Mutex::new(TrimContext::default()));
 
+/// Set while a trim run is queued or running. A run waits on the module lock, so while the
+/// main thread holds it for longer than the trim interval, the cron would otherwise start
+/// another thread every tick.
+static TRIM_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct TrimRunGuard;
+
+impl TrimRunGuard {
+    fn acquire() -> Option<Self> {
+        TRIM_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+            .then_some(TrimRunGuard)
+    }
+}
+
+impl Drop for TrimRunGuard {
+    fn drop(&mut self) {
+        TRIM_IN_PROGRESS.store(false, Ordering::Release);
+    }
+}
+
 pub fn process_series_trim() {
     if is_shutting_down() {
         return;
     }
+    let Some(guard) = TrimRunGuard::acquire() else {
+        return;
+    };
     // Takes the module lock and fans out on the pool under it: must not be a pool job.
-    spawn_background("ts-series-trim", process_trim_internal);
+    // If the thread cannot be started, the job and the guard it owns are dropped.
+    spawn_background("ts-series-trim", move || {
+        let _guard = guard;
+        process_trim_internal();
+    });
 }
 
 fn process_trim_internal() {

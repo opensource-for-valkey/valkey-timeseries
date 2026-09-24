@@ -54,6 +54,10 @@ pub enum ErrorKind {
     /// The request selected a database that is not available on this node.
     InvalidDb = 11,
 
+    /// A node rejected its share because its fan-out work queue was full. Retryable.
+    /// A peer too old to know this kind reports it as an invalid message.
+    Busy = 12,
+
     Custom = 255,
 }
 
@@ -71,6 +75,8 @@ pub(super) const CLUSTER_MAP_MISMATCH_ERROR: &str =
     "A multi-shard command failed because the cluster topology has changed";
 pub(super) const UNSUPPORTED_FEATURES_ERROR: &str = "A multi-shard command failed because a peer requires fanout features this node does not support";
 pub(super) const INVALID_DB_ERROR: &str = "Invalid database";
+pub(super) const BUSY_ERROR: &str =
+    "A multi-shard command failed because a node has too many fanout requests queued; retry later";
 
 impl ErrorKind {
     pub fn as_str(&self) -> &'static str {
@@ -87,6 +93,7 @@ impl ErrorKind {
             Self::ClusterMapMismatch => CLUSTER_MAP_MISMATCH_ERROR,
             Self::UnsupportedFeatures => UNSUPPORTED_FEATURES_ERROR,
             Self::InvalidDb => INVALID_DB_ERROR,
+            Self::Busy => BUSY_ERROR,
             Self::Custom => "Custom error",
         }
     }
@@ -128,6 +135,10 @@ impl FanoutError {
     #[cfg(test)]
     pub fn invalid_db() -> Self {
         ErrorKind::InvalidDb.into()
+    }
+
+    pub fn busy() -> Self {
+        ErrorKind::Busy.into()
     }
 
     pub fn custom<S: Into<String>>(description: S) -> Self {
@@ -187,6 +198,7 @@ impl TryFrom<u8> for ErrorKind {
             9 => Ok(ErrorKind::ClusterMapMismatch),
             10 => Ok(ErrorKind::UnsupportedFeatures),
             11 => Ok(ErrorKind::InvalidDb),
+            12 => Ok(ErrorKind::Busy),
             255 => Ok(ErrorKind::Custom),
             _ => {
                 let msg = format!("Invalid error kind: {value}");
@@ -271,6 +283,7 @@ fn convert_from_string(err: &str) -> FanoutError {
         CLUSTER_MAP_MISMATCH_ERROR => ErrorKind::ClusterMapMismatch.into(),
         UNSUPPORTED_FEATURES_ERROR => ErrorKind::UnsupportedFeatures.into(),
         INVALID_DB_ERROR => ErrorKind::InvalidDb.into(),
+        BUSY_ERROR => ErrorKind::Busy.into(),
         NODE_UNREACHABLE_ERROR => ErrorKind::NodeUnreachable.into(),
         UNKNOWN_MESSAGE_TYPE_ERROR => ErrorKind::UnknownMessageType.into(),
         SERIALIZATION_ERROR => FanoutError::serialization(String::new()),
@@ -399,6 +412,7 @@ mod tests {
             ErrorKind::ClusterMapMismatch,
             ErrorKind::UnsupportedFeatures,
             ErrorKind::InvalidDb,
+            ErrorKind::Busy,
             ErrorKind::Custom,
         ];
 

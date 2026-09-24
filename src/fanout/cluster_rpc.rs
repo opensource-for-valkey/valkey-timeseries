@@ -7,7 +7,6 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::pool::get_pooled_buffer;
 use crate::common::sync::lock;
-use crate::common::threads::spawn_background;
 use crate::config::FANOUT_COMMAND_TIMEOUT;
 use crate::fanout::acl::get_fanout_user;
 use crate::fanout::cluster_map::{CURRENT_NODE_ID, NodeId, NodeRole, SocketAddress};
@@ -15,6 +14,7 @@ use crate::fanout::fanout_command::FanoutResponseCallback;
 use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::registry::{RequestHandlerCallback, get_fanout_request_handler};
 use crate::fanout::serialization::Serializable;
+use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
 use crate::fanout::{
     FanoutResult, NodeInfo, get_cluster_map, get_or_refresh_cluster_map, mark_cluster_map_stale,
     refresh_cluster_map,
@@ -608,10 +608,18 @@ extern "C" fn on_request_received(
 
     alloc_db_if_needed(&ctx, message.db);
 
+    let (request_id, db) = (header.request_id, header.db);
+
     // Off the pool: the handler takes the module lock (see `spawn_background`).
-    spawn_background("ts-fanout-request", move || {
+    let queued = PEER_REQUEST_EXECUTOR.try_spawn(move || {
         process_request_message(header, handler, &buf, sender);
     });
+    if queued.is_err() {
+        // Answer now rather than leave the requester waiting out its timeout.
+        send_error_response(&ctx, request_id, db, sender_id, FanoutError::busy());
+        let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
+        ctx.log_warning(&msg);
+    }
 }
 
 /// Runs `f` against an in-flight request. `f` reports whether it delivered an answer that

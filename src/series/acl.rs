@@ -208,7 +208,6 @@ fn cached_all_keys_grants(
 /// selector's key patterns in a field of its own, unlike the flat rule string.
 /// `None` when the reply is not the expected shape (or the user is gone).
 fn query_all_keys_grants(ctx: &Context, user_name: &ValkeyString) -> Option<AllKeysGrants> {
-    
     /// A field of a RESP2 map reply (a flat key/value array).
     fn field<'a>(map: &'a CallReply, name: &[u8]) -> Option<CallReply<'a>> {
         let CallReply::Array(pairs) = map else {

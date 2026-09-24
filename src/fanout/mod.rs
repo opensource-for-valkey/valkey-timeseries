@@ -10,6 +10,7 @@ mod fanout_message;
 mod registry;
 pub mod serialization;
 mod utils;
+mod workers;
 
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
 use ahash::HashSet;

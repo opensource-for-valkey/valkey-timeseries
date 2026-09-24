@@ -1,5 +1,6 @@
 use super::utils::find_next_db;
 use crate::common::sync::lock;
+use crate::common::threads::spawn_background;
 use crate::is_shutting_down;
 use crate::series::index::{IndexKey, TIMESERIES_INDEX};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,14 +74,10 @@ fn acquire_run_lock() -> Option<StaleIdCleanupGuard> {
     Some(StaleIdCleanupGuard)
 }
 
-pub(in crate::series) fn remove_stale_series_internal() {
+fn remove_stale_series_internal(_guard: StaleIdCleanupGuard) {
     if is_shutting_down() {
         return;
     }
-
-    let Some(_cleanup_guard) = acquire_run_lock() else {
-        return;
-    };
 
     let (db, cursor) = {
         let mut context = lock(&STALE_ID_CLEANUP_CONTEXT);
@@ -120,7 +117,13 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
 }
 
 pub(crate) fn remove_stale_series_ids_incremental() {
-    std::thread::spawn(remove_stale_series_internal);
+    // Checked before spawning, so a run still in progress costs no thread.
+    let Some(guard) = acquire_run_lock() else {
+        return;
+    };
+    // `spawn_background` logs a failed spawn (dropping the job and its guard);
+    // `std::thread::spawn` would panic inside the cron handler.
+    spawn_background("ts-stale-ids", move || remove_stale_series_internal(guard));
 }
 
 #[cfg(test)]
