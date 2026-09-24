@@ -46,7 +46,7 @@ impl Cursor {
 
         match spec {
             CursorSpec::Literal(ts) => Cursor::From(ts),
-            CursorSpec::Earliest => Cursor::From(series.first_timestamp),
+            CursorSpec::Earliest => Cursor::From(series.visible_first_timestamp()),
             CursorSpec::Latest => Cursor::From(series.last_timestamp()),
             CursorSpec::Next => match series.last_timestamp().checked_add(1) {
                 Some(next) => Cursor::From(next),

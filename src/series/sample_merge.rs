@@ -110,6 +110,9 @@ pub(super) fn merge_samples(
 /// - `groups`: A slice of series with their related samples.
 /// - `ctx`: Command context; when present, compaction rules are propagated after the merge.
 ///
+/// The retention trim is left to the caller, which must run `TimeSeries::apply_retention` on
+/// every series afterwards (see the note at the end of the body).
+///
 /// ### Returns
 /// Returns a `ValkeyResult` containing a `SmallVec` of tuples (group index, SampleAddResult) on success.:
 /// - The second element is the result of processing the samples for that series.
@@ -142,18 +145,17 @@ pub fn multi_series_merge_samples(
         run_group_compactions(ctx, &mut groups);
     }
 
-    // Retention is applied only now. The merge above deliberately skipped the eager trim so
-    // that `add_group_sequentially`'s read-back still sees a sample which a later item in the
-    // same batch pushed outside the window — that is what lets retention be decided ahead of
-    // the duplicate policy (corpus: madd_retention_beats_duplicate_policy).
+    // Retention is *not* applied here; the caller runs `TimeSeries::apply_retention` on each
+    // series afterwards. The merge deliberately skips the eager trim so that
+    // `add_group_sequentially`'s read-back still sees a sample which a later item in the same
+    // batch pushed outside the window — that is what lets retention be decided ahead of the
+    // duplicate policy (corpus: madd_retention_beats_duplicate_policy). The caller also reads
+    // each series' pre-trim sample count first: the trim can drop more samples than the batch
+    // added, which would hide the insert from the `TS.READ` wake-up.
     //
     // Deferring it does *not* leak expired samples into the destination buckets: compaction
-    // aggregates through the retention-clamped `range_iter`, so a sample this trim is about to
+    // aggregates through the retention-clamped `range_iter`, so a sample the trim is about to
     // evict is already invisible to the bucket recalculation.
-    for group in groups.iter_mut() {
-        group.series.apply_retention();
-    }
-
     Ok(res)
 }
 

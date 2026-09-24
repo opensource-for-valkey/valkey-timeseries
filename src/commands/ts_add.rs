@@ -125,14 +125,12 @@ fn handle_add(
     let mut ignored = false;
 
     let last_ts = series.last_sample.map(|s| s.timestamp);
-    // Compared after the add to decide whether to wake blocked `TS.READ` readers. A count
-    // comparison rather than `!is_upsert`: an out-of-order insert *below* the tail is not an
-    // append, but it does add a sample that a reader's cursor may already cover. Duplicates,
-    // ignored writes, and value-only updates leave the count unchanged and correctly do not
-    // signal.
-    let samples_before = series.total_samples;
-
-    let (replication_timestamp, ts, value) = match series.add(timestamp, value, on_duplicate) {
+    // `inserted` decides whether to wake blocked `TS.READ` readers. An insert rather than
+    // `!is_upsert`: an out-of-order insert *below* the tail is not an append, but it does add a
+    // sample that a reader's cursor may already cover. Duplicates, ignored writes, and
+    // value-only updates insert nothing and correctly do not signal.
+    let (result, inserted) = series.add_reporting_insert(timestamp, value, on_duplicate);
+    let (replication_timestamp, ts, value) = match result {
         SampleAddResult::Ignored(res_ts) => {
             ignored = true;
             let timestamp = if timestamp_str == "*" {
@@ -177,8 +175,7 @@ fn handle_add(
             }
             // Fall through to replicate_and_notify: an upsert is still a
             // successful TS.ADD — it must replicate and emit `ts.add` like
-            // any other add (the early return here previously skipped both,
-            // leaving replicas without the sample).
+            // any other add.
         } else {
             let sample = series.last_sample.unwrap_or(Sample::new(ts, value));
             // If the sample is not an upsert, we run compaction
@@ -186,7 +183,7 @@ fn handle_add(
         }
     }
 
-    if series.total_samples > samples_before {
+    if inserted {
         signal_timeseries_ready(ctx, &args[1]);
     }
 

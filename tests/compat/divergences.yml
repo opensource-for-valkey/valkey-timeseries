@@ -374,21 +374,21 @@
   description: >
     TS.DEL over a range covering only already-expired samples reports 0 where RTS
     reports the number of expired-but-still-stored samples it removed. Root cause is
-    a retention-model difference, not a TS.DEL bug: RTS trims lazily (an out-of-window
-    sample stays physically stored until its chunk expires) and filters it out of every
-    read path, so TS.DEL can still find and count it; we trim eagerly on write, so the
-    sample is already gone. Every read path agrees on both engines — TS.RANGE hides the
-    sample and TS.INFO reports totalSamples/firstTimestamp over the retained window —
-    so the divergence is confined to the TS.DEL return value for samples a client can
-    not observe anyway.
+    a retention-model difference, not a TS.DEL bug: both engines keep some out-of-window
+    samples physically stored and filter them out of every read path, but RTS keeps one
+    until its whole chunk expires and lets TS.DEL find and count it, while we trim a
+    compressed head chunk once a quarter of its span has expired and have TS.DEL drop
+    the expired prefix *before* it deletes — an expired sample is never counted. Every
+    read path agrees on both engines — TS.RANGE hides the sample and TS.INFO reports
+    totalSamples/firstTimestamp over the retained window — so the divergence is
+    confined to the TS.DEL return value for samples a client can not observe anyway.
   rationale: >
-    owner decision pending — matching RTS exactly means adopting its lazy-trim model
-    (physical retention deferred, every read path filtering logically), which is the
-    architecture the eager trim deliberately replaced to make TS.INFO's totalSamples /
-    firstTimestamp agree with TS.RANGE (see the plan's "retention accounting" fix).
-    Reverting that is a much larger change than the observable delta justifies, so the
-    divergence is documented rather than chased. Pinned by
-    TestDelRetention::test_del_of_expired_range_counts_differently.
+    owner decision pending — matching RTS exactly means reproducing its chunk-granular
+    physical retention, so that the count depends on where chunk boundaries fall. Ours
+    trims on a different schedule (chosen for write cost: re-encoding the head chunk on
+    every append was the whole cost of TS.ADD), so counting stored-but-expired samples
+    would still not match and would vary with chunk layout; reporting 0 keeps the count
+    deterministic. Pinned by TestDelRetention::test_del_of_expired_range_counts_differently.
   since: 0.1.0
 
 # DIV-0022 is a Tier C (differential fuzzer) finding, pinned per-engine in

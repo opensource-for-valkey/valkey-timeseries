@@ -606,6 +606,32 @@ class TestTsReadWakeupPaths(TsReadTestBase):
         finally:
             reader.close(self.client)
 
+    @pytest.mark.parametrize("command", ["TS.ADD", "TS.MADD", "TS.INCRBY"])
+    def test_append_to_a_series_at_its_retention_limit(self, command):
+        """Each append past the retention window also expires a sample, so the series' size
+        stays flat. The insert must still wake the reader: the wake-up used to compare sample
+        counts across the retention trim and never fired here."""
+        self.client.execute_command(
+            "TS.CREATE", "k", "RETENTION", 10, "ENCODING", "UNCOMPRESSED"
+        )
+        for ts in range(100, 111):
+            self.client.execute_command("TS.ADD", "k", ts, 1.0)
+        reader = self.reader("TS.READ", "k", "$", "BLOCK", LONG_BLOCK_MS, 1)
+        try:
+            if command == "TS.ADD":
+                self.client.execute_command("TS.ADD", "k", 111, 1.0)
+            elif command == "TS.MADD":
+                self.client.execute_command("TS.MADD", "k", 111, 1.0)
+            else:
+                self.client.execute_command("TS.INCRBY", "k", 1, "TIMESTAMP", 111)
+            # Well inside the BLOCK: a missed wake-up would still return [111], at the timeout.
+            assert self.timestamps(reader.result(timeout=LONG_BLOCK_MS / 2000)) == [111]
+            info = self.ts_info("k")
+            assert info["totalSamples"] == 11
+            assert info["firstTimestamp"] == 101
+        finally:
+            reader.close(self.client)
+
     def test_addbulk(self):
         self.client.execute_command("TS.CREATE", "k")
         reader = self.reader("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2)

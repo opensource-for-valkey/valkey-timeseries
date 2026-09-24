@@ -227,11 +227,27 @@ impl TimeSeries {
         value: f64,
         dp_override: Option<DuplicatePolicy>,
     ) -> SampleAddResult {
+        self.add_reporting_insert(ts, value, dp_override).0
+    }
+
+    /// [`Self::add`], also reporting whether a sample was *inserted* — as opposed to ignored,
+    /// rejected, or merged into one already stored under the duplicate policy. That is what
+    /// decides whether blocked `TS.READ` readers have anything new. It is measured before the
+    /// retention trim, which can drop more samples than the add inserted, so comparing
+    /// `total_samples` around the whole call would miss inserts on a series with retention.
+    pub fn add_reporting_insert(
+        &mut self,
+        ts: Timestamp,
+        value: f64,
+        dp_override: Option<DuplicatePolicy>,
+    ) -> (SampleAddResult, bool) {
+        let samples_before = self.total_samples;
         let result = self.add_deferring_retention(ts, value, dp_override);
+        let inserted = self.total_samples > samples_before;
         if result.is_ok() {
             self.apply_retention();
         }
-        result
+        (result, inserted)
     }
 
     /// [`Self::add`] without the eager retention trim.
@@ -295,7 +311,7 @@ impl TimeSeries {
         if self.retention.is_zero() {
             return;
         }
-        if let Err(e) = self.trim() {
+        if let Err(e) = self.trim_lazily() {
             logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
         }
     }
@@ -470,11 +486,11 @@ impl TimeSeries {
                     return res;
                 }
 
-                // best-effort trim; don't block ingestion on failure
-                if let Err(e) = self.trim() {
-                    logging::log_warning(format!("TSDB: Error trimming time series: {e:?}"));
-                }
-
+                // No retention trim here: every caller applies it after the add (see
+                // `add_deferring_retention`). Splitting halves the head chunk's span, which can
+                // make its expired prefix due, so a trim here could drop more samples than this
+                // insert adds — hiding the insert from the count comparisons that wake
+                // `TS.READ` readers, and trimming ahead of batch compaction.
                 self.total_samples += added;
                 // The insert above shifts chunk positions, so recompute both ends rather than
                 // relying on the pre-split `is_last`.
@@ -611,6 +627,7 @@ impl TimeSeries {
 
     /// Get the time series between given start and end time (both inclusive).
     pub fn get_range(&self, start_time: Timestamp, end_time: Timestamp) -> Vec<Sample> {
+        let start_time = start_time.max(self.get_min_timestamp());
         if start_time > end_time {
             return Vec::new();
         }
@@ -637,6 +654,7 @@ impl TimeSeries {
         timestamp_filter: Option<&[Timestamp]>,
         value_filter: Option<ValueFilter>,
     ) -> Vec<Sample> {
+        let start_timestamp = start_timestamp.max(self.get_min_timestamp());
         if start_timestamp > end_timestamp {
             return Vec::new();
         }
@@ -728,7 +746,45 @@ impl TimeSeries {
     }
 
     pub fn iter(&self) -> SeriesSampleIterator<'_> {
-        SeriesSampleIterator::new(self, self.first_timestamp, self.last_timestamp(), false)
+        self.range_iter(self.first_timestamp, self.last_timestamp())
+    }
+
+    /// Timestamp of the earliest sample inside the retention window.
+    ///
+    /// `first_timestamp` is the earliest *stored* sample, which with retention can be an
+    /// expired one the write path has not trimmed yet (see [`Self::trim_lazily`]).
+    pub fn visible_first_timestamp(&self) -> Timestamp {
+        let min_timestamp = self.get_min_timestamp();
+        if self.first_timestamp >= min_timestamp {
+            return self.first_timestamp;
+        }
+        self.range_iter(min_timestamp, self.last_timestamp())
+            .next()
+            .map_or(self.first_timestamp, |sample| sample.timestamp)
+    }
+
+    /// Number of samples inside the retention window; `total_samples` also counts expired
+    /// samples the write path has not trimmed yet (see [`Self::trim_lazily`]).
+    pub fn visible_total_samples(&self) -> usize {
+        let min_timestamp = self.get_min_timestamp();
+        if self.first_timestamp >= min_timestamp {
+            return self.total_samples;
+        }
+        let expired: usize = self
+            .chunks
+            .iter()
+            .take_while(|chunk| chunk.first_timestamp() < min_timestamp)
+            .map(|chunk| {
+                if chunk.last_timestamp() < min_timestamp {
+                    chunk.len()
+                } else {
+                    chunk
+                        .range_iter(chunk.first_timestamp(), min_timestamp - 1)
+                        .count()
+                }
+            })
+            .sum();
+        self.total_samples.saturating_sub(expired)
     }
 
     pub fn range_iter(&self, start: Timestamp, end: Timestamp) -> SeriesSampleIterator<'_> {
@@ -771,20 +827,47 @@ impl TimeSeries {
     /// keeps `timestamp >= lastTimestamp - R`), so a chunk whose last sample is
     /// `min_timestamp` is kept and trimmed partially by the caller.
     pub(super) fn remove_expired_chunks(&mut self, min_timestamp: Timestamp) -> usize {
-        let mut deleted_count = 0;
-        self.chunks.retain(|chunk| {
-            let last_ts = chunk.last_timestamp();
-            if last_ts < min_timestamp {
-                deleted_count += chunk.len();
-                false
-            } else {
-                true
-            }
-        });
+        // Chunks are ordered and disjoint, so the expired ones are a prefix. The lazy write
+        // path lands here on every append while the head chunk holds an untrimmed expired
+        // prefix, so this must not walk the whole chunk list.
+        let expired = self
+            .chunks
+            .iter()
+            .take_while(|chunk| chunk.last_timestamp() < min_timestamp)
+            .count();
+        if expired == 0 {
+            return 0;
+        }
+        let deleted_count = self.chunks.drain(..expired).map(|chunk| chunk.len()).sum();
+        self.chunks.shrink_to_fit();
         deleted_count
     }
 
+    /// Physically removes every sample older than the retention window.
+    ///
+    /// Exact, and for a compressed head chunk expensive: dropping a prefix re-encodes the
+    /// whole chunk. The write path uses [`Self::trim_lazily`]; this is for the places that
+    /// need the prefix gone — defrag, the trim cron, and deletes (see [`Self::remove_range`]).
     pub(super) fn trim(&mut self) -> TsdbResult<usize> {
+        self.trim_expired(true)
+    }
+
+    /// Removes expired samples on the write path.
+    ///
+    /// Whole expired chunks go at once. A compressed head chunk that is only partly expired
+    /// is re-encoded only once a quarter of its time span has expired: re-encoding it on
+    /// every append (in steady state one sample expires per append) cost the whole chunk per
+    /// TS.ADD — ~37 µs for Chimp against ~80 ns without retention. Deferring it amortizes the
+    /// re-encode over many appends, at the price of keeping some expired samples in the head
+    /// chunk. Those are invisible: reads clamp to [`Self::get_min_timestamp`], and TS.INFO
+    /// reports [`Self::visible_first_timestamp`] and [`Self::visible_total_samples`]. So with
+    /// retention, `first_timestamp` and `total_samples` describe what is *stored*, not what is
+    /// live.
+    pub(super) fn trim_lazily(&mut self) -> TsdbResult<usize> {
+        self.trim_expired(false)
+    }
+
+    fn trim_expired(&mut self, force: bool) -> TsdbResult<usize> {
         let min_timestamp = self.get_min_timestamp();
         if self.first_timestamp >= min_timestamp {
             return Ok(0);
@@ -797,6 +880,7 @@ impl TimeSeries {
         // `min_timestamp - 1` — the sample at `min_timestamp` itself is retained.
         if let Some(chunk) = self.chunks.first_mut()
             && chunk.first_timestamp() < min_timestamp
+            && (force || head_trim_due(chunk, min_timestamp))
         {
             if let Ok(count) = chunk.remove_range(0, min_timestamp - 1) {
                 deleted_count += count;
@@ -812,12 +896,24 @@ impl TimeSeries {
             self.update_first_last_timestamps();
         }
 
-        self.chunks.shrink_to_fit();
-
         Ok(deleted_count)
     }
 
     pub fn remove_range(&mut self, start_ts: Timestamp, end_ts: Timestamp) -> TsdbResult<usize> {
+        if start_ts > end_ts {
+            return Ok(0);
+        }
+
+        // With retention, drop the untrimmed expired prefix first (see `trim_lazily`). The
+        // retention floor follows the last sample, so a delete that removes the live tail
+        // would otherwise pull the floor back and resurrect it. Expired samples are not part
+        // of the series, so they are neither deleted nor counted here.
+        let start_ts = if self.retention.is_zero() {
+            start_ts
+        } else {
+            self.trim()?;
+            start_ts.max(self.get_min_timestamp())
+        };
         if start_ts > end_ts {
             return Ok(0);
         }
@@ -914,7 +1010,7 @@ impl TimeSeries {
         // impact is minimal for a single series's chunks.
         chunks
             .iter()
-            .any(|c| c.has_samples_in_range(start_time, end_time))
+            .any(|c| c.has_samples_in_range(min_timestamp, end_time))
     }
 
     pub fn increment_sample_value(
@@ -985,7 +1081,7 @@ impl TimeSeries {
     /// Counting allocations, not bytes, is what the server's own estimators do (a quicklist
     /// reports its node count, a stream its macro nodes): the cost being modelled is the number
     /// of `free` calls, not the volume.
-    pub fn free_effort(&self) -> usize {
+    pub(crate) fn free_effort(&self) -> usize {
         // The chunk vector, plus one buffer per chunk -- a bit stream for the compressed
         // encodings, a sample vector for the uncompressed one.
         let chunks = 1 + self.chunks.len();
@@ -1121,12 +1217,22 @@ impl TimeSeries {
         if crate::config::is_strict_rts_compat()
             && self.is_compaction()
             && !self.is_empty()
-            && let Some(published) = self.last_forward_close
-            && let Ok(Some(current)) = self.get_sample(published.timestamp)
+            && let Some(current) = self.live_forward_close()
         {
             return Some(current);
         }
         self.last_sample
+    }
+
+    /// The stored sample at the forward-close marker, if it is still inside the retention
+    /// window. `get_sample` alone is not enough: the head chunk can still hold samples below
+    /// the floor that the write path has not trimmed yet (see [`Self::trim_lazily`]).
+    pub(super) fn live_forward_close(&self) -> Option<Sample> {
+        let published = self.last_forward_close?;
+        if self.is_older_than_retention(published.timestamp) {
+            return None;
+        }
+        self.get_sample(published.timestamp).ok().flatten()
     }
 
     pub(crate) fn debug_digest(&self, digest: &mut Digest) {
@@ -1147,13 +1253,24 @@ impl TimeSeries {
         }
         digest.add_long_long(self.chunk_size_bytes as i64);
 
-        digest.add_long_long(self.chunks.len() as i64);
-        for chunk in self.chunks.iter() {
-            chunk.debug_digest(digest);
+        // Hash the samples inside the retention window, not the chunks. How many expired
+        // samples the head chunk still holds depends on when a trim last ran (see
+        // `trim_lazily`), and the trim cron runs independently on a primary and its replicas,
+        // so the stored layout is not a function of the data set.
+        if self.retention.is_zero() {
+            digest.add_long_long(self.chunks.len() as i64);
+            for chunk in self.chunks.iter() {
+                chunk.debug_digest(digest);
+            }
+        } else {
+            for sample in self.iter() {
+                digest.add_long_long(sample.timestamp);
+                digest.add_string_buffer(sample.value.to_le_bytes().as_ref());
+            }
         }
 
-        digest.add_long_long(self.total_samples as i64);
-        digest.add_long_long(self.first_timestamp);
+        digest.add_long_long(self.visible_total_samples() as i64);
+        digest.add_long_long(self.visible_first_timestamp());
         if let Some(sample) = &self.last_sample {
             digest.add_long_long(sample.timestamp);
             digest.add_string_buffer(sample.value.to_le_bytes().as_ref());
@@ -1212,6 +1329,19 @@ fn binary_search_chunks_by_timestamp(chunks: &[TimeSeriesChunk], ts: Timestamp) 
         Ok(pos) => (pos, true),
         Err(pos) => (pos, false),
     }
+}
+
+/// Whether a partly expired head chunk is due for a physical trim on the write path (see
+/// [`TimeSeries::trim_lazily`]): always for an uncompressed chunk, whose prefix removal is a
+/// cheap move, and for a compressed one once a quarter of its time span has expired.
+fn head_trim_due(chunk: &TimeSeriesChunk, min_timestamp: Timestamp) -> bool {
+    if !chunk.is_compressed() {
+        return true;
+    }
+    let first = chunk.first_timestamp() as i128;
+    let expired = min_timestamp as i128 - first;
+    let span = chunk.last_timestamp() as i128 - first;
+    expired * 4 >= span
 }
 
 const LINEAR_SCAN_MAX: usize = 16;

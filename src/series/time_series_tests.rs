@@ -2034,4 +2034,226 @@ mod tests {
             small.free_effort(),
         );
     }
+    /// A series with `retention_ms` fed one sample per millisecond through the write path.
+    fn retained_series(encoding: ChunkEncoding, retention_ms: u64) -> TimeSeries {
+        let mut ts = TimeSeries::new();
+        ts.chunk_encoding = encoding;
+        ts.retention = Duration::from_millis(retention_ms);
+        ts
+    }
+
+    #[test]
+    fn test_lazy_trim_bounds_the_expired_prefix() {
+        for encoding in [
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Uncompressed,
+        ] {
+            let mut ts = retained_series(encoding, 1_000);
+            let mut saw_lazy_prefix = false;
+            for i in 0..20_000 {
+                assert!(ts.add(i, i as f64, None).is_ok());
+
+                let floor = ts.get_min_timestamp();
+                // Whole expired chunks never survive an add; only the head chunk may hold
+                // expired samples, and then less than a quarter of its time span.
+                assert!(
+                    ts.chunks
+                        .iter()
+                        .skip(1)
+                        .all(|c| c.first_timestamp() >= floor)
+                );
+                let head = &ts.chunks[0];
+                if head.first_timestamp() < floor {
+                    assert!(
+                        head.is_compressed(),
+                        "{encoding:?}: uncompressed trims eagerly"
+                    );
+                    let span = head.last_timestamp() - head.first_timestamp();
+                    assert!(
+                        (floor - head.first_timestamp()) * 4 < span,
+                        "{encoding:?} at {i}"
+                    );
+                    saw_lazy_prefix = true;
+                }
+            }
+            assert_eq!(saw_lazy_prefix, encoding != ChunkEncoding::Uncompressed);
+        }
+    }
+
+    #[test]
+    fn test_untrimmed_expired_samples_are_invisible() {
+        for encoding in [ChunkEncoding::Chimp, ChunkEncoding::Gorilla] {
+            let mut ts = retained_series(encoding, 1_000);
+            let mut i = 0;
+            // Stop at a point where the head chunk still holds an expired prefix.
+            while i < 3_000 || ts.chunks[0].first_timestamp() >= ts.get_min_timestamp() {
+                ts.add(i, i as f64, None);
+                i += 1;
+            }
+            let floor = ts.get_min_timestamp();
+            let last = ts.last_timestamp();
+            let live = (last - floor + 1) as usize;
+            assert!(
+                ts.total_samples > live,
+                "{encoding:?}: the prefix is still stored"
+            );
+
+            assert_eq!(ts.visible_total_samples(), live);
+            assert_eq!(ts.visible_first_timestamp(), floor);
+            assert_eq!(ts.iter().count(), live);
+            assert_eq!(ts.iter().next().map(|s| s.timestamp), Some(floor));
+            assert_eq!(ts.get_range(0, last).len(), live);
+            assert_eq!(
+                ts.get_range_filtered(0, last, Some(&[0, floor]), None)
+                    .len(),
+                1
+            );
+            assert!(!ts.has_samples_in_range(0, floor - 1));
+        }
+    }
+
+    #[test]
+    fn test_delete_does_not_resurrect_untrimmed_samples() {
+        let mut ts = retained_series(ChunkEncoding::Chimp, 1_000);
+        let mut i = 0;
+        while i < 3_000 || ts.chunks[0].first_timestamp() >= ts.get_min_timestamp() {
+            ts.add(i, i as f64, None);
+            i += 1;
+        }
+        let floor = ts.get_min_timestamp();
+        let last = ts.last_timestamp();
+
+        // Dropping the newer half pulls the floor back by 500ms. Expired samples from that
+        // stretch must not come back into view, and must not be counted as deleted.
+        let deleted = ts.remove_range(floor + 500, last).unwrap();
+        assert_eq!(deleted, (last - floor - 500 + 1) as usize);
+        assert_eq!(ts.iter().next().map(|s| s.timestamp), Some(floor));
+        assert_eq!(ts.first_timestamp, floor);
+        assert_eq!(ts.total_samples, 500);
+        assert_eq!(ts.visible_total_samples(), 500);
+
+        // A delete wholly below the floor removes nothing.
+        assert_eq!(ts.remove_range(0, floor - 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_add_reporting_insert_counts_before_the_retention_trim() {
+        // With uncompressed chunks every append past the window trims one sample, so the
+        // series' size is flat and only the pre-trim count shows the insert.
+        let mut ts = retained_series(ChunkEncoding::Uncompressed, 100);
+        for i in 0..1_000 {
+            let (result, inserted) = ts.add_reporting_insert(i, i as f64, None);
+            assert!(result.is_ok() && inserted, "append at {i}");
+        }
+        let (result, inserted) = ts.add_reporting_insert(999, 1.0, Some(DuplicatePolicy::KeepLast));
+        assert!(
+            result.is_ok() && !inserted,
+            "an update in place inserts nothing"
+        );
+    }
+
+    /// A compressed series whose sealed head chunk holds an untrimmed expired prefix, a fifth
+    /// of its span: under the quarter at which the write path re-encodes it. Samples sit on
+    /// even timestamps, so odd ones are free for out-of-order inserts. Returns the series and
+    /// the first odd timestamp inside the retention window.
+    fn series_with_lazy_expired_head() -> (TimeSeries, Timestamp) {
+        let mut ts = retained_series(ChunkEncoding::Chimp, 0);
+        let mut i = 0;
+        while ts.chunks.len() < 2 {
+            ts.add(i, i as f64, None);
+            i += 2;
+        }
+        // Retention is set only now, so no write has trimmed against it yet.
+        let (first, last) = (
+            ts.chunks[0].first_timestamp(),
+            ts.chunks[0].last_timestamp(),
+        );
+        let floor = first + (last - first) / 5;
+        ts.retention = Duration::from_millis((ts.last_timestamp() - floor) as u64);
+        assert_eq!(ts.get_min_timestamp(), floor);
+        (ts, floor | 1)
+    }
+
+    /// Out-of-order inserts into the head chunk until it splits; returns whether each insert
+    /// was reported, the last one being the one that took the split path.
+    fn insert_until_head_splits(
+        ts: &mut TimeSeries,
+        mut next: Timestamp,
+        mut insert: impl FnMut(&mut TimeSeries, Timestamp) -> bool,
+    ) -> Vec<bool> {
+        let chunk_count = ts.chunks.len();
+        let mut reported = Vec::new();
+        while ts.chunks.len() == chunk_count {
+            assert!(
+                next < ts.chunks[0].last_timestamp(),
+                "head chunk never split"
+            );
+            reported.push(insert(ts, next));
+            next += 2;
+        }
+        reported
+    }
+
+    #[test]
+    fn test_add_reporting_insert_through_a_chunk_split() {
+        // The split path used to run the lazy trim before counting its own insert. Splitting
+        // halves the head chunk's span, which makes its expired prefix due, so the trim
+        // dropped more samples than the insert added and the insert went unreported.
+        let (mut ts, next) = series_with_lazy_expired_head();
+        let reported = insert_until_head_splits(&mut ts, next, |ts, t| {
+            let (result, inserted) = ts.add_reporting_insert(t, 0.5, None);
+            assert!(result.is_ok(), "insert at {t}");
+            inserted
+        });
+        assert!(reported.len() > 1);
+        assert_eq!(reported.iter().position(|&r| !r), None, "unreported insert");
+        assert_eq!(ts.iter().count(), ts.visible_total_samples());
+    }
+
+    #[test]
+    fn test_deferred_add_through_a_chunk_split_defers_the_trim() {
+        // TS.MADD detects inserts by comparing sample counts across the batch, which only holds
+        // if nothing inside the batch trims. The split path was the one place that did.
+        let (mut ts, next) = series_with_lazy_expired_head();
+        let reported = insert_until_head_splits(&mut ts, next, |ts, t| {
+            let before = ts.total_samples;
+            assert!(
+                ts.add_deferring_retention(t, 0.5, None).is_ok(),
+                "insert at {t}"
+            );
+            ts.total_samples == before + 1
+        });
+        assert_eq!(reported.iter().position(|&r| !r), None, "unreported insert");
+        let floor = ts.get_min_timestamp();
+        assert!(ts.chunks[0].first_timestamp() < floor, "trim was deferred");
+
+        ts.apply_retention();
+        assert!(ts.chunks[0].first_timestamp() >= floor);
+        assert_eq!(ts.iter().count(), ts.visible_total_samples());
+    }
+
+    #[test]
+    fn test_forward_close_marker_is_ignored_once_expired() {
+        let mut ts = retained_series(ChunkEncoding::Chimp, 0);
+        for i in (0..2_000).step_by(2) {
+            ts.add(i, i as f64, None);
+        }
+        let marker = ts.get_sample(0).unwrap().unwrap();
+        ts.last_forward_close = Some(marker);
+        assert_eq!(ts.live_forward_close(), Some(marker));
+
+        // A floor a tenth of the way in: the head chunk keeps the expired marker sample
+        // stored, but it is outside the window and must not be reported.
+        let last = ts.last_timestamp();
+        ts.retention = Duration::from_millis((last - 200) as u64);
+        assert_eq!(ts.get_sample(0).unwrap(), Some(marker), "still stored");
+        assert_eq!(ts.live_forward_close(), None);
+
+        // A marker at the floor itself is still live.
+        let floor = ts.get_min_timestamp();
+        let at_floor = ts.get_sample(floor).unwrap().unwrap();
+        ts.last_forward_close = Some(at_floor);
+        assert_eq!(ts.live_forward_close(), Some(at_floor));
+    }
 }

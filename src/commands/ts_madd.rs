@@ -136,12 +136,16 @@ fn handle_update(
         }
     }
 
+    // The merge leaves the retention trim to us so the counts above still compare like for
+    // like: a trim can drop more samples than the batch added.
     for (key, count_before) in counts_before {
-        if let Some(samples) = input_map.get(key)
-            && let Some(series) = &samples.series
-            && series.total_samples > count_before
+        if let Some(samples) = input_map.get_mut(key)
+            && let Some(series) = &mut samples.series
         {
-            signal_timeseries_ready(ctx, key);
+            if series.total_samples > count_before {
+                signal_timeseries_ready(ctx, key);
+            }
+            series.apply_retention();
         }
     }
 

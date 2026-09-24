@@ -125,7 +125,7 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
     map.insert("metric".into(), metric.into());
     map.insert(
         "totalSamples".into(),
-        ValkeyValue::Integer(ts.total_samples as i64),
+        ValkeyValue::Integer(ts.visible_total_samples() as i64),
     );
     map.insert(
         "memoryUsage".into(),
@@ -133,7 +133,7 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
     );
     map.insert(
         "firstTimestamp".into(),
-        ValkeyValue::Integer(ts.first_timestamp),
+        ValkeyValue::Integer(ts.visible_first_timestamp()),
     );
     // `reported_last_sample`, not `last_sample`: under `ts-compatibility-mode strict` a
     // compaction destination reports the last bucket closed by forward progress, and

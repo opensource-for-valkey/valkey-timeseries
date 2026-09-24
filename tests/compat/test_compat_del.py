@@ -49,7 +49,8 @@ class TestDel:
 
 
 class TestDelRetention:
-    """DIV-0021: retention model (lazy physical trim vs eager) leaks through TS.DEL."""
+    """DIV-0021: the retention model (when expired samples are physically trimmed) leaks
+    through TS.DEL."""
 
     @staticmethod
     def _expired(client):
@@ -70,7 +71,8 @@ class TestDelRetention:
 
     def test_del_of_expired_range_counts_differently(self, diff):
         """RTS still physically holds the out-of-window sample and reports deleting it;
-        we trimmed it on write, so there is nothing left to delete. Pins DIV-0021."""
+        we drop the expired prefix before deleting, so there is nothing left to count.
+        Pins DIV-0021."""
         self._expired(diff.reference)
         self._expired(diff.subject)
 

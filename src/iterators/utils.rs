@@ -35,14 +35,6 @@ where
     AggregateIterator::with_empty_fill(iter, aggregation, aligned_timestamp, empty_fill)
 }
 
-/// Timestamp of the series' earliest *visible* sample: the earliest stored one, or the
-/// retention floor when that is later. `get_min_timestamp` alone gives the floor, which for a
-/// series whose data all postdates it is not a sample timestamp at all — reading it as one
-/// invents data before the first sample.
-fn visible_first_timestamp(series: &TimeSeries) -> Timestamp {
-    series.first_timestamp.max(series.get_min_timestamp())
-}
-
 /// Does any sample in `[from, to]` pass the query's `FILTER_BY_TS`/`FILTER_BY_VALUE`?
 ///
 /// Used to look *outside* the queried window, which is why it takes the series rather than the
@@ -58,7 +50,9 @@ fn has_passing_sample(
         return false;
     }
 
-    let first = visible_first_timestamp(series);
+    // The earliest *visible* sample, not the retention floor: the floor is usually not a
+    // sample timestamp, and reading it as one invents data before the first sample.
+    let first = series.visible_first_timestamp();
     let last = series.last_timestamp();
     if to < first || from > last {
         return false;
@@ -88,7 +82,9 @@ fn last_passing_sample_before(
     options: &RangeOptions,
     to: Timestamp,
 ) -> Option<Sample> {
-    let first = visible_first_timestamp(series);
+    // The earliest *visible* sample, not the retention floor: the floor is usually not a
+    // sample timestamp, and reading it as one invents data before the first sample.
+    let first = series.visible_first_timestamp();
     if series.is_empty() || to < first {
         return None;
     }

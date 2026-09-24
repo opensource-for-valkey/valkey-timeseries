@@ -51,6 +51,9 @@ impl<'a> TimestampFilterIterator<'a> {
         let mut timestamps: SmallVec<[Timestamp; 16]> = SmallVec::from(timestamps);
         timestamps.sort_unstable();
         timestamps.dedup();
+        // Expired samples the write path has not trimmed yet are not part of the series.
+        let min_timestamp = series.get_min_timestamp();
+        timestamps.retain(|ts| *ts >= min_timestamp);
 
         let chunk_idx = if series.is_empty() {
             -1

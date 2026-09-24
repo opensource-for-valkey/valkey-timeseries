@@ -163,10 +163,6 @@ fn handle_update(
     // existing sample in place, which compaction must treat as an upsert rather than a
     // fresh append (see `run_compaction_for_increment`).
     let prev_last_ts = series.last_sample.map(|s| s.timestamp);
-    // An increment at the last timestamp updates in place and adds nothing readable, so only a
-    // genuine count increase wakes blocked `TS.READ` readers.
-    let samples_before = series.total_samples;
-
     let result = series.increment_sample_value(timestamp, delta)?;
     match result {
         SampleAddResult::Ok(added) => {
@@ -174,7 +170,10 @@ fn handle_update(
             // compaction rules; without this a counter maintained by
             // TS.INCRBY/TS.DECRBY never reaches its downstream series.
             run_compaction_for_increment(ctx, series, key_name, added, prev_last_ts)?;
-            if series.total_samples > samples_before {
+            // An increment at the last timestamp updates in place and adds nothing readable, so
+            // only an append wakes blocked `TS.READ` readers. Not a `total_samples` comparison:
+            // the retention trim that follows an append can drop more than it added.
+            if prev_last_ts.is_none_or(|last| added.timestamp > last) {
                 signal_timeseries_ready(ctx, key_name);
             }
             Ok(IncrOutcome {

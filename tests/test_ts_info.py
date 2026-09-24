@@ -321,3 +321,34 @@ class TestTimeseriesInfo(ValkeyTimeSeriesTestCaseBase):
         d = dict(zip(dst_info[::2], dst_info[1::2]))
         assert d[b'labels'] == []
         assert d[b'rules'] == []
+
+    def test_info_agrees_with_range_under_retention(self):
+        """With retention, a compressed head chunk keeps its expired prefix until a quarter of
+        its span has expired (re-encoding it on every append was the whole cost of TS.ADD).
+        TS.INFO must count and date only what TS.RANGE can see, including after a delete of
+        the newest samples pulls the retention floor back."""
+        key = 'ts_retention_lazy_trim'
+        self.client.execute_command(
+            'TS.CREATE', key, 'RETENTION', 1000, 'ENCODING', 'COMPRESSED'
+        )
+
+        def check():
+            samples = self.client.execute_command('TS.RANGE', key, '-', '+')
+            info = self.ts_info(key)
+            assert info['totalSamples'] == len(samples)
+            assert info['firstTimestamp'] == samples[0][0]
+            assert info['lastTimestamp'] == samples[-1][0]
+            return samples
+
+        for start in range(0, 5000, 250):
+            pipe = self.client.pipeline(transaction=False)
+            for ts in range(start, start + 250):
+                pipe.execute_command('TS.ADD', key, ts, ts)
+            pipe.execute()
+            check()
+
+        assert [s[0] for s in check()] == list(range(3999, 5000))
+        # Deleting the newest half moves the floor back by 500ms; the expired samples in that
+        # stretch must stay gone.
+        assert self.client.execute_command('TS.DEL', key, 4500, 4999) == 500
+        assert [s[0] for s in check()] == list(range(3999, 4500))
