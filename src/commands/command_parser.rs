@@ -25,9 +25,8 @@ use crate::series::request_types::{
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
 use crate::series::{TimestampRange, TimestampValue};
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use smallvec::SmallVec;
-use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::iter::{Peekable, Skip};
 use std::time::Duration;
@@ -527,20 +526,25 @@ pub fn parse_label_list(
     args: &mut CommandArgIterator,
     stop_tokens: &[CommandArgToken],
 ) -> ValkeyResult<Vec<String>> {
-    let mut labels: BTreeSet<String> = BTreeSet::new();
+    // Kept in the requested order: SELECTED_LABELS replies list the labels in the order they
+    // were asked for (as the reference does), and a set here used to sort them. The set only
+    // detects duplicates.
+    let mut labels: Vec<String> = Vec::new();
+    let mut seen: AHashSet<String> = AHashSet::new();
 
     for_each_arg_until_stop(args, stop_tokens, |label| {
-        if labels.contains(label) {
+        if seen.contains(label) {
             return Err(ValkeyError::Str(error_consts::DUPLICATE_LABEL));
         }
         if labels.len() == MAX_LABELS_PER_SERIES {
             return Err(ValkeyError::Str(error_consts::TOO_MANY_LABELS));
         }
-        labels.insert(label.to_string());
+        seen.insert(label.to_string());
+        labels.push(label.to_string());
         Ok(())
     })?;
 
-    Ok(labels.into_iter().collect())
+    Ok(labels)
 }
 
 pub fn parse_label_value_pairs(
@@ -1397,7 +1401,17 @@ pub(super) fn parse_mrange_options(args: &mut CommandArgIterator) -> ValkeyResul
             CommandArgToken::WithLabels => {
                 options.with_labels = true;
             }
-            _ => {}
+            // Rejected, as TS.RANGE rejects them (DIV-0042). The reference skips arguments it
+            // does not recognize, and so did this parser: a misspelled `AGREGATION avg 10`
+            // quietly returned raw samples.
+            _ => {
+                return if token == CommandArgToken::Invalid {
+                    Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT))
+                } else {
+                    let msg = format!("TSDB: invalid argument '{token}'");
+                    Err(ValkeyError::String(msg))
+                };
+            }
         }
     }
 

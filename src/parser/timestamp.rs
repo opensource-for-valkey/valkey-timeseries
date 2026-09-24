@@ -43,6 +43,10 @@ pub fn parse_numeric_timestamp(
     if s.contains(CHARS_TO_CHECK) {
         // Unix timestamps in seconds with optional milliseconds after the point. For example, 1562529662.678.
         let ts: f64 = s.parse()?;
+        // `1e999` parses as infinity, which would saturate to `i64::MAX` below.
+        if !ts.is_finite() {
+            return Err(format!("timestamp is not finite: {s}").into());
+        }
         if ts >= u32::MAX as f64 {
             // The timestamp is in milliseconds
             return Ok(ts.round() as i64);
@@ -73,4 +77,21 @@ pub fn parse_numeric_timestamp(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_finite_numeric_timestamps_are_rejected() {
+        for s in ["1e999", "-1e999", "nan", "NaN", "inf", "1.5e400"] {
+            assert!(parse_timestamp(s, false).is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_fractional_timestamps_are_seconds() {
+        // DIV-0041: a fraction or exponent means Unix seconds; a plain integer milliseconds.
+        assert_eq!(parse_timestamp("1000", false).unwrap(), 1000);
+        assert_eq!(parse_timestamp("1.5", false).unwrap(), 1500);
+        assert_eq!(parse_timestamp("1000.0", false).unwrap(), 1_000_000);
+    }
+}

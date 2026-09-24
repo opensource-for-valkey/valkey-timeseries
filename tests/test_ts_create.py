@@ -192,3 +192,9 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         """`TS.ADD labels <ts> <v>` names a key; it must not start a label list."""
         self.client.execute_command("TS.ADD", "labels", 1, 2)
         assert self.ts_info("labels")["labels"] == {}
+
+    def test_retention_nan_rejected(self):
+        """`f64::parse` accepts `nan`, which slipped past every range check as a 0 duration."""
+        for value in ("nan", "NaNms", "inf"):
+            with pytest.raises(ResponseError):
+                self.client.execute_command("TS.CREATE", f"nanret:{value}", "RETENTION", value)

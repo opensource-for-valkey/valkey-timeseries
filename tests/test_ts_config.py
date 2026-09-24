@@ -508,3 +508,11 @@ class TestTimeseriesRoundingConfig(ValkeyTimeSeriesTestCaseBase):
                 self.set_config("ts-decimal-digits", "0")
         finally:
             self.set_config("ts-significant-digits", "none")
+
+    def test_digit_settings_reject_nan_and_fractions(self):
+        """NaN passed the range check (every comparison with it is false) and became 0
+        digits; fractions were truncated while CONFIG GET echoed the original text."""
+        for name in ("ts-significant-digits", "ts-decimal-digits"):
+            for value in ("nan", "2.9"):
+                with pytest.raises(ResponseError):
+                    self.set_config(name, value)

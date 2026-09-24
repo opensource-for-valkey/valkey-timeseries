@@ -9,7 +9,7 @@ use crate::labels::Label;
 use crate::series::index::with_matched_series;
 use crate::series::request_types::{MGetRequest, MGetSeriesData, MatchFilterOptions};
 use crate::series::{get_latest_compaction_sample, get_series_labels};
-use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
 acl_categories!(TS_MGET, "ts.mget", "fast read timeseries");
 /// TS.MGET
@@ -47,15 +47,16 @@ pub fn ts_mget_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     reply_with_mget_values(ctx, &mget_results)
 }
 
-/// Parsing commands with variadic args gets wonky. For example, if we have something like:
+/// Parses `TS.MGET [LATEST] [WITHLABELS | SELECTED_LABELS label...] [HASHTAG tags] FILTER
+/// filterExpr...`, walking the options in order.
 ///
-/// `TS.MGET SELECTED_LABELS label1 label2 FILTER a=b x=y`
-///
-/// It's not clear if FILTER a=b and x=y are to be parsed as part of SELECTED_LABELS.
-/// To avoid this, we need to check backwards for variadic command arguments and remove them
-/// before handling the rest of the arguments.
+/// The variadic lists (SELECTED_LABELS, FILTER) end at the next option token, so options may
+/// also follow the FILTER list (DIV-0056, matching TS.MRANGE's DIV-0050). This used to take
+/// everything after the last FILTER as filter expressions; in this dialect a bare word is a
+/// metric-name selector, so `FILTER z=1 WITHLABELS` parsed as `__name__="WITHLABELS"` and
+/// replied with an empty array — a silently wrong answer where the reference errors.
 pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> {
-    let supported_tokens = &[
+    const OPTION_TOKENS: &[CommandArgToken] = &[
         CommandArgToken::SelectedLabels,
         CommandArgToken::Filter,
         CommandArgToken::Latest,
@@ -64,20 +65,7 @@ pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> 
     ];
 
     let mut options = MGetRequest::default();
-
-    let Some(filter_index) = args
-        .iter()
-        .rposition(|arg| arg.as_slice().eq_ignore_ascii_case(b"FILTER"))
-    else {
-        return Err(ValkeyError::WrongArity);
-    };
-
-    let mut args = args;
-    let filter_args = args.split_off(filter_index);
-
-    if filter_args.len() < 2 {
-        return Err(ValkeyError::WrongArity);
-    }
+    let mut filter_seen = false;
 
     let mut args = args.into_iter().skip(1).peekable(); // Skip the command name
 
@@ -87,7 +75,7 @@ pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> 
 
         match token {
             CommandArgToken::SelectedLabels => {
-                options.selected_labels = parse_label_list(&mut args, supported_tokens)?;
+                options.selected_labels = parse_label_list(&mut args, OPTION_TOKENS)?;
                 if options.selected_labels.is_empty() {
                     return Err(ValkeyError::Str(
                         "TSDB: SELECT_LABELS should have at least 1 parameter",
@@ -101,25 +89,39 @@ pub fn parse_mget_options(args: Vec<ValkeyString>) -> ValkeyResult<MGetRequest> 
                 options.latest = true;
             }
             CommandArgToken::HashTag => {
+                // An option token is not a tag value: `HASHTAG FILTER ...` is a missing value.
+                if args.peek().is_some_and(|next| {
+                    parse_command_arg_token(next.as_slice())
+                        .is_some_and(|t| OPTION_TOKENS.contains(&t))
+                }) {
+                    return Err(ValkeyError::Str(error_consts::MISSING_HASHTAG));
+                }
                 options.tags = parse_hash_tags(&mut args)?;
             }
             CommandArgToken::Filter => {
-                return Err(ValkeyError::Str("TSDB: FILTER must be the last argument"));
+                // The reference rejects a second FILTER too.
+                if filter_seen {
+                    return Err(ValkeyError::Str("TSDB: FILTER specified more than once"));
+                }
+                filter_seen = true;
+                // An empty list is an arity error, as the reference reports it (and as a bare
+                // trailing `FILTER` always was here), not a selector-parse error.
+                let list_is_empty = args.peek().is_none_or(|next| {
+                    parse_command_arg_token(next.as_slice())
+                        .is_some_and(|t| OPTION_TOKENS.contains(&t))
+                });
+                if list_is_empty {
+                    return Err(ValkeyError::WrongArity);
+                }
+                options.filters = parse_series_selector_list(&mut args, OPTION_TOKENS)?;
             }
             _ => return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT)),
         }
     }
 
-    if options.with_labels && !options.selected_labels.is_empty() {
-        return Err(ValkeyError::Str(
-            error_consts::WITH_LABELS_AND_SELECTED_LABELS_SPECIFIED,
-        ));
+    if !filter_seen {
+        return Err(ValkeyError::WrongArity);
     }
-
-    let mut args = filter_args.into_iter().skip(1).peekable();
-    options.filters = parse_series_selector_list(&mut args, &[])?;
-
-    args.done()?;
 
     if options.filters.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_FILTER));

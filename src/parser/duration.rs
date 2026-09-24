@@ -76,9 +76,12 @@ pub fn parse_duration_value(s: &str) -> ParseResult<i64> {
 fn scan_duration_segment(s: &str) -> ParseResult<(f64, &str)> {
     fn parse_prefix(str: &str, end: usize) -> ParseResult<f64> {
         let num_str = &str[..end];
+        // `f64::parse` also accepts `nan`/`inf`/`infinity`. NaN in particular slipped past
+        // every range check (all its comparisons are false) and came out as a zero duration,
+        // so `RETENTION nan` and `RETENTION NaNms` were accepted.
         match num_str.parse::<f64>() {
-            Ok(num) => Ok(num),
-            Err(_) => Err(ParseError::InvalidDuration(num_str.to_string())),
+            Ok(num) if num.is_finite() => Ok(num),
+            _ => Err(ParseError::InvalidDuration(num_str.to_string())),
         }
     }
 
@@ -118,6 +121,15 @@ mod tests {
         MILLIS_PER_DAY, MILLIS_PER_MINUTE, MILLIS_PER_SECOND, parse_duration_value,
         parse_positive_duration_value, scan_duration_segment,
     };
+
+    #[test]
+    fn test_non_finite_numbers_are_not_durations() {
+        for s in [
+            "nan", "NaN", "NaNms", "nanh", "inf", "infinity", "-inf", "infms",
+        ] {
+            assert!(parse_duration_value(s).is_err(), "{s}");
+        }
+    }
 
     #[test]
     fn test_scan_duration_segment_empty() {

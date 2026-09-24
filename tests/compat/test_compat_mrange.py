@@ -166,6 +166,14 @@ class TestWithLabels:
             "SELECTED_LABELS", "host", "region", "FILTER", "metric=cpu",
         )
 
+    def test_selected_labels_keep_the_requested_order(self, diff, mrange_cmd):
+        """Labels come back in the order they were asked for, not sorted."""
+        mk_label_universe(diff)
+        diff(
+            mrange_cmd, "-", "+",
+            "SELECTED_LABELS", "region", "host", "FILTER", "metric=cpu",
+        )
+
     def test_selected_labels_missing_becomes_nil(self, diff, mrange_cmd):
         mk_label_universe(diff)
         # u:mem:1 lacks `region`; the selected slot must come back nil, not
@@ -498,3 +506,21 @@ class TestArgParsing:
             "FILTER", "metric=cpu",
             "GROUPBY", "metric", "REDUCE", "sum",
         )
+
+
+class TestMRangeDivergences:
+    """DIV-0057 / DIV-0058: unrecognized arguments are rejected here; RTS skips them."""
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("BOGUS",),
+            ("RETENTION", "5"),
+            ("AGREGATION", "avg", "10"),
+        ],
+    )
+    def test_unrecognized_arguments_are_rejected_not_ignored(self, diff, mrange_cmd, args):
+        mk_label_universe(diff)
+        diff.reference.execute_command(mrange_cmd, "-", "+", *args, "FILTER", "metric=cpu")
+        with pytest.raises(ResponseError, match="invalid argument"):
+            diff.subject.execute_command(mrange_cmd, "-", "+", *args, "FILTER", "metric=cpu")

@@ -948,10 +948,12 @@
   kind: behavior
   documentation_only: true
   description: >
-    RETENTION and the TS.ADD timestamp accept duration strings (`1h`, `30m`) and
-    fractional milliseconds (`1.5` -> 1500 ms); RTS accepts a plain integer only
-    ("Couldn't parse RETENTION" / "invalid timestamp"). Both engines reject
-    genuinely unparseable input (`abc`, `100abc`, a leading space).
+    RETENTION and the TS.ADD timestamp accept duration strings (`1h`, `30m`), and the
+    timestamp also accepts a number with a fraction or exponent, read as Unix *seconds*
+    (Prometheus style: `1.5` -> 1500 ms, `1000.0` -> 1000000 ms) where a plain integer is
+    milliseconds; values at or above 2^32 are taken as milliseconds. RTS accepts a plain
+    integer only ("Couldn't parse RETENTION" / "invalid timestamp"). Both engines reject
+    genuinely unparseable input (`abc`, `100abc`, a leading space), and NaN / infinity.
   rationale: >
     Accepted (owner sign-off 2026-07-29, §5.3): duration-string parsing is a
     deliberate extension shared by the whole command surface, and the fractional
@@ -1222,4 +1224,48 @@
     pattern of declining to copy the reference contradicting itself. The affected
     state is narrow (ALIGN offset off-grid, data within one bucket of timestamp 0)
     and the correction is additive: we return buckets RTS omits, never fewer.
+  since: 0.1.0
+
+- id: DIV-0056
+  command: TS.MGET
+  kind: behavior
+  documentation_only: true
+  description: >
+    The FILTER expression list ends at the next option token (SELECTED_LABELS, LATEST,
+    WITHLABELS, HASHTAG), so options may follow it — `TS.MGET FILTER z=1 WITHLABELS` is
+    accepted and honors WITHLABELS. RTS 8.10 replies "TSDB: failed parsing labels" because
+    its FILTER list runs to the end of the command. A second FILTER is rejected by both.
+  rationale: >
+    Accepted (owner sign-off 2026-09-23, §5.3) — the TS.MGET counterpart of DIV-0050,
+    same reasoning: in this dialect a bare word is a metric-name selector, so not stopping
+    at the token parsed the option as `__name__="WITHLABELS"` and replied with an empty
+    array, a silently wrong answer where RTS at least errors. The fuzzer emits MGET options
+    before FILTER only. Pinned by
+    TestMGetDivergences::test_options_may_follow_the_filter_list.
+  since: 0.1.0
+
+- id: DIV-0057
+  command: TS.MRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    An argument that is not a recognized option is rejected here ("invalid argument");
+    RTS 8.10 skips it, so `TS.MRANGE - + BOGUS FILTER l=v` and a misspelled
+    `AGREGATION avg 10` succeed there — the latter returning raw samples.
+  rationale: >
+    Accepted (owner sign-off 2026-09-23, §5.3) — DIV-0042's policy extended to the
+    multi-series range commands, matching TS.RANGE here: a typo in an option name is a bug
+    the caller wants to hear about, not a silently different reply. Pinned by
+    TestMRangeDivergences::test_unrecognized_arguments_are_rejected_not_ignored.
+  since: 0.1.0
+
+- id: DIV-0058
+  command: TS.MREVRANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    TS.MREVRANGE twin of DIV-0057: unrecognized arguments are rejected here and skipped
+    by RTS 8.10. Same parser, same rationale.
+  rationale: see DIV-0057 (registry matching is per-command, so the entry is duplicated
+    rather than shared; delete both together if the decision is ever reversed)
   since: 0.1.0

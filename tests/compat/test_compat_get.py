@@ -127,6 +127,11 @@ class TestMget:
         mk_label_universe(diff)
         diff("TS.MGET", "SELECTED_LABELS", "host", "region", "FILTER", "metric=cpu")
 
+    def test_mget_selected_labels_keep_the_requested_order(self, diff):
+        """Labels come back in the order they were asked for, not sorted."""
+        mk_label_universe(diff)
+        diff("TS.MGET", "SELECTED_LABELS", "region", "host", "FILTER", "metric=cpu")
+
     def test_mget_selected_labels_missing_becomes_nil(self, diff):
         # u:mem:1 lacks `region`; the slot must come back nil.
         mk_label_universe(diff)
@@ -194,3 +199,26 @@ class TestMgetFilterSupersets:
         with pytest.raises(ResponseError):
             diff.reference.execute_command("TS.MGET", "FILTER", "not-a-matcher")
         diff.subject.execute_command("TS.MGET", "FILTER", "not-a-matcher")
+
+
+class TestMGetDivergences:
+    """DIV-0056: the FILTER list ends at the next option token. Pinned per-engine because
+    an accepted-input superset is non-registrable (plan §5.2)."""
+
+    @pytest.mark.parametrize("option", [("WITHLABELS",), ("SELECTED_LABELS", "host"), ("LATEST",)])
+    def test_options_may_follow_the_filter_list(self, diff, option):
+        mk_label_universe(diff)
+        with pytest.raises(ResponseError):
+            diff.reference.execute_command("TS.MGET", "FILTER", "metric=cpu", *option)
+        # Same reply as the canonical order, which both engines accept.
+        trailing = diff.subject.execute_command("TS.MGET", "FILTER", "metric=cpu", *option)
+        leading = diff.subject.execute_command("TS.MGET", *option, "FILTER", "metric=cpu")
+        assert trailing == leading
+        diff("TS.MGET", *option, "FILTER", "metric=cpu")
+
+    def test_second_filter_rejected(self, diff):
+        mk_label_universe(diff)
+        with pytest.raises(ResponseError):
+            diff.reference.execute_command("TS.MGET", "FILTER", "metric=cpu", "FILTER", "host=h1")
+        with pytest.raises(ResponseError):
+            diff.subject.execute_command("TS.MGET", "FILTER", "metric=cpu", "FILTER", "host=h1")

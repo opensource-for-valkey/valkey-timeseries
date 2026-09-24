@@ -522,7 +522,9 @@ fn parse_duration_in_range(name: &str, value: &str, min: i64, max: i64) -> Valke
 }
 
 fn validate_number_range(name: &str, value: f64, min: f64, max: f64) -> ValkeyResult<()> {
-    if value < min || value > max {
+    // Written so NaN fails it: `value < min || value > max` is false for NaN, which let
+    // `CONFIG SET ts-significant-digits nan` through as 0 digits.
+    if !value.is_finite() || !(min..=max).contains(&value) {
         return Err(ValkeyError::String(format!(
             "Invalid value ({value}) for \"{name}\". Must be in the range [{min}, {max}]",
         )));
@@ -687,7 +689,15 @@ fn update_rounding(
     let request = if val.eq_ignore_ascii_case(CONFIG_VALUE_NONE) {
         RoundingRequest::Disable
     } else {
-        RoundingRequest::Digits(parse_number_in_range(name, val, min as f64, max as f64)? as u8)
+        let digits = parse_number_in_range(name, val, min as f64, max as f64)?;
+        // A digit count is a whole number; `2.9` used to be truncated to 2 while CONFIG GET
+        // kept echoing "2.9".
+        if digits.fract() != 0.0 {
+            return Err(ValkeyError::String(format!(
+                "Invalid value ({val}) for \"{name}\". Expected an integer"
+            )));
+        }
+        RoundingRequest::Digits(digits as u8)
     };
 
     let active_kind = rounding_strategy().as_ref().map(RoundingKind::of);
@@ -1308,6 +1318,20 @@ mod tests {
         ("ts-index-persist", "yes"),
         ("debug-mode", "no"),
     ];
+
+    #[test]
+    fn test_number_range_rejects_non_finite_values() {
+        for value in ["nan", "NaN", "inf", "-inf"] {
+            assert!(
+                parse_number_in_range("ts-significant-digits", value, 1.0, 18.0).is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse_number_in_range("ts-significant-digits", "3", 1.0, 18.0).unwrap(),
+            3.0
+        );
+    }
 
     #[test]
     fn registration_defaults_are_unchanged() {
