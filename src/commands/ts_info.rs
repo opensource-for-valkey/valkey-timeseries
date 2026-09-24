@@ -1,11 +1,8 @@
+use crate::common::replies::ReplyContext;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
 use crate::series::index::get_timeseries_index;
-use crate::series::{
-    SeriesRef, TimeSeries,
-    chunks::{ChunkOps, TimeSeriesChunk},
-    get_timeseries,
-};
+use crate::series::{SeriesRef, TimeSeries, chunks::ChunkOps, get_timeseries};
 use blart::AsBytes;
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -39,7 +36,83 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     args.done()?;
     let series = get_timeseries(ctx, &key, Some(AclPermissions::ACCESS))?;
     // The key is what TS.INFO DEBUG reports as `keySelfName`.
-    Ok(get_ts_info(ctx, &series, debugging, &key))
+    let ValkeyValue::Map(mut fields) = get_ts_info(ctx, &series, debugging, &key) else {
+        unreachable!("get_ts_info builds a map");
+    };
+
+    // Written field by field, in a fixed order. Returned as a `ValkeyValue::Map` — a
+    // `HashMap` — the fields came back in a different order on every call.
+    let reply = ReplyContext::new(ctx.ctx);
+    reply.reply_with_map(fields.len());
+    for name in INFO_FIELD_ORDER {
+        let key = ValkeyValueKey::String(name.to_string());
+        let Some(value) = fields.remove(&key) else {
+            continue;
+        };
+        reply.reply_with_string(name);
+        if *name == "Chunks" {
+            reply_with_chunks_info(&reply, &series);
+        } else {
+            reply.reply(Ok(value));
+        }
+    }
+    // Anything not in the list still has to go out: the map length above counted it.
+    debug_assert!(
+        fields.is_empty(),
+        "TS.INFO field missing from INFO_FIELD_ORDER"
+    );
+    for (key, value) in fields {
+        match key {
+            ValkeyValueKey::String(name) => reply.reply_with_string(&name),
+            other => reply.reply_with_string(&format!("{other:?}")),
+        };
+        reply.reply(Ok(value));
+    }
+    Ok(ValkeyValue::NoReply)
+}
+
+/// The order TS.INFO reports its fields in: the reference's, with this module's additions
+/// (`encoding`, `metric`, `rounding`) beside their nearest relatives. DEBUG adds the last two.
+const INFO_FIELD_ORDER: &[&str] = &[
+    "totalSamples",
+    "memoryUsage",
+    "firstTimestamp",
+    "lastTimestamp",
+    "retentionTime",
+    "chunkCount",
+    "chunkSize",
+    "chunkType",
+    "encoding",
+    "duplicatePolicy",
+    "labels",
+    "metric",
+    "sourceKey",
+    "rules",
+    "ignoreMaxTimeDiff",
+    "ignoreMaxValDiff",
+    "rounding",
+    "keySelfName",
+    "Chunks",
+];
+
+/// `Chunks` for TS.INFO DEBUG: one map per chunk, its fields in a fixed order.
+fn reply_with_chunks_info(reply: &ReplyContext, ts: &TimeSeries) {
+    reply.reply_with_array(ts.chunks.len());
+    for chunk in &ts.chunks {
+        reply.reply_with_map(5);
+        reply.reply_with_string("startTimestamp");
+        reply.reply_with_integer(chunk.first_timestamp());
+        reply.reply_with_string("endTimestamp");
+        reply.reply_with_integer(chunk.last_timestamp());
+        reply.reply_with_string("samples");
+        reply.reply_with_integer(chunk.len() as i64);
+        reply.reply_with_string("size");
+        reply.reply_with_integer(chunk.size() as i64);
+        // RTS replies bytesPerSample via ReplyWithDouble: native double on RESP3,
+        // bulk string on RESP2 (compat finding #12).
+        reply.reply_with_string("bytesPerSample");
+        reply.reply(Ok(ValkeyValue::Float(chunk.bytes_per_sample() as f64)));
+    }
 }
 
 fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) -> ValkeyValue {
@@ -149,41 +222,11 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
 
     if debug {
         map.insert("keySelfName".into(), ValkeyValue::from(key));
-        // yes, I know its title case, but that's what redis does
-        map.insert("Chunks".into(), get_chunks_info(ts));
+        // yes, I know its title case, but that's what redis does. Written by
+        // `reply_with_chunks_info`; only the key is needed here, for its place in the reply.
+        map.insert("Chunks".into(), ValkeyValue::Null);
     }
 
-    ValkeyValue::Map(map)
-}
-
-fn get_chunks_info(ts: &TimeSeries) -> ValkeyValue {
-    let items = ts
-        .chunks
-        .iter()
-        .map(get_one_chunk_info)
-        .collect::<Vec<ValkeyValue>>();
-
-    ValkeyValue::Array(items)
-}
-
-fn get_one_chunk_info(chunk: &TimeSeriesChunk) -> ValkeyValue {
-    let mut map: HashMap<ValkeyValueKey, ValkeyValue> = HashMap::with_capacity(6);
-    map.insert(
-        "startTimestamp".into(),
-        ValkeyValue::Integer(chunk.first_timestamp()),
-    );
-    map.insert(
-        "endTimestamp".into(),
-        ValkeyValue::Integer(chunk.last_timestamp()),
-    );
-    map.insert("samples".into(), ValkeyValue::Integer(chunk.len() as i64));
-    map.insert("size".into(), ValkeyValue::Integer(chunk.size() as i64));
-    // RTS replies bytesPerSample via ReplyWithDouble: native double on RESP3,
-    // bulk string on RESP2 (compat finding #12) — Float reproduces both.
-    map.insert(
-        "bytesPerSample".into(),
-        ValkeyValue::Float(chunk.bytes_per_sample() as f64),
-    );
     ValkeyValue::Map(map)
 }
 

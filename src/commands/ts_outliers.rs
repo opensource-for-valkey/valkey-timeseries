@@ -54,7 +54,7 @@ enum ZScoreType {
     Smoothed,
 }
 
-acl_categories!(TS_OUTLIERS, "ts.outliers", "fast read timeseries");
+acl_categories!(TS_OUTLIERS, "ts.outliers", "read timeseries");
 /// TS.OUTLIERS key fromTimestamp toTimestamp
 ///     METHOD <method> [method-specific-options]
 ///     [OUTPUT <full|simple|cleaned>]
@@ -62,7 +62,7 @@ acl_categories!(TS_OUTLIERS, "ts.outliers", "fast read timeseries");
 ///     [SEASONALITY <period1> [period2] ...]
 #[valkey_module_macros::command({
     name: "ts.outliers",
-    flags: [ReadOnly, DenyOOM],
+    flags: [ReadOnly],
     summary: "Detect outlier samples in a time series over a timestamp range.",
     complexity: "O(N) where N is the number of samples in the requested range.",
     since: "1.0.0",

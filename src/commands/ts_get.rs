@@ -8,7 +8,7 @@ acl_categories!(TS_GET, "ts.get", "fast read timeseries");
 /// TS.GET key [LATEST]
 #[valkey_module_macros::command({
     name: "ts.get",
-    flags: [ReadOnly, Fast],
+    flags: [ReadOnly],
     summary: "Get the last sample of a time series.",
     complexity: "O(1)",
     since: "1.0.0",

@@ -11,7 +11,7 @@ use crate::series::request_types::{MGetRequest, MGetSeriesData, MatchFilterOptio
 use crate::series::{get_latest_compaction_sample, get_series_labels};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
-acl_categories!(TS_MGET, "ts.mget", "fast read timeseries");
+acl_categories!(TS_MGET, "ts.mget", "read timeseries");
 /// TS.MGET
 ///   [LATEST]
 ///   [WITHLABELS | SELECTED_LABELS label...]
@@ -19,7 +19,7 @@ acl_categories!(TS_MGET, "ts.mget", "fast read timeseries");
 ///   [FILTER filterExpr...]
 #[valkey_module_macros::command({
     name: "ts.mget",
-    flags: [ReadOnly, Fast],
+    flags: [ReadOnly],
     summary: "Get the last sample of each time series matching a filter.",
     complexity: "O(N) where N is the number of time series that match the filters.",
     since: "1.0.0",

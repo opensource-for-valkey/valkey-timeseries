@@ -30,8 +30,8 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.ALTER":       (-2, 1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.ADD":         (-4, 1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.ADDBULK":     (-3, 1,  1, 1, [b"write", b"denyoom", b"module"]),
-        "TS.GET":         (-2, 1,  1, 1, [b"readonly", b"module", b"fast"]),
-        "TS.MGET":        (-2, 0,  0, 0, [b"readonly", b"module", b"fast"]),
+        "TS.GET":         (-2, 1,  1, 1, [b"readonly", b"module"]),
+        "TS.MGET":        (-2, 0,  0, 0, [b"readonly", b"module"]),
         "TS.MADD":        (-4, 1, -1, 3, [b"write", b"denyoom", b"module"]),
         "TS.DEL":         (4,  1,  1, 1, [b"write", b"denyoom", b"module"]),
         "TS.DECRBY":      (-3, 1,  1, 1, [b"write", b"denyoom", b"module"]),
@@ -54,7 +54,7 @@ class TestTimeSeriesCommand(ValkeyTimeSeriesTestCaseBase):
         "TS.LABELSTATS":  (-1, 0,  0, 0, [b"readonly", b"module"]),
         "TS.CREATERULE":  (-6, 1,  2, 1, [b"write", b"denyoom", b"module"]),
         "TS.DELETERULE":   (3, 1,  2, 1, [b"write", b"denyoom", b"module"]),
-        "TS.OUTLIERS":    (-6, 1,  1, 1, [b"readonly", b"denyoom", b"module"]),
+        "TS.OUTLIERS":    (-6, 1,  1, 1, [b"readonly", b"module"]),
     }
 
     def command_info(self, command):
