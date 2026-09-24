@@ -19,8 +19,8 @@
 use crate::common::context::{get_current_db, is_real_user_client};
 use crate::config::is_debug_mode_enabled;
 use crate::series::TimeSeries;
+use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
 use crate::series::index::index_series_by_key;
-use crate::series::index::server_events::{add_delayed_indexing_key, is_key_in_slot_import};
 use crate::series::series_data_type::{TIMESERIES_TYPE_ENCODING_VERSION, VK_TIME_SERIES_TYPE};
 use std::os::raw::c_void;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};

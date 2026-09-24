@@ -66,14 +66,14 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
     (`DEFAULT_CHUNK_ENCODING` in `src/config.rs`). Storage encoding is a user choice; cluster *wire*
     encoding is a separate, internal policy (see Conventions below).
   - Per-series ACL filtering: `acl.rs`.
+  - `index/asm.rs` — atomic slot migration (ASM, Valkey 9.0+): event subscription, deferred
+    indexing mid-import, source-side index cleanup after export. During an ASM the source node's
+    forked `aof_rewrite` child can't take the module GIL, so it serializes via `rdb_save` and emits
+    the internal `TS._RESTORE key <blob>` command instead of `DUMP`/normal commands; the
+    destination replays it like a replication feed (`src/commands/ts_restore.rs`).
 - `src/fanout/` + `src/commands/*_fanout_command.rs` — cluster fanout over the protobuf contract in
   `proto/v1/`, registered via `register_fanout_operations` (8 ops: LabelStats, Card, LabelSearch,
   MDel, MGet, MRange, QueryIndex, QueryLabels).
-  - `cluster_migrations.rs` — atomic slot migration (ASM, Valkey 9.0+) tracking. During an ASM the
-    source node's forked `aof_rewrite` child can't take the module GIL, so it serializes via
-    `rdb_save` and emits the internal `TS._RESTORE key <blob>` command instead of `DUMP`/normal
-    commands; the destination replays it like a replication feed (`src/commands/ts_restore.rs`).
-    Indexing is deferred mid-import (`src/series/index/server_events.rs`).
 - Other command surfaces beyond RTS: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` + statistical machinery
   (`src/analysis/` — ESD/CUSUM/EWMA/IQR/MAD/z-score/RCF), `TS.ADDBULK`, `TS.LABELSTATS`,
   `TS.METRICNAMES`, `TS.MDEL`, Prometheus-style selectors (`src/parser/`).

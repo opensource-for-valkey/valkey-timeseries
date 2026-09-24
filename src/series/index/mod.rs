@@ -25,6 +25,7 @@ pub use postings::PostingsBitmap;
 pub use querier::*;
 pub use timeseries_index::*;
 
+pub(crate) mod asm;
 mod ids;
 mod key_buffer;
 mod label_filter;

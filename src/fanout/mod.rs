@@ -1,7 +1,6 @@
 pub mod acl;
 mod blocked_client;
 mod cluster_map;
-pub(crate) mod cluster_migrations;
 mod cluster_rpc;
 mod fanout_client_command;
 mod fanout_command;
@@ -28,6 +27,8 @@ pub use fanout_context::FanoutContext;
 pub use fanout_error::*;
 pub use utils::*;
 
+#[cfg(test)]
+pub(crate) use cluster_map::NUM_SLOTS;
 pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};
 pub use registry::register_fanout_operation;
 
