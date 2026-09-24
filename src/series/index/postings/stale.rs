@@ -19,6 +19,15 @@ use std::ops::Bound;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(in crate::series::index) struct StaleSet {
     ids: PostingsBitmap,
+    /// The ids a drain pass (see [`Postings::remove_stale_ids`]) may retire when it finishes:
+    /// those marked when the pass started and not marked again since. `None` between passes.
+    ///
+    /// A pass walks the label index in batches, releasing the lock between them, so ids marked
+    /// mid-pass are masked only in the keys it has yet to visit. Clearing the whole set at the
+    /// end (as the drain used to) unmasked those ids in the keys it had already passed, and
+    /// TS.CARD / TS.LABELSTATS / label values over-counted them until something marked them
+    /// again. Only the snapshot is retired; later marks wait for the next pass.
+    pass: Option<PostingsBitmap>,
 }
 
 impl StaleSet {
@@ -36,6 +45,10 @@ impl StaleSet {
     #[inline]
     pub(in crate::series::index) fn heap_size(&self) -> usize {
         crate::series::index::memory::bitmap_heap_size(&self.ids)
+            + self
+                .pass
+                .as_ref()
+                .map_or(0, crate::series::index::memory::bitmap_heap_size)
     }
 
     /// How many of `postings`' ids are stale. Cheaper than masking when only the count is wanted.
@@ -79,6 +92,23 @@ impl StaleSet {
     #[inline]
     fn mark_many(&mut self, ids: &[SeriesRef]) {
         self.ids.add_many(ids);
+        // Marked (again) during a pass: its postings may sit in keys the pass already visited,
+        // so this pass must not retire it.
+        if let Some(pass) = self.pass.as_mut() {
+            pass.remove_many(ids);
+        }
+    }
+
+    /// Starts a drain pass: snapshot the ids it may retire.
+    fn begin_pass(&mut self) {
+        self.pass = Some(self.ids.clone());
+    }
+
+    /// Ends a drain pass that has visited every label key: retire the snapshot.
+    fn finish_pass(&mut self) {
+        if let Some(pass) = self.pass.take() {
+            self.ids.andnot_inplace(&pass);
+        }
     }
 
     /// Un-marks an id, asserting it is alive again.
@@ -90,6 +120,7 @@ impl StaleSet {
     #[inline]
     pub(super) fn clear(&mut self) {
         self.ids.clear();
+        self.pass = None;
     }
 }
 
@@ -141,6 +172,10 @@ impl Postings {
         if self.stale_ids.is_empty() {
             return None;
         }
+        // A pass starts at the first key; a resumed batch keeps the pass's snapshot.
+        if start_prefix.is_none() || self.stale_ids.pass.is_none() {
+            self.stale_ids.begin_pass();
+        }
 
         let mut keys_processed = 0;
         let mut keys_to_remove = Vec::new();
@@ -186,7 +221,7 @@ impl Postings {
         // If we processed keys and there are no more keys to process, it means we've reached the end of the index,
         // so we can clear the stale IDs as they have been fully processed.
         if keys_processed > 0 && next_key.is_none() {
-            self.stale_ids.clear();
+            self.stale_ids.finish_pass();
         }
 
         next_key
@@ -267,5 +302,67 @@ mod tests {
         assert!(matches!(out, Cow::Owned(_)), "marks present: must copy");
         assert!(!out.contains(1));
         assert!(out.contains(2));
+    }
+
+    #[test]
+    fn test_ids_marked_mid_pass_survive_the_pass() {
+        // An id marked while a pass is between batches was masked only in the keys still to
+        // come; clearing every stale id at the end unmasked it in the keys already visited.
+        let mut postings = Postings::default();
+        for i in 0..40u64 {
+            postings.add_posting_for_label_value(i as SeriesRef, "host", &format!("h{i:04}"));
+            postings.add_posting_for_label_value(i as SeriesRef, "job", "web");
+        }
+        postings.mark_ids_as_stale(&[0]);
+
+        // First batch covers the early `host=*` keys only.
+        let cursor = postings
+            .remove_stale_ids(None, 4)
+            .expect("more keys to visit");
+        // Id 1 goes stale now: its `host=h0001` key has already been visited.
+        postings.mark_ids_as_stale(&[1]);
+
+        let mut cursor = Some(cursor);
+        while let Some(next) = postings.remove_stale_ids(cursor.take(), 4) {
+            cursor = Some(next);
+        }
+
+        assert!(
+            !postings.stale_ids.contains(0),
+            "id 0 was drained everywhere"
+        );
+        assert!(
+            postings.stale_ids.contains(1),
+            "id 1 must stay marked until a pass has visited every key after its marking"
+        );
+
+        // The next full pass retires it.
+        let mut cursor = None;
+        while let Some(next) = postings.remove_stale_ids(cursor.take(), 4) {
+            cursor = Some(next);
+        }
+        assert!(!postings.has_stale_ids());
+        let host1 = IndexKey::for_label_value("host", "h0001");
+        assert!(postings.label_index.get::<IndexKey>(&host1).is_none());
+    }
+
+    #[test]
+    fn test_id_remarked_mid_pass_survives_the_pass() {
+        let mut postings = Postings::default();
+        for i in 0..40u64 {
+            postings.add_posting_for_label_value(i as SeriesRef, "host", &format!("h{i:04}"));
+        }
+        postings.mark_ids_as_stale(&[2]);
+        let cursor = postings
+            .remove_stale_ids(None, 4)
+            .expect("more keys to visit");
+        // Re-indexed, then stale again, all within the pass.
+        postings.stale_ids.revoke(2);
+        postings.mark_ids_as_stale(&[2]);
+        let mut cursor = Some(cursor);
+        while let Some(next) = postings.remove_stale_ids(cursor.take(), 4) {
+            cursor = Some(next);
+        }
+        assert!(postings.stale_ids.contains(2));
     }
 }

@@ -23,7 +23,7 @@ use crate::series::tasks::remove_all_stale_series_internal;
 use crate::series::{SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_mut};
 use range_set_blaze::RangeSetBlaze;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use valkey_module::server_events::{
     FLUSH_SERVER_EVENTS_LIST, FlushSubevent, LoadingSubevent, PersistenceSubevent,
@@ -118,21 +118,26 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
     skipped
 }
 
-fn process_delayed_keys_for_db(db: i32) {
+/// Removes and returns the keys queued for `db` whose hash slot is in `slots`, leaving every
+/// other queued key — another import's — where it is.
+fn take_delayed_keys_in_slots(db: i32, slots: &RangeSetBlaze<u16>) -> Vec<Box<[u8]>> {
     let pending_keys = DELAYED_KEYS_MAP.pin();
     let Some(lock) = pending_keys.get(&db) else {
-        return;
+        return Vec::new();
     };
+    // The entry itself stays (possibly empty) so a concurrent append cannot be lost.
+    let mut guard = write_lock(lock);
+    let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
+        .into_iter()
+        .partition(|key| slots.contains(crate::fanout::calculate_hash_slot(key)));
+    *guard = kept;
+    taken
+}
 
-    // Take ownership of the queued keys so we can index without holding the write lock. Keys that
-    // are appended concurrently (e.g. by an overlapping import) stay in the map and are handled by
-    // a later drain; we intentionally leave the (now-empty) entry in place to avoid a race where a
-    // concurrent append is dropped. Empty entries are reused on the next import and cleared on
-    // flush/abort.
-    let keys_vec = {
-        let mut guard = write_lock(lock);
-        std::mem::take(&mut *guard)
-    };
+fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) {
+    // Take ownership of this import's queued keys so we can index without holding the write
+    // lock. Keys of an import still in progress stay queued for its own completion.
+    let keys_vec = take_delayed_keys_in_slots(db, slots);
 
     if keys_vec.is_empty() {
         return;
@@ -166,35 +171,20 @@ fn process_delayed_keys_for_db(db: i32) {
     }
 }
 
-static PROCESSING_DELAYED_INDEXING: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn process_delayed_indexing() {
-    let result = PROCESSING_DELAYED_INDEXING.compare_exchange(
-        false,
-        true,
-        Ordering::AcqRel,
-        Ordering::Relaxed,
-    );
-
-    if let Err(true) = result {
-        // Another cleanup is already in progress, we can skip this run
-        log_debug("ASM delayed indexing drain skipped: already running");
-        return;
-    }
-
+/// Indexes the keys queued during the import of `slots`, which has just completed.
+///
+/// There is no "already running" guard: a completion that found one drain in flight used to
+/// skip its own, and with each drain now taking only its own import's keys, that would strand
+/// them. Concurrent drains touch disjoint keys.
+pub(super) fn process_delayed_indexing(slots: RangeSetBlaze<u16>) {
     let pending_keys = DELAYED_KEYS_MAP.pin();
     let mut dbs: Vec<i32> = pending_keys.keys().copied().collect();
     dbs.sort_unstable();
-    let total_keys: usize = dbs
-        .iter()
-        .filter_map(|db| pending_keys.get(db))
-        .map(|keys| read_lock(keys).len())
-        .sum();
 
     log_debug(format!(
-        "ASM delayed indexing drain scheduled: dbs={}, keys={}",
+        "ASM delayed indexing drain scheduled: dbs={}, slot_ranges={}",
         dbs.len(),
-        total_keys
+        slots.ranges_len()
     ));
 
     // On its own thread rather than the pool because it takes the module lock (see
@@ -205,13 +195,11 @@ pub(super) fn process_delayed_indexing() {
         for db in dbs {
             if crate::is_shutting_down() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
-                PROCESSING_DELAYED_INDEXING.store(false, Ordering::SeqCst);
                 return;
             }
-            process_delayed_keys_for_db(db);
+            process_delayed_keys_for_db(db, &slots);
         }
         log_debug("ASM delayed indexing drain finished");
-        PROCESSING_DELAYED_INDEXING.store(false, Ordering::SeqCst);
     });
 }
 
@@ -360,34 +348,54 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
     });
 }
 
-static IN_SLOT_IMPORT: AtomicBool = AtomicBool::new(false);
-static IS_PERSISTING: AtomicUsize = AtomicUsize::new(0);
+/// Slots this node is importing right now, across every in-flight atomic slot migration.
+///
+/// This used to be one flag for "an import is running". With imports overlapping, the first to
+/// complete cleared it and let the others' keys be indexed mid-import (phantom reads), and an
+/// abort dropped every import's queued keys. Keyed by slot, each import is handled on its own.
+static IMPORTING_SLOTS: LazyLock<Mutex<RangeSetBlaze<u16>>> =
+    LazyLock::new(|| Mutex::new(RangeSetBlaze::new()));
 
-pub(crate) fn is_in_asm_slot_import() -> bool {
-    IN_SLOT_IMPORT.load(Ordering::Relaxed)
+/// Whether `key` belongs to a slot being imported, in which case indexing it waits for that
+/// import to complete.
+pub(crate) fn is_key_in_slot_import(key: &[u8]) -> bool {
+    let importing = lock(&IMPORTING_SLOTS);
+    !importing.is_empty() && importing.contains(crate::fanout::calculate_hash_slot(key))
+}
+
+/// Drops the keys queued during an aborted import of `slots` (the series themselves are
+/// removed by the server).
+fn discard_delayed_keys_in_slots(slots: &RangeSetBlaze<u16>) {
+    let dbs: Vec<i32> = DELAYED_KEYS_MAP.pin().keys().copied().collect();
+    for db in dbs {
+        let _ = take_delayed_keys_in_slots(db, slots);
+    }
+}
+
+fn remove_importing_slots(slots: &RangeSetBlaze<u16>) {
+    let mut importing = lock(&IMPORTING_SLOTS);
+    *importing = &*importing - slots;
 }
 
 pub(crate) fn slot_migration_event_handler(
     event: AtomicSlotMigrationEvent,
     slots: RangeSetBlaze<u16>,
 ) {
-    // Relaxed ordering is enough for IN_SLOT_IMPORT, as Valkey itself will ensure that
-    // this callback is called serially with respect to the migration events.
     match event {
         AtomicSlotMigrationEvent::ExportCompleted => {
             handle_post_migration_cleanup(slots);
         }
         AtomicSlotMigrationEvent::ImportStarted => {
-            IN_SLOT_IMPORT.store(true, Ordering::Relaxed);
+            *lock(&IMPORTING_SLOTS) |= &slots;
         }
         AtomicSlotMigrationEvent::ImportCompleted => {
-            IN_SLOT_IMPORT.store(false, Ordering::Relaxed);
+            remove_importing_slots(&slots);
             log_debug("ASM ImportCompleted received; triggering delayed indexing");
-            process_delayed_indexing();
+            process_delayed_indexing(slots);
         }
         AtomicSlotMigrationEvent::ImportAborted => {
-            IN_SLOT_IMPORT.store(false, Ordering::Relaxed);
-            clear_delayed_keys_map();
+            remove_importing_slots(&slots);
+            discard_delayed_keys_in_slots(&slots);
         }
         _ => {
             // no action needed for other events
@@ -395,44 +403,19 @@ pub(crate) fn slot_migration_event_handler(
     }
 }
 
+/// Logs persistence activity. Nothing here touches the ASM delayed-indexing queue: that queue
+/// belongs to a slot import on this node, and a save that fails (a BGSAVE out of disk, say)
+/// says nothing about the import. Clearing it on a failed save — as this did — left every
+/// imported series unindexed, invisible to MRANGE/MGET until a restart rebuilt the index.
 #[persistence_event_handler]
 fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSubevent) {
-    fn increment() {
-        IS_PERSISTING.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn decrement() -> bool {
-        let prev = IS_PERSISTING.fetch_sub(1, Ordering::SeqCst);
-        prev == 1
-    }
-
     match persistence_event {
-        PersistenceSubevent::RdbStart => {
-            increment();
-            ctx.log_notice("RDB persistence started");
-        }
-        PersistenceSubevent::AofStart => {
-            increment();
-            ctx.log_notice("AOF persistence started");
-        }
-        PersistenceSubevent::SyncRdbStart => {
-            increment();
-            ctx.log_notice("Sync RDB persistence started");
-        }
-        PersistenceSubevent::SyncAofStart => {
-            increment();
-            ctx.log_notice("Sync AOF persistence started");
-        }
-        PersistenceSubevent::Ended => {
-            ctx.log_notice("Persistence operation ended");
-            decrement();
-        }
-        PersistenceSubevent::Failed => {
-            ctx.log_warning("Persistence operation failed");
-            if decrement() {
-                clear_delayed_keys_map();
-            }
-        }
+        PersistenceSubevent::RdbStart => ctx.log_notice("RDB persistence started"),
+        PersistenceSubevent::AofStart => ctx.log_notice("AOF persistence started"),
+        PersistenceSubevent::SyncRdbStart => ctx.log_notice("Sync RDB persistence started"),
+        PersistenceSubevent::SyncAofStart => ctx.log_notice("Sync AOF persistence started"),
+        PersistenceSubevent::Ended => ctx.log_notice("Persistence operation ended"),
+        PersistenceSubevent::Failed => ctx.log_warning("Persistence operation failed"),
     }
 }
 
@@ -512,7 +495,7 @@ fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
 /// otherwise it indexes them immediately.
 fn handle_key_restore(ctx: &Context, key: &[u8]) {
     let db = get_current_db(ctx);
-    if is_in_asm_slot_import() {
+    if is_key_in_slot_import(key) {
         add_delayed_indexing_key(db, key);
         return;
     }
@@ -700,4 +683,55 @@ pub(crate) fn register_server_event_handlers(ctx: &Context) -> ValkeyResult<()> 
     register_server_event_handler(ctx, raw::REDISMODULE_EVENT_FLUSHDB, Some(on_flush_event))?;
     register_server_event_handler(ctx, raw::REDISMODULE_EVENT_SWAPDB, Some(on_swap_db_event))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot_of(key: &[u8]) -> u16 {
+        crate::fanout::calculate_hash_slot(key)
+    }
+
+    fn slots(keys: &[&[u8]]) -> RangeSetBlaze<u16> {
+        keys.iter().map(|k| slot_of(k)).collect()
+    }
+
+    #[test]
+    fn test_overlapping_imports_are_tracked_per_slot() {
+        // Two imports in flight: `{a}` keys belong to the first, `{b}` keys to the second.
+        let first = slots(&[b"{a}x"]);
+        let second = slots(&[b"{b}x"]);
+        assert_ne!(first, second);
+        const DB: i32 = 91;
+
+        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportStarted, first.clone());
+        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportStarted, second.clone());
+        assert!(is_key_in_slot_import(b"{a}1"));
+        assert!(is_key_in_slot_import(b"{b}1"));
+        assert!(
+            !is_key_in_slot_import(b"{c}1"),
+            "a key outside both imports is indexed now"
+        );
+
+        add_delayed_indexing_key(DB, b"{a}1");
+        add_delayed_indexing_key(DB, b"{b}1");
+        add_delayed_indexing_key(DB, b"{b}2");
+
+        // Aborting the first drops its queued key only, and leaves the second import running.
+        slot_migration_event_handler(AtomicSlotMigrationEvent::ImportAborted, first.clone());
+        assert!(!is_key_in_slot_import(b"{a}1"));
+        assert!(
+            is_key_in_slot_import(b"{b}1"),
+            "the second import is still in progress"
+        );
+        let remaining = take_delayed_keys_in_slots(DB, &second);
+        let mut remaining: Vec<&[u8]> = remaining.iter().map(|k| k.as_ref()).collect();
+        remaining.sort();
+        assert_eq!(remaining, vec![&b"{b}1"[..], &b"{b}2"[..]]);
+        assert!(take_delayed_keys_in_slots(DB, &first).is_empty());
+
+        remove_importing_slots(&second);
+        assert!(!is_key_in_slot_import(b"{b}1"));
+    }
 }

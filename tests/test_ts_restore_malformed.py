@@ -152,3 +152,26 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
 
         assert client.ping()
         assert self.server.is_alive()
+
+    def test_restore_is_written_to_the_aof(self):
+        """TS._RESTORE is how a slot import delivers series. It was never propagated, so the
+        importing node's AOF (and a replica's) lacked every imported series and a restart
+        lost them."""
+        client = self.client
+        payload = self._genuine_payload()
+        client.config_set('appendfsync', 'always')
+
+        assert client.execute_command('TS._RESTORE', 'restored:aof', payload)
+
+        server_dir = client.config_get('dir')['dir']
+        aof_dir = os.path.join(server_dir, client.config_get('appenddirname')['appenddirname'])
+        needle = b'TS._RESTORE\r\n$12\r\nrestored:aof\r\n'
+
+        def in_incr_aof():
+            for name in os.listdir(aof_dir):
+                if name.endswith('.incr.aof'):
+                    if needle in open(os.path.join(aof_dir, name), 'rb').read():
+                        return True
+            return False
+
+        wait_for_true(in_incr_aof, timeout=10)
