@@ -248,3 +248,14 @@ class TestTimeSeriesIncrby(ValkeyTimeSeriesTestCaseBase):
         assert self.client.execute_command(
             "TS.INCRBY", "incr:lbl2", 5, "TIMESTAMP", 10, "LABELS", "a", "b") == 10
         assert self.ts_info("incr:lbl2")["labels"] == {"a": "b"}
+
+    def test_incrby_option_operand_named_like_a_keyword(self):
+        """Operands are skipped when looking for TIMESTAMP and LABELS: `METRIC labels`
+        does not end the option list, and `METRIC timestamp` is not the TIMESTAMP option."""
+        assert self.client.execute_command(
+            "TS.INCRBY", "incr:op", 5, "METRIC", "labels", "TIMESTAMP", 10) == 10
+        assert self.ts_info("incr:op")["labels"] == {"__name__": "labels"}
+
+        assert self.client.execute_command(
+            "TS.INCRBY", "incr:op2", 5, "METRIC", "timestamp", "TIMESTAMP", 20) == 20
+        assert self.ts_info("incr:op2")["labels"] == {"__name__": "timestamp"}

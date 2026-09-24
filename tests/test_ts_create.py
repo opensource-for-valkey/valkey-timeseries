@@ -188,6 +188,24 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command("TS.CREATE", "lbl:name", "LABELS", "labels", "x")
         assert self.ts_info("lbl:name")["labels"] == {"labels": "x"}
 
+    def test_option_operand_named_labels_is_not_the_keyword(self):
+        """An option's operand spelled `labels` is that option's value, not the LABELS
+        keyword: `METRIC labels` used to split there and leave METRIC with no operand."""
+        self.client.execute_command("TS.CREATE", "op:metric", "METRIC", "labels")
+        assert self.ts_info("op:metric")["labels"] == {"__name__": "labels"}
+
+        self.client.execute_command(
+            "TS.CREATE", "op:metric_then_opts", "METRIC", "LABELS", "RETENTION", 1000)
+        info = self.ts_info("op:metric_then_opts")
+        assert info["labels"] == {"__name__": "LABELS"}
+        assert info["retentionTime"] == 1000
+
+        # A real LABELS list after such an operand still conflicts with METRIC.
+        with pytest.raises(ResponseError):
+            self.client.execute_command(
+                "TS.CREATE", "op:both", "METRIC", "labels", "LABELS", "a", "b")
+        assert self.client.exists("op:both") == 0
+
     def test_add_key_named_labels_is_not_a_label_list(self):
         """`TS.ADD labels <ts> <v>` names a key; it must not start a label list."""
         self.client.execute_command("TS.ADD", "labels", 1, 2)

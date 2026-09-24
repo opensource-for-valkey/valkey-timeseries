@@ -93,15 +93,13 @@ pub fn parse_series_options_onto(
     let mut options = base;
 
     // Labels are variadic, so we handle them first to make parsing easier. LABELS ends
-    // the option list (DIV-0043), so the list starts at the *first* LABELS token in the
-    // option region. Searching the whole vector from the end took a label named or
-    // valued `labels` (`LABELS type labels`) for the keyword, and a key named `labels`
-    // in `TS.ADD labels <ts> <v>` for the start of an empty-keyed label list.
-    let pos = args
-        .iter()
-        .skip(args_to_skip)
-        .position(|x| x.eq_ignore_ascii_case(b"labels"))
-        .map(|pos| pos + args_to_skip);
+    // the option list (DIV-0043), so the list starts at the first LABELS *keyword* in
+    // the option region — found by walking option boundaries, not by matching raw
+    // arguments, so an operand spelled `labels` (`METRIC labels`, `LABELS type labels`,
+    // a key named `labels` in `TS.ADD labels <ts> <v>`) is never taken for it.
+    let pos = series_option_keywords(&args, args_to_skip)
+        .find(|&(_, token)| token == CommandArgToken::Labels)
+        .map(|(pos, _)| pos);
 
     // Extract and process labels if they exist
     let args = if let Some(pos) = pos {
@@ -233,14 +231,57 @@ pub fn parse_series_options_onto(
 /// ones keep their own already-set diagnostics. The bare COMPRESSED/UNCOMPRESSED
 /// keywords are handled separately (see the call site).
 fn first_occurrence_wins_operands(token: CommandArgToken) -> Option<usize> {
-    match token {
+    matches!(
+        token,
         CommandArgToken::Retention
-        | CommandArgToken::Encoding
-        | CommandArgToken::ChunkSize
+            | CommandArgToken::Encoding
+            | CommandArgToken::ChunkSize
+            | CommandArgToken::DuplicatePolicy
+            | CommandArgToken::OnDuplicate
+            | CommandArgToken::Ignore
+    )
+    .then(|| series_option_operands(token))
+}
+
+/// The option keywords of a series-option list starting at `start`, with their
+/// indexes, walked the way the option parser consumes them: each keyword is followed
+/// by its operands, which are skipped rather than inspected. The walk stops after
+/// LABELS, whose variadic operands end the list.
+///
+/// Unknown tokens are yielded as `CommandArgToken::default()` with no operands; the
+/// option parser rejects them.
+pub(crate) fn series_option_keywords(
+    args: &[ValkeyString],
+    start: usize,
+) -> impl Iterator<Item = (usize, CommandArgToken)> + '_ {
+    let mut index = start;
+    std::iter::from_fn(move || {
+        let arg = args.get(index)?;
+        let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
+        let at = index;
+        index = if token == CommandArgToken::Labels {
+            args.len()
+        } else {
+            index + 1 + series_option_operands(token)
+        };
+        Some((at, token))
+    })
+}
+
+/// Operand count of each series option (including TS.INCRBY/TS.DECRBY's TIMESTAMP).
+fn series_option_operands(token: CommandArgToken) -> usize {
+    match token {
+        CommandArgToken::ChunkSize
+        | CommandArgToken::DecimalDigits
         | CommandArgToken::DuplicatePolicy
-        | CommandArgToken::OnDuplicate => Some(1),
-        CommandArgToken::Ignore => Some(2),
-        _ => None,
+        | CommandArgToken::Encoding
+        | CommandArgToken::Metric
+        | CommandArgToken::OnDuplicate
+        | CommandArgToken::Retention
+        | CommandArgToken::SignificantDigits
+        | CommandArgToken::Timestamp => 1,
+        CommandArgToken::Ignore => 2,
+        _ => 0,
     }
 }
 

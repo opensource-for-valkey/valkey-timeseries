@@ -1,6 +1,6 @@
 use crate::commands::CommandArgToken;
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
-use crate::commands::ts_create::parse_series_options;
+use crate::commands::ts_create::{parse_series_options, series_option_keywords};
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
@@ -125,18 +125,15 @@ const FIRST_OPTION_INDEX: usize = 3;
 /// key named `timestamp` for the option (removing the key and delta, then indexing past
 /// the end: a panic, which aborts the server) and a `timestamp` label for the option
 /// too. The first occurrence wins, and its operand is the next argument even when that
-/// is `LABELS` (the reference then rejects it as an invalid timestamp).
+/// is `LABELS` (the reference then rejects it as an invalid timestamp). Option keywords
+/// are found by walking option boundaries, so another option's operand spelled
+/// `timestamp` or `labels` (`METRIC labels`) is not taken for a keyword.
 fn handle_parse_timestamp(args: &mut Vec<ValkeyString>) -> ValkeyResult<Option<Timestamp>> {
-    let options = args.get(FIRST_OPTION_INDEX..).unwrap_or_default();
-    let options_end = options
-        .iter()
-        .position(|x| x.eq_ignore_ascii_case(b"labels"))
-        .unwrap_or(options.len());
-    if let Some(index) = options[..options_end]
-        .iter()
-        .position(|x| x.eq_ignore_ascii_case(b"timestamp"))
-        .map(|pos| pos + FIRST_OPTION_INDEX)
-    {
+    let timestamp_index = series_option_keywords(args, FIRST_OPTION_INDEX)
+        .take_while(|&(_, token)| token != CommandArgToken::Labels)
+        .find(|&(_, token)| token == CommandArgToken::Timestamp)
+        .map(|(index, _)| index);
+    if let Some(index) = timestamp_index {
         return if index < args.len() - 1 {
             args.remove(index);
             let timestamp_str = args.remove(index).to_string_lossy();
