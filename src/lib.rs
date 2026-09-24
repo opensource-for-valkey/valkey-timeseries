@@ -1,5 +1,4 @@
 #![deny(unsafe_op_in_unsafe_fn)]
-#![allow(dead_code)]
 extern crate enum_dispatch;
 extern crate get_size2;
 #[cfg(test)]

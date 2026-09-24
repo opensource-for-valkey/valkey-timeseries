@@ -37,20 +37,6 @@ impl ModifiedZScoreOutlierDetector {
         }
     }
 
-    /// NaN propagates rather than being substituted with `0.0`: the substitute
-    /// is a real position in the data, so it scores and classifies as if the
-    /// missing reading were a genuine observation at zero. A NaN statistic
-    /// scores `0.0` and fails every `>` comparison in `classify`, which is the
-    /// treatment a missing reading should get.
-    #[inline]
-    fn get_modified_zscore(&self, value: f64) -> f64 {
-        if self.mad_scaled > 1e-10 {
-            0.6745 * (value - self.median) / self.mad
-        } else {
-            0.0
-        }
-    }
-
     /// Deviation from the median, and the distance out to the fence.
     ///
     /// `|0.6745 * (v - med) / MAD| > T` is the same test as
@@ -158,6 +144,7 @@ impl PointDetector for ModifiedZScoreOutlierDetector {
 }
 
 /// Modified Z-score using median absolute deviation
+#[cfg(test)]
 fn detect_anomalies_modified_zscore(
     ts: &[f64],
     threshold: Option<f64>,

@@ -49,21 +49,19 @@ impl MadOutlierDetector {
         }
     }
 
+    #[cfg(test)]
     pub fn with_estimator(estimator: AnomalyMADEstimator) -> Self {
         Self::new(Self::DEFAULT_K, estimator)
     }
 
     /// Returns whether a value is an outlier, according to the detector.
+    #[cfg(test)]
     pub fn is_outlier(&self, value: f64) -> bool {
         self.classify(value).is_anomaly()
     }
 
-    /// Returns the lower fence.
-    pub fn lower_fence(&self) -> f64 {
-        self.lower_fence
-    }
-
     /// Returns the upper fence.
+    #[cfg(test)]
     pub fn upper_fence(&self) -> f64 {
         self.upper_fence
     }

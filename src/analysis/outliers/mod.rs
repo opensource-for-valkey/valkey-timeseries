@@ -60,22 +60,6 @@ pub enum AnomalyMethod {
 }
 
 impl AnomalyMethod {
-    /// Returns a human-readable name for the method
-    pub fn name(&self) -> &'static str {
-        match self {
-            AnomalyMethod::Ewma => "EWMA",
-            AnomalyMethod::Cusum => "CUSUM",
-            AnomalyMethod::ZScore => "Z-Score",
-            AnomalyMethod::ModifiedZScore => "Modified Z-Score",
-            AnomalyMethod::SmoothedZScore => "Smoothed Z-Score",
-            AnomalyMethod::Mad => "Median Absolute Deviation (MAD)",
-            AnomalyMethod::DoubleMAD => "Double MAD",
-            AnomalyMethod::InterquartileRange => "Interquartile Range (IQR)",
-            AnomalyMethod::RandomCutForest => "Random Cut Forest",
-            AnomalyMethod::Esd => "Extreme Studentized Deviate (ESD)",
-        }
-    }
-
     pub fn short_name(&self) -> &'static str {
         match self {
             AnomalyMethod::Ewma => "ewma",
@@ -256,10 +240,12 @@ impl Anomaly {
         self.signal.is_anomaly()
     }
 
+    #[cfg(test)]
     pub fn is_negative(&self) -> bool {
         self.signal.is_negative()
     }
 
+    #[cfg(test)]
     pub fn is_positive(&self) -> bool {
         self.signal.is_positive()
     }

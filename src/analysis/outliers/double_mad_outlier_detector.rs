@@ -46,6 +46,7 @@ impl Fitted {
 }
 
 impl DoubleMadOutlierDetector {
+    #[cfg(test)]
     pub(crate) const DEFAULT_K: f64 = 3.0;
 
     pub fn new(threshold: f64, estimator: AnomalyMADEstimator) -> Self {
@@ -157,10 +158,6 @@ impl DoubleMadOutlierDetector {
             Some((deviation, boundary)) => normalize_evidence(deviation.abs(), boundary),
             None => 0.0,
         }
-    }
-
-    pub fn is_outlier(&self, value: f64) -> bool {
-        self.classify(value).is_anomaly()
     }
 
     pub fn detect(&mut self, ts: &[f64]) -> TimeSeriesAnalysisResult<AnomalyResult> {

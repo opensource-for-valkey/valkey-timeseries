@@ -312,25 +312,6 @@ impl BitStream {
         Ok(())
     }
 
-    pub(in crate::series::chunks) fn write_unsigned_int(&mut self, mut n: u64) {
-        while n >= 0x80 {
-            self.write_byte_raw((n as u8) | 0x80);
-            n >>= 7;
-        }
-        self.write_byte_raw(n as u8);
-    }
-
-    pub(in crate::series::chunks) fn write_signed_int(&mut self, n: i64) {
-        let zigzag = ((n << 1) ^ (n >> 63)) as u64;
-        let mut remaining = zigzag;
-        while remaining >= 0x80 {
-            let byte = ((remaining & 0x7F) | 0x80) as u8;
-            self.write_byte_raw(byte);
-            remaining >>= 7;
-        }
-        self.write_byte_raw(remaining as u8);
-    }
-
     pub fn write_u64(&mut self, value: u64) {
         for byte in value.to_be_bytes() {
             self.write_byte_raw(byte);
@@ -367,10 +348,6 @@ impl BitWrite for BitStream {
         U: PrimInt,
     {
         self.write_bits(bits, value.to_u64().expect("Invalid u64 cast"))
-    }
-
-    fn write_byte(&mut self, byte: u8) {
-        self.write_byte_raw(byte);
     }
 }
 

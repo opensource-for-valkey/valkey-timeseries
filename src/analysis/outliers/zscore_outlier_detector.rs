@@ -41,17 +41,6 @@ impl ZScoreOutlierDetector {
         }
     }
 
-    /// Guards on `EPSILON` rather than exact zero: a standard deviation that is
-    /// merely denormal still divides into an arbitrarily large z-score, which
-    /// would flag every point of a series that is constant to within rounding.
-    #[inline]
-    fn get_zscore(&self, value: f64) -> f64 {
-        if self.std_dev < f64::EPSILON {
-            return 0.0;
-        }
-        (value - self.mean) / self.std_dev
-    }
-
     /// Deviation from the mean, and the distance out to the fence.
     ///
     /// `|z| > T` and `|value - mean| > T * sigma` are the same test, but only

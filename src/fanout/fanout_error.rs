@@ -125,6 +125,7 @@ impl FanoutError {
         ErrorKind::UnsupportedFeatures.into()
     }
 
+    #[cfg(test)]
     pub fn invalid_db() -> Self {
         ErrorKind::InvalidDb.into()
     }

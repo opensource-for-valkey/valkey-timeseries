@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 
-use crate::analysis::seasonality::SeasonalityDetector;
 use itertools::Itertools;
 use welch_sde::{Build, SpectralDensity};
 
@@ -29,35 +28,6 @@ impl Default for Builder {
 }
 
 impl Builder {
-    /// Set the minimum period to consider when detecting seasonal periods.
-    ///
-    /// The default is 4.
-    #[must_use]
-    pub fn min_period(mut self, min_period: u32) -> Self {
-        self.min_period = min_period;
-        self
-    }
-
-    /// Set the maximum period to consider when detecting seasonal periods.
-    ///
-    /// The default is the length of the data divided by 3, or 512, whichever is smaller.
-    #[must_use]
-    pub fn max_period(mut self, max_period: u32) -> Self {
-        self.max_period = Some(max_period);
-        self
-    }
-
-    /// Set the threshold for detecting peaks in the periodogram.
-    ///
-    /// The value will be clamped to the range 0.01 to 0.99.
-    ///
-    /// The default is 0.9.
-    #[must_use]
-    pub fn threshold(mut self, threshold: f64) -> Self {
-        self.threshold = threshold.clamp(0.01, 0.99);
-        self
-    }
-
     /// Build the periodogram detector.
     ///
     /// The data is the time series to detect seasonal periods in.
@@ -223,12 +193,6 @@ impl Detector {
 impl Default for Detector {
     fn default() -> Self {
         Self::builder().build()
-    }
-}
-
-impl SeasonalityDetector for Detector {
-    fn detect(&self, data: &[f64]) -> Vec<u32> {
-        self.detect(data)
     }
 }
 

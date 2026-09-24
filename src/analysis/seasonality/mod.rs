@@ -9,12 +9,6 @@ use crate::analysis::seasonality::stl::Stl;
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 pub use periodogram::Detector as PeriodogramDetector;
 
-/// A detector of periodic signals in a time series.
-pub trait SeasonalityDetector {
-    /// Detects the periods of a time series.
-    fn detect(&self, data: &[f64]) -> Vec<u32>;
-}
-
 #[derive(Clone, Debug)]
 pub enum Seasonality {
     Auto,

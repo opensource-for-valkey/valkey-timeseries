@@ -17,20 +17,6 @@ impl BetaDistribution {
     pub fn cdf(&self, x: f64) -> f64 {
         beta_regularized_incomplete_value(self.alpha, self.beta, x)
     }
-
-    pub fn variance(&self) -> f64 {
-        self.alpha * self.beta / (self.alpha + self.beta).powi(2) / (self.alpha + self.beta + 1.0)
-    }
-
-    pub fn std_dev(&self) -> f64 {
-        self.variance().sqrt()
-    }
-
-    pub fn skewness(&self) -> f64 {
-        2.0 * (self.beta - self.alpha) * (self.alpha + self.beta + 1.0).sqrt()
-            / (self.alpha + self.beta + 2.0)
-            / (self.alpha * self.beta).sqrt()
-    }
 }
 
 impl fmt::Display for BetaDistribution {

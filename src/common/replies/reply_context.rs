@@ -1,14 +1,11 @@
 use super::raw_replies::{
     IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_array_len,
-    reply_with_bulk_string, reply_with_simple_string,
+    reply_with_bulk_string,
 };
-use crate::series::index::{TimeSeriesIndexGuard, get_db_index};
 use std::ops::Deref;
 use std::os::raw::c_long;
 use valkey_module::logging::ValkeyLogLevel;
-use valkey_module::{
-    Context, RedisModule_GetSelectedDb, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, raw,
-};
+use valkey_module::{Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, raw};
 
 /// `ReplyContext` is a thin wrapper around `RedisModuleCtx` that provides efficient,
 /// zero-allocation reply helpers and automatic database state management.
@@ -51,19 +48,8 @@ impl ReplyContext {
     pub fn log_debug(&self, message: &str) {
         self.log(ValkeyLogLevel::Debug, message);
     }
-    pub fn log_notice(&self, message: &str) {
-        self.log(ValkeyLogLevel::Notice, message);
-    }
-    pub fn log_verbose(&self, message: &str) {
-        self.log(ValkeyLogLevel::Verbose, message);
-    }
     pub fn log_warning(&self, message: &str) {
         self.log(ValkeyLogLevel::Warning, message);
-    }
-
-    /// Return the currently selected DB index from the underlying context.
-    pub fn get_current_db(&self) -> i32 {
-        unsafe { RedisModule_GetSelectedDb.unwrap()(self.raw_ctx) }
     }
 
     /// Reply with a 64-bit integer value.
@@ -81,11 +67,6 @@ impl ReplyContext {
         raw::reply_with_bool(self.raw_ctx, value.into())
     }
 
-    /// Reply with a simple string.
-    pub fn reply_with_simple_string(&self, s: &str) -> Status {
-        reply_with_simple_string(self.raw_ctx, s)
-    }
-
     /// Reply with an error string.
     pub fn reply_error_string(&self, s: &str) -> Status {
         reply_error_string(self.raw_ctx, s)
@@ -94,11 +75,6 @@ impl ReplyContext {
     /// Reply with a bulk string.
     pub fn reply_with_string(&self, value: &str) -> Status {
         reply_with_bulk_string(self.raw_ctx, value)
-    }
-
-    /// Reply with a NULL value.
-    pub fn reply_with_null(&self) -> Status {
-        raw::reply_with_null(self.raw_ctx)
     }
 
     /// Start an array reply with the given length.
@@ -137,12 +113,6 @@ impl ReplyContext {
     #[allow(clippy::must_use_candidate)]
     pub fn reply(&self, result: ValkeyResult) -> Status {
         reply(self.raw_ctx, result)
-    }
-
-    /// Get the index guard for the currently selected DB.
-    pub fn get_db_index(&self) -> TimeSeriesIndexGuard<'_> {
-        let db = self.get_current_db();
-        get_db_index(db)
     }
 }
 

@@ -714,7 +714,7 @@ mod tests {
         );
     }
 
-    // #[test]
+    #[test]
     fn test_merge_samples_spanning_multiple_chunks() {
         // Force small chunks
         let mut ts = TimeSeries::with_options(TimeSeriesOptions {

@@ -55,6 +55,8 @@ impl ClusterNodesSource for DetachedContext {
 pub const NUM_SLOTS: u16 = 16384;
 
 /// Enumeration for fanout target modes
+// The full targeting vocabulary is matched in target selection; not every mode has a caller yet.
+#[allow(dead_code)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum FanoutTarget {
     /// Select only the local node
@@ -76,19 +78,6 @@ pub enum FanoutTarget {
     HashTags(Vec<String>),
     /// Select the primary node for each slot corresponding to the hash tags provided
     HashTagsPrimary(Vec<String>),
-}
-
-impl FanoutTarget {
-    pub fn for_hash_tags(hash_tags: &[&str]) -> Self {
-        let mut slots = SmallVec::<[u16; 4]>::new();
-        for tag in hash_tags {
-            let slot = calculate_hash_slot(tag.as_ref());
-            if !slots.contains(&slot) {
-                slots.push(slot);
-            }
-        }
-        FanoutTarget::Slots(slots)
-    }
 }
 
 /// Node role enumeration
@@ -156,35 +145,19 @@ pub struct SlotRangeSet {
 }
 
 impl SlotRangeSet {
-    pub fn new() -> Self {
-        Self {
-            ranges: RangeSetBlaze::new(),
-        }
-    }
-
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.ranges.len() as usize
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
+    #[cfg(test)]
     pub fn contains(&self, slot: u16) -> bool {
         self.ranges.contains(slot)
-    }
-
-    pub fn insert(&mut self, slot: u16) {
-        self.ranges.insert(slot);
     }
 
     pub fn insert_range(&mut self, start: u16, end: u16) {
         debug_assert!(start <= end, "Invalid range: start ({start}) > end ({end})");
         self.ranges.ranges_insert(start..=end);
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = u16> + '_ {
-        self.ranges.iter()
     }
 
     pub fn range_iter(&self) -> RangesIter<'_, u16> {
@@ -195,14 +168,6 @@ impl SlotRangeSet {
         for range in other.range_iter() {
             self.ranges.ranges_insert(range.clone());
         }
-    }
-
-    pub fn first(&self) -> Option<u16> {
-        self.ranges.first()
-    }
-
-    pub fn last(&self) -> Option<u16> {
-        self.ranges.last()
     }
 
     /// Helper method to calculate slot fingerprint
@@ -321,14 +286,6 @@ impl NodeId {
     pub fn is_empty(&self) -> bool {
         self.0[0] == 0
     }
-
-    pub fn len(&self) -> usize {
-        if self.is_empty() {
-            0
-        } else {
-            VALKEYMODULE_NODE_ID_LEN as usize
-        }
-    }
 }
 
 impl AsRef<str> for NodeId {
@@ -408,10 +365,6 @@ impl NodeInfo {
 
     pub fn is_local(&self) -> bool {
         self.location == NodeLocation::Local
-    }
-
-    pub fn is_primary(&self) -> bool {
-        self.role == NodeRole::Primary
     }
 }
 
@@ -512,22 +465,8 @@ impl ShardInfo {
         }
     }
 
-    pub fn get_random_replica(&self) -> NodeInfo {
-        let mut rng_ = rng();
-        self.pick_target(&mut rng_, true, false)
-    }
-
     pub fn is_empty(&self) -> bool {
         self.primary.is_none() && self.replicas.is_empty()
-    }
-
-    pub fn i_own_slot(&self, slot: u16) -> bool {
-        self.owned_slots.contains(slot)
-    }
-
-    pub fn owns_key(&self, key: &[u8]) -> bool {
-        let slot = calculate_hash_slot(key);
-        self.i_own_slot(slot)
     }
 }
 
@@ -591,21 +530,19 @@ pub struct ClusterMap {
 
 impl ClusterMap {
     /// Slot ownership checks
+    #[cfg(test)]
     pub fn i_own_slot(&self, slot: u16) -> bool {
         self.owned_slots.contains(slot)
     }
 
-    pub fn is_owned_key(&self, key: &[u8]) -> bool {
-        let slot = calculate_hash_slot(key);
-        self.i_own_slot(slot)
-    }
-
     /// Get the count of owned slots
+    #[cfg(test)]
     pub fn owned_slot_count(&self) -> usize {
         self.owned_slots.len()
     }
 
     /// Look up a shard by id. Will return None if shard does not exist
+    #[cfg(test)]
     pub fn get_shard_by_id(&self, shard_id: &str) -> Option<&ShardInfo> {
         self.shards.get(shard_id)
     }
@@ -616,6 +553,7 @@ impl ClusterMap {
     }
 
     /// Get all shards
+    #[cfg(test)]
     pub fn all_shards(&self) -> &BTreeSet<ShardInfo> {
         &self.shards
     }

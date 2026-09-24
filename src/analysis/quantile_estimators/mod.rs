@@ -2,7 +2,6 @@ mod harrell_davis_quantile_estimator;
 mod hyndman_fan_quantile_estimator;
 mod samples;
 mod simple_quantile_estimator;
-mod trimmed_hd_estimator;
 
 pub use harrell_davis_quantile_estimator::*;
 pub use hyndman_fan_quantile_estimator::*;

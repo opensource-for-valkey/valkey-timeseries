@@ -6,6 +6,7 @@ use crate::analysis::outliers::{
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 use crate::config::num_threads;
 use krcf::{RandomCutForest, RandomCutForestOptions};
+#[cfg(test)]
 use orx_parallel::{Par, ParResult, Parallelizable};
 use valkey_module::logging::log_warning;
 use valkey_module::{ValkeyError, ValkeyResult};
@@ -216,6 +217,7 @@ impl RcfOutlierDetector {
         })
     }
 
+    #[cfg(test)]
     pub fn set_data(&mut self, data: &[f64]) {
         for &value in data {
             if let Err(e) = self.forest.update(&[value as f32]) {
@@ -227,6 +229,7 @@ impl RcfOutlierDetector {
     }
 
     /// Return the Rcf anomaly score for a single scalar value.
+    #[cfg(test)]
     pub fn score(&self, value: f64) -> f64 {
         self.forest.score(&[value as f32]).unwrap_or_else(|e| {
             log_warning(format!("Failed to score RCF value {value}: {e:?}"));
@@ -246,6 +249,7 @@ impl RcfOutlierDetector {
     /// Parallelizes over input points when the batch is large enough to amortize overhead.
     /// Because this method does not update the model, all points are scored against
     /// the same forest state and the calls are fully independent — safe to parallelize.
+    #[cfg(test)]
     pub fn try_batch_scores(&self, values: &[f64]) -> ValkeyResult<Vec<f64>> {
         let num_threads = num_threads();
 

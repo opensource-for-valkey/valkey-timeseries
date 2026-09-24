@@ -2,30 +2,11 @@
 // Reference: Harrell, Frank E., and C. E. Davis. "A new distribution-free quantile estimator." Biometrika 69, no. 3 (1982): 635-640.
 // https://doi.org/10.1093/biomet/69.3.635
 
-use crate::analysis::math::{BetaDistribution, ConfidenceIntervalEstimator};
+use crate::analysis::math::BetaDistribution;
 use crate::analysis::quantile_estimators::{QuantileEstimator, Samples};
 use std::f64;
 
 pub struct HarrellDavisQuantileEstimator;
-
-impl HarrellDavisQuantileEstimator {
-    pub fn quantile(samples: &Samples, probability: f64) -> f64 {
-        get_moments(samples, probability, false).0
-    }
-
-    /// Estimates confidence intervals using the Maritz-Jarrett method
-    pub fn quantile_confidence_interval_estimator(
-        samples: &Samples,
-        probability: f64,
-    ) -> ConfidenceIntervalEstimator {
-        let (c1, c2) = get_moments(samples, probability, true);
-        let estimation = c1;
-        let standard_error = (c2 - c1 * c1).sqrt();
-        let weighted_count = samples.weighted_size();
-
-        ConfidenceIntervalEstimator::new(weighted_count, estimation, standard_error)
-    }
-}
 
 impl QuantileEstimator for HarrellDavisQuantileEstimator {
     fn quantile(&self, sample: &Samples, probability: f64) -> f64 {

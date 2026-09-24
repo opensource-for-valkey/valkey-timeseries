@@ -9,6 +9,8 @@ use std::fmt;
 
 pub type Probability = f64;
 
+// The nine definitions from Hyndman & Fan (1996); only Type7 is selected today.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HyndmanFanType {
     Type1 = 1,
@@ -23,33 +25,6 @@ pub enum HyndmanFanType {
 }
 
 impl HyndmanFanType {
-    pub const ALL_TYPES: [HyndmanFanType; 9] = [
-        HyndmanFanType::Type1,
-        HyndmanFanType::Type2,
-        HyndmanFanType::Type3,
-        HyndmanFanType::Type4,
-        HyndmanFanType::Type5,
-        HyndmanFanType::Type6,
-        HyndmanFanType::Type7,
-        HyndmanFanType::Type8,
-        HyndmanFanType::Type9,
-    ];
-
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Type1),
-            2 => Some(Self::Type2),
-            3 => Some(Self::Type3),
-            4 => Some(Self::Type4),
-            5 => Some(Self::Type5),
-            6 => Some(Self::Type6),
-            7 => Some(Self::Type7),
-            8 => Some(Self::Type8),
-            9 => Some(Self::Type9),
-            _ => None,
-        }
-    }
-
     /// Returns true if the type supports weighted samples
     pub fn supports_weighted_samples(&self) -> bool {
         match self {
@@ -127,34 +102,6 @@ pub struct HyndmanFanQuantileEstimator {
 }
 
 impl HyndmanFanQuantileEstimator {
-    pub const TYPE1: Self = Self {
-        typ: HyndmanFanType::Type1,
-    };
-    pub const TYPE2: Self = Self {
-        typ: HyndmanFanType::Type2,
-    };
-    pub const TYPE3: Self = Self {
-        typ: HyndmanFanType::Type3,
-    };
-    pub const TYPE4: Self = Self {
-        typ: HyndmanFanType::Type4,
-    };
-    pub const TYPE5: Self = Self {
-        typ: HyndmanFanType::Type5,
-    };
-    pub const TYPE6: Self = Self {
-        typ: HyndmanFanType::Type6,
-    };
-    pub const TYPE7: Self = Self {
-        typ: HyndmanFanType::Type7,
-    };
-    pub const TYPE8: Self = Self {
-        typ: HyndmanFanType::Type8,
-    };
-    pub const TYPE9: Self = Self {
-        typ: HyndmanFanType::Type9,
-    };
-
     pub const fn new(typ: HyndmanFanType) -> Self {
         Self { typ }
     }

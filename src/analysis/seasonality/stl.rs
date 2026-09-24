@@ -5,6 +5,7 @@
 //! - Seasonal: The repeating seasonal pattern
 //! - Remainder: The residual after removing trend and seasonal
 
+#[cfg(test)]
 use crate::analysis::math::calculate_variance;
 
 /// Result of Stl decomposition.
@@ -18,6 +19,7 @@ pub struct STLResult {
     pub remainder: Vec<f64>,
 }
 
+#[cfg(test)]
 impl STLResult {
     /// Get the seasonal strength (0 to 1).
     /// Values close to 1 indicate strong seasonality.
@@ -127,6 +129,7 @@ impl Stl {
     }
 
     /// Set number of inner iterations.
+    #[cfg(test)]
     pub fn with_inner_iterations(mut self, n: usize) -> Self {
         self.inner_iterations = n;
         self

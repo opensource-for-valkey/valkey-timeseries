@@ -193,6 +193,7 @@ impl SmoothedZScoreAnomalyDetector {
         Ok(signal)
     }
 
+    #[cfg(test)]
     pub fn next_batch(&mut self, values: &[f64]) -> TimeSeriesAnalysisResult<Vec<AnomalySignal>> {
         values
             .iter()

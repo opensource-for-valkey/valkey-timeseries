@@ -936,8 +936,10 @@ mod tests {
         assert_eq!(result[4].value, 6.0);
     }
 
-    // #[test] TODO
+    #[test]
     fn test_empty_buckets_last() {
+        // This iterator leaves an empty `last` bucket as NaN; carrying the previous value
+        // into it is `CarryLastEmpty`'s job, applied downstream in the range pipeline.
         let samples = vec![
             Sample::new(10, 1.0),
             Sample::new(15, 99.0),
@@ -953,18 +955,15 @@ mod tests {
 
         let result: Vec<Sample> = iterator.collect();
 
-        assert_eq!(result.len(), 5);
-        assert_eq!(result[0].timestamp, 10);
+        let timestamps: Vec<_> = result.iter().map(|s| s.timestamp).collect();
+        assert_eq!(timestamps, vec![10, 20, 30, 40, 50]);
         assert_eq!(result[0].value, 99.0);
-        assert_eq!(result[1].timestamp, 20);
-        assert_eq!(result[1].value, 99.0); // Empty bucket with value 0 for sum
-        assert_eq!(result[2].timestamp, 30);
-        assert_eq!(result[2].value, 99.0); // Empty bucket
-        assert_eq!(result[3].timestamp, 40);
+        assert!(result[1].value.is_nan(), "empty bucket");
+        assert!(result[2].value.is_nan(), "empty bucket");
         assert_eq!(result[3].value, 5.0);
-        assert_eq!(result[4].timestamp, 50);
         assert_eq!(result[4].value, 6.0);
     }
+
     #[test]
     fn test_bucket_timestamp_end() {
         let samples = create_test_samples();

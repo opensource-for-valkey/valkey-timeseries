@@ -7,7 +7,6 @@ use crate::analysis::outliers::{
 
 /// Default alpha for Ewma SPC
 pub const EWMA_DEFAULT_ALPHA: f64 = 0.3;
-pub const EWMA_DEFAULT_MULTIPLIER: f64 = 3.0;
 
 /// SPC Exponentially Weighted Moving Average (EWMA) outlier detector
 #[derive(Debug)]
@@ -23,15 +22,6 @@ pub struct EwmaOutlierDetector {
 }
 
 impl EwmaOutlierDetector {
-    pub fn new(alpha: f64, target: f64, sigma: f64) -> Self {
-        EwmaOutlierDetector {
-            alpha,
-            target,
-            sigma,
-            multiplier: EWMA_DEFAULT_MULTIPLIER,
-        }
-    }
-
     pub fn from_series(ts: &[f64], alpha: f64) -> Self {
         let training_size = (ts.len() as f64 * 0.5).min(100.0) as usize;
         let training_data = &ts[0..training_size];

@@ -32,6 +32,7 @@ impl FanoutAclScope {
     /// that only need to exercise the thread-local scope, not ACL resolution.
     /// Production code enters through [`FanoutContext::lock`](crate::fanout::FanoutContext::lock), which resolves
     /// the handle under the GIL and keeps it for that lock's lifetime.
+    #[cfg(test)]
     pub fn enter_with_user(user: &str) -> Self {
         Self::enter(FanoutIdentity {
             name: user.to_owned(),
@@ -55,6 +56,7 @@ impl Drop for FanoutAclScope {
     }
 }
 
+#[cfg(test)]
 #[inline]
 pub fn fanout_acl_scope_active() -> bool {
     FANOUT_ACL_USER.with(|u| u.borrow().as_ref().is_some_and(|id| !id.name.is_empty()))

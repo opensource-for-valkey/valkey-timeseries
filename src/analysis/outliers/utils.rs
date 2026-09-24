@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::analysis::outliers::AnomalySignal;
 
 /// Map `evidence` against a detection `boundary` onto `[0, 1]`, with `0.5` at the
@@ -107,6 +108,7 @@ pub(super) fn normalize_value(v: f64) -> f64 {
 }
 
 #[inline]
+#[cfg(test)]
 pub(super) fn get_anomaly_direction(
     low_threshold: f64,
     hi_threshold: f64,

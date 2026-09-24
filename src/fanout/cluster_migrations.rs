@@ -1,38 +1,19 @@
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{read_lock, write_lock};
+#[cfg(test)]
 use crate::fanout::cluster_map::NUM_SLOTS;
 use crate::fanout::is_clustered;
 use crate::fanout::mark_cluster_map_stale;
 use range_set_blaze::RangeSetBlaze;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::{LazyLock, RwLock};
-use valkey_module::{
-    CallOptionResp, CallOptionsBuilder, CallReply, CallResult, Context, Version, raw,
-};
+use valkey_module::{Context, Version, raw};
 
 const ASM_MINIMUM_VERSION: Version = Version {
     major: 9,
     minor: 0,
     patch: 0,
 };
-
-/// Representation of a single slot migration entry returned by
-/// `CLUSTER GETSLOTMIGRATIONS`.
-#[derive(Debug, Clone, Default)]
-pub struct SlotMigration {
-    pub name: String,
-    pub operation: String,
-    pub slot_ranges: RangeSetBlaze<u16>,
-    pub target_node: Option<String>,
-    pub source_node: Option<String>,
-    pub create_time: i64,
-    pub last_update_time: i64,
-    pub last_ack_time: i64,
-    pub state: String,
-    pub message: String,
-    pub cow_size: i64,
-    pub remaining_repl_size: i64,
-}
 
 pub fn supports_atomic_slot_migration(ctx: &Context) -> bool {
     if !is_clustered(ctx) {
@@ -56,113 +37,6 @@ pub fn supports_atomic_slot_migration(ctx: &Context) -> bool {
     }
 }
 
-/// Call CLUSTER GETSLOTMIGRATIONS and parse the result into a Vec<SlotMigration>.
-pub fn get_slot_migrations(ctx: &Context) -> Result<Vec<SlotMigration>, String> {
-    let call_options = CallOptionsBuilder::new()
-        .resp(CallOptionResp::Resp3)
-        .errors_as_replies()
-        .build();
-
-    let res: CallResult =
-        ctx.call_ext::<_, CallResult>("CLUSTER", &call_options, &["GETSLOTMIGRATIONS"]);
-
-    let top = match res {
-        Err(e) => return Err(format!("Error calling CLUSTER GETSLOTMIGRATIONS: {e}")),
-        Ok(CallReply::Array(arr)) => {
-            debug_assert!(
-                arr.len() % 2 == 0,
-                "Expected even number of entries in CLUSTER GETSLOTMIGRATIONS result"
-            );
-            arr
-        }
-        _ => return Err("CLUSTER GETSLOTMIGRATIONS did not return an array".to_string()),
-    };
-
-    let mut out = Vec::with_capacity(top.len());
-
-    fn apply_field(ctx: &Context, mig: &mut SlotMigration, key: &str, value: CallResult) {
-        match key {
-            "name" => mig.name = as_str(value).unwrap_or_default(),
-            "operation" => mig.operation = as_str(value).unwrap_or_default(),
-            "slot_ranges" => {
-                let s = as_str(value).unwrap_or_default();
-                match parse_slot_ranges(&s) {
-                    Ok(ranges) => mig.slot_ranges = ranges,
-                    Err(e) => ctx.log_warning(&format!("Error parsing slot ranges '{s}': {e}")),
-                }
-            }
-            "target_node" => {
-                let s = as_str(value).unwrap_or_default();
-                if !s.is_empty() {
-                    mig.target_node = Some(s);
-                }
-            }
-            "source_node" => {
-                let s = as_str(value).unwrap_or_default();
-                if !s.is_empty() {
-                    mig.source_node = Some(s);
-                }
-            }
-            "create_time" => mig.create_time = as_i64(value).unwrap_or(0),
-            "last_update_time" => mig.last_update_time = as_i64(value).unwrap_or(0),
-            "last_ack_time" => mig.last_ack_time = as_i64(value).unwrap_or(0),
-            "state" => mig.state = as_str(value).unwrap_or_default(),
-            "message" => mig.message = as_str(value).unwrap_or_default(),
-            "cow_size" => mig.cow_size = as_i64(value).unwrap_or(0),
-            "remaining_repl_size" => mig.remaining_repl_size = as_i64(value).unwrap_or(0),
-            _ => {}
-        }
-    }
-
-    for job_entry in top.iter().flatten() {
-        let mut mig = SlotMigration::default();
-        match job_entry {
-            CallReply::Array(arr) => {
-                let mut i = 0usize;
-                while i + 1 < arr.len() {
-                    let key = arr.get(i).and_then(as_str).unwrap_or_default();
-                    if !key.is_empty()
-                        && let Some(value) = arr.get(i + 1)
-                    {
-                        apply_field(ctx, &mut mig, &key.to_ascii_lowercase(), value);
-                    }
-                    i += 2;
-                }
-            }
-            CallReply::Map(map) => {
-                for (key, value) in map.iter() {
-                    let Some(key) = as_str(key) else {
-                        continue;
-                    };
-                    apply_field(ctx, &mut mig, &key.to_ascii_lowercase(), value);
-                }
-            }
-            other => {
-                ctx.log_warning(&format!("Unexpected slot migration entry type: {other:?}"));
-                continue;
-            }
-        }
-
-        out.push(mig);
-    }
-
-    Ok(out)
-}
-
-fn as_str(r: CallResult) -> Option<String> {
-    match r {
-        Ok(CallReply::String(v)) => v.to_string(),
-        _ => None,
-    }
-}
-
-fn as_i64(r: CallResult) -> Option<i64> {
-    match r {
-        Ok(CallReply::I64(v)) => Some(v.to_i64()),
-        _ => None,
-    }
-}
-
 /// Parse a slot ranges string into a vector of inclusive ranges.
 ///
 /// Examples accepted:
@@ -170,6 +44,7 @@ fn as_i64(r: CallResult) -> Option<i64> {
 /// - "0-100 200-300"
 /// - "0-100,200-300"
 /// - "5" (single slot)
+#[cfg(test)]
 fn parse_slot_ranges(s: &str) -> Result<RangeSetBlaze<u16>, String> {
     let mut out = RangeSetBlaze::new();
     let trimmed = s.trim();
@@ -227,8 +102,10 @@ fn parse_slot_ranges(s: &str) -> Result<RangeSetBlaze<u16>, String> {
 // fall back to the numeric constant below.
 const VALKEYMODULE_EVENT_ATOMIC_SLOT_MIGRATION: u64 = 19u64;
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_IMPORT_STARTED: u64 = 0;
+#[allow(dead_code)] // mirrors valkeymodule.h; export start is not acted on
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_EXPORT_STARTED: u64 = 1;
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_IMPORT_ABORTED: u64 = 2;
+#[allow(dead_code)] // mirrors valkeymodule.h; export abort is not acted on
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_EXPORT_ABORTED: u64 = 3;
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_IMPORT_COMPLETED: u64 = 4;
 const VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_EXPORT_COMPLETED: u64 = 5;
@@ -238,8 +115,10 @@ const VALKEYMODULE_NODE_ID_LEN: usize = 40;
 #[derive(Debug)]
 pub enum AtomicSlotMigrationEvent {
     ImportStarted,
+    #[allow(dead_code)] // mirrors the server subevent; not raised yet
     ExportStarted,
     ImportAborted,
+    #[allow(dead_code)] // mirrors the server subevent; not raised yet
     ExportAborted,
     ImportCompleted,
     ExportCompleted,
@@ -268,11 +147,6 @@ pub struct ValkeyModuleAtomicSlotMigrationInfoV1 {
 }
 
 impl ValkeyModuleAtomicSlotMigrationInfoV1 {
-    pub fn job_name_str(&self) -> String {
-        let c_str = unsafe { std::ffi::CStr::from_ptr(self.job_name.as_ptr()) };
-        c_str.to_string_lossy().into_owned()
-    }
-
     fn convert_slot_ranges(&self) -> RangeSetBlaze<u16> {
         let mut ranges = RangeSetBlaze::new();
         self.extend_slot_ranges(&mut ranges);
@@ -286,17 +160,6 @@ impl ValkeyModuleAtomicSlotMigrationInfoV1 {
                 let start = range.start as u16;
                 let end = range.end as u16;
                 dest.extend(start..=end);
-            }
-        }
-    }
-
-    fn remove_slots_from(&self, dest: &mut RangeSetBlaze<u16>) {
-        for i in 0..self.num_slot_ranges {
-            unsafe {
-                let range = *self.slot_ranges.add(i as usize);
-                let start = range.start as u16;
-                let end = range.end as u16;
-                dest.retain(|x| !(start..=end).contains(x));
             }
         }
     }

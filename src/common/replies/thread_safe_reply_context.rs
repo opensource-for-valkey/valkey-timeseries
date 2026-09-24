@@ -1,7 +1,6 @@
 use crate::common::replies::{IntoRawCtx, ReplyContext};
-use std::os::raw::c_int;
 use std::ptr;
-use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
+use valkey_module::{Context, ValkeyResult, raw};
 
 /// A lightweight "fork" of the BlockedClient in `valkey_module` to allow raw client replies from background threads
 /// without needing to lock the context. This is safe, since the Valkey modules API does not require locking for
@@ -16,23 +15,6 @@ unsafe impl Send for BlockedClient {}
 impl BlockedClient {
     pub(crate) fn new(inner: *mut raw::RedisModuleBlockedClient) -> Self {
         Self { inner }
-    }
-
-    /// Aborts the blocked client operation
-    ///
-    /// # Returns
-    /// * `Ok(())` - If the blocked client was successfully aborted
-    /// * `Err(ValkeyError)` - If the abort operation failed
-    pub fn abort(mut self) -> Result<(), ValkeyError> {
-        unsafe {
-            if raw::RedisModule_AbortBlock.unwrap()(self.inner) == raw::REDISMODULE_OK as c_int {
-                // Prevent the normal Drop from running
-                self.inner = ptr::null_mut();
-                Ok(())
-            } else {
-                Err(ValkeyError::Str("Failed to abort blocked client"))
-            }
-        }
     }
 }
 

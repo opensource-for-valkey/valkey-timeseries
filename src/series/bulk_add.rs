@@ -3,19 +3,26 @@
 //! This module provides bulk insertion of samples into a time series, with support for duplicate
 //! policies and automatic compaction handling. It is optimized for high-throughput data ingestion
 //! scenarios by leveraging parallel processing and efficient sample merging.
+#[cfg(not(test))]
 use crate::common::block_on_keys::signal_timeseries_ready;
+#[cfg(not(test))]
 use crate::common::context::create_key_string;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
+#[cfg(not(test))]
+use crate::series::SeriesRef;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
+#[cfg(not(test))]
 use crate::series::index::with_timeseries_postings;
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
-use crate::series::{DuplicatePolicy, SampleAddResult, SeriesRef, TimeSeries, seal_chunk};
+use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries, seal_chunk};
 use orx_parallel::{IterIntoParIter, Par, ParCollection};
 use simd_json::base::{ValueAsArray, ValueAsScalar};
 use simd_json::borrowed::Value;
 use simd_json::prelude::ValueObjectAccess;
-use valkey_module::{Context, NotifyEvent, ValkeyError, ValkeyResult};
+#[cfg(not(test))]
+use valkey_module::NotifyEvent;
+use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 pub const MAX_SAMPLES_PER_INSERT: usize = 1_000;
 const EARLY_CHUNK_CAPACITY_FACTOR: f64 = 0.7;
@@ -474,6 +481,7 @@ pub fn bulk_insert_samples(
     results
 }
 
+#[cfg(not(test))]
 fn notify_added(ctx: &Context, event: &str, ids: &[SeriesRef]) {
     with_timeseries_postings(ctx, |postings| {
         for &id in ids {

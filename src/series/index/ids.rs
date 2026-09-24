@@ -35,6 +35,7 @@ pub const EPOCH_BITS: u32 = 24;
 pub const COUNTER_BITS: u32 = 40;
 
 const EPOCH_MASK: u64 = (1 << EPOCH_BITS) - 1;
+#[cfg(test)]
 const COUNTER_MASK: u64 = (1 << COUNTER_BITS) - 1;
 
 /// Generates unique timeseries IDs.
@@ -78,18 +79,17 @@ impl IdGenerator {
         self.state.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    pub fn generate(&self) -> TimeseriesId {
-        self.next_id()
-    }
-
+    #[cfg(test)]
     pub fn epoch(&self) -> u32 {
         extract_epoch(self.state.load(Ordering::Relaxed))
     }
 
+    #[cfg(test)]
     pub fn extract_epoch(id: TimeseriesId) -> u32 {
         extract_epoch(id)
     }
 
+    #[cfg(test)]
     pub fn extract_counter(id: TimeseriesId) -> u64 {
         extract_counter(id)
     }
@@ -110,10 +110,12 @@ pub fn next_timeseries_id() -> TimeseriesId {
     generate()
 }
 
+#[cfg(test)]
 pub fn extract_epoch(id: TimeseriesId) -> u32 {
     (id >> COUNTER_BITS) as u32
 }
 
+#[cfg(test)]
 pub fn extract_counter(id: TimeseriesId) -> u64 {
     id & COUNTER_MASK
 }

@@ -4,21 +4,26 @@
 //! patterns in hourly data.
 
 use super::stl::Stl;
+#[cfg(test)]
 use crate::analysis::math::calculate_variance;
 
 /// Result of Mstl decomposition.
 #[derive(Debug, Clone)]
 pub struct MSTLResult {
     /// Trend component.
+    #[cfg(test)]
     pub trend: Vec<f64>,
     /// Seasonal components (one for each period).
+    #[cfg(test)]
     pub seasonal_components: Vec<Vec<f64>>,
     /// The seasonal periods corresponding to each component.
+    #[cfg(test)]
     pub seasonal_periods: Vec<usize>,
     /// Remainder component.
     pub remainder: Vec<f64>,
 }
 
+#[cfg(test)]
 impl MSTLResult {
     /// Get the total seasonal component (sum of all seasonal components).
     pub fn total_seasonal(&self) -> Vec<f64> {
@@ -106,6 +111,7 @@ impl Mstl {
     }
 
     /// Set number of iterations.
+    #[cfg(test)]
     pub fn with_iterations(mut self, n: usize) -> Self {
         self.iterations = n;
         self
@@ -118,6 +124,7 @@ impl Mstl {
     }
 
     /// Get the seasonal periods.
+    #[cfg(test)]
     pub fn seasonal_periods(&self) -> &[usize] {
         &self.seasonal_periods
     }
@@ -207,8 +214,11 @@ impl Mstl {
         }
 
         Some(MSTLResult {
+            #[cfg(test)]
             trend,
+            #[cfg(test)]
             seasonal_components,
+            #[cfg(test)]
             seasonal_periods: self.seasonal_periods.clone(),
             remainder,
         })

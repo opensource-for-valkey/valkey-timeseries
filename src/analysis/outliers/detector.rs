@@ -6,6 +6,8 @@
 //! lets callers ask whether a detector supports a narrower interface via
 //! [`Detector::as_point_detector`], with no downcasting.
 
+#[cfg(test)]
+use super::PointDetector;
 use super::cusum_outlier_detector::CusumOutlierDetector;
 use super::double_mad_outlier_detector::DoubleMadOutlierDetector;
 use super::esd_outlier_detector::{ESDOutlierDetector, ESDOutlierOptions};
@@ -20,7 +22,6 @@ use super::smoothed_zscores::SmoothedZScoreAnomalyDetector;
 use super::zscore_outlier_detector::ZScoreOutlierDetector;
 use super::{
     AnomalyDetectionMethodOptions, AnomalyDetector, AnomalyMethod, AnomalyResult, MethodInfo,
-    PointDetector,
 };
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 
@@ -132,6 +133,7 @@ impl Detector {
     /// function of the fitted model. Sequential and whole-sample methods return
     /// `None` — for them a per-point answer either does not exist or would
     /// disagree with [`AnomalyDetector::detect`].
+    #[cfg(test)]
     pub fn as_point_detector(&self) -> Option<&dyn PointDetector> {
         match self {
             Detector::DoubleMad(d) => Some(d),

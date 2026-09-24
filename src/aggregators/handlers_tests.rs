@@ -26,7 +26,7 @@ mod tests {
         assert_eq!(agg.current(), None); // Should reset after finalize
     }
 
-    // #[test]
+    #[test]
     fn test_last_aggregator() {
         let mut agg = LastAggregator::default();
         assert_eq!(agg.current(), None);

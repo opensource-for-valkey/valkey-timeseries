@@ -41,6 +41,7 @@ impl Default for CusumOutlierDetector {
 }
 
 impl CusumOutlierDetector {
+    #[cfg(test)]
     pub fn with_params(mean: f64, std_dev: f64) -> Self {
         CusumOutlierDetector {
             target: mean,
@@ -50,6 +51,7 @@ impl CusumOutlierDetector {
         }
     }
 
+    #[cfg(test)]
     pub fn from_series(ts: &[f64]) -> Self {
         let (target, std_dev) = fit_baseline(ts);
         Self::with_params(target, std_dev)

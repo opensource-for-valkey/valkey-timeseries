@@ -25,7 +25,7 @@ use crate::series::request_types::{
 };
 use crate::series::types::{DuplicatePolicy, ValueFilter};
 use crate::series::{TimestampRange, TimestampValue};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashSet;
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::iter::{Peekable, Skip};
@@ -140,41 +140,6 @@ impl Display for CommandArgToken {
 
 pub type CommandArgIterator = Peekable<Skip<IntoIter<ValkeyString>>>;
 
-pub fn parse_number_arg(arg: &ValkeyString, name: &str) -> ValkeyResult<f64> {
-    if let Ok(value) = arg.parse_float() {
-        return Ok(value);
-    }
-    let arg_str = arg.to_string_lossy();
-    parse_number_with_unit(&arg_str).map_err(|_| {
-        let msg = format!("ERR invalid number parsing {name}");
-        ValkeyError::String(msg)
-    })
-}
-
-pub fn parse_integer_arg(
-    arg: &ValkeyString,
-    name: &str,
-    allow_negative: bool,
-) -> ValkeyResult<i64> {
-    let value = if let Ok(val) = arg.parse_integer() {
-        val
-    } else {
-        let num = parse_number_arg(arg, name)?;
-        if num != num.floor() {
-            return Err(ValkeyError::Str(error_consts::INVALID_INTEGER));
-        }
-        if num > i64::MAX as f64 {
-            return Err(ValkeyError::Str("TSDB: value is too large"));
-        }
-        num as i64
-    };
-    if !allow_negative && value < 0 {
-        let msg = format!("TSDB: {name} must be a non-negative integer");
-        return Err(ValkeyError::String(msg));
-    }
-    Ok(value)
-}
-
 pub fn parse_timestamp(arg: &str) -> ValkeyResult<Timestamp> {
     if arg == "*" {
         return Ok(current_time_millis());
@@ -182,28 +147,8 @@ pub fn parse_timestamp(arg: &str) -> ValkeyResult<Timestamp> {
     parse_timestamp_internal(arg, false).map_err(|e| ValkeyError::Str(timestamp_error(&e)))
 }
 
-pub fn parse_timestamp_arg(arg: &str, name: &str) -> Result<TimestampValue, ValkeyError> {
-    parse_timestamp_range_value(arg).map_err(|_e| {
-        let msg = format!("TSDB: invalid {name} timestamp");
-        ValkeyError::String(msg)
-    })
-}
-
 pub fn parse_timestamp_range_value(arg: &str) -> ValkeyResult<TimestampValue> {
     TimestampValue::try_from(arg)
-}
-
-pub fn parse_duration_arg(arg: &ValkeyString) -> ValkeyResult<Duration> {
-    if let Ok(value) = arg.parse_integer() {
-        if value < 0 {
-            return Err(ValkeyError::Str(
-                "TSDB: invalid duration, must be a non-negative integer",
-            ));
-        }
-        return Ok(Duration::from_millis(value as u64));
-    }
-    let value_str = arg.to_string_lossy();
-    parse_duration(&value_str)
 }
 
 /// Parse a bucket duration (the `AGGREGATION <aggregator> <bucketDuration>` operand,
@@ -441,34 +386,6 @@ fn expect_next_token(args: &mut CommandArgIterator, expected: CommandArgToken) -
     Ok(())
 }
 
-pub(crate) fn parse_next_token(
-    args: &mut CommandArgIterator,
-    tokens: Option<&[CommandArgToken]>,
-) -> ValkeyResult<Option<CommandArgToken>> {
-    let arg = args.next_str()?;
-    let Some(token) = parse_command_arg_token(arg.as_bytes()) else {
-        return Ok(None);
-    };
-    let Some(valid_tokens) = tokens else {
-        return Ok(Some(token));
-    };
-    if valid_tokens.contains(&token) {
-        return Ok(Some(token));
-    }
-    let msg = if valid_tokens.len() == 1 {
-        format!(
-            "TSDB: expected \"{}\", found \"{arg}\"",
-            valid_tokens[0].as_str()
-        )
-    } else {
-        format!(
-            "TSDB: expected one of {:?}, found \"{arg}\"",
-            valid_tokens.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
-        )
-    };
-    Err(ValkeyError::String(msg))
-}
-
 pub(crate) fn advance_if_next_token_one_of(
     args: &mut CommandArgIterator,
     tokens: &[CommandArgToken],
@@ -544,38 +461,6 @@ pub fn parse_label_list(
         labels.push(label.to_string());
         Ok(())
     })?;
-
-    Ok(labels)
-}
-
-pub fn parse_label_value_pairs(
-    args: &mut CommandArgIterator,
-    stop_tokens: &[CommandArgToken],
-) -> ValkeyResult<AHashMap<String, String>> {
-    let mut labels: AHashMap<String, String> = AHashMap::new();
-
-    while !is_stop_token_or_end(args, stop_tokens) {
-        let name = args
-            .next_str()
-            .map_err(|_| ValkeyError::Str(error_consts::INVALID_LABEL_NAME))?;
-
-        if name.is_empty() {
-            return Err(ValkeyError::Str(error_consts::INVALID_LABEL_NAME));
-        }
-
-        // Must have a value next; if we hit stop/end here, it's an odd number of args.
-        if is_stop_token_or_end(args, stop_tokens) || args.peek().is_none() {
-            return Err(ValkeyError::Str(error_consts::INVALID_LABEL_VALUE));
-        }
-
-        let value = args
-            .next_str()
-            .map_err(|_| ValkeyError::Str(error_consts::INVALID_LABEL_VALUE))?;
-
-        if labels.insert(name.to_string(), value.to_string()).is_some() {
-            return Err(ValkeyError::Str(error_consts::DUPLICATE_LABEL));
-        }
-    }
 
     Ok(labels)
 }
@@ -1467,13 +1352,6 @@ fn parse_asof_join_options(args: &mut CommandArgIterator) -> ValkeyResult<JoinTy
 
     let mut allow_exact_match = true;
     if args.peek().is_some() {
-        if let Some(next_token) = peek_token(args) {
-            // If the next thing is a known token, it's not a duration.
-            if next_token != AllowExactMatch {
-                // no-op; duration parsing below will handle only digit-starting strings
-            }
-        }
-
         if let Some(next_arg) = args.peek()
             && let Ok(arg_str) = next_arg.try_as_str()
         {
@@ -1868,22 +1746,6 @@ fn parse_limit_value(val: &str) -> ValkeyResult<Option<usize>> {
         return Err(ValkeyError::String(msg));
     }
     Ok(Some(limit as usize))
-}
-
-pub(super) fn find_last_token_instance(
-    args: &[ValkeyString],
-    cmd_tokens: &[CommandArgToken],
-) -> Option<(CommandArgToken, usize)> {
-    let mut i = args.len() - 1;
-    for arg in args.iter().rev() {
-        if let Some(token) = parse_command_arg_token(arg)
-            && cmd_tokens.contains(&token)
-        {
-            return Some((token, i));
-        }
-        i -= 1;
-    }
-    None
 }
 
 #[cfg(test)]

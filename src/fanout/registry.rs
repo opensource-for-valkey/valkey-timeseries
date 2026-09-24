@@ -75,46 +75,9 @@ impl FanoutOperationRegistry {
         Ok(())
     }
 
-    /// Execute a registered fanout operation by name.
-    ///
-    /// # Arguments
-    /// - `ctx`: The shard-local request context (GIL not held)
-    /// - `name`: The name of the operation to execute
-    /// - `payload`: Serialized request data
-    /// - `dest`: destination buffer. This will be sent back to requester
-    fn execute(
-        &self,
-        ctx: &FanoutContext,
-        name: &str,
-        payload: &[u8],
-        dest: &mut Vec<u8>,
-    ) -> FanoutResult<()> {
-        let executor = self
-            .get_operation_by_name(name)
-            .ok_or_else(FanoutError::invalid_message)?;
-
-        executor(ctx, payload, dest)
-    }
-
     #[inline]
     fn get_operation_by_name(&self, name: &str) -> Option<RequestHandlerCallback> {
         self.operations.pin().get(name).copied()
-    }
-
-    /// Check if an operation is registered.
-    pub fn contains(&self, name: &str) -> bool {
-        self.operations.pin().contains_key(name)
-    }
-
-    /// Get the list of all registered operation names.
-    pub fn list_operations(&self) -> Vec<&'static str> {
-        let mut ops = Vec::new();
-        let map = self.operations.pin();
-        for key in map.keys() {
-            ops.push(*key);
-        }
-        ops.sort();
-        ops
     }
 }
 
@@ -136,8 +99,4 @@ where
 
 pub(super) fn get_fanout_request_handler(name: &str) -> Option<RequestHandlerCallback> {
     FANOUT_REGISTRY.get_operation_by_name(name)
-}
-
-pub(crate) fn get_registered_fanout_operations() -> Vec<&'static str> {
-    FANOUT_REGISTRY.list_operations()
 }

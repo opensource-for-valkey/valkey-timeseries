@@ -80,22 +80,6 @@ impl SimilarityMatcher {
         }
     }
 
-    pub fn name(&self) -> &'static str {
-        match self {
-            SimilarityMatcher::JaroWinkler(_) => "jarowinkler",
-            SimilarityMatcher::Subsequence(_) => "subsequence",
-            SimilarityMatcher::NoOp(_) => "noop",
-        }
-    }
-
-    pub fn algorithm(&self) -> FuzzyAlgorithm {
-        match self {
-            SimilarityMatcher::JaroWinkler(_) => FuzzyAlgorithm::JaroWinkler,
-            SimilarityMatcher::Subsequence(_) => FuzzyAlgorithm::Subsequence,
-            SimilarityMatcher::NoOp(_) => FuzzyAlgorithm::NoOp,
-        }
-    }
-
     pub fn score(&self, value: &str) -> f64 {
         match self {
             SimilarityMatcher::JaroWinkler(m) => m.score(value),
@@ -113,6 +97,7 @@ pub struct SimilarityFilter {
 }
 
 impl SimilarityFilter {
+    #[cfg(test)]
     pub fn new(pattern: &str, algorithm: FuzzyAlgorithm, threshold: f64) -> Self {
         Self::new_with_case_sensitivity(pattern, algorithm, threshold, true)
     }
@@ -134,14 +119,6 @@ impl SimilarityFilter {
             threshold,
             case_sensitive,
         }
-    }
-
-    pub fn algorithm(&self) -> FuzzyAlgorithm {
-        self.matcher.algorithm()
-    }
-
-    pub fn is_noop(&self) -> bool {
-        matches!(self.matcher, SimilarityMatcher::NoOp(_))
     }
 }
 

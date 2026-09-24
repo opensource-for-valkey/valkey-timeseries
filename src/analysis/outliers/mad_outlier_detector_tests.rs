@@ -3,7 +3,6 @@ use super::outlier_test_data::{
     EMPTY_DATASET, SAME_DATASET, TestData, beta_data_set, modified_beta_data_set, real_data_set,
     yang_data_set,
 };
-use crate::analysis::outliers::{AnomalySignal, PointDetector};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -228,38 +227,6 @@ static HD_QE_TEST_DATA_MAP: LazyLock<HashMap<&'static str, TestData>> = LazyLock
 
     map
 });
-
-/// Requires [`PointDetector`] rather than [`AnomalyDetector`]: it decides
-/// outliers by asking about each value in isolation, which only the fence-based
-/// detectors can answer.
-pub fn check<F>(test_data: &TestData, create_detector: F)
-where
-    F: FnOnce(&[f64]) -> Box<dyn PointDetector>,
-{
-    let detector = create_detector(test_data.values);
-    let actual_outliers = test_data
-        .values
-        .iter()
-        .copied()
-        .filter(|&v| detector.classify(v) != AnomalySignal::None)
-        .collect::<Vec<f64>>();
-
-    assert_eq!(
-        actual_outliers.len(),
-        test_data.expected_outliers.len(),
-        "Number of outliers doesn't match"
-    );
-
-    for (&actual, &expected) in actual_outliers
-        .iter()
-        .zip(test_data.expected_outliers.iter())
-    {
-        assert!(
-            (actual - expected).abs() < 1e-9,
-            "Expected {expected}, got {actual}",
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

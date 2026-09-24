@@ -220,12 +220,6 @@ fn str_as_legal_resp_string(s: &str) -> CString {
     CString::new(bytes).unwrap()
 }
 
-pub fn reply_with_simple_string<C: IntoRawCtx>(ctx: C, s: &str) -> Status {
-    let raw_ctx = ctx.into_raw();
-    let msg = str_as_legal_resp_string(s);
-    raw::reply_with_simple_string(raw_ctx, msg.as_ptr())
-}
-
 pub fn reply_error_string<C: IntoRawCtx>(ctx: C, s: &str) -> Status {
     let raw_ctx = ctx.into_raw();
     let msg = str_as_legal_resp_string(s);

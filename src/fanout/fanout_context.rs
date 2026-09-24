@@ -3,7 +3,6 @@ use crate::fanout::{FanoutAclScope, FanoutIdentity};
 use crate::series::acl::ModuleUser;
 use std::ops::Deref;
 use std::rc::Rc;
-use valkey_module::logging::ValkeyLogLevel;
 use valkey_module::{
     Context, DetachedContext, DetachedContextGuard, MODULE_CONTEXT, Status, ValkeyError,
     ValkeyResult,
@@ -18,20 +17,7 @@ use valkey_module::{
 pub struct FanoutContextGuard {
     // Declared first so the resolved `ModuleUser` handle is freed under the lock.
     _acl: Option<FanoutAclScope>,
-    db: i32,
     ctx: DetachedContextGuard,
-}
-
-impl FanoutContextGuard {
-    /// Access the underlying detached context guard.
-    pub fn context(&self) -> &DetachedContextGuard {
-        &self.ctx
-    }
-
-    /// The database selected for the duration of this lock.
-    pub fn db(&self) -> i32 {
-        self.db
-    }
 }
 
 impl Deref for FanoutContextGuard {
@@ -76,11 +62,13 @@ impl FanoutContext {
     }
 
     /// The ACL user the request executes as, if enforcement applies.
+    #[cfg(test)]
     pub fn user(&self) -> Option<&str> {
         self.user.as_deref()
     }
 
     /// The database the request runs against.
+    #[cfg(test)]
     pub fn db(&self) -> i32 {
         self.db
     }
@@ -118,28 +106,7 @@ impl FanoutContext {
             None => None,
         };
 
-        Ok(FanoutContextGuard {
-            _acl: acl,
-            db: self.db,
-            ctx,
-        })
-    }
-
-    /// Log a message at the specified `level` without taking the GIL.
-    pub fn log(&self, level: ValkeyLogLevel, message: &str) {
-        self.ctx.log(level, message);
-    }
-
-    pub fn log_debug(&self, message: &str) {
-        self.log(ValkeyLogLevel::Debug, message);
-    }
-
-    pub fn log_notice(&self, message: &str) {
-        self.log(ValkeyLogLevel::Notice, message);
-    }
-
-    pub fn log_warning(&self, message: &str) {
-        self.log(ValkeyLogLevel::Warning, message);
+        Ok(FanoutContextGuard { _acl: acl, ctx })
     }
 }
 

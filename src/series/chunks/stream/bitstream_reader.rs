@@ -250,10 +250,6 @@ impl BitRead for BitStreamReader<'_> {
         BitStreamReader::read_bit(self)
     }
 
-    fn read_byte(&mut self) -> io::Result<u8> {
-        BitStreamReader::read_byte(self)
-    }
-
     fn read_bits(&mut self, num: u32) -> io::Result<u64> {
         if num > 64 {
             return Err(too_many_bits(num));

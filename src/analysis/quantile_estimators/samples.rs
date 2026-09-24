@@ -7,10 +7,6 @@ pub struct Samples {
 }
 
 impl Samples {
-    pub fn new(values: Vec<f64>) -> Self {
-        Self::new_sorted_unweighted(values)
-    }
-
     /// NaN values (missing readings) are dropped rather than sorted in: with
     /// `total_cmp`, NaN sorts as a real (if extreme) element, which both
     /// biases every quantile position — `n` counts an observation that carries
@@ -37,6 +33,7 @@ impl Samples {
     /// A NaN value is dropped along with its weight, for the same reason
     /// [`Self::new_unweighted`] drops one: it carries no information but would
     /// still bias `total_weight` and every quantile position derived from it.
+    #[cfg(test)]
     pub fn new_weighted(mut values: Vec<(f64, f64)>) -> Self {
         values.retain(|(v, _)| !v.is_nan());
         values.sort_by(|a, b| a.0.total_cmp(&b.0));
