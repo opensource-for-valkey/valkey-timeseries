@@ -67,11 +67,102 @@ use std::sync::atomic::{AtomicUsize, Ordering, fence};
 /// `papaya::HashSet` lacks the conditional insert/remove this needs.
 type StringPool = HashMap<PoolEntry, (), RandomState>;
 
-static STRING_POOL: LazyLock<StringPool> =
-    LazyLock::new(|| HashMap::builder().hasher(RandomState::new()).build());
+/// A pool of interned strings and the memory it accounts for.
+pub(crate) struct Interner {
+    pool: StringPool,
+    /// Total memory used by the interned strings in `pool`.
+    memory_used: AtomicUsize,
+}
 
-/// Total memory used by all interned strings.
-static STRING_MEMORY_USED: AtomicUsize = AtomicUsize::new(0);
+impl Interner {
+    fn new() -> Self {
+        Self {
+            pool: HashMap::builder().hasher(RandomState::new()).build(),
+            memory_used: AtomicUsize::new(0),
+        }
+    }
+}
+
+static GLOBAL_INTERNER: LazyLock<Interner> = LazyLock::new(Interner::new);
+
+/// The interner every string goes through: the process-wide one.
+#[cfg(not(test))]
+#[inline(always)]
+fn interner() -> &'static Interner {
+    &GLOBAL_INTERNER
+}
+
+/// The interner every string goes through: the process-wide one, unless the calling thread
+/// has installed a private one ([`test_pool`]).
+#[cfg(test)]
+#[inline]
+fn interner() -> &'static Interner {
+    test_pool::installed().unwrap_or(&GLOBAL_INTERNER)
+}
+
+/// Per-test string pools.
+///
+/// The pool is process-wide, and ~1400 other tests intern concurrently with any one test, so
+/// a test that inspects pool state — counts, memory, statistics — sees theirs too, and failed
+/// intermittently (`#[serial]` only excludes other `#[serial]` tests). A test that inspects the
+/// pool installs its own with [`isolated`] instead, which also needs no reset.
+///
+/// The override is per thread: strings interned or dropped on a thread the test spawns go
+/// through that thread's pool, so such a test installs the same pool there with
+/// [`TestPool::enter`]. Guards must outlive the strings interned under them — declare the guard
+/// first, so it drops last.
+#[cfg(test)]
+pub(crate) mod test_pool {
+    use super::Interner;
+    use std::cell::Cell;
+
+    thread_local! {
+        static INSTALLED: Cell<Option<&'static Interner>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn installed() -> Option<&'static Interner> {
+        INSTALLED.with(Cell::get)
+    }
+
+    /// A handle to an isolated pool, for installing it on other threads.
+    #[derive(Clone, Copy)]
+    pub(crate) struct TestPool(&'static Interner);
+
+    impl TestPool {
+        /// Installs this pool on the calling thread until the guard drops.
+        pub(crate) fn enter(self) -> TestPoolGuard {
+            let previous = INSTALLED.with(|cell| cell.replace(Some(self.0)));
+            TestPoolGuard {
+                pool: self,
+                previous,
+            }
+        }
+    }
+
+    /// Restores the thread's previous pool when dropped.
+    pub(crate) struct TestPoolGuard {
+        pool: TestPool,
+        previous: Option<&'static Interner>,
+    }
+
+    impl TestPoolGuard {
+        pub(crate) fn pool(&self) -> TestPool {
+            self.pool
+        }
+    }
+
+    impl Drop for TestPoolGuard {
+        fn drop(&mut self) {
+            INSTALLED.with(|cell| cell.set(self.previous));
+        }
+    }
+
+    /// Installs a fresh, empty pool on the calling thread. Leaked: tests are short-lived, and a
+    /// string that outlives its test must never find its pool freed.
+    pub(crate) fn isolated() -> TestPoolGuard {
+        TestPool(Box::leak(Box::new(Interner::new()))).enter()
+    }
+}
 
 /// Marker in [`Header::name_len`] for a string with no `=`.
 const NO_SEPARATOR: u32 = u32::MAX;
@@ -285,7 +376,8 @@ impl Node {
 /// `remove_if` makes exactly one of them succeed, and the pointer check keeps
 /// a lookalike entry (same bytes, different allocation) untouched.
 fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
-    let removed = STRING_POOL.remove_if(
+    let interner = interner();
+    let removed = interner.pool.remove_if(
         node.bytes(),
         |entry, _| entry.0.0 == node.0 && node.strong().load(Ordering::Acquire) == 1,
         guard,
@@ -293,7 +385,9 @@ fn retire_if_dead(node: Node, guard: &impl Guard) -> bool {
     if !matches!(removed, Ok(Some(_))) {
         return false;
     }
-    STRING_MEMORY_USED.fetch_sub(allocated_size(node.len()), Ordering::SeqCst);
+    interner
+        .memory_used
+        .fetch_sub(allocated_size(node.len()), Ordering::SeqCst);
     true
 }
 
@@ -544,9 +638,10 @@ impl InternedString {
     }
 
     fn intern(bytes: &[u8]) -> InternedString {
-        let guard = STRING_POOL.guard();
+        let interner = interner();
+        let guard = interner.pool.guard();
         loop {
-            if let Some((entry, _)) = STRING_POOL.get_key_value(bytes, &guard) {
+            if let Some((entry, _)) = interner.pool.get_key_value(bytes, &guard) {
                 let node = entry.0;
                 if node.try_acquire() {
                     return InternedString(node);
@@ -558,9 +653,14 @@ impl InternedString {
 
             // Absent: insert a node carrying the pool's reference and ours.
             let node = Node::allocate(bytes, 2);
-            match STRING_POOL.try_insert_with(PoolEntry(node), || (), &guard) {
+            match interner
+                .pool
+                .try_insert_with(PoolEntry(node), || (), &guard)
+            {
                 Ok(_) => {
-                    STRING_MEMORY_USED.fetch_add(allocated_size(bytes.len()), Ordering::SeqCst);
+                    interner
+                        .memory_used
+                        .fetch_add(allocated_size(bytes.len()), Ordering::SeqCst);
                     return InternedString(node);
                 }
                 Err(_) => {
@@ -665,12 +765,12 @@ impl InternedString {
 
     /// Return the number of unique interned strings.
     pub fn interned_count() -> usize {
-        STRING_POOL.len()
+        interner().pool.len()
     }
 
     /// Return the total memory used by all interned strings.
     pub fn memory_used() -> usize {
-        STRING_MEMORY_USED.load(Ordering::Relaxed)
+        interner().memory_used.load(Ordering::Relaxed)
     }
 
     /// Collect statistics about the interned string pool, including the top `k`
@@ -679,14 +779,15 @@ impl InternedString {
     /// Passing `k = 0` skips the top-K collection entirely (both `top_k_by_size` and
     /// `top_k_by_ref` will be empty).
     pub fn get_stats_with_top_k(k: usize) -> Stats {
-        let guard = STRING_POOL.guard();
+        let interner = interner();
+        let guard = interner.pool.guard();
         let mut stats = Stats::default();
 
         // MinMaxHeap allows us to efficiently track top-K and extract the max values
         let mut size_heap: MinMaxHeap<TopKBySize> = MinMaxHeap::new();
         let mut ref_heap: MinMaxHeap<TopKByRef> = MinMaxHeap::new();
 
-        for (entry, _) in STRING_POOL.iter(&guard) {
+        for (entry, _) in interner.pool.iter(&guard) {
             let node = entry.0;
             let strong = node.strong().load(Ordering::Acquire);
             if strong < 2 {
@@ -819,7 +920,7 @@ impl Drop for InternedString {
                 // races (see `Header`), then give up our reference — the entry
                 // is dead from that moment — and retire it.
                 2 => {
-                    let guard = STRING_POOL.guard();
+                    let guard = interner().pool.guard();
                     match strong.compare_exchange(2, 1, Ordering::AcqRel, Ordering::Acquire) {
                         Ok(_) => {
                             retire_if_dead(node, &guard);
@@ -955,17 +1056,14 @@ impl Ord for InternedString {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InternedString, MAX_REFCOUNT, Node, PoolEntry, STRING_MEMORY_USED, increment_refcount,
-    };
+    use super::{InternedString, MAX_REFCOUNT, Node, PoolEntry, increment_refcount, test_pool};
     use ahash::{HashSet, HashSetExt};
-    use serial_test::serial;
     use std::collections::HashMap;
     use std::ops::Deref;
     use std::sync::atomic::Ordering;
     use std::thread;
 
-    // Tests are run serially to avoid interference via the global string pool and memory tracker.
+    // Tests that inspect pool state run against a pool of their own (`test_pool::isolated`).
 
     #[test]
     fn refcount_increment_stops_at_the_limit() {
@@ -984,8 +1082,8 @@ mod tests {
 
     // Test basic functionality.
     #[test]
-    #[serial]
     fn basic() {
+        let _pool = test_pool::isolated();
         assert_eq!(InternedString::new("foo"), InternedString::new("foo"));
         assert_ne!(InternedString::new("foo"), InternedString::new("bar"));
         // The above refs should be deallocated by now.
@@ -1009,8 +1107,8 @@ mod tests {
     // Ordering should be based on values, not pointers.
     // Also tests `Display` implementation.
     #[test]
-    #[serial]
     fn sorting() {
+        let _pool = test_pool::isolated();
         let mut interned_vals = [
             InternedString::new("4"),
             InternedString::new("2"),
@@ -1025,8 +1123,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn sequential() {
+        let _pool = test_pool::isolated();
         for _i in 0..10_000 {
             let mut interned = Vec::with_capacity(100);
             for j in 0..100 {
@@ -1042,12 +1140,14 @@ mod tests {
     // Quickly create and destroy a small number of interned objects from
     // multiple threads.
     #[test]
-    #[serial]
     fn multithreading1() {
+        let _pool = test_pool::isolated();
+        let pool = _pool.pool();
         let mut thread_handles = vec![];
         for _i in 0..10 {
             let t = thread::spawn({
                 move || {
+                    let _pool = pool.enter();
                     for _i in 0..100_000 {
                         let interned1 = InternedString::new("foo");
                         let _interned2 = InternedString::new("bar");
@@ -1066,17 +1166,9 @@ mod tests {
         assert_eq!(InternedString::interned_count(), 0);
     }
 
-    // Helper to reset memory tracking before each test. The pool itself is
-    // not cleared: every test scopes its holders, so its own entries are gone
-    // by now, and entries other tests hold concurrently must stay valid.
-    fn reset_memory_tracking() {
-        STRING_MEMORY_USED.store(0, std::sync::atomic::Ordering::SeqCst);
-    }
-
     #[test]
-    #[serial]
     fn test_new_creates_interned_string() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("hello");
         let s2 = InternedString::new("hello");
@@ -1088,9 +1180,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_different_interned_strings_are_not_equal() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("hello");
         let s2 = InternedString::new("world");
@@ -1099,9 +1190,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_clone_interned_string_increases_refcount() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("test");
         let initial_refcount = s1.ref_count();
@@ -1114,9 +1204,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_drop_decreases_interned_string_refcount() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("test");
         let s2 = s1.clone();
@@ -1128,9 +1217,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_memory_tracking_on_first_creation() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         assert_eq!(InternedString::memory_used(), 0);
 
@@ -1149,9 +1237,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_memory_tracking_on_drop() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("test_drop_memory");
         let s2 = s1.clone();
@@ -1167,9 +1254,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_memory_tracking_with_different_strings() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("short");
         let memory_after_first = InternedString::memory_used();
@@ -1186,9 +1272,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_interned_string_deref_trait() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s = InternedString::new("test_string");
 
@@ -1201,9 +1286,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_partial_ord_and_ord() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("apple");
         let s2 = InternedString::new("banana");
@@ -1222,9 +1306,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_hash_consistency() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s1 = InternedString::new("hash_test");
         let s2 = InternedString::new("hash_test");
@@ -1249,9 +1332,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_empty_string() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let empty1 = InternedString::new("");
         let empty2 = InternedString::new("");
@@ -1263,9 +1345,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_unicode_strings() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let unicode1 = InternedString::new("🦀 Rust");
         let unicode2 = InternedString::new("🦀 Rust");
@@ -1277,16 +1358,14 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     #[should_panic(expected = "InternedString bytes must be valid UTF-8")]
     fn byte_slice_constructor_rejects_invalid_utf8() {
         let _ = InternedString::from(&[0xff][..]);
     }
 
     #[test]
-    #[serial]
     fn test_very_long_strings() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let long_string = "a".repeat(10000);
         let s1 = InternedString::new(&long_string);
@@ -1300,9 +1379,8 @@ mod tests {
     // ── Basic top-K by size ──────────────────────────────────────────────────
 
     #[test]
-    #[serial]
     fn test_top_k_by_size_returns_k_entries() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("a");
         let _s2 = InternedString::new("bbb");
@@ -1315,9 +1393,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_size_sorted_descending() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("z");
         let _s2 = InternedString::new("yy");
@@ -1337,9 +1414,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_size_contains_largest() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         const LARGE_STRING: &str = "this_is_the_largest_string_in_pool";
 
@@ -1353,9 +1429,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_size_excludes_smaller_strings() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("a");
         let _s2 = InternedString::new("bb");
@@ -1378,9 +1453,8 @@ mod tests {
     // ── Basic top-K by ref ───────────────────────────────────────────────────
 
     #[test]
-    #[serial]
     fn test_top_k_by_ref_returns_k_entries() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("one");
         let s2 = InternedString::new("two");
@@ -1394,9 +1468,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_ref_sorted_descending() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("alpha");
         let s2 = InternedString::new("beta");
@@ -1418,9 +1491,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_ref_most_referenced_is_first() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s_low = InternedString::new("low_refs");
         let s_high = InternedString::new("high_refs");
@@ -1438,9 +1510,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_ref_excludes_low_ref_strings() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("single");
         let s2 = InternedString::new("double");
@@ -1465,9 +1536,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_entry_value_field() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s = InternedString::new("check_value");
 
@@ -1479,9 +1549,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_entry_bytes_field() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s = InternedString::new("hello");
 
@@ -1490,9 +1559,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_entry_ref_count_field() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s = InternedString::new("ref_check");
         let _c1 = s.clone();
@@ -1504,9 +1572,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_entry_allocated_gte_bytes() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s = InternedString::new("allocation_check");
 
@@ -1523,9 +1590,8 @@ mod tests {
     // ── Edge cases ───────────────────────────────────────────────────────────
 
     #[test]
-    #[serial]
     fn test_top_k_zero_returns_empty_vecs() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s = InternedString::new("ignored");
 
@@ -1535,9 +1601,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_zero_still_populates_aggregate_stats() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("aaa");
         let _s2 = InternedString::new("bbbb");
@@ -1550,9 +1615,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_empty_pool() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let stats = InternedString::get_stats_with_top_k(5);
         assert!(stats.top_k_by_size.is_empty());
@@ -1561,9 +1625,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_larger_than_pool_returns_all() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("x");
         let _s2 = InternedString::new("yy");
@@ -1576,9 +1639,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_equal_to_pool_size_returns_all() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("p");
         let _s2 = InternedString::new("qq");
@@ -1590,9 +1652,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_single_string_in_pool() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let s = InternedString::new("only_one");
         let _c = s.clone();
@@ -1608,9 +1669,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_k_equals_one() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s1 = InternedString::new("short");
         let _s2 = InternedString::new("much_longer_string");
@@ -1624,9 +1684,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_get_stats_equivalent_to_top_k_zero() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _s = InternedString::new("convenience");
 
@@ -1642,9 +1701,8 @@ mod tests {
     /// holder keeps either way sits in the denominator alone. The two are checked against hand
     /// arithmetic here because the gap between them is the whole point of reporting both.
     #[test]
-    #[serial]
     fn storage_saving_counts_the_slot_every_holder_keeps() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         const HOLDERS: usize = 8;
         // 48 bytes of payload, so every figure below is exact in binary.
@@ -1695,9 +1753,8 @@ mod tests {
     /// The slot is the whole difference between the two percentages, so a pool whose strings
     /// are shared by exactly one holder each saves nothing under either measure.
     #[test]
-    #[serial]
     fn unshared_strings_save_nothing_under_either_measure() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         let _a = InternedString::new("unshared-alpha");
         let _b = InternedString::new("unshared-beta");
@@ -1714,9 +1771,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_entries_ref_count_excludes_pool_ref() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         // One external reference only
         let _s = InternedString::new("solo");
@@ -1727,9 +1783,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_size_ties_all_included_when_k_gte_pool_size() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         // Four strings of the same length
         let _s1 = InternedString::new("aa");
@@ -1746,9 +1801,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_top_k_by_ref_ties_all_included_when_k_gte_pool_size() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
 
         // Three strings each with 2 external refs
         let s1 = InternedString::new("tie_a");
@@ -1768,8 +1822,8 @@ mod tests {
     // ── thin representation ────────────────────────────────────────────────
 
     #[test]
-    #[serial]
     fn interned_string_is_one_pointer() {
+        let _pool = test_pool::isolated();
         assert_eq!(size_of::<InternedString>(), size_of::<usize>());
         assert_eq!(size_of::<Option<InternedString>>(), size_of::<usize>());
         // The header replaces the `Arc<[u8]>` control block byte for byte.
@@ -1778,9 +1832,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn name_and_value_split_at_first_separator() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         let l = InternedString::new_pair("env", "prod");
         assert!(l.is_pair());
         assert_eq!(l.name(), "env");
@@ -1811,9 +1864,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn constructors_deduplicate_to_one_allocation() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         let a = InternedString::new_pair("host", "h1");
         let b = InternedString::new("host=h1");
         let c: InternedString = String::from("host=h1").into();
@@ -1829,9 +1881,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn long_pair_beyond_stack_buffer() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         let value = "v".repeat(1000);
         let l = InternedString::new_pair("id", &value);
         assert_eq!(l.name(), "id");
@@ -1842,9 +1893,8 @@ mod tests {
     /// Two last holders dropping at once must not both take the fast path and
     /// leave a holder-less entry in the pool.
     #[test]
-    #[serial]
     fn racing_last_holders_retire_the_entry() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         for round in 0..200 {
             let s = format!("race{round}");
             let a = InternedString::new(&s);
@@ -1852,7 +1902,13 @@ mod tests {
             let c = a.clone();
             let handles: Vec<_> = [a, b, c]
                 .into_iter()
-                .map(|h| thread::spawn(move || drop(h)))
+                .map(|h| {
+                    let pool = _pool.pool();
+                    thread::spawn(move || {
+                        let _pool = pool.enter();
+                        drop(h)
+                    })
+                })
                 .collect();
             for h in handles {
                 h.join().unwrap();
@@ -1865,13 +1921,16 @@ mod tests {
     /// Interning a string while its last holder is dropping it must yield a
     /// live value either way.
     #[test]
-    #[serial]
     fn intern_races_drop_of_last_holder() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         for round in 0..200 {
             let s = format!("churn{round}");
             let holder = InternedString::new(&s);
-            let dropper = thread::spawn(move || drop(holder));
+            let pool = _pool.pool();
+            let dropper = thread::spawn(move || {
+                let _pool = pool.enter();
+                drop(holder)
+            });
             let re = InternedString::new(&s);
             dropper.join().unwrap();
             assert_eq!(&*re, s);
@@ -1886,13 +1945,14 @@ mod tests {
     /// live values with equal content must always be the same allocation, and
     /// nothing may be left behind.
     #[test]
-    #[serial]
     fn concurrent_churn_keeps_one_allocation_per_content() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         const NAMES: [&str; 4] = ["churn=a", "churn=b", "churn=c", "churn=d"];
+        let pool = _pool.pool();
         let handles: Vec<_> = (0..8)
             .map(|t| {
                 thread::spawn(move || {
+                    let _pool = pool.enter();
                     for i in 0..20_000usize {
                         let s = NAMES[(i + t) % NAMES.len()];
                         let a = InternedString::new(s);
@@ -1914,9 +1974,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn stats_top_k_holds_no_extra_references_afterwards() {
-        reset_memory_tracking();
+        let _pool = test_pool::isolated();
         let a = InternedString::new("solo");
         let stats = InternedString::get_stats_with_top_k(1);
         assert_eq!(stats.top_k_by_ref[0].ref_count, 1);

@@ -380,6 +380,7 @@ mod tests {
     /// alone reported the labels as costing nothing at all from inside `TimeSeries`.
     #[test]
     fn test_heap_size_counts_interned_labels() {
+        let _pool = crate::common::string_interner::test_pool::isolated();
         let empty = MetricName::default().get_heap_size();
 
         let mut metric_name = MetricName::with_capacity(8);
@@ -407,6 +408,7 @@ mod tests {
     /// a keyspace exceed what the module holds by the sharing factor.
     #[test]
     fn test_shared_labels_are_amortized_across_holders() {
+        let _pool = crate::common::string_interner::test_pool::isolated();
         let mut only = MetricName::with_capacity(1);
         only.add_label("amortize_probe", "shared_value_for_the_amortization_test");
         let sole_holder = only.get_heap_size();
@@ -431,12 +433,12 @@ mod tests {
     }
 
     /// Interning on a realistic fleet: every `key=value` pair the fleet repeats is held once,
-    /// and the per-holder accounting sums back to the pool's footprint. The entry count is read
-    /// off the fleet's own `MetricName`s rather than the process-global pool, but the pool-wide
-    /// figures (`memory_saved_pct`, the shared allocations behind `amortized_size`) still see
-    /// whatever other tests intern concurrently, so those bounds stay loose.
+    /// and the per-holder accounting sums back to the pool's footprint. Runs against a pool of
+    /// its own, so the pool-wide figures (`memory_saved_pct`, the shared allocations behind
+    /// `amortized_size`) describe this fleet alone rather than whatever other tests intern.
     #[test]
     fn fleet_labels_intern_to_unique_pairs() {
+        let _pool = crate::common::string_interner::test_pool::isolated();
         use crate::common::string_interner::InternedString;
         use crate::tests::generators::{FleetPreset, FleetTopology};
         use std::collections::HashSet;
