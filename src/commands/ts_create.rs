@@ -202,6 +202,8 @@ pub fn parse_series_options_onto(
                 if metric_set {
                     return Err(ValkeyError::Str(error_consts::METRIC_ALREADY_SET));
                 }
+                // Set here too, not only by LABELS: a second METRIC used to replace the first.
+                metric_set = true;
                 let metric = args_iter.next_string()?;
                 options.labels = Some(parse_metric_name(&metric)?);
             }

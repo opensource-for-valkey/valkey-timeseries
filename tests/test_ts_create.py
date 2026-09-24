@@ -198,3 +198,10 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
         for value in ("nan", "NaNms", "inf"):
             with pytest.raises(ResponseError):
                 self.client.execute_command("TS.CREATE", f"nanret:{value}", "RETENTION", value)
+
+    def test_create_metric_given_twice_rejected(self):
+        """A second METRIC used to replace the first silently; it is rejected like a second
+        rounding option."""
+        with pytest.raises(ResponseError):
+            self.client.execute_command("TS.CREATE", "metric:twice", "METRIC", "a", "METRIC", "b")
+        assert self.client.exists("metric:twice") == 0
