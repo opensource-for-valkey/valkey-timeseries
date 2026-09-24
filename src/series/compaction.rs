@@ -1017,11 +1017,19 @@ fn apply_rules_internal(
         return Ok(Vec::new());
     }
 
-    let len = rules.len();
+    // Rules run in parallel only for the multi-sample operations. For a single added or
+    // upserted sample each rule does O(1) aggregator work (or recomputes one bucket), far less
+    // than the thread spawns a parallel pass costs — which every TS.ADD to a source with two or
+    // more rules used to pay.
+    let parallel = rules.len() >= PARALLEL_THRESHOLD
+        && matches!(
+            op,
+            CompactionOp::AddBatch { .. } | CompactionOp::RemoveRange { .. }
+        );
     let mut destinations = rules.iter_mut().zip(child_series).collect::<Vec<_>>();
     let results: Vec<Result<RuleOutcome, TsdbError>> = destinations
         .par_mut()
-        .num_threads(if len < PARALLEL_THRESHOLD { 1 } else { 0 }) // 0 is shorthand for Auto
+        .num_threads(if parallel { 0 } else { 1 }) // 0 is shorthand for Auto
         .map(|(rule, dest_guard)| {
             let dest_id = dest_guard.id;
             let dest_prev_last = dest_guard.last_sample.map(|s| s.timestamp);
