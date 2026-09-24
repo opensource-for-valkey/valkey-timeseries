@@ -28,6 +28,8 @@ pub mod iterators;
 mod join;
 pub mod labels;
 mod parser;
+// Work in progress: much of the engine is scaffolding not yet wired to a command.
+#[allow(dead_code)]
 pub mod promql;
 pub mod series;
 

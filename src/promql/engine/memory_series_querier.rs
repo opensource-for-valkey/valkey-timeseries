@@ -14,8 +14,8 @@ use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
 use ahash::AHashMap;
-use orx_parallel::ParIter;
-use orx_parallel::ParIterResult;
+use orx_parallel::Par;
+use orx_parallel::ParResult;
 use promql_parser::parser::VectorSelector;
 use std::sync::RwLock;
 use valkey_module::ValkeyResult;
@@ -120,8 +120,8 @@ impl MemorySeriesQuerier {
                     .collect::<Vec<_>>()
             })
             .iter_into_par_rayon()
-            .map(f)
-            .into_fallible_result()
+            .map(&f)
+            .into_fallible()
             .flat_map(|opt| opt)
             .collect();
 

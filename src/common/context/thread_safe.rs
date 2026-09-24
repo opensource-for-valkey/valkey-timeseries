@@ -65,6 +65,7 @@ impl ClientThreadSafeContext {
 
     /// All other APIs require locking the context, so we wrap it in a way
     /// similar to `std::sync::Mutex`.
+    #[allow(dead_code)]
     pub fn lock(&self) -> ContextGuard {
         unsafe { raw::RedisModule_ThreadSafeContextLock.unwrap()(self.ctx) };
         let ctx = unsafe { raw::RedisModule_GetThreadSafeContext.unwrap()(ptr::null_mut()) };

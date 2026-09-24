@@ -158,46 +158,6 @@ fn placeholder_node() -> NodeInfo {
         role: NodeRole::Primary,
         location: Default::default(),
     }
-
-    /// The deadline passed with shards still outstanding.
-    ///
-    /// Not a response from anyone, so there is no sender to look up. It used
-    /// to go through [`Self::handle_response`] as if the local node had sent
-    /// it, and when the local node was not a target — a `HASHTAG` routed to
-    /// other shards, or a random replica pick — the lookup failed and the
-    /// timeout became an "unknown sender" error. That kind does not complete
-    /// the fan-out, so the caller waited on shards that would never answer.
-    /// It is always delivered as a timeout, attributed (for the error log
-    /// only) to `local` when it is a target and to any target otherwise.
-    fn handle_timeout(&self, local: &NodeId) {
-        let fallback;
-        let node = match self
-            .targets
-            .get(local)
-            .or_else(|| self.targets.iter().next())
-        {
-            Some(node) => node,
-            None => {
-                fallback = unknown_node();
-                &fallback
-            }
-        };
-        (self.response_handler)(Err(FanoutError::timeout()), node);
-    }
-}
-
-/// Stand-in for a node the response cannot be attributed to.
-fn unknown_node() -> NodeInfo {
-    NodeInfo {
-        id: Default::default(),
-        shard_id: Default::default(),
-        socket_address: SocketAddress {
-            port: 0,
-            primary_endpoint: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        },
-        role: NodeRole::Primary,
-        location: Default::default(),
-    }
 }
 
 type InFlightRequestMap = HashMap<u64, InFlightRequest, BuildNoHashHasher<u64>>;
@@ -881,6 +841,7 @@ mod tests {
             outstanding: AtomicU64::new(1),
             timer_id: 0,
             timed_out: AtomicBool::new(false),
+            responded: Mutex::new(HashSet::default()),
         }
     }
 
@@ -893,8 +854,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let remote = NodeInfo::for_test(7001);
         let req = request(HashSet::from_iter([remote]), Arc::clone(&seen));
-        let local = NodeId::from_raw(c"0123456789abcdef0123456789abcdef01234567".as_ptr());
-        req.handle_timeout(&local);
+        req.deliver_timeout();
         assert_eq!(*seen.lock().unwrap(), vec![ErrorKind::Timeout]);
     }
 
@@ -902,7 +862,7 @@ mod tests {
     fn a_timeout_with_no_targets_is_still_a_timeout() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let req = request(HashSet::default(), Arc::clone(&seen));
-        req.handle_timeout(&NodeId::default());
+        req.deliver_timeout();
         assert_eq!(*seen.lock().unwrap(), vec![ErrorKind::Timeout]);
     }
 }

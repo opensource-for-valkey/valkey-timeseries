@@ -41,6 +41,7 @@ mod fanout_codec;
 // and re-exports `generated` from here.
 pub(crate) mod fanout_codec;
 mod label_search_utils;
+#[allow(dead_code)]
 mod promql_utils;
 mod ts_add;
 mod ts_addbulk;

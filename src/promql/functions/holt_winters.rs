@@ -5,7 +5,7 @@ use crate::promql::functions::utils::{
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DoubleExponentialSmoothingFunction;

@@ -68,10 +68,12 @@ macro_rules! impl_promql_function_kind {
             type Error = ValkeyError;
 
             fn try_from(value: &str) -> Result<Self, Self::Error> {
-                let v = hashify::tiny_map! {
+                let v = hashify::map!(
                     value.as_bytes(),
+                    PromqlFunctionKind,
                     $( $name => PromqlFunctionKind::$Variant, )*
-                };
+                )
+                .copied();
 
                 match v {
                     Some(f) => Ok(f),
@@ -137,10 +139,12 @@ macro_rules! impl_promql_function_impl {
             type Error = ValkeyError;
 
             fn try_from(value: &str) -> Result<Self, Self::Error> {
-                let v = hashify::tiny_map! {
+                let v = hashify::map!(
                     value.as_bytes(),
-                    $( $name => Self::$Variant($Ty), )*
-                };
+                    PromQLFunctionImpl,
+                    $( $name => PromQLFunctionImpl::$Variant($Ty), )*
+                )
+                .copied();
 
                 match v {
                     Some(f) => Ok(f),

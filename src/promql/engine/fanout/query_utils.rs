@@ -18,8 +18,8 @@ use crate::promql::generated::{
 };
 use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::series_by_selectors;
-use orx_parallel::ParIter;
-use orx_parallel::ParIterResult;
+use orx_parallel::Par;
+use orx_parallel::ParResult;
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyResult};
 
@@ -177,7 +177,7 @@ pub(super) fn local_grid_windows(
                 crate::promql::model::RangeSample { labels, samples }
             }))
         })
-        .into_fallible_result()
+        .into_fallible()
         .collect::<Vec<_>>()
         .map_err(valkey_module::ValkeyError::String)?;
 
@@ -271,7 +271,7 @@ pub(super) fn handle_range_query(
                 data: Some(data),
             }))
         })
-        .into_fallible_result()
+        .into_fallible()
         .filter_map(|range| range)
         .collect::<Vec<_>>()
         .map_err(valkey_module::ValkeyError::String)?;

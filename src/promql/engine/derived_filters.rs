@@ -34,7 +34,7 @@ use crate::promql::hashers::SelectorKey;
 use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
 use crate::promql::{PromqlResult, QueryError};
 use ahash::{AHashMap, AHashSet};
-use orx_parallel::{ParIter, ParIterResult};
+use orx_parallel::{Par, ParResult};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
@@ -209,7 +209,7 @@ impl ProfiledLeaves {
                     Ok((key, None))
                 }
             })
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         Ok(Self {

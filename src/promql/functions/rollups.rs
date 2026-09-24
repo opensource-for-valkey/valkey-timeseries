@@ -24,7 +24,7 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples};
 use num_traits::Zero;
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 
 /// Evaluate `rollup_fn` over each series' window, one value per series.
 ///

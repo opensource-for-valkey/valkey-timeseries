@@ -16,7 +16,7 @@ use crate::promql::engine::QueryReader;
 #[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 use promql_parser::parser::VectorSelector;
 use std::time::{Duration, Instant};
 

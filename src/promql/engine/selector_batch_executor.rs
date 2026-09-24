@@ -1,7 +1,7 @@
 use crate::common::Timestamp;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
-use crate::common::threads::{RayonPool, panic_message};
+use crate::common::threads::{ParWithPool, RayonPool, panic_message};
 use crate::common::time::current_time_millis;
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
@@ -23,8 +23,8 @@ use crate::series::chunks::ChunkOps;
 use crate::series::index::series_by_selectors;
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::IntoParIter;
-use orx_parallel::ParIter;
-use orx_parallel::ParIterResult;
+use orx_parallel::Par;
+use orx_parallel::ParResult;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1086,7 +1086,7 @@ fn decode_range_snapshots(
             }
             Some(Ok(RangeSample { samples, labels }))
         })
-        .into_fallible_result()
+        .into_fallible()
         .collect::<Vec<_>>()?;
 
     // Bound the series the query returns, not the ones the selector matched:
@@ -1101,10 +1101,10 @@ fn decode_range_snapshots(
 #[cfg(test)]
 mod selector_batch_executor_tests {
     use super::{MATERIALIZE_POOL, collect_batch, selector_fanout_failure, wait_for_result};
-    use crate::common::threads::RayonPool;
+    use crate::common::threads::{ParWithPool, RayonPool};
     use crate::fanout::FanoutError;
     use crate::promql::QueryError;
-    use orx_parallel::{IntoParIter, ParIter};
+    use orx_parallel::{IntoParIter, Par};
     use std::sync::mpsc;
     use std::time::Duration;
 

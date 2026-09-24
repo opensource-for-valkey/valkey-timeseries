@@ -188,7 +188,7 @@ mod tests {
     use crate::config::{
         DEFAULT_QUEUED_QUERIES, MAX_QUEUED_QUERIES_CELL, max_concurrent_queries, num_threads,
     };
-    use orx_parallel::ParIter;
+    use orx_parallel::Par;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::Duration;

@@ -2,7 +2,7 @@ use crate::common::Sample;
 use crate::common::threads::IntoParRayon;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 
 /// Generic aggregator for range vector functions. As opposed to `aggr_over_time`, this operates
 /// over the entire range rather than bucketed windows.

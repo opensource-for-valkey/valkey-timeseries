@@ -35,6 +35,7 @@ impl IntoRawCtx for &Context {
     }
 }
 
+#[allow(dead_code)]
 pub fn reply_with_str(ctx: &Context, s: &str) -> Status {
     let msg = CString::new(s).unwrap_or_else(|_| {
         // Remove any interior NUL bytes to ensure CString::new cannot fail here.
@@ -172,11 +173,13 @@ pub fn reply_with_integer<C: IntoRawCtx>(ctx: C, value: i64) -> Status {
     raw::reply_with_long_long(raw_ctx, value)
 }
 
+#[allow(dead_code)]
 pub fn reply_with_usize<C: IntoRawCtx>(ctx: C, value: usize) -> Status {
     let raw_ctx = ctx.into_raw();
     raw::reply_with_long_long(raw_ctx, value as i64)
 }
 
+#[allow(dead_code)]
 pub fn reply_with_double<C: IntoRawCtx>(ctx: C, value: f64) -> Status {
     let raw_ctx = ctx.into_raw();
     raw::reply_with_double(raw_ctx, value)

@@ -185,6 +185,7 @@ pub(crate) fn quantile_sorted(phi: f64, values: &[f64]) -> f64 {
     values[lower_index] * (1.0 - weight) + values[upper_index] * weight
 }
 
+#[allow(dead_code)]
 pub(crate) fn median(values: &[f64]) -> f64 {
     quantile_sorted(0.5, values)
 }

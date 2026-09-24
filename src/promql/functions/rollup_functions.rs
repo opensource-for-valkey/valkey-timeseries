@@ -96,8 +96,9 @@ impl RollupKind {
     /// * `double_exponential_smoothing` / `holt_winters` — takes two scalar
     ///   parameters and the request carries one.
     pub(in crate::promql) fn from_function_name(name: &str) -> Option<Self> {
-        hashify::tiny_map!(
+        hashify::map!(
             name.as_bytes(),
+            RollupKind,
             "sum_over_time" => RollupKind::SumOverTime,
             "count_over_time" => RollupKind::CountOverTime,
             "last_over_time" => RollupKind::LastOverTime,
@@ -123,6 +124,7 @@ impl RollupKind {
             "resets" => RollupKind::Resets,
             "changes" => RollupKind::Changes
         )
+        .copied()
     }
 
     /// The PromQL function this kind stands for. Tests use it to build a query

@@ -208,6 +208,7 @@ fn reply_with_mget_value<C: IntoRawCtx>(ctx: C, value: &MGetValue) -> Status {
     Status::Ok
 }
 
+#[allow(dead_code)]
 impl ClientReplyContext {
     pub fn reply_with_label(&self, label: &str, value: &str) {
         let value = if value.is_empty() { None } else { Some(value) };

@@ -3,7 +3,7 @@ use crate::common::threads::IntoParRayon;
 use crate::promql::common::math::sample_regression;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, ExprResult};
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct DerivFunction;

@@ -35,6 +35,7 @@ pub(crate) struct ClientReplyContext {
     pub(crate) ctx: *mut raw::RedisModuleCtx,
 }
 
+#[allow(dead_code)]
 impl ClientReplyContext {
     pub fn new<C: IntoRawCtx>(ctx: C) -> Self {
         Self {
@@ -241,6 +242,7 @@ impl ClientReplyContext {
     }
 }
 
+#[allow(dead_code)]
 fn str_as_legal_resp_string(s: &str) -> CString {
     let mut bytes = s.as_bytes().to_owned();
     for b in &mut bytes {

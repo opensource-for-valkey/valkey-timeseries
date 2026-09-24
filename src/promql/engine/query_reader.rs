@@ -11,7 +11,7 @@ use crate::promql::{
     model::{InstantSample, RangeSample},
 };
 use crate::series::SeriesRef;
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use std::sync::Arc;
 

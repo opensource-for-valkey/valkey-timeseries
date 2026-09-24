@@ -10,6 +10,7 @@ pub enum ReplyCallback<T> {
 
 #[derive(Debug)]
 struct BlockedClientPrivateData<T: 'static> {
+    #[allow(dead_code)]
     reply_callback: Option<ReplyCallback<T>>,
     free_callback: Option<FreePrivateDataCallback<T>>,
     data: Option<Box<T>>,

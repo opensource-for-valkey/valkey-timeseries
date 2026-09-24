@@ -2,7 +2,7 @@ use crate::common::Sample;
 use crate::common::threads::IntoParRayon;
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::promql) enum RateKind {

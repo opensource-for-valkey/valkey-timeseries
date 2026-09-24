@@ -125,6 +125,7 @@ pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
     ctx.get_current_user()
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModuleServerInfoData {
     let info_fn = unsafe { ValkeyModule_GetServerInfo.unwrap() };
     let context = ctx.ctx as *mut ValkeyModuleCtx;
@@ -132,6 +133,7 @@ pub(crate) fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModule
     unsafe { info_fn(context, section_cstr.as_ptr()) }
 }
 
+#[allow(dead_code)]
 fn get_server_info_field_signed(
     info: *mut ValkeyModuleServerInfoData,
     field: &str,
@@ -191,7 +193,8 @@ pub fn notify_keyspace_event(ctx: &Context, event: &std::ffi::CStr, key: &Valkey
     }
 }
 
-pub fn get_available_memory(ctx: &Context) -> Option<i64> {
+#[allow(dead_code)]
+pub(crate) fn get_available_memory(ctx: &Context) -> Option<i64> {
     // Fetch INFO MEMORY
     let info = crate::common::context::get_server_info(ctx, "memory");
 

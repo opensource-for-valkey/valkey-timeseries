@@ -6,7 +6,7 @@ use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::HashSetExt;
-use orx_parallel::ParIter;
+use orx_parallel::Par;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};

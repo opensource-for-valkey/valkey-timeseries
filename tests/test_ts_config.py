@@ -659,3 +659,112 @@ class TestTimeseriesRoundingConfig(ValkeyTimeSeriesTestCaseBase):
             for value in ("nan", "2.9"):
                 with pytest.raises(ResponseError):
                     self.set_config(name, value)
+
+
+class TestPromqlQueryQueueConfig(ValkeyTimeSeriesTestCaseBase):
+    """`ts-promql-max-queued-queries` bounds the PromQL worker backlog and `INFO ts_promql`
+    reports the pool. Filling the backlog needs a query slower than the test can make one,
+    so the refusal itself is covered by the Rust unit tests on the pool."""
+
+    NAME = "ts.ts-promql-max-queued-queries"
+
+    def _promql_info(self) -> dict:
+        parsed = self.client.execute_command("INFO", "ts_promql")
+        return {k: int(v) for k, v in parsed.items() if k.startswith("ts_")}
+
+    def test_queue_limit_round_trips_and_is_range_checked(self):
+        assert self.client.execute_command("CONFIG", "GET", self.NAME)[1] == b"128"
+        try:
+            self.client.execute_command("CONFIG", "SET", self.NAME, 5)
+            assert self.client.execute_command("CONFIG", "GET", self.NAME)[1] == b"5"
+            self.client.execute_command("CONFIG", "SET", self.NAME, 0)
+            assert self.client.execute_command("CONFIG", "GET", self.NAME)[1] == b"0"
+            for bad in (-1, 65537):
+                with pytest.raises(ResponseError):
+                    self.client.execute_command("CONFIG", "SET", self.NAME, bad)
+        finally:
+            self.client.execute_command("CONFIG", "SET", self.NAME, 128)
+
+    def test_info_reports_an_idle_pool_after_queries(self):
+        self.client.execute_command("TS.ADD", "q:cpu", 1000, 1.0, "LABELS", "__name__", "cpu")
+        for _ in range(5):
+            self.client.execute_command("TS.QUERY", "cpu", "TIME", 1000)
+            self.client.execute_command("TS.QUERYRANGE", "cpu", "START", 0, "END", 2000, "STEP", "1s")
+        info = self._promql_info()
+        assert set(info) >= {"ts_queries_running", "ts_queries_queued", "ts_queries_rejected"}
+        # Every query above was answered before its client got the reply, so nothing is
+        # running or waiting, and none was refused.
+        assert info["ts_queries_running"] == 0
+        assert info["ts_queries_queued"] == 0
+        assert info["ts_queries_rejected"] == 0
+
+
+class TestPromqlConfigIsLive(ValkeyTimeSeriesTestCaseBase):
+    """`CONFIG SET ts-promql-*` takes effect for the next query. The engine reads a snapshot
+    of these parameters, which used to be copied once at module load: a runtime change was
+    accepted and reported by `CONFIG GET` but never reached a query."""
+
+    # A realistic millisecond base: TIME/START/END infer their unit from the magnitude.
+    BASE = 1_700_000_000_000
+
+    def _set(self, name, value):
+        self.client.execute_command("CONFIG", "SET", f"ts.{name}", value)
+
+    def _series(self):
+        for i in range(10):
+            self.client.execute_command(
+                "TS.ADD", "live:cpu", self.BASE + i * 1000, 1.0, "LABELS", "__name__", "cpu")
+
+    def test_sample_budget_change_is_live(self):
+        self._series()
+        query = ("TS.QUERYRANGE", "cpu", "START", self.BASE, "END", self.BASE + 9000, "STEP", "1s")
+        self.client.execute_command(*query)
+        try:
+            self._set("ts-promql-max-samples-per-query", 1)
+            with pytest.raises(ResponseError, match="too many samples"):
+                self.client.execute_command(*query)
+        finally:
+            self._set("ts-promql-max-samples-per-query", 50000000)
+        self.client.execute_command(*query)
+
+    def test_query_length_change_is_live(self):
+        self._series()
+        # Valid PromQL longer than the 1024-byte minimum limit.
+        long_query = "cpu" + " + cpu" * 200
+        at = self.BASE + 9000
+        self.client.execute_command("TS.QUERY", long_query, "TIME", at)
+        try:
+            self._set("ts-promql-max-query-len", 1024)
+            with pytest.raises(ResponseError):
+                self.client.execute_command("TS.QUERY", long_query, "TIME", at)
+        finally:
+            self._set("ts-promql-max-query-len", 4096)
+        self.client.execute_command("TS.QUERY", long_query, "TIME", at)
+
+    def test_lookback_change_is_live(self):
+        self.client.execute_command("TS.ADD", "live:old", self.BASE, 1.0, "LABELS", "__name__", "old")
+
+        def found():
+            result = self.client.execute_command("TS.QUERY", "old", "TIME", self.BASE + 10000)
+            return QueryResult.from_raw(result).result
+
+        assert found(), "10s after the sample, within the default 5m lookback"
+        try:
+            self._set("ts-promql-lookback-delta", "5000")
+            assert not found(), "outside a 5s lookback"
+        finally:
+            self._set("ts-promql-lookback-delta", "300000")
+        assert found()
+
+    def test_experimental_functions_are_off_by_default_and_can_be_enabled(self):
+        name = "ts.ts-promql-enable-experimental-functions"
+        assert self.client.execute_command("CONFIG", "GET", name)[1] == b"no"
+        self._series()
+        query = ("TS.QUERY", "mad_over_time(cpu[1m])", "TIME", self.BASE + 9000)
+        with pytest.raises(ResponseError, match="not enabled"):
+            self.client.execute_command(*query)
+        try:
+            self._set("ts-promql-enable-experimental-functions", "yes")
+            assert QueryResult.from_raw(self.client.execute_command(*query)).result
+        finally:
+            self._set("ts-promql-enable-experimental-functions", "no")

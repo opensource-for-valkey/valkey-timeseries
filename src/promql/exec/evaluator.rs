@@ -41,8 +41,8 @@ use crate::promql::{
     QueryError,
 };
 use ahash::AHashSet;
-use orx_parallel::ParIter;
-use orx_parallel::ParIterResult;
+use orx_parallel::Par;
+use orx_parallel::ParResult;
 use promql_parser::parser::token::T_LAND;
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{
@@ -298,7 +298,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let _: Vec<()> = unique_selectors
             .par_rayon()
             .map(|&vs| self.preload_vector_selector(vs, grid))
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         self.preload_rollups(expr, grid)?;
@@ -443,7 +443,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 self.check_deadline()?;
                 self.preload_rollup(key, kind, matrix, param, aggregation, grid)
             })
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         Ok(())
@@ -520,7 +520,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 self.check_deadline()?;
                 self.preload_matrix(key, matrix, grid)
             })
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         Ok(())
@@ -820,7 +820,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 self.check_deadline()?;
                 self.preload_stepped_aggregation(key, vs, aggregation, grid)
             })
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         Ok(())
@@ -1335,7 +1335,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let step_results: Vec<(i64, Vec<EvalSample>)> = batch
                     .into_par_rayon()
                     .map(|eval_ts| sub.eval_subquery_step(subquery, ctx, eval_ts))
-                    .into_fallible_result()
+                    .into_fallible()
                     .collect()?;
                 // Parallel collection preserves batch input order, and batches
                 // are consumed chronologically, so series values stay sorted.

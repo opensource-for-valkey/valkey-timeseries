@@ -19,6 +19,7 @@ use std::fmt::Display;
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Labels(pub(crate) Vec<Label>);
 
+#[allow(dead_code)]
 impl Labels {
     pub fn with_capacity(capacity: usize) -> Self {
         Labels(Vec::with_capacity(capacity))

@@ -14,7 +14,7 @@ use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::step_times;
 use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
-use orx_parallel::{ParIter, ParIterResult};
+use orx_parallel::{Par, ParResult};
 use promql_parser::parser::{EvalStmt, Expr};
 use std::ops::RangeBounds;
 use std::sync::Arc;
@@ -263,7 +263,7 @@ pub fn evaluate_range(
         let chunk_results: Vec<(Timestamp, ExprResult)> = chunk
             .into_par_rayon()
             .map(eval_step)
-            .into_fallible_result()
+            .into_fallible()
             .collect()?;
 
         for (current_time, result) in chunk_results {

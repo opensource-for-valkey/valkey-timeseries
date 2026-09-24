@@ -1567,34 +1567,28 @@ mod tests {
     }
 
     #[test]
-    fn test_find_start_chunk_index_linear_scan_agrees_with_binary_search() {
+    fn last_sample_in_range_reads_only_the_latest_matching_chunk() {
         use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
 
-        // Chunks covering [0,9], [20,29], [40,49], [60,69].
-        let chunks: Vec<TimeSeriesChunk> = (0..4)
-            .map(|c| {
-                let samples: Vec<Sample> = (0..10)
-                    .map(|i| Sample {
-                        timestamp: c * 20 + i,
-                        value: i as f64,
-                    })
-                    .collect();
-                TimeSeriesChunk::Uncompressed(UncompressedChunk::new(1024, &samples))
-            })
-            .collect();
-        assert!(chunks.len() <= LINEAR_SCAN_MAX);
-
-        for ts in -5..80 {
-            let expected = if ts <= chunks[0].first_timestamp() {
-                0
-            } else {
-                binary_search_chunks_by_timestamp(&chunks, ts).0
-            };
-            assert_eq!(find_start_chunk_index(&chunks, ts), expected, "ts={ts}");
+        fn sample(timestamp: Timestamp) -> Sample {
+            Sample::new(timestamp, timestamp as f64)
         }
-        assert_eq!(find_start_chunk_index(&chunks, 45), 2);
-        assert_eq!(find_start_chunk_index(&chunks, 35), 2);
-        assert_eq!(find_start_chunk_index(&chunks, 70), 4);
+
+        let ts = TimeSeries::from_chunks(vec![
+            TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                sample(10),
+                sample(20),
+            ])),
+            TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(vec![
+                sample(30),
+                sample(40),
+            ])),
+        ])
+        .unwrap();
+
+        assert_eq!(ts.last_sample_in_range(0, 35), Some(sample(30)));
+        assert_eq!(ts.last_sample_in_range(21, 29), None);
+        assert_eq!(ts.last_sample_in_range(0, 5), None);
     }
 
     #[test]
@@ -1626,5 +1620,36 @@ mod tests {
         // An empty series has no head to short-circuit on.
         let empty = TimeSeries::from_chunks(vec![]).unwrap();
         assert_eq!(empty.last_sample_in_range(0, 1_000), None);
+    }
+
+    #[test]
+    fn test_find_start_chunk_index_linear_scan_agrees_with_binary_search() {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        // Chunks covering [0,9], [20,29], [40,49], [60,69].
+        let chunks: Vec<TimeSeriesChunk> = (0..4)
+            .map(|c| {
+                let samples: Vec<Sample> = (0..10)
+                    .map(|i| Sample {
+                        timestamp: c * 20 + i,
+                        value: i as f64,
+                    })
+                    .collect();
+                TimeSeriesChunk::Uncompressed(UncompressedChunk::new(1024, &samples))
+            })
+            .collect();
+        assert!(chunks.len() <= LINEAR_SCAN_MAX);
+
+        for ts in -5..80 {
+            let expected = if ts <= chunks[0].first_timestamp() {
+                0
+            } else {
+                binary_search_chunks_by_timestamp(&chunks, ts).0
+            };
+            assert_eq!(find_start_chunk_index(&chunks, ts), expected, "ts={ts}");
+        }
+        assert_eq!(find_start_chunk_index(&chunks, 45), 2);
+        assert_eq!(find_start_chunk_index(&chunks, 35), 2);
+        assert_eq!(find_start_chunk_index(&chunks, 70), 4);
     }
 }
