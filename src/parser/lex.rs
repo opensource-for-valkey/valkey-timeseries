@@ -92,8 +92,9 @@ impl Token {
             Self::Number => "<number>",
 
             // symbols
-            Self::LeftBrace => "{{",
-            Self::RightBrace => "}}",
+            // Plain strings, not format strings: `{{` here printed as two braces.
+            Self::LeftBrace => "{",
+            Self::RightBrace => "}",
             Self::Comma => ",",
             Self::LeftParen => "(",
             Self::RightParen => ")",
