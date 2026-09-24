@@ -31,14 +31,15 @@ use std::fmt::Display;
 use std::iter::{Peekable, Skip};
 use std::time::Duration;
 use std::vec::IntoIter;
-use strum_macros::EnumIter;
 use valkey_module::{NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
 pub const MAX_TS_VALUES_FILTER: usize = 128;
 
 macro_rules! command_arg_tokens {
     ( $( $variant:ident => $lit:literal ),+ $(,)? ) => {
-        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default, EnumIter)]
+        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+        // Only the token round-trip test iterates the variants.
+        #[cfg_attr(test, derive(strum_macros::EnumIter))]
         pub enum CommandArgToken {
             $(
                 $variant,

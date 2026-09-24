@@ -4,8 +4,6 @@ extern crate enum_dispatch;
 extern crate get_size2;
 #[cfg(test)]
 extern crate serial_test;
-extern crate strum;
-extern crate strum_macros;
 extern crate valkey_module_macros;
 
 use crate::commands::register_fanout_operations;
@@ -148,10 +146,14 @@ fn assign_command_acl_categories(ctx: &Context) -> Result<(), String> {
     Ok(())
 }
 
+// Without this feature the ACL-category API is unavailable, and a module built without it
+// used to load with a no-op here: every TS.* command without `@timeseries`/`@write`, so a
+// `-@write` user could run the write commands. Refuse to build that instead.
 #[cfg(not(feature = "min-valkey-compatibility-version-8-0"))]
-fn assign_command_acl_categories(_ctx: &Context) -> Result<(), String> {
-    Ok(())
-}
+compile_error!(
+    "the `min-valkey-compatibility-version-8-0` feature is required: without it TS.* commands \
+     would load with no ACL categories (see `assign_command_acl_categories`)"
+);
 
 fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     init_croaring_allocator();
