@@ -51,7 +51,10 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         if is_blocking_denied(ctx) {
             return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
         }
-        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(ctx)));
+        let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(
+            ctx,
+            self.get_timeout(),
+        )));
         let bc_for_closure = Arc::clone(&blocked_client);
 
         let handle_response = move |op: Self, result: FanoutResult| {
