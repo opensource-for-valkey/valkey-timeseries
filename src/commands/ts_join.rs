@@ -3,7 +3,7 @@ use crate::common::replies::{reply_with_array, reply_with_null, reply_with_sampl
 use crate::error_consts;
 use crate::join::{JoinOptions, JoinResultType, process_join};
 use crate::series::get_timeseries;
-use joinkit::EitherOrBoth;
+use itertools::EitherOrBoth;
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };

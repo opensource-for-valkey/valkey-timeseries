@@ -9,7 +9,7 @@ mod tests {
     };
     use crate::series::TimeSeries;
     use crate::series::request_types::AggregationOptions;
-    use joinkit::EitherOrBoth;
+    use itertools::EitherOrBoth;
     use std::ops::Deref;
     use std::time::Duration;
 

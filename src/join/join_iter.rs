@@ -1,9 +1,13 @@
-use super::join_right_iter::JoinRightIter;
 use super::{JoinAsOfIter, JoinkitExt};
 use super::{JoinType, JoinValue};
 use crate::common::Sample;
-use joinkit::Joinkit;
+use itertools::{EitherOrBoth, Itertools};
 
+/// Joins two timestamp-sorted sample streams.
+///
+/// Every positional join is one sorted merge (`merge_join_by`) filtered to the rows the join
+/// type keeps. A series holds at most one sample per timestamp, so the merge pairs samples
+/// one-to-one; no join needs to fan a timestamp out across several rows.
 pub fn create_join_iter<L, R, IL, IR>(
     left: IL,
     right: IR,
@@ -26,23 +30,6 @@ where
             );
             Box::new(iter)
         }
-        JoinType::Left => Box::new(
-            left.into_iter()
-                .merge_join_left_outer_by(right, compare_by_timestamp)
-                .map(JoinValue),
-        ),
-        JoinType::Anti => {
-            let iter = left
-                .into_iter()
-                .merge_join_left_excl_by(right, compare_by_timestamp)
-                .map(JoinValue::left);
-
-            Box::new(iter)
-        }
-        JoinType::Right => {
-            let iter = JoinRightIter::new(left, right);
-            Box::new(iter)
-        }
         JoinType::Semi => {
             let iter = left
                 .into_iter()
@@ -51,23 +38,41 @@ where
 
             Box::new(iter)
         }
-        JoinType::Inner => {
-            let iter = left
-                .into_iter()
-                .merge_join_inner_by(right, compare_by_timestamp)
-                .map(|(l, r)| JoinValue::both(l, r));
-
-            Box::new(iter)
-        }
-        JoinType::Full => {
-            let iter = left
-                .into_iter()
-                .merge_join_full_outer_by(right, compare_by_timestamp)
-                .map(JoinValue);
-
-            Box::new(iter)
-        }
+        JoinType::Left => Box::new(
+            merge(left.into_iter(), right.into_iter()).filter_map(|row| match row {
+                EitherOrBoth::Right(_) => None,
+                row => Some(JoinValue(row)),
+            }),
+        ),
+        JoinType::Right => Box::new(
+            merge(left.into_iter(), right.into_iter()).filter_map(|row| match row {
+                EitherOrBoth::Left(_) => None,
+                row => Some(JoinValue(row)),
+            }),
+        ),
+        JoinType::Anti => Box::new(
+            merge(left.into_iter(), right.into_iter()).filter_map(|row| match row {
+                EitherOrBoth::Left(l) => Some(JoinValue::left(l)),
+                _ => None,
+            }),
+        ),
+        JoinType::Inner => Box::new(
+            merge(left.into_iter(), right.into_iter()).filter_map(|row| match row {
+                EitherOrBoth::Both(l, r) => Some(JoinValue::both(l, r)),
+                _ => None,
+            }),
+        ),
+        JoinType::Full => Box::new(merge(left.into_iter(), right.into_iter()).map(JoinValue)),
     }
+}
+
+/// Full outer merge of two timestamp-sorted streams.
+fn merge<L, R>(left: L, right: R) -> impl Iterator<Item = EitherOrBoth<Sample, Sample>>
+where
+    L: Iterator<Item = Sample>,
+    R: Iterator<Item = Sample>,
+{
+    left.merge_join_by(right, compare_by_timestamp)
 }
 
 #[inline]

@@ -4,7 +4,7 @@ use crate::common::binop::BinopFunc;
 use crate::common::threads::join;
 use crate::join::{JoinOptions, JoinType, JoinValue, create_join_iter};
 use crate::series::TimeSeries;
-use joinkit::EitherOrBoth;
+use itertools::EitherOrBoth;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 // naming is hard :-)

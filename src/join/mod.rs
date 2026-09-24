@@ -1,5 +1,5 @@
 use crate::series::types::ValueFilter;
-use joinkit::EitherOrBoth;
+use itertools::EitherOrBoth;
 use std::fmt::Display;
 use std::ops::Deref;
 use std::time::Duration;
@@ -8,7 +8,6 @@ mod asof;
 mod join_handler;
 mod join_iter;
 pub mod join_reducer;
-mod join_right_iter;
 
 #[cfg(test)]
 mod join_handler_tests;
