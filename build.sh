@@ -15,9 +15,12 @@
 #                  0 and 1 both mean serial. Defaults to serial when not given.
 #                  Also settable as PARALLEL_WORKERS. The compatibility suite
 #                  always runs serially: it shares one reference server and a
-#                  fixed port. See docs/plans/parallel-integration-tests-plan.md.
+#                  fixed port.
 #
-# See docs/rts-compat-build-integration-plan.md for the compatibility integration.
+#   SERVER_VERSION selects the valkey-server to test against: "unstable" (the
+#   default) or "8.1" — the versions CI tests.
+#
+# See tests/compat/README.md for the compatibility suite.
 
 # Exit the script if any command fails. Unset variables are errors too, so every
 # optional knob below is read with an explicit default.
@@ -183,12 +186,13 @@ fi
 
 # Ensure SERVER_VERSION environment variable is set
 if [ -z "${SERVER_VERSION:-}" ]; then
-    echo "ERROR: SERVER_VERSION environment variable is not set. Defaulting to unstable."
+    echo "SERVER_VERSION is not set; defaulting to unstable."
     export SERVER_VERSION="unstable"
 fi
 
-if [ "$SERVER_VERSION" != "unstable" ] && [ "$SERVER_VERSION" != "9.1" ]; then
-  echo "ERROR: Unsupported version - $SERVER_VERSION"
+# Keep in step with the server_version matrix in .github/workflows/ci.yml.
+if [ "$SERVER_VERSION" != "unstable" ] && [ "$SERVER_VERSION" != "8.1" ]; then
+  echo "ERROR: Unsupported version - $SERVER_VERSION (supported: unstable, 8.1)"
   exit 1
 fi
 
@@ -223,9 +227,8 @@ if [ "$NEEDS_BUILD" = true ]; then
     mkdir -p "tests/build/binaries/$SERVER_VERSION"
     cd tests/build
     rm -rf valkey
-    git clone "$REPO_URL"
+    git clone --depth 1 --branch "$SERVER_VERSION" "$REPO_URL"
     cd valkey
-    git checkout "$SERVER_VERSION"
     make -j
     cp src/valkey-server ../binaries/$SERVER_VERSION/
     cd "$SCRIPT_DIR"
@@ -255,13 +258,16 @@ if [ -n "$ASAN_BUILD" ]; then
 fi
 
 TEST_FRAMEWORK_REPO="https://github.com/valkey-io/valkey-test-framework"
+# The commit CI pins (TEST_FRAMEWORK_REF in .github/workflows/ci.yml); keep them in step.
+TEST_FRAMEWORK_REF="${TEST_FRAMEWORK_REF:-33cc62660ea94d49bd6ab27cb8c09b345fc5d577}"
 TEST_FRAMEWORK_DIR="tests/valkeytestframework"
 
 if [ -d "$TEST_FRAMEWORK_DIR" ]; then
     echo "valkeytestframework found."
 else
-    echo "Cloning valkey-test-framework..."
-    git clone "$TEST_FRAMEWORK_REPO"
+    echo "Cloning valkey-test-framework at $TEST_FRAMEWORK_REF..."
+    git clone --filter=blob:none "$TEST_FRAMEWORK_REPO"
+    git -C valkey-test-framework checkout --quiet "$TEST_FRAMEWORK_REF"
     mkdir -p "$TEST_FRAMEWORK_DIR"
     mv "valkey-test-framework/src"/* "$TEST_FRAMEWORK_DIR/"
     rm -rf valkey-test-framework

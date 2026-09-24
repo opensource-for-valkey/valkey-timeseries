@@ -6,11 +6,42 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.96.0
   VALKEY_REPO_URL: https://github.com/valkey-io/valkey.git
   TEST_FRAMEWORK_REPO: https://github.com/valkey-io/valkey-test-framework
+  # Pinned so a change upstream cannot change what a run tests. Keep in step with the
+  # default in build.sh.
+  TEST_FRAMEWORK_REF: 33cc62660ea94d49bd6ab27cb8c09b345fc5d577
   TEST_FRAMEWORK_DIR: tests/valkeytestframework
 
 jobs:
+  # Runs once rather than in every matrix leg: the contracts do not depend on the server.
+  proto-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Lint protobuf contracts
+        run: buf lint
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Fails on vulnerabilities and unsound crates; unmaintained-crate notices are
+      # reported as warnings.
+      - name: Audit dependencies
+        run: cargo audit
+
   build-ubuntu-latest:
     runs-on: ubuntu-latest
     strategy:
@@ -23,14 +54,13 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
 
-      - name: Set up Buf
-        uses: bufbuild/buf-setup-action@v1
-
-      - name: Lint protobuf contracts
-        run: buf lint
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu
 
       - name: Set the server version for python integration tests
         run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
@@ -40,32 +70,50 @@ jobs:
           cargo fmt --check
           cargo clippy --profile release --all-targets -- -D clippy::all
 
+      # The report binaries under tools/ need these features, so the default-feature
+      # checks above never compile them.
+      - name: Lint and build the tools
+        run: |
+          cargo clippy --profile release --all-targets --features enable-system-alloc,test-utils -- -D clippy::all
+          RUSTFLAGS="-D warnings" cargo build --release --bins --features enable-system-alloc,test-utils
+
       - name: Release Build
         run: RUSTFLAGS="-D warnings" cargo build --all --all-targets --release
 
       - name: Run unit tests
-        run: cargo test --features enable-system-alloc
+        run: |
+          cargo test --features enable-system-alloc
+          cargo test --doc --features enable-system-alloc
+
+      - name: Resolve valkey commit
+        id: valkey
+        run: echo "sha=$(git ls-remote "$VALKEY_REPO_URL" "refs/heads/${{ matrix.server_version }}" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache valkey-server binary
+        id: valkey-cache
+        uses: actions/cache@v4
+        with:
+          path: tests/build/binaries/${{ matrix.server_version }}
+          key: valkey-server-${{ runner.os }}-${{ matrix.server_version }}-${{ steps.valkey.outputs.sha }}
 
       - name: Make valkey-server binary
+        if: steps.valkey-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
-          cd tests/build
-          git clone "${{ env.VALKEY_REPO_URL }}"
-          cd valkey
-          git checkout ${{ matrix.server_version }}
-          make -j
-          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+          git clone --depth 1 --branch "${{ matrix.server_version }}" "$VALKEY_REPO_URL" tests/build/valkey
+          make -C tests/build/valkey -j"$(nproc)"
+          cp tests/build/valkey/src/valkey-server "tests/build/binaries/${{ matrix.server_version }}/"
 
       - name: Set up test framework
         run: |
-          echo "Cloning test framework..."
-          git clone ${{ env.TEST_FRAMEWORK_REPO }}
-          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
-          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          git clone --filter=blob:none "$TEST_FRAMEWORK_REPO" valkey-test-framework
+          git -C valkey-test-framework checkout --quiet "$TEST_FRAMEWORK_REF"
+          mkdir -p "$TEST_FRAMEWORK_DIR"
+          mv valkey-test-framework/src/* "$TEST_FRAMEWORK_DIR"/
           rm -rf valkey-test-framework
 
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -83,8 +131,7 @@ jobs:
       # -n auto spreads the suite over the runner's cores. loadscope keeps a test
       # class on one worker, which several classes here rely on for their per-class
       # directories under test-data/. Ports and working directories are partitioned
-      # per worker in tests/conftest.py; see
-      # docs/plans/parallel-integration-tests-plan.md.
+      # per worker in tests/conftest.py.
       - name: Run integration tests
         run: python3 -m pytest --cache-clear -v -n auto --dist=loadscope "tests/" --ignore=tests/compat
 
@@ -102,31 +149,50 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu
+
       # No protobuf compiler is installed here on purpose: build.rs parses
-      # proto/v1/*.proto with protox (pure Rust), so protoc is never invoked. The
-      # build-ubuntu-latest job has never installed one either.
+      # proto/v1/*.proto with protox (pure Rust), so protoc is never invoked.
       - name: Release Build
-        run: RUSTFLAGS="-D warnings" cargo build --all --all-targets --release
+        run: cargo build --release
+
+      - name: Resolve valkey commit
+        id: valkey
+        run: echo "sha=$(git ls-remote "$VALKEY_REPO_URL" "refs/heads/${SERVER_VERSION}" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache valkey-server binary
+        id: valkey-cache
+        uses: actions/cache@v4
+        with:
+          path: tests/build/binaries/${{ env.SERVER_VERSION }}
+          key: valkey-server-${{ runner.os }}-${{ env.SERVER_VERSION }}-${{ steps.valkey.outputs.sha }}
 
       - name: Make valkey-server binary
+        if: steps.valkey-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "tests/build/binaries/${SERVER_VERSION}"
-          cd tests/build
-          git clone "${{ env.VALKEY_REPO_URL }}"
-          cd valkey
-          git checkout ${SERVER_VERSION}
-          make -j
-          cp src/valkey-server ../binaries/${SERVER_VERSION}/
+          git clone --depth 1 --branch "${SERVER_VERSION}" "$VALKEY_REPO_URL" tests/build/valkey
+          make -C tests/build/valkey -j"$(nproc)"
+          cp tests/build/valkey/src/valkey-server "tests/build/binaries/${SERVER_VERSION}/"
 
       - name: Set up test framework
         run: |
-          git clone ${{ env.TEST_FRAMEWORK_REPO }}
-          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
-          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          git clone --filter=blob:none "$TEST_FRAMEWORK_REPO" valkey-test-framework
+          git -C valkey-test-framework checkout --quiet "$TEST_FRAMEWORK_REF"
+          mkdir -p "$TEST_FRAMEWORK_DIR"
+          mv valkey-test-framework/src/* "$TEST_FRAMEWORK_DIR"/
           rm -rf valkey-test-framework
 
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -162,8 +228,11 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.96.0
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
       - name: Run cargo and clippy format check
         run: |
@@ -176,8 +245,32 @@ jobs:
       - name: Run unit tests
         run: cargo test --features enable-system-alloc
 
+  # Early warning for the next Rust release: builds and unit-tests on the latest stable
+  # toolchain. Non-blocking — a new compiler or lint is not a regression in this change.
+  build-rust-stable:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and unit test
+        run: |
+          cargo build --all --all-targets --release
+          cargo test --features enable-system-alloc
+
+  # Formatting, lints and unit tests run in build-ubuntu-latest; this job only adds the
+  # integration suite against an ASAN-instrumented server.
   asan-build:
     runs-on: ubuntu-latest
+    env:
+      # Part of the binary cache key below: changing the flags rebuilds the server.
+      ASAN_MAKE_FLAGS: SANITIZER=address SERVER_CFLAGS=-Werror BUILD_TLS=module
     strategy:
       fail-fast: false
       matrix:
@@ -188,44 +281,52 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.96.0
-          components: rustfmt, clippy
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu
 
       - name: Set the server version for python integration tests
         run: echo "SERVER_VERSION=${{ matrix.server_version }}" >> $GITHUB_ENV
 
-      - name: Run cargo and clippy format check
-        run: |
-          cargo fmt --check
-          cargo clippy --profile release --all-targets -- -D clippy::all
-
       - name: Release Build
-        run: RUSTFLAGS="-D warnings" cargo build --all --all-targets --release
+        run: cargo build --release
 
-      - name: Run unit tests
-        run: cargo test --features enable-system-alloc
+      - name: Resolve valkey commit
+        id: valkey
+        run: |
+          echo "sha=$(git ls-remote "$VALKEY_REPO_URL" "refs/heads/${{ matrix.server_version }}" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "flags=$(echo "$ASAN_MAKE_FLAGS" | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ASAN valkey-server binary
+        id: valkey-cache
+        uses: actions/cache@v4
+        with:
+          path: tests/build/binaries/${{ matrix.server_version }}
+          key: valkey-server-asan-${{ runner.os }}-${{ matrix.server_version }}-${{ steps.valkey.outputs.sha }}-${{ steps.valkey.outputs.flags }}
 
       - name: Make Valkey-server binary with asan
+        if: steps.valkey-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "tests/build/binaries/${{ matrix.server_version }}"
-          cd tests/build
-          git clone "${{ env.VALKEY_REPO_URL }}"
-          cd valkey
-          git checkout ${{ matrix.server_version }}
-          make distclean
-          make -j SANITIZER=address SERVER_CFLAGS='-Werror' BUILD_TLS=module
-          cp src/valkey-server ../binaries/${{ matrix.server_version }}/
+          git clone --depth 1 --branch "${{ matrix.server_version }}" "$VALKEY_REPO_URL" tests/build/valkey
+          # Word-split on purpose: ASAN_MAKE_FLAGS is a list of make variables.
+          # shellcheck disable=SC2086
+          make -C tests/build/valkey -j"$(nproc)" $ASAN_MAKE_FLAGS
+          cp tests/build/valkey/src/valkey-server "tests/build/binaries/${{ matrix.server_version }}/"
 
       - name: Set up test framework
         run: |
-          echo "Cloning test framework..."
-          git clone ${{ env.TEST_FRAMEWORK_REPO }}
-          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
-          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          git clone --filter=blob:none "$TEST_FRAMEWORK_REPO" valkey-test-framework
+          git -C valkey-test-framework checkout --quiet "$TEST_FRAMEWORK_REF"
+          mkdir -p "$TEST_FRAMEWORK_DIR"
+          mv valkey-test-framework/src/* "$TEST_FRAMEWORK_DIR"/
           rm -rf valkey-test-framework
 
       - name: Set up Python
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
@@ -243,8 +344,7 @@ jobs:
       # Deliberately serial. The leak attribution below reads the test name from the
       # two lines above each LeakSanitizer report, which only holds while pytest
       # output is ordered; xdist interleaves workers and prefixes lines with [gwN].
-      # Routing sanitizer output to per-server files would lift this restriction --
-      # see docs/plans/parallel-integration-tests-plan.md section 3.6.
+      # Routing sanitizer output to per-server files would lift this restriction.
       - name: Run integration tests
         run: |
           python3 -m pytest --capture=sys --cache-clear -v "tests/" --ignore=tests/compat -m "not skip_for_asan" 2>&1 | tee test_output.tmp
@@ -254,7 +354,7 @@ jobs:
             LEAKING_TESTS=$(grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp | \
               grep -v "LeakSanitizer" | \
               grep ".*\.py::")
-            LEAK_COUNT=$(echo "$LEAKING_TESTS" | wc -l)        
+            LEAK_COUNT=$(echo "$LEAKING_TESTS" | wc -l)
             echo "$LEAKING_TESTS" | while read -r line; do
               echo "::error::Test with leak: $line"
             done

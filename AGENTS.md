@@ -48,7 +48,7 @@ tools/interning_report.sh [--preset small|medium|large] [--emit-commands f]   # 
 ./fuzz.sh --examples 20000 --duration 20m --stats
 ```
 
-Key `./build.sh` env vars: `SERVER_VERSION` (required: `unstable`/`8.0`/`8.1`), `ASAN_BUILD`,
+Key `./build.sh` env vars: `SERVER_VERSION` (`unstable` (default) or `8.1`, the versions CI tests), `ASAN_BUILD`,
 `TEST_PATTERN` (pytest `-k`), `PARALLEL_WORKERS`/`--parallel[=N]` (integration phase only — the
 compat suite and ASAN job always run serially), `CLUSTER_MEET_TIMEOUT`, `RTS_COMPAT=1` (adds the
 compat phase; mutually exclusive with `ASAN_BUILD`). `MODULE_PATH` is exported after build.
