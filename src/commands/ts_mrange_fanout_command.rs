@@ -25,8 +25,8 @@ use crate::series::mrange::{
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
 };
-use orx_parallel::ParIter;
-use orx_parallel::ParIterResult;
+use orx_parallel::Par;
+use orx_parallel::ParResult;
 use orx_parallel::{IntoParIter, IterIntoParIter};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
@@ -337,7 +337,7 @@ fn normalize_response_series(
             ));
             result.try_into()
         })
-        .into_fallible_result()
+        .into_fallible()
         .collect()
 }
 
@@ -370,7 +370,7 @@ fn compensate_group_partials(
     let results = series
         .into_par()
         .map(MRangeSeriesResult::try_from)
-        .into_fallible_result()
+        .into_fallible()
         .collect()?;
     let grouped = construct_group_map(results);
 
@@ -424,7 +424,7 @@ fn handle_basic(
     series
         .into_par()
         .map(MRangeSeriesResult::try_from) // Explicit conversion
-        .into_fallible_result()
+        .into_fallible()
         .map(|series| process_series_samples(series, options))
         .collect()
 }
@@ -453,7 +453,7 @@ fn handle_grouping(
     let results = series
         .into_par()
         .map(MRangeSeriesResult::try_from)
-        .into_fallible_result()
+        .into_fallible()
         .collect()?;
     let grouped_by_key = construct_group_map(results);
 

@@ -4,8 +4,8 @@ use crate::common::sync::lock;
 use crate::common::threads::spawn_background;
 use crate::is_shutting_down;
 use crate::series::tasks::utils::{fetch_series_batch, find_next_db};
-use orx_parallel::ParIter;
-use orx_parallel::ParallelizableCollectionMut;
+use orx_parallel::Par;
+use orx_parallel::ParCollectionMut;
 use std::sync::{LazyLock, Mutex};
 use valkey_module::{Context, MODULE_CONTEXT, Status};
 

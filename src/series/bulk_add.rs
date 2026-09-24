@@ -11,7 +11,7 @@ use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
 use crate::series::index::with_timeseries_postings;
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
 use crate::series::{DuplicatePolicy, SampleAddResult, SeriesRef, TimeSeries, seal_chunk};
-use orx_parallel::{IterIntoParIter, ParIter, ParallelizableCollection};
+use orx_parallel::{IterIntoParIter, Par, ParCollection};
 use simd_json::base::{ValueAsArray, ValueAsScalar};
 use simd_json::borrowed::Value;
 use simd_json::prelude::ValueObjectAccess;

@@ -6,7 +6,7 @@ use crate::analysis::outliers::{
 use crate::analysis::{TimeSeriesAnalysisError, TimeSeriesAnalysisResult};
 use crate::config::num_threads;
 use krcf::{RandomCutForest, RandomCutForestOptions};
-use orx_parallel::{ParIter, ParIterResult, Parallelizable};
+use orx_parallel::{Par, ParResult, Parallelizable};
 use valkey_module::logging::log_warning;
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -256,7 +256,7 @@ impl RcfOutlierDetector {
             values
                 .par()
                 .map(|&v| self.try_score(v))
-                .into_fallible_result()
+                .into_fallible()
                 .collect()
         } else {
             values.iter().map(|&v| self.try_score(v)).collect()

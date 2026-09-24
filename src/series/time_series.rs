@@ -19,8 +19,8 @@ use crate::series::sample_merge::merge_samples;
 use crate::series::series_sample_iterator::SeriesSampleIterator;
 use crate::{config, error_consts};
 use get_size2::GetSize;
-use orx_parallel::ParIterResult;
-use orx_parallel::{IntoParIter, ParIter, Parallelizable, ParallelizableCollectionMut};
+use orx_parallel::ParResult;
+use orx_parallel::{IntoParIter, Par, ParCollectionMut, Parallelizable};
 use smallvec::SmallVec;
 use std::hash::Hash;
 use std::mem::size_of;
@@ -707,7 +707,7 @@ impl TimeSeries {
                 _ => slice
                     .par()
                     .map(|meta| meta_fetch(meta))
-                    .into_fallible_result()
+                    .into_fallible()
                     .flat_map(|r| r)
                     .collect(),
             }
@@ -861,7 +861,7 @@ impl TimeSeries {
             (true, many) => many
                 .into_par()
                 .map(|chunk| remove_internal(chunk, start_ts, end_ts))
-                .into_fallible_result()
+                .into_fallible()
                 .sum()?,
         };
 
@@ -1283,7 +1283,7 @@ fn get_range_parallel(
         _ => chunks
             .into_par()
             .map(|chunk| chunk.get_range(start, end))
-            .into_fallible_result()
+            .into_fallible()
             .flat_map(|x| x)
             .collect(),
     }

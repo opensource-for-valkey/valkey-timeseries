@@ -10,8 +10,8 @@ use crate::series::{
 };
 use blart::AsBytes;
 use croaring::bitmap64::Bitmap64Iterator;
-use orx_parallel::ParIter;
-use orx_parallel::ParallelizableCollectionMut;
+use orx_parallel::Par;
+use orx_parallel::ParCollectionMut;
 use smallvec::SmallVec;
 use std::ops::{Deref, DerefMut};
 use valkey_module::{

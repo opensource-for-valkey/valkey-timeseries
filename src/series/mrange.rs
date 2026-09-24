@@ -16,7 +16,7 @@ use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, RangeOptions, SeriesResultData,
 };
 use ahash::AHashMap;
-use orx_parallel::{IntoParIter, IterIntoParIter, ParIter};
+use orx_parallel::{IntoParIter, IterIntoParIter, Par};
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 struct MRangeSeriesMeta<'a> {

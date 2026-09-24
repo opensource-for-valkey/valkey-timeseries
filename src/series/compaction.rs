@@ -13,7 +13,7 @@ use crate::series::{
     DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries,
 };
 use get_size2::GetSize;
-use orx_parallel::{ParIter, ParallelizableCollectionMut};
+use orx_parallel::{Par, ParCollectionMut};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use topo_sort::TopoSort;

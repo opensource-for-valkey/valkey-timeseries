@@ -22,7 +22,11 @@ hashify = { version = "0.3" }
 itertools = "0.15.0"
 linkme = "0.3"
 logos = "0.16"
-orx-parallel = "3.4"
+# `transient-pool`: spawn scoped threads per parallel computation, as 3.4's default runner did.
+# 4.0's default is a persistent pool whose callers block without helping, so the nested
+# parallel iterators here (per-series inside per-query) could deadlock it once every worker
+# waits on an inner scope. Reusing threads is a separate, measured change.
+orx-parallel = { version = "4", features = ["transient-pool"] }
 min-max-heap = "1.3"
 num-traits = "0.2"
 joinkit = "0.2.0"

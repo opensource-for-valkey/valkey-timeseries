@@ -35,7 +35,7 @@ use crate::series::{
     SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as,
 };
 use blart::AsBytes;
-use orx_parallel::{IterIntoParIter, ParIter};
+use orx_parallel::{IterIntoParIter, Par};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
