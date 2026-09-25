@@ -24,7 +24,6 @@ struct ParsedInput<'a> {
     raw_value: &'a ValkeyString,
     timestamp: Timestamp,
     value: f64,
-    index: usize,
     res: SampleAddResult,
 }
 
@@ -275,7 +274,6 @@ fn parse_args<'a>(
             raw_value,
             timestamp,
             value,
-            index: sample_index,
             res,
         });
     }
