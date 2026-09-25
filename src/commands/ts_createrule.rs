@@ -7,7 +7,7 @@ use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{
-    CompactionRule, SeriesRef, check_new_rule_circular_dependency, get_timeseries,
+    CompactionRule, SeriesLink, check_new_rule_circular_dependency, get_timeseries,
     get_timeseries_mut,
 };
 use valkey_module::{
@@ -56,12 +56,9 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // Read both series while validating the rule. The mutable guards are
     // acquired only after cycle detection so recursive reachability checks
     // cannot alias either series.
-    let (source_id, dest_id, rule) = {
+    let rule = {
         let source_series = get_timeseries(ctx, &source_key, Some(AclPermissions::UPDATE))?;
-        let source_id = source_series.id;
-
         let dest_series = get_timeseries(ctx, &dest_key, Some(AclPermissions::UPDATE))?;
-        let dest_id = dest_series.id;
 
         if dest_series.is_compaction() {
             return Err(ValkeyError::Str(
@@ -73,7 +70,7 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         if source_series
             .rules
             .iter()
-            .any(|rule| rule.dest_id == dest_id)
+            .any(|rule| rule.dest.points_to(dest_key.as_slice()))
         {
             // match error from redis-ts
             return Err(ValkeyError::Str(
@@ -82,18 +79,17 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         }
 
         // Parse aggregation options
-        let rule = parse_args(&mut args, dest_id)?;
-        (source_id, dest_id, rule)
+        parse_args(&mut args, SeriesLink::from_key(dest_key.as_slice()))?
     };
 
-    check_new_rule_circular_dependency(ctx, source_id, dest_id)?;
+    check_new_rule_circular_dependency(ctx, &source_key, &dest_key)?;
 
     let mut source_series = get_timeseries_mut(ctx, &source_key, Some(AclPermissions::UPDATE))?;
     let mut dest_series = get_timeseries_mut(ctx, &dest_key, Some(AclPermissions::UPDATE))?;
 
     source_series.add_compaction_rule(rule);
     // Add the rule to the destination series
-    dest_series.src_series = Some(source_id);
+    dest_series.src_series = Some(SeriesLink::from_key(source_key.as_slice()));
 
     // Replicate the command
     ctx.replicate_verbatim();
@@ -104,7 +100,7 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     VALKEY_OK
 }
 
-fn parse_args(args: &mut CommandArgIterator, dest_id: SeriesRef) -> ValkeyResult<CompactionRule> {
+fn parse_args(args: &mut CommandArgIterator, dest: SeriesLink) -> ValkeyResult<CompactionRule> {
     let aggregation = args.next_str()?;
     if !aggregation.eq_ignore_ascii_case("AGGREGATION") {
         return Err(ValkeyError::Str(error_consts::CANNOT_PARSE_AGGREGATION));
@@ -138,7 +134,7 @@ fn parse_args(args: &mut CommandArgIterator, dest_id: SeriesRef) -> ValkeyResult
     }
 
     Ok(CompactionRule {
-        dest_id,
+        dest,
         aggregator,
         bucket_duration,
         align_timestamp,

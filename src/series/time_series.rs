@@ -7,16 +7,16 @@ use crate::common::{Sample, Timestamp};
 use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
 use crate::error::{TsdbError, TsdbResult};
 use crate::labels::{InternedLabel, MetricName};
-use crate::series::DuplicatePolicy;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk, validate_chunk_size};
 use crate::series::compaction::CompactionRule;
 use crate::series::digest::{
-    calc_compaction_digest, calc_duplicate_policy_digest, calc_metric_name_digest,
-    calc_rounding_digest,
+    calc_compaction_digest, calc_duplicate_policy_digest, calc_link_digest,
+    calc_metric_name_digest, calc_rounding_digest,
 };
 use crate::series::index::next_timeseries_id;
 use crate::series::sample_merge::merge_samples;
 use crate::series::series_sample_iterator::SeriesSampleIterator;
+use crate::series::{DuplicatePolicy, SeriesLink};
 use crate::{config, error_consts};
 use get_size2::GetSize;
 use orx_parallel::ParResult;
@@ -60,6 +60,10 @@ pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
 pub struct TimeSeries {
     /// fixed, opaque internal id used in indexing
     pub id: SeriesRef,
+    /// The key this series is stored under. Runtime-only, never serialized: assigned whenever
+    /// the series enters the keyspace (creation, RDB load, `RESTORE`, `TS._RESTORE`, `COPY`) and
+    /// updated on `RENAME`. Empty for a series that is not stored under a key.
+    pub key: Box<[u8]>,
     /// The label/value pairs
     pub labels: MetricName,
     /// Duration for which data is retained before automatic removal
@@ -81,7 +85,8 @@ pub struct TimeSeries {
     pub first_timestamp: Timestamp,
     /// The last timestamp in the time series
     pub last_sample: Option<Sample>,
-    pub src_series: Option<TimeseriesId>,
+    /// The source series, if this is a compaction destination (see [`SeriesLink`]).
+    pub src_series: Option<SeriesLink>,
     pub rules: Vec<CompactionRule>,
     /// Internal bookkeeping for current db. Simplifies event handling related to indexing.
     /// This is not part of the time series data itself, nor is it stored to rdb.
@@ -137,7 +142,7 @@ impl TimeSeries {
         } else {
             MetricName::default()
         };
-        res.src_series = options.src_id;
+        res.src_series = options.src;
         res.id = next_timeseries_id();
 
         Ok(res)
@@ -1278,12 +1283,7 @@ impl TimeSeries {
             digest.add_long_long(-1); // indicate no last sample
         }
 
-        let src_id = if let Some(id) = self.src_series {
-            id as i64
-        } else {
-            -1 // use -1 to indicate no source series
-        };
-        digest.add_long_long(src_id);
+        calc_link_digest(self.src_series.as_ref(), digest);
         // add rules
         digest.add_long_long(self.rules.len() as i64);
         for rule in self.rules.iter() {
@@ -1298,6 +1298,7 @@ impl Default for TimeSeries {
     fn default() -> Self {
         Self {
             id: 0,
+            key: Box::default(),
             labels: Default::default(),
             retention: Default::default(),
             sample_duplicates: Default::default(),

@@ -9,11 +9,7 @@ use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::create_key_string;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-#[cfg(not(test))]
-use crate::series::SeriesRef;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
-#[cfg(not(test))]
-use crate::series::index::with_timeseries_postings;
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries, seal_chunk};
 use orx_parallel::{IterIntoParIter, Par, ParCollection};
@@ -447,7 +443,7 @@ pub fn bulk_insert_samples(
         } else {
             "ts.add"
         };
-        notify_added(ctx, event, &[series.id]);
+        notify_added(ctx, event, &series.key);
     }
 
     // Propagate the accepted samples to compaction destinations in one batch.
@@ -488,20 +484,12 @@ pub fn bulk_insert_samples(
 }
 
 #[cfg(not(test))]
-fn notify_added(ctx: &Context, event: &str, ids: &[SeriesRef]) {
-    with_timeseries_postings(ctx, |postings| {
-        for &id in ids {
-            let Some(key) = postings.get_key_by_id(id) else {
-                ctx.log_warning("Compaction notification failed: series key not found");
-                continue;
-            };
-            let key = create_key_string(ctx, key.as_ref());
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key);
-            // The sole caller already gated on the series' sample count having grown, which is
-            // exactly the condition that can satisfy a blocked `TS.READ`.
-            signal_timeseries_ready(ctx, &key);
-        }
-    });
+fn notify_added(ctx: &Context, event: &str, key: &[u8]) {
+    let key = create_key_string(ctx, key);
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key);
+    // The sole caller already gated on the series' sample count having grown, which is
+    // exactly the condition that can satisfy a blocked `TS.READ`.
+    signal_timeseries_ready(ctx, &key);
 }
 
 #[cfg(test)]

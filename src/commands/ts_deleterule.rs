@@ -54,13 +54,19 @@ pub fn ts_deleterule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         return Err(ValkeyError::Str(error_consts::COMPACTION_RULE_NOT_FOUND));
     };
 
-    let dest_id = dest_series.id;
-    let Some(_rule) = source_series.remove_compaction_rule(dest_id) else {
+    let Some(_rule) = source_series.remove_compaction_rule(dest_key.as_slice()) else {
         return Err(ValkeyError::Str(error_consts::COMPACTION_RULE_NOT_FOUND));
     };
 
-    // Clear the src_series field in the destination series
-    dest_series.src_series = None;
+    // Clear the destination's source link — unless it names another source, in which case the
+    // removed rule was already stale and the link belongs to a live rule.
+    let links_back = dest_series
+        .src_series
+        .as_ref()
+        .is_some_and(|src| src.points_to(source_key.as_slice()));
+    if links_back {
+        dest_series.src_series = None;
+    }
 
     // Replicate the command
     ctx.replicate_verbatim();

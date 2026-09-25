@@ -1,10 +1,7 @@
 use crate::common::replies::ReplyContext;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
-use crate::series::index::get_timeseries_index;
-use crate::series::{SeriesRef, TimeSeries, chunks::ChunkOps, get_timeseries};
-use blart::AsBytes;
-use smallvec::SmallVec;
+use crate::series::{TimeSeries, chunks::ChunkOps, get_timeseries, try_get_timeseries};
 use std::collections::HashMap;
 use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{AclPermissions, Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
@@ -181,15 +178,8 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
     map.insert("labels".into(), get_labels_info(ts, is_resp3));
 
     // Always present: nil when the series is not a compaction target
-    // (RedisTimeSeries parity), or when the source id cannot be resolved.
-    let source_key = ts.src_series.and_then(|src_id| {
-        let key = get_key_by_id(ctx, src_id);
-        if key.is_none() {
-            let msg = format!("Source series with id {src_id} not found");
-            ctx.log_warning(&msg);
-        }
-        key
-    });
+    // (RedisTimeSeries parity), or when its source no longer feeds it.
+    let source_key = get_source_key(ctx, ts);
     map.insert(
         "sourceKey".into(),
         source_key.map_or(ValkeyValue::Null, ValkeyValue::from),
@@ -276,27 +266,26 @@ fn rule_aggregator_name(rule: &crate::series::CompactionRule) -> String {
 ///
 /// RESP3: a map of `destKey -> [bucketDuration, aggregator, alignTimestamp]`.
 /// RESP2: an array of `[destKey, bucketDuration, aggregator, alignTimestamp]`.
-/// A rule whose destination key can no longer be resolved is dropped from the
-/// reply (and logged), in both protocols.
+/// A rule whose destination no longer exists, or no longer names this series as
+/// its source, is dropped from the reply (and logged), in both protocols.
 fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyValue {
-    let series_ids: SmallVec<[_; 16]> = series.rules.iter().map(|rule| rule.dest_id).collect();
-    let keys_map = get_keys_by_id(ctx, &series_ids);
-
-    // Resolve destination keys once; a rule with a dangling destination id is
-    // logged and skipped so it appears in neither protocol's reply.
     let resolved = series
         .rules
         .iter()
-        .filter_map(|x| match keys_map.get(&x.dest_id) {
-            Some(dest_key) => Some((dest_key, x)),
-            None => {
-                let msg = format!(
-                    "Compaction rule has invalid destination id {}. Removing rule.",
-                    x.dest_id
-                );
-                ctx.log_warning(&msg);
-                None
+        .filter_map(|rule| {
+            let dest_key = rule.dest.to_key_string(ctx);
+            let links_back = matches!(
+                try_get_timeseries(ctx, &dest_key, None),
+                Ok(Some(dest)) if dest
+                    .src_series
+                    .as_ref()
+                    .is_some_and(|src| src.points_to(&series.key))
+            );
+            if !links_back {
+                ctx.log_warning("Compaction rule has an invalid destination; omitting it");
+                return None;
             }
+            Some((dest_key.to_string_lossy(), rule))
         })
         .collect::<Vec<_>>();
 
@@ -331,25 +320,19 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
     ValkeyValue::Array(rules_value)
 }
 
-fn get_key_by_id(ctx: &Context, id: SeriesRef) -> Option<String> {
-    let mut keys = get_keys_by_id(ctx, &[id]);
-    keys.remove(&id)
-}
-
-fn get_keys_by_id(ctx: &Context, ids: &[SeriesRef]) -> HashMap<SeriesRef, String> {
-    let index = get_timeseries_index(ctx);
-    let mut state = ();
-    index.with_postings(&mut state, |posting, _| {
-        let mut map = HashMap::with_capacity(ids.len());
-        for id in ids.iter().cloned() {
-            if let Some(key) = posting.get_key_by_id(id) {
-                let key_str = String::from_utf8_lossy(key.as_bytes()).to_string();
-                map.insert(id, key_str);
-            } else {
-                let msg = format!("Series with id {id} not found");
-                ctx.log_warning(&msg);
-            }
-        }
-        map
-    })
+/// The key of the series that feeds `series`, if it still has a rule for it.
+fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<String> {
+    let source_key = series.src_series.as_ref()?.to_key_string(ctx);
+    let feeds_series = matches!(
+        try_get_timeseries(ctx, &source_key, None),
+        Ok(Some(source)) if source
+            .rules
+            .iter()
+            .any(|rule| rule.dest.points_to(&series.key))
+    );
+    if !feeds_series {
+        ctx.log_warning("Compaction source series not found");
+        return None;
+    }
+    Some(source_key.to_string_lossy())
 }

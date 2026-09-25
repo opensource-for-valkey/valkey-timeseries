@@ -8,7 +8,7 @@ use crate::config::{
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
 use crate::labels::Label;
-use crate::series::SeriesRef;
+use crate::series::SeriesLink;
 use crate::series::chunks::ChunkEncoding;
 use get_size2::GetSize;
 use std::fmt::Display;
@@ -350,8 +350,8 @@ impl From<SampleAddResult> for ValkeyResult {
 /// Options for time series configuration
 #[derive(Debug, Clone)]
 pub struct TimeSeriesOptions {
-    /// The source ID of the series, if this is a derived series
-    pub src_id: Option<SeriesRef>,
+    /// The source series, if this is a compaction destination
+    pub src: Option<SeriesLink>,
     pub chunk_encoding: ChunkEncoding,
     pub chunk_size: Option<usize>,
     pub retention: Option<Duration>,
@@ -406,7 +406,7 @@ impl TimeSeriesOptions {
 impl Default for TimeSeriesOptions {
     fn default() -> Self {
         Self {
-            src_id: None,
+            src: None,
             chunk_encoding: ChunkEncoding::default(),
             chunk_size: Some(CHUNK_SIZE_DEFAULT as usize),
             retention: None,

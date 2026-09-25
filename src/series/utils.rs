@@ -7,7 +7,8 @@ use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
-    SeriesGuard, SeriesGuardMut, TimeSeries, TimeSeriesOptions, create_compaction_rules_from_config,
+    SeriesGuard, SeriesGuardMut, SeriesLink, TimeSeries, TimeSeriesOptions,
+    create_compaction_rules_from_config,
 };
 use std::ops::Deref;
 use std::time::Duration;
@@ -141,6 +142,7 @@ pub fn create_series(
     if ts.id == 0 {
         ts.id = next_timeseries_id();
     }
+    ts.key = key.as_slice().into();
 
     let db = get_current_db(ctx);
 
@@ -239,7 +241,7 @@ fn add_default_compactions(
 
     // create a new series for each compaction rule
     let mut rules = Vec::with_capacity(compaction_rules.len());
-    for (dest_key, (mut rule, retention)) in compaction_rules.into_iter() {
+    for (dest_key, (rule, retention)) in compaction_rules.into_iter() {
         let bucket_duration = rule.bucket_duration;
         let agg_type = rule.aggregator.aggregation_type();
 
@@ -251,7 +253,7 @@ fn add_default_compactions(
 
         let child_key = create_key_string(ctx, dest_key.as_bytes());
         let options = TimeSeriesOptions {
-            src_id: Some(series.id),
+            src: Some(SeriesLink::from_key(key.as_slice())),
             retention: Some(Duration::from_millis(retention)),
             labels: Some(labels),
             ..base_config
@@ -274,7 +276,6 @@ fn add_default_compactions(
             }
         };
 
-        rule.dest_id = destination.id;
         value_key.set_value(&VK_TIME_SERIES_TYPE, destination)?;
 
         rules.push(rule);

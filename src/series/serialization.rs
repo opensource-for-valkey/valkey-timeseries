@@ -3,8 +3,11 @@ use crate::common::{Sample, Timestamp};
 use crate::labels::MetricName;
 use crate::series::chunks::{Chunk, ChunkEncoding, ChunkOps, TimeSeriesChunk};
 use crate::series::compaction::CompactionRule;
-use crate::series::series_data_type::TIMESERIES_TYPE_ENCODING_VERSION;
-use crate::series::{SampleDuplicatePolicy, TimeSeries, TimeseriesId};
+use crate::series::series_data_type::{
+    MIN_TIMESERIES_TYPE_ENCODING_VERSION, TIMESERIES_TYPE_ENCODING_VERSION,
+    is_supported_encoding_version,
+};
+use crate::series::{SampleDuplicatePolicy, SeriesLink, TimeSeries, TimeseriesId};
 use valkey_module::{ValkeyError, ValkeyResult, raw};
 
 pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
@@ -26,8 +29,7 @@ pub fn rdb_save_series(series: &TimeSeries, rdb: *mut raw::RedisModuleIO) {
     }
 
     // rule related
-    let src_id = series.src_series.unwrap_or_default();
-    raw::save_unsigned(rdb, src_id);
+    SeriesLink::rdb_save_optional(series.src_series.as_ref(), rdb);
     rdb_save_usize(rdb, series.rules.len());
     for rule in series.rules.iter() {
         rule.rdb_save(rdb);
@@ -40,10 +42,11 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     // incompatible layout (encver 9 as of RTS 8.6); parsing it here would
     // silently misread data. Migration is via export/re-ingest, not RDB —
     // see COMPATIBILITY.md.
-    if enc_ver != TIMESERIES_TYPE_ENCODING_VERSION {
+    if !is_supported_encoding_version(enc_ver) {
         return Err(ValkeyError::String(format!(
             "TSDB: cannot load TSDB-TYPE RDB payload with encoding version {enc_ver} \
-             (this module writes version {TIMESERIES_TYPE_ENCODING_VERSION}). \
+             (this module reads versions {MIN_TIMESERIES_TYPE_ENCODING_VERSION} to \
+             {TIMESERIES_TYPE_ENCODING_VERSION}). \
              RedisTimeSeries RDB/DUMP payloads are incompatible and cannot be imported; \
              re-ingest via TS.RANGE export -> TS.MADD (see COMPATIBILITY.md)"
         )));
@@ -82,8 +85,7 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let first_timestamp = first_timestamp.unwrap_or_default();
 
     // rule related
-    let src_id = raw::load_unsigned(rdb)? as TimeseriesId;
-    let src_series = if src_id == 0 { None } else { Some(src_id) };
+    let src_series = SeriesLink::rdb_load_optional(rdb)?;
 
     let rules_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
     let mut rules = Vec::with_capacity(rules_len);
@@ -95,6 +97,8 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
 
     let mut ts = TimeSeries {
         id,
+        // Assigned from the IO context below, or by the caller for a payload without one.
+        key: Box::default(),
         labels,
         retention,
         chunk_encoding,

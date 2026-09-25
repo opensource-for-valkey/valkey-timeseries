@@ -1,6 +1,5 @@
 use crate::aggregators::{AggregationHandler, Aggregator, calc_bucket_start};
 use crate::common::block_on_keys::signal_timeseries_ready;
-use crate::common::context::create_key_string;
 use crate::common::logging::log_warning;
 use crate::common::rdb::{
     RdbSerializable, rdb_load_bool, rdb_load_timestamp, rdb_save_bool, rdb_save_timestamp,
@@ -8,26 +7,23 @@ use crate::common::rdb::{
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
-use crate::series::index::{get_series_by_id, get_series_key_by_id, with_timeseries_postings};
 use crate::series::{
-    DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries,
+    DuplicatePolicy, SampleAddResult, SeriesGuardMut, SeriesLink, TimeSeries, try_get_timeseries,
+    try_get_timeseries_mut,
 };
 use get_size2::GetSize;
 use orx_parallel::{Par, ParCollectionMut};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use topo_sort::TopoSort;
-use valkey_module::{Context, NotifyEvent, ValkeyError, ValkeyResult, raw};
+use valkey_module::{Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, raw};
 
 const PARALLEL_THRESHOLD: usize = 2;
 const TEMP_VEC_LEN: usize = 6;
 
-/// (dest_id, written samples, previous last sample) queued for cascading compaction.
-type PendingCompactionWrite = (SeriesRef, Vec<Sample>, Option<Timestamp>);
-
 #[derive(Debug, Clone, Hash, PartialEq)]
 pub struct CompactionRule {
-    pub dest_id: SeriesRef,
+    /// The destination series (see [`SeriesLink`]).
+    pub dest: SeriesLink,
     pub aggregator: Aggregator,
     pub bucket_duration: u64,
     pub align_timestamp: Timestamp,
@@ -37,7 +33,7 @@ pub struct CompactionRule {
 
 impl GetSize for CompactionRule {
     fn get_size(&self) -> usize {
-        size_of::<SeriesRef>() // dest_id
+        self.dest.get_size()
             + self.aggregator.get_size()
             + size_of::<u64>() // bucket_duration
             + size_of::<Timestamp>() // align_timestamp
@@ -83,7 +79,7 @@ impl CompactionRule {
 
 impl RdbSerializable for CompactionRule {
     fn rdb_save(&self, rdb: *mut raw::RedisModuleIO) {
-        raw::save_unsigned(rdb, self.dest_id);
+        self.dest.rdb_save(rdb);
         self.aggregator.rdb_save(rdb);
         raw::save_unsigned(rdb, self.bucket_duration);
         rdb_save_timestamp(rdb, self.align_timestamp);
@@ -92,7 +88,7 @@ impl RdbSerializable for CompactionRule {
     }
 
     fn rdb_load(rdb: *mut raw::RedisModuleIO) -> ValkeyResult<Self> {
-        let dest_id = raw::load_unsigned(rdb)? as SeriesRef;
+        let dest = SeriesLink::rdb_load(rdb)?;
         let mut aggregator = Aggregator::rdb_load(rdb)?;
         let bucket_duration = raw::load_unsigned(rdb)?;
         // `rate` persists its window in whole seconds; the rule's bucket duration is exact.
@@ -107,7 +103,7 @@ impl RdbSerializable for CompactionRule {
         validate_restored_rule_parameters(bucket_duration, align_timestamp)?;
 
         Ok(CompactionRule {
-            dest_id,
+            dest,
             aggregator,
             bucket_duration,
             align_timestamp,
@@ -822,7 +818,9 @@ fn resync_open_bucket_after_removal(ctx: &mut CompactionContext<'_>) -> TsdbResu
 
 /// Outcome of applying one compaction rule to its destination series.
 struct RuleOutcome {
-    dest_id: SeriesRef,
+    /// Position of the rule in its source's rule list — and so of its destination in the
+    /// [`Destinations`] the rules were applied to.
+    rule_index: usize,
     /// `dest`'s last timestamp *before* this operation ran — the `prev_last` a cascaded
     /// `AddBatch` into `dest`'s own rules must use.
     dest_prev_last: Option<Timestamp>,
@@ -858,11 +856,30 @@ fn dedupe_written_samples(mut samples: Vec<Sample>) -> Vec<Sample> {
     out
 }
 
-/// Iterates through compaction rules (possibly in parallel) and applies the specified operation,
-/// cascading through chained compaction series (a destination that itself has rules).
+/// A cascade entry: (destination key, samples written to it, its previous last timestamp).
+type PendingCompactionWrite = (ValkeyString, Vec<Sample>, Option<Timestamp>);
+
+/// Keys of the series whose rules a compaction pass has already run: the series it started
+/// from (recorded once the pass cascades), plus every cascaded series.
 ///
 /// Rule creation rejects circular chains (`check_new_rule_circular_dependency`), but the
-/// traversal keeps a `visited` guard anyway so a corrupted topology cannot loop forever.
+/// traversal keeps this guard anyway so a corrupted topology can neither loop forever nor open
+/// a series that is already borrowed further up the pass.
+#[derive(Default)]
+struct Visited(SmallVec<[Box<[u8]>; TEMP_VEC_LEN]>);
+
+impl Visited {
+    fn contains(&self, key: &[u8]) -> bool {
+        self.0.iter().any(|k| k.as_ref() == key)
+    }
+
+    fn insert(&mut self, key: &[u8]) {
+        self.0.push(key.into());
+    }
+}
+
+/// Iterates through compaction rules (possibly in parallel) and applies the specified operation,
+/// cascading through chained compaction series (a destination that itself has rules).
 ///
 /// Cascading strategy differs by operation:
 /// - `RemoveRange` reapplies the *same* absolute `[start, end]` range at every level. This is
@@ -888,78 +905,90 @@ fn process_series_with_compaction(
     // silently, and a TS.DEL propagated into destinations emits only the
     // source's `ts.del`.
     let notify_destinations = matches!(op, CompactionOp::AddNew(_) | CompactionOp::AddBatch { .. });
-    let mut notified: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
-    let mut visited: SmallVec<[SeriesRef; TEMP_VEC_LEN]> = SmallVec::new();
-    visited.push(series.id);
+    let mut notified: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = SmallVec::new();
+    let mut visited = Visited::default();
 
-    let destinations = get_compaction_series(ctx, series);
+    let destinations = get_compaction_series(ctx, series, &visited);
     if destinations.is_empty() {
         return Ok(());
     }
+    let Destinations {
+        mut keys,
+        series: guards,
+    } = destinations;
 
-    let outcomes = apply_rules_on_destinations(series, destinations, op)?;
+    let outcomes = apply_rules_on_destinations(series, guards, op)?;
 
     match op {
         CompactionOp::RemoveRange { .. } => {
-            let mut pending: SmallVec<[SeriesRef; TEMP_VEC_LEN]> =
-                outcomes.iter().map(|o| o.dest_id).collect();
-            for outcome in &outcomes {
-                if !outcome.written.is_empty() {
-                    notified.push(outcome.dest_id);
-                }
+            let mut pending: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = outcomes
+                .iter()
+                .filter_map(|o| keys[o.rule_index].take())
+                .collect();
+            if !pending.is_empty() {
+                visited.insert(&series.key);
             }
 
-            while let Some(id) = pending.pop() {
-                if visited.contains(&id) {
+            while let Some(child_key) = pending.pop() {
+                if visited.contains(child_key.as_slice()) {
                     continue;
                 }
-                visited.push(id);
-
-                let Some(mut child) = get_destination_series(ctx, id) else {
+                let Ok(Some(mut child)) = try_get_timeseries_mut(ctx, &child_key, None) else {
                     continue;
                 };
-                let child_destinations = get_compaction_series(ctx, &mut child);
+                if child.rules.is_empty() {
+                    continue;
+                }
+                visited.insert(child_key.as_slice());
+
+                let child_destinations = get_compaction_series(ctx, &mut child, &visited);
                 if child_destinations.is_empty() {
                     continue;
                 }
-                pending.extend(child_destinations.iter().map(|d| d.id));
-
-                let child_outcomes =
-                    apply_rules_on_destinations(&mut child, child_destinations, op)?;
-                for outcome in child_outcomes {
-                    if !outcome.written.is_empty() {
-                        notified.push(outcome.dest_id);
-                    }
-                }
+                let Destinations {
+                    keys: mut child_keys,
+                    series: child_guards,
+                } = child_destinations;
+                let child_outcomes = apply_rules_on_destinations(&mut child, child_guards, op)?;
+                pending.extend(
+                    child_outcomes
+                        .iter()
+                        .filter_map(|o| child_keys[o.rule_index].take()),
+                );
             }
         }
         _ => {
             let mut pending: SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]> = SmallVec::new();
-            for outcome in outcomes {
-                if outcome.written.is_empty() {
-                    continue;
-                }
-                notified.push(outcome.dest_id);
-                pending.push((
-                    outcome.dest_id,
-                    dedupe_written_samples(outcome.written),
-                    outcome.dest_prev_last,
-                ));
+            queue_written_outcomes(
+                &mut keys,
+                outcomes,
+                notify_destinations.then_some(&mut notified),
+                &mut pending,
+            );
+            if !pending.is_empty() {
+                visited.insert(&series.key);
             }
 
-            while let Some((id, samples, prev_last)) = pending.pop() {
-                if visited.contains(&id) {
+            while let Some((child_key, samples, prev_last)) = pending.pop() {
+                if visited.contains(child_key.as_slice()) {
                     continue;
                 }
-                visited.push(id);
-
-                let Some(mut child) = get_destination_series(ctx, id) else {
+                let Ok(Some(mut child)) = try_get_timeseries_mut(ctx, &child_key, None) else {
                     continue;
                 };
-                let child_destinations = get_compaction_series(ctx, &mut child);
+                if child.rules.is_empty() {
+                    continue;
+                }
+                visited.insert(child_key.as_slice());
+
+                let child_destinations = get_compaction_series(ctx, &mut child, &visited);
                 if child_destinations.is_empty() {
                     continue;
                 }
+                let Destinations {
+                    keys: mut child_keys,
+                    series: child_guards,
+                } = child_destinations;
 
                 // A cascaded batch is this level's own committed buckets, which are published
                 // in bucket order — so input order and sorted order coincide.
@@ -971,33 +1000,53 @@ fn process_series_with_compaction(
                     input_order: &cascade_order,
                 };
                 let child_outcomes =
-                    apply_rules_on_destinations(&mut child, child_destinations, batch_op)?;
-
-                for outcome in child_outcomes {
-                    if outcome.written.is_empty() {
-                        continue;
-                    }
-                    notified.push(outcome.dest_id);
-                    pending.push((
-                        outcome.dest_id,
-                        dedupe_written_samples(outcome.written),
-                        outcome.dest_prev_last,
-                    ));
-                }
+                    apply_rules_on_destinations(&mut child, child_guards, batch_op)?;
+                queue_written_outcomes(
+                    &mut child_keys,
+                    child_outcomes,
+                    notify_destinations.then_some(&mut notified),
+                    &mut pending,
+                );
             }
         }
     }
 
-    if notify_destinations && !notified.is_empty() {
+    if !notified.is_empty() {
         notify_compaction(ctx, &notified);
     }
 
     Ok(())
 }
 
+/// Queues every destination that `outcomes` wrote to for the next cascade level, and for a
+/// `ts.add:dest` notification when `notified` is given.
+fn queue_written_outcomes(
+    keys: &mut [Option<ValkeyString>],
+    outcomes: Vec<RuleOutcome>,
+    mut notified: Option<&mut SmallVec<[ValkeyString; TEMP_VEC_LEN]>>,
+    pending: &mut SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]>,
+) {
+    for outcome in outcomes {
+        if outcome.written.is_empty() {
+            continue;
+        }
+        let Some(dest_key) = keys[outcome.rule_index].take() else {
+            continue;
+        };
+        if let Some(notified) = notified.as_deref_mut() {
+            notified.push(dest_key.clone());
+        }
+        pending.push((
+            dest_key,
+            dedupe_written_samples(outcome.written),
+            outcome.dest_prev_last,
+        ));
+    }
+}
+
 fn apply_rules_on_destinations(
     series: &mut TimeSeries,
-    destinations: SmallVec<[SeriesGuardMut; TEMP_VEC_LEN]>,
+    destinations: SmallVec<[Option<SeriesGuardMut>; TEMP_VEC_LEN]>,
     op: CompactionOp,
 ) -> TsdbResult<Vec<RuleOutcome>> {
     let mut rules = std::mem::take(&mut series.rules);
@@ -1006,14 +1055,21 @@ fn apply_rules_on_destinations(
     result
 }
 
-/// Internal function that handles execution of compaction rules.
+/// Internal function that handles execution of compaction rules. `child_series` holds one
+/// entry per rule, in rule order; a rule whose entry is `None` is skipped.
 fn apply_rules_internal(
     series: &TimeSeries,
     rules: &mut [CompactionRule],
-    child_series: SmallVec<[SeriesGuardMut; TEMP_VEC_LEN]>,
+    child_series: SmallVec<[Option<SeriesGuardMut>; TEMP_VEC_LEN]>,
     op: CompactionOp,
 ) -> TsdbResult<Vec<RuleOutcome>> {
-    if rules.is_empty() {
+    let mut destinations = rules
+        .iter_mut()
+        .zip(child_series)
+        .enumerate()
+        .filter_map(|(index, (rule, dest))| dest.map(|dest| (index, rule, dest)))
+        .collect::<Vec<_>>();
+    if destinations.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1021,21 +1077,20 @@ fn apply_rules_internal(
     // upserted sample each rule does O(1) aggregator work (or recomputes one bucket), far less
     // than the thread spawns a parallel pass costs — which every TS.ADD to a source with two or
     // more rules used to pay.
-    let parallel = rules.len() >= PARALLEL_THRESHOLD
+    let parallel = destinations.len() >= PARALLEL_THRESHOLD
         && matches!(
             op,
             CompactionOp::AddBatch { .. } | CompactionOp::RemoveRange { .. }
         );
-    let mut destinations = rules.iter_mut().zip(child_series).collect::<Vec<_>>();
     let results: Vec<Result<RuleOutcome, TsdbError>> = destinations
         .par_mut()
         .num_threads(if parallel { 0 } else { 1 }) // 0 is shorthand for Auto
-        .map(|(rule, dest_guard)| {
-            let dest_id = dest_guard.id;
+        .map(|(rule_index, rule, dest_guard)| {
+            let rule_index = *rule_index;
             let dest_prev_last = dest_guard.last_sample.map(|s| s.timestamp);
             let mut cctx = CompactionContext::new(series, dest_guard, rule);
             apply_op(&mut cctx, op).map(|_| RuleOutcome {
-                dest_id,
+                rule_index,
                 dest_prev_last,
                 written: cctx.written,
             })
@@ -1065,61 +1120,117 @@ fn apply_rules_internal(
     }
 }
 
-pub(super) fn get_destination_series(
-    ctx: &'_ Context,
-    dest_id: SeriesRef,
-) -> Option<SeriesGuardMut<'_>> {
-    if let Ok(Some(res)) = get_series_by_id(ctx, dest_id, None)
-        && res.is_compaction()
-    {
-        return Some(res);
-    };
-    ctx.log_verbose("Destination series for compaction not found or not a compaction series");
-    None
+/// The destinations of a series' rules, opened for writing: one slot per rule, in rule order.
+/// A `None` slot is a rule that is kept but not applied this time.
+struct Destinations<'a> {
+    keys: SmallVec<[Option<ValkeyString>; TEMP_VEC_LEN]>,
+    series: SmallVec<[Option<SeriesGuardMut<'a>>; TEMP_VEC_LEN]>,
 }
 
+impl Destinations<'_> {
+    fn is_empty(&self) -> bool {
+        self.series.iter().all(Option::is_none)
+    }
+}
+
+/// How one rule's destination resolved.
+enum Resolved<'a> {
+    Open(ValkeyString, SeriesGuardMut<'a>),
+    /// Keep the rule, but don't apply it now.
+    Skip,
+    /// The rule no longer has a destination; remove it.
+    Stale,
+}
+
+/// Opens the destination of each of `series`' rules for writing.
+///
+/// A destination is found by key, and is accepted only while it still
+/// names `series` as its source (the back-link). A rule whose destination key is gone, holds a
+/// different kind of value, or now belongs to another source (the key was deleted and
+/// re-created, overwritten by `RENAME`, restored from another series' dump...) is removed:
+/// writing into it would corrupt an unrelated series.
 fn get_compaction_series<'a>(
     ctx: &'a Context,
     series: &mut TimeSeries,
-) -> SmallVec<[SeriesGuardMut<'a>; TEMP_VEC_LEN]> {
+    visited: &Visited,
+) -> Destinations<'a> {
+    let mut destinations = Destinations {
+        keys: SmallVec::new(),
+        series: SmallVec::new(),
+    };
     if series.rules.is_empty() {
-        return SmallVec::new();
+        return destinations;
     }
 
-    let mut missing: SmallVec<[_; TEMP_VEC_LEN]> = SmallVec::new();
-    let mut destinations: SmallVec<[_; TEMP_VEC_LEN]> = SmallVec::new();
-
-    for rule in series.rules.iter() {
-        if let Some(dest_series) = get_destination_series(ctx, rule.dest_id) {
-            // Destination series exists, add it to the list
-            destinations.push(dest_series);
-        } else {
-            // Destination series doesn't exist, mark rule for removal
-            missing.push(rule.dest_id);
-        }
+    let mut stale: SmallVec<[usize; TEMP_VEC_LEN]> = SmallVec::new();
+    for (index, rule) in series.rules.iter().enumerate() {
+        let resolved = resolve_destination(ctx, &series.key, rule, visited, &destinations);
+        let (dest_key, dest) = match resolved {
+            Resolved::Open(dest_key, dest) => (Some(dest_key), Some(dest)),
+            Resolved::Skip => (None, None),
+            Resolved::Stale => {
+                stale.push(index);
+                (None, None)
+            }
+        };
+        destinations.keys.push(dest_key);
+        destinations.series.push(dest);
     }
 
-    if !missing.is_empty() {
-        series.rules.retain(|r| !missing.contains(&r.dest_id));
+    for &index in stale.iter().rev() {
+        series.rules.remove(index);
+        destinations.keys.remove(index);
+        destinations.series.remove(index);
     }
     destinations
 }
 
-fn notify_compaction(ctx: &Context, ids: &[SeriesRef]) {
-    with_timeseries_postings(ctx, |postings| {
-        for &id in ids {
-            let Some(key) = postings.get_key_by_id(id) else {
-                ctx.log_warning("Compaction notification failed: series key not found");
-                continue;
-            };
-            let key = create_key_string(ctx, key.as_ref());
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add:dest", &key);
-            // Callers only reach here for destinations that materialized a sample, so this is
-            // the one place both direct and cascaded compaction output can wake a `TS.READ`
-            // reader blocked on a rollup key.
-            signal_timeseries_ready(ctx, &key);
-        }
-    });
+fn resolve_destination<'a>(
+    ctx: &'a Context,
+    source_key: &[u8],
+    rule: &CompactionRule,
+    visited: &Visited,
+    opened: &Destinations<'a>,
+) -> Resolved<'a> {
+    let dest_bytes = rule.dest.key();
+    if dest_bytes == source_key || visited.contains(dest_bytes) {
+        // A cycle: the series is already borrowed by this pass.
+        return Resolved::Skip;
+    }
+    if opened
+        .keys
+        .iter()
+        .flatten()
+        .any(|k| k.as_slice() == dest_bytes)
+    {
+        // A second rule for the same destination; it can never have been valid.
+        return Resolved::Stale;
+    }
+
+    let dest_key = rule.dest.to_key_string(ctx);
+    let Ok(Some(dest)) = try_get_timeseries_mut(ctx, &dest_key, None) else {
+        ctx.log_verbose("Destination series for compaction not found");
+        return Resolved::Stale;
+    };
+    let links_back = dest
+        .src_series
+        .as_ref()
+        .is_some_and(|src| src.points_to(source_key));
+    if !links_back {
+        ctx.log_verbose("Compaction destination no longer names this series as its source");
+        return Resolved::Stale;
+    }
+    Resolved::Open(dest_key, dest)
+}
+
+fn notify_compaction(ctx: &Context, keys: &[ValkeyString]) {
+    for key in keys {
+        ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add:dest", key);
+        // Callers only reach here for destinations that materialized a sample, so this is
+        // the one place both direct and cascaded compaction output can wake a `TS.READ`
+        // reader blocked on a rollup key.
+        signal_timeseries_ready(ctx, key);
+    }
 }
 
 /// Write one aggregated bucket to the destination.
@@ -1210,16 +1321,13 @@ impl TimeSeries {
         self.rules.push(rule);
     }
 
-    pub fn remove_compaction_rule(&mut self, dest_id: SeriesRef) -> Option<CompactionRule> {
-        let Some(index) = self.rules.iter().position(|rule| rule.dest_id == dest_id) else {
-            // No rule found for this destination ID
-            return None;
-        };
+    /// Removes the rule whose destination is the series stored under `dest_key`.
+    pub fn remove_compaction_rule(&mut self, dest_key: &[u8]) -> Option<CompactionRule> {
+        let index = self
+            .rules
+            .iter()
+            .position(|rule| rule.dest.points_to(dest_key))?;
         Some(self.rules.remove(index))
-    }
-
-    pub fn get_rule_by_dest_id(&self, dest_id: SeriesRef) -> Option<&CompactionRule> {
-        self.rules.iter().find(|rule| rule.dest_id == dest_id)
     }
 
     pub fn remove_range_with_compaction(
@@ -1286,14 +1394,18 @@ impl TimeSeries {
     }
 }
 
+/// The still-open bucket of the rule that feeds `series`, a compaction destination (`LATEST`).
 pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -> Option<Sample> {
-    let src_id = series.src_series?;
-    let Ok(Some(parent)) = get_series_by_id(ctx, src_id, None) else {
+    let parent_key = series.src_series.as_ref()?.to_key_string(ctx);
+    let Ok(Some(parent)) = try_get_timeseries(ctx, &parent_key, None) else {
         // No source series or it doesn't exist
         return None;
     };
 
-    let rule = parent.get_rule_by_dest_id(series.id)?;
+    let rule = parent
+        .rules
+        .iter()
+        .find(|rule| rule.dest.points_to(&series.key))?;
     let start = rule.bucket_start?;
 
     let mut agg = rule.aggregator.clone();
@@ -1303,28 +1415,50 @@ pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -
     Some(sample)
 }
 
-pub fn check_circular_dependencies(ctx: &Context, series: &mut TimeSeries) -> ValkeyResult<()> {
-    let graph = build_dependency_graph(ctx, series)?;
-    if graph.is_empty() {
-        return Ok(());
+/// Points the compaction partners of a series renamed from `old_key` to its current key at that
+/// key: its source's rule for it, and each of its destinations' source link.
+pub(crate) fn relink_renamed_series(ctx: &Context, series: &TimeSeries, old_key: &[u8]) {
+    let new_key: &[u8] = &series.key;
+    // Never re-open the renamed series itself: the caller holds it.
+    let is_partner = |link: &SeriesLink| !link.points_to(new_key);
+
+    if let Some(source_link) = series.src_series.as_ref().filter(|l| is_partner(l))
+        && let Ok(Some(mut source)) =
+            try_get_timeseries_mut(ctx, &source_link.to_key_string(ctx), None)
+    {
+        for rule in source.rules.iter_mut() {
+            if rule.dest.points_to(old_key) {
+                rule.dest = SeriesLink::from_key(new_key);
+            }
+        }
     }
-    Ok(())
+
+    for rule in series.rules.iter().filter(|rule| is_partner(&rule.dest)) {
+        if let Ok(Some(mut dest)) = try_get_timeseries_mut(ctx, &rule.dest.to_key_string(ctx), None)
+            && dest
+                .src_series
+                .as_ref()
+                .is_some_and(|src| src.points_to(old_key))
+        {
+            dest.src_series = Some(SeriesLink::from_key(new_key));
+        }
+    }
 }
 
 /// Check if adding a new compaction rule would create a circular dependency
 pub fn check_new_rule_circular_dependency(
     ctx: &Context,
-    source_id: SeriesRef,
-    dest_id: SeriesRef,
+    source_key: &ValkeyString,
+    dest_key: &ValkeyString,
 ) -> ValkeyResult<()> {
     // Adding source -> destination creates a cycle exactly when the
     // destination can already reach the source. Traverse with read-only
     // guards: callers acquire mutable guards only after this check, so a
-    // path that reaches source_id cannot alias an existing mutable borrow.
+    // path that reaches the source cannot alias an existing mutable borrow.
     if dependency_reaches(
         ctx,
-        dest_id,
-        source_id,
+        dest_key,
+        source_key.as_slice(),
         &mut std::collections::HashSet::new(),
     )? {
         return Err(ValkeyError::Str(
@@ -1337,65 +1471,27 @@ pub fn check_new_rule_circular_dependency(
 
 fn dependency_reaches(
     ctx: &Context,
-    current_id: SeriesRef,
-    target_id: SeriesRef,
-    visited: &mut std::collections::HashSet<SeriesRef>,
+    current: &ValkeyString,
+    target: &[u8],
+    visited: &mut std::collections::HashSet<Vec<u8>>,
 ) -> ValkeyResult<bool> {
-    if current_id == target_id {
+    if current.as_slice() == target {
         return Ok(true);
     }
-    if !visited.insert(current_id) {
+    if !visited.insert(current.as_slice().to_vec()) {
         return Ok(false);
     }
 
-    let Some(key) = get_series_key_by_id(ctx, current_id) else {
-        return Ok(false);
-    };
-    let Some(series) = try_get_timeseries(ctx, &key, None)? else {
+    let Some(series) = try_get_timeseries(ctx, current, None)? else {
         return Ok(false);
     };
 
     for rule in &series.rules {
-        if dependency_reaches(ctx, rule.dest_id, target_id, visited)? {
+        if dependency_reaches(ctx, &rule.dest.to_key_string(ctx), target, visited)? {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-pub fn build_dependency_graph(
-    ctx: &Context,
-    series: &mut TimeSeries,
-) -> ValkeyResult<TopoSort<SeriesRef>> {
-    let mut graph = TopoSort::with_capacity(10);
-
-    if !series.rules.is_empty() {
-        build_dependency_graph_internal(ctx, series, &mut graph)?;
-    }
-
-    Ok(graph)
-}
-
-fn build_dependency_graph_internal(
-    ctx: &Context,
-    source_series: &mut TimeSeries,
-    graph: &mut TopoSort<SeriesRef>,
-) -> ValkeyResult<()> {
-    let mut destinations = get_compaction_series(ctx, source_series);
-    if destinations.is_empty() {
-        return Ok(());
-    }
-    let dest_ids = destinations.iter().map(|x| x.id).collect::<Vec<_>>();
-    graph.insert(source_series.id, dest_ids);
-    if graph.cycle_detected() {
-        return Err(ValkeyError::Str(
-            error_consts::COMPACTION_CIRCULAR_DEPENDENCY,
-        ));
-    }
-    for dest in destinations.iter_mut() {
-        build_dependency_graph_internal(ctx, dest, graph)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

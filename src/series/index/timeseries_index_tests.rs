@@ -1,12 +1,15 @@
 #[cfg(test)]
 mod tests {
+    use crate::aggregators::AggregationType;
     use crate::common::constants::METRIC_NAME_LABEL;
     use crate::labels::Label;
     use crate::labels::filters::{LabelFilter, SeriesSelector};
     use crate::series::index::{
-        PostingStat, TimeSeriesIndex, index_loaded_series, next_timeseries_id,
+        PostingStat, TimeSeriesIndex, index_imported_series, index_loaded_series,
+        next_timeseries_id,
     };
     use crate::series::time_series::TimeSeries;
+    use crate::series::{CompactionRule, SeriesLink};
 
     fn create_series_from_metric_name(prometheus_name: &str) -> TimeSeries {
         let mut ts = TimeSeries::new();
@@ -672,7 +675,8 @@ mod tests {
         index.index_timeseries(&original, b"a");
 
         let mut copy = original.clone();
-        copy.src_series = Some(next_timeseries_id());
+        copy.src_series = Some(SeriesLink::from_key(b"src"));
+        copy.rules.push(test_rule(b"dst"));
         {
             let mut postings = index.get_postings_mut();
             index_loaded_series(&mut postings, &mut copy, b"b");
@@ -680,7 +684,7 @@ mod tests {
 
         assert_ne!(copy.id, original.id, "the copy must get a fresh id");
         assert!(
-            copy.src_series.is_none(),
+            copy.src_series.is_none() && copy.rules.is_empty(),
             "compaction linkage belongs to the original"
         );
         assert_eq!(index.count(), 2);
@@ -693,6 +697,47 @@ mod tests {
             postings.get_key_by_id(copy.id).map(|k| k.as_ref()),
             Some(&b"b"[..])
         );
+    }
+
+    #[test]
+    fn test_index_imported_series_remaps_a_colliding_id_but_keeps_its_links() {
+        // A slot import brings `b` with an id that a different local key already owns.
+        let index = TimeSeriesIndex::new();
+        let local = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&local, b"a");
+
+        let mut imported = create_series_from_metric_name(r#"latency{region="eu-west-1"}"#);
+        imported.id = local.id;
+        imported.src_series = Some(SeriesLink::from_key(b"{t}src"));
+        imported.rules.push(test_rule(b"{t}dst"));
+        {
+            let mut postings = index.get_postings_mut();
+            index_imported_series(&mut postings, &mut imported, b"b");
+        }
+
+        assert_ne!(
+            imported.id, local.id,
+            "the imported series must get a fresh id"
+        );
+        assert_eq!(imported.src_series, Some(SeriesLink::from_key(b"{t}src")));
+        assert_eq!(imported.rules.len(), 1);
+        assert_eq!(imported.rules[0].dest, SeriesLink::from_key(b"{t}dst"));
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(imported.id).map(|k| k.as_ref()),
+            Some(&b"b"[..])
+        );
+    }
+
+    fn test_rule(dest_key: &[u8]) -> CompactionRule {
+        CompactionRule {
+            dest: SeriesLink::from_key(dest_key),
+            aggregator: AggregationType::Sum.into(),
+            bucket_duration: 1000,
+            align_timestamp: 0,
+            bucket_start: None,
+            has_samples: false,
+        }
     }
 
     #[test]

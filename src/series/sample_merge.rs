@@ -1,7 +1,7 @@
+use crate::common::context::key_for_display;
 use crate::common::{Sample, Timestamp};
 use crate::error::TsdbResult;
 use crate::series::bulk_add::merge_samples_into_series;
-use crate::series::index::get_series_key_by_id;
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries};
 use orx_parallel::ParResult;
 use orx_parallel::{Par, ParCollectionMut};
@@ -298,8 +298,7 @@ fn run_group_compactions(ctx: &Context, groups: &mut [PerSeriesSamples]) {
                 .series
                 .batch_compaction(ctx, &group.added, group.prev_last, &group.added_order)
         {
-            let key = get_series_key_by_id(ctx, group.series.id)
-                .unwrap_or_else(|| ctx.create_string("Unknown"));
+            let key = key_for_display(&group.series.key);
             let msg = format!("TSDB: error running compaction for key '{key}': {e}");
             ctx.log_warning(&msg);
         }

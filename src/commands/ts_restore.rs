@@ -20,12 +20,16 @@ use crate::common::context::{get_current_db, is_real_user_client};
 use crate::config::is_debug_mode_enabled;
 use crate::series::TimeSeries;
 use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
-use crate::series::index::index_series_by_key;
-use crate::series::series_data_type::{TIMESERIES_TYPE_ENCODING_VERSION, VK_TIME_SERIES_TYPE};
+use crate::series::index::index_imported_series_by_key;
+use crate::series::series_data_type::{VK_TIME_SERIES_TYPE, is_supported_encoding_version};
 use std::os::raw::c_void;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};
 
-/// `TS._RESTORE key <serialized-payload>`
+/// `TS._RESTORE key <serialized-payload> <encoding-version>`
+///
+/// The payload carries no encoding version of its own, so the emitter names it: a node reading
+/// a payload from a newer or older node (slot migration, AOF replay) parses it by the layout it
+/// was written with, or refuses a version it does not support instead of misreading it.
 ///
 /// Internal-only: fed by `aof_rewrite`/AOF replay, never meant to be invoked by a regular
 /// client. The payload bypasses `RESTORE`'s DUMP footer (version/CRC) checks entirely, so a
@@ -43,24 +47,28 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             "ERR TS._RESTORE is an internal command and cannot be invoked directly",
         ));
     }
-    if args.len() != 3 {
+    if args.len() != 4 {
         return Err(ValkeyError::WrongArity);
     }
+    let enc_ver = args[3]
+        .parse_integer()
+        .ok()
+        .and_then(|v| i32::try_from(v).ok())
+        .filter(|v| is_supported_encoding_version(*v))
+        .ok_or(ValkeyError::Str(
+            "TSDB: unsupported TS._RESTORE payload encoding version",
+        ))?;
     let key = &args[1];
     let payload = &args[2];
 
     // Reconstruct the series via the type's `rdb_load`. This mirrors `RESTORE` but reads the
     // buffer produced by `RedisModule_SaveDataTypeToString` (no version/CRC footer). The string
-    // carries no encoding version of its own, so pass ours explicitly — the plain
+    // carries no encoding version of its own, so pass the one the emitter named — the plain
     // `LoadDataTypeFromString` supplies encver 0, which `rdb_load_series`'s foreign-payload
     // guard would (correctly) reject.
     let raw_type = *VK_TIME_SERIES_TYPE.raw_type.borrow();
     let series_ptr: *mut c_void = unsafe {
-        raw::RedisModule_LoadDataTypeFromStringEncver.unwrap()(
-            payload.inner,
-            raw_type,
-            TIMESERIES_TYPE_ENCODING_VERSION,
-        )
+        raw::RedisModule_LoadDataTypeFromStringEncver.unwrap()(payload.inner, raw_type, enc_ver)
     };
     if series_ptr.is_null() {
         return Err(ValkeyError::Str("TSDB: failed to deserialize series"));
@@ -71,6 +79,7 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let db = get_current_db(ctx);
     series._db = Some(db);
+    series.key = key.as_slice().into();
 
     let writable_key = ctx.open_key_writable(key);
     if !writable_key.is_empty() {
@@ -90,7 +99,7 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if is_key_in_slot_import(key.as_slice()) {
         add_delayed_indexing_key(db, key.as_slice());
     } else {
-        index_series_by_key(ctx, key.as_slice());
+        index_imported_series_by_key(ctx, key.as_slice());
     }
 
     Ok(ValkeyValue::SimpleStringStatic("OK"))
