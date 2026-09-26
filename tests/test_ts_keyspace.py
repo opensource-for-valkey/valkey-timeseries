@@ -116,6 +116,21 @@ class TestNotifications(ValkeyTimeSeriesTestCaseBase):
         # Verify we received the expected notifications
         assert_message(notifications, "ts.add", key)
 
+    def test_add_auto_timestamp_notifications(self):
+        """TS.ADD with `*` rewrites its replication args; the event must still name the key."""
+
+        self.create_subscribe_clients()
+
+        key = "ts:notifications:add:auto_ts"
+        self.create_ts(key)
+
+        self.collect_notifications(timeout=0.5)
+
+        self.client.execute_command("TS.ADD", key, "*", 42.0)
+
+        notifications = self.collect_notifications()
+        assert_message(notifications, "ts.add", key)
+
     def test_madd_notifications(self):
         """Test that TS.MADD generates appropriate keyspace notifications."""
 
@@ -202,6 +217,83 @@ class TestNotifications(ValkeyTimeSeriesTestCaseBase):
 
         # Verify we received the expected notifications
         assert_message(notifications, "ts.del", key)
+
+    def test_mdel_notifications(self):
+        """TS.MDEL with a range emits `ts.del` for each matching series it deleted from."""
+
+        self.create_subscribe_clients()
+
+        keys = ["ts:notifications:mdel1", "ts:notifications:mdel2"]
+        for key in keys:
+            self.client.execute_command("TS.CREATE", key, "LABELS", "group", "mdel")
+            self.client.execute_command("TS.ADD", key, 1000, 1.0)
+        other = "ts:notifications:mdel:other"
+        self.client.execute_command("TS.CREATE", other, "LABELS", "group", "other")
+        self.client.execute_command("TS.ADD", other, 1000, 1.0)
+
+        self.collect_notifications(timeout=0.5)
+
+        result = self.client.execute_command("TS.MDEL", 0, 2000, "FILTER", "group=mdel")
+        assert result == 2
+
+        notifications = self.collect_notifications(timeout=1.0)
+        for key in keys:
+            assert_message(notifications, "ts.del", key)
+        assert not any(n['channel'] == other for n in notifications), notifications
+
+    def test_addbulk_notifications(self):
+        """TS.ADDBULK emits `ts.add` for the target series."""
+
+        self.create_subscribe_clients()
+
+        key = "ts:notifications:addbulk"
+        self.client.execute_command("TS.CREATE", key)
+
+        self.collect_notifications(timeout=0.5)
+
+        payload = r'{"values":[1,2,3],"timestamps":[1000,2000,3000]}'
+        assert self.client.execute_command("TS.ADDBULK", key, payload) == [3, 3]
+
+        notifications = self.collect_notifications()
+        assert_message(notifications, "ts.add", key)
+
+    def test_addbulk_into_compaction_dest_notifications(self):
+        """A direct TS.ADDBULK into a compaction destination is a client write, not rule
+        output: it emits `ts.add`, like TS.ADD/TS.MADD into a destination on RedisTimeSeries."""
+
+        self.create_subscribe_clients()
+
+        source_key = "ts:parent:addbulk_direct"
+        dest_key = "ts:compaction:addbulk_direct"
+        self.create_ts_with_compaction_rule(source_key, dest_key)
+
+        self.collect_notifications(timeout=0.5)
+
+        payload = r'{"values":[1,2],"timestamps":[1000,2000]}'
+        assert self.client.execute_command("TS.ADDBULK", dest_key, payload) == [2, 2]
+
+        notifications = self.collect_notifications()
+        assert_message(notifications, "ts.add", dest_key)
+        assert not any(n['data'] == 'ts.add:dest' for n in notifications), notifications
+
+    def test_addbulk_compaction_notifications(self):
+        """TS.ADDBULK on a source that closes a bucket emits `ts.add` and `ts.add:dest`."""
+
+        self.create_subscribe_clients()
+
+        source_key = "ts:parent:addbulk"
+        dest_key = "ts:compaction:addbulk"
+        self.create_ts_with_compaction_rule(source_key, dest_key)
+
+        self.collect_notifications(timeout=0.5)
+
+        # 1000 and 2000 fill the first 60s bucket; 61000 closes it.
+        payload = r'{"values":[1,2,3],"timestamps":[1000,2000,61000]}'
+        assert self.client.execute_command("TS.ADDBULK", source_key, payload) == [3, 3]
+
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add", source_key)
+        assert_message(notifications, "ts.add:dest", dest_key)
 
     def test_createrule_notifications(self):
         """Test that TS.CREATERULE generates appropriate keyspace notifications."""
