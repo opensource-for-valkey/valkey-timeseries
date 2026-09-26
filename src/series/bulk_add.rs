@@ -9,18 +9,43 @@ use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
+use crate::series::chunks::{ChunkOps, MIN_SAMPLES_FOR_BPS_ESTIMATE, TimeSeriesChunk};
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
-use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries, seal_chunk};
+use crate::series::{
+    DuplicatePolicy, SPLIT_SLACK_DIVISOR, SampleAddResult, TimeSeries, seal_chunk,
+};
 use orx_parallel::{IterIntoParIter, Par, ParCollection};
 use simd_json::base::{ValueAsArray, ValueAsScalar};
 use simd_json::borrowed::Value;
 use simd_json::prelude::ValueObjectAccess;
+use std::cell::OnceCell;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 pub const MAX_SAMPLES_PER_INSERT: usize = 1_000;
-const EARLY_CHUNK_CAPACITY_FACTOR: f64 = 0.7;
-const EARLY_CHUNK_SAMPLE_THRESHOLD: usize = 10;
+
+// Chunk sizing for bulk ingest. Chunks are planned to `max_size` from an estimate of the
+// series' encoded bytes per sample. Where a chunk is sealed as soon as it is built (samples
+// older than the series), a remainder is spread across the new chunks instead of becoming a
+// nearly empty chunk of its own, overshooting by up to `max_size / OVERFILL_DIVISOR`. That
+// limit sits below the split threshold (`max_size / SPLIT_SLACK_DIVISOR` over), leaving the
+// gap as headroom for estimate error. Appends never overfill: their last chunk becomes the
+// append target and keeps growing, so a small remainder there is not a permanent small chunk.
+const OVERFILL_DIVISOR: usize = 8;
+const _: () = assert!(OVERFILL_DIVISOR > SPLIT_SLACK_DIVISOR);
+/// Fixed-point scale for bytes-per-sample estimates: encoded bytes per `BPS_SCALE` samples.
+/// Compressed encodings commonly land between 1 and 3 bytes per sample, where rounding to a
+/// whole byte would misjudge capacity by up to 2x.
+const BPS_SCALE: usize = 256;
+/// Recent chunks averaged for the estimate.
+const BPS_HISTORY_CHUNKS: usize = 4;
+/// A series with no usable history is estimated by encoding up to `BPS_PROBE_WINDOWS`
+/// windows of `BPS_PROBE_WINDOW` samples, spread across the batch, into a scratch chunk.
+const BPS_PROBE_WINDOW: usize = 128;
+const BPS_PROBE_WINDOWS: usize = 4;
+/// Upper bound on the encoded size of one sample in any encoding (XOR encodings can exceed the
+/// 16 raw bytes by a few control bits; pinned by a test on adversarial input). A group this
+/// bound says fits needs no estimate at all.
+const WORST_CASE_BYTES_PER_SAMPLE: usize = 20;
 
 #[derive(Debug)]
 pub struct IngestedSamples {
@@ -108,46 +133,144 @@ fn exec_merge(
     })
 }
 
-#[inline]
-fn calculate_capacity(chunk: &TimeSeriesChunk) -> usize {
-    let mut capacity = chunk.estimate_remaining_sample_capacity();
-
-    if capacity > 0 && chunk.len() < EARLY_CHUNK_SAMPLE_THRESHOLD && chunk.is_compressed() {
-        capacity = (capacity as f64 * EARLY_CHUNK_CAPACITY_FACTOR).floor() as usize;
-        capacity = capacity.max(1);
+/// Encoded bytes per [`BPS_SCALE`] samples expected for new data in `series`.
+///
+/// Averages the most recent chunks that hold enough samples for their ratio to mean something
+/// (sealed chunks are shrunk, so `size()` is encoded bytes, not allocation). A series with no
+/// such chunk is measured by encoding samples of `batch` into a scratch chunk.
+fn estimate_bps(series: &TimeSeries, batch: &[Sample]) -> usize {
+    const UNCOMPRESSED: usize = size_of::<Sample>() * BPS_SCALE;
+    if !series.is_compressed() {
+        return UNCOMPRESSED;
     }
 
-    capacity
+    let (bytes, count) = series
+        .chunks
+        .iter()
+        .rev()
+        .filter(|c| c.len() >= MIN_SAMPLES_FOR_BPS_ESTIMATE)
+        .take(BPS_HISTORY_CHUNKS)
+        .fold((0usize, 0usize), |(b, n), c| (b + c.size(), n + c.len()));
+    if count > 0 {
+        return (bytes * BPS_SCALE).div_ceil(count).max(1);
+    }
+
+    if batch.len() < MIN_SAMPLES_FOR_BPS_ESTIMATE {
+        return UNCOMPRESSED;
+    }
+    // Probe contiguous windows spread across the batch (a prefix alone misjudges data whose
+    // shape changes along the batch), each measured without its first sample: that one is
+    // stored raw, and over a short window of very compressible data it would dominate.
+    // At most half the batch is probed, so a batch just past the no-estimate fast path is
+    // not encoded twice over.
+    let window = BPS_PROBE_WINDOW.min(batch.len());
+    let windows = BPS_PROBE_WINDOWS.min(batch.len() / (2 * window)).max(1);
+    let stride = batch.len() / windows;
+    let (mut bytes, mut count) = (0usize, 0usize);
+    let mut scratch = TimeSeriesChunk::new(series.chunk_encoding, series.chunk_size_bytes);
+    for w in 0..windows {
+        let probe = &batch[w * stride..w * stride + window];
+        scratch.clear();
+        if scratch
+            .merge_samples(&probe[..1], Some(DuplicatePolicy::KeepLast))
+            .is_err()
+        {
+            return UNCOMPRESSED;
+        }
+        let head = scratch.size();
+        if scratch
+            .merge_samples(&probe[1..], Some(DuplicatePolicy::KeepLast))
+            .is_err()
+        {
+            return UNCOMPRESSED;
+        }
+        bytes += scratch.size().saturating_sub(head);
+        count += scratch.len().saturating_sub(1);
+    }
+    if count == 0 {
+        return UNCOMPRESSED;
+    }
+    (bytes * BPS_SCALE).div_ceil(count).max(1)
 }
 
-fn add_chunks_for_remaining_samples<'a>(
-    dest: &mut Vec<ChunkSampleGroup<'a>>,
-    series: &TimeSeries,
-    samples: &'a [Sample],
-) {
-    if samples.is_empty() {
-        return;
+/// How many samples fit in `bytes` at `bps` (see [`estimate_bps`]).
+#[inline]
+fn samples_for(bytes: usize, bps: usize) -> usize {
+    bytes * BPS_SCALE / bps
+}
+
+/// Number of samples to append to the tail chunk out of `rest` samples newer than it: as many
+/// as fill it to `max_size`, the rest being left for [`add_chunks_for_appends`].
+fn tail_take(tail: &TimeSeriesChunk, rest: usize, bps: impl Fn() -> usize) -> usize {
+    let room = tail.max_size().saturating_sub(tail.size());
+    // The common TS.MADD case: a few samples into a roomy tail. No estimate needed.
+    if rest.saturating_mul(WORST_CASE_BYTES_PER_SAMPLE) <= room {
+        return rest;
     }
+    samples_for(room, bps()).min(rest)
+}
 
-    let is_compressed = series.is_compressed();
-    // based on max chunk size and encoding, estimate capacity
-    let chunk_size = series.chunk_size_bytes;
-    // if we're compressed, estimate how many samples per chunk based on a conservative compression ratio of 2:1
-    let sample_size = size_of::<Sample>();
-    let sample_capacity = if is_compressed {
-        chunk_size / (sample_size / 2)
-    } else {
-        // uncompressed, so each sample is 16 bytes (8 bytes timestamp + 8 bytes value)
-        chunk_size / sample_size
-    };
-
-    // chunk the samples into new chunks
-    for slice in samples.chunks(sample_capacity) {
+fn push_new_groups<'a>(dest: &mut Vec<ChunkSampleGroup<'a>>, samples: &'a [Sample], size: usize) {
+    for slice in samples.chunks(size) {
         dest.push(ChunkSampleGroup {
             chunk: ChunkHolder::New,
             samples: slice,
         });
     }
+}
+
+/// Groups samples newer than every existing chunk into new chunks of `chunk_size` bytes.
+///
+/// Each chunk is filled to capacity and the last takes the remainder. It becomes the series'
+/// append target, so a small remainder grows with the next appends rather than staying small.
+fn add_chunks_for_appends<'a>(
+    dest: &mut Vec<ChunkSampleGroup<'a>>,
+    samples: &'a [Sample],
+    chunk_size: usize,
+    bps: impl Fn() -> usize,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    // Fits a single chunk even at the worst encoded size: skip the estimate.
+    if samples.len().saturating_mul(WORST_CASE_BYTES_PER_SAMPLE) <= chunk_size {
+        push_new_groups(dest, samples, samples.len());
+        return;
+    }
+    let cap = samples_for(chunk_size, bps()).max(1);
+    push_new_groups(dest, samples, cap);
+}
+
+/// Groups samples older than every existing chunk into new chunks of `chunk_size` bytes.
+///
+/// These chunks are sealed as soon as they are built, and appends never reach them, so a
+/// remainder is spread evenly: the chunk count is chosen first, preferring one fewer chunk
+/// when the resulting share stays within the overfill limit.
+fn add_chunks_for_backfill<'a>(
+    dest: &mut Vec<ChunkSampleGroup<'a>>,
+    samples: &'a [Sample],
+    chunk_size: usize,
+    bps: impl Fn() -> usize,
+) {
+    let n = samples.len();
+    if n == 0 {
+        return;
+    }
+    if n.saturating_mul(WORST_CASE_BYTES_PER_SAMPLE) <= chunk_size {
+        push_new_groups(dest, samples, n);
+        return;
+    }
+
+    let bps = bps();
+    let cap = samples_for(chunk_size, bps).max(1);
+    let hard = samples_for(chunk_size + chunk_size / OVERFILL_DIVISOR, bps).max(cap);
+    let fewer = n / cap;
+    let count = if fewer > 0 && n.div_ceil(fewer) <= hard {
+        fewer
+    } else {
+        n.div_ceil(cap)
+    };
+    push_new_groups(dest, samples, n.div_ceil(count));
 }
 
 /// Groups a sorted `samples` slice into the chunk they would belong to if inserted.
@@ -162,6 +285,11 @@ fn add_chunks_for_remaining_samples<'a>(
 ///   so a new chunk is never created overlapping an existing one.
 /// - Samples newer than the last chunk are appended to the last chunk while it has
 ///   (estimated) remaining capacity; overflow goes to new chunk(s).
+/// - New chunks older than the series are split evenly and may overfill a little (they are
+///   sealed for good); new chunks past its end are filled to capacity (see
+///   [`add_chunks_for_backfill`] and [`add_chunks_for_appends`]).
+/// - Capacity is estimated from the series' recent chunks (see [`estimate_bps`]), computed at
+///   most once per call and only when a group could exceed a chunk.
 /// - Returns groups in ascending chunk order, each group borrowing from the input slice.
 ///
 /// # Arguments
@@ -179,9 +307,13 @@ fn group_samples_by_chunk<'a>(
     let estimated_groups = series.chunks.len().saturating_add(2);
     let mut out: Vec<ChunkSampleGroup<'a>> = Vec::with_capacity(estimated_groups);
 
+    let chunk_size = series.chunk_size_bytes;
+    let bps_cell = OnceCell::new();
+    let bps = || *bps_cell.get_or_init(|| estimate_bps(series, samples));
+
     // Empty series: create new chunks from all samples.
     if series.chunks.is_empty() || series.is_empty() {
-        add_chunks_for_remaining_samples(&mut out, series, samples);
+        add_chunks_for_appends(&mut out, samples, chunk_size, bps);
         return out;
     }
 
@@ -194,7 +326,7 @@ fn group_samples_by_chunk<'a>(
         while i < samples.len() && samples[i].timestamp < first_chunk_start {
             i += 1;
         }
-        add_chunks_for_remaining_samples(&mut out, series, &samples[start..i]);
+        add_chunks_for_backfill(&mut out, &samples[start..i], chunk_size, bps);
 
         if i >= samples.len() {
             return out;
@@ -213,8 +345,7 @@ fn group_samples_by_chunk<'a>(
 
         // Beyond the last chunk: keep appending into it while it has estimated capacity.
         if chunk_idx == last_index && i < samples.len() {
-            let take = calculate_capacity(chunk).min(samples.len() - i);
-            i += take;
+            i += tail_take(chunk, samples.len() - i, bps);
         }
 
         if start < i {
@@ -227,7 +358,7 @@ fn group_samples_by_chunk<'a>(
 
     // Whatever the last chunk couldn't absorb goes to new chunk(s).
     if i < samples.len() {
-        add_chunks_for_remaining_samples(&mut out, series, &samples[i..]);
+        add_chunks_for_appends(&mut out, &samples[i..], chunk_size, bps);
     }
 
     out
@@ -490,6 +621,7 @@ fn notify_added(ctx: &Context, key: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::chunks::ChunkEncoding;
     use crate::tests::generators::DataGenerator;
     use std::time::Duration;
 
@@ -880,11 +1012,13 @@ mod tests {
         let chunks_before = series.chunks.len();
         assert!(chunks_before >= 1);
 
-        // Pick a timestamp that we know lies inside an *existing* chunk.
+        // Pick a timestamp that lies inside an *existing* chunk, off the seed's 10 ms grid so
+        // it is an insert rather than a duplicate (the default policy is BLOCK).
         let c0 = &series.chunks[0];
-        let existing_ts = c0
+        let mid = c0
             .first_timestamp()
             .saturating_add((c0.last_timestamp().saturating_sub(c0.first_timestamp())) / 2);
+        let existing_ts = mid / 10 * 10 + 5;
         assert!(c0.is_timestamp_in_range(existing_ts));
 
         // Append far more samples than the last chunk can absorb so the overflow is
@@ -1061,5 +1195,175 @@ mod tests {
         let stored: Vec<Sample> = series.iter().collect();
         assert_eq!(stored, vec![s(1000, 1.0), s(2000, 2.0), s(3000, 5.0)]);
         assert_eq!(series.total_samples, 3);
+    }
+
+    // --- chunk sizing -------------------------------------------------------------------------
+    //
+    // Uncompressed series make the arithmetic exact: 16 bytes per sample, so a 4096-byte chunk
+    // holds 256 samples and the backfill overfill limit (1/8 over) is 288.
+
+    fn uncompressed_series() -> TimeSeries {
+        TimeSeries {
+            chunk_encoding: ChunkEncoding::Uncompressed,
+            chunk_size_bytes: 4096,
+            ..Default::default()
+        }
+    }
+
+    fn run(start: i64, count: usize) -> Vec<Sample> {
+        (0..count as i64).map(|i| s(start + i, i as f64)).collect()
+    }
+
+    fn group_shape(groups: &[ChunkSampleGroup<'_>]) -> Vec<(Option<usize>, usize)> {
+        groups
+            .iter()
+            .map(|g| match g.chunk {
+                ChunkHolder::ExistingIdx(idx) => (Some(idx), g.samples.len()),
+                ChunkHolder::New => (None, g.samples.len()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appends_fill_new_chunks_and_leave_the_remainder_to_the_last() {
+        let series = uncompressed_series();
+        let samples = run(0, 600);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(
+            group_shape(&groups),
+            vec![(None, 256), (None, 256), (None, 88)]
+        );
+    }
+
+    #[test]
+    fn tail_is_filled_to_chunk_size_before_opening_a_chunk() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        bulk_insert_samples(&ctx, &mut series, &run(0, 250), None);
+        assert_eq!(series.chunks.len(), 1);
+
+        // 96 free bytes = 6 samples; the other 94 open a new chunk.
+        let samples = run(1_000, 100);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(group_shape(&groups), vec![(Some(0), 6), (None, 94)]);
+    }
+
+    #[test]
+    fn small_append_to_a_roomy_tail_stays_in_the_tail() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        bulk_insert_samples(&ctx, &mut series, &run(0, 10), None);
+
+        let samples = run(1_000, 3);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(group_shape(&groups), vec![(Some(0), 3)]);
+    }
+
+    #[test]
+    fn backfill_spreads_a_remainder_within_the_overfill_limit() {
+        let ctx = Context::dummy();
+        let mut series = uncompressed_series();
+        bulk_insert_samples(&ctx, &mut series, &run(1_000_000, 10), None);
+
+        // One sample over a chunk: absorbed rather than left as a chunk of its own.
+        let samples = run(0, 257);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(group_shape(&groups), vec![(None, 257)]);
+
+        // Two chunks at 260 stay under the 288 limit.
+        let samples = run(0, 520);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(group_shape(&groups), vec![(None, 260), (None, 260)]);
+
+        // Two chunks would be 300 each, over the limit: three even chunks instead.
+        let samples = run(0, 600);
+        let groups = group_samples_by_chunk(&series, &samples);
+        assert_eq!(
+            group_shape(&groups),
+            vec![(None, 200), (None, 200), (None, 200)]
+        );
+    }
+
+    #[test]
+    fn bulk_loads_keep_compressed_chunks_near_chunk_size() {
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+
+        let ctx = Context::dummy();
+        let count = 20_000;
+        for workload in [
+            ValueWorkload::Constant,
+            ValueWorkload::Counter,
+            ValueWorkload::Drift,
+            ValueWorkload::Noisy,
+        ] {
+            let key = DatasetKey::new(workload, TimestampModel::Regular);
+            let data = generate_dataset(key, count, dataset_seed(key));
+            for encoding in [ChunkEncoding::Chimp, ChunkEncoding::Gorilla] {
+                for batch in [count, 1_000, 100] {
+                    let mut series = TimeSeries {
+                        chunk_encoding: encoding,
+                        chunk_size_bytes: 4096,
+                        ..Default::default()
+                    };
+                    for part in data.chunks(batch) {
+                        bulk_insert_samples(&ctx, &mut series, part, None);
+                    }
+                    assert_eq!(series.total_samples, count);
+
+                    // The last chunk is the append target and may be partly filled.
+                    let max = series.chunk_size_bytes;
+                    let sealed = &series.chunks[..series.chunks.len() - 1];
+                    for (i, chunk) in sealed.iter().enumerate() {
+                        let size = chunk.size();
+                        assert!(
+                            size >= max / 2 && size <= max + max / SPLIT_SLACK_DIVISOR,
+                            "{} {encoding:?} batch {batch}: chunk {i} holds {size} of {max} bytes",
+                            key.id(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn worst_case_bytes_per_sample_bounds_adversarial_input() {
+        // Random bit patterns as values and random timestamp jumps defeat both XOR value
+        // encoding and delta-of-delta timestamps.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut ts = 0i64;
+        let samples: Vec<Sample> = (0..2_000)
+            .filter_map(|_| {
+                ts += 1 + (next() >> 34) as i64;
+                let value = f64::from_bits(next());
+                value.is_finite().then(|| s(ts, value))
+            })
+            .collect();
+
+        for encoding in [
+            ChunkEncoding::Chimp,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Uncompressed,
+        ] {
+            let mut chunk = TimeSeriesChunk::new(encoding, 1024 * 1024);
+            chunk
+                .merge_samples(&samples, Some(DuplicatePolicy::KeepLast))
+                .unwrap();
+            assert_eq!(chunk.len(), samples.len());
+            assert!(
+                chunk.size() <= samples.len() * WORST_CASE_BYTES_PER_SAMPLE,
+                "{encoding:?}: {} bytes for {} samples",
+                chunk.size(),
+                samples.len()
+            );
+        }
     }
 }
