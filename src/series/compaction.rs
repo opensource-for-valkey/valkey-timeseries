@@ -1,6 +1,6 @@
 use crate::aggregators::{AggregationHandler, Aggregator, calc_bucket_start};
 use crate::common::block_on_keys::signal_timeseries_ready;
-use crate::common::context::{create_key_string, notify_module_event};
+use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::common::logging::log_warning;
 use crate::common::rdb::{
     RdbSerializable, rdb_load_bool, rdb_load_timestamp, rdb_save_bool, rdb_save_timestamp,
@@ -1113,7 +1113,7 @@ fn notify_compaction(ctx: &Context, ids: &[SeriesRef]) {
                 continue;
             };
             let key = create_key_string(ctx, key.as_ref());
-            notify_module_event(ctx, c"ts.add:dest", &key);
+            notify_keyspace_event(ctx, c"ts.add:dest", &key);
             // Callers only reach here for destinations that materialized a sample, so this is
             // the one place both direct and cascaded compaction output can wake a `TS.READ`
             // reader blocked on a rollup key.

@@ -3,7 +3,7 @@ use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::{
     parse_bucket_duration_str, parse_inline_condition, split_aggregator_condition,
 };
-use crate::common::context::notify_module_event;
+use crate::common::context::notify_keyspace_event;
 use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
@@ -102,8 +102,8 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // Replicate the command
     ctx.replicate_verbatim();
 
-    notify_module_event(ctx, CREATERULE_SRC_EVENT, &source_key);
-    notify_module_event(ctx, CREATERULE_DEST_EVENT, &dest_key);
+    notify_keyspace_event(ctx, CREATERULE_SRC_EVENT, &source_key);
+    notify_keyspace_event(ctx, CREATERULE_DEST_EVENT, &dest_key);
 
     VALKEY_OK
 }

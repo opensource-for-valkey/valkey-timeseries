@@ -1,5 +1,5 @@
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{create_key_string, get_current_db, notify_module_event};
+use crate::common::context::{create_key_string, get_current_db, notify_keyspace_event};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::{KeyAccess, check_key_permissions};
@@ -185,7 +185,7 @@ pub fn create_and_store_internal(
     // commands (TS.ADD/TS.MADD/TS.INCRBY/...) emit just their own write
     // event, matching RedisTimeSeries (compat plan §7.3).
     if notify {
-        notify_module_event(ctx, c"ts.create", key);
+        notify_keyspace_event(ctx, c"ts.create", key);
         ctx.log_verbose("series created");
     }
 

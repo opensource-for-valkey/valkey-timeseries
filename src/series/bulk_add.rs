@@ -6,7 +6,7 @@
 #[cfg(not(test))]
 use crate::common::block_on_keys::signal_timeseries_ready;
 #[cfg(not(test))]
-use crate::common::context::{create_key_string, notify_module_event};
+use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 #[cfg(not(test))]
@@ -491,7 +491,7 @@ fn notify_added(ctx: &Context, ids: &[SeriesRef]) {
                 continue;
             };
             let key = create_key_string(ctx, key.as_ref());
-            notify_module_event(ctx, c"ts.add", &key);
+            notify_keyspace_event(ctx, c"ts.add", &key);
             // The sole caller already gated on the series' sample count having grown, which is
             // exactly the condition that can satisfy a blocked `TS.READ`.
             signal_timeseries_ready(ctx, &key);

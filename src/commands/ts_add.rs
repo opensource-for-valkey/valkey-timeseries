@@ -3,7 +3,7 @@ use crate::commands::command_parser::{
 };
 use crate::commands::ts_create::parse_series_options;
 use crate::common::block_on_keys::signal_timeseries_ready;
-use crate::common::context::notify_module_event;
+use crate::common::context::notify_keyspace_event;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
@@ -202,9 +202,9 @@ fn replicate_and_notify(ctx: &Context, args: Vec<ValkeyString>, timestamp: Optio
         let replication_args = args.iter().collect::<Vec<_>>();
         ctx.replicate("TS.ADD", &*replication_args);
         let key = args.swap_remove(0);
-        notify_module_event(ctx, c"ts.add", &key);
+        notify_keyspace_event(ctx, c"ts.add", &key);
     } else {
         ctx.replicate_verbatim();
-        notify_module_event(ctx, c"ts.add", &args[1]);
+        notify_keyspace_event(ctx, c"ts.add", &args[1]);
     }
 }

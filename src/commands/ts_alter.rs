@@ -1,6 +1,6 @@
 use crate::commands::command_parser::CommandArgToken;
 use crate::commands::ts_create::parse_series_options_onto;
-use crate::common::context::notify_module_event;
+use crate::common::context::notify_keyspace_event;
 use crate::labels::MetricName;
 use crate::series::index::get_timeseries_index;
 use crate::series::{TimeSeries, TimeSeriesOptions, with_timeseries_mut};
@@ -54,7 +54,7 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
         ctx.replicate_verbatim();
         if changed {
-            notify_module_event(ctx, ALTER_EVENT, &key);
+            notify_keyspace_event(ctx, ALTER_EVENT, &key);
         }
         VALKEY_OK
     })

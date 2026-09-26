@@ -1,5 +1,5 @@
 use crate::common::Timestamp;
-use crate::common::context::{create_key_string, notify_module_event};
+use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
 use crate::series::acl::KeyAccess;
@@ -142,7 +142,7 @@ fn delete_range_batch(
             }
 
             total_deleted += *deleted;
-            notify_module_event(ctx, c"ts.del", &keys[i]);
+            notify_keyspace_event(ctx, c"ts.del", &keys[i]);
             // run compaction if needed
             apply_compaction(
                 ctx,

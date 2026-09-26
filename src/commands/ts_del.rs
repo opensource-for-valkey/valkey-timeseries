@@ -1,5 +1,5 @@
 use crate::commands::command_parser::parse_timestamp_range;
-use crate::common::context::notify_module_event;
+use crate::common::context::notify_keyspace_event;
 use crate::series::with_timeseries_mut;
 use std::ffi::CStr;
 use valkey_module::{
@@ -60,7 +60,7 @@ pub fn ts_del_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             &ctx.create_string(end_ts.to_string()),
         ],
     );
-    notify_module_event(ctx, DEL_EVENT, &key);
+    notify_keyspace_event(ctx, DEL_EVENT, &key);
 
     Ok(ValkeyValue::from(count))
 }

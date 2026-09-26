@@ -2,7 +2,7 @@ use crate::commands::CommandArgToken;
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::commands::ts_create::{parse_series_options, series_option_keywords};
 use crate::common::block_on_keys::signal_timeseries_ready;
-use crate::common::context::notify_module_event;
+use crate::common::context::notify_keyspace_event;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{SampleAddResult, TimeSeries, create_and_store_series, try_get_timeseries_mut};
@@ -251,5 +251,5 @@ fn replicate_and_notify(
     replication_args.extend(create_options.iter());
 
     ctx.replicate(command, &*replication_args);
-    notify_module_event(ctx, event, key_name);
+    notify_keyspace_event(ctx, event, key_name);
 }

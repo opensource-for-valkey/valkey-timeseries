@@ -164,7 +164,7 @@ pub fn register_server_event_handler(
 /// compile-time C string. `Context::notify_keyspace_event` takes a `&str` and allocates a
 /// `CString` per call; every event this module emits is a literal, so use this instead.
 #[inline]
-pub fn notify_module_event(ctx: &Context, event: &std::ffi::CStr, key: &ValkeyString) {
+pub fn notify_keyspace_event(ctx: &Context, event: &std::ffi::CStr, key: &ValkeyString) {
     // SAFETY: `ctx` is a live command context, `event` is NUL-terminated by construction and
     // `key` is a live module string; the API copies what it keeps.
     unsafe {
