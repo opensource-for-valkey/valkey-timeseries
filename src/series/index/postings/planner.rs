@@ -125,47 +125,31 @@ impl<'a> Terms<'a> {
                     let it = self.postings_for_all_label_values(&filter.label);
                     not_its.push(Cow::Owned(it));
                 }
+                // l!="" (the RTS `l!=` form parses to PredicateValue::Empty): any non-empty value.
+                // Go straight to all label values rather than inverting to l="" first.
+                _ if matches!(&filter.matcher, PredicateMatch::NotEqual(v) if v.is_empty()) => {
+                    let it = self.postings_for_all_label_values(&filter.label);
+                    if it.is_empty() {
+                        return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
+                    }
+                    its.push(Cow::Owned(it));
+                }
                 // See which label must be non-empty.
                 // Optimization for a case like {l=~".", l!="1"}.
                 _ if !matches_empty => {
-                    // If this matcher must be non-empty, we can be smarter.
-                    let is_not = matches!(
-                        typ,
-                        MatchOp::NotEqual
-                            | MatchOp::RegexNotEqual
-                            | MatchOp::NotContains
-                            | MatchOp::NotStartsWith
-                    );
-                    match (is_not, matches_empty) {
-                        // l!="foo"
-                        (true, true) => {
-                            // If the label can't be empty and is a Not and the inner matcher
-                            // doesn't match empty, then subtract it out at the end.
-                            let inverse = filter.clone().inverse();
-                            let it = self.postings_for_filter(&inverse)?;
-                            not_its.push(it);
-                        }
-                        // l!=""
-                        (true, false) => {
-                            // If the label can't be empty and is a Not, but the inner matcher can
-                            // be empty, we need to use inverse_postings_for_filter.
-                            let inverse = filter.clone().inverse();
-                            let it = self.inverse_postings_for_filter(&inverse);
-                            if it.is_empty() {
-                                return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-                            }
-                            its.push(it);
-                        }
+                    let it = if filter.is_negative_matcher() {
+                        // l!~"a*": the inner matcher matches empty, so the label must be present
+                        // with a value the inner matcher rejects.
+                        let inverse = filter.clone().inverse();
+                        self.inverse_postings_for_filter(&inverse)
+                    } else {
                         // l="a", l=~"a|b", etc.
-                        _ => {
-                            // Non-Not matcher, use normal postings_for_filter.
-                            let it = self.postings_for_filter(filter)?;
-                            if it.is_empty() {
-                                return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-                            }
-                            its.push(it);
-                        }
+                        self.postings_for_filter(filter)?
+                    };
+                    if it.is_empty() {
+                        return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
                     }
+                    its.push(it);
                 }
                 _ => {
                     // l=""
@@ -372,6 +356,81 @@ mod tests {
         assert!(result.contains(2));
         assert!(result.contains(4));
         assert!(!result.contains(3)); // node3 should not be matched
+    }
+
+    fn not_equal_empty_fixture() -> Postings {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "i", "x");
+        postings.add_posting_for_label_value(1, "n", "1");
+        postings.add_posting_for_label_value(2, "i", "y");
+        postings.add_posting_for_label_value(3, "n", "1");
+        postings
+    }
+
+    #[test]
+    fn test_not_equal_empty_selects_series_with_label() {
+        let postings = not_equal_empty_fixture();
+
+        // `PredicateValue::Empty` is what the RTS `i!=` form and fanout decoding produce.
+        for value in [PredicateValue::Empty, PredicateValue::String(String::new())] {
+            let filter = LabelFilter {
+                label: "i".to_string(),
+                matcher: PredicateMatch::NotEqual(value.clone()),
+            };
+            let result = postings
+                .terms()
+                .postings_for_label_filters(&[filter])
+                .unwrap();
+            assert_eq!(result.iter().collect::<Vec<_>>(), vec![1, 2], "{value:?}");
+        }
+    }
+
+    #[test]
+    fn test_not_equal_empty_intersects_with_other_matchers() {
+        let postings = not_equal_empty_fixture();
+        let filters = [
+            LabelFilter::equals("n".to_string(), "1"),
+            LabelFilter {
+                label: "i".to_string(),
+                matcher: PredicateMatch::NotEqual(PredicateValue::Empty),
+            },
+        ];
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&filters)
+            .unwrap();
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn test_not_equal_empty_on_absent_label_is_empty() {
+        let postings = not_equal_empty_fixture();
+        let filters = [
+            LabelFilter::equals("n".to_string(), "1"),
+            LabelFilter::not_equals("missing".to_string(), ""),
+        ];
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&filters)
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_negative_regex_matching_empty_requires_label() {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "i", "x");
+        postings.add_posting_for_label_value(2, "i", "xx");
+        postings.add_posting_for_label_value(3, "i", "y");
+        postings.add_posting_for_label_value(4, "n", "1");
+
+        // `x*` matches "", so `i!~"x*"` excludes series without `i`.
+        let filter = LabelFilter::create(MatchOp::RegexNotEqual, "i", "x*").unwrap();
+        let result = postings
+            .terms()
+            .postings_for_label_filters(&[filter])
+            .unwrap();
+        assert_eq!(result.iter().collect::<Vec<_>>(), vec![3]);
     }
 
     #[test]
