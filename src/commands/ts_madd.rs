@@ -1,5 +1,6 @@
 use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::common::block_on_keys::signal_timeseries_ready;
+use crate::common::context::notify_module_event;
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
@@ -11,7 +12,7 @@ use ahash::AHashMap;
 use smallvec::SmallVec;
 use std::ops::DerefMut;
 use valkey_module::{
-    AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
+    AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
 #[derive(Debug)]
@@ -274,7 +275,7 @@ fn handle_replication(ctx: &Context, inputs: &[ParsedInput]) {
     if !replication_args.is_empty() {
         ctx.replicate("TS.MADD", &*replication_args);
         for key in replication_args.into_iter().step_by(3) {
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", key);
+            notify_module_event(ctx, c"ts.add", key);
         }
     }
 }

@@ -160,6 +160,23 @@ pub fn register_server_event_handler(
     Ok(())
 }
 
+/// `ValkeyModule_NotifyKeyspaceEvent` for a `MODULE`-class event whose name is a
+/// compile-time C string. `Context::notify_keyspace_event` takes a `&str` and allocates a
+/// `CString` per call; every event this module emits is a literal, so use this instead.
+#[inline]
+pub fn notify_module_event(ctx: &Context, event: &std::ffi::CStr, key: &ValkeyString) {
+    // SAFETY: `ctx` is a live command context, `event` is NUL-terminated by construction and
+    // `key` is a live module string; the API copies what it keeps.
+    unsafe {
+        raw::RedisModule_NotifyKeyspaceEvent.unwrap()(
+            ctx.ctx,
+            raw::NotifyEvent::MODULE.bits(),
+            event.as_ptr(),
+            key.inner,
+        );
+    }
+}
+
 pub fn get_available_memory(ctx: &Context) -> Option<i64> {
     // Fetch INFO MEMORY
     let info = get_server_info(ctx, "memory");

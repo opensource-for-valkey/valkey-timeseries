@@ -1,5 +1,5 @@
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{create_key_string, get_current_db};
+use crate::common::context::{create_key_string, get_current_db, notify_module_event};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label};
 use crate::series::acl::{KeyAccess, check_key_permissions};
@@ -12,9 +12,7 @@ use crate::series::{
 use std::ops::Deref;
 use std::time::Duration;
 use valkey_module::key::ValkeyKeyWritable;
-use valkey_module::{
-    AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
-};
+use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// Runs `f` against the series stored at `key`, opened read-only.
 ///
@@ -187,7 +185,7 @@ pub fn create_and_store_internal(
     // commands (TS.ADD/TS.MADD/TS.INCRBY/...) emit just their own write
     // event, matching RedisTimeSeries (compat plan §7.3).
     if notify {
-        ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.create", key);
+        notify_module_event(ctx, c"ts.create", key);
         ctx.log_verbose("series created");
     }
 

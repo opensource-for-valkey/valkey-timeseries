@@ -1,12 +1,14 @@
 use crate::commands::command_parser::CommandArgToken;
 use crate::commands::ts_create::parse_series_options_onto;
+use crate::common::context::notify_module_event;
 use crate::labels::MetricName;
 use crate::series::index::get_timeseries_index;
 use crate::series::{TimeSeries, TimeSeriesOptions, with_timeseries_mut};
+use std::ffi::CStr;
 use std::ops::Deref;
-use valkey_module::{
-    AclPermissions, Context, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
-};
+use valkey_module::{AclPermissions, Context, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString};
+
+const ALTER_EVENT: &CStr = c"ts.alter";
 
 acl_categories!(TS_ALTER, "ts.alter", "write timeseries");
 /// Alter a time series
@@ -52,7 +54,7 @@ pub fn ts_alter_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
         ctx.replicate_verbatim();
         if changed {
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.alter", &key);
+            notify_module_event(ctx, ALTER_EVENT, &key);
         }
         VALKEY_OK
     })

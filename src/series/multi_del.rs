@@ -1,5 +1,5 @@
 use crate::common::Timestamp;
-use crate::common::context::create_key_string;
+use crate::common::context::{create_key_string, notify_module_event};
 use crate::config::num_threads;
 use crate::labels::filters::SeriesSelector;
 use crate::series::acl::KeyAccess;
@@ -14,9 +14,7 @@ use orx_parallel::Par;
 use orx_parallel::ParCollectionMut;
 use smallvec::SmallVec;
 use std::ops::{Deref, DerefMut};
-use valkey_module::{
-    AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
-};
+use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// Apply `TS.MDEL` on this node and propagate its *effects* to this node's replicas and AOF.
 ///
@@ -144,7 +142,7 @@ fn delete_range_batch(
             }
 
             total_deleted += *deleted;
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.del", &keys[i]);
+            notify_module_event(ctx, c"ts.del", &keys[i]);
             // run compaction if needed
             apply_compaction(
                 ctx,

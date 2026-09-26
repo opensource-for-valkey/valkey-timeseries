@@ -3,6 +3,7 @@ use crate::commands::CommandArgIterator;
 use crate::commands::command_parser::{
     parse_bucket_duration_str, parse_inline_condition, split_aggregator_condition,
 };
+use crate::common::context::notify_module_event;
 use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
@@ -10,10 +11,13 @@ use crate::series::{
     CompactionRule, SeriesRef, check_new_rule_circular_dependency, get_timeseries,
     get_timeseries_mut,
 };
+use std::ffi::CStr;
 use valkey_module::{
-    AclPermissions, Context, NextArg, NotifyEvent, VALKEY_OK, ValkeyError, ValkeyResult,
-    ValkeyString,
+    AclPermissions, Context, NextArg, VALKEY_OK, ValkeyError, ValkeyResult, ValkeyString,
 };
+
+const CREATERULE_SRC_EVENT: &CStr = c"ts.createrule:src";
+const CREATERULE_DEST_EVENT: &CStr = c"ts.createrule:dest";
 
 acl_categories!(TS_CREATERULE, "ts.createrule", "write timeseries");
 ///
@@ -98,8 +102,8 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // Replicate the command
     ctx.replicate_verbatim();
 
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.createrule:src", &source_key);
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.createrule:dest", &dest_key);
+    notify_module_event(ctx, CREATERULE_SRC_EVENT, &source_key);
+    notify_module_event(ctx, CREATERULE_DEST_EVENT, &dest_key);
 
     VALKEY_OK
 }

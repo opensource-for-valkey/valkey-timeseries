@@ -1,9 +1,12 @@
 use crate::commands::command_parser::parse_timestamp_range;
+use crate::common::context::notify_module_event;
 use crate::series::with_timeseries_mut;
+use std::ffi::CStr;
 use valkey_module::{
-    AclPermissions, Context, NextArg, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString,
-    ValkeyValue,
+    AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
+
+const DEL_EVENT: &CStr = c"ts.del";
 
 acl_categories!(TS_DEL, "ts.del", "write timeseries");
 ///
@@ -57,7 +60,7 @@ pub fn ts_del_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             &ctx.create_string(end_ts.to_string()),
         ],
     );
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.del", &key);
+    notify_module_event(ctx, DEL_EVENT, &key);
 
     Ok(ValkeyValue::from(count))
 }

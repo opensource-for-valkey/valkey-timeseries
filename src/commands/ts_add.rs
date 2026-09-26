@@ -3,13 +3,14 @@ use crate::commands::command_parser::{
 };
 use crate::commands::ts_create::parse_series_options;
 use crate::common::block_on_keys::signal_timeseries_ready;
+use crate::common::context::notify_module_event;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::{
     DuplicatePolicy, SampleAddResult, TimeSeries, create_and_store_series, try_get_timeseries_mut,
 };
 use valkey_module::{
-    AclPermissions, Context, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
+    AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
 };
 
 acl_categories!(TS_ADD, "ts.add", "write timeseries");
@@ -201,9 +202,9 @@ fn replicate_and_notify(ctx: &Context, args: Vec<ValkeyString>, timestamp: Optio
         let replication_args = args.iter().collect::<Vec<_>>();
         ctx.replicate("TS.ADD", &*replication_args);
         let key = args.swap_remove(0);
-        ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", &key);
+        notify_module_event(ctx, c"ts.add", &key);
     } else {
         ctx.replicate_verbatim();
-        ctx.notify_keyspace_event(NotifyEvent::MODULE, "ts.add", &args[1]);
+        notify_module_event(ctx, c"ts.add", &args[1]);
     }
 }
