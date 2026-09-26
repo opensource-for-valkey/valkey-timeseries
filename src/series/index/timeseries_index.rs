@@ -257,7 +257,10 @@ impl TimeSeriesIndex {
         let mut acl_denied = false;
 
         let cloned_perms = acl_permissions.as_ref().map(clone_permissions);
-        let access = acl_permissions.map(|perms| KeyAccess::new(ctx, perms));
+        let access = match acl_permissions {
+            Some(perms) => KeyAccess::new(ctx, clone_permissions(&perms)),
+            None => KeyAccess::unrestricted(),
+        };
 
         // The read guard is confined to this block. Recording the dangling ids collected below
         // needs the *write* lock, and `RwLock` is not reentrant: asking for it while this thread
@@ -280,9 +283,7 @@ impl TimeSeriesIndex {
                     continue;
                 };
                 let real_key = create_key_string(ctx, key.as_ref());
-                if let Some(access) = &access
-                    && !access.allows(&real_key)
-                {
+                if !access.allows(&real_key) {
                     acl_denied = true;
                     break;
                 }

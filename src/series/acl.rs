@@ -309,6 +309,13 @@ impl KeyAccess {
         }
     }
 
+    pub fn unrestricted() -> Self {
+        Self {
+            identity: Identity::Unrestricted,
+            permissions: AclPermissions::empty(),
+        }
+    }
+
     /// Whether the caller holds the permissions on `key`.
     #[inline]
     pub fn allows(&self, key: &ValkeyString) -> bool {
@@ -337,6 +344,15 @@ impl KeyAccess {
 
     pub fn is_unrestricted(&self) -> bool {
         matches!(self.identity, Identity::Unrestricted)
+    }
+}
+
+impl Default for KeyAccess {
+    fn default() -> Self {
+        Self {
+            identity: Identity::Unknown,
+            permissions: AclPermissions::empty(),
+        }
     }
 }
 
