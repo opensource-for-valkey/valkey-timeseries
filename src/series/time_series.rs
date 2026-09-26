@@ -49,6 +49,10 @@ pub type SeriesRef = u64;
 /// nor pays for the shrink. An in-order `merge_samples` into a sealed chunk does append in place
 /// and will regrow, but from a smaller base and still by doubling, so the cost stays amortized
 /// O(1) per byte.
+/// A chunk is split only once it exceeds `max_size` by more than `max_size / SPLIT_SLACK_DIVISOR`
+/// (see [`TimeSeries::needs_split`]).
+pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
+
 pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
     if let Err(e) = chunk.optimize() {
         logging::log_warning(format!("TSDB: Error compacting a sealed chunk: {e:?}"));
@@ -507,14 +511,32 @@ impl TimeSeries {
         }
     }
 
+    /// Whether a merge left `chunk` big enough that a split should halve it. "Full" is not
+    /// the test: a chunk completed by appends sits at its size limit (the append that
+    /// crosses it is the last one accepted), and the next append seals it and starts a new
+    /// chunk — halving it later would re-encode every sample it holds only to leave two
+    /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
+    /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
+    /// overfill below that line (see `bulk_add`).
+    pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
+        let max = chunk.max_size();
+        chunk.is_full() && chunk.size() > max + max / SPLIT_SLACK_DIVISOR
+    }
+
     pub(crate) fn split_chunks_if_needed(&mut self) -> TsdbResult<()> {
+        // Almost every merge ends here with nothing to split: decide that with a scan
+        // before entering a parallel section.
+        if !self.chunks.iter().any(Self::needs_split) {
+            return Ok(());
+        }
+
         let errored: AtomicBool = AtomicBool::new(false);
 
         // todo: track error, but allow partials
         let mut new_chunks = if self.is_compressed() {
             self.chunks
                 .par_mut()
-                .filter(|c| c.is_full())
+                .filter(|c| Self::needs_split(c))
                 .flat_map(|chunks| {
                     if let Ok(mut split_chunk) = chunks.split() {
                         // `split` re-encodes both halves from scratch, so both arrive with a
@@ -530,7 +552,7 @@ impl TimeSeries {
                 .collect::<Vec<_>>()
         } else {
             let mut new_chunks = Vec::with_capacity(std::cmp::max(2, self.chunks.len() / 6));
-            for c in self.chunks.iter_mut().filter(|c| c.is_full()) {
+            for c in self.chunks.iter_mut().filter(|c| Self::needs_split(c)) {
                 if let Ok(mut split_chunk) = c.split() {
                     seal_chunk(c);
                     seal_chunk(&mut split_chunk);
