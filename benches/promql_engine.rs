@@ -301,6 +301,7 @@ fn bench_range_query(c: &mut Criterion) {
     let opts = QueryOptions {
         timeout: None,
         deadline: None,
+        enable_experimental_functions: true,
         ..QueryOptions::default()
     };
 
@@ -550,6 +551,7 @@ fn bench_group_samples(c: &mut Criterion) {
     let opts = QueryOptions {
         timeout: None,
         deadline: None,
+        enable_experimental_functions: true,
         ..QueryOptions::default()
     };
     let query_time = ms_to_system_time((NUM_INTERVALS as i64 - 1) * INTERVAL_MS);
