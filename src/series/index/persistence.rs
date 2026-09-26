@@ -333,10 +333,10 @@ pub(crate) fn check_required_module_apis() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Digest contribution for the series currently being deserialized, from the key name the
-/// engine is loading it under. `None` when the name is unavailable, which degrades that db's
-/// digest to `incomplete` and forces the sweep rather than producing a wrong match.
-fn loaded_entry_hash(rdb: *mut RedisModuleIO, id: SeriesRef) -> Option<u64> {
+/// The key name the engine is loading the current value under, if the IO context has one.
+///
+/// Borrowed for the duration of the load callback only: the engine owns the string.
+fn io_key_name<'a>(rdb: *mut RedisModuleIO) -> Option<&'a [u8]> {
     // Presence is a load-time invariant (`check_required_module_apis`).
     let get_key_name = unsafe { raw::RedisModule_GetKeyNameFromIO }
         .expect("RedisModule_GetKeyNameFromIO unavailable");
@@ -349,18 +349,19 @@ fn loaded_entry_hash(rdb: *mut RedisModuleIO, id: SeriesRef) -> Option<u64> {
     if ptr.is_null() {
         return None;
     }
-    // Borrowed for the duration of this call only: the engine owns the string, and we neither
-    // retain nor free it.
-    let name = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-    Some(entry_hash(id, name))
+    Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) })
 }
 
 /// Called from `rdb_load_series` for every series deserialized from an RDB stream: assigns
-/// `series._db` from the IO context (previously done by the `loaded` notification handler,
-/// which required opening the key), and counts the series toward the current load window's
-/// per-db total. Payloads with no db context (`RESTORE` / `TS._RESTORE` strings) are skipped;
-/// their callers assign `_db` themselves.
+/// `series.key` and `series._db` from the IO context (previously done by the `loaded`
+/// notification handler, which required opening the key), and counts the series toward the
+/// current load window's per-db total. Payloads with no key or db context (`TS._RESTORE`
+/// strings) are skipped; their callers assign them themselves.
 pub(crate) fn observe_series_rdb_load(rdb: *mut RedisModuleIO, series: &mut TimeSeries) {
+    let key = io_key_name(rdb);
+    if let Some(key) = key {
+        series.key = key.into();
+    }
     // Presence is a load-time invariant (`check_required_module_apis`).
     let get_db_id =
         unsafe { raw::RedisModule_GetDbIdFromIO }.expect("RedisModule_GetDbIdFromIO unavailable");
@@ -372,7 +373,9 @@ pub(crate) fn observe_series_rdb_load(rdb: *mut RedisModuleIO, series: &mut Time
     }
     series._db = Some(db);
     if LOADING_ACTIVE.load(Ordering::Relaxed) {
-        note_series_loaded(db, loaded_entry_hash(rdb, series.id));
+        // A missing name degrades that db's digest to `incomplete` and forces the sweep rather
+        // than producing a wrong match.
+        note_series_loaded(db, key.map(|key| entry_hash(series.id, key)));
     }
 }
 

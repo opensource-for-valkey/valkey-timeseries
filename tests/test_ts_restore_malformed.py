@@ -27,13 +27,19 @@ from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 
 
+# The module's payload encoding version (`TIMESERIES_TYPE_ENCODING_VERSION`), which TS._RESTORE
+# takes as its last argument. `_genuine_payload` checks it against what `aof_rewrite` emits.
+CURRENT_ENCVER = 1
+
+
 class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
 
     def _genuine_payload(self, key='payload_src', bucket_duration=None):
         """Produce a real TS._RESTORE payload by way of the command-format AOF.
 
-        `aof_rewrite` emits `TS._RESTORE key <blob>`, where the blob is what the type's
-        `rdb_save` produced -- the exact input shape this command reads in production.
+        `aof_rewrite` emits `TS._RESTORE key <blob> <encoding-version>`, where the blob is what
+        the type's `rdb_save` produced -- the exact input shape this command reads in production.
+        The version is kept in `self.payload_encver` and must be passed back with the blob.
         """
         client = self.client
         client.config_set('aof-use-rdb-preamble', 'no')
@@ -81,8 +87,13 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         m = re.match(rb'\$(\d+)\r\n', data[p:])
         assert m, 'could not locate the TS._RESTORE payload bulk string'
         start = p + m.end()
-        payload = data[start:start + int(m.group(1))]
+        end = start + int(m.group(1))
+        payload = data[start:end]
         assert len(payload) > 0
+        v = re.match(rb'\r\n\$\d+\r\n(\d+)\r\n', data[end:])
+        assert v, 'could not locate the TS._RESTORE encoding version'
+        self.payload_encver = int(v.group(1))
+        assert self.payload_encver == CURRENT_ENCVER
         return payload
 
     def test_restore_garbage_payload_does_not_crash(self):
@@ -90,7 +101,7 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         client = self.client
         for i, blob in enumerate([b'', b'garbage', b'\x01\x02\x03', b'A' * 32, b'\x00' * 256]):
             try:
-                client.execute_command('TS._RESTORE', f'garbage{i}', blob)
+                client.execute_command('TS._RESTORE', f'garbage{i}', blob, CURRENT_ENCVER)
             except Exception as e:
                 assert 'failed to deserialize' in str(e), f'unexpected error for {blob!r}: {e}'
             else:
@@ -104,12 +115,12 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         payload = self._genuine_payload()
 
         # The untruncated payload must still restore cleanly, or the test proves nothing.
-        assert client.execute_command('TS._RESTORE', 'restored', payload)
+        assert client.execute_command('TS._RESTORE', 'restored', payload, self.payload_encver)
         assert self.ts_info('restored')['totalSamples'] == 200
 
         for cut in list(range(0, len(payload), 7)) + [len(payload) - 1]:
             try:
-                client.execute_command('TS._RESTORE', f'trunc{cut}', payload[:cut])
+                client.execute_command('TS._RESTORE', f'trunc{cut}', payload[:cut], self.payload_encver)
             except Exception as e:
                 assert 'failed to deserialize' in str(e), f'unexpected error at cut {cut}: {e}'
             else:
@@ -128,11 +139,23 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
             for _ in range(rng.randint(1, 8)):
                 b[rng.randrange(len(b))] = rng.randrange(256)
             try:
-                client.execute_command('TS._RESTORE', f'fuzz{trial}', bytes(b))
+                client.execute_command('TS._RESTORE', f'fuzz{trial}', bytes(b), self.payload_encver)
             except Exception:
                 pass  # any clean error is fine; only a dead server is a failure
             assert client.ping(), f'server died on corrupt payload, trial {trial}'
         assert self.server.is_alive()
+
+    def test_restore_rejects_unsupported_encoding_version(self):
+        """A payload version this module cannot read is refused before it is parsed."""
+        client = self.client
+        payload = self._genuine_payload(key='encver_src')
+        for version in (0, 99, -1, 'x'):
+            with pytest.raises(Exception, match='unsupported TS._RESTORE payload encoding version'):
+                client.execute_command('TS._RESTORE', f'encver{version}', payload, version)
+        with pytest.raises(Exception, match='wrong number of arguments'):
+            client.execute_command('TS._RESTORE', 'encver_missing', payload)
+        assert client.execute_command('TS._RESTORE', 'encver_ok', payload, self.payload_encver)
+        assert self.ts_info('encver_ok')['totalSamples'] == 200
 
     def test_restore_zero_duration_rule_is_rejected(self):
         """A restored zero-duration rule is rejected before a later write can divide by zero."""
@@ -148,7 +171,7 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         malformed = payload.replace(encoded_duration, zero_duration)
 
         with pytest.raises(Exception, match='failed to deserialize'):
-            client.execute_command('TS._RESTORE', 'zero_duration_restored', malformed)
+            client.execute_command('TS._RESTORE', 'zero_duration_restored', malformed, self.payload_encver)
 
         assert client.ping()
         assert self.server.is_alive()
@@ -161,7 +184,7 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
         payload = self._genuine_payload()
         client.config_set('appendfsync', 'always')
 
-        assert client.execute_command('TS._RESTORE', 'restored:aof', payload)
+        assert client.execute_command('TS._RESTORE', 'restored:aof', payload, self.payload_encver)
 
         server_dir = client.config_get('dir')['dir']
         aof_dir = os.path.join(server_dir, client.config_get('appenddirname')['appenddirname'])

@@ -2,7 +2,7 @@ use crate::aggregators::Aggregator;
 use crate::common::hash::DeterministicHasher;
 use crate::common::rounding::RoundingStrategy;
 use crate::labels::MetricName;
-use crate::series::{CompactionRule, SampleDuplicatePolicy};
+use crate::series::{CompactionRule, SampleDuplicatePolicy, SeriesLink};
 use std::hash::BuildHasher;
 use valkey_module::digest::Digest;
 
@@ -23,8 +23,15 @@ pub(super) fn calc_duplicate_policy_digest(policy: &SampleDuplicatePolicy, diges
     digest.add_long_long(policy.max_time_delta as i64);
 }
 
+pub(super) fn calc_link_digest(link: Option<&SeriesLink>, digest: &mut Digest) {
+    match link {
+        None => digest.add_long_long(-1),
+        Some(link) => digest.add_string_buffer(link.key()),
+    }
+}
+
 pub(super) fn calc_compaction_digest(rule: &CompactionRule, digest: &mut Digest) {
-    digest.add_long_long(rule.dest_id as i64);
+    calc_link_digest(Some(&rule.dest), digest);
     digest.add_long_long(rule.bucket_duration as i64);
     digest.add_long_long(rule.align_timestamp);
     digest.add_long_long(rule.bucket_start.unwrap_or(-1));

@@ -9,11 +9,7 @@ use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::{create_key_string, notify_keyspace_event};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
-#[cfg(not(test))]
-use crate::series::SeriesRef;
 use crate::series::chunks::{ChunkOps, TimeSeriesChunk};
-#[cfg(not(test))]
-use crate::series::index::with_timeseries_postings;
 use crate::series::ingest_normalize::{NormalizedBatch, normalize_batch};
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries, seal_chunk};
 use orx_parallel::{IterIntoParIter, Par, ParCollection};

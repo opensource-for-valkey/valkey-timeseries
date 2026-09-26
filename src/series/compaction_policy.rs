@@ -1,7 +1,7 @@
 use crate::aggregators::AggregationType;
 use crate::common::Timestamp;
 use crate::parser::parse_positive_duration_value;
-use crate::series::CompactionRule;
+use crate::series::{CompactionRule, SeriesLink};
 use ahash::{HashSet, HashSetExt};
 use regex::RegexSet;
 use std::collections::HashMap;
@@ -215,7 +215,7 @@ impl PolicyConfig {
         for policy in policies {
             let rule_key = policy.format_key(key);
             let rule = CompactionRule {
-                dest_id: 0, // This will be set later when the rule is applied
+                dest: SeriesLink::from_key(rule_key.as_bytes()),
                 aggregator: policy.aggregator.into(),
                 bucket_duration: policy.bucket_duration_ms,
                 align_timestamp: policy.bucket_alignment,
@@ -751,7 +751,7 @@ mod tests {
         let (rule, retention) = &rules[rule_key];
 
         // Check all rule properties
-        assert_eq!(rule.dest_id, 0); // Should be 0 initially
+        assert_eq!(rule.dest, SeriesLink::from_key(rule_key.as_bytes()));
         assert_eq!(rule.aggregator, AggregationType::StdP.into());
         assert_eq!(rule.bucket_duration, 45000); // 45s in ms
         assert_eq!(rule.align_timestamp, 5000);

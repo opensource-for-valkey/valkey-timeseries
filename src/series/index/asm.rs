@@ -12,7 +12,7 @@ use crate::common::sync::{lock, read_lock, write_lock};
 #[cfg(test)]
 use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
-use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
+use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_imported_series};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::tasks::remove_all_stale_series_internal;
 use crate::series::{SeriesRef, TimeSeries};
@@ -303,8 +303,8 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
         };
         series._db = Some(db);
         // Imported ids come from another node's id space: remap a collision rather than
-        // merging two series' postings.
-        index_loaded_series(&mut postings, series, key_name.as_ref());
+        // merging two series' postings. Compaction links name keys, so they survive it.
+        index_imported_series(&mut postings, series, key_name.as_ref());
     }
     drop(postings);
     drop(opened);

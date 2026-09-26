@@ -22,10 +22,23 @@ use valkey_module_macros::flush_event_handler;
 ///
 /// We register the same module type name as RedisTimeSeries (`TSDB-TYPE`)
 /// with an incompatible payload format; RTS 8.6 uses encver 9. The loaders
-/// reject any encver other than this one (see `rdb_load_series`) so a
-/// foreign payload fails cleanly instead of being misparsed — RTS→valkey
-/// RDB/DUMP migration is explicitly not supported (compat plan §7.4).
+/// reject any encver outside [`MIN_TIMESERIES_TYPE_ENCODING_VERSION`]..=this
+/// (see `rdb_load_series`) so a foreign payload fails cleanly instead of being
+/// misparsed — RTS→valkey RDB/DUMP migration is explicitly not supported
+/// (compat plan §7.4).
+///
+/// A later format bumps this and keeps [`MIN_TIMESERIES_TYPE_ENCODING_VERSION`] at the oldest
+/// version it can still read, so payloads from older nodes (RDB, `DUMP`, `TS._RESTORE`) keep
+/// loading.
 pub(crate) const TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
+
+/// Oldest encoding version the loaders still accept.
+pub(crate) const MIN_TIMESERIES_TYPE_ENCODING_VERSION: i32 = 1;
+
+/// Whether this module can read a payload written with encoding version `enc_ver`.
+pub(crate) fn is_supported_encoding_version(enc_ver: i32) -> bool {
+    (MIN_TIMESERIES_TYPE_ENCODING_VERSION..=TIMESERIES_TYPE_ENCODING_VERSION).contains(&enc_ver)
+}
 
 pub static VK_TIME_SERIES_TYPE: ValkeyType = ValkeyType::new(
     "TSDB-TYPE",
@@ -113,7 +126,7 @@ unsafe extern "C" fn aux_load(rdb: *mut RedisModuleIO, encver: c_int, when: c_in
     // Same guard as `rdb_load`: an aux field written by a foreign TSDB-TYPE
     // (or a future encoding) cannot be consumed positionally — fail the load
     // cleanly rather than misparse the stream.
-    if encver != TIMESERIES_TYPE_ENCODING_VERSION {
+    if !is_supported_encoding_version(encver) {
         logging::log_warning(format!(
             "Refusing TSDB-TYPE aux RDB payload with encoding version {encver} \
              (this module writes version {TIMESERIES_TYPE_ENCODING_VERSION})"
@@ -188,6 +201,13 @@ unsafe extern "C" fn copy(
     // `_db` is intentionally left unset; the `copy_to` handler assigns it while indexing.
     new_series._db = None;
     new_series.id = next_timeseries_id();
+    let mut len = 0usize;
+    let to_ptr = raw::string_ptr_len(to_key, &mut len);
+    new_series.key = if to_ptr.is_null() {
+        Box::default()
+    } else {
+        unsafe { std::slice::from_raw_parts(to_ptr.cast::<u8>(), len) }.into()
+    };
     new_series.src_series = None;
     new_series.rules.clear();
     Box::into_raw(Box::new(new_series)).cast::<c_void>()
@@ -271,7 +291,8 @@ unsafe extern "C" fn aof_rewrite(
     // rewrites and for atomic slot migration). In the child the module GIL mutex is inherited in a
     // locked state, so we must NOT lock a context or invoke commands (e.g. `DUMP`). Instead we
     // serialize the value directly through the type's own `rdb_save` callback, which needs no lock,
-    // and emit `TS._RESTORE key <payload>` — reconstructed by `ts_restore_cmd` on replay.
+    // and emit `TS._RESTORE key <payload> <encoding-version>` — reconstructed by `ts_restore_cmd`
+    // on replay.
     let raw_type = *VK_TIME_SERIES_TYPE.raw_type.borrow();
     let payload = unsafe {
         raw::RedisModule_SaveDataTypeToString.unwrap()(std::ptr::null_mut(), value, raw_type)
@@ -286,7 +307,8 @@ unsafe extern "C" fn aof_rewrite(
     }
 
     let restore_cmd = CString::new("TS._RESTORE").unwrap();
-    let format_str = CString::new("ss").unwrap(); // two RedisModuleString arguments
+    // Two RedisModuleString arguments and the payload's encoding version.
+    let format_str = CString::new("ssl").unwrap();
     unsafe {
         raw::RedisModule_EmitAOF.unwrap()(
             aof,
@@ -294,6 +316,7 @@ unsafe extern "C" fn aof_rewrite(
             format_str.as_ptr(),
             key,
             payload,
+            TIMESERIES_TYPE_ENCODING_VERSION as std::ffi::c_longlong,
         );
         // We passed a NULL context to SaveDataTypeToString, so the string is not auto-managed;
         // release the reference we own.

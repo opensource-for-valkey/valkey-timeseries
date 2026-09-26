@@ -14,7 +14,7 @@ use crate::series::index::{
     TIMESERIES_INDEX, clear_all_timeseries_indexes, clear_timeseries_index, get_db_index,
     get_timeseries_index, get_timeseries_index_for_db, index_loaded_series, index_series_by_key,
 };
-use crate::series::{try_get_timeseries, try_get_timeseries_mut};
+use crate::series::{relink_renamed_series, try_get_timeseries_mut};
 use std::os::raw::c_void;
 use std::sync::Mutex;
 use valkey_module::server_events::{
@@ -104,11 +104,14 @@ fn handle_key_move(ctx: &Context, key: &[u8], old_db: i32) {
 fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
     let index = get_timeseries_index(ctx);
     let key = create_key_string(ctx, new_key);
-    let Ok(Some(series)) = try_get_timeseries(ctx, &key, None) else {
+    let Ok(Some(mut series)) = try_get_timeseries_mut(ctx, &key, None) else {
         logging::log_warning("Failed to load series for key rename");
         return;
     };
+    series.key = new_key.into();
     index.reindex_timeseries(&series, old_key, new_key);
+    // Compaction partners link to each other by key.
+    relink_renamed_series(ctx, &series, old_key);
 }
 
 /// Handle the "restore" event, which is triggered for each key restored from disk during server startup

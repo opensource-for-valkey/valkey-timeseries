@@ -13,9 +13,11 @@ These tests require Valkey >= 9.0 (ASM minimum version).
 """
 
 import logging
+import threading
 import time
 import pytest
-from valkey import Valkey, ValkeyCluster
+from valkey import ResponseError, Valkey, ValkeyCluster
+from common import CompactionRule, parse_info_response
 from valkeytestframework.util.waiters import wait_for_true, WaitTimeout
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
@@ -628,6 +630,309 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         # The aborted import should leave no keys in the target's keyspace.
         self._assert_dbsize_zero(target_client, "Target keyspace should be empty after aborted import")
+
+    # ------------------------------------------------------------------------------------------
+    # Compaction rules across a migration
+    #
+    # A rule links its source and destination series by series id (the source's rule holds the
+    # destination id, the destination holds the source id), and compaction resolves the
+    # destination id through the secondary index. On the importing node that index is populated
+    # late (after ImportCompleted, on a background thread) and imported ids can be remapped on a
+    # collision, so the links have to survive both.
+    # ------------------------------------------------------------------------------------------
+
+    RULE_BUCKET = 100
+
+    @staticmethod
+    def _ts_info(client: Valkey, key: str) -> dict:
+        return parse_info_response(client.execute_command("TS.INFO", key))  # type: ignore[arg-type]
+
+    @staticmethod
+    def _samples(client: Valkey, key: str, *extra) -> list:
+        """TS.RANGE key - + [extra...] as a list of (timestamp, float value) tuples."""
+        reply = client.execute_command("TS.RANGE", key, "-", "+", *extra)  # type: ignore[union-attr]
+        return [(int(ts), float(value)) for ts, value in reply]  # type: ignore[union-attr]
+
+    @staticmethod
+    def _closed_sum_buckets(samples: list, bucket: int) -> list:
+        """The SUM compaction a rule with this bucket duration (alignment 0) must have written:
+        one sample per bucket, excluding the bucket holding the latest sample, which is still
+        open."""
+        sums: dict = {}
+        for ts, value in samples:
+            start = ts - ts % bucket
+            sums[start] = sums.get(start, 0.0) + value
+        last_open = max(ts for ts, _ in samples)
+        last_open -= last_open % bucket
+        return [(start, sums[start]) for start in sorted(sums) if start != last_open]
+
+    def _create_rule_pair(self, client: Valkey, hash_tag: str, create_rule: bool = True):
+        """Create `src` and `dst` in the hash tag's slot, with a SUM rule src -> dst."""
+        src = f"ts:{{{hash_tag}}}:src"
+        dst = f"ts:{{{hash_tag}}}:dst"
+        client.execute_command("TS.CREATE", dst, "LABELS", "asm_rule", "dst", "tag", hash_tag)
+        client.execute_command("TS.CREATE", src, "LABELS", "asm_rule", "src", "tag", hash_tag)
+        if create_rule:
+            client.execute_command(
+                "TS.CREATERULE", src, dst, "AGGREGATION", "sum", self.RULE_BUCKET
+            )
+        return src, dst
+
+    def _assert_rule_intact(self, client: Valkey, src: str, dst: str, where: str):
+        """The src -> dst rule is still reported from both ends."""
+        src_info = self._ts_info(client, src)
+        expected_rule = CompactionRule(dst, self.RULE_BUCKET, "sum", 0)
+        actual_rules = src_info.get("rules", [])
+        assert actual_rules == [expected_rule], (
+            f"{where}: TS.INFO {src} should still list the rule to {dst}; "
+            f"got rules={[(r.dest_key, r.bucket_duration, r.aggregation) for r in actual_rules]}"
+        )
+        dst_info = self._ts_info(client, dst)
+        assert dst_info.get("sourceKey") == src, (
+            f"{where}: TS.INFO {dst} should report sourceKey={src}; "
+            f"got {dst_info.get('sourceKey')!r}"
+        )
+
+    class _FollowingWriter(threading.Thread):
+        """TS.ADDs strictly increasing timestamps to one key, as fast as it can, until stopped.
+
+        Starts on the slot's current owner and follows MOVED redirects to the other node, so it
+        keeps writing through a slot migration. Only acknowledged writes are recorded in
+        `written`, which therefore is exactly the key's expected content.
+        """
+
+        def __init__(self, clients_by_port: dict, first_port: int, key: str, start_ts: int, step: int):
+            super().__init__(daemon=True)
+            self.clients_by_port = clients_by_port
+            self.port = first_port
+            self.key = key
+            self.next_ts = start_ts
+            self.step = step
+            self.written: list = []
+            self.redirects: list = []
+            self.writes_after_redirect = 0
+            self.error = None
+            self.stop_event = threading.Event()
+
+        def run(self):
+            i = 0
+            try:
+                while not self.stop_event.is_set():
+                    value = float(i % 7 + 1)
+                    try:
+                        self.clients_by_port[self.port].execute_command(
+                            "TS.ADD", self.key, self.next_ts, value
+                        )
+                    except ResponseError as e:
+                        msg = str(e)
+                        if msg.startswith("MOVED"):
+                            # "MOVED <slot> <host>:<port>" -- not executed; retry on the new owner.
+                            self.port = int(msg.split()[2].rsplit(":", 1)[1])
+                            self.redirects.append(self.port)
+                            continue
+                        if msg.startswith(("TRYAGAIN", "ASK", "LOADING")):
+                            time.sleep(0.001)
+                            continue
+                        raise
+                    self.written.append((self.next_ts, value))
+                    if self.redirects:
+                        self.writes_after_redirect += 1
+                    self.next_ts += self.step
+                    i += 1
+            except Exception as e:  # surfaced by the test after join()
+                self.error = e
+
+    def test_compaction_rule_survives_writes_during_migration(self):
+        """Writes to a rule's source key while its slot is migrating must not lose the rule.
+
+        The source node streams each TS.ADD made after the slot snapshot to the importing node,
+        which re-runs it -- including the compaction step -- before the imported destination
+        series is indexed there. The rule's destination must still resolve (during the import
+        and while the post-import indexing drain is running), so on the target the rule is
+        still listed, the destination still names its source, and the destination holds
+        exactly the SUM of every closed bucket of what was written.
+        """
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        self._skip_if_asm_commands_not_supported(source_client)
+        target_client = self.new_client_for_primary(1)
+        target_node_id = self._get_node_id(target_client)
+
+        hash_tag = self._find_hash_tag_for_shard(source_client, "asm_rule_writes", shard_index=0)
+        src, dst = self._create_rule_pair(source_client, hash_tag)
+        slot = self._get_key_slot(source_client, src)
+        assert self._shard_index_for_slot(slot) == 0, "Keys not in source shard"
+
+        # Filler series in the same slot, to give the migration a snapshot worth streaming and
+        # so widen the window in which the writer's TS.ADDs are replayed on the importing node.
+        pipe = source_client.pipeline(transaction=False)
+        for i in range(64):
+            filler = f"ts:{{{hash_tag}}}:filler{i}"
+            pipe.execute_command("TS.CREATE", filler, "LABELS", "asm_filler", "yes")
+            for j in range(200):
+                pipe.execute_command("TS.ADD", filler, 1000 + j * 10, float(j))
+        pipe.execute()
+
+        clients_by_port = {
+            self.get_primary_port(0): self.new_client_for_primary(0),
+            self.get_primary_port(1): self.new_client_for_primary(1),
+        }
+        writer = self._FollowingWriter(
+            clients_by_port, self.get_primary_port(0), src, start_ts=10_000, step=10
+        )
+        writer.start()
+        try:
+            # Let a few buckets close on the source before the migration starts.
+            wait_for_true(lambda: len(writer.written) >= 100 or writer.error is not None, timeout=10)
+
+            self._migrate_slot_range(source_client, target_node_id, slot, slot)
+            self._wait_for_no_migrations(source_client)
+            self._wait_for_no_migrations(target_client)
+
+            # Keep writing on the new owner for a while: this also covers the window after
+            # ImportCompleted in which the imported keys are still waiting to be indexed.
+            wait_for_true(
+                lambda: writer.writes_after_redirect >= 200 or writer.error is not None,
+                timeout=15,
+            )
+        finally:
+            writer.stop_event.set()
+            writer.join(timeout=10)
+
+        assert writer.error is None, f"writer failed: {writer.error!r}"
+        assert writer.redirects, "writer never followed the slot to the target node"
+        assert writer.writes_after_redirect >= 200, (
+            f"writer made only {writer.writes_after_redirect} writes on the target"
+        )
+
+        # Wait for the imported keys to be indexed on the target.
+        self._assert_local_queryindex_contains(target_client, f"tag={hash_tag}", [src, dst])
+
+        # Close the bucket the writer left open (and one more), on the new owner.
+        written = list(writer.written)
+        last_ts = written[-1][0]
+        for k in (1, 2):
+            ts = last_ts + k * self.RULE_BUCKET
+            target_client.execute_command("TS.ADD", src, ts, 1.0)
+            written.append((ts, 1.0))
+
+        # The source data itself is intact, so `written` is exactly what the rule compacted.
+        assert self._samples(target_client, src) == written, "source series data mismatch on target"
+
+        self._assert_rule_intact(target_client, src, dst, "after migration under writes")
+
+        expected = self._closed_sum_buckets(written, self.RULE_BUCKET)
+        # Cross-check the Python model against the server's own aggregation of the source.
+        server_agg = self._samples(target_client, src, "AGGREGATION", "sum", self.RULE_BUCKET)
+        assert server_agg[:-1] == expected, "expected-bucket model disagrees with TS.RANGE AGGREGATION"
+
+        actual = self._samples(target_client, dst)
+        missing = sorted(set(expected) - set(actual))
+        unexpected = sorted(set(actual) - set(expected))
+        assert actual == expected, (
+            f"{dst} on target does not hold the SUM of every closed bucket of {src}: "
+            f"{len(actual)} samples vs {len(expected)} expected; "
+            f"first missing={missing[:5]}, first unexpected={unexpected[:5]}"
+        )
+
+    def test_compaction_rule_survives_migration_id_collision(self):
+        """A rule survives a migration whose imported destination's id is taken on the target.
+
+        Series ids are only probabilistically unique across nodes, and an imported series whose
+        id is already used by a different key on the target is given a fresh id. The rule's
+        other end still refers to the old id, which on the target belongs to an unrelated key.
+
+        The collision is forced deterministically: the destination is DUMPed on the source
+        right after creation, and that payload is RESTOREd on the target under an unrelated key
+        (in a slot the target owns), so that key carries the destination's id. That decoy is
+        also made the destination of a local rule, so a rule still resolving the stale id would
+        write its aggregates into it.
+        """
+        source_client = self.new_client_for_primary(0)
+        self._skip_if_asm_not_supported(source_client)
+        self._skip_if_asm_commands_not_supported(source_client)
+        target_rg = self.get_replication_group(1)
+        target_client = self.new_client_for_primary(1)
+        target_node_id = self._get_node_id(target_client)
+
+        hash_tag = self._find_hash_tag_for_shard(source_client, "asm_rule_collide", shard_index=0)
+        decoy_tag = self._find_hash_tag_for_shard(source_client, "asm_rule_decoy", shard_index=1)
+
+        src, dst = self._create_rule_pair(source_client, hash_tag, create_rule=False)
+        slot = self._get_key_slot(source_client, src)
+        assert self._shard_index_for_slot(slot) == 0, "Keys not in source shard"
+
+        # Snapshot dst before it is linked, so the decoy is an unrelated series that merely
+        # shares dst's id (no labels, rules or source link of dst's).
+        payload = source_client.execute_command("DUMP", dst)
+        source_client.execute_command(
+            "TS.CREATERULE", src, dst, "AGGREGATION", "sum", self.RULE_BUCKET
+        )
+
+        decoy = f"ts:{{{decoy_tag}}}:decoy"
+        local_src = f"ts:{{{decoy_tag}}}:localsrc"
+        target_client.execute_command("RESTORE", decoy, 0, payload)
+        target_client.execute_command("TS.ALTER", decoy, "LABELS", "asm_rule", "decoy")
+        target_client.execute_command("TS.CREATE", local_src, "LABELS", "asm_rule", "localsrc")
+        target_client.execute_command(
+            "TS.CREATERULE", local_src, decoy, "AGGREGATION", "max", 1000
+        )
+        for ts in range(0, 2600, 250):
+            target_client.execute_command("TS.ADD", local_src, ts, float(ts % 7))
+        decoy_before = self._samples(target_client, decoy)
+        assert decoy_before, "decoy should hold local compaction output"
+
+        # Source data before the migration: closes buckets 0..300, leaves 400 open.
+        written = []
+        for ts in range(0, 500, 10):
+            value = float(ts // 10 % 5 + 1)
+            source_client.execute_command("TS.ADD", src, ts, value)
+            written.append((ts, value))
+        self._assert_rule_intact(source_client, src, dst, "before migration")
+
+        self._migrate_slot(source_client, target_node_id, slot)
+        self._wait_for_no_migrations(target_client)
+        self._assert_local_queryindex_contains(target_client, f"tag={hash_tag}", [src, dst])
+
+        # Precondition: the import really did collide on dst's id.
+        collision_marker = f"for key {dst} is already in use by another key"
+        self._poll_until(lambda: target_rg.primary.does_logfile_contains(collision_marker))
+        assert target_rg.primary.does_logfile_contains(collision_marker), (
+            f"expected the import of {dst} to collide with {decoy}'s id "
+            f"(log line containing {collision_marker!r})"
+        )
+
+        # Right after the import, before any write: the rule must name dst, not the unrelated
+        # series that owns dst's pre-migration id on this node.
+        self._assert_rule_intact(target_client, src, dst, "after colliding migration, before writes")
+
+        # Write on the new owner, closing buckets 400..900 (1000 stays open).
+        for ts in range(500, 1010, 10):
+            value = float(ts // 10 % 5 + 1)
+            target_client.execute_command("TS.ADD", src, ts, value)
+            written.append((ts, value))
+
+        self._assert_rule_intact(target_client, src, dst, "after colliding migration and writes on the target")
+
+        expected = self._closed_sum_buckets(written, self.RULE_BUCKET)
+        actual = self._samples(target_client, dst)
+        assert actual == expected, (
+            f"{dst} on target does not hold the SUM of every closed bucket of {src}: "
+            f"got {actual}, expected {expected}"
+        )
+
+        # The unrelated series that owned the id is untouched, and still linked to its own source.
+        assert self._samples(target_client, decoy) == decoy_before, (
+            f"{src}'s rule wrote into the unrelated series {decoy}"
+        )
+        decoy_info = self._ts_info(target_client, decoy)
+        assert decoy_info.get("sourceKey") == local_src, (
+            f"{decoy} should still report sourceKey={local_src}; got {decoy_info.get('sourceKey')!r}"
+        )
+        local_rules = self._ts_info(target_client, local_src).get("rules", [])
+        assert local_rules == [CompactionRule(decoy, 1000, "max", 0)], (
+            f"{local_src}'s own rule changed: {[(r.dest_key, r.aggregation) for r in local_rules]}"
+        )
 
     def _find_hash_tag_for_shard(self, client: Valkey, prefix: str, shard_index: int, max_attempts: int = 512) -> str:
         """Find a hash tag whose slot is owned by the requested shard."""

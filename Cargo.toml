@@ -37,7 +37,6 @@ rand_distr = { version = "0.6", optional = true }
 smallvec = "1.16"
 speedate = "0.17"
 thiserror = "2.0"
-topo_sort = "0.4.0"
 valkey-module = "0.1.14"
 valkey-module-macros = "0.1.14"
 range-set-blaze = "0.7.0"
