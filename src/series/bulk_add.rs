@@ -6,7 +6,7 @@
 #[cfg(not(test))]
 use crate::common::block_on_keys::signal_timeseries_ready;
 #[cfg(not(test))]
-use crate::common::context::create_key_string;
+use crate::common::context::{create_key_string, notify_module_event};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 #[cfg(not(test))]
@@ -20,8 +20,6 @@ use orx_parallel::{IterIntoParIter, Par, ParCollection};
 use simd_json::base::{ValueAsArray, ValueAsScalar};
 use simd_json::borrowed::Value;
 use simd_json::prelude::ValueObjectAccess;
-#[cfg(not(test))]
-use valkey_module::NotifyEvent;
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
 pub const MAX_SAMPLES_PER_INSERT: usize = 1_000;
@@ -440,14 +438,11 @@ pub fn bulk_insert_samples(
         ))
     });
 
+    // Always `ts.add`, even when the target is a compaction destination: `ts.add:dest` marks
+    // rule output only (emitted by the compaction path), matching TS.ADD/TS.MADD on RTS.
     #[cfg(not(test))]
     if series.total_samples > _saved_sample_count {
-        let event = if series.is_compaction() {
-            "ts.add:dest"
-        } else {
-            "ts.add"
-        };
-        notify_added(ctx, event, &[series.id]);
+        notify_added(ctx, &[series.id]);
     }
 
     // Propagate the accepted samples to compaction destinations in one batch.
@@ -488,15 +483,15 @@ pub fn bulk_insert_samples(
 }
 
 #[cfg(not(test))]
-fn notify_added(ctx: &Context, event: &str, ids: &[SeriesRef]) {
+fn notify_added(ctx: &Context, ids: &[SeriesRef]) {
     with_timeseries_postings(ctx, |postings| {
         for &id in ids {
             let Some(key) = postings.get_key_by_id(id) else {
-                ctx.log_warning("Compaction notification failed: series key not found");
+                ctx.log_warning("TS.ADDBULK notification failed: series key not found");
                 continue;
             };
             let key = create_key_string(ctx, key.as_ref());
-            ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key);
+            notify_module_event(ctx, c"ts.add", &key);
             // The sole caller already gated on the series' sample count having grown, which is
             // exactly the condition that can satisfy a blocked `TS.READ`.
             signal_timeseries_ready(ctx, &key);
