@@ -266,10 +266,93 @@ generalization, one for tests, half to measure.
 
 ## 7. Open questions
 
-- **In-range profiles.** `series_by_selectors` accepts a `MetaDateRangeFilter`; passing
-  each leaf's `selector_bounds` would exclude retired series and tighten the filters at no
-  extra cost. Left out of v1 to keep the profile independent of time modifiers; worth
-  doing if a real dataset shows label drift diluting the value sets.
+- **In-range profiles — evaluated 2026-09-26, not started.** Profiling each leaf over the
+  window its reads cover, not the whole index, would drop retired series (a rolled-out
+  pod, a region that stopped reporting). That tightens three things: the derived filters,
+  `retain_pruning` on the target, and `short_circuit_empty_operands`, which would then
+  also fire on selectors that match only retired series. It stays sound. A series with no
+  sample in a leaf's window adds nothing to that leaf's read at any step, so an in-range
+  profile is still a superset of every step's series. The payoff is churn. With pod
+  churn, `pod` collects values without bound and overflows the 60-value cap in an index
+  profile, while the pods live in the window can stay under it. That is what an
+  `on(pod) group_left` join needs. The earlier note's "at no extra cost" is wrong for the
+  obvious call, `series_by_selectors(…, Some(range))` (step 4). Steps:
+
+  1. **A window per leaf.** `collect_operand_leaves`/`collect_all_selectors`
+     ([derived_filters.rs](../../src/promql/engine/derived_filters.rs)) walk the tree
+     without any time context. The walk has to carry the evaluation window down the tree
+     the way `preload_ranges_inner` ([time.rs](../../src/promql/time.rs)) does: offset,
+     `@` (fixed, `start()`, `end()`), matrix range versus lookback, and each enclosing
+     subquery's own window. Each leaf then comes out as `(leaf, (earliest, latest))`.
+     Turn `preload_ranges_inner` into a visitor that both walks share, rather than adding
+     a third copy of those rules, and widen `selector_bounds` from `pub(super)`.
+     `evaluate_range` already builds its `EvalContext` before calling
+     `derive_filters_in_place`, so the call only needs the extra argument.
+  2. **Still one profile per selector: take the hull of its windows.** `SelectorKey`
+     leaves out offset and `@`, so `cpu - cpu offset 5m` needs a single profile today.
+     Keying by (selector, window) would make that two, and in cluster mode that is one
+     more label fan-out, ≈0.5–1 ms (measured below). Instead, merge each key's windows
+     into their hull and profile once. The hull covers every occurrence's window, so
+     soundness holds, and the counting-reader tests keep their numbers. Tightening is
+     lost only when occurrences sit far apart (`x - x offset 1w`), and even then, series
+     retired before the earliest window are still dropped.
+  3. **Reader and wire.** `QueryReader::label_profile` takes the range. That touches
+     every implementation: `ValkeySeriesQuerier`, `ConcreteSeriesQuerier`,
+     `CountingQueryReader` and its test wrapper, `MemorySeriesQuerier`, and the
+     `derived_filters` test mock. `ProfileSelectorCommand` and
+     `LabelProfileFanoutCommand` carry it too. `LabelProfileQuery` gets a field of the
+     `MetaDateRangeFilter` message the other fan-outs already use, followed by
+     `VALKEY_TS_PROTO_REGEN=1 cargo build`. The codebase is pre-release, so no version-skew
+     handling is needed.
+  4. **The walk, locally and on each shard.** Don't pass the range to
+     `series_by_selectors`, for two reasons. Its `filter_series_by_date_range` calls
+     `has_samples_in_range`, which decodes into a chunk to find a sample. It also runs
+     that filter on the global rayon pool, and `local_label_profile` runs on a thread
+     that holds `MODULE_CONTEXT`, the combination the request-pool rule forbids. Instead,
+     `local_label_profile` checks each series inside its builder loop with a new O(1),
+     retention-aware `TimeSeries` predicate: not empty,
+     `last_timestamp >= start`, and `max(first_timestamp, get_min_timestamp()) <= end`.
+     It is looser than `has_samples_in_range` only for a series whose gap spans the whole
+     window. Looser is sound, and that is not the case this item targets.
+     `MemorySeriesQuerier` uses the same predicate.
+  5. **What the series cap counts.** `local_label_profile` compares the matched count
+     with the cap only after `series_by_selectors` has opened every key, so the cap
+     already limits the label walk, not the key opening. Count the in-range series (the
+     ones walked) against it. Otherwise a churny selector such as 60 000 matched, 5 000
+     live is never profiled, and that is exactly the dataset this item is for.
+  6. **Text to restate.** §2.1 ("time-agnostic") and §3 *Results* ("over the index")
+     should describe the leaf's window instead of the whole index. The short-circuit
+     entry below should say "no series with a sample in its window". §3 *Errors* grows:
+     a wide operand whose read would have failed is now skipped when the other side
+     matches only retired series. Planting a proven-empty selector in the other operand's
+     place stays correct, because the empty operand itself remains in the tree. The
+     planted copy, though, is read over the new position's window, where it may not be
+     empty. That costs a small read and never gives a wrong result.
+  7. **Tests.**
+     - Unit tests for window collection: offset; `@` fixed, `start()` and `end()`;
+       matrix range versus lookback; nested subqueries; and the hull for
+       `x - x offset 1h`.
+     - A `derived_filters` case with a retired `region="eu"` series. An index profile
+       finds nothing common, and an in-range profile derives `region="us"`.
+     - A short-circuit on a selector that matches only retired series.
+     - The predicate itself: retention, empty series, and a window that only touches
+       one end.
+     - Counting-reader counts stay as they are.
+     - The `eval range` promqltest parity stays as it is (it already runs with the pass
+       on).
+     - Cluster: add a retired generation to
+       `test_ts_query_derived_filter_pushdown_cme.py`, check on/off parity, and repeat
+       the `ts-promql-max-response-series` proof on a churn shape.
+  8. **Measure.** In the 3-node harness every series spans the whole range, so it can
+     only show the overhead. Expect noise, since the predicate is two comparisons per key
+     that is opened anyway. Showing a gain needs a churn fixture: live series plus retired
+     generations with different `pod` values, queried as
+     `info * on(pod) group_left live{namespace="x"}`.
+
+  Estimate: ≈1–1.5 days. Half of that goes to the window threading and the hull, the only
+  part with subtle rules. A quarter goes to the reader, proto and walk plumbing, and the
+  rest to tests and the churn fixture. Worth doing once a churn workload matters. Without
+  churn the change is neutral, so it can wait until then without cost.
 - **Empty operand short-circuit — done (2026-09-13).** `short_circuit_empty_operands`
   runs before the rewrite: where a profile proves an operand's selector matches no
   series and the operand's shape passes emptiness through (aggregations,
