@@ -438,7 +438,7 @@ pub fn bulk_insert_samples(
     // rule output only (emitted by the compaction path), matching TS.ADD/TS.MADD on RTS.
     #[cfg(not(test))]
     if series.total_samples > _saved_sample_count {
-        notify_added(ctx, &[series.id]);
+        notify_added(ctx, &series.key);
     }
 
     // Propagate the accepted samples to compaction destinations in one batch.
@@ -479,20 +479,12 @@ pub fn bulk_insert_samples(
 }
 
 #[cfg(not(test))]
-fn notify_added(ctx: &Context, ids: &[SeriesRef]) {
-    with_timeseries_postings(ctx, |postings| {
-        for &id in ids {
-            let Some(key) = postings.get_key_by_id(id) else {
-                ctx.log_warning("TS.ADDBULK notification failed: series key not found");
-                continue;
-            };
-            let key = create_key_string(ctx, key.as_ref());
-            notify_keyspace_event(ctx, c"ts.add", &key);
-            // The sole caller already gated on the series' sample count having grown, which is
-            // exactly the condition that can satisfy a blocked `TS.READ`.
-            signal_timeseries_ready(ctx, &key);
-        }
-    });
+fn notify_added(ctx: &Context, key: &[u8]) {
+    let key = create_key_string(ctx, key);
+    notify_keyspace_event(ctx, c"ts.add", &key);
+    // The sole caller already gated on the series' sample count having grown, which is
+    // exactly the condition that can satisfy a blocked `TS.READ`.
+    signal_timeseries_ready(ctx, &key);
 }
 
 #[cfg(test)]

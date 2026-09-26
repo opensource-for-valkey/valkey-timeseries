@@ -1,6 +1,6 @@
 use crate::aggregators::{AggregationHandler, Aggregator, calc_bucket_start};
 use crate::common::block_on_keys::signal_timeseries_ready;
-use crate::common::context::{create_key_string, notify_keyspace_event};
+use crate::common::context::notify_keyspace_event;
 use crate::common::logging::log_warning;
 use crate::common::rdb::{
     RdbSerializable, rdb_load_bool, rdb_load_timestamp, rdb_save_bool, rdb_save_timestamp,
@@ -16,8 +16,7 @@ use get_size2::GetSize;
 use orx_parallel::{Par, ParCollectionMut};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
-use topo_sort::TopoSort;
-use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, raw};
 
 const PARALLEL_THRESHOLD: usize = 2;
 const TEMP_VEC_LEN: usize = 6;
@@ -1225,21 +1224,14 @@ fn resolve_destination<'a>(
     Resolved::Open(dest_key, dest)
 }
 
-fn notify_compaction(ctx: &Context, ids: &[SeriesRef]) {
-    with_timeseries_postings(ctx, |postings| {
-        for &id in ids {
-            let Some(key) = postings.get_key_by_id(id) else {
-                ctx.log_warning("Compaction notification failed: series key not found");
-                continue;
-            };
-            let key = create_key_string(ctx, key.as_ref());
-            notify_keyspace_event(ctx, c"ts.add:dest", &key);
-            // Callers only reach here for destinations that materialized a sample, so this is
-            // the one place both direct and cascaded compaction output can wake a `TS.READ`
-            // reader blocked on a rollup key.
-            signal_timeseries_ready(ctx, &key);
-        }
-    });
+fn notify_compaction(ctx: &Context, keys: &[ValkeyString]) {
+    for key in keys {
+        notify_keyspace_event(ctx, c"ts.add:dest", key);
+        // Callers only reach here for destinations that materialized a sample, so this is
+        // the one place both direct and cascaded compaction output can wake a `TS.READ`
+        // reader blocked on a rollup key.
+        signal_timeseries_ready(ctx, key);
+    }
 }
 
 /// Write one aggregated bucket to the destination.
