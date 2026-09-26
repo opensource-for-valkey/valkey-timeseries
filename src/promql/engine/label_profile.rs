@@ -10,6 +10,7 @@
 //! the distinct values they carry, capped at [`MAX_PUSHDOWN_VALUES`] beyond
 //! which the label is only known to be high-cardinality.
 
+use crate::labels::filters::RegexMatcher;
 use ahash::AHashMap;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use regex::{Regex, escape};
@@ -71,9 +72,9 @@ impl LabelProfile {
             .iter()
             .filter(|label| label.carried_by == self.series && !label.overflow)
             .filter(|label| !label.values.is_empty())
-            .map(|label| match label.values.as_slice() {
-                [value] => Matcher::new(MatchOp::Equal, &label.name, value),
-                values => regex_matcher(
+            .filter_map(|label| match label.values.as_slice() {
+                [value] => Some(Matcher::new(MatchOp::Equal, &label.name, value)),
+                values => try_regex_matcher(
                     &label.name,
                     join_regexp_values(values.iter().map(String::as_str)),
                 ),
@@ -208,6 +209,14 @@ pub fn regex_matcher(name: &str, alternation: String) -> Matcher {
     // Escaped literals joined by `|`: a valid regex by construction.
     let regex = Regex::new(&format!("^(?:{alternation})$")).unwrap();
     Matcher::new(MatchOp::Re(regex), name, &alternation)
+}
+
+/// The index uses a bounded regex compiler. Omit a derived filter when its
+/// alternation exceeds that bound; the original selector still gives the
+/// correct result.
+pub fn try_regex_matcher(name: &str, alternation: String) -> Option<Matcher> {
+    let regex = RegexMatcher::create(&alternation).ok()?.regex;
+    Some(Matcher::new(MatchOp::Re(regex), name, &alternation))
 }
 
 /// The values as a regex alternation, sorted so the same set always yields
@@ -382,5 +391,22 @@ mod tests {
     fn regexp_values_are_sorted_and_escaped() {
         assert_eq!(join_regexp_values(["b", "a.c", "a"]), r"a|a\.c|b");
         assert_eq!(join_regexp_values(["x"]), "x");
+    }
+
+    #[test]
+    fn common_filters_skip_alternations_the_index_cannot_compile() {
+        let values = (0_u64..60)
+            .map(|i| format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)))
+            .collect();
+        let profile = LabelProfile {
+            series: 60,
+            labels: vec![LabelValueProfile {
+                name: "instance".into(),
+                carried_by: 60,
+                values,
+                overflow: false,
+            }],
+        };
+        assert!(profile.common_filters().is_empty());
     }
 }

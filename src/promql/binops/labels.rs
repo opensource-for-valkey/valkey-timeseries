@@ -1,6 +1,6 @@
 use crate::labels::{HasFingerprint, SeriesFingerprint, fingerprint_labels};
 use crate::promql::engine::label_profile::{
-    MAX_PUSHDOWN_VALUES, join_regexp_values, regex_matcher,
+    MAX_PUSHDOWN_VALUES, join_regexp_values, try_regex_matcher,
 };
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
@@ -190,12 +190,14 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
         let lf = if values.len() == 1 {
             // Safety: length checked above.
             let val = *values.iter().next().unwrap();
-            Matcher::new(MatchOp::Equal, key, val)
+            Some(Matcher::new(MatchOp::Equal, key, val))
         } else {
-            regex_matcher(key, join_regexp_values(values))
+            try_regex_matcher(key, join_regexp_values(values))
         };
 
-        lfs.push(lf);
+        if let Some(lf) = lf {
+            lfs.push(lf);
+        }
     }
 
     lfs
@@ -292,6 +294,22 @@ mod tests {
             .map(|i| labelled(&[("region", "us"), ("host", &format!("h{i}"))]))
             .collect();
         assert_eq!(derived(&many), vec!["region=us"]);
+    }
+
+    #[test]
+    fn common_label_filters_skip_alternations_the_index_cannot_compile() {
+        let samples: Vec<EvalSample> = (0_u64..60)
+            .map(|i| {
+                labelled(&[
+                    ("region", "us"),
+                    (
+                        "instance",
+                        &format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)),
+                    ),
+                ])
+            })
+            .collect();
+        assert_eq!(derived(&samples), vec!["region=us"]);
     }
 
     /// Parse `query` and return its top-level binary expression.
