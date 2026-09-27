@@ -168,19 +168,24 @@ pub fn get_series_key_by_id(ctx: &Context, id: SeriesRef) -> Option<ValkeyString
     })
 }
 
-/// Index a timeseries by its key. Looks up the series from the key, assigns the current
-/// database, and inserts it into the index if not already present.
+/// Index a timeseries by its key under a fresh id. Looks up the series from the key, assigns
+/// the current database, and indexes it with [`index_loaded_series`].
 pub fn index_series_by_key(ctx: &Context, key: &[u8]) {
-    index_key_with(ctx, key, index_loaded_series);
+    with_series_for_indexing(ctx, key, index_loaded_series);
 }
 
-/// [`index_series_by_key`] for a series that is the same series, under the same key, as the
-/// one it was serialized from (`TS._RESTORE`); see [`index_imported_series`].
-pub fn index_imported_series_by_key(ctx: &Context, key: &[u8]) {
-    index_key_with(ctx, key, index_imported_series);
+/// Like [`index_series_by_key`], but idempotent: a series already indexed under `key` is left
+/// alone, and an unindexed one keeps its id (see [`index_series_keep_id`]). For the post-load
+/// repair scan, which visits every key of a db whose index is mostly correct already.
+pub(in crate::series::index) fn ensure_series_indexed_by_key(ctx: &Context, key: &[u8]) {
+    with_series_for_indexing(ctx, key, index_series_keep_id);
 }
 
-fn index_key_with(ctx: &Context, key: &[u8], index_fn: fn(&mut Postings, &mut TimeSeries, &[u8])) {
+fn with_series_for_indexing(
+    ctx: &Context,
+    key: &[u8],
+    index_fn: fn(&mut Postings, &mut TimeSeries, &[u8]),
+) {
     let db = get_current_db(ctx);
     let valkey_key = create_key_string(ctx, key);
     // Open the key before taking the index lock: opening runs lazy expiry, which can reach
@@ -194,72 +199,63 @@ fn index_key_with(ctx: &Context, key: &[u8], index_fn: fn(&mut Postings, &mut Ti
     index_fn(&mut postings, &mut series, key);
 }
 
-/// Index a series that entered the keyspace carrying a serialized id (RESTORE, `TS._RESTORE`,
-/// a slot import), unless it is already indexed under `key` (an RDB load whose index was
-/// preloaded from the aux payload).
+/// Index a series that entered the keyspace (via `RESTORE`, `MIGRATE`, `TS._RESTORE`, a slot
+/// import, `MOVE`, `COPY`) under a freshly generated id.
 ///
-/// A serialized id is not guaranteed to be free. `RESTORE b <DUMP a>` with `a` still live
-/// brings back `a`'s id verbatim; skipping it as "already indexed" left `b` unqueryable, and
-/// indexing it anyway would merge the two series' postings. Such a series is a new series
-/// that happens to share bytes with another, so it gets a fresh id and — like `COPY` — drops
-/// its compaction linkage, which still belongs to the original.
-pub(crate) fn index_loaded_series(postings: &mut Postings, series: &mut TimeSeries, key: &[u8]) {
-    index_series_with_serialized_id(postings, series, key, false);
-}
-
-/// [`index_loaded_series`] for a series that arrived through an atomic slot migration, or any
-/// other `TS._RESTORE` (which replicas of the importing node, and AOF replay, see too).
+/// The id is regenerated unconditionally: the roaring bitmaps in this module stay dense only
+/// while ids share their high (epoch) bits, which a serialized id from another node or process
+/// does not. If `key` is already indexed under the series' current id, that entry -- its
+/// `id_to_key` mapping, `all_postings` bit and label postings -- is removed first, so the old id
+/// cannot keep resolving to `key`. An id owned by a *different* key is left alone: that is
+/// another series (`RESTORE b <DUMP a>` with `a` live carries `a`'s id).
 ///
-/// Its id may come from another node's id space, so it too is remapped on a collision. Unlike a
-/// `RESTORE` copy, though, it is the same series under the same key as the one it was
-/// serialized from, and so are its compaction partners (a rule's two keys share a slot, so they
-/// migrate together): its links, which name keys, stay valid and are kept.
-pub(crate) fn index_imported_series(postings: &mut Postings, series: &mut TimeSeries, key: &[u8]) {
-    index_series_with_serialized_id(postings, series, key, true);
-}
-
-fn index_series_with_serialized_id(
+/// Compaction links are kept either way: they name keys, not ids, and every use checks the
+/// back-link (see [`crate::series::link`]). A series restored under its own key -- including a
+/// per-key `MIGRATE`, whose partners arrive separately -- keeps working rules; a copy restored
+/// under another key has links that no partner names back, so they are inert and never reported.
+pub(in crate::series::index) fn index_loaded_series(
     postings: &mut Postings,
     series: &mut TimeSeries,
     key: &[u8],
-    keep_links: bool,
 ) {
     // The series is stored under `key` now, whatever it was loaded under.
     if series.key.as_ref() != key {
         series.key = key.into();
     }
-    let collides = match postings.get_key_by_id(series.id) {
-        Some(owner) if owner.as_ref() == key => return,
-        Some(_) => true,
-        None => false,
+    // Retire the old id while `series` still carries it (and the labels it was indexed with).
+    postings.remove_timeseries_for_key(series, key);
+    series.id = loop {
+        let id = next_timeseries_id();
+        if !postings.has_id(id) {
+            break id;
+        }
     };
-    if collides && keep_links {
-        let old_id = series.id;
-        series.id = next_timeseries_id();
-        log_warning(format!(
-            "series id {old_id} for key {} is already in use by another key; reassigned id {}",
-            String::from_utf8_lossy(key),
-            series.id,
-        ));
-    } else if collides {
-        let old_id = series.id;
-        series.id = next_timeseries_id();
-        let dropped_rules = series.rules.len();
-        let had_source = series.src_series.take().is_some();
-        series.rules.clear();
-        log_warning(format!(
-            "series id {old_id} for key {} is already in use by another key; reassigned id {} \
-             (dropped {dropped_rules} compaction rule(s){})",
-            String::from_utf8_lossy(key),
-            series.id,
-            if had_source {
-                " and its source link"
-            } else {
-                ""
-            }
-        ));
-    }
     postings.index_timeseries(series, key);
+}
+
+/// Index a series under the id it already carries, unless `key` is already indexed under that
+/// id (then this is a no-op). An id owned by a different key is a collision, not a duplicate:
+/// the series falls back to [`index_loaded_series`] and gets a fresh id rather than being left
+/// unindexed or merged into the other series' postings.
+pub(in crate::series::index) fn index_series_keep_id(
+    postings: &mut Postings,
+    series: &mut TimeSeries,
+    key: &[u8],
+) {
+    match postings.get_key_by_id(series.id) {
+        Some(owner) if owner.as_ref() == key => {
+            if series.key.as_ref() != key {
+                series.key = key.into();
+            }
+        }
+        Some(_) => index_loaded_series(postings, series, key),
+        None => {
+            if series.key.as_ref() != key {
+                series.key = key.into();
+            }
+            postings.index_timeseries(series, key);
+        }
+    }
 }
 
 /// Drops the index for a single database. Takes the db explicitly: the only caller is the

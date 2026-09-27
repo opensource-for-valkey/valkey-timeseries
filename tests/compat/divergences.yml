@@ -1269,3 +1269,22 @@
   rationale: see DIV-0057 (registry matching is per-command, so the entry is duplicated
     rather than shared; delete both together if the decision is ever reversed)
   since: 0.1.0
+
+- id: DIV-0059
+  command: RESTORE
+  kind: behavior
+  documentation_only: true
+  description: >
+    A compaction rule survives DUMP/RESTORE of either or both of its ends under their own
+    keys (including RESTORE ... REPLACE in place, and the per-key DUMP + RESTORE that MIGRATE
+    performs): both ends report it in TS.INFO and compaction output keeps flowing. RTS 8.10
+    drops the rule on both ends — the restored key has no rules or sourceKey, neither does
+    its partner, and nothing more reaches the destination. A copy restored under a different
+    key is inert on both engines: its links name keys that do not name it back.
+  rationale: >
+    Owner sign-off pending (behavior kind, §5.3). Rules link their ends by key so that a
+    series keeps its compaction wiring wherever its key goes — slot migration (ASM, and the
+    MIGRATE-based resharding that predates it), TS._RESTORE, AOF replay. Dropping the rule on
+    RESTORE would silently stop a rollup whenever a slot moves. Pinned by
+    TestRestoreKeepsRules::test_rule_survives_restore_under_the_same_key.
+  since: 0.1.0

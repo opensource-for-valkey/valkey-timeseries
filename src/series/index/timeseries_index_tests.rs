@@ -5,8 +5,7 @@ mod tests {
     use crate::labels::Label;
     use crate::labels::filters::{LabelFilter, SeriesSelector};
     use crate::series::index::{
-        PostingStat, TimeSeriesIndex, index_imported_series, index_loaded_series,
-        next_timeseries_id,
+        PostingStat, TimeSeriesIndex, index_loaded_series, index_series_keep_id, next_timeseries_id,
     };
     use crate::series::time_series::TimeSeries;
     use crate::series::{CompactionRule, SeriesLink};
@@ -675,18 +674,13 @@ mod tests {
         index.index_timeseries(&original, b"a");
 
         let mut copy = original.clone();
-        copy.src_series = Some(SeriesLink::from_key(b"src"));
-        copy.rules.push(test_rule(b"dst"));
         {
             let mut postings = index.get_postings_mut();
             index_loaded_series(&mut postings, &mut copy, b"b");
         }
 
         assert_ne!(copy.id, original.id, "the copy must get a fresh id");
-        assert!(
-            copy.src_series.is_none() && copy.rules.is_empty(),
-            "compaction linkage belongs to the original"
-        );
+        assert_eq!(copy.key.as_ref(), b"b");
         assert_eq!(index.count(), 2);
         let postings = index.get_postings();
         assert_eq!(
@@ -700,8 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn test_index_imported_series_remaps_a_colliding_id_but_keeps_its_links() {
-        // A slot import brings `b` with an id that a different local key already owns.
+    fn test_index_loaded_series_keeps_its_links_through_an_id_remap() {
+        // A series migrated to another node (slot import, or a per-key `MIGRATE`) whose id a
+        // different local key already owns. Its links name keys, so the remap leaves them alone.
         let index = TimeSeriesIndex::new();
         let local = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
         index.index_timeseries(&local, b"a");
@@ -712,7 +707,7 @@ mod tests {
         imported.rules.push(test_rule(b"{t}dst"));
         {
             let mut postings = index.get_postings_mut();
-            index_imported_series(&mut postings, &mut imported, b"b");
+            index_loaded_series(&mut postings, &mut imported, b"b");
         }
 
         assert_ne!(
@@ -740,19 +735,182 @@ mod tests {
         }
     }
 
+    /// 20 groups of 32 series with consecutive ids: each group's posting list is a run that
+    /// `run_optimize` turns into a run container.
+    fn index_with_run_shaped_postings() -> TimeSeriesIndex {
+        let index = TimeSeriesIndex::new();
+        let mut id = 1 << 32;
+        for group in 0..20 {
+            for member in 0..32 {
+                let mut ts = create_series_from_metric_name(&format!(
+                    r#"cpu{{group="g{group}",member="m{member}"}}"#
+                ));
+                ts.id = id;
+                id += 1;
+                index.index_timeseries(&ts, format!("{group}:{member}").as_bytes());
+            }
+        }
+        index
+    }
+
+    fn group_lists_with_runs(index: &TimeSeriesIndex) -> (usize, usize) {
+        let postings = index.get_postings();
+        let groups: Vec<_> = postings
+            .label_index
+            .iter()
+            .filter(|(key, _)| key.as_str().starts_with("group="))
+            .map(|(_, bitmap)| bitmap.statistics().n_run_containers > 0)
+            .collect();
+        (groups.iter().filter(|&&runs| runs).count(), groups.len())
+    }
+
     #[test]
-    fn test_index_loaded_series_keeps_an_id_already_indexed_under_the_same_key() {
-        // A preloaded index (RDB aux payload) already holds the series under its key.
+    fn test_optimize_all_reaches_every_posting_list() {
+        let index = index_with_run_shaped_postings();
+        assert_eq!(group_lists_with_runs(&index), (0, 20));
+
+        // Far more lists than one batch.
+        assert!(index.optimize_all(4, || false));
+
+        assert_eq!(group_lists_with_runs(&index), (20, 20));
+        assert!(
+            index
+                .get_postings()
+                .all_postings
+                .statistics()
+                .n_run_containers
+                > 0
+        );
+    }
+
+    #[test]
+    fn test_optimize_all_stops_when_asked() {
+        let index = index_with_run_shaped_postings();
+        let calls = std::cell::Cell::new(0);
+        let stop_after_one_batch = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+
+        assert!(!index.optimize_all(4, stop_after_one_batch));
+
+        let (optimized, total) = group_lists_with_runs(&index);
+        assert!(
+            optimized < total,
+            "stopped after one batch, got {optimized}/{total}"
+        );
+    }
+
+    /// Asserts `id` is gone from every structure of the index: the directory, `all_postings`,
+    /// and the `region=us-east-1` posting list the helpers index under.
+    fn assert_id_fully_retired(index: &TimeSeriesIndex, id: u64) {
+        let postings = index.get_postings();
+        assert!(
+            postings.get_key_by_id(id).is_none(),
+            "id_to_key still maps {id}"
+        );
+        assert!(
+            !postings.all_postings.contains(id),
+            "all_postings still has {id}"
+        );
+        assert!(
+            !postings
+                .postings_for_label_value("region", "us-east-1")
+                .contains(id),
+            "label postings still have {id}"
+        );
+    }
+
+    #[test]
+    fn test_index_loaded_series_retires_the_old_id_of_a_key_already_indexed() {
+        // A key already indexed under the series' own id (a preloaded index, or an ASM key
+        // queued twice) is re-indexed under a fresh id; the old one must not keep resolving.
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&series, b"a");
+        let old_id = series.id;
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_loaded_series(&mut postings, &mut series, b"a");
+        }
+
+        assert_ne!(series.id, old_id);
+        assert_eq!(index.count(), 1);
+        assert_id_fully_retired(&index, old_id);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(series.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert!(postings.all_postings.contains(series.id));
+        assert!(
+            postings
+                .postings_for_label_value("region", "us-east-1")
+                .contains(series.id)
+        );
+    }
+
+    #[test]
+    fn test_index_series_keep_id_is_a_noop_for_a_key_already_indexed() {
+        // The post-load repair scan visits keys the preloaded index already holds.
         let index = TimeSeriesIndex::new();
         let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
         index.index_timeseries(&series, b"a");
         let id = series.id;
 
-        let mut postings = index.get_postings_mut();
-        index_loaded_series(&mut postings, &mut series, b"a");
-        drop(postings);
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut series, b"a");
+        }
 
         assert_eq!(series.id, id);
         assert_eq!(index.count(), 1);
+    }
+
+    #[test]
+    fn test_index_series_keep_id_indexes_an_unindexed_series_under_its_own_id() {
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        let id = series.id;
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut series, b"a");
+        }
+
+        assert_eq!(series.id, id);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+    }
+
+    #[test]
+    fn test_index_series_keep_id_remaps_an_id_owned_by_another_key() {
+        // Skipping the collision would leave `b` unqueryable; indexing it under the id would
+        // merge it into `a`'s postings.
+        let index = TimeSeriesIndex::new();
+        let original = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&original, b"a");
+        let mut copy = original.clone();
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut copy, b"b");
+        }
+
+        assert_ne!(copy.id, original.id);
+        assert_eq!(index.count(), 2);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(original.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            postings.get_key_by_id(copy.id).map(|k| k.as_ref()),
+            Some(&b"b"[..])
+        );
     }
 }

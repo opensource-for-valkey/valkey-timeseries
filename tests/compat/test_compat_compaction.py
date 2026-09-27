@@ -282,6 +282,38 @@ class TestRuleLifecycle:
         diff("TS.RANGE", "c:ddst:src", "-", "+")
         diff("TS.INFO", "c:ddst:src")
 
+    def test_deleting_the_source_frees_the_destination_for_a_new_rule(self, diff):
+        _rule(diff, "c:refeed:src", "c:refeed:dst")
+        mk_series(diff, "c:refeed:other")
+        diff("TS.ADD", "c:refeed:src", 0, 1.0)
+        diff("DEL", "c:refeed:src")
+        diff("TS.CREATERULE", "c:refeed:other", "c:refeed:dst", "AGGREGATION", "max", BUCKET)
+        diff("TS.INFO", "c:refeed:dst")
+        for ts, value in [(0, 5.0), (1000, 7.0)]:
+            diff("TS.ADD", "c:refeed:other", ts, value)
+        diff("TS.RANGE", "c:refeed:dst", "-", "+")
+
+    @pytest.mark.parametrize("original", ["live", "deleted"])
+    def test_restored_copy_of_a_destination_accepts_a_rule(self, diff, original):
+        """A copy of a destination restored under another key is not fed by the original's
+        source, so it can take a rule of its own. DUMP payloads are engine-specific (DIV-0010),
+        so each engine restores its own."""
+        _rule(diff, "c:dcopy:src", "c:dcopy:dst")
+        mk_series(diff, "c:dcopy:other")
+        diff("TS.ADD", "c:dcopy:src", 0, 1.0)
+        for client in (diff.reference, diff.subject):
+            payload = client.dump("c:dcopy:dst")
+            if original == "deleted":
+                client.delete("c:dcopy:dst")
+            client.restore("c:dcopy:copy", 0, payload)
+        diff("TS.INFO", "c:dcopy:copy")
+        diff("TS.CREATERULE", "c:dcopy:other", "c:dcopy:copy", "AGGREGATION", "max", BUCKET)
+        diff("TS.INFO", "c:dcopy:copy")
+        for ts, value in [(1000, 2.0), (2000, 4.0)]:
+            diff("TS.ADD", "c:dcopy:src", ts, value)
+            diff("TS.ADD", "c:dcopy:other", ts, value * 10)
+        diff("TS.RANGE", "c:dcopy:copy", "-", "+")
+
     def test_multiple_rules_from_one_source(self, diff):
         mk_series(diff, "c:multi:src")
         mk_series(diff, "c:multi:sum")
@@ -329,6 +361,50 @@ class TestRuleLifecycle:
         mk_series(diff, "c:norule:dst")
         with pytest.raises(ResponseError):
             diff("TS.DELETERULE", "c:norule:src", "c:norule:dst")
+
+
+class TestRestoreKeepsRules:
+    """DIV-0059: a rule survives DUMP/RESTORE of its ends under their own keys here; RTS 8.10
+    drops it on both ends. Asserted per-engine: DUMP payloads are engine-specific (DIV-0010)."""
+
+    @staticmethod
+    def _restore_in_place(client, *keys):
+        payloads = [client.dump(key) for key in keys]
+        client.delete(*keys)
+        for key, payload in zip(keys, payloads):
+            client.restore(key, 0, payload)
+
+    @staticmethod
+    def _links(client, src, dst):
+        def info(key):
+            reply = client.execute_command("TS.INFO", key)
+            return reply if isinstance(reply, dict) else dict(zip(reply[::2], reply[1::2]))
+
+        rules = info(src)[b"rules"]
+        # RESP3 replies with a map of destKey -> rule, RESP2 with [destKey, ...] entries.
+        dests = list(rules) if isinstance(rules, dict) else [rule[0] for rule in rules]
+        return dests, info(dst)[b"sourceKey"]
+
+    @pytest.mark.parametrize(
+        "restored",
+        [("c:rst:src",), ("c:rst:dst",), ("c:rst:src", "c:rst:dst")],
+        ids=["source", "destination", "both"],
+    )
+    def test_rule_survives_restore_under_the_same_key(self, diff, restored):
+        _rule(diff, "c:rst:src", "c:rst:dst")
+        diff("TS.ADD", "c:rst:src", 0, 1.0)
+        for client in (diff.reference, diff.subject):
+            self._restore_in_place(client, *restored)
+            client.execute_command("TS.ADD", "c:rst:src", 1000, 2.0)
+
+        assert self._links(diff.reference, "c:rst:src", "c:rst:dst") == ([], None)
+        assert diff.reference.execute_command("TS.RANGE", "c:rst:dst", "-", "+") == []
+
+        assert self._links(diff.subject, "c:rst:src", "c:rst:dst") == ([b"c:rst:dst"], b"c:rst:src")
+        assert [
+            (int(ts), float(value))
+            for ts, value in diff.subject.execute_command("TS.RANGE", "c:rst:dst", "-", "+")
+        ] == [(0, 1.0)]
 
 
 class TestAlignTimestamp:

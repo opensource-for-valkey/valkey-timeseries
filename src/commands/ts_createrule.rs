@@ -9,7 +9,7 @@ use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{
     CompactionRule, SeriesLink, check_new_rule_circular_dependency, get_timeseries,
-    get_timeseries_mut,
+    get_timeseries_mut, live_source_key,
 };
 use std::ffi::CStr;
 use valkey_module::{
@@ -61,22 +61,15 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     // acquired only after cycle detection so recursive reachability checks
     // cannot alias either series.
     let rule = {
-        let source_series = get_timeseries(ctx, &source_key, Some(AclPermissions::UPDATE))?;
+        // Opened for its existence, type and ACL checks.
+        let _source_series = get_timeseries(ctx, &source_key, Some(AclPermissions::UPDATE))?;
         let dest_series = get_timeseries(ctx, &dest_key, Some(AclPermissions::UPDATE))?;
 
-        if dest_series.is_compaction() {
-            return Err(ValkeyError::Str(
-                "TSDB: the destination key already has a src rule",
-            ));
-        }
-
-        // check for duplicate compaction rule
-        if source_series
-            .rules
-            .iter()
-            .any(|rule| rule.dest.points_to(dest_key.as_slice()))
-        {
-            // match error from redis-ts
+        // A source link whose source no longer has a rule for this key (the source was deleted
+        // or overwritten, or this key is a `RESTORE`d copy of a destination) is stale, and is
+        // replaced below rather than blocking the new rule. This also refuses a duplicate
+        // `source -> dest` rule: a live one makes `source` the live source of `dest`.
+        if live_source_key(ctx, &dest_series).is_some() {
             return Err(ValkeyError::Str(
                 "TSDB: the destination key already has a src rule",
             ));
@@ -91,6 +84,10 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
     let mut source_series = get_timeseries_mut(ctx, &source_key, Some(AclPermissions::UPDATE))?;
     let mut dest_series = get_timeseries_mut(ctx, &dest_key, Some(AclPermissions::UPDATE))?;
 
+    // Any rule `source` still holds for `dest` is stale (the live case was refused above: `dest`
+    // was deleted and re-created, or overwritten). Drop it, or the old rule would shadow the new
+    // one when compaction resolves destinations.
+    source_series.remove_compaction_rule(dest_key.as_slice());
     source_series.add_compaction_rule(rule);
     // Add the rule to the destination series
     dest_series.src_series = Some(SeriesLink::from_key(source_key.as_slice()));

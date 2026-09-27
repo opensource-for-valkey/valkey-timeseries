@@ -1,7 +1,9 @@
 use crate::common::replies::ReplyContext;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
-use crate::series::{TimeSeries, chunks::ChunkOps, get_timeseries, try_get_timeseries};
+use crate::series::{
+    TimeSeries, chunks::ChunkOps, get_timeseries, live_source_key, try_get_timeseries,
+};
 use std::collections::HashMap;
 use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{AclPermissions, Context, NextArg, ValkeyResult, ValkeyString, ValkeyValue};
@@ -322,17 +324,10 @@ fn get_rules_info(ctx: &Context, series: &TimeSeries, is_resp3: bool) -> ValkeyV
 
 /// The key of the series that feeds `series`, if it still has a rule for it.
 fn get_source_key(ctx: &Context, series: &TimeSeries) -> Option<String> {
-    let source_key = series.src_series.as_ref()?.to_key_string(ctx);
-    let feeds_series = matches!(
-        try_get_timeseries(ctx, &source_key, None),
-        Ok(Some(source)) if source
-            .rules
-            .iter()
-            .any(|rule| rule.dest.points_to(&series.key))
-    );
-    if !feeds_series {
+    series.src_series.as_ref()?;
+    let Some(source_key) = live_source_key(ctx, series) else {
         ctx.log_warning("Compaction source series not found");
         return None;
-    }
+    };
     Some(source_key.to_string_lossy())
 }

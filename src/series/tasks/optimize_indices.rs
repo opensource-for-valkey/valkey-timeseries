@@ -1,11 +1,14 @@
 use crate::common::logging::log_debug;
 use crate::common::sync::lock;
 use crate::common::threads::spawn;
+use crate::is_shutting_down;
 use crate::series::index::{IndexKey, TIMESERIES_INDEX, get_db_index};
 use crate::series::tasks::utils::find_next_db;
 use std::sync::{LazyLock, Mutex};
 
-const INDEX_OPTIMIZE_BATCH_SIZE: usize = 50;
+const INDEX_OPTIMIZE_BATCH_SIZE: usize = 128;
+/// Lists per write-lock acquisition in a full pass ([`optimize_index_fully`]).
+const FULL_PASS_BATCH_SIZE: usize = 256;
 
 #[derive(Default)]
 struct OptimizeContext {
@@ -29,6 +32,29 @@ fn set_optimize_cursor(db: i32, cursor: Option<IndexKey>) {
 
 pub fn optimize_indices_for_db() {
     spawn(optimize_indices_internal);
+}
+
+/// Optimizes all of `db`'s posting lists now, rather than leaving them to the periodic task.
+///
+/// Meant for a bulk change to the index, such as an atomic slot migration indexing or retiring
+/// every series of the migrated slots. The periodic task visits [`INDEX_OPTIMIZE_BATCH_SIZE`]
+/// lists a minute across all dbs, so reaching a large index would take hours. Blocks until
+/// done, so call it from a background thread.
+pub(in crate::series) fn optimize_index_fully(db: i32) {
+    let map = TIMESERIES_INDEX.pin();
+    let Some(index) = map.get(&db) else {
+        return;
+    };
+    // A flush drops the db's index; there is no point finishing a detached one.
+    let replaced = || {
+        !TIMESERIES_INDEX
+            .pin()
+            .get(&db)
+            .is_some_and(|current| std::ptr::eq(current, index))
+    };
+    if index.optimize_all(FULL_PASS_BATCH_SIZE, || is_shutting_down() || replaced()) {
+        log_debug(format!("Optimized every posting list of db {db}"));
+    }
 }
 
 /// Process optimization for a specific database, called by the dispatcher.

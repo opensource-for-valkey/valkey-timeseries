@@ -6,6 +6,7 @@ is deleted and re-created, overwritten by RENAME, or re-pointed at another sourc
 compaction output meant for another series. RENAME re-points the partners of the renamed key.
 """
 
+from valkey.exceptions import ResponseError
 from valkeytestframework.conftest import resource_port_tracker
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
@@ -161,3 +162,121 @@ class TestCompactionLinks(ValkeyTimeSeriesTestCaseBase):
         self.add('src', (500, 2), (1000, 5))
         assert self.dest_samples('dst') == [(0, 3.0)]
         assert self.source_key('dst') == 'src'
+
+    def test_createrule_replaces_a_stale_source_link(self):
+        """`dst` still carries a link to its deleted source; that must not block a new rule."""
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        self.client.delete('src')
+
+        self.create_rule('other', 'dst', aggregation='max')
+
+        assert self.source_key('dst') == 'other'
+        self.add('other', (0, 5), (1000, 7))
+        assert self.dest_samples('dst') == [(0, 5.0)]
+
+    def test_restored_copy_of_a_destination_accepts_a_rule(self):
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        self.client.restore('dst:copy', 0, self.client.dump('dst'))
+
+        # The copy's link names `src`, which feeds `dst`, not the copy.
+        self.create_rule('other', 'dst:copy', aggregation='max')
+
+        assert self.source_key('dst:copy') == 'other'
+        assert self.source_key('dst') == 'src'
+        self.add('src', (0, 1), (1000, 2))
+        self.add('other', (0, 10), (1000, 20))
+        assert self.dest_samples('dst') == [(0, 1.0)]
+        assert self.dest_samples('dst:copy') == [(0, 10.0)]
+
+    def test_createrule_rejects_a_destination_with_a_live_source(self):
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        try:
+            self.create_rule('other', 'dst')
+            assert False, 'expected the second source to be refused'
+        except ResponseError as e:
+            assert 'already has a src rule' in str(e)
+        assert self.source_key('dst') == 'src'
+
+    def test_stale_rule_does_not_close_a_cycle(self):
+        """`a`'s rule for a deleted-and-recreated `b` is dead, so `b -> a` is not a cycle."""
+        self.client.execute_command('TS.CREATE', 'a')
+        self.client.execute_command('TS.CREATE', 'b')
+        self.create_rule('a', 'b')
+
+        self.client.delete('b')
+        self.client.execute_command('TS.CREATE', 'b')
+        # No write to `a` in between: its stale rule has not been pruned yet.
+        self.create_rule('b', 'a')
+
+        assert self.source_key('a') == 'b'
+        assert self.rule_dests('b') == ['a']
+        self.add('b', (0, 1), (500, 2), (1000, 5))
+        assert self.dest_samples('a') == [(0, 3.0)]
+        # A direct write to `a` must not feed its dead rule's old destination.
+        self.add('a', (2000, 7), (3000, 9))
+        assert self.dest_samples('b') == [(0, 1.0), (500, 2.0), (1000, 5.0)]
+
+    def test_stale_rule_mid_chain_does_not_close_a_cycle(self):
+        for key in ('a', 'b', 'c'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('a', 'b')
+        self.create_rule('b', 'c')
+
+        self.client.delete('b')
+        self.client.execute_command('TS.CREATE', 'b')
+        self.create_rule('b', 'c')
+
+        # The new `b` feeds `c`, but `a -> b` is dead, so `a` no longer reaches `c`.
+        self.create_rule('c', 'a')
+        assert self.source_key('a') == 'c'
+        assert self.source_key('c') == 'b'
+
+    def test_restored_destination_still_closes_a_cycle(self):
+        """A destination restored under its own key names its source again, reviving the rule."""
+        self.client.execute_command('TS.CREATE', 'a')
+        self.client.execute_command('TS.CREATE', 'b')
+        self.create_rule('a', 'b')
+        dump = self.client.dump('b')
+
+        self.client.delete('b')
+        self.client.restore('b', 0, dump)
+
+        try:
+            self.create_rule('b', 'a')
+            assert False, 'expected the cycle to be refused'
+        except ResponseError as e:
+            assert 'circular dependency' in str(e)
+        assert self.source_key('a') is None
+
+    def test_createrule_replaces_a_stale_rule_for_the_same_destination(self):
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.create_rule('src', 'dst', aggregation='sum')
+
+        self.client.delete('dst')
+        self.client.execute_command('TS.CREATE', 'dst')
+        # No write to `src` in between: its stale `sum` rule for `dst` is still stored.
+        self.create_rule('src', 'dst', aggregation='max')
+
+        assert self.rule_dests('src') == ['dst']
+        assert self.source_key('dst') == 'src'
+        # The new `max` rule feeds `dst`, not the stale `sum` one.
+        self.add('src', (0, 1), (500, 5), (1000, 0))
+        assert self.dest_samples('dst') == [(0, 5.0)]
+
+    def test_createrule_still_rejects_a_live_duplicate(self):
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.create_rule('src', 'dst')
+        try:
+            self.create_rule('src', 'dst', aggregation='max')
+            assert False, 'expected the duplicate rule to be refused'
+        except ResponseError as e:
+            assert 'already has a src rule' in str(e)
+        assert self.rule_dests('src') == ['dst']

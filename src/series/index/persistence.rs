@@ -13,7 +13,7 @@
 
 use super::postings::Postings;
 use super::postings::serialization;
-use super::{TIMESERIES_INDEX, get_db_index, index_series_by_key};
+use super::{TIMESERIES_INDEX, ensure_series_indexed_by_key, get_db_index};
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
@@ -527,8 +527,8 @@ fn read_indexed_count(db: i32) -> u64 {
 ///
 /// Runtime traffic between load end and this check can legitimately skew the counts (a DEL
 /// removes a key and unindexes it; a TS.CREATE adds an id the loader never counted). That only
-/// makes the scan fire spuriously — `index_series_by_key` is guarded, so the scan is always
-/// safe, just not free.
+/// makes the scan fire spuriously — `ensure_series_indexed_by_key` skips a key already indexed
+/// under its id, so the scan is always safe, just not free.
 fn verify_and_repair_db(db: i32, loaded_count: u64) {
     let indexed_count = read_indexed_count(db);
 
@@ -544,7 +544,7 @@ fn verify_and_repair_db(db: i32, loaded_count: u64) {
     ));
 
     let scan_callback = |ctx: &Context, key_name: ValkeyString, _key: Option<&ValkeyKey>| {
-        index_series_by_key(ctx, key_name.as_slice());
+        ensure_series_indexed_by_key(ctx, key_name.as_slice());
     };
 
     let cursor = KeysCursor::new();

@@ -105,6 +105,14 @@ Requirements common to both modules are unchanged and are not part of this diver
 
 The failure modes are deliberately defined and tested rather than left to chance (both modules register the same `TSDB-TYPE` type name, so a payload can *reach* the wrong module): `RESTORE` of a RedisTimeSeries `DUMP` payload into Valkey TimeSeries fails with a clean error and creates no key; starting Valkey TimeSeries on a RedisTimeSeries RDB file is refused with a clear log message; and the module's own encoding-version guard rejects any foreign `TSDB-TYPE` payload even when the server-level RDB version check would admit it (for example, an RDB produced by RedisTimeSeries on an older Redis). The reverse direction is outside this project's control; as observed against RedisTimeSeries 8.10, a Valkey TimeSeries payload is rejected there cleanly, with no key created — currently at the server's envelope check (`DUMP payload version or checksum are wrong`) rather than by the module, because the payload carries a newer RDB version than the reference accepts. The specific text is server wrapping and is not part of the compatibility contract; what is pinned is that the rejection is clean.
 
+### Compaction rules across `DUMP`/`RESTORE`
+
+**What differs.** A compaction rule survives `DUMP` and `RESTORE` of either or both of its series under their own keys. This covers `RESTORE ... REPLACE` in place, and the per-key `DUMP` + `RESTORE` that `MIGRATE` performs during resharding. `TS.INFO` keeps reporting the rule on both ends, and samples written to the source keep compacting into the destination. RedisTimeSeries 8.10 drops the rule on both ends: afterwards neither key reports it and the destination stops receiving output. A series restored under a *different* key behaves the same on both modules. It is not attached to the original's rule, and it can take a new `TS.CREATERULE` as a source or a destination.
+
+**Why.** A rule names its source and destination by key, so it stays attached to the series wherever the key goes: slot migration, replication and AOF replay. Losing the rule on `RESTORE` would silently stop a rollup whenever a slot moves between nodes.
+
+**Migration impact.** Only applications that relied on `RESTORE` detaching a series from its rule are affected. After restoring, remove any rule that should not carry over with `TS.DELETERULE`.
+
 ### Variance and standard-deviation aggregations
 
 **What differs.** The four variance-family aggregators — `std.p`, `std.s`, `var.p`, `var.s` — can return substantially different values on the two modules for the same samples. RedisTimeSeries evaluates them with the textbook sum-of-squares identity, `E[x²] − E[x]²`; Valkey TimeSeries accumulates in a numerically stable form and returns the mathematically correct result. The identity fails in two distinct regimes, and in both the difference is categorical rather than a matter of trailing digits:
