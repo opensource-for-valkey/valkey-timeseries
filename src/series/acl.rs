@@ -361,6 +361,9 @@ pub fn clone_permissions(permissions: &AclPermissions) -> AclPermissions {
     if permissions.contains(AclPermissions::ACCESS) {
         cloned |= AclPermissions::ACCESS;
     }
+    if permissions.contains(AclPermissions::INSERT) {
+        cloned |= AclPermissions::INSERT;
+    }
     if permissions.contains(AclPermissions::UPDATE) {
         cloned |= AclPermissions::UPDATE;
     }

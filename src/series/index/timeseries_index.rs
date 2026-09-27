@@ -303,8 +303,9 @@ impl TimeSeriesIndex {
             // The requested permission decides which "all keys" error the caller sees.
             let all_keys_error = match cloned_perms {
                 Some(perms)
-                    if perms.contains(AclPermissions::DELETE)
-                        || perms.contains(AclPermissions::UPDATE) =>
+                    if perms.intersects(
+                        AclPermissions::INSERT | AclPermissions::UPDATE | AclPermissions::DELETE,
+                    ) =>
                 {
                     error_consts::ALL_KEYS_WRITE_PERMISSION_ERROR
                 }
