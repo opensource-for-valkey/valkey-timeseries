@@ -15,7 +15,7 @@ use crate::fanout::NUM_SLOTS;
 use crate::fanout::{is_clustered, mark_cluster_map_stale};
 use crate::series::index::{TIMESERIES_INDEX, get_db_index, index_loaded_series};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
-use crate::series::tasks::remove_all_stale_series_internal;
+use crate::series::tasks::{optimize_index_fully, remove_all_stale_series_internal};
 use crate::series::{SeriesRef, TimeSeries};
 use range_set_blaze::RangeSetBlaze;
 use std::ffi::{c_char, c_int, c_void};
@@ -330,13 +330,14 @@ fn take_delayed_keys_in_slots(db: i32, slots: &RangeSetBlaze<u16>) -> Vec<Box<[u
     taken
 }
 
-fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) {
+/// Indexes the keys of `db` queued during the import of `slots`. Returns how many were indexed.
+fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) -> usize {
     // Take ownership of this import's queued keys so we can index without holding the write
     // lock. Keys of an import still in progress stay queued for its own completion.
     let keys_vec = take_delayed_keys_in_slots(db, slots);
 
     if keys_vec.is_empty() {
-        return;
+        return 0;
     }
 
     let total = keys_vec.len();
@@ -352,7 +353,7 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) {
                 "ASM delayed indexing for db={db} aborted by shutdown; {} of {total} key(s) left un-indexed",
                 total - indexed
             ));
-            return;
+            return 0;
         }
         indexed += batch.len();
         skipped += index_timeseries_in_batch(db, batch);
@@ -365,6 +366,7 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) {
             "ASM delayed indexing dropped {skipped} key(s) with no series value in db={db}"
         ));
     }
+    indexed - skipped
 }
 
 /// Indexes the keys queued during the import of `slots`, which has just completed.
@@ -393,7 +395,10 @@ fn process_delayed_indexing(slots: RangeSetBlaze<u16>) {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
                 return;
             }
-            process_delayed_keys_for_db(db, &slots);
+            // The import added a slot's worth of series to the postings in one burst.
+            if process_delayed_keys_for_db(db, &slots) > 0 {
+                optimize_index_fully(db);
+            }
         }
         log_debug("ASM delayed indexing drain finished");
     });
@@ -530,12 +535,24 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
         ));
 
         let mut deleted_count = 0usize;
+        let mut touched_dbs = Vec::new();
         for db in dbs {
-            deleted_count += remove_non_owned_keys(db, &source_slots);
+            let deleted = remove_non_owned_keys(db, &source_slots);
+            if deleted > 0 {
+                touched_dbs.push(db);
+                deleted_count += deleted;
+            }
         }
 
         if deleted_count > 0 {
             remove_all_stale_series_internal();
+            // Masking the exported ids out leaves the surviving posting lists sparse.
+            for db in touched_dbs {
+                if crate::is_shutting_down() {
+                    break;
+                }
+                optimize_index_fully(db);
+            }
         }
 
         log_notice(format!(

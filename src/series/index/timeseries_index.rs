@@ -642,6 +642,23 @@ impl TimeSeriesIndex {
         let mut inner = write_lock(&self.inner);
         inner.optimize_postings(start_prefix, count)
     }
+
+    /// Optimizes every posting list in one pass, taking the write lock for `batch_size` lists
+    /// at a time so queries and writes interleave. Returns `false` if `should_stop` ended the
+    /// pass early.
+    pub fn optimize_all(&self, batch_size: usize, should_stop: impl Fn() -> bool) -> bool {
+        let mut cursor = None;
+        loop {
+            if should_stop() {
+                return false;
+            }
+            cursor = self.optimize_incremental(cursor, batch_size);
+            if cursor.is_none() {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Helper struct for batch iteration over the label index

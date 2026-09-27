@@ -736,6 +736,72 @@ mod tests {
         }
     }
 
+    /// 20 groups of 32 series with consecutive ids: each group's posting list is a run that
+    /// `run_optimize` turns into a run container.
+    fn index_with_run_shaped_postings() -> TimeSeriesIndex {
+        let index = TimeSeriesIndex::new();
+        let mut id = 1 << 32;
+        for group in 0..20 {
+            for member in 0..32 {
+                let mut ts = create_series_from_metric_name(&format!(
+                    r#"cpu{{group="g{group}",member="m{member}"}}"#
+                ));
+                ts.id = id;
+                id += 1;
+                index.index_timeseries(&ts, format!("{group}:{member}").as_bytes());
+            }
+        }
+        index
+    }
+
+    fn group_lists_with_runs(index: &TimeSeriesIndex) -> (usize, usize) {
+        let postings = index.get_postings();
+        let groups: Vec<_> = postings
+            .label_index
+            .iter()
+            .filter(|(key, _)| key.as_str().starts_with("group="))
+            .map(|(_, bitmap)| bitmap.statistics().n_run_containers > 0)
+            .collect();
+        (groups.iter().filter(|&&runs| runs).count(), groups.len())
+    }
+
+    #[test]
+    fn test_optimize_all_reaches_every_posting_list() {
+        let index = index_with_run_shaped_postings();
+        assert_eq!(group_lists_with_runs(&index), (0, 20));
+
+        // Far more lists than one batch.
+        assert!(index.optimize_all(4, || false));
+
+        assert_eq!(group_lists_with_runs(&index), (20, 20));
+        assert!(
+            index
+                .get_postings()
+                .all_postings
+                .statistics()
+                .n_run_containers
+                > 0
+        );
+    }
+
+    #[test]
+    fn test_optimize_all_stops_when_asked() {
+        let index = index_with_run_shaped_postings();
+        let calls = std::cell::Cell::new(0);
+        let stop_after_one_batch = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+
+        assert!(!index.optimize_all(4, stop_after_one_batch));
+
+        let (optimized, total) = group_lists_with_runs(&index);
+        assert!(
+            optimized < total,
+            "stopped after one batch, got {optimized}/{total}"
+        );
+    }
+
     #[test]
     fn test_index_loaded_series_keeps_an_id_already_indexed_under_the_same_key() {
         // A preloaded index (RDB aux payload) already holds the series under its key.
