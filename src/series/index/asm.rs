@@ -303,8 +303,8 @@ fn index_timeseries_in_batch(db: i32, batch: &[Box<[u8]>]) -> usize {
             continue;
         };
         series._db = Some(db);
-        // Imported ids come from another node's id space: a collision is remapped rather than
-        // merging two series' postings.
+        // Imported ids come from another node's id space, so every imported series gets a
+        // fresh local id; a key queued twice has its first id retired, not duplicated.
         index_loaded_series(&mut postings, series, key_name.as_ref());
     }
     drop(postings);

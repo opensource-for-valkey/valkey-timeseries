@@ -5,7 +5,7 @@ mod tests {
     use crate::labels::Label;
     use crate::labels::filters::{LabelFilter, SeriesSelector};
     use crate::series::index::{
-        PostingStat, TimeSeriesIndex, index_loaded_series, next_timeseries_id,
+        PostingStat, TimeSeriesIndex, index_loaded_series, index_series_keep_id, next_timeseries_id,
     };
     use crate::series::time_series::TimeSeries;
     use crate::series::{CompactionRule, SeriesLink};
@@ -802,19 +802,116 @@ mod tests {
         );
     }
 
+    /// Asserts `id` is gone from every structure of the index: the directory, `all_postings`,
+    /// and the `region=us-east-1` posting list the helpers index under.
+    fn assert_id_fully_retired(index: &TimeSeriesIndex, id: u64) {
+        let postings = index.get_postings();
+        assert!(
+            postings.get_key_by_id(id).is_none(),
+            "id_to_key still maps {id}"
+        );
+        assert!(
+            !postings.all_postings.contains(id),
+            "all_postings still has {id}"
+        );
+        assert!(
+            !postings
+                .postings_for_label_value("region", "us-east-1")
+                .contains(id),
+            "label postings still have {id}"
+        );
+    }
+
     #[test]
-    fn test_index_loaded_series_keeps_an_id_already_indexed_under_the_same_key() {
-        // A preloaded index (RDB aux payload) already holds the series under its key.
+    fn test_index_loaded_series_retires_the_old_id_of_a_key_already_indexed() {
+        // A key already indexed under the series' own id (a preloaded index, or an ASM key
+        // queued twice) is re-indexed under a fresh id; the old one must not keep resolving.
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&series, b"a");
+        let old_id = series.id;
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_loaded_series(&mut postings, &mut series, b"a");
+        }
+
+        assert_ne!(series.id, old_id);
+        assert_eq!(index.count(), 1);
+        assert_id_fully_retired(&index, old_id);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(series.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert!(postings.all_postings.contains(series.id));
+        assert!(
+            postings
+                .postings_for_label_value("region", "us-east-1")
+                .contains(series.id)
+        );
+    }
+
+    #[test]
+    fn test_index_series_keep_id_is_a_noop_for_a_key_already_indexed() {
+        // The post-load repair scan visits keys the preloaded index already holds.
         let index = TimeSeriesIndex::new();
         let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
         index.index_timeseries(&series, b"a");
         let id = series.id;
 
-        let mut postings = index.get_postings_mut();
-        index_loaded_series(&mut postings, &mut series, b"a");
-        drop(postings);
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut series, b"a");
+        }
 
         assert_eq!(series.id, id);
         assert_eq!(index.count(), 1);
+    }
+
+    #[test]
+    fn test_index_series_keep_id_indexes_an_unindexed_series_under_its_own_id() {
+        let index = TimeSeriesIndex::new();
+        let mut series = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        let id = series.id;
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut series, b"a");
+        }
+
+        assert_eq!(series.id, id);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+    }
+
+    #[test]
+    fn test_index_series_keep_id_remaps_an_id_owned_by_another_key() {
+        // Skipping the collision would leave `b` unqueryable; indexing it under the id would
+        // merge it into `a`'s postings.
+        let index = TimeSeriesIndex::new();
+        let original = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
+        index.index_timeseries(&original, b"a");
+        let mut copy = original.clone();
+
+        {
+            let mut postings = index.get_postings_mut();
+            index_series_keep_id(&mut postings, &mut copy, b"b");
+        }
+
+        assert_ne!(copy.id, original.id);
+        assert_eq!(index.count(), 2);
+        let postings = index.get_postings();
+        assert_eq!(
+            postings.get_key_by_id(original.id).map(|k| k.as_ref()),
+            Some(&b"a"[..])
+        );
+        assert_eq!(
+            postings.get_key_by_id(copy.id).map(|k| k.as_ref()),
+            Some(&b"b"[..])
+        );
     }
 }

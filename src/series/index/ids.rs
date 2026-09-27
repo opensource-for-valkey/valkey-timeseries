@@ -7,10 +7,9 @@
 //!
 //! - **Cluster-wide uniqueness (probabilistic)**: two nodes collide only if
 //!   they draw the same 24-bit epoch. A series that arrives carrying a
-//!   serialized id (slot import, `RESTORE`, `TS._RESTORE`) is checked against
-//!   the index as it is indexed and remapped on a collision (see
-//!   `index_loaded_series`), so uniqueness only needs to be rare-failure, not
-//!   absolute.
+//!   serialized id (slot import, `RESTORE`, `TS._RESTORE`) is given a fresh
+//!   local id as it is indexed (see `index_loaded_series`), so uniqueness only
+//!   needs to be rare-failure, not absolute.
 //! - **Dense postings bitmaps**: all IDs minted by one process share their
 //!   high 24 bits and increment in the low bits, so roaring containers in
 //!   the postings index fill completely before a new one opens — the same
@@ -44,6 +43,7 @@ const COUNTER_MASK: u64 = (1 << COUNTER_BITS) - 1;
 /// generation is one wait-free `fetch_add`; a counter wrap carries into the
 /// epoch bits, so there is no epoch/counter tearing under contention.
 pub struct IdGenerator {
+    epoch: u32,
     /// The last issued ID; `fetch_add(1)` issues the next one.
     state: AtomicU64,
 }
@@ -61,17 +61,19 @@ impl IdGenerator {
     /// [EPOCH_BITS]; the counter starts at zero, so the first ID issued is
     /// `epoch << COUNTER_BITS | 1`.
     pub fn with_epoch(epoch: u64) -> Self {
+        let epoch = epoch & EPOCH_MASK;
         IdGenerator {
-            state: AtomicU64::new((epoch & EPOCH_MASK) << COUNTER_BITS),
+            epoch: (epoch as u32),
+            state: AtomicU64::new(epoch << COUNTER_BITS),
         }
     }
 
     #[cfg(test)]
     fn with_parts(epoch: u64, counter: u64) -> Self {
+        let epoch = epoch & EPOCH_MASK;
         IdGenerator {
-            state: AtomicU64::new(
-                ((epoch & EPOCH_MASK) << COUNTER_BITS) | (counter & COUNTER_MASK),
-            ),
+            epoch: (epoch as u32),
+            state: AtomicU64::new((epoch << COUNTER_BITS) | (counter & COUNTER_MASK)),
         }
     }
 
@@ -81,7 +83,7 @@ impl IdGenerator {
 
     #[cfg(test)]
     pub fn epoch(&self) -> u32 {
-        extract_epoch(self.state.load(Ordering::Relaxed))
+        self.epoch
     }
 
     #[cfg(test)]
@@ -118,6 +120,12 @@ pub fn extract_epoch(id: TimeseriesId) -> u32 {
 #[cfg(test)]
 pub fn extract_counter(id: TimeseriesId) -> u64 {
     id & COUNTER_MASK
+}
+
+/// The epoch of the process-wide generator: the high bits every id minted by this process shares.
+#[allow(dead_code)] // no caller yet
+pub(crate) fn epoch() -> u32 {
+    DEFAULT_GENERATOR.epoch
 }
 
 /// Draw the process-lifetime epoch. `0` is reserved (legacy dense IDs and

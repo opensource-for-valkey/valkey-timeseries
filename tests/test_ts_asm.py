@@ -835,24 +835,22 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             f"first missing={missing[:5]}, first unexpected={unexpected[:5]}"
         )
 
-    def test_compaction_rule_survives_migration_id_collision(self):
-        """A rule survives a migration whose imported destination's id is taken on the target.
+    def test_compaction_rule_survives_migration_beside_restored_copy(self):
+        """A rule survives a migration to a target that holds a restored copy of its destination.
 
-        Series ids are only probabilistically unique across nodes, and an imported series whose
-        id is already used by a different key on the target is given a fresh id. Rules link
-        their ends by key, so the remap must leave the rule intact -- and must not route output
-        to the unrelated key that owns the old id on the target.
+        Every series that arrives carrying a serialized id (slot import, RESTORE) is indexed
+        under a fresh local id, and rules link their ends by key, so the migrated rule must stay
+        intact -- and must not route output to an unrelated series on the target that was
+        restored from the same destination.
 
-        The collision is forced deterministically: the destination is DUMPed on the source
-        right after creation, and that payload is RESTOREd on the target under an unrelated key
-        (in a slot the target owns), so that key carries the destination's id. That decoy is
-        also made the destination of a local rule, so a rule still resolving the stale id would
-        write its aggregates into it.
+        The destination is DUMPed on the source right after creation, and that payload is
+        RESTOREd on the target under an unrelated key (in a slot the target owns). That decoy is
+        also made the destination of a local rule, so a rule resolving its destination by
+        anything other than its key would write its aggregates into it.
         """
         source_client = self.new_client_for_primary(0)
         self._skip_if_asm_not_supported(source_client)
         self._skip_if_asm_commands_not_supported(source_client)
-        target_rg = self.get_replication_group(1)
         target_client = self.new_client_for_primary(1)
         target_node_id = self._get_node_id(target_client)
 
@@ -863,8 +861,8 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
         slot = self._get_key_slot(source_client, src)
         assert self._shard_index_for_slot(slot) == 0, "Keys not in source shard"
 
-        # Snapshot dst before it is linked, so the decoy is an unrelated series that merely
-        # shares dst's id (no labels, rules or source link of dst's).
+        # Snapshot dst before it is linked, so the decoy is an unrelated series restored from
+        # dst's payload (no labels, rules or source link of dst's).
         payload = source_client.execute_command("DUMP", dst)
         source_client.execute_command(
             "TS.CREATERULE", src, dst, "AGGREGATION", "sum", self.RULE_BUCKET
@@ -895,17 +893,9 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
         self._wait_for_no_migrations(target_client)
         self._assert_local_queryindex_contains(target_client, f"tag={hash_tag}", [src, dst])
 
-        # Precondition: the import really did collide on dst's id.
-        collision_marker = f"for key {dst} is already in use by another key"
-        self._poll_until(lambda: target_rg.primary.does_logfile_contains(collision_marker))
-        assert target_rg.primary.does_logfile_contains(collision_marker), (
-            f"expected the import of {dst} to collide with {decoy}'s id "
-            f"(log line containing {collision_marker!r})"
-        )
-
         # Right after the import, before any write: the rule must name dst, not the unrelated
-        # series that owns dst's pre-migration id on this node.
-        self._assert_rule_intact(target_client, src, dst, "after colliding migration, before writes")
+        # series restored from dst's payload on this node.
+        self._assert_rule_intact(target_client, src, dst, "after migration, before writes")
 
         # Write on the new owner, closing buckets 400..900 (1000 stays open).
         for ts in range(500, 1010, 10):
@@ -913,7 +903,7 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
             target_client.execute_command("TS.ADD", src, ts, value)
             written.append((ts, value))
 
-        self._assert_rule_intact(target_client, src, dst, "after colliding migration and writes on the target")
+        self._assert_rule_intact(target_client, src, dst, "after migration and writes on the target")
 
         expected = self._closed_sum_buckets(written, self.RULE_BUCKET)
         actual = self._samples(target_client, dst)
