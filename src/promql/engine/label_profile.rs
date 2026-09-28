@@ -7,19 +7,36 @@
 //! pushed into the other operand of a binary operation), and whether a given
 //! filter would exclude any of its series at all (so a filter that prunes
 //! nothing is never added). Both are per label: how many series carry it, and
-//! the distinct values they carry, capped at [`MAX_PUSHDOWN_VALUES`] beyond
-//! which the label is only known to be high-cardinality.
+//! the distinct values they carry, capped at [`MAX_PUSHDOWN_VALUES`] and
+//! [`MAX_PUSHDOWN_BYTES`] beyond which the label is only known to be
+//! high-cardinality.
+//!
+//! Label values are unbounded at write time, so the byte caps are what bound
+//! a derived filter's cost: its values are copied into the profile (and
+//! shipped by every shard), and the regex its PromQL matcher carries costs
+//! ~250 ns and ~260 bytes of transient heap per byte of pattern to compile,
+//! ~27 bytes of it retained for the query's lifetime.
 
-use crate::labels::filters::RegexMatcher;
+use crate::labels::compile_literal_set;
 use ahash::AHashMap;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use regex::{Regex, escape};
 use std::collections::BTreeSet;
 
-/// The most distinct values a derived filter enumerates. Past this a label is
-/// not worth a filter: the regex alternation costs more to match than the
-/// series it would prune, and the values are unlikely to be selective anyway.
+/// The most distinct values a derived filter enumerates. The index resolves
+/// the filter by one lookup per value, and past this the values are unlikely
+/// to be selective anyway.
 pub const MAX_PUSHDOWN_VALUES: usize = 60;
+
+/// The most bytes of distinct values a label's profile — and so one derived
+/// filter — holds: 60 values of up to ~68 bytes. At this size the filter's
+/// regex compiles in ~1 ms with ~1 MiB of transient heap, ~110 KiB retained.
+pub const MAX_PUSHDOWN_BYTES: usize = 4 * 1024;
+
+/// The most alternation text the derived filters of one selector compile,
+/// together — ~4 ms, whatever number of labels its series share. Equality
+/// filters compile nothing and are not counted.
+pub const MAX_DERIVED_BYTES_PER_SELECTOR: usize = 16 * 1024;
 
 /// The most series a profile is built from. Past this the selector is left
 /// alone (its profile is unavailable) rather than walked at length under the
@@ -45,8 +62,9 @@ pub struct LabelValueProfile {
     pub carried_by: u64,
     /// The distinct values, sorted; complete unless `overflow`.
     pub values: Vec<String>,
-    /// More than [`MAX_PUSHDOWN_VALUES`] distinct values were seen; `values`
-    /// holds only the first of them and says nothing about the rest.
+    /// More than [`MAX_PUSHDOWN_VALUES`] distinct values, or more than
+    /// [`MAX_PUSHDOWN_BYTES`] of them, were seen. `values` is then empty: a
+    /// partial set is never used.
     pub overflow: bool,
 }
 
@@ -65,19 +83,30 @@ impl LabelProfile {
     /// carried by all of them with a known, bounded value set — `name="v"`
     /// for a single value, `name=~"v1|v2|…"` otherwise.
     pub fn common_filters(&self) -> Vec<Matcher> {
+        self.common_filters_where(|_| true)
+    }
+
+    /// [`Self::common_filters`], limited to the labels `wanted` accepts —
+    /// which is asked before a filter's regex is compiled, the one costly
+    /// step. Within [`MAX_DERIVED_BYTES_PER_SELECTOR`], by label name.
+    pub fn common_filters_where(
+        &self,
+        wanted: impl Fn(&LabelValueProfile) -> bool,
+    ) -> Vec<Matcher> {
         if self.series == 0 {
             return Vec::new();
         }
+        let mut budget = MAX_DERIVED_BYTES_PER_SELECTOR;
         self.labels
             .iter()
             .filter(|label| label.carried_by == self.series && !label.overflow)
-            .filter(|label| !label.values.is_empty())
-            .filter_map(|label| match label.values.as_slice() {
-                [value] => Some(Matcher::new(MatchOp::Equal, &label.name, value)),
-                values => try_regex_matcher(
+            .filter(|label| wanted(label))
+            .filter_map(|label| {
+                derived_filter(
                     &label.name,
-                    join_regexp_values(values.iter().map(String::as_str)),
-                ),
+                    label.values.iter().map(String::as_str),
+                    &mut budget,
+                )
             })
             .collect()
     }
@@ -105,6 +134,29 @@ impl LabelProfile {
         }
     }
 
+    /// Whether the filter `filter.name ∈ filter.values` — another profile's
+    /// label, as [`Self::common_filters`] would derive it — could exclude
+    /// any series of this one: `!satisfied_by_all` for that filter, answered
+    /// from the value sets alone so the question costs no regex. Errs towards
+    /// `true` where unsure (an overflowed label, an empty value), which only
+    /// means the filter is built and `satisfied_by_all` decides.
+    pub fn could_be_pruned_by(&self, filter: &LabelValueProfile) -> bool {
+        if self.series == 0 {
+            return false;
+        }
+        match self.label(&filter.name) {
+            None => true,
+            Some(label) => {
+                label.overflow
+                    || label.carried_by < self.series
+                    || label
+                        .values
+                        .iter()
+                        .any(|value| filter.values.binary_search(value).is_err())
+            }
+        }
+    }
+
     fn label(&self, name: &str) -> Option<&LabelValueProfile> {
         self.labels
             .binary_search_by(|label| label.name.as_str().cmp(name))
@@ -125,21 +177,29 @@ pub struct LabelProfileBuilder {
 struct LabelAccumulator {
     carried_by: u64,
     values: BTreeSet<String>,
+    /// The summed length of `values`.
+    bytes: usize,
     overflow: bool,
 }
 
 impl LabelAccumulator {
     fn add_value(&mut self, value: &str) {
-        if self.overflow {
+        if self.overflow || self.values.contains(value) {
             return;
         }
-        if self.values.len() >= MAX_PUSHDOWN_VALUES && !self.values.contains(value) {
-            self.overflow = true;
+        if self.values.len() >= MAX_PUSHDOWN_VALUES || self.bytes + value.len() > MAX_PUSHDOWN_BYTES
+        {
+            self.set_overflow();
             return;
         }
-        if !self.values.contains(value) {
-            self.values.insert(value.to_string());
-        }
+        self.bytes += value.len();
+        self.values.insert(value.to_string());
+    }
+
+    fn set_overflow(&mut self) {
+        self.overflow = true;
+        self.values = BTreeSet::new();
+        self.bytes = 0;
     }
 }
 
@@ -176,10 +236,12 @@ impl LabelProfileBuilder {
         for entry in other.labels {
             let label = self.labels.entry(entry.name).or_default();
             label.carried_by += entry.carried_by;
+            if entry.overflow {
+                label.set_overflow();
+            }
             for value in &entry.values {
                 label.add_value(value);
             }
-            label.overflow |= entry.overflow;
         }
     }
 
@@ -202,6 +264,37 @@ impl LabelProfileBuilder {
     }
 }
 
+/// The filter `name ∈ values`: `name="v"` for one value, `name=~"v1|v2|…"`
+/// otherwise, which the index resolves by lookup (see
+/// [`crate::labels::literal_alternatives`]). `None` — no filter, the selector
+/// left as written — for more than [`MAX_PUSHDOWN_VALUES`] or
+/// [`MAX_PUSHDOWN_BYTES`] of values, or an alternation longer than what is
+/// left of `budget`, which it is charged against.
+pub fn derived_filter<'a>(
+    name: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    budget: &mut usize,
+) -> Option<Matcher> {
+    let values: Vec<&str> = values.into_iter().collect();
+    let bytes: usize = values.iter().map(|v| v.len()).sum();
+    if values.len() > MAX_PUSHDOWN_VALUES || bytes > MAX_PUSHDOWN_BYTES {
+        return None;
+    }
+    match values.as_slice() {
+        [] => None,
+        [value] => Some(Matcher::new(MatchOp::Equal, name, value)),
+        _ => {
+            let alternation = join_regexp_values(values);
+            if alternation.len() > *budget {
+                return None;
+            }
+            let regex = compile_literal_set(&alternation).ok()?;
+            *budget -= alternation.len();
+            Some(Matcher::new(MatchOp::Re(regex), name, &alternation))
+        }
+    }
+}
+
 /// A `name=~"alternation"` matcher. PromQL regexes are fully anchored, and
 /// the compiled form must agree with the text the index will parse from
 /// `value`, or `is_match` would say `a|b` matches `ab`.
@@ -209,14 +302,6 @@ pub fn regex_matcher(name: &str, alternation: String) -> Matcher {
     // Escaped literals joined by `|`: a valid regex by construction.
     let regex = Regex::new(&format!("^(?:{alternation})$")).unwrap();
     Matcher::new(MatchOp::Re(regex), name, &alternation)
-}
-
-/// The index uses a bounded regex compiler. Omit a derived filter when its
-/// alternation exceeds that bound; the original selector still gives the
-/// correct result.
-pub fn try_regex_matcher(name: &str, alternation: String) -> Option<Matcher> {
-    let regex = RegexMatcher::create(&alternation).ok()?.regex;
-    Some(Matcher::new(MatchOp::Re(regex), name, &alternation))
 }
 
 /// The values as a regex alternation, sorted so the same set always yields
@@ -286,7 +371,7 @@ mod tests {
         let refs: Vec<&[(&str, &str)]> = series.iter().map(|s| s.as_slice()).collect();
         let p = profile(&refs);
         assert!(p.labels[0].overflow);
-        assert_eq!(p.labels[0].values.len(), MAX_PUSHDOWN_VALUES);
+        assert!(p.labels[0].values.is_empty());
         assert!(p.common_filters().is_empty());
     }
 
@@ -393,20 +478,135 @@ mod tests {
         assert_eq!(join_regexp_values(["x"]), "x");
     }
 
+    fn single_label(name: &str, values: Vec<String>) -> LabelValueProfile {
+        LabelValueProfile {
+            name: name.into(),
+            carried_by: 60,
+            values,
+            overflow: false,
+        }
+    }
+
+    /// Sixty hex ids used to exceed the general regex size limit, and the
+    /// filter was dropped; within the byte budget it is now derived.
     #[test]
-    fn common_filters_skip_alternations_the_index_cannot_compile() {
-        let values = (0_u64..60)
+    fn sixty_values_within_the_byte_budget_are_one_filter() {
+        let mut values: Vec<String> = (0_u64..60)
             .map(|i| format!("{:016x}", i.wrapping_mul(0x9e3779b97f4a7c15)))
             .collect();
+        values.sort();
         let profile = LabelProfile {
             series: 60,
-            labels: vec![LabelValueProfile {
-                name: "instance".into(),
-                carried_by: 60,
-                values,
-                overflow: false,
-            }],
+            labels: vec![single_label("instance", values.clone())],
         };
-        assert!(profile.common_filters().is_empty());
+        let filters = profile.common_filters();
+        assert_eq!(filters.len(), 1);
+        assert!(values.iter().all(|v| filters[0].is_match(v)));
+        assert!(!filters[0].is_match("0000000000000000x"));
+    }
+
+    #[test]
+    fn values_past_the_byte_budget_overflow_the_label() {
+        let big = "x".repeat(MAX_PUSHDOWN_BYTES / 2 + 1);
+        let a = format!("a{big}");
+        let b = format!("b{big}");
+        let p = profile(&[&[("host", &a)], &[("host", &b)]]);
+        assert!(p.labels[0].overflow);
+        assert!(p.labels[0].values.is_empty());
+        assert!(p.common_filters().is_empty());
+
+        // One value past the budget on its own is never copied either.
+        let huge = "y".repeat(MAX_PUSHDOWN_BYTES + 1);
+        let p = profile(&[&[("host", &huge)]]);
+        assert!(p.labels[0].overflow && p.labels[0].values.is_empty());
+    }
+
+    #[test]
+    fn an_overflowed_shard_clears_the_merged_values() {
+        let mut builder = LabelProfileBuilder::new();
+        builder.merge(profile(&[&[("host", "a")]]));
+        builder.merge(LabelProfile {
+            series: 1,
+            labels: vec![LabelValueProfile {
+                name: "host".into(),
+                carried_by: 1,
+                values: vec![],
+                overflow: true,
+            }],
+        });
+        builder.add_series([("host", "b")]);
+        let merged = builder.finish();
+        assert!(merged.labels[0].overflow);
+        assert!(merged.labels[0].values.is_empty());
+    }
+
+    #[test]
+    fn a_selector_compiles_at_most_its_derived_byte_budget() {
+        // Each label's alternation is ~3.6 KiB: only four fit in 16 KiB.
+        let labels: Vec<LabelValueProfile> = (0..10)
+            .map(|l| {
+                let mut values: Vec<String> = (0..60)
+                    .map(|i| format!("{l}-{i:02}-{}", "v".repeat(52)))
+                    .collect();
+                values.sort();
+                single_label(&format!("l{l:02}"), values)
+            })
+            .collect();
+        let profile = LabelProfile { series: 60, labels };
+        let filters = profile.common_filters();
+        let compiled: usize = filters.iter().map(|m| m.value.len()).sum();
+        assert_eq!(filters.len(), 4);
+        assert!(compiled <= MAX_DERIVED_BYTES_PER_SELECTOR);
+
+        // Equalities cost nothing to compile and are never crowded out.
+        let mut labels = profile.labels.clone();
+        labels.push(single_label("zone", vec!["z1".into()]));
+        let filters = LabelProfile { series: 60, labels }.common_filters();
+        assert_eq!(filters.last().unwrap().to_string(), r#"zone="z1""#);
+    }
+
+    #[test]
+    fn common_filters_where_asks_before_compiling() {
+        let p = profile(&[
+            &[("region", "us"), ("host", "a")],
+            &[("region", "eu"), ("host", "b")],
+        ]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let filters = p.common_filters_where(|label| {
+            asked.borrow_mut().push(label.name.clone());
+            label.name == "region"
+        });
+        assert_eq!(*asked.borrow(), vec!["host", "region"]);
+        assert_eq!(rendered(&filters), vec![r#"region=~"eu|us""#]);
+    }
+
+    /// `could_be_pruned_by` must never answer `false` where
+    /// `satisfied_by_all` of the built filter would: a `false` skips the
+    /// filter without building it.
+    #[test]
+    fn could_be_pruned_by_agrees_with_satisfied_by_all() {
+        let source = profile(&[&[("host", "a")], &[("host", "b")]]);
+        let host = &source.labels[0];
+        let filter = source.common_filters().pop().unwrap();
+
+        let targets = [
+            profile(&[&[("host", "a")], &[("host", "b")]]),
+            profile(&[&[("host", "a")]]),
+            profile(&[&[("host", "a")], &[("host", "c")]]),
+            profile(&[&[("host", "a")], &[("rack", "1")]]),
+            profile(&[&[("rack", "1")]]),
+            profile(&[]),
+        ];
+        let expected = [false, false, true, true, true, false];
+        for (target, expected) in targets.iter().zip(expected) {
+            assert_eq!(target.could_be_pruned_by(host), expected, "{target:?}");
+            assert_eq!(!target.satisfied_by_all(&filter), expected, "{target:?}");
+        }
+
+        let series: Vec<Vec<(&str, &str)>> = (0..=MAX_PUSHDOWN_VALUES)
+            .map(|i| vec![("host", Box::leak(format!("h{i}").into_boxed_str()) as &str)])
+            .collect();
+        let refs: Vec<&[(&str, &str)]> = series.iter().map(|s| s.as_slice()).collect();
+        assert!(profile(&refs).could_be_pruned_by(host));
     }
 }

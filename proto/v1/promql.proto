@@ -340,8 +340,9 @@ message LabelValueProfile {
   uint64 carried_by = 2;
   /// Its distinct values, sorted; complete unless `overflow`.
   repeated string values = 3;
-  /// More distinct values exist than the coordinator would enumerate;
-  /// `values` holds only the first of them.
+  /// More distinct values, or more bytes of them, exist than the coordinator
+  /// would enumerate; `values` is then empty (older nodes send a partial set,
+  /// which is ignored).
   bool overflow = 4;
 }
 

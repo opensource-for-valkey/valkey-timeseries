@@ -28,7 +28,7 @@
 
 use crate::common::threads::IntoParRayon;
 use crate::promql::binops::can_push_down_common_filters;
-use crate::promql::engine::label_profile::LabelProfile;
+use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile};
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::hashers::SelectorKey;
 use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
@@ -39,6 +39,7 @@ use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
 use promql_parser::parser::{BinaryExpr, Expr, VectorSelector};
+use std::cell::RefCell;
 
 /// Narrow the selectors of `expr`'s binary operations by what the index
 /// knows about their operands' series. A no-op, without touching `reader`,
@@ -172,6 +173,10 @@ fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a 
 struct ProfiledLeaves {
     by_node: AHashMap<usize, SelectorKey>,
     profiles: AHashMap<SelectorKey, LabelProfile>,
+    /// Each profile's derived filters, built on first use: a nested operation
+    /// asks for a leaf's filters at every level above it, and building them
+    /// compiles a regex per multi-valued label.
+    derived: RefCell<AHashMap<SelectorKey, Vec<Matcher>>>,
 }
 
 impl ProfiledLeaves {
@@ -218,6 +223,7 @@ impl ProfiledLeaves {
                 .into_iter()
                 .filter_map(|(key, profile)| profile.map(|p| (key, p)))
                 .collect(),
+            derived: RefCell::default(),
         })
     }
 
@@ -253,6 +259,35 @@ impl ProfiledLeaves {
             .get(&node_id(vs))
             .and_then(|key| self.profiles.get(key))
     }
+
+    /// `vs`'s profile's common filters, less those that could prune no
+    /// operand of the query — `retain_pruning` would drop them wherever they
+    /// landed, after their regex had been compiled for nothing.
+    fn derived_filters(&self, vs: &VectorSelector) -> Vec<Matcher> {
+        let Some(key) = self.by_node.get(&node_id(vs)) else {
+            return Vec::new();
+        };
+        let Some(profile) = self.profiles.get(key) else {
+            return Vec::new();
+        };
+        if let Some(filters) = self.derived.borrow().get(key) {
+            return filters.clone();
+        }
+        let filters = profile.common_filters_where(|label| self.could_prune_a_leaf(label));
+        self.derived.borrow_mut().insert(*key, filters.clone());
+        filters
+    }
+
+    /// Whether the filter derived from `label` could narrow any selector the
+    /// pass may push it into. A selector without a profile keeps whatever it
+    /// is given, so it always could.
+    fn could_prune_a_leaf(&self, label: &LabelValueProfile) -> bool {
+        self.by_node.values().any(|key| {
+            self.profiles
+                .get(key)
+                .is_none_or(|profile| profile.could_be_pruned_by(label))
+        })
+    }
 }
 
 impl LeafFilters for ProfiledLeaves {
@@ -262,10 +297,7 @@ impl LeafFilters for ProfiledLeaves {
     /// just added is tighter than the pre-rewrite profile. Whatever is
     /// redundant is dropped where it lands, by `retain_pruning`.
     fn common_filters(&self, vs: &VectorSelector) -> Vec<Matcher> {
-        let mut filters = self
-            .profile(vs)
-            .map(LabelProfile::common_filters)
-            .unwrap_or_default();
+        let mut filters = self.derived_filters(vs);
         for written in vs.matchers.matchers.iter() {
             if written.name != METRIC_NAME && !filters.contains(written) {
                 filters.push(written.clone());
@@ -370,7 +402,7 @@ fn collect_all_selectors<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::engine::label_profile::LabelProfileBuilder;
+    use crate::promql::engine::label_profile::{LabelProfileBuilder, join_regexp_values};
     use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
     use crate::promql::exec::types::EvalLabels;
     use crate::promql::model::{InstantSample, RangeSample};
@@ -513,6 +545,45 @@ mod tests {
         assert_eq!(
             rewrite(r#"cpu{region="us"} - cpu offset 5m"#, &reader),
             r#"cpu{region="us"} - cpu{host=~"a|b",region="us"} offset 5m"#
+        );
+    }
+
+    /// Twenty `host-NNNNNN.example.net:9100` names: their alternation exceeds
+    /// the general regex size limit (eleven fit), which used to drop the
+    /// filter. Within the byte budget it is derived and pushed.
+    #[test]
+    fn a_long_value_set_within_the_byte_budget_is_pushed() {
+        fn table(job: &str, hosts: std::ops::Range<usize>) -> SeriesTable<'static> {
+            let rows: Vec<&'static [(&'static str, &'static str)]> = hosts
+                .map(|i| {
+                    let host: &'static str =
+                        Box::leak(format!("host-{i:06}.example.net:9100").into_boxed_str());
+                    let job: &'static str = Box::leak(job.to_string().into_boxed_str());
+                    let row: &'static [(&str, &str)] = Box::leak(
+                        vec![("__name__", "cpu"), ("job", job), ("instance", host)].into(),
+                    );
+                    row
+                })
+                .collect();
+            Box::leak(rows.into_boxed_slice())
+        }
+        let batch = table("batch", 0..20);
+        let all: SeriesTable<'static> =
+            Box::leak([batch, table("web", 20..40)].concat().into_boxed_slice());
+        let reader = TableReader::new(vec![(r#"cpu{job="batch"}"#, batch), ("cpu", all)]);
+
+        let rewritten = rewrite(r#"cpu{job="batch"} - cpu offset 5m"#, &reader);
+        let expected = join_regexp_values(
+            (0..20)
+                .map(|i| format!("host-{i:06}.example.net:9100"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str),
+        );
+        assert_eq!(
+            rewritten,
+            format!(r#"cpu{{job="batch"}} - cpu{{instance=~"{expected}",job="batch"}} offset 5m"#)
+                .replace('\\', r"\\")
         );
     }
 

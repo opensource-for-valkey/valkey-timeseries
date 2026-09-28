@@ -158,3 +158,8 @@ use-redismodule-api = [] # We don't support this feature flag which is why it is
 test-utils = ["dep:bon", "dep:rand_distr"]
 # tools/fleet_loader: the fleet generator plus a Valkey client to load it with.
 fleet-loader = ["test-utils", "dep:redis"]
+
+[[bench]]
+name = "literal_set_filter"
+harness = false
+required-features = ["enable-system-alloc"]

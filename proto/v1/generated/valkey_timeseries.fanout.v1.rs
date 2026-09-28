@@ -790,8 +790,9 @@ pub struct LabelValueProfile {
     /// / Its distinct values, sorted; complete unless `overflow`.
     #[prost(string, repeated, tag = "3")]
     pub values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// / More distinct values exist than the coordinator would enumerate;
-    /// / `values` holds only the first of them.
+    /// / More distinct values, or more bytes of them, exist than the coordinator
+    /// / would enumerate; `values` is then empty (older nodes send a partial set,
+    /// / which is ignored).
     #[prost(bool, tag = "4")]
     pub overflow: bool,
 }

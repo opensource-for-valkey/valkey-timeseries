@@ -77,8 +77,14 @@ LabelProfile {
 
 `__name__` is never included. A label is *common* when `carried_by == series`; it yields
 `name="v"` for one value and `name=~"v1|v2|…"` (sorted, escaped — `join_regexp_values`)
-for several, unless `overflow` (more than `MAX_PUSHDOWN_VALUES` = 60, the cap
-`get_common_label_filters` already applies). A profile is **unavailable** when `|S|`
+for several, unless `overflow` (more than `MAX_PUSHDOWN_VALUES` = 60 values or
+`MAX_PUSHDOWN_BYTES` = 4 KiB of them, the caps `get_common_label_filters` also applies; an
+overflowed label carries no values). Label values are unbounded at write time, so the byte cap
+is what bounds a filter: the profile copies its values, every shard ships them, and the regex
+its matcher carries costs ~250 ns and ~260 B of transient heap per byte of pattern to compile.
+One selector's derived alternations are further capped at `MAX_DERIVED_BYTES_PER_SELECTOR` =
+16 KiB, and a filter no operand's profile could be pruned by is never built. The index never
+runs these regexes: a literal alternation reaches it as `Equal(List)`. A profile is **unavailable** when `|S|`
 exceeds `MAX_PROFILED_SERIES` (min of `options.max_series` and 50 000) or the source cannot
 answer; unavailable means "derive nothing from this leaf", never an error.
 

@@ -1,14 +1,12 @@
 use crate::labels::{HasFingerprint, SeriesFingerprint, fingerprint_labels};
-use crate::promql::engine::label_profile::{
-    MAX_PUSHDOWN_VALUES, join_regexp_values, try_regex_matcher,
-};
+use crate::promql::engine::label_profile::{MAX_DERIVED_BYTES_PER_SELECTOR, derived_filter};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::exec::utils::strip_parens;
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::optimizer::pushdown;
 use crate::promql::{EvalResult, EvalSample, EvaluationError, ExprResult};
 use ahash::AHashSet;
-use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
+use promql_parser::label::{METRIC_NAME, Matcher};
 use promql_parser::parser::token::{
     T_ADD, T_ATAN2, T_BOTTOMK, T_DIV, T_LIMIT_RATIO, T_LIMITK, T_LOR, T_MOD, T_MUL, T_POW, T_SUB,
     T_TOPK, TokenType,
@@ -174,28 +172,20 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
         }
     }
 
-    let mut lfs: Vec<Matcher> = Vec::with_capacity(kv_map.len());
-    for (key, (carried_by, values)) in kv_map {
+    // Label values are unbounded, so `derived_filter` skips a label with too
+    // many values or bytes of them, and this budget caps what the regexes of
+    // all the filters cost to compile together.
+    let mut budget = MAX_DERIVED_BYTES_PER_SELECTOR;
+    // By name, so which filters the budget admits never depends on hash order.
+    let mut labels: Vec<_> = kv_map.into_iter().collect();
+    labels.sort_unstable_by_key(|(name, _)| *name);
+    let mut lfs: Vec<Matcher> = Vec::with_capacity(labels.len());
+    for (key, (carried_by, values)) in labels {
         if carried_by != samples.len() {
             // Skip the tag, since it doesn't belong to all the time series.
             continue;
         }
-
-        if values.len() > MAX_PUSHDOWN_VALUES {
-            // Skip the filter on the given tag, since it needs to enumerate too many unique values.
-            // This may slow down the provider for matching time series.
-            continue;
-        }
-
-        let lf = if values.len() == 1 {
-            // Safety: length checked above.
-            let val = *values.iter().next().unwrap();
-            Some(Matcher::new(MatchOp::Equal, key, val))
-        } else {
-            try_regex_matcher(key, join_regexp_values(values))
-        };
-
-        if let Some(lf) = lf {
+        if let Some(lf) = derived_filter(key, values, &mut budget) {
             lfs.push(lf);
         }
     }
@@ -206,6 +196,7 @@ pub(in crate::promql) fn get_common_label_filters(samples: &[EvalSample]) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::promql::engine::label_profile::MAX_PUSHDOWN_BYTES;
 
     /// Two samples whose labels are identical once pending `__name__` drops
     /// are applied are duplicates, whatever their `drop_name` flags say.
@@ -296,8 +287,10 @@ mod tests {
         assert_eq!(derived(&many), vec!["region=us"]);
     }
 
+    /// Sixty hex ids exceeded the general regex size limit and were dropped;
+    /// within the byte budget they are one filter now.
     #[test]
-    fn common_label_filters_skip_alternations_the_index_cannot_compile() {
+    fn common_label_filters_enumerate_sixty_ids_within_the_byte_budget() {
         let samples: Vec<EvalSample> = (0_u64..60)
             .map(|i| {
                 labelled(&[
@@ -309,7 +302,24 @@ mod tests {
                 ])
             })
             .collect();
+        let filters = derived(&samples);
+        assert_eq!(filters.len(), 2);
+        assert!(filters[0].starts_with("instance=~0000000000000000|"));
+        assert_eq!(filters[1], "region=us");
+    }
+
+    /// Label values are unbounded: a label whose values add up past the byte
+    /// budget is left out rather than copied into a regex.
+    #[test]
+    fn common_label_filters_skip_labels_past_the_byte_budget() {
+        let big = "x".repeat(MAX_PUSHDOWN_BYTES);
+        let samples = vec![
+            labelled(&[("region", "us"), ("host", &format!("a{big}"))]),
+            labelled(&[("region", "us"), ("host", &format!("b{big}"))]),
+        ];
         assert_eq!(derived(&samples), vec!["region=us"]);
+        // A single value past the budget is no equality either.
+        assert_eq!(derived(&samples[..1]), vec!["region=us"]);
     }
 
     /// Parse `query` and return its top-level binary expression.
