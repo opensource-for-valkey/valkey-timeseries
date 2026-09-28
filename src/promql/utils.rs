@@ -1,6 +1,7 @@
 use crate::common::Timestamp;
 use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::promql::{EvalResult, EvaluationError, QueryError};
+use promql_parser::parser::Expr;
 use std::ops::{Bound, RangeBounds};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -160,6 +161,126 @@ pub(crate) fn check_subquery_steps(
         )));
     }
     Ok(())
+}
+
+/// The deepest expression tree a query may have: the longest chain of nested
+/// nodes, where every operator, function call, aggregation, subquery and
+/// parenthesis counts as one.
+///
+/// The evaluator, the optimizer and the push-down passes all recurse over the
+/// tree, on threads with 2 MiB stacks, and a stack overflow aborts the server.
+/// Measured on 2026-09-28 (release build, 2 MiB stack), the cheapest overflow
+/// was a chain of vector-to-vector operators (`a or a or ...`, `a + a + ...`,
+/// `and on(...)`, `group_left`) at about 1,860 nodes: roughly 1.1 KiB of stack
+/// per node. Aggregations, function calls and unary minus cost less. 500
+/// leaves a margin of about 3.7 for frames on paths the measurement did not
+/// reach. Real queries rarely nest past a few dozen, though a generated
+/// `a or b or ...` chain counts one per operand.
+pub const MAX_QUERY_DEPTH: usize = 500;
+
+/// Rejects an expression nested deeper than [`MAX_QUERY_DEPTH`].
+///
+/// Walks the tree with an explicit stack rather than recursion: this runs on
+/// the thread that parses the command, and a 16 KiB query can nest about
+/// 16,000 unary minus signs.
+pub(crate) fn check_query_depth(expr: &Expr) -> Result<(), String> {
+    let mut pending: Vec<(&Expr, usize)> = vec![(expr, 1)];
+    while let Some((expr, depth)) = pending.pop() {
+        if depth > MAX_QUERY_DEPTH {
+            return Err(format!(
+                "TSDB: query is nested too deeply; the limit is {MAX_QUERY_DEPTH} levels"
+            ));
+        }
+        let children = depth + 1;
+        match expr {
+            Expr::Aggregate(agg) => {
+                pending.push((&agg.expr, children));
+                if let Some(param) = &agg.param {
+                    pending.push((param, children));
+                }
+            }
+            Expr::Unary(unary) => pending.push((&unary.expr, children)),
+            Expr::Binary(binary) => {
+                pending.push((&binary.lhs, children));
+                pending.push((&binary.rhs, children));
+            }
+            Expr::Paren(paren) => pending.push((&paren.expr, children)),
+            Expr::Subquery(subquery) => pending.push((&subquery.expr, children)),
+            Expr::Call(call) => pending.extend(call.args.args.iter().map(|arg| (&**arg, children))),
+            Expr::Extension(ext) => {
+                pending.extend(ext.expr.children().iter().map(|c| (c, children)))
+            }
+            Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::VectorSelector(_)
+            | Expr::MatrixSelector(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    fn depth_ok(query: &str) -> Result<(), String> {
+        check_query_depth(&promql_parser::parser::parse(query).expect("valid query"))
+    }
+
+    #[test]
+    fn every_node_kind_counts_toward_the_depth() {
+        let n = MAX_QUERY_DEPTH;
+        // Each shape nests exactly `levels` nodes above the leaf.
+        type Shape = (&'static str, fn(usize) -> String);
+        let shapes: [Shape; 6] = [
+            ("binary chain", |levels| {
+                format!("up{}", "+up".repeat(levels))
+            }),
+            ("unary", |levels| format!("{}up", "-".repeat(levels))),
+            ("parens", |levels| {
+                format!("{}up{}", "(".repeat(levels), ")".repeat(levels))
+            }),
+            ("calls", |levels| {
+                format!("{}up{}", "abs(".repeat(levels), ")".repeat(levels))
+            }),
+            ("aggregations", |levels| {
+                format!("{}up{}", "sum(".repeat(levels), ")".repeat(levels))
+            }),
+            ("or chain", |levels| {
+                format!("up{}", " or up".repeat(levels))
+            }),
+        ];
+        for (name, build) in shapes {
+            assert!(depth_ok(&build(n - 1)).is_ok(), "{name} at the limit");
+            let err = depth_ok(&build(n)).expect_err(name);
+            assert!(err.contains("nested too deeply"), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn subqueries_and_aggregation_params_are_walked() {
+        let deep = format!("{}up", "-".repeat(MAX_QUERY_DEPTH));
+        assert!(depth_ok(&format!("max_over_time(({deep})[5m:1m])")).is_err());
+        assert!(depth_ok(&format!("topk(scalar({deep}), up)")).is_err());
+        assert!(depth_ok(&format!("clamp(up, 0, scalar({deep}))")).is_err());
+    }
+
+    #[test]
+    fn the_walk_does_not_recurse() {
+        // Far deeper than any stack-bound recursion would survive on a small
+        // stack; the parser itself is not recursive.
+        let query = format!("{}up", "-".repeat(16_000));
+        let expr = promql_parser::parser::parse(&query).expect("valid query");
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                assert!(check_query_depth(&expr).is_err());
+                std::mem::forget(expr); // dropping it recurses; not what this tests
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

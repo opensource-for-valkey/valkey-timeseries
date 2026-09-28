@@ -571,6 +571,31 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         assert datetime.now() - started < timedelta(seconds=1)
         assert self.client.execute_command('PING')
 
+    def test_deeply_nested_query_is_rejected_not_crashing(self):
+        """Evaluation recurses over the expression on 2 MiB stacks. A chain of ~1,900
+        vector operators overflowed one and aborted the server; at the 16 KiB maximum
+        query length that is easy to send. Depth is now capped at 500 levels."""
+        time = self.setup_http_requests_scenario()
+        self.client.execute_command("CONFIG", "SET", "ts.ts-promql-max-query-len", 16384)
+        try:
+            # Past the measured overflow point (~1,900 vector operators).
+            chain = "u" + "+u" * 2500
+            with pytest.raises(ResponseError, match="nested too deeply"):
+                self.client.execute_command('TS.QUERY', chain)
+            assert self.client.execute_command('PING')
+
+            deep = "http_requests_total" + " + http_requests_total" * 700
+            assert len(deep) <= 16384
+            with pytest.raises(ResponseError, match="nested too deeply"):
+                self.client.execute_command('TS.QUERY', deep)
+
+            # Just under the limit still evaluates.
+            ok = "http_requests_total" + " or http_requests_total" * 498
+            result = self.instant_query(ok, time)
+            assert len(self._vector_values_by_label(result, "server")) == 4
+        finally:
+            self.client.execute_command("CONFIG", "SET", "ts.ts-promql-max-query-len", 4096)
+
     def test_aggregation_sum(self):
         time = self.setup_http_requests_scenario()
 

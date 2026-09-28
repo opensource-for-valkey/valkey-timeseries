@@ -19,6 +19,7 @@ use crate::parser::{
     parse_positive_duration_value, timestamp::parse_timestamp as parse_timestamp_internal,
     timestamp::timestamp_error,
 };
+use crate::promql::check_query_depth;
 use crate::promql::engine::promql_config::PromqlConfig;
 use crate::promql::engine::validate_query_regexes;
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
@@ -1829,6 +1830,8 @@ fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> 
         log_debug(format!("TSDB: failed to parse query {_e:?}"));
         ValkeyError::Str(error_consts::INVALID_QUERY)
     })?;
+    // Evaluation recurses over the tree on 2 MiB stacks; an overflow aborts the server.
+    check_query_depth(&expr).map_err(ValkeyError::String)?;
 
     Ok(expr)
 }
