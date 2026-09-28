@@ -528,6 +528,28 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
 
         assert sorted(values.keys()) == ["web_prod_1", "web_prod_2", "web_prod_3"]
 
+    def test_empty_regex_matcher_selects_series_without_the_label(self):
+        """`=~""` is valid PromQL for "label absent"; it used to panic the selector conversion."""
+        time = self.setup_http_requests_scenario()
+        self.client.execute_command(
+            "TS.CREATE", "web-dev-1", "METRIC", 'http_requests_total{server="web_dev_1"}')
+        self.client.execute_command("TS.ADD", "web-dev-1", time, 5)
+
+        result = self.instant_query('http_requests_total{environment=~""}', time)
+        assert sorted(self._vector_values_by_label(result, "server")) == ["web_dev_1"]
+
+        result = self.instant_query('http_requests_total{environment!~""}', time)
+        assert sorted(self._vector_values_by_label(result, "server")) == [
+            "web_prod_1", "web_prod_2", "web_prod_3", "web_stg_1"]
+
+    def test_regex_over_the_size_limit_is_rejected_at_parse_time(self):
+        """A pattern the parser accepts but the module's regex size limit refuses is an
+        error reply naming the label, not a failure inside evaluation."""
+        self.setup_http_requests_scenario()
+        with pytest.raises(ResponseError, match="regex for label 'server'"):
+            self.client.execute_command('TS.QUERY', 'http_requests_total{server=~"[a-z]{3000}"}')
+        assert self.client.execute_command('PING')
+
     def test_aggregation_sum(self):
         time = self.setup_http_requests_scenario()
 

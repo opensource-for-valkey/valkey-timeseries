@@ -5,6 +5,7 @@ use crate::labels::filters::{
     SeriesSelector,
 };
 use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, literal_alternatives};
+use crate::parser::parse_error::ParseError;
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::AggregationPartial;
 use crate::promql::exec::types::EvalLabels;
@@ -16,7 +17,9 @@ use crate::promql::generated::{
 use crate::promql::{EvalSample, RangeSample};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use promql_parser::label::{Labels as ModifierLabels, MatchOp as PromMatchOp, Matcher, Matchers};
-use promql_parser::parser::{LabelModifier, VectorSelector};
+use promql_parser::parser::{Expr, LabelModifier, VectorSelector};
+use promql_parser::util::{ExprVisitor, walk_expr};
+use regex::Regex;
 use valkey_module::{ValkeyError, ValkeyResult};
 
 impl From<InternedLabel<'_>> for ProtoLabel {
@@ -149,8 +152,8 @@ fn matcher_predicate(matcher: &Matcher) -> PredicateMatch {
     match &matcher.op {
         PromMatchOp::Equal => PredicateMatch::Equal(literal_value(value)),
         PromMatchOp::NotEqual => PredicateMatch::NotEqual(literal_value(value)),
-        PromMatchOp::Re(_) => regex_predicate(value),
-        PromMatchOp::NotRe(_) => regex_predicate(value).inverse(),
+        PromMatchOp::Re(parsed) => regex_predicate(value, parsed),
+        PromMatchOp::NotRe(parsed) => regex_predicate(value, parsed).inverse(),
     }
 }
 
@@ -167,20 +170,70 @@ fn literal_value(value: &str) -> PredicateValue {
 /// ([`crate::promql::engine::label_profile`]) and most hand-written `a|b`
 /// selectors — is an equality over the list: resolved by one postings lookup
 /// per value rather than a regex run over every value of the label.
-fn regex_predicate(value: &str) -> PredicateMatch {
+///
+/// `parsed` is the regex promql-parser compiled for the same text. It is used
+/// only if the module's own compile fails, which [`validate_selector_regexes`]
+/// rules out for every query a command accepts; falling back keeps this
+/// conversion infallible instead of panicking on a selector that got past it.
+fn regex_predicate(value: &str, parsed: &Regex) -> PredicateMatch {
+    try_regex_predicate(value).unwrap_or_else(|_| {
+        PredicateMatch::RegexEqual(RegexMatcher::new(parsed.clone(), value.to_string()))
+    })
+}
+
+/// The `=~` predicate for `value`, compiled with the module's size limits.
+fn try_regex_predicate(value: &str) -> Result<PredicateMatch, ParseError> {
+    // The anchored empty regex matches only the empty value, which is what
+    // `=""` means: the label is absent.
     if value.is_empty() {
-        panic!("Invalid regex matcher with empty value");
+        return Ok(PredicateMatch::Equal(PredicateValue::Empty));
     }
     if let Some(mut values) = literal_alternatives(value) {
         let value = if values.len() == 1 {
-            PredicateValue::String(values.pop().unwrap())
+            PredicateValue::String(values.swap_remove(0))
         } else {
             PredicateValue::from(values)
         };
-        return PredicateMatch::Equal(value);
+        return Ok(PredicateMatch::Equal(value));
     }
-    let regex_matcher = RegexMatcher::create(value).expect("Failed to create regex matcher");
-    PredicateMatch::RegexEqual(regex_matcher)
+    RegexMatcher::create(value).map(PredicateMatch::RegexEqual)
+}
+
+/// Rejects a query whose regex matchers the module cannot compile.
+///
+/// promql-parser compiles each `=~`/`!~` with the regex crate's defaults; the
+/// selector conversion recompiles it under the module's tighter size limit.
+/// Checking here, when the command is parsed, turns a pattern between the two
+/// limits into an error reply instead of a failure deep inside evaluation.
+pub(crate) fn validate_selector_regexes(expr: &Expr) -> Result<(), String> {
+    struct Check;
+    impl ExprVisitor for Check {
+        type Error = String;
+        fn pre_visit(&mut self, expr: &Expr) -> Result<bool, String> {
+            let selector = match expr {
+                Expr::VectorSelector(vs) => vs,
+                Expr::MatrixSelector(ms) => &ms.vs,
+                _ => return Ok(true),
+            };
+            let matchers = &selector.matchers;
+            for matcher in matchers
+                .matchers
+                .iter()
+                .chain(matchers.or_matchers.iter().flatten())
+            {
+                if matches!(matcher.op, PromMatchOp::Re(_) | PromMatchOp::NotRe(_))
+                    && try_regex_predicate(&matcher.value).is_err()
+                {
+                    return Err(format!(
+                        "TSDB: the regex for label '{}' is invalid or too large",
+                        matcher.name
+                    ));
+                }
+            }
+            Ok(true)
+        }
+    }
+    walk_expr(&mut Check, expr).map(|_| ())
 }
 
 impl From<Matchers> for SeriesSelector {
@@ -556,6 +609,69 @@ mod tests {
                 assert!(!filters[3].matches("laptop"));
             }
             other => panic!("expected SeriesSelector::And, got {other:?}"),
+        }
+    }
+
+    /// The matchers of the first selector in `query`, as the parser built them.
+    fn parsed_matchers(query: &str) -> Vec<Matcher> {
+        match promql_parser::parser::parse(query).expect("valid query") {
+            Expr::VectorSelector(vs) => vs.matchers.matchers,
+            other => panic!("expected a vector selector, got {other:?}"),
+        }
+    }
+
+    /// `=~""` is valid PromQL (the label is absent) and used to panic here.
+    #[test]
+    fn test_empty_regex_matches_only_the_absent_label() {
+        let matchers = parsed_matchers(r#"up{job=~"", env!~""}"#);
+        let job = LabelFilter::from(&matchers[0]);
+        assert_eq!(job.matcher, PredicateMatch::Equal(PredicateValue::Empty));
+        assert!(job.matches(""));
+        assert!(!job.matches("api"));
+
+        let env = LabelFilter::from(&matchers[1]);
+        assert_eq!(env.matcher, PredicateMatch::NotEqual(PredicateValue::Empty));
+        assert!(env.matches("prod"));
+        assert!(!env.matches(""));
+    }
+
+    /// A pattern promql-parser accepts under the regex crate's 10 MiB default
+    /// but the module's 16 KiB limit refuses used to panic in the conversion.
+    /// A command now rejects it at parse time, and the conversion itself falls
+    /// back to the parser's regex rather than panicking.
+    #[test]
+    fn test_regex_over_the_module_size_limit() {
+        let query = r#"up{host=~"[a-z]{3000}"}"#;
+        let matchers = parsed_matchers(query);
+        assert!(
+            RegexMatcher::create("[a-z]{3000}").is_err(),
+            "must exceed the module limit"
+        );
+
+        let filter = LabelFilter::from(&matchers[0]);
+        assert_eq!(filter.op(), MatchOp::RegexEqual);
+        assert!(filter.matches(&"a".repeat(3000)));
+        assert!(!filter.matches("a"));
+
+        let expr = promql_parser::parser::parse(query).unwrap();
+        let err = validate_selector_regexes(&expr).expect_err("rejected at parse time");
+        assert!(err.contains("'host'"), "{err}");
+
+        // Inside a range selector, a subquery and a function argument too.
+        for query in [
+            r#"rate(up{host=~"[a-z]{3000}"}[5m])"#,
+            r#"max_over_time(sum(up{host=~"[a-z]{3000}"})[10m:1m])"#,
+            r#"up{job="a"} or on() up{host!~"[a-z]{3000}"}"#,
+        ] {
+            let expr = promql_parser::parser::parse(query).unwrap();
+            assert!(validate_selector_regexes(&expr).is_err(), "{query}");
+        }
+        for query in [
+            r#"up{host=~"a|b", job=~""}"#,
+            r#"rate(up{host=~"web-[0-9]+"}[5m])"#,
+        ] {
+            let expr = promql_parser::parser::parse(query).unwrap();
+            assert!(validate_selector_regexes(&expr).is_ok(), "{query}");
         }
     }
 

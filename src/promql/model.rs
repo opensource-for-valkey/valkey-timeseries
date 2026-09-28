@@ -180,7 +180,8 @@ impl EvalContext {
     }
 
     pub fn expected_steps(&self) -> usize {
-        crate::promql::time::grid_step_count(self.query_start, self.query_end, self.step_ms) as usize
+        crate::promql::time::grid_step_count(self.query_start, self.query_end, self.step_ms)
+            as usize
     }
 
     pub fn get_timestamps(&self) -> Vec<Timestamp> {

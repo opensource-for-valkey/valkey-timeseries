@@ -146,7 +146,11 @@ pub(crate) fn validate_max_points_per_timeseries(
 /// than [`MAX_GRID_STEPS`] steps. No configured limit covers subqueries, so
 /// this is their only bound: `m[100y:1ms]` would otherwise be walked (and its
 /// window ends collected) three trillion steps per series.
-pub(crate) fn check_subquery_steps(start: Timestamp, end: Timestamp, step_ms: i64) -> EvalResult<()> {
+pub(crate) fn check_subquery_steps(
+    start: Timestamp,
+    end: Timestamp,
+    step_ms: i64,
+) -> EvalResult<()> {
     let steps = grid_step_count(start, end, step_ms);
     if steps > MAX_GRID_STEPS {
         return Err(EvaluationError::ArgumentError(format!(

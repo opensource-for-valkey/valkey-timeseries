@@ -1319,17 +1319,17 @@ mod tests {
     fn test_label_boundaries_are_part_of_the_match_key() {
         // Label sets are hashed in name order, so the names are chosen to sort
         // the way the bytes must line up.
-        for rhs_labels in [
-            &[("a", "xb0xfey")][..],
-            &[("a", ""), ("xb", "y")][..],
-        ] {
+        for rhs_labels in [&[("a", "xb0xfey")][..], &[("a", ""), ("xb", "y")][..]] {
             let lhs = vec![sample(1000, 10.0, &[("a", "x"), ("b", "y")])];
             let rhs = vec![sample(1000, 3.0, rhs_labels)];
             let result = eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs)
                 .unwrap()
                 .into_instant_vector()
                 .unwrap();
-            assert!(result.is_empty(), "{rhs_labels:?} matched {{a=\"x\", b=\"y\"}}");
+            assert!(
+                result.is_empty(),
+                "{rhs_labels:?} matched {{a=\"x\", b=\"y\"}}"
+            );
         }
     }
 

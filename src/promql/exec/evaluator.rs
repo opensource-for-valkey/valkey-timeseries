@@ -37,8 +37,8 @@ use crate::promql::model::RangeSample;
 use crate::promql::time::{
     MAX_GRID_STEPS, apply_time_modifiers_ms, grid_step_count, selector_bounds, step_times,
 };
-use crate::promql::utils::check_subquery_steps;
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
+use crate::promql::utils::check_subquery_steps;
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, InstantSample, PreloadMap,
     QueryError,

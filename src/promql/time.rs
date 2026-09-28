@@ -373,7 +373,13 @@ mod tests {
 
     #[test]
     fn step_times_matches_grid_step_count() {
-        for (start, end, step) in [(0, 0, 1), (0, 999, 1), (0, 1000, 7), (-41, 59, 10), (3, 2, 1)] {
+        for (start, end, step) in [
+            (0, 0, 1),
+            (0, 999, 1),
+            (0, 1000, 7),
+            (-41, 59, 10),
+            (3, 2, 1),
+        ] {
             assert_eq!(
                 step_times(start, end, step).count() as u64,
                 grid_step_count(start, end, step),

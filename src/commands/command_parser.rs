@@ -20,6 +20,7 @@ use crate::parser::{
     timestamp::timestamp_error,
 };
 use crate::promql::engine::promql_config::PromqlConfig;
+use crate::promql::engine::validate_selector_regexes;
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
     AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS, MRangeOptions, MatchFilterOptions,
@@ -1826,6 +1827,7 @@ fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> 
         log_debug(format!("TSDB: failed to parse query {_e:?}"));
         ValkeyError::Str(error_consts::INVALID_QUERY)
     })?;
+    validate_selector_regexes(&expr).map_err(ValkeyError::String)?;
 
     Ok(expr)
 }

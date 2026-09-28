@@ -36,7 +36,6 @@ use crate::fanout::{
 use crate::labels::InternedLabel;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
-use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
 use crate::promql::engine::fanout::type_conversions::{
     proto_labels_to_eval_labels, range_sample_to_proto,
@@ -55,6 +54,7 @@ use crate::promql::generated::{
 };
 use crate::promql::hashers::FingerprintHashMap;
 use crate::promql::model::RangeSample;
+use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::series::chunks::WIRE_COMPRESSION_MIN_SAMPLES;
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
@@ -2210,7 +2210,10 @@ mod tests {
         let err = decode_request(&req).expect_err("unbounded grid");
         assert!(err.to_string().contains("steps"), "{err}");
         req.query_end = crate::promql::MAX_GRID_STEPS as i64 - 1;
-        assert!(decode_request(&req).is_ok(), "a grid at the ceiling decodes");
+        assert!(
+            decode_request(&req).is_ok(),
+            "a grid at the ceiling decodes"
+        );
 
         // A selecting operator decodes with its parameter.
         let req = command(fused_with(

@@ -207,6 +207,18 @@ class TestTsQueryRange(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.range_query("http_requests", "1000", start=4000, end=2000)
 
+    def test_queryrange_unbounded_end_is_rejected(self):
+        """`END +` is i64::MAX. With no points limit configured (the default) the step grid
+        used to be walked until the allocation aborted the server; the built-in grid
+        ceiling now rejects it before anything is read."""
+        self.setup_simple_series()
+
+        with pytest.raises(ResponseError, match="too many points"):
+            self.range_query("http_requests", "1ms", start=0, end="+")
+        with pytest.raises(ResponseError, match="too many steps"):
+            self.client.execute_command("TS.QUERY", "sum_over_time(http_requests[100y:1ms])")
+        assert self.client.execute_command("PING")
+
     def test_queryrange_scalar_expression_returns_matrix(self):
         self.setup_simple_series()
 
