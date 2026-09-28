@@ -85,3 +85,30 @@ class TestRdbLoadAcceptsWhatWritesAccept(ValkeyTimeSeriesTestCaseBase):
         assert sorted(client.execute_command("TS.QUERYINDEX", "job=api")) == sorted(
             [b"short", long_key.encode()]
         )
+
+    def test_series_with_more_chunks_than_the_load_preallocation_survives_restart(self):
+        """The loader reserves room for at most MAX_RDB_PREALLOC (1024) chunks up front and
+        grows past that as chunks arrive; a series with more must load back intact."""
+        client = self.server.get_new_client()
+        # The smallest chunk holds three uncompressed samples.
+        client.execute_command("TS.CREATE", "many_chunks", "ENCODING", "UNCOMPRESSED",
+                               "CHUNK_SIZE", 48)
+        samples = 4000
+        pipe = client.pipeline(transaction=False)
+        for i in range(samples):
+            pipe.execute_command("TS.ADD", "many_chunks", 1000 + i, i)
+        pipe.execute()
+
+        def info(c):
+            raw = c.execute_command("TS.INFO", "many_chunks")
+            as_map = dict(zip(raw[::2], raw[1::2]))
+            return {(k.decode() if isinstance(k, bytes) else k): v for k, v in as_map.items()}
+
+        chunks = info(client)["chunkCount"]
+        assert chunks > 1024, f"only {chunks} chunks; the test needs more than 1024"
+        before = client.execute_command("TS.RANGE", "many_chunks", "-", "+")
+
+        client = self._restart(client)
+        assert info(client)["chunkCount"] == chunks
+        assert info(client)["totalSamples"] == samples
+        assert client.execute_command("TS.RANGE", "many_chunks", "-", "+") == before

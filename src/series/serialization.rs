@@ -63,7 +63,7 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
     let chunk_encoding = ChunkEncoding::try_from(rdb_load_string(rdb)?)?;
     let chunk_size_bytes = rdb_load_usize(rdb)?;
     let chunks_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
-    let mut chunks = Vec::with_capacity(chunks_len);
+    let mut chunks = Vec::with_capacity(rdb_prealloc(chunks_len));
     let mut total_samples: usize = 0;
     // `None` until the first non-empty chunk, not `0`: 0 is a valid timestamp, and using it
     // as the "unset" marker took chunk 1's first timestamp for a series whose data starts at
@@ -82,13 +82,15 @@ pub fn rdb_load_series(rdb: *mut raw::RedisModuleIO, enc_ver: i32) -> ValkeyResu
         last_sample = chunk.last_sample();
         chunks.push(chunk);
     }
+    // Past the up-front reservation the list grew by doubling; don't keep the slack.
+    chunks.shrink_to_fit();
     let first_timestamp = first_timestamp.unwrap_or_default();
 
     // rule related
     let src_series = SeriesLink::rdb_load_optional(rdb)?;
 
     let rules_len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
-    let mut rules = Vec::with_capacity(rules_len);
+    let mut rules = Vec::with_capacity(rdb_prealloc(rules_len));
     for _ in 0..rules_len {
         let rule = CompactionRule::rdb_load(rdb)?;
         rules.push(rule);

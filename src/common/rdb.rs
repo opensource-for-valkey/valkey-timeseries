@@ -140,6 +140,20 @@ pub fn rdb_load_len(rdb: *mut RedisModuleIO, max: usize) -> ValkeyResult<usize> 
     Ok(len)
 }
 
+/// The most elements a loader reserves room for before reading any of them.
+///
+/// A declared length is only a claim: [`rdb_load_len`] caps it at
+/// [`MAX_RDB_COLLECTION_LEN`] (16 Mi), still enough for a corrupt payload of a
+/// few bytes to reserve over a gigabyte before its first element fails to
+/// read. Reserving at most this many up front and growing as elements arrive
+/// means only data that is really in the payload costs memory.
+pub const MAX_RDB_PREALLOC: usize = 1024;
+
+/// The capacity to reserve for a collection that declares `len` elements.
+pub fn rdb_prealloc(len: usize) -> usize {
+    len.min(MAX_RDB_PREALLOC)
+}
+
 pub fn rdb_save_optional_usize(rdb: *mut RedisModuleIO, value: Option<usize>) {
     save_optional_unsigned(rdb, value.map(|x| x as u64));
 }
@@ -233,7 +247,7 @@ pub fn rdb_save_string_hashmap(rdb: *mut RedisModuleIO, map: &HashMap<String, St
 
 pub fn rdb_load_string_hashmap(rdb: *mut RedisModuleIO) -> ValkeyResult<HashMap<String, String>> {
     let len = rdb_load_len(rdb, MAX_RDB_COLLECTION_LEN)?;
-    let mut map = HashMap::with_capacity(len);
+    let mut map = HashMap::with_capacity(rdb_prealloc(len));
     for _ in 0..len {
         let key = rdb_load_string(rdb)?;
         let val = rdb_load_string(rdb)?;
@@ -301,5 +315,19 @@ pub(crate) fn rdb_load_optional_rounding(
         Ok(Some(rounding))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_RDB_COLLECTION_LEN, MAX_RDB_PREALLOC, rdb_prealloc};
+
+    #[test]
+    fn prealloc_never_exceeds_the_cap() {
+        assert_eq!(rdb_prealloc(0), 0);
+        assert_eq!(rdb_prealloc(7), 7);
+        assert_eq!(rdb_prealloc(MAX_RDB_PREALLOC), MAX_RDB_PREALLOC);
+        assert_eq!(rdb_prealloc(MAX_RDB_COLLECTION_LEN), MAX_RDB_PREALLOC);
+        assert_eq!(rdb_prealloc(usize::MAX), MAX_RDB_PREALLOC);
     }
 }

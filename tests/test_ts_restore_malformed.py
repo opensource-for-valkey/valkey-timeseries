@@ -145,6 +145,48 @@ class TestTimeseriesRestoreMalformed(ValkeyTimeSeriesTestCaseDebugMode):
             assert client.ping(), f'server died on corrupt payload, trial {trial}'
         assert self.server.is_alive()
 
+    @staticmethod
+    def _rdb_len_end(data, pos):
+        """End offset of the RDB length encoding that starts at `pos`."""
+        kind = data[pos] >> 6
+        if kind == 0:
+            return pos + 1
+        if kind == 1:
+            return pos + 2
+        return pos + {0x80: 5, 0x81: 9}[data[pos]]
+
+    def test_restore_huge_declared_chunk_count_is_rejected_cleanly(self):
+        """The loader reserved room for the declared chunk count before reading any chunk,
+        so a few bytes claiming 16 Mi chunks (just under the loader's ceiling) reserved about
+        a gigabyte, and a server with less memory aborts on that allocation. It now reserves
+        at most a small fixed amount (`MAX_RDB_PREALLOC`) and grows only with chunks that are
+        really there.
+
+        This test pins the clean error and a live server. It cannot observe the reservation
+        itself: the server samples peak memory between commands, and the reservation is made
+        and freed within this one."""
+        client = self.client
+        payload = self._genuine_payload(key='huge_count_src')
+
+        # The series is saved as ... encoding name, chunk size, chunk count, chunks ...
+        # A module string is opcode 5 + RDB length + bytes; a module unsigned is opcode 2 +
+        # RDB length.
+        name = b'\x05\x05chimp'
+        assert payload.count(name) == 1
+        size_at = payload.index(name) + len(name)
+        assert payload[size_at] == 2
+        count_at = self._rdb_len_end(payload, size_at + 1)
+        assert payload[count_at] == 2
+        count_end = self._rdb_len_end(payload, count_at + 1)
+        assert payload[count_at + 1:count_end] == b'\x01', 'expected a one-chunk series'
+        huge = b'\x02\x80' + (16 * 1024 * 1024 - 1).to_bytes(4, 'big')
+        malformed = payload[:count_at] + huge + payload[count_end:]
+
+        with pytest.raises(Exception, match='failed to deserialize'):
+            client.execute_command('TS._RESTORE', 'huge_count', malformed, self.payload_encver)
+        assert client.ping()
+        assert self.server.is_alive()
+
     def test_restore_rejects_unsupported_encoding_version(self):
         """A payload version this module cannot read is refused before it is parsed."""
         client = self.client
