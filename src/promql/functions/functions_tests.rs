@@ -600,6 +600,71 @@ mod tests {
         );
     }
 
+    /// `label_replace(v, "dst", "$1", "src", regex)` over one sample whose `src`
+    /// label is `src_value`: the `dst` label it produces, or the error.
+    fn label_replace_dst(src_value: &str, regex: &str) -> Result<Option<String>, String> {
+        let func = resolve_function("label_replace").unwrap();
+        let ctx = EvalContext {
+            evaluation_ts: 1000,
+            ..Default::default()
+        };
+        let result = func
+            .apply_call(
+                vec![
+                    PromQLArg::InstantVector(vec![create_sample_with_labels(
+                        1.0,
+                        &[(METRIC_NAME, "test_metric"), ("src", src_value)],
+                    )]),
+                    "dst".into(),
+                    "$1".into(),
+                    "src".into(),
+                    regex.into(),
+                ],
+                &no_raw_args(&ctx),
+            )
+            .map_err(|err| err.to_string())?;
+        let ExprResult::InstantVector(result) = result else {
+            panic!("expected InstantVector");
+        };
+        Ok(result[0].labels.get("dst").map(str::to_string))
+    }
+
+    /// The pattern used to compile with the regex crate's defaults: ~100 ms to
+    /// build or refuse a pattern like this one, and up to ~12 MiB per cached
+    /// entry. It now compiles under the module's limits.
+    #[test]
+    fn label_replace_regex_is_size_limited() {
+        let started = std::time::Instant::now();
+        let err = label_replace_dst("abc", r"(\w{2000})").expect_err("over the size limit");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.contains("invalid regular expression in label_replace()"),
+            "{err}"
+        );
+
+        // Everyday patterns still fit.
+        assert_eq!(
+            label_replace_dst("web-01", r"(\w+)-\d+")
+                .unwrap()
+                .as_deref(),
+            Some("web")
+        );
+    }
+
+    /// Go reads `a{b}` as literal braces, so Prometheus accepts it; the plain
+    /// Rust compile refused it, while selector matchers already accepted it.
+    #[test]
+    fn label_replace_accepts_go_literal_braces() {
+        assert_eq!(
+            label_replace_dst("a{b}", r"(a{b})").unwrap().as_deref(),
+            Some("a{b}")
+        );
+    }
+
     #[test]
     fn should_error_when_label_replace_produces_duplicate_output_labelsets() {
         let func = resolve_function("label_replace").unwrap();

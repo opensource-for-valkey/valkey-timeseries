@@ -1,3 +1,4 @@
+use crate::labels::build_with_repeat_fallback;
 use crate::promql::binops::ensure_unique_labelsets;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::functions::utils::{
@@ -34,6 +35,12 @@ thread_local! {
     /// Patterns come from user queries, so the map is bounded: once it holds
     /// [`REGEX_CACHE_CAPACITY`] entries, the oldest tenth make room for the
     /// next pattern rather than the map growing with every distinct query.
+    ///
+    /// Each entry is bounded too: patterns compile under the module's regex
+    /// limits (a 64 KiB program and a 16 KiB lazy-DFA cache), so a full cache
+    /// holds roughly 5 MiB per thread. With the regex crate's defaults (10 MiB
+    /// and 2 MiB) it could hold about 770 MiB, and one hostile pattern took
+    /// ~100 ms to build or refuse.
     static REGEX_CACHE: RefCell<AHashMap<String, CachedRegex>> = RefCell::new(AHashMap::new());
 }
 
@@ -72,8 +79,13 @@ fn with_anchored_regex<T>(regex_src: &str, f: impl FnOnce(&Regex) -> T) -> EvalR
     REGEX_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if !cache.contains_key(&anchored) {
-            let regex = Regex::new(&anchored)
-                .map_err(|err| EvaluationError::InternalError(err.to_string()))?;
+            // Also accepts Go's literal braces (`a{b}`), as Prometheus does and
+            // as selector matchers already did.
+            let regex = build_with_repeat_fallback(&anchored).map_err(|err| {
+                EvaluationError::ArgumentError(format!(
+                    "invalid regular expression in label_replace(): {err}"
+                ))
+            })?;
             if cache.len() >= REGEX_CACHE_CAPACITY {
                 evict_oldest(&mut cache);
             }

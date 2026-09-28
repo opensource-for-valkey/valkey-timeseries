@@ -14,5 +14,6 @@ pub use labels_struct::*;
 /// `EvalLabels::Interned` variant carries it straight from storage.
 pub use metric_name::MetricName;
 pub(crate) use metric_name::*;
+pub(crate) use regex::build_with_repeat_fallback;
 pub use regex::compile_literal_set;
 pub use regex_utils::{compile_regex, is_match_all_regex_pattern, literal_alternatives};
