@@ -1,7 +1,7 @@
 use crate::common::time::system_time_to_millis;
 use crate::labels::{
-    HasFingerprint, LabelHasher, SeriesFingerprint, create_hasher, create_unseeded_hasher,
-    hash_key_value,
+    HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher,
+    create_unseeded_hasher, hash_key_value,
 };
 use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
 use crate::promql::exec::aggregations::AggregationKind;
@@ -94,6 +94,7 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(
     if let Some(name) = &vs.name {
         hasher.write(name.as_bytes());
     }
+    hasher.write(&[LABEL_SEP]);
 
     update_list(&vs.matchers.matchers, hasher);
 
@@ -124,22 +125,21 @@ pub(in crate::promql) fn update_hasher_for_vector_selector(
 
 fn update_hash_for_matcher(m: &Matcher, hasher: &mut LabelHasher) {
     hash_key_value(hasher, &m.name, &m.value);
+    // One distinct tag per operator: `a="x.*"` and `a=~"x.*"` select different
+    // series, so they must not share a preload key.
     match &m.op {
-        MatchOp::Equal => {
-            hasher.write(b"=");
-        }
-        MatchOp::NotEqual => {
-            hasher.write(b"!");
-        }
-        MatchOp::Re(r) => {
-            hasher.write(b"=");
-            hasher.write(r.as_str().as_bytes())
+        MatchOp::Equal => hasher.write(b"="),
+        MatchOp::NotEqual => hasher.write(b"!="),
+        MatchOp::Re(regex) => {
+            hasher.write(b"=~");
+            hasher.write(regex.as_str().as_bytes());
         }
         MatchOp::NotRe(regex) => {
-            hasher.write(b"!");
-            hasher.write(regex.as_str().as_bytes())
+            hasher.write(b"!~");
+            hasher.write(regex.as_str().as_bytes());
         }
     }
+    hasher.write(&[LABEL_SEP]);
 }
 
 pub(in crate::promql) type FingerprintHashMap<V> =

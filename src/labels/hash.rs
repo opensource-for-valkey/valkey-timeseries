@@ -49,10 +49,19 @@ pub(crate) fn create_unseeded_hasher() -> LabelHasher {
     RawHasher::new(SecretBuffer::default())
 }
 
+/// Written after every label name and every label value.
+///
+/// The byte 0xFF never occurs in UTF-8, so a sequence of framed labels decodes
+/// one way only: `{a="x", b="y"}`, `{a="xb", ""="y"}` and `{a="", xb="y"}`
+/// all hash differently. (The same framing as Prometheus' label hash.)
+pub(crate) const LABEL_SEP: u8 = 0xff;
+
+/// Feed one `name=value` pair into a label-set hash, framed by [`LABEL_SEP`].
 pub(crate) fn hash_key_value(hasher: &mut LabelHasher, key: &str, value: &str) {
     hasher.write(key.as_bytes());
-    hasher.write(b"0xfe");
+    hasher.write(&[LABEL_SEP]);
     hasher.write(value.as_bytes());
+    hasher.write(&[LABEL_SEP]);
 }
 
 impl HasFingerprint for &str {
@@ -72,6 +81,34 @@ mod tests {
     use super::*;
 
     /// The borrowed-secret hashers must produce exactly what the allocating
+    /// Label boundaries must survive hashing: the separator used to be the
+    /// four ASCII bytes `0xfe`, with nothing after a value, so a value
+    /// containing that text (or an empty value) could stand in for a label
+    /// boundary and two different label sets shared a fingerprint.
+    #[test]
+    fn label_boundaries_are_part_of_the_fingerprint() {
+        use crate::labels::{Label, fingerprint_labels};
+        let set = |pairs: &[(&str, &str)]| -> Vec<Label> {
+            pairs.iter().map(|(n, v)| Label::new(*n, *v)).collect()
+        };
+        let fp = |pairs: &[(&str, &str)]| fingerprint_labels(set(pairs).iter());
+        let two = fp(&[("a", "x"), ("b", "y")]);
+        assert_ne!(two, fp(&[("a", "xb0xfey")]));
+        assert_ne!(two, fp(&[("a", ""), ("xb", "y")]));
+        assert_ne!(two, fp(&[("a", "xb"), ("", "y")]));
+        assert_ne!(fp(&[("a", "0xfeb")]), fp(&[("a0xfe", "b")]));
+
+        // `impl Hash for Label` frames the same way.
+        let std_hash = |pairs: &[(&str, &str)]| {
+            use std::hash::{BuildHasher, RandomState};
+            thread_local!(static STATE: RandomState = RandomState::new());
+            STATE.with(|s| s.hash_one(set(pairs)))
+        };
+        let two = std_hash(&[("a", "x"), ("b", "y")]);
+        assert_ne!(two, std_hash(&[("a", ""), ("xb", "y")]));
+        assert_ne!(two, std_hash(&[("a", "xb"), ("", "y")]));
+    }
+
     /// `xxhash3_128::Hasher` constructors produce: fingerprints are compared
     /// across shards and used as map keys, so they cannot drift.
     #[test]

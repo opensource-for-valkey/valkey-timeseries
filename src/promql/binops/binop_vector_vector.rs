@@ -1,6 +1,6 @@
 use super::labels::get_metric_signature;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
-use crate::labels::{LabelHasher, SeriesFingerprint, SeriesLabel, create_unseeded_hasher};
+use crate::labels::{SeriesFingerprint, create_unseeded_hasher, hash_key_value};
 use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
@@ -791,23 +791,17 @@ fn compute_binary_match_key(
         None => labels
             .iter()
             .filter(|k| k.name != METRIC_NAME)
-            .for_each(|label| hash_label(&mut hasher, &label)),
+            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
         Some(m @ LabelModifier::Include(_)) => labels
             .iter()
             .filter(|l| listed(l.name, m))
-            .for_each(|label| hash_label(&mut hasher, &label)),
+            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
         Some(m @ LabelModifier::Exclude(_)) => labels
             .iter()
             .filter(|l| l.name != METRIC_NAME && !listed(l.name, m))
-            .for_each(|label| hash_label(&mut hasher, &label)),
+            .for_each(|label| hash_key_value(&mut hasher, label.name, label.value)),
     };
     hasher.finish_128()
-}
-
-fn hash_label(hasher: &mut LabelHasher, label: &impl SeriesLabel) {
-    hasher.write(label.name().as_bytes());
-    hasher.write(b"0xfe");
-    hasher.write(label.value().as_bytes());
 }
 
 /// Build the result label set for a matched pair.
@@ -1316,6 +1310,27 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 13.0);
+    }
+
+    /// Two label sets that differ only in where one label ends and the next
+    /// begins used to share a match key (the separator was the text `0xfe`,
+    /// with nothing after a value), so these unrelated series were joined.
+    #[test]
+    fn test_label_boundaries_are_part_of_the_match_key() {
+        // Label sets are hashed in name order, so the names are chosen to sort
+        // the way the bytes must line up.
+        for rhs_labels in [
+            &[("a", "xb0xfey")][..],
+            &[("a", ""), ("xb", "y")][..],
+        ] {
+            let lhs = vec![sample(1000, 10.0, &[("a", "x"), ("b", "y")])];
+            let rhs = vec![sample(1000, 3.0, rhs_labels)];
+            let result = eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs)
+                .unwrap()
+                .into_instant_vector()
+                .unwrap();
+            assert!(result.is_empty(), "{rhs_labels:?} matched {{a=\"x\", b=\"y\"}}");
+        }
     }
 
     // ── fill with comparison operator ─────────────────────────────────────────

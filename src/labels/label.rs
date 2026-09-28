@@ -89,8 +89,6 @@ impl From<Label> for ValkeyValue {
     }
 }
 
-const SEP: u8 = 0xfe;
-
 impl Hash for Label {
     fn hash<H: Hasher>(&self, state: &mut H) {
         hash_label(state, &self.name, &self.value);
@@ -107,10 +105,13 @@ impl SeriesLabel for Label {
     }
 }
 
+/// The framing of [`super::hash::hash_key_value`]: a separator after the name
+/// *and* after the value, so adjacent labels cannot run together.
 fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
     state.write(name.as_bytes());
-    state.write_u8(SEP);
+    state.write_u8(super::hash::LABEL_SEP);
     state.write(value.as_bytes());
+    state.write_u8(super::hash::LABEL_SEP);
 }
 
 /// Fingerprint a sequence of labels, in the order given.
