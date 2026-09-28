@@ -16,8 +16,18 @@
 //! shipped by every shard), and the regex its PromQL matcher carries costs
 //! ~250 ns and ~260 bytes of transient heap per byte of pattern to compile,
 //! ~27 bytes of it retained for the query's lifetime.
+//!
+//! Label names are unbounded too, in number across series and in length, so a
+//! profile tracks at most [`MAX_PROFILED_LABELS`] of them within
+//! [`MAX_PROFILED_NAME_BYTES`] and marks itself `truncated` past that. Neither
+//! cap costs a common filter while the first series' names fit: a label every
+//! series carries is carried by the first one added, which normally has at
+//! most `MAX_LABELS_PER_SERIES` (`TS.CREATE … LABELS` does not enforce it, so
+//! one may carry more — then a common label can be missed, which costs a
+//! push-down, never a result). Together the caps bound a profile — and a
+//! shard's reply — to about 1 MiB.
 
-use crate::labels::compile_literal_set;
+use crate::labels::{MAX_LABELS_PER_SERIES, compile_literal_set};
 use ahash::AHashMap;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use regex::{Regex, escape};
@@ -37,6 +47,14 @@ pub const MAX_PUSHDOWN_BYTES: usize = 4 * 1024;
 /// together — ~4 ms, whatever number of labels its series share. Equality
 /// filters compile nothing and are not counted.
 pub const MAX_DERIVED_BYTES_PER_SELECTOR: usize = 16 * 1024;
+
+/// The most label names a profile tracks: twice what one series normally
+/// carries, so every label of the first series added — the only candidates
+/// for a common filter — fits, with room for those only some series carry.
+pub const MAX_PROFILED_LABELS: usize = 2 * MAX_LABELS_PER_SERIES;
+
+/// The most bytes of label names a profile tracks — 128 names of 128 bytes.
+pub const MAX_PROFILED_NAME_BYTES: usize = 16 * 1024;
 
 /// The most series a profile is built from. Past this the selector is left
 /// alone (its profile is unavailable) rather than walked at length under the
@@ -74,8 +92,12 @@ pub struct LabelProfile {
     /// How many series the selector matched.
     pub series: u64,
     /// One entry per label name any of them carries, `__name__` excluded,
-    /// sorted by name.
+    /// sorted by name — all of them unless `truncated`.
     pub labels: Vec<LabelValueProfile>,
+    /// More label names were seen than [`MAX_PROFILED_LABELS`] or
+    /// [`MAX_PROFILED_NAME_BYTES`] admit, and `labels` omits them: a label
+    /// missing from it may still be carried.
+    pub truncated: bool,
 }
 
 impl LabelProfile {
@@ -121,6 +143,8 @@ impl LabelProfile {
         }
         let missing_matches = || matcher.is_match("");
         match self.label(&matcher.name) {
+            // Not tracked: the profile cannot vouch for it.
+            None if self.truncated => false,
             // No series carries the label: for all of them its value is "".
             None => missing_matches(),
             Some(label) => {
@@ -171,6 +195,9 @@ impl LabelProfile {
 pub struct LabelProfileBuilder {
     series: u64,
     labels: AHashMap<String, LabelAccumulator>,
+    /// The summed length of the keys of `labels`.
+    name_bytes: usize,
+    truncated: bool,
 }
 
 #[derive(Default)]
@@ -222,19 +249,42 @@ impl LabelProfileBuilder {
             }
             let label = match self.labels.get_mut(name) {
                 Some(label) => label,
-                None => self.labels.entry(name.to_string()).or_default(),
+                None => match self.track(name.to_string()) {
+                    Some(label) => label,
+                    None => continue,
+                },
             };
             label.carried_by += 1;
             label.add_value(value);
         }
     }
 
+    /// A new entry for `name`, or `None` — and the profile truncated — when
+    /// the name caps are reached.
+    fn track(&mut self, name: String) -> Option<&mut LabelAccumulator> {
+        if self.labels.len() >= MAX_PROFILED_LABELS
+            || self.name_bytes + name.len() > MAX_PROFILED_NAME_BYTES
+        {
+            self.truncated = true;
+            return None;
+        }
+        self.name_bytes += name.len();
+        Some(self.labels.entry(name).or_default())
+    }
+
     /// Fold in another profile — a shard's, over series disjoint from those
     /// already counted, so the counts add.
     pub fn merge(&mut self, other: LabelProfile) {
         self.series += other.series;
+        self.truncated |= other.truncated;
         for entry in other.labels {
-            let label = self.labels.entry(entry.name).or_default();
+            let label = match self.labels.get_mut(&entry.name) {
+                Some(label) => label,
+                None => match self.track(entry.name) {
+                    Some(label) => label,
+                    None => continue,
+                },
+            };
             label.carried_by += entry.carried_by;
             if entry.overflow {
                 label.set_overflow();
@@ -260,6 +310,7 @@ impl LabelProfileBuilder {
         LabelProfile {
             series: self.series,
             labels,
+            truncated: self.truncated,
         }
     }
 }
@@ -498,6 +549,7 @@ mod tests {
         let profile = LabelProfile {
             series: 60,
             labels: vec![single_label("instance", values.clone())],
+            truncated: false,
         };
         let filters = profile.common_filters();
         assert_eq!(filters.len(), 1);
@@ -533,6 +585,7 @@ mod tests {
                 values: vec![],
                 overflow: true,
             }],
+            truncated: false,
         });
         builder.add_series([("host", "b")]);
         let merged = builder.finish();
@@ -552,7 +605,11 @@ mod tests {
                 single_label(&format!("l{l:02}"), values)
             })
             .collect();
-        let profile = LabelProfile { series: 60, labels };
+        let profile = LabelProfile {
+            series: 60,
+            labels,
+            truncated: false,
+        };
         let filters = profile.common_filters();
         let compiled: usize = filters.iter().map(|m| m.value.len()).sum();
         assert_eq!(filters.len(), 4);
@@ -561,7 +618,12 @@ mod tests {
         // Equalities cost nothing to compile and are never crowded out.
         let mut labels = profile.labels.clone();
         labels.push(single_label("zone", vec!["z1".into()]));
-        let filters = LabelProfile { series: 60, labels }.common_filters();
+        let filters = LabelProfile {
+            series: 60,
+            labels,
+            truncated: false,
+        }
+        .common_filters();
         assert_eq!(filters.last().unwrap().to_string(), r#"zone="z1""#);
     }
 
@@ -608,5 +670,77 @@ mod tests {
             .collect();
         let refs: Vec<&[(&str, &str)]> = series.iter().map(|s| s.as_slice()).collect();
         assert!(profile(&refs).could_be_pruned_by(host));
+    }
+
+    /// Series that each carry a label no other does — `pod_<uuid>`-style names
+    /// — would grow a profile without bound. The labels every series shares
+    /// are the first series' and always fit, so the filters survive the cap.
+    #[test]
+    fn label_names_past_the_cap_truncate_the_profile_but_keep_common_filters() {
+        let names: Vec<String> = (0..1000).map(|i| format!("only_{i}")).collect();
+        let series: Vec<Vec<(&str, &str)>> = names
+            .iter()
+            .map(|name| vec![("job", "api"), ("region", "us"), (name.as_str(), "x")])
+            .collect();
+        let refs: Vec<&[(&str, &str)]> = series.iter().map(|s| s.as_slice()).collect();
+        let p = profile(&refs);
+
+        assert!(p.truncated);
+        assert_eq!(p.labels.len(), MAX_PROFILED_LABELS);
+        assert_eq!(
+            rendered(&p.common_filters()),
+            vec![r#"job="api""#, r#"region="us""#]
+        );
+        // A tracked label is still answered from its values...
+        assert!(!p.satisfied_by_all(&Matcher::new(MatchOp::Equal, "only_0", "x")));
+        // ...but an untracked one could be carried: never vouched for, even
+        // by a filter that would accept the missing value.
+        assert!(!p.satisfied_by_all(&Matcher::new(MatchOp::NotEqual, "only_999", "x")));
+        assert!(!p.satisfied_by_all(&Matcher::new(MatchOp::Equal, "only_999", "")));
+        assert!(p.could_be_pruned_by(&single_label("only_999", vec!["x".into()])));
+    }
+
+    #[test]
+    fn label_name_bytes_past_the_budget_truncate_the_profile() {
+        let long: Vec<String> = (0..20)
+            .map(|i| format!("{i:02}{}", "n".repeat(1024)))
+            .collect();
+        let mut labels: Vec<(&str, &str)> = long.iter().map(|n| (n.as_str(), "v")).collect();
+        labels.push(("job", "api"));
+        let p = profile(&[&labels]);
+        assert!(p.truncated);
+        let bytes: usize = p.labels.iter().map(|l| l.name.len()).sum();
+        assert!(bytes <= MAX_PROFILED_NAME_BYTES);
+        // Short names that still fit are tracked after the budget first binds.
+        assert!(p.labels.iter().any(|l| l.name == "job"));
+    }
+
+    #[test]
+    fn merge_keeps_the_label_cap_and_the_truncated_flag() {
+        let shard = |offset: usize| {
+            let names: Vec<String> = (0..200).map(|i| format!("l{}", offset + i)).collect();
+            let mut labels: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "v")).collect();
+            labels.push(("job", "api"));
+            profile(&[&labels])
+        };
+        let a = shard(0);
+        let b = shard(1000);
+        assert!(!a.truncated && !b.truncated);
+
+        let mut builder = LabelProfileBuilder::new();
+        builder.merge(a);
+        builder.merge(b);
+        let merged = builder.finish();
+        assert!(merged.truncated);
+        assert_eq!(merged.labels.len(), MAX_PROFILED_LABELS);
+        // `job` is in both shards' first series, so it is counted in full.
+        assert_eq!(rendered(&merged.common_filters()), vec![r#"job="api""#]);
+
+        let mut builder = LabelProfileBuilder::new();
+        builder.merge(LabelProfile {
+            truncated: true,
+            ..profile(&[&[("job", "api")]])
+        });
+        assert!(builder.finish().truncated);
     }
 }

@@ -808,6 +808,12 @@ pub struct LabelProfileResponse {
     /// / are not filled in.
     #[prost(bool, tag = "3")]
     pub overflow: bool,
+    /// / More label names were seen than the node tracks, and `labels` omits
+    /// / them. Unset from a node that predates the cap, which never truncates;
+    /// / a coordinator that predates it takes the profile as complete, which can
+    /// / only cost it a push-down, never a result.
+    #[prost(bool, tag = "4")]
+    pub truncated: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregationQueryResponse {

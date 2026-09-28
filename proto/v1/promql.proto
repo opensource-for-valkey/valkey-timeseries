@@ -354,6 +354,11 @@ message LabelProfileResponse {
   /// The node matched more series than `max_series`: `series` and `labels`
   /// are not filled in.
   bool overflow = 3;
+  /// More label names were seen than the node tracks, and `labels` omits
+  /// them. Unset from a node that predates the cap, which never truncates;
+  /// a coordinator that predates it takes the profile as complete, which can
+  /// only cost it a push-down, never a result.
+  bool truncated = 4;
 }
 
 message AggregationQueryResponse {

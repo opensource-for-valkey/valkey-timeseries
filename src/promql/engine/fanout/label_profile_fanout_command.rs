@@ -79,6 +79,7 @@ impl From<LabelProfile> for LabelProfileResponse {
                 })
                 .collect(),
             overflow: false,
+            truncated: profile.truncated,
         }
     }
 }
@@ -97,6 +98,7 @@ impl From<LabelProfileResponse> for LabelProfile {
                     overflow: label.overflow,
                 })
                 .collect(),
+            truncated: resp.truncated,
         }
     }
 }
@@ -163,7 +165,7 @@ impl FanoutCommand for LabelProfileFanoutCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::engine::label_profile::MAX_PUSHDOWN_VALUES;
+    use crate::promql::engine::label_profile::{MAX_PROFILED_LABELS, MAX_PUSHDOWN_VALUES};
 
     fn node(port: u16) -> NodeInfo {
         NodeInfo::for_test(port)
@@ -236,6 +238,26 @@ mod tests {
                 .unwrap();
         }
         assert!(cmd.into_result().is_none());
+    }
+
+    /// A shard that stopped tracking label names says so, and the merged
+    /// profile keeps saying so: a label missing from it may be carried.
+    #[test]
+    fn a_truncated_shard_profile_stays_truncated_after_the_merge() {
+        let names: Vec<String> = (0..=MAX_PROFILED_LABELS).map(|i| format!("l{i}")).collect();
+        let mut labels: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "v")).collect();
+        labels.push(("job", "api"));
+        let response = shard(&[&labels]);
+        assert!(response.truncated);
+        assert!(response.labels.len() <= MAX_PROFILED_LABELS);
+
+        let mut cmd = command(0);
+        cmd.on_response(response, &node(1)).unwrap();
+        cmd.on_response(shard(&[&[("job", "api")]]), &node(2))
+            .unwrap();
+        let profile = cmd.into_result().unwrap();
+        assert!(profile.truncated);
+        assert_eq!(profile.series, 2);
     }
 
     #[test]

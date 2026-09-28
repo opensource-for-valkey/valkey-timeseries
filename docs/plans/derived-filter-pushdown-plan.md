@@ -84,7 +84,12 @@ is what bounds a filter: the profile copies its values, every shard ships them, 
 its matcher carries costs ~250 ns and ~260 B of transient heap per byte of pattern to compile.
 One selector's derived alternations are further capped at `MAX_DERIVED_BYTES_PER_SELECTOR` =
 16 KiB, and a filter no operand's profile could be pruned by is never built. The index never
-runs these regexes: a literal alternation reaches it as `Equal(List)`. A profile is **unavailable** when `|S|`
+runs these regexes: a literal alternation reaches it as `Equal(List)`. Label *names* are capped
+too — `MAX_PROFILED_LABELS` = 256 and `MAX_PROFILED_NAME_BYTES` = 16 KiB per profile, past which
+it is marked `truncated` — and neither cap costs a common filter while the first series' names
+fit: a label every series carries is carried by the first one added, which normally has at most
+128 labels (`TS.CREATE … LABELS` does not enforce that; past it a common label can be missed,
+costing a push-down, never a result). So a profile, and a shard's reply, stays within about 1 MiB. A profile is **unavailable** when `|S|`
 exceeds `MAX_PROFILED_SERIES` (min of `options.max_series` and 50 000) or the source cannot
 answer; unavailable means "derive nothing from this leaf", never an error.
 

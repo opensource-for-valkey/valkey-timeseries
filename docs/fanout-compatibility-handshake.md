@@ -166,7 +166,12 @@ self-describing in the same sense as the grid's: a shard that matched more
 series than the request's `max_series` answers `overflow` instead of a profile,
 and the coordinator then leaves the selector as written, which is always safe.
 Per-label value lists past the coordinator's cap are marked `overflow` too and
-derive no filter. Counts add across shards (a series lives on one shard), so
+derive no filter. A profile that stopped tracking label names — past
+`MAX_PROFILED_LABELS` (256) or `MAX_PROFILED_NAME_BYTES` (16 KiB) — sets
+`truncated`, and a label missing from it is then never vouched for. An older
+shard never sets it and never truncates; an older coordinator ignores it and
+takes a missing label as uncarried, which can only drop a push-down filter,
+never change a result. Counts add across shards (a series lives on one shard), so
 "carried by every series" stays exact after the merge. See
 `src/promql/engine/fanout/label_profile_fanout_command.rs`,
 `src/promql/engine/derived_filters.rs` and

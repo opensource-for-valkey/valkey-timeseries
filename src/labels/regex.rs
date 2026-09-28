@@ -111,7 +111,7 @@ pub(crate) fn build_with_repeat_fallback(re: &str) -> Result<Regex, regex::Error
 
 /// The anchored regex for `alternation`, a `|`-joined list of escaped literals
 /// whose length the caller has bounded — a derived push-down filter. The
-/// general [`REGEX_SIZE_LIMIT`] would reject a dozen host names; the index
+/// general `REGEX_SIZE_LIMIT` would reject a dozen host names; the index
 /// never runs this regex anyway (it looks the values up), so it only has to
 /// exist for the PromQL matcher that carries it.
 pub fn compile_literal_set(alternation: &str) -> Result<Regex, regex::Error> {
