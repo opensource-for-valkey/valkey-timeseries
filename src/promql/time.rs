@@ -56,12 +56,12 @@ pub(super) fn selector_bounds(
     if let Some(off) = offset {
         match off {
             Offset::Pos(d) => {
-                let off_ms = d.as_millis() as i64;
+                let off_ms = duration_ms(d);
                 start = start.saturating_sub(off_ms);
                 end = end.saturating_sub(off_ms);
             }
             Offset::Neg(d) => {
-                let off_ms = d.as_millis() as i64;
+                let off_ms = duration_ms(d);
                 start = start.saturating_add(off_ms);
                 end = end.saturating_add(off_ms);
             }
@@ -94,8 +94,8 @@ pub(in crate::promql) fn apply_time_modifiers_ms(
 
     if let Some(offset) = offset {
         adjusted = match offset {
-            Offset::Pos(duration) => adjusted - (duration.as_millis() as i64),
-            Offset::Neg(duration) => adjusted + (duration.as_millis() as i64),
+            Offset::Pos(duration) => adjusted.saturating_sub(duration_ms(duration)),
+            Offset::Neg(duration) => adjusted.saturating_add(duration_ms(duration)),
         };
     }
 
@@ -130,7 +130,7 @@ fn preload_ranges_inner(
             ));
         }
         Expr::MatrixSelector(ms) => {
-            let range_ms = ms.range.as_millis() as i64;
+            let range_ms = duration_ms(ms.range);
             out.push(selector_bounds(
                 ms.vs.at.as_ref(),
                 ms.vs.offset.as_ref(),
@@ -152,7 +152,7 @@ fn preload_ranges_inner(
                 eval_end_ms,
                 0,
             );
-            let range_ms = sq.range.as_millis() as i64;
+            let range_ms = duration_ms(sq.range);
             let inner_eval_start = sq_start.saturating_sub(range_ms);
             // Recurse: evaluate_subquery passes the original query_start/query_end
             // through, so @ start()/@ end() inside the subquery resolve to the
@@ -262,7 +262,7 @@ pub(in crate::promql) fn compute_preload_ranges(
 ) -> Vec<(i64, i64)> {
     let start_ms = system_time_to_millis(query_start);
     let end_ms = system_time_to_millis(query_end);
-    let lookback_ms = lookback_delta.as_millis() as i64;
+    let lookback_ms = duration_ms(lookback_delta);
     // At the top level, eval range == query range
     let mut ranges = Vec::new();
     preload_ranges_inner(
@@ -308,6 +308,15 @@ pub(crate) fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     }
     merged.push((cur_start, cur_end));
     merged
+}
+
+/// `d` in whole milliseconds, saturating at `i64::MAX`.
+///
+/// Timestamps are `i64` milliseconds, so every duration is added to or subtracted from one;
+/// `as_millis() as i64` truncates a duration past `i64::MAX` ms (about 292 million years, which
+/// promql-parser accepts) to a meaningless value instead. Pair it with saturating arithmetic.
+pub(crate) fn duration_ms(d: impl std::borrow::Borrow<Duration>) -> i64 {
+    i64::try_from(d.borrow().as_millis()).unwrap_or(i64::MAX)
 }
 
 /// The most steps one evaluation grid may have, whatever the configuration.

@@ -34,6 +34,7 @@ use crate::promql::functions::{
 use crate::promql::hashers::{AggregationKey, GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::model::RangeSample;
+use crate::promql::time::duration_ms;
 use crate::promql::time::{
     MAX_GRID_STEPS, apply_time_modifiers_ms, grid_step_count, selector_bounds, step_times,
 };
@@ -127,9 +128,7 @@ fn subquery_step_ms(subquery: &SubqueryExpr) -> i64 {
     const DEFAULT_EVALUATION_INTERVAL_MS: i64 = 60_000;
     subquery
         .step
-        .map_or(DEFAULT_EVALUATION_INTERVAL_MS, |step| {
-            step.as_millis() as i64
-        })
+        .map_or(DEFAULT_EVALUATION_INTERVAL_MS, duration_ms)
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
@@ -356,7 +355,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             };
             let (first_end, last_end) = (resolve(first), resolve(last));
             let (earliest_end, latest_end) = (first_end.min(last_end), first_end.max(last_end));
-            let range_ms = subquery.range.as_millis() as i64;
+            let range_ms = duration_ms(subquery.range);
             let (aligned_start_ms, _, _, _) = compute_subquery_alignment(
                 earliest_end.saturating_sub(range_ms),
                 latest_end,
@@ -897,7 +896,11 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     ) -> Option<ExprResult> {
         let guard = self.preloaded_grids.read().unwrap();
         let preloaded = guard.get(key)?;
-        let step_idx = ((ctx.evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
+        let step_idx = step_index(
+            ctx.evaluation_ts,
+            preloaded.eval_start_ms,
+            preloaded.step_ms,
+        );
 
         let samples = preloaded
             .series
@@ -1072,8 +1075,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             query_start: system_time_to_millis(stmt.start),
             query_end: system_time_to_millis(stmt.end),
             evaluation_ts: system_time_to_millis(stmt.end),
-            lookback_delta_ms: stmt.lookback_delta.as_millis() as i64,
-            step_ms: stmt.interval.as_millis() as i64,
+            lookback_delta_ms: duration_ms(stmt.lookback_delta),
+            step_ms: duration_ms(stmt.interval),
         };
 
         self.evaluate_with_context(&stmt.expr, ctx)
@@ -1215,7 +1218,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // Calculate subquery time range: [adjusted_eval_ts - range, adjusted_eval_ts]
         let subquery_end_ms = adjusted_eval_ts;
-        let range_ms = subquery.range.as_millis() as i64;
+        let range_ms = duration_ms(subquery.range);
         let subquery_start_ms = subquery_end_ms.saturating_sub(range_ms);
 
         let step_ms = subquery_step_ms(subquery);
@@ -1416,7 +1419,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let evaluation_ts = ctx.evaluation_ts;
                 // Step index from raw evaluation_ts (before modifiers) — matches outer step loop
                 let step_idx =
-                    ((evaluation_ts - preloaded.eval_start_ms) / preloaded.step_ms) as usize;
+                    step_index(evaluation_ts, preloaded.eval_start_ms, preloaded.step_ms);
 
                 let mut samples = Vec::new();
                 for series in &preloaded.series {
@@ -2090,7 +2093,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             lookback_delta_ms: ctx.lookback_delta_ms,
             rollup: Some(GridRollup {
                 kind,
-                range_ms: matrix.range.as_millis() as i64,
+                range_ms: duration_ms(matrix.range),
                 param,
             }),
             aggregation,
@@ -2171,7 +2174,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 }
 
 fn matrix_range_ms(matrix: &MatrixSelector) -> i64 {
-    matrix.range.as_millis() as i64
+    duration_ms(matrix.range)
 }
 
 /// The aggregation of `aggregate` as something a shard can fold a grid into,
@@ -2334,4 +2337,31 @@ fn is_selector(expr: &Expr) -> bool {
 
 fn should_parallelize_binary_expr(be: &BinaryExpr) -> bool {
     is_selector(be.lhs.as_ref()) && is_selector(be.rhs.as_ref())
+}
+
+/// The index of the step at `ts` on a grid starting at `start` with `step`, without
+/// overflow. A time before the grid (or a non-positive step) maps to `usize::MAX`, which no
+/// series holds, as the plain cast of a negative difference did.
+fn step_index(ts: Timestamp, start: Timestamp, step: i64) -> usize {
+    if ts < start || step <= 0 {
+        return usize::MAX;
+    }
+    let idx = (i128::from(ts) - i128::from(start)) / i128::from(step);
+    usize::try_from(idx).unwrap_or(usize::MAX)
+}
+
+#[cfg(test)]
+mod step_index_tests {
+    use super::step_index;
+
+    #[test]
+    fn step_index_handles_the_whole_timestamp_range() {
+        assert_eq!(step_index(10, 0, 5), 2);
+        assert_eq!(step_index(0, 0, 5), 0);
+        assert_eq!(step_index(-1, 0, 5), usize::MAX);
+        assert_eq!(step_index(10, 0, 0), usize::MAX);
+        // The plain difference overflowed i64 here.
+        assert_eq!(step_index(i64::MAX, i64::MIN, 1), usize::MAX);
+        assert_eq!(step_index(i64::MAX, i64::MIN, i64::MAX), 2);
+    }
 }

@@ -11,6 +11,7 @@ use crate::promql::exec::types::{EvalLabels, SeriesMap};
 use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
+use crate::promql::time::duration_ms;
 use crate::promql::time::step_times;
 use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
@@ -45,7 +46,7 @@ fn resolve_deadline_ms(opts: QueryOptions) -> i64 {
         return deadline;
     }
     if let Some(timeout) = opts.timeout {
-        return current_time_millis().saturating_add(timeout.as_millis() as i64);
+        return current_time_millis().saturating_add(duration_ms(timeout));
     }
     0
 }
@@ -199,8 +200,8 @@ pub fn evaluate_range(
 
     let deadline = resolve_deadline_ms(opts);
 
-    let step_ms = step.as_millis() as i64;
-    let lookback_delta_ms = lookback_delta.as_millis() as i64;
+    let step_ms = duration_ms(step);
+    let lookback_delta_ms = duration_ms(lookback_delta);
     let range_ctx = crate::promql::EvalContext {
         query_start: start_ms,
         query_end: end_ms,
@@ -629,7 +630,7 @@ mod tests {
                 assert_eq!(value, 2.0);
                 assert_eq!(
                     timestamp_ms,
-                    query_time.duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+                    duration_ms(query_time.duration_since(UNIX_EPOCH).unwrap())
                 );
             }
             other => panic!("expected Scalar, got {:?}", other),

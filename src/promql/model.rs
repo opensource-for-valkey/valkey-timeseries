@@ -7,6 +7,7 @@ use crate::common::constants::MILLIS_PER_MIN;
 use crate::common::time::{current_time_millis, system_time_to_millis, valkey_cached_time_millis};
 use crate::common::{Sample, Timestamp};
 use crate::labels::{HasFingerprint, Labels};
+use crate::promql::time::duration_ms;
 use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult, QueryError, QueryResult};
 use promql_parser::parser::EvalStmt;
 use promql_parser::parser::value::ValueType;
@@ -242,8 +243,8 @@ impl From<&EvalStmt> for EvalContext {
         let query_start = system_time_to_millis(value.start);
         let query_end = system_time_to_millis(value.end);
         let evaluation_ts = query_end; // using end follows the "as-of" convention
-        let interval_ms = value.interval.as_millis() as i64;
-        let lookback_delta_ms = value.lookback_delta.as_millis() as i64;
+        let interval_ms = duration_ms(value.interval);
+        let lookback_delta_ms = duration_ms(value.lookback_delta);
         Self {
             query_start,
             query_end,

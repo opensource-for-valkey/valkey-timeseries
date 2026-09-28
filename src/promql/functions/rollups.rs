@@ -116,7 +116,7 @@ pub(in crate::promql) fn rollup_series_over_grid(
         .into_iter()
         .enumerate()
         .filter_map(|(idx, t_end)| {
-            let t_start = t_end - window_ms;
+            let t_start = t_end.saturating_sub(window_ms);
 
             // Window ends are non-decreasing in every caller, so the search for
             // the window start can resume from the previous window's start.
@@ -133,7 +133,7 @@ pub(in crate::promql) fn rollup_series_over_grid(
             let mut window = RollupWindow {
                 window: window_ms,
                 prev_value: f64::NAN,
-                prev_timestamp: t_start - prev_step,
+                prev_timestamp: t_start.saturating_sub(prev_step),
                 real_prev_value: f64::NAN,
                 values: &values[i..j],
                 timestamps: &timestamps[i..j],
@@ -161,7 +161,7 @@ pub(in crate::promql) fn rollup_series_over_grid(
                 // Use the actual timestamp of the preceding sample for the
                 // staleness check, not a synthetic value of 0 or t_start.
                 let curr_timestamp = window.timestamps[0];
-                if lookback_ms.is_zero() || (curr_timestamp - prev_ts) < lookback_ms {
+                if lookback_ms.is_zero() || curr_timestamp.saturating_sub(prev_ts) < lookback_ms {
                     window.real_prev_value = values[prev_idx];
                 }
             }
@@ -269,7 +269,7 @@ pub(in crate::promql) fn window_range(
     window_end: Timestamp,
     window_ms: i64,
 ) -> Option<std::ops::Range<usize>> {
-    let window_start = window_end - window_ms;
+    let window_start = window_end.saturating_sub(window_ms);
     let i = samples.partition_point(|s| s.timestamp <= window_start);
     let j = samples.partition_point(|s| s.timestamp <= window_end);
     (i < j).then_some(i..j)

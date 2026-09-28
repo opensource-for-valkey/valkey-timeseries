@@ -1,4 +1,5 @@
 use crate::common::Timestamp;
+use crate::promql::time::duration_ms;
 use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::promql::{EvalResult, EvaluationError, QueryError};
 use promql_parser::parser::Expr;
@@ -89,7 +90,7 @@ pub(in crate::promql) fn adjust_start_end(
     // Make sure that the new number of points is the same as the initial number of points.
     let mut new_points = calc_points(start, end, &step);
     let mut _end = end;
-    let _step = step.as_millis() as i64;
+    let _step = duration_ms(step);
     while new_points > points {
         _end = end.saturating_sub(_step);
         new_points -= 1;
@@ -103,7 +104,7 @@ pub(in crate::promql) fn align_start_end(
     end: Timestamp,
     step: &Duration,
 ) -> (Timestamp, Timestamp) {
-    let step = step.as_millis() as i64;
+    let step = duration_ms(step);
     // Round start to the nearest smaller value divisible by step.
     let new_start = start - start % step;
     // Round end to the nearest bigger value divisible by step.

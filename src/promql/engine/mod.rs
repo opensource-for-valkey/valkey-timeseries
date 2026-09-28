@@ -1,5 +1,7 @@
 pub mod counting_query_reader;
 pub mod derived_filters;
+#[cfg(test)]
+mod extreme_time_tests;
 mod fanout;
 pub mod label_profile;
 pub mod memory_series_querier;
@@ -15,6 +17,7 @@ mod selector_batch_executor;
 
 use crate::common::Timestamp;
 use crate::common::time::current_time_millis;
+use crate::promql::time::duration_ms;
 pub(crate) use fanout::*;
 pub use promql_engine::{evaluate_instant, evaluate_range};
 pub(in crate::promql) use query_limits::*;
@@ -67,7 +70,7 @@ impl Default for QueryOptions {
     fn default() -> Self {
         let config = PROMQL_CONFIG.read().unwrap();
         let timeout = config.max_query_duration;
-        let deadline = current_time_millis().saturating_add(timeout.as_millis() as i64);
+        let deadline = current_time_millis().saturating_add(duration_ms(timeout));
         let enable_experimental_functions = config.enable_experimental_functions;
         Self {
             lookback_delta: config.lookback_delta,

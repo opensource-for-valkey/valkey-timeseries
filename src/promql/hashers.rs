@@ -7,6 +7,7 @@ use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::Label as ProtoLabel;
+use crate::promql::time::duration_ms;
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{AtModifier, LabelModifier, Offset, VectorSelector};
 use smallvec::{SmallVec, smallvec};
@@ -24,8 +25,8 @@ pub(in crate::promql) enum OffsetKey {
 impl From<&Offset> for OffsetKey {
     fn from(offset: &Offset) -> Self {
         match offset {
-            Offset::Pos(d) => OffsetKey::Pos(d.as_millis() as i64),
-            Offset::Neg(d) => OffsetKey::Neg(d.as_millis() as i64),
+            Offset::Pos(d) => OffsetKey::Pos(duration_ms(d)),
+            Offset::Neg(d) => OffsetKey::Neg(duration_ms(d)),
         }
     }
 }

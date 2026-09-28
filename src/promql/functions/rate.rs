@@ -129,7 +129,7 @@ pub(in crate::promql) fn extrapolated_rate_window(
         return None;
     }
 
-    let range_start = range_end_ms - range_ms;
+    let range_start = range_end_ms.saturating_sub(range_ms);
     let range_end = range_end_ms;
     let range_duration_seconds = range_ms as f64 / 1000.0;
 

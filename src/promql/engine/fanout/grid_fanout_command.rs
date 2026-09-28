@@ -588,7 +588,8 @@ fn decode_columns<'a>(
     Ok(present.into_iter().enumerate().map(move |(k, i)| {
         let step_ts = window_ends[i];
         let lag = series.sample_lag.get(k).copied().unwrap_or(0);
-        (step_ts, step_ts - lag, series.values[k])
+        // The lag comes from a peer; a corrupt one must not wrap the timestamp.
+        (step_ts, step_ts.saturating_sub(lag), series.values[k])
     }))
 }
 

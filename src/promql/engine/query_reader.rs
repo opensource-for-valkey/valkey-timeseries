@@ -380,7 +380,7 @@ pub(in crate::promql) fn grid_fetch_bounds(
     backward_ms: i64,
 ) -> Option<(Timestamp, Timestamp)> {
     let (&first, &last) = (window_ends.first()?, window_ends.last()?);
-    Some(((first - backward_ms).saturating_add(1), last))
+    Some((first.saturating_sub(backward_ms).saturating_add(1), last))
 }
 
 /// What a data source made of a [`GridRequest`]. Every variant tells the

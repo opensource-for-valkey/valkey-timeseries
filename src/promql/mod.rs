@@ -26,7 +26,7 @@ use crate::promql::engine::register_fanout_commands;
 pub use error::*;
 pub use exec::*;
 pub use model::*;
-pub(crate) use time::MAX_GRID_STEPS;
+pub(crate) use time::{MAX_GRID_STEPS, duration_ms};
 pub(crate) use utils::check_query_depth;
 use valkey_module::ValkeyResult;
 

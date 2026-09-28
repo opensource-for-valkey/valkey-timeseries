@@ -75,7 +75,7 @@ impl QueryPlan {
         lookback_delta_ms: Timestamp,
     ) -> Self {
         let end_ms = adjusted_eval_ts_ms;
-        let start_ms = end_ms - lookback_delta_ms;
+        let start_ms = end_ms.saturating_sub(lookback_delta_ms);
         QueryPlan {
             sample_start_ms: start_ms,
             sample_end_ms: end_ms,
@@ -89,7 +89,7 @@ impl QueryPlan {
     /// with `[start_ms, end_ms]`. All samples are merged per label set.
     pub(crate) fn for_matrix(adjusted_eval_ts_ms: Timestamp, range_ms: Timestamp) -> Self {
         let end_ms = adjusted_eval_ts_ms;
-        let start_ms = end_ms - range_ms;
+        let start_ms = end_ms.saturating_sub(range_ms);
         QueryPlan {
             sample_start_ms: start_ms,
             sample_end_ms: end_ms,
@@ -116,7 +116,7 @@ impl QueryPlan {
                 lookback_delta_ms,
             );
 
-        let range_ms = subquery_end_ms - subquery_start_ms;
+        let range_ms = subquery_end_ms.saturating_sub(subquery_start_ms);
         QueryPlan {
             sample_start_ms: range_start_ms,
             sample_end_ms: range_end_ms,
@@ -143,13 +143,15 @@ pub(crate) fn compute_subquery_alignment(
     step_ms: Timestamp,
     lookback_delta_ms: Timestamp,
 ) -> (Timestamp, Timestamp, Timestamp, usize) {
-    let div = subquery_start_ms.div_euclid(step_ms);
-    let mut aligned_start_ms = div * step_ms;
+    // The step multiple at or below the start, then the first one strictly after it. Saturating:
+    // near the ends of the range the multiple may not be representable.
+    let mut aligned_start_ms =
+        subquery_start_ms.saturating_sub(subquery_start_ms.rem_euclid(step_ms));
     if aligned_start_ms <= subquery_start_ms {
-        aligned_start_ms += step_ms;
+        aligned_start_ms = aligned_start_ms.saturating_add(step_ms);
     }
     let expected_steps = grid_step_count(aligned_start_ms, subquery_end_ms, step_ms) as usize;
-    let range_start_ms = aligned_start_ms - lookback_delta_ms;
+    let range_start_ms = aligned_start_ms.saturating_sub(lookback_delta_ms);
     let range_end_ms = subquery_end_ms;
     (
         aligned_start_ms,
@@ -179,7 +181,7 @@ pub(crate) fn for_each_step_sample<I, F>(
     let mut last_valid: Option<&Sample> = None;
 
     for step_ts in steps {
-        let lookback_start = step_ts - lookback_delta_ms;
+        let lookback_start = step_ts.saturating_sub(lookback_delta_ms);
 
         while i < samples.len() && samples[i].timestamp <= step_ts {
             last_valid = Some(&samples[i]);

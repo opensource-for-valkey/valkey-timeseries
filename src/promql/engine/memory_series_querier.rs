@@ -10,6 +10,7 @@ use crate::promql::engine::label_profile::{
 };
 use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
+use crate::promql::time::duration_ms;
 use crate::promql::{PromqlResult, QueryError, QueryOptions, RangeSample};
 use crate::series::index::Postings;
 use crate::series::{SeriesRef, TimeSeries};
@@ -156,7 +157,7 @@ impl QueryReader for MemorySeriesQuerier {
         // Implement lookback semantics: return the latest sample with
         // timestamp <= `timestamp` and timestamp > (timestamp - lookback_delta).
         // `QueryOptions::lookback_delta` is provided in `_options`.
-        let lookback_ms = _options.lookback_delta.as_millis() as i64;
+        let lookback_ms = duration_ms(_options.lookback_delta);
         let start_inclusive = timestamp.saturating_sub(lookback_ms).saturating_add(1);
 
         self.select_series(selector, |ts| {
