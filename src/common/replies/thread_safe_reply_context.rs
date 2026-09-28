@@ -1,4 +1,4 @@
-use crate::common::replies::{IntoRawCtx, ReplyContext};
+use crate::common::replies::{IntoRawCtx, ReplyContext, reply};
 use crate::error_consts;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,17 +39,12 @@ impl Drop for BlockedClient {
         unsafe {
             if !self.answered {
                 let ctx = raw::RedisModule_GetThreadSafeContext.unwrap()(self.inner);
-                reply_no_reply_written(ctx);
+                reply(ctx, Err(ValkeyError::Str(error_consts::NO_REPLY_WRITTEN)));
                 raw::RedisModule_FreeThreadSafeContext.unwrap()(ctx);
             }
             raw::RedisModule_UnblockClient.unwrap()(self.inner, ptr::null_mut());
         }
     }
-}
-
-/// Answers a blocked client whose worker never wrote a reply.
-fn reply_no_reply_written(ctx: *mut raw::RedisModuleCtx) {
-    let _ = Context::new(ctx).reply(Err(ValkeyError::Str(error_consts::NO_REPLY_WRITTEN)));
 }
 
 pub(crate) fn block_client(ctx: &Context) -> BlockedClient {
@@ -99,8 +94,7 @@ impl ThreadSafeReplyContext {
     #[allow(clippy::must_use_candidate)]
     pub fn reply(&self, r: ValkeyResult) -> raw::Status {
         self.answered.store(true, Ordering::Relaxed);
-        let ctx = Context::new(self.ctx);
-        ctx.reply(r)
+        reply(self.ctx, r)
     }
 
     /// A context to write the reply through. The caller takes responsibility for writing it.
@@ -113,7 +107,10 @@ impl ThreadSafeReplyContext {
 impl Drop for ThreadSafeReplyContext {
     fn drop(&mut self) {
         if !self.answered.load(Ordering::Relaxed) {
-            reply_no_reply_written(self.ctx);
+            reply(
+                self.ctx,
+                Err(ValkeyError::Str(error_consts::NO_REPLY_WRITTEN)),
+            );
         }
         unsafe { raw::RedisModule_FreeThreadSafeContext.unwrap()(self.ctx) };
         // Answered above if it was not already; the handle must not answer again.

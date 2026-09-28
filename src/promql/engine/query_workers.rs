@@ -30,7 +30,18 @@ use crate::common::time::current_time_millis;
 use crate::config::{max_concurrent_queries, max_queued_queries};
 use crate::error_consts;
 use crate::promql::{QueryError, QueryResult};
+use std::sync::atomic::{AtomicBool, Ordering};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyValue};
+
+/// Set by `TS._DEBUG PANIC_NEXT_EVALUATION` (debug mode only): the next evaluation panics.
+/// Integration tests use it to check that a failed evaluation still answers its client.
+static PANIC_NEXT_EVALUATION: AtomicBool = AtomicBool::new(false);
+
+/// Makes the next PromQL evaluation panic on the evaluation pool. For tests; see
+/// [`PANIC_NEXT_EVALUATION`].
+pub(crate) fn panic_next_evaluation() {
+    PANIC_NEXT_EVALUATION.store(true, Ordering::Relaxed);
+}
 
 static QUERY_WORKERS: BoundedExecutor = BoundedExecutor::new(
     "ts-promql-query",
@@ -87,6 +98,12 @@ where
             thread_ctx.reply(Err(ValkeyError::String(QueryError::Timeout.to_string())));
             return;
         }
+        let evaluate = move || {
+            if PANIC_NEXT_EVALUATION.swap(false, Ordering::Relaxed) {
+                panic!("TS._DEBUG PANIC_NEXT_EVALUATION");
+            }
+            evaluate()
+        };
         match run_evaluation(evaluate) {
             Ok(value) => reply(&thread_ctx.get_reply_context(), value),
             Err(err) => {
