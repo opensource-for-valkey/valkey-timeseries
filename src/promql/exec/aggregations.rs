@@ -151,26 +151,8 @@ pub(in crate::promql) fn apply_aggregation(
     eval_time: Timestamp,
 ) -> EvalResult<Vec<EvalSample>> {
     if samples.is_empty() {
-        // Prometheus checks a selection operator's parameter before it looks at
-        // the input, so `topk(NaN, absent_metric)` is an error, not an empty
-        // result. A coordinator re-applying selection passes no parameter.
-        if param.is_some() {
-            match kind {
-                AggregationKind::Topk => {
-                    get_k_param(param, 0, "topk")?;
-                }
-                AggregationKind::Bottomk => {
-                    get_k_param(param, 0, "bottomk")?;
-                }
-                AggregationKind::Limitk => {
-                    get_k_param(param, 0, "limitk")?;
-                }
-                AggregationKind::LimitRatio => {
-                    select_limit_ratio(Vec::new(), get_param_as_scalar(param, "limit_ratio")?)?;
-                }
-                _ => {}
-            }
-        }
+        // A shard with no matching series still reports a bad parameter.
+        check_aggregation_param(kind, param.as_ref())?;
         return Ok(Vec::new());
     }
 
@@ -211,18 +193,56 @@ pub(in crate::promql) fn apply_aggregation(
     }
 }
 
-fn eval_count_values(
-    modifier: Option<&LabelModifier>,
-    param: Option<ExprResult>,
-    samples: Vec<EvalSample>,
-    timestamp_ms: Timestamp,
-) -> EvalResult<Vec<EvalSample>> {
+/// Rejects a parameter the operator would reject, without looking at any input.
+///
+/// Prometheus checks the parameter before it looks at the input, so `topk(NaN, absent)` and
+/// `count_values("", absent)` are errors, not empty results. The evaluator calls this before
+/// choosing between its local and pushed-down paths, so every path reports the same error; a
+/// shard with no matching series calls it too. A coordinator re-applying selection passes no
+/// parameter.
+pub(in crate::promql) fn check_aggregation_param(
+    kind: AggregationKind,
+    param: Option<&ExprResult>,
+) -> EvalResult<()> {
+    let Some(param) = param else {
+        return Ok(());
+    };
+    // The parser types every aggregation parameter as a scalar or a string.
+    let param = Some(match param {
+        ExprResult::Scalar(value) => ExprResult::Scalar(*value),
+        ExprResult::String(label) => ExprResult::String(label.clone()),
+        _ => return Ok(()),
+    });
+    match kind {
+        AggregationKind::Topk => get_k_param(param, 0, "topk").map(drop),
+        AggregationKind::Bottomk => get_k_param(param, 0, "bottomk").map(drop),
+        AggregationKind::Limitk => get_k_param(param, 0, "limitk").map(drop),
+        AggregationKind::LimitRatio => {
+            select_limit_ratio(Vec::new(), get_param_as_scalar(param, "limit_ratio")?).map(drop)
+        }
+        AggregationKind::CountValues => count_values_label(param).map(drop),
+        _ => Ok(()),
+    }
+}
+
+/// The label `count_values` writes each value into, which must be a valid label name.
+fn count_values_label(param: Option<ExprResult>) -> EvalResult<String> {
     let label_name = get_param_as_string(param, "count_values")?;
     if !is_valid_label_name(&label_name) {
         return Err(EvaluationError::InternalError(format!(
             "invalid label name {label_name:?}"
         )));
     }
+    Ok(label_name)
+}
+
+fn eval_count_values(
+    modifier: Option<&LabelModifier>,
+    param: Option<ExprResult>,
+    samples: Vec<EvalSample>,
+    timestamp_ms: Timestamp,
+) -> EvalResult<Vec<EvalSample>> {
+    let label_name = count_values_label(param)?;
 
     // Prometheus sets the value label on every sample *before* grouping, so a
     // value label that reuses an input label's name replaces it for grouping

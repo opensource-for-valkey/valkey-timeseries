@@ -456,6 +456,42 @@ eval instant at 50m limitk(NaN, non_existent)
 eval instant at 50m limit_ratio(NaN, non_existent)
     expect fail msg: Ratio value is NaN
 
+# The same parameters over an input that is not a bare selector, which is evaluated
+# locally rather than pushed down: an empty input used to return before the parameter
+# was even evaluated, so these succeeded with an empty result.
+eval instant at 50m topk(NaN, rate(non_existent[5m]))
+    expect fail msg: Parameter value is NaN
+
+eval instant at 50m bottomk(NaN, rate(non_existent[5m]))
+    expect fail msg: Parameter value is NaN
+
+eval instant at 50m limitk(NaN, rate(non_existent[5m]))
+    expect fail msg: Parameter value is NaN
+
+eval instant at 50m limit_ratio(NaN, rate(non_existent[5m]))
+    expect fail msg: Ratio value is NaN
+
+eval instant at 50m count_values("", rate(non_existent[5m]))
+    expect fail msg:invalid label name ""
+
+eval instant at 50m count_values("", non_existent)
+    expect fail msg:invalid label name ""
+
+eval instant at 50m count_values("", abs(non_existent))
+    expect fail msg:invalid label name ""
+
+# In a range query, a bare selector or a rollup directly under the aggregation is
+# preloaded as one pushed-down grid, which answered an empty input without looking at
+# the parameter.
+eval range from 0 to 10m step 1m topk(NaN, rate(non_existent[5m]))
+    expect fail msg: Parameter value is NaN
+
+eval range from 0 to 10m step 1m topk(NaN, non_existent)
+    expect fail msg: Parameter value is NaN
+
+eval range from 0 to 10m step 1m count_values("", non_existent)
+    expect fail msg:invalid label name ""
+
 clear
 
 # Tests for count_values.

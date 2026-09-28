@@ -1,4 +1,6 @@
-use super::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation, eval_aggregation};
+use super::aggregations::{
+    AggregationKind, PushdownStrategy, apply_aggregation, check_aggregation_param, eval_aggregation,
+};
 use crate::common::Timestamp;
 use crate::common::threads::join;
 use crate::common::threads::{IntoParRayon, ParCollectionRayon};
@@ -1767,6 +1769,18 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<ExprResult> {
+        // The parameter first, as Prometheus does, and checked before any path
+        // is chosen: `topk(NaN, m)`, an invalid `count_values` label or a
+        // failing `scalar(...)` is an error whatever the input holds. The
+        // preloaded and fused paths below would otherwise answer an empty
+        // input without ever looking at it.
+        let kind = AggregationKind::try_from(aggregate.op)?;
+        let param = match &aggregate.param {
+            Some(p) => Some(self.evaluate_expr(p, ctx, preload_eligible)?),
+            None => None,
+        };
+        check_aggregation_param(kind, param.as_ref())?;
+
         // A bare selector directly under a reducing aggregation, in a range
         // query, was folded per (group, step) at the source before the step
         // loop began: this step is a slice of that grid.
@@ -1788,7 +1802,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // cluster that turns the input vector into one value per group per
         // shard.
         if let Some(result) =
-            self.evaluate_pushed_down_aggregate(aggregate, ctx, preload_eligible)?
+            self.evaluate_pushed_down_aggregate(aggregate, param.as_ref(), ctx, preload_eligible)?
         {
             return Ok(result);
         }
@@ -1813,17 +1827,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             }
         };
 
-        // If there are no samples, return empty result
-        if samples.is_empty() {
-            return Ok(ExprResult::InstantVector(vec![]));
-        }
-
-        let param = if let Some(p) = &aggregate.param {
-            Some(self.evaluate_expr(p, ctx, preload_eligible)?)
-        } else {
-            None
-        };
-
+        // No early return for an empty input: `apply_aggregation` checks the
+        // parameter first, and the pushed-down path reaches the same checks on
+        // each shard, so a single node and a cluster answer alike.
         // Use the evaluation_ts time as the timestamp for the aggregated result
         let timestamp_ms = ctx.evaluation_ts;
 
@@ -1845,6 +1851,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     fn evaluate_pushed_down_aggregate(
         &self,
         aggregate: &AggregateExpr,
+        param: Option<&ExprResult>,
         ctx: &EvalContext,
         preload_eligible: bool,
     ) -> EvalResult<Option<ExprResult>> {
@@ -1861,13 +1868,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(None);
         }
 
-        let param = match &aggregate.param {
+        // Evaluated (and checked) once by the caller.
+        let param = match param {
             None => None,
-            Some(expr) => match self.evaluate_expr(expr, ctx, preload_eligible)? {
-                ExprResult::Scalar(value) => Some(AggregationParam::Scalar(value)),
-                ExprResult::String(label) => Some(AggregationParam::Label(label)),
-                _ => return Ok(None),
-            },
+            Some(ExprResult::Scalar(value)) => Some(AggregationParam::Scalar(*value)),
+            Some(ExprResult::String(label)) => Some(AggregationParam::Label(label.clone())),
+            Some(_) => return Ok(None),
         };
 
         let request = AggregationRequest {
