@@ -2,7 +2,14 @@ use crate::parser::ParseError;
 use regex::{Regex, RegexBuilder};
 
 /// Sets the approximate size limit, in bytes, of the compiled regex.
-const REGEX_SIZE_LIMIT: usize = 16 * 1024;
+///
+/// 64 KiB, raised from 16 KiB on 2026-09-28: 16 KiB refused everyday patterns
+/// such as `\w+`, `\pL+` and `(?i)\w+` (one Unicode word class is most of it).
+/// Refusing a heavy pattern still takes well under a millisecond, and the
+/// worst query of admitted patterns that fits the default 4 KiB query length
+/// costs about 75 ms to check (measurements in
+/// `docs/plans/promql-threads-review-2026-09-28.md`, section 2.1).
+const REGEX_SIZE_LIMIT: usize = 64 * 1024;
 /// Sets the approximate size limit, in bytes, of the cache used by the lazy DFA at match time.
 const DFA_SIZE_LIMIT: usize = 16 * 1024;
 /// The compiled size limit for [`compile_literal_set`]. Its callers bound the

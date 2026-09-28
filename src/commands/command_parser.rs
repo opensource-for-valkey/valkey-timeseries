@@ -20,7 +20,7 @@ use crate::parser::{
     timestamp::timestamp_error,
 };
 use crate::promql::engine::promql_config::PromqlConfig;
-use crate::promql::engine::validate_selector_regexes;
+use crate::promql::engine::validate_query_regexes;
 use crate::series::chunks::{ChunkEncoding, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::series::request_types::{
     AggregationOptions, AggregatorConfig, MAX_AGGREGATIONS, MRangeOptions, MatchFilterOptions,
@@ -1822,12 +1822,13 @@ fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> 
         let msg = "TSDB: query too long"; // todo: better error
         return Err(ValkeyError::Str(msg));
     }
+    // Before parsing: the parser compiles every regex matcher without a size limit.
+    validate_query_regexes(query).map_err(ValkeyError::String)?;
     // TODO: it may be helpful to return the exact error
     let expr = promql_parser::parser::parse(query).map_err(|_e| {
         log_debug(format!("TSDB: failed to parse query {_e:?}"));
         ValkeyError::Str(error_consts::INVALID_QUERY)
     })?;
-    validate_selector_regexes(&expr).map_err(ValkeyError::String)?;
 
     Ok(expr)
 }

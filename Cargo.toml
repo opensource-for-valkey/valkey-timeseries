@@ -65,6 +65,9 @@ simd-json = "0.18.1"
 statrs = { version = "0.19.1", default-features = false, features = ["std"] }
 welch-sde = "0.1.0"
 regex-syntax = "0.8.11"
+# The traits promql-parser's public `lexer()` returns its tokens through. Keep this in
+# step with promql-parser's own lrpar version, or they are two different crates.
+lrpar = "0.14.2"
 serde = "1.0.228"
 twox-hash = { version = "2.1.2", features = ["xxhash3_64"] }
 chrono = "0.4.45"

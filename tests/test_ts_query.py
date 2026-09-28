@@ -528,6 +528,13 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
 
         assert sorted(values.keys()) == ["web_prod_1", "web_prod_2", "web_prod_3"]
 
+    def test_unicode_word_class_regex_matcher(self):
+        """`\\w+` compiles to more than the old 16 KiB regex size limit and was refused."""
+        time = self.setup_http_requests_scenario()
+
+        result = self.instant_query('http_requests_total{server=~"web_stg_\\\\w+"}', time)
+        assert sorted(self._vector_values_by_label(result, "server")) == ["web_stg_1"]
+
     def test_empty_regex_matcher_selects_series_without_the_label(self):
         """`=~""` is valid PromQL for "label absent"; it used to panic the selector conversion."""
         time = self.setup_http_requests_scenario()
@@ -548,6 +555,20 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         self.setup_http_requests_scenario()
         with pytest.raises(ResponseError, match="regex for label 'server'"):
             self.client.execute_command('TS.QUERY', 'http_requests_total{server=~"[a-z]{3000}"}')
+        assert self.client.execute_command('PING')
+
+    def test_heavy_regex_matchers_do_not_stall_the_server(self):
+        """Each matcher like `\\w{2000}` took ~100 ms for the parser to build or refuse, on the
+        main thread, and a 4 KiB query holds hundreds of them (~30 s). They are now refused
+        under the module's regex size limit before the parser runs."""
+        self.setup_http_requests_scenario()
+        matcher = 'a=~"\\\\w{2000}"'
+        query = "up{" + ",".join([matcher] * (4000 // (len(matcher) + 1))) + "}"
+        assert len(query) <= 4096
+        started = datetime.now()
+        with pytest.raises(ResponseError, match="regex for label 'a'"):
+            self.client.execute_command('TS.QUERY', query)
+        assert datetime.now() - started < timedelta(seconds=1)
         assert self.client.execute_command('PING')
 
     def test_aggregation_sum(self):
