@@ -1,13 +1,20 @@
 use super::raw_replies::{
     IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_bulk_string,
 };
-use std::ops::Deref;
+use crate::common::Sample;
 use std::os::raw::c_long;
 use valkey_module::logging::ValkeyLogLevel;
 use valkey_module::{Context, Status, ValkeyResult, raw};
 
 /// `ReplyContext` is a thin wrapper around `RedisModuleCtx` that provides efficient,
-/// zero-allocation reply helpers and automatic database state management.
+/// zero-allocation reply helpers, writing straight to the client rather than through an
+/// intermediate `ValkeyValue`.
+///
+/// Also the writer a worker thread answers a blocked client with (see
+/// [`ThreadSafeReplyContext`](super::ThreadSafeReplyContext)): replies need no GIL, so its reply
+/// methods are safe there. It deliberately does not dereference to [`Context`]: anything else a
+/// `Context` offers — key access, flags, ACL lookups — needs the GIL, and goes through the
+/// explicit [`Self::context`] on the main thread only.
 pub struct ReplyContext {
     ctx: Context,
     raw_ctx: *mut raw::RedisModuleCtx,
@@ -32,6 +39,8 @@ impl ReplyContext {
     /// and ACL identity. Inside a blocked-client reply or timeout callback this carries the real
     /// blocked client, so both protocol detection and ACL lookups behave as they do on the
     /// original command call.
+    ///
+    /// Main thread only (or with the GIL held): never from a worker answering a blocked client.
     #[inline]
     pub(crate) fn context(&self) -> &Context {
         &self.ctx
@@ -76,6 +85,17 @@ impl ReplyContext {
         reply_with_bulk_string(self.raw_ctx, value)
     }
 
+    /// Reply with a simple string; `\r`, `\n` and NUL become spaces.
+    pub fn reply_with_simple_string(&self, value: &str) -> Status {
+        reply_with_simple_string(self.raw_ctx, value)
+    }
+
+    /// Reply with a `[timestamp, value]` pair.
+    pub fn reply_with_sample(&self, sample: &Sample) -> Status {
+        reply_with_sample(self.raw_ctx, sample);
+        Status::Ok
+    }
+
     /// Start an array reply with the given length.
     pub fn reply_with_array(&self, len: usize) -> Status {
         raw::reply_with_array(self.raw_ctx, len as c_long)
@@ -102,14 +122,6 @@ impl ReplyContext {
     #[allow(clippy::must_use_candidate)]
     pub fn reply(&self, result: ValkeyResult) -> Status {
         reply(self.raw_ctx, result)
-    }
-}
-
-impl Deref for ReplyContext {
-    type Target = Context;
-
-    fn deref(&self) -> &Self::Target {
-        &self.ctx
     }
 }
 

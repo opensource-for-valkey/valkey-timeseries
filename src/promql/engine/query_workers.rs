@@ -21,9 +21,8 @@
 //! shared pool: see [`run_evaluation`].
 
 use crate::common::Timestamp;
-use crate::common::context::{
-    ClientReplyContext, ClientThreadSafeContext, create_blocked_client, is_blocking_denied,
-};
+use crate::common::context::is_blocking_denied;
+use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
 use crate::common::threads::{
     BoundedExecutor, Capacity, EVAL_POOL, ExecutorStats, Rejected, check_may_wait_on_eval_pool,
 };
@@ -68,7 +67,7 @@ pub(crate) fn submit_evaluation<R, E, P>(
 where
     R: Send + 'static,
     E: FnOnce() -> QueryResult<R> + Send + 'static,
-    P: FnOnce(&ClientReplyContext, R) + Send + 'static,
+    P: FnOnce(&ReplyContext, R) + Send + 'static,
 {
     // Checked before blocking: the server asserts on a blocked deny-blocking
     // client (a module `RM_Call` without the K flag) and aborts, and inside
@@ -80,16 +79,16 @@ where
     let slot = QUERY_WORKERS
         .try_reserve()
         .map_err(|rejected| ValkeyError::String(format!("TSDB: {}", rejection(rejected))))?;
-    let blocked_client = create_blocked_client(ctx);
+    let blocked_client = block_client(ctx);
 
     slot.spawn(move || {
-        let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
+        let thread_ctx = ThreadSafeReplyContext::with_blocked_client(blocked_client);
         if deadline.is_some_and(|d| current_time_millis() > d) {
             thread_ctx.reply(Err(ValkeyError::String(QueryError::Timeout.to_string())));
             return;
         }
         match run_evaluation(evaluate) {
-            Ok(value) => reply(&thread_ctx.get_write_context(), value),
+            Ok(value) => reply(&thread_ctx.get_reply_context(), value),
             Err(err) => {
                 thread_ctx.reply(Err(ValkeyError::String(err.to_string())));
             }

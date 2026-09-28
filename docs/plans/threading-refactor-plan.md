@@ -28,10 +28,20 @@ Deviations from the text below:
 - **The selector processor's spawn failure is no longer a panic**
   (`SelectorBatchExecutor::sender` is an `Option`).
 - **Phase 5.1 moved into Phase 2**, since `optimize_indices` needed a single-flight guard.
-- **Phase 5.2 was narrowed** to deleting the dead `ClientThreadSafeContext::lock`, the one
-  GIL path that bypassed the checks. The two blocked-client types turned out to sit on two
-  separate reply-writer stacks (`common::replies::ReplyContext` and
-  `common::context::ClientReplyContext`); merging those is reply formatting, not threading.
+- **Phase 5.2 landed as a follow-up.** The two blocked-client types turned out to sit on two
+  separate reply-writer stacks, so the merge folded the PromQL one
+  (`common::context::{BlockedClient, ClientThreadSafeContext, ClientReplyContext, replies}`)
+  into `common::replies`. The fan-out's `FanoutBlockedClient` (server-side reply callbacks)
+  stays separate by design.
+  - `ReplyContext` no longer dereferences to `Context`, so a worker answering a blocked client
+    cannot reach GIL-only calls by accident. Main-thread callers use `context()`.
+  - `reply()` is now a local, byte-safe version. `Context::reply` maps each `char` of an error
+    to a byte and garbled non-ASCII text, which `ReplyContext` users (TS.OUTLIERS, fan-out
+    replies) inherited.
+  - PromQL string results are sanitized: a `\r` or `\n` in one used to end the simple string
+    early and desynchronize the connection.
+  - The unused helpers `reply_with_samples` and `reply_with_string_iter` in the deleted stack
+    wrote a second array header instead of setting the postponed length.
 - **Not done:**
   - the TS.JOIN / TS.LABELSTATS A/B (both now wait on a pool of N threads, not C);
   - the thread-count comparison;

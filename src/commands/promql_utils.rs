@@ -1,4 +1,4 @@
-use crate::common::context::ClientReplyContext;
+use crate::common::replies::ReplyContext;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryReader};
@@ -15,7 +15,7 @@ pub(super) fn get_promql_querier(ctx: &Context, hash_tags: Vec<String>) -> Arc<d
     Arc::new(querier)
 }
 
-pub(super) fn write_samples(ctx: &ClientReplyContext, samples: &[Sample]) -> Status {
+pub(super) fn write_samples(ctx: &ReplyContext, samples: &[Sample]) -> Status {
     ctx.reply_with_array(samples.len());
     for sample in samples {
         ctx.reply_with_sample(sample);
@@ -53,11 +53,11 @@ impl ReplyLabels for [Label] {
     }
 }
 
-fn write_metric_hash(ctx: &ClientReplyContext, labels: &(impl ReplyLabels + ?Sized)) -> Status {
+fn write_metric_hash(ctx: &ReplyContext, labels: &(impl ReplyLabels + ?Sized)) -> Status {
     ctx.reply_with_map(labels.len());
     labels.for_each_label(|name, value| {
-        ctx.reply_with_string_key(name);
-        ctx.reply_with_bulk_string(value);
+        ctx.reply_with_string(name);
+        ctx.reply_with_string(value);
     });
     Status::Ok
 }
@@ -80,14 +80,14 @@ fn write_metric_hash(ctx: &ClientReplyContext, labels: &(impl ReplyLabels + ?Siz
 ///
 /// ```
 fn reply_with_range_sample(
-    ctx: &ClientReplyContext,
+    ctx: &ReplyContext,
     metric: &(impl ReplyLabels + ?Sized),
     values: &[Sample],
 ) -> Status {
     ctx.reply_with_map(2);
-    ctx.reply_with_string_key("metric");
+    ctx.reply_with_string("metric");
     write_metric_hash(ctx, metric);
-    ctx.reply_with_string_key("value");
+    ctx.reply_with_string("value");
     ctx.reply_with_array(values.len());
     for sample in values {
         ctx.reply_with_sample(sample);
@@ -95,7 +95,7 @@ fn reply_with_range_sample(
     Status::Ok
 }
 
-pub(super) fn reply_with_matrix(ctx: &ClientReplyContext, samples: &[EvalSamples]) -> Status {
+pub(super) fn reply_with_matrix(ctx: &ReplyContext, samples: &[EvalSamples]) -> Status {
     ctx.reply_with_array(samples.len());
     for sample in samples {
         reply_with_range_sample(ctx, &sample.labels, &sample.values);
@@ -115,20 +115,20 @@ pub(super) fn reply_with_matrix(ctx: &ClientReplyContext, samples: &[EvalSamples
 /// }
 /// ```
 pub fn reply_with_instant_sample(
-    ctx: &ClientReplyContext,
+    ctx: &ReplyContext,
     metric: &(impl ReplyLabels + ?Sized),
     ts: Timestamp,
     value: f64,
 ) -> Status {
     ctx.reply_with_map(2);
-    ctx.reply_with_string_key("metric");
+    ctx.reply_with_string("metric");
     write_metric_hash(ctx, metric);
-    ctx.reply_with_string_key("value");
+    ctx.reply_with_string("value");
     ctx.reply_with_sample(&Sample::new(ts, value));
     Status::Ok
 }
 
-pub(super) fn reply_with_instant_vector(ctx: &ClientReplyContext, sample: &[EvalSample]) -> Status {
+pub(super) fn reply_with_instant_vector(ctx: &ReplyContext, sample: &[EvalSample]) -> Status {
     ctx.reply_with_array(sample.len());
     for s in sample {
         reply_with_instant_sample(ctx, &s.labels, s.timestamp_ms, s.value);
@@ -136,31 +136,31 @@ pub(super) fn reply_with_instant_vector(ctx: &ClientReplyContext, sample: &[Eval
     Status::Ok
 }
 
-fn reply_with_value_type(ctx: &ClientReplyContext, value_type: ValueType) -> Status {
+fn reply_with_value_type(ctx: &ReplyContext, value_type: ValueType) -> Status {
     match value_type {
-        ValueType::Scalar => ctx.reply_with_string_key("scalar"),
-        ValueType::String => ctx.reply_with_string_key("string"),
-        ValueType::Matrix => ctx.reply_with_string_key("matrix"),
-        ValueType::Vector => ctx.reply_with_string_key("vector"),
+        ValueType::Scalar => ctx.reply_with_string("scalar"),
+        ValueType::String => ctx.reply_with_string("string"),
+        ValueType::Matrix => ctx.reply_with_string("matrix"),
+        ValueType::Vector => ctx.reply_with_string("vector"),
     }
 }
 
-fn reply_with_string_value(ctx: &ClientReplyContext, timestamp: Timestamp, value: &str) -> Status {
+fn reply_with_string_value(ctx: &ReplyContext, timestamp: Timestamp, value: &str) -> Status {
     ctx.reply_with_array(2);
-    ctx.reply_with_i64(timestamp);
+    ctx.reply_with_integer(timestamp);
     ctx.reply_with_simple_string(value);
     Status::Ok
 }
 
 pub(super) fn reply_with_expr_result(
-    ctx: &ClientReplyContext,
+    ctx: &ReplyContext,
     result: ExprResult,
     eval_ts: Timestamp,
 ) -> Status {
     ctx.reply_with_map(2);
-    ctx.reply_with_string_key("resultType");
+    ctx.reply_with_string("resultType");
     reply_with_value_type(ctx, result.value_type());
-    ctx.reply_with_string_key("result");
+    ctx.reply_with_string("result");
     match result {
         ExprResult::InstantVector(samples) => reply_with_instant_vector(ctx, &samples),
         ExprResult::RangeVector(samples) => reply_with_matrix(ctx, &samples),
@@ -170,15 +170,15 @@ pub(super) fn reply_with_expr_result(
 }
 
 pub(super) fn reply_with_query_value(
-    ctx: &ClientReplyContext,
+    ctx: &ReplyContext,
     value: QueryValue,
     eval_ts: Timestamp,
 ) -> Status {
     ctx.reply_with_map(2);
-    ctx.reply_with_string_key("resultType");
+    ctx.reply_with_string("resultType");
     let value_type = value.value_type().to_string();
-    ctx.reply_with_bulk_string(&value_type);
-    ctx.reply_with_string_key("result");
+    ctx.reply_with_string(&value_type);
+    ctx.reply_with_string("result");
 
     match value {
         QueryValue::Vector(values) => {

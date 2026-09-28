@@ -275,6 +275,25 @@ class TestTsQuery(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.client.execute_command('TS.QUERY', 'invalid {[}')
 
+    def test_query_string_result_stays_on_one_line(self):
+        """A string result is sent as a simple string, which a newline would end early and
+        leave the connection out of step; the newline arrives as a space instead."""
+        result = self.client.execute_command('TS.QUERY', '"a\\nb"')
+        qr = QueryResult.from_raw(result)
+        assert qr.is_string(), "expected a string result"
+        assert qr.result.value == 'a b'
+        # The connection is still in step.
+        assert self.client.execute_command('PING')
+
+    def test_query_error_keeps_non_ascii_text(self):
+        """An evaluation error echoing non-ASCII input arrives as valid UTF-8, on one line."""
+        self.setup_simple_series()
+        with pytest.raises(ResponseError) as err:
+            self.client.execute_command(
+                'TS.QUERY', 'label_replace(http_requests, "dst", "$1", "service", "é(")')
+        assert 'é(' in str(err.value)
+        assert self.client.execute_command('PING')
+
     def test_query_missing_query_argument(self):
         """Test TS.QUERY without the required query argument."""
         # Command requires at least one argument (the query)

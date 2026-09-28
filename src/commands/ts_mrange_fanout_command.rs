@@ -212,7 +212,7 @@ impl FanoutClientCommand for MRangeFanoutCommand {
         match self.process_responses(series, group_partials) {
             Ok(mut series) => {
                 sort_mrange_results(&mut series, is_grouped);
-                let _ = reply_with_mrange_series_results(ctx, &series, &shape);
+                let _ = reply_with_mrange_series_results(ctx.context(), &series, &shape);
                 Status::Ok
             }
             Err(e) => {

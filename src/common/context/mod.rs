@@ -1,8 +1,3 @@
-mod blocked;
-mod client_reply_context;
-pub mod replies;
-mod thread_safe;
-
 use std::ffi::CString;
 use std::os::raw::c_int;
 use valkey_module::{
@@ -12,9 +7,6 @@ use valkey_module::{
 };
 
 use crate::fanout::FANOUT_ACL_USER;
-pub use blocked::*;
-pub(crate) use client_reply_context::*;
-pub(crate) use thread_safe::*;
 
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
