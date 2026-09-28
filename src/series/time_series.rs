@@ -2,7 +2,7 @@ use super::chunks::utils::{filter_samples_by_value, filter_timestamp_slice};
 use super::{SampleAddResult, SampleDuplicatePolicy, TimeSeriesOptions, ValueFilter};
 use crate::common::hash::IntMap;
 use crate::common::rounding::RoundingStrategy;
-use crate::common::threads::{IntoParRayon, ParMutRayon, ParRayon};
+use crate::common::threads::{IntoParRayon, ParMutRayon, ParRayon, on_pool_worker};
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
@@ -648,8 +648,7 @@ impl TimeSeries {
         };
         let (start_index, end_index) = range;
         let chunks = &self.chunks[start_index..=end_index];
-        if chunks.len() < PARALLEL_RANGE_MIN_CHUNKS || rayon_core::current_thread_index().is_some()
-        {
+        if chunks.len() < PARALLEL_RANGE_MIN_CHUNKS || on_pool_worker() {
             // Decode on this thread when the range is small, or when the caller
             // is already a pool worker — a fan-out across series, where a
             // nested scope per series costs more than it parallelizes (and its

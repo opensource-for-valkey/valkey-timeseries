@@ -98,6 +98,15 @@ pub trait IntoParRayon: IntoParIter {
     {
         self.into_par().with_pool(ModulePool)
     }
+
+    /// `.into_par()` on one specific pool, for a computation that must not depend on the
+    /// caller's (see [`RayonPool`]).
+    fn into_par_on(self, pool: &'static rayon_core::ThreadPool) -> impl Par<Item = Self::Item>
+    where
+        Self: Sized,
+    {
+        self.into_par().with_pool(RayonPool(pool))
+    }
 }
 
 impl<T: IntoParIter> IntoParRayon for T {}

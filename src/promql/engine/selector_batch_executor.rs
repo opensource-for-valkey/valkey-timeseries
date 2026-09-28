@@ -1,7 +1,10 @@
 use crate::common::Timestamp;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
-use crate::common::threads::{ParWithPool, RayonPool, panic_message};
+use crate::common::threads::{
+    IntoParRayon, LockGil, MATERIALIZE_POOL, ThreadRole, check_may_block, panic_message,
+    set_thread_role,
+};
 use crate::common::time::current_time_millis;
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
@@ -22,13 +25,12 @@ use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeS
 use crate::series::chunks::ChunkOps;
 use crate::series::index::series_by_selectors;
 use crate::series::{RangeSnapshot, TimeSeries};
-use orx_parallel::IntoParIter;
 use orx_parallel::Par;
 use orx_parallel::ParResult;
 use promql_parser::label::Matchers;
 use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, LazyLock, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
 
@@ -129,8 +131,7 @@ impl SelectorOutput {
         match self {
             SelectorOutput::Matrix(series) => Ok(series),
             SelectorOutput::WireMatrix(series) => Ok(series
-                .into_par()
-                .with_pool(RayonPool(&MATERIALIZE_POOL))
+                .into_par_on(&MATERIALIZE_POOL)
                 .map(WireRangeSeries::decode)
                 .collect()),
             _ => Err(QueryError::Execution(
@@ -219,8 +220,7 @@ impl SelectorTask {
 ///    keep running pool jobs; that let one worker nest a blocking wait per stolen closure,
 ///    which under a burst of subquery steps recursed until the stack overflowed.)
 ///
-/// A third rule lives with the callers: a pool job must not hold the module lock while it
-/// waits on the pool — see `threads::spawn_background`.
+/// These are rules R1–R3 of `common::threads`; `wait_for_result` checks the submitter's side.
 ///
 /// For local queries the thread does two things per batch. Under the module lock it resolves
 /// each task's series, answers the instant reads (one cached sample per series), and copies
@@ -258,7 +258,9 @@ impl SelectorTask {
 pub struct SelectorBatchExecutor {
     /// Hand-off to the processor thread. Unbounded: a submitter blocks on its
     /// responder anyway, so back-pressure here would only add a second wait.
-    sender: mpsc::Sender<SelectorTask>,
+    /// `None` when the thread could not be started: every query then fails,
+    /// rather than the executor panicking inside its `LazyLock` and poisoning it.
+    sender: Option<mpsc::Sender<SelectorTask>>,
 }
 
 /// The processor loop: wait for one task, sweep up whatever else is already
@@ -273,7 +275,7 @@ fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
         // — the bulk of a range read — happens below, with the lock released
         // and the main thread free to serve commands meanwhile.
         let deferred: Vec<DeferredRangeDecode> = {
-            let ctx = MODULE_CONTEXT.lock();
+            let ctx = MODULE_CONTEXT.lock_gil();
             batch
                 .into_iter()
                 .filter_map(|task| {
@@ -349,10 +351,21 @@ fn collect_batch<T>(receiver: &mpsc::Receiver<T>, first: T, max_batch_size: usiz
 impl SelectorBatchExecutor {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("ts-promql-selector".to_string())
-            .spawn(move || run_processor(receiver))
-            .expect("failed to spawn the PromQL selector executor thread");
+            .spawn(move || {
+                set_thread_role(ThreadRole::Blocking);
+                run_processor(receiver)
+            });
+        let sender = match spawned {
+            Ok(_) => Some(sender),
+            Err(err) => {
+                log_warning(format!(
+                    "failed to spawn the PromQL selector executor thread: {err}"
+                ));
+                None
+            }
+        };
         Self { sender }
     }
 
@@ -473,7 +486,11 @@ impl SelectorBatchExecutor {
             responder: result_tx,
         };
 
-        if self.sender.send(task).is_err() {
+        let sent = self
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.send(task).is_ok());
+        if !sent {
             return Err(QueryError::Execution(
                 "selector executor thread is not running".to_string(),
             ));
@@ -492,23 +509,12 @@ impl SelectorBatchExecutor {
     }
 }
 
-/// The pool the processor materializes on. Private to the executor so that its work never
-/// depends on a pool whose workers may all be parked in
-/// [`SelectorBatchExecutor::submit_selector_task`] waiting for exactly this work.
-static MATERIALIZE_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
-    rayon_core::ThreadPoolBuilder::new()
-        .num_threads(crate::config::num_threads())
-        .thread_name(|index| format!("ts-promql-io-{index}"))
-        // Nested `*_rayon` work (e.g. per-chunk decode) stays on this pool.
-        .start_handler(|_| crate::common::threads::pin_to_own_pool())
-        .build()
-        .expect("failed to build the PromQL materialization pool")
-});
-
 /// Wait for a selector result. A plain blocking wait, on a pool worker too: the processor
 /// needs nothing from this thread's pool to answer (see the type-level docs), and a wait
 /// that ran other jobs meanwhile would stack one blocking wait per stolen closure.
+#[track_caller]
 fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+    check_may_block();
     rx.recv()
 }
 
@@ -996,8 +1002,7 @@ pub(in crate::promql) fn query_instant_local(
     // mutex-wrapped iterator (see `snapshot_range_local`).
     let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
     let samples = series
-        .into_par()
-        .with_pool(RayonPool(&MATERIALIZE_POOL))
+        .into_par_on(&MATERIALIZE_POOL)
         .filter_map(|s| {
             let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
 
@@ -1044,8 +1049,7 @@ fn snapshot_range_local(
     // small per item the pull lock convoys through the kernel.
     let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
     Ok(series
-        .into_par()
-        .with_pool(RayonPool(&MATERIALIZE_POOL))
+        .into_par_on(&MATERIALIZE_POOL)
         .map(|s| {
             (
                 EvalLabels::interned(&s.labels),
@@ -1067,8 +1071,7 @@ fn decode_range_snapshots(
     // so the overshoot is at most one series per pool thread.
     let budget = SampleBudget::new(options.max_samples);
     let ranges = series
-        .into_par()
-        .with_pool(RayonPool(&MATERIALIZE_POOL))
+        .into_par_on(&MATERIALIZE_POOL)
         .filter_map(|(labels, snapshot)| {
             if budget.exhausted() {
                 return Some(Err(too_many_samples(budget.loaded(), budget.limit())));
@@ -1103,10 +1106,10 @@ fn decode_range_snapshots(
 #[cfg(test)]
 mod selector_batch_executor_tests {
     use super::{MATERIALIZE_POOL, collect_batch, selector_fanout_failure, wait_for_result};
-    use crate::common::threads::{ParWithPool, RayonPool};
+    use crate::common::threads::{IntoParRayon, ThreadRole, set_thread_role};
     use crate::fanout::FanoutError;
     use crate::promql::QueryError;
-    use orx_parallel::{IntoParIter, Par};
+    use orx_parallel::Par;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1141,15 +1144,13 @@ mod selector_batch_executor_tests {
     fn parked_pool_never_starves_a_processor_with_its_own_pool() {
         let callers = rayon_core::ThreadPoolBuilder::new()
             .num_threads(2)
+            .start_handler(|_| set_thread_role(ThreadRole::EvalPool))
             .build()
             .unwrap();
         let (task_tx, task_rx) = mpsc::channel::<mpsc::SyncSender<usize>>();
         std::thread::spawn(move || {
             for responder in task_rx {
-                let sum: usize = (0..10_000usize)
-                    .into_par()
-                    .with_pool(RayonPool(&MATERIALIZE_POOL))
-                    .sum();
+                let sum: usize = (0..10_000usize).into_par_on(&MATERIALIZE_POOL).sum();
                 responder.send(sum).unwrap();
             }
         });

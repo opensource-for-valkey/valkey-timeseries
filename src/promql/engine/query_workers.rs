@@ -12,295 +12,123 @@
 //! whole `TIMEOUT` holding a blocked client, its parsed statement and its
 //! querier, only to be answered with a timeout anyway.
 //!
-//! Dedicated threads, not the rayon pool: an evaluation blocks — on the
-//! selector executor's answer, on its own fan-outs — and a pool worker that
-//! blocks steals other jobs while it waits (see
-//! `SelectorBatchExecutor`'s design notes for what that did). A plain thread
-//! waits without stealing.
+//! Blocking threads, not a pool: an evaluation blocks — on the selector
+//! executor's answer, on its own fan-outs — and a pool worker that blocks
+//! steals other jobs while it waits (see `SelectorBatchExecutor`'s design
+//! notes for what that did). A plain thread waits without stealing.
 //!
-//! An evaluation's own parallel work runs on [`EVAL_POOL`], never orx's shared
-//! pool: see [`run_evaluation`].
+//! An evaluation's own parallel work runs on the evaluation pool, never the
+//! shared pool: see [`run_evaluation`].
 
-use crate::common::logging::log_warning;
-use crate::common::threads::{panic_message, pin_to_own_pool};
-use crate::config::{max_concurrent_queries, max_queued_queries, num_threads};
-use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, LazyLock, Mutex};
+use crate::common::Timestamp;
+use crate::common::context::{
+    ClientReplyContext, ClientThreadSafeContext, create_blocked_client, is_blocking_denied,
+};
+use crate::common::threads::{
+    BoundedExecutor, Capacity, EVAL_POOL, ExecutorStats, Rejected, check_may_wait_on_eval_pool,
+};
+use crate::common::time::current_time_millis;
+use crate::config::{max_concurrent_queries, max_queued_queries};
+use crate::error_consts;
+use crate::promql::{QueryError, QueryResult};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyValue};
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+static QUERY_WORKERS: BoundedExecutor = BoundedExecutor::new(
+    "ts-promql-query",
+    max_concurrent_queries,
+    Capacity::Dynamic(max_queued_queries),
+);
 
-struct QueryWorkers {
-    sender: mpsc::Sender<Job>,
-}
-
-/// Jobs accepted but not yet taken by a worker. Kept outside the pool so
-/// reading it (`INFO`) does not build the pool.
-static QUEUED: AtomicUsize = AtomicUsize::new(0);
-/// Jobs a worker is currently running.
-static RUNNING: AtomicUsize = AtomicUsize::new(0);
-/// Submissions refused because the backlog was full, since startup.
-static REJECTED: AtomicU64 = AtomicU64::new(0);
-
-static QUERY_WORKERS: LazyLock<QueryWorkers> = LazyLock::new(|| {
-    let (sender, receiver) = mpsc::channel::<Job>();
-    let receiver = Arc::new(Mutex::new(receiver));
-    for index in 0..max_concurrent_queries() {
-        let receiver = Arc::clone(&receiver);
-        let spawned = std::thread::Builder::new()
-            .name(format!("ts-promql-query-{index}"))
-            .spawn(move || {
-                loop {
-                    // Hold the queue lock only to take a job, never while running one.
-                    let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                    match job {
-                        Ok(job) => {
-                            QUEUED.fetch_sub(1, Ordering::AcqRel);
-                            RUNNING.fetch_add(1, Ordering::AcqRel);
-                            run_job(index, job);
-                            RUNNING.fetch_sub(1, Ordering::AcqRel);
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
-        if let Err(err) = spawned {
-            log_warning(format!(
-                "failed to spawn PromQL query worker {index}: {err}"
-            ));
-        }
-    }
-    QueryWorkers { sender }
-});
-
-/// Run one job, surviving its panic. A panic that unwound through the worker
-/// would end its loop and shrink the pool by one for the life of the process;
-/// after `max_concurrent_queries` such panics every query would be refused.
-/// The client is still answered: the job's captured blocked client is dropped
-/// during the unwind, which unblocks it.
-fn run_job(worker: usize, job: Job) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
-        let reason = panic_message(payload.as_ref());
-        log_warning(format!(
-            "PromQL query worker {worker}: evaluation panicked: {reason}"
-        ));
-    }
-}
-
-/// The rayon pool PromQL evaluations fan out on, sized like orx's shared pool
-/// (`ts-num-threads`).
-///
-/// An evaluation's parallel jobs block: they ask the selector executor for data
-/// and wait, and the executor needs the module GIL to answer. On orx's shared pool
-/// those parked jobs could occupy every worker while a GIL holder — `TS.RANGE`
-/// over enough chunks, `TS.MRANGE`, the trim cron, a shard's local fan-out
-/// handler — waits on that same pool for its own parallel decode: the holder
-/// waits on the pool, the pool waits on the executor, the executor waits on the
-/// holder, and the server freezes. Here the parked jobs can only exhaust this
-/// pool, which no GIL holder ever waits on, so the shared pool always drains.
-/// Its workers are pinned ([`pin_to_own_pool`]) so the `*_rayon` iterators they reach
-/// stay here instead of moving to the shared pool.
-static EVAL_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
-    rayon_core::ThreadPoolBuilder::new()
-        .num_threads(num_threads())
-        .thread_name(|index| format!("ts-promql-eval-{index}"))
-        .start_handler(|_| pin_to_own_pool())
-        .build()
-        .expect("failed to build the PromQL evaluation pool")
-});
-
-/// Run a PromQL evaluation on [`EVAL_POOL`].
+/// Run a PromQL evaluation on the evaluation pool.
 ///
 /// Every parallel entry point the evaluation reaches — the `*_rayon` iterators,
-/// `threads::join`, `threads::spawn` — resolves to the pool of the worker that
-/// calls it (the `*_rayon` iterators because the worker is pinned), so installing
-/// the evaluation here keeps all of its nested work off the shared pool without
-/// touching those call sites.
+/// `threads::join` — resolves to the pool of the pinned worker that calls it, so
+/// installing the evaluation there keeps all of its nested work off the shared
+/// pool without touching those call sites.
 ///
-/// Wrap only the evaluation, never the reply: replying takes the GIL, and a GIL
-/// holder must not run on a pool that parks on the executor.
+/// Wrap only the evaluation: the reply is written from the query worker.
+#[track_caller]
 pub(crate) fn run_evaluation<R: Send>(evaluate: impl FnOnce() -> R + Send) -> R {
+    check_may_wait_on_eval_pool();
     EVAL_POOL.install(evaluate)
 }
 
-/// Why [`submit_query`] did not queue a job. In every case the caller still
-/// owns the reply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubmitError {
-    /// `ts-promql-max-queued-queries` jobs are already waiting for a worker.
-    QueueFull { limit: usize },
-    /// No worker will ever run it: the workers are gone.
-    WorkersGone,
-}
+/// Evaluate a query for the client of `ctx` on a query worker, and answer it from there.
+///
+/// The client is blocked only once the backlog has room for the query, so a refusal is an
+/// ordinary error reply. `evaluate` runs on the evaluation pool ([`run_evaluation`]); `reply`
+/// writes its result afterwards. A query whose `deadline` passed while it waited for a worker
+/// is answered with a timeout and never evaluated: the wait counts against its budget.
+pub(crate) fn submit_evaluation<R, E, P>(
+    ctx: &Context,
+    deadline: Option<Timestamp>,
+    evaluate: E,
+    reply: P,
+) -> ValkeyResult
+where
+    R: Send + 'static,
+    E: FnOnce() -> QueryResult<R> + Send + 'static,
+    P: FnOnce(&ClientReplyContext, R) + Send + 'static,
+{
+    // Checked before blocking: the server asserts on a blocked deny-blocking
+    // client (a module `RM_Call` without the K flag) and aborts, and inside
+    // MULTI or a script the client would get the server's own error while the
+    // query still ran with nobody to answer.
+    if is_blocking_denied(ctx) {
+        return Err(ValkeyError::Str(error_consts::PROMQL_BLOCKING_NOT_ALLOWED));
+    }
+    let slot = QUERY_WORKERS
+        .try_reserve()
+        .map_err(|rejected| ValkeyError::String(format!("TSDB: {}", rejection(rejected))))?;
+    let blocked_client = create_blocked_client(ctx);
 
-impl fmt::Display for SubmitError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::QueueFull { limit } => write!(
-                f,
-                "too many queued PromQL queries (ts-promql-max-queued-queries = {limit})"
-            ),
-            Self::WorkersGone => f.write_str("query workers are not running"),
+    slot.spawn(move || {
+        let thread_ctx = ClientThreadSafeContext::with_blocked_client(blocked_client);
+        if deadline.is_some_and(|d| current_time_millis() > d) {
+            thread_ctx.reply(Err(ValkeyError::String(QueryError::Timeout.to_string())));
+            return;
         }
+        match run_evaluation(evaluate) {
+            Ok(value) => reply(&thread_ctx.get_write_context(), value),
+            Err(err) => {
+                thread_ctx.reply(Err(ValkeyError::String(err.to_string())));
+            }
+        }
+    });
+
+    // Answered later, from a query worker.
+    Ok(ValkeyValue::NoReply)
+}
+
+fn rejection(rejected: Rejected) -> String {
+    match rejected {
+        Rejected::QueueFull { limit } => {
+            format!("too many queued PromQL queries (ts-promql-max-queued-queries = {limit})")
+        }
+        Rejected::NotRunning => "query workers are not running".to_string(),
     }
 }
 
-/// Queue `job` for one of the query workers, unless the backlog is already at
-/// `ts-promql-max-queued-queries`.
-pub(crate) fn submit_query<F: FnOnce() + Send + 'static>(job: F) -> Result<(), SubmitError> {
-    // Reserve the slot before checking, so two concurrent submitters cannot
-    // both see room for one. `queued` is the count before this reservation.
-    let queued = QUEUED.fetch_add(1, Ordering::AcqRel);
-    let limit = max_queued_queries();
-    if limit != 0 && queued >= limit {
-        QUEUED.fetch_sub(1, Ordering::AcqRel);
-        REJECTED.fetch_add(1, Ordering::Relaxed);
-        return Err(SubmitError::QueueFull { limit });
-    }
-    if QUERY_WORKERS.sender.send(Box::new(job)).is_err() {
-        QUEUED.fetch_sub(1, Ordering::AcqRel);
-        return Err(SubmitError::WorkersGone);
-    }
-    Ok(())
-}
-
-/// A snapshot of the pool for `INFO`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct QueryWorkerStats {
-    /// Queries waiting for a worker.
-    pub queued: usize,
-    /// Queries being evaluated.
-    pub running: usize,
-    /// Queries refused because the backlog was full, since startup.
-    pub rejected: u64,
-}
-
-pub(crate) fn stats() -> QueryWorkerStats {
-    QueryWorkerStats {
-        queued: QUEUED.load(Ordering::Acquire),
-        running: RUNNING.load(Ordering::Acquire),
-        rejected: REJECTED.load(Ordering::Relaxed),
-    }
+/// The query workers' load, for `INFO`.
+pub(crate) fn stats() -> ExecutorStats {
+    QUERY_WORKERS.stats()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{REJECTED, SubmitError, run_evaluation, stats, submit_query};
-    use crate::common::threads::IntoParRayon;
-    use crate::config::{
-        DEFAULT_QUEUED_QUERIES, MAX_QUEUED_QUERIES_CELL, max_concurrent_queries, num_threads,
-    };
+    use super::run_evaluation;
+    use crate::common::threads::{IntoParRayon, join};
+    use crate::config::num_threads;
     use orx_parallel::Par;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier, Mutex, mpsc};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
-    /// The pool and its counters are process-wide, so tests that fill or
-    /// block it must not overlap.
-    static POOL: Mutex<()> = Mutex::new(());
-
-    /// Sets `ts-promql-max-queued-queries` for one test and restores the
-    /// default on the way out, however the test ends.
-    struct QueueLimit;
-
-    impl QueueLimit {
-        fn set(limit: usize) -> Self {
-            MAX_QUEUED_QUERIES_CELL.store(limit as i64, Ordering::Relaxed);
-            Self
-        }
-    }
-
-    impl Drop for QueueLimit {
-        fn drop(&mut self) {
-            MAX_QUEUED_QUERIES_CELL.store(DEFAULT_QUEUED_QUERIES, Ordering::Relaxed);
-        }
-    }
-
-    #[test]
-    fn a_panicking_job_does_not_take_its_worker_down() {
-        let _pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        // Saturate the pool with panicking jobs so every worker sees one, then
-        // check that the same number of ordinary jobs still get served.
-        let workers = max_concurrent_queries();
-        for _ in 0..workers {
-            assert_eq!(submit_query(|| panic!("evaluation blew up")), Ok(()));
-        }
-        let (tx, rx) = mpsc::channel();
-        for i in 0..workers {
-            let tx = tx.clone();
-            assert_eq!(submit_query(move || tx.send(i).unwrap()), Ok(()));
-        }
-        drop(tx);
-        let mut served: Vec<usize> = rx.iter().collect();
-        served.sort_unstable();
-        assert_eq!(served, (0..workers).collect::<Vec<_>>());
-
-        // And the pool is still alive for a later submission.
-        let (tx, rx) = mpsc::channel();
-        assert_eq!(submit_query(move || tx.send(()).unwrap()), Ok(()));
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("a worker should still be running");
-    }
-
-    #[test]
-    fn a_full_backlog_refuses_on_arrival_and_drains_when_workers_free_up() {
-        let _pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        const LIMIT: usize = 2;
-        let rejected_before = REJECTED.load(Ordering::Relaxed);
-
-        // Park every worker inside a job so nothing drains the backlog. The
-        // limit goes on only once they are all parked: a job counts as queued
-        // from submission until a worker takes it, so the parking jobs
-        // themselves would otherwise trip a limit smaller than the pool.
-        let workers = max_concurrent_queries();
-        let entered = Arc::new(Barrier::new(workers + 1));
-        let release = Arc::new(Barrier::new(workers + 1));
-        for _ in 0..workers {
-            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
-            assert_eq!(
-                submit_query(move || {
-                    entered.wait();
-                    release.wait();
-                }),
-                Ok(())
-            );
-        }
-        entered.wait();
-        assert_eq!(stats().running, workers);
-        assert_eq!(stats().queued, 0);
-        let _limit = QueueLimit::set(LIMIT);
-
-        // LIMIT more are admitted to wait; the next is refused at once.
-        let (tx, rx) = mpsc::channel();
-        for i in 0..LIMIT {
-            let tx = tx.clone();
-            assert_eq!(submit_query(move || tx.send(i).unwrap()), Ok(()));
-        }
-        assert_eq!(stats().queued, LIMIT);
-        let overflow = tx.clone();
-        assert_eq!(
-            submit_query(move || overflow.send(usize::MAX).unwrap()),
-            Err(SubmitError::QueueFull { limit: LIMIT })
-        );
-        // A refusal releases its reservation, so the backlog is unchanged...
-        assert_eq!(stats().queued, LIMIT);
-        assert_eq!(REJECTED.load(Ordering::Relaxed), rejected_before + 1);
-        drop(tx);
-
-        // ...and the admitted jobs all run once the workers are free again.
-        release.wait();
-        let mut served: Vec<usize> = rx.iter().collect();
-        served.sort_unstable();
-        assert_eq!(served, (0..LIMIT).collect::<Vec<_>>());
-    }
-
-    /// The freeze [`EVAL_POOL`](super::EVAL_POOL) exists to prevent: evaluation
-    /// jobs parked on a processor that needs the GIL (a mutex here), while the
-    /// GIL holder waits on orx's shared pool for its own parallel work. With the
-    /// evaluation on the shared pool, the parked jobs hold every shared worker
-    /// and the holder's fan-out never runs.
+    /// The freeze the evaluation pool exists to prevent: evaluation jobs parked on
+    /// a processor that needs the GIL (a mutex here), while the GIL holder waits on
+    /// orx's shared pool for its own parallel work. With the evaluation on the shared
+    /// pool, the parked jobs hold every shared worker and the holder's fan-out never
+    /// runs.
     #[test]
     fn parked_evaluations_never_starve_a_gil_holder_on_the_shared_pool() {
         let gil = Arc::new(Mutex::new(()));
@@ -348,34 +176,21 @@ mod tests {
             std::thread::yield_now();
         }
 
-        // The GIL holder's own fan-out, on the shared pool.
+        // The GIL holder's own fan-out, on the shared pool: a parallel iterator, and a
+        // `join` like TS.JOIN's and TS.LABELSTATS'.
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done_tx.send((0..10_000usize).into_par_rayon().sum::<usize>());
+            let sum = || (0..10_000usize).into_par_rayon().sum::<usize>();
+            let (a, b) = join(sum, sum);
+            let _ = done_tx.send(a + b);
         });
         let sum = done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("parked evaluation jobs starved the shared pool");
-        assert_eq!(sum, (0..10_000usize).sum::<usize>());
+        assert_eq!(sum, 2 * (0..10_000usize).sum::<usize>());
 
         drop(held);
         evaluation.join().unwrap();
         assert_eq!(off_eval_pool.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn zero_means_unbounded() {
-        let _pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        let _limit = QueueLimit::set(0);
-        let workers = max_concurrent_queries();
-        let (tx, rx) = mpsc::channel();
-        // Far more than any bound the pool size would imply.
-        let burst = workers * 64;
-        for i in 0..burst {
-            let tx = tx.clone();
-            assert_eq!(submit_query(move || tx.send(i).unwrap()), Ok(()));
-        }
-        drop(tx);
-        assert_eq!(rx.iter().count(), burst);
     }
 }

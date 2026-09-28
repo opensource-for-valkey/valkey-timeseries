@@ -14,7 +14,7 @@ use valkey_module::{
 use crate::fanout::FANOUT_ACL_USER;
 pub use blocked::*;
 pub(crate) use client_reply_context::*;
-pub use thread_safe::*;
+pub(crate) use thread_safe::*;
 
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
