@@ -4,24 +4,36 @@ pub use executor::{BoundedExecutor, ExecutorBusy};
 
 use crate::common::context::{get_current_db, set_current_db};
 use crate::is_main_thread;
-use rayon_core::{Scope, ThreadPoolBuilder};
+use rayon_core::Scope;
+use std::env;
 use std::os::raw::c_void;
 use valkey_module::logging::log_notice;
 use valkey_module::{Context, MODULE_CONTEXT, raw};
 
-/// Builds the module's global rayon thread pool, sized from `config::NUM_THREADS`
-/// (`ts-num-threads`). Config registration runs before this in `initialize()`, so the config
-/// value is already resolved (from `valkey.conf`/`MODULE LOAD` args, or its default) by the
-/// time this reads it. `ts-num-threads` is registered `IMMUTABLE` because rayon's global pool
-/// cannot be resized once built — there is no later point at which this needs to re-run.
+const MAX_NUM_THREADS_ENV_VARIABLE: &str = "ORX_NUM_THREADS";
+
+/// Sizes and builds the rayon-core pool that runs every orx-parallel `.par()` computation.
+///
+/// With the `persistent-pool-rayon` feature, orx's default runner executes on a dedicated
+/// rayon-core pool (not rayon's global pool used by [`spawn`]/[`join`]). orx builds it lazily on
+/// first use, sized from `ORX_NUM_THREADS` capped at the core count, and never resizes it. So the
+/// variable must be set before anything touches the pool, and we force the build here rather than
+/// leave it to the first command — which would pay for spawning the workers, and would size the
+/// pool to every core if it ran before this function.
+///
+/// Must run after the module config is loaded (`ts-num-threads`).
 pub fn init_thread_pool() {
     let threads = crate::config::num_threads();
-    log_notice(format!("Setting number of threads to {threads}"));
-    ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|index| format!("valkey-timeseries-{index}"))
-        .build_global()
-        .unwrap();
+    unsafe {
+        env::set_var(MAX_NUM_THREADS_ENV_VARIABLE, threads.to_string());
+    }
+    let actual = orx_parallel::Pool::global().current_num_threads();
+    if actual != threads {
+        log_notice(format!(
+            "parallel query pool has {actual} threads (ts-num-threads={threads}, capped at the \
+             available cores)"
+        ));
+    }
 }
 
 /// Spawn a job which runs asynchronously.
@@ -95,7 +107,7 @@ where
     RB: Send + 'scope,
 {
     // does this make sense?
-    spawn_scoped(|s| rayon_core::join(|| oper_a(s), || oper_b(s)))
+    spawn_scoped(|s| join(|| oper_a(s), || oper_b(s)))
 }
 
 extern "C" fn event_loop_callback_wrapper<F>(data: *mut c_void)
@@ -201,5 +213,47 @@ where
 
     unsafe {
         raw::ValkeyModule_EventLoopAddOneShot.unwrap()(Some(event_loop_callback), raw_data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join;
+    use orx_parallel::{Par, ParCollection, Parallelizable, Pool};
+
+    /// Whether every item of a parallel computation ran on a worker of orx's rayon pool.
+    fn all_on_orx_pool(items: &[usize]) -> bool {
+        let pool = Pool::global();
+        items
+            .par()
+            .map(|_| pool.current_thread_index().is_some())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .all(|on_pool| on_pool)
+    }
+
+    #[test]
+    fn par_runs_on_the_orx_rayon_pool() {
+        let items: Vec<usize> = (0..10_000).collect();
+        assert!(Pool::global().current_thread_index().is_none());
+        assert!(all_on_orx_pool(&items));
+    }
+
+    #[test]
+    fn nested_par_stays_on_the_orx_rayon_pool() {
+        let outer: Vec<usize> = (0..64).collect();
+        let inner: Vec<usize> = (0..1_000).collect();
+        let all = outer
+            .par()
+            .map(|_| all_on_orx_pool(&inner))
+            .collect::<Vec<_>>();
+        assert!(all.into_iter().all(|on_pool| on_pool));
+    }
+
+    #[test]
+    fn par_from_the_global_rayon_pool_runs_on_the_orx_pool() {
+        let items: Vec<usize> = (0..10_000).collect();
+        let (a, b) = join(|| all_on_orx_pool(&items), || all_on_orx_pool(&items));
+        assert!(a && b);
     }
 }

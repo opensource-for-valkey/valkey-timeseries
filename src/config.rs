@@ -273,14 +273,15 @@ impl ConfigDesc {
 
 pub static CHUNK_SIZE: AtomicI64 = AtomicI64::new(CHUNK_SIZE_DEFAULT);
 
-/// Size of the module's global rayon thread pool (`ts-num-threads`).
+/// Size of the rayon-core pool that runs orx-parallel `.par()` computations (`ts-num-threads`).
 ///
 /// This is the single source of truth for pool size: `init_thread_pool()` reads it directly
-/// when building the global rayon pool, and heuristics that scale work by thread count
-/// (`multi_del.rs`, `rcf_outlier_detector.rs`) read it too.
+/// when building that pool (capped at the core count), and heuristics that scale work by thread
+/// count (`multi_del.rs`, `rcf_outlier_detector.rs`) read it too. Rayon's own global pool
+/// (`threads::spawn`/`join`) is not sized by it.
 ///
-/// Rayon's global thread pool cannot be resized once built (`ThreadPoolBuilder::build_global`
-/// has no counterpart to shrink/grow an already-initialized `Registry`), so this config is
+/// A rayon pool cannot be resized once built (there is no counterpart to shrink/grow an
+/// already-initialized `Registry`), so this config is
 /// registered with `ConfigurationFlags::IMMUTABLE`: it can only be set at startup (`valkey.conf`
 /// or `MODULE LOAD` args), and `CONFIG SET ts-num-threads` is rejected by the server itself
 /// rather than silently no-op-ing.
@@ -1023,7 +1024,7 @@ pub static CONFIGS: &[ConfigDesc] = &[
         default: ConfigValue::Integer(DEFAULT_THREADS),
         min: Some(ConfigValue::Integer(MIN_THREADS)),
         max: Some(ConfigValue::Integer(MAX_THREADS)),
-        // Rayon's global thread pool cannot be resized after `build_global()`, so this can
+        // Sizes the orx-parallel rayon pool, which cannot be resized once built, so this can
         // only be set at startup; runtime `CONFIG SET` is rejected by the server itself.
         flags: ConfigurationFlags::IMMUTABLE,
         description: "Number of worker threads for parallel query processing",
