@@ -4,6 +4,7 @@ use orx_parallel::{
     IntoParIter, IterIntoParIter, Par, ParCollection, ParCollectionMut, Parallelizable, Runner,
     ThreadPool,
 };
+use std::cell::Cell;
 
 /// orx-parallel adapter that runs a computation on orx's own rayon-core pool
 /// (`orx_parallel::Pool::global()`, sized from `ts-num-threads` in

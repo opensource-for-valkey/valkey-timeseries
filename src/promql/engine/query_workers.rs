@@ -18,11 +18,11 @@
 //! `SelectorBatchExecutor`'s design notes for what that did). A plain thread
 //! waits without stealing.
 //!
-//! An evaluation's own parallel work runs on [`EVAL_POOL`], never the global
-//! rayon pool: see [`run_evaluation`].
+//! An evaluation's own parallel work runs on [`EVAL_POOL`], never orx's shared
+//! pool: see [`run_evaluation`].
 
 use crate::common::logging::log_warning;
-use crate::common::threads::panic_message;
+use crate::common::threads::{panic_message, pin_to_own_pool};
 use crate::config::{max_concurrent_queries, max_queued_queries, num_threads};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -89,21 +89,24 @@ fn run_job(worker: usize, job: Job) {
     }
 }
 
-/// The rayon pool PromQL evaluations fan out on, sized like the global pool
+/// The rayon pool PromQL evaluations fan out on, sized like orx's shared pool
 /// (`ts-num-threads`).
 ///
 /// An evaluation's parallel jobs block: they ask the selector executor for data
-/// and wait, and the executor needs the module GIL to answer. On the global pool
+/// and wait, and the executor needs the module GIL to answer. On orx's shared pool
 /// those parked jobs could occupy every worker while a GIL holder — `TS.RANGE`
 /// over enough chunks, `TS.MRANGE`, the trim cron, a shard's local fan-out
 /// handler — waits on that same pool for its own parallel decode: the holder
 /// waits on the pool, the pool waits on the executor, the executor waits on the
 /// holder, and the server freezes. Here the parked jobs can only exhaust this
-/// pool, which no GIL holder ever waits on, so the global pool always drains.
+/// pool, which no GIL holder ever waits on, so the shared pool always drains.
+/// Its workers are pinned ([`pin_to_own_pool`]) so the `*_rayon` iterators they reach
+/// stay here instead of moving to the shared pool.
 static EVAL_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
     rayon_core::ThreadPoolBuilder::new()
         .num_threads(num_threads())
         .thread_name(|index| format!("ts-promql-eval-{index}"))
+        .start_handler(|_| pin_to_own_pool())
         .build()
         .expect("failed to build the PromQL evaluation pool")
 });
@@ -112,8 +115,9 @@ static EVAL_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
 ///
 /// Every parallel entry point the evaluation reaches — the `*_rayon` iterators,
 /// `threads::join`, `threads::spawn` — resolves to the pool of the worker that
-/// calls it, so installing the evaluation here moves all of its nested work off
-/// the global pool without touching those call sites.
+/// calls it (the `*_rayon` iterators because the worker is pinned), so installing
+/// the evaluation here keeps all of its nested work off the shared pool without
+/// touching those call sites.
 ///
 /// Wrap only the evaluation, never the reply: replying takes the GIL, and a GIL
 /// holder must not run on a pool that parks on the executor.
@@ -294,11 +298,11 @@ mod tests {
 
     /// The freeze [`EVAL_POOL`](super::EVAL_POOL) exists to prevent: evaluation
     /// jobs parked on a processor that needs the GIL (a mutex here), while the
-    /// GIL holder waits on the global pool for its own parallel work. With the
-    /// evaluation on the global pool, the parked jobs hold every global worker
+    /// GIL holder waits on orx's shared pool for its own parallel work. With the
+    /// evaluation on the shared pool, the parked jobs hold every shared worker
     /// and the holder's fan-out never runs.
     #[test]
-    fn parked_evaluations_never_starve_a_gil_holder_on_the_global_pool() {
+    fn parked_evaluations_never_starve_a_gil_holder_on_the_shared_pool() {
         let gil = Arc::new(Mutex::new(()));
         let held = gil.lock().unwrap();
 
@@ -313,7 +317,7 @@ mod tests {
 
         // Enough parking jobs to occupy every worker of either pool.
         let eval_workers = num_threads();
-        let jobs = 2 * eval_workers.max(rayon_core::current_num_threads());
+        let jobs = 2 * eval_workers.max(orx_parallel::Pool::global().current_num_threads());
         let parked = Arc::new(AtomicUsize::new(0));
         let off_eval_pool = Arc::new(AtomicUsize::new(0));
         let evaluation = {
@@ -344,14 +348,14 @@ mod tests {
             std::thread::yield_now();
         }
 
-        // The GIL holder's own fan-out, on the global pool.
+        // The GIL holder's own fan-out, on the shared pool.
         let (done_tx, done_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = done_tx.send((0..10_000usize).into_par_rayon().sum::<usize>());
         });
         let sum = done_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("parked evaluation jobs starved the global pool");
+            .expect("parked evaluation jobs starved the shared pool");
         assert_eq!(sum, (0..10_000usize).sum::<usize>());
 
         drop(held);

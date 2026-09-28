@@ -2177,7 +2177,7 @@ mod tests {
     }
 
     /// The two thread-pool sizes are the only parameters that cannot change after startup:
-    /// rayon's global pool cannot be resized once built, and the PromQL query workers are
+    /// a rayon pool cannot be resized once built, and the PromQL query workers are
     /// created once, on first use.
     #[test]
     fn only_thread_pool_sizes_are_immutable() {

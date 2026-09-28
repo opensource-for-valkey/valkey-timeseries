@@ -1090,8 +1090,8 @@ impl TimeSeries {
 
         // Do NOT use parallel iteration here. This method can be called from within
         // another parallel iterator (e.g., in `filter_series_by_date_range`),
-        // and nested parallelism with Rayon can lead to deadlocks if the global
-        // thread pool is exhausted. A sequential check is safer and the performance
+        // and nested parallelism can lead to deadlocks if the pool it runs on is
+        // exhausted. A sequential check is safer and the performance
         // impact is minimal for a single series's chunks.
         chunks
             .iter()

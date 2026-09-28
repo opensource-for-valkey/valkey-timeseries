@@ -115,11 +115,6 @@ pub fn init_thread_pool() {
     unsafe {
         env::set_var(MAX_NUM_THREADS_ENV_VARIABLE, threads.to_string());
     }
-    ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|index| format!("valkey-timeseries-{index}"))
-        .build_global()
-        .unwrap();
     let actual = orx_parallel::Pool::global().current_num_threads();
     if actual != threads {
         log_notice(format!(

@@ -212,9 +212,9 @@ impl SelectorTask {
 ///    submitter drain the queue; a worker in that role could be handed another submitter's
 ///    closure by work-stealing while it waited on its own fan-out, and that closure would
 ///    then wait on the processor's own thread forever.
-/// 2. Nothing the processor does needs the global pool. Its materialization fans out on a
+/// 2. Nothing the processor does needs a shared pool. Its materialization fans out on a
 ///    private pool ([`MATERIALIZE_POOL`]), and `TimeSeries::get_range` decodes on the calling
-///    thread when that thread is a pool worker. So every global worker may sit in `recv` at
+///    thread when that thread is a pool worker. So every evaluation worker may sit in `recv` at
 ///    once and the processor still finishes. (An earlier version instead had waiting workers
 ///    keep running pool jobs; that let one worker nest a blocking wait per stolen closure,
 ///    which under a burst of subquery steps recursed until the stack overflowed.)
@@ -493,12 +493,14 @@ impl SelectorBatchExecutor {
 }
 
 /// The pool the processor materializes on. Private to the executor so that its work never
-/// depends on the global pool, whose workers may all be parked in
+/// depends on a pool whose workers may all be parked in
 /// [`SelectorBatchExecutor::submit_selector_task`] waiting for exactly this work.
 static MATERIALIZE_POOL: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| {
     rayon_core::ThreadPoolBuilder::new()
         .num_threads(crate::config::num_threads())
         .thread_name(|index| format!("ts-promql-io-{index}"))
+        // Nested `*_rayon` work (e.g. per-chunk decode) stays on this pool.
+        .start_handler(|_| crate::common::threads::pin_to_own_pool())
         .build()
         .expect("failed to build the PromQL materialization pool")
 });
