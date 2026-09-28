@@ -1,10 +1,10 @@
 use crate::commands::fanout_codec::chunks::{deserialize_chunk, serialize_chunk};
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::filters::{
-    FilterList, LabelFilter, MatchOp, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
+    FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
 };
-use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel};
+use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, literal_alternatives};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::exec::partial_aggregation::AggregationPartial;
 use crate::promql::exec::types::EvalLabels;
@@ -15,7 +15,7 @@ use crate::promql::generated::{
 };
 use crate::promql::{EvalSample, RangeSample};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
-use promql_parser::label::{Labels as ModifierLabels, Matcher, Matchers};
+use promql_parser::label::{Labels as ModifierLabels, MatchOp as PromMatchOp, Matcher, Matchers};
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use valkey_module::{ValkeyError, ValkeyResult};
 
@@ -127,42 +127,7 @@ pub(in crate::promql) fn range_sample_to_proto(
 
 impl From<Matcher> for LabelFilter {
     fn from(matcher: Matcher) -> Self {
-        let operator = match matcher.op {
-            promql_parser::label::MatchOp::Equal => MatchOp::Equal,
-            promql_parser::label::MatchOp::NotEqual => MatchOp::NotEqual,
-            promql_parser::label::MatchOp::Re(_re) => MatchOp::RegexEqual,
-            promql_parser::label::MatchOp::NotRe(_re) => MatchOp::RegexNotEqual,
-        };
-        let predicate = match operator {
-            MatchOp::Equal | MatchOp::NotEqual => {
-                let value = if matcher.value.is_empty() {
-                    PredicateValue::Empty
-                } else {
-                    PredicateValue::String(matcher.value.clone())
-                };
-                if operator == MatchOp::Equal {
-                    PredicateMatch::Equal(value)
-                } else {
-                    PredicateMatch::NotEqual(value)
-                }
-            }
-            MatchOp::RegexEqual | MatchOp::RegexNotEqual => {
-                // For regex matchers, an empty value doesn't make sense. We can choose to treat it as matching nothing or everything.
-                // Here we will treat it as matching nothing (i.e., it won't match any series).
-                if matcher.value.is_empty() {
-                    panic!("Invalid regex matcher with empty value");
-                }
-                let regex_matcher =
-                    RegexMatcher::create(&matcher.value).expect("Failed to create regex matcher");
-                if operator == MatchOp::RegexEqual {
-                    PredicateMatch::RegexEqual(regex_matcher)
-                } else {
-                    PredicateMatch::RegexNotEqual(regex_matcher)
-                }
-            }
-            _ => unreachable!("All match operators should be covered in the match statement above"),
-        };
-
+        let predicate = matcher_predicate(&matcher);
         LabelFilter {
             label: matcher.name,
             matcher: predicate,
@@ -172,45 +137,50 @@ impl From<Matcher> for LabelFilter {
 
 impl From<&Matcher> for LabelFilter {
     fn from(matcher: &Matcher) -> Self {
-        let operator = match &matcher.op {
-            promql_parser::label::MatchOp::Equal => MatchOp::Equal,
-            promql_parser::label::MatchOp::NotEqual => MatchOp::NotEqual,
-            promql_parser::label::MatchOp::Re(_re) => MatchOp::RegexEqual,
-            promql_parser::label::MatchOp::NotRe(_re) => MatchOp::RegexNotEqual,
-        };
-        let predicate = match operator {
-            MatchOp::Equal | MatchOp::NotEqual => {
-                let value = if matcher.value.is_empty() {
-                    PredicateValue::Empty
-                } else {
-                    PredicateValue::String(matcher.value.clone())
-                };
-                if operator == MatchOp::Equal {
-                    PredicateMatch::Equal(value)
-                } else {
-                    PredicateMatch::NotEqual(value)
-                }
-            }
-            MatchOp::RegexEqual | MatchOp::RegexNotEqual => {
-                if matcher.value.is_empty() {
-                    panic!("Invalid regex matcher with empty value");
-                }
-                let regex_matcher =
-                    RegexMatcher::create(&matcher.value).expect("Failed to create regex matcher");
-                if operator == MatchOp::RegexEqual {
-                    PredicateMatch::RegexEqual(regex_matcher)
-                } else {
-                    PredicateMatch::RegexNotEqual(regex_matcher)
-                }
-            }
-            _ => unreachable!("All match operators should be covered in the match statement above"),
-        };
-
         LabelFilter {
             label: matcher.name.clone(),
-            matcher: predicate,
+            matcher: matcher_predicate(matcher),
         }
     }
+}
+
+fn matcher_predicate(matcher: &Matcher) -> PredicateMatch {
+    let value = &matcher.value;
+    match &matcher.op {
+        PromMatchOp::Equal => PredicateMatch::Equal(literal_value(value)),
+        PromMatchOp::NotEqual => PredicateMatch::NotEqual(literal_value(value)),
+        PromMatchOp::Re(_) => regex_predicate(value),
+        PromMatchOp::NotRe(_) => regex_predicate(value).inverse(),
+    }
+}
+
+fn literal_value(value: &str) -> PredicateValue {
+    if value.is_empty() {
+        PredicateValue::Empty
+    } else {
+        PredicateValue::String(value.to_string())
+    }
+}
+
+/// The `=~` predicate for `value`. PromQL regexes are fully anchored, so one
+/// that only alternates literals — every derived push-down filter
+/// ([`crate::promql::engine::label_profile`]) and most hand-written `a|b`
+/// selectors — is an equality over the list: resolved by one postings lookup
+/// per value rather than a regex run over every value of the label.
+fn regex_predicate(value: &str) -> PredicateMatch {
+    if value.is_empty() {
+        panic!("Invalid regex matcher with empty value");
+    }
+    if let Some(mut values) = literal_alternatives(value) {
+        let value = if values.len() == 1 {
+            PredicateValue::String(values.pop().unwrap())
+        } else {
+            PredicateValue::from(values)
+        };
+        return PredicateMatch::Equal(value);
+    }
+    let regex_matcher = RegexMatcher::create(value).expect("Failed to create regex matcher");
+    PredicateMatch::RegexEqual(regex_matcher)
 }
 
 impl From<Matchers> for SeriesSelector {
@@ -463,6 +433,7 @@ pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) ->
 mod tests {
     use super::*;
     use crate::common::Sample;
+    use crate::labels::filters::MatchOp;
     use crate::series::chunks::ChunkOps;
     use promql_parser::label::{MatchOp as PromMatchOp, Matcher, Matchers};
     use promql_parser::parser::VectorSelector;
@@ -585,6 +556,42 @@ mod tests {
                 assert!(!filters[3].matches("laptop"));
             }
             other => panic!("expected SeriesSelector::And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_literal_alternation_regex_becomes_a_list_equality() {
+        let re =
+            |value: &str| PromMatchOp::Re(regex::Regex::new(&format!("^(?:{value})$")).unwrap());
+        let not_re =
+            |value: &str| PromMatchOp::NotRe(regex::Regex::new(&format!("^(?:{value})$")).unwrap());
+        let list = |values: &[&str]| {
+            PredicateValue::from(values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+        };
+
+        let filter = LabelFilter::from(Matcher::new(re(r"a|b\.c"), "host", r"a|b\.c"));
+        assert_eq!(filter.matcher, PredicateMatch::Equal(list(&["a", "b.c"])));
+        assert!(filter.matches("b.c"));
+        assert!(!filter.matches("bxc"));
+        assert!(!filter.matches("ab"));
+        assert!(!filter.matches(""));
+
+        let filter = LabelFilter::from(&Matcher::new(not_re("a|b"), "host", "a|b"));
+        assert_eq!(filter.matcher, PredicateMatch::NotEqual(list(&["a", "b"])));
+        assert!(filter.matches(""));
+        assert!(!filter.matches("a"));
+
+        let filter = LabelFilter::from(&Matcher::new(re("api"), "job", "api"));
+        assert_eq!(
+            filter.matcher,
+            PredicateMatch::Equal(PredicateValue::String("api".into()))
+        );
+
+        // Anything but plain literals keeps the regex, including an empty
+        // alternative, which the list form would not match.
+        for value in ["a.c", "a|", "server[0-9]+"] {
+            let filter = LabelFilter::from(&Matcher::new(re(value), "host", value));
+            assert_eq!(filter.op(), MatchOp::RegexEqual, "{value:?}");
         }
     }
 

@@ -115,6 +115,45 @@ pub fn is_match_all_regex_pattern(expr: &str) -> bool {
     remove_start_end_anchors(expr) == ".*"
 }
 
+/// The values of `expr` when it is nothing but `|`-separated literals with
+/// their metacharacters escaped — `a|b\.c` gives `["a", "b.c"]`. Anchored, such
+/// a regex matches exactly those values, so the index can look each one up
+/// instead of running the regex over every value of the label.
+///
+/// `None` for anything else, including an empty alternative: a
+/// [`PredicateValue::List`] never matches `""`. Unlike [`decompose_regex`] this
+/// is a scan of the text, not the HIR, and has no size cap, so it also covers
+/// the long alternations the derived push-down filters produce.
+pub fn literal_alternatives(expr: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut chars = expr.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some(escaped) if regex_syntax::is_meta_character(escaped) => current.push(escaped),
+                _ => return None,
+            },
+            '|' => {
+                if current.is_empty() {
+                    return None;
+                }
+                values.push(std::mem::take(&mut current));
+            }
+            // Special only inside a class or under the `x` flag, and neither can
+            // be opened without a metacharacter rejected below.
+            '-' | '&' | '~' | '#' => current.push(c),
+            c if regex_syntax::is_meta_character(c) => return None,
+            c => current.push(c),
+        }
+    }
+    if current.is_empty() {
+        return None;
+    }
+    values.push(current);
+    Some(values)
+}
+
 fn get_or_values(sre: &Hir, dest: &mut Vec<String>) -> bool {
     use HirKind::*;
 
@@ -801,9 +840,42 @@ fn extract_trailing_literal_sequence(sre: &Hir) -> Option<String> {
 #[cfg(test)]
 mod test {
     use super::{
-        RegexDecomposition, decompose_regex, parse_regex_matcher, remove_start_end_anchors,
+        RegexDecomposition, decompose_regex, literal_alternatives, parse_regex_matcher,
+        remove_start_end_anchors,
     };
     use crate::labels::filters::{PredicateMatch, PredicateValue};
+
+    #[test]
+    fn literal_alternatives_accepts_only_escaped_literals() {
+        let lits = |s: &str| literal_alternatives(s);
+        let owned = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        assert_eq!(lits("api"), owned(&["api"]));
+        assert_eq!(lits(r"a|a\.c|b"), owned(&["a", "a.c", "b"]));
+        assert_eq!(
+            lits(r"us-east|eu west|x\|y"),
+            owned(&["us-east", "eu west", "x|y"])
+        );
+        assert_eq!(lits(r"\(\)\[\]\{\}\^\$\*\+\?\\"), owned(&[r"()[]{}^$*+?\"]));
+        assert_eq!(lits("café|日本"), owned(&["café", "日本"]));
+        // The derived filters' own encoding round-trips.
+        let values = ["b", "a.c", "1+1", "(x)"];
+        let mut sorted = values.map(String::from).to_vec();
+        sorted.sort();
+        assert_eq!(
+            lits(&crate::promql::engine::label_profile::join_regexp_values(
+                values
+            )),
+            Some(sorted)
+        );
+
+        for expr in [
+            "", "a|", "|a", "a||b", "a.c", "a*", "(a|b)", "[ab]", "a{2}", "^a", "a$", r"\d", r"\n",
+            r"a\", "(?i)a",
+        ] {
+            assert_eq!(lits(expr), None, "{expr:?}");
+        }
+    }
 
     #[test]
     fn test_is_dot_star() {
