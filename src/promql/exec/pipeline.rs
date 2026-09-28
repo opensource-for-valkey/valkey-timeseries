@@ -15,6 +15,7 @@ use crate::common::{Sample, Timestamp};
 use crate::promql::engine::QueryReader;
 #[cfg(test)]
 use crate::promql::exec::types::EvalLabels;
+use crate::promql::time::grid_step_count;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::Par;
 use promql_parser::parser::VectorSelector;
@@ -147,7 +148,7 @@ pub(crate) fn compute_subquery_alignment(
     if aligned_start_ms <= subquery_start_ms {
         aligned_start_ms += step_ms;
     }
-    let expected_steps = ((subquery_end_ms - aligned_start_ms) / step_ms) as usize + 1;
+    let expected_steps = grid_step_count(aligned_start_ms, subquery_end_ms, step_ms) as usize;
     let range_start_ms = aligned_start_ms - lookback_delta_ms;
     let range_end_ms = subquery_end_ms;
     (

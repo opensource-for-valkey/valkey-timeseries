@@ -310,21 +310,85 @@ pub(crate) fn normalize_ranges(mut ranges: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
     merged
 }
 
+/// The most steps one evaluation grid may have, whatever the configuration.
+///
+/// Applies to a range query's outer grid, to every subquery grid, and to a grid
+/// a peer asks this node to evaluate. Every grid is walked step by step and its
+/// window ends are materialized, so without a ceiling `END +` (`i64::MAX`) or
+/// `m[100y:1ms]` would allocate until the process aborts.
+/// `ts-promql-max-points-per-timeseries` can only lower the outer grid's limit.
+/// One million leaves room for real queries: a 30-day subquery at a 1-minute
+/// step is 43,200 steps.
+pub const MAX_GRID_STEPS: u64 = 1_000_000;
+
+/// How many timestamps [`step_times`] yields for `start..=end` at `step`,
+/// computed without overflow. 0 when `step <= 0` or `end < start`.
+pub fn grid_step_count(start: i64, end: i64, step: i64) -> u64 {
+    if step <= 0 || end < start {
+        return 0;
+    }
+    let steps = (i128::from(end) - i128::from(start)) / i128::from(step) + 1;
+    u64::try_from(steps).unwrap_or(u64::MAX)
+}
+
+/// `start, start + step, ...` up to and including `end`.
+///
+/// Stops when the next step would overflow, so an `end` of `i64::MAX` still
+/// ends. A `step <= 0` yields at most `start`: a zero step would otherwise
+/// repeat it forever.
 pub fn step_times(start: i64, end: i64, step: i64) -> impl Iterator<Item = i64> {
-    let mut current = start;
+    let mut next = (start <= end).then_some(start);
     std::iter::from_fn(move || {
-        if current > end {
-            return None;
-        }
-        let out = current;
-        current = current.saturating_add(step);
-        Some(out)
+        let current = next?;
+        next = if step > 0 {
+            current.checked_add(step).filter(|&ts| ts <= end)
+        } else {
+            None
+        };
+        Some(current)
     })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::promql::time::normalize_ranges;
+    use crate::promql::time::{grid_step_count, step_times};
+
+    #[test]
+    fn step_times_ends_at_the_largest_timestamp() {
+        // `END +` is i64::MAX. The last step used to saturate at i64::MAX and
+        // repeat forever, since `current > end` could never become true.
+        let tail: Vec<i64> = step_times(i64::MAX - 25, i64::MAX, 10).collect();
+        assert_eq!(tail, vec![i64::MAX - 25, i64::MAX - 15, i64::MAX - 5]);
+        let exact: Vec<i64> = step_times(i64::MAX - 10, i64::MAX, 10).collect();
+        assert_eq!(exact, vec![i64::MAX - 10, i64::MAX]);
+    }
+
+    #[test]
+    fn step_times_non_positive_step_yields_at_most_start() {
+        assert_eq!(step_times(5, 10, 0).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(step_times(5, 10, -1).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(step_times(11, 10, 0).count(), 0);
+    }
+
+    #[test]
+    fn step_times_matches_grid_step_count() {
+        for (start, end, step) in [(0, 0, 1), (0, 999, 1), (0, 1000, 7), (-41, 59, 10), (3, 2, 1)] {
+            assert_eq!(
+                step_times(start, end, step).count() as u64,
+                grid_step_count(start, end, step),
+                "{start}..={end} step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_step_count_does_not_overflow() {
+        assert_eq!(grid_step_count(i64::MIN, i64::MAX, 1), u64::MAX);
+        assert_eq!(grid_step_count(0, i64::MAX, 1), i64::MAX as u64 + 1);
+        assert_eq!(grid_step_count(0, 10, 0), 0);
+        assert_eq!(grid_step_count(10, 0, 1), 0);
+    }
 
     #[test]
     fn normalize_ranges_basic() {

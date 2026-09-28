@@ -1,6 +1,6 @@
 use crate::common::Timestamp;
 use crate::promql::model::EvalContext;
-use crate::promql::time::step_times;
+use crate::promql::time::{grid_step_count, step_times};
 use promql_parser::parser::Expr;
 
 /// Immutable description of the step grid preloading must cover.
@@ -57,10 +57,7 @@ impl PreloadGrid {
     }
 
     pub(crate) fn expected_steps(&self) -> usize {
-        if self.step_ms <= 0 {
-            return 0;
-        }
-        ((self.end_ms - self.start_ms) / self.step_ms) as usize + 1
+        grid_step_count(self.start_ms, self.end_ms, self.step_ms) as usize
     }
 }
 

@@ -308,6 +308,50 @@ mod tests {
     }
 
     #[test]
+    fn range_unbounded_end_is_rejected_without_a_configured_limit() {
+        // The shipped default sets no points limit. `END +` at a 60s step is still
+        // ~1.5e14 steps, which used to be walked (and collected) until the server aborted.
+        let (counting, reader) = build_reader();
+        let stmt = EvalStmt {
+            expr: promql_parser::parser::parse("a").expect("valid test query"),
+            start: ms(RANGE_START_MS),
+            end: ms(i64::MAX),
+            interval: STEP,
+            lookback_delta: options().lookback_delta,
+        };
+        assert_eq!(options().max_points_per_series, None);
+        let err = evaluate_range(reader, stmt, options()).expect_err("must be rejected");
+        assert!(err.to_string().contains("too many points"), "{err}");
+        assert_eq!(counting.counts(), ReaderCallCounts::default());
+    }
+
+    #[test]
+    fn oversized_subquery_is_rejected() {
+        // `a[100y:1ms]` is ~3.15e12 steps; no configuration limits a subquery's grid.
+        let query = "sum_over_time(a[100y:1ms])";
+        let (_, reader) = build_reader();
+        let err = try_range(reader, query, 0).expect_err("range query must be rejected");
+        assert!(err.to_string().contains("too many steps"), "{err}");
+
+        let (_, reader) = build_reader();
+        let expr = promql_parser::parser::parse(query).expect("valid test query");
+        let stmt = EvalStmt {
+            expr,
+            start: ms(RANGE_END_MS),
+            end: ms(RANGE_END_MS),
+            interval: Duration::ZERO,
+            lookback_delta: options().lookback_delta,
+        };
+        let err = evaluate_instant(reader, stmt, ms(RANGE_END_MS), options())
+            .expect_err("instant query must be rejected");
+        assert!(err.to_string().contains("too many steps"), "{err}");
+
+        // An ordinary subquery still evaluates.
+        let (_, reader) = build_reader();
+        run_range(reader, "max_over_time(a[30d:1m])");
+    }
+
+    #[test]
     fn range_unbounded_end_is_rejected_before_any_fetch() {
         // `END +` resolves to i64::MAX, making the step grid (end - start) / step
         // astronomically large. With a finite points limit the query must be rejected up

@@ -166,8 +166,9 @@ const PROMQL_MAX_RESPONSE_SERIES_MIN: i64 = 0;
 const PROMQL_MAX_RESPONSE_SERIES_MAX: i64 = i64::MAX;
 const PROMQL_MAX_RESPONSE_SERIES_DEFAULT: i64 = 1000;
 const PROMQL_MAX_POINTS_PER_TIMESERIES_MIN: i64 = 0;
-const PROMQL_MAX_POINTS_PER_TIMESERIES_MAX: i64 = i64::MAX;
-const PROMQL_MAX_POINTS_PER_TIMESERIES_DEFAULT: i64 = 0; // 0 = unlimited
+// Every grid is capped at MAX_GRID_STEPS regardless; a larger setting could never apply.
+const PROMQL_MAX_POINTS_PER_TIMESERIES_MAX: i64 = crate::promql::MAX_GRID_STEPS as i64;
+const PROMQL_MAX_POINTS_PER_TIMESERIES_DEFAULT: i64 = 0; // 0 = only the MAX_GRID_STEPS ceiling
 const PROMQL_MAX_SAMPLES_PER_QUERY_MIN: i64 = 0;
 const PROMQL_MAX_SAMPLES_PER_QUERY_MAX: i64 = i64::MAX;
 /// Prometheus' `--query.max-samples` default. 0 = unlimited.
@@ -1422,7 +1423,7 @@ pub static CONFIGS: &[ConfigDesc] = &[
         min: Some(ConfigValue::Integer(PROMQL_MAX_POINTS_PER_TIMESERIES_MIN)),
         max: Some(ConfigValue::Integer(PROMQL_MAX_POINTS_PER_TIMESERIES_MAX)),
         flags: ConfigurationFlags::DEFAULT,
-        description: "Maximum points a PromQL query may generate per series (0 = unlimited)",
+        description: "Maximum points a PromQL range query may generate per series (0 = the built-in 1000000 ceiling)",
         storage: ConfigStorage::I64 {
             cell: || &PROMQL_MAX_POINTS_PER_TIMESERIES,
             validate: None,

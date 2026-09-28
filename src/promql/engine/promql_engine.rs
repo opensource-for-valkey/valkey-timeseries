@@ -187,7 +187,8 @@ pub fn evaluate_range(
     // phase reserves one slot per step — `(end - start) / step` of them — so an
     // unbounded `END` (the `+` sentinel resolves to i64::MAX) would otherwise drive a
     // multi-terabyte allocation and abort the server. `max_points_per_series` carries
-    // the configured `ts-promql-max-points-per-timeseries`; 0 (its default) is unlimited.
+    // the configured `ts-promql-max-points-per-timeseries`; 0 (its default) leaves only
+    // the `MAX_GRID_STEPS` ceiling, which applies whatever the setting.
     validate_max_points_per_timeseries(
         start_ms,
         end_ms,

@@ -34,7 +34,10 @@ use crate::promql::functions::{
 use crate::promql::hashers::{AggregationKey, GridPreloadKey, MatrixPreloadKey, PreloadKey};
 use crate::promql::model::EvalContext;
 use crate::promql::model::RangeSample;
-use crate::promql::time::{apply_time_modifiers_ms, selector_bounds, step_times};
+use crate::promql::time::{
+    MAX_GRID_STEPS, apply_time_modifiers_ms, grid_step_count, selector_bounds, step_times,
+};
+use crate::promql::utils::check_subquery_steps;
 use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, InstantSample, PreloadMap,
@@ -354,8 +357,18 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             let (first_end, last_end) = (resolve(first), resolve(last));
             let (earliest_end, latest_end) = (first_end.min(last_end), first_end.max(last_end));
             let range_ms = subquery.range.as_millis() as i64;
-            let (aligned_start_ms, _, _, _) =
-                compute_subquery_alignment(earliest_end - range_ms, latest_end, step_ms, 0);
+            let (aligned_start_ms, _, _, _) = compute_subquery_alignment(
+                earliest_end.saturating_sub(range_ms),
+                latest_end,
+                step_ms,
+                0,
+            );
+            // The union spans every outer step, so it can pass the ceiling
+            // where each step's own grid does not. Those steps then prepare
+            // their own grids, and each is checked there.
+            if grid_step_count(aligned_start_ms, latest_end, step_ms) > MAX_GRID_STEPS {
+                continue;
+            }
             let union = PreloadGrid {
                 start_ms: aligned_start_ms,
                 end_ms: latest_end,
@@ -1203,7 +1216,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // Calculate subquery time range: [adjusted_eval_ts - range, adjusted_eval_ts]
         let subquery_end_ms = adjusted_eval_ts;
         let range_ms = subquery.range.as_millis() as i64;
-        let subquery_start_ms = subquery_end_ms - range_ms;
+        let subquery_start_ms = subquery_end_ms.saturating_sub(range_ms);
 
         let step_ms = subquery_step_ms(subquery);
 
@@ -1213,6 +1226,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 "subquery step must be > 0".to_string(),
             ));
         }
+        // Before anything walks or sizes the grid; both paths below do.
+        check_subquery_steps(subquery_start_ms, subquery_end_ms, step_ms)?;
 
         // The union of every outer step's grid, prepared up front for a range
         // query (`preload_subqueries`); see the per-step preload below.

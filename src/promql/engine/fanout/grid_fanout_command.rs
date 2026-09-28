@@ -36,6 +36,7 @@ use crate::fanout::{
 use crate::labels::InternedLabel;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
+use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
 use crate::promql::engine::fanout::type_conversions::{
     proto_labels_to_eval_labels, range_sample_to_proto,
@@ -492,6 +493,14 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
             })
         })
         .transpose()?;
+    // The shard walks this grid and materializes its window ends before any
+    // series or point limit applies, so the peer's geometry is bounded here.
+    let steps = grid_step_count(req.query_start, req.query_end, req.step_ms);
+    if steps > MAX_GRID_STEPS {
+        return Err(ValkeyError::String(format!(
+            "TSDB: grid push-down request has {steps} steps; cannot exceed {MAX_GRID_STEPS}"
+        )));
+    }
     Ok(GridRequest {
         step_ms: req.step_ms,
         query_start: req.query_start,
@@ -2191,6 +2200,17 @@ mod tests {
         );
         req.aggregation.as_mut().unwrap().kind = 99;
         assert!(decode_request(&req).is_err());
+
+        // A grid wider than the ceiling: the shard would walk and collect every
+        // window end before any series or point limit applies.
+        let mut req = command(stepped_grid_request()).generate_request();
+        req.step_ms = 1;
+        req.query_start = 0;
+        req.query_end = i64::MAX;
+        let err = decode_request(&req).expect_err("unbounded grid");
+        assert!(err.to_string().contains("steps"), "{err}");
+        req.query_end = crate::promql::MAX_GRID_STEPS as i64 - 1;
+        assert!(decode_request(&req).is_ok(), "a grid at the ceiling decodes");
 
         // A selecting operator decodes with its parameter.
         let req = command(fused_with(

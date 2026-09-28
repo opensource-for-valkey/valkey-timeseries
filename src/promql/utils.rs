@@ -1,4 +1,5 @@
 use crate::common::Timestamp;
+use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use crate::promql::{EvalResult, EvaluationError, QueryError};
 use std::ops::{Bound, RangeBounds};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -115,7 +116,8 @@ pub(in crate::promql) fn align_start_end(
 
 /// Checks the maximum number of points that may be returned per each time series.
 ///
-/// The number mustn't exceed `max_points_per_timeseries`.
+/// The number mustn't exceed `max_points_per_timeseries`, or [`MAX_GRID_STEPS`]
+/// when that is 0 (no configured limit) or larger.
 pub(crate) fn validate_max_points_per_timeseries(
     start: Timestamp,
     end: Timestamp,
@@ -123,10 +125,14 @@ pub(crate) fn validate_max_points_per_timeseries(
     max_points_per_timeseries: usize,
 ) -> EvalResult<()> {
     let points = calc_points(start, end, &step);
-    if (max_points_per_timeseries > 0) && points > max_points_per_timeseries as i64 {
+    let limit = match max_points_per_timeseries as u64 {
+        0 => MAX_GRID_STEPS,
+        configured => configured.min(MAX_GRID_STEPS),
+    };
+    if points as u64 > limit {
         let msg = format!(
-            "too many points for the given step={:?}, start={start} and end={end}: {points}; cannot exceed {}",
-            step, max_points_per_timeseries
+            "too many points for the given step={:?}, start={start} and end={end}: {points}; cannot exceed {limit}",
+            step
         );
         // A request-level rejection (the window is too wide for the step), not a server
         // fault: classify it so the surfaced error reads as a bad argument.
@@ -136,19 +142,70 @@ pub(crate) fn validate_max_points_per_timeseries(
     }
 }
 
+/// Rejects a subquery whose own grid, `start..=end` at `step_ms`, has more
+/// than [`MAX_GRID_STEPS`] steps. No configured limit covers subqueries, so
+/// this is their only bound: `m[100y:1ms]` would otherwise be walked (and its
+/// window ends collected) three trillion steps per series.
+pub(crate) fn check_subquery_steps(start: Timestamp, end: Timestamp, step_ms: i64) -> EvalResult<()> {
+    let steps = grid_step_count(start, end, step_ms);
+    if steps > MAX_GRID_STEPS {
+        return Err(EvaluationError::ArgumentError(format!(
+            "subquery has too many steps: {steps} for a {}ms range at a {step_ms}ms step; \
+             cannot exceed {MAX_GRID_STEPS}",
+            i128::from(end) - i128::from(start)
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod max_points_tests {
     use super::*;
     use crate::common::constants::MAX_TIMESTAMP;
 
     #[test]
-    fn zero_limit_is_unlimited() {
-        // The default configuration (0). Even the pathological i64::MAX window must pass,
-        // so an unconfigured server is never made to reject queries by this guard.
+    fn zero_limit_falls_back_to_the_grid_ceiling() {
+        // The default configuration (0) sets no limit of its own, but the
+        // i64::MAX window (`END +` at a 1ms step) must still be rejected: it
+        // used to be walked until the allocation aborted the server.
+        let err = validate_max_points_per_timeseries(0, MAX_TIMESTAMP, Duration::from_millis(1), 0)
+            .expect_err("an i64::MAX window must exceed the grid ceiling");
+        assert!(matches!(err, EvaluationError::ArgumentError(_)));
+
+        let at_ceiling = MAX_GRID_STEPS as i64 - 1;
         assert!(
-            validate_max_points_per_timeseries(0, MAX_TIMESTAMP, Duration::from_millis(1), 0)
-                .is_ok()
+            validate_max_points_per_timeseries(0, at_ceiling, Duration::from_millis(1), 0).is_ok()
         );
+        assert!(
+            validate_max_points_per_timeseries(0, at_ceiling + 1, Duration::from_millis(1), 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn configured_limit_above_the_ceiling_is_capped() {
+        let over = MAX_GRID_STEPS as i64;
+        assert!(
+            validate_max_points_per_timeseries(
+                0,
+                over,
+                Duration::from_millis(1),
+                2 * MAX_GRID_STEPS as usize
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subquery_steps_are_bounded() {
+        // `m[100y:1ms]`: about 3.15e12 steps.
+        let hundred_years_ms = 100 * 365 * 24 * 3_600_000_i64;
+        let err = check_subquery_steps(-hundred_years_ms, 0, 1).expect_err("too many steps");
+        assert!(matches!(err, EvaluationError::ArgumentError(_)));
+        // A 30-day subquery at a 1-minute step is ordinary.
+        assert!(check_subquery_steps(0, 30 * 24 * 3_600_000, 60_000).is_ok());
+        // Extreme bounds must not overflow while counting.
+        assert!(check_subquery_steps(i64::MIN, i64::MAX, 1).is_err());
     }
 
     #[test]

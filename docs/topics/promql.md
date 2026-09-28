@@ -319,7 +319,7 @@ at startup.
 | `ts-promql-max-queued-queries` | 128 | Queries that may wait for a worker; further ones are refused on arrival with an error. `0` means unbounded. |
 | `ts-promql-max-query-len` | 4096 bytes | Maximum query string length. |
 | `ts-promql-max-response-series` | 1000 | Maximum returned series; `0` means unlimited. |
-| `ts-promql-max-points-per-timeseries` | 0 | Maximum generated points per series; `0` means unlimited. |
+| `ts-promql-max-points-per-timeseries` | 0 | Maximum points a range query generates per series, at most 1000000; `0` leaves only that built-in ceiling. |
 | `ts-promql-max-samples-per-query` | 50000000 | Maximum samples one query may load across all its reads (Prometheus' `--query.max-samples`); `0` means unlimited. In a cluster each shard applies its own value to what it reads. |
 | `ts-promql-lookback-delta` | 5m | Default sample lookback interval. |
 | `ts-promql-max-lookback` | 0 | Optional upper bound on lookback; `0` uses the lookback delta. |
@@ -332,6 +332,11 @@ at startup.
 The per-query `LOOKBACK_DELTA` and `TIMEOUT` options override their corresponding
 defaults. Limits are particularly important for broad selectors and long range queries,
 which can otherwise materialize many series and points.
+
+Whatever the configuration, no step grid may have more than 1,000,000 steps: a range
+query's own grid, a subquery's grid (`m[30d:1m]` is 43,200 steps), and a grid another
+node asks this one to evaluate. A query that needs more is rejected with an error before
+anything is read. Prometheus caps only the outer grid, at 11,000 points.
 
 A query that is admitted to the queue keeps its `TIMEOUT` budget while it waits: one that
 expires before a worker takes it is answered with a timeout error without being evaluated.
