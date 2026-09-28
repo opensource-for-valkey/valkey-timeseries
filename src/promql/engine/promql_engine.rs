@@ -293,13 +293,18 @@ pub fn evaluate_range(
         }
     }
 
-    let result = series_map
+    let mut result: Vec<RangeSample> = series_map
         .into_iter()
         .map(|(labels, samples)| RangeSample {
             samples,
             labels: labels.into_labels(),
         })
         .collect();
+    // The map iterates in a per-process random order, so without this the same query
+    // returned its series in a different order after a restart or on another node.
+    // Prometheus sorts a range result by labels: pair by pair, name then value, the
+    // shorter set first, which is `Labels`' own ordering.
+    result.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
 
     Ok(result)
 }
@@ -665,6 +670,62 @@ mod tests {
         assert_eq!(results[0].labels.get("env"), Some("prod"));
         assert!(!results[0].samples.is_empty());
         assert_eq!(results[1].labels.get("env"), Some("staging"));
+    }
+
+    /// Range results come back sorted by labels, as Prometheus returns them, not in the
+    /// series map's random iteration order.
+    #[test]
+    fn eval_query_range_sorts_series_by_labels() {
+        let querier = MemorySeriesQuerier::new();
+        let mut label_sets: Vec<Vec<(String, String)>> = (0..30)
+            .map(|i| {
+                let mut pairs = vec![
+                    ("__name__".to_string(), format!("m{}", i % 3)),
+                    ("host".to_string(), format!("h{:02}", (i * 7) % 30)),
+                ];
+                if i % 4 == 0 {
+                    pairs.push(("zone".to_string(), "a".to_string()));
+                }
+                pairs
+            })
+            .collect();
+        // A set that is a prefix of another sorts first.
+        label_sets.push(vec![("__name__".to_string(), "m0".to_string())]);
+        for pairs in &label_sets {
+            let pairs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            querier.add_sample(
+                &crate::labels::Labels::from_pairs(&pairs),
+                Sample::new(1000, 1.0),
+            );
+        }
+        let tsdb = PromqlQuerier::with_query_reader(Arc::new(querier));
+
+        let at = UNIX_EPOCH + Duration::from_secs(1);
+        let results = tsdb
+            .eval_query_range(
+                r#"{__name__=~"m.*"}"#,
+                at..=at,
+                Duration::from_secs(60),
+                &QueryOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(results.len(), label_sets.len());
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].labels < pair[1].labels,
+                "{} came before {}",
+                pair[0].labels,
+                pair[1].labels
+            );
+        }
+        assert_eq!(
+            results[0].labels.iter().count(),
+            1,
+            "the shortest m0 set sorts first"
+        );
     }
 
     #[test]

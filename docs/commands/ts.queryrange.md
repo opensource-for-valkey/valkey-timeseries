@@ -116,6 +116,8 @@ rejected with `TSDB: missing HASHTAG argument`.
 ## Return Value
 
 The command returns the result of the PromQL range evaluation as a matrix (list of series with their samples).
+The series are sorted by their labels, as Prometheus sorts a range query's result, so the same query
+returns them in the same order on every node and after a restart.
 
 The query is evaluated on a background worker, so `TS.QUERYRANGE` blocks the calling client until the
 result is ready. It is therefore rejected inside `MULTI`/`EXEC`, inside a script (`EVAL`,
