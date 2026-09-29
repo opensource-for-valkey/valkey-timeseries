@@ -11,8 +11,8 @@ use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::duration_ms;
-use crate::promql::time::step_times;
-use crate::promql::utils::validate_max_points_per_timeseries;
+use crate::promql::time::{grid_step_count, step_times};
+use crate::promql::utils::{check_subquery_cost, validate_max_points_per_timeseries};
 use crate::promql::{Evaluator, ExprResult, QueryResult};
 use orx_parallel::{Par, ParResult};
 use promql_parser::parser::EvalStmt;
@@ -125,6 +125,7 @@ pub fn evaluate_instant(
     opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
     optimize_statement(&mut stmt, &opts)?;
+    check_subquery_cost(&stmt.expr, 1).map_err(QueryError::from)?;
     let deadline = resolve_deadline_ms(opts);
     let evaluator = Evaluator::new(&reader, opts);
 
@@ -211,6 +212,9 @@ pub fn evaluate_range(
     let deadline = resolve_deadline_ms(opts);
 
     let step_ms = duration_ms(step);
+    // Every outer step evaluates each subquery in full.
+    check_subquery_cost(&stmt.expr, grid_step_count(start_ms, end_ms, step_ms))
+        .map_err(QueryError::from)?;
     let lookback_delta_ms = duration_ms(lookback_delta);
     let range_ctx = crate::promql::EvalContext {
         query_start: start_ms,

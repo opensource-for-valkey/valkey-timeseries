@@ -2,8 +2,9 @@
 //! lookup rather than a read. Covers selectors, matrices, subquery unions, and the rollups and
 //! stepped aggregations a source answers over the whole grid.
 
-use super::subquery::{subquery_key, subquery_step_ms};
+use super::subquery::subquery_key;
 use super::*;
+use crate::promql::utils::subquery_step_ms;
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     #[cfg(test)]

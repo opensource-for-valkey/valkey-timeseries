@@ -10,6 +10,8 @@ pub mod label_profile;
 /// In-memory [`QueryReader`] for unit tests and benchmarks.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod memory_series_querier;
+#[cfg(test)]
+mod nested_subquery_tests;
 pub mod promql_config;
 pub mod promql_engine;
 mod querier;

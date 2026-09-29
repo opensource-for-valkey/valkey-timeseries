@@ -216,6 +216,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         ctx: &EvalContext,
         current_time_ms: i64,
     ) -> EvalResult<(i64, Vec<EvalSample>)> {
+        // Once preloaded, stepping a subquery is pure CPU: no reader call or
+        // preload request is left to notice the deadline, and nested subqueries
+        // multiply their steps level by level. Without this check a passed
+        // deadline was only seen after the whole tree had been evaluated.
+        self.check_deadline()?;
+
         let new_ctx = EvalContext {
             query_start: ctx.query_start,
             query_end: ctx.query_end,
@@ -247,20 +253,4 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
 pub(super) fn subquery_key(subquery: &SubqueryExpr, step_ms: i64) -> (usize, i64) {
     (subquery as *const SubqueryExpr as usize, step_ms)
-}
-
-/// The step a subquery runs at, per the PromQL spec: its own `<resolution>`,
-/// else the global evaluation interval — Prometheus' default of one minute.
-///
-/// Never the step of the query it sits in: that would make `m[5m:]` sample
-/// every 15s inside a `step=15s` range query but every minute in an instant
-/// query at the same timestamp, so `count_over_time(m[5m:])` would answer 20
-/// in one and 5 in the other.
-/// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery>
-/// and `DefaultGlobalConfig.EvaluationInterval` in prometheus/config/config.go.
-pub(super) fn subquery_step_ms(subquery: &SubqueryExpr) -> i64 {
-    const DEFAULT_EVALUATION_INTERVAL_MS: i64 = 60_000;
-    subquery
-        .step
-        .map_or(DEFAULT_EVALUATION_INTERVAL_MS, duration_ms)
 }

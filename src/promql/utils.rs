@@ -1,7 +1,7 @@
 use crate::common::Timestamp;
-use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
+use crate::promql::time::{MAX_GRID_STEPS, duration_ms, grid_step_count};
 use crate::promql::{EvalResult, EvaluationError};
-use promql_parser::parser::Expr;
+use promql_parser::parser::{Expr, SubqueryExpr};
 use std::time::Duration;
 #[cfg(test)]
 use std::{
@@ -95,6 +95,92 @@ pub(crate) fn check_subquery_steps(
     Ok(())
 }
 
+/// The step a subquery runs at, per the PromQL spec: its own `<resolution>`,
+/// else the global evaluation interval — Prometheus' default of one minute.
+///
+/// Never the step of the query it sits in: that would make `m[5m:]` sample
+/// every 15s inside a `step=15s` range query but every minute in an instant
+/// query at the same timestamp, so `count_over_time(m[5m:])` would answer 20
+/// in one and 5 in the other.
+/// See: <https://prometheus.io/docs/prometheus/latest/querying/basics/#subquery>
+/// and `DefaultGlobalConfig.EvaluationInterval` in prometheus/config/config.go.
+pub(crate) fn subquery_step_ms(subquery: &SubqueryExpr) -> i64 {
+    const DEFAULT_EVALUATION_INTERVAL_MS: i64 = 60_000;
+    subquery
+        .step
+        .map_or(DEFAULT_EVALUATION_INTERVAL_MS, duration_ms)
+}
+
+/// The most subquery steps one query may evaluate, summed over every subquery
+/// and multiplied through the ones that enclose it and the query's own steps.
+///
+/// [`check_subquery_steps`] bounds each subquery grid alone, but nesting
+/// multiplies them: every step of an outer subquery evaluates the whole inner
+/// one, so `max_over_time((...)[1m:10s])` nested 10 deep is up to 7^10 ≈ 280
+/// million steps. Measured 2026-09-29 (debug build, `vector(1)` leaf) it ran for
+/// 55 s. The subquery step loop now checks the deadline, but a query like that
+/// still holds a query worker and the evaluation pool for the whole
+/// `ts-promql-max-query-duration`; this rejects it before any work. A hundred
+/// million leaves room for real queries: a 1,000-point range query over a 7-day
+/// subquery at a 1-minute step is about 10 million.
+pub(crate) const MAX_SUBQUERY_STEP_EVALUATIONS: u64 = 100 * MAX_GRID_STEPS;
+
+/// Rejects a query whose subqueries would evaluate more than
+/// [`MAX_SUBQUERY_STEP_EVALUATIONS`] steps in total, when the query itself is
+/// evaluated at `outer_steps` points (1 for an instant query).
+///
+/// Counted from the query text alone, before anything is read: a subquery's
+/// range and step are literals, and its grid has at most `range / step + 1`
+/// steps wherever it is aligned.
+pub(crate) fn check_subquery_cost(expr: &Expr, outer_steps: u64) -> EvalResult<()> {
+    let mut total: u64 = 0;
+    let mut pending: Vec<(&Expr, u64)> = vec![(expr, outer_steps.max(1))];
+    while let Some((expr, evaluations)) = pending.pop() {
+        let mut child_evaluations = evaluations;
+        if let Expr::Subquery(subquery) = expr {
+            let (range_ms, step_ms) = (duration_ms(subquery.range), subquery_step_ms(subquery));
+            // A single grid over its own limit gets that error, which names the grid.
+            check_subquery_steps(0, range_ms, step_ms)?;
+            child_evaluations = evaluations.saturating_mul(grid_step_count(0, range_ms, step_ms));
+            total = total.saturating_add(child_evaluations);
+            if total > MAX_SUBQUERY_STEP_EVALUATIONS {
+                return Err(EvaluationError::ArgumentError(format!(
+                    "subqueries would evaluate more than {MAX_SUBQUERY_STEP_EVALUATIONS} steps; \
+                     nested subqueries multiply their steps, so reduce the nesting, \
+                     a subquery's range, or use a coarser subquery step"
+                )));
+            }
+        }
+        for_each_child(expr, |child| pending.push((child, child_evaluations)));
+    }
+    Ok(())
+}
+
+/// Calls `f` with each direct child of `expr`.
+fn for_each_child<'a>(expr: &'a Expr, mut f: impl FnMut(&'a Expr)) {
+    match expr {
+        Expr::Aggregate(agg) => {
+            f(&agg.expr);
+            if let Some(param) = &agg.param {
+                f(param);
+            }
+        }
+        Expr::Unary(unary) => f(&unary.expr),
+        Expr::Binary(binary) => {
+            f(&binary.lhs);
+            f(&binary.rhs);
+        }
+        Expr::Paren(paren) => f(&paren.expr),
+        Expr::Subquery(subquery) => f(&subquery.expr),
+        Expr::Call(call) => call.args.args.iter().for_each(|arg| f(arg)),
+        Expr::Extension(ext) => ext.expr.children().iter().for_each(f),
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::VectorSelector(_)
+        | Expr::MatrixSelector(_) => {}
+    }
+}
+
 /// The deepest expression tree a query may have: the longest chain of nested
 /// nodes, where every operator, function call, aggregation, subquery and
 /// parenthesis counts as one.
@@ -123,30 +209,7 @@ pub(crate) fn check_query_depth(expr: &Expr) -> Result<(), String> {
                 "TSDB: query is nested too deeply; the limit is {MAX_QUERY_DEPTH} levels"
             ));
         }
-        let children = depth + 1;
-        match expr {
-            Expr::Aggregate(agg) => {
-                pending.push((&agg.expr, children));
-                if let Some(param) = &agg.param {
-                    pending.push((param, children));
-                }
-            }
-            Expr::Unary(unary) => pending.push((&unary.expr, children)),
-            Expr::Binary(binary) => {
-                pending.push((&binary.lhs, children));
-                pending.push((&binary.rhs, children));
-            }
-            Expr::Paren(paren) => pending.push((&paren.expr, children)),
-            Expr::Subquery(subquery) => pending.push((&subquery.expr, children)),
-            Expr::Call(call) => pending.extend(call.args.args.iter().map(|arg| (&**arg, children))),
-            Expr::Extension(ext) => {
-                pending.extend(ext.expr.children().iter().map(|c| (c, children)))
-            }
-            Expr::NumberLiteral(_)
-            | Expr::StringLiteral(_)
-            | Expr::VectorSelector(_)
-            | Expr::MatrixSelector(_) => {}
-        }
+        for_each_child(expr, |child| pending.push((child, depth + 1)));
     }
     Ok(())
 }
@@ -313,5 +376,88 @@ mod max_points_tests {
         )
         .expect_err("saturated span still exceeds the limit");
         assert!(matches!(err, EvaluationError::ArgumentError(_)));
+    }
+}
+
+#[cfg(test)]
+mod subquery_cost_tests {
+    use super::*;
+
+    fn cost(query: &str, outer_steps: u64) -> EvalResult<()> {
+        check_subquery_cost(
+            &promql_parser::parser::parse(query).expect("valid query"),
+            outer_steps,
+        )
+    }
+
+    /// `m` wrapped in `depth` subqueries of seven steps each (`[1m:10s]`).
+    fn nested(depth: u32) -> String {
+        (0..depth).fold("m".to_string(), |expr, _| {
+            format!("max_over_time(({expr})[1m:10s])")
+        })
+    }
+
+    #[test]
+    fn nesting_multiplies_the_steps() {
+        // 7^9 ≈ 40 million is under the cap, 7^10 ≈ 282 million over it.
+        assert!(7u64.pow(9) + 7u64.pow(8) < MAX_SUBQUERY_STEP_EVALUATIONS);
+        cost(&nested(9), 1).unwrap();
+        cost(&nested(10), 1).unwrap_err();
+    }
+
+    #[test]
+    fn a_range_query_multiplies_by_its_own_steps() {
+        // Every outer step evaluates the subquery tree in full: 3 × 7^9 ≈ 121 million.
+        cost(&nested(9), 2).unwrap();
+        cost(&nested(9), 3).unwrap_err();
+    }
+
+    #[test]
+    fn sibling_subqueries_add_up() {
+        // A 10-day subquery at 1 s is 864,001 steps: 115 of them fit, 116 do not.
+        let one = "max_over_time(m[10d:1s])";
+        let siblings = |n: usize| vec![one; n].join(" + ");
+        cost(&siblings(115), 1).unwrap();
+        let err = cost(&siblings(116), 1).unwrap_err();
+        assert!(
+            err.to_string().contains("subqueries would evaluate"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn one_oversized_grid_reports_its_own_limit() {
+        let err = cost("max_over_time(m[30d:1s])", 1).unwrap_err();
+        assert!(
+            err.to_string().contains("subquery has too many steps"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_subquery_without_a_resolution_steps_every_minute() {
+        // `[1y:]` is 525,601 one-minute steps: 190 outer steps fit, 191 do not.
+        cost("max_over_time(m[1y:])", 190).unwrap();
+        cost("max_over_time(m[1y:])", 191).unwrap_err();
+    }
+
+    #[test]
+    fn subqueries_are_found_under_every_node_kind() {
+        let deep = nested(10);
+        for query in [
+            format!("sum({deep})"),
+            format!("-{deep}"),
+            format!("1 + {deep}"),
+            format!("({deep})"),
+            format!("abs({deep})"),
+            format!("topk(1, {deep})"),
+        ] {
+            cost(&query, 1).expect_err(&query);
+        }
+    }
+
+    #[test]
+    fn a_query_without_subqueries_costs_nothing() {
+        cost("rate(m[5m]) + sum(m)", MAX_GRID_STEPS).unwrap();
     }
 }
