@@ -27,7 +27,8 @@ use crate::fanout::{
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_instant_eval_samples;
 use crate::promql::engine::fanout::type_conversions::{
-    decode_partial_state, proto_labels_to_eval_labels,
+    aggregation_param_from_wire, aggregation_param_to_wire, decode_peer_partial,
+    decode_pushdown_kind, proto_labels_to_eval_labels, wrong_payload,
 };
 use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::{AggregationParam, AggregationRequest};
@@ -38,7 +39,7 @@ use crate::promql::generated::{
     AggregationQueryResponse, InstantQuery, InstantSample as ProtoInstantSample,
     SeriesSelector as ProtoSeriesSelector,
 };
-use crate::promql::{EvalResult, EvalSample, ExprResult};
+use crate::promql::{EvalResult, EvalSample};
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
@@ -207,12 +208,11 @@ impl AggregationFanoutCommand {
         target: &NodeInfo,
     ) -> FanoutCommandResult {
         for partial in partials {
-            let state = decode_partial_state(partial.state).map_err(|what| {
-                FanoutError::custom(format!(
-                    "TSDB: peer {} sent {what} for a pushed-down {:?} reduction",
-                    target.socket_address, self.aggregation.kind,
-                ))
-            })?;
+            let state = decode_peer_partial(
+                partial.state,
+                target,
+                format_args!("a pushed-down {:?} reduction", self.aggregation.kind),
+            )?;
             let labels = proto_labels_to_eval_labels(partial.labels);
             self.partials.merge(labels, state);
         }
@@ -259,7 +259,7 @@ impl FanoutCommand for AggregationFanoutCommand {
         // An unrecognized operator means the coordinator is newer than this
         // node. Ship the raw instant vector and let it aggregate: correct, at
         // the cost of the transfer the push-down would have saved.
-        let Some((kind, strategy)) = decode_kind(req.kind) else {
+        let Some((kind, strategy)) = decode_pushdown_kind(req.kind) else {
             ctx.log_warning(&format!(
                 "Unsupported aggregation kind {} in pushed-down query; returning the raw instant vector",
                 req.kind
@@ -286,7 +286,9 @@ impl FanoutCommand for AggregationFanoutCommand {
                 })
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
-                let param = request_param(req.scalar_param, req.label_param);
+                let param = aggregation_param_from_wire(req.scalar_param, req.label_param)
+                    .as_ref()
+                    .map(AggregationParam::to_expr_result);
                 let aggregated =
                     apply_aggregation(kind, modifier.as_ref(), param, samples, req.eval_timestamp)
                         .map_err(|e| ValkeyError::String(e.to_string()))?;
@@ -308,11 +310,8 @@ impl FanoutCommand for AggregationFanoutCommand {
             max_points_per_series: self.vector.max_points_per_series,
         };
 
-        let (scalar_param, label_param) = match &self.aggregation.param {
-            Some(AggregationParam::Scalar(value)) => (Some(*value), None),
-            Some(AggregationParam::Label(label)) => (None, Some(label.clone())),
-            None => (None, None),
-        };
+        let (scalar_param, label_param) =
+            aggregation_param_to_wire(self.aggregation.param.as_ref());
 
         AggregationQuery {
             query: Some(query),
@@ -343,23 +342,25 @@ impl FanoutCommand for AggregationFanoutCommand {
                 // only. Aggregating stray samples as if they were reduced
                 // values would silently double-count.
                 if !samples.is_empty() {
-                    return Err(FanoutError::custom(format!(
-                        "TSDB: peer {} returned {} samples for a pushed-down {:?} reduction, which ships partial states",
-                        target.socket_address,
+                    return Err(wrong_payload(
+                        target,
                         samples.len(),
-                        self.aggregation.kind,
-                    )));
+                        "samples",
+                        format_args!("a pushed-down {:?} reduction", self.aggregation.kind),
+                        "partial states",
+                    ));
                 }
                 self.accumulate_partials(resp.partials, target)?;
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 if !resp.partials.is_empty() {
-                    return Err(FanoutError::custom(format!(
-                        "TSDB: peer {} returned {} partial states for a pushed-down {:?}, which ships samples",
-                        target.socket_address,
+                    return Err(wrong_payload(
+                        target,
                         resp.partials.len(),
-                        self.aggregation.kind,
-                    )));
+                        "partial states",
+                        format_args!("a pushed-down {:?}", self.aggregation.kind),
+                        "samples",
+                    ));
                 }
                 self.samples.extend(samples);
             }
@@ -390,24 +391,6 @@ fn samples_response(samples: Vec<EvalSample>, applied: bool) -> AggregationQuery
         samples,
         applied,
         labels: Some(labels),
-    }
-}
-
-/// Decode the operator and how to apply it, rejecting a value this node does not
-/// know (proto3 decodes an unknown enum to its raw `i32`, which must not be
-/// silently taken for the zero variant), the unset zero variant itself, and one
-/// that is known but never pushed down. All three mean this node cannot honor
-/// the request.
-fn decode_kind(kind: i32) -> Option<(AggregationKind, PushdownStrategy)> {
-    let kind = AggregationKind::try_from(ProtoAggregationKind::try_from(kind).ok()?).ok()?;
-    Some((kind, kind.pushdown_strategy()?))
-}
-
-fn request_param(scalar: Option<f64>, label: Option<String>) -> Option<ExprResult> {
-    match (scalar, label) {
-        (Some(value), _) => Some(ExprResult::Scalar(value)),
-        (None, Some(label)) => Some(ExprResult::String(label)),
-        (None, None) => None,
     }
 }
 
@@ -702,22 +685,22 @@ mod tests {
     /// Only the decomposable operators are pushed down, and an operator this
     /// node does not know is never mistaken for a real one.
     #[test]
-    fn test_decode_kind() {
+    fn test_decode_pushdown_kind() {
         assert_eq!(
-            decode_kind(ProtoAggregationKind::Sum as i32),
+            decode_pushdown_kind(ProtoAggregationKind::Sum as i32),
             Some((AggregationKind::Sum, PushdownStrategy::Reduce))
         );
         assert_eq!(
-            decode_kind(ProtoAggregationKind::LimitRatio as i32),
+            decode_pushdown_kind(ProtoAggregationKind::LimitRatio as i32),
             Some((AggregationKind::LimitRatio, PushdownStrategy::Select))
         );
         // Zero is `AGGREGATION_KIND_UNSPECIFIED` — what a peer sends when it
         // omits the field — not an operator. Reading it as one would silently
         // apply whichever operator happened to be listed first.
-        assert_eq!(decode_kind(0), None);
+        assert_eq!(decode_pushdown_kind(0), None);
         // Beyond the enum: a newer coordinator's operator.
-        assert_eq!(decode_kind(99), None);
-        assert_eq!(decode_kind(-1), None);
+        assert_eq!(decode_pushdown_kind(99), None);
+        assert_eq!(decode_pushdown_kind(-1), None);
     }
 
     /// A response that carries the wrong payload shape for the request's

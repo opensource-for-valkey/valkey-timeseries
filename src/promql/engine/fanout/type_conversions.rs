@@ -1,12 +1,14 @@
 use crate::commands::fanout_codec::chunks::{deserialize_chunk, serialize_chunk};
 use crate::common::constants::METRIC_NAME_LABEL;
+use crate::fanout::{FanoutError, NodeInfo};
 use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
 };
 use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, literal_alternatives};
 use crate::parser::parse_error::ParseError;
-use crate::promql::exec::aggregations::AggregationKind;
+use crate::promql::engine::query_reader::AggregationParam;
+use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::AggregationPartial;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::generated::{
@@ -466,6 +468,75 @@ pub(in crate::promql) fn decode_partial_state(
         None => Err("a partial with no state"),
         Some(state) if state.count == 0 => Err("a partial that counts no samples"),
         Some(state) => Ok(state.into()),
+    }
+}
+
+/// [`decode_partial_state`] for a peer's response: the reason names the peer
+/// and the query it was answering.
+pub(in crate::promql) fn decode_peer_partial(
+    state: Option<ProtoAggregationPartialState>,
+    target: &NodeInfo,
+    query: impl std::fmt::Display,
+) -> Result<AggregationPartial, FanoutError> {
+    decode_partial_state(state).map_err(|what| {
+        FanoutError::custom(format!(
+            "TSDB: peer {} sent {what} for {query}",
+            target.socket_address
+        ))
+    })
+}
+
+/// A peer answered a push-down in the wrong form: `count` items of `payload`
+/// for `query`, which is answered in `expected`. A corrupt-peer defense: stray
+/// samples folded in as reduced values double-count, and stray partials group
+/// a query that asked for series.
+#[cold]
+pub(in crate::promql) fn wrong_payload(
+    target: &NodeInfo,
+    count: usize,
+    payload: &str,
+    query: impl std::fmt::Display,
+    expected: &str,
+) -> FanoutError {
+    FanoutError::custom(format!(
+        "TSDB: peer {} returned {count} {payload} for {query}, which ships {expected}",
+        target.socket_address
+    ))
+}
+
+/// Decode an aggregation operator a peer asks this node to push down, and how
+/// to apply it. `None` for a value this node does not know (proto3 decodes an
+/// unknown enum to its raw `i32`, which must not be silently taken for the
+/// zero variant), for the unset zero variant itself, and for one that is known
+/// but never pushed down: all three mean this node cannot honor the request.
+pub(in crate::promql) fn decode_pushdown_kind(
+    kind: i32,
+) -> Option<(AggregationKind, PushdownStrategy)> {
+    let kind = AggregationKind::try_from(ProtoAggregationKind::try_from(kind).ok()?).ok()?;
+    Some((kind, kind.pushdown_strategy()?))
+}
+
+/// An aggregation parameter as the request's two optional fields.
+pub(in crate::promql) fn aggregation_param_to_wire(
+    param: Option<&AggregationParam>,
+) -> (Option<f64>, Option<String>) {
+    match param {
+        Some(AggregationParam::Scalar(value)) => (Some(*value), None),
+        Some(AggregationParam::Label(label)) => (None, Some(label.clone())),
+        None => (None, None),
+    }
+}
+
+/// The inverse of [`aggregation_param_to_wire`]. A scalar wins if a peer sets
+/// both.
+pub(in crate::promql) fn aggregation_param_from_wire(
+    scalar: Option<f64>,
+    label: Option<String>,
+) -> Option<AggregationParam> {
+    match (scalar, label) {
+        (Some(value), _) => Some(AggregationParam::Scalar(value)),
+        (None, Some(label)) => Some(AggregationParam::Label(label)),
+        (None, None) => None,
     }
 }
 
