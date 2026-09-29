@@ -1137,6 +1137,51 @@ mod tests {
         assert!(value.is_nan());
     }
 
+    fn scalar_from(result: EvalResult<ExprResult>) -> f64 {
+        let ExprResult::Scalar(value) = result.unwrap() else {
+            panic!("expected Scalar result")
+        };
+        value
+    }
+
+    #[test]
+    fn end_returns_query_end_not_step_time_on_both_paths() {
+        // A step in the middle of a range query: the step time differs from the query end.
+        let ctx = EvalContext {
+            query_start: 10_000,
+            query_end: 50_000,
+            evaluation_ts: 30_000,
+            step_ms: 10_000,
+            lookback_delta_ms: 300_000,
+        };
+        let func = resolve_function("end").unwrap();
+
+        let via_apply = scalar_from(func.apply(PromQLArg::Scalar(0.0), &ctx));
+        let via_apply_args = scalar_from(func.apply_args(vec![], &ctx));
+
+        assert_eq!(via_apply, 50.0);
+        assert_eq!(via_apply_args, 50.0);
+    }
+
+    #[test]
+    fn range_saturates_instead_of_overflowing() {
+        // Unreachable while pre-1970 times clamp to 0, but a negative start must not wrap.
+        let ctx = EvalContext {
+            query_start: -1,
+            query_end: i64::MAX,
+            evaluation_ts: i64::MAX,
+            step_ms: 1_000,
+            lookback_delta_ms: 300_000,
+        };
+        let func = resolve_function("range").unwrap();
+
+        let via_apply = scalar_from(func.apply(PromQLArg::Scalar(0.0), &ctx));
+        let via_apply_args = scalar_from(func.apply_args(vec![], &ctx));
+
+        assert_eq!(via_apply, i64::MAX as f64 / 1000.0);
+        assert_eq!(via_apply_args, i64::MAX as f64 / 1000.0);
+    }
+
     #[test]
     fn should_apply_timestamp_function() {
         let samples = vec![EvalSample {

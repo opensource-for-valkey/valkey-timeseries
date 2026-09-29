@@ -92,7 +92,8 @@ impl PromQLFunction for VectorFunction {
     }
 }
 
-/// Scalar function: returns the maximum of the input values
+/// Start function: returns the start timestamp of the query as the number of seconds since
+/// January 1, 1970 UTC.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct StartFunction;
 
@@ -106,18 +107,25 @@ impl PromQLFunction for StartFunction {
     }
 }
 
-/// End function: returns the end timestamp of the current query range evaluation as the number of seconds
-/// since January 1, 1970 UTC. For instant queries, this is equal to the evaluation timestamp.
+/// End function: returns the end timestamp of the query as the number of seconds since
+/// January 1, 1970 UTC. It is fixed for the whole query, not the current step, so it equals the
+/// evaluation timestamp only for instant queries.
 #[derive(Copy, Clone)]
 pub(in crate::promql) struct EndFunction;
 
+impl EndFunction {
+    fn end_seconds(ctx: &EvalContext) -> f64 {
+        ctx.query_end as f64 / 1000.0
+    }
+}
+
 impl PromQLFunction for EndFunction {
     fn apply(&self, _arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Ok(ExprResult::Scalar(ctx.evaluation_ts as f64 / 1000.0))
+        Ok(ExprResult::Scalar(Self::end_seconds(ctx)))
     }
 
-    fn apply_args(&self, mut _args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Ok(ExprResult::Scalar(ctx.query_end as f64 / 1000.0))
+    fn apply_args(&self, _args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Ok(ExprResult::Scalar(Self::end_seconds(ctx)))
     }
 }
 
@@ -127,12 +135,7 @@ pub(in crate::promql) struct RangeFunction;
 
 impl RangeFunction {
     fn range_seconds(ctx: &EvalContext) -> f64 {
-        let range = (ctx.query_end - ctx.query_start).max(0);
-        if range > 0 {
-            (range as f64) / 1000.0
-        } else {
-            0.0
-        }
+        ctx.query_end.saturating_sub(ctx.query_start).max(0) as f64 / 1000.0
     }
 }
 impl PromQLFunction for RangeFunction {
