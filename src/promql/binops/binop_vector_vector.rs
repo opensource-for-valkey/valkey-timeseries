@@ -1,5 +1,5 @@
 use super::labels::get_metric_signature;
-use crate::common::threads::{IntoParRayon, IterIntoParRayon};
+use crate::common::threads::IterIntoParRayon;
 use crate::labels::{SeriesFingerprint, create_unseeded_hasher, hash_key_value};
 use crate::promql::binops::binary_op_fn;
 use crate::promql::exec::types::EvalLabels;
@@ -10,8 +10,6 @@ use orx_parallel::Par;
 use promql_parser::label::METRIC_NAME;
 use promql_parser::parser::token::{T_LAND, T_LOR, T_LUNLESS, TokenType};
 use promql_parser::parser::{BinaryExpr, LabelModifier, VectorMatchCardinality};
-use std::iter::Peekable;
-use std::vec::IntoIter;
 
 /// Operand size at which computing match keys is worth spreading across
 /// threads — the one remaining fan-out in this module.
@@ -316,8 +314,8 @@ fn label_set_string(labels: &EvalLabels, drop_name: bool) -> String {
 /// The scalar outcome of one matched pair: the value to emit and whether the
 /// result still owes a `__name__` drop, or `None` when the pair drops out.
 ///
-/// The single home of the rule both joins share, so the hash-join fast path and
-/// the general merge join cannot drift apart on it:
+/// The single home of the rule both joins share, so the no-modifier fast path
+/// and the general join cannot drift apart on it:
 ///
 /// - A non-`bool` comparison is a *filter*, not a rewrite. A false result —
 ///   exactly `0.0`, which is what the comparison operators return — removes the
@@ -386,7 +384,7 @@ fn observes_metric_name(ctx: &ArithOpContext<'_>) -> bool {
 /// Sentinel stored in the probe map for an RHS match key seen more than once.
 /// Only an error once an LHS sample actually matches the key; a repeated key
 /// that matches nothing produces nothing and is legal. (Prometheus rejects it
-/// while indexing the right-hand side; see [`validate_one_side`] for why this
+/// while indexing the right-hand side; see [`eval_arith_ops_hash_join`] for why this
 /// engine does not.)
 const NO_MATCH: u32 = u32::MAX;
 /// Sentinel stored in the probe map for an RHS match key already paired with
@@ -395,12 +393,12 @@ const CONSUMED: u32 = u32::MAX - 1;
 
 /// The no-modifier case: a hash join, emitting one result per matched key.
 ///
-/// The general path ([`eval_arith_ops_merge_join`]) has to gather each key's
-/// group on both sides, because a group may be many-to-one and an unmatched
-/// group may need a fill. Here a key has at most one partner on each side and
-/// an unmatched key produces nothing, so no group is ever materialized: the
-/// RHS is indexed in a hash map keyed by match key, then the LHS is probed
-/// against it in a single pass, emitting as it goes.
+/// The general join ([`eval_arith_ops_hash_join`]) is a hash join too, but
+/// carries what a modifier can ask for: many-to-one groups, fills on either
+/// side, and a result-wide duplicate check. Here a key has at most one partner
+/// on each side and an unmatched key produces nothing: the RHS is indexed by
+/// match key, then the LHS is probed against it in a single pass, emitting as
+/// it goes, and each LHS label set is moved into its result rather than cloned.
 ///
 /// Two sentinels ride in the map value, which otherwise holds an index into
 /// `right_vector`, so the join needs no auxiliary duplicate-key set.
@@ -491,12 +489,8 @@ fn eval_arith_ops_fast_path(
 }
 
 /// Match keys for a whole operand, spread across threads above
-/// [`PARALLEL_MATCH_KEY_THRESHOLD`] exactly as [`collect_fingerprints`] does.
-///
-/// Kept separate from `collect_fingerprints` because the hash join needs the
-/// samples to stay in place: it maps over a borrow and returns keys alone,
-/// where the merge join consumes its operand into `(key, sample)` pairs so it
-/// can sort them.
+/// [`PARALLEL_MATCH_KEY_THRESHOLD`]. The operand stays in place: both joins
+/// map over a borrow and keep the keys alongside.
 fn collect_match_keys(
     samples: &[EvalSample],
     matching: Option<&LabelModifier>,
@@ -612,80 +606,109 @@ fn eval_arith_ops(
         (right_vector, left_vector)
     };
 
-    let result = eval_arith_ops_merge_join(&ctx, one_vec, many_vec)?;
+    let result = eval_arith_ops_hash_join(&ctx, one_vec, many_vec)?;
     Ok(ExprResult::InstantVector(result))
+}
+
+/// Where a "one"-side match key sits in the operand: one position, or the first
+/// two of a key that repeats (kept so the error can name both series).
+#[derive(Clone, Copy)]
+enum OneSlot {
+    Unique(u32),
+    Repeated(u32, u32),
 }
 
 /// The general case: every modifier combination the fast path declines.
 ///
-/// Both sides become sorted `(match key, sample)` vectors and are zip-merged.
-/// Because both are ordered by key, an unmatched key on either side falls out
-/// of the merge as a run with no partner and is handled inline through the
-/// fill modifiers; there is no separate "unmatched" pass. A matched key's
-/// group is gathered on each side so its cardinality can be checked before
-/// the combinations are emitted.
-fn eval_arith_ops_merge_join(
+/// A hash join. The "one" side is indexed by match key; the "many" side is
+/// probed in input order, emitting as it goes (or filling a missing "one"
+/// operand); a last sweep fills a missing "many" operand for every "one"
+/// series nothing matched. It replaced a merge join that sorted both operands
+/// by key and gathered each key's group into a `Vec`.
+///
+/// Cardinality is a property of the match-key grouping, never of the operator
+/// or of a comparison's outcome (a false comparison still errors):
+///
+/// - Under `group_left` / `group_right` the "one" side must be unique per
+///   match key, matched or not, because the grouping is what keeps the output
+///   series identity unique.
+/// - Under one-to-one a repeated "one" key is an error only once something
+///   matches it, and a repeated "many" key only once it matches. An unmatched
+///   repeat emits nothing, so it is harmless.
+///
+///   Prometheus is stricter: it rejects any repeat on the one side while
+///   indexing it, matched or not. Here filter push-down reads each operand
+///   narrowed by the other's labels, so an unmatched repeat is often never
+///   read at all; erroring on it would make a query fail or succeed depending
+///   on the data and the push-down settings. Tolerating it keeps the result
+///   the same either way. A *filled* unmatched repeat does emit, once per
+///   series; the result-wide duplicate check rejects it only if those series
+///   collide.
+fn eval_arith_ops_hash_join(
     ctx: &ArithOpContext<'_>,
     one_vec: Vec<EvalSample>,
     many_vec: Vec<EvalSample>,
 ) -> EvalResult<Vec<EvalSample>> {
+    let one_keys = collect_match_keys(&one_vec, ctx.matching);
+    let mut index: FingerprintHashMap<OneSlot> =
+        FingerprintHashMap::with_capacity_and_hasher(one_vec.len(), Default::default());
+    for (i, &key) in one_keys.iter().enumerate() {
+        let i = u32::try_from(i).expect("operand has more than u32::MAX series");
+        index
+            .entry(key)
+            .and_modify(|slot| {
+                if let OneSlot::Unique(first) = *slot {
+                    *slot = OneSlot::Repeated(first, i);
+                }
+            })
+            .or_insert(OneSlot::Unique(i));
+    }
+    let repeated_error =
+        |a: u32, b: u32| one_side_duplicate_error(ctx, &one_vec[a as usize], &one_vec[b as usize]);
+
+    // Under grouping the "one" side must be unique per key, matched or not.
+    if !ctx.is_one_to_one
+        && let Some(&OneSlot::Repeated(a, b)) = index
+            .values()
+            .find(|slot| matches!(slot, OneSlot::Repeated(..)))
+    {
+        return Err(repeated_error(a, b));
+    }
+
+    let many_keys = collect_match_keys(&many_vec, ctx.matching);
+    let mut matched = vec![false; one_vec.len()];
     let mut result = Vec::with_capacity(many_vec.len());
-
-    let mut many_it = collect_fingerprints(ctx, many_vec).into_iter().peekable();
-    let mut one_it = collect_fingerprints(ctx, one_vec).into_iter().peekable();
-
-    loop {
-        match (
-            many_it.peek().map(|(k, _)| *k),
-            one_it.peek().map(|(k, _)| *k),
-        ) {
-            (None, None) => break,
-            // Only "many" entries remain — all unmatched.
-            (Some(many_key), None) => {
-                handle_unmatched_many(ctx, &mut many_it, many_key, &mut result);
-            }
-            // Only "one" entries remain — all unmatched.
-            (None, Some(one_key)) => {
-                handle_unmatched_one(ctx, &mut one_it, one_key, &mut result)?;
-            }
-            (Some(many_key), Some(one_key)) => {
-                if many_key < one_key {
-                    // "many" key has no "one" partner — unmatched.
-                    handle_unmatched_many(ctx, &mut many_it, many_key, &mut result);
-                } else if many_key > one_key {
-                    // "one" key has no "many" partner — unmatched.
-                    handle_unmatched_one(ctx, &mut one_it, one_key, &mut result)?;
-                } else {
-                    // Matched key on both sides.
-                    // Collect groups so we can safely inspect cardinality and then
-                    // iterate over all combinations.
-                    let one_samples: Vec<_> = take_group(&mut one_it, one_key).collect();
-                    let many_samples = take_group(&mut many_it, many_key);
-
-                    // Cardinality is a property of the match-key grouping, not
-                    // of the operator, and not of any individual comparison's
-                    // truth value: a comparison that would come out false must
-                    // still error on an ambiguous match, exactly like an
-                    // arithmetic operator would. See [`validate_one_side`] for
-                    // when the "one" side has to be unique.
-                    validate_one_side(ctx, &one_samples, true)?;
-                    if ctx.is_one_to_one {
-                        let mut iter = many_samples.into_iter();
-                        let sample = iter.next().unwrap();
-                        if iter.next().is_some() {
-                            return Err(many_side_duplicate_error());
-                        }
-                        result.extend(handle_match(ctx, &sample, &one_samples));
-                        continue;
-                    }
-
-                    // `one_samples` holds exactly one element: the check
-                    // above returns an error for any longer group.
-                    for many_sample in many_samples {
-                        result.extend(handle_match(ctx, &many_sample, &one_samples));
-                    }
+    for (many_sample, key) in many_vec.iter().zip(&many_keys) {
+        match index.get(key) {
+            None => {
+                if let Some(fill_val) = ctx.fill_for_one {
+                    let fill_one = make_fill_one_sample(many_sample, fill_val);
+                    result.extend(build_result_sample(ctx, many_sample, &fill_one));
                 }
             }
+            Some(&OneSlot::Repeated(a, b)) => return Err(repeated_error(a, b)),
+            Some(&OneSlot::Unique(i)) => {
+                let i = i as usize;
+                if ctx.is_one_to_one && matched[i] {
+                    return Err(many_side_duplicate_error());
+                }
+                matched[i] = true;
+                result.extend(build_result_sample(ctx, many_sample, &one_vec[i]));
+            }
+        }
+    }
+
+    // A "one" series nothing matched: filled if the missing "many" operand has
+    // a fill value. A repeated key lands here only under one-to-one, once per
+    // series; the check below rejects the fills if they collide.
+    if let Some(fill_val) = ctx.fill_for_many {
+        for (one_sample, _) in one_vec
+            .iter()
+            .zip(&matched)
+            .filter(|(_, matched)| !**matched)
+        {
+            let fill_many = make_fill_many_sample(ctx.matching, one_sample, fill_val);
+            result.extend(build_result_sample(ctx, &fill_many, one_sample));
         }
     }
 
@@ -694,7 +717,7 @@ fn eval_arith_ops_merge_join(
     //
     // One-to-one matching produces unique label sets by construction, except
     // through a fill: an unmatched match key repeated on either side (which is
-    // tolerated when it emits nothing, see `validate_one_side`) is filled once
+    // tolerated when it emits nothing, see above) is filled once
     // per series, and the `on`/`ignoring` projection can reduce those to one
     // label set. Only a collision is an error: filled series that stay distinct
     // (a comparison keeps `__name__`) are fine.
@@ -715,180 +738,6 @@ fn eval_arith_ops_merge_join(
     }
 
     Ok(result)
-}
-
-/// Every combination of one "many" sample with the "one" group it matched.
-#[inline]
-fn handle_match<'a>(
-    ctx: &'a ArithOpContext<'_>,
-    many_sample: &'a EvalSample,
-    one_samples: &'a [EvalSample],
-) -> impl Iterator<Item = EvalSample> + 'a {
-    one_samples
-        .iter()
-        .filter_map(move |one_sample| build_result_sample(ctx, many_sample, one_sample))
-}
-
-/// A "many"-side run with no "one" partner: filled if the missing side has a
-/// fill value, otherwise skipped.
-#[inline]
-fn handle_unmatched_many(
-    ctx: &ArithOpContext<'_>,
-    many_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-    many_key: SeriesFingerprint,
-    result: &mut Vec<EvalSample>,
-) {
-    if let Some(fill_val) = ctx.fill_for_one {
-        let many_samples = take_group(many_it, many_key);
-        emit_fill_for_one(ctx, many_samples, fill_val, result);
-    } else {
-        skip_group(many_it, many_key);
-    }
-}
-
-/// A "one"-side run with no "many" partner: filled if the missing side has a
-/// fill value, otherwise skipped — but its cardinality is still checked.
-#[inline]
-fn handle_unmatched_one(
-    ctx: &ArithOpContext<'_>,
-    one_it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-    one_key: SeriesFingerprint,
-    result: &mut Vec<EvalSample>,
-) -> EvalResult<()> {
-    if let Some(fill_val) = ctx.fill_for_many {
-        // Collected rather than streamed because the group has to be validated
-        // before anything is emitted, and the fill path needs the samples
-        // anyway.
-        let one_samples: Vec<EvalSample> = take_group(one_it, one_key).collect();
-        validate_one_side(ctx, &one_samples, false)?;
-        emit_fill_for_many(ctx, one_samples, fill_val, result);
-    } else if ctx.is_one_to_one {
-        // An unmatched repeat emits nothing under one-to-one: tolerated.
-        skip_group(one_it, one_key);
-    } else {
-        let one_samples: Vec<EvalSample> = take_group(one_it, one_key).collect();
-        validate_one_side(ctx, &one_samples, false)?;
-    }
-    Ok(())
-}
-
-#[inline]
-fn take_group(
-    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-    key: SeriesFingerprint,
-) -> impl Iterator<Item = EvalSample> + '_ {
-    std::iter::from_fn(move || it.next_if(|(next_key, _)| *next_key == key).map(|(_, s)| s))
-}
-
-#[inline]
-fn skip_group(
-    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-    key: SeriesFingerprint,
-) {
-    while it.next_if(|(next_key, _)| *next_key == key).is_some() {}
-}
-
-/// The one place that decides whether a repeated "one"-side match key is an
-/// error.
-///
-/// The rule is a property of the match-key grouping, not of the operator and
-/// not of any comparison's truth value:
-///
-/// - Under `group_left` / `group_right` the "one" side must be unique per
-///   match key as soon as it is looked at, matched or not, because the grouping
-///   is what keeps the output series identity unique.
-/// - Under one-to-one an *unmatched* key emits nothing, so a repeat there is
-///   harmless; only a matched key is ambiguous. That is the `matched` flag.
-///
-///   Prometheus is stricter: it rejects any repeat on the one side while
-///   indexing it, matched or not. Here filter push-down reads each operand
-///   narrowed by the other's labels, so an unmatched repeat is often never
-///   read at all; erroring on it would make a query fail or succeed depending
-///   on the data and the push-down settings. Tolerating it keeps the result
-///   the same either way.
-///
-/// The three call sites (a matched key, an unmatched key with a fill, an
-/// unmatched key without one) differ in when they run, not in the rule, so they
-/// ask here rather than each spelling it out. A filled unmatched repeat does
-/// emit, once per series; the result-wide duplicate check after the join
-/// rejects it only if those series collide.
-#[inline]
-fn validate_one_side(ctx: &ArithOpContext, group: &[EvalSample], matched: bool) -> EvalResult<()> {
-    if let [a, b, ..] = group
-        && (matched || !ctx.is_one_to_one)
-    {
-        return Err(one_side_duplicate_error(ctx, a, b));
-    }
-    Ok(())
-}
-
-/// Emit results for "many" samples whose match key had no "one" partner.
-/// Uses `fill_for_one` to synthesize the missing "one" operand; a no-op when
-/// no left/right fill is configured for the missing side.
-#[inline]
-fn emit_fill_for_one(
-    ctx: &ArithOpContext,
-    many_samples: impl IntoIterator<Item = EvalSample>,
-    fill_val: f64,
-    result: &mut Vec<EvalSample>,
-) {
-    for many_sample in many_samples {
-        let fill_one = make_fill_one_sample(&many_sample, fill_val);
-        if let Some(sample) = build_result_sample(ctx, &many_sample, &fill_one) {
-            result.push(sample);
-        }
-    }
-}
-
-/// Emit results for "one" samples whose match key had no "many" partner.
-/// Synthesizes a phantom "many" sample, labelled with the match group's labels
-/// (see [`make_fill_many_sample`]), filled with `fill_val`.
-///
-/// Validating the group is the caller's job — it runs [`validate_one_side`]
-/// first — so this only emits.
-#[inline]
-fn emit_fill_for_many(
-    ctx: &ArithOpContext,
-    one_samples: impl IntoIterator<Item = EvalSample>,
-    fill_val: f64,
-    result: &mut Vec<EvalSample>,
-) {
-    for one_sample in one_samples {
-        let fill_many = make_fill_many_sample(ctx.matching, &one_sample, fill_val);
-        if let Some(sample) = build_result_sample(ctx, &fill_many, &one_sample) {
-            result.push(sample);
-        }
-    }
-}
-
-fn collect_fingerprints(
-    ctx: &ArithOpContext,
-    samples: Vec<EvalSample>,
-) -> Vec<(SeriesFingerprint, EvalSample)> {
-    // Only a genuinely large operand, where the per-sample hashing dominates
-    // the fan-out, goes wide. See [`PARALLEL_MATCH_KEY_THRESHOLD`].
-    let mut kvs: Vec<(SeriesFingerprint, EvalSample)> =
-        if samples.len() >= PARALLEL_MATCH_KEY_THRESHOLD {
-            samples
-                .into_par_rayon()
-                .map(|s| {
-                    let key = compute_binary_match_key(&s.labels, ctx.matching);
-                    (key, s)
-                })
-                .collect()
-        } else {
-            samples
-                .into_iter()
-                .map(|s| {
-                    let key = compute_binary_match_key(&s.labels, ctx.matching);
-                    (key, s)
-                })
-                .collect()
-        };
-
-    kvs.sort_unstable_by_key(|(key, _sample)| *key);
-
-    kvs
 }
 
 /// Compute a match signature for a sample's labels per Prometheus binary op semantics.
@@ -1120,7 +969,7 @@ mod bench_support {
         /// probe-miss path, which the aligned shape never reaches.
         HalfOverlap,
         /// Half overlap under `fill_left`/`fill_right`, which forces the
-        /// general merge-join and makes both fill branches emit.
+        /// general join and makes both fill branches emit.
         HalfOverlapWithFill,
     }
 
@@ -1258,6 +1107,82 @@ mod bench_support {
         }
     }
 
+    /// `a + on(l) b` against `a + on(l) group_right b` over the same operands:
+    /// `n` series a side, one partner each, so both produce `n` results. Either
+    /// interned labels (a local selector's output) or `Shared` ones (what a
+    /// cluster range read decodes into).
+    pub struct OnMatchCase {
+        expr: BinaryExpr,
+        n: usize,
+        interned: bool,
+    }
+
+    impl OnMatchCase {
+        pub fn new(group_right: bool, interned: bool, n: usize) -> Self {
+            use promql_parser::label::Labels as ModifierLabels;
+            use promql_parser::parser::{LabelModifier, VectorMatchCardinality};
+            let mut modifier = BinModifier::default()
+                .with_matching(Some(LabelModifier::Include(ModifierLabels::new(vec!["l"]))));
+            if group_right {
+                modifier = modifier.with_card(VectorMatchCardinality::OneToMany(
+                    ModifierLabels::new(Vec::<&str>::new()),
+                ));
+            }
+            Self {
+                expr: BinaryExpr {
+                    op: TokenType::new(T_ADD),
+                    lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                    rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                    modifier: Some(modifier),
+                },
+                n,
+                interned,
+            }
+        }
+
+        pub fn input(&self) -> (Vec<EvalSample>, Vec<EvalSample>) {
+            use crate::labels::MetricName;
+            let make = |pairs: &[(&str, &str)], value: f64| EvalSample {
+                timestamp_ms: 1,
+                value,
+                labels: if self.interned {
+                    EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied()))
+                } else {
+                    let mut raw: Vec<Label> =
+                        pairs.iter().map(|(n, v)| Label::new(*n, *v)).collect();
+                    raw.sort();
+                    EvalLabels::shared(raw)
+                },
+                drop_name: false,
+            };
+            let side = |name: &str| -> Vec<EvalSample> {
+                (0..self.n)
+                    .map(|i| {
+                        let (l, inst) = (i.to_string(), format!("10.0.0.{}:9100", i % 50));
+                        make(
+                            &[
+                                ("__name__", name),
+                                ("instance", &inst),
+                                ("job", "api"),
+                                ("l", &l),
+                            ],
+                            i as f64,
+                        )
+                    })
+                    .collect()
+            };
+            (side("a"), side("b"))
+        }
+
+        pub fn run(&self, (left, right): (Vec<EvalSample>, Vec<EvalSample>)) -> Vec<EvalSample> {
+            match eval_binop_vector_vector(&self.expr, left, right) {
+                Ok(ExprResult::InstantVector(v)) => v,
+                Ok(_) => unreachable!("vector-vector always yields an instant vector"),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
     /// `n` series shaped like selector output: `__name__` plus a unique `id`
     /// and two shared labels, held as a sole-owner `Shared` Arc.
     fn series(n: usize, id_offset: usize) -> Vec<EvalSample> {
@@ -1305,7 +1230,7 @@ mod bench_support {
 }
 
 #[cfg(feature = "bench")]
-pub use bench_support::{GroupLeftCase, VectorVectorCase, VectorVectorShape};
+pub use bench_support::{GroupLeftCase, OnMatchCase, VectorVectorCase, VectorVectorShape};
 
 #[cfg(test)]
 mod tests {
@@ -1467,7 +1392,7 @@ mod tests {
     }
 
     /// Two right-hand series share `job="x"` and nothing on the left matches it. Without a
-    /// fill the repeat is tolerated (it emits nothing; see `validate_one_side`). With
+    /// fill the repeat is tolerated (it emits nothing; see `eval_arith_ops_hash_join`). With
     /// `fill_left` both were emitted, and `on(job)` reduces both to `{job="x"}`: two series
     /// with one label set, which `sum(...)` would silently double-count.
     #[test]

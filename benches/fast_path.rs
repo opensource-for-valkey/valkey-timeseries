@@ -8,7 +8,8 @@ use criterion::BatchSize;
 #[cfg(feature = "bench")]
 // These items are provided by the crate under the `bench` feature.
 use valkey_timeseries::promql::binops::{
-    BenchOp, GroupLeftCase, LabelMode, VectorScalarCase, VectorVectorCase, VectorVectorShape,
+    BenchOp, GroupLeftCase, LabelMode, OnMatchCase, VectorScalarCase, VectorVectorCase,
+    VectorVectorShape,
 };
 
 /// Vector-vector `a + b` by input shape. Operand construction sits in
@@ -58,6 +59,31 @@ fn bench_group_left_extra_label(c: &mut Criterion) {
                 BatchSize::LargeInput,
             )
         });
+    }
+    group.finish();
+}
+/// `a + on(l) b` against `a + on(l) group_right b`: same operands, same result count,
+/// with interned labels and with `Shared` ones.
+#[cfg(feature = "bench")]
+fn bench_on_match(c: &mut Criterion) {
+    let mut group = c.benchmark_group("on_match");
+    for &size in &[1_000usize, 10_000usize] {
+        for (labels, interned) in [("interned", true), ("shared", false)] {
+            for (shape, group_right) in [("one_to_one", false), ("group_right", true)] {
+                let case = OnMatchCase::new(group_right, interned, size);
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{shape}/{labels}"), size),
+                    &size,
+                    |b, _| {
+                        b.iter_batched(
+                            || case.input(),
+                            |input| case.run(input),
+                            BatchSize::LargeInput,
+                        )
+                    },
+                );
+            }
+        }
     }
     group.finish();
 }
@@ -366,7 +392,8 @@ criterion_group!(
     bench_vector_scalar_labels,
     bench_labels_conversion,
     bench_evallabels_ops,
-    bench_group_left_extra_label
+    bench_group_left_extra_label,
+    bench_on_match
 );
 #[cfg(feature = "bench")]
 criterion_main!(benches);
