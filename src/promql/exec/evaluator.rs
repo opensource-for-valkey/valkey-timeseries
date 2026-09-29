@@ -2,6 +2,7 @@ use super::aggregations::{
     AggregationKind, PushdownStrategy, apply_aggregation, check_aggregation_param, eval_aggregation,
 };
 use crate::common::Timestamp;
+use crate::common::logging::log_debug;
 use crate::common::threads::join;
 use crate::common::threads::{IntoParRayon, ParCollectionRayon};
 use crate::common::time::{current_time_millis, system_time_to_millis};
@@ -511,10 +512,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 Err(err) => {
                     // Same rule as the per-step preload: a reader limit tripped
                     // by the union span downgrades to per-step evaluation.
-                    tracing::debug!(
-                        error = %err,
-                        "subquery union preload failed; each outer step will prepare its own grid"
-                    );
+                    log_debug(format!(
+                        "subquery union preload failed; each outer step will prepare its own grid: {err}"
+                    ));
                 }
             }
         }
@@ -705,10 +705,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             }
             Err(err @ QueryError::TooManySamples { .. }) => return Err(err.into()),
             Err(err) => {
-                tracing::debug!(
-                    error = %err,
-                    "matrix preload failed; falling back to per-step windows"
-                );
+                log_debug(format!(
+                    "matrix preload failed; falling back to per-step windows: {err}"
+                ));
             }
         }
         Ok(())
@@ -1474,28 +1473,30 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let grid =
                     PreloadGrid::for_subquery(aligned_start_ms, subquery_end_ms, step_ms, ctx);
                 let sub_plan = PlannedQuery::for_grid(&subquery.expr, grid);
-                let prepared =
-                    match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
-                        .prepare(sub_plan)
-                    {
-                        Ok(prepared) => prepared,
-                        Err(err) => {
-                            // A deadline or a spent sample budget means the query is
-                            // over: the budget only grows, so per-step reads would
-                            // be refused one by one.
-                            if is_query_ending(&err) {
-                                return Err(err);
-                            }
-                            // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
-                            // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
-                            // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
-                            tracing::debug!(
-                                error = %err,
-                                "subquery preload failed; falling back to per-step evaluation"
-                            );
-                            PreparedQuery::sharing(Arc::clone(&self.budget))
+                let prepared = match Preloader::sharing(
+                    self.reader,
+                    self.options,
+                    Arc::clone(&self.budget),
+                )
+                .prepare(sub_plan)
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        // A deadline or a spent sample budget means the query is
+                        // over: the budget only grows, so per-step reads would
+                        // be refused one by one.
+                        if is_query_ending(&err) {
+                            return Err(err);
                         }
-                    };
+                        // Otherwise best-effort, on the same rule as the matrix preload: the per-step path below
+                        // reproduces the unpreloaded behavior exactly, so a preload that trips a reader limit
+                        // downgrades the subquery to per-step reads rather than failing a query that used to succeed.
+                        log_debug(format!(
+                            "subquery preload failed; falling back to per-step evaluation: {err}"
+                        ));
+                        PreparedQuery::sharing(Arc::clone(&self.budget))
+                    }
+                };
                 Evaluator::with_prepared(self.reader, self.options, prepared)
             }
         };

@@ -19,7 +19,7 @@ use crate::promql::time::grid_step_count;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, ExprResult, QueryOptions};
 use orx_parallel::Par;
 use promql_parser::parser::VectorSelector;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Phase artifact types
@@ -39,16 +39,6 @@ pub(crate) enum QueryPathKind {
         lookback_delta_ms: i64,
         expected_steps: usize,
     },
-}
-
-impl QueryPathKind {
-    fn name(&self) -> &'static str {
-        match self {
-            QueryPathKind::InstantVector { .. } => "instant",
-            QueryPathKind::Matrix => "matrix",
-            QueryPathKind::SubqueryVectorSelector { .. } => "subquery",
-        }
-    }
 }
 
 /// Computed execution plan for a query path.
@@ -262,13 +252,6 @@ fn shape_subquery_results(series_data: Vec<EvalSamples>, plan: &QueryPlan) -> Ve
 // Unified pipeline orchestrator
 // ---------------------------------------------------------------------------
 
-/// Aggregate phase timings for the selector pipeline.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PipelineTimings {
-    pub sample_load_ms: f64,
-    pub shape_samples_ms: f64,
-}
-
 /// Execute the shared selector pipeline for all evaluator-backed query paths.
 ///
 /// Orchestrates: resolve metadata -> build work -> load samples -> shape results.
@@ -280,11 +263,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
     selector: &VectorSelector,
     mut options: QueryOptions,
 ) -> EvalResult<ExprResult> {
-    let mut timings = PipelineTimings::default();
-
     // Phase: LoadSamples
-    let t1 = Instant::now();
-
     // Special-case the handling of instant vector query plans. Since we account for clustering, it makes sense
     // to filter for the last item on the worker nodes instead of shipping the data only to filter
     // out on the requester. The `query` method on the reader should handle this
@@ -301,14 +280,6 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
             })
             .collect::<Vec<_>>();
 
-        timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
-
-        tracing::debug!(
-            path = plan.path_kind.name(),
-            load_ms = format!("{:.2}", timings.sample_load_ms),
-            "pipeline phase timings"
-        );
-
         let result = ExprResult::InstantVector(series_data);
         return Ok(result);
     };
@@ -323,11 +294,7 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
     let raw_range_samples =
         reader.query_range(selector, query_start_inclusive, plan.sample_end_ms, options)?;
 
-    timings.sample_load_ms += t1.elapsed().as_secs_f64() * 1000.0;
-
     // Phase: ShapeSamples
-    let t2 = Instant::now();
-
     let result = match &plan.path_kind {
         QueryPathKind::SubqueryVectorSelector { .. } => {
             // For the subquery fast path the fetch range includes a backward
@@ -368,15 +335,6 @@ pub(crate) fn execute_selector_pipeline<R: QueryReader + ?Sized>(
             ExprResult::RangeVector(series)
         }
     };
-
-    timings.shape_samples_ms = t2.elapsed().as_secs_f64() * 1000.0;
-
-    tracing::debug!(
-        path = plan.path_kind.name(),
-        load_ms = format!("{:.2}", timings.sample_load_ms),
-        shape_ms = format!("{:.2}", timings.shape_samples_ms),
-        "pipeline phase timings"
-    );
 
     Ok(result)
 }

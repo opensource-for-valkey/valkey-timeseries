@@ -1715,11 +1715,10 @@ fn sync_promql_config() {
 }
 
 /// Whether a change to parameter `name` must re-sync the PromQL engine's snapshot: every
-/// `ts-promql-*` parameter, and `debug-mode`, which query stats and tracing follow.
+/// `ts-promql-*` parameter.
 fn feeds_promql_config(name: &str) -> bool {
     name.get(..10)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ts-promql-"))
-        || name.eq_ignore_ascii_case("debug-mode")
 }
 
 /// Everything that follows an accepted configuration change, for every parameter type.
@@ -1735,9 +1734,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn promql_parameters_and_debug_mode_resync_the_engine_snapshot() {
+    fn promql_parameters_resync_the_engine_snapshot() {
         for name in CONFIGS.iter().map(|desc| desc.name) {
-            let expected = name.starts_with("ts-promql-") || name == "debug-mode";
+            let expected = name.starts_with("ts-promql-");
             assert_eq!(feeds_promql_config(name), expected, "{name}");
         }
         // The server matches parameter names case-insensitively.

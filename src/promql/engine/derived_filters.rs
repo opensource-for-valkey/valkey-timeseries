@@ -26,6 +26,7 @@
 //! excludes a series that could have matched at any step. Where a profile is
 //! unavailable, the leaf behaves exactly as in the static pass.
 
+use crate::common::logging::log_debug;
 use crate::common::threads::IntoParRayon;
 use crate::promql::binops::can_push_down_common_filters;
 use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile};
@@ -210,7 +211,9 @@ impl ProfiledLeaves {
                 // The read that follows will report whatever is wrong; a
                 // profile is only ever an optimization.
                 Err(err) => {
-                    tracing::debug!(error = %err, "label profile unavailable; selector left as written");
+                    log_debug(format!(
+                        "label profile unavailable; selector left as written: {err}"
+                    ));
                     Ok((key, None))
                 }
             })

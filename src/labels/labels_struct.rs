@@ -3,9 +3,6 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{Label, MetricName, SeriesFingerprint};
 use ahash::{AHashMap, AHashSet};
 use enquote::enquote;
-use serde::de::{MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Display;
@@ -225,16 +222,6 @@ impl AsRef<[Label]> for Labels {
     }
 }
 
-impl Serialize for Labels {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for label in &self.0 {
-            map.serialize_entry(&label.name, &label.value)?;
-        }
-        map.end()
-    }
-}
-
 impl From<AHashMap<String, String>> for Labels {
     fn from(map: AHashMap<String, String>) -> Self {
         let mut labels: Vec<Label> = map
@@ -265,31 +252,6 @@ impl From<&MetricName> for Labels {
 impl From<&Labels> for MetricName {
     fn from(labels: &Labels) -> Self {
         MetricName::from(labels.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for Labels {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct LabelsVisitor;
-
-        impl<'de> Visitor<'de> for LabelsVisitor {
-            type Value = Labels;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a map of label name to label value")
-            }
-
-            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Labels, M::Error> {
-                let mut labels = Vec::with_capacity(access.size_hint().unwrap_or(0));
-                while let Some((name, value)) = access.next_entry::<String, String>()? {
-                    labels.push(Label { name, value });
-                }
-                labels.sort();
-                Ok(Labels(labels))
-            }
-        }
-
-        deserializer.deserialize_map(LabelsVisitor)
     }
 }
 

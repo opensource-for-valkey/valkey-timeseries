@@ -278,7 +278,6 @@ fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use promql_parser::parser::parse;
 
     // ------------------------------
@@ -411,8 +410,8 @@ mod tests {
 
     #[test]
     fn test_const_evaluator_date_parts() {
-        let now = Utc::now();
-        let epoch = now.timestamp() as f64;
+        // A fixed instant, so a failure reproduces: 2023-11-14 22:13:20 UTC.
+        let epoch = 1_700_000_000.0;
 
         test_date_part_fn("day_of_month", epoch, DateTimePart::DayOfMonth);
         test_date_part_fn("days_in_month", epoch, DateTimePart::DaysInMonth);
