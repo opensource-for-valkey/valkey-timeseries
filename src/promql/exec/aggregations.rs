@@ -822,12 +822,16 @@ fn select_limit_ratio(samples: Vec<EvalSample>, ratio: f64) -> EvalResult<Vec<Ev
     // on that order — only the output order did, which sorting the survivors
     // reproduces for a fraction of the work.
     let max = u128::MAX as f64;
-    let keep: Box<dyn Fn(u128) -> bool> = if ratio > 0.0 {
-        Box::new(move |hash| (hash as f64) / max < ratio)
-    } else {
-        // For negative ratios, select the complement side of the hash space.
-        let threshold = 1.0 + ratio;
-        Box::new(move |hash| (hash as f64) / max >= threshold)
+    // A positive ratio keeps the low end of the hash space; a negative one the
+    // complement, from `1 + ratio` up. One closure, not a boxed one per sign.
+    let (positive, threshold) = (ratio > 0.0, if ratio > 0.0 { ratio } else { 1.0 + ratio });
+    let keep = |hash: u128| {
+        let position = (hash as f64) / max;
+        if positive {
+            position < threshold
+        } else {
+            position >= threshold
+        }
     };
 
     let mut selected: Vec<(u128, EvalSample)> = samples
