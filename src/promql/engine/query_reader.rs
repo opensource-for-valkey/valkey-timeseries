@@ -401,6 +401,21 @@ pub enum GridOutcome {
     /// e.g. a single node): the caller runs [`GridRequest::evaluate`] over
     /// them.
     Raw(Vec<RangeSample<EvalLabels>>),
+    /// A peer runs an older build without grid push-down (a rolling upgrade),
+    /// so nothing was computed. The caller evaluates the expression without
+    /// the grid: a preload is skipped, and a push-down is declined, so the
+    /// per-step selector reads every build supports do the work.
+    Unsupported,
+}
+
+impl GridOutcome {
+    /// `None` for [`GridOutcome::Unsupported`], so a caller can fall back in one line.
+    pub(in crate::promql) fn supported(self) -> Option<GridOutcome> {
+        match self {
+            GridOutcome::Unsupported => None,
+            outcome => Some(outcome),
+        }
+    }
 }
 
 pub trait QueryReader: Send + Sync {

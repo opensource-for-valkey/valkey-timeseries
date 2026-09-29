@@ -3,6 +3,8 @@ pub mod derived_filters;
 #[cfg(test)]
 mod extreme_time_tests;
 mod fanout;
+#[cfg(test)]
+mod grid_fallback_tests;
 pub mod label_profile;
 pub mod memory_series_querier;
 pub mod promql_config;

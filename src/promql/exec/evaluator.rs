@@ -563,7 +563,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // inclusive-lower-bound reader, so start one past the earliest
         // window's lower bound. Same convention as `rollup_fetch_bounds` and
         // the per-step pipeline.
-        let start_ms = (first - range_ms).saturating_add(1);
+        let start_ms = first.saturating_sub(range_ms).saturating_add(1);
 
         match self
             .reader
@@ -678,10 +678,16 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
 
-        let rolled = self.finish_grid(
-            &request,
-            self.reader.query_grid(&matrix.vs, &request, options)?,
-        )?;
+        // A peer without grid push-down: leave the rollup unpreloaded, and
+        // `preload_matrices` reads its span raw instead.
+        let Some(outcome) = self
+            .reader
+            .query_grid(&matrix.vs, &request, options)?
+            .supported()
+        else {
+            return Ok(());
+        };
+        let rolled = self.finish_grid(&request, outcome)?;
 
         let series = rolled
             .into_iter()
@@ -862,6 +868,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // thread, so this becomes the selector's own stepped preload and
             // the aggregation runs per step over it, exactly as an unfused one.
             GridOutcome::Raw(series) => return self.cache_stepped_span(vs, grid, series),
+            // A peer without grid push-down: not cached, so the selector is
+            // preloaded on its own and the aggregation runs per step.
+            GridOutcome::Unsupported => return Ok(()),
             outcome => self.finish_grid(&request, outcome)?,
         };
 
@@ -966,6 +975,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                         return Ok(());
                     }
                     GridOutcome::Raw(series) => series,
+                    // A peer without grid push-down: read the span raw, as
+                    // for a shape the grid request cannot describe.
+                    GridOutcome::Unsupported => self.read_selector_span(vs, grid)?,
                     GridOutcome::Rolled(_) | GridOutcome::Reduced(_) => {
                         return Err(EvaluationError::InternalError(
                             "stepped selection answered with the wrong shape".to_string(),
@@ -975,21 +987,30 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             }
             // A modifier shape the grid request cannot describe: read the
             // span the selector's bounds cover and bucket it here.
-            None => {
-                let (earliest_ms, latest_ms) = selector_bounds(
-                    vs.at.as_ref(),
-                    vs.offset.as_ref(),
-                    grid.at_start_ms,
-                    grid.at_end_ms,
-                    eval_start_ms,
-                    grid.end_ms,
-                    lookback_delta_ms,
-                );
-                self.reader
-                    .query_range(vs, earliest_ms, latest_ms, self.options)?
-            }
+            None => self.read_selector_span(vs, grid)?,
         };
         self.cache_stepped_span(vs, grid, raw_series)
+    }
+
+    /// The raw samples `vs` needs over the whole of `grid`, from an ordinary
+    /// range read.
+    fn read_selector_span(
+        &self,
+        vs: &VectorSelector,
+        grid: &PreloadGrid,
+    ) -> EvalResult<Vec<RangeSample<EvalLabels>>> {
+        let (earliest_ms, latest_ms) = selector_bounds(
+            vs.at.as_ref(),
+            vs.offset.as_ref(),
+            grid.at_start_ms,
+            grid.at_end_ms,
+            grid.start_ms,
+            grid.end_ms,
+            grid.lookback_delta_ms,
+        );
+        Ok(self
+            .reader
+            .query_range(vs, earliest_ms, latest_ms, self.options)?)
     }
 
     /// Bucket a selector's raw span to one sample per step — the last sample
@@ -2026,10 +2047,16 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
 
-        let grouped = self.finish_grid(
-            &request,
-            self.reader.query_grid(&matrix.vs, &request, options)?,
-        )?;
+        // A peer without grid push-down: decline, and the aggregation is
+        // evaluated here from an ordinary read.
+        let Some(outcome) = self
+            .reader
+            .query_grid(&matrix.vs, &request, options)?
+            .supported()
+        else {
+            return Ok(None);
+        };
+        let grouped = self.finish_grid(&request, outcome)?;
 
         let samples = grouped
             .into_iter()
@@ -2110,10 +2137,16 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(ctx.lookback_delta_ms as u64);
 
-        let rolled = self.finish_grid(
-            &request,
-            self.reader.query_grid(&matrix.vs, &request, options)?,
-        )?;
+        // A peer without grid push-down: decline, and the rollup is evaluated
+        // here from an ordinary read.
+        let Some(outcome) = self
+            .reader
+            .query_grid(&matrix.vs, &request, options)?
+            .supported()
+        else {
+            return Ok(None);
+        };
+        let rolled = self.finish_grid(&request, outcome)?;
 
         // A single evaluation yields at most one point per series, stamped with
         // the query's evaluation timestamp rather than the window end — so a

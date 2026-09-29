@@ -887,6 +887,7 @@ fn execute_cluster_grid(
     let cloned_responder = responder.clone();
 
     let handler = move |cmd: GridFanoutCommand, result: FanoutCommandResult| {
+        let peer_unsupported = cmd.peer_unsupported();
         let query_result = match result.and_then(|()| cmd.into_result()) {
             Ok(outcome) => {
                 // The grid output, not the input, is what these bound: one
@@ -897,6 +898,7 @@ fn execute_cluster_grid(
                     GridOutcome::Rolled(series)
                     | GridOutcome::Reduced(series)
                     | GridOutcome::Raw(series) => series.iter().map(|s| s.samples.len()).collect(),
+                    GridOutcome::Unsupported => Vec::new(),
                 };
                 validate_max_series_(points.len(), max_series).and_then(|_| {
                     for count in points {
@@ -904,6 +906,12 @@ fn execute_cluster_grid(
                     }
                     Ok(SelectorOutput::Grid(outcome))
                 })
+            }
+            Err(e) if peer_unsupported => {
+                log_warning(format!(
+                    "promql: grid push-down unsupported by a peer, evaluating without it: {e}"
+                ));
+                Ok(SelectorOutput::Grid(GridOutcome::Unsupported))
             }
             Err(e) => Err(selector_fanout_failure("grid", e)),
         };

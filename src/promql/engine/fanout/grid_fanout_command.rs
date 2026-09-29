@@ -155,6 +155,10 @@ pub(in crate::promql) struct GridFanoutCommand {
     /// Per-step candidates from the shards, for a request fused with a
     /// selecting or counting operator. `None` otherwise.
     selection: Option<SteppedSelection>,
+    /// A peer refused the operation as unknown: it runs an older build that
+    /// has no grid push-down (a rolling upgrade). The caller then evaluates
+    /// without it, over the selector operations every build has.
+    unsupported_peer: bool,
 }
 
 impl Default for GridFanoutCommand {
@@ -208,7 +212,15 @@ impl GridFanoutCommand {
             raw: Vec::new(),
             partials,
             selection,
+            unsupported_peer: false,
         }
+    }
+
+    /// Whether a peer rejected the grid operation as unknown (see
+    /// `unsupported_peer`). Checked when the command fails, before its error is
+    /// reported: the failure is then a reason to evaluate locally, not an error.
+    pub fn peer_unsupported(&self) -> bool {
+        self.unsupported_peer
     }
 
     /// The shards' output as one result.
@@ -439,6 +451,10 @@ impl FanoutCommand for GridFanoutCommand {
     }
 
     fn on_error(&mut self, error: FanoutError, target: &NodeInfo) {
+        // A peer that does not know this operation (rolling upgrade) rejects
+        // the envelope rather than answering it. Latched, as the aggregation
+        // push-down does, so the caller can fall back to local evaluation.
+        self.unsupported_peer |= error.is_unsupported_operation();
         log_fanout_failure(Self::name(), target, &error);
     }
 }
@@ -1020,6 +1036,20 @@ mod tests {
         NodeInfo::for_test(port)
     }
 
+    /// A peer that rejects the operation as unknown (an older build) latches the
+    /// fallback; an ordinary failure does not.
+    #[test]
+    fn test_unsupported_peer_latches_fallback() {
+        let mut cmd = command(stepped_grid_request());
+        assert!(!cmd.peer_unsupported());
+        cmd.on_error(FanoutError::invalid_message(), &node(7000));
+        assert!(cmd.peer_unsupported());
+
+        let mut cmd = command(stepped_grid_request());
+        cmd.on_error(FanoutError::timeout(), &node(7000));
+        assert!(!cmd.peer_unsupported());
+    }
+
     /// One shard's response, produced the way `get_local_response` produces it
     /// once the windows have been read.
     fn response(request: &GridRequest, windows: Vec<RangeSample<EvalLabels>>) -> GridQueryResponse {
@@ -1076,6 +1106,7 @@ mod tests {
                     (s.labels.to_string(), points)
                 })
                 .collect(),
+            GridOutcome::Unsupported => panic!("a test shard never refuses the operation"),
         };
         out.sort();
         out
