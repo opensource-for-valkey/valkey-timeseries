@@ -70,7 +70,7 @@ pub struct QueryOptions {
 
 impl Default for QueryOptions {
     fn default() -> Self {
-        let config = PROMQL_CONFIG.read().unwrap();
+        let config = promql_config();
         let timeout = config.max_query_duration;
         let deadline = current_time_millis().saturating_add(duration_ms(timeout));
         let enable_experimental_functions = config.enable_experimental_functions;

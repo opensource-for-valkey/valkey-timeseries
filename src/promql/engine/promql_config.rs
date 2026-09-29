@@ -1,5 +1,5 @@
 use crate::common::constants::MILLIS_PER_MIN;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 const DEFAULT_MAX_QUERY_LEN: usize = 16 * 1024;
@@ -96,7 +96,45 @@ impl Default for PromqlConfig {
     }
 }
 
+/// The current PromQL settings.
+///
+/// A panic while the snapshot was being written would poison the lock. The snapshot is
+/// plain values that the next `CONFIG SET` rewrites in full, so readers carry on past the
+/// poison rather than turn one bug into every query failing, or into an abort on the main
+/// thread, where the commands read it.
+pub fn promql_config() -> RwLockReadGuard<'static, PromqlConfig> {
+    PROMQL_CONFIG.read().unwrap_or_else(PoisonError::into_inner)
+}
+
 pub(crate) fn update_prom_config<F: FnMut(&mut PromqlConfig)>(mut f: F) {
-    let mut promql_config = PROMQL_CONFIG.write().unwrap();
+    let mut promql_config = PROMQL_CONFIG
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
     f(&mut promql_config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic while the snapshot is being written poisons the lock. Readers and
+    /// writers carry on: `TS.QUERYRANGE` used to `expect` the lock on the main
+    /// thread (a server abort), `TS.QUERY` to fail every later query, and a
+    /// shard to read its sample budget as 0 (unlimited).
+    #[test]
+    fn a_poisoned_config_lock_is_still_readable() {
+        let before = promql_config().max_samples_per_query;
+        let poisoner = std::thread::spawn(|| {
+            let _guard = PROMQL_CONFIG
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            panic!("poison the PromQL config lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(PROMQL_CONFIG.is_poisoned());
+
+        assert_eq!(promql_config().max_samples_per_query, before);
+        update_prom_config(|config| config.max_samples_per_query = before);
+        assert_eq!(promql_config().max_samples_per_query, before);
+    }
 }

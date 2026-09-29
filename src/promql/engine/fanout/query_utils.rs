@@ -5,8 +5,8 @@ use crate::common::threads::IterIntoParRayon;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
-use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::label_profile::{LabelProfile, LabelProfileBuilder};
+use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::grid_fetch_bounds;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
@@ -188,10 +188,9 @@ pub(super) fn local_grid_windows(
 /// This node's `ts-promql-max-samples-per-query`, applied to the reads it
 /// performs on another node's behalf.
 fn local_max_samples() -> usize {
-    PROMQL_CONFIG
-        .read()
-        .map(|config| config.max_samples_per_query)
-        .unwrap_or(0)
+    // Not `unwrap_or(0)` on a poisoned lock: 0 means unlimited, so a poisoned
+    // lock would have lifted this node's sample budget.
+    promql_config().max_samples_per_query
 }
 
 /// Drop the matched-but-empty series, then apply the query limits to what is

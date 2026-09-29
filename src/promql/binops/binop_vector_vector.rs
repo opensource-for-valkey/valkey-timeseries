@@ -115,19 +115,10 @@ struct ArithOpContext<'a> {
 
 impl ArithOpContext<'_> {
     /// Which operand is the "one" side: the one that must be unique per match
-    /// key. The right, unless `group_right` makes it the left.
-    ///
-    /// Every duplicate-series error names a side through these two, so the
-    /// mapping is written once. It used to be repeated at four sites, and one
-    /// of them had the branches the wrong way round.
+    /// key. The right, unless `group_right` makes it the left. The duplicate
+    /// error names it, so the mapping is written once.
     fn one_side(&self) -> &'static str {
         if self.is_group_right { "left" } else { "right" }
-    }
-
-    /// Which operand is the "many" side: the one allowed to repeat a match
-    /// key under `group_left`/`group_right`.
-    fn many_side(&self) -> &'static str {
-        if self.is_group_right { "right" } else { "left" }
     }
 }
 
@@ -214,7 +205,19 @@ fn make_fill_many_sample(
     one_sample: &EvalSample,
     fill_value: f64,
 ) -> EvalSample {
-    let mut labels = one_sample.labels.clone();
+    EvalSample {
+        timestamp_ms: one_sample.timestamp_ms,
+        value: fill_value,
+        labels: match_labels(&one_sample.labels, matching),
+        drop_name: one_sample.drop_name,
+    }
+}
+
+/// The labels of `labels` that identify its match group, as Prometheus'
+/// `Labels.MatchLabels` selects them: with `on(...)` just the listed labels,
+/// otherwise everything but the ignored labels and `__name__`.
+fn match_labels(labels: &EvalLabels, matching: Option<&LabelModifier>) -> EvalLabels {
+    let mut labels = labels.clone();
     match matching {
         Some(LabelModifier::Include(on)) => {
             labels.retain(|l| on.labels.iter().any(|name| name == l.name));
@@ -224,20 +227,90 @@ fn make_fill_many_sample(
         }),
         None => labels.retain(|l| l.name != METRIC_NAME),
     }
-    EvalSample {
-        timestamp_ms: one_sample.timestamp_ms,
-        value: fill_value,
-        labels,
-        drop_name: one_sample.drop_name,
-    }
+    labels
 }
 
-#[inline]
-fn duplicate_side_error(side: &str) -> EvaluationError {
+/// Two series on the "one" side share a match key: Prometheus' error, word for
+/// word, naming the match group and the two series in sorted order so the
+/// message is the same on every run (upstream `operators.test` pins it).
+#[cold]
+fn one_side_duplicate_error(
+    ctx: &ArithOpContext<'_>,
+    a: &EvalSample,
+    b: &EvalSample,
+) -> EvaluationError {
+    let group = label_set_string(&match_labels(&a.labels, ctx.matching), false);
+    let (mut first, mut second) = (
+        label_set_string(&a.labels, a.drop_name),
+        label_set_string(&b.labels, b.drop_name),
+    );
+    if first > second {
+        std::mem::swap(&mut first, &mut second);
+    }
     EvaluationError::InternalError(format!(
-        "many-to-many matching not allowed: found duplicate series on the {} side of the operation",
-        side
+        "found duplicate series for the match group {group} on the {} hand-side of the \
+         operation: [{first}, {second}];many-to-many matching not allowed: matching labels must \
+         be unique on one side",
+        ctx.one_side()
     ))
+}
+
+/// Under one-to-one matching, a match key repeated on the "many" side.
+#[cold]
+fn many_side_duplicate_error() -> EvaluationError {
+    EvaluationError::InternalError(
+        "multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"
+            .to_string(),
+    )
+}
+
+/// A label set as Prometheus prints one: `{__name__="m", job="api"}`, names in
+/// order, values quoted, a name that is not a legacy identifier quoted too. A
+/// `__name__` that is pending removal is left out, as Prometheus has already
+/// removed it.
+fn label_set_string(labels: &EvalLabels, drop_name: bool) -> String {
+    fn quote(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    fn is_legacy_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut out = String::from("{");
+    let mut first = true;
+    for label in labels.iter() {
+        if drop_name && label.name == METRIC_NAME {
+            continue;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        if is_legacy_name(label.name) {
+            out.push_str(label.name);
+        } else {
+            quote(&mut out, label.name);
+        }
+        out.push('=');
+        quote(&mut out, label.value);
+    }
+    out.push('}');
+    out
 }
 
 /// The scalar outcome of one matched pair: the value to emit and whether the
@@ -344,7 +417,7 @@ fn eval_arith_ops_fast_path(
     // than counted, so the duplicate is only reported if the LHS matches it.
     let mut index: FingerprintHashMap<u32> =
         FingerprintHashMap::with_capacity_and_hasher(right_vector.len(), Default::default());
-    for (i, key) in right_keys.into_iter().enumerate() {
+    for (i, &key) in right_keys.iter().enumerate() {
         let slot_i = u32::try_from(i).expect("operand has more than u32::MAX series");
         let slot = *index.entry(key).or_insert(slot_i);
         if slot != slot_i {
@@ -371,10 +444,20 @@ fn eval_arith_ops_fast_path(
         // top level the uniqueness check caught that under a generic message;
         // inside an aggregation it was silently summed.
         if slot == NO_MATCH {
-            return Err(duplicate_side_error(ctx.one_side()));
+            // The index kept no slot for a repeated key; find the two series
+            // again to name them.
+            let mut repeats = right_keys
+                .iter()
+                .zip(&right_vector)
+                .filter(|(k, _)| **k == key)
+                .map(|(_, sample)| sample);
+            let (Some(a), Some(b)) = (repeats.next(), repeats.next()) else {
+                unreachable!("a NO_MATCH key occurs at least twice");
+            };
+            return Err(one_side_duplicate_error(ctx, a, b));
         }
         if slot == CONSUMED {
-            return Err(duplicate_side_error(ctx.many_side()));
+            return Err(many_side_duplicate_error());
         }
         index.insert(key, CONSUMED);
 
@@ -585,12 +668,12 @@ fn eval_arith_ops_merge_join(
                     // still error on an ambiguous match, exactly like an
                     // arithmetic operator would. See [`validate_one_side`] for
                     // when the "one" side has to be unique.
-                    validate_one_side(ctx, one_samples.len(), true)?;
+                    validate_one_side(ctx, &one_samples, true)?;
                     if ctx.is_one_to_one {
                         let mut iter = many_samples.into_iter();
                         let sample = iter.next().unwrap();
                         if iter.next().is_some() {
-                            return Err(duplicate_side_error(ctx.many_side()));
+                            return Err(many_side_duplicate_error());
                         }
                         result.extend(handle_match(ctx, &sample, &one_samples));
                         continue;
@@ -677,11 +760,14 @@ fn handle_unmatched_one(
         // before anything is emitted, and the fill path needs the samples
         // anyway.
         let one_samples: Vec<EvalSample> = take_group(one_it, one_key).collect();
-        validate_one_side(ctx, one_samples.len(), false)?;
+        validate_one_side(ctx, &one_samples, false)?;
         emit_fill_for_many(ctx, one_samples, fill_val, result);
+    } else if ctx.is_one_to_one {
+        // An unmatched repeat emits nothing under one-to-one: tolerated.
+        skip_group(one_it, one_key);
     } else {
-        let one_group_len = skip_group_count(one_it, one_key);
-        validate_one_side(ctx, one_group_len, false)?;
+        let one_samples: Vec<EvalSample> = take_group(one_it, one_key).collect();
+        validate_one_side(ctx, &one_samples, false)?;
     }
     Ok(())
 }
@@ -700,19 +786,6 @@ fn skip_group(
     key: SeriesFingerprint,
 ) {
     while it.next_if(|(next_key, _)| *next_key == key).is_some() {}
-}
-
-/// Same as `skip_group`, but returns the number of consumed items.
-#[inline]
-fn skip_group_count(
-    it: &mut Peekable<IntoIter<(SeriesFingerprint, EvalSample)>>,
-    key: SeriesFingerprint,
-) -> usize {
-    let mut count = 0;
-    while it.next_if(|(next_key, _)| *next_key == key).is_some() {
-        count += 1;
-    }
-    count
 }
 
 /// The one place that decides whether a repeated "one"-side match key is an
@@ -740,9 +813,11 @@ fn skip_group_count(
 /// emit, once per series; the result-wide duplicate check after the join
 /// rejects it only if those series collide.
 #[inline]
-fn validate_one_side(ctx: &ArithOpContext, group_len: usize, matched: bool) -> EvalResult<()> {
-    if group_len > 1 && (matched || !ctx.is_one_to_one) {
-        return Err(duplicate_side_error(ctx.one_side()));
+fn validate_one_side(ctx: &ArithOpContext, group: &[EvalSample], matched: bool) -> EvalResult<()> {
+    if let [a, b, ..] = group
+        && (matched || !ctx.is_one_to_one)
+    {
+        return Err(one_side_duplicate_error(ctx, a, b));
     }
     Ok(())
 }
@@ -1965,13 +2040,53 @@ mod tests {
     // metrics: `a + {env="prod"}` hands the right side one sample per metric,
     // all with the same match key.
 
+    /// A match key repeated on the "one" side: Prometheus' message, naming
+    /// that side.
     fn assert_duplicate_on(result: EvalResult<ExprResult>, side: &str) {
         let err = result.expect_err("ambiguous match must error");
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("on the {side} side")),
-            "expected the {side} side to be named, got: {msg}"
+            msg.contains("found duplicate series for the match group")
+                && msg.contains(&format!("on the {side} hand-side of the operation"))
+                && msg.contains("many-to-many matching not allowed"),
+            "expected a duplicate on the {side} side, got: {msg}"
         );
+    }
+
+    /// Under one-to-one matching, a match key repeated on the "many" side:
+    /// Prometheus' many-to-one message, which names no side.
+    fn assert_many_side_duplicate(result: EvalResult<ExprResult>) {
+        let err = result.expect_err("ambiguous match must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "multiple matches for labels: many-to-one matching must be explicit \
+                 (group_left/group_right)"
+            ),
+            "expected the many-to-one error, got: {msg}"
+        );
+    }
+
+    /// Upstream `operators.test` pins this message word for word, the two
+    /// series sorted so it is the same on every run.
+    #[test]
+    fn test_one_side_duplicate_error_matches_prometheus() {
+        use promql_parser::label::Labels as ModifierLabels;
+        let lhs = vec![sample(0, 3.0, &[("__name__", "scalar_metric")])];
+        let rhs = vec![
+            sample(0, 2.0, &[("__name__", "dup_metric"), ("label", "beta")]),
+            sample(0, 1.0, &[("__name__", "dup_metric"), ("label", "alpha")]),
+        ];
+        let modifier = BinModifier::default().with_matching(Some(LabelModifier::Include(
+            ModifierLabels::new(Vec::<&str>::new()),
+        )));
+        let err = eval_binop_vector_vector(&make_expr(T_GTR, Some(modifier)), lhs, rhs)
+            .expect_err("two dup_metric series on the one side");
+        let expected = "found duplicate series for the match group {} on the right hand-side of \
+             the operation: [{__name__=\"dup_metric\", label=\"alpha\"}, \
+             {__name__=\"dup_metric\", label=\"beta\"}];many-to-many matching not allowed: \
+             matching labels must be unique on one side";
+        assert!(err.to_string().ends_with(expected), "got: {err}");
     }
 
     #[test]
@@ -1994,10 +2109,7 @@ mod tests {
             sample(1000, 2.0, &[("__name__", "b"), ("env", "prod")]),
         ];
         let rhs = vec![sample(1000, 3.0, &[("__name__", "c"), ("env", "prod")])];
-        assert_duplicate_on(
-            eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs),
-            "left",
-        );
+        assert_many_side_duplicate(eval_binop_vector_vector(&make_expr(T_ADD, None), lhs, rhs));
     }
 
     #[test]
@@ -2149,7 +2261,7 @@ mod tests {
         );
         assert!(
             err.to_string()
-                .contains("many-to-many matching not allowed"),
+                .contains("many-to-one matching must be explicit"),
             "unexpected error: {err}"
         );
     }
@@ -2179,7 +2291,7 @@ mod tests {
         );
         assert!(
             err.to_string()
-                .contains("many-to-many matching not allowed"),
+                .contains("many-to-one matching must be explicit"),
             "unexpected error: {err}"
         );
     }

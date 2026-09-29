@@ -25,11 +25,11 @@ use crate::fanout::{
     get_cluster_command_timeout, log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::local_instant_eval_samples;
 use crate::promql::engine::fanout::type_conversions::{
     decode_partial_state, proto_labels_to_eval_labels,
 };
+use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::{AggregationParam, AggregationRequest};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation};
 use crate::promql::exec::partial_aggregation::{PartialGroups, merge_count_values};
@@ -57,7 +57,7 @@ pub(in crate::promql) struct InstantVectorParams {
 impl Default for InstantVectorParams {
     fn default() -> Self {
         let lookback_delta = {
-            let guard = PROMQL_CONFIG.read().unwrap();
+            let guard = promql_config();
             guard.lookback_delta.as_millis() as u64
         };
         Self {

@@ -2545,7 +2545,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the right side"),
+            err.contains("on the right hand-side of the operation"),
             "Error should mention right side: {err}"
         );
     }
@@ -2671,7 +2671,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the left side"),
+            err.contains("many-to-one matching must be explicit"),
             "Error should mention left side: {err}"
         );
     }
@@ -2909,7 +2909,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the right side"),
+            err.contains("on the right hand-side of the operation"),
             "Error should mention right side: {err}"
         );
     }
@@ -2951,7 +2951,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the right side"),
+            err.contains("on the right hand-side of the operation"),
             "Error should mention right side: {err}"
         );
     }
@@ -2996,7 +2996,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the right side"),
+            err.contains("on the right hand-side of the operation"),
             "Error should mention right side: {err}"
         );
     }
@@ -3268,7 +3268,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("duplicate series on the left side"),
+            err.contains("on the left hand-side of the operation"),
             "Error should mention left side: {err}"
         );
     }

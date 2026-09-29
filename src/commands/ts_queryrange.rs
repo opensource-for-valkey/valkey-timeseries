@@ -4,7 +4,7 @@ use crate::common::context::get_current_db;
 use crate::common::time::current_time_millis;
 use crate::promql::QueryValue;
 use crate::promql::engine::query_workers::submit_evaluation;
-use crate::promql::engine::{PROMQL_CONFIG, evaluate_range};
+use crate::promql::engine::{evaluate_range, promql_config};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyResult, ValkeyString};
 
@@ -30,9 +30,7 @@ acl_categories!(TS_QUERYRANGE, "ts.queryrange", "read timeseries");
 })]
 pub fn ts_queryrange_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let mut args = args.into_iter().skip(1).peekable();
-    let config_guard = PROMQL_CONFIG
-        .read()
-        .expect("Failed to acquire read lock on PROMQL_CONFIG");
+    let config_guard = promql_config();
     let promql_config = config_guard.deref();
     let ParsedPromqlQuery {
         eval_stmt,

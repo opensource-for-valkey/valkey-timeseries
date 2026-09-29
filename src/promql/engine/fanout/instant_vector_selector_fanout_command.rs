@@ -3,8 +3,8 @@ use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, FanoutContext, NodeInfo};
 use crate::labels::HasFingerprint;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::handle_instant_query;
+use crate::promql::engine::promql_config;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, SeriesSelector as ProtoSeriesSelector,
 };
@@ -31,7 +31,7 @@ impl Default for InstantVectorSelectorFanoutCommand {
     fn default() -> Self {
         let matchers = Matchers::empty();
         let lookback_delta = {
-            let guard = PROMQL_CONFIG.read().unwrap();
+            let guard = promql_config();
             guard.lookback_delta.as_millis() as u64
         };
         Self {

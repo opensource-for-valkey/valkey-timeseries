@@ -3,7 +3,7 @@ use crate::commands::promql_utils::{get_promql_querier, reply_with_query_value};
 use crate::common::context::get_current_db;
 use crate::common::time::system_time_to_millis;
 use crate::promql::engine::query_workers::submit_evaluation;
-use crate::promql::engine::{PROMQL_CONFIG, evaluate_instant};
+use crate::promql::engine::{evaluate_instant, promql_config};
 use std::ops::Deref;
 use valkey_module::{Context, ValkeyResult, ValkeyString};
 
@@ -25,7 +25,7 @@ acl_categories!(TS_QUERY, "ts.query", "read timeseries");
     key_spec: []
 })]
 pub fn ts_query_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    let config_guard = PROMQL_CONFIG.read()?;
+    let config_guard = promql_config();
     let mut args = args.into_iter().skip(1).peekable();
     let promql_config = config_guard.deref();
     let ParsedPromqlQuery {
