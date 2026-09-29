@@ -170,10 +170,20 @@ fn build_arith_op_context(expr: &BinaryExpr) -> EvalResult<ArithOpContext<'_>> {
         is_group_right,
         is_one_to_one: matches!(card, VectorMatchCardinality::OneToOne),
         group_labels: card.labels().map(|l| &l.labels),
-        // Fill values are operand-side based, not cardinality-side based:
-        // - fill_left applies when LHS is missing
-        // - fill_right applies when RHS is missing
-        // This must remain true for both group_left and group_right.
+        // The fill values follow the cardinality, not the operand: `fill_left`
+        // fills the "many" side and `fill_right` the "one" side. Under group_left
+        // and one-to-one matching that is the left and the right operand. Under
+        // group_right it is the reverse, so `node_meta * on(instance)
+        // group_right fill_left(1) cpu_info` fills a missing cpu_info (the right
+        // operand).
+        //
+        // That is what Prometheus implements (it swaps the operands for
+        // group_right and keeps the fill values) and what its own
+        // `fill-modifier.test` pins; this repository's copy has the same cases.
+        // Prometheus' operator documentation describes the fills per operand
+        // instead ("fill in missing matches on the left side"), which disagrees
+        // with its implementation under group_right. The implementation is
+        // followed here.
         fill_for_one: fill_right,
         fill_for_many: fill_left,
     })
@@ -189,12 +199,35 @@ fn make_fill_one_sample(many_sample: &EvalSample, fill_value: f64) -> EvalSample
     }
 }
 
+/// The "many" sample a fill stands in for: the fill value, labelled with the
+/// "one" sample's *match* labels only, as Prometheus labels it
+/// (`Labels.MatchLabels`): with `on(...)` just the listed labels, otherwise
+/// everything but the ignored labels and `__name__`.
+///
+/// It used to take all of the "one" sample's labels, so under `group_left`
+/// the filled series carried the one side's extra labels
+/// (`{owner="team-c", status="404"}` where Prometheus returns
+/// `{status="404"}`), and a comparison kept the one side's metric name.
 #[inline]
-fn make_fill_many_sample(one_sample: &EvalSample, fill_value: f64) -> EvalSample {
+fn make_fill_many_sample(
+    matching: Option<&LabelModifier>,
+    one_sample: &EvalSample,
+    fill_value: f64,
+) -> EvalSample {
+    let mut labels = one_sample.labels.clone();
+    match matching {
+        Some(LabelModifier::Include(on)) => {
+            labels.retain(|l| on.labels.iter().any(|name| name == l.name));
+        }
+        Some(LabelModifier::Exclude(ignoring)) => labels.retain(|l| {
+            l.name != METRIC_NAME && !ignoring.labels.iter().any(|name| name == l.name)
+        }),
+        None => labels.retain(|l| l.name != METRIC_NAME),
+    }
     EvalSample {
         timestamp_ms: one_sample.timestamp_ms,
         value: fill_value,
-        labels: one_sample.labels.clone(),
+        labels,
         drop_name: one_sample.drop_name,
     }
 }
@@ -733,8 +766,8 @@ fn emit_fill_for_one(
 }
 
 /// Emit results for "one" samples whose match key had no "many" partner.
-/// Synthesizes a phantom "many" sample (using the "one" sample's labels so the
-/// output series identity is preserved) filled with `fill_val`.
+/// Synthesizes a phantom "many" sample, labelled with the match group's labels
+/// (see [`make_fill_many_sample`]), filled with `fill_val`.
 ///
 /// Validating the group is the caller's job — it runs [`validate_one_side`]
 /// first — so this only emits.
@@ -746,7 +779,7 @@ fn emit_fill_for_many(
     result: &mut Vec<EvalSample>,
 ) {
     for one_sample in one_samples {
-        let fill_many = make_fill_many_sample(&one_sample, fill_val);
+        let fill_many = make_fill_many_sample(ctx.matching, &one_sample, fill_val);
         if let Some(sample) = build_result_sample(ctx, &fill_many, &one_sample) {
             result.push(sample);
         }
@@ -1123,7 +1156,7 @@ pub use bench_support::{VectorVectorCase, VectorVectorShape};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_parser::parser::token::{T_ADD, T_DIV, T_GTR, TokenType};
+    use promql_parser::parser::token::{T_ADD, T_DIV, T_GTR, T_NEQ, TokenType};
     use promql_parser::parser::{
         BinModifier, BinaryExpr, Expr, NumberLiteral, VectorMatchFillValues,
     };
@@ -1344,6 +1377,162 @@ mod tests {
             .into_instant_vector()
             .unwrap();
         assert_eq!(result.len(), 2);
+    }
+
+    // ── labels of a filled series ─────────────────────────────────────────────
+    //
+    // Prometheus labels a filled series with the partner's match labels only
+    // (`MatchLabels`). The conformance DSL's label checks cannot see extra labels,
+    // so these compare exact label sets, on the shapes of upstream's
+    // fill-modifier.test.
+
+    fn exact_labels(sample: &EvalSample) -> Vec<(String, String)> {
+        sample
+            .labels
+            .iter()
+            .map(|l| (l.name.to_string(), l.value.to_string()))
+            .collect()
+    }
+
+    fn filled_labels(result: &[EvalSample], value: f64) -> Vec<(String, String)> {
+        let filled: Vec<_> = result.iter().filter(|s| s.value == value).collect();
+        assert_eq!(filled.len(), 1, "expected one result with value {value}");
+        exact_labels(filled[0])
+    }
+
+    fn pairs(labels: &[(&str, &str)]) -> Vec<(String, String)> {
+        labels
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_filled_many_series_takes_only_the_on_labels() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::VectorMatchCardinality;
+        // requests + on(status) group_left fill_left(0) limits
+        let lhs = vec![sample(
+            0,
+            100.0,
+            &[
+                ("__name__", "requests"),
+                ("method", "GET"),
+                ("status", "200"),
+            ],
+        )];
+        let rhs = vec![
+            sample(
+                0,
+                1000.0,
+                &[
+                    ("__name__", "limits"),
+                    ("owner", "team-a"),
+                    ("status", "200"),
+                ],
+            ),
+            sample(
+                0,
+                500.0,
+                &[
+                    ("__name__", "limits"),
+                    ("owner", "team-c"),
+                    ("status", "404"),
+                ],
+            ),
+        ];
+        let modifier = BinModifier::default()
+            .with_matching(Some(LabelModifier::Include(ModifierLabels::new(vec![
+                "status",
+            ]))))
+            .with_card(VectorMatchCardinality::ManyToOne(ModifierLabels::new(
+                vec![],
+            )))
+            .with_fill_values(VectorMatchFillValues::default().with_lhs(0.0));
+        let result = eval_binop_vector_vector(&make_expr(T_ADD, Some(modifier)), lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+        assert_eq!(filled_labels(&result, 500.0), pairs(&[("status", "404")]));
+    }
+
+    #[test]
+    fn test_filled_many_series_drops_ignored_labels_and_the_name() {
+        use promql_parser::label::Labels as ModifierLabels;
+        use promql_parser::parser::VectorMatchCardinality;
+        // left_vector + ignoring(job) group_left fill(0) right_vector
+        let lhs = vec![sample(
+            0,
+            10.0,
+            &[
+                ("__name__", "left_vector"),
+                ("instance", "a"),
+                ("job", "foo"),
+            ],
+        )];
+        let rhs = vec![
+            sample(
+                0,
+                100.0,
+                &[
+                    ("__name__", "right_vector"),
+                    ("instance", "a"),
+                    ("job", "foo"),
+                ],
+            ),
+            sample(
+                0,
+                300.0,
+                &[
+                    ("__name__", "right_vector"),
+                    ("instance", "c"),
+                    ("job", "foo"),
+                ],
+            ),
+        ];
+        let modifier = BinModifier::default()
+            .with_matching(Some(LabelModifier::Exclude(ModifierLabels::new(vec![
+                "job",
+            ]))))
+            .with_card(VectorMatchCardinality::ManyToOne(ModifierLabels::new(
+                vec![],
+            )))
+            .with_fill_values(VectorMatchFillValues::default().with_lhs(0.0).with_rhs(0.0));
+        let result = eval_binop_vector_vector(&make_expr(T_ADD, Some(modifier)), lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+        assert_eq!(filled_labels(&result, 300.0), pairs(&[("instance", "c")]));
+    }
+
+    #[test]
+    fn test_filled_series_in_a_comparison_has_no_metric_name() {
+        // left_vector != fill(30) right_vector: the filled left operand for
+        // label="d" has no name of its own, and a comparison keeps the left labels.
+        let lhs = vec![sample(
+            0,
+            10.0,
+            &[("__name__", "left_vector"), ("label", "a")],
+        )];
+        let rhs = vec![
+            sample(0, 100.0, &[("__name__", "right_vector"), ("label", "a")]),
+            sample(0, 400.0, &[("__name__", "right_vector"), ("label", "d")]),
+        ];
+        let expr = make_expr(
+            T_NEQ,
+            Some(
+                BinModifier::default().with_fill_values(
+                    VectorMatchFillValues::default()
+                        .with_lhs(30.0)
+                        .with_rhs(30.0),
+                ),
+            ),
+        );
+        let result = eval_binop_vector_vector(&expr, lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
+        assert_eq!(filled_labels(&result, 30.0), pairs(&[("label", "d")]));
     }
 
     // ── fill (both sides simultaneously) ─────────────────────────────────────

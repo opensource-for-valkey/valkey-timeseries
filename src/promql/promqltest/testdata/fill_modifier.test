@@ -1,3 +1,8 @@
+# Adapted from Prometheus promqltest suite.
+# Original source:
+# https://github.com/prometheus/prometheus/blob/bb7ec495d2/promql/promqltest/testdata/fill-modifier.test
+# Synced verbatim on 2026-09-28; the cases after the upstream file's end are local.
+
 # ==================== fill / fill_left / fill_right modifier tests ====================
 
 # Test data for fill modifier tests: vectors with partial overlap.
@@ -282,8 +287,6 @@ eval range from 0 to 20m step 5m range_left + fill_left(0) range_right
 # Range queries with intermittently present series.
 clear
 
-ignore
-
 load 5m
   intermittent_left{label="a"}  1  _  3  _  5
   intermittent_left{label="b"}  _  20 _  40 _
@@ -311,7 +314,20 @@ eval range from 0 to 20m step 5m intermittent_left + fill_left(0) intermittent_r
   {label="b"} 100 _ 300 _ 500
   {label="c"} 1000 _ _ 4000 5000
 
-resume
+# Regression test: group_left fill_left in a range query must apply fill values
+# at every timestep, even when the RHS sigOrd was matched at a previous timestep.
+# resetMatchedSigs previously used clear() which left non-nil empty maps, causing
+# the fill-LHS path to incorrectly skip unmatched RHS samples on subsequent timesteps.
+clear
+
+load 5m
+  matched_lhs{key="a"}  1  _  3
+  matched_rhs{key="a"}  10 20 30
+  matched_rhs{key="b"}  100 200 300
+
+eval range from 0 to 10m step 5m matched_lhs + on(key) group_left fill_left(0) matched_rhs
+  {key="a"} 11 20 33
+  {key="b"} 100 200 300
 
 # ---------- fill with vectors where one side is empty ----------
 
@@ -385,6 +401,7 @@ eval instant at 0m other + fill_left(0) fill_left
 eval instant at 0m other + fill_right(0) fill_right
   {label="a"} 1000
   {label="e"} 5000
+
 clear
 
 # A match key repeated on one side with nothing to match on the other is tolerated when
