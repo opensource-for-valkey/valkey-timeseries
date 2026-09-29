@@ -69,8 +69,9 @@ pub struct ExecutorStats {
 ///
 /// That first submission comes from the main thread and pays for starting the workers:
 /// measured (2026-09-29, macOS M-series) at about 40–120 µs for 8 threads, and 0.5–1 ms for 64,
-/// once per process. Deliberately not done at module load: that would start every lane's
-/// threads on every node, including nodes that never fan out or run `TS.OUTLIERS`.
+/// once per process. Deliberately not done at module load: that would start every lane (about
+/// 32 threads at the defaults, far more with a large `ts-promql-max-concurrent-queries`) on
+/// every node, including nodes that never run PromQL or `TS.OUTLIERS`.
 ///
 /// Jobs must not wait on other jobs of the same executor: with every worker waiting, nothing
 /// is left to run what they wait for.
