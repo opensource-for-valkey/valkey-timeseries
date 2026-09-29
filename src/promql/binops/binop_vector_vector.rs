@@ -662,16 +662,18 @@ fn result_metric(
     op: TokenType,
     matching: Option<&LabelModifier>,
 ) -> EvalLabels {
-    if super::changes_metric_schema(op) {
-        labels.drop_name();
-    }
+    // One pass: dropping the name first and filtering after rebuilt the set
+    // twice, and on a `Shared` set the first rebuild cloned every label.
+    let drop_name = super::changes_metric_schema(op);
+    let kept_name = |name: &str| !(drop_name && name == METRIC_NAME);
     match matching {
         Some(LabelModifier::Include(label_list)) => {
-            labels.retain(|k| label_list.labels.iter().any(|n| n == k.name));
+            labels.retain(|k| kept_name(k.name) && label_list.labels.iter().any(|n| n == k.name));
         }
         Some(LabelModifier::Exclude(label_list)) => {
-            labels.retain(|k| !label_list.labels.iter().any(|n| n == k.name));
+            labels.retain(|k| kept_name(k.name) && !label_list.labels.iter().any(|n| n == k.name));
         }
+        None if drop_name => labels.drop_name(),
         None => {}
     }
     labels

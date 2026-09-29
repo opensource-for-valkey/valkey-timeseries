@@ -214,12 +214,8 @@ impl EvalLabels {
                     *self = EvalLabels::Interned(Arc::from(kept));
                 }
             }
-            EvalLabels::Shared(_) => {
-                if self.contains(key) {
-                    self.make_owned();
-                    self.remove(key);
-                }
-            }
+            // Clone only the survivors, not the whole set and then drop one.
+            EvalLabels::Shared(_) => self.retain(|l| l.name != key),
         }
     }
 
@@ -306,6 +302,7 @@ impl EvalLabels {
     }
 
     /// Returns true if the label set contains the given key (binary search).
+    #[cfg(test)]
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
