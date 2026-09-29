@@ -1931,6 +1931,7 @@ pub(super) fn parse_query_range_command_args(
 
     let lookback_delta = normalize_lookback(config, lookback_delta, step);
 
+    let end_given = end_value.is_some();
     let (start, end) = match (start_value, end_value) {
         (Some(start_value), Some(end_value)) => {
             (start_value.as_timestamp(None), end_value.as_timestamp(None))
@@ -1952,10 +1953,14 @@ pub(super) fn parse_query_range_command_args(
         }
     };
 
-    if start >= end {
-        return Err(ValkeyError::Str(
-            "TSDB: start cannot be greater than current time",
-        ));
+    // As Prometheus: an end before the start is an error, and an end equal to it is a
+    // query with a single step. Without END the end is now, so name that instead.
+    if end < start {
+        return Err(ValkeyError::Str(if end_given {
+            "TSDB: END must not be before START"
+        } else {
+            "TSDB: START must not be after the current time (the default END)"
+        }));
     }
 
     let eval_stmt = EvalStmt {

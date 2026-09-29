@@ -67,6 +67,9 @@ same millisecond-by-default rule:
 - `-` for the earliest timestamp across all series
 - Duration spec (e.g., `-30m` for 30 minutes ago)
 
+`END` must not be before `START`. When they are equal the query has a single step, as in
+Prometheus. Without `END` the end is the current time.
+
 </details>
 
 <details open><summary><code>LOOKBACK_DELTA lookback</code></summary>

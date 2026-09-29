@@ -201,11 +201,24 @@ class TestTsQueryRange(ValkeyTimeSeriesTestCaseBase):
         with pytest.raises(ResponseError):
             self.range_query("http_requests", "1000", start="not-a-time", end=5)
 
-    def test_queryrange_rejects_start_greater_or_equal_end(self):
+    def test_queryrange_rejects_end_before_start(self):
         self.setup_simple_series()
 
-        with pytest.raises(ResponseError):
+        with pytest.raises(ResponseError, match="END must not be before START"):
             self.range_query("http_requests", "1000", start=4000, end=2000)
+        # Without END the end is the current time.
+        with pytest.raises(ResponseError, match="START must not be after the current time"):
+            self.range_query("http_requests", "1000", start=10 ** 13)
+
+    def test_queryrange_start_equal_to_end_is_one_step(self):
+        """As in Prometheus, START == END is a range query with a single step. It was
+        rejected, with a message about the current time."""
+        self.setup_simple_series()
+
+        result = QueryResult.from_raw(self.range_query("http_requests", "1000", start=3000, end=3000))
+        assert result.is_matrix(), f"expected a matrix, got {result.result_type}"
+        assert len(result.result) == 1
+        assert [p.timestamp for p in result.result[0].values] == [3000]
 
     def test_queryrange_unbounded_end_is_rejected(self):
         """`END +` is i64::MAX. With no points limit configured (the default) the step grid
