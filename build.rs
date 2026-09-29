@@ -110,6 +110,7 @@ fn main() -> io::Result<()> {
         entries.sort_by_key(|e| e.file_name());
 
         code.push_str("use crate::promql::promqltest::runner::run_test;\n\n");
+        let mut seen = std::collections::HashMap::new();
         for entry in entries {
             let path = entry.path();
             let stem = path
@@ -117,13 +118,25 @@ fn main() -> io::Result<()> {
                 .and_then(|s| s.to_str())
                 .expect("invalid test filename");
 
-            let fn_name = stem.replace('-', "_");
+            // Any character an identifier cannot hold becomes `_`, so `a.b` and `a b` name a
+            // test too. Two files that land on one name would be a duplicate definition, so
+            // that is refused here with both names.
+            let fn_name: String = stem
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            if let Some(other) = seen.insert(fn_name.clone(), stem.to_string()) {
+                panic!("testdata files {other:?} and {stem:?} both map to should_pass_{fn_name}");
+            }
+            // The name and the path are emitted as string literals via `{:?}`, which escapes
+            // any quote or backslash in a file name.
+            let include_path = format!("/src/promql/promqltest/testdata/{stem}.test");
 
             code.push_str(&format!(
                 r#"
 #[test]
 fn should_pass_{fn_name}() {{
-    run_test("{stem}", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/promql/promqltest/testdata/{stem}.test")))
+    run_test({stem:?}, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), {include_path:?})))
         .unwrap();
 }}
 "#,
