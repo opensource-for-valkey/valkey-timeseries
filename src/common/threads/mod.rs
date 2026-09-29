@@ -219,6 +219,36 @@ where
     });
 }
 
+/// Runs `work` on `pool` and waits for it without running anything else meanwhile.
+///
+/// `pool.install(work)` from a worker of *another* pool is rayon's cross-pool path: the waiting
+/// worker keeps running its own pool's jobs until `work` is done. For an evaluation worker those
+/// jobs wait on the selector executor, so one wait could nest a blocking wait per job it took,
+/// and a finished result sat until the job it had taken returned. Here the caller blocks on a
+/// channel instead, which takes nothing. `work` itself may still run in parallel on `pool`.
+///
+/// Only for a pool whose jobs never block (R1 without exception: the shared or the
+/// materialization pool), or the cold wait could be the one that never ends. A panic in `work`
+/// is re-raised in the caller.
+pub(crate) fn run_on_pool_cold<R, W>(pool: &'static rayon_core::ThreadPool, work: W) -> R
+where
+    R: Send + 'static,
+    W: FnOnce() -> R + Send + 'static,
+{
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    gil::check_may_block();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    pool.spawn(move || {
+        // The receiver only goes away if the caller unwound, and then nobody wants this.
+        let _ = tx.send(catch_unwind(AssertUnwindSafe(work)));
+    });
+    match rx.recv() {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => resume_unwind(panic),
+        Err(_) => unreachable!("a pool job ran to completion without answering"),
+    }
+}
+
 /// Runs `oper_a` and `oper_b`, potentially in parallel, on the caller's pool if it is a pinned
 /// worker (R4), on the shared pool otherwise.
 pub fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)

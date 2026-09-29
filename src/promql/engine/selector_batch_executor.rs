@@ -3,7 +3,7 @@ use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::log_warning;
 use crate::common::threads::{
     IntoParRayon, LockGil, MATERIALIZE_POOL, ThreadRole, check_may_block, panic_message,
-    set_thread_role,
+    run_on_pool_cold, set_thread_role,
 };
 use crate::common::time::current_time_millis;
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
@@ -130,10 +130,16 @@ impl SelectorOutput {
     fn into_matrix(self) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
         match self {
             SelectorOutput::Matrix(series) => Ok(series),
-            SelectorOutput::WireMatrix(series) => Ok(series
-                .into_par_on(&MATERIALIZE_POOL)
-                .map(WireRangeSeries::decode)
-                .collect()),
+            // Decoded in parallel on the materialization pool, but waited for
+            // cold: the caller is usually an evaluation worker, and entering
+            // another pool directly would have it run evaluation jobs while it
+            // waits, each of which may block on this executor in turn.
+            SelectorOutput::WireMatrix(series) => Ok(run_on_pool_cold(&MATERIALIZE_POOL, || {
+                series
+                    .into_par_on(&MATERIALIZE_POOL)
+                    .map(WireRangeSeries::decode)
+                    .collect()
+            })),
             _ => Err(QueryError::Execution(
                 "BUG: selector task returned a non-matrix outcome".to_string(),
             )),
