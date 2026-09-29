@@ -24,7 +24,7 @@ use crate::common::Timestamp;
 use crate::common::context::is_blocking_denied;
 use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
 use crate::common::threads::{
-    BoundedExecutor, Capacity, EVAL_POOL, ExecutorStats, Rejected, check_may_wait_on_eval_pool,
+    BoundedExecutor, Capacity, ExecutorStats, Rejected, run_on_eval_pool,
 };
 use crate::common::time::current_time_millis;
 use crate::config::{max_concurrent_queries, max_queued_queries};
@@ -59,8 +59,7 @@ static QUERY_WORKERS: BoundedExecutor = BoundedExecutor::new(
 /// Wrap only the evaluation: the reply is written from the query worker.
 #[track_caller]
 pub(crate) fn run_evaluation<R: Send>(evaluate: impl FnOnce() -> R + Send) -> R {
-    check_may_wait_on_eval_pool();
-    EVAL_POOL.install(evaluate)
+    run_on_eval_pool(evaluate)
 }
 
 /// Evaluate a query for the client of `ctx` on a query worker, and answer it from there.

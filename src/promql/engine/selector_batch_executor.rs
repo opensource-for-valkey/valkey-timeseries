@@ -232,29 +232,8 @@ struct SelectorTask {
 /// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
 ///
-/// # Note
-/// The `SelectorBatchExecutor` is designed for internal use within the PromQL engine and is not intended to be
-/// used directly by external callers. It is exposed as a handle that can be used to perform queries,
-/// but the internal implementation details are abstracted away.
-///
-/// # Example
-/// ```ignore
-/// use crate::promql::engine::SelectorBatchExecutor;
-/// use crate::promql::engine::QueryOptions;
-/// use promql_parser::label::Matchers;
-///
-///
-/// // Create an executor handle and perform queries via the provided API.
-/// let executor = SelectorBatchExecutor::new();
-/// let now = current_time_millis();
-/// let options = QueryOptions {
-///     timeout: Some(now + 60_000), // 1 minute from now
-///     lookback_delta: None,
-///     max_series: 1000,
-/// };
-/// let matchers = vec![Matcher::new("job", "=", "prometheus")];
-/// let _ = executor.query(matchers, now, options);
-/// ```
+/// There is one, [`SERIES_SELECTOR`](super::querier::SERIES_SELECTOR), which
+/// `ValkeySeriesQuerier` submits every selector read to.
 pub struct SelectorBatchExecutor {
     /// Hand-off to the processor thread. Unbounded: a submitter blocks on its
     /// responder anyway, so back-pressure here would only add a second wait.
@@ -1149,6 +1128,10 @@ mod selector_batch_executor_tests {
     /// executor's shape under load; it must complete without any caller-pool worker
     /// running a job.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the scenario needs every worker of a raw pool parked at once"
+    )]
     fn parked_pool_never_starves_a_processor_with_its_own_pool() {
         let callers = rayon_core::ThreadPoolBuilder::new()
             .num_threads(2)
