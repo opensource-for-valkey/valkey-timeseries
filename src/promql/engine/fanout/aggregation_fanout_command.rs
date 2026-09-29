@@ -27,7 +27,9 @@ use crate::fanout::{
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::PROMQL_CONFIG;
 use crate::promql::engine::fanout::query_utils::local_instant_eval_samples;
-use crate::promql::engine::fanout::type_conversions::proto_labels_to_eval_labels;
+use crate::promql::engine::fanout::type_conversions::{
+    decode_partial_state, proto_labels_to_eval_labels,
+};
 use crate::promql::engine::query_reader::{AggregationParam, AggregationRequest};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy, apply_aggregation};
 use crate::promql::exec::partial_aggregation::{PartialGroups, merge_count_values};
@@ -199,12 +201,22 @@ impl AggregationFanoutCommand {
         }
     }
 
-    fn accumulate_partials(&mut self, partials: Vec<AggregationGroupPartial>) {
+    fn accumulate_partials(
+        &mut self,
+        partials: Vec<AggregationGroupPartial>,
+        target: &NodeInfo,
+    ) -> FanoutCommandResult {
         for partial in partials {
+            let state = decode_partial_state(partial.state).map_err(|what| {
+                FanoutError::custom(format!(
+                    "TSDB: peer {} sent {what} for a pushed-down {:?} reduction",
+                    target.socket_address, self.aggregation.kind,
+                ))
+            })?;
             let labels = proto_labels_to_eval_labels(partial.labels);
-            self.partials
-                .merge(labels, partial.state.unwrap_or_default().into());
+            self.partials.merge(labels, state);
         }
+        Ok(())
     }
 }
 
@@ -338,7 +350,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                         self.aggregation.kind,
                     )));
                 }
-                self.accumulate_partials(resp.partials);
+                self.accumulate_partials(resp.partials, target)?;
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 if !resp.partials.is_empty() {
@@ -736,6 +748,43 @@ mod tests {
             labels: None,
         };
         assert!(cmd.on_response(stray, &node(7000)).is_err());
+    }
+
+    /// A partial that covers no samples cannot come from a shard; merged, it
+    /// conjured a group of its own (`sum` 0 for `job="z"`, which no shard saw).
+    #[test]
+    fn test_partial_without_samples_is_rejected() {
+        use crate::promql::generated::{AggregationPartialState, Label as ProtoLabel};
+        let response = |state: Option<AggregationPartialState>| AggregationQueryResponse {
+            partials: vec![AggregationGroupPartial {
+                labels: vec![ProtoLabel {
+                    name: "job".to_string(),
+                    value: "z".to_string(),
+                }],
+                state,
+            }],
+            samples: Vec::new(),
+            applied: true,
+            labels: None,
+        };
+        for (what, state) in [
+            ("no state", None),
+            ("zero count", Some(AggregationPartialState::default())),
+        ] {
+            let mut cmd = command(params(AggregationKind::Sum, None));
+            let err = cmd
+                .on_response(response(state), &node(7000))
+                .expect_err(what);
+            assert!(err.to_string().contains("partial"), "{what}: {err}");
+        }
+
+        let mut cmd = command(params(AggregationKind::Sum, None));
+        let real = AggregationPartialState {
+            count: 2,
+            acc1: 5.0,
+            ..Default::default()
+        };
+        assert!(cmd.on_response(response(Some(real)), &node(7000)).is_ok());
     }
 
     /// A peer that rejects the operation outright latches the fallback flag.

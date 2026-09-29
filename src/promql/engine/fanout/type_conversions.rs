@@ -455,6 +455,24 @@ impl From<AggregationPartial> for ProtoAggregationPartialState {
     }
 }
 
+/// One group's state from a peer's partials, or why it is corrupt.
+///
+/// A shard sends a partial only for a group it saw at least one sample of, so
+/// a partial with no state, or with a zero count, is a corrupt reply. It used
+/// to decode as the zero state: merging that into a group seen elsewhere
+/// changes nothing, but a group seen only here was created with no samples and
+/// finalized into a phantom series (`sum` 0, `count` 0, `group` 1, NaN for the
+/// others).
+pub(in crate::promql) fn decode_partial_state(
+    state: Option<ProtoAggregationPartialState>,
+) -> Result<AggregationPartial, &'static str> {
+    match state {
+        None => Err("a partial with no state"),
+        Some(state) if state.count == 0 => Err("a partial that counts no samples"),
+        Some(state) => Ok(state.into()),
+    }
+}
+
 impl From<ProtoAggregationPartialState> for AggregationPartial {
     fn from(state: ProtoAggregationPartialState) -> Self {
         AggregationPartial {

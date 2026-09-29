@@ -38,7 +38,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
 use crate::promql::engine::fanout::type_conversions::{
-    proto_labels_to_eval_labels, range_sample_to_proto,
+    decode_partial_state, proto_labels_to_eval_labels, range_sample_to_proto,
 };
 use crate::promql::engine::query_reader::{
     AggregationParam, GridAggregation, GridOutcome, GridRequest, GridRollup,
@@ -378,10 +378,16 @@ impl FanoutCommand for GridFanoutCommand {
                     )));
                 }
                 for partial in resp.partials {
+                    let state = decode_partial_state(partial.state).map_err(|what| {
+                        FanoutError::custom(format!(
+                            "TSDB: peer {} sent {what} for a fused grid query",
+                            target.socket_address,
+                        ))
+                    })?;
                     partials.merge(
                         partial.step_ts,
                         proto_labels_to_eval_labels(partial.labels),
-                        partial.state.unwrap_or_default().into(),
+                        state,
                     );
                 }
             }
@@ -1034,6 +1040,45 @@ mod tests {
 
     fn node(port: u16) -> NodeInfo {
         NodeInfo::for_test(port)
+    }
+
+    /// A partial that covers no samples cannot come from a shard; merged, it
+    /// conjured a group of its own for the step.
+    #[test]
+    fn test_partial_without_samples_is_rejected() {
+        use crate::promql::generated::{AggregationPartialState, Label as ProtoLabel};
+        let request = fused(stepped_grid_request(), AggregationKind::Sum, &["job"]);
+        let step_ts = request.window_ends()[0];
+        let response = |state: Option<AggregationPartialState>| GridQueryResponse {
+            series: Vec::new(),
+            partials: vec![GridGroupPartial {
+                labels: vec![ProtoLabel {
+                    name: "job".to_string(),
+                    value: "z".to_string(),
+                }],
+                step_ts,
+                state,
+            }],
+            raw: Vec::new(),
+        };
+        for (what, state) in [
+            ("no state", None),
+            ("zero count", Some(AggregationPartialState::default())),
+        ] {
+            let mut cmd = command(request.clone());
+            let err = cmd
+                .on_response(response(state), &node(7000))
+                .expect_err(what);
+            assert!(err.to_string().contains("partial"), "{what}: {err}");
+        }
+
+        let mut cmd = command(request);
+        let real = AggregationPartialState {
+            count: 1,
+            acc1: 5.0,
+            ..Default::default()
+        };
+        assert!(cmd.on_response(response(Some(real)), &node(7000)).is_ok());
     }
 
     /// A peer that rejects the operation as unknown (an older build) latches the
