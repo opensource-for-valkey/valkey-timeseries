@@ -1,5 +1,6 @@
 use crate::commands::fanout_codec::chunks::{deserialize_chunk, serialize_chunk};
 use crate::common::constants::METRIC_NAME_LABEL;
+use crate::common::string_interner::InternedString;
 use crate::fanout::{FanoutError, NodeInfo};
 use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
@@ -76,14 +77,26 @@ impl From<ProtoInstantSample> for EvalSample {
 /// be checked against [`TimeSeriesChunk::len`] before any sample is
 /// materialized.
 pub(in crate::promql) struct WireRangeSeries {
-    pub labels: EvalLabels,
+    /// As the peer sent them. [`Self::decode`] interns them, so that happens
+    /// on the requester's pool rather than in the fan-out callback.
+    pub labels: Vec<ProtoLabel>,
     pub chunk: TimeSeriesChunk,
 }
 
 impl WireRangeSeries {
+    /// The series with its labels interned. A range read's labels outlive
+    /// every step of the query, and each step's binop or `__name__` drop
+    /// rebuilds them: interned, that is a slice of refcount bumps; held as
+    /// owned `Label`s it cloned a `String` per name and per value, per sample
+    /// per step. Interning costs one pool lookup per label, once per series.
     pub fn decode(self) -> RangeSample<EvalLabels> {
+        let labels = self
+            .labels
+            .iter()
+            .map(|l| InternedString::new_pair(&l.name, &l.value))
+            .collect();
         RangeSample {
-            labels: self.labels,
+            labels: EvalLabels::from_interned_shared(labels),
             samples: self.chunk.iter().collect(),
         }
     }
@@ -99,7 +112,7 @@ impl TryFrom<ProtoRangeSample> for WireRangeSeries {
             None => TimeSeriesChunk::Uncompressed(UncompressedChunk::default()),
         };
         Ok(WireRangeSeries {
-            labels: proto_labels_to_eval_labels(proto.labels),
+            labels: proto.labels,
             chunk,
         })
     }
@@ -622,6 +635,33 @@ mod tests {
                 assert!(a.value == b.value || (a.value.is_nan() && b.value.is_nan()));
             }
         }
+    }
+
+    /// A decoded range read holds its labels interned, so per-step label
+    /// edits stay refcount bumps; a peer's labels out of name order still
+    /// come back sorted.
+    #[test]
+    fn decoded_range_series_labels_are_interned() {
+        let proto = range_sample_to_proto(series(Vec::new())).unwrap();
+        let back = RangeSample::<EvalLabels>::try_from(proto).unwrap();
+        assert!(matches!(back.labels, EvalLabels::Interned(_)));
+        assert_eq!(back.labels, series(Vec::new()).labels);
+
+        let unsorted = ProtoRangeSample {
+            labels: vec![
+                ProtoLabel {
+                    name: "host".to_string(),
+                    value: "a".to_string(),
+                },
+                ProtoLabel {
+                    name: "__name__".to_string(),
+                    value: "cpu".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let back = RangeSample::<EvalLabels>::try_from(unsorted).unwrap();
+        assert_eq!(back.labels, series(Vec::new()).labels);
     }
 
     /// The point of shipping chunks: an hour of 1 s telemetry is a fraction
