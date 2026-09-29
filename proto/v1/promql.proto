@@ -164,6 +164,10 @@ message AggregationPartialState {
 message AggregationGroupPartial {
   repeated Label labels = 1;
   AggregationPartialState state = 2;
+  /// Label references into `AggregationQueryResponse.labels`, as on
+  /// `RangeSample`.
+  repeated uint32 label_name_refs = 3;
+  repeated uint32 label_value_refs = 4;
 }
 
 /// A PromQL range-vector function a shard can evaluate on its own. Mirrors
@@ -386,7 +390,7 @@ message AggregationQueryResponse {
   /// count_values: the shard's locally selected/counted samples. Also carries
   /// the raw instant vector when `applied` is false.
   repeated InstantSample samples = 2;
-  /// Interned label references for `samples`.
+  /// The symbol table the label refs of `samples` and `partials` index into.
   SymbolTable labels = 3;
   /// Compatibility handshake: true when the shard applied the requested
   /// aggregation. A shard that does not recognize the requested `kind` (a

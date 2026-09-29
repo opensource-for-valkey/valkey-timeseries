@@ -623,6 +623,12 @@ pub struct AggregationGroupPartial {
     pub labels: ::prost::alloc::vec::Vec<Label>,
     #[prost(message, optional, tag = "2")]
     pub state: ::core::option::Option<AggregationPartialState>,
+    /// / Label references into `AggregationQueryResponse.labels`, as on
+    /// / `RangeSample`.
+    #[prost(uint32, repeated, tag = "3")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "4")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 /// / The range-vector function half of a grid query: `rate(m\[5m\])`'s `rate` and
 /// / `\[5m\]`. Its presence is what makes a grid query a rollup rather than a
@@ -851,7 +857,7 @@ pub struct AggregationQueryResponse {
     /// / the raw instant vector when `applied` is false.
     #[prost(message, repeated, tag = "2")]
     pub samples: ::prost::alloc::vec::Vec<InstantSample>,
-    /// / Interned label references for `samples`.
+    /// / The symbol table the label refs of `samples` and `partials` index into.
     #[prost(message, optional, tag = "3")]
     pub labels: ::core::option::Option<SymbolTable>,
     /// / Compatibility handshake: true when the shard applied the requested

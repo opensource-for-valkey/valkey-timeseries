@@ -649,11 +649,6 @@ impl From<&EvalLabels> for Vec<ProtoLabel> {
     }
 }
 
-pub(in crate::promql) fn proto_labels_to_eval_labels(labels: Vec<ProtoLabel>) -> EvalLabels {
-    // Already sorted: the sender derived them from a sorted label set.
-    EvalLabels::shared(labels.into_iter().map(Label::from).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,7 +28,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_instant_eval_samples;
 use crate::promql::engine::fanout::type_conversions::{
     aggregation_param_from_wire, aggregation_param_to_wire, decode_peer_partial,
-    decode_pushdown_kind, proto_labels_to_eval_labels, wrong_payload,
+    decode_pushdown_kind, wrong_payload,
 };
 use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::{AggregationParam, AggregationRequest};
@@ -205,15 +205,16 @@ impl AggregationFanoutCommand {
     fn accumulate_partials(
         &mut self,
         partials: Vec<AggregationGroupPartial>,
+        resolver: &mut symbol_table::EvalLabelResolver<'_>,
         target: &NodeInfo,
     ) -> FanoutCommandResult {
-        for partial in partials {
+        for mut partial in partials {
+            let labels = resolver.resolve(&mut partial)?;
             let state = decode_peer_partial(
                 partial.state,
                 target,
                 format_args!("a pushed-down {:?} reduction", self.aggregation.kind),
             )?;
-            let labels = proto_labels_to_eval_labels(partial.labels);
             self.partials.merge(labels, state);
         }
         Ok(())
@@ -272,18 +273,7 @@ impl FanoutCommand for AggregationFanoutCommand {
             PushdownStrategy::Reduce => {
                 let mut groups = PartialGroups::new(kind);
                 groups.accumulate(modifier.as_ref(), samples);
-                Ok(AggregationQueryResponse {
-                    partials: groups
-                        .into_partials()
-                        .map(|(labels, state)| AggregationGroupPartial {
-                            labels: labels.iter().map(Into::into).collect(),
-                            state: Some(state.into()),
-                        })
-                        .collect(),
-                    samples: Vec::new(),
-                    applied: true,
-                    labels: None,
-                })
+                Ok(partials_response(groups))
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 let param = aggregation_param_from_wire(req.scalar_param, req.label_param)
@@ -324,7 +314,7 @@ impl FanoutCommand for AggregationFanoutCommand {
     }
 
     fn on_response(&mut self, mut resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
-        let labels = resp.labels.unwrap_or_default();
+        let labels = resp.labels.take().unwrap_or_default();
         let mut resolver = symbol_table::EvalLabelResolver::new(&labels);
         let samples = std::mem::take(&mut resp.samples)
             .into_iter()
@@ -350,7 +340,7 @@ impl FanoutCommand for AggregationFanoutCommand {
                         "partial states",
                     ));
                 }
-                self.accumulate_partials(resp.partials, target)?;
+                self.accumulate_partials(resp.partials, &mut resolver, target)?;
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 if !resp.partials.is_empty() {
@@ -377,20 +367,58 @@ impl FanoutCommand for AggregationFanoutCommand {
     }
 }
 
+/// A reduction's answer: one partial per group, its labels as refs into the
+/// response's symbol table.
+fn partials_response(groups: PartialGroups) -> AggregationQueryResponse {
+    let mut symbols = symbol_table::SymbolTableBuilder::default();
+    let partials = groups
+        .into_partials()
+        .map(|(labels, state)| {
+            let (label_name_refs, label_value_refs) = symbols.intern_eval(&labels);
+            AggregationGroupPartial {
+                labels: Vec::new(),
+                state: Some(state.into()),
+                label_name_refs,
+                label_value_refs,
+            }
+        })
+        .collect();
+    AggregationQueryResponse {
+        partials,
+        samples: Vec::new(),
+        applied: true,
+        labels: Some(symbols.finish()),
+    }
+}
+
 /// A response carrying the unaggregated instant vector, for a shard that could
 /// not apply the requested operator.
 fn raw_response(samples: Vec<EvalSample>) -> AggregationQueryResponse {
     samples_response(samples, false)
 }
 
+/// Labels go into the response's symbol table straight from the evaluator's
+/// label sets, by identity when they are interned: no owned label strings.
 fn samples_response(samples: Vec<EvalSample>, applied: bool) -> AggregationQueryResponse {
-    let mut samples: Vec<ProtoInstantSample> = samples.into_iter().map(Into::into).collect();
-    let labels = symbol_table::intern_labels(&mut samples);
+    let mut symbols = symbol_table::SymbolTableBuilder::default();
+    let samples = samples
+        .into_iter()
+        .map(|s| {
+            let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
+            ProtoInstantSample {
+                labels: Vec::new(),
+                value: s.value,
+                timestamp: s.timestamp_ms,
+                label_name_refs,
+                label_value_refs,
+            }
+        })
+        .collect();
     AggregationQueryResponse {
         partials: Vec::new(),
         samples,
         applied,
-        labels: Some(labels),
+        labels: Some(symbols.finish()),
     }
 }
 
@@ -443,18 +471,7 @@ mod tests {
             PushdownStrategy::Reduce => {
                 let mut groups = PartialGroups::new(kind);
                 groups.accumulate(modifier, samples);
-                AggregationQueryResponse {
-                    partials: groups
-                        .into_partials()
-                        .map(|(labels, state)| AggregationGroupPartial {
-                            labels: labels.iter().map(Into::into).collect(),
-                            state: Some(state.into()),
-                        })
-                        .collect(),
-                    samples: Vec::new(),
-                    applied: true,
-                    labels: None,
-                }
+                partials_response(groups)
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 let param = aggregation
@@ -733,6 +750,42 @@ mod tests {
         assert!(cmd.on_response(stray, &node(7000)).is_err());
     }
 
+    /// A reduction's partials carry their group labels as refs into the
+    /// response's symbol table, each distinct name and value once; the
+    /// coordinator merges them into interned group labels, and a ref outside
+    /// the table is a corrupt response.
+    #[test]
+    fn test_partials_travel_by_symbol_table() {
+        let by_job = LabelModifier::Include(ModifierLabels::new(vec!["job"]));
+        let aggregation = params(AggregationKind::Sum, Some(by_job));
+        let response = shard_response(&aggregation, test_shards()[0].clone());
+        assert_eq!(response.partials.len(), 2);
+        assert!(response.partials.iter().all(|p| p.labels.is_empty()));
+        let table = response.labels.clone().unwrap();
+        assert_eq!(table.names, vec!["job"]);
+        assert_eq!(table.values.len(), 2);
+
+        let mut cmd = command(aggregation.clone());
+        cmd.on_response(response.clone(), &node(7000)).unwrap();
+        let result = cmd.into_result().unwrap();
+        assert!(
+            result
+                .iter()
+                .all(|s| matches!(s.labels, EvalLabels::Interned(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            rendered(result),
+            single_node(&aggregation, test_shards()[0].clone())
+        );
+
+        let mut corrupt = response;
+        corrupt.partials[0].label_value_refs[0] = 99;
+        let mut cmd = command(aggregation);
+        let err = cmd.on_response(corrupt, &node(7000)).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
     /// A partial that covers no samples cannot come from a shard; merged, it
     /// conjured a group of its own (`sum` 0 for `job="z"`, which no shard saw).
     #[test]
@@ -745,6 +798,7 @@ mod tests {
                     value: "z".to_string(),
                 }],
                 state,
+                ..Default::default()
             }],
             samples: Vec::new(),
             applied: true,
