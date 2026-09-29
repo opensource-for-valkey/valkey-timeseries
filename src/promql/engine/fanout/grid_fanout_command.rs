@@ -28,6 +28,7 @@
 //! no eligible sample is absent from the result, and absence is not the same
 //! as a NaN value.
 
+use crate::commands::fanout_codec::symbol_table::{EvalLabelResolver, SymbolTableBuilder};
 use crate::common::Sample;
 use crate::fanout::{
     FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
@@ -38,7 +39,7 @@ use crate::promql::EvalLabels;
 use crate::promql::engine::fanout::query_utils::local_grid_windows;
 use crate::promql::engine::fanout::type_conversions::{
     aggregation_param_from_wire, aggregation_param_to_wire, decode_peer_partial,
-    decode_pushdown_kind, proto_labels_to_eval_labels, range_sample_to_proto, wrong_payload,
+    decode_pushdown_kind, range_sample_from_proto, range_sample_to_proto, wrong_payload,
 };
 use crate::promql::engine::query_reader::{
     GridAggregation, GridOutcome, GridRequest, GridRollup, GridSeries, SteppedPoint, SteppedSeries,
@@ -365,7 +366,18 @@ impl FanoutCommand for GridFanoutCommand {
         }
     }
 
-    fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
+    fn on_response(&mut self, mut resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
+        // Every element's labels are refs into the response's symbol table,
+        // resolved to interned labels: each distinct pair once per response.
+        let table = resp.labels.take().unwrap_or_default();
+        let mut resolver = EvalLabelResolver::new(&table);
+        let malformed = |why: ValkeyError| {
+            FanoutError::custom(format!(
+                "TSDB: peer {} returned malformed labels: {why}",
+                target.socket_address,
+            ))
+        };
+
         // Corrupt-peer defenses. A request fused with a reduction is answered
         // in partials; every other request in series — a fused selection's
         // series are the shard's per-step picks or counts. A response carrying
@@ -382,17 +394,14 @@ impl FanoutCommand for GridFanoutCommand {
                         "partial states",
                     ));
                 }
-                for partial in resp.partials {
+                for mut partial in resp.partials {
+                    let labels = resolver.resolve(&mut partial).map_err(malformed)?;
                     let state = decode_peer_partial(
                         partial.state,
                         target,
                         "a grid query fused with a reduction",
                     )?;
-                    partials.merge(
-                        partial.step_ts,
-                        proto_labels_to_eval_labels(partial.labels),
-                        state,
-                    );
+                    partials.merge(partial.step_ts, labels, state);
                 }
             }
             None => {
@@ -406,7 +415,8 @@ impl FanoutCommand for GridFanoutCommand {
                     ));
                 }
                 let mut candidates = Vec::new();
-                for series in resp.series {
+                for mut series in resp.series {
+                    let labels = resolver.resolve(&mut series).map_err(malformed)?;
                     let points: Vec<(i64, i64, f64)> = decode_columns(&self.window_ends, &series)
                         .map_err(|why| {
                             FanoutError::custom(format!(
@@ -415,7 +425,6 @@ impl FanoutCommand for GridFanoutCommand {
                             ))
                         })?
                         .collect();
-                    let labels = proto_labels_to_eval_labels(series.labels);
                     if self.selection.is_some() {
                         candidates.push(RangeSample {
                             labels,
@@ -452,7 +461,7 @@ impl FanoutCommand for GridFanoutCommand {
         }
 
         for raw in resp.raw {
-            let series = RangeSample::try_from(raw).map_err(|why| {
+            let series = range_sample_from_proto(raw, &mut resolver).map_err(|why| {
                 FanoutError::custom(format!(
                     "TSDB: peer {} returned an undecodable raw series: {why}",
                     target.socket_address,
@@ -554,9 +563,11 @@ fn shard_response(
     }
     let staged = request.per_series(window_ends, staged);
 
+    // One symbol table for every labelled element of the response.
+    let mut symbols = SymbolTableBuilder::default();
     let raw = raw
         .into_iter()
-        .map(range_sample_to_proto)
+        .map(|series| range_sample_to_proto(series, &mut symbols))
         .collect::<ValkeyResult<Vec<_>>>()?;
 
     if let Some(aggregation) = request.aggregation.as_ref()
@@ -571,26 +582,34 @@ fn shard_response(
             .and_then(|()| selection.finalize())
             .map_err(|e| ValkeyError::String(e.to_string()))
             .map(|selected| GridQueryResponse {
-                series: columnar_series(window_ends, selected),
+                series: columnar_series(window_ends, selected, &mut symbols),
                 partials: Vec::new(),
                 raw,
+                labels: Some(symbols.finish()),
             });
     }
 
     if let Some(aggregation) = request.aggregation.as_ref() {
         let mut groups = SteppedPartialGroups::new(aggregation.kind);
         groups.accumulate(aggregation.modifier.as_ref(), staged.into_step_values());
-        return Ok(GridQueryResponse {
-            series: Vec::new(),
-            partials: groups
-                .into_partials()
-                .map(|(step_ts, labels, state)| GridGroupPartial {
-                    labels: labels.iter().map(Into::into).collect(),
+        let partials = groups
+            .into_partials()
+            .map(|(step_ts, labels, state)| {
+                let (label_name_refs, label_value_refs) = symbols.intern_eval(&labels);
+                GridGroupPartial {
+                    labels: Vec::new(),
                     step_ts,
                     state: Some(state.into()),
-                })
-                .collect(),
+                    label_name_refs,
+                    label_value_refs,
+                }
+            })
+            .collect();
+        return Ok(GridQueryResponse {
+            series: Vec::new(),
+            partials,
             raw,
+            labels: Some(symbols.finish()),
         });
     }
 
@@ -605,20 +624,24 @@ fn shard_response(
                         .map(|p| (p.step_ts, p.sample.timestamp, p.sample.value)),
                     request.sample_timestamps,
                 );
+                let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
                 ProtoGridSeries {
-                    labels: (&s.labels).into(),
+                    labels: Vec::new(),
                     presence,
                     values,
                     sample_lag,
+                    label_name_refs,
+                    label_value_refs,
                 }
             })
             .collect(),
-        GridSeries::Rolled(series) => columnar_series(window_ends, series),
+        GridSeries::Rolled(series) => columnar_series(window_ends, series, &mut symbols),
     };
 
     Ok(GridQueryResponse {
         series,
         partials: Vec::new(),
         raw,
+        labels: Some(symbols.finish()),
     })
 }

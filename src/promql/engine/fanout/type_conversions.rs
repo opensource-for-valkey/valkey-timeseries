@@ -1,7 +1,9 @@
 use crate::commands::fanout_codec::chunks::{deserialize_chunk, serialize_chunk};
+use crate::commands::fanout_codec::generated::SymbolTable;
+use crate::commands::fanout_codec::symbol_table::{EvalLabelResolver, SymbolTableBuilder};
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::string_interner::InternedString;
 use crate::fanout::{FanoutError, NodeInfo};
+use crate::labels::HasFingerprint;
 use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
@@ -15,8 +17,10 @@ use crate::promql::exec::types::EvalLabels;
 use crate::promql::generated::{
     AggregationGrouping as ProtoAggregationGrouping, AggregationKind as ProtoAggregationKind,
     AggregationPartialState as ProtoAggregationPartialState, InstantSample as ProtoInstantSample,
-    Label as ProtoLabel, RangeSample as ProtoRangeSample, SeriesSelector as ProtoSeriesSelector,
+    Label as ProtoLabel, RangeQueryResponse as ProtoRangeQueryResponse,
+    RangeSample as ProtoRangeSample, SeriesSelector as ProtoSeriesSelector,
 };
+use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalSample, RangeSample};
 use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
 use promql_parser::label::{Labels as ModifierLabels, MatchOp as PromMatchOp, Matcher, Matchers};
@@ -48,10 +52,6 @@ impl From<&Labels> for Vec<ProtoLabel> {
     }
 }
 
-pub(in crate::promql) fn metric_name_to_proto_labels(metric_name: &MetricName) -> Vec<ProtoLabel> {
-    metric_name.iter().map(ProtoLabel::from).collect()
-}
-
 impl From<ProtoInstantSample> for EvalSample {
     fn from(proto: ProtoInstantSample) -> Self {
         let labels = proto
@@ -72,69 +72,135 @@ impl From<ProtoInstantSample> for EvalSample {
     }
 }
 
-/// A series as it crosses the wire: labels, and its samples still in the
-/// chunk a shard packed them into. Decoding is the caller's, so a limit can
-/// be checked against [`TimeSeriesChunk::len`] before any sample is
-/// materialized.
-pub(in crate::promql) struct WireRangeSeries {
-    /// As the peer sent them. [`Self::decode`] interns them, so that happens
-    /// on the requester's pool rather than in the fan-out callback.
-    pub labels: Vec<ProtoLabel>,
-    pub chunk: TimeSeriesChunk,
+/// One shard's answer to a range read as it crossed the wire: each series'
+/// samples still in the chunk the shard packed them into, and its labels still
+/// refs into the response's symbol table. Decoding is the caller's, so a limit
+/// can be checked against [`TimeSeriesChunk::len`] before any sample is
+/// materialized, and label resolution runs on the requester's pool rather
+/// than in the fan-out callback.
+pub(in crate::promql) struct WireRangeResponse {
+    table: SymbolTable,
+    series: Vec<WireRangeSeries>,
 }
 
-impl WireRangeSeries {
-    /// The series with its labels interned. A range read's labels outlive
-    /// every step of the query, and each step's binop or `__name__` drop
-    /// rebuilds them: interned, that is a slice of refcount bumps; held as
-    /// owned `Label`s it cloned a `String` per name and per value, per sample
-    /// per step. Interning costs one pool lookup per label, once per series.
-    pub fn decode(self) -> RangeSample<EvalLabels> {
-        let labels = self
-            .labels
-            .iter()
-            .map(|l| InternedString::new_pair(&l.name, &l.value))
-            .collect();
-        RangeSample {
-            labels: EvalLabels::from_interned_shared(labels),
-            samples: self.chunk.iter().collect(),
-        }
-    }
+pub(in crate::promql) struct WireRangeSeries {
+    /// The series' label refs (or inline labels), its chunk taken out.
+    labels: ProtoRangeSample,
+    pub chunk: TimeSeriesChunk,
 }
 
 impl TryFrom<ProtoRangeSample> for WireRangeSeries {
     type Error = ValkeyError;
 
-    fn try_from(proto: ProtoRangeSample) -> Result<Self, Self::Error> {
-        let chunk = match proto.data {
+    fn try_from(mut proto: ProtoRangeSample) -> Result<Self, Self::Error> {
+        let chunk = match proto.data.take() {
             Some(data) => deserialize_chunk(&data)?,
             // A series with no chunk has no samples.
             None => TimeSeriesChunk::Uncompressed(UncompressedChunk::default()),
         };
         Ok(WireRangeSeries {
-            labels: proto.labels,
+            labels: proto,
             chunk,
         })
     }
 }
 
+impl TryFrom<ProtoRangeQueryResponse> for WireRangeResponse {
+    type Error = ValkeyError;
+
+    fn try_from(resp: ProtoRangeQueryResponse) -> Result<Self, Self::Error> {
+        Ok(WireRangeResponse {
+            table: resp.labels.unwrap_or_default(),
+            series: resp
+                .series
+                .into_iter()
+                .map(WireRangeSeries::try_from)
+                .collect::<ValkeyResult<_>>()?,
+        })
+    }
+}
+
+impl WireRangeResponse {
+    pub fn series(&self) -> &[WireRangeSeries] {
+        &self.series
+    }
+
+    /// Each series' labels resolved against this response's symbol table,
+    /// with its chunk still packed.
+    ///
+    /// Interned: a range read's labels outlive every step of the query, and
+    /// each step's binop or `__name__` drop rebuilds them, which for interned
+    /// labels is a slice of refcount bumps and for owned ones a `String` per
+    /// name and per value, per sample per step. Each distinct pair is interned
+    /// once per response, however many series share it.
+    pub fn into_labelled(self) -> ValkeyResult<Vec<(EvalLabels, TimeSeriesChunk)>> {
+        let mut resolver = EvalLabelResolver::new(&self.table);
+        self.series
+            .into_iter()
+            .map(|mut s| Ok((resolver.resolve(&mut s.labels)?, s.chunk)))
+            .collect()
+    }
+}
+
+/// Reject a range read in which two series carry the same labels — across
+/// shards or within one. Prometheus requires label sets to be unique, and a
+/// series answered by two nodes (a slot mid-migration) would be counted twice.
+pub(in crate::promql) fn check_unique_series<'a>(
+    labels: impl IntoIterator<Item = &'a EvalLabels>,
+) -> Result<(), String> {
+    let mut seen = FingerprintHashSet::default();
+    for labels in labels {
+        if !seen.insert(labels.fingerprint()) {
+            return Err(format!("Duplicate series found with labels {labels}"));
+        }
+    }
+    Ok(())
+}
+
+/// A resolved series' samples, decoded out of the chunk they crossed in.
+pub(in crate::promql) fn decode_range_series(
+    (labels, chunk): (EvalLabels, TimeSeriesChunk),
+) -> RangeSample<EvalLabels> {
+    RangeSample {
+        labels,
+        samples: chunk.iter().collect(),
+    }
+}
+
+/// A single series from a response whose symbol table `resolver` reads.
+pub(in crate::promql) fn range_sample_from_proto(
+    proto: ProtoRangeSample,
+    resolver: &mut EvalLabelResolver<'_>,
+) -> ValkeyResult<RangeSample<EvalLabels>> {
+    let mut wire = WireRangeSeries::try_from(proto)?;
+    let labels = resolver.resolve(&mut wire.labels)?;
+    Ok(decode_range_series((labels, wire.chunk)))
+}
+
+/// A series that carries its labels inline, as no shard sends them any more
+/// but a test fixture may.
 impl TryFrom<ProtoRangeSample> for RangeSample<EvalLabels> {
     type Error = ValkeyError;
 
     fn try_from(proto: ProtoRangeSample) -> Result<Self, Self::Error> {
-        WireRangeSeries::try_from(proto).map(WireRangeSeries::decode)
+        range_sample_from_proto(proto, &mut EvalLabelResolver::new(&SymbolTable::default()))
     }
 }
 
 /// The wire form of a series' samples: packed with the chunk codec the
-/// `TS.MRANGE` fan-out uses, so both push-downs ship the same bytes.
+/// `TS.MRANGE` fan-out uses, so both push-downs ship the same bytes. Its
+/// labels go into `symbols`, the enclosing response's table.
 pub(in crate::promql) fn range_sample_to_proto(
     series: RangeSample<EvalLabels>,
+    symbols: &mut SymbolTableBuilder,
 ) -> ValkeyResult<ProtoRangeSample> {
     let RangeSample { labels, samples } = series;
+    let (label_name_refs, label_value_refs) = symbols.intern_eval(&labels);
     Ok(ProtoRangeSample {
-        labels: (&labels).into(),
+        labels: Vec::new(),
         data: Some(serialize_chunk(samples_to_chunk_lossless(samples))?),
+        label_name_refs,
+        label_value_refs,
     })
 }
 
@@ -605,6 +671,37 @@ mod tests {
         }
     }
 
+    /// One series through the wire form and back: labels by the response's
+    /// symbol table, samples by the chunk.
+    fn round_trip(series: RangeSample<EvalLabels>) -> RangeSample<EvalLabels> {
+        let mut symbols = SymbolTableBuilder::default();
+        let proto = range_sample_to_proto(series, &mut symbols).unwrap();
+        assert!(proto.labels.is_empty(), "labels travel as refs");
+        let table = symbols.finish();
+        range_sample_from_proto(proto, &mut EvalLabelResolver::new(&table)).unwrap()
+    }
+
+    /// A range response as a shard builds it: one symbol table for all of its
+    /// series, each series' samples in its own chunk.
+    fn response(series: Vec<RangeSample<EvalLabels>>) -> ProtoRangeQueryResponse {
+        let mut symbols = SymbolTableBuilder::default();
+        let series = series
+            .into_iter()
+            .map(|s| range_sample_to_proto(s, &mut symbols).unwrap())
+            .collect();
+        ProtoRangeQueryResponse {
+            series,
+            labels: Some(symbols.finish()),
+        }
+    }
+
+    fn host_series(host: &str) -> RangeSample<EvalLabels> {
+        RangeSample {
+            labels: EvalLabels::from_pairs(&[("__name__", "cpu"), ("host", host)]),
+            samples: vec![Sample::new(1000, 1.0)],
+        }
+    }
+
     /// A raw series crosses the wire as a chunk and comes back sample for
     /// sample — below the compression threshold (uncompressed), above it
     /// (Chimp), with NaN, and empty.
@@ -623,8 +720,7 @@ mod tests {
             ],
         ];
         for samples in shapes {
-            let proto = range_sample_to_proto(series(samples.clone())).unwrap();
-            let back = RangeSample::<EvalLabels>::try_from(proto).unwrap();
+            let back = round_trip(series(samples.clone()));
             assert_eq!(
                 back.labels.to_string(),
                 series(Vec::new()).labels.to_string()
@@ -642,8 +738,7 @@ mod tests {
     /// come back sorted.
     #[test]
     fn decoded_range_series_labels_are_interned() {
-        let proto = range_sample_to_proto(series(Vec::new())).unwrap();
-        let back = RangeSample::<EvalLabels>::try_from(proto).unwrap();
+        let back = round_trip(series(Vec::new()));
         assert!(matches!(back.labels, EvalLabels::Interned(_)));
         assert_eq!(back.labels, series(Vec::new()).labels);
 
@@ -661,7 +756,63 @@ mod tests {
             ..Default::default()
         };
         let back = RangeSample::<EvalLabels>::try_from(unsorted).unwrap();
+        assert!(matches!(back.labels, EvalLabels::Interned(_)));
         assert_eq!(back.labels, series(Vec::new()).labels);
+    }
+
+    /// Each distinct name and value crosses the wire once per response, and
+    /// every series comes back with its own labels, interned.
+    #[test]
+    fn a_range_response_shares_one_symbol_table() {
+        let resp = response(vec![host_series("a"), host_series("b")]);
+        let table = resp.labels.as_ref().unwrap();
+        assert_eq!(table.names, vec!["__name__", "host"]);
+        assert_eq!(table.values, vec!["cpu", "a", "b"]);
+
+        let labelled = WireRangeResponse::try_from(resp)
+            .unwrap()
+            .into_labelled()
+            .unwrap();
+        let back: Vec<_> = labelled.into_iter().map(decode_range_series).collect();
+        assert_eq!(back.len(), 2);
+        for (got, host) in back.iter().zip(["a", "b"]) {
+            assert!(matches!(got.labels, EvalLabels::Interned(_)));
+            assert_eq!(got.labels, host_series(host).labels);
+            assert_eq!(got.samples, host_series(host).samples);
+        }
+    }
+
+    /// A ref past the end of the table is a malformed response, not a panic.
+    #[test]
+    fn a_label_ref_out_of_range_is_refused() {
+        let mut resp = response(vec![host_series("a")]);
+        resp.series[0].label_value_refs[1] = 99;
+        let err = WireRangeResponse::try_from(resp)
+            .unwrap()
+            .into_labelled()
+            .unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    /// The same series from two shards (a slot mid-migration) is refused
+    /// once both answers are resolved, whichever tables they came from.
+    #[test]
+    fn a_series_answered_twice_is_refused() {
+        let labelled: Vec<_> = [
+            response(vec![host_series("a"), host_series("b")]),
+            response(vec![host_series("c"), host_series("a")]),
+        ]
+        .into_iter()
+        .flat_map(|r| {
+            WireRangeResponse::try_from(r)
+                .unwrap()
+                .into_labelled()
+                .unwrap()
+        })
+        .collect();
+        let err = check_unique_series(labelled.iter().map(|(l, _)| l)).unwrap_err();
+        assert!(err.contains("host=\"a\""), "{err}");
+        assert!(check_unique_series(labelled[..3].iter().map(|(l, _)| l)).is_ok());
     }
 
     /// The point of shipping chunks: an hour of 1 s telemetry is a fraction
@@ -677,7 +828,8 @@ mod tests {
                 )
             })
             .collect();
-        let proto = range_sample_to_proto(series(samples)).unwrap();
+        let proto =
+            range_sample_to_proto(series(samples), &mut SymbolTableBuilder::default()).unwrap();
         let bytes_per_sample = proto.encoded_len() as f64 / 3600.0;
         assert!(bytes_per_sample < 6.0, "{bytes_per_sample:.2} B/sample");
         let wire = WireRangeSeries::try_from(proto).unwrap();

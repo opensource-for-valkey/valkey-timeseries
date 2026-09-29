@@ -9,10 +9,11 @@
 //!
 //! - [`intern_labels`] rewrites owned `labels: Vec<Label>` in place (MRANGE and
 //!   the aggregated PromQL outputs, which are built as owned labels anyway).
-//! - [`SymbolTableBuilder`] interns straight from a series' [`MetricName`] by
-//!   the identity of its interned `name=value` entries: a hit is one integer
-//!   lookup, and no owned strings are built for a label already in the table.
-//!   This is what the shard's instant-query handler uses.
+//! - [`SymbolTableBuilder`] interns straight from a series' [`MetricName`] (or
+//!   interned [`EvalLabels`]) by the identity of its interned `name=value`
+//!   entries: a hit is one integer lookup, and no owned strings are built for a
+//!   label already in the table. The shard's instant, range and grid handlers
+//!   use it.
 //! - [`resolve_labels`] is the coordinator-side inverse for consumers that
 //!   want owned `Label`s back (MRANGE); [`EvalLabelResolver`] goes straight to
 //!   evaluator labels for the PromQL paths.
@@ -29,7 +30,7 @@ use super::generated::{Label, SeriesRangeResponse, SymbolTable};
 use crate::common::context::key_for_display;
 use crate::common::string_interner::InternedString;
 use crate::labels::MetricName;
-use crate::promql::generated::InstantSample;
+use crate::promql::generated::{GridGroupPartial, GridSeries, InstantSample, RangeSample};
 use crate::promql::{EvalLabels, EvalSample};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,30 +73,44 @@ impl SymbolTableRefs for SeriesRangeResponse {
     }
 }
 
-impl SymbolTableRefs for InstantSample {
-    fn take_labels(&mut self) -> Vec<Label> {
-        std::mem::take(&mut self.labels)
-    }
+/// The PromQL wire elements all carry `labels` plus the two ref arrays under
+/// the same field names; only how an error names them differs.
+macro_rules! promql_symbol_table_refs {
+    ($($ty:ty => |$s:ident| $describe:expr;)+) => {$(
+        impl SymbolTableRefs for $ty {
+            fn take_labels(&mut self) -> Vec<Label> {
+                std::mem::take(&mut self.labels)
+            }
 
-    fn set_label_refs(&mut self, names: Vec<u32>, values: Vec<u32>) {
-        self.label_name_refs = names;
-        self.label_value_refs = values;
-    }
+            fn set_label_refs(&mut self, names: Vec<u32>, values: Vec<u32>) {
+                self.label_name_refs = names;
+                self.label_value_refs = values;
+            }
 
-    fn take_label_refs(&mut self) -> (Vec<u32>, Vec<u32>) {
-        (
-            std::mem::take(&mut self.label_name_refs),
-            std::mem::take(&mut self.label_value_refs),
-        )
-    }
+            fn take_label_refs(&mut self) -> (Vec<u32>, Vec<u32>) {
+                (
+                    std::mem::take(&mut self.label_name_refs),
+                    std::mem::take(&mut self.label_value_refs),
+                )
+            }
 
-    fn set_labels(&mut self, labels: Vec<Label>) {
-        self.labels = labels;
-    }
+            fn set_labels(&mut self, labels: Vec<Label>) {
+                self.labels = labels;
+            }
 
-    fn describe(&self) -> String {
-        format!("instant sample at {}", self.timestamp)
-    }
+            fn describe(&self) -> String {
+                let $s = self;
+                $describe
+            }
+        }
+    )+};
+}
+
+promql_symbol_table_refs! {
+    InstantSample => |s| format!("instant sample at {}", s.timestamp);
+    RangeSample => |_s| "range series".to_string();
+    GridSeries => |_s| "grid series".to_string();
+    GridGroupPartial => |s| format!("grid partial at {}", s.step_ts);
 }
 
 /// Builds a response's [`SymbolTable`] from series labels as they are read
@@ -105,38 +120,64 @@ impl SymbolTableRefs for InstantSample {
 /// interner guarantees one allocation per distinct string while it is alive,
 /// so a label's address identifies it: the pair cache is keyed by that
 /// address and a hit costs one integer lookup. Only the first sight of a
-/// label splits it and copies its two halves into the table. The borrowed
-/// keys tie the builder to the series it reads from; [`Self::finish`]
-/// releases them.
+/// label splits it and copies its two halves into the table. The cache holds
+/// a reference to each entry it has keyed, so an address cannot be freed and
+/// reused by a different label while the builder lives — which is what lets
+/// it take label sets that are dropped before [`Self::finish`], such as a
+/// shard's computed group labels.
 #[derive(Default)]
-pub struct SymbolTableBuilder<'a> {
+pub struct SymbolTableBuilder {
     table: SymbolTable,
-    name_ids: HashMap<&'a str, u32, ahash::RandomState>,
-    value_ids: HashMap<&'a str, u32, ahash::RandomState>,
-    /// `name=value` address → (name ref, value ref).
-    pairs: HashMap<usize, (u32, u32), ahash::RandomState>,
+    name_ids: HashMap<Box<str>, u32, ahash::RandomState>,
+    value_ids: HashMap<Box<str>, u32, ahash::RandomState>,
+    /// `name=value` address → (name ref, value ref, the entry kept alive).
+    pairs: HashMap<usize, (u32, u32, InternedString), ahash::RandomState>,
 }
 
-impl<'a> SymbolTableBuilder<'a> {
+impl SymbolTableBuilder {
     /// The ref arrays for one series' labels, in storage (name) order.
+    pub fn intern(&mut self, labels: &MetricName) -> (Vec<u32>, Vec<u32>) {
+        self.intern_entries(labels.raw_entries())
+    }
+
+    /// The ref arrays for evaluator labels, in name order. An interned set
+    /// takes the identity path; an owned one is looked up by its strings.
+    pub fn intern_eval(&mut self, labels: &EvalLabels) -> (Vec<u32>, Vec<u32>) {
+        if let EvalLabels::Interned(entries) = labels {
+            return self.intern_entries(entries.iter());
+        }
+        labels
+            .iter()
+            .map(|l| {
+                (
+                    Self::id(&mut self.name_ids, &mut self.table.names, l.name),
+                    Self::id(&mut self.value_ids, &mut self.table.values, l.value),
+                )
+            })
+            .unzip()
+    }
+
     /// Entries without a separator are malformed; storage never produces
     /// them, and `MetricName::iter` skips them the same way.
-    pub fn intern(&mut self, labels: &'a MetricName) -> (Vec<u32>, Vec<u32>) {
-        let mut names = Vec::with_capacity(labels.len());
-        let mut values = Vec::with_capacity(labels.len());
-        for raw in labels.raw_entries() {
+    fn intern_entries<'e>(
+        &mut self,
+        entries: impl ExactSizeIterator<Item = &'e InternedString>,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut names = Vec::with_capacity(entries.len());
+        let mut values = Vec::with_capacity(entries.len());
+        for raw in entries {
             let key = raw.as_bytes().as_ptr() as usize;
             let (name_ref, value_ref) = match self.pairs.get(&key) {
-                Some(&refs) => refs,
+                Some(&(name_ref, value_ref, _)) => (name_ref, value_ref),
                 None => {
-                    let Some((name, value)) = raw.split_once('=') else {
+                    let Some((name, value)) = raw.split_pair() else {
                         continue;
                     };
                     let refs = (
                         Self::id(&mut self.name_ids, &mut self.table.names, name),
                         Self::id(&mut self.value_ids, &mut self.table.values, value),
                     );
-                    self.pairs.insert(key, refs);
+                    self.pairs.insert(key, (refs.0, refs.1, raw.clone()));
                     refs
                 }
             };
@@ -147,14 +188,17 @@ impl<'a> SymbolTableBuilder<'a> {
     }
 
     fn id(
-        ids: &mut HashMap<&'a str, u32, ahash::RandomState>,
+        ids: &mut HashMap<Box<str>, u32, ahash::RandomState>,
         symbols: &mut Vec<String>,
-        symbol: &'a str,
+        symbol: &str,
     ) -> u32 {
-        *ids.entry(symbol).or_insert_with(|| {
-            symbols.push(symbol.to_owned());
-            (symbols.len() - 1) as u32
-        })
+        if let Some(&id) = ids.get(symbol) {
+            return id;
+        }
+        let id = symbols.len() as u32;
+        symbols.push(symbol.to_owned());
+        ids.insert(symbol.into(), id);
+        id
     }
 
     pub fn finish(self) -> SymbolTable {
@@ -283,9 +327,8 @@ pub fn resolve_labels<T: SymbolTableRefs>(
 /// Each distinct `(name, value)` pair is interned once per response as a
 /// `name=value` [`InternedString`] (the form local series already carry) and every sample that
 /// references it takes a refcount bump, so a 500-series instant response costs
-/// ~500 interned strings instead of 4 000 `String` clones. A sample that
-/// carries inline labels instead of refs (a peer that did not intern) goes
-/// through the ordinary owned conversion.
+/// ~500 interned strings instead of 4 000 `String` clones. An element that
+/// carries inline labels instead of refs is interned label by label.
 pub struct EvalLabelResolver<'a> {
     table: &'a SymbolTable,
     pairs: HashMap<u64, InternedString, ahash::RandomState>,
@@ -306,12 +349,14 @@ impl<'a> EvalLabelResolver<'a> {
     /// inline labels when it has none).
     pub fn resolve<T: SymbolTableRefs>(&mut self, s: &mut T) -> ValkeyResult<EvalLabels> {
         let Some((names, values)) = take_ref_pairs(s)? else {
+            // Inline labels: interned all the same, so a consumer never sees
+            // a `Shared` set that every later label edit would materialize.
             let labels = s
                 .take_labels()
-                .into_iter()
-                .map(crate::Label::from)
+                .iter()
+                .map(|l| InternedString::new_pair(&l.name, &l.value))
                 .collect();
-            return Ok(EvalLabels::shared(labels));
+            return Ok(EvalLabels::from_interned_shared(labels));
         };
         // Check every ref first so the fill below cannot fail: an infallible
         // `TrustedLen` iterator collects straight into the `Arc<[_]>`, one
@@ -594,6 +639,37 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    /// Evaluator labels intern to the same refs whichever variant holds them,
+    /// and a label set dropped before `finish` cannot alias a later one: the
+    /// cache keeps each keyed entry alive, so its address is never reused.
+    #[test]
+    fn builder_interns_eval_labels_of_every_variant() {
+        use crate::labels::MetricName;
+        let pairs = [("__name__", "cpu"), ("host", "h1")];
+        let interned = EvalLabels::interned(&MetricName::from_pairs(pairs));
+        let owned = EvalLabels::owned(
+            pairs
+                .iter()
+                .map(|&(n, v)| crate::Label::new(n, v))
+                .collect(),
+        );
+
+        let mut builder = SymbolTableBuilder::default();
+        let from_interned = builder.intern_eval(&interned);
+        let from_owned = builder.intern_eval(&owned);
+        assert_eq!(from_interned, (vec![0, 1], vec![0, 1]));
+        assert_eq!(from_owned, from_interned);
+
+        // A computed group label set, interned and freed before `finish`.
+        let group = |host: &str| EvalLabels::interned(&MetricName::from_pairs([("host", host)]));
+        let first = builder.intern_eval(&group("zz-transient"));
+        let second = builder.intern_eval(&group("zz-other"));
+        assert_ne!(first, second);
+
+        let table = builder.finish();
+        assert_eq!(table.values, vec!["cpu", "h1", "zz-transient", "zz-other"]);
     }
 
     #[test]

@@ -15,7 +15,9 @@ pub(in crate::promql) use label_profile_fanout_command::LabelProfileFanoutComman
 pub(in crate::promql) use query_utils::local_label_profile;
 pub(in crate::promql) use range_vector_selector_fanout_command::RangeVectorSelectorFanoutCommand;
 pub(crate) use type_conversions::validate_query_regexes;
-pub(in crate::promql) use type_conversions::{WireRangeSeries, metric_name_to_proto_labels};
+pub(in crate::promql) use type_conversions::{
+    WireRangeResponse, check_unique_series, decode_range_series,
+};
 use valkey_module::ValkeyResult;
 
 use crate::fanout::{ErrorKind, FanoutError, register_fanout_operation};

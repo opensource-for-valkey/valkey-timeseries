@@ -1,15 +1,12 @@
 use crate::common::Timestamp;
 use crate::fanout::{
-    FanoutCommand, FanoutCommandResult, FanoutContext, FanoutError, NodeInfo,
-    get_cluster_command_timeout,
+    FanoutCommand, FanoutCommandResult, FanoutContext, NodeInfo, get_cluster_command_timeout,
 };
-use crate::labels::{HasFingerprint, filters::SeriesSelector};
+use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::handle_range_query;
 use crate::promql::generated::{
-    RangeQuery, RangeQueryResponse, RangeSample, SeriesSelector as ProtoSeriesSelector,
+    RangeQuery, RangeQueryResponse, SeriesSelector as ProtoSeriesSelector,
 };
-use crate::promql::hashers::FingerprintHashSet;
-use ahash::HashSetExt;
 use promql_parser::label::Matchers;
 use std::time::Duration;
 use valkey_module::ValkeyResult;
@@ -21,8 +18,10 @@ pub struct RangeVectorSelectorFanoutCommand {
     max_series: u64,
     max_points_per_series: u64,
     timeout: Duration,
-    series: Vec<RangeSample>,
-    seen: FingerprintHashSet,
+    /// One entry per shard, each with its own symbol table. Label resolution
+    /// and the duplicate-series check wait for the requester's pool (see
+    /// `check_unique_series`): this callback runs on the main thread.
+    responses: Vec<RangeQueryResponse>,
 }
 
 impl Default for RangeVectorSelectorFanoutCommand {
@@ -35,8 +34,7 @@ impl Default for RangeVectorSelectorFanoutCommand {
             max_series: 0,
             max_points_per_series: 0,
             timeout: get_cluster_command_timeout(),
-            series: Vec::with_capacity(16),
-            seen: FingerprintHashSet::with_capacity(16),
+            responses: Vec::new(),
         }
     }
 }
@@ -56,16 +54,13 @@ impl RangeVectorSelectorFanoutCommand {
             max_series,
             max_points_per_series,
             timeout,
-            series: Vec::with_capacity(16),
-            seen: Default::default(),
+            responses: Vec::new(),
         }
     }
 
-    /// Consume the accumulated selector results into the final response.
-    pub fn get_response(self) -> RangeQueryResponse {
-        RangeQueryResponse {
-            series: self.series,
-        }
+    /// Consume the accumulated selector results: every shard's response.
+    pub fn get_responses(self) -> Vec<RangeQueryResponse> {
+        self.responses
     }
 }
 
@@ -84,7 +79,7 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
         let Some(selector) = req.selector else {
             // todo: return error
             ctx.log_warning("Received range query with no selector, returning empty response");
-            return Ok(RangeQueryResponse { series: vec![] });
+            return Ok(RangeQueryResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
         let ctx = ctx.lock()?;
@@ -114,18 +109,7 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {
-        // dedupe samples by labels - if multiple responses contain the same labels, we have an issue
-        // Using prometheus semantics, series should have unique label-value pairs..
-
-        for series in resp.series.iter() {
-            let fingerprint = series.labels.fingerprint();
-            if !self.seen.insert(fingerprint) {
-                let msg = format!("Duplicate series found with labels {:?}", series.labels);
-                let err = FanoutError::custom(msg);
-                return Err(err);
-            }
-        }
-        self.series.extend(resp.series);
+        self.responses.push(resp);
         Ok(())
     }
 }

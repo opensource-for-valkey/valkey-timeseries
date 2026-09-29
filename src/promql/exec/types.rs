@@ -159,14 +159,16 @@ impl EvalLabels {
 
     /// Wrap interned `name=value` labels that did not come from a
     /// [`MetricName`] (a fan-out response), guarding name order: a set in
-    /// name order is shared as is, anything else is materialized and sorted.
+    /// name order is shared as is, anything else is sorted — still interned,
+    /// the entries are refcounted pointers — in the `(name, value)` order an
+    /// owned set sorts to.
     pub(crate) fn from_interned_shared(labels: Arc<[InternedString]>) -> Self {
         if labels.is_sorted_by_key(|l| l.name()) {
             EvalLabels::Interned(labels)
         } else {
-            let mut vec: Vec<Label> = labels.iter().map(label_of).collect();
-            vec.sort();
-            EvalLabels::Owned(vec)
+            let mut sorted = labels.to_vec();
+            sorted.sort_by(|a, b| (a.name(), a.value()).cmp(&(b.name(), b.value())));
+            EvalLabels::Interned(Arc::from(sorted))
         }
     }
 

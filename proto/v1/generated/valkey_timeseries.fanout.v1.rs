@@ -525,6 +525,14 @@ pub struct RangeSample {
     /// / bytes per sample on typical telemetry.
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<SampleData>,
+    /// / Interned label references into the enclosing response's symbol table
+    /// / (`RangeQueryResponse.labels` / `GridQueryResponse.labels`): parallel
+    /// / packed arrays, one entry per label (see `SymbolTable`). Empty means the
+    /// / labels travel inline in `labels`.
+    #[prost(uint32, repeated, tag = "3")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "4")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeQuery {
@@ -543,6 +551,8 @@ pub struct RangeQuery {
 pub struct RangeQueryResponse {
     #[prost(message, repeated, tag = "1")]
     pub series: ::prost::alloc::vec::Vec<RangeSample>,
+    #[prost(message, optional, tag = "2")]
+    pub labels: ::core::option::Option<SymbolTable>,
 }
 /// / A `by (...)` / `without (...)` modifier. An absent message means the
 /// / aggregation has no modifier: every sample falls into one group whose label
@@ -730,6 +740,11 @@ pub struct GridSeries {
     /// / negative), one per value. Empty otherwise, and for rollup output.
     #[prost(int64, repeated, tag = "4")]
     pub sample_lag: ::prost::alloc::vec::Vec<i64>,
+    /// / Label references into `GridQueryResponse.labels`, as on `RangeSample`.
+    #[prost(uint32, repeated, tag = "5")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "6")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 /// / One `(group, step, shard)` partial for a fused grid query: the group's label
 /// / set as computed by the request's grouping modifier, the step it belongs to,
@@ -742,6 +757,11 @@ pub struct GridGroupPartial {
     pub step_ts: i64,
     #[prost(message, optional, tag = "3")]
     pub state: ::core::option::Option<AggregationPartialState>,
+    /// / Label references into `GridQueryResponse.labels`, as on `RangeSample`.
+    #[prost(uint32, repeated, tag = "4")]
+    pub label_name_refs: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, repeated, tag = "5")]
+    pub label_value_refs: ::prost::alloc::vec::Vec<u32>,
 }
 /// / Each series the shard read lands in exactly one of the three lists.
 /// /
@@ -765,6 +785,11 @@ pub struct GridQueryResponse {
     pub partials: ::prost::alloc::vec::Vec<GridGroupPartial>,
     #[prost(message, repeated, tag = "3")]
     pub raw: ::prost::alloc::vec::Vec<RangeSample>,
+    /// / The symbol table every `series`, `partials` and `raw` element's label
+    /// / refs index into: one per response, so each distinct name and value
+    /// / crosses the wire once rather than once per series.
+    #[prost(message, optional, tag = "4")]
+    pub labels: ::core::option::Option<SymbolTable>,
 }
 /// / The labels of the series a selector matches on this node, for the
 /// / coordinator's derived filter push-down (a range query narrows one operand

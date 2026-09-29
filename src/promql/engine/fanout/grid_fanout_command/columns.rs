@@ -2,6 +2,7 @@
 //! request's window ends, the present windows' values, and optionally each
 //! pick's lag behind its window end.
 
+use crate::commands::fanout_codec::symbol_table::SymbolTableBuilder;
 use crate::promql::EvalLabels;
 use crate::promql::generated::GridSeries as ProtoGridSeries;
 use crate::promql::model::RangeSample;
@@ -88,10 +89,11 @@ pub(super) fn decode_columns<'a>(
 
 /// Per-entry `(step, value)` points as columnar series: rollup output, or a
 /// fused selection's per-step picks and counts. No lag column — a value here
-/// belongs to its window.
+/// belongs to its window. Labels go into `symbols`, the response's table.
 pub(super) fn columnar_series(
     window_ends: &[i64],
     series: Vec<RangeSample<EvalLabels>>,
+    symbols: &mut SymbolTableBuilder,
 ) -> Vec<ProtoGridSeries> {
     series
         .into_iter()
@@ -103,11 +105,14 @@ pub(super) fn columnar_series(
                     .map(|p| (p.timestamp, p.timestamp, p.value)),
                 false,
             );
+            let (label_name_refs, label_value_refs) = symbols.intern_eval(&s.labels);
             ProtoGridSeries {
-                labels: (&s.labels).into(),
+                labels: Vec::new(),
                 presence,
                 values,
                 sample_lag,
+                label_name_refs,
+                label_value_refs,
             }
         })
         .collect()

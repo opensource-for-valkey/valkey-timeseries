@@ -10,8 +10,7 @@ use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::grid_fetch_bounds;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
-    get_series_range, instant_lookback_start_ms, metric_name_to_proto_labels, validate_max_points,
-    validate_max_series,
+    get_series_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
 };
 use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
@@ -262,13 +261,9 @@ pub(super) fn handle_range_query(
             if series_samples.is_empty() {
                 return Ok(None);
             }
-            let labels = metric_name_to_proto_labels(&s.labels);
             let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
                 .map_err(|e| e.to_string())?;
-            Ok(Some(RangeSample {
-                labels,
-                data: Some(data),
-            }))
+            Ok(Some((&s.labels, data)))
         })
         .into_fallible()
         .filter_map(|range| range)
@@ -278,7 +273,27 @@ pub(super) fn handle_range_query(
     validate_max_series(ranges.len(), max_series as usize)
         .map_err(valkey_module::ValkeyError::String)?;
 
-    Ok(RangeQueryResponse { series: ranges })
+    // Labels go into the response's symbol table by identity, as for an
+    // instant query: serially, since the table is one per response, and after
+    // the parallel read so only the series that ship are interned.
+    let mut symbol_table = symbol_table::SymbolTableBuilder::default();
+    let series = ranges
+        .into_iter()
+        .map(|(labels, data)| {
+            let (label_name_refs, label_value_refs) = symbol_table.intern(labels);
+            RangeSample {
+                labels: Vec::new(),
+                data: Some(data),
+                label_name_refs,
+                label_value_refs,
+            }
+        })
+        .collect();
+
+    Ok(RangeQueryResponse {
+        series,
+        labels: Some(symbol_table.finish()),
+    })
 }
 
 #[cfg(test)]

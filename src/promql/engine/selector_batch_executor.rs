@@ -18,8 +18,9 @@ use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, valid
 use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
-    RangeVectorSelectorFanoutCommand, WireRangeSeries, get_snapshot_range,
-    instant_lookback_start_ms, local_label_profile, validate_max_points, validate_max_series,
+    RangeVectorSelectorFanoutCommand, WireRangeResponse, check_unique_series, decode_range_series,
+    get_snapshot_range, instant_lookback_start_ms, local_label_profile, validate_max_points,
+    validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::chunks::ChunkOps;
@@ -104,10 +105,12 @@ enum SelectorOutput {
     Vector(Vec<InstantSample<EvalLabels>>),
     /// Range-vector selector result, labels still by refcount from storage.
     Matrix(Vec<RangeSample<EvalLabels>>),
-    /// A cluster range read, each series still in the chunk its shard packed
-    /// it into. Decoded by the requester on the executor's pool rather than
-    /// in the fanout callback, which runs on the main thread and serially.
-    WireMatrix(Vec<WireRangeSeries>),
+    /// A cluster range read, one entry per shard: each series still in the
+    /// chunk its shard packed it into, its labels still refs into that
+    /// shard's symbol table. Resolved and decoded by the requester on the
+    /// executor's pool rather than in the fanout callback, which runs on the
+    /// main thread and serially.
+    WireMatrix(Vec<WireRangeResponse>),
     Aggregation(AggregationOutcome),
     Grid(GridOutcome),
     /// A label profile, or `None` when the source declined to build one.
@@ -134,12 +137,29 @@ impl SelectorOutput {
             // cold: the caller is usually an evaluation worker, and entering
             // another pool directly would have it run evaluation jobs while it
             // waits, each of which may block on this executor in turn.
-            SelectorOutput::WireMatrix(series) => Ok(run_on_pool_cold(&MATERIALIZE_POOL, || {
-                series
+            SelectorOutput::WireMatrix(responses) => run_on_pool_cold(&MATERIALIZE_POOL, || {
+                // Labels per response (each resolver caches its own table's
+                // pairs), then the check across all of them, then samples
+                // per series.
+                let mut labelled = Vec::new();
+                for response in responses
                     .into_par_on(&MATERIALIZE_POOL)
-                    .map(WireRangeSeries::decode)
-                    .collect()
-            })),
+                    .map(WireRangeResponse::into_labelled)
+                    .collect::<Vec<_>>()
+                {
+                    labelled.extend(response.map_err(|e| {
+                        QueryError::Execution(format!(
+                            "undecodable range series in cluster response: {e}"
+                        ))
+                    })?);
+                }
+                check_unique_series(labelled.iter().map(|(labels, _)| labels))
+                    .map_err(QueryError::Execution)?;
+                Ok(labelled
+                    .into_par_on(&MATERIALIZE_POOL)
+                    .map(decode_range_series)
+                    .collect())
+            }),
             _ => Err(QueryError::Execution(
                 "BUG: selector task returned a non-matrix outcome".to_string(),
             )),
@@ -735,28 +755,30 @@ fn execute_cluster_range_selector(
     let handler = move |cmd: RangeVectorSelectorFanoutCommand, result: FanoutCommandResult| {
         let query_result = match result {
             Ok(()) => {
-                let resp = cmd.get_response();
+                let responses = cmd.get_responses();
+                let series_count = responses.iter().map(|r| r.series.len()).sum();
 
-                validate_max_series_(resp.series.len(), max_series).and_then(|_| {
+                validate_max_series_(series_count, max_series).and_then(|_| {
                     // The chunks know their length without being decoded, so
                     // the limits are checked before any sample is materialized.
-                    let series = resp
-                        .series
+                    let responses = responses
                         .into_iter()
-                        .map(|rs| {
-                            WireRangeSeries::try_from(rs).map_err(|e| {
+                        .map(|resp| {
+                            WireRangeResponse::try_from(resp).map_err(|e| {
                                 QueryError::Execution(format!(
                                     "undecodable range series in cluster response: {e}"
                                 ))
                             })
                         })
                         .collect::<QueryResult<Vec<_>>>()?;
-                    validate_max_samples(series.iter().map(|s| s.chunk.len()).sum(), max_samples)?;
-                    for s in &series {
+                    let series = || responses.iter().flat_map(|r| r.series());
+                    validate_max_samples(series().map(|s| s.chunk.len()).sum(), max_samples)?;
+                    for s in series() {
                         validate_max_points_per_series(s.chunk.len(), max_points_per_series)?;
                     }
-                    // Still packed: the requester decodes them in parallel.
-                    Ok(SelectorOutput::WireMatrix(series))
+                    // Still packed: the requester resolves and decodes them
+                    // in parallel.
+                    Ok(SelectorOutput::WireMatrix(responses))
                 })
             }
             Err(e) => Err(selector_fanout_failure("range", e)),

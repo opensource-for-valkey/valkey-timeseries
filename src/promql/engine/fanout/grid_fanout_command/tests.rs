@@ -127,8 +127,9 @@ fn test_partial_without_samples_is_rejected() {
             }],
             step_ts,
             state,
+            ..Default::default()
         }],
-        raw: Vec::new(),
+        ..Default::default()
     };
     for (what, state) in [
         ("no state", None),
@@ -172,13 +173,15 @@ fn response(request: &GridRequest, windows: Vec<RangeSample<EvalLabels>>) -> Gri
 
 /// A response carrying every series raw, whatever its size.
 fn raw_response(windows: Vec<RangeSample<EvalLabels>>) -> GridQueryResponse {
+    let mut symbols = SymbolTableBuilder::default();
+    let raw = windows
+        .into_iter()
+        .map(|s| range_sample_to_proto(s, &mut symbols).unwrap())
+        .collect();
     GridQueryResponse {
-        series: Vec::new(),
-        partials: Vec::new(),
-        raw: windows
-            .into_iter()
-            .map(|s| range_sample_to_proto(s).unwrap())
-            .collect(),
+        raw,
+        labels: Some(symbols.finish()),
+        ..Default::default()
     }
 }
 
@@ -755,13 +758,15 @@ fn test_groups_decide_independently() {
     let resp = response(&request, windows.clone());
     assert_eq!(resp.raw.len(), 1, "only the lone series travels raw");
     assert!(resp.series.is_empty());
+    let table = resp.labels.clone().unwrap_or_default();
     let mut groups: Vec<String> = resp
         .partials
         .iter()
         .map(|p| {
-            p.labels
+            p.label_name_refs
                 .iter()
-                .map(|l| format!("{}={}", l.name, l.value))
+                .zip(&p.label_value_refs)
+                .map(|(&n, &v)| format!("{}={}", table.names[n as usize], table.values[v as usize]))
                 .collect::<Vec<_>>()
                 .join(",")
         })
@@ -1105,10 +1110,10 @@ fn test_columns_round_trip() {
         vec![0, 1_234 * 7, 1_234 * 8, 1_234 * 15, 1_234 * 20]
     );
     let series = ProtoGridSeries {
-        labels: Vec::new(),
         presence,
         values,
         sample_lag,
+        ..Default::default()
     };
     let decoded: Vec<(i64, i64, f64)> = decode_columns(&window_ends, &series).unwrap().collect();
     assert_eq!(decoded, points);
@@ -1118,10 +1123,10 @@ fn test_columns_round_trip() {
         encode_columns(&window_ends, points.iter().copied(), false);
     assert!(sample_lag.is_empty());
     let series = ProtoGridSeries {
-        labels: Vec::new(),
         presence,
         values,
         sample_lag,
+        ..Default::default()
     };
     let decoded: Vec<(i64, i64, f64)> = decode_columns(&window_ends, &series).unwrap().collect();
     let stamped: Vec<(i64, i64, f64)> = points.iter().map(|&(s, _, v)| (s, s, v)).collect();
@@ -1390,7 +1395,7 @@ fn test_mismatched_payload_is_rejected() {
     let stray = GridQueryResponse {
         series: Vec::new(),
         partials: vec![GridGroupPartial::default()],
-        raw: Vec::new(),
+        ..Default::default()
     };
     assert!(cmd.on_response(stray, &node(7000)).is_err());
 
@@ -1402,16 +1407,19 @@ fn test_mismatched_payload_is_rejected() {
     let stray = GridQueryResponse {
         series: vec![ProtoGridSeries::default()],
         partials: vec![GridGroupPartial::default()],
-        raw: Vec::new(),
+        ..Default::default()
     };
     assert!(cmd.on_response(stray, &node(7000)).is_err());
 
     // Raw alongside either list is legitimate: that is the size rule.
     let mut cmd = command(stepped_grid_request());
+    let mut symbols = SymbolTableBuilder::default();
+    let raw = range_sample_to_proto(series("0", &[(EVAL_TS, 1.0)]), &mut symbols).unwrap();
     let mixed = GridQueryResponse {
         series: vec![ProtoGridSeries::default()],
-        partials: Vec::new(),
-        raw: vec![range_sample_to_proto(series("0", &[(EVAL_TS, 1.0)])).unwrap()],
+        raw: vec![raw],
+        labels: Some(symbols.finish()),
+        ..Default::default()
     };
     assert!(cmd.on_response(mixed, &node(7000)).is_ok());
 

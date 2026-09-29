@@ -69,6 +69,12 @@ message RangeSample {
   /// `WIRE_COMPRESSION_MIN_SAMPLES` up, uncompressed below it. Around 5-6
   /// bytes per sample on typical telemetry.
   SampleData data = 2;
+  /// Interned label references into the enclosing response's symbol table
+  /// (`RangeQueryResponse.labels` / `GridQueryResponse.labels`): parallel
+  /// packed arrays, one entry per label (see `SymbolTable`). Empty means the
+  /// labels travel inline in `labels`.
+  repeated uint32 label_name_refs = 3;
+  repeated uint32 label_value_refs = 4;
 }
 
 message RangeQuery {
@@ -81,6 +87,7 @@ message RangeQuery {
 
 message RangeQueryResponse {
   repeated RangeSample series = 1;
+  SymbolTable labels = 2;
 }
 
 /// A PromQL aggregation operator. Mirrors
@@ -291,6 +298,9 @@ message GridSeries {
   /// window end each pick's own timestamp lies (`step_ts - sample_ts`, never
   /// negative), one per value. Empty otherwise, and for rollup output.
   repeated int64 sample_lag = 4;
+  /// Label references into `GridQueryResponse.labels`, as on `RangeSample`.
+  repeated uint32 label_name_refs = 5;
+  repeated uint32 label_value_refs = 6;
 }
 
 /// One `(group, step, shard)` partial for a fused grid query: the group's label
@@ -300,6 +310,9 @@ message GridGroupPartial {
   repeated Label labels = 1;
   int64 step_ts = 2;
   AggregationPartialState state = 3;
+  /// Label references into `GridQueryResponse.labels`, as on `RangeSample`.
+  repeated uint32 label_name_refs = 4;
+  repeated uint32 label_value_refs = 5;
 }
 
 /// Each series the shard read lands in exactly one of the three lists.
@@ -320,6 +333,10 @@ message GridQueryResponse {
   repeated GridSeries series = 1;
   repeated GridGroupPartial partials = 2;
   repeated RangeSample raw = 3;
+  /// The symbol table every `series`, `partials` and `raw` element's label
+  /// refs index into: one per response, so each distinct name and value
+  /// crosses the wire once rather than once per series.
+  SymbolTable labels = 4;
 }
 
 /// The labels of the series a selector matches on this node, for the
