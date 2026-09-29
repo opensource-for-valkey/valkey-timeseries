@@ -226,6 +226,8 @@ macro_rules! get_allocator {
     };
 }
 
+// Unit tests only, in practice: `doctest` is set while rustdoc collects examples, but a doctest
+// links the ordinary library build, so doctests still need `enable-system-alloc`.
 #[cfg(any(test, doctest))]
 macro_rules! get_allocator {
     () => {
