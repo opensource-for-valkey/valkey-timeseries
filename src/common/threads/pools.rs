@@ -1,5 +1,7 @@
 //! The pinned pools PromQL runs on. Both are built on first use, so a node that never runs
-//! PromQL never starts them, and both are sized like the shared pool (`ts-num-threads`).
+//! PromQL never starts them. Both take `ts-num-threads` as given, where the shared pool caps it
+//! at the core count: an evaluation worker can park waiting on the selector executor, and
+//! threads beyond the cores let such waits overlap.
 
 use super::{ThreadRole, set_thread_role};
 use crate::config::num_threads;
