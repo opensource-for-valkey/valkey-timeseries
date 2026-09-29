@@ -575,15 +575,25 @@ fn eval_arith_ops_merge_join(
 
     // Duplicate detection for grouped matching must occur after comparison
     // filtering so that comparisons can naturally reduce duplicates.
-    if !ctx.is_one_to_one {
+    //
+    // One-to-one matching produces unique label sets by construction, except
+    // through a fill: an unmatched match key repeated on either side (which is
+    // tolerated when it emits nothing, see `validate_one_side`) is filled once
+    // per series, and the `on`/`ignoring` projection can reduce those to one
+    // label set. Only a collision is an error: filled series that stay distinct
+    // (a comparison keeps `__name__`) are fine.
+    if !ctx.is_one_to_one || ctx.has_fill {
         let mut seen = FingerprintHashSet::with_capacity(result.len());
         for sample in &result {
             let fp = get_metric_signature(&sample.labels, sample.drop_name);
             if !seen.insert(fp) {
-                return Err(EvaluationError::InternalError(
+                let msg = if ctx.is_one_to_one {
+                    "multiple matches for labels: a fill would emit the same labels more than \
+                     once; matching labels must be unique on each side"
+                } else {
                     "multiple matches for labels: grouping labels must ensure unique matches"
-                        .to_string(),
-                ));
+                };
+                return Err(EvaluationError::InternalError(msg.to_string()));
             }
         }
     }
@@ -693,7 +703,9 @@ fn skip_group_count(
 ///
 /// The three call sites (a matched key, an unmatched key with a fill, an
 /// unmatched key without one) differ in when they run, not in the rule, so they
-/// ask here rather than each spelling it out.
+/// ask here rather than each spelling it out. A filled unmatched repeat does
+/// emit, once per series; the result-wide duplicate check after the join
+/// rejects it only if those series collide.
 #[inline]
 fn validate_one_side(ctx: &ArithOpContext, group_len: usize, matched: bool) -> EvalResult<()> {
     if group_len > 1 && (matched || !ctx.is_one_to_one) {
@@ -1252,6 +1264,85 @@ mod tests {
             .expect("staging sample missing (fill_left should emit it)");
         assert_eq!(staging.value, 8.0);
 
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── fill over a repeated, unmatched match key ─────────────────────────────
+
+    fn on_job_with_fill(op: u16, fill: VectorMatchFillValues) -> BinaryExpr {
+        use promql_parser::label::Labels as ModifierLabels;
+        let modifier = BinModifier::default()
+            .with_matching(Some(LabelModifier::Include(ModifierLabels::new(vec![
+                "job",
+            ]))))
+            .with_fill_values(fill);
+        make_expr(op, Some(modifier))
+    }
+
+    /// Two right-hand series share `job="x"` and nothing on the left matches it. Without a
+    /// fill the repeat is tolerated (it emits nothing; see `validate_one_side`). With
+    /// `fill_left` both were emitted, and `on(job)` reduces both to `{job="x"}`: two series
+    /// with one label set, which `sum(...)` would silently double-count.
+    #[test]
+    fn test_fill_rejects_duplicates_from_a_repeated_one_side_key() {
+        let lhs = vec![sample(1000, 1.0, &[("job", "y")])];
+        let rhs = vec![
+            sample(1000, 2.0, &[("job", "x"), ("instance", "1")]),
+            sample(1000, 3.0, &[("job", "x"), ("instance", "2")]),
+        ];
+        let filled = on_job_with_fill(T_ADD, VectorMatchFillValues::default().with_lhs(0.0));
+        let err = eval_binop_vector_vector(&filled, lhs.clone(), rhs.clone())
+            .expect_err("two {job=\"x\"} results");
+        assert!(
+            err.to_string().contains("multiple matches for labels"),
+            "{err}"
+        );
+
+        let unfilled = on_job_with_fill(T_ADD, VectorMatchFillValues::default());
+        assert!(eval_binop_vector_vector(&unfilled, lhs, rhs).is_ok());
+    }
+
+    /// The same on the left: under one-to-one, a repeated unmatched left key was filled once
+    /// per series.
+    #[test]
+    fn test_fill_rejects_duplicates_from_a_repeated_many_side_key() {
+        let lhs = vec![
+            sample(1000, 2.0, &[("job", "x"), ("instance", "1")]),
+            sample(1000, 3.0, &[("job", "x"), ("instance", "2")]),
+        ];
+        let rhs = vec![sample(1000, 1.0, &[("job", "y")])];
+        let filled = on_job_with_fill(T_ADD, VectorMatchFillValues::default().with_rhs(0.0));
+        let err = eval_binop_vector_vector(&filled, lhs.clone(), rhs.clone())
+            .expect_err("two {job=\"x\"} results");
+        assert!(
+            err.to_string().contains("multiple matches for labels"),
+            "{err}"
+        );
+
+        let unfilled = on_job_with_fill(T_ADD, VectorMatchFillValues::default());
+        assert!(eval_binop_vector_vector(&unfilled, lhs, rhs).is_ok());
+    }
+
+    /// A repeated key is only a problem if the filled results collide. A comparison without
+    /// `bool` keeps `__name__`, so two left series that differ only by name stay distinct.
+    #[test]
+    fn test_fill_keeps_repeated_keys_that_stay_distinct() {
+        let lhs = vec![
+            sample(1000, 2.0, &[("__name__", "a1"), ("job", "x")]),
+            sample(1000, 3.0, &[("__name__", "a2"), ("job", "x")]),
+        ];
+        let rhs = vec![sample(1000, 1.0, &[("__name__", "c"), ("job", "y")])];
+        let expr = make_expr(
+            T_GTR,
+            Some(
+                BinModifier::default()
+                    .with_fill_values(VectorMatchFillValues::default().with_rhs(0.0)),
+            ),
+        );
+        let result = eval_binop_vector_vector(&expr, lhs, rhs)
+            .unwrap()
+            .into_instant_vector()
+            .unwrap();
         assert_eq!(result.len(), 2);
     }
 

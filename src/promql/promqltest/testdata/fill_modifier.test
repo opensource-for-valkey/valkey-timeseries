@@ -385,3 +385,17 @@ eval instant at 0m other + fill_left(0) fill_left
 eval instant at 0m other + fill_right(0) fill_right
   {label="a"} 1000
   {label="e"} 5000
+clear
+
+# A match key repeated on one side with nothing to match on the other is tolerated when
+# it emits nothing. A fill emits it once per series, and on(job) reduces both to
+# {job="x"}: that is an error, not two series that sum() would double-count.
+load 1m
+  fill_dup_a{job="y"} 1
+  fill_dup_b{job="x", instance="1"} 2
+  fill_dup_b{job="x", instance="2"} 3
+
+eval instant at 0m sum(fill_dup_a + on(job) fill_left(0) fill_dup_b)
+  expect fail msg: multiple matches for labels
+
+eval instant at 0m sum(fill_dup_a + on(job) fill_dup_b)
