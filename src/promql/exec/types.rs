@@ -450,8 +450,8 @@ impl EvalLabels {
         }
     }
 
-    /// Construct from pairs (for tests and benchmarks). Sorts on construction.
-    #[cfg(any(test, feature = "bench"))]
+    /// Construct from pairs, for tests. Sorts on construction.
+    #[cfg(test)]
     pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
         let mut vec: Vec<Label> = pairs
             .iter()

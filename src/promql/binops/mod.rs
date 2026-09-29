@@ -5,6 +5,8 @@ use promql_parser::parser::token::{
     TokenType,
 };
 
+#[cfg(feature = "bench")]
+mod bench;
 mod binop_range_scalar;
 mod binop_scalar_vector;
 mod binop_string_string;
@@ -17,7 +19,7 @@ pub(in crate::promql) use labels::*;
 /// Re-exported for the external Criterion benchmark crates (`benches/fast_path.rs`),
 /// which reach these through `promql::binops`.
 #[cfg(feature = "bench")]
-pub use binop_vector_vector::{GroupLeftCase, OnMatchCase, VectorVectorCase, VectorVectorShape};
+pub use bench::{GroupLeftCase, OnMatchCase, VectorVectorCase, VectorVectorShape};
 
 #[cfg(feature = "bench")]
 pub use binop_vector_scalar::{BenchOp, LabelMode, VectorScalarCase, VectorScalarInput};

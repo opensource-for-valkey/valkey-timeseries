@@ -68,9 +68,12 @@ fn bench_group_left_extra_label(c: &mut Criterion) {
 fn bench_on_match(c: &mut Criterion) {
     let mut group = c.benchmark_group("on_match");
     for &size in &[1_000usize, 10_000usize] {
-        for (labels, interned) in [("interned", true), ("shared", false)] {
+        for (labels, interned) in [("interned", true), ("indexed", true), ("shared", false)] {
             for (shape, group_right) in [("one_to_one", false), ("group_right", true)] {
-                let case = OnMatchCase::new(group_right, interned, size);
+                let case = match labels {
+                    "indexed" => OnMatchCase::new_indexed(group_right, size),
+                    _ => OnMatchCase::new(group_right, interned, size),
+                };
                 group.bench_with_input(
                     BenchmarkId::new(format!("{shape}/{labels}"), size),
                     &size,

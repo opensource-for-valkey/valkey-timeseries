@@ -28,7 +28,7 @@ pub(in crate::promql) fn changes_metric_schema(op: TokenType) -> bool {
 
 /// Fingerprint of a sample's *effective* label set: the labels as they will
 /// stand once a pending `__name__` drop is applied.
-pub(crate) fn get_metric_signature(labels: &EvalLabels, drop_name: bool) -> SeriesFingerprint {
+pub(crate) fn effective_fingerprint(labels: &EvalLabels, drop_name: bool) -> SeriesFingerprint {
     if !drop_name {
         return labels.fingerprint();
     }
@@ -38,7 +38,7 @@ pub(crate) fn get_metric_signature(labels: &EvalLabels, drop_name: bool) -> Seri
 pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
     let mut seen_label_sets = FingerprintHashSet::default();
     for sample in samples {
-        let key = get_metric_signature(&sample.labels, sample.drop_name);
+        let key = effective_fingerprint(&sample.labels, sample.drop_name);
         if !seen_label_sets.insert(key) {
             return Err(EvaluationError::DuplicateLabelSet);
         }
