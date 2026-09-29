@@ -942,12 +942,7 @@ fn build_result_labels(
     // Nothing else is copied across, for one-to-one or many-to-one matching
     // alike — as in Prometheus's `resultMetric`.
     for name in group_labels.into_iter().flatten() {
-        match one_sample.labels.get(name) {
-            Some(value) => labels.set(name, value.to_string()),
-            None => {
-                labels.remove(name);
-            }
-        }
+        labels.copy_label_from(name, &one_sample.labels);
     }
 
     labels
@@ -1179,6 +1174,90 @@ mod bench_support {
         }
     }
 
+    /// `requests * on(job) group_left(owner) info`: every result copies
+    /// `owner` from its "one"-side series. Both operands carry interned
+    /// labels, as a selector's results do, so this measures the path
+    /// production takes (the shapes above use `Shared` labels).
+    pub struct GroupLeftCase {
+        expr: BinaryExpr,
+        n: usize,
+        groups: usize,
+    }
+
+    impl GroupLeftCase {
+        pub fn new(n: usize) -> Self {
+            use promql_parser::label::Labels as ModifierLabels;
+            use promql_parser::parser::token::T_MUL;
+            use promql_parser::parser::{LabelModifier, VectorMatchCardinality};
+            let modifier = BinModifier::default()
+                .with_matching(Some(LabelModifier::Include(ModifierLabels::new(vec![
+                    "job",
+                ]))))
+                .with_card(VectorMatchCardinality::ManyToOne(ModifierLabels::new(
+                    vec!["owner"],
+                )));
+            Self {
+                expr: BinaryExpr {
+                    op: TokenType::new(T_MUL),
+                    lhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                    rhs: Box::new(Expr::NumberLiteral(NumberLiteral { val: 0.0 })),
+                    modifier: Some(modifier),
+                },
+                n,
+                groups: (n / 10).max(1),
+            }
+        }
+
+        /// Untimed per-iteration setup: `n` request series over `n / 10` jobs,
+        /// and one info series per job.
+        pub fn input(&self) -> (Vec<EvalSample>, Vec<EvalSample>) {
+            use crate::labels::MetricName;
+            let interned = |pairs: &[(&str, &str)], value: f64| EvalSample {
+                timestamp_ms: 1,
+                value,
+                labels: EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied())),
+                drop_name: false,
+            };
+            let many = (0..self.n)
+                .map(|i| {
+                    let (job, instance) = (format!("job{}", i % self.groups), i.to_string());
+                    interned(
+                        &[
+                            ("__name__", "requests"),
+                            ("instance", &instance),
+                            ("job", &job),
+                            ("method", "GET"),
+                        ],
+                        i as f64,
+                    )
+                })
+                .collect();
+            let one = (0..self.groups)
+                .map(|g| {
+                    let (job, owner) = (format!("job{g}"), format!("team-{g}"));
+                    interned(
+                        &[
+                            ("__name__", "info"),
+                            ("job", &job),
+                            ("owner", &owner),
+                            ("version", "v1"),
+                        ],
+                        1.0,
+                    )
+                })
+                .collect();
+            (many, one)
+        }
+
+        pub fn run(&self, (left, right): (Vec<EvalSample>, Vec<EvalSample>)) -> Vec<EvalSample> {
+            match eval_binop_vector_vector(&self.expr, left, right) {
+                Ok(ExprResult::InstantVector(v)) => v,
+                Ok(_) => unreachable!("vector-vector always yields an instant vector"),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
     /// `n` series shaped like selector output: `__name__` plus a unique `id`
     /// and two shared labels, held as a sole-owner `Shared` Arc.
     fn series(n: usize, id_offset: usize) -> Vec<EvalSample> {
@@ -1226,7 +1305,7 @@ mod bench_support {
 }
 
 #[cfg(feature = "bench")]
-pub use bench_support::{VectorVectorCase, VectorVectorShape};
+pub use bench_support::{GroupLeftCase, VectorVectorCase, VectorVectorShape};
 
 #[cfg(test)]
 mod tests {

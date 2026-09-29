@@ -333,6 +333,47 @@ impl EvalLabels {
         self.insert(key.to_string(), value);
     }
 
+    /// Set `name` to its value in `source`, or remove it when `source` has
+    /// none: the label copy of `group_left(...)` / `group_right(...)`.
+    ///
+    /// An `Interned` set stays interned. The source's `name=value` entry is
+    /// shared by refcount when the source is interned too, and interned once
+    /// otherwise, so the result is one new slice. Going through `set` instead
+    /// materialized every label of every result as owned `String`s.
+    pub(crate) fn copy_label_from(&mut self, name: &str, source: &EvalLabels) {
+        let Some(value) = source.get(name) else {
+            self.remove(name);
+            return;
+        };
+        let EvalLabels::Interned(split) = self else {
+            self.set(name, value.to_string());
+            return;
+        };
+        let entry = match source {
+            EvalLabels::Interned(from) => from
+                .binary_search_by(|l| l.name().cmp(name))
+                .map(|i| from[i].clone())
+                .unwrap_or_else(|_| InternedString::new_pair(name, value)),
+            _ => InternedString::new_pair(name, value),
+        };
+        let labels: Vec<InternedString> = match split.binary_search_by(|l| l.name().cmp(name)) {
+            Ok(i) if split[i].value() == value => return,
+            Ok(i) => {
+                let mut labels = split.to_vec();
+                labels[i] = entry;
+                labels
+            }
+            Err(i) => {
+                let mut labels = Vec::with_capacity(split.len() + 1);
+                labels.extend_from_slice(&split[..i]);
+                labels.push(entry);
+                labels.extend_from_slice(&split[i..]);
+                labels
+            }
+        };
+        *self = EvalLabels::Interned(Arc::from(labels));
+    }
+
     /// Compute grouping labels for aggregations.
     ///
     /// Mirrors `Labels::compute_grouping_labels` / `Labels::into_grouping_labels`.
@@ -1273,6 +1314,92 @@ mod step_grid_tests {
         assert!(
             builder.values.capacity() <= STEP_GRID_INITIAL_CAPACITY,
             "a sparse grid must not reserve every requested step"
+        );
+    }
+}
+
+#[cfg(test)]
+mod copy_label_tests {
+    use super::EvalLabels;
+    use crate::labels::MetricName;
+
+    fn interned(pairs: &[(&str, &str)]) -> EvalLabels {
+        EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied()))
+    }
+
+    fn pairs(labels: &EvalLabels) -> Vec<(String, String)> {
+        labels
+            .iter()
+            .map(|l| (l.name.to_string(), l.value.to_string()))
+            .collect()
+    }
+
+    fn expected(p: &[(&str, &str)]) -> Vec<(String, String)> {
+        p.iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn copy_label_keeps_an_interned_set_interned() {
+        let one = interned(&[("job", "a"), ("owner", "team-a")]);
+
+        // Inserted in name order.
+        let mut labels = interned(&[("instance", "1"), ("job", "a"), ("zone", "z")]);
+        labels.copy_label_from("owner", &one);
+        assert!(matches!(labels, EvalLabels::Interned(_)));
+        assert_eq!(
+            pairs(&labels),
+            expected(&[
+                ("instance", "1"),
+                ("job", "a"),
+                ("owner", "team-a"),
+                ("zone", "z")
+            ])
+        );
+
+        // Replaced.
+        let mut labels = interned(&[("job", "a"), ("owner", "old")]);
+        labels.copy_label_from("owner", &one);
+        assert!(matches!(labels, EvalLabels::Interned(_)));
+        assert_eq!(
+            pairs(&labels),
+            expected(&[("job", "a"), ("owner", "team-a")])
+        );
+
+        // Already equal: unchanged.
+        let mut labels = interned(&[("job", "a"), ("owner", "team-a")]);
+        labels.copy_label_from("owner", &one);
+        assert_eq!(
+            pairs(&labels),
+            expected(&[("job", "a"), ("owner", "team-a")])
+        );
+
+        // Absent from the source: removed.
+        let mut labels = interned(&[("job", "a"), ("region", "eu")]);
+        labels.copy_label_from("region", &one);
+        assert!(matches!(labels, EvalLabels::Interned(_)));
+        assert_eq!(pairs(&labels), expected(&[("job", "a")]));
+    }
+
+    #[test]
+    fn copy_label_between_variants() {
+        // From an owned source into an interned set: interned on the way in.
+        let owned_one = EvalLabels::from_pairs(&[("owner", "team-b")]);
+        let mut labels = interned(&[("job", "a")]);
+        labels.copy_label_from("owner", &owned_one);
+        assert!(matches!(labels, EvalLabels::Interned(_)));
+        assert_eq!(
+            pairs(&labels),
+            expected(&[("job", "a"), ("owner", "team-b")])
+        );
+
+        // Into an owned set: the ordinary insert.
+        let mut labels = EvalLabels::from_pairs(&[("job", "a")]);
+        labels.copy_label_from("owner", &interned(&[("owner", "team-c")]));
+        assert_eq!(
+            pairs(&labels),
+            expected(&[("job", "a"), ("owner", "team-c")])
         );
     }
 }

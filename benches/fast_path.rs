@@ -8,7 +8,7 @@ use criterion::BatchSize;
 #[cfg(feature = "bench")]
 // These items are provided by the crate under the `bench` feature.
 use valkey_timeseries::promql::binops::{
-    BenchOp, LabelMode, VectorScalarCase, VectorVectorCase, VectorVectorShape,
+    BenchOp, GroupLeftCase, LabelMode, VectorScalarCase, VectorVectorCase, VectorVectorShape,
 };
 
 /// Vector-vector `a + b` by input shape. Operand construction sits in
@@ -41,6 +41,24 @@ fn bench_paths(c: &mut Criterion) {
         }
     }
 
+    group.finish();
+}
+
+/// `requests * on(job) group_left(owner) info` over interned labels: each result
+/// copies one label from its "one"-side series.
+#[cfg(feature = "bench")]
+fn bench_group_left_extra_label(c: &mut Criterion) {
+    let mut group = c.benchmark_group("group_left_extra_label");
+    for &size in &[100usize, 1_000usize, 10_000usize] {
+        let case = GroupLeftCase::new(size);
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
+            b.iter_batched(
+                || case.input(),
+                |input| case.run(input),
+                BatchSize::LargeInput,
+            )
+        });
+    }
     group.finish();
 }
 /// A/B the vector-scalar loop: the current implementation, which hoists the
@@ -347,7 +365,8 @@ criterion_group!(
     bench_vector_scalar,
     bench_vector_scalar_labels,
     bench_labels_conversion,
-    bench_evallabels_ops
+    bench_evallabels_ops,
+    bench_group_left_extra_label
 );
 #[cfg(feature = "bench")]
 criterion_main!(benches);
