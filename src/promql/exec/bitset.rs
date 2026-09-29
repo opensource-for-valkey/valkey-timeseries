@@ -16,35 +16,9 @@ impl BitSet {
         }
     }
 
-    /// All bits cleared.
-    pub fn with_len(len: usize) -> Self {
-        let word_count = len.div_ceil(64);
-        Self {
-            bits: vec![0u64; word_count],
-            len,
-        }
-    }
-
-    /// All bits set.
-    pub fn all_set(len: usize) -> Self {
-        let word_count = len.div_ceil(64);
-        let mut bits = vec![u64::MAX; word_count];
-        if !len.is_multiple_of(64)
-            && let Some(last) = bits.last_mut()
-        {
-            *last = (1u64 << (len % 64)) - 1;
-        }
-        Self { bits, len }
-    }
-
     #[inline]
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Panics if `idx >= len`.
@@ -58,32 +32,6 @@ impl BitSet {
         );
         let (word, bit) = (idx / 64, idx % 64);
         (self.bits[word] >> bit) & 1 == 1
-    }
-
-    /// Panics if `idx >= len`.
-    #[inline]
-    pub fn set(&mut self, idx: usize) {
-        assert!(
-            idx < self.len,
-            "index {} out of bounds for bitset of len {}",
-            idx,
-            self.len
-        );
-        let (word, bit) = (idx / 64, idx % 64);
-        self.bits[word] |= 1u64 << bit;
-    }
-
-    /// Panics if `idx >= len`.
-    #[inline]
-    pub fn clear(&mut self, idx: usize) {
-        assert!(
-            idx < self.len,
-            "index {} out of bounds for bitset of len {}",
-            idx,
-            self.len
-        );
-        let (word, bit) = (idx / 64, idx % 64);
-        self.bits[word] &= !(1u64 << bit);
     }
 
     /// Append one bit.
@@ -125,10 +73,5 @@ impl BitSet {
     #[inline]
     pub fn shrink_to_fit(&mut self) {
         self.bits.shrink_to_fit();
-    }
-
-    /// Linear in `len / 64`.
-    pub fn count_ones(&self) -> usize {
-        self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 }

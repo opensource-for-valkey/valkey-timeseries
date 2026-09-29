@@ -6,9 +6,11 @@
 use crate::common::constants::MILLIS_PER_MIN;
 use crate::common::time::{current_time_millis, system_time_to_millis, valkey_cached_time_millis};
 use crate::common::{Sample, Timestamp};
-use crate::labels::{HasFingerprint, Labels};
+use crate::labels::Labels;
 use crate::promql::time::duration_ms;
-use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult, QueryError, QueryResult};
+use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult};
+#[cfg(test)]
+use crate::promql::{QueryError, QueryResult};
 use promql_parser::parser::EvalStmt;
 use promql_parser::parser::value::ValueType;
 
@@ -50,6 +52,7 @@ pub enum QueryValue {
 }
 
 impl QueryValue {
+    #[cfg(test)]
     /// Convert into the most general representation (`Vec<RangeSample>`).
     ///
     /// - `Scalar` becomes a single `RangeSample` with empty labels and one sample.
@@ -78,37 +81,6 @@ impl QueryValue {
             }
         };
         Ok(matrix)
-    }
-
-    pub fn into_vector(self) -> QueryResult<Vec<InstantSample>> {
-        let vector = match self {
-            QueryValue::Scalar {
-                timestamp_ms,
-                value,
-            } => vec![InstantSample {
-                labels: Labels::empty(),
-                timestamp_ms,
-                value,
-            }],
-            QueryValue::Vector(samples) => samples,
-            // todo: raise error if any range sample has more than 1 point, since we can't represent that in a vector
-            QueryValue::Matrix(range_samples) => range_samples
-                .into_iter()
-                .flat_map(|rs| {
-                    rs.samples.into_iter().map(move |s| InstantSample {
-                        labels: rs.labels.clone(),
-                        timestamp_ms: s.timestamp,
-                        value: s.value,
-                    })
-                })
-                .collect(),
-            QueryValue::String(_) => {
-                return Err(QueryError::Execution(
-                    "cannot convert string to vector".into(),
-                ));
-            }
-        };
-        Ok(vector)
     }
 
     pub fn value_type(&self) -> ValueType {
@@ -170,6 +142,7 @@ pub(crate) struct EvalContext {
 }
 
 impl EvalContext {
+    #[cfg(test)]
     pub fn for_vector_selector(query_time: Timestamp, lookback_delta_ms: i64) -> Self {
         EvalContext {
             query_start: query_time,
@@ -178,44 +151,6 @@ impl EvalContext {
             step_ms: 0,
             lookback_delta_ms,
         }
-    }
-
-    pub fn expected_steps(&self) -> usize {
-        crate::promql::time::grid_step_count(self.query_start, self.query_end, self.step_ms)
-            as usize
-    }
-
-    pub fn get_timestamps(&self) -> Vec<Timestamp> {
-        if self.step_ms == 0 {
-            return vec![];
-        }
-        // todo: have an upper limit
-        let capacity = self.expected_steps();
-        let mut timestamps = Vec::with_capacity(capacity);
-        for timestamp in (self.query_start..=self.query_end).step_by(self.step_ms as usize) {
-            timestamps.push(timestamp);
-        }
-        timestamps
-    }
-
-    pub fn align_start_end(&mut self) {
-        let start = self.query_start;
-        let end = self.query_end;
-        // Round start to the nearest smaller value divisible by step.
-        self.query_start = start - start % self.step_ms;
-        // Round end to the nearest bigger value divisible by step.
-        let adjust = end % self.step_ms;
-        if adjust > 0 {
-            self.query_end += self.step_ms - adjust
-        }
-    }
-
-    pub fn is_range_selector(&self) -> bool {
-        self.step_ms > 0 && self.query_end > self.query_start
-    }
-
-    pub fn is_instant_selector(&self) -> bool {
-        self.step_ms == 0
     }
 }
 
@@ -342,35 +277,6 @@ impl From<RangeSample<EvalLabels>> for RangeSample {
             samples: sample.samples,
         }
     }
-}
-
-impl RangeSample {
-    pub fn fingerprint(&self) -> u128 {
-        self.labels.fingerprint()
-    }
-}
-
-impl RangeSample<EvalLabels> {
-    pub fn fingerprint(&self) -> u128 {
-        self.labels.fingerprint()
-    }
-}
-
-#[allow(dead_code)]
-#[repr(u8)]
-pub enum AggregationKind {
-    Avg,
-    Bottomk,
-    Count,
-    CountValues,
-    Group,
-    Limitk,
-    LimitRatio,
-    Max,
-    Min,
-    Quantile,
-    Sum,
-    Topk,
 }
 
 #[cfg(test)]

@@ -2,8 +2,7 @@ use crate::common::replies::ReplyContext;
 use crate::common::{Sample, Timestamp};
 use crate::labels::Label;
 use crate::promql::engine::{ConcreteSeriesQuerier, QueryReader};
-use crate::promql::{EvalLabels, EvalSample, EvalSamples, ExprResult, QueryValue};
-use promql_parser::parser::value::ValueType;
+use crate::promql::{EvalLabels, QueryValue};
 use std::sync::Arc;
 use valkey_module::{Context, Status};
 
@@ -13,14 +12,6 @@ use valkey_module::{Context, Status};
 pub(super) fn get_promql_querier(ctx: &Context, hash_tags: Vec<String>) -> Arc<dyn QueryReader> {
     let querier = ConcreteSeriesQuerier::create_with_hash_tags(ctx, Arc::from(hash_tags));
     Arc::new(querier)
-}
-
-pub(super) fn write_samples(ctx: &ReplyContext, samples: &[Sample]) -> Status {
-    ctx.reply_with_array(samples.len());
-    for sample in samples {
-        ctx.reply_with_sample(sample);
-    }
-    Status::Ok
 }
 
 /// A label set the reply writer can walk without caring how it is stored:
@@ -95,14 +86,6 @@ fn reply_with_range_sample(
     Status::Ok
 }
 
-pub(super) fn reply_with_matrix(ctx: &ReplyContext, samples: &[EvalSamples]) -> Status {
-    ctx.reply_with_array(samples.len());
-    for sample in samples {
-        reply_with_range_sample(ctx, &sample.labels, &sample.values);
-    }
-    Status::Ok
-}
-
 /// For an individual series returned from an instant query, return the metric labels and value at the specified timestamp.
 /// ``` json
 /// {
@@ -128,45 +111,11 @@ pub fn reply_with_instant_sample(
     Status::Ok
 }
 
-pub(super) fn reply_with_instant_vector(ctx: &ReplyContext, sample: &[EvalSample]) -> Status {
-    ctx.reply_with_array(sample.len());
-    for s in sample {
-        reply_with_instant_sample(ctx, &s.labels, s.timestamp_ms, s.value);
-    }
-    Status::Ok
-}
-
-fn reply_with_value_type(ctx: &ReplyContext, value_type: ValueType) -> Status {
-    match value_type {
-        ValueType::Scalar => ctx.reply_with_string("scalar"),
-        ValueType::String => ctx.reply_with_string("string"),
-        ValueType::Matrix => ctx.reply_with_string("matrix"),
-        ValueType::Vector => ctx.reply_with_string("vector"),
-    }
-}
-
 fn reply_with_string_value(ctx: &ReplyContext, timestamp: Timestamp, value: &str) -> Status {
     ctx.reply_with_array(2);
     ctx.reply_with_integer(timestamp);
     ctx.reply_with_simple_string(value);
     Status::Ok
-}
-
-pub(super) fn reply_with_expr_result(
-    ctx: &ReplyContext,
-    result: ExprResult,
-    eval_ts: Timestamp,
-) -> Status {
-    ctx.reply_with_map(2);
-    ctx.reply_with_string("resultType");
-    reply_with_value_type(ctx, result.value_type());
-    ctx.reply_with_string("result");
-    match result {
-        ExprResult::InstantVector(samples) => reply_with_instant_vector(ctx, &samples),
-        ExprResult::RangeVector(samples) => reply_with_matrix(ctx, &samples),
-        ExprResult::Scalar(value) => ctx.reply_with_sample(&Sample::new(eval_ts, value)),
-        ExprResult::String(value) => reply_with_string_value(ctx, eval_ts, &value),
-    }
 }
 
 pub(super) fn reply_with_query_value(

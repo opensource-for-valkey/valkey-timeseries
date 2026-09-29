@@ -2,8 +2,7 @@ use crate::common::threads::IntoParRayon;
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
 use crate::promql::engine::derived_filters::derive_filters_in_place;
-use crate::promql::engine::test_utils::MemorySeriesQuerier;
-use crate::promql::engine::{ConcreteSeriesQuerier, QueryOptions, QueryReader};
+use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::exec::planner::PlannedQuery;
 use crate::promql::exec::preloader::Preloader;
@@ -13,15 +12,25 @@ use crate::promql::model::{InstantSample, QueryValue, RangeSample};
 use crate::promql::optimizer::optimize_expr;
 use crate::promql::time::duration_ms;
 use crate::promql::time::step_times;
-use crate::promql::utils::{range_bounds_to_system_time, validate_max_points_per_timeseries};
+use crate::promql::utils::validate_max_points_per_timeseries;
 use crate::promql::{Evaluator, ExprResult, QueryResult};
 use orx_parallel::{Par, ParResult};
-use promql_parser::parser::{EvalStmt, Expr};
-use std::ops::RangeBounds;
+use promql_parser::parser::EvalStmt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use valkey_module::Context;
+use std::time::SystemTime;
 
+#[cfg(test)]
+use crate::promql::utils::range_bounds_to_system_time;
+#[cfg(test)]
+use promql_parser::parser::Expr;
+#[cfg(test)]
+use std::ops::RangeBounds;
+#[cfg(test)]
+use std::time::Duration;
+
+// `parse_query`, `PromqlEngine` and `PromqlQuerier` are a convenience API over
+// `evaluate_instant` / `evaluate_range` that only tests use.
+#[cfg(test)]
 fn parse_query(query: &str) -> QueryResult<Expr> {
     promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)
 }
@@ -51,6 +60,7 @@ fn resolve_deadline_ms(opts: QueryOptions) -> i64 {
     0
 }
 
+#[cfg(test)]
 pub(crate) trait PromqlEngine: Send + Sync {
     /// Build a query reader
     fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>>;
@@ -310,33 +320,15 @@ pub fn evaluate_range(
 }
 
 /// Tsdb manages a unified Promql QueryReader interface
+#[cfg(test)]
 pub(crate) struct PromqlQuerier {
     pub(crate) querier: Arc<dyn QueryReader>,
 }
 
+#[cfg(test)]
 impl PromqlQuerier {
-    pub fn new(ctx: &Context) -> Self {
-        let querier = ConcreteSeriesQuerier::create(ctx);
-        Self::with_query_reader(Arc::new(querier))
-    }
-
-    pub fn in_memory() -> Self {
-        let querier = Arc::new(MemorySeriesQuerier::new());
-        Self::with_query_reader(querier)
-    }
-
     pub(crate) fn with_query_reader(querier: Arc<dyn QueryReader>) -> Self {
         Self { querier }
-    }
-
-    pub fn eval(&self, stmt: EvalStmt) -> QueryResult<ExprResult> {
-        let opts = QueryOptions {
-            timeout: None,
-            lookback_delta: stmt.lookback_delta,
-            ..QueryOptions::default()
-        };
-        let evaluator = Evaluator::new(&self.querier, opts);
-        evaluator.evaluate(stmt).map_err(QueryError::from)
     }
 
     /// Evaluate an instant PromQL query, returning typed `InstantSample`s.
@@ -365,6 +357,7 @@ impl PromqlQuerier {
     }
 }
 
+#[cfg(test)]
 impl PromqlEngine for PromqlQuerier {
     fn make_query_reader(&self) -> QueryResult<Arc<dyn QueryReader>> {
         Ok(self.querier.clone())

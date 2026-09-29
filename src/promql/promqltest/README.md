@@ -19,11 +19,9 @@ promqltest/
 ### Execution Flow
 
 ```
-run_all_promql_tests() (mod.rs)
+build.rs → one should_pass_<stem>() #[test] per testdata/*.test file
     ↓
-run_builtin_tests() (runner.rs)
-    ↓
-discover_test_files() → *.test files in testdata/
+run_test() (runner.rs)
     ↓
 parse_test_file() (dsl.rs) → Command objects
     ↓

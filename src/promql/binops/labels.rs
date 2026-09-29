@@ -50,23 +50,6 @@ pub fn ensure_unique_labelsets(samples: &[EvalSample]) -> EvalResult<()> {
 // vector_contains_same_label_set checks if a vector has samples with the same labelset
 // Such a behavior is semantically undefined
 // https://github.com/prometheus/prometheus/issues/4562
-pub fn vector_contains_same_label_set(v: &[EvalSample]) -> bool {
-    match v {
-        [] => false,
-        [_first] => false,
-        [first, second] => first.labels.fingerprint() == second.labels.fingerprint(),
-        _ => {
-            let mut seen = FingerprintHashSet::default();
-            for sample in v {
-                let hash = sample.labels.fingerprint();
-                if !seen.insert(hash) {
-                    return true;
-                }
-            }
-            false
-        }
-    }
-}
 
 pub(in crate::promql) fn push_down_filters<'a>(
     expr: &'a BinaryExpr,

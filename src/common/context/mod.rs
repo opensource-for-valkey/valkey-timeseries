@@ -1,9 +1,6 @@
-use std::ffi::CString;
-use std::os::raw::c_int;
 use valkey_module::{
     Context, ContextFlags, RedisModule_GetSelectedDb, RedisModule_SelectDb, Status, ValkeyError,
-    ValkeyModule_GetServerInfo, ValkeyModule_ServerInfoGetFieldSigned, ValkeyModuleCtx,
-    ValkeyModuleServerInfoData, ValkeyResult, ValkeyString, raw,
+    ValkeyString, raw,
 };
 
 use crate::fanout::FANOUT_ACL_USER;
@@ -117,35 +114,6 @@ pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
     ctx.get_current_user()
 }
 
-#[allow(dead_code)]
-pub(crate) fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModuleServerInfoData {
-    let info_fn = unsafe { ValkeyModule_GetServerInfo.unwrap() };
-    let context = ctx.ctx as *mut ValkeyModuleCtx;
-    let section_cstr = CString::new(section).expect("Failed to convert section to CString");
-    unsafe { info_fn(context, section_cstr.as_ptr()) }
-}
-
-#[allow(dead_code)]
-fn get_server_info_field_signed(
-    info: *mut ValkeyModuleServerInfoData,
-    field: &str,
-) -> ValkeyResult<i64> {
-    let get_signed_field_fn = unsafe {
-        ValkeyModule_ServerInfoGetFieldSigned
-            .expect("Failed to get ValkeyModule_ServerInfoGetFieldSigned")
-    };
-    let mut ignored: c_int = 0;
-    unsafe {
-        let field_value = CString::new(field).expect("Failed to convert field to CString");
-        let res = get_signed_field_fn(info, field_value.as_ptr(), &mut ignored);
-        if ignored != 0 {
-            let msg = format!("Field '{field}' not found in server info");
-            return Err(ValkeyError::String(msg));
-        }
-        Ok(res)
-    }
-}
-
 pub fn register_server_event_handler(
     ctx: &Context,
     server_event: u64,
@@ -182,22 +150,5 @@ pub fn notify_keyspace_event(ctx: &Context, event: &std::ffi::CStr, key: &Valkey
             event.as_ptr(),
             key.inner,
         );
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn get_available_memory(ctx: &Context) -> Option<i64> {
-    // Fetch INFO MEMORY
-    let info = crate::common::context::get_server_info(ctx, "memory");
-
-    let used_memory: i64 = get_server_info_field_signed(info, "used_memory").ok()?;
-    let max_memory: i64 = get_server_info_field_signed(info, "maxmemory").ok()?;
-
-    // Compute available = maxm_emory - used_memory (clamped to >= 0)
-    if max_memory > 0 {
-        let diff = max_memory - used_memory;
-        Some(if diff > 0 { diff } else { 0 })
-    } else {
-        None
     }
 }

@@ -1695,9 +1695,6 @@ pub(super) fn register_config(ctx: &Context, args: &[ValkeyString]) -> ValkeyRes
 /// change to one of them, so `CONFIG SET ts-promql-*` takes effect for the next query.
 fn sync_promql_config() {
     update_prom_config(|cfg| {
-        // Query stats and tracing follow `debug-mode`.
-        cfg.stats_enabled = is_debug_mode_enabled();
-        cfg.trace_enabled = is_debug_mode_enabled();
         cfg.max_query_len = PROMQL_MAX_QUERY_LEN.load(Ordering::Relaxed) as usize;
         cfg.max_response_series = PROMQL_MAX_RESPONSE_SERIES.load(Ordering::Relaxed) as usize;
         cfg.max_points_per_timeseries =

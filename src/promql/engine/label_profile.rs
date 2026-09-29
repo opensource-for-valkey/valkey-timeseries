@@ -30,7 +30,9 @@
 use crate::labels::{MAX_LABELS_PER_SERIES, compile_literal_set};
 use ahash::AHashMap;
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
-use regex::{Regex, escape};
+#[cfg(test)]
+use regex::Regex;
+use regex::escape;
 use std::collections::BTreeSet;
 
 /// The most distinct values a derived filter enumerates. The index resolves
@@ -101,16 +103,17 @@ pub struct LabelProfile {
 }
 
 impl LabelProfile {
-    /// The filters every series of the profile satisfies: one per label
-    /// carried by all of them with a known, bounded value set — `name="v"`
-    /// for a single value, `name=~"v1|v2|…"` otherwise.
+    /// [`Self::common_filters_where`] with every label wanted.
+    #[cfg(test)]
     pub fn common_filters(&self) -> Vec<Matcher> {
         self.common_filters_where(|_| true)
     }
 
-    /// [`Self::common_filters`], limited to the labels `wanted` accepts —
-    /// which is asked before a filter's regex is compiled, the one costly
-    /// step. Within [`MAX_DERIVED_BYTES_PER_SELECTOR`], by label name.
+    /// The filters every series of the profile satisfies, limited to the
+    /// labels `wanted` accepts: one per label carried by all of them with a
+    /// known, bounded value set — `name="v"` for a single value,
+    /// `name=~"v1|v2|…"` otherwise. `wanted` is asked before a filter's regex
+    /// is compiled, the one costly step. Within [`MAX_DERIVED_BYTES_PER_SELECTOR`], by label name.
     pub fn common_filters_where(
         &self,
         wanted: impl Fn(&LabelValueProfile) -> bool,
@@ -346,6 +349,7 @@ pub fn derived_filter<'a>(
     }
 }
 
+#[cfg(test)]
 /// A `name=~"alternation"` matcher. PromQL regexes are fully anchored, and
 /// the compiled form must agree with the text the index will parse from
 /// `value`, or `is_match` would say `a|b` matches `ab`.

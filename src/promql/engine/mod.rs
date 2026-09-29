@@ -1,4 +1,5 @@
-pub mod counting_query_reader;
+#[cfg(test)]
+mod counting_query_reader;
 pub mod derived_filters;
 #[cfg(test)]
 mod extreme_time_tests;
@@ -6,13 +7,14 @@ mod fanout;
 #[cfg(test)]
 mod grid_fallback_tests;
 pub mod label_profile;
+/// In-memory [`QueryReader`] for unit tests and benchmarks.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod memory_series_querier;
 pub mod promql_config;
 pub mod promql_engine;
 mod querier;
 mod query_limits;
 pub mod query_reader;
-mod query_stats;
 pub mod query_workers;
 pub mod sample_budget;
 mod selector_batch_executor;
@@ -53,8 +55,6 @@ pub struct QueryOptions {
     /// The maximum number of samples this query may load into memory across
     /// all its reads (`ts-promql-max-samples-per-query`). 0 = unlimited.
     pub max_samples: usize,
-    /// Enable tracing for the current request
-    pub is_tracing: bool,
     /// Enable experimental functions for the current request
     pub enable_experimental_functions: bool,
     /// Whether to optimize the queries by simplify the query plan and pushing down filters to the data source.
@@ -87,7 +87,6 @@ impl Default for QueryOptions {
                 None
             },
             max_samples: config.max_samples_per_query,
-            is_tracing: false,
             enable_experimental_functions,
             optimize_queries: config.optimize_queries,
             derived_filter_pushdown: config.derived_filter_pushdown,

@@ -6,66 +6,11 @@ use crate::promql::promqltest::assert::{StepGrid, assert_results, assert_results
 use crate::promql::promqltest::dsl::*;
 use crate::promql::promqltest::evaluator::{eval_instant, eval_range};
 use crate::promql::promqltest::loader::load_series;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-// ============================================================================
-// Test Discovery
-// ============================================================================
-
-/// Discover all .test files in a directory (matches Prometheus fs.Glob pattern)
-fn discover_test_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-
-    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-
-        if path.extension().and_then(|s| s.to_str()) == Some("test") {
-            files.push(path);
-        }
-    }
-
-    files.sort();
-    Ok(files)
-}
 
 // ============================================================================
 // Test Runner (Orchestration)
 // ============================================================================
-
-/// Run all embedded test files (matches Prometheus RunBuiltinTests)
-fn run_builtin_tests() -> Result<(), String> {
-    run_builtin_tests_with_storage(new_test_storage)
-}
-
-/// Run all tests with a custom storage factory (matches Prometheus RunBuiltinTestsWithStorage)
-fn run_builtin_tests_with_storage<F>(storage_factory: F) -> Result<(), String>
-where
-    F: Fn() -> (PromqlQuerier, Arc<MemorySeriesQuerier>),
-{
-    let test_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("promql")
-        .join("promqltest")
-        .join("testdata");
-
-    let files = discover_test_files(&test_dir)?;
-
-    for path in files {
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or("Invalid test filename")?;
-
-        let content = fs::read_to_string(&path).map_err(|e| format!("{name}: {}", e))?;
-
-        run_test_with_storage(name, &content, &storage_factory)
-            .map_err(|e| format!("{name}: {}", e))?;
-    }
-
-    Ok(())
-}
 
 /// Run a single test file (matches Prometheus RunTest)
 pub fn run_test(name: &str, content: &str) -> Result<(), String> {
@@ -154,7 +99,7 @@ where
                             )
                         })
                     };
-                    record(outcome)?;
+                    record(at_line(eval_cmd.line_number, outcome))?;
                 }
             }
 
@@ -183,7 +128,7 @@ where
                             )
                         })
                     };
-                    record(outcome)?;
+                    record(at_line(eval_cmd.line_number, outcome))?;
                 }
             }
         }
@@ -198,6 +143,11 @@ where
             failures.join("\n")
         ))
     }
+}
+
+/// Prefix a failed eval with the 1-based line of its `eval` directive.
+fn at_line(line_number: usize, outcome: Result<(), String>) -> Result<(), String> {
+    outcome.map_err(|e| format!("line {line_number}: {e}"))
 }
 
 // ============================================================================

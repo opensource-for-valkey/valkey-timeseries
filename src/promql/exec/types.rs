@@ -5,7 +5,6 @@ use crate::common::string_interner::InternedString;
 use crate::labels::{
     HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, fingerprint_labels,
 };
-use crate::promql::binops::get_metric_signature;
 use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
 use crate::promql::hashers::{GridPreloadKey, MatrixPreloadKey, PreloadKey};
@@ -246,23 +245,6 @@ impl EvalLabels {
         }
     }
 
-    /// Add labels from `other`, keeping sort order and dropping duplicate
-    /// names. Promotes to `Owned` only when `other` yields something: the
-    /// usual one-to-one join has nothing to copy, and materializing owned
-    /// `String`s for it would undo what `retain` just avoided.
-    pub(crate) fn extend(&mut self, other: impl Iterator<Item = Label>) {
-        let mut other = other.peekable();
-        if other.peek().is_none() {
-            return;
-        }
-        self.make_owned();
-        if let EvalLabels::Owned(vec) = self {
-            vec.extend(other);
-            vec.sort();
-            vec.dedup_by(|a, b| a.name == b.name);
-        }
-    }
-
     /// Retain only labels matching the predicate.
     ///
     /// The predicate sees each label exactly once, in order. An `Interned`
@@ -313,6 +295,7 @@ impl EvalLabels {
         }
     }
 
+    #[cfg(test)]
     /// Returns true if there are no labels.
     pub(crate) fn is_empty(&self) -> bool {
         match self {
@@ -996,20 +979,13 @@ pub struct EvalSample {
 }
 
 impl EvalSample {
+    #[cfg(test)]
     pub fn label_value(&self, label: &str) -> Option<&str> {
         self.labels.get(label)
     }
 
     pub fn remove_metric_group(&mut self) {
         self.labels.remove(METRIC_NAME_LABEL);
-    }
-
-    pub fn add_tag(&mut self, label: &str, value: &str) {
-        self.labels.set(label, value.to_string());
-    }
-
-    pub fn fingerprint(&self) -> SeriesFingerprint {
-        self.labels.fingerprint()
     }
 
     pub fn drop_name_if_needed(&mut self) {
@@ -1036,22 +1012,9 @@ impl EvalSamples {
         self.values.is_empty()
     }
 
-    pub fn label_value(&self, label: &str) -> Option<&str> {
-        self.labels.get(label)
-    }
-
     #[cfg(test)]
     pub fn first_sample(&self) -> Option<&Sample> {
         self.values.first()
-    }
-
-    #[cfg(test)]
-    pub fn last_sample(&self) -> Option<&Sample> {
-        self.values.last()
-    }
-
-    pub fn fingerprint(&self) -> SeriesFingerprint {
-        get_metric_signature(&self.labels, self.drop_name)
     }
 
     pub fn drop_name_if_needed(&mut self) {
@@ -1070,18 +1033,11 @@ pub(crate) enum ExprResult {
 }
 
 impl ExprResult {
+    #[cfg(test)]
     /// Extract the instant vector samples, returning None if this is a scalar or range vector result
     pub(crate) fn into_instant_vector(self) -> Option<Vec<EvalSample>> {
         match self {
             ExprResult::InstantVector(samples) => Some(samples),
-            _ => None,
-        }
-    }
-
-    /// Extract the range vector samples, returning None if this is not a range vector result
-    pub(crate) fn into_range_vector(self) -> Option<Vec<EvalSamples>> {
-        match self {
-            ExprResult::RangeVector(samples) => Some(samples),
             _ => None,
         }
     }
@@ -1101,15 +1057,6 @@ impl ExprResult {
             ExprResult::RangeVector(_) => ValueType::Matrix,
             ExprResult::Scalar(_) => ValueType::Scalar,
             ExprResult::String(_) => ValueType::String,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        match self {
-            ExprResult::InstantVector(samples) => samples.is_empty(),
-            ExprResult::RangeVector(samples) => samples.is_empty(),
-            ExprResult::String(s) => s.is_empty(),
-            _ => false,
         }
     }
 }

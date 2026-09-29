@@ -10,8 +10,8 @@ use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Expr, LabelModifier, VectorMatchCardinality, VectorSelector,
 };
 use smallvec::SmallVec;
+#[cfg(test)]
 use std::borrow::Cow;
-use std::ops::Deref;
 use std::vec::Vec;
 
 /// What the filter push-down knows about a selector's series.
@@ -64,43 +64,6 @@ fn carries_labels(e: &Expr) -> bool {
     matches!(e.value_type(), ValueType::Vector | ValueType::Matrix)
 }
 
-/// `push_down_filters` optimizes expressions to improve their performance.
-///
-/// It performs the following optimizations:
-///
-/// - Adds missing filters to `foo{filters1} op bar{filters2}`
-///   according to https://utcc.utoronto.ca/~cks/space/blog/sysadmin/PrometheusLabelNonOptimization
-pub fn push_down_filters(expr: &Expr) -> Cow<'_, Expr> {
-    if can_pushdown_filters(expr) {
-        let mut clone = expr.clone();
-        pushdown_filters_in_place(&mut clone);
-        Cow::Owned(clone)
-    } else {
-        Cow::Borrowed(expr)
-    }
-}
-
-pub fn can_pushdown_filters(expr: &Expr) -> bool {
-    use Expr::*;
-
-    match expr {
-        Call(call) => call
-            .args
-            .args
-            .iter()
-            .any(|x| can_pushdown_filters(x.deref())),
-        Binary(be) => can_pushdown_filters(&be.lhs) || can_pushdown_filters(&be.rhs),
-        Aggregate(agg) => {
-            can_pushdown_filters(&agg.expr)
-                || agg.param.as_ref().is_some_and(|e| can_pushdown_filters(e))
-        }
-        Paren(p) => can_pushdown_filters(&p.expr),
-        Unary(unary) => can_pushdown_filters(&unary.expr),
-        Subquery(s) => can_pushdown_filters(&s.expr),
-        _ => false,
-    }
-}
-
 pub fn pushdown_filters_in_place(expr: &mut Expr) {
     pushdown_filters_in_place_with(expr, &WrittenFilters)
 }
@@ -146,6 +109,7 @@ pub fn pushdown_filters_in_place_with(expr: &mut Expr, leaves: &dyn LeafFilters)
     }
 }
 
+#[cfg(test)]
 pub fn get_common_label_filters(e: &Expr) -> Vec<Matcher> {
     get_common_label_filters_with(e, &WrittenFilters)
 }
@@ -365,6 +329,7 @@ fn get_label_filters_without_metric_name(lfs: &[Matcher]) -> Vec<Matcher> {
         .collect::<Vec<_>>()
 }
 
+#[cfg(test)]
 /// Pushes down the given common_filters to `expr` if possible.
 ///
 /// `expr` must be a part of a binary operation - either left or right.
@@ -387,6 +352,7 @@ pub fn pushdown_binary_op_filters(expr: &Expr, common_filters: Vec<Matcher>) -> 
     Cow::Owned(copy)
 }
 
+#[cfg(test)]
 fn can_pushdown_op_filters(expr: &Expr) -> bool {
     use Expr::*;
     // these are the types handled below in pushdown_binary_op_filters_in_place
@@ -578,25 +544,6 @@ fn union_label_filters_internal(first: &mut Vec<Matcher>, second: &[Matcher]) {
             first.push(matcher.clone());
         }
     }
-}
-
-fn drop_label_filters_for_label_names<'a>(
-    lfs: &[Matcher],
-    label_names: impl Iterator<Item = &'a Expr>,
-) -> Vec<Matcher> {
-    if lfs.is_empty() {
-        return vec![];
-    }
-    let mut names_set: SmallVec<[&str; 4]> = SmallVec::new();
-    for label_name in label_names {
-        if let Some(v) = get_expr_as_string(label_name) {
-            names_set.push(v);
-        }
-    }
-    lfs.iter()
-        .filter(|x| !names_set.contains(&x.name.as_str()))
-        .cloned()
-        .collect()
 }
 
 fn drop_label_filters_for_label_name(lfs: &[Matcher], label_name: &Expr) -> Vec<Matcher> {

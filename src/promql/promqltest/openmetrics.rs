@@ -200,7 +200,6 @@ impl Parser {
                 labels: series_labels,
                 unit: family.unit.clone(),
                 metric_type: Some(metric_type),
-                description: family.help.clone(),
                 samples: vec![sample],
             });
 

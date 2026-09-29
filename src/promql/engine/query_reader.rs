@@ -10,7 +10,6 @@ use crate::promql::{
     ExprResult, PromqlResult, QueryError, QueryOptions,
     model::{InstantSample, RangeSample},
 };
-use crate::series::SeriesRef;
 use orx_parallel::Par;
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use std::sync::Arc;
@@ -541,29 +540,21 @@ impl QueryReader for Arc<dyn QueryReader> {
     }
 }
 
+#[cfg(test)]
 pub(crate) mod test_utils {
-    use super::*;
-    use crate::commands::parse_metric_name;
     use crate::common::Sample;
     use crate::labels::Labels;
     pub(crate) use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
-    use crate::series::TimeSeries;
-    use crate::series::index::TimeSeriesIndex;
-    use std::collections::HashMap;
 
     /// Builder for creating MockQueryReader instances from test data.
     /// Convenience wrapper for single-bucket scenarios.
     pub(crate) struct MockQueryReaderBuilder {
-        ts_index: TimeSeriesIndex,
-        series: HashMap<SeriesRef, TimeSeries>,
         inner: MockMultiBucketQueryReaderBuilder,
     }
 
     impl MockQueryReaderBuilder {
         pub(crate) fn new() -> Self {
             Self {
-                series: HashMap::new(),
-                ts_index: TimeSeriesIndex::default(),
                 inner: MockMultiBucketQueryReaderBuilder::new(),
             }
         }
@@ -573,20 +564,6 @@ pub(crate) mod test_utils {
         pub(crate) fn add_sample(&mut self, labels: &Labels, sample: Sample) -> &mut Self {
             self.inner.add_sample(labels, sample);
             self
-        }
-
-        pub(crate) fn add_samples(&mut self, labels: &Labels, samples: &[Sample]) -> &mut Self {
-            for sample in samples {
-                self.add_sample(labels, *sample);
-            }
-            self
-        }
-
-        pub(crate) fn add_metric_sample(&mut self, metric: &str, sample: Sample) -> &mut Self {
-            let labels = parse_metric_name(metric)
-                .unwrap_or_else(|_| panic!("Failed to parse metric name: {}", metric));
-            let labels = Labels::new(labels);
-            self.add_sample(&labels, sample)
         }
 
         pub(crate) fn build(self) -> MemorySeriesQuerier {

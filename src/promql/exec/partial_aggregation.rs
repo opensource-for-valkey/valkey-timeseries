@@ -255,10 +255,6 @@ impl PartialGroups {
         self.entry(labels).merge(kind, &state);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
-    }
-
     /// The accumulated states, for transport to the coordinator.
     pub fn into_partials(self) -> impl Iterator<Item = (EvalLabels, AggregationPartial)> {
         self.groups.into_iter().map(|(_, entry)| entry)

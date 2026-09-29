@@ -51,11 +51,6 @@ pub(crate) enum PromQLArg {
 }
 
 impl PromQLArg {
-    #[cfg(test)]
-    pub fn empty_string() -> Self {
-        Self::String(String::new())
-    }
-
     pub fn into_instant_vector(self) -> EvalResult<Vec<EvalSample>> {
         match self {
             Self::InstantVector(s) => Ok(s),
@@ -79,24 +74,6 @@ impl PromQLArg {
             Self::RangeVector(samples) => Ok(samples),
             _ => Err(EvaluationError::InternalError(
                 "expected range vector".to_string(),
-            )),
-        }
-    }
-
-    pub fn into_string(self) -> EvalResult<String> {
-        match self {
-            Self::String(s) => Ok(s),
-            _ => Err(EvaluationError::InternalError(
-                "expected string".to_string(),
-            )),
-        }
-    }
-
-    pub fn as_string(&self) -> EvalResult<&String> {
-        match self {
-            Self::String(s) => Ok(s),
-            _ => Err(EvaluationError::InternalError(
-                "expected string".to_string(),
             )),
         }
     }
@@ -167,23 +144,6 @@ pub(crate) trait PromQLFunction {
         self.apply(args.swap_remove(0), ctx)
     }
 
-    /// Apply the function to evaluated arguments provided as a slice.
-    ///
-    /// This helper avoids allocating a temporary `Vec` in the common unary
-    /// case by directly calling `apply` when there is exactly one argument.
-    /// Callers that already have a `Vec` can use `apply_args` directly.
-    fn apply_args_slice(&self, args: &[PromQLArg], ctx: &EvalContext) -> EvalResult<ExprResult> {
-        if args.len() != 1 {
-            return Err(EvaluationError::InternalError(format!(
-                "function requires exactly one argument, got {}",
-                args.len()
-            )));
-        }
-
-        // Clone the single argument and delegate to `apply`.
-        self.apply(args[0].clone(), ctx)
-    }
-
     /// Apply the function at a call site, with the unevaluated argument
     /// expressions available alongside the evaluated ones.
     ///
@@ -197,34 +157,6 @@ pub(crate) trait PromQLFunction {
     ) -> EvalResult<ExprResult> {
         self.apply_args(evaluated_args, ctx.eval_context)
     }
-}
-
-/// Function that applies a unary operation to each sample
-pub(super) struct UnaryFunction {
-    pub(super) op: fn(f64) -> f64,
-}
-
-impl PromQLFunction for UnaryFunction {
-    fn apply(&self, arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        let mut samples = arg.into_instant_vector()?;
-        for sample in &mut samples {
-            sample.value = (self.op)(sample.value);
-        }
-        Ok(ExprResult::InstantVector(samples))
-    }
-}
-
-impl Default for UnaryFunction {
-    fn default() -> Self {
-        fn identity(x: f64) -> f64 {
-            x
-        }
-        UnaryFunction { op: identity }
-    }
-}
-
-pub struct RangeFunctionOpts {
-    pub step_ms: i64,
 }
 
 /// One window's view for a rollup function.
@@ -246,7 +178,7 @@ pub(super) struct RollupWindow<'a> {
     /// The timestamp for prev_value.
     pub(super) prev_timestamp: Timestamp,
 
-    /// Values that fit the window ending at curr_timestamp.
+    /// Values that fit the window.
     pub(crate) values: &'a [f64],
 
     /// Timestamps for values.
@@ -258,13 +190,4 @@ pub(super) struct RollupWindow<'a> {
 
     /// Real value that goes after values.
     pub(crate) real_next_value: f64,
-
-    /// Current timestamp for rollup evaluation.
-    pub(super) curr_timestamp: Timestamp,
-
-    /// Index for the currently evaluated point relative to the time range for query evaluation.
-    pub(super) idx: usize,
-
-    /// Time window for rollup calculations.
-    pub(super) window: i64,
 }

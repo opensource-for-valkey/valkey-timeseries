@@ -4,9 +4,7 @@ use std::time::Duration;
 
 const DEFAULT_MAX_QUERY_LEN: usize = 16 * 1024;
 const DEFAULT_MAX_UNIQUE_TIMESERIES: usize = 1000;
-const DEFAULT_LATENCY_OFFSET: usize = 30 * 1000;
 const DEFAULT_LOOKBACK_DELTA_MS: u64 = 5 * MILLIS_PER_MIN;
-const DEFAULT_STEP: i64 = 5 * 60 * 1000;
 
 pub static PROMQL_CONFIG: LazyLock<RwLock<PromqlConfig>> =
     LazyLock::new(|| RwLock::new(PromqlConfig::default()));
@@ -14,12 +12,6 @@ pub static PROMQL_CONFIG: LazyLock<RwLock<PromqlConfig>> =
 /// Global configuration options for request context
 #[derive(Clone, Copy, Debug)]
 pub struct PromqlConfig {
-    /// should we log query stats?
-    pub stats_enabled: bool,
-
-    /// Whether query tracing is enabled.
-    pub trace_enabled: bool,
-
     /// The maximum query length in bytes
     pub max_query_len: usize,
 
@@ -63,23 +55,9 @@ pub struct PromqlConfig {
     pub enable_experimental_functions: bool,
 }
 
-impl PromqlConfig {
-    /// Create an execution config with the default setting
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn with_stats_enabled(mut self, stats_enabled: bool) -> Self {
-        self.stats_enabled = stats_enabled;
-        self
-    }
-}
-
 impl Default for PromqlConfig {
     fn default() -> Self {
         PromqlConfig {
-            stats_enabled: false,
-            trace_enabled: false,
             lookback_delta: Duration::from_millis(DEFAULT_LOOKBACK_DELTA_MS),
             max_query_len: DEFAULT_MAX_QUERY_LEN,
             max_points_per_timeseries: 0,

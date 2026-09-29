@@ -1,6 +1,7 @@
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::label_profile::LabelProfile;
+#[cfg(test)]
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
@@ -203,21 +204,22 @@ fn normalize_selector(selector: &VectorSelector) -> Matchers {
 /// Use this enum to create a concrete series querier that can be used in the PromQL engine irrespective of
 /// whether we are in a test or production environment.
 pub(crate) enum ConcreteSeriesQuerier {
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "unit tests have no server, so they always get Mock"
+        )
+    )]
     Actual(ValkeySeriesQuerier),
+    #[cfg(test)]
     Mock(MemorySeriesQuerier),
 }
 
 impl ConcreteSeriesQuerier {
-    /// A querier with no cluster routing scope: it reads the whole keyspace the
-    /// caller can see. This is the default for internal and programmatic
-    /// callers, which have no `HASHTAG` clause to honor.
-    pub fn create(ctx: &Context) -> Self {
-        Self::create_with_hash_tags(ctx, Arc::from([]))
-    }
-
     /// A querier scoped to the shards owning `hash_tags`, for command handlers
-    /// that parsed a `HASHTAG` clause. An empty list is equivalent to
-    /// [`Self::create`].
+    /// that parsed a `HASHTAG` clause. An empty list reads the whole keyspace
+    /// the caller can see.
     pub fn create_with_hash_tags(_ctx: &Context, _hash_tags: Arc<[String]>) -> Self {
         cfg_select! {
             test => { ConcreteSeriesQuerier::Mock(MemorySeriesQuerier::new()) }
@@ -232,13 +234,6 @@ impl ConcreteSeriesQuerier {
             }
         }
     }
-
-    pub fn as_series_querier(&self) -> &dyn QueryReader {
-        match self {
-            ConcreteSeriesQuerier::Actual(local) => local,
-            ConcreteSeriesQuerier::Mock(mock) => mock,
-        }
-    }
 }
 
 impl QueryReader for ConcreteSeriesQuerier {
@@ -250,6 +245,7 @@ impl QueryReader for ConcreteSeriesQuerier {
     ) -> PromqlResult<Vec<InstantSample<EvalLabels>>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query(selector, timestamp, options),
+            #[cfg(test)]
             ConcreteSeriesQuerier::Mock(mock) => mock.query(selector, timestamp, options),
         }
     }
@@ -265,6 +261,7 @@ impl QueryReader for ConcreteSeriesQuerier {
             ConcreteSeriesQuerier::Actual(local) => {
                 local.query_range(selector, start_ms, end_ms, options)
             }
+            #[cfg(test)]
             ConcreteSeriesQuerier::Mock(mock) => {
                 mock.query_range(selector, start_ms, end_ms, options)
             }
@@ -284,6 +281,7 @@ impl QueryReader for ConcreteSeriesQuerier {
             }
             // The in-memory querier has no shards to push to; the evaluator
             // aggregates the vector it selects.
+            #[cfg(test)]
             ConcreteSeriesQuerier::Mock(mock) => {
                 mock.query_aggregation(selector, timestamp, aggregation, options)
             }
@@ -298,6 +296,7 @@ impl QueryReader for ConcreteSeriesQuerier {
     ) -> PromqlResult<GridOutcome> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.query_grid(selector, request, options),
+            #[cfg(test)]
             ConcreteSeriesQuerier::Mock(mock) => mock.query_grid(selector, request, options),
         }
     }
@@ -309,6 +308,7 @@ impl QueryReader for ConcreteSeriesQuerier {
     ) -> PromqlResult<Option<LabelProfile>> {
         match self {
             ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, options),
+            #[cfg(test)]
             ConcreteSeriesQuerier::Mock(mock) => mock.label_profile(selector, options),
         }
     }

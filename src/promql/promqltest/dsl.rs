@@ -24,6 +24,7 @@ pub struct EvalInstantCmd {
     pub expected: QueryValue,
     pub expect_ordered: bool,
     pub expect_fail: bool,
+    /// 1-based line of the `eval` directive, for failure messages.
     pub line_number: usize,
 }
 
@@ -35,6 +36,7 @@ pub struct EvalRangeCmd {
     pub query: String,
     pub expected: QueryValue,
     pub expect_fail: bool,
+    /// 1-based line of the `eval` directive, for failure messages.
     pub line_number: usize,
 }
 

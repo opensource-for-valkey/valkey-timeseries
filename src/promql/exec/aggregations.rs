@@ -17,12 +17,6 @@ enum KAggregationOrder {
     Bottom,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum KLimitType {
-    Limit,
-    LimitRatio,
-}
-
 /// A PromQL aggregation operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregationKind {

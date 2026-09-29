@@ -121,12 +121,6 @@ mod tests {
         Labels::new(labels)
     }
 
-    fn parse_labels(metric: &str) -> Labels {
-        let labels = parse_metric_name(metric)
-            .unwrap_or_else(|_| panic!("Failed to parse metric name: {}", metric));
-        Labels::new(labels)
-    }
-
     /// Setup helper: Creates a MockQueryReader with test data
     ///
     /// data: Vec of (metric_name, labels, timestamp_offset_ms, value)

@@ -48,7 +48,6 @@ macro_rules! impl_promql_function_kind {
         }
 
         impl PromqlFunctionKind {
-            #[allow(dead_code)]
             pub fn name(&self) -> &'static str {
                 use PromqlFunctionKind::*;
                 match self {
@@ -101,7 +100,6 @@ macro_rules! impl_promql_function_impl {
         }
 
         impl PromQLFunctionImpl {
-            #[allow(dead_code)]
             pub fn name(&self) -> &'static str {
                 match self {
                     $( Self::$Variant(_) => $name, )*
@@ -114,25 +112,6 @@ macro_rules! impl_promql_function_impl {
                 }
             }
 
-            pub(in crate::promql) fn is_rollup(&self) -> bool {
-                matches!(self.kind(), PromqlFunctionKind::AbsentOverTime
-                    | PromqlFunctionKind::AvgOverTime
-                    | PromqlFunctionKind::CountOverTime
-                    | PromqlFunctionKind::FirstOverTime
-                    | PromqlFunctionKind::LastOverTime
-                    | PromqlFunctionKind::MadOverTime
-                    | PromqlFunctionKind::MaxOverTime
-                    | PromqlFunctionKind::MinOverTime
-                    | PromqlFunctionKind::PresentOverTime
-                    | PromqlFunctionKind::QuantileOverTime
-                    | PromqlFunctionKind::StddevOverTime
-                    | PromqlFunctionKind::StdvarOverTime
-                    | PromqlFunctionKind::SumOverTime
-                    | PromqlFunctionKind::TsOfFirstOverTime
-                    | PromqlFunctionKind::TsOfLastOverTime
-                    | PromqlFunctionKind::TsOfMaxOverTime
-                    | PromqlFunctionKind::TsOfMinOverTime)
-            }
         }
 
         impl TryFrom<&str> for PromQLFunctionImpl {

@@ -26,12 +26,6 @@ macro_rules! make_unary_function {
         #[derive(Copy, Clone, Default)]
         pub(crate) struct $name;
 
-        impl $name {
-            pub fn new() -> Self {
-                Self
-            }
-        }
-
         impl PromQLFunction for $name {
             fn apply(&self, arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
                 exec_unary_fn(arg, $rf)

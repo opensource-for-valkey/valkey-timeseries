@@ -22,59 +22,6 @@ pub(crate) fn max_with_nan(left: f64, right: f64) -> f64 {
     }
 }
 
-pub(crate) fn linear_regression(
-    values: &[f64],
-    timestamps: &[i64],
-    intercept_time: i64,
-) -> (f64, f64) {
-    let n = values.len();
-    if n == 0 {
-        return (f64::NAN, f64::NAN);
-    }
-    if are_const_values(values) {
-        return (values[0], 0.0);
-    }
-
-    // See https://en.wikipedia.org/wiki/Simple_linear_regression#Numerical_example
-    let mut v_sum: f64 = 0.0;
-    let mut t_sum: f64 = 0.0;
-    let mut tv_sum: f64 = 0.0;
-    let mut tt_sum: f64 = 0.0;
-
-    for (ts, v) in timestamps.iter().zip(values.iter()) {
-        let dt = (ts - intercept_time) as f64 / 1e3_f64;
-        v_sum += v;
-        t_sum += dt;
-        tv_sum += dt * v;
-        tt_sum += dt * dt
-    }
-
-    let mut k: f64 = 0.0;
-    let n = n as f64;
-    let t_diff = tt_sum - t_sum * t_sum / n;
-    if t_diff.abs() >= 1e-6 {
-        // Prevent from incorrect division for too small t_diff values.
-        k = (tv_sum - t_sum * v_sum / n) / t_diff;
-    }
-    let v = v_sum / n - k * t_sum / n;
-    (v, k)
-}
-
-pub(crate) fn are_const_values(values: &[f64]) -> bool {
-    if values.len() <= 1 {
-        return true;
-    }
-    let mut v_prev = values[0];
-    for v in &values[1..] {
-        if *v != v_prev {
-            return false;
-        }
-        v_prev = *v
-    }
-
-    true
-}
-
 pub(in crate::promql) fn sample_regression(samples: &[Sample]) -> Option<(f64, f64)> {
     if samples.len() < 2 {
         return None;
@@ -130,10 +77,6 @@ pub(in crate::promql) fn sample_regression(samples: &[Sample]) -> Option<(f64, f
     let slope = (count * sum_xy - sum_x * sum_y) / denominator;
     let intercept = (sum_y - slope * sum_x) / count;
     Some((slope, intercept))
-}
-
-pub(crate) fn float_to_int_bounded(f: f64) -> i64 {
-    (f as i64).clamp(i64::MIN, i64::MAX)
 }
 
 #[cfg(test)]

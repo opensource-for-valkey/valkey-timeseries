@@ -344,12 +344,6 @@ macro_rules! make_rollup_function {
         #[derive(Copy, Clone, Default)]
         pub(in crate::promql) struct $type_name;
 
-        impl $type_name {
-            pub fn new() -> Self {
-                Self
-            }
-        }
-
         impl PromQLFunction for $type_name {
             fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
                 Err(EvaluationError::ArgumentError(format!(
@@ -373,12 +367,6 @@ macro_rules! basic_rollup_function {
     ( $type_name: ident, $name: expr, $rf: expr) => {
         #[derive(Copy, Clone, Default)]
         pub(in crate::promql) struct $type_name;
-
-        impl $type_name {
-            pub fn new() -> Self {
-                Self
-            }
-        }
 
         impl PromQLFunction for $type_name {
             fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {

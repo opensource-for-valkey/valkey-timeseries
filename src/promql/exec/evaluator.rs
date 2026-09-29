@@ -358,6 +358,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Ok(())
     }
 
+    #[cfg(test)]
     /// Preload VectorSelector data for all steps of a range query.
     /// Must be called before the step loop. Walks the AST, deduplicates selectors,
     /// and builds dense per-step sample arrays for O(1) per-step lookup.
@@ -1077,13 +1078,6 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .collect();
 
         Some(ExprResult::InstantVector(samples))
-    }
-
-    /// Convenience wrapper that builds an [`EvalContext`] from a full [`EvalStmt`]
-    /// so callers outside the `exec` module don't need to construct it manually.
-    pub(in crate::promql) fn preload_for_range_from_stmt(&self, stmt: &EvalStmt) -> EvalResult<()> {
-        let ctx = EvalContext::from(stmt);
-        self.preload_for_range(&stmt.expr, &ctx)
     }
 
     /// Preload one vector selector over the whole step grid: at every step,

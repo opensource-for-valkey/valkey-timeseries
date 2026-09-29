@@ -37,23 +37,6 @@ pub(super) fn is_number(s: &Expr) -> bool {
     matches!(s, Expr::NumberLiteral(_))
 }
 
-pub(super) fn is_number_value(s: &Expr, num: f64) -> bool {
-    match s {
-        Expr::NumberLiteral(NumberLiteral { val, .. }) => {
-            val.total_cmp(&num) == std::cmp::Ordering::Equal
-        }
-        _ => false,
-    }
-}
-
-pub(super) fn is_zero(s: &Expr) -> bool {
-    is_number_value(s, 0.0)
-}
-
-pub(super) fn is_one(s: &Expr) -> bool {
-    is_number_value(s, 1.0)
-}
-
 pub(super) fn is_null(expr: &Expr) -> bool {
     match expr {
         Expr::NumberLiteral(NumberLiteral { val, .. }) => val.is_nan(),

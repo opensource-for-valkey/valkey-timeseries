@@ -114,8 +114,7 @@ pub(in crate::promql) fn rollup_series_over_grid(
 
     window_ends
         .into_iter()
-        .enumerate()
-        .filter_map(|(idx, t_end)| {
+        .filter_map(|t_end| {
             let t_start = t_end.saturating_sub(window_ms);
 
             // Window ends are non-decreasing in every caller, so the search for
@@ -131,14 +130,11 @@ pub(in crate::promql) fn rollup_series_over_grid(
             }
 
             let mut window = RollupWindow {
-                window: window_ms,
                 prev_value: f64::NAN,
                 prev_timestamp: t_start.saturating_sub(prev_step),
                 real_prev_value: f64::NAN,
                 values: &values[i..j],
                 timestamps: &timestamps[i..j],
-                curr_timestamp: t_end,
-                idx,
                 ..Default::default()
             };
 

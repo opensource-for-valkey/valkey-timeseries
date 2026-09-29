@@ -86,22 +86,6 @@ fn sample_delta_value(samples: &[Sample]) -> Option<f64> {
     Some(samples.last()?.value - samples.first()?.value)
 }
 
-/// Computes counter-reset-corrected increase for a sample series.
-/// Walks through samples and accumulates previous values at each reset point.
-fn counter_reset_increase(values: &[Sample]) -> f64 {
-    let first = &values[0];
-    let last = &values[values.len() - 1];
-    let mut result = last.value - first.value;
-    let mut prev_value = first.value;
-    for sample in &values[1..] {
-        if sample.value < prev_value {
-            result += prev_value;
-        }
-        prev_value = sample.value;
-    }
-    result
-}
-
 /// Computes extrapolated rate for a series as per Prometheus logic.
 pub(in crate::promql) fn extrapolated_rate(samples: &EvalSamples, kind: RateKind) -> Option<f64> {
     extrapolated_rate_window(

@@ -2,7 +2,7 @@ use crate::common::Sample;
 use crate::common::hash::IntMap;
 use crate::common::threads::IterIntoParRayon;
 use crate::labels::filters::SeriesSelector;
-use crate::labels::{Label, Labels, MetricName, SeriesFingerprint};
+use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::label_profile::{
@@ -134,14 +134,6 @@ impl MemorySeriesQuerier {
             ))),
         }
     }
-
-    pub fn clear(&self) {
-        let mut inner = self.inner.write().unwrap();
-        inner.series.clear();
-        inner.next_id = 1;
-        inner.postings.clear();
-        inner.fingerprint_to_id.clear();
-    }
 }
 
 impl QueryReader for MemorySeriesQuerier {
@@ -245,11 +237,4 @@ impl QueryReader for MemorySeriesQuerier {
         }
         Ok(Some(builder.finish()))
     }
-}
-
-fn metric_name_to_labels(metric_name: &MetricName) -> Vec<Label> {
-    metric_name
-        .iter()
-        .map(|label| Label::new(label.name.to_string(), label.value.to_string()))
-        .collect()
 }

@@ -6,7 +6,6 @@ mod model;
 mod evaluator;
 pub mod openmetrics;
 mod runner;
-mod tester;
 
 #[cfg(test)]
 mod tests {

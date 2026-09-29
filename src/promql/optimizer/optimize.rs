@@ -313,23 +313,6 @@ mod tests {
     fn parse(expr: &str) -> Expr {
         promql_parser::parser::parse(expr).unwrap()
     }
-    fn assert_expr_eq(expected: &Expr, actual: &Expr) {
-        assert_eq!(
-            expected, actual,
-            "expected: \n{}\n but got: \n{}",
-            expected, actual
-        );
-    }
-
-    fn assert_string_expr_eq(expr: &str, expected: Expr) {
-        let expr = parse(expr);
-        let actual = simplify(expr);
-        assert_eq!(
-            expected, actual,
-            "expected: \n{}\n but got: \n{}",
-            expected, actual
-        );
-    }
 
     fn assert_string_simplify(expr: &str, expected: &str) {
         let expr = parse(expr);

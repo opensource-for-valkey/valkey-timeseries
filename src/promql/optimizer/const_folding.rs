@@ -275,26 +275,15 @@ fn handle_rollup_expr(re: SubqueryExpr) -> Expr {
     Expr::Subquery(new_expr)
 }
 
-fn handle_expr_vecs(args: Vec<Expr>) -> Vec<Expr> {
-    args.into_iter().map(fold_constants).collect::<Vec<Expr>>()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use promql_parser::parser::{NumberLiteral, StringLiteral, parse};
+    use promql_parser::parser::parse;
 
     // ------------------------------
     // --- ConstEvaluator tests -----
     // ------------------------------
-    fn test_const_simplify(input_expr: Expr, expected_expr: Expr) {
-        let evaluated_expr = fold_constants(input_expr.clone());
-        assert_eq!(
-            &evaluated_expr, &expected_expr,
-            "Mismatch evaluating {input_expr}\n  Expected:{expected_expr}\n  Got:{evaluated_expr}"
-        );
-    }
 
     fn test_simplify(input_expr: &str, expected_expr: &str) {
         let input = parse(input_expr).expect("parse failed");
@@ -306,24 +295,6 @@ mod tests {
             "Mismatch simplifying {input_expr}\n  Expected:{expected_expr}\n  Got:{}",
             simplified.prettify()
         );
-    }
-
-    fn remove_bool_modifier(expr: Expr) -> Expr {
-        match expr {
-            Expr::Binary(mut be) => {
-                be.modifier = None;
-                Expr::Binary(be)
-            }
-            _ => expr,
-        }
-    }
-
-    fn number(v: f64) -> Expr {
-        Expr::NumberLiteral(NumberLiteral { val: v })
-    }
-
-    fn lit(s: &str) -> Expr {
-        Expr::StringLiteral(StringLiteral { val: s.to_string() })
     }
 
     #[test]

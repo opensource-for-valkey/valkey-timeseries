@@ -95,12 +95,6 @@ macro_rules! make_datetime_function {
         #[derive(Copy, Clone)]
         pub(in crate::promql) struct $name;
 
-        impl $name {
-            pub fn new() -> Self {
-                Self
-            }
-        }
-
         impl PromQLFunction for $name {
             fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
                 let mut samples = arg.into_instant_vector()?;

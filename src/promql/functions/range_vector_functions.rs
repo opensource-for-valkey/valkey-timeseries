@@ -34,40 +34,6 @@ where
     ExprResult::InstantVector(res)
 }
 
-/// Generic aggregator for range vector functions.
-///
-/// Invariant:
-/// - Each input series is reduced to a single output sample at eval_timestamp_ms.
-/// - Empty series are skipped (matching Prometheus behavior).
-/// - Aggregation function `f` must implement PromQL float semantics exactly.
-pub(super) fn aggr_over_time<F>(
-    samples: Vec<EvalSamples>,
-    eval_timestamp_ms: i64,
-    f: F,
-) -> ExprResult
-where
-    F: Fn(&[Sample]) -> f64 + Send + Sync,
-{
-    let vec = samples
-        .into_par_rayon()
-        .filter_map(|series| {
-            if series.values.is_empty() {
-                None
-            } else {
-                let value = f(&series.values);
-                Some(EvalSample {
-                    timestamp_ms: eval_timestamp_ms,
-                    value,
-                    labels: series.labels,
-                    drop_name: series.drop_name,
-                })
-            }
-        })
-        .collect::<Vec<_>>();
-
-    ExprResult::InstantVector(vec)
-}
-
 /// Returns the number of counter-resets within the provided time range as an instant vector. Any decrease in the value
 /// between two consecutive float samples is interpreted as a counter-reset.
 #[derive(Copy, Clone)]

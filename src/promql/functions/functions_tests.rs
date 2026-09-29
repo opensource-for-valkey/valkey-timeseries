@@ -5,16 +5,12 @@ mod tests {
     use crate::labels::Labels;
     use crate::promql::exec::types::EvalLabels;
     use crate::promql::functions::PromQLFunctionImpl;
-    use crate::promql::functions::utils::variance_kahan;
     use crate::promql::functions::{
         FunctionCallContext, PromQLArg, PromQLFunction, resolve_function,
     };
-    use crate::promql::{
-        EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult, is_stale_nan,
-    };
+    use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
     use ahash::AHashMap as HashMap;
     use promql_parser::label::METRIC_NAME;
-    use promql_parser::parser::{Expr, ParenExpr, StringLiteral};
     use rstest::rstest;
     use std::time::Duration;
     // ========================================================================
@@ -35,18 +31,6 @@ mod tests {
     }
 
     impl RangeFunctionAdapter {
-        pub(crate) fn apply(
-            &self,
-            samples: Vec<EvalSamples>,
-            eval_timestamp_ms: i64,
-        ) -> EvalResult<ExprResult> {
-            let ctx = EvalContext {
-                evaluation_ts: eval_timestamp_ms,
-                ..Default::default()
-            };
-            self.inner.apply(PromQLArg::RangeVector(samples), &ctx)
-        }
-
         pub(crate) fn apply_with_range(
             &self,
             mut samples: Vec<EvalSamples>,
@@ -72,84 +56,14 @@ mod tests {
             let arg = PromQLArg::RangeVector(samples);
             self.inner.apply_call(vec![arg], &no_raw_args(&ctx))
         }
-
-        pub(crate) fn apply_rollup(
-            &self,
-            mut samples: Vec<EvalSamples>,
-            eval_timestamp_ms: i64,
-            range: Duration,
-            step: i64,
-        ) -> EvalResult<ExprResult> {
-            let range_ms = range.as_millis() as i64;
-            let query_start_ms = eval_timestamp_ms - range_ms;
-            let query_end_ms = eval_timestamp_ms;
-
-            let ctx = EvalContext {
-                query_start: query_start_ms,
-                query_end: query_end_ms,
-                evaluation_ts: eval_timestamp_ms,
-                step_ms: step,
-                lookback_delta_ms: 0,
-            };
-            let range_ms = range.as_millis() as i64;
-            for s in &mut samples {
-                s.range_ms = range_ms;
-                s.range_end_ms = eval_timestamp_ms;
-            }
-            let arg = PromQLArg::RangeVector(samples);
-            self.inner.apply_call(vec![arg], &no_raw_args(&ctx))
-        }
     }
 
     fn get_range_function(name: &str) -> Option<RangeFunctionAdapter> {
         resolve_function(name).map(|x| RangeFunctionAdapter { inner: x })
     }
 
-    /// Converts f64 values to Sample structs with sequential timestamps
-    fn test_samples(values: &[f64]) -> Vec<Sample> {
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| Sample {
-                timestamp: i as i64,
-                value: v,
-            })
-            .collect()
-    }
-
-    /// Relative error allowed for sample values (matches Prometheus defaultEpsilon)
-    const DEFAULT_EPSILON: f64 = 0.000001;
-
-    /// Compare two floats with tolerance.
-    ///
-    /// Handles StaleNaN, NaN, exact equality, near-zero, and relative tolerance.
-    fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
-        const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
-
-        if is_stale_nan(a) || is_stale_nan(b) {
-            return is_stale_nan(a) && is_stale_nan(b);
-        }
-
-        if a.is_nan() && b.is_nan() {
-            return true;
-        }
-
-        if a == b {
-            return true;
-        }
-
-        let abs_sum = a.abs() + b.abs();
-        let diff = (a - b).abs();
-
-        if a == 0.0 || b == 0.0 || abs_sum < MIN_NORMAL {
-            return diff < epsilon * MIN_NORMAL;
-        }
-
-        diff / abs_sum.min(f64::MAX) < epsilon
-    }
-
     // ========================================================================
-    // Tests for variance_kahan
+    // Sample and argument builders
     // ========================================================================
 
     fn create_sample(value: f64) -> EvalSample {
@@ -168,43 +82,6 @@ mod tests {
             labels: Labels::from_pairs(labels).into(),
             drop_name: false,
         }
-    }
-
-    fn string_arg(value: &str) -> Expr {
-        Expr::StringLiteral(StringLiteral {
-            val: value.to_string(),
-        })
-    }
-
-    fn paren_string_arg(value: &str) -> Expr {
-        Expr::Paren(ParenExpr {
-            expr: Box::new(string_arg(value)),
-        })
-    }
-
-    fn box_exprs(args: Vec<Expr>) -> Box<[Box<Expr>]> {
-        args.into_iter().map(Box::new).collect()
-    }
-
-    fn label_replace_raw_args(dst: &str, replacement: &str, src: &str, regex: &str) -> Vec<Expr> {
-        vec![
-            Expr::NumberLiteral(promql_parser::parser::NumberLiteral { val: 0.0 }),
-            paren_string_arg(dst),
-            string_arg(replacement),
-            string_arg(src),
-            string_arg(regex),
-        ]
-    }
-
-    fn label_join_raw_args(dst: &str, separator: &str, src_labels: &[&str]) -> Vec<Expr> {
-        let mut args = vec![
-            Expr::NumberLiteral(promql_parser::parser::NumberLiteral { val: 0.0 }),
-            paren_string_arg(dst),
-            string_arg(separator),
-        ];
-
-        args.extend(src_labels.iter().map(|label| string_arg(label)));
-        args
     }
 
     fn call_apply(name: &str, arg: PromQLArg, eval_timestamp_ms: i64) -> Vec<EvalSample> {
@@ -232,22 +109,6 @@ mod tests {
             ..Default::default()
         };
         let result = func.apply_args(args, &ctx).unwrap();
-        let ExprResult::InstantVector(samples) = result else {
-            panic!("expected instant vector result");
-        };
-        samples
-    }
-
-    fn call_range_function(
-        name: &str,
-        samples: Vec<EvalSamples>,
-        eval_timestamp_ms: i64,
-    ) -> Vec<EvalSample> {
-        let func = get_range_function(name).unwrap();
-        // todo: pass in range
-        let result = func
-            .apply_with_range(samples, eval_timestamp_ms, Duration::default())
-            .unwrap();
         let ExprResult::InstantVector(samples) = result else {
             panic!("expected instant vector result");
         };
@@ -282,13 +143,6 @@ mod tests {
             panic!("expected instant vector result");
         };
         samples
-    }
-
-    fn create_vector_arg(_values: Vec<f64>) -> PromQLArg {
-        PromQLArg::InstantVector(vec![create_sample_with_labels(
-            1.0,
-            &[(METRIC_NAME, "test_metric"), ("src", "source\nvalue-10")],
-        )])
     }
 
     #[test]
@@ -1606,74 +1460,6 @@ mod tests {
         // then
         // Empty series are skipped (Prometheus behavior)
         assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn variance_kahan_empty_returns_nan() {
-        assert!(variance_kahan(&[]).is_nan());
-    }
-
-    #[test]
-    fn variance_kahan_single_value_returns_zero() {
-        let result = variance_kahan(&test_samples(&[42.0]));
-        assert!(almost_equal(result, 0.0, 1e-6));
-    }
-
-    #[rstest]
-    #[case(&[10.0, 20.0, 30.0, 40.0], 125.0)]
-    #[case(&[5.0, 5.0, 5.0, 5.0], 0.0)]
-    #[case(&[1.0, 2.0], 0.25)]
-    #[case(&[1.0, 2.0, 3.0, 4.0, 5.0], 2.0)]
-    fn variance_kahan_fixed_vectors(#[case] values: &[f64], #[case] expected: f64) {
-        let result = variance_kahan(&test_samples(values));
-        assert!(
-            almost_equal(result, expected, 1e-6),
-            "Expected {}, got {}",
-            expected,
-            result
-        );
-    }
-
-    #[test]
-    fn variance_kahan_numerical_stability_stress() {
-        // Large base + small deltas: base=1e10, values [base+0, base+1, base+2, base+3]
-        // Expected from delta-space variance ([0,1,2,3]) = 1.25
-        let base = 1e10;
-        let samples = test_samples(&[base, base + 1.0, base + 2.0, base + 3.0]);
-        let result = variance_kahan(&samples);
-        assert!(
-            almost_equal(result, 1.25, 1e-6),
-            "Expected 1.25, got {}",
-            result
-        );
-    }
-
-    #[test]
-    fn variance_kahan_vs_two_pass_oracle() {
-        // Test against independent two-pass algorithm (inlined to prevent misuse)
-        let samples = test_samples(&[10.0, 20.0, 30.0, 40.0]);
-
-        let welford_result = variance_kahan(&samples);
-
-        // Two-pass oracle (inlined)
-        let mean = samples.iter().map(|s| s.value).sum::<f64>() / samples.len() as f64;
-        let two_pass_result = samples
-            .iter()
-            .map(|s| (s.value - mean).powi(2))
-            .sum::<f64>()
-            / samples.len() as f64;
-
-        assert!(
-            almost_equal(welford_result, two_pass_result, 1e-6),
-            "Welford: {}, Two-pass: {}",
-            welford_result,
-            two_pass_result
-        );
-    }
-
-    #[test]
-    fn variance_kahan_nan_propagation() {
-        assert!(variance_kahan(&test_samples(&[1.0, f64::NAN, 3.0])).is_nan());
     }
 
     #[test]

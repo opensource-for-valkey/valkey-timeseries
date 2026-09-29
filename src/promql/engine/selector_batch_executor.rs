@@ -190,12 +190,6 @@ struct SelectorTask {
     responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
 }
 
-impl SelectorTask {
-    fn db(&self) -> i32 {
-        self.kind.db()
-    }
-}
-
 /// An executor responsible for executing PromQL selectors as part of a keyspace batch operation.
 ///
 /// The `SelectorBatchExecutor` optimizes latency in the PromQL evaluator (especially in cluster mode) by:

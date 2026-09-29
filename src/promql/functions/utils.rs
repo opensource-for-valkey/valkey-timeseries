@@ -1,66 +1,10 @@
-use crate::common::Sample;
-use crate::common::math::kahan_inc;
-use crate::labels::{Label, Labels};
+use crate::labels::Label;
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::functions::PromQLArg;
 use crate::promql::{EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult};
 use promql_parser::label::{METRIC_NAME, MatchOp};
 use promql_parser::parser::Expr;
-use std::borrow::Cow;
 use std::cmp::Ordering;
-
-/// Variance calculation using Welford's online algorithm (1962)
-/// with compensated summation for improved numerical stability.
-///
-/// Algorithm:
-///   For each value x:
-///     count += 1
-///     delta  = x - mean
-///     mean  += delta / count
-///     delta2 = x - mean
-///     M2    += delta * delta2
-///   variance = M2 / count   (population variance)
-///
-/// Enhancement:
-///   Kahan compensated summation is applied to the M2 accumulator
-///   to reduce floating-point rounding error in long sequences.
-///   The mean update uses standard Welford (without Kahan) because
-///   Kahan compensation on the running mean can introduce inconsistent
-///   rounding between the mean update and delta2 computation, causing
-///   catastrophic precision loss when values are extremely close.
-///
-/// Semantics:
-///   - Computes population variance (divides by n)
-///   - Matches Prometheus population variance semantics
-///
-/// NaN handling:
-///   - Empty input returns NaN
-///   - Single value returns 0.0
-///   - NaN values propagate through the calculation
-///
-/// References:
-///   - <https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm>
-///   - Prometheus: `promql/functions.go::varianceOverTime`
-pub(in crate::promql) fn variance_kahan(values: &[Sample]) -> f64 {
-    if values.is_empty() {
-        return f64::NAN;
-    }
-
-    let mut count = 0.0;
-    let mut mean = 0.0;
-    let mut m2 = 0.0;
-    let mut c_m2 = 0.0;
-
-    for sample in values {
-        count += 1.0;
-        let delta = sample.value - mean;
-        mean += delta / count;
-        let new_delta = sample.value - mean;
-        (m2, c_m2) = kahan_inc(delta * new_delta, m2, c_m2);
-    }
-
-    (m2 + c_m2) / count
-}
 
 pub(super) fn exact_arity_error(
     function_name: &str,
@@ -122,39 +66,6 @@ pub(super) fn expect_min_arg_count(
 /// a valid label name, since a Rust `&str` is already guaranteed valid UTF-8.
 pub(in crate::promql) fn is_valid_label_name(label: &str) -> bool {
     !label.is_empty()
-}
-
-pub(super) fn output_labelset_key(labels: &'_ Labels, drop_name: bool) -> Cow<'_, Labels> {
-    let modified = labels
-        .iter()
-        .any(|label| drop_name && label.name.as_str() == METRIC_NAME);
-    if !modified {
-        return Cow::Borrowed(labels);
-    }
-
-    let key = labels
-        .iter()
-        .filter(|label| !drop_name || label.name.as_str() != METRIC_NAME)
-        .cloned()
-        .collect();
-
-    Cow::Owned(Labels::new(key))
-}
-
-pub(super) fn extract_string_arg(
-    expr: &Expr,
-    function_name: &str,
-    arg_index: usize,
-) -> EvalResult<String> {
-    match expr {
-        Expr::StringLiteral(string) => Ok(string.val.clone()),
-        Expr::Paren(paren) => extract_string_arg(&paren.expr, function_name, arg_index),
-        _ => Err(EvaluationError::InternalError(format!(
-            "expected string literal for argument {} to function '{}'",
-            arg_index + 1,
-            function_name
-        ))),
-    }
 }
 
 pub(super) fn expect_string(value: PromQLArg, func: &str, arg_name: &str) -> EvalResult<String> {
@@ -223,19 +134,6 @@ pub(super) fn map_scalar_or_vector(
             "function expects scalar or instant vector, got {other:?}"
         ))),
     }
-}
-
-pub(super) fn series_len(val: &ExprResult) -> usize {
-    match &val {
-        ExprResult::RangeVector(rv) => rv.len(),
-        ExprResult::InstantVector(iv) => iv.len(),
-        _ => 1,
-    }
-}
-
-#[inline]
-pub fn remove_empty_series(tss: &mut Vec<EvalSamples>) {
-    tss.retain(|ts| !ts.values.iter().all(|v| v.value.is_nan()));
 }
 
 pub(super) fn is_inf(x: f64, sign: i8) -> bool {

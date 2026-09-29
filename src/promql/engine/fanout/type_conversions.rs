@@ -45,10 +45,6 @@ impl From<&Labels> for Vec<ProtoLabel> {
     }
 }
 
-pub(in crate::promql) fn proto_labels_to_labels(labels: Vec<ProtoLabel>) -> Labels {
-    Labels::new(labels.into_iter().map(Label::from).collect())
-}
-
 pub(in crate::promql) fn metric_name_to_proto_labels(metric_name: &MetricName) -> Vec<ProtoLabel> {
     metric_name.iter().map(ProtoLabel::from).collect()
 }

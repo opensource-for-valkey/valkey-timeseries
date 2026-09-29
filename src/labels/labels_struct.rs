@@ -3,7 +3,6 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::{Label, MetricName, SeriesFingerprint};
 use ahash::{AHashMap, AHashSet};
 use enquote::enquote;
-use promql_parser::parser::LabelModifier;
 use serde::de::{MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,7 +18,6 @@ use std::fmt::Display;
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct Labels(pub(crate) Vec<Label>);
 
-#[allow(dead_code)]
 impl Labels {
     pub fn with_capacity(capacity: usize) -> Self {
         Labels(Vec::with_capacity(capacity))
@@ -167,28 +165,6 @@ impl Labels {
 
     pub fn reset_metric_group(&mut self) {
         self.0.retain(|label| label.name != METRIC_NAME_LABEL);
-    }
-
-    pub(crate) fn into_grouping_labels(self, modifier: Option<&LabelModifier>) -> Self {
-        let mut this = self;
-        match modifier {
-            None => Self(vec![]), // No grouping, return empty labels
-            Some(LabelModifier::Include(label_list)) => {
-                // Keep only specified labels
-                this.retain(|k| label_list.labels.contains(&k.name));
-                this
-            }
-            Some(LabelModifier::Exclude(label_list)) => {
-                // Remove specified labels
-                this.retain(|k| !label_list.labels.contains(&k.name));
-                this
-            }
-        }
-    }
-
-    pub(crate) fn compute_grouping_labels(&self, modifier: Option<&LabelModifier>) -> Self {
-        let this = self.clone();
-        this.into_grouping_labels(modifier)
     }
 
     pub fn get_fingerprint(&self) -> SeriesFingerprint {
