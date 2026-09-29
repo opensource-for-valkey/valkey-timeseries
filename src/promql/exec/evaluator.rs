@@ -55,7 +55,9 @@ use promql_parser::parser::{
     AggregateExpr, BinaryExpr, Call, EvalStmt, Expr, MatrixSelector, SubqueryExpr, UnaryExpr,
     VectorSelector,
 };
-use std::sync::{Arc, RwLock};
+use promql_parser::util::{ExprVisitor, walk_expr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 /// How many preload requests may be in flight at once.
@@ -84,6 +86,10 @@ pub(crate) struct PreparedQuery {
     /// The query's sample budget, shared by the preload phase, the step loop and
     /// every sub-evaluator, so it counts the whole query.
     budget: Arc<SampleBudget>,
+    /// Set once any preload map gains an entry; see `has_preloaded_data`.
+    any_preloaded: Arc<AtomicBool>,
+    /// Filled at the end of the preload phase; see [`NodeKeys`].
+    node_keys: Arc<OnceLock<NodeKeys>>,
 }
 
 impl PreparedQuery {
@@ -102,6 +108,32 @@ impl PreparedQuery {
 /// evaluator) and the resolved step, which is all that distinguishes two
 /// grids of the same subquery within one outer query.
 type SubqueryPreloadMap = ahash::AHashMap<(usize, i64), Arc<PreparedQuery>>;
+
+/// The keys the step loop looks preloaded data up by, computed once per node of
+/// the expression instead of once per step.
+///
+/// Building a key hashes a selector's matchers and, for an aggregation, clones
+/// and sorts its grouping labels. A light range query (`sum(m)` over 1,000
+/// steps) spent about a tenth of its CPU doing that three or four times a step.
+///
+/// Keyed by node address: the expression outlives the evaluation and is never
+/// changed, so an address names one live node. A node filter push-down builds
+/// during evaluation is a separate allocation, never a live node's address, so
+/// it misses here and computes its key as before: a miss is slower, never
+/// wrong. `None` records a node that has no such key (not a pushable rollup,
+/// not a fusable aggregation), so that question is answered once too.
+#[derive(Default)]
+pub(crate) struct NodeKeys {
+    selectors: ahash::AHashMap<usize, PreloadKey>,
+    rollups: ahash::AHashMap<usize, Option<GridPreloadKey>>,
+    stepped: ahash::AHashMap<usize, Option<GridPreloadKey>>,
+    fused: ahash::AHashMap<usize, Option<GridPreloadKey>>,
+}
+
+/// A node's address, the key of [`NodeKeys`].
+fn node_addr<T>(node: &T) -> usize {
+    node as *const T as usize
+}
 
 /// Errors that end the query rather than downgrade a best-effort preload: a
 /// passed deadline, or a sample budget already spent (it only grows, so every
@@ -155,6 +187,12 @@ pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
     /// Samples loaded so far on behalf of the whole query; see
     /// [`crate::promql::engine::sample_budget`].
     budget: Arc<SampleBudget>,
+    /// Whether any preload map has an entry: one atomic load for the per-step
+    /// question `has_preloaded_data` answers, where reading the four maps took
+    /// four lock round-trips for every binary operator at every step.
+    any_preloaded: Arc<AtomicBool>,
+    /// Per-node lookup keys; see [`NodeKeys`].
+    node_keys: Arc<OnceLock<NodeKeys>>,
     options: QueryOptions,
 }
 
@@ -179,6 +217,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_matrices: prepared.preloaded_matrices,
             preloaded_subqueries: prepared.preloaded_subqueries,
             budget: prepared.budget,
+            any_preloaded: prepared.any_preloaded,
+            node_keys: prepared.node_keys,
             options,
         }
     }
@@ -198,6 +238,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_matrices: Arc::clone(&prepared.preloaded_matrices),
             preloaded_subqueries: Arc::clone(&prepared.preloaded_subqueries),
             budget: Arc::clone(&prepared.budget),
+            any_preloaded: Arc::clone(&prepared.any_preloaded),
+            node_keys: Arc::clone(&prepared.node_keys),
             options,
         }
     }
@@ -209,7 +251,78 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             preloaded_matrices: self.preloaded_matrices,
             preloaded_subqueries: self.preloaded_subqueries,
             budget: self.budget,
+            any_preloaded: self.any_preloaded,
+            node_keys: self.node_keys,
         }
+    }
+
+    /// Record that a preload map has an entry.
+    fn note_preloaded(&self) {
+        self.any_preloaded.store(true, Ordering::Release);
+    }
+
+    /// Compute [`NodeKeys`] for every node of `expr`. Called once the preload
+    /// phase is done; a second call (a second grid on one evaluator) keeps the
+    /// first table, whose misses still compute.
+    fn fill_node_keys(&self, expr: &Expr) {
+        self.node_keys.get_or_init(|| {
+            struct Collect<'e, 'r, R: QueryReader + ?Sized> {
+                evaluator: &'e Evaluator<'r, R>,
+                keys: NodeKeys,
+            }
+            impl<R: QueryReader + ?Sized> ExprVisitor for Collect<'_, '_, R> {
+                type Error = std::convert::Infallible;
+                fn pre_visit(&mut self, expr: &Expr) -> Result<bool, Self::Error> {
+                    match expr {
+                        Expr::VectorSelector(vs) => {
+                            self.keys
+                                .selectors
+                                .insert(node_addr(vs), PreloadKey::from_selector(vs));
+                        }
+                        Expr::Call(call) => {
+                            let key = self.evaluator.rollup_key(call);
+                            self.keys.rollups.insert(node_addr(call), key);
+                        }
+                        Expr::Aggregate(aggregate) => {
+                            let addr = node_addr(aggregate);
+                            self.keys
+                                .stepped
+                                .insert(addr, stepped_aggregation_key(aggregate));
+                            let fused = self.evaluator.fused_rollup_key(aggregate);
+                            self.keys.fused.insert(addr, fused);
+                        }
+                        _ => {}
+                    }
+                    Ok(true)
+                }
+            }
+            let mut collect = Collect {
+                evaluator: self,
+                keys: NodeKeys::default(),
+            };
+            let Ok(_) = walk_expr(&mut collect, expr);
+            collect.keys
+        });
+    }
+
+    /// The memoized key for `node` in the table `pick` selects: `Some(key)`
+    /// or `Some(None)` when [`NodeKeys`] answered, `None` when it has no entry
+    /// (not filled yet, or a node built during evaluation).
+    fn memoized<'k, T>(
+        &'k self,
+        node: &T,
+        pick: impl FnOnce(&'k NodeKeys) -> &'k ahash::AHashMap<usize, Option<GridPreloadKey>>,
+    ) -> Option<Option<&'k GridPreloadKey>> {
+        let keys = self.node_keys.get()?;
+        pick(keys).get(&node_addr(node)).map(Option::as_ref)
+    }
+
+    /// The [`PreloadKey`] of `vs`, from [`NodeKeys`] when it has one.
+    fn selector_key(&self, vs: &VectorSelector) -> PreloadKey {
+        self.node_keys
+            .get()
+            .and_then(|keys| keys.selectors.get(&node_addr(vs)).cloned())
+            .unwrap_or_else(|| PreloadKey::from_selector(vs))
     }
 
     /// Count `samples` against the query's budget; fails the query once the
@@ -309,6 +422,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         self.preload_matrices(expr, grid)?;
         self.preload_subqueries(expr, grid)?;
 
+        self.fill_node_keys(expr);
         Ok(())
     }
 
@@ -390,6 +504,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                         .write()
                         .unwrap()
                         .insert(key, Arc::new(prepared));
+                    self.note_preloaded();
                 }
                 Err(err) if is_query_ending(&err) => return Err(err),
                 Err(err) => {
@@ -585,6 +700,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .write()
                     .unwrap()
                     .insert(key, PreloadedMatrixData { series });
+                self.note_preloaded();
             }
             Err(err @ QueryError::TooManySamples { .. }) => return Err(err.into()),
             Err(err) => {
@@ -799,6 +915,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 series,
             },
         );
+        self.note_preloaded();
     }
 
     /// Ask the source to fold each aggregation that sits directly over a bare
@@ -892,9 +1009,39 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// This step's slice of a preloaded rollup, or `None` when the call was not
     /// preloaded and has to be evaluated here.
     fn preloaded_rollup(&self, call: &Call, ctx: &EvalContext) -> Option<ExprResult> {
+        match self.memoized(call, |keys| &keys.rollups) {
+            Some(key) => self.preloaded_grid_by_key(key?, ctx, false),
+            None => self.preloaded_grid_by_key(&self.rollup_key(call)?, ctx, false),
+        }
+    }
+
+    /// The grid key an unfused pushable rollup `call` is preloaded under.
+    fn rollup_key(&self, call: &Call) -> Option<GridPreloadKey> {
         let (kind, matrix, param) = self.pushable_rollup(call)?;
-        let key = GridPreloadKey::rollup(&matrix.vs, kind, matrix_range_ms(matrix), param, None);
-        self.preloaded_grid_by_key(&key, ctx, false)
+        Some(GridPreloadKey::rollup(
+            &matrix.vs,
+            kind,
+            matrix_range_ms(matrix),
+            param,
+            None,
+        ))
+    }
+
+    /// The grid key a rollup fused with `aggregate` is preloaded under, when
+    /// `aggregate` is a fusable aggregation directly over a pushable rollup.
+    fn fused_rollup_key(&self, aggregate: &AggregateExpr) -> Option<GridPreloadKey> {
+        let Expr::Call(call) = strip_parens(&aggregate.expr) else {
+            return None;
+        };
+        let aggregation = fusable_aggregation(aggregate)?;
+        let (kind, matrix, param) = self.pushable_rollup(call)?;
+        Some(GridPreloadKey::rollup(
+            &matrix.vs,
+            kind,
+            matrix_range_ms(matrix),
+            param,
+            Some(AggregationKey::of(&aggregation)),
+        ))
     }
 
     /// This step's slice of a preloaded grid, keyed explicitly so the fused
@@ -1084,6 +1231,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         };
         let mut cache = self.preloaded_instant.write().unwrap();
         cache.insert(key, data);
+        drop(cache);
+        self.note_preloaded();
     }
 
     pub(crate) fn evaluate(&self, stmt: EvalStmt) -> EvalResult<ExprResult> {
@@ -1436,7 +1585,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // `preload_eligible` says only whether `self`'s maps describe the grid
         // being stepped over.
         if preload_eligible {
-            let preload_key = PreloadKey::from_selector(vector_selector);
+            let preload_key = self.selector_key(vector_selector);
             let guard = self.preloaded_instant.read().unwrap();
             if let Some(preloaded) = guard.get(&preload_key) {
                 let evaluation_ts = ctx.evaluation_ts;
@@ -1444,7 +1593,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 let step_idx =
                     step_index(evaluation_ts, preloaded.eval_start_ms, preloaded.step_ms);
 
-                let mut samples = Vec::new();
+                let mut samples = Vec::with_capacity(preloaded.series.len());
                 for series in &preloaded.series {
                     if let Some(sample) = series.values.get(step_idx) {
                         samples.push(EvalSample {
@@ -1638,13 +1787,11 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// it and falls back to one live query per step. That trade is only worth
     /// making when there is no grid to lose. An instant query never calls
     /// `preload_for_range`, so both maps stay empty and pushdown costs nothing.
+    ///
+    /// Subquery preloads count too: they are keyed by node address, so a
+    /// pushed-down copy of a subquery would miss its prepared union.
     fn has_preloaded_data(&self) -> bool {
-        !self.preloaded_instant.read().unwrap().is_empty()
-            || !self.preloaded_grids.read().unwrap().is_empty()
-            || !self.preloaded_matrices.read().unwrap().is_empty()
-            // Subquery preloads are keyed by node address, so a pushed-down
-            // copy of a subquery would miss its prepared union too.
-            || !self.preloaded_subqueries.read().unwrap().is_empty()
+        self.any_preloaded.load(Ordering::Acquire)
     }
 
     fn evaluate_binary_expr(
@@ -1949,14 +2096,16 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         aggregate: &AggregateExpr,
         ctx: &EvalContext,
     ) -> Option<ExprResult> {
-        let key = stepped_aggregation_key(aggregate)?;
-        self.preloaded_grid_by_key(&key, ctx, false)
+        match self.memoized(aggregate, |keys| &keys.stepped) {
+            Some(key) => self.preloaded_grid_by_key(key?, ctx, false),
+            None => self.preloaded_grid_by_key(&stepped_aggregation_key(aggregate)?, ctx, false),
+        }
     }
 
     /// Whether this selector's samples were already fetched by
     /// [`Self::preload_for_range`].
     fn is_preloaded(&self, selector: &VectorSelector) -> bool {
-        let key = PreloadKey::from_selector(selector);
+        let key = self.selector_key(selector);
         self.preloaded_instant.read().unwrap().contains_key(&key)
     }
 
@@ -1983,6 +2132,19 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let Expr::Call(call) = strip_parens(&aggregate.expr) else {
             return Ok(None);
         };
+        // A range step answered from [`NodeKeys`] without rebuilding the key:
+        // `Some(None)` means the aggregation does not fuse at all.
+        if ctx.step_ms > 0
+            && let Some(memo) = self.memoized(aggregate, |keys| &keys.fused)
+        {
+            let Some(key) = memo else {
+                return Ok(None);
+            };
+            if preload_eligible {
+                return Ok(self.preloaded_grid_by_key(key, ctx, drops_metric_name(call)));
+            }
+            return Ok(None);
+        }
         let Some(aggregation) = fusable_aggregation(aggregate) else {
             return Ok(None);
         };
