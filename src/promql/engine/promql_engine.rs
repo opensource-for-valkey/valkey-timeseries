@@ -318,9 +318,37 @@ pub fn evaluate_range(
     // returned its series in a different order after a restart or on another node.
     // Prometheus sorts a range result by labels: pair by pair, name then value, the
     // shorter set first, which is `Labels`' own ordering.
-    result.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+    par_sort_unstable_by(&mut result, &|a: &RangeSample, b: &RangeSample| {
+        a.labels.cmp(&b.labels)
+    });
 
     Ok(result)
+}
+
+/// Below this many series a range result is sorted on the calling thread: at a few
+/// nanoseconds a comparison, that is well under a millisecond.
+const PAR_SORT_MIN_LEN: usize = 8192;
+
+/// `sort_unstable_by`, split across the pool for a large slice: partition around the
+/// median in place, then sort the two halves concurrently. A result with one series per
+/// distinct value (`count_values` over many series and steps) can hold 100 000+ series,
+/// and sorting that many label sets on one thread cost 12 ms of a 55 ms query.
+fn par_sort_unstable_by<T, F>(v: &mut [T], cmp: &F)
+where
+    T: Send,
+    F: Fn(&T, &T) -> std::cmp::Ordering + Sync,
+{
+    if v.len() <= PAR_SORT_MIN_LEN {
+        v.sort_unstable_by(cmp);
+        return;
+    }
+    let mid = v.len() / 2;
+    v.select_nth_unstable_by(mid, cmp);
+    let (lo, hi) = v.split_at_mut(mid);
+    crate::common::threads::join(
+        || par_sort_unstable_by(lo, cmp),
+        || par_sort_unstable_by(hi, cmp),
+    );
 }
 
 /// Tsdb manages a unified Promql QueryReader interface
@@ -667,6 +695,20 @@ mod tests {
         assert_eq!(results[0].labels.get("env"), Some("prod"));
         assert!(!results[0].samples.is_empty());
         assert_eq!(results[1].labels.get("env"), Some("staging"));
+    }
+
+    /// The parallel sort orders a slice past the sequential cutoff exactly as the
+    /// sequential sort does, and leaves a short one to it.
+    #[test]
+    fn par_sort_matches_sequential_sort() {
+        for len in [0, 1, PAR_SORT_MIN_LEN, PAR_SORT_MIN_LEN * 5 + 3] {
+            // A scrambled permutation with repeats: a large stride modulo a prime.
+            let mut v: Vec<u64> = (0..len as u64).map(|i| (i * 7_919) % 10_007).collect();
+            let mut expected = v.clone();
+            expected.sort_unstable();
+            par_sort_unstable_by(&mut v, &|a: &u64, b: &u64| a.cmp(b));
+            assert_eq!(v, expected, "len {len}");
+        }
     }
 
     /// Range results come back sorted by labels, as Prometheus returns them, not in the
