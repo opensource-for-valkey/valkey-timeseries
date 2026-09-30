@@ -56,12 +56,30 @@ pub(crate) fn create_unseeded_hasher() -> LabelHasher {
 /// all hash differently. (The same framing as Prometheus' label hash.)
 pub(crate) const LABEL_SEP: u8 = 0xff;
 
+/// A framed label up to this many bytes is hashed with a single write.
+const INLINE_LABEL_LEN: usize = 128;
+
 /// Feed one `name=value` pair into a label-set hash, framed by [`LABEL_SEP`].
+///
+/// The streaming hash is the same however its input is split, so a label that
+/// fits is framed in a stack buffer and written once: four writes per label, two
+/// of them a single byte, cost a join's match keys about 15 %.
+#[inline]
 pub(crate) fn hash_key_value(hasher: &mut LabelHasher, key: &str, value: &str) {
-    hasher.write(key.as_bytes());
-    hasher.write(&[LABEL_SEP]);
-    hasher.write(value.as_bytes());
-    hasher.write(&[LABEL_SEP]);
+    let len = key.len() + value.len() + 2;
+    if len <= INLINE_LABEL_LEN {
+        let mut buf = [0u8; INLINE_LABEL_LEN];
+        buf[..key.len()].copy_from_slice(key.as_bytes());
+        buf[key.len()] = LABEL_SEP;
+        buf[key.len() + 1..len - 1].copy_from_slice(value.as_bytes());
+        buf[len - 1] = LABEL_SEP;
+        hasher.write(&buf[..len]);
+    } else {
+        hasher.write(key.as_bytes());
+        hasher.write(&[LABEL_SEP]);
+        hasher.write(value.as_bytes());
+        hasher.write(&[LABEL_SEP]);
+    }
 }
 
 impl HasFingerprint for &str {
@@ -79,6 +97,48 @@ impl HasFingerprint for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A label framed in the stack buffer hashes exactly as its four separate
+    /// writes do, on both sides of the inline limit and across a long sequence
+    /// that crosses the hash's internal block boundaries: fingerprints are
+    /// compared between shards, so they must not change.
+    #[test]
+    fn inline_label_write_matches_separate_writes() {
+        let separate = |hasher: &mut LabelHasher, key: &str, value: &str| {
+            hasher.write(key.as_bytes());
+            hasher.write(&[LABEL_SEP]);
+            hasher.write(value.as_bytes());
+            hasher.write(&[LABEL_SEP]);
+        };
+        let fits = "x".repeat(INLINE_LABEL_LEN - 3);
+        let over = "x".repeat(INLINE_LABEL_LEN - 2);
+        let long = "y".repeat(1000);
+        let labels: Vec<(String, String)> = [
+            ("", ""),
+            ("job", "api"),
+            ("a", &fits),
+            ("a", &over),
+            ("b", &long),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .chain((0..40).map(|i| (format!("label_{i}"), format!("value-{}", i * 7))))
+        .collect();
+
+        for (key, value) in &labels {
+            let (mut one, mut four) = (create_hasher(), create_hasher());
+            hash_key_value(&mut one, key, value);
+            separate(&mut four, key, value);
+            assert_eq!(one.finish_128(), four.finish_128(), "{key}={value}");
+        }
+
+        let (mut one, mut four) = (create_unseeded_hasher(), create_unseeded_hasher());
+        for (key, value) in &labels {
+            hash_key_value(&mut one, key, value);
+            separate(&mut four, key, value);
+        }
+        assert_eq!(one.finish_128(), four.finish_128());
+    }
 
     /// The borrowed-secret hashers must produce exactly what the allocating
     /// Label boundaries must survive hashing: the separator used to be the
