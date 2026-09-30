@@ -337,7 +337,9 @@ pub(super) fn exec_basic_rollup_fn(
     expect_exact_arg_count(name, 1, args.len())?;
     let range = args.swap_remove(0).into_range_vector()?;
     Ok(ExprResult::InstantVector(eval_rollups_basic(
-        ctx, range, f,
+        ctx,
+        range,
+        |window| Some(f(window)),
     )?))
 }
 

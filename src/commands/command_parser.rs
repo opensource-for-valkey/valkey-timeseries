@@ -1847,7 +1847,7 @@ fn prepare_promql_query(query: &str) -> ValkeyResult<Expr> {
     // Before parsing: the parser compiles every regex matcher without a size limit.
     validate_query_regexes(query).map_err(ValkeyError::String)?;
     // TODO: it may be helpful to return the exact error
-    let expr = promql_parser::parser::parse(query).map_err(|_e| {
+    let expr = crate::promql::parse_query(query).map_err(|_e| {
         log_debug(format!("TSDB: failed to parse query {_e:?}"));
         ValkeyError::Str(error_consts::INVALID_QUERY)
     })?;

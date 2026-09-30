@@ -21,7 +21,7 @@ pub(super) fn eval_instant(
 ) -> Result<QueryValue, String> {
     let options = test_query_options();
     // Quick debug: attempt to parse the query directly to get a more detailed parser error
-    match promql_parser::parser::parse(query) {
+    match crate::promql::parse_query(query) {
         Ok(_) => {
             // parsed OK, proceed
             tsdb.eval_query(query, Some(time), &options)
@@ -37,7 +37,7 @@ pub(super) fn eval_instant(
                 .unwrap()
                 .replace_all(query, " ")
                 .to_string();
-            if promql_parser::parser::parse(&normalized).is_ok() {
+            if crate::promql::parse_query(&normalized).is_ok() {
                 eprintln!(
                     "[promqltest] retrying with normalized query: '{}'",
                     normalized

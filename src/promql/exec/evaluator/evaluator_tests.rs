@@ -46,7 +46,9 @@ mod tests {
         end_time: SystemTime,
         lookback_delta: Duration,
     ) -> EvalResult<Vec<EvalSample>> {
-        let expr = promql_parser::parser::parse(query)
+        // Tests never load the module, which is where extra functions are registered.
+        crate::promql::register_parser_functions().map_err(EvaluationError::InternalError)?;
+        let expr = crate::promql::parse_query(query)
             .map_err(|e| EvaluationError::InternalError(format!("Parse error: {}", e)))?;
 
         let stmt = EvalStmt {
@@ -4365,6 +4367,8 @@ mod tests {
             "changes(metric[1m])",
             "resets(metric[1m])",
             "predict_linear(metric[1m], 60)",
+            "state_duration_over_time(metric[1m], 12)",
+            "state_duration_over_time(metric[1m], 12, \"1m\")",
         ] {
             let result = eval_rollup(&reader, query, 120_000);
             assert_eq!(result.len(), 1, "{query}: one output series");
@@ -4393,6 +4397,76 @@ mod tests {
                 Some("api"),
                 "{query}: job kept"
             );
+        }
+    }
+
+    /// `state_duration_over_time` is registered as experimental, so it must be
+    /// refused unless the request enables experimental functions.
+    #[test]
+    fn state_duration_over_time_is_experimental() {
+        let reader = rollup_reader();
+        let options = QueryOptions {
+            timeout: None,
+            enable_experimental_functions: false,
+            ..QueryOptions::default()
+        };
+        let evaluator = Evaluator::new(&reader, options);
+        let err = parse_and_evaluate(
+            &evaluator,
+            "state_duration_over_time(metric[1m], 12)",
+            UNIX_EPOCH + Duration::from_secs(120),
+            Duration::from_secs(300),
+        )
+        .expect_err("experimental function must be gated");
+        assert!(
+            err.to_string()
+                .contains("state_duration_over_time is not enabled"),
+            "{err}"
+        );
+    }
+
+    /// promqltest never compares `expect fail msg:` text, so the argument
+    /// errors' wording is pinned here.
+    #[test]
+    fn state_duration_over_time_argument_errors_name_the_argument() {
+        let reader = rollup_reader();
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
+        let at = UNIX_EPOCH + Duration::from_secs(120);
+        for (query, expected) in [
+            (
+                r#"state_duration_over_time(metric[1m], 12, "60")"#,
+                r#"state_duration_over_time: invalid unit "60": a time unit suffix is required"#,
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "0s")"#,
+                r#"state_duration_over_time: invalid unit "0s": must be greater than zero"#,
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "-1m")"#,
+                r#"state_duration_over_time: invalid unit "-1m": "#,
+            ),
+            (
+                "state_duration_over_time(metric[1m], NaN)",
+                "state_duration_over_time: state must not be NaN",
+            ),
+        ] {
+            let err = parse_and_evaluate(&evaluator, query, at, Duration::from_secs(300))
+                .expect_err(query)
+                .to_string();
+            assert!(err.contains(expected), "{query}: {err}");
+        }
+
+        // Arity and argument types are the parser's to reject.
+        for query in [
+            "state_duration_over_time(metric[1m])",
+            r#"state_duration_over_time(metric[1m], 12, "1s", "1s")"#,
+            "state_duration_over_time(metric[1m], 12, 60)",
+            "state_duration_over_time(metric, 12)",
+        ] {
+            let err = parse_and_evaluate(&evaluator, query, at, Duration::from_secs(300))
+                .expect_err(query)
+                .to_string();
+            assert!(err.contains("Parse error"), "{query}: {err}");
         }
     }
 

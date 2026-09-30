@@ -16,6 +16,7 @@ mod rollup_functions;
 mod rollups;
 mod sort;
 mod special_functions;
+mod state_duration;
 mod types;
 pub(crate) mod utils;
 
@@ -29,4 +30,21 @@ pub(crate) use types::*;
 // implementation without relying on opaque `impl Trait` return types.
 pub(in crate::promql) fn resolve_function(name: &str) -> Option<PromQLFunctionImpl> {
     PromQLFunctionImpl::try_from(name).ok()
+}
+
+/// Declare this engine's functions that promql-parser doesn't know, so queries
+/// using them parse and are arity/type-checked like the built-ins.
+///
+/// Idempotent and cheap after the first call. The parser's registry is
+/// process-global and filled once, at module load, before any command can
+/// parse a query; a clash with a future built-in fails the load. Tests never
+/// load the module, so a test that parses one of these functions must call this
+/// first (the generated promqltest tests do, via `build.rs`).
+pub(crate) fn register_parser_functions() -> Result<(), String> {
+    static REGISTERED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    REGISTERED
+        .get_or_init(|| {
+            promql_parser::parser::register_extra_functions(vec![state_duration::parser_function()])
+        })
+        .clone()
 }

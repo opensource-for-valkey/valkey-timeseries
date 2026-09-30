@@ -136,6 +136,9 @@ fn main() -> io::Result<()> {
                 r#"
 #[test]
 fn should_pass_{fn_name}() {{
+    // Module load registers the engine's extra functions with the parser; a test never
+    // loads the module, so it has to register them itself.
+    crate::promql::register_parser_functions().expect("register PromQL parser functions");
     run_test({stem:?}, include_str!(concat!(env!("CARGO_MANIFEST_DIR"), {include_path:?})))
         .unwrap();
 }}

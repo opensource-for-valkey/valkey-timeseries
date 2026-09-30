@@ -35,7 +35,7 @@ use std::time::Duration;
 // `evaluate_instant` / `evaluate_range` that only tests use.
 #[cfg(test)]
 fn parse_query(query: &str) -> QueryResult<Expr> {
-    promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)
+    crate::promql::parse_query(query).map_err(QueryError::InvalidQuery)
 }
 
 /// Apply the static optimizer if it is enabled. `push_down_filters` is false

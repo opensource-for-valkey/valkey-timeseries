@@ -230,14 +230,16 @@ fn seek_first_timestamp_idx_after(
 ///
 /// Window selection and the empty-window rule are the same as
 /// [`rollup_series_over_grid`]; see that function for why the grid belongs to the
-/// caller.
+/// caller. `f` may also decline a non-empty window (`None`), which drops the
+/// series from the result like an empty window does — declining is not the same
+/// as answering NaN.
 pub(super) fn eval_rollups_basic<F>(
     ctx: &EvalContext,
     series_data: Vec<EvalSamples>,
     f: F,
 ) -> EvalResult<Vec<EvalSample>>
 where
-    F: Fn(&[Sample]) -> f64 + Sync,
+    F: Fn(&[Sample]) -> Option<f64> + Sync,
 {
     // Checked per series, weighted by its samples, outside `f`'s loop over them.
     let deadline = ctx.deadline;
@@ -250,9 +252,13 @@ where
                 return Ok(None);
             };
 
+            let Some(value) = f(window) else {
+                return Ok(None);
+            };
+
             Ok(Some(EvalSample {
                 timestamp_ms: ctx.evaluation_ts,
-                value: f(window),
+                value,
                 labels: series.labels,
                 drop_name: series.drop_name,
             }))
