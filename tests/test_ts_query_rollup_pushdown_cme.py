@@ -442,6 +442,56 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
              'web-1': 5.5, 'web-2': 8.25, 'web-3': 7},
             context='quantile_over_time(0.25)')
 
+    def test_state_duration_over_time_across_shards(self):
+        """`web-3` reads 7, 7, 7, 8, 8 (every other series is strictly
+        increasing), so it is the only series with a run longer than a sample.
+        A series whose last sample is not in the state is absent, not -1."""
+        self.setup_fleet()
+
+        # Window (T0, T0+120]: web-3 is 7, 8, 8 — in state 8 since T0+90.
+        result = self.instant_query(f'state_duration_over_time(mem_usage[{RANGE}], 8)')
+        self.assert_values_exact(self.values_by_instance(result), {'web-3': 30},
+                                 context='state 8, seconds')
+
+        # The unit travels with the request; the shard divides.
+        result = self.instant_query(
+            f'state_duration_over_time(mem_usage[{RANGE}], 8, "500ms")')
+        self.assert_values_exact(self.values_by_instance(result), {'web-3': 60},
+                                 context='state 8, 500ms')
+
+        # Window (T0-60, T0+60]: web-3 is 7 at T0, T0+30 and T0+60.
+        for unit, want in (('', 60), (', "1m"', 1)):
+            result = self.instant_query(
+                f'state_duration_over_time(mem_usage[{RANGE}], 7{unit})', time=T0 + 60)
+            self.assert_values_exact(self.values_by_instance(result), {'web-3': want},
+                                     context=f'state 7{unit}')
+
+        # Fused: only series in state reach the reduction.
+        result = self.instant_query(
+            f'sum by (job) (state_duration_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_values_exact(self.values_by_label(result, 'job'), {'web': 30},
+                                 context='sum by (job)')
+        result = self.instant_query(
+            f'count(state_duration_over_time(mem_usage[{RANGE}], 5))')
+        self.assert_single_value(result, 1)  # api-1 ends on 5
+
+        # A stepped grid: in state at T0 and T0+60, out of it at T0+120.
+        result = self.range_query(f'state_duration_over_time(mem_usage[{RANGE}], 7)')
+        self.assert_steps_exact(self.steps_by_instance(result), {'web-3': [0, 60]},
+                                context='range, state 7')
+
+    def test_state_duration_over_time_rejects_bad_arguments(self):
+        """Arguments the function rejects never reach a shard: the coordinator
+        keeps the call local, and the local error is the reply."""
+        self.setup_fleet()
+        for query in (f'state_duration_over_time(mem_usage[{RANGE}], 8, "60")',
+                      f'state_duration_over_time(mem_usage[{RANGE}], 8, "0s")',
+                      f'state_duration_over_time(mem_usage[{RANGE}], NaN)'):
+            with pytest.raises(ResponseError):
+                self.instant_query(query)
+            with pytest.raises(ResponseError):
+                self.range_query(query)
+
     def test_ts_of_functions_across_shards(self):
         """The `ts_of_*` family returns a timestamp in seconds.
 
@@ -1022,6 +1072,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'topk(2, sum_over_time(mem_usage[2m]))',
         'sort(sum_over_time(mem_usage[2m]))',
         'sum_over_time(mem_usage[2m]) * 2',
+        'state_duration_over_time(mem_usage[2m], 8, "1m")',
+        'state_duration_over_time(mem_usage[3m], 7)',
     ]
 
     EQUIVALENCE_RANGE = [
@@ -1044,6 +1096,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'absent_over_time(mem_usage{instance="nope"}[2m])',
         'predict_linear(http_requests_total[2m], 30)',
         'topk(2, sum_over_time(mem_usage[2m]))',
+        'state_duration_over_time(mem_usage[2m], 7)',
+        'state_duration_over_time(mem_usage[2m], 8, "500ms")',
     ]
 
     # Fused: the coordinator merges per-shard partials, whose summation order
@@ -1060,6 +1114,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'sum(rate(http_requests_total[2m]))',
         'sum without (instance) (sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(mem_usage[2m] offset 60s))',
+        'sum by (job) (state_duration_over_time(mem_usage[2m], 7, "1m"))',
+        'count(state_duration_over_time(mem_usage[1m], 8))',
         'quantile by (job) (0.5, sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(no_such_metric[2m]))',
     ]

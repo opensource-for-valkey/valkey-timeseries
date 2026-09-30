@@ -62,7 +62,8 @@ fn rollup_request(kind: RollupKind) -> GridRequest {
         rollup: Some(GridRollup {
             kind,
             range_ms: RANGE_MS,
-            param: param_for(kind),
+            param: kind.test_params().0,
+            unit_ms: kind.test_params().1,
         }),
         ..stepped_request()
     }
@@ -98,11 +99,6 @@ fn fused_with(
         }),
         ..base
     }
-}
-
-/// The rollup's parameter, where it takes one.
-fn param_for(kind: RollupKind) -> Option<f64> {
-    (kind == RollupKind::QuantileOverTime).then_some(0.9)
 }
 
 fn command(request: GridRequest) -> GridFanoutCommand {
@@ -1020,6 +1016,7 @@ fn test_windows_per_sample() {
             kind: RollupKind::Rate,
             range_ms: 45_000,
             param: None,
+            unit_ms: None,
         }),
         ..rollup_grid_request(RollupKind::Rate)
     };
@@ -1157,6 +1154,7 @@ fn expanding_arrivals() -> (GridRequest, Vec<RangeSample<EvalLabels>>) {
             kind: RollupKind::CountOverTime,
             range_ms: 10_000_000,
             param: None,
+            unit_ms: None,
         }),
         ..stepped_request()
     };
@@ -1677,6 +1675,63 @@ fn test_request_round_trip() {
     let stepped = decode_request(&wire).unwrap();
     assert!(stepped.rollup.is_none() && stepped.aggregation.is_none());
     assert_eq!(stepped.window_ends().len(), 11);
+}
+
+/// `state_duration_over_time` ships its state as the scalar parameter and its
+/// unit resolved to milliseconds; both survive the wire, and a missing unit
+/// stays missing (the shard's default) rather than becoming zero.
+#[test]
+fn test_state_duration_request_round_trip() {
+    use crate::fanout::serialization::{Deserialized, Serialized};
+
+    let with_unit = rollup_grid_request(RollupKind::StateDurationOverTime);
+    let without_unit = GridRequest {
+        rollup: Some(GridRollup {
+            unit_ms: None,
+            ..with_unit.rollup.clone().unwrap()
+        }),
+        ..with_unit.clone()
+    };
+    for (request, want_unit) in [(with_unit, Some(60_000)), (without_unit, None)] {
+        let wire = command(request).generate_request();
+        let mut buf = Vec::new();
+        wire.serialize(&mut buf);
+        let decoded = GridQuery::deserialize(&buf).unwrap();
+        assert_eq!(decoded.rollup.as_ref().unwrap().unit_ms, want_unit);
+
+        let rollup = decode_request(&decoded).unwrap().rollup.unwrap();
+        assert_eq!(rollup.kind, RollupKind::StateDurationOverTime);
+        assert_eq!(rollup.param, Some(1.0));
+        assert_eq!(rollup.unit_ms, want_unit);
+    }
+}
+
+/// Rollup parameters no coordinator of this build sends are refused by the
+/// shard, not answered: a unit on a kind that takes none, a unit that is not
+/// positive, and a state duration without a usable state.
+#[test]
+fn test_decode_rejects_rollup_params_the_coordinator_never_sends() {
+    let good = command(rollup_request(RollupKind::StateDurationOverTime)).generate_request();
+    assert!(decode_request(&good).is_ok());
+
+    let mut cases = Vec::new();
+    for unit_ms in [0, -1_000] {
+        let mut req = good.clone();
+        req.rollup.as_mut().unwrap().unit_ms = Some(unit_ms);
+        cases.push((format!("unit {unit_ms}"), req));
+    }
+    for state in [None, Some(f64::NAN)] {
+        let mut req = good.clone();
+        req.rollup.as_mut().unwrap().scalar_param = state;
+        cases.push((format!("state {state:?}"), req));
+    }
+    let mut req = command(rollup_request(RollupKind::SumOverTime)).generate_request();
+    req.rollup.as_mut().unwrap().unit_ms = Some(1_000);
+    cases.push(("unit on sum_over_time".into(), req));
+
+    for (what, req) in cases {
+        assert!(decode_request(&req).is_err(), "{what} must be refused");
+    }
 }
 
 /// A rollup this node does not know, or an aggregation it cannot fuse, is a

@@ -3,19 +3,30 @@
 
 use super::preload::Keeps;
 use super::*;
+use crate::promql::functions::parse_unit;
+
+/// A pushable rollup call's matrix selector, scalar parameter, and unit in
+/// milliseconds.
+type RollupArguments<'a> = (&'a MatrixSelector, Option<f64>, Option<i64>);
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
-    /// The rollup a call can be pushed down as, if any.
+    /// The rollup a call can be pushed down as, if any, with its matrix
+    /// selector.
     ///
     /// Unlike the instant path's [`Self::rollup_arguments`], the scalar
     /// parameter must be a *literal*. One grid request carries one parameter, so
     /// a parameter that could differ per step — `quantile_over_time(scalar(q),
     /// m[5m])` — cannot be answered by a single request at all. That is a
     /// correctness bound, not an optimization: such a call stays local.
+    ///
+    /// A string argument is a unit (`state_duration_over_time`'s), parsed here
+    /// so the request carries milliseconds. A unit that does not parse, or
+    /// parameters [`RollupKind::check_params`] refuses, keep the call local,
+    /// where evaluating it reports the error.
     pub(super) fn pushable_rollup<'a>(
         &self,
         call: &'a Call,
-    ) -> Option<(RollupKind, &'a MatrixSelector, Option<f64>)> {
+    ) -> Option<(&'a MatrixSelector, GridRollup)> {
         // The coordinator keeps authority over experimental functions: a shard
         // must never be asked to run one the request was not approved for. The
         // step loop rejects the query anyway, but preloading runs before it, so
@@ -28,15 +39,27 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         let mut matrix = None;
         let mut param = None;
+        let mut unit_ms = None;
         for arg in call.args.args.iter().map(|arg| strip_parens(arg)) {
             match arg {
                 Expr::MatrixSelector(ms) if matrix.is_none() => matrix = Some(ms),
                 Expr::NumberLiteral(literal) if param.is_none() => param = Some(literal.val),
+                Expr::StringLiteral(unit) if unit_ms.is_none() => {
+                    unit_ms = Some(parse_unit(&unit.val).ok()?);
+                }
                 _ => return None,
             }
         }
+        let matrix = matrix?;
+        kind.check_params(param, unit_ms).ok()?;
 
-        Some((kind, matrix?, param))
+        let rollup = GridRollup {
+            kind,
+            range_ms: matrix_range_ms(matrix),
+            param,
+            unit_ms,
+        };
+        Some((matrix, rollup))
     }
 
     /// This step's slice of a preloaded rollup, or `None` when the call was not
@@ -50,14 +73,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
     /// The grid key an unfused pushable rollup `call` is preloaded under.
     pub(super) fn rollup_key(&self, call: &Call) -> Option<GridPreloadKey> {
-        let (kind, matrix, param) = self.pushable_rollup(call)?;
-        Some(GridPreloadKey::rollup(
-            &matrix.vs,
-            kind,
-            matrix_range_ms(matrix),
-            param,
-            None,
-        ))
+        let (matrix, rollup) = self.pushable_rollup(call)?;
+        Some(GridPreloadKey::rollup(&matrix.vs, &rollup, None))
     }
 
     /// The grid key a rollup fused with `aggregate` is preloaded under, when
@@ -67,12 +84,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return None;
         };
         let aggregation = fusable_aggregation(aggregate)?;
-        let (kind, matrix, param) = self.pushable_rollup(call)?;
+        let (matrix, rollup) = self.pushable_rollup(call)?;
         Some(GridPreloadKey::rollup(
             &matrix.vs,
-            kind,
-            matrix_range_ms(matrix),
-            param,
+            &rollup,
             Some(AggregationKey::of(&aggregation)),
         ))
     }
@@ -257,7 +272,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let Some(aggregation) = fusable_aggregation(aggregate) else {
             return Ok(None);
         };
-        let Some((kind, matrix, param)) = self.pushable_rollup(call) else {
+        let Some((matrix, rollup)) = self.pushable_rollup(call) else {
             return Ok(None);
         };
 
@@ -267,13 +282,8 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // it. See `drops_metric_name`.
         let drop_name = drops_metric_name(call);
 
-        let key = GridPreloadKey::rollup(
-            &matrix.vs,
-            kind,
-            matrix_range_ms(matrix),
-            param,
-            Some(AggregationKey::of(&aggregation)),
-        );
+        let key =
+            GridPreloadKey::rollup(&matrix.vs, &rollup, Some(AggregationKey::of(&aggregation)));
 
         // A grid resolved before the step loop answers this step from its
         // slice — the outer range query's grid, or a subquery's own when this
@@ -305,11 +315,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             query_end: ctx.query_end,
             range_end_ms,
             lookback_delta_ms: ctx.lookback_delta_ms,
-            rollup: Some(GridRollup {
-                kind,
-                range_ms: matrix_range_ms(matrix),
-                param,
-            }),
+            rollup: Some(rollup),
             aggregation: Some(aggregation),
             // A rollup's value belongs to its window, not to any one sample.
             sample_timestamps: false,
@@ -380,9 +386,13 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(None);
         };
 
-        let Some((matrix, param)) = self.rollup_arguments(call, ctx)? else {
+        let Some((matrix, param, unit_ms)) = self.rollup_arguments(call, ctx)? else {
             return Ok(None);
         };
+        // Parameters the local path rejects stay local, so it reports why.
+        if kind.check_params(param, unit_ms).is_err() {
+            return Ok(None);
+        }
         let aggregation = None;
 
         // Resolve `@`/`offset` here: the source is told the window, never the
@@ -405,6 +415,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 kind,
                 range_ms: duration_ms(matrix.range),
                 param,
+                unit_ms,
             }),
             aggregation,
             // A rollup's value belongs to its window, not to any one sample.
@@ -444,13 +455,15 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Ok(Some(ExprResult::InstantVector(samples)))
     }
 
-    /// The matrix selector and optional scalar parameter of a pushable rollup
-    /// call, or `None` when the call's shape rules push-down out.
+    /// The matrix selector, optional scalar parameter and optional unit (in
+    /// milliseconds) of a pushable rollup call, or `None` when the call's shape
+    /// rules push-down out. A unit that does not parse is such a shape: the
+    /// local path then reports the error.
     pub(in crate::promql::exec) fn rollup_arguments<'a>(
         &self,
         call: &'a Call,
         ctx: &EvalContext,
-    ) -> EvalResult<Option<(&'a MatrixSelector, Option<f64>)>> {
+    ) -> EvalResult<Option<RollupArguments<'a>>> {
         let args: Vec<&Expr> = call.args.args.iter().map(|arg| strip_parens(arg)).collect();
 
         // Find the matrix argument first and give up before evaluating anything
@@ -467,25 +480,27 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             return Ok(None);
         }
 
-        // The remaining argument, if any, must be a scalar that can be shipped.
-        // Position is not fixed: `quantile_over_time` takes phi first, while
-        // `predict_linear` takes the matrix first. Only one such argument is
-        // carried, which is what the request has room for.
+        // The remaining arguments, if any, must be a scalar and a unit string
+        // that can be shipped. Position is not fixed: `quantile_over_time` takes
+        // phi first, while `predict_linear` takes the matrix first. One of each
+        // is carried, which is what the request has room for.
         let mut param = None;
+        let mut unit_ms = None;
         for arg in args
             .iter()
             .filter(|arg| !matches!(arg, Expr::MatrixSelector(_)))
         {
-            if param.is_some() {
-                return Ok(None);
-            }
             match self.evaluate_expr(arg, ctx, false)? {
-                ExprResult::Scalar(value) => param = Some(value),
+                ExprResult::Scalar(value) if param.is_none() => param = Some(value),
+                ExprResult::String(unit) if unit_ms.is_none() => match parse_unit(&unit) {
+                    Ok(ms) => unit_ms = Some(ms),
+                    Err(_) => return Ok(None),
+                },
                 _ => return Ok(None),
             }
         }
 
-        Ok(Some((matrix, param)))
+        Ok(Some((matrix, param, unit_ms)))
     }
 }
 

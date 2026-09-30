@@ -3,7 +3,7 @@ use crate::labels::{
     HasFingerprint, LABEL_SEP, LabelHasher, SeriesFingerprint, create_hasher,
     create_unseeded_hasher, hash_key_value,
 };
-use crate::promql::engine::query_reader::{AggregationParam, GridAggregation};
+use crate::promql::engine::query_reader::{AggregationParam, GridAggregation, GridRollup};
 use crate::promql::exec::aggregations::AggregationKind;
 use crate::promql::functions::RollupKind;
 use crate::promql::generated::Label as ProtoLabel;
@@ -265,6 +265,8 @@ pub(in crate::promql) struct RollupKey {
     /// `f64` has no `Hash`/`Eq`; the bit pattern does, and two parameters that
     /// differ in bits are different requests.
     param_bits: Option<u64>,
+    /// `state_duration_over_time(m[1h], 1, "1m")` and its `"1s"` form differ.
+    unit_ms: Option<i64>,
 }
 
 /// The identity of a fused aggregation: operator, grouping and parameter.
@@ -307,20 +309,19 @@ impl AggregationKey {
 }
 
 impl GridPreloadKey {
-    /// A rollup over `vs`, optionally fused with an outer aggregation.
+    /// `rollup` over `vs`, optionally fused with an outer aggregation.
     pub(crate) fn rollup(
         vs: &VectorSelector,
-        kind: RollupKind,
-        range_ms: i64,
-        param: Option<f64>,
+        rollup: &GridRollup,
         aggregation: Option<AggregationKey>,
     ) -> Self {
         Self {
             selector: PreloadKey::from_selector(vs),
             rollup: Some(RollupKey {
-                kind,
-                range_ms,
-                param_bits: param.map(f64::to_bits),
+                kind: rollup.kind,
+                range_ms: rollup.range_ms,
+                param_bits: rollup.param.map(f64::to_bits),
+                unit_ms: rollup.unit_ms,
             }),
             aggregation,
         }

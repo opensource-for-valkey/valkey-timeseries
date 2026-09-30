@@ -98,6 +98,7 @@ impl From<RollupKind> for ProtoRollupKind {
             RollupKind::Deriv => ProtoRollupKind::Deriv,
             RollupKind::Resets => ProtoRollupKind::Resets,
             RollupKind::Changes => ProtoRollupKind::Changes,
+            RollupKind::StateDurationOverTime => ProtoRollupKind::StateDurationOverTime,
         }
     }
 }
@@ -134,6 +135,7 @@ impl TryFrom<ProtoRollupKind> for RollupKind {
             ProtoRollupKind::Deriv => RollupKind::Deriv,
             ProtoRollupKind::Resets => RollupKind::Resets,
             ProtoRollupKind::Changes => RollupKind::Changes,
+            ProtoRollupKind::StateDurationOverTime => RollupKind::StateDurationOverTime,
             ProtoRollupKind::Unspecified => {
                 return Err(ValkeyError::Str(
                     "TSDB: grid push-down request carries a rollup with no function",
@@ -341,6 +343,7 @@ impl FanoutCommand for GridFanoutCommand {
                 kind: ProtoRollupKind::from(rollup.kind) as i32,
                 range_ms: rollup.range_ms,
                 scalar_param: rollup.param,
+                unit_ms: rollup.unit_ms,
             }),
             aggregation: self.request.aggregation.as_ref().map(|agg| {
                 let (scalar_param, label_param) = aggregation_param_to_wire(agg.param.as_ref());
@@ -506,10 +509,15 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
                     ))
                 })
                 .and_then(RollupKind::try_from)?;
+            // Parameters no coordinator of this build sends: refused rather than
+            // answered, since the answer could not match the local one.
+            kind.check_params(rollup.scalar_param, rollup.unit_ms)
+                .map_err(|e| ValkeyError::String(format!("TSDB: grid push-down request: {e}")))?;
             Ok::<_, ValkeyError>(GridRollup {
                 kind,
                 range_ms: rollup.range_ms,
                 param: rollup.scalar_param,
+                unit_ms: rollup.unit_ms,
             })
         })
         .transpose()?;

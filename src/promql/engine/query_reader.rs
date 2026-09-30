@@ -73,8 +73,13 @@ pub struct GridRollup {
     pub kind: RollupKind,
     /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
     pub range_ms: i64,
-    /// Numeric function parameter, e.g. `quantile_over_time`'s phi.
+    /// Numeric function parameter, e.g. `quantile_over_time`'s phi or
+    /// `state_duration_over_time`'s state.
     pub param: Option<f64>,
+    /// Output unit in milliseconds, for the kinds that take one
+    /// (`state_duration_over_time`); `None` is the kind's default. Carried
+    /// resolved, so the source never parses the user's duration string.
+    pub unit_ms: Option<i64>,
 }
 
 /// An outer aggregation fused onto a grid request: the `sum by (job)` of
@@ -328,6 +333,7 @@ impl GridRequest {
                     self.step_ms,
                     window_ends.iter().copied(),
                     rollup.param,
+                    rollup.unit_ms,
                 );
                 (!points.is_empty()).then_some(RangeSample {
                     labels: s.labels,
@@ -952,6 +958,7 @@ mod evaluate_chunk_tests {
                 kind: RollupKind::SumOverTime,
                 range_ms: STEPS as i64 * 1_000,
                 param: None,
+                unit_ms: None,
             }),
             aggregation,
             sample_timestamps: false,
@@ -987,6 +994,7 @@ mod evaluate_chunk_tests {
                 kind: RollupKind::CountOverTime,
                 range_ms: 3_000,
                 param: None,
+                unit_ms: None,
             }),
             ..stepped_request()
         };

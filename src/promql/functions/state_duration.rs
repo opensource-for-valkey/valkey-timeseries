@@ -59,14 +59,28 @@ impl PromQLFunction for StateDurationOverTimeFunction {
         let unit_ms = match iter.next() {
             Some(arg) => parse_unit(&expect_string(arg, NAME, "unit")?)?,
             None => DEFAULT_UNIT_MS,
-        } as f64;
+        };
 
         Ok(ExprResult::InstantVector(eval_rollups_basic(
             ctx,
             range,
-            |window| rollup_state_duration(window, state).map(|ms| ms / unit_ms),
+            |window| state_duration_window(window, Some(state), Some(unit_ms)),
         )?))
     }
+}
+
+/// One window's answer, in `unit_ms` (default seconds), or `None` when the
+/// window has none. The local path and a shard answering a pushed-down grid both
+/// reduce with this function, so the two cannot disagree by implementation. A
+/// request without a `state` has no answer anywhere; the caller rejects that
+/// before it gets here.
+pub(in crate::promql) fn state_duration_window(
+    window: &[Sample],
+    state: Option<f64>,
+    unit_ms: Option<i64>,
+) -> Option<f64> {
+    let duration_ms = rollup_state_duration(window, state?)?;
+    Some(duration_ms / unit_ms.unwrap_or(DEFAULT_UNIT_MS) as f64)
 }
 
 /// The length in milliseconds of the run of samples equal to `state` that ends
@@ -77,7 +91,7 @@ impl PromQLFunction for StateDurationOverTimeFunction {
 /// telescope to `t_last − t_run_start`, which is what this computes — exactly,
 /// in integer milliseconds, however long the run. Unit-agnostic on purpose, so
 /// a pushed-down path only has to carry `state`.
-pub(in crate::promql) fn rollup_state_duration(values: &[Sample], state: f64) -> Option<f64> {
+fn rollup_state_duration(values: &[Sample], state: f64) -> Option<f64> {
     let mut run_start = None;
     for sample in values {
         // IEEE `==`: a NaN sample never matches, and so breaks the run.
@@ -98,7 +112,7 @@ pub(in crate::promql) fn rollup_state_duration(values: &[Sample], state: f64) ->
 /// where a PromQL reader would expect seconds. A suffix-less segment can only be
 /// the last one (it consumes the rest of the input), so checking the final
 /// character covers compound values like `"1h30"` too.
-fn parse_unit(unit: &str) -> EvalResult<i64> {
+pub(in crate::promql) fn parse_unit(unit: &str) -> EvalResult<i64> {
     let invalid = |reason: &str| {
         EvaluationError::ArgumentError(format!("{NAME}: invalid unit {unit:?}: {reason}"))
     };

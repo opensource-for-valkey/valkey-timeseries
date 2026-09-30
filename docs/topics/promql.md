@@ -166,6 +166,8 @@ not in `state`, use `present_over_time(x[w]) unless state_duration_over_time(x[w
   the window's first sample, and time between the last sample and the evaluation time is
   not counted.
 - The result drops `__name__`, as other range-vector functions do.
+- In cluster mode it is pushed down to the shards like the other rollups (see
+  [overview](../overview.md)); the answer is the same either way.
 
 ```
 # Seconds each "up" series has been in state 1, over the last hour.

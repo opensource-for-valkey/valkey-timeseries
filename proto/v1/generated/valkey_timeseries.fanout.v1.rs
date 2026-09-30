@@ -652,10 +652,15 @@ pub struct GridRollup {
     /// / Window width: the `\[5m\]`. Each window is `(end - range_ms, end]`.
     #[prost(int64, tag = "2")]
     pub range_ms: i64,
-    /// / Numeric function parameter — `quantile_over_time`'s phi. Absent for the
-    /// / parameterless rollups.
+    /// / Numeric function parameter — `quantile_over_time`'s phi,
+    /// / `state_duration_over_time`'s state. Absent for the parameterless rollups.
     #[prost(double, optional, tag = "3")]
     pub scalar_param: ::core::option::Option<f64>,
+    /// / Output unit in milliseconds, for the kinds that take one
+    /// / (`state_duration_over_time`); absent means the kind's default (seconds).
+    /// / Positive when present. A shard refuses a unit on any other kind.
+    #[prost(int64, optional, tag = "4")]
+    pub unit_ms: ::core::option::Option<i64>,
 }
 /// / An outer aggregation fused onto a grid query: the `sum by (job)` of
 /// / `sum by (job) (rate(m\[5m\]))` or of `sum by (job) (m)`. The shard groups
@@ -1005,6 +1010,7 @@ pub enum RollupKind {
     Deriv = 22,
     Resets = 23,
     Changes = 24,
+    StateDurationOverTime = 25,
 }
 impl RollupKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1038,6 +1044,7 @@ impl RollupKind {
             Self::Deriv => "ROLLUP_KIND_DERIV",
             Self::Resets => "ROLLUP_KIND_RESETS",
             Self::Changes => "ROLLUP_KIND_CHANGES",
+            Self::StateDurationOverTime => "ROLLUP_KIND_STATE_DURATION_OVER_TIME",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1068,6 +1075,7 @@ impl RollupKind {
             "ROLLUP_KIND_DERIV" => Some(Self::Deriv),
             "ROLLUP_KIND_RESETS" => Some(Self::Resets),
             "ROLLUP_KIND_CHANGES" => Some(Self::Changes),
+            "ROLLUP_KIND_STATE_DURATION_OVER_TIME" => Some(Self::StateDurationOverTime),
             _ => None,
         }
     }

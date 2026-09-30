@@ -39,6 +39,15 @@ mod tests {
     type VectorSelectorTestData = Vec<(&'static str, Vec<(&'static str, &'static str)>, i64, f64)>;
     type VectorSelectorExpectedResults = Vec<(f64, Vec<(&'static str, &'static str)>)>;
 
+    /// Parse `query` with the engine's extra functions (`state_duration_over_time`)
+    /// declared to the parser. Module load normally does that, and tests never
+    /// load the module; without this a test's parse would depend on whether
+    /// another test in the process happened to register them first.
+    fn parse_registered(query: &str) -> Result<Expr, String> {
+        crate::promql::register_parser_functions()?;
+        crate::promql::parse_query(query)
+    }
+
     /// Helper to parse a PromQL query and evaluate it
     fn parse_and_evaluate<'reader, R: QueryReader>(
         evaluator: &Evaluator<'reader, R>,
@@ -46,9 +55,7 @@ mod tests {
         end_time: SystemTime,
         lookback_delta: Duration,
     ) -> EvalResult<Vec<EvalSample>> {
-        // Tests never load the module, which is where extra functions are registered.
-        crate::promql::register_parser_functions().map_err(EvaluationError::InternalError)?;
-        let expr = crate::promql::parse_query(query)
+        let expr = parse_registered(query)
             .map_err(|e| EvaluationError::InternalError(format!("Parse error: {}", e)))?;
 
         let stmt = EvalStmt {
@@ -1188,7 +1195,7 @@ mod tests {
         // when: evaluate the same query multiple times
         let end_time = UNIX_EPOCH + Duration::from_millis(300002);
         let lookback_delta = Duration::from_secs(300);
-        let expr = promql_parser::parser::parse("cached_metric").unwrap();
+        let expr = parse_registered("cached_metric").unwrap();
         let stmt = EvalStmt {
             expr,
             start: end_time,
@@ -1299,7 +1306,7 @@ mod tests {
 
         // when
         let stmt = EvalStmt {
-            expr: promql_parser::parser::parse("time()").unwrap(),
+            expr: parse_registered("time()").unwrap(),
             start: end_time,
             end: end_time,
             interval: Duration::from_secs(0),
@@ -1331,7 +1338,7 @@ mod tests {
 
         // when
         let stmt = EvalStmt {
-            expr: promql_parser::parser::parse("pi()").unwrap(),
+            expr: parse_registered("pi()").unwrap(),
             start: end_time,
             end: end_time,
             interval: Duration::from_secs(0),
@@ -1363,7 +1370,7 @@ mod tests {
 
         // when
         let stmt = EvalStmt {
-            expr: promql_parser::parser::parse("scalar(vector(42))").unwrap(),
+            expr: parse_registered("scalar(vector(42))").unwrap(),
             start: end_time,
             end: end_time,
             interval: Duration::from_secs(0),
@@ -1395,7 +1402,7 @@ mod tests {
 
         // when
         let stmt = EvalStmt {
-            expr: promql_parser::parser::parse("vector(time())").unwrap(),
+            expr: parse_registered("vector(time())").unwrap(),
             start: end_time,
             end: end_time,
             interval: Duration::from_secs(0),
@@ -2081,7 +2088,7 @@ mod tests {
         let query_time = UNIX_EPOCH + Duration::from_millis(6_060_000);
         let query_start = query_time - Duration::from_secs(60);
         let query = "rate(http_requests_total[1m])";
-        let expr = promql_parser::parser::parse(query).expect("Failed to parse query");
+        let expr = parse_registered(query).expect("Failed to parse query");
 
         let query_time_ms = system_time_to_millis(query_time);
         let evaluation_ts = query_time_ms;
@@ -3490,7 +3497,7 @@ mod tests {
 
         // when: evaluate a non-VectorSelector subquery (forces generic subquery path)
         // with 5 steps so it takes the parallel branch.
-        let expr = promql_parser::parser::parse("abs(metric)[25s:5s]").unwrap();
+        let expr = parse_registered("abs(metric)[25s:5s]").unwrap();
         let Expr::Subquery(subquery) = expr else {
             panic!("expected parsed expression to be a subquery");
         };
@@ -4814,21 +4821,21 @@ mod tests {
             ("predict_linear(metric[1m], 60)", Some(60.0)),
             ("sum_over_time(metric[1m])", None),
         ] {
-            let Expr::Call(call) = promql_parser::parser::parse(query).unwrap() else {
+            let Expr::Call(call) = parse_registered(query).unwrap() else {
                 panic!("{query} should parse to a call");
             };
             let args = evaluator
                 .rollup_arguments(&call, &ctx)
                 .unwrap_or_else(|e| panic!("{query}: {e}"));
-            let (matrix, param) = args.unwrap_or_else(|| panic!("{query}: should be pushable"));
+            let (matrix, param, unit_ms) =
+                args.unwrap_or_else(|| panic!("{query}: should be pushable"));
             assert_eq!(matrix.range.as_millis() as i64, 60_000, "{query}");
             assert_eq!(param, want_param, "{query}");
+            assert_eq!(unit_ms, None, "{query}");
         }
 
         // A subquery argument has no matrix selector to push.
-        let Expr::Call(call) =
-            promql_parser::parser::parse("sum_over_time(metric[2m:30s])").unwrap()
-        else {
+        let Expr::Call(call) = parse_registered("sum_over_time(metric[2m:30s])").unwrap() else {
             panic!("should parse to a call");
         };
         assert!(evaluator.rollup_arguments(&call, &ctx).unwrap().is_none());
@@ -4984,7 +4991,7 @@ mod tests {
             },
         );
 
-        let expr = promql_parser::parser::parse("sum_over_time(metric[1m])").unwrap();
+        let expr = parse_registered("sum_over_time(metric[1m])").unwrap();
         let ctx = crate::promql::EvalContext {
             query_start: 60_000,
             query_end: 180_000,
@@ -5030,7 +5037,7 @@ mod tests {
     ) -> (Vec<(i64, Vec<EvalSample>)>, Vec<OfferedGrid>) {
         let reader = GridPushdownReader::new(inner, answer);
         let evaluator = Evaluator::new(&reader, rollup_test_options());
-        let expr = promql_parser::parser::parse(query).unwrap();
+        let expr = parse_registered(query).unwrap();
         let base = crate::promql::EvalContext {
             query_start: start_ms,
             query_end: end_ms,
@@ -5095,6 +5102,11 @@ mod tests {
             // A literal parameter: the grid path requires one, because a
             // parameter that varied per step could not be one request.
             RollupKind::QuantileOverTime => format!("quantile_over_time(0.9, {selector})"),
+            // A state the gappy dataset holds for runs (8 from 240s to 300s),
+            // and a unit, so the unit crosses the wire in every parity check.
+            RollupKind::StateDurationOverTime => {
+                format!(r#"state_duration_over_time({selector}, 8, "1m")"#)
+            }
             other => format!("{}({selector})", other.function_name()),
         }
     }
@@ -5748,6 +5760,184 @@ mod tests {
         }
     }
 
+    // ── state_duration_over_time push-down ──────────────────────────────
+    //
+    // The one rollup with a unit: the request carries the state as its scalar
+    // parameter and the unit resolved to milliseconds, and the shard reduces
+    // with the same function the local path runs.
+
+    /// Doors that open and close in runs of different lengths, so windows see
+    /// runs that start inside them, before them, and not at all.
+    fn door_reader() -> MemorySeriesQuerier {
+        let mut builder = MockQueryReaderBuilder::new();
+        for (site, door, run_len) in [("a", "1", 4i64), ("a", "2", 7), ("b", "1", 3)] {
+            let labels = create_labels("door", vec![("site", site), ("door", door)]);
+            for i in 0..=30i64 {
+                let closed = (i / run_len) % 2 == 0;
+                builder.add_sample(&labels, Sample::new(i * 10_000, closed as u8 as f64));
+            }
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn should_push_down_state_duration_with_its_state_and_unit() {
+        for (query, want_unit) in [
+            ("state_duration_over_time(metric[1m], 12)", None),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "1m")"#,
+                Some(60_000),
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "1h30m")"#,
+                Some(5_400_000),
+            ),
+        ] {
+            let (_, offered) = evaluate_rollup_pushdown(query, 120_000, GridAnswer::Evaluated);
+            assert_eq!(offered.len(), 1, "{query}: instant offered once");
+            let rollup = offered[0].rollup.as_ref().unwrap();
+            assert_eq!(rollup.kind, RollupKind::StateDurationOverTime, "{query}");
+            assert_eq!(rollup.param, Some(12.0), "{query}: the state");
+            assert_eq!(rollup.unit_ms, want_unit, "{query}: the unit");
+
+            let (_, offered) =
+                evaluate_range_with_pushdown(query, 0, 300_000, 30_000, GridAnswer::Evaluated);
+            assert_eq!(offered.len(), 1, "{query}: one grid request");
+            assert_eq!(
+                offered[0].rollup.as_ref().unwrap().unit_ms,
+                want_unit,
+                "{query}: the grid carries the unit too"
+            );
+        }
+    }
+
+    /// Arguments the local path rejects are never shipped: the call stays
+    /// local on both the instant and the grid path, and the local error is
+    /// what the user sees.
+    #[test]
+    fn should_keep_state_duration_local_when_its_arguments_are_invalid() {
+        for (query, want_error) in [
+            (
+                "state_duration_over_time(metric[1m], NaN)",
+                "state must not be NaN",
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "60")"#,
+                "invalid unit",
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "0s")"#,
+                "invalid unit",
+            ),
+            (
+                r#"state_duration_over_time(metric[1m], 12, "-1m")"#,
+                "invalid unit",
+            ),
+        ] {
+            let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Evaluated);
+            let evaluator = Evaluator::new(&reader, rollup_test_options());
+            let err = parse_and_evaluate(
+                &evaluator,
+                query,
+                UNIX_EPOCH + Duration::from_secs(120),
+                Duration::from_secs(300),
+            )
+            .expect_err(query)
+            .to_string();
+            assert!(err.contains(want_error), "{query}: {err}");
+            assert!(reader.offered().is_empty(), "{query}: nothing offered");
+
+            // The range path decides in the preload, before any step runs.
+            let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Evaluated);
+            let evaluator = Evaluator::new(&reader, rollup_test_options());
+            let stmt = EvalStmt {
+                expr: parse_registered(query).unwrap(),
+                start: UNIX_EPOCH,
+                end: UNIX_EPOCH + Duration::from_secs(300),
+                interval: Duration::from_secs(30),
+                lookback_delta: Duration::from_secs(300),
+            };
+            assert!(evaluator.evaluate(stmt).is_err(), "{query}: range errors");
+            assert!(
+                reader.offered().iter().all(|o| o.rollup.is_none()),
+                "{query}: no rollup offered on the grid path"
+            );
+        }
+    }
+
+    /// Pushed down or not, fused or not, the answer is the local one — including
+    /// which `(series, step)` pairs are absent because the door was open.
+    #[test]
+    fn should_match_local_evaluation_for_state_duration() {
+        for query in [
+            "state_duration_over_time(door[1m], 1)",
+            "state_duration_over_time(door[3m], 0)",
+            r#"state_duration_over_time(door[3m], 1, "1m")"#,
+            r#"state_duration_over_time(door[1m], 1, "500ms")"#,
+            "sum by (site) (state_duration_over_time(door[3m], 1))",
+            r#"max(state_duration_over_time(door[3m], 1, "1m"))"#,
+            "count(state_duration_over_time(door[1m], 1))",
+            "avg without (door) (state_duration_over_time(door[3m], 0))",
+            // Two units over one selector are two requests, not one shared grid.
+            r#"state_duration_over_time(door[3m], 1) - 60 * state_duration_over_time(door[3m], 1, "1m")"#,
+        ] {
+            let (local, _) = evaluate_range_with_pushdown_on(
+                door_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            let local = rendered_steps(local);
+            assert!(
+                !local.is_empty(),
+                "{query}: the fixture must produce answers"
+            );
+
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                let (pushed, offered) = evaluate_range_with_pushdown_on(
+                    door_reader(),
+                    query,
+                    0,
+                    300_000,
+                    30_000,
+                    answer,
+                );
+                assert!(!offered.is_empty(), "{query}: pushed down");
+                assert_steps_near(
+                    local.clone(),
+                    rendered_steps(pushed),
+                    &format!("{query} ({answer:?})"),
+                );
+            }
+
+            let instant_local = eval_rollup(&door_reader(), query, 150_000);
+            let (pushed, _) =
+                evaluate_rollup_pushdown_on(door_reader(), query, 150_000, GridAnswer::Evaluated);
+            assert_eq!(
+                rendered_samples(instant_local),
+                rendered_samples(pushed),
+                "{query} (instant)"
+            );
+        }
+
+        let (_, offered) = evaluate_range_with_pushdown_on(
+            door_reader(),
+            r#"state_duration_over_time(door[3m], 1) - 60 * state_duration_over_time(door[3m], 1, "1m")"#,
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        let mut units: Vec<_> = offered
+            .iter()
+            .map(|o| o.rollup.as_ref().unwrap().unit_ms)
+            .collect();
+        units.sort();
+        assert_eq!(units, [None, Some(60_000)], "one grid per unit");
+    }
+
     /// One request for the whole grid, fused — not one per step, and not a
     /// separate one for the inner rollup.
     #[test]
@@ -6204,7 +6394,7 @@ mod tests {
                         ..QueryOptions::default()
                     },
                 );
-                let expr = promql_parser::parser::parse(query).unwrap();
+                let expr = parse_registered(query).unwrap();
                 let base = crate::promql::EvalContext {
                     query_start: 60_000,
                     query_end: 240_000,

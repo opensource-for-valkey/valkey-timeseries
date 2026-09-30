@@ -196,7 +196,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut seen = AHashSet::new();
         let mut requests = Vec::new();
         for candidate in collect_rollup_candidates(expr) {
-            let Some((kind, matrix, param)) = self.pushable_rollup(candidate.call()) else {
+            let Some((matrix, rollup)) = self.pushable_rollup(candidate.call()) else {
                 continue;
             };
             // An aggregation that cannot be fused leaves the rollup to be pushed
@@ -207,15 +207,13 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             };
             let key = GridPreloadKey::rollup(
                 &matrix.vs,
-                kind,
-                matrix_range_ms(matrix),
-                param,
+                &rollup,
                 aggregation.as_ref().map(AggregationKey::of),
             );
             if !seen.insert(key.clone()) {
                 continue;
             }
-            requests.push((key, kind, matrix, param, aggregation));
+            requests.push((key, rollup, matrix, aggregation));
         }
 
         // One request per distinct rollup, in parallel but capped: each is a
@@ -226,9 +224,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let _: Vec<()> = requests
             .into_par_rayon()
             .num_threads(MAX_CONCURRENT_PRELOAD_REQUESTS)
-            .map(|(key, kind, matrix, param, aggregation)| {
+            .map(|(key, rollup, matrix, aggregation)| {
                 self.check_deadline()?;
-                self.preload_rollup(key, kind, matrix, param, aggregation, grid)
+                self.preload_rollup(key, rollup, matrix, aggregation, grid)
             })
             .into_fallible()
             .collect()?;
@@ -273,16 +271,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // Mirror the key the step loop will look up: covered calls short-
             // circuit in evaluate_call / evaluate_fused_rollup before their
             // arguments are evaluated.
-            if let Some((kind, matrix, param)) = self.pushable_rollup(call) {
+            if let Some((matrix, rollup)) = self.pushable_rollup(call) {
                 let aggregation = match candidate {
                     RollupCandidate::Fused(aggregate, _) => fusable_aggregation(aggregate),
                     RollupCandidate::Rollup(_) => None,
                 };
                 let key = GridPreloadKey::rollup(
                     &matrix.vs,
-                    kind,
-                    matrix_range_ms(matrix),
-                    param,
+                    &rollup,
                     aggregation.as_ref().map(AggregationKey::of),
                 );
                 if grids.contains_key(&key) {
@@ -397,21 +393,14 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn preload_rollup(
         &self,
         key: GridPreloadKey,
-        kind: RollupKind,
+        rollup: GridRollup,
         matrix: &MatrixSelector,
-        param: Option<f64>,
         aggregation: Option<GridAggregation>,
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
-        let rollup = GridRollup {
-            kind,
-            range_ms: matrix_range_ms(matrix),
-            param,
-        };
         let Some((request, window_ends)) =
             self.grid_request(&matrix.vs, grid, Some(rollup), aggregation)
         else {
