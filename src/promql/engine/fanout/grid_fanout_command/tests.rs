@@ -1706,6 +1706,22 @@ fn test_state_duration_request_round_trip() {
     }
 }
 
+/// `state_count_over_time` ships its state on the ordinary scalar parameter,
+/// with no unit.
+#[test]
+fn test_state_count_request_round_trip() {
+    use crate::fanout::serialization::{Deserialized, Serialized};
+
+    let wire = command(rollup_grid_request(RollupKind::StateCountOverTime)).generate_request();
+    let mut buf = Vec::new();
+    wire.serialize(&mut buf);
+    let decoded = GridQuery::deserialize(&buf).unwrap();
+    let rollup = decode_request(&decoded).unwrap().rollup.unwrap();
+    assert_eq!(rollup.kind, RollupKind::StateCountOverTime);
+    assert_eq!(rollup.param, Some(1.0));
+    assert_eq!(rollup.unit_ms, None);
+}
+
 /// Rollup parameters no coordinator of this build sends are refused by the
 /// shard, not answered: a unit on a kind that takes none, a unit that is not
 /// positive, and a state duration without a usable state.
@@ -1728,6 +1744,17 @@ fn test_decode_rejects_rollup_params_the_coordinator_never_sends() {
     let mut req = command(rollup_request(RollupKind::SumOverTime)).generate_request();
     req.rollup.as_mut().unwrap().unit_ms = Some(1_000);
     cases.push(("unit on sum_over_time".into(), req));
+
+    let count = command(rollup_request(RollupKind::StateCountOverTime)).generate_request();
+    assert!(decode_request(&count).is_ok());
+    for state in [None, Some(f64::NAN)] {
+        let mut req = count.clone();
+        req.rollup.as_mut().unwrap().scalar_param = state;
+        cases.push((format!("count state {state:?}"), req));
+    }
+    let mut req = count.clone();
+    req.rollup.as_mut().unwrap().unit_ms = Some(1_000);
+    cases.push(("unit on state_count_over_time".into(), req));
 
     for (what, req) in cases {
         assert!(decode_request(&req).is_err(), "{what} must be refused");

@@ -218,6 +218,7 @@ enum RollupKind {
   ROLLUP_KIND_RESETS = 23;
   ROLLUP_KIND_CHANGES = 24;
   ROLLUP_KIND_STATE_DURATION_OVER_TIME = 25;
+  ROLLUP_KIND_STATE_COUNT_OVER_TIME = 26;
 }
 
 /// The range-vector function half of a grid query: `rate(m[5m])`'s `rate` and
@@ -227,8 +228,9 @@ message GridRollup {
   RollupKind kind = 1;
   /// Window width: the `[5m]`. Each window is `(end - range_ms, end]`.
   int64 range_ms = 2;
-  /// Numeric function parameter — `quantile_over_time`'s phi,
-  /// `state_duration_over_time`'s state. Absent for the parameterless rollups.
+  /// Numeric function parameter — `quantile_over_time`'s phi, the state of
+  /// `state_duration_over_time` and `state_count_over_time`. Absent for the
+  /// parameterless rollups.
   optional double scalar_param = 3;
   /// Output unit in milliseconds, for the kinds that take one
   /// (`state_duration_over_time`); absent means the kind's default (seconds).

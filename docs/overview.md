@@ -265,7 +265,7 @@ from the response rather than carrying a NaN, because NaN is a legitimate rolled
 
 Pushed down: the `*_over_time` family (`sum`, `count`, `avg`, `min`, `max`, `stddev`, `stdvar`, `mad`, `present`,
 `first`, `last`, `quantile`), `ts_of_{first,last,min,max}_over_time`, `rate`, `increase`, `delta`, `irate`, `idelta`,
-`deriv`, `resets`, `changes` and `state_duration_over_time` (its `unit` travels resolved to milliseconds; a call
+`deriv`, `resets`, `changes`, `state_count_over_time` and `state_duration_over_time` (its `unit` travels resolved to milliseconds; a call
 whose state or unit the function would reject stays on the coordinator, which reports the error). Three are evaluated coordinator-side by construction: `absent_over_time` (its answer
 depends on absence across the whole cluster, which no shard can observe), `predict_linear` (it predicts relative to
 the query's evaluation timestamp, which `@`/`offset` divorce from the window end a shard is told), and

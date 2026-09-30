@@ -182,6 +182,36 @@ state_duration_over_time(
 )
 ```
 
+**`state_count_over_time(v range-vector, state scalar)`** — how many consecutive samples
+each series has been in `state`, the PromQL form of Flux's
+[`stateCount()`](https://docs.influxdata.com/influxdb/v2/query-data/flux/monitor-states/).
+For each window it counts the run of samples equal to `state` that ends at the window's last
+sample: `1` when only the last sample is in `state`.
+
+A series whose last sample is not in `state` answers **`0`**. That differs from
+`state_duration_over_time`, which leaves such a series out, and from Flux, which writes
+`-1`. For a duration, `0` already means "entered the state at the last sample"; for a count
+it means nothing else, so it can say "not in state". As a result:
+
+- `count(state_count_over_time(...))` counts every series with data. To count the series in
+  `state`, use `count(state_count_over_time(...) > 0)`.
+- `avg` includes the zeros. `sum` and `max` are unaffected.
+- A range query has no gaps: the count falls to `0` while a series is out of `state`.
+- A window with no samples still gives no result, so "no data" stays distinct from `0`.
+
+The other rules match `state_duration_over_time`: a `NaN` sample ends the run, `state` must
+not be `NaN`, each window is counted on its own (so the answer can't exceed the number of
+samples the range holds), the result drops `__name__`, and in cluster mode it is pushed down
+to the shards. There is no `unit` argument.
+
+```
+# Series that have reported state 1 for at least the last five samples.
+state_count_over_time(up[10m], 1) >= 5
+
+# How many series are in state 0 right now.
+count(state_count_over_time(up[5m], 0) > 0)
+```
+
 ## Support, conformance, and deviations from Prometheus
 
 Valkey TimeSeries follows the PromQL expression model and aims to match Prometheus

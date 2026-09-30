@@ -16,7 +16,7 @@ mod rollup_functions;
 mod rollups;
 mod sort;
 mod special_functions;
-mod state_duration;
+mod state;
 mod types;
 pub(crate) mod utils;
 
@@ -24,7 +24,7 @@ pub(in crate::promql) use date_functions::{DateTimePart, datetime_from_seconds};
 pub(crate) use function_list::*;
 pub use rollup_functions::RollupKind;
 pub(in crate::promql) use rollups::window_range;
-pub(in crate::promql) use state_duration::parse_unit;
+pub(in crate::promql) use state::parse_unit;
 pub(crate) use types::*;
 
 // Return the concrete `PromQLFunctionImpl` so callers can store the concrete
@@ -45,7 +45,10 @@ pub(crate) fn register_parser_functions() -> Result<(), String> {
     static REGISTERED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     REGISTERED
         .get_or_init(|| {
-            promql_parser::parser::register_extra_functions(vec![state_duration::parser_function()])
+            promql_parser::parser::register_extra_functions(vec![
+                state::duration_parser_function(),
+                state::count_parser_function(),
+            ])
         })
         .clone()
 }

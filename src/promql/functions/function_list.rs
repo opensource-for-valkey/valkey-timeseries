@@ -32,7 +32,7 @@ use crate::promql::functions::special_functions::{
     AbsentFunction, EndFunction, RangeFunction, ScalarFunction, StartFunction, StepFunction,
     VectorFunction,
 };
-use crate::promql::functions::state_duration::StateDurationOverTimeFunction;
+use crate::promql::functions::state::{StateCountOverTimeFunction, StateDurationOverTimeFunction};
 use std::fmt::Display;
 use strum_macros::EnumIter;
 use valkey_module::ValkeyError;
@@ -291,6 +291,11 @@ macro_rules! promql_function_list {
             (Rate, "rate", RateFunction),
             (Increase, "increase", IncreaseFunction),
             (Resets, "resets", ResetsFunction),
+            (
+                StateCountOverTime,
+                "state_count_over_time",
+                StateCountOverTimeFunction
+            ),
             (
                 StateDurationOverTime,
                 "state_duration_over_time",

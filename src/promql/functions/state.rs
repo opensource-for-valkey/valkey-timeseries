@@ -1,32 +1,42 @@
-//! `state_duration_over_time(v range-vector, state scalar [, unit string])`
+//! Flux's state functions as PromQL rollups. Both measure the run of samples
+//! equal to `state` that ends at the window's last sample, and differ in what
+//! they answer when the last sample is not in `state`:
 //!
-//! Flux's `stateDuration()` as a PromQL rollup: how long the window's final run
-//! of samples equal to `state` has lasted, measured to the window's last sample.
-//! A series whose last sample is not in `state` has no answer and is left out of
-//! the result, as PromQL does for any function without an answer, where Flux
-//! writes a `-1` sentinel. See
-//! `docs/plans/state-duration-over-time-requirements.md` for the contract.
+//! * `state_duration_over_time(v range-vector, state scalar [, unit string])` —
+//!   Flux's `stateDuration()`: how long the run has lasted. Not in `state`: no
+//!   answer, and the series is left out, because `0` already means "the state
+//!   began at the last sample".
+//! * `state_count_over_time(v range-vector, state scalar)` — Flux's
+//!   `stateCount()`: how many samples the run holds. Not in `state`: `0`, which
+//!   for a count means nothing else and is simply true.
+//!
+//! Flux writes a `-1` sentinel for "not in state"; neither function does. See
+//! `docs/plans/state-duration-over-time-requirements.md` and
+//! `docs/plans/state-count-over-time-requirements.md` for the contracts.
 use crate::common::Sample;
 use crate::parser::duration::parse_positive_duration_value;
-use crate::promql::functions::rollups::eval_rollups_basic;
+use crate::promql::functions::rollups::{eval_rollups, eval_rollups_basic};
+use crate::promql::functions::types::RollupWindow;
 use crate::promql::functions::utils::{
-    expect_min_arg_count, expect_range_vector, expect_scalar, expect_string, max_arity_error,
-    min_arity_error,
+    exact_arity_error, expect_exact_arg_count, expect_min_arg_count, expect_range_vector,
+    expect_scalar, expect_string, max_arity_error, min_arity_error,
 };
 use crate::promql::functions::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvaluationError, ExprResult};
 use promql_parser::parser::Function;
 use promql_parser::parser::value::ValueType;
 
-const NAME: &str = "state_duration_over_time";
+const DURATION_NAME: &str = "state_duration_over_time";
+const COUNT_NAME: &str = "state_count_over_time";
 
 /// Flux's default `unit: 1s`, which is also PromQL's unit for durations.
 const DEFAULT_UNIT_MS: i64 = 1_000;
 
-/// The parser-side declaration. The last argument (`unit`) is optional.
-pub(super) fn parser_function() -> Function {
+/// The parser-side declaration of `state_duration_over_time`. The last argument
+/// (`unit`) is optional.
+pub(super) fn duration_parser_function() -> Function {
     Function::new(
-        NAME,
+        DURATION_NAME,
         vec![ValueType::Matrix, ValueType::Scalar, ValueType::String],
         1,
         ValueType::Vector,
@@ -34,30 +44,48 @@ pub(super) fn parser_function() -> Function {
     )
 }
 
+/// The parser-side declaration of `state_count_over_time`: exactly two
+/// arguments.
+pub(super) fn count_parser_function() -> Function {
+    Function::new(
+        COUNT_NAME,
+        vec![ValueType::Matrix, ValueType::Scalar],
+        0,
+        ValueType::Vector,
+        true,
+    )
+}
+
+/// The `state` argument, which both functions take and neither accepts as NaN:
+/// no sample ever equals NaN, so every answer would be the "not in state" one.
+fn expect_state(arg: PromQLArg, name: &str) -> EvalResult<f64> {
+    let state = expect_scalar(arg, name, "state")?;
+    if state.is_nan() {
+        return Err(EvaluationError::ArgumentError(format!(
+            "{name}: state must not be NaN"
+        )));
+    }
+    Ok(state)
+}
+
 #[derive(Copy, Clone, Default)]
 pub(in crate::promql) struct StateDurationOverTimeFunction;
 
 impl PromQLFunction for StateDurationOverTimeFunction {
     fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
-        Err(min_arity_error(NAME, 2, 1))
+        Err(min_arity_error(DURATION_NAME, 2, 1))
     }
 
     fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
-        expect_min_arg_count(NAME, 2, args.len())?;
+        expect_min_arg_count(DURATION_NAME, 2, args.len())?;
         if args.len() > 3 {
-            return Err(max_arity_error(NAME, 3, args.len()));
+            return Err(max_arity_error(DURATION_NAME, 3, args.len()));
         }
         let mut iter = args.into_iter();
-        let range = expect_range_vector(iter.next().unwrap(), NAME)?;
-        let state = expect_scalar(iter.next().unwrap(), NAME, "state")?;
-        if state.is_nan() {
-            // No sample ever equals NaN, so every series would be dropped.
-            return Err(EvaluationError::ArgumentError(format!(
-                "{NAME}: state must not be NaN"
-            )));
-        }
+        let range = expect_range_vector(iter.next().unwrap(), DURATION_NAME)?;
+        let state = expect_state(iter.next().unwrap(), DURATION_NAME)?;
         let unit_ms = match iter.next() {
-            Some(arg) => parse_unit(&expect_string(arg, NAME, "unit")?)?,
+            Some(arg) => parse_unit(&expect_string(arg, DURATION_NAME, "unit")?)?,
             None => DEFAULT_UNIT_MS,
         };
 
@@ -67,6 +95,50 @@ impl PromQLFunction for StateDurationOverTimeFunction {
             |window| state_duration_window(window, Some(state), Some(unit_ms)),
         )?))
     }
+}
+
+#[derive(Copy, Clone, Default)]
+pub(in crate::promql) struct StateCountOverTimeFunction;
+
+impl PromQLFunction for StateCountOverTimeFunction {
+    fn apply(&self, _arg: PromQLArg, _ctx: &EvalContext) -> EvalResult<ExprResult> {
+        Err(exact_arity_error(COUNT_NAME, 2, 1))
+    }
+
+    fn apply_args(&self, args: Vec<PromQLArg>, ctx: &EvalContext) -> EvalResult<ExprResult> {
+        expect_exact_arg_count(COUNT_NAME, 2, args.len())?;
+        let mut iter = args.into_iter();
+        let range = expect_range_vector(iter.next().unwrap(), COUNT_NAME)?;
+        let state = expect_state(iter.next().unwrap(), COUNT_NAME)?;
+        Ok(ExprResult::InstantVector(eval_rollups(
+            ctx,
+            range,
+            Some(state),
+            rollup_state_count,
+        )?))
+    }
+}
+
+/// The number of samples in the run equal to `state` that ends at the window's
+/// last sample: `0` when the last sample is not in `state`.
+///
+/// Only the final run matters, so this scans backwards and stops at the first
+/// sample out of `state` — O(run), not O(window). It reads nothing but the
+/// window's own values, so the local path and a shard answering a pushed-down
+/// grid agree (both reduce with this function). A request without a `state`
+/// never reaches it — `RollupKind::check_params` refuses one — but if it did,
+/// NaN says "no meaningful answer" without panicking the server.
+pub(super) fn rollup_state_count(window: &RollupWindow, state: Option<f64>) -> f64 {
+    let Some(state) = state else {
+        return f64::NAN;
+    };
+    // IEEE `==`: a NaN sample never matches, and so ends the run.
+    window
+        .values
+        .iter()
+        .rev()
+        .take_while(|&&value| value == state)
+        .count() as f64
 }
 
 /// One window's answer, in `unit_ms` (default seconds), or `None` when the
@@ -114,7 +186,7 @@ fn rollup_state_duration(values: &[Sample], state: f64) -> Option<f64> {
 /// character covers compound values like `"1h30"` too.
 pub(in crate::promql) fn parse_unit(unit: &str) -> EvalResult<i64> {
     let invalid = |reason: &str| {
-        EvaluationError::ArgumentError(format!("{NAME}: invalid unit {unit:?}: {reason}"))
+        EvaluationError::ArgumentError(format!("{DURATION_NAME}: invalid unit {unit:?}: {reason}"))
     };
     if !unit.ends_with(|c: char| c.is_ascii_alphabetic()) {
         return Err(invalid(
@@ -216,9 +288,60 @@ mod tests {
         for bad in ["0s", "0ms", "-1m", "60", "1h30", "abc", "", "nans"] {
             let err = parse_unit(bad).expect_err(bad).to_string();
             assert!(
-                err.contains(NAME) && err.contains("invalid unit"),
+                err.contains(DURATION_NAME) && err.contains("invalid unit"),
                 "{bad}: {err}"
             );
         }
+    }
+
+    /// `rollup_state_count` over a bare list of values, the only part of the
+    /// window it reads.
+    fn count(values: &[f64], state: f64) -> f64 {
+        rollup_state_count(
+            &RollupWindow {
+                values,
+                ..Default::default()
+            },
+            Some(state),
+        )
+    }
+
+    #[test]
+    fn count_is_zero_when_the_last_sample_is_not_in_state() {
+        assert_eq!(count(&[0.0], 1.0), 0.0);
+        assert_eq!(count(&[1.0, 1.0, 0.0], 1.0), 0.0);
+        assert_eq!(count(&[2.0, 3.0, 4.0], 1.0), 0.0);
+    }
+
+    #[test]
+    fn count_starts_a_run_at_one() {
+        assert_eq!(count(&[1.0], 1.0), 1.0);
+        assert_eq!(count(&[0.0, 1.0], 1.0), 1.0);
+    }
+
+    /// The Flux docs' door example, closed = 1: 1, 2, 3, then `0` where Flux
+    /// writes -1, then a new run.
+    #[test]
+    fn count_door_example_row_by_row() {
+        let values = [1.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+        let expected = [1.0, 2.0, 3.0, 0.0, 1.0, 2.0];
+        for (i, want) in expected.into_iter().enumerate() {
+            assert_eq!(count(&values[..=i], 1.0), want, "row {i}");
+        }
+    }
+
+    #[test]
+    fn count_nan_sample_ends_the_run() {
+        assert_eq!(count(&[1.0, f64::NAN, 1.0, 1.0], 1.0), 2.0);
+        assert_eq!(count(&[1.0, 1.0, f64::NAN], 1.0), 0.0);
+    }
+
+    #[test]
+    fn count_without_a_state_is_nan_not_a_panic() {
+        let window = RollupWindow {
+            values: &[1.0],
+            ..Default::default()
+        };
+        assert!(rollup_state_count(&window, None).is_nan());
     }
 }

@@ -99,6 +99,7 @@ impl From<RollupKind> for ProtoRollupKind {
             RollupKind::Resets => ProtoRollupKind::Resets,
             RollupKind::Changes => ProtoRollupKind::Changes,
             RollupKind::StateDurationOverTime => ProtoRollupKind::StateDurationOverTime,
+            RollupKind::StateCountOverTime => ProtoRollupKind::StateCountOverTime,
         }
     }
 }
@@ -136,6 +137,7 @@ impl TryFrom<ProtoRollupKind> for RollupKind {
             ProtoRollupKind::Resets => RollupKind::Resets,
             ProtoRollupKind::Changes => RollupKind::Changes,
             ProtoRollupKind::StateDurationOverTime => RollupKind::StateDurationOverTime,
+            ProtoRollupKind::StateCountOverTime => RollupKind::StateCountOverTime,
             ProtoRollupKind::Unspecified => {
                 return Err(ValkeyError::Str(
                     "TSDB: grid push-down request carries a rollup with no function",

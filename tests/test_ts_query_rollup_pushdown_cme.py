@@ -492,6 +492,39 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             with pytest.raises(ResponseError):
                 self.range_query(query)
 
+    def test_state_count_over_time_across_shards(self):
+        """Unlike `state_duration_over_time`, a series not in the state is
+        present with `0`: every gauge series answers, on every shard."""
+        self.setup_fleet()
+        zeros = {instance: 0 for instance in GAUGE_SERIES}
+
+        # Window (T0, T0+120]: web-3 is 7, 8, 8 — two samples in state 8.
+        result = self.instant_query(f'state_count_over_time(mem_usage[{RANGE}], 8)')
+        self.assert_values_exact(self.values_by_instance(result), {**zeros, 'web-3': 2},
+                                 context='state 8')
+
+        result = self.instant_query(
+            f'sum by (job) (state_count_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_values_exact(self.values_by_label(result, 'job'),
+                                 {'api': 0, 'web': 2}, context='sum by (job)')
+        result = self.instant_query(
+            f'count(state_count_over_time(mem_usage[{RANGE}], 8))')
+        self.assert_single_value(result, len(GAUGE_SERIES))
+        result = self.instant_query(
+            f'count(state_count_over_time(mem_usage[{RANGE}], 8) > 0)')
+        self.assert_single_value(result, 1)
+
+        # A stepped grid with no gaps: web-3 is in state 7 for one sample at T0,
+        # three by T0+60, none at T0+120.
+        result = self.range_query(f'state_count_over_time(mem_usage[{RANGE}], 7)')
+        self.assert_steps_exact(
+            self.steps_by_instance(result),
+            {**{instance: [0, 0, 0] for instance in GAUGE_SERIES}, 'web-3': [1, 3, 0]},
+            context='range, state 7')
+
+        with pytest.raises(ResponseError):
+            self.instant_query(f'state_count_over_time(mem_usage[{RANGE}], NaN)')
+
     def test_ts_of_functions_across_shards(self):
         """The `ts_of_*` family returns a timestamp in seconds.
 
@@ -1074,6 +1107,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'sum_over_time(mem_usage[2m]) * 2',
         'state_duration_over_time(mem_usage[2m], 8, "1m")',
         'state_duration_over_time(mem_usage[3m], 7)',
+        'state_count_over_time(mem_usage[2m], 8)',
+        'state_count_over_time(mem_usage[3m], 7)',
     ]
 
     EQUIVALENCE_RANGE = [
@@ -1098,6 +1133,7 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'topk(2, sum_over_time(mem_usage[2m]))',
         'state_duration_over_time(mem_usage[2m], 7)',
         'state_duration_over_time(mem_usage[2m], 8, "500ms")',
+        'state_count_over_time(mem_usage[2m], 7)',
     ]
 
     # Fused: the coordinator merges per-shard partials, whose summation order
@@ -1116,6 +1152,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'sum by (job) (sum_over_time(mem_usage[2m] offset 60s))',
         'sum by (job) (state_duration_over_time(mem_usage[2m], 7, "1m"))',
         'count(state_duration_over_time(mem_usage[1m], 8))',
+        'sum by (job) (state_count_over_time(mem_usage[2m], 7))',
+        'avg(state_count_over_time(mem_usage[1m], 8))',
         'quantile by (job) (0.5, sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(no_such_metric[2m]))',
     ]

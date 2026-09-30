@@ -4376,6 +4376,9 @@ mod tests {
             "predict_linear(metric[1m], 60)",
             "state_duration_over_time(metric[1m], 12)",
             "state_duration_over_time(metric[1m], 12, \"1m\")",
+            "state_count_over_time(metric[1m], 12)",
+            // Not in state: `0`, and the series is still there to drop the name from.
+            "state_count_over_time(metric[1m], 3)",
         ] {
             let result = eval_rollup(&reader, query, 120_000);
             assert_eq!(result.len(), 1, "{query}: one output series");
@@ -4407,10 +4410,10 @@ mod tests {
         }
     }
 
-    /// `state_duration_over_time` is registered as experimental, so it must be
+    /// The state functions are registered as experimental, so they must be
     /// refused unless the request enables experimental functions.
     #[test]
-    fn state_duration_over_time_is_experimental() {
+    fn state_functions_are_experimental() {
         let reader = rollup_reader();
         let options = QueryOptions {
             timeout: None,
@@ -4418,18 +4421,19 @@ mod tests {
             ..QueryOptions::default()
         };
         let evaluator = Evaluator::new(&reader, options);
-        let err = parse_and_evaluate(
-            &evaluator,
-            "state_duration_over_time(metric[1m], 12)",
-            UNIX_EPOCH + Duration::from_secs(120),
-            Duration::from_secs(300),
-        )
-        .expect_err("experimental function must be gated");
-        assert!(
-            err.to_string()
-                .contains("state_duration_over_time is not enabled"),
-            "{err}"
-        );
+        for name in ["state_duration_over_time", "state_count_over_time"] {
+            let err = parse_and_evaluate(
+                &evaluator,
+                &format!("{name}(metric[1m], 12)"),
+                UNIX_EPOCH + Duration::from_secs(120),
+                Duration::from_secs(300),
+            )
+            .expect_err("experimental function must be gated");
+            assert!(
+                err.to_string().contains(&format!("{name} is not enabled")),
+                "{err}"
+            );
+        }
     }
 
     /// promqltest never compares `expect fail msg:` text, so the argument
@@ -4456,6 +4460,10 @@ mod tests {
                 "state_duration_over_time(metric[1m], NaN)",
                 "state_duration_over_time: state must not be NaN",
             ),
+            (
+                "state_count_over_time(metric[1m], NaN)",
+                "state_count_over_time: state must not be NaN",
+            ),
         ] {
             let err = parse_and_evaluate(&evaluator, query, at, Duration::from_secs(300))
                 .expect_err(query)
@@ -4469,6 +4477,10 @@ mod tests {
             r#"state_duration_over_time(metric[1m], 12, "1s", "1s")"#,
             "state_duration_over_time(metric[1m], 12, 60)",
             "state_duration_over_time(metric, 12)",
+            "state_count_over_time(metric[1m])",
+            r#"state_count_over_time(metric[1m], 12, "1s")"#,
+            r#"state_count_over_time(metric[1m], "12")"#,
+            "state_count_over_time(metric, 12)",
         ] {
             let err = parse_and_evaluate(&evaluator, query, at, Duration::from_secs(300))
                 .expect_err(query)
@@ -5107,6 +5119,7 @@ mod tests {
             RollupKind::StateDurationOverTime => {
                 format!(r#"state_duration_over_time({selector}, 8, "1m")"#)
             }
+            RollupKind::StateCountOverTime => format!("state_count_over_time({selector}, 8)"),
             other => format!("{}({selector})", other.function_name()),
         }
     }
@@ -5936,6 +5949,116 @@ mod tests {
             .collect();
         units.sort();
         assert_eq!(units, [None, Some(60_000)], "one grid per unit");
+    }
+
+    // ── state_count_over_time push-down ─────────────────────────────────
+    //
+    // The count rides the ordinary one-parameter path (its state, like
+    // `quantile_over_time`'s phi), and answers `0` rather than dropping a series
+    // that is not in state.
+
+    #[test]
+    fn should_push_down_state_count_with_its_state() {
+        let query = "state_count_over_time(metric[1m], 12)";
+        let (_, offered) = evaluate_rollup_pushdown(query, 120_000, GridAnswer::Evaluated);
+        assert_eq!(offered.len(), 1, "instant offered once");
+        let rollup = offered[0].rollup.as_ref().unwrap();
+        assert_eq!(rollup.kind, RollupKind::StateCountOverTime);
+        assert_eq!(rollup.param, Some(12.0), "the state");
+        assert_eq!(rollup.unit_ms, None, "no unit");
+
+        let (_, offered) =
+            evaluate_range_with_pushdown(query, 0, 300_000, 30_000, GridAnswer::Evaluated);
+        assert_eq!(offered.len(), 1, "one grid request");
+        assert_eq!(offered[0].kind(), RollupKind::StateCountOverTime);
+
+        // A NaN state is the local path's error to report; nothing is shipped.
+        let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Evaluated);
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
+        let err = parse_and_evaluate(
+            &evaluator,
+            "state_count_over_time(metric[1m], NaN)",
+            UNIX_EPOCH + Duration::from_secs(120),
+            Duration::from_secs(300),
+        )
+        .expect_err("NaN state");
+        assert!(err.to_string().contains("state must not be NaN"), "{err}");
+        assert!(reader.offered().is_empty(), "nothing offered");
+    }
+
+    /// Pushed down or not, fused or not, the answer is the local one — and every
+    /// series with data answers at every step, `0` where the door was open.
+    #[test]
+    fn should_match_local_evaluation_for_state_count() {
+        for query in [
+            "state_count_over_time(door[1m], 1)",
+            "state_count_over_time(door[3m], 0)",
+            "sum by (site) (state_count_over_time(door[3m], 1))",
+            "max(state_count_over_time(door[3m], 1))",
+            "count(state_count_over_time(door[1m], 1))",
+            "count(state_count_over_time(door[1m], 1) > 0)",
+            "avg without (door) (state_count_over_time(door[3m], 0))",
+            // The siblings combine: a series out of state is absent on the
+            // duration side, so the count's `0` is never divided by.
+            "state_duration_over_time(door[3m], 1) / state_count_over_time(door[3m], 1)",
+        ] {
+            let (local, _) = evaluate_range_with_pushdown_on(
+                door_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            let local = rendered_steps(local);
+            assert!(
+                !local.is_empty(),
+                "{query}: the fixture must produce answers"
+            );
+
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                let (pushed, offered) = evaluate_range_with_pushdown_on(
+                    door_reader(),
+                    query,
+                    0,
+                    300_000,
+                    30_000,
+                    answer,
+                );
+                assert!(!offered.is_empty(), "{query}: pushed down");
+                assert_steps_near(
+                    local.clone(),
+                    rendered_steps(pushed),
+                    &format!("{query} ({answer:?})"),
+                );
+            }
+
+            let instant_local = eval_rollup(&door_reader(), query, 150_000);
+            let (pushed, _) =
+                evaluate_rollup_pushdown_on(door_reader(), query, 150_000, GridAnswer::Evaluated);
+            assert_eq!(
+                rendered_samples(instant_local),
+                rendered_samples(pushed),
+                "{query} (instant)"
+            );
+        }
+
+        // No gaps: three doors with data at each of the eleven steps, some of
+        // them `0` — which is what sets the count apart from the duration.
+        let (steps, _) = evaluate_range_with_pushdown_on(
+            door_reader(),
+            "state_count_over_time(door[1m], 1)",
+            0,
+            300_000,
+            30_000,
+            GridAnswer::Evaluated,
+        );
+        let rows = rendered_steps(steps);
+        assert_eq!(rows.len(), 33, "every door at every step");
+        assert!(
+            rows.iter().any(|(_, _, v)| v == "0.0"),
+            "open doors answer 0"
+        );
     }
 
     /// One request for the whole grid, fused — not one per step, and not a

@@ -10,7 +10,7 @@ use crate::promql::functions::rate::{RateKind, extrapolated_rate_window};
 use crate::promql::functions::rollups::{
     eval_rollups, eval_rollups_basic, rollup_series_over_grid, window_samples,
 };
-use crate::promql::functions::state_duration::state_duration_window;
+use crate::promql::functions::state::{rollup_state_count, state_duration_window};
 use crate::promql::functions::types::FunctionCallContext;
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::functions::utils::{
@@ -23,7 +23,7 @@ use promql_parser::parser::Expr;
 
 /// A range-vector function that a shard can evaluate on its own.
 ///
-/// A PromQL series lives entirely on one shard, so a rollup over that series'
+/// A timeseries lives entirely on one shard, so a rollup over that series'
 /// own window needs no cross-shard merge algebra: the shard computes the final
 /// value and the coordinator concatenates. That locality — not decomposability —
 /// is the membership rule for this enum. A function belongs here when its output
@@ -63,6 +63,7 @@ pub enum RollupKind {
     Resets,
     Changes,
     StateDurationOverTime,
+    StateCountOverTime,
 }
 
 /// How a rollup reduces one window, mirroring the shapes the local evaluation
@@ -133,7 +134,8 @@ impl RollupKind {
             "deriv" => RollupKind::Deriv,
             "resets" => RollupKind::Resets,
             "changes" => RollupKind::Changes,
-            "state_duration_over_time" => RollupKind::StateDurationOverTime
+            "state_duration_over_time" => RollupKind::StateDurationOverTime,
+            "state_count_over_time" => RollupKind::StateCountOverTime
         )
         .copied()
     }
@@ -170,6 +172,7 @@ impl RollupKind {
             Resets => "resets",
             Changes => "changes",
             StateDurationOverTime => "state_duration_over_time",
+            StateCountOverTime => "state_count_over_time",
         }
     }
 
@@ -180,6 +183,7 @@ impl RollupKind {
         match self {
             RollupKind::QuantileOverTime => (Some(0.9), None),
             RollupKind::StateDurationOverTime => (Some(1.0), Some(60_000)),
+            RollupKind::StateCountOverTime => (Some(1.0), None),
             _ => (None, None),
         }
     }
@@ -190,7 +194,8 @@ impl RollupKind {
     /// The coordinator keeps anything this refuses local, so the local path
     /// reports the error the user should see (a `NaN` state, say); a shard
     /// refuses the request outright, since no coordinator of this build sends
-    /// one. Only `state_duration_over_time` takes a unit, and it needs a state.
+    /// one. Only `state_duration_over_time` takes a unit; it and
+    /// `state_count_over_time` need a state.
     pub(in crate::promql) fn check_params(
         self,
         param: Option<f64>,
@@ -204,7 +209,11 @@ impl RollupKind {
             }
             _ => {}
         }
-        if self == RollupKind::StateDurationOverTime && param.is_none_or(f64::is_nan) {
+        let takes_state = matches!(
+            self,
+            RollupKind::StateDurationOverTime | RollupKind::StateCountOverTime
+        );
+        if takes_state && param.is_none_or(f64::is_nan) {
             return Err(format!("{self:?} needs a state that is not NaN"));
         }
         Ok(())
@@ -242,6 +251,7 @@ impl RollupKind {
             Resets,
             Changes,
             StateDurationOverTime,
+            StateCountOverTime,
         ];
         for kind in all {
             // Exhaustive: adding a variant without adding it above fails to
@@ -271,7 +281,8 @@ impl RollupKind {
                 | Deriv
                 | Resets
                 | Changes
-                | StateDurationOverTime => {}
+                | StateDurationOverTime
+                | StateCountOverTime => {}
             }
         }
         all.to_vec()
@@ -309,6 +320,7 @@ impl RollupKind {
             RollupKind::StateDurationOverTime => {
                 RollupImpl::WholeWindowWithUnit(state_duration_window)
             }
+            RollupKind::StateCountOverTime => RollupImpl::Windowed(rollup_state_count),
         }
     }
 
@@ -871,6 +883,45 @@ mod tests {
         }
     }
 
+    /// The count's version of the check above: a run that started before the
+    /// window is counted from the window's first sample, and windows out of
+    /// state answer `0` rather than dropping out.
+    #[test]
+    fn state_count_ignores_runs_before_the_window() {
+        // Runs of four samples in and four out of state, 10 s apart.
+        let series: Vec<Sample> = (0..=40)
+            .map(|i| Sample {
+                timestamp: i * 10_000,
+                value: ((i / 4) % 2) as f64,
+            })
+            .collect();
+        let window_ms = 25_000;
+        let ends: Vec<Timestamp> = (0..=400_000).step_by(5_000).collect();
+        let kind = RollupKind::StateCountOverTime;
+        let with_context = kind.eval_windows(
+            &series,
+            window_ms,
+            0,
+            5_000,
+            ends.iter().copied(),
+            Some(1.0),
+            None,
+        );
+        let isolated: Vec<Sample> = ends
+            .iter()
+            .filter_map(|&end| {
+                let window = window_samples(&series, end, window_ms)?;
+                kind.eval_windows(window, window_ms, 0, 5_000, [end], Some(1.0), None)
+                    .pop()
+            })
+            .collect();
+        // A 25 s window holds at most three samples, though the runs hold four.
+        assert!(with_context.iter().all(|s| s.value <= 3.0));
+        assert!(with_context.iter().any(|s| s.value == 3.0));
+        assert!(with_context.iter().any(|s| s.value == 0.0));
+        assert_eq!(with_context, isolated);
+    }
+
     #[test]
     fn check_params_keeps_units_and_states_to_state_duration() {
         use RollupKind::*;
@@ -894,6 +945,18 @@ mod tests {
         assert!(
             StateDurationOverTime
                 .check_params(Some(1.0), Some(-1))
+                .is_err()
+        );
+        assert!(StateCountOverTime.check_params(Some(1.0), None).is_ok());
+        assert!(StateCountOverTime.check_params(None, None).is_err());
+        assert!(
+            StateCountOverTime
+                .check_params(Some(f64::NAN), None)
+                .is_err()
+        );
+        assert!(
+            StateCountOverTime
+                .check_params(Some(1.0), Some(1_000))
                 .is_err()
         );
         assert!(SumOverTime.check_params(None, Some(1_000)).is_err());
