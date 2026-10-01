@@ -79,7 +79,7 @@ class TestRdbLoadAcceptsWhatWritesAccept(ValkeyTimeSeriesTestCaseBase):
         client = self._restart(client)
 
         # The persisted index was used, not thrown away for a rebuild.
-        self.server.verify_string_in_logfile(PRELOADED_LOG)
+        assert self.server.verify_string_in_logfile(PRELOADED_LOG)
         assert not self.server.verify_string_in_logfile(DISCARDED_LOG)
         assert client.execute_command("TS.QUERYINDEX", f"blob={long_value}") == [b"short"]
         assert sorted(client.execute_command("TS.QUERYINDEX", "job=api")) == sorted(
