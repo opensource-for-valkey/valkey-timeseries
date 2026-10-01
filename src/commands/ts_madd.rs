@@ -2,6 +2,7 @@ use crate::commands::command_parser::{parse_timestamp, parse_value_arg};
 use crate::common::acl::KeyAccess;
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::notify_keyspace_event;
+use crate::common::replies::{reply_error_string, reply_with_array, reply_with_integer};
 use crate::common::time::current_time_millis;
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
@@ -91,9 +92,21 @@ pub fn ts_madd_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     handle_replication(ctx, &all_inputs, rewrote_args);
 
-    Ok(ValkeyValue::Array(
-        results.into_iter().map(ValkeyValue::from).collect(),
-    ))
+    // Reply straight from the results rather than through a `ValkeyValue` tree: one array
+    // header and one integer (or error) per item, no per-item enum and no `Vec` of them.
+    reply_with_array(ctx, results.len());
+    for res in results {
+        match res {
+            SampleAddResult::Ok(sample) => reply_with_integer(ctx, sample.timestamp),
+            SampleAddResult::Ignored(ts) => reply_with_integer(ctx, ts),
+            // Per-item failures must be real RESP error replies inside the array (clients
+            // type-check the elements), matching RTS.
+            SampleAddResult::Duplicate => reply_error_string(ctx, error_consts::DUPLICATE_SAMPLE),
+            SampleAddResult::TooOld => reply_error_string(ctx, error_consts::SAMPLE_TOO_OLD),
+            SampleAddResult::Error(e) => reply_error_string(ctx, e),
+        };
+    }
+    Ok(ValkeyValue::NoReply)
 }
 
 fn handle_update(
