@@ -4,7 +4,6 @@ use orx_parallel::{
     IntoParIter, IterIntoParIter, Par, ParCollection, ParCollectionMut, Parallelizable, Runner,
     ThreadPool,
 };
-use std::cell::Cell;
 
 /// orx-parallel adapter that runs a computation on orx's own rayon-core pool
 /// (`orx_parallel::Pool::global()`, sized from `ts-num-threads` in
@@ -12,7 +11,7 @@ use std::cell::Cell;
 /// (see [`ThreadRole::is_pinned`](super::ThreadRole::is_pinned)), where it stays on that pool.
 ///
 /// A bare `.par()` would always use orx's pool, including from a pinned worker, and so would
-/// move a blocking pool's jobs onto the pool that GIL holders wait on (R2, R4).
+/// move a PromQL evaluation's blocking jobs onto the pool that module-lock holders wait on.
 /// Enter parallel iteration through the `*_rayon` methods below rather than the bare orx
 /// entry points.
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,6 +43,33 @@ impl ThreadPool for ModulePool {
             orx_parallel::Pool::global().current_num_threads()
         };
         NonZeroUsize::new(threads.max(1)).expect(">0")
+    }
+}
+
+/// orx-parallel adapter over one specific `rayon_core::ThreadPool`, for a
+/// computation that must not depend on a shared pool — the PromQL selector
+/// executor's materialization, which runs while evaluation workers may be parked
+/// waiting for it. Attach with `.with_pool(RayonPool(&pool))`.
+#[derive(Clone, Copy)]
+pub struct RayonPool(pub &'static rayon_core::ThreadPool);
+
+impl ThreadPool for RayonPool {
+    type ScopeRef<'s, 'env, 'scope>
+        = &'s rayon_core::Scope<'scope>
+    where
+        'scope: 's,
+        'env: 'scope + 's;
+
+    fn scope<'env, 'scope, F>(&'env self, f: F)
+    where
+        'env: 'scope,
+        for<'s> F: FnOnce(&'s rayon_core::Scope<'scope>) + Send,
+    {
+        self.0.scope(f)
+    }
+
+    fn max_num_threads(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.0.current_num_threads().max(1)).expect(">0")
     }
 }
 

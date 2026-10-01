@@ -1157,7 +1157,7 @@ mod selector_batch_executor_tests {
     fn parked_pool_never_starves_a_processor_with_its_own_pool() {
         let callers = rayon_core::ThreadPoolBuilder::new()
             .num_threads(2)
-            .start_handler(|_| set_thread_role(ThreadRole::EvalPool))
+            .start_handler(|_| set_thread_role(ThreadRole::BlockingPool))
             .build()
             .unwrap();
         let (task_tx, task_rx) = mpsc::channel::<mpsc::SyncSender<usize>>();

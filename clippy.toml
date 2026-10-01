@@ -7,9 +7,9 @@ disallowed-methods = [
     { path = "rayon_core::join", reason = "use `common::threads::join`, which picks the caller's pool" },
     { path = "rayon_core::scope", reason = "enter parallel work through the `*_rayon` adapters in `common::threads`, which pick the caller's pool" },
     # A pool's own methods, including `orx_parallel::Pool::global()`'s, which is a rayon-core pool
-    # under `persistent-pool-rayon`. Unwrapped, `POOL.spawn(|| ..lock_gil())` compiles, and
-    # `POOL.install` on a blocking pool skips the check that a GIL holder never waits on one.
-    { path = "rayon_core::ThreadPool::install", reason = "enter a pool through a wrapper in `common::threads` that checks the threading rules, or the `*_rayon` adapters" },
+    # under `persistent-pool-rayon`. Unwrapped, `MATERIALIZE_POOL.spawn(|| ..lock_gil())` compiles and
+    # `EVAL_POOL.install` skips the check that a GIL holder never waits on the evaluation pool.
+    { path = "rayon_core::ThreadPool::install", reason = "use `run_on_eval_pool`, `run_on_pool_cold` or the `*_rayon` adapters in `common::threads`, which check the threading rules" },
     { path = "rayon_core::ThreadPool::join", reason = "use `common::threads::join`, which picks the caller's pool" },
     { path = "rayon_core::ThreadPool::scope", reason = "enter parallel work through the `*_rayon` adapters in `common::threads`" },
     { path = "rayon_core::ThreadPool::in_place_scope", reason = "enter parallel work through the `*_rayon` adapters in `common::threads`" },
@@ -20,6 +20,6 @@ disallowed-methods = [
     { path = "orx_parallel::Parallelizable::par", reason = "use `par_rayon`: a bare `.par()` leaves a pinned pool for the shared one" },
     { path = "orx_parallel::ParCollection::par", reason = "use `par_rayon`: a bare `.par()` leaves a pinned pool for the shared one" },
     { path = "orx_parallel::ParCollectionMut::par_mut", reason = "use `par_mut_rayon`: a bare `.par_mut()` leaves a pinned pool for the shared one" },
-    { path = "orx_parallel::IntoParIter::into_par", reason = "use `into_par_rayon`: a bare `.into_par()` leaves a pinned pool for the shared one" },
+    { path = "orx_parallel::IntoParIter::into_par", reason = "use `into_par_rayon` or `into_par_on`: a bare `.into_par()` leaves a pinned pool for the shared one" },
     { path = "orx_parallel::IterIntoParIter::iter_into_par", reason = "use `iter_into_par_rayon`: a bare `.iter_into_par()` leaves a pinned pool for the shared one" },
 ]

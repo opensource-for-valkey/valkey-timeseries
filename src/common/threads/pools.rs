@@ -19,14 +19,14 @@ use std::sync::LazyLock;
 /// which no GIL holder ever waits on (R2), so the shared pool always drains. Its workers are
 /// pinned, so the parallel work they start stays here (R4).
 pub(crate) static EVAL_POOL: LazyLock<ThreadPool> =
-    LazyLock::new(|| build_pinned_pool("ts-promql-eval", ThreadRole::EvalPool));
+    LazyLock::new(|| build_pinned_pool("ts-promql-eval", ThreadRole::BlockingPool));
 
 /// The pool the PromQL selector executor materializes on. Private to the executor so that its
 /// work never depends on a pool whose workers may all be parked waiting for exactly this work.
 /// Its jobs never block (R1 without exception), so the processor may wait on it while holding
 /// the GIL (R2).
 pub(crate) static MATERIALIZE_POOL: LazyLock<ThreadPool> =
-    LazyLock::new(|| build_pinned_pool("ts-promql-io", ThreadRole::MaterializePool));
+    LazyLock::new(|| build_pinned_pool("ts-promql-io", ThreadRole::IsolatedPool));
 
 fn build_pinned_pool(name: &'static str, role: ThreadRole) -> ThreadPool {
     ThreadPoolBuilder::new()

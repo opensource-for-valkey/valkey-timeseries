@@ -5,13 +5,12 @@
 //! | Kind ([`ThreadRole`]) | What | May block | May take the GIL |
 //! |---|---|---|---|
 //! | `Main` | the server's main thread: commands, callbacks, the cron | no | holds it |
-//! | `Blocking` | [`BoundedExecutor`] lanes (fan-out, `TS.OUTLIERS`), [`spawn_background`] tasks | yes | yes |
+//! | `Blocking` | [`BoundedExecutor`] lanes (fan-out, PromQL queries, `TS.OUTLIERS`), the PromQL selector processor, [`spawn_background`] tasks | yes | yes |
 //! | `SharedPool` | orx-parallel's rayon-core pool, sized by `ts-num-threads` ([`init_thread_pool`]) | no | no |
-//! | `BlockingPool` | a pinned pool whose jobs wait for a blocking thread's answer | on blocking threads | no |
-//! | `IsolatedPool` | a pinned pool whose jobs never block | no | no |
+//! | `BlockingPool` | the pool PromQL evaluations fan out on ([`EVAL_POOL`]) | on the selector executor and, without stealing, an isolated pool ([`run_on_pool_cold`]) | no |
+//! | `IsolatedPool` | the pool the PromQL selector executor decodes on ([`MATERIALIZE_POOL`]) | no | no |
 //!
-//! The two pinned kinds are for features that need a pool of their own; this module states
-//! the rules for them so that a feature adds a pool, not a rule.
+//! The two pinned kinds are stated generically, so that a feature adds a pool, not a rule.
 //!
 //! One pool sits outside the table: rayon's global pool, which third-party crates enter on
 //! their own (`krcf`, behind `TS.OUTLIERS METHOD rcf`, when its parallel heuristic fires). The
@@ -73,6 +72,7 @@
 mod executor;
 mod gil;
 mod orx_pool;
+mod pools;
 mod role;
 mod single_flight;
 
@@ -84,8 +84,9 @@ pub use gil::{
 };
 pub use orx_pool::{
     IntoParRayon, IterIntoParRayon, ModulePool, ParCollectionRayon, ParMutRayon, ParRayon,
-    ParWithPool,
+    ParWithPool, RayonPool,
 };
+pub(crate) use pools::{EVAL_POOL, MATERIALIZE_POOL};
 pub use role::{ThreadRole, current_role, on_pool_worker, set_thread_role};
 pub use single_flight::{Flight, SingleFlight};
 use std::env;
@@ -221,7 +222,7 @@ where
 /// checks R2 first. Every parallel entry point `work` reaches resolves to that pool (R4).
 #[track_caller]
 pub(crate) fn run_on_eval_pool<R: Send>(work: impl FnOnce() -> R + Send) -> R {
-    check_may_wait_on_eval_pool();
+    check_may_wait_on_blocking_pool();
     EVAL_POOL.install(work)
 }
 
@@ -376,5 +377,73 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the run never ended");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_wait_tests {
+    use super::run_on_pool_cold;
+    use std::sync::LazyLock;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn one_worker(name: &'static str) -> rayon_core::ThreadPool {
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(move |_| name.to_string())
+            .build()
+            .unwrap()
+    }
+
+    /// While a worker of `waiter` waits for `busy` to finish a 100 ms job, a second job
+    /// is queued on `waiter`. Returns whether that job started before the wait ended,
+    /// i.e. whether the waiting worker took it.
+    fn waiting_worker_takes_other_jobs(
+        waiter: &'static rayon_core::ThreadPool,
+        wait: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let (done_tx, done_rx) = mpsc::channel::<Instant>();
+        let (other_tx, other_rx) = mpsc::channel::<Instant>();
+        waiter.spawn(move || {
+            wait();
+            let _ = done_tx.send(Instant::now());
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        waiter.spawn(move || {
+            let _ = other_tx.send(Instant::now());
+        });
+        let waited_until = done_rx.recv().unwrap();
+        let other_started = other_rx.recv().unwrap();
+        other_started < waited_until
+    }
+
+    /// Rayon's cross-pool wait makes the waiting worker run its own pool's jobs (the
+    /// behavior `run_on_pool_cold` avoids); `run_on_pool_cold` runs none.
+    #[test]
+    fn a_cold_wait_takes_no_other_jobs() {
+        static WAITER: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| one_worker("waiter"));
+        static BUSY: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| one_worker("busy"));
+        let sleep = || std::thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            waiting_worker_takes_other_jobs(&WAITER, move || BUSY.install(sleep)),
+            "rayon's cross-pool install no longer steals; this test's premise changed"
+        );
+        assert!(!waiting_worker_takes_other_jobs(&WAITER, move || {
+            run_on_pool_cold(&BUSY, sleep)
+        }));
+    }
+
+    #[test]
+    fn a_cold_wait_returns_the_result_and_re_raises_a_panic() {
+        static BUSY: LazyLock<rayon_core::ThreadPool> = LazyLock::new(|| one_worker("busy2"));
+        assert_eq!(run_on_pool_cold(&BUSY, || 6 * 7), 42);
+        let caught = std::panic::catch_unwind(|| run_on_pool_cold(&BUSY, || panic!("inside")));
+        assert!(caught.is_err());
+        assert_eq!(
+            run_on_pool_cold(&BUSY, || 1),
+            1,
+            "the pool survives the panic"
+        );
     }
 }
