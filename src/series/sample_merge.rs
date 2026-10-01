@@ -132,6 +132,12 @@ pub fn multi_series_merge_samples(
     }
     let mut groups = groups;
 
+    // Always parallel past one group: unlike a range read, each group carries tens
+    // of microseconds of work (guard bookkeeping, dedup, chunk append), and a paired
+    // A/B showed a sequential 16-sample MADD 16 % *slower* in wall time. The pool is
+    // what matters here: dispatching to it costs no thread creation, where the
+    // default runner spawned one OS thread per group on every command — the source
+    // of MADD's outsized server CPU per command.
     let res = if groups.len() == 1 {
         add_samples_internal(&mut groups[0])
     } else {

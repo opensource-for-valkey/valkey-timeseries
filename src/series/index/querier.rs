@@ -31,7 +31,7 @@ use crate::common::acl::KeyAccess;
 use crate::common::context::{create_key_string, get_current_db};
 use crate::common::hash::IntMap;
 use crate::common::threads::GilSource;
-use crate::common::threads::IterIntoParRayon;
+use crate::common::threads::{IterIntoParRayon, request_par_threads};
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
 use crate::series::request_types::MetaDateRangeFilter;
@@ -397,6 +397,7 @@ fn filter_series_by_date_range<'a>(
         .iter()
         .map(|guard| guard.0.as_ref())
         .iter_into_par_rayon()
+        .num_threads(request_par_threads(series.len(), series.len()))
         .filter_map(|ts| {
             if matches_date_range(ts, start, end, exclude) {
                 Some(ts.id)

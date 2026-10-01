@@ -11,7 +11,7 @@ use crate::commands::utils::{
 use crate::common::context::key_for_display;
 use crate::common::metrics::fanout as fanout_metrics;
 use crate::common::replies::ReplyContext;
-use crate::common::threads::{IntoParRayon, IterIntoParRayon};
+use crate::common::threads::{IntoParRayon, IterIntoParRayon, request_par_threads};
 use crate::common::{MultiSample, Sample};
 use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
@@ -330,8 +330,10 @@ fn normalize_response_series(
     // reversal and COUNT are applied downstream by the coordinator.
     let mut shard_range = options.range.clone();
     shard_range.count = None;
+    let threads = request_par_threads(series.len(), shard_payload_work(&series));
     series
         .into_par_rayon()
+        .num_threads(threads)
         .map(|(response, bucketed)| {
             if bucketed {
                 return Ok(response);
@@ -384,8 +386,10 @@ fn compensate_group_partials(
         )));
     };
 
+    let threads = request_par_threads(series.len(), shard_payload_work_plain(&series));
     let results = series
         .into_par_rayon()
+        .num_threads(threads)
         .map(MRangeSeriesResult::try_from)
         .into_fallible()
         .collect()?;
@@ -438,12 +442,31 @@ fn handle_basic(
     series: Vec<SeriesRangeResponse>,
     options: &MRangeOptions,
 ) -> ValkeyResult<Vec<MRangeSeriesResult>> {
+    let threads = request_par_threads(series.len(), shard_payload_work_plain(&series));
     series
         .into_par_rayon()
+        .num_threads(threads)
         .map(MRangeSeriesResult::try_from) // Explicit conversion
         .into_fallible()
         .map(|series| process_series_samples(series, options))
         .collect()
+}
+
+/// Work estimate for decoding shard responses, in sample-sized units: a sample is
+/// at most 16 bytes uncompressed and compresses to a few, so payload bytes / 4 is
+/// a conservative sample count. Only feeds the dispatch decision.
+fn shard_payload_work(series: &[(SeriesRangeResponse, bool)]) -> usize {
+    series
+        .iter()
+        .map(|(r, _)| r.columns.iter().map(|c| c.data.len()).sum::<usize>() / 4)
+        .sum()
+}
+
+fn shard_payload_work_plain(series: &[SeriesRangeResponse]) -> usize {
+    series
+        .iter()
+        .map(|r| r.columns.iter().map(|c| c.data.len()).sum::<usize>() / 4)
+        .sum()
 }
 
 fn serialize_request(request: &MRangeOptions) -> MultiRangeRequest {
@@ -467,16 +490,21 @@ fn handle_grouping(
         .grouping
         .as_ref()
         .expect("Grouping options should be present");
+    let work = shard_payload_work_plain(&series);
+    let threads = request_par_threads(series.len(), work);
     let results = series
         .into_par_rayon()
+        .num_threads(threads)
         .map(MRangeSeriesResult::try_from)
         .into_fallible()
         .collect()?;
     let grouped_by_key = construct_group_map(results);
 
+    let threads = request_par_threads(grouped_by_key.len(), work);
     Ok(grouped_by_key
         .into_iter()
         .iter_into_par_rayon()
+        .num_threads(threads)
         .map(|(label, data)| process_group(label, data, options, group_options))
         .collect())
 }

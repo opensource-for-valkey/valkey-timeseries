@@ -116,6 +116,10 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   (behavior-kind entries need explicit PR sign-off).
 - When adding/changing a command, update `docs/COMMANDS.md`, `docs/commands/`, `docs/overview.md`,
   and `README.md` (skip this for `TS._DEBUG`/`TS._RESTORE` — intentionally undocumented internals).
+- Per-request parallel sections in command handlers enter the shared pool through the `*_rayon`
+  adapters with `.num_threads(request_par_threads(items, work))` (see `series/mrange.rs`,
+  `sample_merge.rs`): below the threshold a pool round trip costs more than the work. When the
+  threshold says sequential, use a plain loop.
 
 ## Testing
 
