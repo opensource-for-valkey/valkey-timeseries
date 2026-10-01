@@ -129,6 +129,62 @@ class TestCompactionLinks(ValkeyTimeSeriesTestCaseBase):
         assert self.dest_samples('dst') == [(0, 42.0)]
         assert self.rule_dests('src') == []
 
+    def test_rename_source_onto_its_destination(self):
+        """RENAME src onto its own destination must not leave a self-rule."""
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.client.execute_command('TS.CREATE', 'top')
+        self.create_rule('src', 'dst')
+        self.create_rule('src', 'top')
+        self.add('src', (0, 1), (500, 2))
+
+        self.client.rename('src', 'dst')
+
+        # The rule for the overwritten `dst` is gone; the one for `top` is re-pointed.
+        assert self.rule_dests('dst') == ['top']
+        assert self.source_key('dst') is None
+        assert self.source_key('top') == 'dst'
+        self.add('dst', (1000, 5))
+        assert self.dest_samples('top') == [(0, 3.0)]
+        # `dst` is an ordinary series again: it can be made the destination of a rule.
+        self.client.execute_command('TS.CREATE', 'other')
+        self.create_rule('other', 'dst')
+        assert self.source_key('dst') == 'other'
+
+    def test_rename_onto_destination_and_back_allows_new_rule(self):
+        """A self-rule left by RENAME onto a destination is hidden from TS.INFO, but it
+        survives renaming back and blocks re-creating the rule it came from."""
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.create_rule('src', 'dst')
+
+        self.client.rename('src', 'dst')
+        self.client.execute_command('DEBUG', 'RELOAD')
+        self.client.rename('dst', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+
+        self.create_rule('src', 'dst')
+        assert self.rule_dests('src') == ['dst']
+        self.add('src', (0, 1), (1000, 2))
+        assert self.dest_samples('dst') == [(0, 1.0)]
+
+    def test_rename_destination_onto_its_source(self):
+        """RENAME dst onto its own source must not leave a self source link."""
+        self.client.execute_command('TS.CREATE', 'src')
+        self.client.execute_command('TS.CREATE', 'dst')
+        self.client.execute_command('TS.CREATE', 'top')
+        self.create_rule('src', 'dst')
+        self.create_rule('dst', 'top')
+
+        self.client.rename('dst', 'src')
+
+        assert self.source_key('src') is None
+        assert self.rule_dests('src') == ['top']
+        assert self.source_key('top') == 'src'
+        self.client.execute_command('TS.CREATE', 'other')
+        self.create_rule('other', 'src')
+        assert self.source_key('src') == 'other'
+
     def test_links_survive_reload(self):
         self.client.execute_command('TS.CREATE', 'src')
         self.client.execute_command('TS.CREATE', 'mid')

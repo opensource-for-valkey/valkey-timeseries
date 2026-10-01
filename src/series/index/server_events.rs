@@ -111,7 +111,7 @@ fn handle_key_rename(ctx: &Context, old_key: &[u8], new_key: &[u8]) {
     series.key = new_key.into();
     index.reindex_timeseries(&series, old_key, new_key);
     // Compaction partners link to each other by key.
-    relink_renamed_series(ctx, &series, old_key);
+    relink_renamed_series(ctx, &mut series, old_key);
 }
 
 /// Handle the "restore" event, which is triggered for each key restored from disk during server startup

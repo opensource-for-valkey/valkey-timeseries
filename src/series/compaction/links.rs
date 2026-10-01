@@ -46,12 +46,26 @@ pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -
 
 /// Points the compaction partners of a series renamed from `old_key` to its current key at that
 /// key: its source's rule for it, and each of its destinations' source link.
-pub(crate) fn relink_renamed_series(ctx: &Context, series: &TimeSeries, old_key: &[u8]) {
+///
+/// A `RENAME` onto one of the series' own partners overwrote (deleted) that partner, leaving a
+/// link that names the series itself. Such a link is dropped: a self-rule is never applied
+/// (compaction skips it as a cycle, so it is never pruned as stale), `TS.DELETERULE` refuses a
+/// self-rule, and a self source link would make the series look like a compaction destination
+/// forever, so `TS.CREATERULE` could never target it.
+pub(crate) fn relink_renamed_series(ctx: &Context, series: &mut TimeSeries, old_key: &[u8]) {
     let new_key: &[u8] = &series.key;
-    // Never re-open the renamed series itself: the caller holds it.
-    let is_partner = |link: &SeriesLink| !link.points_to(new_key);
+    series.rules.retain(|rule| !rule.dest.points_to(new_key));
+    if series
+        .src_series
+        .as_ref()
+        .is_some_and(|src| src.points_to(new_key))
+    {
+        series.src_series = None;
+    }
+    // No link names the renamed series any more, so none of the partners opened below is the
+    // series the caller holds.
 
-    if let Some(source_link) = series.src_series.as_ref().filter(|l| is_partner(l))
+    if let Some(source_link) = series.src_series.as_ref()
         && let Ok(Some(mut source)) =
             try_get_timeseries_mut(ctx, &source_link.to_key_string(ctx), None)
     {
@@ -62,7 +76,7 @@ pub(crate) fn relink_renamed_series(ctx: &Context, series: &TimeSeries, old_key:
         }
     }
 
-    for rule in series.rules.iter().filter(|rule| is_partner(&rule.dest)) {
+    for rule in series.rules.iter() {
         if let Ok(Some(mut dest)) = try_get_timeseries_mut(ctx, &rule.dest.to_key_string(ctx), None)
             && dest
                 .src_series
