@@ -17,7 +17,8 @@ impl IndexKey {
 
     pub fn as_str(&self) -> &str {
         let buf = &self.0[..self.0.len() - 1];
-        std::str::from_utf8(buf).unwrap()
+        // SAFETY: the inner bytes are valid UTF-8 by construction.
+        unsafe { std::str::from_utf8_unchecked(buf) }
     }
 
     pub fn split(&self) -> Option<(&str, &str)> {
