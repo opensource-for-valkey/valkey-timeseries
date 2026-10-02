@@ -1,0 +1,77 @@
+# range_over_time(v range-vector)
+# MetricsQL's range_over_time: max_over_time - min_over_time over each window.
+# Experimental: the promqltest harness enables experimental functions.
+
+load 1m
+	metric{a="1"} 1 3 2 8 5
+	metric{a="2"} 10 10 10 10 10
+
+eval instant at 4m range_over_time(metric[5m])
+	{a="1"} 7
+	{a="2"} 0
+
+# Windows are left-open, as for every rollup: (2m, 4m] holds 8 and 5.
+eval instant at 4m range_over_time(metric[2m])
+	{a="1"} 3
+	{a="2"} 0
+
+eval range from 0 to 4m step 1m range_over_time(metric{a="1"}[2m])
+	{a="1"} 0 2 1 6 3
+
+# Exactly max_over_time - min_over_time.
+eval instant at 4m range_over_time(metric[5m]) == bool (max_over_time(metric[5m]) - min_over_time(metric[5m]))
+	{a="1"} 1
+	{a="2"} 1
+
+eval instant at 4m sum(range_over_time(metric[5m]))
+	{} 7
+
+# Over a subquery: the steps at 2m, 3m and 4m.
+eval instant at 4m range_over_time(metric[3m:1m])
+	{a="1"} 6
+	{a="2"} 0
+
+# A single sample has no spread.
+eval instant at 0 range_over_time(metric[1m])
+	{a="1"} 0
+	{a="2"} 0
+
+# An empty window yields no sample at all.
+eval instant at 50m range_over_time(metric[1m])
+
+eval instant at 4m range_over_time(nonexistent_metric[5m])
+
+# NaN is replaced by any real value, as in min_over_time and max_over_time;
+# only an all-NaN window answers NaN. Infinities subtract as IEEE 754 says.
+clear
+load 1m
+	nan_first NaN 2 5
+	nan_mid 2 NaN 5
+	all_nan NaN NaN NaN
+	inf_mixed -Inf 3 Inf
+	inf_only Inf Inf Inf
+
+eval instant at 2m range_over_time(nan_first[5m])
+	{} 3
+
+eval instant at 2m range_over_time(nan_mid[5m])
+	{} 3
+
+eval instant at 2m range_over_time(all_nan[5m])
+	{} NaN
+
+eval instant at 2m range_over_time(inf_mixed[5m])
+	{} +Inf
+
+eval instant at 2m range_over_time(inf_only[5m])
+	{} NaN
+
+# Argument errors.
+eval instant at 1m range_over_time(nan_first)
+	expect fail
+
+eval instant at 1m range_over_time(nan_first[5m], 1)
+	expect fail
+
+eval instant at 1m range_over_time()
+	expect fail

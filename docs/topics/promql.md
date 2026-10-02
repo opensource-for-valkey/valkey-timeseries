@@ -212,6 +212,26 @@ state_count_over_time(up[10m], 1) >= 5
 count(state_count_over_time(up[5m], 0) > 0)
 ```
 
+**`range_over_time(v range-vector)`** — the spread of each series' samples in the window,
+`max_over_time(v) - min_over_time(v)`, from VictoriaMetrics' MetricsQL. It reads the window
+once rather than twice, and gives the same answer as the two-function form:
+
+- A `NaN` sample is skipped when a real value is in the window, as in `min_over_time` and
+  `max_over_time`. A window of only `NaN` samples answers `NaN`.
+- Infinities subtract as IEEE 754 says: a window holding `-Inf` and `+Inf` answers `+Inf`,
+  and a window of only `+Inf` answers `NaN`.
+- A window with one sample, or with all samples equal, answers `0`. A window with no samples
+  gives no result.
+- The result drops `__name__`, and in cluster mode it is pushed down to the shards.
+
+```
+# How far each temperature sensor swung over the last hour.
+range_over_time(temperature_celsius[1h])
+
+# Series whose value moved by more than 10 in the last 5 minutes.
+range_over_time(queue_depth[5m]) > 10
+```
+
 ## Support, conformance, and deviations from Prometheus
 
 Valkey TimeSeries follows the PromQL expression model and aims to match Prometheus

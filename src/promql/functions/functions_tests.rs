@@ -1403,6 +1403,22 @@ mod tests {
     }
 
     #[test]
+    fn should_apply_range_over_time_function() {
+        // range_over_time(metric[3s]) at t=3s: window (0, 3000] → 50 - 10 = 40
+        let samples = vec![create_eval_samples(
+            vec![(1000, 10.0), (2000, 50.0), (3000, 30.0)],
+            Labels::default(),
+        )];
+        let func = get_range_function("range_over_time").unwrap();
+        let result = func
+            .apply_with_range(samples, 3000, Duration::from_millis(3000))
+            .unwrap()
+            .expect_instant_vector("expected instant vector result");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].value, 40.0);
+    }
+
+    #[test]
     fn should_apply_count_over_time_function() {
         // count_over_time(metric[4s]) at t=4s: window (0, 4000] → count = 4
         let samples = vec![create_eval_samples(
@@ -1990,6 +2006,39 @@ mod tests {
     }
 
     #[test]
+    fn should_handle_nan_in_range_over_time() {
+        // A leading or interior NaN is skipped by both ends, as in
+        // min_over_time and max_over_time; an all-NaN window stays NaN.
+        for (values, want) in [
+            (vec![f64::NAN, 2.0, 5.0], 3.0),
+            (vec![2.0, f64::NAN, 5.0], 3.0),
+            (vec![5.0, 2.0, f64::NAN], 3.0),
+            (vec![f64::NAN], f64::NAN),
+            (vec![f64::NAN, f64::NAN], f64::NAN),
+            (vec![f64::NEG_INFINITY, 3.0, f64::INFINITY], f64::INFINITY),
+            (vec![f64::INFINITY, f64::INFINITY], f64::NAN),
+            (vec![7.0], 0.0),
+        ] {
+            let last_ts = (values.len() as i64) * 1000;
+            let samples = vec![create_eval_samples(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| ((i as i64 + 1) * 1000, v))
+                    .collect(),
+                Labels::default(),
+            )];
+            let result = call_rollup_function("range_over_time", samples, last_ts, 1000);
+            assert_eq!(result.len(), 1, "{values:?}");
+            let got = result[0].value;
+            assert!(
+                got == want || (got.is_nan() && want.is_nan()),
+                "{values:?}: want {want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
     fn should_match_prometheus_all_nan_min() {
         // Test that all-NaN returns NaN (not +inf from fold)
         let samples = vec![create_eval_samples(
@@ -2111,6 +2160,25 @@ mod tests {
                 let expected_max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
                 assert_eq!(computed_max, expected_max, "max_over_time should return exact maximum");
+            }
+
+            /// Test that range_over_time is exactly max_over_time - min_over_time
+            #[test]
+            fn range_over_time_is_max_minus_min(
+                values in prop::collection::vec(finite_f64(), 1..100)
+            ) {
+                let last_ts = (values.len() as i64 - 1) * 1000;
+                let points: Vec<(i64, f64)> =
+                    values.iter().enumerate().map(|(i, &v)| ((i as i64) * 1000, v)).collect();
+                let call = |name: &str| {
+                    let samples = vec![create_eval_samples(points.clone(), Labels::default())];
+                    call_rollup_function(name, samples, last_ts, 1000)[0].value
+                };
+
+                let range = call("range_over_time");
+                let expected = call("max_over_time") - call("min_over_time");
+
+                assert_eq!(range.to_bits(), expected.to_bits(), "range_over_time should equal max - min");
             }
 
             /// Test that count_over_time returns the correct count

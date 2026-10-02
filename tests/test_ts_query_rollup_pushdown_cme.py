@@ -116,7 +116,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         # Every rollup kind is covered, the experimental ones included
         # (`first_over_time`, `mad_over_time`, `ts_of_*_over_time`,
-        # `double_exponential_smoothing`), and those are off by default.
+        # `range_over_time`, `double_exponential_smoothing`, the state
+        # functions), and those are off by default.
         lines = super().get_config_file_lines(test_dir, port)
         return [f'{line} ts-promql-enable-experimental-functions yes'
                 if line.startswith('loadmodule ') else line
@@ -380,6 +381,9 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
             ('max_over_time',
              {'api-1': 5, 'api-2': 50, 'api-3': 500,
               'web-1': 10, 'web-2': 15, 'web-3': 8}),
+            ('range_over_time',
+             {'api-1': 3, 'api-2': 30, 'api-3': 300,
+              'web-1': 6, 'web-2': 9, 'web-3': 1}),
             ('first_over_time',
              {'api-1': 2, 'api-2': 20, 'api-3': 200,
               'web-1': 4, 'web-2': 6, 'web-3': 7}),
@@ -524,6 +528,34 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
 
         with pytest.raises(ResponseError):
             self.instant_query(f'state_count_over_time(mem_usage[{RANGE}], NaN)')
+
+    def test_range_over_time_across_shards(self):
+        """`range_over_time` is `max_over_time - min_over_time`, per window and
+        per series, whichever shard holds the series."""
+        self.setup_fleet()
+
+        # A stepped grid: the T0 window holds one sample (no spread), the
+        # T0+60 window three, the T0+120 window four.
+        result = self.range_query(f'range_over_time(mem_usage[{RANGE}])')
+        self.assert_steps_exact(
+            self.steps_by_instance(result),
+            {'api-1': [0, 2, 3], 'api-2': [0, 20, 30], 'api-3': [0, 200, 300],
+             'web-1': [0, 4, 6], 'web-2': [0, 6, 9], 'web-3': [0, 0, 1]},
+            context='range')
+
+        reference = self.range_query(
+            f'max_over_time(mem_usage[{RANGE}]) - min_over_time(mem_usage[{RANGE}])')
+        self.assert_steps_exact(
+            self.matrix_by_labelset(result), self.matrix_by_labelset(reference),
+            context='range_over_time == max - min')
+
+        result = self.instant_query(
+            f'sum by (job) (range_over_time(mem_usage[{RANGE}]))')
+        self.assert_values_exact(self.values_by_label(result, 'job'),
+                                 {'api': 333, 'web': 16}, context='sum by (job)')
+
+        with pytest.raises(ResponseError):
+            self.instant_query(f'range_over_time(mem_usage[{RANGE}], 1)')
 
     def test_ts_of_functions_across_shards(self):
         """The `ts_of_*` family returns a timestamp in seconds.
@@ -1109,6 +1141,9 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'state_duration_over_time(mem_usage[3m], 7)',
         'state_count_over_time(mem_usage[2m], 8)',
         'state_count_over_time(mem_usage[3m], 7)',
+        'range_over_time(mem_usage[2m])',
+        'range_over_time(mem_usage[30s])',
+        'range_over_time(sparse_metric[1m])',
     ]
 
     EQUIVALENCE_RANGE = [
@@ -1134,6 +1169,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'state_duration_over_time(mem_usage[2m], 7)',
         'state_duration_over_time(mem_usage[2m], 8, "500ms")',
         'state_count_over_time(mem_usage[2m], 7)',
+        'range_over_time(mem_usage[2m])',
+        'range_over_time(mem_usage[2m] offset 60s)',
     ]
 
     # Fused: the coordinator merges per-shard partials, whose summation order
@@ -1154,6 +1191,8 @@ class TestPromQLRollupPushdownCluster(ValkeyTimeSeriesClusterTestCase):
         'count(state_duration_over_time(mem_usage[1m], 8))',
         'sum by (job) (state_count_over_time(mem_usage[2m], 7))',
         'avg(state_count_over_time(mem_usage[1m], 8))',
+        'max by (job) (range_over_time(mem_usage[2m]))',
+        'sum(range_over_time(mem_usage[1m]))',
         'quantile by (job) (0.5, sum_over_time(mem_usage[2m]))',
         'sum by (job) (sum_over_time(no_such_metric[2m]))',
     ]

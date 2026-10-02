@@ -219,6 +219,7 @@ enum RollupKind {
   ROLLUP_KIND_CHANGES = 24;
   ROLLUP_KIND_STATE_DURATION_OVER_TIME = 25;
   ROLLUP_KIND_STATE_COUNT_OVER_TIME = 26;
+  ROLLUP_KIND_RANGE_OVER_TIME = 27;
 }
 
 /// The range-vector function half of a grid query: `rate(m[5m])`'s `rate` and

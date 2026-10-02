@@ -21,8 +21,8 @@ use crate::promql::functions::rate::{DeltaFunction, IncreaseFunction, RateFuncti
 use crate::promql::functions::rollup_functions::{
     AbsentOverTimeFunction, AvgOverTimeFunction, CountOverTimeFunction, FirstOverTimeFunction,
     LastOverTimeFunction, MadOverTimeFunction, MaxOverTimeFunction, MinOverTimeFunction,
-    PresentOverTimeFunction, QuantileOverTimeFunction, StddevOverTimeFunction,
-    StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
+    PresentOverTimeFunction, QuantileOverTimeFunction, RangeOverTimeFunction,
+    StddevOverTimeFunction, StdvarOverTimeFunction, SumOverTimeFunction, TsOfFirstOverTimeFunction,
     TsOfLastOverTimeFunction, TsOfMaxOverTimeFunction, TsOfMinOverTimeFunction,
 };
 use crate::promql::functions::sort::{
@@ -288,6 +288,7 @@ macro_rules! promql_function_list {
                 "quantile_over_time",
                 QuantileOverTimeFunction
             ),
+            (RangeOverTime, "range_over_time", RangeOverTimeFunction),
             (Rate, "rate", RateFunction),
             (Increase, "increase", IncreaseFunction),
             (Resets, "resets", ResetsFunction),

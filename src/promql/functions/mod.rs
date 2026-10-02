@@ -45,10 +45,10 @@ pub(crate) fn register_parser_functions() -> Result<(), String> {
     static REGISTERED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     REGISTERED
         .get_or_init(|| {
-            promql_parser::parser::register_extra_functions(vec![
-                state::duration_parser_function(),
-                state::count_parser_function(),
-            ])
+            let mut functions = rollup_functions::get_extended_rollup_functions();
+            functions.push(state::duration_parser_function());
+            functions.push(state::count_parser_function());
+            promql_parser::parser::register_extra_functions(functions)
         })
         .clone()
 }

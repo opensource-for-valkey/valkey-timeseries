@@ -4361,6 +4361,7 @@ mod tests {
             "count_over_time(metric[1m])",
             "min_over_time(metric[1m])",
             "max_over_time(metric[1m])",
+            "range_over_time(metric[1m])",
             "stddev_over_time(metric[1m])",
             "present_over_time(metric[1m])",
             "quantile_over_time(0.5, metric[1m])",
@@ -4410,10 +4411,11 @@ mod tests {
         }
     }
 
-    /// The state functions are registered as experimental, so they must be
-    /// refused unless the request enables experimental functions.
+    /// The state functions and `range_over_time` are registered as
+    /// experimental, so they must be refused unless the request enables
+    /// experimental functions.
     #[test]
-    fn state_functions_are_experimental() {
+    fn extension_functions_are_experimental() {
         let reader = rollup_reader();
         let options = QueryOptions {
             timeout: None,
@@ -4421,10 +4423,14 @@ mod tests {
             ..QueryOptions::default()
         };
         let evaluator = Evaluator::new(&reader, options);
-        for name in ["state_duration_over_time", "state_count_over_time"] {
+        for (name, args) in [
+            ("state_duration_over_time", ", 12"),
+            ("state_count_over_time", ", 12"),
+            ("range_over_time", ""),
+        ] {
             let err = parse_and_evaluate(
                 &evaluator,
-                &format!("{name}(metric[1m], 12)"),
+                &format!("{name}(metric[1m]{args})"),
                 UNIX_EPOCH + Duration::from_secs(120),
                 Duration::from_secs(300),
             )
@@ -4481,6 +4487,10 @@ mod tests {
             r#"state_count_over_time(metric[1m], 12, "1s")"#,
             r#"state_count_over_time(metric[1m], "12")"#,
             "state_count_over_time(metric, 12)",
+            "range_over_time()",
+            "range_over_time(metric)",
+            "range_over_time(metric[1m], 1)",
+            "range_over_time(1)",
         ] {
             let err = parse_and_evaluate(&evaluator, query, at, Duration::from_secs(300))
                 .expect_err(query)
@@ -4503,6 +4513,7 @@ mod tests {
             ("sum_over_time(metric[1m])", 57.0),
             ("min_over_time(metric[1m])", 7.0),
             ("max_over_time(metric[1m])", 12.0),
+            ("range_over_time(metric[1m])", 5.0),
             ("avg_over_time(metric[1m])", 9.5),
             ("last_over_time(metric[1m])", 12.0),
             ("first_over_time(metric[1m])", 7.0),
@@ -6059,6 +6070,159 @@ mod tests {
             rows.iter().any(|(_, _, v)| v == "0.0"),
             "open doors answer 0"
         );
+    }
+
+    // ── range_over_time push-down ───────────────────────────────────────
+    //
+    // A parameterless window statistic: `max_over_time - min_over_time` in one
+    // pass, shipped like `max_over_time` with nothing but its kind and window.
+
+    #[test]
+    fn should_push_down_range_over_time_without_parameters() {
+        let query = "range_over_time(metric[1m])";
+        let (pushed, offered) = evaluate_rollup_pushdown(query, 120_000, GridAnswer::Evaluated);
+        assert_eq!(offered.len(), 1, "instant offered once");
+        let rollup = offered[0].rollup.as_ref().unwrap();
+        assert_eq!(rollup.kind, RollupKind::RangeOverTime);
+        assert_eq!(rollup.param, None, "no parameter");
+        assert_eq!(rollup.unit_ms, None, "no unit");
+        // Window (60s, 120s] holds 7..12.
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].value, 5.0);
+
+        let (_, offered) =
+            evaluate_range_with_pushdown(query, 0, 300_000, 30_000, GridAnswer::Evaluated);
+        assert_eq!(offered.len(), 1, "one grid request");
+        assert_eq!(offered[0].kind(), RollupKind::RangeOverTime);
+    }
+
+    /// A series whose windows hold NaNs and infinities, which is where a
+    /// one-pass `max - min` could part ways with the two functions it fuses.
+    fn non_finite_rollup_reader() -> MemorySeriesQuerier {
+        let mut builder = MockQueryReaderBuilder::new();
+        let labels = create_labels("metric", vec![("job", "api")]);
+        for (ts, value) in [
+            (0i64, f64::NAN),
+            (10_000, 4.0),
+            (20_000, f64::NAN),
+            (30_000, -2.0),
+            (40_000, 6.0),
+            (90_000, f64::NAN),
+            (100_000, f64::NAN),
+            (150_000, f64::INFINITY),
+            (160_000, 3.0),
+            (210_000, f64::INFINITY),
+            (220_000, f64::INFINITY),
+            (270_000, f64::NEG_INFINITY),
+            (280_000, f64::INFINITY),
+        ] {
+            builder.add_sample(&labels, Sample::new(ts, value));
+        }
+        builder.build()
+    }
+
+    /// `range_over_time` is `max_over_time - min_over_time` at every step,
+    /// NaN and infinities included, and push-down — fused or not — does not
+    /// change that.
+    #[test]
+    fn should_match_max_minus_min_for_range_over_time() {
+        let readers: [RollupDataset; 4] = [
+            ("dense", rollup_reader),
+            ("gappy", gappy_rollup_reader),
+            ("grouped", grouped_rollup_reader),
+            ("non-finite", non_finite_rollup_reader),
+        ];
+        for (dataset, reader) in readers {
+            for range in ["10s", "30s", "1m", "3m"] {
+                let query = format!("range_over_time(metric[{range}])");
+                let reference =
+                    format!("max_over_time(metric[{range}]) - min_over_time(metric[{range}])");
+                let (expected, _) = evaluate_range_with_pushdown_on(
+                    reader(),
+                    &reference,
+                    0,
+                    300_000,
+                    30_000,
+                    GridAnswer::Local,
+                );
+                let expected = rendered_steps(expected);
+                assert!(!expected.is_empty(), "{dataset}/{query}: has answers");
+
+                for answer in [GridAnswer::Local, GridAnswer::Evaluated, GridAnswer::Raw] {
+                    let (got, _) = evaluate_range_with_pushdown_on(
+                        reader(),
+                        &query,
+                        0,
+                        300_000,
+                        30_000,
+                        answer,
+                    );
+                    assert_eq!(
+                        rendered_steps(got),
+                        expected,
+                        "{dataset}/{query} ({answer:?})"
+                    );
+                }
+            }
+        }
+
+        // The non-finite fixture really does reach the edge cases.
+        let (steps, _) = evaluate_range_with_pushdown_on(
+            non_finite_rollup_reader(),
+            "range_over_time(metric[20s])",
+            0,
+            300_000,
+            10_000,
+            GridAnswer::Evaluated,
+        );
+        let values: Vec<String> = rendered_steps(steps)
+            .into_iter()
+            .map(|(_, _, v)| v)
+            .collect();
+        for want in ["NaN", "inf", "0.0", "8.0"] {
+            assert!(
+                values.iter().any(|v| v == want),
+                "{want} missing from {values:?}"
+            );
+        }
+    }
+
+    /// Aggregations over `range_over_time` fuse like any other rollup.
+    #[test]
+    fn should_match_local_evaluation_for_fused_range_over_time() {
+        for query in [
+            "sum by (job) (range_over_time(metric[1m]))",
+            "max(range_over_time(metric[3m]))",
+            "avg without (instance) (range_over_time(metric[1m]))",
+            "count(range_over_time(metric[1m]) >= 5)",
+        ] {
+            let (local, _) = evaluate_range_with_pushdown_on(
+                grouped_rollup_reader(),
+                query,
+                0,
+                300_000,
+                30_000,
+                GridAnswer::Local,
+            );
+            let local = rendered_steps(local);
+            assert!(!local.is_empty(), "{query}: has answers");
+            for answer in [GridAnswer::Evaluated, GridAnswer::Raw] {
+                let (pushed, offered) = evaluate_range_with_pushdown_on(
+                    grouped_rollup_reader(),
+                    query,
+                    0,
+                    300_000,
+                    30_000,
+                    answer,
+                );
+                assert!(!offered.is_empty(), "{query}: pushed down");
+                assert_steps_near(
+                    local.clone(),
+                    rendered_steps(pushed),
+                    &format!("{query} ({answer:?})"),
+                );
+            }
+        }
     }
 
     /// One request for the whole grid, fused — not one per step, and not a

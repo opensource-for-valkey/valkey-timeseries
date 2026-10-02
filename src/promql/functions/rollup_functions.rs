@@ -19,6 +19,8 @@ use crate::promql::functions::utils::{
 };
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvaluationError, ExprResult};
 use promql_parser::parser::Expr;
+use promql_parser::parser::Function;
+use promql_parser::parser::value::ValueType;
 // https://github.com/VictoriaMetrics/VictoriaMetrics/blob/master/app/vmselect/promql/rollup.go
 
 /// A range-vector function that a shard can evaluate on its own.
@@ -64,6 +66,7 @@ pub enum RollupKind {
     Changes,
     StateDurationOverTime,
     StateCountOverTime,
+    RangeOverTime,
 }
 
 /// How a rollup reduces one window, mirroring the shapes the local evaluation
@@ -135,7 +138,8 @@ impl RollupKind {
             "resets" => RollupKind::Resets,
             "changes" => RollupKind::Changes,
             "state_duration_over_time" => RollupKind::StateDurationOverTime,
-            "state_count_over_time" => RollupKind::StateCountOverTime
+            "state_count_over_time" => RollupKind::StateCountOverTime,
+            "range_over_time" => RollupKind::RangeOverTime
         )
         .copied()
     }
@@ -173,6 +177,7 @@ impl RollupKind {
             Changes => "changes",
             StateDurationOverTime => "state_duration_over_time",
             StateCountOverTime => "state_count_over_time",
+            RangeOverTime => "range_over_time",
         }
     }
 
@@ -252,6 +257,7 @@ impl RollupKind {
             Changes,
             StateDurationOverTime,
             StateCountOverTime,
+            RangeOverTime,
         ];
         for kind in all {
             // Exhaustive: adding a variant without adding it above fails to
@@ -282,7 +288,8 @@ impl RollupKind {
                 | Resets
                 | Changes
                 | StateDurationOverTime
-                | StateCountOverTime => {}
+                | StateCountOverTime
+                | RangeOverTime => {}
             }
         }
         all.to_vec()
@@ -321,6 +328,7 @@ impl RollupKind {
                 RollupImpl::WholeWindowWithUnit(state_duration_window)
             }
             RollupKind::StateCountOverTime => RollupImpl::Windowed(rollup_state_count),
+            RollupKind::RangeOverTime => RollupImpl::Windowed(rollup_range),
         }
     }
 
@@ -488,6 +496,7 @@ make_rollup_function!(AvgOverTimeFunction, "avg_over_time", rollup_avg);
 make_rollup_function!(MinOverTimeFunction, "min_over_time", rollup_min);
 make_rollup_function!(MadOverTimeFunction, "mad_over_time", rollup_mad);
 make_rollup_function!(MaxOverTimeFunction, "max_over_time", rollup_max);
+make_rollup_function!(RangeOverTimeFunction, "range_over_time", rollup_range);
 make_rollup_function!(SumOverTimeFunction, "sum_over_time", rollup_sum);
 make_rollup_function!(
     TsOfMinOverTimeFunction,
@@ -582,6 +591,27 @@ fn rollup_max(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
         }
     }
     max
+}
+
+/// `range_over_time`: `max_over_time - min_over_time`, in one pass.
+///
+/// Both ends follow [`rollup_min`] and [`rollup_max`] exactly — a NaN is
+/// replaced by any later real value — so the answer is the difference of the
+/// two functions' answers, including NaN for an all-NaN window. Infinities
+/// subtract as IEEE says: `+Inf` and `-Inf` give `+Inf`, an all-`+Inf` window
+/// gives NaN.
+fn rollup_range(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
+    let mut min = rfa.values[0];
+    let mut max = min;
+    for &cur in rfa.values.iter().skip(1) {
+        if cur < min || min.is_nan() {
+            min = cur;
+        }
+        if cur > max || max.is_nan() {
+            max = cur;
+        }
+    }
+    max - min
 }
 
 fn rollup_ts_of_min(rfa: &RollupWindow, _param: Option<f64>) -> f64 {
@@ -752,6 +782,19 @@ impl PromQLFunction for QuantileOverTimeFunction {
     }
 }
 
+/// Parser-side declarations for the rollups that are not PromQL built-ins.
+/// Each is experimental, so a request must enable experimental functions to
+/// call it.
+pub(in crate::promql) fn get_extended_rollup_functions() -> Vec<Function> {
+    vec![Function::new(
+        "range_over_time",
+        vec![ValueType::Matrix],
+        0,
+        ValueType::Vector,
+        true,
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +963,53 @@ mod tests {
         assert!(with_context.iter().any(|s| s.value == 3.0));
         assert!(with_context.iter().any(|s| s.value == 0.0));
         assert_eq!(with_context, isolated);
+    }
+
+    /// `range_over_time` folds `max_over_time - min_over_time` into one pass;
+    /// the two must agree bit for bit, including where NaN and the infinities
+    /// make a naive fold go wrong.
+    #[test]
+    fn rollup_range_is_max_minus_min() {
+        let nan = f64::NAN;
+        let inf = f64::INFINITY;
+        let cases: &[&[f64]] = &[
+            &[1.0],
+            &[3.0, 1.0, 2.0],
+            &[nan, 2.0, 5.0],
+            &[2.0, nan, 5.0],
+            &[5.0, 2.0, nan],
+            &[nan],
+            &[nan, nan, nan],
+            &[-inf, 3.0, inf],
+            &[inf, inf],
+            &[-inf, -inf],
+            &[nan, -inf, nan],
+            &[-0.0, 0.0],
+        ];
+        for values in cases {
+            let timestamps: Vec<Timestamp> = (0..values.len() as i64).collect();
+            let window = RollupWindow {
+                values,
+                timestamps: &timestamps,
+                ..RollupWindow::default()
+            };
+            let want = rollup_max(&window, None) - rollup_min(&window, None);
+            let got = rollup_range(&window, None);
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "{values:?}: want {want}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_over_time_takes_no_params() {
+        assert!(RollupKind::RangeOverTime.check_params(None, None).is_ok());
+        assert!(
+            RollupKind::RangeOverTime
+                .check_params(None, Some(1_000))
+                .is_err()
+        );
     }
 
     #[test]
