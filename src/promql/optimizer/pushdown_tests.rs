@@ -140,6 +140,15 @@ mod tests {
     #[case(r#"{a="b"} + on(c) group_left() {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on(a,c) group_left() {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on(d) group_left() {c="d"}"#, r#"{a="b"}"#)]
+    // A label named in the group clause is taken from the "one" side: a filter
+    // on it from the "many" side holds only when the label is matched on too.
+    #[case(r#"{a="b"} + on(c) group_left(a) {c="d"}"#, r#"{c="d"}"#)]
+    #[case(r#"{a="b"} + on() group_left(a) {c="d"}"#, "")]
+    #[case(r#"{a="b"} + ignoring(a) group_left(a) {c="d"}"#, r#"{c="d"}"#)]
+    #[case(r#"{a="b"} + ignoring(x) group_left(a) {c="d"}"#, r#"{a="b",c="d"}"#)]
+    #[case(r#"{a="b"} + on(a) group_right(c) {c="d"}"#, r#"{a="b"}"#)]
+    #[case(r#"{a="b"} + ignoring(c) group_right(c) {c="d"}"#, r#"{a="b"}"#)]
+    #[case(r#"{a="b"} + ignoring(x) group_right(c) {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on() group_right(s) {c="d"}"#, r#"{c="d"}"#)]
     #[case(r#"{a="b"} + On(a) groUp_right() {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on(c) group_right() {c="d"}"#, r#"{c="d"}"#)]
@@ -249,6 +258,24 @@ mod tests {
     #[case(
         r#"foo{x="y"} * on(a) group_right(x, y) baz{a="b"}"#,
         r#"foo{a="b", x="y"} * on (a) group_right (x, y) baz{a="b"}"#
+    )]
+    // The joined `a` is bar's, not foo's: `a="x"` must not reach baz.
+    #[case(
+        r#"baz and on(a) (foo{a="x"} * on(instance) group_left(a) bar)"#,
+        r#"baz and on(a) (foo{a="x"} * on(instance) group_left(a) bar)"#
+    )]
+    #[case(
+        r#"(foo{a="x"} * on(instance) group_left(a) bar) and on(a) baz"#,
+        r#"(foo{a="x"} * on(instance) group_left(a) bar) and on(a) baz"#
+    )]
+    #[case(
+        r#"baz and on(a) (foo * on(instance) group_right(a) bar{a="x"})"#,
+        r#"baz and on(a) (foo * on(instance) group_right(a) bar{a="x"})"#
+    )]
+    // Matched on as well as copied: both sides agree, so the filter crosses.
+    #[case(
+        r#"baz and on(a) (foo{a="x"} * ignoring(x) group_left(a) bar)"#,
+        r#"baz{a="x"} and on(a) (foo{a="x"} * ignoring(x) group_left(a) bar{a="x"})"#
     )]
     #[case(r#"foo AND bar{baz="aa"}"#, r#"foo{baz="aa"} and bar{baz="aa"}"#)]
     #[case(

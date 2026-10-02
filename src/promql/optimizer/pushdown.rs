@@ -3,6 +3,7 @@ use crate::promql::binops::can_push_down_common_filters;
 use crate::promql::functions::{PromqlFunctionKind, resolve_function};
 use crate::promql::hashers::FingerprintHashSet;
 use ahash::HashSetExt;
+use promql_parser::label::Labels;
 use promql_parser::label::{METRIC_NAME, Matcher, Matchers};
 use promql_parser::parser::token::{T_COUNT_VALUES, T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
@@ -208,24 +209,30 @@ pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<
                 _ => {
                     match join_modifier {
                         // group_left
-                        VectorMatchCardinality::ManyToOne(_) => {
+                        VectorMatchCardinality::ManyToOne(include) => {
                             // {f1} * group_left() {f2} -> {f1, f2}
                             // {f1} * on() group_left() {f2} -> {f1}
                             // {f1} * on(f1) group_left() {f2} -> {f1}
                             // {f1} * on(f2) group_left() {f2} -> {f1, f2}
                             // {f1} * on(f1, f2) group_left() {f2} -> {f1, f2}
                             // {f1} * on(f3) group_left() {f2} -> {f1}
+                            // {f1} * on(f3) group_left(f1) {f2} -> {}
+                            // {f1} * ignoring(f1) group_left(f1) {f2} -> {}
+                            // {f1} * ignoring(f3) group_left(f1) {f2} -> {f1}
+                            drop_overwritten_label_filters(&mut lfs_left, include, group_modifier);
                             trim_filters_by_match_modifier(&mut lfs_right, group_modifier);
                             union_label_filters(lfs_left, lfs_right)
                         }
                         // group_right
-                        VectorMatchCardinality::OneToMany(_) => {
+                        VectorMatchCardinality::OneToMany(include) => {
                             // {f1} * group_right() {f2} -> {f1, f2}
                             // {f1} * on() group_right() {f2} -> {f2}
                             // {f1} * on(f1) group_right() {f2} -> {f1, f2}
                             // {f1} * on(f2) group_right() {f2} -> {f2}
                             // {f1} * on(f1, f2) group_right() {f2} -> {f1, f2}
                             // {f1} * on(f3) group_right() {f2} -> {f2}
+                            // {f1} * on(f3) group_right(f2) {f2} -> {}
+                            drop_overwritten_label_filters(&mut lfs_right, include, group_modifier);
                             trim_filters_by_match_modifier(&mut lfs_left, group_modifier);
                             union_label_filters(lfs_left, lfs_right)
                         }
@@ -280,6 +287,36 @@ fn trim_filters_by_aggr_modifier(lfs: &mut Vec<Matcher>, afe: &AggregateExpr) {
             LabelModifier::Exclude(args) => filter_label_filters_ignoring(lfs, &args.labels),
         },
     }
+}
+
+/// Drop from `lfs` — the common filters of the "many" side of a
+/// `group_left(...)`/`group_right(...)` — those on a label the group clause
+/// names. The result carries the *other* operand's value for such a label
+/// (or no label at all, when that operand lacks it), so a filter on the
+/// many side says nothing about the result. The one exception is a label
+/// that also takes part in the matching: both sides are then known to agree
+/// on it, and the filter holds. `on()` may not share a label with the group
+/// clause (the parser rejects it), so under `on()` every named label is
+/// overwritten; under `ignoring()` only the ignored ones are; and with no
+/// matching modifier every label is matched on, so nothing is dropped.
+fn drop_overwritten_label_filters(
+    lfs: &mut Vec<Matcher>,
+    include: &Labels,
+    group_modifier: &Option<LabelModifier>,
+) {
+    if include.labels.is_empty() || lfs.is_empty() {
+        return;
+    }
+    lfs.retain(|m| {
+        if !include.labels.contains(&m.name) {
+            return true;
+        }
+        match group_modifier {
+            None => true,
+            Some(LabelModifier::Include(on)) => on.labels.contains(&m.name),
+            Some(LabelModifier::Exclude(ignoring)) => !ignoring.labels.contains(&m.name),
+        }
+    });
 }
 
 /// Trims lfs by the specified be.modifier.matching (e.g., on() or ignoring()).

@@ -674,6 +674,40 @@ mod tests {
         );
     }
 
+    /// `group_left(a)` writes bar's `a` onto the result, so what the index
+    /// proves about foo's `a` is not true of the join, and must not narrow
+    /// the operand matched on it.
+    #[test]
+    fn a_label_the_group_clause_overwrites_does_not_cross() {
+        const FOO: SeriesTable<'static> = &[
+            &[("__name__", "foo"), ("a", "x"), ("instance", "i1")],
+            &[("__name__", "foo"), ("a", "x"), ("instance", "i2")],
+        ];
+        const BAR: SeriesTable<'static> = &[
+            &[("__name__", "bar"), ("a", "y"), ("instance", "i1")],
+            &[("__name__", "bar"), ("a", "z"), ("instance", "i2")],
+        ];
+        const BAZ: SeriesTable<'static> = &[
+            &[("__name__", "baz"), ("a", "y")],
+            &[("__name__", "baz"), ("a", "z")],
+        ];
+        let reader = TableReader::new(vec![("foo", FOO), ("bar", BAR), ("baz", BAZ)]);
+        assert_eq!(
+            rewrite(
+                r#"baz and on(a) (foo * on(instance) group_left(a) bar)"#,
+                &reader
+            ),
+            r#"baz and on (a) (foo * on (instance) group_left (a) bar)"#
+        );
+        assert_eq!(
+            rewrite(
+                r#"baz and on(a) (bar * on(instance) group_right(a) foo)"#,
+                &reader
+            ),
+            r#"baz and on (a) (bar * on (instance) group_right (a) foo)"#
+        );
+    }
+
     #[test]
     fn an_aggregated_operand_contributes_its_grouping_labels_only() {
         let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
@@ -767,9 +801,30 @@ mod tests {
                 }
             }
         }
+        // `foo` carries one `a` everywhere, `bar` and `baz` others: the
+        // join's `a` is bar's, and narrowing `baz` by foo's would empty it.
+        for (name, a, instance) in [
+            ("foo", "x", Some("i1")),
+            ("foo", "x", Some("i2")),
+            ("bar", "y", Some("i1")),
+            ("bar", "z", Some("i2")),
+            ("baz", "y", None),
+            ("baz", "z", None),
+        ] {
+            let mut pairs = vec![("__name__", name), ("a", a)];
+            if let Some(instance) = instance {
+                pairs.push(("instance", instance));
+            }
+            let labels = Labels::from_pairs(&pairs);
+            for point in 0..=200 {
+                querier.add_sample(&labels, Sample::new(point * 10_000, 1.0));
+            }
+        }
         let reader: Arc<dyn QueryReader> = Arc::new(querier);
 
         let queries = [
+            r#"baz and on(a) (foo * on(instance) group_left(a) bar)"#,
+            r#"baz and on(a) (bar * on(instance) group_right(a) foo)"#,
             r#"cpu{region="us"} - cpu offset 5m"#,
             r#"cpu{region="us"} / on(host) mem"#,
             r#"cpu{region="us", host="h0"} / ignoring(host, metric, kind) mem{host="h2"}"#,
