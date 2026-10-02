@@ -722,6 +722,35 @@ mod tests {
         );
     }
 
+    /// A grouped join's result carries the many side's labels and the group
+    /// clause's labels from the one side: a filter reaching it from above goes
+    /// to whichever side the label comes from — and nowhere under `fill()`.
+    #[test]
+    fn a_filter_reaching_a_grouped_join_goes_to_the_side_its_label_comes_from() {
+        let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
+        assert_eq!(
+            rewrite(
+                r#"(cpu offset 1m * on(host) group_left cpu offset 2m) and on(region) cpu{region="us"}"#,
+                &reader
+            ),
+            r#"(cpu{region="us"} offset 1m * on (host) group_left () cpu offset 2m) and on (region) cpu{region="us"}"#
+        );
+        assert_eq!(
+            rewrite(
+                r#"cpu{region="us"} and on(region) (cpu offset 1m * on(host) group_left(region) cpu offset 2m)"#,
+                &reader
+            ),
+            r#"cpu{region="us"} and on (region) (cpu offset 1m * on (host) group_left (region) cpu{region="us"} offset 2m)"#
+        );
+        assert_eq!(
+            rewrite(
+                r#"(cpu offset 1m * on(host) group_left fill(0) cpu offset 2m) and on(region) cpu{region="us"}"#,
+                &reader
+            ),
+            r#"(cpu offset 1m * on (host) group_left () fill (0) cpu offset 2m) and on (region) cpu{region="us"}"#
+        );
+    }
+
     #[test]
     fn an_aggregated_operand_contributes_its_grouping_labels_only() {
         let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
@@ -846,6 +875,10 @@ mod tests {
             r#"(cpu{region="us"} * on(host) group_left mem) and on(region) cpu offset 5m"#,
             r#"(mem{region="eu"} * on(host) group_left cpu) unless on(region, kind) mem{region="us"}"#,
             r#"label_replace(cpu{region="ap"}, "metric", "m", "", "") and on(region) mem"#,
+            r#"(cpu * on(host) group_left(kind) mem) and on(region) cpu{region="us"} offset 5m"#,
+            r#"(mem * on(host) group_left(metric) cpu) and on(metric, region) cpu{region="eu"}"#,
+            r#"cpu{region="us"} and on(region) (mem * on(host) group_left(region) cpu{region="us"})"#,
+            r#"(cpu * on(host) group_left(kind) fill(0) mem) and on(region) cpu{region="us"} offset 5m"#,
             r#"cpu and on(host) mem{host=~"h[0-3]"}"#,
             r#"cpu unless on(host) mem{region="ap"}"#,
             r#"cpu{region="us"} or mem"#,

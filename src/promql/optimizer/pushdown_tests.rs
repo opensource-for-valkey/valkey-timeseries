@@ -36,7 +36,7 @@ mod tests {
     #[case(
         r#"foo == on(x) group_LEft bar"#,
         r#"{a="b"}"#,
-        r#"foo == on (x) group_left () bar"#
+        r#"foo{a="b"} == on (x) group_left () bar"#
     )]
     #[case(
         r#"foo{x="y"} > ignoRIng(x) group_left(abc) bar"#,
@@ -68,7 +68,7 @@ mod tests {
     #[case(
         r#"(foo * on(x) group_left bar) + baz"#,
         r#"{x="1",y="2"}"#,
-        r#"(foo{x="1"} * on (x) group_left () bar{x="1"}) + baz{x="1", y="2"}"#
+        r#"(foo{x="1", y="2"} * on (x) group_left () bar{x="1"}) + baz{x="1", y="2"}"#
     )]
     #[case(
         r#"foo{f1!~"x"} UNLEss bar{f2=~"y.+"}"#,
@@ -166,6 +166,23 @@ mod tests {
     #[case(r#"{a="b"} + on(a) group_right(c) {c="d"}"#, r#"{a="b"}"#)]
     #[case(r#"{a="b"} + ignoring(c) group_right(c) {c="d"}"#, r#"{a="b"}"#)]
     #[case(r#"{a="b"} + ignoring(x) group_right(c) {c="d"}"#, r#"{a="b",c="d"}"#)]
+    // The one side's filters on a group-clause label hold for the result,
+    // which takes that label from it; its other unmatched labels do not reach
+    // the result at all.
+    #[case(
+        r#"{a="b"} + on(c) group_left(e) {c="d",e="f"}"#,
+        r#"{a="b",c="d",e="f"}"#
+    )]
+    #[case(r#"{a="b"} + on(c) group_left(e) {c="d",g="h"}"#, r#"{a="b",c="d"}"#)]
+    #[case(
+        r#"{a="b",e="x"} + on(c) group_left(e) {c="d",e="f"}"#,
+        r#"{a="b",c="d",e="f"}"#
+    )]
+    #[case(
+        r#"{a="z"} + ignoring(a) group_left(a) {a="y",c="d"}"#,
+        r#"{a="y",c="d"}"#
+    )]
+    #[case(r#"{a="b",e="f"} + on(c) group_right(a) {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on() group_right(s) {c="d"}"#, r#"{c="d"}"#)]
     #[case(r#"{a="b"} + On(a) groUp_right() {c="d"}"#, r#"{a="b",c="d"}"#)]
     #[case(r#"{a="b"} + on(c) group_right() {c="d"}"#, r#"{c="d"}"#)]
@@ -286,6 +303,33 @@ mod tests {
         r#"(foo{c="d"} * on(instance) group_left(a) bar) and on(c) baz"#,
         r#"(foo{c="d"} * on(instance) group_left(a) bar) and on(c) baz{c="d"}"#
     )]
+    // The joined `a` is bar's: bar's filter on it holds for the join, and
+    // narrows what the join is matched with.
+    #[case(
+        r#"baz and on(a) (foo * on(instance) group_left(a) bar{a="y"})"#,
+        r#"baz{a="y"} and on(a) (foo * on(instance) group_left(a) bar{a="y"})"#
+    )]
+    // A filter reaching a grouped join from above goes to the side whose
+    // label the result carries: the many side for its own labels...
+    #[case(
+        r#"(foo * on(instance) group_left(version) bar) and on(job) baz{job="api"}"#,
+        r#"(foo{job="api"} * on(instance) group_left(version) bar) and on(job) baz{job="api"}"#
+    )]
+    #[case(
+        r#"baz{job="api"} and on(job) (bar * on(instance) group_right(version) foo)"#,
+        r#"baz{job="api"} and on(job) (bar * on(instance) group_right(version) foo{job="api"})"#
+    )]
+    // ...the one side for a group-clause label.
+    #[case(
+        r#"(foo * on(instance) group_left(version) bar) and on(version) baz{version="1"}"#,
+        r#"(foo * on(instance) group_left(version) bar{version="1"}) and on(version) baz{version="1"}"#
+    )]
+    // With fill(), narrowing a side on an unmatched label could unmatch a
+    // series of the other side and make the fill synthesize a new result.
+    #[case(
+        r#"(foo * on(instance) group_left(version) fill(0) bar) and on(job) baz{job="api"}"#,
+        r#"(foo * on(instance) group_left(version) fill(0) bar) and on(job) baz{job="api"}"#
+    )]
     // The joined `a` is bar's, not foo's: `a="x"` must not reach baz.
     #[case(
         r#"baz and on(a) (foo{a="x"} * on(instance) group_left(a) bar)"#,
@@ -311,7 +355,7 @@ mod tests {
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on() group_left() {e="f"})"#,
-        r#"{a="b", c="d"} + ({c="d"} * on () group_left () {e="f"})"#
+        r#"{a="b", c="d"} + ({a="b", c="d"} * on () group_left () {e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(a) group_left() {e="f"})"#,
@@ -319,19 +363,19 @@ mod tests {
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(c) group_left() {e="f"})"#,
-        r#"{a="b", c="d"} + ({c="d"} * on (c) group_left () {c="d", e="f"})"#
+        r#"{a="b", c="d"} + ({a="b", c="d"} * on (c) group_left () {c="d", e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(e) group_left() {e="f"})"#,
-        r#"{a="b", c="d", e="f"} + ({c="d", e="f"} * on (e) group_left () {e="f"})"#
+        r#"{a="b", c="d", e="f"} + ({a="b", c="d", e="f"} * on (e) group_left () {e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(x) group_left() {e="f"})"#,
-        r#"{a="b", c="d"} + ({c="d"} * on (x) group_left () {e="f"})"#
+        r#"{a="b", c="d"} + ({a="b", c="d"} * on (x) group_left () {e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on() group_right() {e="f"})"#,
-        r#"{a="b", e="f"} + ({c="d"} * on () group_right () {e="f"})"#
+        r#"{a="b", e="f"} + ({c="d"} * on () group_right () {a="b", e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(a) group_right() {e="f"})"#,
@@ -339,15 +383,15 @@ mod tests {
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(c) group_right() {e="f"})"#,
-        r#"{a="b", c="d", e="f"} + ({c="d"} * on (c) group_right () {c="d", e="f"})"#
+        r#"{a="b", c="d", e="f"} + ({c="d"} * on (c) group_right () {a="b", c="d", e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(e) group_right() {e="f"})"#,
-        r#"{a="b", e="f"} + ({c="d", e="f"} * on (e) group_right () {e="f"})"#
+        r#"{a="b", e="f"} + ({c="d", e="f"} * on (e) group_right () {a="b", e="f"})"#
     )]
     #[case(
         r#"{a="b"} + ({c="d"} * on(x) group_right() {e="f"})"#,
-        r#"{a="b", e="f"} + ({c="d"} * on (x) group_right () {e="f"})"#
+        r#"{a="b", e="f"} + ({c="d"} * on (x) group_right () {a="b", e="f"})"#
     )]
     fn test_common_binary_expressions(#[case] q: &str, #[case] result_expected: &str) {
         validate_optimized(q, result_expected);

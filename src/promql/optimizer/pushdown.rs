@@ -219,8 +219,9 @@ pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<
                             // {f1} * on(f3) group_left(f1) {f2} -> {}
                             // {f1} * ignoring(f1) group_left(f1) {f2} -> {}
                             // {f1} * ignoring(f3) group_left(f1) {f2} -> {f1}
-                            drop_overwritten_label_filters(&mut lfs_left, include, group_modifier);
-                            trim_filters_by_match_modifier(&mut lfs_right, group_modifier);
+                            // {f1} * on(f3) group_left(f2) {f2} -> {f1, f2}
+                            retain_many_side_label_filters(&mut lfs_left, include, group_modifier);
+                            retain_one_side_label_filters(&mut lfs_right, include, group_modifier);
                             union_label_filters(lfs_left, lfs_right)
                         }
                         // group_right
@@ -232,8 +233,9 @@ pub fn get_common_label_filters_with(e: &Expr, leaves: &dyn LeafFilters) -> Vec<
                             // {f1} * on(f1, f2) group_right() {f2} -> {f1, f2}
                             // {f1} * on(f3) group_right() {f2} -> {f2}
                             // {f1} * on(f3) group_right(f2) {f2} -> {}
-                            drop_overwritten_label_filters(&mut lfs_right, include, group_modifier);
-                            trim_filters_by_match_modifier(&mut lfs_left, group_modifier);
+                            // {f1} * on(f3) group_right(f1) {f2} -> {f1, f2}
+                            retain_many_side_label_filters(&mut lfs_right, include, group_modifier);
+                            retain_one_side_label_filters(&mut lfs_left, include, group_modifier);
                             union_label_filters(lfs_left, lfs_right)
                         }
                         _ => {
@@ -289,34 +291,55 @@ fn trim_filters_by_aggr_modifier(lfs: &mut Vec<Matcher>, afe: &AggregateExpr) {
     }
 }
 
-/// Drop from `lfs` — the common filters of the "many" side of a
-/// `group_left(...)`/`group_right(...)` — those on a label the group clause
-/// names. The result carries the *other* operand's value for such a label
-/// (or no label at all, when that operand lacks it), so a filter on the
-/// many side says nothing about the result. The one exception is a label
-/// that also takes part in the matching: both sides are then known to agree
-/// on it, and the filter holds. `on()` may not share a label with the group
-/// clause (the parser rejects it), so under `on()` every named label is
-/// overwritten; under `ignoring()` only the ignored ones are; and with no
-/// matching modifier every label is matched on, so nothing is dropped.
-fn drop_overwritten_label_filters(
+/// Whether a grouped join matches its operands on `label`, i.e. both sides
+/// are known to carry the same value for it. `on()` and `ignoring()` are the
+/// only cases: a group clause cannot be written without one of them.
+fn is_matched_label(label: &str, matching: &Option<LabelModifier>) -> bool {
+    match matching {
+        None => true,
+        Some(LabelModifier::Include(on)) => on.labels.iter().any(|l| l == label),
+        Some(LabelModifier::Exclude(ignoring)) => !ignoring.labels.iter().any(|l| l == label),
+    }
+}
+
+/// Of filters on the "many" side of a `group_left(...)`/`group_right(...)`
+/// (the left of `group_left`, the right of `group_right`), keep those that
+/// hold for the join's result. A grouped join keeps every label of the many
+/// side except the ones the group clause names: those are written from the
+/// "one" side, or deleted when it has none, so a many-side filter on one says
+/// nothing about the result — unless the label is also matched on, and both
+/// sides agree on it. `on()` may not share a label with the group clause
+/// (the parser rejects it), so under `on()` every named label is overwritten.
+///
+/// The same set is what may be pushed *into* the many side from a filter
+/// known of the result: its result labels are its own labels, bar those.
+fn retain_many_side_label_filters(
     lfs: &mut Vec<Matcher>,
     include: &Labels,
-    group_modifier: &Option<LabelModifier>,
+    matching: &Option<LabelModifier>,
 ) {
-    if include.labels.is_empty() || lfs.is_empty() {
+    if include.labels.is_empty() {
         return;
     }
-    lfs.retain(|m| {
-        if !include.labels.contains(&m.name) {
-            return true;
-        }
-        match group_modifier {
-            None => true,
-            Some(LabelModifier::Include(on)) => on.labels.contains(&m.name),
-            Some(LabelModifier::Exclude(ignoring)) => !ignoring.labels.contains(&m.name),
-        }
-    });
+    lfs.retain(|m| !include.labels.contains(&m.name) || is_matched_label(&m.name, matching));
+}
+
+/// Of filters on the "one" side of a `group_left(...)`/`group_right(...)`,
+/// keep those that hold for the join's result: filters on a matched label,
+/// which the many side carries too, and filters on a label the group clause
+/// names, which the result takes from this side. A label the one side lacks
+/// is deleted from the result rather than copied, and a matcher treats a
+/// missing label as the empty value, so the filter holds either way. Every
+/// other label of the one side is absent from the result.
+///
+/// As with the many side, the same set is what may be pushed into the one
+/// side from a filter known of the result.
+fn retain_one_side_label_filters(
+    lfs: &mut Vec<Matcher>,
+    include: &Labels,
+    matching: &Option<LabelModifier>,
+) {
+    lfs.retain(|m| include.labels.contains(&m.name) || is_matched_label(&m.name, matching));
 }
 
 /// Trims lfs by the specified be.modifier.matching (e.g., on() or ignoring()).
@@ -489,18 +512,36 @@ pub fn push_down_binary_op_filters_in_place_with(
             push_down_binary_op_filters_in_place_with(&mut unary.expr, common_filters, leaves);
         }
         Binary(bo) => {
-            let trimmed;
-            let filters = match &bo.modifier {
-                Some(modifier) => {
-                    let mut lfs = common_filters.to_vec();
-                    trim_filters_by_match_modifier(&mut lfs, &modifier.matching);
-                    trimmed = lfs;
-                    &trimmed[..]
-                }
-                None => common_filters,
+            let Some(modifier) = &bo.modifier else {
+                push_down_binary_op_filters_in_place_with(&mut bo.lhs, common_filters, leaves);
+                push_down_binary_op_filters_in_place_with(&mut bo.rhs, common_filters, leaves);
+                return;
             };
-            push_down_binary_op_filters_in_place_with(&mut bo.lhs, filters, leaves);
-            push_down_binary_op_filters_in_place_with(&mut bo.rhs, filters, leaves);
+            // A grouped join's result carries the many side's labels and the
+            // group clause's labels from the one side, so each side can take
+            // the filters on its own labels, not only the matched ones. Not
+            // with `fill()`: narrowing one side on an unmatched label could
+            // leave a series of the other side unmatched, and the fill would
+            // then synthesize a result for it that was not there before.
+            let fills = modifier.fill_values.lhs.is_some() || modifier.fill_values.rhs.is_some();
+            let (mut lhs_filters, mut rhs_filters) =
+                (common_filters.to_vec(), common_filters.to_vec());
+            match &modifier.card {
+                VectorMatchCardinality::ManyToOne(include) if !fills => {
+                    retain_many_side_label_filters(&mut lhs_filters, include, &modifier.matching);
+                    retain_one_side_label_filters(&mut rhs_filters, include, &modifier.matching);
+                }
+                VectorMatchCardinality::OneToMany(include) if !fills => {
+                    retain_one_side_label_filters(&mut lhs_filters, include, &modifier.matching);
+                    retain_many_side_label_filters(&mut rhs_filters, include, &modifier.matching);
+                }
+                _ => {
+                    trim_filters_by_match_modifier(&mut lhs_filters, &modifier.matching);
+                    trim_filters_by_match_modifier(&mut rhs_filters, &modifier.matching);
+                }
+            }
+            push_down_binary_op_filters_in_place_with(&mut bo.lhs, &lhs_filters, leaves);
+            push_down_binary_op_filters_in_place_with(&mut bo.rhs, &rhs_filters, leaves);
         }
         Aggregate(aggr) => {
             // Grouping labels pass through an aggregation unchanged, so a filter
