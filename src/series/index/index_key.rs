@@ -5,30 +5,61 @@ use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
+/// A `name=value` label-index key, NUL-terminated so no key is a prefix of another (the radix
+/// tree requires that).
 #[derive(Debug, Clone, PartialEq, Eq, GetSize)]
-pub struct IndexKey(Box<[u8]>);
+pub struct IndexKey {
+    bytes: Box<[u8]>,
+    /// Byte offset of the first `=`, cached so [`IndexKey::split`] needn't search for it. Always
+    /// derived from `bytes`, so equal bytes imply an equal `split`. [`NO_SPLIT`] when the key has
+    /// no `=` or the offset doesn't fit; `split` searches instead.
+    split: u16,
+}
 
 const SENTINEL: u8 = 0;
+const NO_SPLIT: u16 = u16::MAX;
 
 impl IndexKey {
     pub fn for_label_value(label_name: &str, value: &str) -> Self {
-        Self::from(format!("{label_name}={value}"))
+        // The first `=`, as `split` has always reported it — inside the name if the name has one.
+        let split = label_name.find('=').unwrap_or(label_name.len());
+        let mut bytes = Vec::with_capacity(label_name.len() + value.len() + 2);
+        bytes.extend_from_slice(label_name.as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.as_bytes());
+        Self::from_parts(bytes, Some(split))
+    }
+
+    /// `bytes` must be valid UTF-8 without the sentinel; `split` the offset of its first `=`.
+    fn from_parts(mut bytes: Vec<u8>, split: Option<usize>) -> Self {
+        debug_assert_eq!(split, bytes.iter().position(|&b| b == b'='));
+        bytes.push(SENTINEL);
+        let split = split
+            .and_then(|i| u16::try_from(i).ok())
+            .unwrap_or(NO_SPLIT);
+        IndexKey {
+            bytes: bytes.into_boxed_slice(),
+            split,
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        let buf = &self.0[..self.0.len() - 1];
-        // SAFETY: the inner bytes are valid UTF-8 by construction.
-        unsafe { std::str::from_utf8_unchecked(buf) }
+        self.sub_string(0)
     }
 
     pub fn split(&self) -> Option<(&str, &str)> {
         let key = self.as_str();
-        key.find('=')
-            .map(|index| (&key[..index], &key[index + 1..self.len()]))
+        let index = match self.split {
+            NO_SPLIT => key.find('=')?,
+            index => index as usize,
+        };
+        debug_assert_eq!(key.as_bytes()[index], b'=');
+        // SAFETY: `index` is the offset of an ASCII `=` in `key`, so both sides are char boundaries.
+        unsafe { Some((key.get_unchecked(..index), key.get_unchecked(index + 1..))) }
     }
 
     pub(crate) fn sub_string(&self, start: usize) -> &str {
-        let buf = &self.0[start..self.0.len() - 1];
+        let buf = &self.bytes[start..self.bytes.len() - 1];
         // SAFETY: We always ensure that the inner bytes are valid UTF-8 when constructing an IndexKey.
         debug_assert!(
             std::str::from_utf8(buf).is_ok(),
@@ -38,12 +69,12 @@ impl IndexKey {
     }
 
     pub fn len(&self) -> usize {
-        self.0.len() - 1
+        self.bytes.len() - 1
     }
 
     pub fn is_empty(&self) -> bool {
         // The inner buffer is always NUL-terminated, so an "empty" key is `[0]`.
-        self.0.len() <= 1
+        self.bytes.len() <= 1
     }
 }
 
@@ -57,13 +88,13 @@ impl Deref for IndexKey {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.bytes
     }
 }
 
 impl AsBytes for IndexKey {
     fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 }
 
@@ -75,10 +106,7 @@ impl AsRef<[u8]> for IndexKey {
 
 impl From<&[u8]> for IndexKey {
     fn from(key: &[u8]) -> Self {
-        let utf8 = String::from_utf8_lossy(key);
-        let mut v = utf8.as_bytes().to_vec();
-        v.push(SENTINEL);
-        IndexKey(v.into_boxed_slice())
+        Self::from(String::from_utf8_lossy(key).as_ref())
     }
 }
 
@@ -90,15 +118,14 @@ impl From<Vec<u8>> for IndexKey {
 
 impl From<&str> for IndexKey {
     fn from(key: &str) -> Self {
-        let mut key = key.as_bytes().to_vec();
-        key.push(SENTINEL);
-        IndexKey(key.into_boxed_slice())
+        Self::from_parts(key.as_bytes().to_vec(), key.find('='))
     }
 }
 
 impl From<String> for IndexKey {
     fn from(key: String) -> Self {
-        Self::from(key.as_str())
+        let split = key.find('=');
+        Self::from_parts(key.into_bytes(), split)
     }
 }
 
@@ -110,7 +137,7 @@ impl Borrow<[u8]> for IndexKey {
 
 impl Hash for IndexKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
+        self.bytes.hash(state);
     }
 }
 
@@ -145,6 +172,52 @@ mod tests {
         let (label, value) = key.split().unwrap();
         assert_eq!(label, "label");
         assert_eq!(value, "value");
+    }
+
+    #[test]
+    fn test_split_agrees_across_constructors() {
+        // The cached offset is the first `=`, whichever constructor built the key, so a key
+        // reloaded from bytes equals (and splits like) the one built from its name and value.
+        for (name, value) in [
+            ("job", "api"),
+            ("a=b", "c"),
+            ("eq", "x=y"),
+            ("", "v"),
+            ("n", ""),
+        ] {
+            let built = IndexKey::for_label_value(name, value);
+            let text = format!("{name}={value}");
+            let expected = text.split_once('=');
+            for key in [
+                IndexKey::from(text.as_str()),
+                IndexKey::from(text.clone()),
+                IndexKey::from(text.as_bytes()),
+            ] {
+                assert_eq!(key, built);
+                assert_eq!(key.split(), expected);
+            }
+            assert_eq!(built.split(), expected);
+        }
+    }
+
+    #[test]
+    fn test_split_without_separator() {
+        assert_eq!(IndexKey::from("bare").split(), None);
+        assert_eq!(IndexKey::from("").split(), None);
+    }
+
+    #[test]
+    fn test_split_past_u16_offset_falls_back_to_search() {
+        let name = "n".repeat(u16::MAX as usize + 10);
+        let key = IndexKey::for_label_value(&name, "v");
+        assert_eq!(key.split, NO_SPLIT);
+        assert_eq!(key.split(), Some((name.as_str(), "v")));
+        assert_eq!(IndexKey::from(key.as_str()), key);
+
+        let name = "n".repeat(u16::MAX as usize - 1);
+        let key = IndexKey::for_label_value(&name, "v");
+        assert_eq!(key.split as usize, name.len());
+        assert_eq!(key.split(), Some((name.as_str(), "v")));
     }
 
     #[test]
