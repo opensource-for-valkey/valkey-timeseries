@@ -68,7 +68,7 @@ regex-syntax = "0.8.11"
 # The traits promql-parser's public `lexer()` returns its tokens through. Keep this in
 # step with promql-parser's own lrpar version, or they are two different crates.
 lrpar = "0.14.2"
-twox-hash = { version = "2.1.2", features = ["xxhash3_64"] }
+twox-hash = { version = "2.1.4", features = ["xxhash3_64"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 crc16 = "0.4.0"
 
@@ -77,8 +77,8 @@ crc16 = "0.4.0"
 # `test-utils` module (src/tests) without it leaking into the shipped module.
 valkey-timeseries = { path = ".", features = ["test-utils"] }
 criterion = { version = "0.8", features = ["html_reports"] }
-rstest = "0.26"
-test-case = "3.3"
+rstest = "0.27.0"
+test-case = "3.4.0"
 serial_test = { version = "4.0.1", default-features = false }
 proptest = "1"
 
