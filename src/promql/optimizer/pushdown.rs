@@ -99,8 +99,8 @@ pub fn pushdown_filters_in_place_with(expr: &mut Expr, leaves: &dyn LeafFilters)
             pushdown_filters_in_place_with(&mut be.lhs, leaves);
             pushdown_filters_in_place_with(&mut be.rhs, leaves);
             if leaves.narrows(be) {
-                let mut lfs = get_common_label_filters_with(expr, leaves);
-                push_down_binary_op_filters_in_place_with(expr, &mut lfs, leaves);
+                let lfs = get_common_label_filters_with(expr, leaves);
+                push_down_binary_op_filters_in_place_with(expr, &lfs, leaves);
             }
         }
         Unary(unary) => pushdown_filters_in_place_with(&mut unary.expr, leaves),
@@ -384,8 +384,7 @@ pub fn pushdown_binary_op_filters(expr: &Expr, common_filters: Vec<Matcher>) -> 
     }
 
     let mut copy = expr.clone();
-    let mut common_filters = common_filters;
-    push_down_binary_op_filters_in_place(&mut copy, &mut common_filters);
+    push_down_binary_op_filters_in_place(&mut copy, &common_filters);
     Cow::Owned(copy)
 }
 
@@ -434,15 +433,21 @@ fn push_filters_to_matchers(matchers: &mut Matchers, common_filters: &[Matcher])
     }
 }
 
-pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &mut Vec<Matcher>) {
+pub fn push_down_binary_op_filters_in_place(e: &mut Expr, common_filters: &[Matcher]) {
     push_down_binary_op_filters_in_place_with(e, common_filters, &WrittenFilters)
 }
 
 /// [`push_down_binary_op_filters_in_place`] with `leaves` deciding, at each
 /// selector, which of the filters are worth adding.
+///
+/// `common_filters` is read-only: a node that narrows the set for its own
+/// subtree (a matching modifier, an aggregation's grouping, a relabeling
+/// function) trims a copy. The operands of a binary operation are siblings
+/// and must each see the set as their parent left it — when they shared one
+/// list, whatever the left operand trimmed for itself was lost to the right.
 pub fn push_down_binary_op_filters_in_place_with(
     e: &mut Expr,
-    common_filters: &mut Vec<Matcher>,
+    common_filters: &[Matcher],
     leaves: &dyn LeafFilters,
 ) {
     use Expr::*;
@@ -484,11 +489,18 @@ pub fn push_down_binary_op_filters_in_place_with(
             push_down_binary_op_filters_in_place_with(&mut unary.expr, common_filters, leaves);
         }
         Binary(bo) => {
-            if let Some(modifier) = &bo.modifier {
-                trim_filters_by_match_modifier(common_filters, &modifier.matching);
-            }
-            push_down_binary_op_filters_in_place_with(&mut bo.lhs, common_filters, leaves);
-            push_down_binary_op_filters_in_place_with(&mut bo.rhs, common_filters, leaves);
+            let trimmed;
+            let filters = match &bo.modifier {
+                Some(modifier) => {
+                    let mut lfs = common_filters.to_vec();
+                    trim_filters_by_match_modifier(&mut lfs, &modifier.matching);
+                    trimmed = lfs;
+                    &trimmed[..]
+                }
+                None => common_filters,
+            };
+            push_down_binary_op_filters_in_place_with(&mut bo.lhs, filters, leaves);
+            push_down_binary_op_filters_in_place_with(&mut bo.rhs, filters, leaves);
         }
         Aggregate(aggr) => {
             // Grouping labels pass through an aggregation unchanged, so a filter
@@ -496,13 +508,14 @@ pub fn push_down_binary_op_filters_in_place_with(
             // *synthesizes* is not: `count_values` writes its value label onto the
             // output, and the input series carry no such label, so pushing a
             // filter on it into the selector would match nothing.
-            if aggr.op.id() == T_COUNT_VALUES
-                && let Some(label_name) = aggr.param.as_deref()
-            {
-                *common_filters = drop_label_filters_for_label_name(common_filters, label_name);
-            }
-            trim_filters_by_aggr_modifier(common_filters, aggr);
-            push_down_binary_op_filters_in_place_with(&mut aggr.expr, common_filters, leaves);
+            let mut filters = match aggr.param.as_deref() {
+                Some(label_name) if aggr.op.id() == T_COUNT_VALUES => {
+                    drop_label_filters_for_label_name(common_filters, label_name)
+                }
+                _ => common_filters.to_vec(),
+            };
+            trim_filters_by_aggr_modifier(&mut filters, aggr);
+            push_down_binary_op_filters_in_place_with(&mut aggr.expr, &filters, leaves);
             // `aggr.param` is a scalar or string (the `k` of topk, the quantile,
             // the count_values label) — never an operand of the binary op's label
             // matching. Rewriting a selector under it, as in `topk(scalar(x), y)`,
@@ -515,15 +528,15 @@ pub fn push_down_binary_op_filters_in_place_with(
 
 fn pushdown_label_filters_for_label_replace(
     args: &mut [Box<Expr>],
-    lfs: &mut Vec<Matcher>,
+    lfs: &[Matcher],
     leaves: &dyn LeafFilters,
 ) {
     if args.len() < 2 {
         return;
     }
-    *lfs = drop_label_filters_for_label_name(lfs, &args[1]);
+    let lfs = drop_label_filters_for_label_name(lfs, &args[1]);
     if let Some(arg) = args.get_mut(0) {
-        push_down_binary_op_filters_in_place_with(arg, lfs, leaves);
+        push_down_binary_op_filters_in_place_with(arg, &lfs, leaves);
     }
 }
 

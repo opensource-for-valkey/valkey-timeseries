@@ -708,6 +708,20 @@ mod tests {
         );
     }
 
+    /// The inner join trims the set to `host` for its own operands; that must
+    /// not cost the outer right operand the `region` it is matched on.
+    #[test]
+    fn a_join_on_the_left_does_not_narrow_what_its_sibling_receives() {
+        let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
+        assert_eq!(
+            rewrite(
+                r#"(cpu{region="us"} * on(host) group_left cpu offset 1m) and on(region) cpu offset 5m"#,
+                &reader
+            ),
+            r#"(cpu{region="us"} * on (host) group_left () cpu{host=~"a|b"} offset 1m) and on (region) cpu{region="us"} offset 5m"#
+        );
+    }
+
     #[test]
     fn an_aggregated_operand_contributes_its_grouping_labels_only() {
         let reader = TableReader::new(vec![(r#"cpu{region="us"}"#, CPU_US), ("cpu", CPU_ALL)]);
@@ -829,6 +843,9 @@ mod tests {
             r#"cpu{region="us"} / on(host) mem"#,
             r#"cpu{region="us", host="h0"} / ignoring(host, metric, kind) mem{host="h2"}"#,
             r#"mem{region=~"us|eu"} * on(host) group_left cpu"#,
+            r#"(cpu{region="us"} * on(host) group_left mem) and on(region) cpu offset 5m"#,
+            r#"(mem{region="eu"} * on(host) group_left cpu) unless on(region, kind) mem{region="us"}"#,
+            r#"label_replace(cpu{region="ap"}, "metric", "m", "", "") and on(region) mem"#,
             r#"cpu and on(host) mem{host=~"h[0-3]"}"#,
             r#"cpu unless on(host) mem{region="ap"}"#,
             r#"cpu{region="us"} or mem"#,

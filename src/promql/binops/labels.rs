@@ -65,7 +65,7 @@ pub(in crate::promql) fn push_down_filters<'a>(
             pushdown::trim_filters_by_match_modifier(&mut common_filters, &modifier.matching);
         }
         let mut copy = dest.clone();
-        pushdown::push_down_binary_op_filters_in_place(&mut copy, &mut common_filters);
+        pushdown::push_down_binary_op_filters_in_place(&mut copy, &common_filters);
         return Ok(Cow::Owned(copy));
     }
     Ok(Cow::Borrowed(dest))

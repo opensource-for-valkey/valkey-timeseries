@@ -53,6 +53,23 @@ mod tests {
         r#"{a="b"}"#,
         r#"foo{a="b"} * ignoring (x) bar{a="b"}"#
     )]
+    // Whatever the left operand drops for its own subtree, the right operand
+    // still receives in full: the two are siblings.
+    #[case(
+        r#"label_replace(foo, "c", "$1", "x", "(.*)") + bar"#,
+        r#"{a="b",c="d"}"#,
+        r#"label_replace(foo{a="b"}, "c", "$1", "x", "(.*)") + bar{a="b", c="d"}"#
+    )]
+    #[case(
+        r#"count_values("v", foo) + bar"#,
+        r#"{v="1"}"#,
+        r#"count_values("v", foo) + bar{v="1"}"#
+    )]
+    #[case(
+        r#"(foo * on(x) group_left bar) + baz"#,
+        r#"{x="1",y="2"}"#,
+        r#"(foo{x="1"} * on (x) group_left () bar{x="1"}) + baz{x="1", y="2"}"#
+    )]
     #[case(
         r#"foo{f1!~"x"} UNLEss bar{f2=~"y.+"}"#,
         r#"{a="b",x=~"y"}"#,
@@ -258,6 +275,16 @@ mod tests {
     #[case(
         r#"foo{x="y"} * on(a) group_right(x, y) baz{a="b"}"#,
         r#"foo{a="b", x="y"} * on (a) group_right (x, y) baz{a="b"}"#
+    )]
+    // A join on the left trims the set for its own operands only; the
+    // right operand still gets the join's filters.
+    #[case(
+        r#"(foo{c="d"} * on(instance) group_left bar) + baz"#,
+        r#"(foo{c="d"} * on(instance) group_left bar) + baz{c="d"}"#
+    )]
+    #[case(
+        r#"(foo{c="d"} * on(instance) group_left(a) bar) and on(c) baz"#,
+        r#"(foo{c="d"} * on(instance) group_left(a) bar) and on(c) baz{c="d"}"#
     )]
     // The joined `a` is bar's, not foo's: `a="x"` must not reach baz.
     #[case(
