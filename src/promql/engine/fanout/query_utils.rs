@@ -22,7 +22,7 @@ use crate::series::index::{
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
 use orx_parallel::ParResult;
-use std::ops::{ControlFlow, Deref};
+use std::ops::ControlFlow;
 use valkey_module::ValkeyResult;
 
 /// This shard's share of an instant-vector selector: the newest sample in the
@@ -159,9 +159,12 @@ pub(in crate::promql) fn local_label_profile<S: GilSource + ?Sized>(
 
 /// Copy, under each batch's lock, the chunks `[start_time, end_time]` touches
 /// in every series `selector` matches, keeping `labels` of each series that has
-/// any. The copy fans out across the pool: one thread copying a query's worth
-/// of chunks was most of what decoding them under the lock had cost. Decoding
-/// is left to the caller, with the lock released.
+/// any. Decoding is left to the caller, with the lock released.
+///
+/// The copy is sequential on purpose. A batch is a few hundred KB, and fanning
+/// it out across the shared pool made the lock holder wait for workers busy
+/// decoding other queries' snapshots: with 4 concurrent rollups the main
+/// thread's PING p99 stayed at 85–100 ms, against 6–15 ms sequential.
 ///
 /// `labels` picks what is kept: the evaluator's shared set, or the storage set
 /// itself for a response whose symbol table interns by identity. Either shares
@@ -185,16 +188,10 @@ where
         None,
         DEFAULT_SERIES_BATCH_SIZE,
         |_, batch| {
-            let series: Vec<&TimeSeries> = batch.iter().map(|(s, _)| s.deref()).collect();
-            snapshots.extend(
-                series
-                    .into_par_rayon()
-                    .filter_map(|s| {
-                        let snapshot = s.snapshot_range(start_time, end_time);
-                        (!snapshot.is_empty()).then(|| (labels(s), snapshot))
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            snapshots.extend(batch.iter().filter_map(|(s, _)| {
+                let snapshot = s.snapshot_range(start_time, end_time);
+                (!snapshot.is_empty()).then(|| (labels(s), snapshot))
+            }));
             Ok(ControlFlow::Continue(()))
         },
     )?;
