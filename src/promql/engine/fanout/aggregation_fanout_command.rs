@@ -246,16 +246,14 @@ impl FanoutCommand for AggregationFanoutCommand {
             return Ok(AggregationQueryResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
-        let samples = {
-            let ctx = ctx.lock()?;
-            local_instant_eval_samples(
-                &ctx,
-                series_selector,
-                query.timestamp,
-                query.lookback_delta,
-                query.max_series,
-            )?
-        };
+        // Locks per batch of matched series, not for the whole read.
+        let samples = local_instant_eval_samples(
+            ctx,
+            series_selector,
+            query.timestamp,
+            query.lookback_delta,
+            query.max_series,
+        )?;
 
         // An unrecognized operator means the coordinator is newer than this
         // node. Ship the raw instant vector and let it aggregate: correct, at

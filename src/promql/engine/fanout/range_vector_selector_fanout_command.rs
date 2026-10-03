@@ -82,9 +82,9 @@ impl FanoutCommand for RangeVectorSelectorFanoutCommand {
             return Ok(RangeQueryResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
-        let ctx = ctx.lock()?;
+        // Locks per batch of matched series; decodes with the lock released.
         handle_range_query(
-            &ctx,
+            ctx,
             series_selector,
             req.start_time,
             req.end_time,

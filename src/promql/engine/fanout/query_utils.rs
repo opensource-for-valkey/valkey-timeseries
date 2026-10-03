@@ -1,7 +1,7 @@
 use crate::commands::fanout_codec::chunks::serialize_chunk;
 use crate::commands::fanout_codec::symbol_table;
 use crate::common::Timestamp;
-use crate::common::threads::IterIntoParRayon;
+use crate::common::threads::IntoParRayon;
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::EvalSample;
@@ -10,50 +10,63 @@ use crate::promql::engine::promql_config;
 use crate::promql::engine::query_reader::grid_fetch_bounds;
 use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples};
 use crate::promql::engine::{
-    get_series_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
+    get_snapshot_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
 };
 use crate::promql::generated::{
     InstantQueryResponse, InstantSample, RangeQueryResponse, RangeSample,
 };
 use crate::series::chunks::samples_to_chunk_lossless;
-use crate::series::index::series_by_selectors;
+use crate::series::index::{
+    DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series, for_each_series_batch,
+};
+use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
 use orx_parallel::ParResult;
-use std::ops::Deref;
-use valkey_module::{Context, ValkeyResult};
+use std::ops::{ControlFlow, Deref};
+use valkey_module::ValkeyResult;
 
-pub(super) fn handle_instant_query(
-    ctx: &Context,
+/// This shard's share of an instant-vector selector: the newest sample in the
+/// lookback window of every matched series, read one batch per lock hold. The
+/// head chunk's cached last sample usually answers without a decode, so all of
+/// it runs under the lock.
+pub(super) fn handle_instant_query<S: GilSource + ?Sized>(
+    src: &S,
     selector: SeriesSelector,
     timestamp: Timestamp,
     lookback_delta: u64,
     max_series: u64,
     _max_points_per_series: u64,
 ) -> ValkeyResult<InstantQueryResponse> {
-    let series = series_by_selectors(ctx, &[selector], None)?;
     // in prometheus, given a timestamp and delta, we select the latest sample in the range
     // (ts - delta, ts], so we need to adjust the timestamp accordingly
     let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
     let end_time = timestamp;
 
     // Labels go straight from storage into the response's symbol table by
-    // identity; no owned label strings are built per series.
+    // identity; no owned label strings are built per series. Interning under
+    // each batch's lock is safe across them: the builder keeps every entry it
+    // has keyed alive, so an address cannot be reused by another label.
     let mut symbol_table = symbol_table::SymbolTableBuilder::default();
-    let samples = series
-        .iter()
-        .filter_map(|(s, _)| {
-            let series = s.deref();
-            let sample = series.last_sample_in_range(start_time, end_time)?;
-            let (label_name_refs, label_value_refs) = symbol_table.intern(&series.labels);
-            Some(InstantSample {
-                labels: Vec::new(),
-                value: sample.value,
-                timestamp: sample.timestamp,
-                label_name_refs,
-                label_value_refs,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut samples = Vec::new();
+    for_each_series(
+        src,
+        &[selector],
+        None,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_, series, _| {
+            if let Some(sample) = series.last_sample_in_range(start_time, end_time) {
+                let (label_name_refs, label_value_refs) = symbol_table.intern(&series.labels);
+                samples.push(InstantSample {
+                    labels: Vec::new(),
+                    value: sample.value,
+                    timestamp: sample.timestamp,
+                    label_name_refs,
+                    label_value_refs,
+                });
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     let symbol_table = symbol_table.finish();
 
     validate_max_series(samples.len(), max_series as usize)
@@ -71,31 +84,35 @@ pub(super) fn handle_instant_query(
 /// evaluator-native samples so the aggregation operators can be applied to them
 /// directly instead of round-tripping through the wire types. Only the
 /// aggregated result crosses the wire, which is the point of the push-down.
-pub(super) fn local_instant_eval_samples(
-    ctx: &Context,
+pub(super) fn local_instant_eval_samples<S: GilSource + ?Sized>(
+    src: &S,
     selector: SeriesSelector,
     timestamp: Timestamp,
     lookback_delta: u64,
     max_series: u64,
 ) -> ValkeyResult<Vec<EvalSample>> {
-    let series = series_by_selectors(ctx, &[selector], None)?;
     // Prometheus selects the latest sample in (ts - delta, ts].
     let start_time = instant_lookback_start_ms(timestamp, lookback_delta as i64);
 
-    let samples = series
-        .iter()
-        .filter_map(|s| {
-            let series = s.0.deref();
-            let sample = series.last_sample_in_range(start_time, timestamp)?;
-            let labels = EvalLabels::interned(&series.labels);
-            Some(EvalSample {
-                labels,
-                value: sample.value,
-                timestamp_ms: sample.timestamp,
-                drop_name: false,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut samples = Vec::new();
+    for_each_series(
+        src,
+        &[selector],
+        None,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_, series, _| {
+            if let Some(sample) = series.last_sample_in_range(start_time, timestamp) {
+                samples.push(EvalSample {
+                    // Shares the series' label set; nothing borrows the series.
+                    labels: EvalLabels::interned(&series.labels),
+                    value: sample.value,
+                    timestamp_ms: sample.timestamp,
+                    drop_name: false,
+                });
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
 
     // Bound the shard's own working set, exactly as the unaggregated instant
     // query does. The coordinator additionally bounds the aggregated result.
@@ -111,22 +128,77 @@ pub(super) fn local_instant_eval_samples(
 /// for the same reason the coordinator has: a selector that large is not
 /// worth walking to narrow another.
 ///
-/// No sample is read. `series_by_selectors` opens every matched key, as a
-/// read of the same selector would, so the cost is bounded by the cap alone.
-pub(in crate::promql) fn local_label_profile(
-    ctx: &Context,
+/// No sample is read. Every matched key is opened, as a read of the same
+/// selector would, until the cap is passed; the walk stops there.
+pub(in crate::promql) fn local_label_profile<S: GilSource + ?Sized>(
+    src: &S,
     selector: SeriesSelector,
     max_series: usize,
 ) -> ValkeyResult<Option<LabelProfile>> {
-    let series = series_by_selectors(ctx, &[selector], None)?;
-    if max_series > 0 && series.len() > max_series {
-        return Ok(None);
-    }
     let mut builder = LabelProfileBuilder::new();
-    for (s, _) in series.iter() {
-        builder.add_series(s.deref().labels.iter().map(|l| (l.name, l.value)));
-    }
-    Ok(Some(builder.finish()))
+    let mut matched = 0usize;
+    let mut overflow = false;
+    for_each_series(
+        src,
+        &[selector],
+        None,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_, series, _| {
+            matched += 1;
+            if max_series > 0 && matched > max_series {
+                overflow = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            // The builder copies what it keeps, so nothing outlives the lock.
+            builder.add_series(series.labels.iter().map(|l| (l.name, l.value)));
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    Ok((!overflow).then(|| builder.finish()))
+}
+
+/// Copy, under each batch's lock, the chunks `[start_time, end_time]` touches
+/// in every series `selector` matches, keeping `labels` of each series that has
+/// any. The copy fans out across the pool: one thread copying a query's worth
+/// of chunks was most of what decoding them under the lock had cost. Decoding
+/// is left to the caller, with the lock released.
+///
+/// `labels` picks what is kept: the evaluator's shared set, or the storage set
+/// itself for a response whose symbol table interns by identity. Either shares
+/// the series' `Arc`, so no string is copied and nothing borrows the series.
+fn snapshot_matched_ranges<S, L, T>(
+    src: &S,
+    selector: SeriesSelector,
+    start_time: Timestamp,
+    end_time: Timestamp,
+    labels: L,
+) -> ValkeyResult<Vec<(T, RangeSnapshot)>>
+where
+    S: GilSource + ?Sized,
+    L: Fn(&TimeSeries) -> T + Sync,
+    T: Send,
+{
+    let mut snapshots = Vec::new();
+    for_each_series_batch(
+        src,
+        &[selector],
+        None,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_, batch| {
+            let series: Vec<&TimeSeries> = batch.iter().map(|(s, _)| s.deref()).collect();
+            snapshots.extend(
+                series
+                    .into_par_rayon()
+                    .filter_map(|s| {
+                        let snapshot = s.snapshot_range(start_time, end_time);
+                        (!snapshot.is_empty()).then(|| (labels(s), snapshot))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(snapshots)
 }
 
 /// Read the raw windows a pushed-down grid query needs, one entry per series.
@@ -141,8 +213,8 @@ pub(in crate::promql) fn local_label_profile(
 /// `max_points_per_series` bounds the *raw* points examined per series, which is
 /// the resource this push-down is trading away; the coordinator separately
 /// bounds the points it accepts back.
-pub(super) fn local_grid_windows(
-    ctx: &Context,
+pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
+    src: &S,
     selector: SeriesSelector,
     window_ends: &[Timestamp],
     backward_ms: i64,
@@ -153,28 +225,26 @@ pub(super) fn local_grid_windows(
         return Ok(Vec::new());
     };
 
-    let series = series_by_selectors(ctx, &[selector], None)?;
+    let snapshots = snapshot_matched_ranges(src, selector, start_time, end_time, |s| {
+        EvalLabels::interned(&s.labels)
+    })?;
 
+    // The lock is released: decode on the pool.
     let budget = SampleBudget::new(local_max_samples());
-    let candidates = series
-        .iter()
-        .map(|(s, _)| s.deref())
-        .iter_into_par_rayon()
-        .map(|s| {
+    let candidates = snapshots
+        .into_par_rayon()
+        .map(|(labels, snapshot)| {
             if budget.exhausted() {
                 return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
             }
-            let samples = s.get_range(start_time, end_time);
+            let samples = snapshot.get_range();
             budget
                 .charge(samples.len())
                 .map_err(|err| err.to_string())?;
-            // An empty window contributes nothing, so skip the label conversion
-            // for it as well — matched-but-empty series are the common case for
-            // a wide selector over a narrow time range.
-            Ok((!samples.is_empty()).then(|| {
-                let labels = EvalLabels::interned(&s.labels);
-                crate::promql::model::RangeSample { labels, samples }
-            }))
+            // A snapshot with chunks can still hold nothing inside the span:
+            // the chunks only overlap it.
+            Ok((!samples.is_empty())
+                .then_some(crate::promql::model::RangeSample { labels, samples }))
         })
         .into_fallible()
         .collect::<Vec<_>>()
@@ -219,42 +289,44 @@ fn bound_windows(
     Ok(windows)
 }
 
-/// Translate the wire form of the per-series point limit for [`get_series_range`].
+/// Translate the wire form of the per-series point limit for [`get_snapshot_range`].
 ///
-/// On the wire both `0` and `u64::MAX` mean "unlimited", while `get_series_range`
-/// reads `Some(0)` as "this series contributes nothing" — so the sentinels have to
-/// become `None` before the limit reaches the reader.
+/// On the wire both `0` and `u64::MAX` mean "unlimited". `get_snapshot_range`
+/// already reads `Some(0)` that way, but `Some(u64::MAX as usize)` would be a
+/// real limit, so both sentinels become `None` before the limit reaches it.
 fn points_limit(max_points_per_series: u64) -> Option<usize> {
     (max_points_per_series > 0 && max_points_per_series != u64::MAX)
         .then_some(max_points_per_series as usize)
 }
 
-pub(super) fn handle_range_query(
-    ctx: &Context,
+pub(super) fn handle_range_query<S: GilSource + ?Sized>(
+    src: &S,
     selector: SeriesSelector,
     start_time: i64,
     end_time: i64,
     max_series: u64,
     max_points_per_series: u64,
 ) -> ValkeyResult<RangeQueryResponse> {
-    let series = series_by_selectors(ctx, &[selector], None)?;
+    // The storage label set itself, not an evaluator copy: the symbol table
+    // below interns by identity.
+    let snapshots =
+        snapshot_matched_ranges(src, selector, start_time, end_time, |s| s.labels.clone())?;
+
     let max_points = points_limit(max_points_per_series);
     // This shard's own `ts-promql-max-samples-per-query`: the request does not
     // carry the coordinator's budget, and one node's share of a query should
     // not exceed what that node would allow a query of its own.
     let budget = SampleBudget::new(local_max_samples());
-    let ranges = series
-        .iter()
-        .map(|(s, _)| s.deref())
-        .iter_into_par_rayon()
-        .map(|s| {
+    // The lock is released: decode and encode on the pool.
+    let ranges = snapshots
+        .into_par_rayon()
+        .map(|(labels, snapshot)| {
             if budget.exhausted() {
                 return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
             }
-            // `get_series_range` applies the per-series point limit from the chunk headers
-            // first, so a shard rejects an over-wide span before decoding it instead of
-            // after materializing the whole thing.
-            let series_samples = get_series_range(s, start_time, end_time, max_points)?;
+            // Streams against the per-series point limit, so an over-wide span
+            // is rejected having kept at most the permitted samples.
+            let series_samples = get_snapshot_range(&snapshot, max_points)?;
             budget
                 .charge(series_samples.len())
                 .map_err(|err| err.to_string())?;
@@ -263,7 +335,7 @@ pub(super) fn handle_range_query(
             }
             let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
                 .map_err(|e| e.to_string())?;
-            Ok(Some((&s.labels, data)))
+            Ok(Some((labels, data)))
         })
         .into_fallible()
         .filter_map(|range| range)
@@ -280,7 +352,7 @@ pub(super) fn handle_range_query(
     let series = ranges
         .into_iter()
         .map(|(labels, data)| {
-            let (label_name_refs, label_value_refs) = symbol_table.intern(labels);
+            let (label_name_refs, label_value_refs) = symbol_table.intern(&labels);
             RangeSample {
                 labels: Vec::new(),
                 data: Some(data),

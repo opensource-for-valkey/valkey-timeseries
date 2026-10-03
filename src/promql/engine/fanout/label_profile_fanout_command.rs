@@ -122,9 +122,9 @@ impl FanoutCommand for LabelProfileFanoutCommand {
             return Ok(LabelProfileResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
-        let ctx = ctx.lock()?;
+        // Locks per batch of matched series, not for the whole read.
         Ok(
-            match local_label_profile(&ctx, series_selector, req.max_series as usize)? {
+            match local_label_profile(ctx, series_selector, req.max_series as usize)? {
                 Some(profile) => profile.into(),
                 None => LabelProfileResponse {
                     overflow: true,

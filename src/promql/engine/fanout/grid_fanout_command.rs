@@ -319,17 +319,15 @@ impl FanoutCommand for GridFanoutCommand {
             req.range_end_ms,
         );
 
-        let windows = {
-            let ctx = ctx.lock()?;
-            local_grid_windows(
-                &ctx,
-                series_selector,
-                &window_ends,
-                request.backward_ms(),
-                req.max_series,
-                req.max_points_per_series,
-            )?
-        };
+        // Locks per batch of matched series; decodes with the lock released.
+        let windows = local_grid_windows(
+            ctx,
+            series_selector,
+            &window_ends,
+            request.backward_ms(),
+            req.max_series,
+            req.max_points_per_series,
+        )?;
 
         shard_response(&request, &window_ends, windows)
     }

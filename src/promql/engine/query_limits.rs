@@ -1,5 +1,5 @@
 use crate::common::{Sample, Timestamp};
-use crate::series::{RangeSnapshot, TimeSeries};
+use crate::series::RangeSnapshot;
 
 pub(crate) const MAX_SERIES_ERROR_MSG: &str =
     "the query returns more than the configured max series limit";
@@ -29,44 +29,15 @@ pub(in crate::promql) fn validate_max_series(
     }
 }
 
-pub(in crate::promql) fn get_series_range(
-    series: &TimeSeries,
-    start_time: Timestamp,
-    end_time: Timestamp,
-    max_points_per_series: Option<usize>,
-) -> Result<Vec<Sample>, String> {
-    let Some(points_count) = max_points_per_series else {
-        let samples = series.get_range(start_time, end_time);
-        return Ok(samples);
-    };
-
-    if points_count == 0 {
-        let samples = series.get_range(start_time, end_time);
-        return Ok(samples);
-    }
-
-    if !series.overlaps(start_time, end_time) {
-        return Ok(Vec::new());
-    }
-    // Chunk headers only describe the entire chunk. A chunk that overlaps the
-    // query may contain many samples outside the requested interval, so its
-    // length is an upper bound rather than the number of returned points.
-    // Stream the range instead: a rejected query keeps at most the permitted
-    // samples and the sample that proves the limit was exceeded.
-    let mut samples = Vec::new();
-    for sample in series.range_iter(start_time, end_time) {
-        if samples.len() >= points_count {
-            validate_max_points(points_count.saturating_add(1), max_points_per_series)?;
-        }
-        samples.push(sample);
-    }
-
-    Ok(samples)
-}
-
-/// [`get_series_range`] over a [`RangeSnapshot`]: the same point limit and
-/// the same streaming rejection, decoding chunks the caller copied out under
-/// the module lock so that this runs without it.
+/// The samples of a [`RangeSnapshot`] under the per-series point limit,
+/// decoding chunks the caller copied out under the module lock so that this
+/// runs without it.
+///
+/// Chunk headers only describe the entire chunk. A chunk that overlaps the
+/// query may contain many samples outside the requested interval, so its
+/// length is an upper bound rather than the number of returned points. Stream
+/// the range instead: a rejected query keeps at most the permitted samples and
+/// the sample that proves the limit was exceeded.
 pub(in crate::promql) fn get_snapshot_range(
     snapshot: &RangeSnapshot,
     max_points_per_series: Option<usize>,
@@ -105,7 +76,7 @@ pub(in crate::promql) fn validate_max_points(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::SampleAddResult;
+    use crate::series::{SampleAddResult, TimeSeries};
 
     #[test]
     fn range_limit_counts_only_samples_inside_the_requested_interval() {
@@ -117,7 +88,7 @@ mod tests {
             ));
         }
 
-        let samples = get_series_range(&series, 5, 5, Some(1))
+        let samples = get_snapshot_range(&series.snapshot_range(5, 5), Some(1))
             .expect("one in-range sample must not be rejected by its larger chunk");
 
         assert_eq!(samples, vec![Sample::new(5, 5.0)]);
@@ -133,8 +104,8 @@ mod tests {
             ));
         }
 
-        let samples =
-            get_series_range(&series, 5, 7, Some(3)).expect("the configured boundary is inclusive");
+        let samples = get_snapshot_range(&series.snapshot_range(5, 7), Some(3))
+            .expect("the configured boundary is inclusive");
 
         assert_eq!(
             samples,
@@ -156,7 +127,7 @@ mod tests {
             ));
         }
 
-        let error = get_series_range(&series, 5, 7, Some(2))
+        let error = get_snapshot_range(&series.snapshot_range(5, 7), Some(2))
             .expect_err("three in-range samples exceed the two-point limit");
 
         assert!(error.contains("3 > 2"));

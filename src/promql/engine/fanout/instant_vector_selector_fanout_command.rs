@@ -93,9 +93,9 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             });
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
-        let ctx = ctx.lock()?;
+        // Locks per batch of matched series, not for the whole read.
         handle_instant_query(
-            &ctx,
+            ctx,
             series_selector,
             req.timestamp,
             req.lookback_delta,

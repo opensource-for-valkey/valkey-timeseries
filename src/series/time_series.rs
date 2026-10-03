@@ -1463,6 +1463,11 @@ pub struct RangeSnapshot {
 }
 
 impl RangeSnapshot {
+    /// Whether no chunk overlaps the range: the series has nothing in it to decode.
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
     /// The decoded samples in `[start, end]`, ascending. Equivalent to
     /// [`TimeSeries::get_range`] over the same range at snapshot time.
     pub fn get_range(&self) -> Vec<Sample> {
