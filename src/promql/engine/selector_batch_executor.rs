@@ -10,7 +10,9 @@ use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
-use crate::promql::engine::label_profile::{LabelProfile, profiled_series_cap};
+use crate::promql::engine::label_profile::{
+    LabelProfile, LabelProfileBuilder, profiled_series_cap,
+};
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
@@ -19,24 +21,23 @@ use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
     RangeVectorSelectorFanoutCommand, WireRangeResponse, check_unique_series, decode_range_series,
-    get_snapshot_range, instant_lookback_start_ms, local_label_profile, validate_max_points,
-    validate_max_series,
+    get_snapshot_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
+use crate::series::RangeSnapshot;
 use crate::series::chunks::ChunkOps;
-use crate::series::index::series_by_selectors;
-use crate::series::{RangeSnapshot, TimeSeries};
+use crate::series::index::{DEFAULT_SERIES_BATCH_SIZE, SeriesCursor};
 use orx_parallel::Par;
 use orx_parallel::ParResult;
 use promql_parser::label::Matchers;
-use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use valkey_module::{Context, MODULE_CONTEXT};
 
-/// Max number of requests to process in a single batch to
-/// avoid excessively locking the GIL and starving other tasks.
+/// Max number of requests to process in a single batch. The batch's reads share
+/// each lock hold (see [`run_local_batch`]), so this bounds how many tasks split
+/// one hold's series between them.
 const MAX_BATCH_SIZE: usize = 4;
 
 struct InstantVectorSelectorCommand {
@@ -216,8 +217,8 @@ struct SelectorTask {
 ///
 /// - Serializing access to the Valkey keyspace via `MODULE_CONTEXT` to avoid deadlocks, ensuring that
 ///   we can query safely from multiple threads.
-/// - Collecting incoming selector tasks into a batch and processing the batch in a single lock
-///   acquisition to reduce locking overhead.
+/// - Collecting incoming selector tasks into a batch whose reads share each lock acquisition, to
+///   reduce locking overhead.
 ///
 /// # Design
 ///
@@ -242,12 +243,12 @@ struct SelectorTask {
 ///
 /// These are rules R1–R3 of `common::threads`; `wait_for_result` checks the submitter's side.
 ///
-/// For local queries the thread does two things per batch. Under the module lock it resolves
-/// each task's series, answers the instant reads (one cached sample per series), and copies
-/// out the compressed chunks a range or grid read touches ([`RangeSnapshot`]). It then
-/// releases the lock and decodes those chunks on [`MATERIALIZE_POOL`], so the lock is held
-/// for the memcpy rather than for the decode — the main thread serves commands while a
-/// range read materializes.
+/// For local queries the thread reads the keyspace a batch of series per module-lock hold,
+/// shared among the queued tasks ([`run_local_batch`]): under the lock it answers the instant
+/// reads (one cached sample per series) and copies out the compressed chunks a range or grid
+/// read touches ([`RangeSnapshot`]); between holds it decodes them on [`MATERIALIZE_POOL`]. So
+/// the lock is held for at most a hold's worth of copying, however many series a selector
+/// matches, and the main thread serves commands in between.
 /// For cluster queries, a synchronous call is made per query and the context is released. The processing itself
 /// is executed in parallel across all target cluster nodes, and results are returned asynchronously without
 /// holding the GIL.
@@ -263,28 +264,30 @@ pub struct SelectorBatchExecutor {
 }
 
 /// The processor loop: wait for one task, sweep up whatever else is already
-/// queued (bounded by [`MAX_BATCH_SIZE`]), then run the batch under a single
-/// module-lock acquisition. Exits when the executor handle is dropped.
+/// queued (bounded by [`MAX_BATCH_SIZE`]), then run the batch. Exits when the
+/// executor handle is dropped.
+///
+/// In a cluster every task only starts a fan-out, so the batch shares one
+/// short module-lock hold. On a single node the tasks read the keyspace
+/// themselves, a batch of series per hold, shared among them: see
+/// [`run_local_batch`].
 fn run_processor(receiver: mpsc::Receiver<SelectorTask>) {
     while let Ok(first) = receiver.recv() {
         let batch = collect_batch(&receiver, first, MAX_BATCH_SIZE);
 
-        // Under the module lock: resolve series, answer what is cheap to
-        // answer, and copy out the chunks the range reads need. Decoding them
-        // — the bulk of a range read — happens below, with the lock released
-        // and the main thread free to serve commands meanwhile.
-        let deferred: Vec<DeferredRangeDecode> = {
+        let local = {
             let ctx = MODULE_CONTEXT.lock_gil();
-            batch
-                .into_iter()
-                .filter_map(|task| {
-                    isolate_panic("selector task", || execute_selector_task(&ctx, task)).flatten()
-                })
-                .collect()
-            // ctx dropped here — MODULE_CONTEXT released
+            if is_clustered(&ctx) {
+                for task in batch {
+                    isolate_panic("selector task", || execute_selector_task(&ctx, task));
+                }
+                Vec::new()
+            } else {
+                batch
+            }
         };
-        for work in deferred {
-            isolate_panic("range decode", || work.finish());
+        if !local.is_empty() {
+            run_local_batch(local);
         }
     }
 }
@@ -308,28 +311,6 @@ fn isolate_panic<T>(what: &str, task: impl FnOnce() -> T) -> Option<T> {
             ));
             None
         }
-    }
-}
-
-/// A local range or grid read whose chunks were copied under the module
-/// lock and still have to be decoded, validated and answered.
-struct DeferredRangeDecode {
-    series: Vec<(EvalLabels, RangeSnapshot)>,
-    options: QueryOptions,
-    grid: bool,
-    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
-}
-
-impl DeferredRangeDecode {
-    fn finish(self) {
-        let result = decode_range_snapshots(self.series, &self.options).map(|ranges| {
-            if self.grid {
-                SelectorOutput::Grid(GridOutcome::Raw(ranges))
-            } else {
-                SelectorOutput::Matrix(ranges)
-            }
-        });
-        deliver_task_result(&self.responder, result);
     }
 }
 
@@ -517,7 +498,9 @@ fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
     rx.recv()
 }
 
-fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRangeDecode> {
+/// Start one task's cluster fan-out, under the module lock, as the task's
+/// database and caller.
+fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     let SelectorTask {
         kind,
         caller_user,
@@ -532,36 +515,18 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRa
     }
 
     let error_responder = responder.clone();
-    let mut deferred = None;
+    // The fanout command captures the authenticated user while this scope is
+    // active and propagates it to every shard.
     let result = with_fanout_user(ctx, caller_user.as_deref(), |ctx| {
-        if is_clustered(ctx) {
-            // The fanout command captures the authenticated user while this
-            // scope is active and propagates it to every shard.
-            execute_selector_task_cluster(
-                ctx,
-                SelectorTask {
-                    kind,
-                    caller_user: None,
-                    hash_tags,
-                    responder,
-                },
-            );
-        } else {
-            // The local index is the whole picture on a single node, so the
-            // routing scope is deliberately ignored here: `HASHTAG` selects
-            // shards, it does not filter keys or labels.
-            match execute_selector_task_local(ctx, kind) {
-                LocalOutcome::Answered(result) => deliver_task_result(&responder, result),
-                LocalOutcome::Deferred(series, options, grid) => {
-                    deferred = Some(DeferredRangeDecode {
-                        series,
-                        options,
-                        grid,
-                        responder,
-                    });
-                }
-            }
-        }
+        execute_selector_task_cluster(
+            ctx,
+            SelectorTask {
+                kind,
+                caller_user: None,
+                hash_tags,
+                responder,
+            },
+        );
         Ok(())
     });
 
@@ -574,71 +539,6 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) -> Option<DeferredRa
 
     if target_db != original_db {
         let _ = set_current_db(ctx, original_db);
-    }
-    deferred
-}
-
-/// What running a task under the module lock produced: a finished answer, or
-/// — for the range reads — the copied chunks still to decode once the lock is
-/// gone (`series`, the task's options, and whether the answer is a grid's).
-enum LocalOutcome {
-    Answered(QueryResult<SelectorOutput>),
-    Deferred(Vec<(EvalLabels, RangeSnapshot)>, QueryOptions, bool),
-}
-
-fn execute_selector_task_local(ctx: &Context, command: SelectorTaskKind) -> LocalOutcome {
-    match command {
-        SelectorTaskKind::Vector(iqc) => {
-            let timestamp = iqc.timestamp;
-            let selector: SeriesSelector = SeriesSelector::from(iqc.matchers);
-            LocalOutcome::Answered(
-                query_instant_local(ctx, selector, timestamp, iqc.options)
-                    .map(SelectorOutput::Vector),
-            )
-        }
-        SelectorTaskKind::Range(rc) => {
-            let start = rc.start_timestamp;
-            let end = rc.end_timestamp;
-            let selector: SeriesSelector = SeriesSelector::from(rc.matchers);
-            match snapshot_range_local(ctx, selector, start, end, &rc.options) {
-                Ok(series) => LocalOutcome::Deferred(series, rc.options, false),
-                Err(err) => LocalOutcome::Answered(Err(err)),
-            }
-        }
-        SelectorTaskKind::Aggregation(ac) => {
-            // Single node: there is no shard to push the operator to, so hand
-            // the raw vector back and let the caller aggregate it outside the
-            // module lock.
-            let timestamp = ac.timestamp;
-            let selector: SeriesSelector = SeriesSelector::from(ac.matchers);
-            LocalOutcome::Answered(
-                query_instant_local(ctx, selector, timestamp, ac.options)
-                    .map(|samples| SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))),
-            )
-        }
-        SelectorTaskKind::Grid(gc) => {
-            // Single node: same reasoning as the aggregation task — read the
-            // spans and let the caller evaluate them outside the module lock.
-            let Some((start, end)) = gc.request.fetch_bounds() else {
-                return LocalOutcome::Answered(Ok(SelectorOutput::Grid(GridOutcome::Raw(
-                    Vec::new(),
-                ))));
-            };
-            let selector: SeriesSelector = SeriesSelector::from(gc.matchers);
-            match snapshot_range_local(ctx, selector, start, end, &gc.options) {
-                Ok(series) => LocalOutcome::Deferred(series, gc.options, true),
-                Err(err) => LocalOutcome::Answered(Err(err)),
-            }
-        }
-        SelectorTaskKind::Profile(pc) => {
-            let selector: SeriesSelector = SeriesSelector::from(pc.matchers);
-            let cap = profiled_series_cap(&pc.options);
-            LocalOutcome::Answered(
-                local_label_profile(ctx, selector, cap)
-                    .map(SelectorOutput::Profile)
-                    .map_err(|e| QueryError::Execution(e.to_string())),
-            )
-        }
     }
 }
 
@@ -982,104 +882,413 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
     }
 }
 
-pub(in crate::promql) fn query_instant_local(
-    ctx: &Context,
-    selector: SeriesSelector,
-    timestamp: Timestamp,
-    options: QueryOptions,
-) -> QueryResult<Vec<InstantSample<EvalLabels>>> {
-    if let Some(d) = options.deadline
-        && current_time_millis() > d
-    {
-        return Err(QueryError::Timeout);
+/// What one module-lock hold on a single node may read, in units of an instant
+/// series: a range or grid series costs [`RANGE_SERIES_COST`] (its chunks are
+/// copied), an instant or profile series one (a cached sample, or its labels).
+/// So a hold reads 512 range series, as a fan-out share's batch does, or 4096
+/// instant ones — with one hold per 512, a 15 000-series instant query paid
+/// thirty lock acquisitions and lost 15 % of its throughput.
+const HOLD_BUDGET: usize = RANGE_SERIES_COST * DEFAULT_SERIES_BATCH_SIZE.get();
+
+/// The cost of a range or grid series against [`HOLD_BUDGET`].
+const RANGE_SERIES_COST: usize = 8;
+
+/// Run a batch of single-node tasks to completion.
+///
+/// Each task is planned with no lock (the postings only), then read under
+/// module-lock holds of [`HOLD_BUDGET`], with its database selected
+/// and its caller's identity installed. A hold's series go to the tasks with
+/// the fewest left first. So small tasks finish in the first hold, sharing one
+/// lock acquisition (which can mean waiting out a main-thread event-loop
+/// iteration), and large ones run one after another, each split across holds,
+/// as they did before the reads were split at all. An even split looked fairer
+/// and was worse: four equal reads all finished at the end instead of one
+/// after another (4T each against 2.5T on average, queries 16–30 % slower) and
+/// held all four reads' decoded samples at once (peak memory +60 %). Under the lock an instant
+/// read takes its samples and a profile its labels; a range or grid read copies
+/// the chunks it touches ([`RangeSnapshot`]) and decodes them on
+/// [`MATERIALIZE_POOL`] once the lock is released, before the next hold. The
+/// copy is sequential: the lock holder never waits on a pool.
+///
+/// The local index is the whole picture on a single node, so the routing scope
+/// is deliberately ignored here: `HASHTAG` selects shards, it does not filter
+/// keys or labels.
+fn run_local_batch(tasks: Vec<SelectorTask>) {
+    let mut reads: Vec<LocalRead> = tasks.into_iter().filter_map(LocalRead::plan).collect();
+    while !reads.is_empty() {
+        // Shortest remaining first; stable, so equal reads keep their arrival order.
+        reads.sort_by_key(LocalRead::remaining_cost);
+        let mut copied: Vec<Option<CopiedSnapshots>> = Vec::with_capacity(reads.len());
+        {
+            let ctx = MODULE_CONTEXT.lock_gil();
+            let original_db = get_current_db(&ctx);
+            let mut budget = HOLD_BUDGET;
+            for read in reads.iter_mut() {
+                let cost = read.series_cost();
+                let share = (budget / cost).min(read.cursor.remaining());
+                if share == 0 && !read.cursor.is_done() {
+                    copied.push(None);
+                    continue;
+                }
+                budget -= share * cost;
+                let batch = isolate_panic("selector read", || read.copy(&ctx, share));
+                copied.push(match batch {
+                    Some(Ok(batch)) => batch,
+                    Some(Err(err)) => {
+                        read.fail(err);
+                        None
+                    }
+                    // A panic: the responder goes with the read, failing its caller.
+                    None => {
+                        read.failed = true;
+                        None
+                    }
+                });
+            }
+            if get_current_db(&ctx) != original_db {
+                let _ = set_current_db(&ctx, original_db);
+            }
+        }
+
+        for (read, batch) in reads.iter_mut().zip(copied) {
+            if let Some(batch) = batch
+                && isolate_panic("range decode", || read.decode(batch)).is_none()
+            {
+                read.failed = true;
+            }
+        }
+
+        reads.retain_mut(|read| {
+            if read.failed {
+                return false;
+            }
+            if read.cursor.is_done() {
+                read.finish();
+                return false;
+            }
+            if read
+                .options
+                .deadline
+                .is_some_and(|d| current_time_millis() > d)
+            {
+                read.fail(QueryError::Timeout);
+                return false;
+            }
+            true
+        });
+        if !reads.is_empty() {
+            // As between a fan-out share's batches: let a waiting main thread in.
+            std::thread::yield_now();
+        }
     }
-    let series = series_by_selectors(ctx, &[selector], None)
-        .map_err(|e| QueryError::Execution(e.to_string()))?;
+}
 
-    // PromQL instant-query semantics: return the most recent sample per series
-    // whose timestamp falls within the lookback window (timestamp - lookback_delta, timestamp].
-    // This mirrors the Prometheus staleness semantics described in:
-    // https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness
-    let lookback_delta_ms = options.lookback_delta.as_millis() as Timestamp;
-    // The lower bound is exclusive per PromQL spec, so subtract 1 to make the
-    // TimeSeries::get_range inclusive-lower-bound call behave correctly.
-    let lookback_start_ms = instant_lookback_start_ms(timestamp, lookback_delta_ms);
+/// One range or grid batch's chunks, copied under the lock for decoding after.
+type CopiedSnapshots = Vec<(EvalLabels, RangeSnapshot)>;
 
-    // The executor's own pool, never the global one: its workers may all be
-    // waiting on this very task. From a `Vec` rather than `iter_into_par` —
-    // one cached sample per item is far too little work to pull through a
-    // mutex-wrapped iterator (see `snapshot_range_local`).
-    let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
-    let samples = series
-        .into_par_on(&MATERIALIZE_POOL)
-        .filter_map(|s| {
-            let sample = s.last_sample_in_range(lookback_start_ms, timestamp)?;
+/// One single-node task's read in progress.
+struct LocalRead {
+    cursor: SeriesCursor,
+    caller_user: Option<String>,
+    options: QueryOptions,
+    responder: mpsc::SyncSender<QueryResult<SelectorOutput>>,
+    state: ReadState,
+    /// Answered with an error, or lost to a panic: nothing more to do.
+    failed: bool,
+}
 
-            let labels = EvalLabels::interned(&s.labels);
-            Some(InstantSample {
-                timestamp_ms: sample.timestamp,
-                value: sample.value,
-                labels,
+enum ReadState {
+    /// The newest sample in `[start, end]` of every series: a vector, or the
+    /// raw input of an aggregation the caller evaluates itself.
+    Instant {
+        start: Timestamp,
+        end: Timestamp,
+        aggregation: bool,
+        samples: Vec<InstantSample<EvalLabels>>,
+    },
+    /// The samples in `[start, end]` of every series that has any.
+    Range {
+        start: Timestamp,
+        end: Timestamp,
+        grid: bool,
+        budget: SampleBudget,
+        ranges: Vec<RangeSample<EvalLabels>>,
+    },
+    /// The label profile of the matched series, up to `cap` of them.
+    Profile {
+        cap: usize,
+        matched: usize,
+        builder: LabelProfileBuilder,
+        overflow: bool,
+    },
+}
+
+impl LocalRead {
+    /// What reading one series costs against [`HOLD_BUDGET`].
+    fn series_cost(&self) -> usize {
+        match self.state {
+            ReadState::Range { .. } => RANGE_SERIES_COST,
+            ReadState::Instant { .. } | ReadState::Profile { .. } => 1,
+        }
+    }
+
+    /// What the rest of the read costs: the order a hold serves reads in.
+    fn remaining_cost(&self) -> usize {
+        self.cursor.remaining() * self.series_cost()
+    }
+
+    /// Plan `task`'s read, or answer it on the spot (`None`): past its deadline,
+    /// a grid with nothing to fetch, or a selector the index cannot plan.
+    fn plan(task: SelectorTask) -> Option<Self> {
+        let SelectorTask {
+            kind,
+            caller_user,
+            hash_tags: _,
+            responder,
+        } = task;
+        let db = kind.db();
+        let (matchers, options, state) = match kind {
+            SelectorTaskKind::Vector(iqc) => {
+                let lookback_ms = iqc.options.lookback_delta.as_millis() as Timestamp;
+                let state = ReadState::Instant {
+                    // PromQL's lookback window is (timestamp - lookback, timestamp].
+                    start: instant_lookback_start_ms(iqc.timestamp, lookback_ms),
+                    end: iqc.timestamp,
+                    aggregation: false,
+                    samples: Vec::new(),
+                };
+                (iqc.matchers, iqc.options, state)
+            }
+            SelectorTaskKind::Aggregation(ac) => {
+                // Single node: there is no shard to push the operator to, so the
+                // raw vector goes back and the caller aggregates it off the lock.
+                let lookback_ms = ac.options.lookback_delta.as_millis() as Timestamp;
+                let state = ReadState::Instant {
+                    start: instant_lookback_start_ms(ac.timestamp, lookback_ms),
+                    end: ac.timestamp,
+                    aggregation: true,
+                    samples: Vec::new(),
+                };
+                (ac.matchers, ac.options, state)
+            }
+            SelectorTaskKind::Range(rc) => {
+                let state = ReadState::Range {
+                    start: rc.start_timestamp,
+                    end: rc.end_timestamp,
+                    grid: false,
+                    budget: SampleBudget::new(rc.options.max_samples),
+                    ranges: Vec::new(),
+                };
+                (rc.matchers, rc.options, state)
+            }
+            SelectorTaskKind::Grid(gc) => {
+                // Single node: same reasoning as the aggregation task — read the
+                // spans and let the caller evaluate them off the lock.
+                let Some((start, end)) = gc.request.fetch_bounds() else {
+                    let empty = SelectorOutput::Grid(GridOutcome::Raw(Vec::new()));
+                    deliver_task_result(&responder, Ok(empty));
+                    return None;
+                };
+                let state = ReadState::Range {
+                    start,
+                    end,
+                    grid: true,
+                    budget: SampleBudget::new(gc.options.max_samples),
+                    ranges: Vec::new(),
+                };
+                (gc.matchers, gc.options, state)
+            }
+            SelectorTaskKind::Profile(pc) => {
+                let state = ReadState::Profile {
+                    cap: profiled_series_cap(&pc.options),
+                    matched: 0,
+                    builder: LabelProfileBuilder::new(),
+                    overflow: false,
+                };
+                (pc.matchers, pc.options, state)
+            }
+        };
+
+        if options.deadline.is_some_and(|d| current_time_millis() > d) {
+            deliver_task_result(&responder, Err(QueryError::Timeout));
+            return None;
+        }
+        let selector = SeriesSelector::from(matchers);
+        match SeriesCursor::plan(db, &[selector], None) {
+            Ok(cursor) => Some(Self {
+                cursor,
+                caller_user,
+                options,
+                responder,
+                state,
+                failed: false,
+            }),
+            Err(err) => {
+                deliver_task_result(&responder, Err(QueryError::Execution(err.to_string())));
+                None
+            }
+        }
+    }
+
+    /// Under the lock: read up to `share` more series as this task's database and
+    /// caller. A range read hands back the chunks it copied, for [`Self::decode`].
+    fn copy(&mut self, ctx: &Context, share: usize) -> QueryResult<Option<CopiedSnapshots>> {
+        if self.cursor.is_done() {
+            return Ok(None);
+        }
+        let _ = set_current_db(ctx, self.cursor.db());
+        let Self { cursor, state, .. } = self;
+        with_fanout_user(ctx, self.caller_user.as_deref(), |ctx| {
+            Ok(match state {
+                ReadState::Instant {
+                    start,
+                    end,
+                    samples,
+                    ..
+                } => {
+                    let (start, end) = (*start, *end);
+                    // Straight into the answer, sized for every planned series on
+                    // the first hold: a batch `Vec` per hold, and the answer
+                    // doubling across holds, left macOS's allocator holding
+                    // 300 MB it no longer used under four concurrent queries.
+                    if samples.capacity() == 0 {
+                        samples.reserve_exact(cursor.remaining());
+                    }
+                    cursor.next_batch(ctx, share, &mut |_, batch| {
+                        samples.extend(batch.iter().filter_map(|(s, _)| {
+                            let sample = s.last_sample_in_range(start, end)?;
+                            Some(InstantSample {
+                                timestamp_ms: sample.timestamp,
+                                value: sample.value,
+                                labels: EvalLabels::interned(&s.labels),
+                            })
+                        }));
+                        Ok(())
+                    })?;
+                    None
+                }
+                ReadState::Range { start, end, .. } => {
+                    let (start, end) = (*start, *end);
+                    cursor.next_batch(ctx, share, &mut |_, batch| {
+                        Ok(batch
+                            .iter()
+                            .filter_map(|(s, _)| {
+                                let snapshot = s.snapshot_range(start, end);
+                                (!snapshot.is_empty())
+                                    .then(|| (EvalLabels::interned(&s.labels), snapshot))
+                            })
+                            .collect::<Vec<_>>())
+                    })?
+                }
+                ReadState::Profile {
+                    cap,
+                    matched,
+                    builder,
+                    overflow,
+                } => {
+                    let cap = *cap;
+                    cursor.next_batch(ctx, share, &mut |_, batch| {
+                        for (s, _) in batch.iter() {
+                            *matched += 1;
+                            if cap > 0 && *matched > cap {
+                                *overflow = true;
+                                break;
+                            }
+                            // The builder copies what it keeps.
+                            builder.add_series(s.labels.iter().map(|l| (l.name, l.value)));
+                        }
+                        Ok(())
+                    })?;
+                    if *overflow {
+                        // Past the cap the profile is not worth finishing.
+                        cursor.finish();
+                    }
+                    None
+                }
             })
         })
-        .collect::<Vec<_>>();
-
-    // Bound what the query returns, not what the selector matched: a series
-    // whose latest sample predates the lookback window contributes nothing, so
-    // it must not count against the limit. The cluster paths filter first for
-    // the same reason, and a query's fate should not turn on which one ran it.
-    validate_max_series_(samples.len(), options.max_series)?;
-    // No max-points-per-series validation here: an instant query yields at most one
-    // sample per series, so the per-series point limit can never be exceeded.
-
-    Ok(samples)
-}
-
-/// The under-lock half of a local range read: resolve the series and copy
-/// out the chunks the range touches. Nothing here decodes a sample.
-fn snapshot_range_local(
-    ctx: &Context,
-    selector: SeriesSelector,
-    start_time: i64,
-    end_time: i64,
-    options: &QueryOptions,
-) -> QueryResult<Vec<(EvalLabels, RangeSnapshot)>> {
-    if let Some(d) = options.deadline
-        && current_time_millis() > d
-    {
-        return Err(QueryError::Timeout);
+        .map_err(|err| QueryError::Execution(err.to_string()))
     }
-    let series = series_by_selectors(ctx, &[selector], None)
-        .map_err(|e| QueryError::Execution(e.to_string()))?;
-    // The copy fans out on the executor's pool, as the decode it replaced did:
-    // one thread copying a query's worth of chunks was most of what the
-    // decode had cost, and the lock is held either way. From a `Vec`, not
-    // `iter_into_par`: that wraps the iterator in a mutex, and with work this
-    // small per item the pull lock convoys through the kernel.
-    let series: Vec<&TimeSeries> = series.iter().map(|(s, _)| s.deref()).collect();
-    Ok(series
-        .into_par_on(&MATERIALIZE_POOL)
-        .map(|s| {
-            (
-                EvalLabels::interned(&s.labels),
-                s.snapshot_range(start_time, end_time),
-            )
-        })
-        .collect())
+
+    /// Off the lock: decode one batch's chunks on the executor's own pool,
+    /// charging this read's sample budget and applying the per-series limit.
+    fn decode(&mut self, batch: CopiedSnapshots) {
+        let ReadState::Range { budget, ranges, .. } = &mut self.state else {
+            return;
+        };
+        match decode_snapshot_batch(batch, &self.options, budget) {
+            Ok(decoded) => ranges.extend(decoded),
+            Err(err) => self.fail(err),
+        }
+    }
+
+    /// Every series is read: apply the series-count limit and answer.
+    fn finish(&mut self) {
+        let result = match std::mem::replace(
+            &mut self.state,
+            ReadState::Instant {
+                start: 0,
+                end: 0,
+                aggregation: false,
+                samples: Vec::new(),
+            },
+        ) {
+            ReadState::Instant {
+                samples,
+                aggregation,
+                ..
+            } => {
+                // Bound what the query returns, not what the selector matched: a
+                // series whose latest sample predates the lookback window
+                // contributes nothing, so it must not count against the limit.
+                // The cluster paths filter first for the same reason. No
+                // per-series point limit: an instant read yields one sample.
+                validate_max_series_(samples.len(), self.options.max_series).map(|()| {
+                    if aggregation {
+                        SelectorOutput::Aggregation(AggregationOutcome::Raw(samples))
+                    } else {
+                        SelectorOutput::Vector(samples)
+                    }
+                })
+            }
+            ReadState::Range { ranges, grid, .. } => {
+                // The series the query returns, as above. This is also the path
+                // a single-node grid query takes, so it must agree with the
+                // pushed-down one about which queries `max_series` rejects.
+                validate_max_series_(ranges.len(), self.options.max_series).map(|()| {
+                    if grid {
+                        SelectorOutput::Grid(GridOutcome::Raw(ranges))
+                    } else {
+                        SelectorOutput::Matrix(ranges)
+                    }
+                })
+            }
+            ReadState::Profile {
+                builder, overflow, ..
+            } => Ok(SelectorOutput::Profile(
+                (!overflow).then(|| builder.finish()),
+            )),
+        };
+        deliver_task_result(&self.responder, result);
+    }
+
+    fn fail(&mut self, err: QueryError) {
+        self.failed = true;
+        deliver_task_result(&self.responder, Err(err));
+    }
 }
 
-/// The other half, off the lock: decode every snapshot on the executor's own
-/// pool and apply the per-series and series-count limits.
-fn decode_range_snapshots(
-    series: Vec<(EvalLabels, RangeSnapshot)>,
+/// Decode one batch of a local range read on the executor's own pool. Exact
+/// accounting against the query's sample budget, and an early stop: once it is
+/// spent the remaining series are not decoded, so the overshoot is at most one
+/// series per pool thread.
+fn decode_snapshot_batch(
+    series: CopiedSnapshots,
     options: &QueryOptions,
+    budget: &SampleBudget,
 ) -> QueryResult<Vec<RangeSample<EvalLabels>>> {
     let max_points = options.max_points_per_series;
-    // Exact accounting for this read against the query's sample budget, and an
-    // early stop: once it is spent, the remaining series are not decoded at all,
-    // so the overshoot is at most one series per pool thread.
-    let budget = SampleBudget::new(options.max_samples);
-    let ranges = series
+    series
         .into_par_on(&MATERIALIZE_POOL)
         .filter_map(|(labels, snapshot)| {
             if budget.exhausted() {
@@ -1101,15 +1310,7 @@ fn decode_range_snapshots(
             Some(Ok(RangeSample { samples, labels }))
         })
         .into_fallible()
-        .collect::<Vec<_>>()?;
-
-    // Bound the series the query returns, not the ones the selector matched:
-    // an empty range contributes nothing. This is also the path a single-node
-    // grid query takes, so it must agree with the pushed-down one about which
-    // queries `max_series` rejects.
-    validate_max_series_(ranges.len(), options.max_series)?;
-
-    Ok(ranges)
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
