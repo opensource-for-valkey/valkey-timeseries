@@ -54,6 +54,7 @@ use crate::promql::generated::{
     GridSeries as ProtoGridSeries, RollupKind as ProtoRollupKind,
     SeriesSelector as ProtoSeriesSelector,
 };
+use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::model::RangeSample;
 use crate::promql::time::{MAX_GRID_STEPS, grid_step_count};
 use promql_parser::label::Matchers;
@@ -67,7 +68,7 @@ mod tests;
 mod transport;
 
 use columns::{columnar_series, decode_columns, encode_columns};
-use transport::transport_plan;
+use transport::ships_raw;
 
 impl From<RollupKind> for ProtoRollupKind {
     fn from(kind: RollupKind) -> Self {
@@ -319,17 +320,20 @@ impl FanoutCommand for GridFanoutCommand {
             req.range_end_ms,
         );
 
-        // Locks per batch of matched series; decodes with the lock released.
-        let windows = local_grid_windows(
+        // Locks per batch of matched series; each batch is decoded and run
+        // through the per-series stage with the lock released, before the next
+        // batch is read.
+        let mut grid = ShardGrid::new(&request, &window_ends);
+        local_grid_windows(
             ctx,
             series_selector,
             &window_ends,
             request.backward_ms(),
             req.max_series,
             req.max_points_per_series,
+            |windows| grid.add(windows),
         )?;
-
-        shard_response(&request, &window_ends, windows)
+        grid.finish()
     }
 
     fn get_timeout(&self) -> Duration {
@@ -541,26 +545,110 @@ fn decode_request(req: &GridQuery) -> ValkeyResult<GridRequest> {
     })
 }
 
-/// One shard's response: the per-series stage over every series that
-/// [`transport_plan`] keeps, the rest shipped raw, and — for a fused request
-/// — the staged series folded into per-`(group, step)` partials.
+/// One shard's response over all of its windows at once: the per-series stage
+/// over every series that [`transport::transport_plan`] keeps, the rest shipped
+/// raw, and — for a fused request — the staged series folded into
+/// per-`(group, step)` partials. The shard itself builds it a batch at a time
+/// with [`ShardGrid`]; this is that, in one batch.
+#[cfg(test)]
 fn shard_response(
     request: &GridRequest,
     window_ends: &[i64],
     windows: Vec<RangeSample<EvalLabels>>,
 ) -> ValkeyResult<GridQueryResponse> {
-    let plan = transport_plan(request, window_ends, &windows);
-    let mut raw = Vec::new();
-    let mut staged = Vec::with_capacity(windows.len());
-    for (series, ships_raw) in windows.into_iter().zip(plan) {
-        if ships_raw {
-            raw.push(series);
-        } else {
-            staged.push(series);
+    let mut grid = ShardGrid::new(request, window_ends);
+    grid.add(windows);
+    grid.finish()
+}
+
+/// A shard's grid response, built one batch of windows at a time so that the
+/// shard never holds more than a batch of decoded samples.
+///
+/// Each series goes through the per-series stage as its batch arrives, which
+/// shrinks it to one point per window end, unless [`ships_raw`] finds its span
+/// the smaller form — and such a span is, by that test, smaller than its stage
+/// output would be. The raw spans wait for [`ShardGrid::finish`], because a
+/// fused reduction decides per *group* whether they travel raw or join their
+/// group's partials, and a group is only complete once every batch is in.
+///
+/// Promoted spans are folded after the group's other members rather than in
+/// match order. Under a fused reduction that can move a sum in its last bits,
+/// as merging the shards' partials in arrival order already does.
+pub(super) struct ShardGrid<'a> {
+    request: &'a GridRequest,
+    window_ends: &'a [i64],
+    raw: Vec<RangeSample<EvalLabels>>,
+    staged: Option<GridSeries>,
+    staged_groups: FingerprintHashSet,
+}
+
+impl<'a> ShardGrid<'a> {
+    pub(super) fn new(request: &'a GridRequest, window_ends: &'a [i64]) -> Self {
+        Self {
+            request,
+            window_ends,
+            raw: Vec::new(),
+            staged: None,
+            staged_groups: FingerprintHashSet::default(),
         }
     }
-    let staged = request.per_series(window_ends, staged);
 
+    /// Take one batch of non-empty windows.
+    pub(super) fn add(&mut self, windows: Vec<RangeSample<EvalLabels>>) {
+        let (raw, staged): (Vec<_>, Vec<_>) = windows
+            .into_iter()
+            .partition(|series| ships_raw(self.window_ends, series));
+        self.raw.extend(raw);
+        self.staged_groups.extend(transport::staged_groups(
+            self.request,
+            staged.iter().map(|series| (series, &false)),
+        ));
+        self.stage(staged);
+    }
+
+    fn stage(&mut self, series: Vec<RangeSample<EvalLabels>>) {
+        if series.is_empty() {
+            return;
+        }
+        let output = self.request.per_series(self.window_ends, series);
+        match &mut self.staged {
+            Some(staged) => staged.append(output),
+            None => self.staged = Some(output),
+        }
+    }
+
+    pub(super) fn finish(mut self) -> ValkeyResult<GridQueryResponse> {
+        let request = self.request;
+        let window_ends = self.window_ends;
+        let candidates = std::mem::take(&mut self.raw);
+        let promoted = {
+            let candidates: Vec<&RangeSample<EvalLabels>> = candidates.iter().collect();
+            transport::promoted_raw(request, window_ends, &candidates, &self.staged_groups)
+        };
+        let mut raw = Vec::with_capacity(candidates.len());
+        let mut folded = Vec::new();
+        for (series, promote) in candidates.into_iter().zip(promoted) {
+            if promote {
+                folded.push(series);
+            } else {
+                raw.push(series);
+            }
+        }
+        self.stage(folded);
+        let staged = self
+            .staged
+            .unwrap_or_else(|| request.per_series(window_ends, Vec::new()));
+        respond(request, window_ends, raw, staged)
+    }
+}
+
+/// The wire response from a shard's raw spans and per-series stage output.
+fn respond(
+    request: &GridRequest,
+    window_ends: &[i64],
+    raw: Vec<RangeSample<EvalLabels>>,
+    staged: GridSeries,
+) -> ValkeyResult<GridQueryResponse> {
     // One symbol table for every labelled element of the response.
     let mut symbols = SymbolTableBuilder::default();
     let raw = raw

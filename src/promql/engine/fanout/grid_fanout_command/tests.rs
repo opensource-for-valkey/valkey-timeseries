@@ -1484,3 +1484,99 @@ fn test_window_ends_and_fetch_bounds() {
     assert!(empty.window_ends().is_empty());
     assert_eq!(empty.fetch_bounds(), None);
 }
+
+/// One shard's read as the shard sees it, over every transport case at
+/// once: a group with dense members (staged) and sparse ones (promoted
+/// because the group ships partials anyway), a sparse-only group (promoted
+/// on size), and a lone sparse series (kept raw).
+fn mixed_transport_windows() -> Vec<RangeSample<EvalLabels>> {
+    let dense = |job: &str, i: usize| {
+        let instance = format!("{job}-dense-{i}");
+        series_with(
+            &[("__name__", "m"), ("job", job), ("instance", &instance)],
+            &(0..=30)
+                .map(|t| (t * 10_000, (i * 100 + t as usize) as f64))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut windows = Vec::new();
+    for i in 0..5 {
+        windows.push(dense("api", i));
+        windows.extend(sparse_job("api", 40).into_iter().skip(i * 8).take(8));
+    }
+    windows.extend(sparse_job("web", 200));
+    windows.push(series_with(
+        &[("__name__", "m"), ("job", "solo"), ("instance", "solo-0")],
+        &[(150_000, 7.0)],
+    ));
+    windows
+}
+
+/// A shard builds its response a batch at a time ([`ShardGrid`]); the
+/// answer must be the one the whole read gives in one batch, however the
+/// batches cut across groups — the transport decision is deferred until
+/// every batch is in, so a group split over batches is sized as a whole.
+#[test]
+fn test_shard_grid_in_batches_answers_as_one_batch() {
+    let windows = mixed_transport_windows();
+    let requests = [
+        ("stepped", stepped_grid_request(), false),
+        ("rate", rollup_grid_request(RollupKind::Rate), false),
+        (
+            "sum by (job) stepped",
+            fused(stepped_grid_request(), AggregationKind::Sum, &["job"]),
+            true,
+        ),
+        (
+            "sum by (job) rate",
+            fused(
+                rollup_grid_request(RollupKind::Rate),
+                AggregationKind::Sum,
+                &["job"],
+            ),
+            true,
+        ),
+        (
+            "max by (job) rate",
+            fused(
+                rollup_grid_request(RollupKind::Rate),
+                AggregationKind::Max,
+                &["job"],
+            ),
+            true,
+        ),
+    ];
+    for (what, request, is_fused) in requests {
+        let ends = request.window_ends();
+        let whole = shard_response(&request, &ends, windows.clone()).unwrap();
+
+        let mut grid = ShardGrid::new(&request, &ends);
+        for batch in windows.chunks(7) {
+            grid.add(batch.to_vec());
+        }
+        let split = grid.finish().unwrap();
+
+        assert_eq!(split.raw.len(), whole.raw.len(), "{what}: raw spans");
+        assert_eq!(split.series.len(), whole.series.len(), "{what}: series");
+        assert_eq!(
+            split.partials.len(),
+            whole.partials.len(),
+            "{what}: partials"
+        );
+        if is_fused {
+            // The sparse groups are folded; the lone series may go either way
+            // (one accumulator for `max` makes even it cheaper as partials).
+            assert!(split.raw.len() <= 1, "{what}: the sparse groups are folded");
+        }
+
+        let want = rendered(request.evaluate(windows.clone()).unwrap());
+        let mut cmd = command(request.clone());
+        cmd.on_response(split, &node(7000)).unwrap();
+        let got = rendered(cmd.into_result().unwrap());
+        if is_fused {
+            assert_rendered_close(&want, &got, what);
+        } else {
+            assert_eq!(got, want, "{what}");
+        }
+    }
+}

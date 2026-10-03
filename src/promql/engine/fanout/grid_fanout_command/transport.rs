@@ -4,9 +4,9 @@
 
 use crate::labels::InternedLabel;
 use crate::promql::EvalLabels;
-use crate::promql::engine::query_reader::GridRequest;
+use crate::promql::engine::query_reader::{GridAggregation, GridRequest};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
-use crate::promql::hashers::FingerprintHashMap;
+use crate::promql::hashers::{FingerprintHashMap, FingerprintHashSet};
 use crate::promql::model::RangeSample;
 use crate::series::chunks::WIRE_COMPRESSION_MIN_SAMPLES;
 
@@ -157,24 +157,75 @@ impl GroupEstimate {
 /// per-series rule are never demoted: their span is the larger form by
 /// itself. The estimate reads labels and counts only, never a sample, and
 /// a read with nothing to promote costs one pass over the flags.
+///
+/// The shard decides in two halves as its batches arrive — [`ships_raw`] per
+/// series, then [`promoted_raw`] once the groups are complete — and this is the
+/// two run over one batch, the form the decision is specified and tested in.
+#[cfg(test)]
 pub(super) fn transport_plan(
     request: &GridRequest,
     window_ends: &[i64],
     windows: &[RangeSample<EvalLabels>],
 ) -> Vec<bool> {
-    let mut raw: Vec<bool> = windows
+    let mut plan: Vec<bool> = windows
         .iter()
         .map(|series| ships_raw(window_ends, series))
         .collect();
-    let Some(aggregation) = request
+    let staged_groups = staged_groups(request, windows.iter().zip(&plan).filter(|(_, r)| !**r));
+    let raw: Vec<&RangeSample<EvalLabels>> = windows
+        .iter()
+        .zip(&plan)
+        .filter_map(|(series, &is_raw)| is_raw.then_some(series))
+        .collect();
+    let mut promoted = promoted_raw(request, window_ends, &raw, &staged_groups).into_iter();
+    for is_raw in plan.iter_mut().filter(|is_raw| **is_raw) {
+        if promoted.next() == Some(true) {
+            *is_raw = false;
+        }
+    }
+    plan
+}
+
+/// The aggregation groups of `staged` series — those [`ships_raw`] keeps on the shard —
+/// under a fused reduction, and empty otherwise: what [`promoted_raw`] needs to know about
+/// the series it is not deciding. Taken as they go by, so a reader that evaluates the
+/// staged series a batch at a time need not keep them.
+pub(super) fn staged_groups<'a>(
+    request: &GridRequest,
+    staged: impl Iterator<Item = (&'a RangeSample<EvalLabels>, &'a bool)>,
+) -> FingerprintHashSet {
+    let mut groups = FingerprintHashSet::default();
+    if let Some(aggregation) = reduction(request) {
+        let modifier = aggregation.modifier.as_ref();
+        groups.extend(staged.map(|(series, _)| series.labels.compute_grouping_key(modifier)));
+    }
+    groups
+}
+
+/// The fused reduction a request answers in partials, if it does.
+fn reduction(request: &GridRequest) -> Option<&GridAggregation> {
+    request
         .aggregation
         .as_ref()
         .filter(|agg| agg.strategy() == PushdownStrategy::Reduce)
-    else {
-        return raw;
+}
+
+/// Of the series [`ships_raw`] picked, which are promoted to their group's partials:
+/// `true` at the index of each. All `false` unless the request is fused with a reduction.
+///
+/// `staged_groups` are the groups of every series that stages under the per-series rule
+/// (see [`staged_groups`]): a group shipping partials anyway takes its raw members too.
+pub(super) fn promoted_raw(
+    request: &GridRequest,
+    window_ends: &[i64],
+    raw: &[&RangeSample<EvalLabels>],
+    staged_groups: &FingerprintHashSet,
+) -> Vec<bool> {
+    let Some(aggregation) = reduction(request) else {
+        return vec![false; raw.len()];
     };
-    if !raw.iter().any(|&is_raw| is_raw) {
-        return raw;
+    if raw.is_empty() {
+        return Vec::new();
     }
 
     let modifier = aggregation.modifier.as_ref();
@@ -186,29 +237,24 @@ pub(super) fn transport_plan(
     // One pass to size every group, remembering each series' group so the
     // second pass need not hash its labels again.
     let mut groups: FingerprintHashMap<GroupEstimate> = FingerprintHashMap::default();
-    let mut keys = Vec::with_capacity(windows.len());
-    for (series, &is_raw) in windows.iter().zip(&raw) {
+    let mut keys = Vec::with_capacity(raw.len());
+    for series in raw {
         let key = series.labels.compute_grouping_key(modifier);
         keys.push(key);
         let group = groups.entry(key).or_insert_with(|| {
-            GroupEstimate::new(
+            let mut group = GroupEstimate::new(
                 partial_overhead + labels_wire_bytes(series.labels.grouping_labels(modifier)),
-            )
+            );
+            group.staged = staged_groups.contains(&key);
+            group
         });
-        if is_raw {
-            group.raw_bytes = group.raw_bytes.saturating_add(raw_wire_bytes(series));
-            group.raw_samples = group
-                .raw_samples
-                .saturating_add(series.samples.len() as u64);
-        } else {
-            group.staged = true;
-        }
+        group.raw_bytes = group.raw_bytes.saturating_add(raw_wire_bytes(series));
+        group.raw_samples = group
+            .raw_samples
+            .saturating_add(series.samples.len() as u64);
     }
 
-    for (is_raw, key) in raw.iter_mut().zip(keys) {
-        if *is_raw && groups[&key].promotes(steps, spread) {
-            *is_raw = false;
-        }
-    }
-    raw
+    keys.into_iter()
+        .map(|key| groups[&key].promotes(steps, spread))
+        .collect()
 }

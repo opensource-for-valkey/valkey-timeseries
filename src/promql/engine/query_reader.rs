@@ -184,6 +184,15 @@ pub enum GridSeries {
 }
 
 impl GridSeries {
+    /// Append another batch's output of the same request's per-series stage.
+    pub(in crate::promql) fn append(&mut self, other: GridSeries) {
+        match (self, other) {
+            (GridSeries::Stepped(series), GridSeries::Stepped(more)) => series.extend(more),
+            (GridSeries::Rolled(series), GridSeries::Rolled(more)) => series.extend(more),
+            _ => unreachable!("BUG: one request's per-series stage yields one kind of output"),
+        }
+    }
+
     /// Every entry as sparse `(step, value)` samples, whichever stage made it.
     pub(in crate::promql) fn into_step_values(self) -> Vec<RangeSample<EvalLabels>> {
         match self {

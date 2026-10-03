@@ -17,7 +17,7 @@ use crate::promql::generated::{
 };
 use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::{
-    DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series, for_each_series_batch,
+    DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series, for_each_series_batch_then,
 };
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
@@ -157,59 +157,71 @@ pub(in crate::promql) fn local_label_profile<S: GilSource + ?Sized>(
     Ok((!overflow).then(|| builder.finish()))
 }
 
-/// Copy, under each batch's lock, the chunks `[start_time, end_time]` touches
-/// in every series `selector` matches, keeping `labels` of each series that has
-/// any. Decoding is left to the caller, with the lock released.
+/// Read the chunks `[start_time, end_time]` touches in every series `selector`
+/// matches, a batch at a time: copy a batch's chunks under its lock, then hand
+/// them to `decode` once the lock is released, before the next batch takes it.
+/// A shard so never holds more than one batch of decoded samples, and the
+/// decoding is the gap in which the main thread gets the lock back.
+///
+/// Only series with a chunk in the span are kept, with `labels` of each: the
+/// evaluator's shared set, or the storage set itself for a response whose
+/// symbol table interns by identity. Either shares the series' `Arc`, so no
+/// string is copied and nothing borrows the series.
 ///
 /// The copy is sequential on purpose. A batch is a few hundred KB, and fanning
 /// it out across the shared pool made the lock holder wait for workers busy
 /// decoding other queries' snapshots: with 4 concurrent rollups the main
 /// thread's PING p99 stayed at 85–100 ms, against 6–15 ms sequential.
-///
-/// `labels` picks what is kept: the evaluator's shared set, or the storage set
-/// itself for a response whose symbol table interns by identity. Either shares
-/// the series' `Arc`, so no string is copied and nothing borrows the series.
-fn snapshot_matched_ranges<S, L, T>(
+fn for_each_snapshot_batch<S, L, T>(
     src: &S,
     selector: SeriesSelector,
     start_time: Timestamp,
     end_time: Timestamp,
     labels: L,
-) -> ValkeyResult<Vec<(T, RangeSnapshot)>>
+    mut decode: impl FnMut(Vec<(T, RangeSnapshot)>) -> ValkeyResult<()>,
+) -> ValkeyResult<()>
 where
     S: GilSource + ?Sized,
-    L: Fn(&TimeSeries) -> T + Sync,
-    T: Send,
+    L: Fn(&TimeSeries) -> T,
 {
-    let mut snapshots = Vec::new();
-    for_each_series_batch(
+    for_each_series_batch_then(
         src,
         &[selector],
         None,
         DEFAULT_SERIES_BATCH_SIZE,
         |_, batch| {
-            snapshots.extend(batch.iter().filter_map(|(s, _)| {
-                let snapshot = s.snapshot_range(start_time, end_time);
-                (!snapshot.is_empty()).then(|| (labels(s), snapshot))
-            }));
+            Ok(batch
+                .iter()
+                .filter_map(|(s, _)| {
+                    let snapshot = s.snapshot_range(start_time, end_time);
+                    (!snapshot.is_empty()).then(|| (labels(s), snapshot))
+                })
+                .collect::<Vec<_>>())
+        },
+        |snapshots| {
+            if !snapshots.is_empty() {
+                decode(snapshots)?;
+            }
             Ok(ControlFlow::Continue(()))
         },
-    )?;
-    Ok(snapshots)
+    )
 }
 
-/// Read the raw windows a pushed-down grid query needs, one entry per series.
+/// Read the raw windows a pushed-down grid query needs, one entry per series,
+/// handing them to `sink` a batch at a time.
 ///
-/// The samples returned are exactly those inside the union of the requested
-/// windows — `(first_end - backward_ms, last_end]`, where `backward_ms` is the
-/// window width for a rollup and the lookback for a stepped selection — so the
-/// shard evaluates the same data the coordinator's own selector would have
-/// loaded. Series with no samples in that span are dropped: an empty window
+/// The samples are exactly those inside the union of the requested windows —
+/// `(first_end - backward_ms, last_end]`, where `backward_ms` is the window
+/// width for a rollup and the lookback for a stepped selection — so the shard
+/// evaluates the same data the coordinator's own selector would have loaded.
+/// Series with no samples in that span are dropped: an empty window
 /// contributes nothing.
 ///
 /// `max_points_per_series` bounds the *raw* points examined per series, which is
 /// the resource this push-down is trading away; the coordinator separately
-/// bounds the points it accepts back.
+/// bounds the points it accepts back. Both limits are judged over the whole
+/// read, so a violation is reported only once every batch is in (see
+/// [`WindowBounds`]), after `sink` has seen them.
 pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
     src: &S,
     selector: SeriesSelector,
@@ -217,38 +229,48 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
     backward_ms: i64,
     max_series: u64,
     max_points_per_series: u64,
-) -> ValkeyResult<Vec<crate::promql::model::RangeSample<EvalLabels>>> {
+    mut sink: impl FnMut(Vec<crate::promql::model::RangeSample<EvalLabels>>),
+) -> ValkeyResult<()> {
     let Some((start_time, end_time)) = grid_fetch_bounds(window_ends, backward_ms) else {
-        return Ok(Vec::new());
+        return Ok(());
     };
 
-    let snapshots = snapshot_matched_ranges(src, selector, start_time, end_time, |s| {
-        EvalLabels::interned(&s.labels)
-    })?;
-
-    // The lock is released: decode on the pool.
     let budget = SampleBudget::new(local_max_samples());
-    let candidates = snapshots
-        .into_par_rayon()
-        .map(|(labels, snapshot)| {
-            if budget.exhausted() {
-                return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
+    let mut bounds = WindowBounds::new(max_series, max_points_per_series);
+    for_each_snapshot_batch(
+        src,
+        selector,
+        start_time,
+        end_time,
+        |s| EvalLabels::interned(&s.labels),
+        |snapshots| {
+            let candidates = snapshots
+                .into_par_rayon()
+                .map(|(labels, snapshot)| {
+                    if budget.exhausted() {
+                        return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
+                    }
+                    let samples = snapshot.get_range();
+                    budget
+                        .charge(samples.len())
+                        .map_err(|err| err.to_string())?;
+                    // A snapshot with chunks can still hold nothing inside the
+                    // span: the chunks only overlap it.
+                    Ok((!samples.is_empty())
+                        .then_some(crate::promql::model::RangeSample { labels, samples }))
+                })
+                .into_fallible()
+                .collect::<Vec<_>>()
+                .map_err(valkey_module::ValkeyError::String)?;
+            let windows = bounds.admit(candidates);
+            if !windows.is_empty() {
+                sink(windows);
             }
-            let samples = snapshot.get_range();
-            budget
-                .charge(samples.len())
-                .map_err(|err| err.to_string())?;
-            // A snapshot with chunks can still hold nothing inside the span:
-            // the chunks only overlap it.
-            Ok((!samples.is_empty())
-                .then_some(crate::promql::model::RangeSample { labels, samples }))
-        })
-        .into_fallible()
-        .collect::<Vec<_>>()
-        .map_err(valkey_module::ValkeyError::String)?;
+            Ok(())
+        },
+    )?;
 
-    bound_windows(candidates, max_series, max_points_per_series)
-        .map_err(valkey_module::ValkeyError::String)
+    bounds.finish().map_err(valkey_module::ValkeyError::String)
 }
 
 /// This node's `ts-promql-max-samples-per-query`, applied to the reads it
@@ -259,31 +281,57 @@ fn local_max_samples() -> usize {
     promql_config().max_samples_per_query
 }
 
-/// Drop the matched-but-empty series, then apply the query limits to what is
-/// left.
+/// The query limits on a shard's grid windows, applied as batches of them are
+/// decoded: drop the matched-but-empty series, then bound what is left.
 ///
-/// The order matters: `max_series` bounds the series the query actually
-/// *returns*, not the ones the selector happened to match. Validating the match
-/// count instead would make the push-down reject queries that the unaggregated
-/// range path — which filters first, see [`handle_range_query`] — accepts, so
-/// whether a query succeeded would depend on an internal optimization decision.
-fn bound_windows(
-    candidates: Vec<Option<crate::promql::model::RangeSample<EvalLabels>>>,
+/// `max_series` bounds the series the query actually *returns*, not the ones
+/// the selector happened to match. Validating the match count instead would
+/// make the push-down reject queries that the unaggregated range path — which
+/// filters first, see [`handle_range_query`] — accepts, so whether a query
+/// succeeded would depend on an internal optimization decision.
+///
+/// That count is only known once every batch is in. A window over the point
+/// limit is remembered rather than reported, so a read over both limits still
+/// fails on `max_series`, as it did when the windows were bounded all at once.
+struct WindowBounds {
     max_series: u64,
-    max_points_per_series: u64,
-) -> Result<Vec<crate::promql::model::RangeSample<EvalLabels>>, String> {
-    let windows: Vec<_> = candidates.into_iter().flatten().collect();
+    max_points: Option<usize>,
+    returned: usize,
+    over_points: Option<String>,
+}
 
-    validate_max_series(windows.len(), max_series as usize)?;
-
-    if max_points_per_series > 0 && max_points_per_series != u64::MAX {
-        let limit = max_points_per_series as usize;
-        for window in &windows {
-            validate_max_points(window.samples.len(), Some(limit))?;
+impl WindowBounds {
+    fn new(max_series: u64, max_points_per_series: u64) -> Self {
+        Self {
+            max_series,
+            max_points: points_limit(max_points_per_series),
+            returned: 0,
+            over_points: None,
         }
     }
 
-    Ok(windows)
+    /// The non-empty windows of one batch, counted against the limits.
+    fn admit(
+        &mut self,
+        candidates: Vec<Option<crate::promql::model::RangeSample<EvalLabels>>>,
+    ) -> Vec<crate::promql::model::RangeSample<EvalLabels>> {
+        let windows: Vec<_> = candidates.into_iter().flatten().collect();
+        self.returned += windows.len();
+        if self.over_points.is_none()
+            && let Some(limit) = self.max_points
+        {
+            self.over_points = windows
+                .iter()
+                .find_map(|w| validate_max_points(w.samples.len(), Some(limit)).err());
+        }
+        windows
+    }
+
+    /// The verdict over every batch admitted.
+    fn finish(self) -> Result<(), String> {
+        validate_max_series(self.returned, self.max_series as usize)?;
+        self.over_points.map_or(Ok(()), Err)
+    }
 }
 
 /// Translate the wire form of the per-series point limit for [`get_snapshot_range`].
@@ -296,6 +344,10 @@ fn points_limit(max_points_per_series: u64) -> Option<usize> {
         .then_some(max_points_per_series as usize)
 }
 
+/// This shard's share of a range-vector selector: every matched series' raw
+/// span, encoded for the wire. Each batch is decoded and encoded as soon as
+/// its lock is released, so what accumulates is compressed chunks, never the
+/// whole share's decoded samples.
 pub(super) fn handle_range_query<S: GilSource + ?Sized>(
     src: &S,
     selector: SeriesSelector,
@@ -304,40 +356,49 @@ pub(super) fn handle_range_query<S: GilSource + ?Sized>(
     max_series: u64,
     max_points_per_series: u64,
 ) -> ValkeyResult<RangeQueryResponse> {
-    // The storage label set itself, not an evaluator copy: the symbol table
-    // below interns by identity.
-    let snapshots =
-        snapshot_matched_ranges(src, selector, start_time, end_time, |s| s.labels.clone())?;
-
     let max_points = points_limit(max_points_per_series);
     // This shard's own `ts-promql-max-samples-per-query`: the request does not
     // carry the coordinator's budget, and one node's share of a query should
     // not exceed what that node would allow a query of its own.
     let budget = SampleBudget::new(local_max_samples());
-    // The lock is released: decode and encode on the pool.
-    let ranges = snapshots
-        .into_par_rayon()
-        .map(|(labels, snapshot)| {
-            if budget.exhausted() {
-                return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
-            }
-            // Streams against the per-series point limit, so an over-wide span
-            // is rejected having kept at most the permitted samples.
-            let series_samples = get_snapshot_range(&snapshot, max_points)?;
-            budget
-                .charge(series_samples.len())
-                .map_err(|err| err.to_string())?;
-            if series_samples.is_empty() {
-                return Ok(None);
-            }
-            let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
-                .map_err(|e| e.to_string())?;
-            Ok(Some((labels, data)))
-        })
-        .into_fallible()
-        .filter_map(|range| range)
-        .collect::<Vec<_>>()
-        .map_err(valkey_module::ValkeyError::String)?;
+    let mut ranges = Vec::new();
+    // The storage label set itself, not an evaluator copy: the symbol table
+    // below interns by identity.
+    for_each_snapshot_batch(
+        src,
+        selector,
+        start_time,
+        end_time,
+        |s| s.labels.clone(),
+        |snapshots| {
+            let batch = snapshots
+                .into_par_rayon()
+                .map(|(labels, snapshot)| {
+                    if budget.exhausted() {
+                        return Err(too_many_samples(budget.loaded(), budget.limit()).to_string());
+                    }
+                    // Streams against the per-series point limit, so an
+                    // over-wide span is rejected having kept at most the
+                    // permitted samples.
+                    let series_samples = get_snapshot_range(&snapshot, max_points)?;
+                    budget
+                        .charge(series_samples.len())
+                        .map_err(|err| err.to_string())?;
+                    if series_samples.is_empty() {
+                        return Ok(None);
+                    }
+                    let data = serialize_chunk(samples_to_chunk_lossless(series_samples))
+                        .map_err(|e| e.to_string())?;
+                    Ok(Some((labels, data)))
+                })
+                .into_fallible()
+                .filter_map(|range| range)
+                .collect::<Vec<_>>()
+                .map_err(valkey_module::ValkeyError::String)?;
+            ranges.extend(batch);
+            Ok(())
+        },
+    )?;
 
     validate_max_series(ranges.len(), max_series as usize)
         .map_err(valkey_module::ValkeyError::String)?;
@@ -370,6 +431,17 @@ mod tests {
     use super::*;
     use crate::common::Sample;
     use crate::promql::model::RangeSample;
+
+    /// [`WindowBounds`] over a read that arrives in one batch.
+    fn bound_windows(
+        candidates: Vec<Option<RangeSample<EvalLabels>>>,
+        max_series: u64,
+        max_points_per_series: u64,
+    ) -> Result<Vec<RangeSample<EvalLabels>>, String> {
+        let mut bounds = WindowBounds::new(max_series, max_points_per_series);
+        let windows = bounds.admit(candidates);
+        bounds.finish().map(|()| windows)
+    }
 
     fn sample(timestamp: Timestamp, value: f64) -> Sample {
         Sample { timestamp, value }
@@ -429,5 +501,46 @@ mod tests {
         let windows = bound_windows(candidates, 0, 0).expect("no limits configured");
 
         assert_eq!(windows.len(), 10);
+    }
+
+    /// The limits are judged over the whole read, not per batch: three batches
+    /// of 40 returned series exceed a limit of 100 that none exceeds alone.
+    #[test]
+    fn max_series_counts_every_batch() {
+        let mut bounds = WindowBounds::new(100, 0);
+        for b in 0..3 {
+            let batch: Vec<_> = (0..40).map(|i| filled(&format!("s{b}_{i}"), 1)).collect();
+            assert_eq!(bounds.admit(batch).len(), 40);
+        }
+
+        let err = bounds.finish().expect_err("120 returned > 100");
+
+        assert!(err.contains("120 > 100"), "unexpected message: {err}");
+    }
+
+    /// A batch over the point limit early in the read does not pre-empt the
+    /// series-count verdict, which needs every batch: over both, the read fails
+    /// on `max_series`, as it did bounded all at once.
+    #[test]
+    fn max_series_outranks_an_earlier_point_violation() {
+        let mut bounds = WindowBounds::new(2, 4);
+        bounds.admit(vec![filled("wide", 5)]);
+        bounds.admit(vec![filled("a", 1), filled("b", 1)]);
+
+        let err = bounds.finish().expect_err("3 returned > 2");
+
+        assert!(err.contains("3 > 2"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_point_violation_in_any_batch_fails_the_read() {
+        let mut bounds = WindowBounds::new(0, 4);
+        bounds.admit(vec![filled("a", 1)]);
+        bounds.admit(vec![empty(), filled("wide", 5)]);
+        bounds.admit(vec![filled("b", 1)]);
+
+        let err = bounds.finish().expect_err("5 points > 4");
+
+        assert!(err.contains("5 > 4"), "unexpected message: {err}");
     }
 }
