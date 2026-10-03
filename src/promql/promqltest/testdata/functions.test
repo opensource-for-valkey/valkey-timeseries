@@ -1238,6 +1238,62 @@ eval instant at 0m days_in_month(vector(1485907200))
 
 clear
 
+# Test NaN and infinite timestamps. They do not denote a point in time,
+# so the result is NaN and the element is kept.
+load 5m
+    not_a_time{val="NaN"} NaN
+    not_a_time{val="+Inf"} +Inf
+    not_a_time{val="-Inf"} -Inf
+
+eval instant at 0m day_of_month(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m day_of_week(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m day_of_year(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m days_in_month(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m hour(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m minute(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m month(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+eval instant at 0m year(not_a_time)
+  {val="NaN"} NaN
+  {val="+Inf"} NaN
+  {val="-Inf"} NaN
+
+# Literal arguments take the const-folding path, which must leave the call unfolded.
+eval instant at 0m year(vector(NaN))
+  {} NaN
+
+eval instant at 0m hour(vector(-Inf))
+  {} NaN
+
+clear
+
 # Test duplicate labelset in promql output.
 load 5m
   testmetric1{src="a",dst="b"} 0

@@ -426,6 +426,20 @@ mod tests {
     }
 
     #[test]
+    fn test_const_evaluator_date_parts_not_a_time() {
+        // NaN and ±Inf are not a point in time: the call must stay unfolded so
+        // evaluation returns NaN, not a calendar value for some fallback instant.
+        for arg in ["NaN", "Inf", "-Inf"] {
+            let expr = format!("year(vector({arg}))");
+            let simplified = fold_constants(parse(&expr).expect("parse failed")).prettify();
+            assert!(
+                simplified.starts_with("year("),
+                "{expr} folded to {simplified}"
+            );
+        }
+    }
+
+    #[test]
     fn test_scalar_vector() {
         struct TestCase {
             expr: &'static str,
