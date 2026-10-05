@@ -42,6 +42,8 @@ thiserror = "2.0"
 valkey-module = "0.1.14"
 valkey-module-macros = "0.1.14"
 range-set-blaze = "0.7.0"
+# Client for tools/fleet_loader only; never linked into the module.
+redis = { version = "1.7", optional = true, default-features = false, features = ["cluster"] }
 rayon-core = "1.13"
 regex = "1"
 simd-json = "0.18.1"
@@ -105,6 +107,11 @@ name = "interning_report"
 path = "tools/interning_report.rs"
 required-features = ["test-utils", "enable-system-alloc"]
 
+[[bin]]
+name = "fleet_loader"
+path = "tools/fleet_loader.rs"
+required-features = ["fleet-loader", "enable-system-alloc"]
+
 [features]
 default = ["min-valkey-compatibility-version-8-0", "croaring/alloc"]
 enable-system-alloc = ["valkey-module/enable-system-alloc"]
@@ -114,3 +121,5 @@ use-redismodule-api = [] # We don't support this feature flag which is why it is
 # Enabled automatically for dev targets via the self dev-dependency above.
 # The generators in src/tests are the only users of these two.
 test-utils = ["dep:bon", "dep:rand_distr"]
+# tools/fleet_loader: the fleet generator plus a Valkey client to load it with.
+fleet-loader = ["test-utils", "dep:redis"]

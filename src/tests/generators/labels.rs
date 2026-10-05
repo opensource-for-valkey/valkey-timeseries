@@ -390,7 +390,7 @@ const NODE_GAUGES: &[&str] = &[
 ];
 
 /// The default `prometheus.DefBuckets`, as a client library renders them.
-const LE_BUCKETS: &[&str] = &[
+pub(super) const LE_BUCKETS: &[&str] = &[
     "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
 ];
 
@@ -1029,7 +1029,7 @@ fn weighted<'a>(choices: &[(&'a str, u32)], rng: &mut StdRng) -> &'a str {
 }
 
 /// Stable across toolchains, unlike `DefaultHasher`; see [`super::dataset_seed`].
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(super) fn fnv1a(bytes: &[u8]) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     bytes.iter().fold(FNV_OFFSET, |hash, b| {

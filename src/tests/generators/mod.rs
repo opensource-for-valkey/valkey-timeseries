@@ -1,4 +1,5 @@
 mod dataset;
+mod fleet_metrics;
 mod generator;
 mod labels;
 mod mackey_glass;
@@ -9,6 +10,7 @@ use ::rand::prelude::StdRng;
 use ::rand::{SeedableRng, rng};
 
 pub use dataset::*;
+pub use fleet_metrics::*;
 pub use labels::*;
 pub use rand::*;
 pub use workload::*;
