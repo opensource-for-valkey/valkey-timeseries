@@ -77,6 +77,27 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         with pytest.raises(ResponseError, match="wrong number of arguments"):
             self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 10, 'bah')
 
+    def test_debug_stringpoolstats_local(self):
+        """LOCAL is accepted outside cluster mode, alone or after k, and reports the same pool"""
+        self.set_debug_mode()
+        self.client.execute_command('TS.CREATE', 'ts_local', 'LABELS', 'sensor', 'temp')
+
+        plain = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
+        local = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'local')
+        assert local == plain
+
+        with_top_k = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 3, 'LOCAL')
+        assert len(with_top_k) == 6
+        assert with_top_k[:4] == plain
+
+    def test_debug_replies_are_not_followed_by_a_stray_null(self):
+        """Each subcommand writes its own reply; the handler must not add a Null after it"""
+        self.set_debug_mode()
+        for args in (('STRINGPOOLSTATS',), ('STRINGPOOLSTATS', 2), ('HELP',), ('LIST_CONFIGS',)):
+            self.client.execute_command('TS._DEBUG', *args)
+            # A stray Null would be read as the reply to the next command.
+            assert self.client.execute_command('PING') is True, args
+
     def test_debug_list_configs_compact(self):
         """Test TS._DEBUG LIST_CONFIGS in compact mode (default)"""
         result = self.client.execute_command('TS._DEBUG', 'LIST_CONFIGS')

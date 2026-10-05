@@ -1,13 +1,16 @@
+use super::fanout_codec::generated::StringPoolTopKEntry;
 use super::ts_debug_configs::list_configs_cmd;
+use super::ts_string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
-use crate::common::string_interner::{BucketStats, InternedString, TopKEntry};
+use crate::common::string_interner::{BucketStats, saved_pct};
 use crate::config::is_debug_mode_enabled;
 use crate::error_consts;
+use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::series_keys_by_selectors;
-use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// Dumps a bucket's statistics to the reply.
 fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
@@ -33,56 +36,78 @@ fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
     reply_with_usize(ctx, utilization as usize);
 }
 
-/// Dumps a TopKEntry to the reply.
-fn dump_top_k_entry(ctx: &Context, entry: &TopKEntry) {
+/// Dumps a top-K entry to the reply.
+fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
     reply_with_array(ctx, 8);
 
     reply_with_str(ctx, "value");
     reply_with_bulk_string(ctx, &entry.value);
 
     reply_with_str(ctx, "refCount");
-    reply_with_usize(ctx, entry.ref_count);
+    reply_with_usize(ctx, entry.ref_count as usize);
 
     reply_with_str(ctx, "bytes");
-    reply_with_usize(ctx, entry.bytes);
+    reply_with_usize(ctx, entry.bytes as usize);
 
     reply_with_str(ctx, "allocated");
-    reply_with_usize(ctx, entry.allocated);
+    reply_with_usize(ctx, entry.allocated as usize);
 }
 
 /// Returns statistics about the string pool.
 ///
-/// TS._DEBUG STRINGPOOLSTATS
+/// TS._DEBUG STRINGPOOLSTATS [k] [LOCAL]
+///
+/// In cluster mode the statistics are summed over one primary per shard (see
+/// [`StringPoolSummary`] for what the sums mean); `LOCAL` reports this node's pool alone.
 fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     // Parse optional k parameter (default: 0 for backward compatibility)
-    let k = if args.peek().is_some() {
-        args.next_u64()? as usize
-    } else {
-        0
+    let k = match args.peek() {
+        Some(arg) if !arg.as_slice().eq_ignore_ascii_case(b"LOCAL") => args.next_u64()? as usize,
+        _ => 0,
+    };
+    let local = match args.peek() {
+        Some(arg) if arg.as_slice().eq_ignore_ascii_case(b"LOCAL") => {
+            args.next();
+            true
+        }
+        _ => false,
     };
 
     args.done()?;
 
-    // todo: currently we're local only. Support cluster mode
-    let stats = InternedString::get_stats_with_top_k(k);
+    if !local && is_clustered(ctx) {
+        StringPoolStatsFanoutCommand::new(k).exec(ctx)?;
+        return Ok(());
+    }
 
-    let arr_len = if k > 0 { 6 } else { 4 };
+    reply_with_string_pool_stats(ctx, &StringPoolSummary::local(k), k > 0);
+    Ok(())
+}
+
+/// Writes a `TS._DEBUG STRINGPOOLSTATS` reply. Shared by the local path and the cluster fan-out,
+/// so both reply with the same shape.
+pub(super) fn reply_with_string_pool_stats(
+    ctx: &Context,
+    stats: &StringPoolSummary,
+    with_top_k: bool,
+) {
+    let arr_len = if with_top_k { 6 } else { 4 };
     reply_with_array(ctx, arr_len);
 
     // Reply[0] -> GlobalStats
-    dump_bucket(ctx, &stats.total_stats);
+    dump_bucket(ctx, &stats.total);
 
     // Reply[1] -> ByRefcount
-    reply_with_array(ctx, stats.by_ref_stats.len());
-    for (&ref_count, bucket) in &stats.by_ref_stats {
+    reply_with_array(ctx, stats.by_ref_count.len());
+    for (&ref_count, bucket) in &stats.by_ref_count {
         reply_with_array(ctx, 2);
         reply_with_usize(ctx, ref_count);
         dump_bucket(ctx, bucket);
     }
 
     // Reply[2] -> BySize
-    reply_with_array(ctx, stats.by_size_stats.len());
-    for (&size, bucket) in &stats.by_size_stats {
+    reply_with_array(ctx, stats.by_size.len());
+    for (&size, bucket) in &stats.by_size {
         reply_with_array(ctx, 2);
         reply_with_usize(ctx, size);
         dump_bucket(ctx, bucket);
@@ -94,21 +119,28 @@ fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
     // so it reads near 100% on any label set worth interning. The holder slot is what a
     // reference costs whether or not the bytes behind it are shared, so the four fields after
     // it restate the same saving against total string storage; see `Stats` for the split.
+    let total_storage_bytes = stats.total_storage_bytes();
     reply_with_array(ctx, 12);
     reply_with_str(ctx, "memorySavedBytes");
     reply_with_usize(ctx, stats.memory_saved_bytes);
     reply_with_str(ctx, "memorySavedPct");
-    reply_with_double(ctx.ctx, stats.memory_saved_pct);
+    reply_with_double(
+        ctx.ctx,
+        saved_pct(stats.memory_saved_bytes, stats.total.allocated),
+    );
     reply_with_str(ctx, "holders");
     reply_with_usize(ctx, stats.holder_count);
     reply_with_str(ctx, "holderSlotBytes");
     reply_with_usize(ctx, stats.holder_slot_bytes);
     reply_with_str(ctx, "totalStorageBytes");
-    reply_with_usize(ctx, stats.total_storage_bytes);
+    reply_with_usize(ctx, total_storage_bytes);
     reply_with_str(ctx, "storageSavedPct");
-    reply_with_double(ctx.ctx, stats.storage_saved_pct);
+    reply_with_double(
+        ctx.ctx,
+        saved_pct(stats.memory_saved_bytes, total_storage_bytes),
+    );
 
-    if k > 0 {
+    if with_top_k {
         // Reply[4] -> TopK by RefCount
         reply_with_array(ctx, stats.top_k_by_ref.len());
         for entry in &stats.top_k_by_ref {
@@ -121,8 +153,6 @@ fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
             dump_top_k_entry(ctx, entry);
         }
     }
-
-    Ok(())
 }
 
 /// Runs a query against this node's *local* index only, bypassing the cluster fanout that
@@ -152,8 +182,8 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     const HELP_TEXT: &[(&str, &str)] = &[
         ("TS._DEBUG SHOW_INFO", "Show Info Variable Information"),
         (
-            "TS._DEBUG STRINGPOOLSTATS [TOPK]",
-            "Show String Interner Stats",
+            "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]",
+            "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)",
         ),
         (
             "TS._DEBUG QUERYINDEX <filter> [<filter> ...]",
@@ -184,7 +214,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 /// subcommands expose module internals that are not part of the supported API. The gate is
 /// checked before the subcommand is parsed, so a disabled server reports that it is disabled
 /// rather than complaining about the arguments.
-pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult<()> {
+///
+/// Every subcommand writes its own reply, so success maps to `NoReply`: `Ok(())` would convert
+/// to a Null reply and send it after the real one, desynchronizing the client.
+pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if !is_debug_mode_enabled() {
         return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
     }
@@ -194,7 +227,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult<()> 
 
     let keyword = itr.next_str()?.to_ascii_uppercase();
 
-    match keyword.as_str() {
+    let result = match keyword.as_str() {
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),
@@ -209,5 +242,6 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult<()> 
             "Unknown subcommand: {} try HELP subcommand",
             keyword
         ))),
-    }
+    };
+    result.map(|()| ValkeyValue::NoReply)
 }

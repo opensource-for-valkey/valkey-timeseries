@@ -101,3 +101,10 @@ message MultiRangeRequest {
   // peer that ignores this field still produces the same reply.
   bool exclude_empty = 10;
 }
+// TS._DEBUG STRINGPOOLSTATS: each shard reports its own interning pool, which
+// is process-wide (not per database) and holds no keys, so there is nothing to
+// filter.
+message StringPoolStatsRequest {
+  // Ship the top `top_k` strings by reference count and by size; 0 skips both.
+  uint32 top_k = 1;
+}

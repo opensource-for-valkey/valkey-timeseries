@@ -564,6 +564,15 @@ pub struct MultiRangeRequest {
     #[prost(bool, tag = "10")]
     pub exclude_empty: bool,
 }
+/// TS._DEBUG STRINGPOOLSTATS: each shard reports its own interning pool, which
+/// is process-wide (not per database) and holds no keys, so there is nothing to
+/// filter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StringPoolStatsRequest {
+    /// Ship the top `top_k` strings by reference count and by size; 0 skips both.
+    #[prost(uint32, tag = "1")]
+    pub top_k: u32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum QueryLabelsSubtype {
@@ -828,4 +837,50 @@ pub struct StatsResponse {
     pub labels_bitmap: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "7")]
     pub label_value_pairs_bitmap: ::prost::alloc::vec::Vec<u8>,
+}
+/// One bucket of a node's interning pool. `key` is the bucket's grouping value —
+/// the external reference count or the string length — and is unused for the
+/// pool-wide total.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StringPoolBucket {
+    #[prost(uint64, tag = "1")]
+    pub key: u64,
+    #[prost(uint64, tag = "2")]
+    pub count: u64,
+    #[prost(uint64, tag = "3")]
+    pub bytes: u64,
+    #[prost(uint64, tag = "4")]
+    pub allocated: u64,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StringPoolTopKEntry {
+    #[prost(string, tag = "1")]
+    pub value: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub ref_count: u64,
+    #[prost(uint64, tag = "3")]
+    pub bytes: u64,
+    #[prost(uint64, tag = "4")]
+    pub allocated: u64,
+}
+/// A node's interning pool statistics. The percentages are not shipped: they
+/// are ratios, so the coordinator recomputes them from the summed byte counts.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StringPoolStatsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub total: ::core::option::Option<StringPoolBucket>,
+    #[prost(message, repeated, tag = "2")]
+    pub by_ref_count: ::prost::alloc::vec::Vec<StringPoolBucket>,
+    #[prost(message, repeated, tag = "3")]
+    pub by_size: ::prost::alloc::vec::Vec<StringPoolBucket>,
+    #[prost(uint64, tag = "4")]
+    pub memory_saved_bytes: u64,
+    #[prost(uint64, tag = "5")]
+    pub holder_count: u64,
+    #[prost(uint64, tag = "6")]
+    pub holder_slot_bytes: u64,
+    #[prost(message, repeated, tag = "7")]
+    pub top_k_by_ref: ::prost::alloc::vec::Vec<StringPoolTopKEntry>,
+    #[prost(message, repeated, tag = "8")]
+    pub top_k_by_size: ::prost::alloc::vec::Vec<StringPoolTopKEntry>,
 }

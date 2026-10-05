@@ -74,6 +74,7 @@ mod ts_querylabels_fanout_command;
 mod ts_range;
 mod ts_read;
 mod ts_restore;
+mod ts_string_pool_stats_fanout_command;
 mod utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
@@ -96,6 +97,7 @@ use ts_mget_fanout_command::MGetFanoutCommand;
 use ts_mrange_fanout_command::MRangeFanoutCommand;
 use ts_queryindex_fanout_command::QueryIndexFanoutCommand;
 use ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
+use ts_string_pool_stats_fanout_command::StringPoolStatsFanoutCommand;
 
 pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<LabelStatsFanoutCommand>()?;
@@ -106,6 +108,7 @@ pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<MRangeFanoutCommand>()?;
     register_fanout_operation::<QueryIndexFanoutCommand>()?;
     register_fanout_operation::<QueryLabelsFanoutCommand>()?;
+    register_fanout_operation::<StringPoolStatsFanoutCommand>()?;
     Ok(())
 }
 

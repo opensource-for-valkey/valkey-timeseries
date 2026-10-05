@@ -96,3 +96,32 @@ message StatsResponse {
   bytes labels_bitmap = 6;
   bytes label_value_pairs_bitmap = 7;
 }
+// One bucket of a node's interning pool. `key` is the bucket's grouping value —
+// the external reference count or the string length — and is unused for the
+// pool-wide total.
+message StringPoolBucket {
+  uint64 key = 1;
+  uint64 count = 2;
+  uint64 bytes = 3;
+  uint64 allocated = 4;
+}
+
+message StringPoolTopKEntry {
+  string value = 1;
+  uint64 ref_count = 2;
+  uint64 bytes = 3;
+  uint64 allocated = 4;
+}
+
+// A node's interning pool statistics. The percentages are not shipped: they
+// are ratios, so the coordinator recomputes them from the summed byte counts.
+message StringPoolStatsResponse {
+  StringPoolBucket total = 1;
+  repeated StringPoolBucket by_ref_count = 2;
+  repeated StringPoolBucket by_size = 3;
+  uint64 memory_saved_bytes = 4;
+  uint64 holder_count = 5;
+  uint64 holder_slot_bytes = 6;
+  repeated StringPoolTopKEntry top_k_by_ref = 7;
+  repeated StringPoolTopKEntry top_k_by_size = 8;
+}

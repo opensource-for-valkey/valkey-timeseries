@@ -589,6 +589,18 @@ pub struct Stats {
     pub storage_saved_pct: f64,
 }
 
+/// `saved` as a percentage of the hypothetical uninterned cost, which is what is `held` now
+/// plus what was `saved`. Shared by [`Stats`] and the cluster aggregate of several nodes' stats,
+/// which has to recompute the ratio from summed byte counts.
+pub fn saved_pct(saved: usize, held: usize) -> f64 {
+    let uninterned = held + saved;
+    if uninterned == 0 {
+        0.0
+    } else {
+        saved as f64 / uninterned as f64 * 100.0
+    }
+}
+
 /// A pointer to an interned, reference-counted, and immutable string object.
 ///
 /// One machine word. The interned string will be held in memory only until
@@ -864,25 +876,14 @@ impl InternedString {
             stats.top_k_by_ref = top_by_ref;
         }
 
-        // Hypothetical uninterned cost = what we hold now + what we saved
-        let total_uninterned = stats.total_stats.allocated + stats.memory_saved_bytes;
-        stats.memory_saved_pct = if total_uninterned == 0 {
-            0.0
-        } else {
-            stats.memory_saved_bytes as f64 / total_uninterned as f64 * 100.0
-        };
+        stats.memory_saved_pct = saved_pct(stats.memory_saved_bytes, stats.total_stats.allocated);
 
         // The same saving against everything the strings cost, slots included. The slot is in
         // both layouts, so it enters the denominator only, which is exactly why this figure
         // sits below `memory_saved_pct` instead of alongside it.
         stats.holder_slot_bytes = stats.holder_count * size_of::<InternedString>();
         stats.total_storage_bytes = stats.total_stats.allocated + stats.holder_slot_bytes;
-        let storage_uninterned = stats.total_storage_bytes + stats.memory_saved_bytes;
-        stats.storage_saved_pct = if storage_uninterned == 0 {
-            0.0
-        } else {
-            stats.memory_saved_bytes as f64 / storage_uninterned as f64 * 100.0
-        };
+        stats.storage_saved_pct = saved_pct(stats.memory_saved_bytes, stats.total_storage_bytes);
 
         stats
     }

@@ -70,8 +70,8 @@ TS._DEBUG HELP
 ```
 1) "TS._DEBUG SHOW_INFO"
 2) "Show Info Variable Information"
-3) "TS._DEBUG STRINGPOOLSTATS [TOPK]"
-4) "Show String Interner Stats"
+3) "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]"
+4) "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)"
 5) "TS._DEBUG LIST_CONFIGS [VERBOSE] [APP|DEV|HIDDEN]"
 6) "List config names (default) or VERBOSE details, optionally filtered by visibility"
 ```
@@ -83,12 +83,14 @@ TS._DEBUG HELP
 Returns memory usage and efficiency statistics for the global string interning pool. The pool deduplicates repeated
 label names and values across all time series.
 
-> **Note:** In cluster mode, this command reports statistics for the local node only.
+In cluster mode the command fans out to one primary per shard and sums their pools; pass `LOCAL`
+to report the node you are connected to alone. Every primary must have `debug-mode` enabled, or
+the command fails. See **Cluster mode** below for how the sums read.
 
 ### Syntax
 
 ```bash
-TS._DEBUG STRINGPOOLSTATS [k]
+TS._DEBUG STRINGPOOLSTATS [k] [LOCAL]
 ```
 
 ### Arguments
@@ -96,6 +98,7 @@ TS._DEBUG STRINGPOOLSTATS [k]
 | Argument | Type    | Required | Description                                                                             |
 |----------|---------|----------|-----------------------------------------------------------------------------------------|
 | `k`      | integer | No       | If provided and greater than `0`, include top-K entries ranked by ref count and by size |
+| `LOCAL`  | keyword | No       | In cluster mode, report this node's pool only instead of summing every primary's         |
 
 ### Return Value
 
@@ -170,6 +173,19 @@ Each `TopKEntry` is a flat array of 8 alternating key/value fields:
 | `bytes`     | integer | Logical byte length of the string                                  |
 | `allocated` | integer | Total allocated memory for this string (Arc overhead + data)       |
 
+#### Cluster mode
+
+Each node has its own pool, and replicas are left out because they mirror their primary's
+labels. The reply has the same shape as on a single node, with these meanings:
+
+- Counts, bytes and allocations are summed, so a string held by three primaries counts three
+  times. `allocated` and `totalStorageBytes` are what the cluster spends on interned strings.
+- `ByRefcount` buckets are keyed by each node's *local* reference count.
+- `memorySavedPct` and `storageSavedPct` are recomputed from the summed byte counts.
+- Top-K lists merge each primary's own top K by value, adding up `refCount` and `allocated`.
+  `TopKBySize` is exact. `TopKByRef` is approximate: a string just below the cut on every node
+  can be missing, and a listed string's `refCount` omits the nodes where it fell below the cut.
+
 ### Examples
 
 Basic statistics (no top-K):
@@ -182,6 +198,12 @@ Statistics with top 10 strings by ref count and size:
 
 ```aiignore
 TS._DEBUG STRINGPOOLSTATS 10
+```
+
+The same, for the connected node only in cluster mode:
+
+```aiignore
+TS._DEBUG STRINGPOOLSTATS 10 LOCAL
 ```
 
 ---
