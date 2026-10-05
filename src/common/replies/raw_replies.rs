@@ -121,15 +121,9 @@ pub fn reply_with_sample<C: IntoRawCtx>(ctx: C, sample: &Sample) {
 
 pub fn reply_with_samples<C: IntoRawCtx>(ctx: C, samples: impl Iterator<Item = Sample>) {
     let raw_ctx = ctx.into_raw();
-    reply_with_postponed_array(raw_ctx);
-
-    let mut len = 0;
-    for sample in samples {
+    reply_with_counted_array(raw_ctx, samples, |sample| {
         reply_with_sample(raw_ctx, &sample);
-        len += 1;
-    }
-
-    reply_with_array_len(raw_ctx, len);
+    });
 }
 
 /// One multi-aggregation row: `[timestamp, value_1, ..., value_n]` with one
@@ -148,15 +142,9 @@ pub fn reply_with_multi_samples<C: IntoRawCtx, T: std::borrow::Borrow<MultiSampl
     rows: impl Iterator<Item = T>,
 ) {
     let raw_ctx = ctx.into_raw();
-    reply_with_postponed_array(raw_ctx);
-
-    let mut len = 0;
-    for row in rows {
+    reply_with_counted_array(raw_ctx, rows, |row| {
         reply_with_multi_sample(raw_ctx, row.borrow());
-        len += 1;
-    }
-
-    reply_with_array_len(raw_ctx, len);
+    });
 }
 
 /// One pivoted row: `[timestamp, [value, ...]]`.
@@ -179,15 +167,9 @@ pub fn reply_with_pivot_rows<C: IntoRawCtx, T: std::borrow::Borrow<MultiSample>>
     rows: impl Iterator<Item = T>,
 ) {
     let raw_ctx = ctx.into_raw();
-    reply_with_postponed_array(raw_ctx);
-
-    let mut len = 0;
-    for row in rows {
+    reply_with_counted_array(raw_ctx, rows, |row| {
         reply_with_pivot_row(raw_ctx, row.borrow());
-        len += 1;
-    }
-
-    reply_with_array_len(raw_ctx, len);
+    });
 }
 
 pub fn reply_with_integer<C: IntoRawCtx>(ctx: C, value: i64) -> Status {
@@ -259,7 +241,35 @@ pub fn reply_with_string_set<C: IntoRawCtx>(ctx: C, values: &[String]) -> Status
     Status::Ok
 }
 
-pub fn reply_with_array_len<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
+/// Reply with an array whose length is only known once every element has been written.
+///
+/// Opens a postponed-length array, calls `emit` once per item, then fixes the length with
+/// `ValkeyModule_ReplySetArrayLength`. `emit` must write exactly one reply element per call —
+/// the length is the number of items, not the number of calls to the reply API — so a row made of
+/// several values has to be wrapped in its own array. Filtering belongs in `items`: skipped items
+/// never reach `emit` and are not counted.
+///
+/// This is the only way to write a postponed array. Opening one and then writing a second array
+/// header instead of setting the length leaves the first array's length unset and desynchronizes
+/// the connection, so the open and close halves are private to this module.
+pub fn reply_with_counted_array<C: IntoRawCtx, T>(
+    ctx: C,
+    items: impl IntoIterator<Item = T>,
+    mut emit: impl FnMut(T),
+) {
+    let raw_ctx = ctx.into_raw();
+    reply_with_postponed_array(raw_ctx);
+
+    let mut len = 0;
+    for item in items {
+        emit(item);
+        len += 1;
+    }
+
+    reply_with_array_len(raw_ctx, len);
+}
+
+fn reply_with_array_len<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
     let raw_ctx = ctx.into_raw() as *mut ValkeyModuleCtx;
     unsafe {
         ValkeyModule_ReplySetArrayLength
@@ -271,7 +281,7 @@ pub fn reply_with_array_len<C: IntoRawCtx>(ctx: C, len: usize) -> Status {
     Status::Ok
 }
 
-pub fn reply_with_postponed_array<C: IntoRawCtx>(ctx: C) -> Status {
+fn reply_with_postponed_array<C: IntoRawCtx>(ctx: C) -> Status {
     let raw_ctx = ctx.into_raw();
     raw::reply_with_array(raw_ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long)
 }

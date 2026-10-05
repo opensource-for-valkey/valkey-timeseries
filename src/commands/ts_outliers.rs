@@ -12,7 +12,7 @@ use crate::commands::{
 use crate::common::Sample;
 use crate::common::context::is_blocking_denied;
 use crate::common::hash::{IntMap, IntSet};
-use crate::common::replies::{ReplyContext, reply_with_sample};
+use crate::common::replies::{ReplyContext, reply_with_counted_array, reply_with_sample};
 use crate::series::{TimestampRange, get_timeseries};
 use valkey_module::{
     AclPermissions, Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -798,21 +798,14 @@ fn reply_with_cleaned_samples(
         .map(|anomaly| anomaly.index)
         .collect();
 
-    ctx.reply_with_postponed_array();
-    let mut count: usize = 0;
-
-    for sample in samples.iter().enumerate().filter_map(|(idx, sample)| {
+    let kept = samples.iter().enumerate().filter_map(|(idx, sample)| {
         if excluded_indices.contains(&idx) {
             None
         } else {
             Some(sample)
         }
-    }) {
-        reply_with_sample(ctx, sample);
-        count += 1;
-    }
-
-    ctx.reply_with_array_len(count);
+    });
+    reply_with_counted_array(ctx, kept, |sample| reply_with_sample(ctx, sample));
 }
 
 /// Returns anomalies only as a list of tuples (timestamp, value, anomaly_direction, score)
@@ -822,20 +815,16 @@ fn reply_with_anomalies(
     samples: &[Sample],
     direction: AnomalyDirection,
 ) {
-    ctx.reply_with_postponed_array();
-    let mut count: usize = 0;
     // Collect only the anomalies
-    for (outlier, sample) in result.anomalies.iter().filter_map(|outlier| {
+    let matching = result.anomalies.iter().filter_map(|outlier| {
         if !outlier.signal.matches_direction(direction) {
             return None;
         }
         samples.get(outlier.index).map(|sample| (outlier, sample))
-    }) {
+    });
+    reply_with_counted_array(ctx, matching, |(outlier, sample)| {
         reply_with_outlier(ctx, outlier, sample);
-        count += 1;
-    }
-
-    ctx.reply_with_array_len(count);
+    });
 }
 
 fn reply_output_full(

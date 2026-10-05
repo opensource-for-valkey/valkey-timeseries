@@ -1,11 +1,10 @@
 use super::raw_replies::{
-    IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_array_len,
-    reply_with_bulk_string,
+    IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_bulk_string,
 };
 use std::ops::Deref;
 use std::os::raw::c_long;
 use valkey_module::logging::ValkeyLogLevel;
-use valkey_module::{Context, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyResult, raw};
+use valkey_module::{Context, Status, ValkeyResult, raw};
 
 /// `ReplyContext` is a thin wrapper around `RedisModuleCtx` that provides efficient,
 /// zero-allocation reply helpers and automatic database state management.
@@ -97,16 +96,6 @@ impl ReplyContext {
         } else {
             self.reply_with_array(len)
         }
-    }
-
-    /// Start a postponed-length array reply.
-    pub fn reply_with_postponed_array(&self) -> Status {
-        raw::reply_with_array(self.raw_ctx, VALKEYMODULE_POSTPONED_ARRAY_LEN as c_long)
-    }
-
-    /// Set the length of a previously started postponed-length array reply.
-    pub fn reply_with_array_len(&self, len: usize) -> Status {
-        reply_with_array_len(self.raw_ctx, len)
     }
 
     /// Forward a `ValkeyResult` to the reply machinery.
