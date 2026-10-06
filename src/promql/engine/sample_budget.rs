@@ -56,6 +56,14 @@ impl SampleBudget {
     pub fn exhausted(&self) -> bool {
         self.limit > 0 && self.loaded() >= self.limit
     }
+
+    /// Fail if `pending` more samples, not yet charged, would exceed the
+    /// limit. For a read that can refuse itself before decoding: `pending`
+    /// must be a lower bound on what it will charge, so this never fails a
+    /// read that [`Self::charge`] would have admitted.
+    pub fn check_ahead(&self, pending: usize) -> QueryResult<()> {
+        validate_max_samples(self.loaded().saturating_add(pending), self.limit)
+    }
 }
 
 pub fn too_many_samples(loaded: usize, limit: usize) -> QueryError {
@@ -91,6 +99,19 @@ mod tests {
         let err = b.charge(1).unwrap_err().to_string();
         assert!(err.contains("11 > 10"), "{err}");
         assert!(err.contains("ts-promql-max-samples-per-query"), "{err}");
+    }
+
+    #[test]
+    fn check_ahead_counts_pending_on_top_of_what_is_charged() {
+        let b = SampleBudget::new(10);
+        assert!(b.check_ahead(10).is_ok(), "exactly the limit is allowed");
+        assert!(b.check_ahead(11).is_err());
+        b.charge(6).unwrap();
+        assert!(b.check_ahead(4).is_ok());
+        let err = b.check_ahead(5).unwrap_err().to_string();
+        assert!(err.contains("11 > 10"), "{err}");
+        assert_eq!(b.loaded(), 6, "a check charges nothing");
+        assert!(SampleBudget::new(0).check_ahead(usize::MAX).is_ok());
     }
 
     #[test]

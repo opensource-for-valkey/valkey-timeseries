@@ -162,3 +162,86 @@ class TestBatchedLocalSelectorReads(ValkeyTimeSeriesTestCaseBase):
         self.client.execute_command('TS.ADD', 'hidden', END * 1000, 1)
         with pytest.raises(ResponseError, match='(?i)permission'):
             self.instant_query('wide', client=user)
+
+
+# ── Heavy series: holds bounded by copied bytes, not just series ──────────
+
+# 48-byte uncompressed chunks hold three samples; each weighs 112 (the chunk
+# struct) + 48 bytes against a hold's 4 MiB copy budget (`DEFAULT_BATCH_COPY_BYTES`).
+HEAVY_COUNT = 200
+HEAVY_CHUNK_SAMPLES = 3
+HEAVY_SAMPLES = 900
+HEAVY_CHUNK_WEIGHT = 112 + 48
+COPY_BUDGET = 4 << 20
+
+
+def _heavy_value(i: int, j: int) -> float:
+    return float(i * 1000 + j)
+
+
+class TestBatchedLocalCopyBudget(ValkeyTimeSeriesTestCaseBase):
+    """200 series is a single hold by count, but their chunks weigh about
+    9.6 MB, so a range read over all of them is split across holds by bytes.
+    A series lost or read twice where a hold ends part-way through the planned
+    ids changes the per-series counts and sums."""
+
+    def setup_heavy(self, count=HEAVY_COUNT, metric='heavy'):
+        pipe = self.client.pipeline(transaction=False)
+        for i in range(count):
+            key = f'{metric}:{i}'
+            pipe.execute_command('TS.CREATE', key, 'ENCODING', 'UNCOMPRESSED',
+                                 'CHUNK_SIZE', 48, 'METRIC', f'{metric}{{i="{i}"}}')
+            args = []
+            for j in range(HEAVY_SAMPLES):
+                args += [key, (T0 + j) * 1000, _heavy_value(i, j)]
+            pipe.execute_command('TS.MADD', *args)
+        pipe.execute()
+
+        info = self.client.execute_command('TS.INFO', f'{metric}:0')
+        chunks = info[info.index(b'chunkCount') + 1]
+        assert chunks == HEAVY_SAMPLES // HEAVY_CHUNK_SAMPLES, info
+
+    def instant_query(self, query: str, time: int) -> QueryResult:
+        return QueryResult.from_raw(
+            self.client.execute_command('TS.QUERY', query, 'TIME', str(time)))
+
+    def test_rollup_over_heavy_series_reads_every_sample_once(self):
+        self.setup_heavy()
+        assert HEAVY_COUNT * (HEAVY_SAMPLES // HEAVY_CHUNK_SAMPLES) * HEAVY_CHUNK_WEIGHT \
+            > 2 * COPY_BUDGET, "the read must span more than two holds by bytes"
+        at = T0 + HEAVY_SAMPLES - 1
+
+        counts = TestBatchedLocalSelectorReads.instants_by(
+            self.instant_query('count_over_time(heavy[1000s])', at), 'i')
+        sums = TestBatchedLocalSelectorReads.instants_by(
+            self.instant_query('sum_over_time(heavy[1000s])', at), 'i')
+
+        assert counts == {str(i): float(HEAVY_SAMPLES) for i in range(HEAVY_COUNT)}
+        assert sums == {
+            str(i): sum(_heavy_value(i, j) for j in range(HEAVY_SAMPLES))
+            for i in range(HEAVY_COUNT)
+        }
+
+    def test_sample_limit_admits_a_read_exactly_at_it(self):
+        """The early check counts only chunks wholly inside the window, so it
+        never refuses what the exact count admits: a window that cuts a chunk
+        (500 samples, from j=301) and one that covers whole chunks (all 900)
+        each pass at their exact count and fail one below it."""
+        self.setup_heavy(count=1, metric='budget')
+        cases = ((T0 + 800, '500s', 500), (T0 + HEAVY_SAMPLES - 1, '1000s', HEAVY_SAMPLES))
+        try:
+            for at, window, samples in cases:
+                query = f'budget[{window}]'
+                self.client.execute_command(
+                    'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', str(samples))
+                result = self.instant_query(query, at)
+                assert result.is_matrix() and len(result.result) == 1, query
+                assert len(result.result[0].values) == samples, query
+
+                self.client.execute_command(
+                    'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', str(samples - 1))
+                with pytest.raises(ResponseError, match='too many samples'):
+                    self.instant_query(query, at)
+        finally:
+            self.client.execute_command(
+                'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', '50000000')

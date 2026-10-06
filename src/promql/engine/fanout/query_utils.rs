@@ -17,7 +17,8 @@ use crate::promql::generated::{
 };
 use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::{
-    DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series, for_each_series_batch_then,
+    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series,
+    for_each_series_batch_then,
 };
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
@@ -163,6 +164,16 @@ pub(in crate::promql) fn local_label_profile<S: GilSource + ?Sized>(
 /// A shard so never holds more than one batch of decoded samples, and the
 /// decoding is the gap in which the main thread gets the lock back.
 ///
+/// A batch is at most 512 series and [`DEFAULT_BATCH_COPY_BYTES`] of chunks,
+/// so a long window over dense series is copied in more, shorter holds rather
+/// than one hold per 512 series however many chunks each has.
+///
+/// The copy also refuses the read early against `budget`: the samples of the
+/// chunks wholly inside the span ([`RangeSnapshot::min_samples`]) are known
+/// without decoding, so a read whose batch alone would overrun what `decode`
+/// has left fails before decoding any of it. `decode` still charges the exact
+/// count; this only gets to the same answer sooner.
+///
 /// Only series with a chunk in the span are kept, with `labels` of each: the
 /// evaluator's shared set, or the storage set itself for a response whose
 /// symbol table interns by identity. Either shares the series' `Arc`, so no
@@ -177,6 +188,7 @@ fn for_each_snapshot_batch<S, L, T>(
     selector: SeriesSelector,
     start_time: Timestamp,
     end_time: Timestamp,
+    budget: &SampleBudget,
     labels: L,
     mut decode: impl FnMut(Vec<(T, RangeSnapshot)>) -> ValkeyResult<()>,
 ) -> ValkeyResult<()>
@@ -184,19 +196,31 @@ where
     S: GilSource + ?Sized,
     L: Fn(&TimeSeries) -> T,
 {
+    let limit = BatchLimit::weighed(
+        DEFAULT_SERIES_BATCH_SIZE.get(),
+        DEFAULT_BATCH_COPY_BYTES,
+        |s: &TimeSeries| s.range_copy_bytes(start_time, end_time),
+    );
     for_each_series_batch_then(
         src,
         &[selector],
         None,
-        DEFAULT_SERIES_BATCH_SIZE,
+        limit,
         |_, batch| {
-            Ok(batch
-                .iter()
-                .filter_map(|(s, _)| {
-                    let snapshot = s.snapshot_range(start_time, end_time);
-                    (!snapshot.is_empty()).then(|| (labels(s), snapshot))
-                })
-                .collect::<Vec<_>>())
+            let mut copied = Vec::with_capacity(batch.len());
+            let mut pending = 0usize;
+            for (s, _) in batch {
+                let snapshot = s.snapshot_range(start_time, end_time);
+                if snapshot.is_empty() {
+                    continue;
+                }
+                pending = pending.saturating_add(snapshot.min_samples());
+                budget
+                    .check_ahead(pending)
+                    .map_err(|err| valkey_module::ValkeyError::String(err.to_string()))?;
+                copied.push((labels(s), snapshot));
+            }
+            Ok(copied)
         },
         |snapshots| {
             if !snapshots.is_empty() {
@@ -242,6 +266,7 @@ pub(super) fn local_grid_windows<S: GilSource + ?Sized>(
         selector,
         start_time,
         end_time,
+        &budget,
         |s| EvalLabels::interned(&s.labels),
         |snapshots| {
             let candidates = snapshots
@@ -369,6 +394,7 @@ pub(super) fn handle_range_query<S: GilSource + ?Sized>(
         selector,
         start_time,
         end_time,
+        &budget,
         |s| s.labels.clone(),
         |snapshots| {
             let batch = snapshots

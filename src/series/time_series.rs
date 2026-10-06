@@ -824,16 +824,33 @@ impl TimeSeries {
     /// Copy the chunks `[start, end]` touches, for decoding after this series
     /// is no longer borrowed. See [`RangeSnapshot`].
     pub fn snapshot_range(&self, start: Timestamp, end: Timestamp) -> RangeSnapshot {
+        let (start, chunks) = self.range_chunks(start, end);
+        RangeSnapshot {
+            start,
+            end,
+            chunks: chunks.to_vec(),
+        }
+    }
+
+    /// What [`Self::snapshot_range`] would copy for `[start, end]`, in
+    /// [`RangeSnapshot::copied_bytes`], without copying it: a chunk-index
+    /// search, so a batched read can size a lock hold before taking the copy.
+    pub fn range_copy_bytes(&self, start: Timestamp, end: Timestamp) -> usize {
+        chunk_copy_bytes(self.range_chunks(start, end).1)
+    }
+
+    /// The chunks overlapping `[start, end]`, and `start` clamped to the
+    /// retention floor, as `range_iter` clamps it.
+    fn range_chunks(&self, start: Timestamp, end: Timestamp) -> (Timestamp, &[TimeSeriesChunk]) {
         let start = start.max(self.get_min_timestamp());
-        let chunks = if start > end || self.is_empty() || !self.overlaps(start, end) {
-            Vec::new()
-        } else {
-            match self.get_chunk_index_bounds(start, end) {
-                Some((first, last)) => self.chunks[first..=last].to_vec(),
-                None => Vec::new(),
-            }
+        if start > end || self.is_empty() || !self.overlaps(start, end) {
+            return (start, &[]);
+        }
+        let chunks = match self.get_chunk_index_bounds(start, end) {
+            Some((first, last)) => &self.chunks[first..=last],
+            None => &[],
         };
-        RangeSnapshot { start, end, chunks }
+        (start, chunks)
     }
 
     /// Return the latest visible sample in the inclusive range `[start, end]`.
@@ -1468,6 +1485,24 @@ impl RangeSnapshot {
         self.chunks.is_empty()
     }
 
+    /// What taking this snapshot copied: each chunk's encoded bytes plus its
+    /// own struct, a stand-in for the allocation the copy made for it.
+    pub fn copied_bytes(&self) -> usize {
+        chunk_copy_bytes(&self.chunks)
+    }
+
+    /// A lower bound on the samples [`Self::get_range`] yields, without
+    /// decoding: those of the chunks lying wholly inside `[start, end]`. A
+    /// boundary chunk counts nothing, since any of its samples may fall
+    /// outside, so a read can be refused on this count but never wrongly.
+    pub fn min_samples(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| c.first_timestamp() >= self.start && c.last_timestamp() <= self.end)
+            .map(|c| c.len())
+            .sum()
+    }
+
     /// The decoded samples in `[start, end]`, ascending. Equivalent to
     /// [`TimeSeries::get_range`] over the same range at snapshot time.
     pub fn get_range(&self) -> Vec<Sample> {
@@ -1488,6 +1523,14 @@ impl RangeSnapshot {
             .iter()
             .flat_map(|chunk| chunk.range_iter(self.start, self.end))
     }
+}
+
+/// See [`RangeSnapshot::copied_bytes`].
+fn chunk_copy_bytes(chunks: &[TimeSeriesChunk]) -> usize {
+    chunks
+        .iter()
+        .map(|chunk| size_of::<TimeSeriesChunk>() + chunk.size())
+        .sum()
 }
 
 /// How many of `chunk`'s samples `[start, end]` is likely to cover, from the
@@ -1568,6 +1611,59 @@ mod tests {
 
         assert!(ts.get_chunk_index_bounds(40, 20).is_none());
         assert!(!ts.has_samples_in_range(40, 20));
+    }
+
+    fn three_chunk_series() -> TimeSeries {
+        use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk};
+
+        let chunk = |timestamps: [Timestamp; 2]| {
+            TimeSeriesChunk::Uncompressed(UncompressedChunk::from_vec(
+                timestamps.map(|t| Sample::new(t, t as f64)).to_vec(),
+            ))
+        };
+        TimeSeries::from_chunks(vec![chunk([10, 20]), chunk([30, 40]), chunk([50, 60])]).unwrap()
+    }
+
+    #[test]
+    fn snapshot_min_samples_counts_only_wholly_covered_chunks() {
+        let ts = three_chunk_series();
+
+        // Every chunk overlaps, only the middle one lies inside.
+        let snapshot = ts.snapshot_range(15, 55);
+        assert_eq!(snapshot.min_samples(), 2);
+        assert_eq!(snapshot.get_range().len(), 4);
+
+        // Exact when the window covers every chunk it touches.
+        assert_eq!(ts.snapshot_range(10, 60).min_samples(), 6);
+        assert_eq!(ts.snapshot_range(0, 100).min_samples(), 6);
+    }
+
+    #[test]
+    fn snapshot_min_samples_never_exceeds_the_decoded_count() {
+        let ts = three_chunk_series();
+        for start in (0..=70).step_by(5) {
+            for end in (start..=70).step_by(5) {
+                let snapshot = ts.snapshot_range(start, end);
+                assert!(
+                    snapshot.min_samples() <= snapshot.get_range().len(),
+                    "[{start}, {end}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn range_copy_bytes_matches_what_the_snapshot_copies() {
+        let ts = three_chunk_series();
+        for (start, end) in [(15, 55), (10, 60), (31, 39), (21, 29), (61, 70), (40, 20)] {
+            assert_eq!(
+                ts.range_copy_bytes(start, end),
+                ts.snapshot_range(start, end).copied_bytes(),
+                "[{start}, {end}]"
+            );
+        }
+        assert_eq!(ts.range_copy_bytes(61, 70), 0);
+        assert!(ts.range_copy_bytes(15, 55) > ts.range_copy_bytes(31, 39));
     }
 
     #[test]

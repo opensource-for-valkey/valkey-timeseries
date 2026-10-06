@@ -24,9 +24,11 @@ use crate::promql::engine::{
     get_snapshot_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
-use crate::series::RangeSnapshot;
 use crate::series::chunks::ChunkOps;
-use crate::series::index::{DEFAULT_SERIES_BATCH_SIZE, SeriesCursor};
+use crate::series::index::{
+    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, SeriesCursor,
+};
+use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
 use orx_parallel::ParResult;
 use promql_parser::label::Matchers;
@@ -888,6 +890,11 @@ fn execute_selector_task_cluster(ctx: &Context, task: SelectorTask) {
 /// So a hold reads 512 range series, as a fan-out share's batch does, or 4096
 /// instant ones — with one hold per 512, a 15 000-series instant query paid
 /// thirty lock acquisitions and lost 15 % of its throughput.
+///
+/// Range and grid reads also share [`DEFAULT_BATCH_COPY_BYTES`] of chunk
+/// copies per hold, as a fan-out share's batch does: a long window over dense
+/// series copies hundreds of chunks per series, and the series count alone
+/// would let one hold copy them all.
 const HOLD_BUDGET: usize = RANGE_SERIES_COST * DEFAULT_SERIES_BATCH_SIZE.get();
 
 /// The cost of a range or grid series against [`HOLD_BUDGET`].
@@ -923,17 +930,24 @@ fn run_local_batch(tasks: Vec<SelectorTask>) {
             let ctx = MODULE_CONTEXT.lock_gil();
             let original_db = get_current_db(&ctx);
             let mut budget = HOLD_BUDGET;
+            let mut copy_bytes = DEFAULT_BATCH_COPY_BYTES;
             for read in reads.iter_mut() {
                 let cost = read.series_cost();
                 let share = (budget / cost).min(read.cursor.remaining());
-                if share == 0 && !read.cursor.is_done() {
+                let out_of_bytes = read.copies_chunks() && copy_bytes == 0;
+                if (share == 0 || out_of_bytes) && !read.cursor.is_done() {
                     copied.push(None);
                     continue;
                 }
                 budget -= share * cost;
-                let batch = isolate_panic("selector read", || read.copy(&ctx, share));
+                let batch = isolate_panic("selector read", || read.copy(&ctx, share, copy_bytes));
                 copied.push(match batch {
-                    Some(Ok(batch)) => batch,
+                    Some(Ok(batch)) => {
+                        let bytes: usize =
+                            batch.iter().flatten().map(|(_, s)| s.copied_bytes()).sum();
+                        copy_bytes = copy_bytes.saturating_sub(bytes);
+                        batch
+                    }
                     Some(Err(err)) => {
                         read.fail(err);
                         None
@@ -1026,10 +1040,17 @@ enum ReadState {
 impl LocalRead {
     /// What reading one series costs against [`HOLD_BUDGET`].
     fn series_cost(&self) -> usize {
-        match self.state {
-            ReadState::Range { .. } => RANGE_SERIES_COST,
-            ReadState::Instant { .. } | ReadState::Profile { .. } => 1,
+        if self.copies_chunks() {
+            RANGE_SERIES_COST
+        } else {
+            1
         }
+    }
+
+    /// Whether this read copies chunks, against a hold's
+    /// [`DEFAULT_BATCH_COPY_BYTES`].
+    fn copies_chunks(&self) -> bool {
+        matches!(self.state, ReadState::Range { .. })
     }
 
     /// What the rest of the read costs: the order a hold serves reads in.
@@ -1131,14 +1152,24 @@ impl LocalRead {
     }
 
     /// Under the lock: read up to `share` more series as this task's database and
-    /// caller. A range read hands back the chunks it copied, for [`Self::decode`].
-    fn copy(&mut self, ctx: &Context, share: usize) -> QueryResult<Option<CopiedSnapshots>> {
+    /// caller. A range read hands back the chunks it copied, for [`Self::decode`],
+    /// stopping once they reach `copy_bytes`; it fails here, before decoding,
+    /// when the samples it is sure to load would overrun its sample budget.
+    fn copy(
+        &mut self,
+        ctx: &Context,
+        share: usize,
+        copy_bytes: usize,
+    ) -> QueryResult<Option<CopiedSnapshots>> {
         if self.cursor.is_done() {
             return Ok(None);
         }
         let _ = set_current_db(ctx, self.cursor.db());
         let Self { cursor, state, .. } = self;
-        with_fanout_user(ctx, self.caller_user.as_deref(), |ctx| {
+        // Kept apart from the read's own errors, which become `Execution`: this
+        // one must reach the caller as the budget error `decode` would raise.
+        let mut over_budget = None;
+        let copied = with_fanout_user(ctx, self.caller_user.as_deref(), |ctx| {
             Ok(match state {
                 ReadState::Instant {
                     start,
@@ -1167,17 +1198,29 @@ impl LocalRead {
                     })?;
                     None
                 }
-                ReadState::Range { start, end, .. } => {
+                ReadState::Range {
+                    start, end, budget, ..
+                } => {
                     let (start, end) = (*start, *end);
-                    cursor.next_batch(ctx, share, &mut |_, batch| {
-                        Ok(batch
-                            .iter()
-                            .filter_map(|(s, _)| {
-                                let snapshot = s.snapshot_range(start, end);
-                                (!snapshot.is_empty())
-                                    .then(|| (EvalLabels::interned(&s.labels), snapshot))
-                            })
-                            .collect::<Vec<_>>())
+                    let limit = BatchLimit::weighed(share, copy_bytes, |s: &TimeSeries| {
+                        s.range_copy_bytes(start, end)
+                    });
+                    cursor.next_batch_within(ctx, &limit, &mut |_, batch| {
+                        let mut copied = Vec::with_capacity(batch.len());
+                        let mut pending = 0usize;
+                        for (s, _) in batch.iter() {
+                            let snapshot = s.snapshot_range(start, end);
+                            if snapshot.is_empty() {
+                                continue;
+                            }
+                            pending = pending.saturating_add(snapshot.min_samples());
+                            if let Err(err) = budget.check_ahead(pending) {
+                                over_budget = Some(err);
+                                break;
+                            }
+                            copied.push((EvalLabels::interned(&s.labels), snapshot));
+                        }
+                        Ok(copied)
                     })?
                 }
                 ReadState::Profile {
@@ -1207,7 +1250,11 @@ impl LocalRead {
                 }
             })
         })
-        .map_err(|err| QueryError::Execution(err.to_string()))
+        .map_err(|err| QueryError::Execution(err.to_string()))?;
+        match over_budget {
+            Some(err) => Err(err),
+            None => Ok(copied),
+        }
     }
 
     /// Off the lock: decode one batch's chunks on the executor's own pool,

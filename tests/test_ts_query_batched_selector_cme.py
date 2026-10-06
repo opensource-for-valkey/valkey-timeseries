@@ -250,3 +250,97 @@ class TestBatchedSelectorReadsCluster(ValkeyTimeSeriesClusterTestCase):
 
         with pytest.raises(ResponseError, match='(?i)permission'):
             self.instant_query('wide', client=user)
+
+
+# ── Heavy series: batches bounded by copied bytes, not just series ────────
+
+# 48-byte uncompressed chunks hold three samples; each weighs 112 (the chunk
+# struct) + 48 bytes against a batch's 4 MiB copy budget (`DEFAULT_BATCH_COPY_BYTES`).
+HEAVY_COUNT = 200
+HEAVY_CHUNK_SAMPLES = 3
+HEAVY_SAMPLES = 900
+HEAVY_CHUNK_WEIGHT = 112 + 48
+COPY_BUDGET = 4 << 20
+MAX_SAMPLES_CONFIG = 'ts.ts-promql-max-samples-per-query'
+
+
+def _heavy_value(i: int, j: int) -> float:
+    return float(i * 1000 + j)
+
+
+class TestBatchedCopyBudgetCluster(ValkeyTimeSeriesClusterTestCase):
+    """200 series on one shard is a single batch by count, but their chunks
+    weigh about 9.6 MB, so the shard's share is split across batches by bytes,
+    on both the grid push-down and the raw range read."""
+
+    def setup_heavy(self, count=HEAVY_COUNT, metric='heavy'):
+        shard = self.new_client_for_primary(1)
+        pipe = shard.pipeline(transaction=False)
+        for i in range(count):
+            key = f'{metric}:{i}:{{{WIDE_TAG}}}'
+            pipe.execute_command('TS.CREATE', key, 'ENCODING', 'UNCOMPRESSED',
+                                 'CHUNK_SIZE', 48, 'METRIC', f'{metric}{{i="{i}"}}')
+            args = []
+            for j in range(HEAVY_SAMPLES):
+                args += [key, (T0 + j) * 1000, _heavy_value(i, j)]
+            pipe.execute_command('TS.MADD', *args)
+        pipe.execute()
+
+        info = shard.execute_command('TS.INFO', f'{metric}:0:{{{WIDE_TAG}}}')
+        chunks = info[info.index(b'chunkCount') + 1]
+        assert chunks == HEAVY_SAMPLES // HEAVY_CHUNK_SAMPLES, info
+
+    def instant_query(self, query: str, time: int) -> QueryResult:
+        raw = self.new_client_for_primary(0).execute_command(
+            'TS.QUERY', query, 'TIME', str(time))
+        return QueryResult.from_raw(raw)
+
+    def set_config(self, name, value):
+        for i in range(self.CLUSTER_SIZE):
+            self.new_client_for_primary(i).execute_command('CONFIG', 'SET', name, value)
+
+    @pytest.fixture(params=['yes', 'no'], ids=['pushdown-on', 'pushdown-off'])
+    def rollup_pushdown(self, request):
+        self.set_config(ROLLUP_PUSHDOWN_CONFIG, request.param)
+        yield request.param
+        self.set_config(ROLLUP_PUSHDOWN_CONFIG, 'yes')
+
+    def test_rollup_over_heavy_series_reads_every_sample_once(self, rollup_pushdown):
+        self.setup_heavy()
+        assert HEAVY_COUNT * (HEAVY_SAMPLES // HEAVY_CHUNK_SAMPLES) * HEAVY_CHUNK_WEIGHT \
+            > 2 * COPY_BUDGET, "the share must span more than two batches by bytes"
+        at = T0 + HEAVY_SAMPLES - 1
+
+        counts = TestBatchedSelectorReadsCluster.instants_by(
+            self.instant_query('count_over_time(heavy[1000s])', at), 'i')
+        sums = TestBatchedSelectorReadsCluster.instants_by(
+            self.instant_query('sum_over_time(heavy[1000s])', at), 'i')
+
+        assert counts == {str(i): float(HEAVY_SAMPLES) for i in range(HEAVY_COUNT)}
+        assert sums == {
+            str(i): sum(_heavy_value(i, j) for j in range(HEAVY_SAMPLES))
+            for i in range(HEAVY_COUNT)
+        }
+
+    def test_sample_limit_admits_a_read_exactly_at_it(self):
+        """The shard's early check counts only chunks wholly inside the window,
+        so it never refuses what the exact count admits. One series, so the
+        shard's share is the whole read."""
+        self.setup_heavy(count=1, metric='budget')
+        cases = ((T0 + 800, '500s', 500), (T0 + HEAVY_SAMPLES - 1, '1000s', HEAVY_SAMPLES))
+        try:
+            for at, window, samples in cases:
+                query = f'budget[{window}]'
+                self.set_config(MAX_SAMPLES_CONFIG, str(samples))
+                result = self.instant_query(query, at)
+                assert result.is_matrix() and len(result.result) == 1, query
+                assert len(result.result[0].values) == samples, query
+
+                self.set_config(MAX_SAMPLES_CONFIG, str(samples - 1))
+                # The shard refuses its share; the fan-out currently replaces a
+                # shard's error text with a generic one.
+                with pytest.raises(ResponseError,
+                                   match='too many samples|Internal error in fanout'):
+                    self.instant_query(query, at)
+        finally:
+            self.set_config(MAX_SAMPLES_CONFIG, '50000000')
