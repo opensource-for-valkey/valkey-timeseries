@@ -23,7 +23,6 @@
 //! same series set byte for byte on any toolchain.
 
 use crate::labels::Label;
-use crate::parser::metric_name;
 use crate::tests::generators::create_rng;
 use rand::RngExt;
 use rand::prelude::{IndexedRandom, StdRng};
@@ -530,7 +529,12 @@ impl<'a> FleetBuilder<'a> {
     }
 
     fn push(&mut self, set: LabelSet) {
-        let metric_name = &set.labels.iter().find(|l| l.name == "__name__").expect("metric name").value;
+        let metric_name = &set
+            .labels
+            .iter()
+            .find(|l| l.name == "__name__")
+            .expect("metric name")
+            .value;
         let key = format!("{}:ts:{}", metric_name, self.next_key);
         self.next_key += 1;
         self.series.push(SeriesSpec {
