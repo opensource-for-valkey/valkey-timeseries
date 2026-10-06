@@ -61,6 +61,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+#[cfg(test)]
+mod evaluator_tests;
 mod preload;
 mod pushdown;
 mod subquery;

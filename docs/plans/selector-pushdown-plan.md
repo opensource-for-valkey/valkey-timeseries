@@ -29,7 +29,7 @@ what crosses the cluster bus:
 For the benchmark shape that is 1.8M raw samples (~29 MB of protobuf) per query per
 selector, materialized on the coordinator and then reduced to 500 × 240 = 120k grid
 points — a 15× amplification that grows with `cadence / step`. `preload_vector_selector`
-([evaluator.rs](../../src/promql/exec/evaluator.rs)) does the bucketing; the wire carries
+([evaluator/mod.rs](../../src/promql/exec/evaluator/mod.rs)) does the bucketing; the wire carries
 `RangeQueryResponse` ([promql.proto](../../proto/v1/promql.proto)).
 
 The rollup push-down already solved the identical problem for `rate(...)`: ship the

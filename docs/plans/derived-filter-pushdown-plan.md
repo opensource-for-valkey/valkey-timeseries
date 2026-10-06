@@ -36,14 +36,14 @@ There are two filter push-downs today and a range query gets neither of the usef
 | mechanism | derives filters from | runs | applies to range queries? |
 |---|---|---|---|
 | static rewrite (`ts-promql-optimize-queries` → `optimize_expr` → `pushdown_filters_in_place`, [pushdown.rs](../../src/promql/optimizer/pushdown.rs)) | matchers *written in the query* | at parse time, before planning | yes — but only helps when the user already wrote a selective matcher on one side |
-| runtime push-down (`eval_binop_with_pushdown`, [evaluator.rs](../../src/promql/exec/evaluator.rs); `get_common_label_filters`, [labels.rs](../../src/promql/binops/labels.rs)) | the *label values the first operand's result actually carries* | per evaluation, one side after the other | **no** — gated off by `has_preloaded_data()` |
+| runtime push-down (`eval_binop_with_pushdown`, [evaluator/mod.rs](../../src/promql/exec/evaluator/mod.rs); `get_common_label_filters`, [labels.rs](../../src/promql/binops/labels.rs)) | the *label values the first operand's result actually carries* | per evaluation, one side after the other | **no** — gated off by `has_preloaded_data()` |
 
 The runtime path is the one with real leverage (`kube_pod_created{namespace="prod"} *
 on(uid) group_left kube_pod_info`: the right side is every pod in the cluster unless the
 left's `namespace="prod"` is pushed into it), and it is switched off for range queries for
 a structural reason, not a semantic one: a rewritten selector has a different `PreloadKey`
 than the one `preload_grid` loaded, so the rewritten subtree would miss its grid and fall
-back to one live read per step. The gate at [evaluator.rs](../../src/promql/exec/evaluator.rs)
+back to one live read per step. The gate at [evaluator/mod.rs](../../src/promql/exec/evaluator/mod.rs)
 (`has_preloaded_data`) is the right call given that mechanism; the mechanism is what has
 to change.
 
