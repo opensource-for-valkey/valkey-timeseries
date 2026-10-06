@@ -41,8 +41,8 @@ cpu_usage{host=~"web-[0-9]+"} > 0.8
 ### Instant queries
 
 `TS.QUERY` returns a scalar, vector, matrix, or string result depending on the
-expression. The default evaluation time is now; `TIME` can select an explicit timestamp,
-the earliest or latest timestamp in the database, or a relative duration.
+expression. The default evaluation time is now; `TIME` can select an explicit timestamp
+or a duration relative to now.
 
 ```text
 TS.QUERY sum(rate(http_requests_total[5m])) TIME 1672531200000
