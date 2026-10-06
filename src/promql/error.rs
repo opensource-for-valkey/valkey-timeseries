@@ -27,7 +27,8 @@ pub enum QueryError {
     /// limit that legitimately degrades to per-step reads: this one is
     /// query-wide and already exceeded, so the query fails at once.
     #[error(
-        "query processing would load too many samples into memory: {loaded} > {limit} (ts-promql-max-samples-per-query)"
+        "{prefix}: {loaded} > {limit} (ts-promql-max-samples-per-query)",
+        prefix = crate::error_consts::PROMQL_TOO_MANY_SAMPLES_ERROR
     )]
     TooManySamples { loaded: usize, limit: usize },
 }

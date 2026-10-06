@@ -262,6 +262,9 @@ HEAVY_SAMPLES = 900
 HEAVY_CHUNK_WEIGHT = 112 + 48
 COPY_BUDGET = 4 << 20
 MAX_SAMPLES_CONFIG = 'ts.ts-promql-max-samples-per-query'
+MAX_POINTS_CONFIG = 'ts.ts-promql-max-points-per-timeseries'
+MAX_SERIES_CONFIG = MAX_RESPONSE_SERIES_CONFIG
+LIMIT_DEFAULTS = {MAX_SAMPLES_CONFIG: '50000000', MAX_POINTS_CONFIG: '0', MAX_SERIES_CONFIG: '1000'}
 
 
 def _heavy_value(i: int, j: int) -> float:
@@ -337,10 +340,31 @@ class TestBatchedCopyBudgetCluster(ValkeyTimeSeriesClusterTestCase):
                 assert len(result.result[0].values) == samples, query
 
                 self.set_config(MAX_SAMPLES_CONFIG, str(samples - 1))
-                # The shard refuses its share; the fan-out currently replaces a
-                # shard's error text with a generic one.
                 with pytest.raises(ResponseError,
-                                   match='too many samples|Internal error in fanout'):
+                                   match=f'too many samples.*: {samples} > {samples - 1}'):
                     self.instant_query(query, at)
         finally:
             self.set_config(MAX_SAMPLES_CONFIG, '50000000')
+
+    def test_shard_limit_refusals_reach_the_client_verbatim(self):
+        """A shard refusing its share for a query limit must not collapse into
+        the generic fan-out failure: its message names the limit and both
+        numbers. All the series are on one shard, so the shard is the one that
+        refuses, before the coordinator sees anything."""
+        self.setup_heavy(count=5, metric='few')
+        at = T0 + HEAVY_SAMPLES - 1
+        cases = (
+            (MAX_SERIES_CONFIG, '3', 'few[1000s]', 'max series limit: 5 > 3'),
+            (MAX_POINTS_CONFIG, '100', 'few[1000s]',
+             'max points per series limit: 101 > 100'),
+            (MAX_SAMPLES_CONFIG, '1000', 'few[1000s]', 'too many samples'),
+        )
+        for name, value, query, expected in cases:
+            self.set_config(name, value)
+            try:
+                with pytest.raises(ResponseError) as err:
+                    self.instant_query(query, at)
+                assert expected in str(err.value), (name, str(err.value))
+                assert 'Internal error in fanout' not in str(err.value), name
+            finally:
+                self.set_config(name, LIMIT_DEFAULTS[name])

@@ -1,10 +1,10 @@
 use crate::common::{Sample, Timestamp};
+use crate::error_consts;
 use crate::series::RangeSnapshot;
 
-pub(crate) const MAX_SERIES_ERROR_MSG: &str =
-    "the query returns more than the configured max series limit";
+pub(crate) const MAX_SERIES_ERROR_MSG: &str = error_consts::PROMQL_MAX_SERIES_ERROR;
 pub(crate) const MAX_POINTS_PER_SERIES_ERROR_MSG: &str =
-    "the query returns a series with more points than the configured max points per series limit";
+    error_consts::PROMQL_MAX_POINTS_PER_SERIES_ERROR;
 
 pub(in crate::promql) fn instant_lookback_start_ms(
     timestamp: Timestamp,
