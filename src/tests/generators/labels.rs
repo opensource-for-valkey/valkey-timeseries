@@ -175,7 +175,8 @@ impl FleetTopology {
         Ok(())
     }
 
-    /// Generate every series in the fleet. Keys are `ts:<n>` in generation order.
+    /// Generate every series in the fleet. Keys are `<metric>:ts:<n>`, where `<metric>` is the
+    /// series' `__name__` and `<n>` counts up in generation order.
     ///
     /// Panics if the topology fails [`validate`](Self::validate); callers that take knobs from
     /// outside (the report tool's overrides) should use [`try_generate`](Self::try_generate)

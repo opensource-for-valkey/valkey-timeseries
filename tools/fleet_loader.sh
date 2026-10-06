@@ -17,7 +17,7 @@
 #   tools/fleet_loader.sh --emit /tmp/fleet.resp     # RESP to a file instead; then
 #                                                    #   valkey-cli --pipe < /tmp/fleet.resp
 #
-# Keys are <prefix><n> (default prefix `k8s:`). The loader refuses to write
+# Keys are <prefix><metric>:ts:<n> (default prefix `k8s:`). The loader refuses to write
 # over an earlier load unless --flush is given. The server rejects a series
 # whose label set already exists under any key, so a second copy of the same
 # fleet needs both another --prefix and a --label. Exits non-zero if any reply

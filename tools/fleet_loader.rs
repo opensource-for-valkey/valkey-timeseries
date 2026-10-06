@@ -404,13 +404,14 @@ impl Tally {
 // Load
 // ---------------------------------------------------------------------------------------------
 
+/// The key a series is loaded under: `--prefix` followed by the generated `<metric>:ts:<n>`.
+fn series_key(cfg: &Config, spec: &SeriesSpec) -> String {
+    format!("{}{}", cfg.prefix, spec.key)
+}
+
 /// One `TS.CREATE` and the `TS.MADD` batches that fill it.
 fn series_commands(cfg: &Config, spec: &SeriesSpec, samples: &[Sample]) -> Vec<Cmd> {
-    let key = format!(
-        "{}{}",
-        cfg.prefix,
-        spec.key.strip_prefix("ts:").unwrap_or(&spec.key)
-    );
+    let key = series_key(cfg, spec);
     let mut create = redis::cmd("TS.CREATE");
     create.arg(&key);
     for (option, value) in &cfg.create_options {
@@ -629,10 +630,10 @@ fn main() {
                 conn.query(&redis::cmd("FLUSHALL"))
                     .unwrap_or_else(|e| fail(format!("FLUSHALL on {target}: {e}")));
                 eprintln!("Flushed {target}");
-            } else {
+            } else if let Some(spec) = fleet.series().first() {
                 // Loading over an earlier fleet would append its samples to whichever series
                 // now has the same key, so refuse rather than mix two fleets.
-                let first = format!("{}0", cfg.prefix);
+                let first = series_key(&cfg, spec);
                 let exists: bool = conn
                     .query(redis::cmd("EXISTS").arg(&first))
                     .and_then(|v| Ok(redis::from_redis_value(v)?))
