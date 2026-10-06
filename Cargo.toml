@@ -57,7 +57,6 @@ valkey-module-macros = "0.1.15"
 range-set-blaze = "0.8"
 # Client for tools/fleet_loader only; never linked into the module.
 redis = { version = "1.7", optional = true, default-features = false, features = ["cluster"] }
-rayon = "1"
 rayon-core = "1.13"
 regex = "1"
 simd-json = "0.18.1"
@@ -133,6 +132,7 @@ required-features = ["test-utils", "enable-system-alloc"]
 name = "fleet_loader"
 path = "tools/fleet_loader.rs"
 required-features = ["fleet-loader", "enable-system-alloc"]
+
 [[bench]]
 name = "promql_engine"
 harness = false
@@ -163,8 +163,3 @@ use-redismodule-api = [] # We don't support this feature flag which is why it is
 test-utils = ["dep:bon", "dep:rand_distr"]
 # tools/fleet_loader: the fleet generator plus a Valkey client to load it with.
 fleet-loader = ["test-utils", "dep:redis"]
-
-[[bench]]
-name = "literal_set_filter"
-harness = false
-required-features = ["enable-system-alloc"]

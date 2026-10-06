@@ -1,5 +1,6 @@
 use super::raw_replies::{
     IntoRawCtx, is_resp3_client, reply, reply_error_string, reply_with_bulk_string,
+    reply_with_sample, reply_with_simple_string,
 };
 use crate::common::Sample;
 use std::os::raw::c_long;
