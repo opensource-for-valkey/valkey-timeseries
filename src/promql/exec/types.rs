@@ -4,6 +4,7 @@ use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::string_interner::InternedString;
 use crate::labels::{
     HasFingerprint, InternedLabel, Labels, MetricName, SeriesFingerprint, fingerprint_labels,
+    hash_label,
 };
 use crate::promql::error::QueryError;
 use crate::promql::exec::bitset::BitSet;
@@ -562,10 +563,10 @@ impl Ord for EvalLabels {
 
 impl Hash for EvalLabels {
     /// Identical byte stream for every variant: the `[Label]` hash — a length
-    /// prefix, then `name`, `0xfe`, `value` per label. Slice-backed variants
+    /// prefix, then each label framed by [`hash_label`]. Slice-backed variants
     /// hash the slice directly; `Interned` emits the same bytes from its
-    /// pre-split entries, so an `Owned` set with equal content is the same
-    /// map key.
+    /// pre-split entries through the same helper, so an `Owned` set with
+    /// equal content is the same map key.
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self.as_label_slice() {
             Some(slice) => slice.hash(state),
@@ -575,9 +576,7 @@ impl Hash for EvalLabels {
                 };
                 state.write_usize(split.len());
                 for l in split.iter() {
-                    state.write(l.name().as_bytes());
-                    state.write_u8(0xfe);
-                    state.write(l.value().as_bytes());
+                    hash_label(state, l.name(), l.value());
                 }
             }
         }
@@ -1347,5 +1346,74 @@ mod copy_label_tests {
             pairs(&labels),
             expected(&[("job", "a"), ("owner", "team-c")])
         );
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::{EvalLabels, SeriesMap};
+    use crate::common::Sample;
+    use crate::labels::{Label, MetricName};
+
+    fn variants(pairs: &[(&str, &str)]) -> [EvalLabels; 3] {
+        let labels: Vec<Label> = pairs.iter().map(|(n, v)| Label::new(*n, *v)).collect();
+        [
+            EvalLabels::interned(&MetricName::from_pairs(pairs.iter().copied())),
+            EvalLabels::shared(labels.clone()),
+            EvalLabels::owned(labels),
+        ]
+    }
+
+    /// Every variant of one label set is the same map key: equal *and* equally
+    /// hashed. `Interned` emits its bytes by hand, so it is the one that can
+    /// drift from the `[Label]` framing the slice-backed variants use.
+    #[test]
+    fn variants_with_equal_content_hash_equal() {
+        let state = ahash::RandomState::with_seeds(1, 2, 3, 4);
+        let sets: &[&[(&str, &str)]] = &[
+            &[],
+            &[("__name__", "m")],
+            &[("__name__", "m"), ("job", "api")],
+            &[("a", ""), ("b", "y")],
+            &[("instance", "host-1:9100"), ("job", "node"), ("le", "+Inf")],
+        ];
+        for pairs in sets {
+            let [interned, shared, owned] = variants(pairs);
+            assert!(matches!(interned, EvalLabels::Interned(_)));
+            for other in [&shared, &owned] {
+                assert_eq!(&interned, other, "{pairs:?}");
+                assert_eq!(
+                    state.hash_one(&interned),
+                    state.hash_one(other),
+                    "{pairs:?}"
+                );
+            }
+        }
+    }
+
+    /// The range-query step merge folds a series into one entry whichever
+    /// variant each step's sample carries.
+    #[test]
+    fn series_map_merges_variants_into_one_entry() {
+        // A small `halfbrown` map scans by `Eq` and never hashes; fill it past
+        // that so the lookups below go through the hash table.
+        const FILLER: usize = 64;
+        let mut map = SeriesMap::default();
+        for i in 0..FILLER {
+            let instance = format!("host-{i}");
+            map.insert(
+                EvalLabels::from_pairs(&[("__name__", "m"), ("instance", &instance)]),
+                Vec::new(),
+            );
+        }
+        let pairs = [("__name__", "m"), ("job", "api")];
+        for (step, labels) in variants(&pairs).into_iter().enumerate() {
+            map.entry(labels)
+                .or_default()
+                .push(Sample::new(step as i64, step as f64));
+        }
+        assert_eq!(map.len(), FILLER + 1);
+        let [interned, ..] = variants(&pairs);
+        assert_eq!(map.get(&interned).map(Vec::len), Some(3));
     }
 }

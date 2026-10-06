@@ -107,7 +107,7 @@ impl SeriesLabel for Label {
 
 /// The framing of [`super::hash::hash_key_value`]: a separator after the name
 /// *and* after the value, so adjacent labels cannot run together.
-fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
+pub(crate) fn hash_label<H: Hasher>(state: &mut H, name: &str, value: &str) {
     state.write(name.as_bytes());
     state.write_u8(super::hash::LABEL_SEP);
     state.write(value.as_bytes());
