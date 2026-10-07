@@ -298,7 +298,9 @@ do this, and they differ in where the label values come from:
   left), so the other operand is not read either. This is governed by
   `ts-promql-derived-filter-pushdown`
   (default `yes`); the static optimizer's `ts-promql-optimize-queries` pushes only the
-  matchers written in the query, and blindly.
+  matchers written in the query, and blindly. With both on, a range query gets the
+  optimizer's other rewrites but leaves the push-down to the derived pass, which pushes
+  the written matchers too, but only where they exclude series.
 
 Both are exact: a filter only ever removes series that could not have matched at any
 step. A selector matching more than 50 000 series (or the query's

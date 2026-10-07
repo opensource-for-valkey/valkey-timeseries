@@ -528,6 +528,50 @@ mod tests {
         );
     }
 
+    /// With derived filters on, the static optimizer leaves a range query's
+    /// push-down to them. Its blind push-down would copy the `l` regex — true
+    /// of every `a` series — onto the right, making the two selectors one;
+    /// the derived pass sees it prunes nothing and leaves both as written.
+    #[test]
+    fn range_optimizer_leaves_the_push_down_to_derived_filters() {
+        let run = |derived: bool| {
+            let (counting, reader) = build_reader();
+            let opts = QueryOptions {
+                optimize_queries: true,
+                derived_filter_pushdown: derived,
+                ..options()
+            };
+            evaluate_range(
+                reader,
+                EvalStmt {
+                    expr: promql_parser::parser::parse(r#"a{l=~"0|1|2"} - a"#).unwrap(),
+                    start: ms(RANGE_START_MS),
+                    end: ms(RANGE_END_MS),
+                    interval: STEP,
+                    lookback_delta: opts.lookback_delta,
+                },
+                opts,
+            )
+            .unwrap();
+            counting.counts()
+        };
+        assert_eq!(
+            run(false),
+            ReaderCallCounts {
+                query_grid: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            run(true),
+            ReaderCallCounts {
+                query_grid: 2,
+                label_profile: 2,
+                ..Default::default()
+            }
+        );
+    }
+
     #[test]
     fn instant_join_derives_its_filters_at_evaluation_not_from_the_index() {
         let (counting, reader) = build_reader();

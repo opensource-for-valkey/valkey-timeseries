@@ -601,36 +601,38 @@ mod tests {
         assert_eq!(reader.asked.lock().unwrap().len(), 1);
     }
 
-    /// With the static optimizer on, the pass profiles the tree it left. A
-    /// written filter it pushed narrows that profile, so the derived filter
-    /// it would have implied is no longer added; but one it pushed that
-    /// prunes nothing stays, as this pass only ever adds matchers.
+    /// With the static optimizer on, a range query gets its rewrites but not
+    /// its blind push-down (`simplify_expr`): that would leave a matcher that
+    /// prunes nothing — `cpu{metric="cpu"}` on the right below — and this
+    /// pass only ever adds matchers. The written filters still cross, where
+    /// the profiles show they prune.
     #[test]
-    fn the_pass_narrows_what_the_static_optimizer_left() {
+    fn the_static_optimizer_leaves_the_push_down_to_the_pass() {
         let reader = TableReader::new(vec![
             (r#"cpu{region="us"}"#, CPU_US),
             (r#"cpu{metric="cpu"}"#, CPU_ALL),
             ("cpu", CPU_ALL),
         ]);
-        let rewrite_optimized = |query: &str| {
+        let rewrite_simplified = |query: &str| {
             let expr = promql_parser::parser::parse(query).unwrap();
-            let mut expr = crate::promql::optimizer::optimize_expr(expr).unwrap();
+            let mut expr = crate::promql::optimizer::simplify_expr(expr).unwrap();
             derive_filters_in_place(&mut expr, &reader, options()).unwrap();
             expr.to_string()
         };
 
         assert_eq!(
-            rewrite_optimized(r#"cpu{region="us"} - cpu offset 5m"#),
-            r#"cpu{region="us"} - cpu{region="us"} offset 5m"#
-        );
-        assert_eq!(
-            rewrite(r#"cpu{metric="cpu"} - cpu offset 5m"#, &reader),
+            rewrite_simplified(r#"cpu{metric="cpu"} - cpu offset 5m"#),
             r#"cpu{metric="cpu"} - cpu offset 5m"#
         );
         assert_eq!(
-            rewrite_optimized(r#"cpu{metric="cpu"} - cpu offset 5m"#),
-            r#"cpu{metric="cpu"} - cpu{metric="cpu"} offset 5m"#
+            rewrite_simplified(r#"cpu{region="us"} - cpu offset 5m"#),
+            r#"cpu{region="us"} - cpu{host=~"a|b",region="us"} offset 5m"#
         );
+        // The rewrites still apply: `A + A` becomes `A * 2`, which has no
+        // vector operand pair left to narrow, so no profile is asked for.
+        reader.asked.lock().unwrap().clear();
+        assert_eq!(rewrite_simplified("cpu + cpu"), "cpu * 2");
+        assert!(reader.asked.lock().unwrap().is_empty());
     }
 
     #[test]

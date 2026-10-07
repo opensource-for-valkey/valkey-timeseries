@@ -214,11 +214,14 @@ like the other `ts-promql-*` parameters; off skips the pass entirely. It exists 
 same reason `ts-fanout-rollup-pushdown` does — a new cross-node request wants a kill
 switch, and the cluster suite uses it for on/off parity. It is independent of
 `ts-promql-optimize-queries` (which stays off by default and still governs pushing
-*written* matchers blindly); with both on, the static pass runs first. Note that the
-derived pass's leaf rule is *written ∪ derived*, so with only the derived toggle on a
-written `region="us"` is pushed across the binop too — subject to `retain_pruning`, i.e.
-only where the index says it prunes. For binops the derived pass therefore subsumes the
-static one; the static flag keeps its meaning for the blind (no-profile) rewrite.
+*written* matchers blindly). Note that the derived pass's leaf rule is *written ∪
+derived*, so with only the derived toggle on a written `region="us"` is pushed across the
+binop too — subject to `retain_pruning`, i.e. only where the index says it prunes. For
+binops the derived pass therefore subsumes the static one, so with both on a range query
+runs the static optimizer without its push-down (`simplify_expr`: folding and algebraic
+rewrites only). Running the blind push-down first would leave matchers that prune
+nothing, which the derived pass — it only adds — cannot remove. Instant queries, which
+the derived pass never sees, keep the full static pass.
 
 ## 5. Expected effect
 

@@ -9,7 +9,7 @@ use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{EvalLabels, SeriesMap};
 use crate::promql::exec::utils::merge_step_into_series_map;
 use crate::promql::model::{InstantSample, QueryValue, RangeSample};
-use crate::promql::optimizer::optimize_expr;
+use crate::promql::optimizer::{optimize_expr, simplify_expr};
 use crate::promql::time::duration_ms;
 use crate::promql::time::{grid_step_count, step_times};
 use crate::promql::utils::{check_subquery_cost, validate_max_points_per_timeseries};
@@ -35,12 +35,24 @@ fn parse_query(query: &str) -> QueryResult<Expr> {
     promql_parser::parser::parse(query).map_err(QueryError::InvalidQuery)
 }
 
-fn optimize_statement(stmt: &mut EvalStmt, options: &QueryOptions) -> QueryResult<()> {
+/// Apply the static optimizer if it is enabled. `push_down_filters` is false
+/// where the data-derived pass will narrow the tree instead (see
+/// [`simplify_expr`]).
+fn optimize_statement(
+    stmt: &mut EvalStmt,
+    options: &QueryOptions,
+    push_down_filters: bool,
+) -> QueryResult<()> {
     if options.optimize_queries {
         // Keep this at the shared evaluation boundary so command handlers and
         // the convenience API apply precisely the same optional rewrites.
-        stmt.expr = optimize_expr(stmt.expr.clone())
-            .map_err(|e| QueryError::InvalidQuery(format!("optimization error: {e}")))?;
+        let expr = stmt.expr.clone();
+        stmt.expr = if push_down_filters {
+            optimize_expr(expr)
+        } else {
+            simplify_expr(expr)
+        }
+        .map_err(|e| QueryError::InvalidQuery(format!("optimization error: {e}")))?;
     }
     Ok(())
 }
@@ -124,7 +136,7 @@ pub fn evaluate_instant(
     query_time: SystemTime,
     opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
-    optimize_statement(&mut stmt, &opts)?;
+    optimize_statement(&mut stmt, &opts, true)?;
     check_subquery_cost(&stmt.expr, 1).map_err(QueryError::from)?;
     let deadline = resolve_deadline_ms(opts);
     let evaluator = Evaluator::new(&reader, opts);
@@ -180,7 +192,7 @@ pub fn evaluate_range(
     mut stmt: EvalStmt,
     opts: QueryOptions,
 ) -> QueryResult<Vec<RangeSample>> {
-    optimize_statement(&mut stmt, &opts)?;
+    optimize_statement(&mut stmt, &opts, !opts.derived_filter_pushdown)?;
     let start = stmt.start;
     let end = stmt.end;
     let step = stmt.interval;

@@ -5,4 +5,4 @@ pub mod pushdown;
 mod pushdown_tests;
 mod utils;
 
-pub use optimize::optimize_expr;
+pub use optimize::{optimize_expr, simplify_expr};

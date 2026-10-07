@@ -43,6 +43,20 @@ use promql_parser::parser::{BinaryExpr, Expr, ParenExpr};
 /// `b > 2`
 ///
 pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
+    let mut expr = simplify_expr(expr)?;
+
+    // push down filters
+    pushdown_filters_in_place(&mut expr);
+    Ok(expr)
+}
+
+/// [`optimize_expr`] without the filter push-down: constant folding and the
+/// algebraic rewrites only.
+///
+/// For a range query the data-derived pass (`engine::derived_filters`)
+/// pushes written filters too, but only where the index shows they prune;
+/// pushing them blindly first would leave matchers that pass cannot remove.
+pub fn simplify_expr(expr: Expr) -> ParseResult<Expr> {
     const MAX_OPTIMIZATION_PASSES: usize = 4;
 
     let mut expr = expr;
@@ -53,9 +67,6 @@ pub fn optimize_expr(expr: Expr) -> ParseResult<Expr> {
             break;
         }
     }
-
-    // push down filters
-    pushdown_filters_in_place(&mut expr);
     Ok(expr)
 }
 
