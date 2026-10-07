@@ -57,14 +57,168 @@ impl std::error::Error for EvaluationError {}
 
 pub(crate) type EvalResult<T> = Result<T, EvaluationError>;
 
-/// Type alias for complex HashMap used in matrix selector evaluation.
-/// Maps from a label key (sorted vector of label pairs) to samples vector
-pub(crate) type SeriesMap = halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState>;
+/// No series: the end of a successor chain, or no step seen yet.
+const NO_SERIES: usize = usize::MAX;
+
+/// Misses a step may take beyond its hits before it stops guessing.
+const GUESS_MISS_BUDGET: i32 = 8;
+
+/// Folds the instant vectors of consecutive evaluation steps into one entry
+/// per series.
+///
+/// A range query's steps re-emit mostly the same series, in mostly the same
+/// order, and hashing every sample's label set to find its series cost
+/// 16–48 ns a sample. So each series remembers which series followed it in
+/// the previous step, and a sample is first checked against that guess: one
+/// `Eq`, which for interned labels is a pointer compare per label. The guess
+/// survives labels rebuilt every step (`rate` dropping `__name__` makes a new
+/// `Arc` per sample, so pointer identity would not), and a series appearing
+/// or vanishing costs one miss before the chain resyncs. A step whose order
+/// is scrambled (`count_values`, whose series follow the values) stops
+/// guessing once its misses outrun its hits by [`GUESS_MISS_BUDGET`].
+///
+/// A miss falls back to a hash index over the slots, which holds no second
+/// copy of the labels: cloning an owned label set per new series cost
+/// `count_values` a quarter of its run time. A guess is accepted only when
+/// `Eq` confirms it and each label set has one slot, so the result is a hash
+/// map's exactly.
+///
+/// Feed steps in ascending time order and call [`end_step`](Self::end_step)
+/// after each, so per-series values stay chronologically sorted.
+pub struct StepMerger<V> {
+    /// `(labels, value, successor in the previous step)` per series, in
+    /// first-seen order.
+    series: Vec<(EvalLabels, V, usize)>,
+    /// Slot indices, hashed by their series' labels.
+    index: hashbrown::HashTable<usize>,
+    state: RandomState,
+    /// The first series of the previous step: the guess for a step's first
+    /// sample.
+    head: usize,
+    /// The series the current step touched last; [`NO_SERIES`] at a step's start.
+    last: usize,
+    /// This step's hits minus misses, plus the budget; guessing stops for
+    /// the rest of the step at zero.
+    guess_credit: i32,
+    /// [`GUESS_MISS_BUDGET`], or whatever the benchmark set.
+    budget: i32,
+}
+
+impl<V: Default> Default for StepMerger<V> {
+    fn default() -> Self {
+        Self {
+            series: Vec::new(),
+            index: hashbrown::HashTable::new(),
+            state: RandomState::new(),
+            head: NO_SERIES,
+            last: NO_SERIES,
+            guess_credit: GUESS_MISS_BUDGET,
+            budget: GUESS_MISS_BUDGET,
+        }
+    }
+}
+
+impl<V: Default> StepMerger<V> {
+    /// A merger with a different miss budget, for the benchmarks that
+    /// separate the guesses' cost from the fallback's: `0` never guesses.
+    #[cfg(feature = "bench")]
+    pub fn with_guess_budget(budget: i32) -> Self {
+        Self {
+            guess_credit: budget,
+            budget,
+            ..Self::default()
+        }
+    }
+
+    /// The value for `labels` in the current step, created on first sight.
+    #[inline]
+    pub fn entry(&mut self, labels: EvalLabels) -> &mut V {
+        let guess = if self.last == NO_SERIES {
+            self.head
+        } else {
+            self.series[self.last].2
+        };
+        let slot = if guess != NO_SERIES && self.guess_credit > 0 {
+            if self.series[guess].0 == labels {
+                self.guess_credit += 1;
+                guess
+            } else {
+                self.guess_credit -= 1;
+                self.lookup(labels)
+            }
+        } else {
+            self.lookup(labels)
+        };
+        // Overwrites the previous step's successor only after it was used as
+        // the guess above.
+        if self.last == NO_SERIES {
+            self.head = slot;
+        } else {
+            self.series[self.last].2 = slot;
+        }
+        self.last = slot;
+        &mut self.series[slot].1
+    }
+
+    /// The slot of `labels`, created if new: one hash, and the labels are
+    /// moved into the slot rather than copied into the index.
+    ///
+    /// Inline, with the labels borrowed until a slot has to be created, so a
+    /// hit drops its labels in the caller, where the refcount decrement
+    /// inlines. On a stream every guess misses this path is what the merge
+    /// costs, and it runs about 10 % behind a hash map's `entry`: the
+    /// successor bookkeeping and the `series[slot]` indirection in the
+    /// probe, spread too thin for a profile to show. As an out-of-line call
+    /// taking the labels by value it was a further 4 % behind.
+    #[inline]
+    fn lookup(&mut self, labels: EvalLabels) -> usize {
+        let hash = self.state.hash_one(&labels);
+        let series = &self.series;
+        match self.index.find(hash, |&slot| series[slot].0 == labels) {
+            Some(&slot) => slot,
+            None => self.insert(hash, labels),
+        }
+    }
+
+    #[cold]
+    fn insert(&mut self, hash: u64, labels: EvalLabels) -> usize {
+        let slot = self.series.len();
+        let (state, series) = (&self.state, &self.series);
+        self.index
+            .insert_unique(hash, slot, |&s| state.hash_one(&series[s].0));
+        self.series.push((labels, V::default(), NO_SERIES));
+        slot
+    }
+
+    /// Close the current step: the next sample is guessed from this step's head.
+    #[inline]
+    pub fn end_step(&mut self) {
+        self.last = NO_SERIES;
+        self.guess_credit = self.budget;
+    }
+
+    pub fn len(&self) -> usize {
+        self.series.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.series.is_empty()
+    }
+
+    /// Every series and its value, in first-seen order.
+    pub fn into_series(self) -> impl Iterator<Item = (EvalLabels, V)> {
+        self.series
+            .into_iter()
+            .map(|(labels, value, _)| (labels, value))
+    }
+}
+
+/// [`StepMerger`] for a range query's series.
+pub(crate) type SeriesMap = StepMerger<Vec<Sample>>;
 
 /// [`SeriesMap`] plus each series' pending `__name__` drop, for merging a
 /// subquery's inner steps.
-pub(crate) type SubquerySeriesMap =
-    halfbrown::HashMap<EvalLabels, (Vec<Sample>, bool), RandomState>;
+pub(crate) type SubquerySeriesMap = StepMerger<(Vec<Sample>, bool)>;
 
 /// An owned `Label` from an interned `name=value` entry.
 #[inline]
@@ -1354,6 +1508,7 @@ mod hash_tests {
     use super::{EvalLabels, SeriesMap};
     use crate::common::Sample;
     use crate::labels::{Label, MetricName};
+    use ahash::RandomState;
 
     fn variants(pairs: &[(&str, &str)]) -> [EvalLabels; 3] {
         let labels: Vec<Label> = pairs.iter().map(|(n, v)| Label::new(*n, *v)).collect();
@@ -1391,14 +1546,15 @@ mod hash_tests {
         }
     }
 
-    /// The range-query step merge folds a series into one entry whichever
-    /// variant each step's sample carries.
+    /// A hash map keyed by label set holds one entry per series whichever
+    /// variant each insert carries.
     #[test]
-    fn series_map_merges_variants_into_one_entry() {
+    fn hash_map_merges_variants_into_one_entry() {
         // A small `halfbrown` map scans by `Eq` and never hashes; fill it past
         // that so the lookups below go through the hash table.
         const FILLER: usize = 64;
-        let mut map = SeriesMap::default();
+        let mut map: halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState> =
+            halfbrown::HashMap::default();
         for i in 0..FILLER {
             let instance = format!("host-{i}");
             map.insert(
@@ -1415,5 +1571,55 @@ mod hash_tests {
         assert_eq!(map.len(), FILLER + 1);
         let [interned, ..] = variants(&pairs);
         assert_eq!(map.get(&interned).map(Vec::len), Some(3));
+    }
+
+    fn labels(variant: usize, pairs: &[(&str, &str)]) -> EvalLabels {
+        variants(pairs)[variant % 3].clone()
+    }
+
+    /// Folding steps through the merger gives exactly what a plain hash map
+    /// gives, across the shapes that break a guess: reordering, series that
+    /// appear and vanish, duplicates within a step, empty steps, and one
+    /// series arriving as a different variant from step to step.
+    #[test]
+    fn step_merger_matches_a_hash_map() {
+        const SERIES: usize = 80;
+        let names: Vec<String> = (0..SERIES).map(|i| format!("host-{i}")).collect();
+        let pairs = |i: usize| [("__name__", "m"), ("instance", names[i].as_str())];
+
+        let mut steps: Vec<Vec<EvalLabels>> = Vec::new();
+        for step in 0..40usize {
+            let mut ids: Vec<usize> = match step % 8 {
+                0 => (0..SERIES).collect(),
+                1 => (0..SERIES).rev().collect(),
+                2 => (0..SERIES).filter(|i| i % 3 != 0).collect(),
+                3 => (0..SERIES).map(|i| (i * 37 + step) % SERIES).collect(),
+                4 => Vec::new(),
+                5 => (0..SERIES).flat_map(|i| [i, i]).collect(),
+                6 => (step..SERIES).chain(0..step).collect(),
+                _ => (0..SERIES / 2).collect(),
+            };
+            if step % 5 == 0 {
+                ids.insert(ids.len() / 2, (step * 7) % SERIES);
+            }
+            steps.push(ids.iter().map(|&i| labels(i + step, &pairs(i))).collect());
+        }
+
+        let mut merger = SeriesMap::default();
+        let mut reference: halfbrown::HashMap<EvalLabels, Vec<Sample>, RandomState> =
+            halfbrown::HashMap::default();
+        for (t, step) in steps.into_iter().enumerate() {
+            for (k, labels) in step.into_iter().enumerate() {
+                let sample = Sample::new(t as i64, k as f64);
+                reference.entry(labels.clone()).or_default().push(sample);
+                merger.entry(labels).push(sample);
+            }
+            merger.end_step();
+        }
+
+        assert_eq!(merger.len(), reference.len());
+        for (labels, values) in merger.into_series() {
+            assert_eq!(reference.get(&labels), Some(&values), "{labels}");
+        }
     }
 }

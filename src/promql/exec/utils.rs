@@ -17,9 +17,9 @@ pub(in crate::promql) fn merge_step_into_series_map(
     for sample in samples {
         series_map
             .entry(sample.labels)
-            .or_default()
             .push(Sample::new(step_ts, sample.value));
     }
+    series_map.end_step();
 }
 
 /// [`merge_step_into_series_map`] for a subquery's inner steps, whose samples
@@ -33,10 +33,11 @@ pub(in crate::promql) fn merge_step_into_subquery_map(
     samples: Vec<EvalSample>,
 ) {
     for sample in samples {
-        let (values, drop_name) = series_map.entry(sample.labels).or_default();
+        let (values, drop_name) = series_map.entry(sample.labels);
         values.push(Sample::new(step_ts, sample.value));
         *drop_name |= sample.drop_name;
     }
+    series_map.end_step();
 }
 
 /// Every vector selector evaluated at this grid, except the operand of an

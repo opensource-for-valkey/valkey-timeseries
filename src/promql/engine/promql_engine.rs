@@ -290,8 +290,8 @@ pub fn evaluate_range(
                 ExprResult::Scalar(value) => {
                     series_map
                         .entry(EvalLabels::empty())
-                        .or_default()
                         .push(Sample::new(current_time, value));
+                    series_map.end_step();
                 }
                 ExprResult::RangeVector(_) => {
                     return Err(QueryError::Execution(
@@ -308,14 +308,15 @@ pub fn evaluate_range(
     }
 
     let mut result: Vec<RangeSample> = series_map
-        .into_iter()
+        .into_series()
         .map(|(labels, samples)| RangeSample {
             samples,
             labels: labels.into_labels(),
         })
         .collect();
-    // The map iterates in a per-process random order, so without this the same query
-    // returned its series in a different order after a restart or on another node.
+    // Series come out in first-seen order, which follows the evaluator's own (often
+    // hash-map, so per-process random) order, so without this the same query returned
+    // its series in a different order after a restart or on another node.
     // Prometheus sorts a range result by labels: pair by pair, name then value, the
     // shorter set first, which is `Labels`' own ordering.
     par_sort_unstable_by(&mut result, &|a: &RangeSample, b: &RangeSample| {

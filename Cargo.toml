@@ -19,6 +19,7 @@ enquote = "1.1.0"
 enum_dispatch = "0.3.13"
 get-size2 = { version = "0.11.0", features = ["derive"] }
 halfbrown = { version = "0.4", features = ["arraybackend"] }
+hashbrown = { version = "0.16", default-features = false, features = ["inline-more"] }
 hashify = { version = "0.3" }
 itertools = "0.15.0"
 # `mmap` for the RDB save counters, which the BGSAVE fork child must share with the server

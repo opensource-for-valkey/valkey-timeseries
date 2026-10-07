@@ -297,7 +297,7 @@ fn bench_labels_conversion(c: &mut Criterion) {
 fn bench_evallabels_ops(c: &mut Criterion) {
     use ahash::RandomState;
     use valkey_timeseries::labels::{Label, MetricName};
-    use valkey_timeseries::promql::EvalLabels;
+    use valkey_timeseries::promql::{EvalLabels, StepMerger};
 
     const SERIES: usize = 100;
     const STEPS: usize = 1000;
@@ -382,6 +382,100 @@ fn bench_evallabels_ops(c: &mut Criterion) {
                     std::hint::black_box(&l);
                 }
             })
+        });
+    }
+
+    // The range-query step merge: every step's samples folded into one entry
+    // per series, by hash map (`entry` per sample) and by `StepMerger`. Shapes:
+    // `same_arc` — a bare selector, one `Arc` per series for every step;
+    // `rebuilt` — labels rebuilt per step (`rate` dropping `__name__`), equal
+    // content but a fresh `Arc`; `shared` — owned labels from fan-in;
+    // `shuffled` — a different series order each step, so every guess misses.
+    type StepStream = Vec<Vec<EvalLabels>>;
+    let steps_of = |src: &Vec<EvalLabels>, f: &dyn Fn(usize, &EvalLabels) -> EvalLabels| {
+        (0..STEPS)
+            .map(|step| src.iter().map(|l| f(step, l)).collect())
+            .collect::<StepStream>()
+    };
+    let rebuilt = |_: usize, l: &EvalLabels| {
+        let mut l = l.clone();
+        l.drop_name();
+        l
+    };
+    // A different multiplier coprime to SERIES per step: a permutation whose
+    // successors differ from the previous step's.
+    const MULTIPLIERS: [usize; 8] = [3, 7, 9, 11, 13, 17, 19, 21];
+    let shuffled = |step: usize, i: usize| {
+        interned[(i * MULTIPLIERS[step % MULTIPLIERS.len()] + step) % SERIES].clone()
+    };
+    let shapes: [(&str, StepStream); 4] = [
+        ("same_arc", steps_of(&interned, &|_, l| l.clone())),
+        ("rebuilt", steps_of(&interned, &rebuilt)),
+        ("shared", steps_of(&shared, &|_, l| l.clone())),
+        (
+            "shuffled",
+            (0..STEPS)
+                .map(|step| (0..SERIES).map(|i| shuffled(step, i)).collect())
+                .collect(),
+        ),
+    ];
+    // The shuffled shape with guessing off (every sample takes the fallback)
+    // and with guessing never cut off, to split the fallback's cost from the
+    // guesses'.
+    let shuffled_stream = &shapes[3].1;
+    for (name, budget) in [("budget0", 0), ("budget_inf", i32::MAX)] {
+        group.bench_function(
+            BenchmarkId::new("merge_steps/step_merger", format!("shuffled_{name}")),
+            |b| {
+                b.iter_batched(
+                    || shuffled_stream.clone(),
+                    |stream| {
+                        let mut merger = StepMerger::<Vec<f64>>::with_guess_budget(budget);
+                        for (t, step) in stream.into_iter().enumerate() {
+                            for l in step {
+                                merger.entry(l).push(t as f64);
+                            }
+                            merger.end_step();
+                        }
+                        merger
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+    for (shape, stream) in &shapes {
+        group.bench_function(BenchmarkId::new("merge_steps/hash_map", shape), |b| {
+            b.iter_batched(
+                || stream.clone(),
+                |stream| {
+                    let mut map: halfbrown::HashMap<EvalLabels, Vec<f64>, RandomState> =
+                        halfbrown::HashMap::with_hasher(RandomState::new());
+                    for (t, step) in stream.into_iter().enumerate() {
+                        for l in step {
+                            map.entry(l).or_default().push(t as f64);
+                        }
+                    }
+                    map
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        group.bench_function(BenchmarkId::new("merge_steps/step_merger", shape), |b| {
+            b.iter_batched(
+                || stream.clone(),
+                |stream| {
+                    let mut merger = StepMerger::<Vec<f64>>::default();
+                    for (t, step) in stream.into_iter().enumerate() {
+                        for l in step {
+                            merger.entry(l).push(t as f64);
+                        }
+                        merger.end_step();
+                    }
+                    merger
+                },
+                BatchSize::LargeInput,
+            )
         });
     }
     group.finish();

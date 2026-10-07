@@ -167,7 +167,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         }
 
         let vector = series_map
-            .into_iter()
+            .into_series()
             .map(|(labels, (values, drop_name))| EvalSamples {
                 values: values.into(),
                 labels,
