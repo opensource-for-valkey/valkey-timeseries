@@ -601,6 +601,38 @@ mod tests {
         assert_eq!(reader.asked.lock().unwrap().len(), 1);
     }
 
+    /// With the static optimizer on, the pass profiles the tree it left. A
+    /// written filter it pushed narrows that profile, so the derived filter
+    /// it would have implied is no longer added; but one it pushed that
+    /// prunes nothing stays, as this pass only ever adds matchers.
+    #[test]
+    fn the_pass_narrows_what_the_static_optimizer_left() {
+        let reader = TableReader::new(vec![
+            (r#"cpu{region="us"}"#, CPU_US),
+            (r#"cpu{metric="cpu"}"#, CPU_ALL),
+            ("cpu", CPU_ALL),
+        ]);
+        let rewrite_optimized = |query: &str| {
+            let expr = promql_parser::parser::parse(query).unwrap();
+            let mut expr = crate::promql::optimizer::optimize_expr(expr).unwrap();
+            derive_filters_in_place(&mut expr, &reader, options()).unwrap();
+            expr.to_string()
+        };
+
+        assert_eq!(
+            rewrite_optimized(r#"cpu{region="us"} - cpu offset 5m"#),
+            r#"cpu{region="us"} - cpu{region="us"} offset 5m"#
+        );
+        assert_eq!(
+            rewrite(r#"cpu{metric="cpu"} - cpu offset 5m"#, &reader),
+            r#"cpu{metric="cpu"} - cpu offset 5m"#
+        );
+        assert_eq!(
+            rewrite_optimized(r#"cpu{metric="cpu"} - cpu offset 5m"#),
+            r#"cpu{metric="cpu"} - cpu{metric="cpu"} offset 5m"#
+        );
+    }
+
     #[test]
     fn no_binary_operation_means_no_profile_is_asked_for() {
         let reader = TableReader::new(vec![("cpu", CPU_ALL)]);
@@ -806,6 +838,8 @@ mod tests {
 
     /// The narrowed tree evaluates to exactly what the original does: a
     /// derived filter only ever removes series that could not have matched.
+    /// That holds with the static optimizer on too, whose rewrites the pass
+    /// then profiles and narrows further.
     #[test]
     fn narrowed_range_queries_evaluate_identically() {
         use crate::common::Sample;
@@ -894,10 +928,18 @@ mod tests {
             r#"cpu unless on(host) mem{region="mars"}"#,
             r#"cpu{region="mars"} or mem{region="us"}"#,
             r#"absent(cpu{region="mars"}) * on() group_right mem{region="us"}"#,
+            // Static rewrites the derived pass then sees: `A + A → A * 2`,
+            // folded constants, and written filters already pushed across.
+            r#"cpu + cpu"#,
+            r#"cpu{region="us"} + on(host) ((2 - 1) * mem)"#,
+            r#"cpu{metric="cpu"} - cpu offset 5m"#,
+            r#"cpu{host=~"h[0-4]"} / on(host) mem"#,
+            r#"mem / on(region) group_left sum by (region) (cpu{region=~"us|eu"})"#,
         ];
         for query in queries {
-            let run = |derived: bool| {
+            let run = |optimize: bool, derived: bool| {
                 let opts = QueryOptions {
+                    optimize_queries: optimize,
                     derived_filter_pushdown: derived,
                     ..options()
                 };
@@ -922,13 +964,23 @@ mod tests {
                 result.sort_by(|a, b| a.0.cmp(&b.0));
                 result
             };
-            let (with, without) = (run(true), run(false));
-            assert_eq!(with, without, "{query}");
+            let unrewritten = run(false, false);
+            for (optimize, derived) in [(false, true), (true, false), (true, true)] {
+                assert_eq!(
+                    run(optimize, derived),
+                    unrewritten,
+                    "{query} (optimize={optimize}, derived={derived})"
+                );
+            }
             let empty_by_design = query.contains("mars")
                 && !query.contains("unless")
                 && !query.contains(" or ")
                 && !query.contains("absent");
-            assert_eq!(with.is_empty(), empty_by_design, "{query}: {with:?}");
+            assert_eq!(
+                unrewritten.is_empty(),
+                empty_by_design,
+                "{query}: {unrewritten:?}"
+            );
         }
     }
 
