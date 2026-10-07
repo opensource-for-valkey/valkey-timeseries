@@ -108,3 +108,11 @@ message StringPoolStatsRequest {
   // Ship the top `top_k` strings by reference count and by size; 0 skips both.
   uint32 top_k = 1;
 }
+
+// TS._DEBUG INDEXMEMORY: each shard reports the heap footprint of its label
+// index for the request's database, or summed over every database. The index
+// is module-global state that no key owns, so there is nothing to filter.
+message IndexMemoryRequest {
+  // Sum every database's index rather than only the request's.
+  bool all_dbs = 1;
+}

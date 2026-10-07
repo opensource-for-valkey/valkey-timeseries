@@ -573,6 +573,15 @@ pub struct StringPoolStatsRequest {
     #[prost(uint32, tag = "1")]
     pub top_k: u32,
 }
+/// TS._DEBUG INDEXMEMORY: each shard reports the heap footprint of its label
+/// index for the request's database, or summed over every database. The index
+/// is module-global state that no key owns, so there is nothing to filter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexMemoryRequest {
+    /// Sum every database's index rather than only the request's.
+    #[prost(bool, tag = "1")]
+    pub all_dbs: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum QueryLabelsSubtype {
@@ -883,4 +892,26 @@ pub struct StringPoolStatsResponse {
     pub top_k_by_ref: ::prost::alloc::vec::Vec<StringPoolTopKEntry>,
     #[prost(message, repeated, tag = "8")]
     pub top_k_by_size: ::prost::alloc::vec::Vec<StringPoolTopKEntry>,
+}
+/// A node's label-index heap footprint, in bytes, for one database or summed
+/// over all of them.
+/// `terms_bytes` and `id_to_key_bytes` omit the internal node overhead of the
+/// structures holding them, so the totals are a floor. The total is not shipped:
+/// the coordinator recomputes it from the summed parts.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexMemoryResponse {
+    #[prost(uint64, tag = "1")]
+    pub db_count: u64,
+    #[prost(uint64, tag = "2")]
+    pub term_count: u64,
+    #[prost(uint64, tag = "3")]
+    pub series_count: u64,
+    #[prost(uint64, tag = "4")]
+    pub terms_bytes: u64,
+    #[prost(uint64, tag = "5")]
+    pub postings_bytes: u64,
+    #[prost(uint64, tag = "6")]
+    pub id_to_key_bytes: u64,
+    #[prost(uint64, tag = "7")]
+    pub bookkeeping_bytes: u64,
 }

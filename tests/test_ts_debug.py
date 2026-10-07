@@ -816,3 +816,84 @@ class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
             f"Total savings ({savings['memorySavedBytes']}) < "
             f"implied by top-k entries alone ({topk_implied_savings})"
         )
+
+
+class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
+
+    INFO_FIELDS = (
+        ('totalBytes', 'ts_index_total_bytes'),
+        ('termsBytes', 'ts_index_terms_bytes'),
+        ('postingsBytes', 'ts_index_postings_bytes'),
+        ('idToKeyBytes', 'ts_index_id_to_key_bytes'),
+        ('bookkeepingBytes', 'ts_index_bookkeeping_bytes'),
+        ('terms', 'ts_index_terms'),
+        ('series', 'ts_index_series'),
+        ('databases', 'ts_index_databases'),
+    )
+    # The fields that add up across databases; `nodes` stays 1.
+    SUMMED_FIELDS = tuple(field for field, _ in INFO_FIELDS)
+
+    @staticmethod
+    def index_memory(client, *args):
+        flat = client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
+        return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+    @staticmethod
+    def populate(client, db, count):
+        client.select(db)
+        for i in range(count):
+            client.execute_command(
+                'TS.CREATE', f'idxmem:{db}:{i}', 'LABELS', 'env', f'db{db}', 'uniq', f's{i}')
+
+    def test_alldbs_matches_info_ts_memory(self):
+        client = self.server.get_new_client()
+        assert self.index_memory(client, 'ALLDBS')['totalBytes'] == 0
+
+        self.populate(client, 0, 50)
+        self.populate(client, 1, 20)
+
+        reply = self.index_memory(client, 'ALLDBS')
+        info = client.execute_command('INFO', 'ts_memory')
+        for field, info_field in self.INFO_FIELDS:
+            assert reply[field] == int(info[info_field]), field
+        assert reply['series'] == 70
+        assert reply['databases'] == 2
+        assert reply['nodes'] == 1
+        # LOCAL is the same thing on a standalone server, in either order.
+        assert self.index_memory(client, 'ALLDBS', 'LOCAL') == reply
+        assert self.index_memory(client, 'local', 'alldbs') == reply
+
+    def test_defaults_to_the_selected_db(self):
+        client = self.server.get_new_client()
+        self.populate(client, 0, 50)
+        self.populate(client, 1, 20)
+
+        client.select(0)
+        db0 = self.index_memory(client)
+        client.select(1)
+        db1 = self.index_memory(client)
+        all_dbs = self.index_memory(client, 'ALLDBS')
+
+        assert (db0['series'], db0['databases']) == (50, 1)
+        assert (db1['series'], db1['databases']) == (20, 1)
+        for field in self.SUMMED_FIELDS:
+            assert db0[field] + db1[field] == all_dbs[field], field
+
+    def test_db_without_an_index_reports_zero(self):
+        client = self.server.get_new_client()
+        self.populate(client, 0, 5)
+        client.select(7)
+        reply = self.index_memory(client)
+        assert all(reply[field] == 0 for field in self.SUMMED_FIELDS), reply
+        # Asking did not create an index there.
+        assert self.index_memory(client, 'ALLDBS')['databases'] == 1
+
+    @pytest.mark.parametrize('args', [
+        ('LOCAL', 'extra'),
+        ('ALLDBS', 'ALLDBS'),
+        ('LOCAL', 'LOCAL'),
+    ])
+    def test_rejects_bad_arguments(self, args):
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError):
+            client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)

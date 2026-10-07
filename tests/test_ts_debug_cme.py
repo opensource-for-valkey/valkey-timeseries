@@ -1,10 +1,12 @@
 """
-TS._DEBUG STRINGPOOLSTATS in cluster mode: the coordinator sums every primary's string pool.
+TS._DEBUG in cluster mode: STRINGPOOLSTATS sums every primary's string pool, and INDEXMEMORY sums
+one node per shard's label index, preferring replicas.
 """
 
 import pytest
 from valkey import ResponseError, ValkeyCluster
 
+from common import SERVER_VERSION
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 
@@ -110,3 +112,137 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
                 self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
         finally:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+
+def index_memory(client, *args):
+    return bucket_fields(client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args))
+
+
+class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    REPLICAS_COUNT = 1
+
+    # Every field a replica's index shares exactly with its primary's. `bookkeepingBytes`
+    # includes the stale-id tombstones, which each node sweeps on its own schedule.
+    EXACT_FIELDS = ('termsBytes', 'postingsBytes', 'idToKeyBytes', 'terms', 'series', 'databases')
+
+    def populate(self):
+        cluster_client = self.new_cluster_client()
+        for i in range(60):
+            cluster_client.execute_command(
+                'TS.CREATE', f'idxmem:{i}', 'LABELS', 'env', 'prod', 'uniq', f'series-{i}')
+        for i in range(self.CLUSTER_SIZE):
+            self.get_replication_group(i).wait_for_replica_offset_to_sync_up(0)
+
+    def replica(self, shard):
+        return self.get_replication_group(shard).get_replica_connection(0)
+
+    def test_sums_one_node_per_shard(self):
+        self.populate()
+
+        locals_ = [index_memory(self.client_for_primary(i), 'LOCAL') for i in range(self.CLUSTER_SIZE)]
+        merged = index_memory(self.client_for_primary(0))
+
+        assert merged['nodes'] == self.CLUSTER_SIZE
+        assert merged['series'] == 60
+        for field in self.EXACT_FIELDS:
+            assert merged[field] == sum(r[field] for r in locals_), field
+        assert merged['totalBytes'] == (
+            merged['termsBytes'] + merged['postingsBytes']
+            + merged['idToKeyBytes'] + merged['bookkeepingBytes'])
+
+    def test_replica_mirrors_its_primary(self):
+        self.populate()
+        for i in range(self.CLUSTER_SIZE):
+            primary = index_memory(self.client_for_primary(i), 'LOCAL')
+            replica = index_memory(self.replica(i), 'LOCAL')
+            for field in self.EXACT_FIELDS:
+                assert replica[field] == primary[field], (i, field)
+
+    def test_reads_from_replicas(self):
+        """With debug-mode off on every other primary, only their replicas can answer."""
+        self.populate()
+        peers = [self.client_for_primary(i) for i in range(1, self.CLUSTER_SIZE)]
+        for peer in peers:
+            peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            merged = index_memory(self.client_for_primary(0))
+            assert merged['nodes'] == self.CLUSTER_SIZE
+            assert merged['series'] == 60
+        finally:
+            for peer in peers:
+                peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+    def test_replica_with_debug_mode_off_fails_the_command(self):
+        replica = self.replica(1)
+        replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            with pytest.raises(ResponseError):
+                index_memory(self.client_for_primary(0))
+        finally:
+            replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+    def test_local_reports_one_node(self):
+        self.populate()
+        local = index_memory(self.client_for_primary(0), 'LOCAL')
+        merged = index_memory(self.client_for_primary(0))
+        assert local['nodes'] == 1
+        assert local['series'] < merged['series']
+
+
+def server_major_version():
+    """`unstable` is ahead of every release."""
+    head = SERVER_VERSION.split('.')[0]
+    return int(head) if head.isdigit() else 1 << 30
+
+
+@pytest.mark.skipif(server_major_version() < 9, reason='cluster-databases needs Valkey >= 9.0')
+class TestIndexMemoryMultiDbCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """Each node measures the coordinator's selected database, which travels with the request."""
+    REPLICAS_COUNT = 1
+    SERIES_PER_SHARD = {0: 4, 1: 9}
+
+    def get_config_file_lines(self, test_dir, port):
+        return super().get_config_file_lines(test_dir, port) + ['cluster-databases 16']
+
+    def tag_for_shard(self, client, shard):
+        start, end = self._split_range_pairs(0, 16384, self.CLUSTER_SIZE)[shard]
+        for i in range(4096):
+            tag = f't{i}'
+            if start <= int(client.execute_command('CLUSTER KEYSLOT', tag)) < end:
+                return tag
+        raise AssertionError(f'no hash tag for shard {shard}')
+
+    def populate(self):
+        for shard in range(self.CLUSTER_SIZE):
+            primary = self.new_client_for_primary(shard)
+            tag = self.tag_for_shard(primary, shard)
+            for db, count in self.SERIES_PER_SHARD.items():
+                primary.select(db)
+                for i in range(count):
+                    primary.execute_command(
+                        'TS.CREATE', f'idxmem:{{{tag}}}:{db}:{i}',
+                        'LABELS', 'env', f'db{db}', 'uniq', f's{i}')
+            self.get_replication_group(shard).wait_for_replica_offset_to_sync_up(0)
+
+    def test_defaults_to_the_selected_db(self):
+        self.populate()
+        coordinator = self.new_client_for_primary(0)
+
+        replies = {}
+        for db in self.SERIES_PER_SHARD:
+            coordinator.select(db)
+            replies[db] = index_memory(coordinator)
+        all_dbs = index_memory(coordinator, 'ALLDBS')
+
+        for db, count in self.SERIES_PER_SHARD.items():
+            assert replies[db]['series'] == count * self.CLUSTER_SIZE, db
+            assert replies[db]['databases'] == self.CLUSTER_SIZE, db
+            assert replies[db]['nodes'] == self.CLUSTER_SIZE, db
+        assert all_dbs['series'] == sum(self.SERIES_PER_SHARD.values()) * self.CLUSTER_SIZE
+        assert all_dbs['databases'] == len(self.SERIES_PER_SHARD) * self.CLUSTER_SIZE
+        for field in ('termsBytes', 'postingsBytes', 'idToKeyBytes', 'terms', 'series'):
+            assert sum(r[field] for r in replies.values()) == all_dbs[field], field
+
+        # An empty database reports zero everywhere.
+        coordinator.select(5)
+        assert index_memory(coordinator)['series'] == 0

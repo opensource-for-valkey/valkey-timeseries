@@ -125,3 +125,18 @@ message StringPoolStatsResponse {
   repeated StringPoolTopKEntry top_k_by_ref = 7;
   repeated StringPoolTopKEntry top_k_by_size = 8;
 }
+
+// A node's label-index heap footprint, in bytes, for one database or summed
+// over all of them.
+// `terms_bytes` and `id_to_key_bytes` omit the internal node overhead of the
+// structures holding them, so the totals are a floor. The total is not shipped:
+// the coordinator recomputes it from the summed parts.
+message IndexMemoryResponse {
+  uint64 db_count = 1;
+  uint64 term_count = 2;
+  uint64 series_count = 3;
+  uint64 terms_bytes = 4;
+  uint64 postings_bytes = 5;
+  uint64 id_to_key_bytes = 6;
+  uint64 bookkeeping_bytes = 7;
+}

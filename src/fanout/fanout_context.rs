@@ -66,7 +66,6 @@ impl FanoutContext {
     }
 
     /// The database the request runs against.
-    #[cfg(test)]
     pub fn db(&self) -> i32 {
         self.db
     }

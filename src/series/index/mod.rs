@@ -19,7 +19,7 @@ use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
 pub use index_key::IndexKey;
-pub use memory::{IndexMemory, index_memory_usage};
+pub use memory::{IndexMemory, db_index_memory_usage, index_memory_usage};
 pub use posting_stats::*;
 pub use postings::PostingsBitmap;
 pub use querier::*;

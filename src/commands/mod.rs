@@ -50,6 +50,7 @@ mod ts_del;
 mod ts_deleterule;
 mod ts_get;
 mod ts_incr_decr_by;
+mod ts_index_memory_fanout_command;
 mod ts_info;
 mod ts_join;
 mod ts_label_search_fanout_command;
@@ -90,6 +91,7 @@ use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;
 use ts_card_fanout_command::CardFanoutCommand;
+use ts_index_memory_fanout_command::IndexMemoryFanoutCommand;
 use ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use ts_labelstats_fanout_command::LabelStatsFanoutCommand;
 use ts_mdel_fanout_command::MDelFanoutCommand;
@@ -109,6 +111,7 @@ pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<QueryIndexFanoutCommand>()?;
     register_fanout_operation::<QueryLabelsFanoutCommand>()?;
     register_fanout_operation::<StringPoolStatsFanoutCommand>()?;
+    register_fanout_operation::<IndexMemoryFanoutCommand>()?;
     Ok(())
 }
 

@@ -1,15 +1,17 @@
 use super::fanout_codec::generated::StringPoolTopKEntry;
 use super::ts_debug_configs::list_configs_cmd;
+use super::ts_index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_memory};
 use super::ts_string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
+use crate::common::context::get_current_db;
 use crate::common::replies::*;
 use crate::common::string_interner::{BucketStats, saved_pct};
 use crate::config::is_debug_mode_enabled;
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::index::series_keys_by_selectors;
+use crate::series::index::{IndexMemory, series_keys_by_selectors};
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// Dumps a bucket's statistics to the reply.
@@ -155,6 +157,60 @@ pub(super) fn reply_with_string_pool_stats(
     }
 }
 
+/// Returns the label index's heap footprint for the selected database, or summed over every
+/// database with `ALLDBS`.
+///
+/// TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]
+///
+/// In cluster mode the footprint is summed over one node per shard, a replica where the shard
+/// has one (see [`IndexMemoryFanoutCommand`]); `LOCAL` reports this node's index alone.
+fn index_memory(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+    let mut all_dbs = false;
+    let mut local = false;
+    for arg in args.by_ref() {
+        let arg = arg.as_slice();
+        if arg.eq_ignore_ascii_case(b"ALLDBS") && !all_dbs {
+            all_dbs = true;
+        } else if arg.eq_ignore_ascii_case(b"LOCAL") && !local {
+            local = true;
+        } else {
+            return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
+        }
+    }
+
+    if !local && is_clustered(ctx) {
+        IndexMemoryFanoutCommand::new(all_dbs).exec(ctx)?;
+        return Ok(());
+    }
+
+    let memory = local_index_memory(get_current_db(ctx), all_dbs);
+    reply_with_index_memory(ctx, &memory, 1);
+    Ok(())
+}
+
+/// Writes a `TS._DEBUG INDEXMEMORY` reply. Shared by the local path and the cluster fan-out, so
+/// both reply with the same shape. The fields are those of `INFO ts_memory`'s `index_*` group;
+/// `nodes` is how many nodes the figures were summed over.
+pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes: usize) {
+    let fields = [
+        ("totalBytes", memory.total_bytes()),
+        ("termsBytes", memory.terms_bytes),
+        ("postingsBytes", memory.postings_bytes),
+        ("idToKeyBytes", memory.id_to_key_bytes),
+        ("bookkeepingBytes", memory.bookkeeping_bytes),
+        ("terms", memory.term_count),
+        ("series", memory.series_count),
+        ("databases", memory.db_count),
+        ("nodes", nodes),
+    ];
+
+    reply_with_array(ctx, fields.len() * 2);
+    for (name, value) in fields {
+        reply_with_str(ctx, name);
+        reply_with_usize(ctx, value);
+    }
+}
+
 /// Runs a query against this node's *local* index only, bypassing the cluster fanout that
 /// `TS.QUERYINDEX` performs. This is primarily used by tests to assert per-node index state (for
 /// example, that a source node's index was cleared after an atomic slot migration, which a
@@ -184,6 +240,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         (
             "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]",
             "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)",
+        ),
+        (
+            "TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]",
+            "Show label index heap usage for the selected db, or every db with ALLDBS (summed over one node per shard, replicas preferred, in cluster mode unless LOCAL)",
         ),
         (
             "TS._DEBUG QUERYINDEX <filter> [<filter> ...]",
@@ -229,6 +289,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let result = match keyword.as_str() {
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
+        "INDEXMEMORY" => index_memory(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),
         "LIST_CONFIGS" => list_configs_cmd(ctx, &mut itr),
