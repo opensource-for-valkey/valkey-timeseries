@@ -788,4 +788,5 @@ fn match_keys_set(samples: &[EvalSample], matching: Option<&LabelModifier>) -> F
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "binop_vector_vector_tests.rs"]
+mod binop_vector_vector_tests;
