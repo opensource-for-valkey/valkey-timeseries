@@ -17,7 +17,7 @@ use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, V
 
 /// Dumps a bucket's statistics to the reply.
 fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
-    reply_with_array(ctx, 12);
+    reply_with_map(ctx, 6);
 
     reply_with_str(ctx, "count");
     reply_with_usize(ctx, bucket.count);
@@ -41,7 +41,7 @@ fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
 
 /// Dumps a top-K entry to the reply.
 fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
-    reply_with_array(ctx, 8);
+    reply_with_map(ctx, 4);
 
     reply_with_str(ctx, "value");
     reply_with_bulk_string(ctx, &entry.value);
@@ -123,7 +123,7 @@ pub(super) fn reply_with_string_pool_stats(
     // reference costs whether or not the bytes behind it are shared, so the four fields after
     // it restate the same saving against total string storage; see `Stats` for the split.
     let total_storage_bytes = stats.total_storage_bytes();
-    reply_with_array(ctx, 12);
+    reply_with_map(ctx, 6);
     reply_with_str(ctx, "memorySavedBytes");
     reply_with_usize(ctx, stats.memory_saved_bytes);
     reply_with_str(ctx, "memorySavedPct");
@@ -205,7 +205,7 @@ pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes
         ("nodes", nodes),
     ];
 
-    reply_with_array(ctx, fields.len() * 2);
+    reply_with_map(ctx, fields.len());
     for (name, value) in fields {
         reply_with_str(ctx, name);
         reply_with_usize(ctx, value);
@@ -213,7 +213,7 @@ pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes
 }
 
 /// Lists this node's fanout RPCs that still have remote shares outstanding, oldest first: one
-/// flat key/value array per request with `id` (a string: ids span the full `u64` range),
+/// map per request with `id` (a string: ids span the full `u64` range),
 /// `command`, `ageMs`, `remoteTargets` and `outstanding`.
 ///
 /// TS._DEBUG INFLIGHT
@@ -226,7 +226,7 @@ fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     let requests = inflight_requests();
     reply_with_array(ctx, requests.len());
     for request in &requests {
-        reply_with_array(ctx, 10);
+        reply_with_map(ctx, 5);
         reply_with_str(ctx, "id");
         reply_with_bulk_string(ctx, &request.id.to_string());
         reply_with_str(ctx, "command");
@@ -304,7 +304,7 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         ),
     ];
 
-    reply_with_array(ctx, HELP_TEXT.len() * 2);
+    reply_with_map(ctx, HELP_TEXT.len());
     for &(command, description) in HELP_TEXT {
         reply_with_bulk_string(ctx, command);
         reply_with_bulk_string(ctx, description);

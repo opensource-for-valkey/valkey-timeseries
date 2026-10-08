@@ -10,7 +10,7 @@ fn saturating_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// Emits a histogram as a flat key/value list: `count`, `sum`, then `buckets`, an array of
+/// Emits a histogram as a map: `count`, `sum`, then `buckets`, an array of
 /// `[le, count]` pairs with cumulative counts. Only the finite buckets are listed: the `+Inf`
 /// bucket's count is `count`.
 fn reply_histogram(ctx: &Context, snapshot: &HistogramSnapshot) {
@@ -19,7 +19,7 @@ fn reply_histogram(ctx: &Context, snapshot: &HistogramSnapshot) {
         .iter()
         .filter(|bucket| bucket.le.is_finite())
         .collect();
-    reply_with_array(ctx, 6);
+    reply_with_map(ctx, 3);
     reply_with_str(ctx, "count");
     reply_with_integer(ctx, saturating_i64(snapshot.count));
     reply_with_str(ctx, "sum");
@@ -57,7 +57,7 @@ fn reply_metric_value(ctx: &Context, value: &MetricValue) {
     }
 }
 
-/// As [`reply_metric_value`], except that a gauge is a flat `address value ...` list, one pair
+/// As [`reply_metric_value`], except that a gauge is a map from node address to value, one entry
 /// per node, sorted by address.
 fn reply_cluster_value(ctx: &Context, value: &ClusterValue) {
     match value {
@@ -65,7 +65,7 @@ fn reply_cluster_value(ctx: &Context, value: &ClusterValue) {
             reply_with_integer(ctx, saturating_i64(*v));
         }
         ClusterValue::Gauge(per_node) => {
-            reply_with_array(ctx, per_node.len() * 2);
+            reply_with_map(ctx, per_node.len());
             for (node, v) in per_node {
                 reply_with_bulk_string(ctx, node);
                 reply_scalar(ctx, v);
@@ -75,13 +75,13 @@ fn reply_cluster_value(ctx: &Context, value: &ClusterValue) {
     }
 }
 
-/// Emits one metric in verbose format as a flat key/value list, like `LIST_CONFIGS VERBOSE`.
+/// Emits one metric in verbose format as a map, like `LIST_CONFIGS VERBOSE`.
 fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
-    reply_with_array(ctx, 10);
+    reply_with_map(ctx, 5);
     reply_with_str(ctx, "name");
     reply_with_bulk_string(ctx, &reading.name);
     reply_with_str(ctx, "section");
-    reply_with_str(ctx, reading.section.as_str());
+    reply_with_bulk_string(ctx, reading.section.as_str());
     reply_with_str(ctx, "kind");
     reply_with_str(ctx, reading.kind.as_str());
     reply_with_str(ctx, "value");
@@ -100,7 +100,7 @@ pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], ve
                 Some(section) => section.as_str(),
                 None => reading.name.split('_').next().unwrap_or_default(),
             };
-            reply_with_array(ctx, 10);
+            reply_with_map(ctx, 5);
             reply_with_str(ctx, "name");
             reply_with_bulk_string(ctx, &reading.name);
             reply_with_str(ctx, "section");
@@ -113,7 +113,7 @@ pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], ve
             reply_with_bulk_string(ctx, &reading.help);
         }
     } else {
-        reply_with_array(ctx, readings.len() * 2);
+        reply_with_map(ctx, readings.len());
         for reading in readings {
             reply_with_bulk_string(ctx, &reading.name);
             reply_cluster_value(ctx, &reading.value);
@@ -139,18 +139,18 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// - `TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]`
 /// - `TS._DEBUG STATS RESET [LOCAL]`
 ///
-/// Without `VERBOSE`, replies with a flat `name value ...` list covering the named sections
+/// Without `VERBOSE`, replies with a `name => value` map covering the named sections
 /// (every section when none is given), section by section and by name within each. Counters
-/// are integers, gauges integers or doubles; a histogram's value is a nested list (see
-/// [`reply_histogram`]). With `VERBOSE`, replies with one flat key/value list per metric: name,
+/// are integers, gauges integers or doubles; a histogram's value is a nested map (see
+/// [`reply_histogram`]). With `VERBOSE`, replies with one map per metric: name,
 /// section, kind, value, description.
 ///
 /// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
 /// gauges alone. It is not replicated.
 ///
 /// In cluster mode both fan out to every node, replicas included (see [`StatsFanoutCommand`]):
-/// counters and histograms are summed, and each gauge's value becomes a flat `address value ...`
-/// list, one pair per node. `LOCAL` reports, or resets, the connected node alone, in the
+/// counters and histograms are summed, and each gauge's value becomes an `address => value`
+/// map, one entry per node. `LOCAL` reports, or resets, the connected node alone, in the
 /// single-node layout.
 pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     if args
@@ -206,7 +206,7 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
             reply_metric_verbose(ctx, reading);
         }
     } else {
-        reply_with_array(ctx, readings.len() * 2);
+        reply_with_map(ctx, readings.len());
         for reading in &readings {
             reply_with_bulk_string(ctx, &reading.name);
             reply_metric_value(ctx, &reading.value);

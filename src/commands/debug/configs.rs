@@ -36,11 +36,11 @@ fn verbose_fields(desc: &ConfigDesc) -> Vec<(&'static str, Option<ConfigValue>)>
     ]
 }
 
-/// Emits a single config entry in verbose format as a flat key/value list, suitable for RESP3
-/// maps or RESP2 arrays. `min`/`max` are reported as "none" for parameters that have no range.
+/// Emits a single config entry in verbose format as a map (a flat key/value array under RESP2).
+/// `min`/`max` are reported as "none" for parameters that have no range.
 fn reply_config_verbose(ctx: &Context, desc: &ConfigDesc) {
     let fields = verbose_fields(desc);
-    reply_with_array(ctx, fields.len() * 2);
+    reply_with_map(ctx, fields.len());
 
     for (key, value) in &fields {
         reply_with_str(ctx, key);
@@ -58,7 +58,7 @@ fn reply_config_verbose(ctx: &Context, desc: &ConfigDesc) {
 /// Syntax: `TS._DEBUG LIST_CONFIGS [VERBOSE]`
 ///
 /// Without VERBOSE, replies with a flat array of config names.
-/// With VERBOSE, replies with an array of arrays, each containing key/value pairs for name,
+/// With VERBOSE, replies with an array of maps, one per parameter, holding name,
 /// type, default, min, max, value, description, and mutability. Every field is read from the
 /// configuration registry, so the reply always covers exactly the parameters the module
 /// registered.

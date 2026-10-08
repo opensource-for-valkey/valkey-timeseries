@@ -7,7 +7,7 @@ import threading
 import time
 
 import pytest
-from valkey import ResponseError, ValkeyCluster
+from valkey import ResponseError, Valkey, ValkeyCluster
 
 from common import SERVER_VERSION
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
@@ -530,6 +530,17 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert ports == self.node_ports(), name
             assert list(values) == sorted(values), 'sorted by address'
         assert all(float(v) > 0 for v in per_node(cluster['cron_interval_seconds']).values())
+
+    def test_resp3_gauges_are_maps_of_nodes(self):
+        server = self.replication_groups[0].primary.server
+        resp3 = Valkey(host=server.bind_ip, port=server.port, protocol=3)
+        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'cron')
+
+        assert isinstance(cluster, dict)
+        values = cluster[b'cron_interval_seconds']
+        assert isinstance(values, dict)
+        assert {int(address.decode().rsplit(':', 1)[1]) for address in values} == self.node_ports()
+        assert all(isinstance(value, float) for value in values.values())
 
     def test_local_reports_one_node_in_the_single_node_layout(self):
         local = debug_stats(self.client_for_primary(0), 'cron')

@@ -49,6 +49,11 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
 | `PANIC_NEXT_ANALYSIS_JOB` | Make the next background analysis job (`TS.OUTLIERS` on a large range) panic, to test that its client still gets an error reply |
 
+### Reply protocol
+
+Replies made of named fields are RESP3 maps. A RESP2 client gets the same pairs as a flat array
+of alternating keys and values, in the same order. Over RESP2, doubles arrive as bulk strings.
+
 ---
 
 ### TS._DEBUG HELP
@@ -63,7 +68,7 @@ TS._DEBUG HELP
 
 ### Return Value
 
-A flat array of alternating command name and description strings.
+A map from each command synopsis to its description.
 
 ### Example
 
@@ -117,9 +122,9 @@ TS._DEBUG STATS RESET [LOCAL]
 
 ### Return Value
 
-**Without `VERBOSE`:** a flat array of alternating metric name and value, in a fixed order
+**Without `VERBOSE`:** a map from metric name to value, in a fixed order
 (by section, then by name within a section). Counters are integers; gauges are integers, or doubles when
-the unit is fractional (seconds). A histogram's value is a flat key/value array:
+the unit is fractional (seconds). A histogram's value is a map:
 
 | Field     | Type    | Description                                                                         |
 |-----------|---------|-------------------------------------------------------------------------------------|
@@ -130,15 +135,12 @@ the unit is fractional (seconds). A histogram's value is a flat key/value array:
 The `+Inf` bucket is not listed: its count is `count`.
 
 **In cluster mode** (without `LOCAL`) the layout is the same, except that a gauge's value is a
-flat array of alternating node address (`host:port`) and value, one pair per node, sorted by
-address. Counters and histogram counts are summed over the nodes. A histogram whose buckets
-differ from the others' (a node on another version) is left out of the sum, with a warning in
+map from node address (`host:port`) to value, one entry per node, sorted by address.
+Counters and histogram counts are summed over the nodes. A histogram whose buckets differ from the others' (a node on another version) is left out of the sum, with a warning in
 that coordinator's log. Duration histograms are in seconds,
 with 24 bounds at powers of two from 1 µs (`0.000001`) to 2²³ µs (about 8.4 s).
 
-Over RESP2, doubles arrive as bulk strings.
-
-**With `VERBOSE`:** an array with one flat array of 10 alternating key/value fields per metric:
+**With `VERBOSE`:** an array with one map of 5 fields per metric:
 `name`, `section`, `kind` (`counter`, `gauge` or `histogram`), `value`, `description`.
 
 **`RESET`:** `OK`.
@@ -302,7 +304,7 @@ TS._DEBUG INFLIGHT
 
 ### Return Value
 
-An array with one flat array of 10 alternating key/value fields per request:
+An array with one map of 5 fields per request:
 
 | Field           | Type    | Description                                                             |
 |-----------------|---------|-------------------------------------------------------------------------|
@@ -360,7 +362,7 @@ When `k > 0`, two additional elements are appended:
 
 #### BucketStats fields
 
-Each `BucketStats` entry is a flat array of 12 alternating key/value fields:
+Each `BucketStats` entry is a map of 6 fields:
 
 | Field          | Type    | Description                                              |
 |----------------|---------|----------------------------------------------------------|
@@ -373,7 +375,7 @@ Each `BucketStats` entry is a flat array of 12 alternating key/value fields:
 
 #### MemorySavings fields
 
-A flat array of 12 alternating key/value fields:
+A map of 6 fields:
 
 | Field               | Type    | Description                                                                    |
 |---------------------|---------|--------------------------------------------------------------------------------|
@@ -404,7 +406,7 @@ pool across the series that share it.
 
 #### TopKEntry fields
 
-Each `TopKEntry` is a flat array of 8 alternating key/value fields:
+Each `TopKEntry` is a map of 4 fields:
 
 | Field       | Type    | Description                                                        |
 |-------------|---------|--------------------------------------------------------------------|
@@ -469,16 +471,18 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 
 **Without `VERBOSE`:** A flat array of configuration parameter name strings.
 
-**With `VERBOSE`:** An array where each element is a flat array of 12 alternating key/value fields:
+**With `VERBOSE`:** An array with one map of 8 fields per parameter:
 
 | Field     | Type   | Description                                                     |
 |-----------|--------|-----------------------------------------------------------------|
 | `name`    | string | Configuration parameter name                                    |
-| `type`    | string | Value type: `integer`, `float`, `string`, `duration`, or `enum` |
+| `type`    | string | Value type: `integer`, `float`, `boolean`, `string`, `duration`, or `enum` |
 | `default` | varies | Default value for the parameter                                 |
 | `min`     | varies | Minimum allowed value, or `"none"` if unbounded                 |
 | `max`     | varies | Maximum allowed value, or `"none"` if unbounded                 |
 | `value`   | varies | Current runtime value                                           |
+| `description` | string | What the parameter controls                                 |
+| `mutable` | string | `yes` if `CONFIG SET` can change it at runtime, else `no`          |
 
 ### Configuration Parameters
 

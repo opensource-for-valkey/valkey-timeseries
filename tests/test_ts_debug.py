@@ -1,5 +1,5 @@
 import pytest
-from valkey import ResponseError
+from valkey import ResponseError, Valkey
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseDebugMode
@@ -106,6 +106,47 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', *args)
             # A stray Null would be read as the reply to the next command.
             assert self.client.execute_command('PING') is True, args
+
+    def test_debug_resp3_named_fields_are_maps(self):
+        """Named-field replies are RESP3 maps; RESP2 gets the same pairs as a flat array"""
+        self.set_debug_mode()
+        self.client.execute_command('TS.ADD', 'resp3:a', 1, 1.0, 'LABELS', 'host', 'a')
+        resp3 = Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
+
+        def same_keys(map_reply, flat_reply):
+            assert isinstance(map_reply, dict), map_reply
+            assert list(map_reply) == flat_reply[0::2]
+
+        for args in (('HELP',), ('INDEXMEMORY',), ('STATS', 'cron')):
+            same_keys(resp3.execute_command('TS._DEBUG', *args),
+                      self.client.execute_command('TS._DEBUG', *args))
+
+        # STRINGPOOLSTATS' sections are positional, so the top level stays an array.
+        pool3 = resp3.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 2)
+        pool2 = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 2)
+        assert isinstance(pool3, list) and len(pool3) == 6
+        same_keys(pool3[0], pool2[0])  # GlobalStats
+        same_keys(pool3[3], pool2[3])  # MemorySavings
+        for section in (1, 2):  # [key, BucketStats] pairs
+            assert pool3[section]
+            for (_, bucket3), (_, bucket2) in zip(pool3[section], pool2[section]):
+                same_keys(bucket3, bucket2)
+        for section in (4, 5):  # TopKEntry lists
+            assert pool3[section]
+            for entry3, entry2 in zip(pool3[section], pool2[section]):
+                same_keys(entry3, entry2)
+
+        configs = resp3.execute_command('TS._DEBUG', 'LIST_CONFIGS', 'VERBOSE')
+        assert all(isinstance(config, dict) for config in configs)
+        assert list(configs[0]) == [b'name', b'type', b'default', b'min', b'max', b'value',
+                                    b'description', b'mutable']
+
+        verbose = {m[b'name']: m for m in resp3.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')}
+        assert list(verbose[b'cron_ticks_total']) == [b'name', b'section', b'kind', b'value',
+                                                      b'description']
+        histogram = verbose[b'cron_tick_duration_seconds'][b'value']
+        assert list(histogram) == [b'count', b'sum', b'buckets']
+        assert isinstance(histogram[b'sum'], float)
 
     def test_debug_list_configs_compact(self):
         """Test TS._DEBUG LIST_CONFIGS in compact mode (default)"""
