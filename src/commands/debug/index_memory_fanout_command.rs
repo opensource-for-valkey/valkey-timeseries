@@ -1,5 +1,5 @@
-use super::fanout_codec::generated::{IndexMemoryRequest, IndexMemoryResponse};
 use super::ts_debug::reply_with_index_memory;
+use crate::commands::fanout_codec::generated::{IndexMemoryRequest, IndexMemoryResponse};
 use crate::common::replies::ReplyContext;
 use crate::config::is_debug_mode_enabled;
 use crate::error_consts;

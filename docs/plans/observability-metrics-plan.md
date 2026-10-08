@@ -20,11 +20,11 @@ subcommand. What exists today:
 | Surface | Exposes | Gap |
 |---|---|---|
 | `INFO ts_memory` ([module_info.rs:25-53](../../src/common/module_info.rs#L25-L53)) | index bytes by component, term/series/db counts, interner count and bytes | memory only. **Not O(1) any more**: `index_memory_usage()` ([memory.rs:203-209](../../src/series/index/memory.rs#L203-L209)) walks every term and every id→key entry in 250 µs lock-released slices |
-| `TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]` ([ts_debug.rs:163-213](../../src/commands/ts_debug.rs#L163-L213)) | same walk as `INFO ts_memory`, camelCase keys | fans out cluster-wide by default (`ReplicaPerShard`, summed) |
+| `TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]` ([ts_debug.rs:163-213](../../src/commands/debug/ts_debug.rs#L163-L213)) | same walk as `INFO ts_memory`, camelCase keys | fans out cluster-wide by default (`ReplicaPerShard`, summed) |
 | `TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]` | interner distribution, top-K | O(pool) walk; fans out by default |
 | `TS._DEBUG QUERYINDEX` | node-local index query | test hook, not a metric |
-| `TS._DEBUG LIST_CONFIGS [VERBOSE]` | config roster from `CONFIGS` | not metrics. HELP advertises `[APP\|DEV\|HIDDEN]`, which [ts_debug_configs.rs:68-77](../../src/commands/ts_debug_configs.rs#L68-L77) rejects |
-| `TS._DEBUG HELP` ([ts_debug.rs:238-260](../../src/commands/ts_debug.rs#L238-L260)) | advertises `SHOW_INFO` | **`SHOW_INFO` still has no implementation**; the dispatcher ([:290-306](../../src/commands/ts_debug.rs#L290-L306)) returns "Unknown subcommand" |
+| `TS._DEBUG LIST_CONFIGS [VERBOSE]` | config roster from `CONFIGS` | not metrics. HELP advertises `[APP\|DEV\|HIDDEN]`, which [debug/configs.rs:68-77](../../src/commands/debug/configs.rs#L68-L77) rejects |
+| `TS._DEBUG HELP` ([ts_debug.rs:238-260](../../src/commands/debug/ts_debug.rs#L238-L260)) | advertises `SHOW_INFO` | **`SHOW_INFO` still has no implementation**; the dispatcher ([:290-306](../../src/commands/debug/ts_debug.rs#L290-L306)) returns "Unknown subcommand" |
 | `BoundedExecutor::stats()` ([executor.rs:131-137](../../src/common/threads/executor.rs#L131-L137)) | `queued`, `running`, `rejected` per lane, documented "for INFO" | **already collected, never read** outside tests |
 | Log lines | trim counts, drain durations, sweep outcomes, rule pruning, threading-rule violations | computed and thrown away; tests grep logs to observe background work |
 
@@ -101,7 +101,7 @@ kind, threading rule, prune reason), expand it to one counter per value at decla
 with `Custom = 255`, so discriminant indexing is out.
 
 **Gated like the rest of `TS._DEBUG`.** The `debug-mode` check
-([ts_debug.rs:281-283](../../src/commands/ts_debug.rs#L281-L283)) covers any new subcommand.
+([ts_debug.rs:281-283](../../src/commands/debug/ts_debug.rs#L281-L283)) covers any new subcommand.
 Counters are always collected; only the read surface is gated (`INFO ts_stats` later lifts that for
 a curated subset).
 
@@ -459,9 +459,9 @@ feed `read_callback_panics_total`).
 ## 4. The `TS._DEBUG` surface
 
 New subcommands sit behind the existing `debug-mode` gate, reply themselves and return `NoReply`
-([ts_debug.rs:278-279](../../src/commands/ts_debug.rs#L278-L279)), and follow the flat key/value
-convention ([ts_debug_configs.rs:39-54](../../src/commands/ts_debug_configs.rs#L39-L54),
-`reply_with_index_memory` [ts_debug.rs:194-212](../../src/commands/ts_debug.rs#L194-L212)) — a map
+([ts_debug.rs:278-279](../../src/commands/debug/ts_debug.rs#L278-L279)), and follow the flat key/value
+convention ([debug/configs.rs:39-54](../../src/commands/debug/configs.rs#L39-L54),
+`reply_with_index_memory` [ts_debug.rs:194-212](../../src/commands/debug/ts_debug.rs#L194-L212)) — a map
 on RESP3, an array on RESP2. For variable-length lists use `reply_with_counted_array`
 ([raw_replies.rs:255-271](../../src/common/replies/raw_replies.rs#L255-L271)); its `emit` must write
 exactly one element per item, so flat pairs need one wrapper array per pair.
@@ -518,7 +518,7 @@ Each phase is independently mergeable, adds its own tests, and updates
 ### Phase 0 — registry and skeleton (small) — **done 2026-10-07**
 
 As built: [metrics.rs](../../src/common/metrics.rs) (per-section `metered` registries, the
-`RESET` baseline, unit and roster tests), [ts_debug_stats.rs](../../src/commands/ts_debug_stats.rs),
+`RESET` baseline, unit and roster tests), [debug/stats.rs](../../src/commands/debug/stats.rs),
 `TestDebugStats` in [tests/test_ts_debug.py](../../tests/test_ts_debug.py), and the `STATS`
 section of [ts._debug.md](../commands/ts._debug.md). Differences from the list below:
 
@@ -541,7 +541,7 @@ Original list:
    snapshot order.
 2. Roster tests modelled on the `CONFIGS` tests ([config.rs:1339-1446](../../src/config.rs#L1339-L1446)):
    non-empty descriptions, unique snake_case names, counters end in `_total`, section prefix matches.
-3. `TS._DEBUG STATS` / `STATS RESET` / HELP cleanup in [ts_debug.rs](../../src/commands/ts_debug.rs).
+3. `TS._DEBUG STATS` / `STATS RESET` / HELP cleanup in [ts_debug.rs](../../src/commands/debug/ts_debug.rs).
    First metrics are the ones that already exist and cost nothing: `cron_ticks_total`,
    `cron_interval_ms`, and the `exec_<lane>_{queued,running,rejected_total}` read from
    `BoundedExecutor::stats()`.
@@ -591,7 +591,7 @@ As built: [metrics/fanout.rs](../../src/common/metrics/fanout.rs) and
 [fanout_client_command.rs](../../src/fanout/fanout_client_command.rs),
 [fanout/mod.rs](../../src/fanout/mod.rs) and
 [ts_mrange_fanout_command.rs](../../src/commands/ts_mrange_fanout_command.rs); `TS._DEBUG
-INFLIGHT` in [ts_debug.rs](../../src/commands/ts_debug.rs); `TestFanoutStatsCME` in
+INFLIGHT` in [ts_debug.rs](../../src/commands/debug/ts_debug.rs); `TestFanoutStatsCME` in
 [tests/test_ts_debug_cme.py](../../tests/test_ts_debug_cme.py). Differences from §3.8:
 
 - `src/common/metrics.rs` became a directory: `mod.rs` (registries, snapshot, baseline) plus one
@@ -647,7 +647,7 @@ against a paused peer (`DEBUG SLEEP` via a second client) → `fanout_client_tim
 ### Phase 6 — cluster view (optional)
 
 `STATS` fans out by default with a `LOCAL` opt-out, following
-`ts_index_memory_fanout_command.rs`: counters and histograms summed, gauges reported per node. Adds
+`commands/debug/index_memory_fanout_command.rs`: counters and histograms summed, gauges reported per node. Adds
 an eleventh fanout op and a proto message (regenerate under `proto/v1/generated/`).
 
 ## 6. Out of scope, on purpose

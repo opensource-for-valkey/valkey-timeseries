@@ -1,11 +1,11 @@
-use super::fanout_codec::generated::StringPoolTopKEntry;
-use super::ts_debug_configs::list_configs_cmd;
-use super::ts_debug_stats::stats_cmd;
-use super::ts_index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_memory};
-use super::ts_string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
+use super::configs::list_configs_cmd;
+use super::index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_memory};
+use super::stats::stats_cmd;
+use super::string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
+use crate::commands::fanout_codec::generated::StringPoolTopKEntry;
 use crate::common::context::get_current_db;
 use crate::common::replies::*;
 use crate::common::string_interner::{BucketStats, saved_pct};

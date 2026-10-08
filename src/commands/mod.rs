@@ -35,6 +35,7 @@ macro_rules! acl_categories {
 
 mod analysis_runner;
 pub mod command_parser;
+mod debug;
 mod fanout_codec;
 mod label_search_utils;
 mod ts_add;
@@ -44,14 +45,10 @@ mod ts_card;
 mod ts_card_fanout_command;
 mod ts_create;
 mod ts_createrule;
-mod ts_debug;
-mod ts_debug_configs;
-mod ts_debug_stats;
 mod ts_del;
 mod ts_deleterule;
 mod ts_get;
 mod ts_incr_decr_by;
-mod ts_index_memory_fanout_command;
 mod ts_info;
 mod ts_join;
 mod ts_label_search_fanout_command;
@@ -76,7 +73,6 @@ mod ts_querylabels_fanout_command;
 mod ts_range;
 mod ts_read;
 mod ts_restore;
-mod ts_string_pool_stats_fanout_command;
 mod utils;
 
 // Command handlers are registered through the `#[valkey_module_macros::command]` attribute on
@@ -86,14 +82,14 @@ mod utils;
 // Only modules whose items are consumed through `crate::commands::*` are re-exported below.
 pub(crate) use analysis_runner::analysis_lane_stats;
 pub use command_parser::*;
-pub use ts_debug::*;
+pub use debug::ts_debug_cmd;
 pub use ts_mget::*;
 pub use ts_restore::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;
+use debug::{IndexMemoryFanoutCommand, StringPoolStatsFanoutCommand};
 use ts_card_fanout_command::CardFanoutCommand;
-use ts_index_memory_fanout_command::IndexMemoryFanoutCommand;
 use ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use ts_labelstats_fanout_command::LabelStatsFanoutCommand;
 use ts_mdel_fanout_command::MDelFanoutCommand;
@@ -101,7 +97,6 @@ use ts_mget_fanout_command::MGetFanoutCommand;
 use ts_mrange_fanout_command::MRangeFanoutCommand;
 use ts_queryindex_fanout_command::QueryIndexFanoutCommand;
 use ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
-use ts_string_pool_stats_fanout_command::StringPoolStatsFanoutCommand;
 
 pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<LabelStatsFanoutCommand>()?;

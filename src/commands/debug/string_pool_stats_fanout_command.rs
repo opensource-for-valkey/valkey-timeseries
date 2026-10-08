@@ -1,7 +1,7 @@
-use super::fanout_codec::generated::{
+use super::ts_debug::reply_with_string_pool_stats;
+use crate::commands::fanout_codec::generated::{
     StringPoolBucket, StringPoolStatsRequest, StringPoolStatsResponse, StringPoolTopKEntry,
 };
-use super::ts_debug::reply_with_string_pool_stats;
 use crate::common::replies::ReplyContext;
 use crate::common::string_interner::{BucketStats, InternedString, Stats, TopKEntry};
 use crate::config::is_debug_mode_enabled;

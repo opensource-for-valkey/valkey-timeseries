@@ -62,6 +62,8 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   registered via `#[valkey_module_macros::command({...})]` on the handler, picked up by
   `register_commands`. Only `ts._debug` and `ts._restore` (internal/admin, undocumented) sit in the
   positional `commands:` table in `src/lib.rs` instead — see Conventions below for why.
+  `TS._DEBUG` (dispatcher, subcommands, and the fanout commands only it uses) lives in
+  `src/commands/debug/`.
 - `src/series/` — storage, chunk encodings, compaction, background tasks, indexes, serialization.
   - `chunks/`: three encodings — **Chimp** (default), **Gorilla**, **Uncompressed**
     (`DEFAULT_CHUNK_ENCODING` in `src/config.rs`). Storage encoding is a user choice; cluster *wire*
