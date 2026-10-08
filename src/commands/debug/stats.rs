@@ -1,6 +1,8 @@
+use super::stats_fanout_command::{ClusterReading, ClusterValue, StatsFanoutCommand};
 use crate::commands::CommandArgIterator;
 use crate::common::metrics::{self, MetricReading, MetricValue, Section};
 use crate::common::replies::*;
+use crate::fanout::{FanoutClientCommand, is_clustered};
 use metered::{HistogramSnapshot, Scalar};
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
@@ -31,21 +33,45 @@ fn reply_histogram(ctx: &Context, snapshot: &HistogramSnapshot) {
     }
 }
 
+fn reply_scalar(ctx: &Context, value: &Scalar) {
+    match value {
+        Scalar::Int(v) => {
+            reply_with_integer(ctx, *v);
+        }
+        Scalar::UInt(v) => {
+            reply_with_integer(ctx, saturating_i64(*v));
+        }
+        Scalar::Float(v) => {
+            reply_with_double(ctx, *v);
+        }
+    }
+}
+
 fn reply_metric_value(ctx: &Context, value: &MetricValue) {
     match value {
         MetricValue::Counter(v) => {
             reply_with_integer(ctx, saturating_i64(*v));
         }
-        MetricValue::Gauge(Scalar::Int(v)) => {
-            reply_with_integer(ctx, *v);
-        }
-        MetricValue::Gauge(Scalar::UInt(v)) => {
+        MetricValue::Gauge(v) => reply_scalar(ctx, v),
+        MetricValue::Histogram(snapshot) => reply_histogram(ctx, snapshot),
+    }
+}
+
+/// As [`reply_metric_value`], except that a gauge is a flat `address value ...` list, one pair
+/// per node, sorted by address.
+fn reply_cluster_value(ctx: &Context, value: &ClusterValue) {
+    match value {
+        ClusterValue::Counter(v) => {
             reply_with_integer(ctx, saturating_i64(*v));
         }
-        MetricValue::Gauge(Scalar::Float(v)) => {
-            reply_with_double(ctx, *v);
+        ClusterValue::Gauge(per_node) => {
+            reply_with_array(ctx, per_node.len() * 2);
+            for (node, v) in per_node {
+                reply_with_bulk_string(ctx, node);
+                reply_scalar(ctx, v);
+            }
         }
-        MetricValue::Histogram(snapshot) => reply_histogram(ctx, snapshot),
+        ClusterValue::Histogram(snapshot) => reply_histogram(ctx, snapshot),
     }
 }
 
@@ -64,6 +90,41 @@ fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
     reply_with_bulk_string(ctx, &reading.help);
 }
 
+/// Writes the cluster view in the same layout as a single node's reply (see [`stats_cmd`]).
+pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], verbose: bool) {
+    if verbose {
+        reply_with_array(ctx, readings.len());
+        for reading in readings {
+            // A metric only a newer peer knows has no section here; its name's prefix stands in.
+            let section = match reading.section {
+                Some(section) => section.as_str(),
+                None => reading.name.split('_').next().unwrap_or_default(),
+            };
+            reply_with_array(ctx, 10);
+            reply_with_str(ctx, "name");
+            reply_with_bulk_string(ctx, &reading.name);
+            reply_with_str(ctx, "section");
+            reply_with_bulk_string(ctx, section);
+            reply_with_str(ctx, "kind");
+            reply_with_str(ctx, reading.kind.as_str());
+            reply_with_str(ctx, "value");
+            reply_cluster_value(ctx, &reading.value);
+            reply_with_str(ctx, "description");
+            reply_with_bulk_string(ctx, &reading.help);
+        }
+    } else {
+        reply_with_array(ctx, readings.len() * 2);
+        for reading in readings {
+            reply_with_bulk_string(ctx, &reading.name);
+            reply_cluster_value(ctx, &reading.value);
+        }
+    }
+}
+
+fn is_keyword(arg: &[u8], keyword: &[u8]) -> bool {
+    arg.eq_ignore_ascii_case(keyword)
+}
+
 fn unknown_section(name: &str) -> ValkeyError {
     let valid: Vec<_> = Section::ALL.iter().map(|s| s.as_str()).collect();
     ValkeyError::String(format!(
@@ -75,8 +136,8 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// Reports module metrics, or starts them over.
 ///
 /// Syntax:
-/// - `TS._DEBUG STATS [section ...] [VERBOSE]`
-/// - `TS._DEBUG STATS RESET`
+/// - `TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]`
+/// - `TS._DEBUG STATS RESET [LOCAL]`
 ///
 /// Without `VERBOSE`, replies with a flat `name value ...` list covering the named sections
 /// (every section when none is given), section by section and by name within each. Counters
@@ -85,17 +146,30 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// section, kind, value, description.
 ///
 /// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
-/// gauges alone. It is node-local and not replicated.
+/// gauges alone. It is not replicated.
+///
+/// In cluster mode both fan out to every node, replicas included (see [`StatsFanoutCommand`]):
+/// counters and histograms are summed, and each gauge's value becomes a flat `address value ...`
+/// list, one pair per node. `LOCAL` reports, or resets, the connected node alone, in the
+/// single-node layout.
 pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     if args
         .peek()
-        .is_some_and(|arg| arg.as_slice().eq_ignore_ascii_case(b"RESET"))
+        .is_some_and(|arg| is_keyword(arg.as_slice(), b"RESET"))
     {
         args.next();
-        if args.peek().is_some() {
-            return Err(ValkeyError::Str(
-                "TSDB: STATS RESET takes no further arguments",
-            ));
+        let local = match args.next() {
+            None => false,
+            Some(arg) if is_keyword(arg.as_slice(), b"LOCAL") && args.peek().is_none() => true,
+            Some(_) => {
+                return Err(ValkeyError::Str(
+                    "TSDB: STATS RESET takes no further arguments but LOCAL",
+                ));
+            }
+        };
+        if !local && is_clustered(ctx) {
+            StatsFanoutCommand::reset().exec(ctx)?;
+            return Ok(());
         }
         metrics::reset();
         reply_with_str(ctx, "OK");
@@ -103,11 +177,14 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
     }
 
     let mut verbose = false;
+    let mut local = false;
     let mut sections = Vec::new();
     for arg in args.by_ref() {
         let arg = arg.as_slice();
-        if arg.eq_ignore_ascii_case(b"VERBOSE") {
+        if is_keyword(arg, b"VERBOSE") {
             verbose = true;
+        } else if is_keyword(arg, b"LOCAL") {
+            local = true;
         } else {
             let section = Section::parse(arg)
                 .ok_or_else(|| unknown_section(&String::from_utf8_lossy(arg)))?;
@@ -115,6 +192,11 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
                 sections.push(section);
             }
         }
+    }
+
+    if !local && is_clustered(ctx) {
+        StatsFanoutCommand::report(sections, verbose).exec(ctx)?;
+        return Ok(());
     }
 
     let readings = metrics::snapshot(&sections);

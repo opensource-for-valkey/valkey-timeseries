@@ -267,12 +267,12 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 
     const HELP_TEXT: &[(&str, &str)] = &[
         (
-            "TS._DEBUG STATS [section ...] [VERBOSE]",
-            "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description)",
+            "TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]",
+            "Show module metrics, optionally for the named sections only (VERBOSE adds kind and description); in cluster mode counters and histograms are summed over every node and gauges listed per node, unless LOCAL",
         ),
         (
-            "TS._DEBUG STATS RESET",
-            "Zero this node's metric counters and histograms (gauges are left alone)",
+            "TS._DEBUG STATS RESET [LOCAL]",
+            "Start metric counters and histograms over (gauges are left alone), on every node in cluster mode unless LOCAL",
         ),
         (
             "TS._DEBUG INFLIGHT",

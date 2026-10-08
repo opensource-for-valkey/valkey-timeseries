@@ -29,8 +29,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert any(b'STRINGPOOLSTATS' in cmd for cmd in commands)
         assert any(b'LIST_CONFIGS' in cmd for cmd in commands)
         assert any(b'INDEXMEMORY' in cmd for cmd in commands)
-        assert b'TS._DEBUG STATS [section ...] [VERBOSE]' in commands
-        assert b'TS._DEBUG STATS RESET' in commands
+        assert b'TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]' in commands
+        assert b'TS._DEBUG STATS RESET [LOCAL]' in commands
         assert b'TS._DEBUG INFLIGHT' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
@@ -1033,7 +1033,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > after['cron_ticks_total'])
 
     def test_reset_takes_no_arguments(self):
-        with pytest.raises(ResponseError, match="no further arguments"):
+        with pytest.raises(ResponseError, match="no further arguments but LOCAL"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
 
     def test_verbose(self):
@@ -1062,6 +1062,15 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         cron = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'cron')
         assert [e[1].decode() for e in cron] == self.CRON_METRICS
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'
+
+    def test_local_is_the_same_on_a_standalone_server(self):
+        assert list(self.stats('cron', 'LOCAL')) == self.CRON_METRICS
+        assert list(self.stats('local')) == list(self.stats())
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+
+    def test_reset_takes_only_local(self):
+        with pytest.raises(ResponseError, match="no further arguments but LOCAL"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL', 'LOCAL')
 
     def test_inflight_is_empty_on_a_standalone_server(self):
         assert self.client.execute_command('TS._DEBUG', 'INFLIGHT') == []

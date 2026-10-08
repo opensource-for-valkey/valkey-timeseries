@@ -116,3 +116,16 @@ message IndexMemoryRequest {
   // Sum every database's index rather than only the request's.
   bool all_dbs = 1;
 }
+
+// TS._DEBUG STATS: each node reports its own module metrics, or starts them
+// over. Metrics are per node and process-wide, so every node is asked (replicas
+// included) and there is nothing to filter by key or database.
+message DebugStatsRequest {
+  // Section names to report (`fanout`, `cron`, ...); empty reports every
+  // section. A node skips a name it does not know, so a newer coordinator's
+  // section does not fail an older node.
+  repeated string sections = 1;
+  // Start this node's counters and histograms over (TS._DEBUG STATS RESET)
+  // instead of reporting; the response is then empty.
+  bool reset = 2;
+}

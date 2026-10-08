@@ -105,9 +105,10 @@ with `Custom = 255`, so discriminant indexing is out.
 Counters are always collected; only the read surface is gated (`INFO ts_stats` later lifts that for
 a curated subset).
 
-**Node-local first.** Every value is for this node. Counters increment on replicas too. A cluster
-view follows the `STRINGPOOLSTATS`/`INDEXMEMORY` pattern (fan out by default, `LOCAL` opt-out) in a
-later phase; counters sum meaningfully, gauges are reported per node.
+**Counted per node, viewed per cluster.** Every value is counted on the node where the event
+happens, replicas included. `TS._DEBUG STATS` fans out to every node by default, following the
+`STRINGPOOLSTATS`/`INDEXMEMORY` pattern (`LOCAL` opt-out): counters and histograms sum, gauges
+are reported per node (Phase 6).
 
 **Count where the parent process can see it.** `rdb_save`, the index aux save
 (`build_aux_payload`), and `aof_rewrite` run in the `BGSAVE` / AOF-rewrite fork child — and the ASM
@@ -644,7 +645,28 @@ against a paused peer (`DEBUG SLEEP` via a second client) → `fanout_client_tim
    `Busy` errors → `exec_*_rejected_total`).
 3. Update the Operations row of `docs/proposal.md` (on the `proposal` branch).
 
-### Phase 6 — cluster view (optional)
+### Phase 6 — cluster view — **done 2026-10-08**
+
+As built: the `cmd::debug_stats` fanout op ([stats_fanout_command.rs](../../src/commands/debug/stats_fanout_command.rs),
+`DebugStatsRequest` / `DebugStatsResponse` in `proto/v1/`), dispatched from
+[stats.rs](../../src/commands/debug/stats.rs); `TestStatsClusterViewCME` in
+[tests/test_ts_debug_cme.py](../../tests/test_ts_debug_cme.py). Beyond the sketch below:
+
+- **Targets are every node** (`FanoutTarget::All`), not one per shard as for `INDEXMEMORY`: each
+  node counts only what happened on it, and a replica's counts (replicated writes, fanout
+  requests it served) are not its primary's.
+- **`RESET` fans out too**, with the same `LOCAL` opt-out, so a cluster read after a cluster
+  reset is coherent.
+- **Gauges** reply as an `address => value` map per metric, sorted by address — the same
+  reply layout otherwise, so `VERBOSE` and section filters work unchanged.
+- **Version skew:** each metric travels by name. A section a node doesn't know is skipped; a
+  metric only some nodes have is reported (help from the coordinator's registry, empty if it
+  doesn't know it, sorted last); a histogram with different bounds, or a name whose kind differs
+  between nodes, is left out of the merge with a warning in the coordinator's log.
+- The cluster view counts itself (its fan-out is an operation on the coordinator). Tests that
+  read one node's own counters use `LOCAL`.
+
+Original sketch:
 
 `STATS` fans out by default with a `LOCAL` opt-out, following
 `commands/debug/index_memory_fanout_command.rs`: counters and histograms summed, gauges reported per node. Adds
@@ -691,6 +713,8 @@ an eleventh fanout op and a proto message (regenerate under `proto/v1/generated/
   `TimeSeriesIndex::remove_stale_ids` and `series_posting_ids_by_selectors` are dead code.
 
 ## Revision log
+
+**2026-10-08 (Phase 6)** — implemented the cluster view; see the "as built" note in Phase 6.
 
 **2026-10-07 (Phase 4)** — implemented §3.8 and `INFLIGHT`; see the "as built" note in Phase 4
 for renames and the push-down test that had to become a unit test.

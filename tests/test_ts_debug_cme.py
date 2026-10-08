@@ -194,8 +194,8 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 
 def fanout_stats(client):
-    """This node's `fanout` section of TS._DEBUG STATS, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout')
+    """This node's own `fanout` section of TS._DEBUG STATS, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout', 'LOCAL')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -215,7 +215,7 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
 
     def mrange(self, *filters):
         """Runs TS.MRANGE with node 0 as coordinator; returns each node's fanout stats."""
@@ -270,8 +270,8 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 
 def debug_stats(client, *sections):
-    """This node's TS._DEBUG STATS for the given sections, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', *sections)
+    """This node's own TS._DEBUG STATS for the given sections, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', *sections, 'LOCAL')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -294,7 +294,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
 
     def tag_per_primary(self):
         """One hash tag per primary, in primary order."""
@@ -467,6 +467,114 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert stats['clustermap_refresh_failures_total'] == 0
         assert float(stats['clustermap_age_seconds']) >= 0
         assert float(stats['clustermap_refresh_interval_seconds']) > 0
+
+
+def cluster_stats(client, *args):
+    """TS._DEBUG STATS across the cluster (no LOCAL), as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', *args)
+    return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+
+def per_node(gauge):
+    """A cluster-view gauge: flat [address, value, ...] -> {address: value}."""
+    return {gauge[i].decode(): gauge[i + 1] for i in range(0, len(gauge), 2)}
+
+
+class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """TS._DEBUG STATS without LOCAL: every node, replicas included, summed or listed per node."""
+
+    REPLICAS_COUNT = 1
+
+    def all_nodes(self):
+        """A client and `host:port` address for every node, primaries and replicas."""
+        nodes = []
+        for i in range(self.CLUSTER_SIZE):
+            group = self.get_replication_group(i)
+            nodes.append(self.client_for_primary(i))
+            nodes.append(group.get_replica_connection(0))
+        return nodes
+
+    def node_ports(self):
+        ports = set()
+        for line in self.client_for_primary(0).execute_command('CLUSTER', 'NODES').decode().splitlines():
+            address = line.split()[1].split('@')[0]
+            ports.add(int(address.rsplit(':', 1)[1]))
+        return ports
+
+    def test_counters_and_histograms_sum_over_every_node(self):
+        coordinator = self.client_for_primary(0)
+        for client in self.all_nodes():
+            client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL')
+        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+
+        local = [debug_stats(client, 'fanout', 'cron') for client in self.all_nodes()]
+        cluster = cluster_stats(coordinator, 'fanout', 'cron')
+
+        # INDEXMEMORY asked one node per shard, a replica where there is one, so never the
+        # coordinator: every shard's answer was served remotely. The reading itself is served after
+        # each node's snapshot, so it does not count itself.
+        served = sum(stats['fanout_served_ok_total'] for stats in local)
+        assert served == self.CLUSTER_SIZE
+        assert cluster['fanout_served_ok_total'] == served
+        # The cron keeps ticking between the reads, so the cluster view can only be ahead.
+        assert cluster['cron_ticks_total'] >= sum(s['cron_ticks_total'] for s in local)
+        assert histogram_count(cluster['cron_tick_duration_seconds']) >= sum(
+            histogram_count(s['cron_tick_duration_seconds']) for s in local)
+
+    def test_gauges_are_listed_per_node(self):
+        cluster = cluster_stats(self.client_for_primary(0), 'cron', 'exec')
+
+        for name in ('cron_interval_seconds', 'exec_fanout_queued'):
+            values = per_node(cluster[name])
+            ports = {int(address.rsplit(':', 1)[1]) for address in values}
+            assert ports == self.node_ports(), name
+            assert list(values) == sorted(values), 'sorted by address'
+        assert all(float(v) > 0 for v in per_node(cluster['cron_interval_seconds']).values())
+
+    def test_local_reports_one_node_in_the_single_node_layout(self):
+        local = debug_stats(self.client_for_primary(0), 'cron')
+        assert float(local['cron_interval_seconds']) > 0  # a scalar, not a per-node list
+
+    def test_verbose_and_section_order_match_a_single_node(self):
+        coordinator = self.client_for_primary(0)
+        local_names = list(debug_stats(coordinator))
+        entries = coordinator.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
+        assert [e[1].decode() for e in entries] == local_names
+        for entry in entries:
+            fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
+            assert fields['description'], fields['name']
+            if fields['kind'] == b'gauge':
+                assert len(per_node(fields['value'])) == len(self.node_ports()), fields['name']
+
+    def test_reset_starts_every_node_over(self):
+        coordinator = self.client_for_primary(0)
+        wait_for_true(lambda: all(debug_stats(c, 'cron')['cron_ticks_total'] >= 20
+                                  for c in self.all_nodes()))
+
+        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+
+        for client in self.all_nodes():
+            assert debug_stats(client, 'cron')['cron_ticks_total'] < 10
+
+    def test_reset_local_starts_only_this_node_over(self):
+        coordinator, peer = self.client_for_primary(0), self.client_for_primary(1)
+        wait_for_true(lambda: debug_stats(peer, 'cron')['cron_ticks_total'] >= 20)
+
+        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+
+        assert debug_stats(coordinator, 'cron')['cron_ticks_total'] < 10
+        assert debug_stats(peer, 'cron')['cron_ticks_total'] >= 20
+
+    def test_a_node_with_debug_mode_off_fails_the_command(self):
+        replica = self.get_replication_group(1).get_replica_connection(0)
+        replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            with pytest.raises(ResponseError):
+                cluster_stats(self.client_for_primary(0))
+            # LOCAL needs only this node.
+            assert debug_stats(self.client_for_primary(0), 'cron')
+        finally:
+            replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
 
 def server_major_version():

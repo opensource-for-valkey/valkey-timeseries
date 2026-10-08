@@ -85,18 +85,25 @@ TS._DEBUG HELP
 
 ### TS._DEBUG STATS
 
-Reports module metrics for the node you are connected to: events that happen inside a command
-or in background work, which the server's own `INFO commandstats` / `latencystats` cannot see.
-Counters are collected whether or not `debug-mode` is on; only reading them needs it.
+Reports module metrics: events that happen inside a command or in background work, which the
+server's own `INFO commandstats` / `latencystats` cannot see. Counters are collected whether or
+not `debug-mode` is on; only reading them needs it.
 
-Values are node-local, including in cluster mode. A reply is not an atomic snapshot: two values
-in one reply may straddle an update.
+Each node counts what happens on it. In cluster mode the command fans out to every node,
+replicas included, and combines their metrics: counters and histograms are summed, and each
+gauge's value becomes a list with one value per node (summing refresh intervals or queue depths
+across nodes would hide which node they describe). `LOCAL` reports the connected node alone.
+Every node must have `debug-mode` enabled, or the command fails.
+
+The cluster view counts itself: the fan-out that collects it is an operation on the coordinator,
+like any other. A reply is not an atomic snapshot, on one node or across nodes: two values may
+straddle an update.
 
 ### Syntax
 
 ```bash
-TS._DEBUG STATS [section ...] [VERBOSE]
-TS._DEBUG STATS RESET
+TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]
+TS._DEBUG STATS RESET [LOCAL]
 ```
 
 ### Arguments
@@ -105,7 +112,8 @@ TS._DEBUG STATS RESET
 |-----------|----------|-----------------------------------------------------------------------------------------------|
 | `section` | No       | Report only these sections (case-insensitive, repeatable). An unknown name is an error that lists the valid ones |
 | `VERBOSE` | No       | Report each metric's section, kind and description alongside its value                         |
-| `RESET`   | No       | Start every counter and histogram on this node over from zero. Gauges are left alone. Takes no other argument |
+| `RESET`   | No       | Start every counter and histogram over from zero, on every node in cluster mode. Gauges are left alone. Takes no other argument but `LOCAL` |
+| `LOCAL`   | No       | In cluster mode, report (or reset) the connected node alone, in the single-node layout          |
 
 ### Return Value
 
@@ -119,7 +127,13 @@ the unit is fractional (seconds). A histogram's value is a flat key/value array:
 | `sum`     | double  | Sum of the observations, in the metric's unit                                       |
 | `buckets` | array   | `[le, count]` pairs for the finite bounds; `le` is a double, `count` is cumulative (observations `<= le`) |
 
-The `+Inf` bucket is not listed: its count is `count`. Duration histograms are in seconds,
+The `+Inf` bucket is not listed: its count is `count`.
+
+**In cluster mode** (without `LOCAL`) the layout is the same, except that a gauge's value is a
+flat array of alternating node address (`host:port`) and value, one pair per node, sorted by
+address. Counters and histogram counts are summed over the nodes. A histogram whose buckets
+differ from the others' (a node on another version) is left out of the sum, with a warning in
+that coordinator's log. Duration histograms are in seconds,
 with 24 bounds at powers of two from 1 µs (`0.000001`) to 2²³ µs (about 8.4 s).
 
 Over RESP2, doubles arrive as bulk strings.
