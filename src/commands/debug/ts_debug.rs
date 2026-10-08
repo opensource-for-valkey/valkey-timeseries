@@ -342,9 +342,9 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // skip the command name and parse the subcommand keyword
     let mut itr = args.into_iter().skip(1).peekable();
 
-    let keyword = itr.next_str()?.to_ascii_uppercase();
+    let keyword = itr.next_str()?;
 
-    let result = match keyword.as_str() {
+    let result = hashify::fnc_map_ignore_case!(keyword.as_bytes(),
         "STATS" => stats_cmd(ctx, &mut itr),
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
@@ -368,6 +368,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             "Unknown subcommand: {} try HELP subcommand",
             keyword
         ))),
-    };
+    );
+
     result.map(|()| ValkeyValue::NoReply)
 }
