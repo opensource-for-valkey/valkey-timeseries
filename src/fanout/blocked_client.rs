@@ -1,6 +1,8 @@
+use crate::common::metrics::fanout as metrics;
 use crate::common::replies::ReplyContext;
 use crate::fanout::fanout_error::TIMEOUT_ERROR;
 use crate::fanout::{FanoutClientCommand, FanoutResult};
+use metered::Counter;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 use std::time::Duration;
@@ -176,6 +178,7 @@ extern "C" fn timeout_callback(
     _argv: *mut *mut ValkeyModuleString,
     _argc: c_int,
 ) -> c_int {
+    metrics::CLIENT_TIMEOUTS.incr();
     let ctx = ReplyContext::new(ctx as *mut raw::RedisModuleCtx);
     ctx.reply_error_string(TIMEOUT_ERROR) as c_int
 }

@@ -9,6 +9,7 @@ use crate::commands::utils::{
     MRangeReplyShape, get_multi_command_targets, reply_with_mrange_series_results,
 };
 use crate::common::context::key_for_display;
+use crate::common::metrics::fanout as fanout_metrics;
 use crate::common::replies::ReplyContext;
 use crate::common::threads::{IntoParRayon, IterIntoParRayon};
 use crate::common::{MultiSample, Sample};
@@ -26,6 +27,7 @@ use crate::series::mrange::{
 use crate::series::request_types::{
     MRangeOptions, MRangeSeriesResult, RangeGroupingOptions, SeriesResultData,
 };
+use metered::Counter;
 use orx_parallel::Par;
 use orx_parallel::ParResult;
 use smallvec::SmallVec;
@@ -309,6 +311,8 @@ fn normalize_response_series(
     if !needs_bucketing {
         return Ok(series.into_iter().map(|(response, _)| response).collect());
     }
+    let unbucketed = series.iter().filter(|(_, bucketed)| !bucketed).count();
+    fanout_metrics::PUSHDOWN_FALLBACK_SERIES.incr_by(unbucketed as u64);
     // Aggregate exactly as the shard would have: ascending, unbounded —
     // reversal and COUNT are applied downstream by the coordinator.
     let mut shard_range = options.range.clone();
@@ -356,6 +360,7 @@ fn compensate_group_partials(
     if series.is_empty() {
         return Ok(Vec::new());
     }
+    fanout_metrics::PUSHDOWN_GROUP_FALLBACK_SERIES.incr_by(series.len() as u64);
     let group_options = options
         .grouping
         .as_ref()
@@ -2167,6 +2172,52 @@ mod tests {
                 .expect("__source__ label present");
             assert_eq!(source.value, "a,b");
         }
+    }
+
+    /// Each raw series from a peer that ignored a push-down is counted where the coordinator
+    /// compensates for it. Other tests feed mixed batches too, so this asserts lower bounds.
+    #[test]
+    fn test_pushdown_fallbacks_are_counted() {
+        use crate::common::metrics::fanout::{
+            PUSHDOWN_FALLBACK_SERIES, PUSHDOWN_GROUP_FALLBACK_SERIES,
+        };
+        use metered::CounterSource;
+
+        let raw = samples(&[(0, 1.0), (110, 5.0)]);
+        let mut options = mrange_options(0, 1000);
+        options.range.aggregation = Some(avg_aggregation(100));
+
+        let before = PUSHDOWN_FALLBACK_SERIES.get();
+        let mut command = MRangeFanoutCommand::new(options.clone());
+        command
+            .process_responses(
+                vec![
+                    (to_response(series_result("a", None, raw.clone())), false),
+                    (to_response(series_result("b", None, raw.clone())), false),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(PUSHDOWN_FALLBACK_SERIES.get() >= before + 2);
+
+        options.with_labels = true;
+        options.grouping = Some(RangeGroupingOptions {
+            aggregation: AggregatorConfig::new(AggregationType::Sum, None).unwrap(),
+            group_label: "region".into(),
+        });
+        let before = PUSHDOWN_GROUP_FALLBACK_SERIES.get();
+        let mut command = MRangeFanoutCommand::new(options);
+        assert!(command.pushdown_group);
+        command
+            .process_responses(
+                tagged(
+                    vec![to_response(series_result("a", Some("us"), raw))],
+                    false,
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(PUSHDOWN_GROUP_FALLBACK_SERIES.get() > before);
     }
 
     /// Compatibility handshake, grouped multi-aggregation: mixes wire

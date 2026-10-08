@@ -11,7 +11,7 @@ use crate::common::replies::*;
 use crate::common::string_interner::{BucketStats, saved_pct};
 use crate::config::is_debug_mode_enabled;
 use crate::error_consts;
-use crate::fanout::{FanoutClientCommand, is_clustered};
+use crate::fanout::{FanoutClientCommand, inflight_requests, is_clustered};
 use crate::series::index::{IndexMemory, series_keys_by_selectors};
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -212,6 +212,35 @@ pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes
     }
 }
 
+/// Lists this node's fanout RPCs that still have remote shares outstanding, oldest first: one
+/// flat key/value array per request with `id` (a string: ids span the full `u64` range),
+/// `command`, `ageMs`, `remoteTargets` and `outstanding`.
+///
+/// TS._DEBUG INFLIGHT
+///
+/// Node-local: a request is in flight only on the node coordinating it. A fanout whose only
+/// target is this node has no RPC and never appears, and a request leaves the list as soon as
+/// its timer fires.
+fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+    args.done()?;
+    let requests = inflight_requests();
+    reply_with_array(ctx, requests.len());
+    for request in &requests {
+        reply_with_array(ctx, 10);
+        reply_with_str(ctx, "id");
+        reply_with_bulk_string(ctx, &request.id.to_string());
+        reply_with_str(ctx, "command");
+        reply_with_str(ctx, request.command);
+        reply_with_str(ctx, "ageMs");
+        reply_with_integer(ctx, request.age.as_millis().min(i64::MAX as u128) as i64);
+        reply_with_str(ctx, "remoteTargets");
+        reply_with_usize(ctx, request.remote_targets);
+        reply_with_str(ctx, "outstanding");
+        reply_with_integer(ctx, request.outstanding.min(i64::MAX as u64) as i64);
+    }
+    Ok(())
+}
+
 /// Runs a query against this node's *local* index only, bypassing the cluster fanout that
 /// `TS.QUERYINDEX` performs. This is primarily used by tests to assert per-node index state (for
 /// example, that a source node's index was cleared after an atomic slot migration, which a
@@ -244,6 +273,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         (
             "TS._DEBUG STATS RESET",
             "Zero this node's metric counters and histograms (gauges are left alone)",
+        ),
+        (
+            "TS._DEBUG INFLIGHT",
+            "List this node's fanout requests with remote shares outstanding, oldest first",
         ),
         (
             "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]",
@@ -303,6 +336,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         "STATS" => stats_cmd(ctx, &mut itr),
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
+        "INFLIGHT" => inflight(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),
         "LIST_CONFIGS" => list_configs_cmd(ctx, &mut itr),

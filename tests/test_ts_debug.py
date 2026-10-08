@@ -31,6 +31,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert any(b'INDEXMEMORY' in cmd for cmd in commands)
         assert b'TS._DEBUG STATS [section ...] [VERBOSE]' in commands
         assert b'TS._DEBUG STATS RESET' in commands
+        assert b'TS._DEBUG INFLIGHT' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
         assert not any(b'SHOW_INFO' in cmd for cmd in commands)
@@ -912,17 +913,15 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
+    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     CRON_METRICS = ['cron_interval_seconds', 'cron_tick_duration_seconds', 'cron_ticks_total',
                     'cron_ticks_skipped_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    FANOUT_METRICS = ['fanout_error_response_sent_bytes_total', 'fanout_error_responses_sent_total',
-                      'fanout_request_sent_bytes_total', 'fanout_requests_sent_total',
-                      'fanout_response_sent_bytes_total', 'fanout_responses_sent_total']
-    ALL_METRICS = CRON_METRICS + EXEC_METRICS + FANOUT_METRICS
-    HISTOGRAMS = {'cron_tick_duration_seconds'}
-    DOUBLE_GAUGES = {'cron_interval_seconds'}
+    HISTOGRAMS = {'cron_tick_duration_seconds', 'fanout_duration_seconds'}
+    DOUBLE_GAUGES = {'cron_interval_seconds', 'clustermap_refresh_interval_seconds',
+                     'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
 
     def stats(self, *args):
@@ -931,6 +930,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         names = [flat[i].decode() for i in range(0, len(flat), 2)]
         assert len(names) == len(set(names)), names
         return {name: flat[i * 2 + 1] for i, name in enumerate(names)}
+
+    @staticmethod
+    def family(name):
+        return name[:-len('_total')] if name.endswith('_total') else name
 
     @staticmethod
     def histogram(value):
@@ -944,19 +947,26 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         }
 
     def test_reports_sections_in_order_and_metrics_by_name(self):
-        flat = self.client.execute_command('TS._DEBUG', 'STATS')
-        names = [flat[i].decode() for i in range(0, len(flat), 2)]
-        assert names == self.ALL_METRICS
+        names = list(self.stats())
+        sections = [name.split('_')[0] for name in names]
+        assert sorted(set(sections), key=sections.index) == self.SECTIONS
+        assert sections == sorted(sections, key=self.SECTIONS.index), 'a section is split'
+        for section in self.SECTIONS:
+            families = [self.family(n) for n in names if n.split('_')[0] == section]
+            assert families == sorted(families), section
 
     def test_section_filter(self):
         assert list(self.stats('cron')) == self.CRON_METRICS
         assert list(self.stats('EXEC')) == self.EXEC_METRICS
-        assert list(self.stats('fanout')) == self.FANOUT_METRICS
+        for section in self.SECTIONS:
+            names = list(self.stats(section))
+            assert names and all(n.startswith(section + '_') for n in names), section
         # Request order and repeats don't change the reply.
         assert list(self.stats('exec', 'cron', 'exec')) == self.CRON_METRICS + self.EXEC_METRICS
 
     def test_unknown_section_lists_valid_ones(self):
-        with pytest.raises(ResponseError, match="unknown STATS section 'bogus'.*cron, exec, fanout"):
+        with pytest.raises(ResponseError,
+                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'bogus')
 
     def test_value_types(self):
@@ -965,14 +975,27 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             if name in self.HISTOGRAMS:
                 self.histogram(value)
             elif name in self.DOUBLE_GAUGES:
-                assert float(value) > 0, (name, value)
+                float(value)
             else:
                 assert isinstance(value, int), (name, value)
                 assert value >= 0, (name, value)
-        # Nothing has been sent to either lane, and a standalone server has no cluster bus.
+        assert float(stats['cron_interval_seconds']) > 0
+        # Nothing has been sent to either lane, and a standalone server never fans out or
+        # builds a cluster map.
         assert stats['exec_fanout_rejected_total'] == 0
         assert stats['exec_analysis_rejected_total'] == 0
-        assert all(stats[name] == 0 for name in self.FANOUT_METRICS)
+        for name, value in stats.items():
+            if name.startswith('fanout_') and name not in self.HISTOGRAMS:
+                assert value == 0, name
+        assert self.histogram(stats['fanout_duration_seconds'])['count'] == 0
+        assert float(stats['clustermap_age_seconds']) == -1
+        assert float(stats['clustermap_refresh_interval_seconds']) == 0
+
+    def test_fanout_metrics_cover_every_error_kind(self):
+        errors = [n for n in self.stats('fanout') if n.startswith('fanout_errors_')]
+        assert len(errors) == 14, errors
+        assert 'fanout_errors_timeout_total' in errors
+        assert 'fanout_errors_key_permissions_total' in errors
 
     def test_cron_ticks_advance(self):
         start = self.stats('cron')['cron_ticks_total']
@@ -1014,8 +1037,9 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
 
     def test_verbose(self):
+        names = list(self.stats())
         entries = self.client.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
-        assert len(entries) == len(self.ALL_METRICS)
+        assert [e[1].decode() for e in entries] == names
         for entry in entries:
             assert len(entry) == 10, entry
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
@@ -1038,3 +1062,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         cron = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'cron')
         assert [e[1].decode() for e in cron] == self.CRON_METRICS
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'
+
+    def test_inflight_is_empty_on_a_standalone_server(self):
+        assert self.client.execute_command('TS._DEBUG', 'INFLIGHT') == []
+
+    def test_inflight_takes_no_arguments(self):
+        with pytest.raises(ResponseError):
+            self.client.execute_command('TS._DEBUG', 'INFLIGHT', 'extra')

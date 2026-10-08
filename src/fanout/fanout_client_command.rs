@@ -1,9 +1,11 @@
 use crate::common::context::is_blocking_denied;
+use crate::common::metrics::fanout as metrics;
 use crate::common::replies::ReplyContext;
 use crate::fanout::FanoutCommandResult;
 use crate::fanout::blocked_client::FanoutBlockedClient;
 use crate::fanout::serialization::Serializable;
 use crate::fanout::{FanoutCommand, FanoutContext, FanoutResult, FanoutTarget, NodeInfo};
+use metered::Counter;
 use std::sync::{Arc, Mutex};
 use valkey_module::{Context, Status, ValkeyError, ValkeyResult, ValkeyValue};
 
@@ -49,6 +51,7 @@ pub trait FanoutClientCommand: Default + Send + 'static {
         // executed anyway, so TS.MDEL deleted keys after the client had already been told the
         // command failed, outside the transaction it was queued in.
         if is_blocking_denied(ctx) {
+            metrics::BLOCKING_DENIED.incr();
             return Err(ValkeyError::Str(FANOUT_BLOCKING_DENIED));
         }
         let blocked_client = Arc::new(Mutex::new(FanoutBlockedClient::<Self>::new(

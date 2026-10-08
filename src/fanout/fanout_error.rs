@@ -66,6 +66,67 @@ pub enum ErrorKind {
     Custom = 255,
 }
 
+impl ErrorKind {
+    /// Every kind, in the order `TS._DEBUG STATS fanout` reports `fanout_errors_<kind>_total`.
+    pub(crate) const ALL: [ErrorKind; 14] = [
+        ErrorKind::InvalidMessage,
+        ErrorKind::NodeUnreachable,
+        ErrorKind::Timeout,
+        ErrorKind::UnknownMessageType,
+        ErrorKind::Permissions,
+        ErrorKind::KeyPermissions,
+        ErrorKind::Serialization,
+        ErrorKind::BadRequestId,
+        ErrorKind::Internal,
+        ErrorKind::ClusterMapMismatch,
+        ErrorKind::UnsupportedFeatures,
+        ErrorKind::InvalidDb,
+        ErrorKind::Busy,
+        ErrorKind::Custom,
+    ];
+
+    /// This kind's position in [`Self::ALL`]: the index of its error counter. Exhaustive, so a
+    /// new kind cannot compile without a counter.
+    pub(crate) const fn metric_index(self) -> usize {
+        match self {
+            ErrorKind::InvalidMessage => 0,
+            ErrorKind::NodeUnreachable => 1,
+            ErrorKind::Timeout => 2,
+            ErrorKind::UnknownMessageType => 3,
+            ErrorKind::Permissions => 4,
+            ErrorKind::KeyPermissions => 5,
+            ErrorKind::Serialization => 6,
+            ErrorKind::BadRequestId => 7,
+            ErrorKind::Internal => 8,
+            ErrorKind::ClusterMapMismatch => 9,
+            ErrorKind::UnsupportedFeatures => 10,
+            ErrorKind::InvalidDb => 11,
+            ErrorKind::Busy => 12,
+            ErrorKind::Custom => 13,
+        }
+    }
+
+    /// This kind's name in its metric, `fanout_errors_<name>_total`.
+    pub(crate) const fn metric_name(self) -> &'static str {
+        match self {
+            ErrorKind::InvalidMessage => "invalid_message",
+            ErrorKind::NodeUnreachable => "node_unreachable",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::UnknownMessageType => "unknown_message_type",
+            ErrorKind::Permissions => "permissions",
+            ErrorKind::KeyPermissions => "key_permissions",
+            ErrorKind::Serialization => "serialization",
+            ErrorKind::BadRequestId => "bad_request_id",
+            ErrorKind::Internal => "internal",
+            ErrorKind::ClusterMapMismatch => "cluster_map_mismatch",
+            ErrorKind::UnsupportedFeatures => "unsupported_features",
+            ErrorKind::InvalidDb => "invalid_db",
+            ErrorKind::Busy => "busy",
+            ErrorKind::Custom => "custom",
+        }
+    }
+}
+
 pub(super) const PERMISSIONS_ERROR: &str = "Permission denied";
 pub(super) const KEY_PERMISSIONS_ERROR: &str = "User does not have access to one or more keys";
 pub(super) const UNKNOWN_MESSAGE_TYPE_ERROR: &str = "Unknown message type.";
@@ -339,6 +400,21 @@ mod tests {
     use super::*;
     use crate::error_consts;
     use valkey_module::ValkeyError;
+
+    #[test]
+    fn metric_index_is_the_position_in_all() {
+        for (i, kind) in ErrorKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.metric_index(), i, "{kind:?}");
+        }
+        let mut names: Vec<_> = ErrorKind::ALL.iter().map(|k| k.metric_name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            ErrorKind::ALL.len(),
+            "metric names must be unique"
+        );
+    }
 
     #[test]
     fn test_fanout_error_constructors() {

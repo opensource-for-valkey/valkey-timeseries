@@ -1,7 +1,8 @@
 //! Module metrics, built on [`metered`]: one registry per [`Section`], read by `TS._DEBUG STATS`.
 //!
 //! Each section is a `metered::Registry` that prefixes its metric names with the section's
-//! name. A metric is registered once, with its help text, in [`build_registry`]. Where the code
+//! name, and a submodule of this one: it declares the section's metrics as statics, next to one
+//! `register` function that registers each with its help text and unit. Where the code
 //! already keeps the value, the registry reads that state directly: a std atomic is a metered
 //! counter or gauge as it stands, and an executor's own counts are read through a closure.
 //! `TS._DEBUG STATS` reports from the registries, and so will the `INFO ts_stats` mirror and any
@@ -30,17 +31,17 @@
 //! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`):
 //!   the parent never sees it. Count on the receiving side instead.
 
-use crate::commands::analysis_lane_stats;
+pub mod clustermap;
+pub mod cron;
+pub mod exec;
+pub mod fanout;
+
 use crate::common::sync::lock;
-use crate::fanout::request_lane_stats;
-use crate::series::background_tasks::{CRON_TICKS, cron_interval_ms};
-use metered::entry::{counter, counter_value, gauge_value, metric};
 use metered::{
     Bucket, BucketHistogram, Buckets, HistogramData, HistogramSnapshot, MetricSampleValue,
     MetricType, MetricValues, Registry, Scalar,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -53,73 +54,42 @@ pub fn duration_buckets() -> Buckets {
     Buckets::exponential_duration(Duration::from_micros(1), 2.0, DURATION_BUCKETS)
 }
 
-// --- cron ---------------------------------------------------------------------------------
-
-/// Cron ticks skipped because the server was loading or shutting down.
-pub static CRON_TICKS_SKIPPED: AtomicU64 = AtomicU64::new(0);
-
-/// Main-thread time per cron tick spent dispatching background tasks.
-pub static CRON_TICK_DURATION: LazyLock<BucketHistogram> =
-    LazyLock::new(|| BucketHistogram::new(duration_buckets()));
-
-// --- fanout -------------------------------------------------------------------------------
-
-/// Fanout messages of one type this node handed to the cluster bus, and their payload bytes.
-///
-/// The payload is what the module passes to `ValkeyModule_SendClusterMessage`; the bus adds its
-/// own framing, which the module cannot see. A request to several peers is sent, and counted,
-/// once per peer. A fanout's local share never touches the bus and is not counted.
-pub struct WireCounters {
-    pub messages: AtomicU64,
-    pub bytes: AtomicU64,
+/// A duration histogram over [`duration_buckets`], for a `static`: built at first use.
+pub const fn duration_histogram() -> LazyLock<BucketHistogram> {
+    LazyLock::new(new_duration_histogram)
 }
 
-impl WireCounters {
-    pub const fn new() -> Self {
-        Self {
-            messages: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-        }
-    }
-
-    #[inline]
-    pub fn record(&self, payload_len: usize) {
-        self.messages.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(payload_len as u64, Ordering::Relaxed);
-    }
+fn new_duration_histogram() -> BucketHistogram {
+    BucketHistogram::new(duration_buckets())
 }
-
-impl Default for WireCounters {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Requests sent to peers, as coordinator.
-pub static FANOUT_REQUESTS_SENT: WireCounters = WireCounters::new();
-/// Successful responses sent back to coordinators, as a peer.
-pub static FANOUT_RESPONSES_SENT: WireCounters = WireCounters::new();
-/// Error responses sent back to coordinators, as a peer.
-pub static FANOUT_ERROR_RESPONSES_SENT: WireCounters = WireCounters::new();
 
 /// Groups of metrics, selectable in `TS._DEBUG STATS`. Each is one registry, and each metric's
 /// name starts with its section's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    /// The cluster map fanouts pick their targets from: refreshes, staleness, age.
+    Clustermap,
     /// The module's cron handler, which schedules the periodic background tasks.
     Cron,
     /// Bounded executors: the lanes that run blocking, GIL-taking work off the main thread.
     Exec,
-    /// Cluster fanout: messages exchanged with peers over the cluster bus.
+    /// Cluster fanout: operations this node coordinates, requests it serves for peers, and the
+    /// messages and bytes exchanged over the cluster bus.
     Fanout,
 }
 
 impl Section {
     /// Every section, in reporting order.
-    pub const ALL: &'static [Section] = &[Section::Cron, Section::Exec, Section::Fanout];
+    pub const ALL: &'static [Section] = &[
+        Section::Clustermap,
+        Section::Cron,
+        Section::Exec,
+        Section::Fanout,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Section::Clustermap => "clustermap",
             Section::Cron => "cron",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
@@ -134,109 +104,15 @@ impl Section {
     }
 }
 
-/// Builds a section's registry: the one place its metrics are declared. Order doesn't matter:
+/// Builds a section's registry from the metrics its module declares. Order doesn't matter:
 /// metered reports a registry's metrics sorted by name.
 fn build_registry(section: Section) -> Registry<'static> {
     let mut registry = Registry::with_prefix(section.as_str());
     match section {
-        Section::Cron => {
-            registry
-                .register(
-                    counter("ticks")
-                        .source(&CRON_TICKS)
-                        .help("Cron ticks that ran the background-task scheduler"),
-                )
-                .register(
-                    counter("ticks_skipped")
-                        .source(&CRON_TICKS_SKIPPED)
-                        .help("Cron ticks skipped because the server was loading or shutting down"),
-                )
-                .register(
-                    gauge_value("interval_seconds")
-                        .read(|_: &()| cron_interval_ms() as f64 / 1000.0)
-                        .help("Time between cron ticks, derived from the server's hz")
-                        .unit("seconds"),
-                )
-                .register(
-                    metric("tick_duration_seconds")
-                        .source(LazyLock::force(&CRON_TICK_DURATION))
-                        .help("Main-thread time per cron tick spent dispatching background tasks")
-                        .unit("seconds"),
-                );
-        }
-        Section::Exec => {
-            registry
-                .register(
-                    gauge_value("fanout_queued")
-                        .read(|_: &()| request_lane_stats().queued)
-                        .help("Jobs waiting for a worker on the ts-fanout-request lane (peer requests and local fanout shares)"),
-                )
-                .register(
-                    gauge_value("fanout_running")
-                        .read(|_: &()| request_lane_stats().running)
-                        .help("Jobs a worker is running on the ts-fanout-request lane"),
-                )
-                .register(
-                    counter_value("fanout_rejected")
-                        .read(|_: &()| request_lane_stats().rejected)
-                        .help("Jobs refused because the ts-fanout-request queue was full (answered as busy)"),
-                )
-                .register(
-                    gauge_value("analysis_queued")
-                        .read(|_: &()| analysis_lane_stats().queued)
-                        .help("Jobs waiting for a worker on the ts-analysis lane"),
-                )
-                .register(
-                    gauge_value("analysis_running")
-                        .read(|_: &()| analysis_lane_stats().running)
-                        .help("Jobs a worker is running on the ts-analysis lane"),
-                )
-                .register(
-                    counter_value("analysis_rejected")
-                        .read(|_: &()| analysis_lane_stats().rejected)
-                        .help("Jobs refused because the ts-analysis queue was full"),
-                );
-        }
-        Section::Fanout => {
-            registry
-                .register(
-                    counter("requests_sent")
-                        .source(&FANOUT_REQUESTS_SENT.messages)
-                        .help("Fanout requests sent to peers over the cluster bus, one per peer"),
-                )
-                .register(
-                    counter("request_sent_bytes")
-                        .source(&FANOUT_REQUESTS_SENT.bytes)
-                        .help("Payload bytes of the fanout requests sent to peers")
-                        .unit("bytes"),
-                )
-                .register(
-                    counter("responses_sent")
-                        .source(&FANOUT_RESPONSES_SENT.messages)
-                        .help("Fanout responses sent back to coordinators over the cluster bus"),
-                )
-                .register(
-                    counter("response_sent_bytes")
-                        .source(&FANOUT_RESPONSES_SENT.bytes)
-                        .help("Payload bytes of the fanout responses sent back to coordinators")
-                        .unit("bytes"),
-                )
-                .register(
-                    counter("error_responses_sent")
-                        .source(&FANOUT_ERROR_RESPONSES_SENT.messages)
-                        .help(
-                            "Fanout error responses sent back to coordinators over the cluster bus",
-                        ),
-                )
-                .register(
-                    counter("error_response_sent_bytes")
-                        .source(&FANOUT_ERROR_RESPONSES_SENT.bytes)
-                        .help(
-                            "Payload bytes of the fanout error responses sent back to coordinators",
-                        )
-                        .unit("bytes"),
-                );
-        }
+        Section::Clustermap => clustermap::register(&mut registry),
+        Section::Cron => cron::register(&mut registry),
+        Section::Exec => exec::register(&mut registry),
+        Section::Fanout => fanout::register(&mut registry),
     }
     registry
 }
@@ -462,7 +338,9 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::series::background_tasks::cron_interval_ms;
     use metered::MetricSchema;
+    use std::sync::atomic::Ordering;
 
     fn schemas() -> impl Iterator<Item = (Section, MetricSchema)> {
         REGISTRIES
@@ -527,8 +405,8 @@ mod tests {
     /// The only test that resets the shared registries, so the counts it asserts are its own.
     #[test]
     fn reset_rebases_counters_and_histograms_but_not_gauges() {
-        CRON_TICKS_SKIPPED.fetch_add(5, Ordering::Relaxed);
-        CRON_TICK_DURATION.observe_duration(Duration::from_micros(10));
+        cron::TICKS_SKIPPED.fetch_add(5, Ordering::Relaxed);
+        cron::TICK_DURATION.observe_duration(Duration::from_micros(10));
         reset();
 
         assert_eq!(
@@ -542,13 +420,13 @@ mod tests {
         };
         assert_eq!(snapshot.count, 0);
 
-        CRON_TICKS_SKIPPED.fetch_add(3, Ordering::Relaxed);
+        cron::TICKS_SKIPPED.fetch_add(3, Ordering::Relaxed);
         assert_eq!(
             reading(&[Section::Cron], "cron_ticks_skipped_total").value,
             MetricValue::Counter(3)
         );
         // The value underneath keeps counting from where it was.
-        assert!(CRON_TICKS_SKIPPED.load(Ordering::Relaxed) >= 8);
+        assert!(cron::TICKS_SKIPPED.load(Ordering::Relaxed) >= 8);
         assert_eq!(
             reading(&[Section::Cron], "cron_interval_seconds").value,
             MetricValue::Gauge(Scalar::Float(cron_interval_ms() as f64 / 1000.0))
@@ -557,7 +435,7 @@ mod tests {
 
     #[test]
     fn wire_counters_count_messages_and_bytes() {
-        let wire = WireCounters::new();
+        let wire = fanout::WireCounters::new();
         wire.record(100);
         wire.record(28);
         assert_eq!(wire.messages.load(Ordering::Relaxed), 2);

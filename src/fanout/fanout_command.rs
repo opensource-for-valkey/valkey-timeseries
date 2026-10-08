@@ -2,6 +2,7 @@ use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
+use crate::common::metrics::fanout as metrics;
 use crate::common::sync::lock;
 use crate::common::threads::Rejected;
 use crate::fanout::fanout_context::FanoutContext;
@@ -10,6 +11,7 @@ use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
 use crate::fanout::{
     FanoutResult, FanoutTarget, NodeInfo, compute_query_fanout_mode, get_fanout_targets,
 };
+use metered::Counter;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use valkey_module::{Context, ValkeyResult};
@@ -115,6 +117,8 @@ where
 {
     let op = command;
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
+    metrics::OPERATIONS.incr();
+    metrics::TARGETS.incr_by(targets.len() as u64);
 
     let req = op.generate_request();
     let outstanding = targets.len();
@@ -133,9 +137,14 @@ where
         // dropping `state` while it is still `Pending` discards the callback
         // without invoking it, as on an RPC setup failure below.
         Some(local) if outstanding == 1 => {
+            metrics::LOCAL_ONLY.incr();
             let state = Arc::new(FanoutState::new(op, outstanding, f));
-            return spawn_local_request(state, req, local, fanout_user, db, deadline)
-                .map_err(|_| FanoutError::busy());
+            return spawn_local_request(state, req, local, fanout_user, db, deadline).map_err(
+                |_| {
+                    metrics::LOCAL_SHARE_BUSY.incr();
+                    FanoutError::busy()
+                },
+            );
         }
         Some(_) => Some(op.generate_request()),
         None => None,
@@ -176,6 +185,7 @@ where
         // for client commands, the blocked client — so the caller can reply
         // with this error right away instead of waiting on a local response
         // that would complete the fanout with a partial result.
+        metrics::SETUP_FAILURES.incr();
         return Err(FanoutError::from(e));
     }
 
@@ -187,6 +197,7 @@ where
         if spawn_local_request(local_state, req_local, local, fanout_user, db, deadline).is_err() {
             // Remote shares are already in flight, so this one fails through
             // the fanout: `Busy` aborts it with that error.
+            metrics::LOCAL_SHARE_BUSY.incr();
             state.on_error(FanoutError::busy(), &local);
         }
     }
@@ -221,6 +232,8 @@ where
     /// per-shard error aggregation.
     abort_error: Option<FanoutError>,
     callback: Option<F>,
+    /// When the operation started, for `fanout_duration_seconds`.
+    started: Instant,
 }
 
 impl<OP, F> FanoutStateInner<OP, F>
@@ -247,9 +260,14 @@ where
         // valid accumulator. Ignore any late-arriving callbacks so we never
         // invoke the operation on that placeholder.
         if self.lifecycle == FanoutLifecycleState::Completed {
+            // A deadline arriving after the result is not a shard's answer.
+            if error.kind != ErrorKind::Timeout {
+                metrics::IGNORED_AFTER_COMPLETION.incr();
+            }
             return;
         }
         self.activate();
+        metrics::record_error(error.kind);
         // Invoke the handler's error callback for custom error handling
         self.operation.on_error(error.clone(), target);
         self.error_count += 1;
@@ -295,11 +313,13 @@ where
         // See `on_error`: after completion `self.operation` is a `mem::take`
         // placeholder, so drop late responses instead of accumulating into it.
         if self.lifecycle == FanoutLifecycleState::Completed {
+            metrics::IGNORED_AFTER_COMPLETION.incr();
             return;
         }
         self.activate();
         if self.timed_out {
             // We already timed out; ignore responses but mark RPC as done.
+            metrics::IGNORED_AFTER_COMPLETION.incr();
             self.rpc_done();
             return;
         }
@@ -314,6 +334,7 @@ where
                 // incrementing the error count. Otherwise, treat it as a normal
                 // per-shard error and continue.
                 if self.operation.fail_fast() {
+                    metrics::record_error(err.kind);
                     // Allow the operation to run its error handler for diagnostics
                     self.operation.on_error(err.clone(), target);
                     self.error_count += 1;
@@ -339,11 +360,14 @@ where
             return;
         };
 
+        metrics::DURATION.observe_duration(self.started.elapsed());
         let result = if let Some(err) = self.abort_error.take() {
+            metrics::ABORTS.incr();
             Err(err)
         } else if self.timed_out {
             Err(FanoutError::timeout())
         } else if self.error_count > 0 {
+            metrics::GENERIC_ERROR_REPLIES.incr();
             Err(self.operation.generate_error_reply())
         } else {
             self.operation.on_completion();
@@ -392,6 +416,7 @@ where
                 timed_out: false,
                 abort_error: None,
                 callback: Some(f),
+                started: Instant::now(),
             }),
         }
     }
@@ -442,6 +467,7 @@ where
             return;
         }
         if Instant::now() >= deadline {
+            metrics::LOCAL_SHARE_EXPIRED.incr();
             state.on_error(FanoutError::timeout(), &target);
             return;
         }

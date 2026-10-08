@@ -582,7 +582,46 @@ equals the db count (no save-side assertion — `BGSAVE` counts would be lost in
 → `task_asm_drain_items_total` equals the migrated key count, `task_asm_delayed_keys_pending` and
 `task_asm_importing_slots` return to 0, and `restore_total` on the destination is non-zero.
 
-### Phase 4 — fanout, cluster map, `INFLIGHT`
+### Phase 4 — fanout, cluster map, `INFLIGHT` — **done 2026-10-07**
+
+As built: [metrics/fanout.rs](../../src/common/metrics/fanout.rs) and
+[metrics/clustermap.rs](../../src/common/metrics/clustermap.rs), hooks in
+[fanout_command.rs](../../src/fanout/fanout_command.rs),
+[cluster_rpc.rs](../../src/fanout/cluster_rpc.rs), [blocked_client.rs](../../src/fanout/blocked_client.rs),
+[fanout_client_command.rs](../../src/fanout/fanout_client_command.rs),
+[fanout/mod.rs](../../src/fanout/mod.rs) and
+[ts_mrange_fanout_command.rs](../../src/commands/ts_mrange_fanout_command.rs); `TS._DEBUG
+INFLIGHT` in [ts_debug.rs](../../src/commands/ts_debug.rs); `TestFanoutStatsCME` in
+[tests/test_ts_debug_cme.py](../../tests/test_ts_debug_cme.py). Differences from §3.8:
+
+- `src/common/metrics.rs` became a directory: `mod.rs` (registries, snapshot, baseline) plus one
+  file per section declaring its statics and a `register` function.
+- Renames: `fanout_requests_total` → `fanout_operations_total` (the wire section already had
+  `fanout_requests_sent_total`); `fanout_serve_rejected_<reason>_total` →
+  `fanout_rejected_<reason>_total`, with `fanout_fingerprint_rejects_total` folded in as
+  `fanout_rejected_cluster_map_mismatch_total`; `fanout_pushdown_*fallbacks_total` →
+  `fanout_pushdown_fallback_series_total` / `fanout_pushdown_group_fallback_series_total` (they
+  count series, not responses); `fanout_responses_ignored_<reason>_total` →
+  `fanout_ignored_<reason>_total`.
+- `exec_fanout_local_share_busy_total` (§3.9) landed here as `fanout_local_share_busy_total`.
+- Error kinds map to counters through `ErrorKind::ALL` / `metric_index` / `metric_name`
+  ([fanout_error.rs](../../src/fanout/fanout_error.rs)), an exhaustive match: a new kind does not
+  compile without a counter.
+- `fanout_ignored_after_completion_total` skips `Timeout` errors: a deadline arriving after the
+  result is not a shard's answer.
+- `clustermap_age_seconds` reads a new `CLUSTER_MAP_VERIFIED_AT_MS`, set whenever a refresh builds
+  the map or confirms it unchanged; -1 before the first build.
+- `INFLIGHT` fields are `id` (a string: request ids are random `u64`s), `command`, `ageMs`,
+  `remoteTargets`, `outstanding`.
+- **The push-down test below is not possible.** `ts-fanout-aggregation-pushdown` is read only by
+  the coordinator; a shard honors whatever the request asks. A fallback needs a peer too old to
+  know the flag, so it is covered by a unit test
+  (`test_pushdown_fallbacks_are_counted`) over the existing mixed-version fixtures.
+- The timeout test can't pin `fanout_client_timeouts_total` to 1: both deadlines are the same
+  length, and when the RPC timer's result reaches the client first, the client timer never
+  fires. It asserts the RPC side exactly and the client side `<= 1`.
+
+Original plan:
 
 Section 3.8 plus `INFLIGHT`. Tests on `ValkeyTimeSeriesClusterTestCase` (hash tags per primary):
 `TS.MRANGE` across three primaries → `fanout_requests_total` +1 and `fanout_targets_total` +3 on the
@@ -652,6 +691,9 @@ an eleventh fanout op and a proto message (regenerate under `proto/v1/generated/
   `TimeSeriesIndex::remove_stale_ids` and `series_posting_ids_by_selectors` are dead code.
 
 ## Revision log
+
+**2026-10-07 (Phase 4)** — implemented §3.8 and `INFLIGHT`; see the "as built" note in Phase 4
+for renames and the push-down test that had to become a unit test.
 
 **2026-10-07 (fanout wire)** — added the `fanout` section early with sent message and payload
 byte counters per message type (§3.8 "Wire volume").

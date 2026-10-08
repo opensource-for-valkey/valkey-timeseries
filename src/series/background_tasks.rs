@@ -1,6 +1,6 @@
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_debug;
-use crate::common::metrics::{CRON_TICK_DURATION, CRON_TICKS_SKIPPED};
+use crate::common::metrics::cron as metrics;
 use crate::is_shutting_down;
 use crate::series::index::TIMESERIES_INDEX;
 use crate::series::index::persistence::is_loading_active;
@@ -155,7 +155,7 @@ fn dispatch_background_task(task: TaskType) {
 #[cron_event_handler]
 fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     if is_shutting_down() || is_loading_active() {
-        CRON_TICKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        metrics::TICKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -170,7 +170,7 @@ fn __cron_event_handler(_ctx: &Context, _hz: u64) {
             }
         }
     }
-    CRON_TICK_DURATION.observe_duration(start.elapsed());
+    metrics::TICK_DURATION.observe_duration(start.elapsed());
 }
 
 fn get_hz(ctx: &Context) -> u64 {

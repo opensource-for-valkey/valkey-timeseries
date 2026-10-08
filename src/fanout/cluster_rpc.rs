@@ -6,9 +6,8 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
-use crate::common::metrics::{
-    FANOUT_ERROR_RESPONSES_SENT, FANOUT_REQUESTS_SENT, FANOUT_RESPONSES_SENT, WireCounters,
-};
+use crate::common::metrics::clustermap as clustermap_metrics;
+use crate::common::metrics::fanout::{self as metrics, WireCounters};
 use crate::common::pool::get_pooled_buffer;
 use crate::common::sync::lock;
 use crate::common::threads::LockGil;
@@ -25,12 +24,14 @@ use crate::fanout::{
 };
 use ahash::HashSet;
 use core::time::Duration;
+use metered::Counter;
 use papaya::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::raw::{c_char, c_int, c_uchar};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 use valkey_module::{
     Context, DetachedContext, MODULE_CONTEXT, RedisModuleCtx, Status, VALKEYMODULE_OK, ValkeyError,
     ValkeyModule_RegisterClusterMessageReceiver, ValkeyModule_SendClusterMessage,
@@ -48,6 +49,11 @@ const FANOUT_RPC_RESPONSE_BUFFER_SIZE: usize = 1024;
 
 struct InFlightRequest {
     id: u64,
+    /// The fanout operation's name, for `TS._DEBUG INFLIGHT`.
+    command: &'static str,
+    started: Instant,
+    /// How many remote targets the request was sent to.
+    remote_targets: usize,
     targets: Arc<HashSet<NodeInfo>>,
     response_handler: FanoutResponseCallback,
     outstanding: AtomicU64,
@@ -104,6 +110,7 @@ impl InFlightRequest {
             .get_target_node_opt(sender_id)
             .filter(|node| !node.is_local())
         else {
+            metrics::IGNORED_UNKNOWN_SENDER.incr();
             ctx.log_warning(&format!(
                 "cluster rpc: ignoring response for request {} from unknown sender {sender}",
                 self.id
@@ -111,6 +118,7 @@ impl InFlightRequest {
             return false;
         };
         if !lock(&self.responded).insert(sender) {
+            metrics::IGNORED_DUPLICATE.incr();
             ctx.log_warning(&format!(
                 "cluster rpc: ignoring duplicate response for request {} from {sender}",
                 self.id
@@ -155,6 +163,39 @@ fn placeholder_node() -> NodeInfo {
 type InFlightRequestMap = HashMap<u64, InFlightRequest, BuildNoHashHasher<u64>>;
 
 static INFLIGHT_REQUESTS: LazyLock<InFlightRequestMap> = LazyLock::new(InFlightRequestMap::default);
+
+/// How many fanout RPCs have remote shares outstanding (`fanout_inflight`).
+pub(crate) fn inflight_request_count() -> usize {
+    INFLIGHT_REQUESTS.pin().len()
+}
+
+/// One in-flight fanout RPC, as `TS._DEBUG INFLIGHT` reports it.
+pub(crate) struct InflightSummary {
+    pub id: u64,
+    pub command: &'static str,
+    pub age: Duration,
+    pub remote_targets: usize,
+    pub outstanding: u64,
+}
+
+/// The fanout RPCs with remote shares outstanding, oldest first. A fanout whose only target is
+/// this node has no RPC and does not appear; nor does one whose timer has fired, since it is
+/// removed then.
+pub(crate) fn inflight_requests() -> Vec<InflightSummary> {
+    let mut requests: Vec<_> = INFLIGHT_REQUESTS
+        .pin()
+        .values()
+        .map(|request| InflightSummary {
+            id: request.id,
+            command: request.command,
+            age: request.started.elapsed(),
+            remote_targets: request.remote_targets,
+            outstanding: request.outstanding.load(Ordering::Acquire),
+        })
+        .collect();
+    requests.sort_by_key(|request| std::cmp::Reverse(request.age));
+    requests
+}
 
 /// Per-node request id counter, seeded once on first use (see [`initial_request_id`]).
 static REQUEST_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(initial_request_id()));
@@ -206,6 +247,7 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
             return;
         }
 
+        metrics::RPC_TIMEOUTS.incr();
         request.deliver_timeout();
 
         map.remove(&id);
@@ -213,6 +255,7 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
 }
 
 fn dispatch_send_failure(ctx: &Context, request_id: u64, target_node_id: *const c_char) {
+    metrics::SEND_FAILURES.incr();
     with_inflight_request(ctx, request_id, |ctx, request| {
         let err = FanoutError::custom("Failed to send fanout request to target node");
         request.handle_response(ctx, Err(err), target_node_id)
@@ -248,7 +291,7 @@ pub fn get_cluster_command_timeout() -> Duration {
 
 pub fn invoke_rpc<Request: Serializable>(
     ctx: &Context,
-    name: &str,
+    name: &'static str,
     req: Request,
     targets: Arc<HashSet<NodeInfo>>,
     cluster_fingerprint: u64,
@@ -273,7 +316,7 @@ pub(super) fn send_cluster_request(
     ctx: &Context,
     request_buf: &[u8],
     targets: Arc<HashSet<NodeInfo>>,
-    handler: &str,
+    handler: &'static str,
     cluster_fingerprint: u64,
     response_handler: FanoutResponseCallback,
     timeout: Option<Duration>,
@@ -311,6 +354,9 @@ pub(super) fn send_cluster_request(
 
     let request = InFlightRequest {
         id,
+        command: handler,
+        started: Instant::now(),
+        remote_targets: node_count,
         response_handler,
         timer_id,
         outstanding: AtomicU64::new(node_count as u64),
@@ -449,6 +495,7 @@ fn cluster_fingerprint_matches(ctx: &DetachedContext, expected: u64) -> bool {
     }
 
     // Our map might just be stale; force one refresh and re-check.
+    clustermap_metrics::FORCED_REFRESHES.incr();
     refresh_cluster_map(ctx);
     get_cluster_map().cluster_slots_fingerprint() == expected
 }
@@ -475,6 +522,7 @@ fn process_request_message(
     // GIL only for the call itself. The aggregate result would otherwise be
     // built from inconsistent per-node views.
     if !cluster_fingerprint_matches(&MODULE_CONTEXT, header.cluster_fingerprint) {
+        metrics::REJECTED_CLUSTER_MAP_MISMATCH.incr();
         let ctx = MODULE_CONTEXT.lock_gil();
         let msg = format!(
             "cluster rpc: rejecting request {request_id} from node {sender_id}: cluster-map fingerprint mismatch"
@@ -497,6 +545,7 @@ fn process_request_message(
     let fanout_ctx = FanoutContext::new(header.user, header.db);
     match handler(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
+            metrics::SERVED_OK.incr();
             let ctx = MODULE_CONTEXT.lock_gil();
             if send_response_message(
                 &ctx,
@@ -507,12 +556,14 @@ fn process_request_message(
                 &dest,
             ) == Status::Err
             {
+                metrics::REPLY_SEND_FAILURES.incr();
                 let msg = format!("Failed to send response message to node {sender_id:?}");
                 // send error ???
                 ctx.log_warning(&msg);
             }
         }
         Err(e) => {
+            metrics::SERVED_ERRORS.incr();
             let msg = e.to_string();
             MODULE_CONTEXT.log_warning(&msg);
             let ctx = MODULE_CONTEXT.lock_gil();
@@ -559,9 +610,9 @@ pub fn send_cluster_message(
 /// Where a sent message of `msg_type` is counted (`TS._DEBUG STATS fanout`).
 fn wire_counters(msg_type: u8) -> Option<&'static WireCounters> {
     match msg_type {
-        FANOUT_REQUEST_MESSAGE => Some(&FANOUT_REQUESTS_SENT),
-        FANOUT_RESPONSE_MESSAGE => Some(&FANOUT_RESPONSES_SENT),
-        FANOUT_ERROR_MESSAGE => Some(&FANOUT_ERROR_RESPONSES_SENT),
+        FANOUT_REQUEST_MESSAGE => Some(&metrics::REQUESTS_SENT),
+        FANOUT_RESPONSE_MESSAGE => Some(&metrics::RESPONSES_SENT),
+        FANOUT_ERROR_MESSAGE => Some(&metrics::ERROR_RESPONSES_SENT),
         _ => None,
     }
 }
@@ -576,6 +627,7 @@ extern "C" fn on_request_received(
 ) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
     let Some(mut message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
+        metrics::REJECTED_PARSE.incr();
         return;
     };
 
@@ -583,6 +635,7 @@ extern "C" fn on_request_received(
     // reject explicitly (addressable, fast) rather than mis-process the
     // request. See docs/fanout-compatibility-handshake.md.
     if has_unsupported_features(message.required_features) {
+        metrics::REJECTED_UNSUPPORTED_FEATURES.incr();
         let e = FanoutError::unsupported_features();
         send_error_response(&ctx, message.request_id, message.db, sender_id, e);
         let msg = format!(
@@ -596,6 +649,7 @@ extern "C" fn on_request_received(
     }
 
     let Some(handler) = get_fanout_request_handler(&message.handler) else {
+        metrics::REJECTED_NO_HANDLER.incr();
         let e = FanoutError::invalid_message();
         send_error_response(&ctx, message.request_id, message.db, sender_id, e);
         let msg = format!(
@@ -630,6 +684,7 @@ extern "C" fn on_request_received(
         process_request_message(header, handler, &buf, sender);
     });
     if queued.is_err() {
+        metrics::REJECTED_BUSY.incr();
         // Answer now rather than leave the requester waiting out its timeout.
         send_error_response(&ctx, request_id, db, sender_id, FanoutError::busy());
         let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
@@ -646,6 +701,7 @@ where
 {
     let map = INFLIGHT_REQUESTS.pin();
     let Some(request) = map.get(&request_id) else {
+        metrics::IGNORED_UNKNOWN_REQUEST.incr();
         ctx.log_warning(&format!(
             "Failed to find inflight request for id {request_id}. Possible timeout.",
         ));
@@ -721,6 +777,7 @@ extern "C" fn on_error_received(
                 request.handle_response(ctx, Err(error), sender_id)
             }
             Err(_) => {
+                metrics::ERROR_DECODE_FAILURES.incr();
                 ctx.log_warning("Failed to deserialize error response");
                 let err = FanoutError::invalid_message();
                 request.handle_response(ctx, Err(err), sender_id)

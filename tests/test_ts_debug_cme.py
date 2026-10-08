@@ -3,12 +3,16 @@ TS._DEBUG in cluster mode: STRINGPOOLSTATS sums every primary's string pool, and
 one node per shard's label index, preferring replicas.
 """
 
+import threading
+import time
+
 import pytest
 from valkey import ResponseError, ValkeyCluster
 
 from common import SERVER_VERSION
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
+from valkeytestframework.util.waiters import wait_for_true
 
 
 def bucket_fields(bucket):
@@ -263,6 +267,206 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert stats['fanout_error_responses_sent_total'] == 1
         assert stats['fanout_error_response_sent_bytes_total'] > 0
         assert stats['fanout_responses_sent_total'] == 0
+
+
+def debug_stats(client, *sections):
+    """This node's TS._DEBUG STATS for the given sections, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', *sections)
+    return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+
+def histogram_count(value):
+    return {value[i].decode(): value[i + 1] for i in range(0, len(value), 2)}['count']
+
+
+def shard_errors(stats):
+    return {name: value for name, value in stats.items()
+            if name.startswith('fanout_errors_') and value}
+
+
+class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """Coordinator, serving and cluster-map metrics around real fanouts."""
+
+    TIMEOUT_CONFIG = 'ts.ts-fanout-command-timeout'
+
+    def primaries(self):
+        return [self.client_for_primary(i) for i in range(self.CLUSTER_SIZE)]
+
+    def reset_all(self):
+        for client in self.primaries():
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+
+    def tag_per_primary(self):
+        """One hash tag per primary, in primary order."""
+        cluster_client = self.new_cluster_client()
+        by_port = {}
+        for i in range(1000):
+            node = cluster_client.get_node_from_key('{tag%d}' % i)
+            by_port.setdefault(node.port, f'tag{i}')
+            if len(by_port) == self.CLUSTER_SIZE:
+                break
+        return [by_port[self.get_primary_port(i)] for i in range(self.CLUSTER_SIZE)]
+
+    def populate(self):
+        cluster_client = self.new_cluster_client()
+        tags = self.tag_per_primary()
+        for tag in tags:
+            for j in range(3):
+                key = f'fo:{{{tag}}}:{j}'
+                cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'env', 'prod')
+                cluster_client.execute_command('TS.ADD', key, 1000, j)
+        return tags
+
+    def test_one_operation_on_the_coordinator_one_request_served_per_peer(self):
+        self.populate()
+        self.reset_all()
+        coordinator, *peers = self.primaries()
+
+        coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+
+        stats = debug_stats(coordinator, 'fanout')
+        assert stats['fanout_operations_total'] == 1
+        assert stats['fanout_targets_total'] == self.CLUSTER_SIZE
+        assert stats['fanout_local_only_total'] == 0
+        assert stats['fanout_inflight'] == 0
+        assert histogram_count(stats['fanout_duration_seconds']) == 1
+        assert shard_errors(stats) == {}
+        assert stats['fanout_aborts_total'] == 0
+        assert stats['fanout_generic_error_replies_total'] == 0
+        assert stats['fanout_served_ok_total'] == 0
+        for peer in peers:
+            peer_stats = debug_stats(peer, 'fanout')
+            assert peer_stats['fanout_served_ok_total'] == 1
+            assert peer_stats['fanout_operations_total'] == 0
+
+    def test_a_hashtag_owned_by_the_coordinator_stays_local(self):
+        tags = self.populate()
+        self.reset_all()
+        coordinator, *peers = self.primaries()
+
+        assert coordinator.execute_command('TS.CARD', 'HASHTAG', tags[0], 'FILTER', 'env=prod') == 3
+
+        stats = debug_stats(coordinator, 'fanout')
+        assert stats['fanout_operations_total'] == 1
+        assert stats['fanout_local_only_total'] == 1
+        assert stats['fanout_targets_total'] == 1
+        assert stats['fanout_requests_sent_total'] == 0
+        assert histogram_count(stats['fanout_duration_seconds']) == 1
+        for peer in peers:
+            assert debug_stats(peer, 'fanout')['fanout_served_ok_total'] == 0
+
+    def test_a_shard_failure_is_counted_by_kind_and_answered_generically(self):
+        """A peer with debug-mode off fails its share of TS._DEBUG INDEXMEMORY."""
+        self.reset_all()
+        coordinator, peer = self.primaries()[:2]
+        peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            with pytest.raises(ResponseError, match='Internal error in fanout operation'):
+                coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+        finally:
+            peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+        stats = debug_stats(coordinator, 'fanout')
+        assert sum(shard_errors(stats).values()) == 1, shard_errors(stats)
+        assert stats['fanout_generic_error_replies_total'] == 1
+        assert stats['fanout_aborts_total'] == 0
+        assert debug_stats(peer, 'fanout')['fanout_served_errors_total'] == 1
+
+    def test_a_key_permission_denial_aborts_the_fanout(self):
+        tags = self.populate()
+        # ACLs are per node: the user exists everywhere, but may read only the coordinator's keys.
+        for client in self.primaries():
+            client.execute_command('ACL', 'SETUSER', 'fo_limited', 'on', 'nopass',
+                                   f'~fo:{{{tags[0]}}}:*', '+@all')
+        self.reset_all()
+        coordinator = self.primaries()[0]
+        limited = self.new_client_for_primary(0)
+        limited.execute_command('AUTH', 'fo_limited', 'any')
+
+        with pytest.raises(ResponseError):
+            limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+
+        stats = debug_stats(coordinator, 'fanout')
+        assert stats['fanout_aborts_total'] == 1
+        errors = shard_errors(stats)
+        assert set(errors) <= {'fanout_errors_key_permissions_total',
+                               'fanout_errors_permissions_total'}, errors
+        assert sum(errors.values()) >= 1
+
+    def test_timeouts(self):
+        """A sleeping peer runs the fanout into both deadlines; its late answer is dropped."""
+        self.populate()
+        coordinator, peer = self.primaries()[:2]
+        coordinator.execute_command('CONFIG', 'SET', self.TIMEOUT_CONFIG, '500ms')
+        self.reset_all()
+        sleeper = threading.Thread(
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 2))
+        sleeper.start()
+        try:
+            time.sleep(0.2)
+            with pytest.raises(ResponseError, match='did not reply'):
+                coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+        finally:
+            sleeper.join()
+            coordinator.execute_command('CONFIG', 'SET', self.TIMEOUT_CONFIG, '5000ms')
+
+        stats = debug_stats(coordinator, 'fanout')
+        assert stats['fanout_rpc_timeouts_total'] == 1
+        assert stats['fanout_errors_timeout_total'] == 1
+        # The two deadlines race: the client's fires unless the RPC's result reached it first.
+        assert stats['fanout_client_timeouts_total'] <= 1
+        assert stats['fanout_inflight'] == 0
+        # Once awake, the peer answers a request the coordinator no longer has.
+        wait_for_true(lambda: debug_stats(peer, 'fanout')['fanout_served_ok_total'] == 1)
+        wait_for_true(lambda: debug_stats(coordinator, 'fanout')[
+            'fanout_ignored_unknown_request_total'] >= 1)
+
+    def test_inflight_lists_a_request_waiting_on_a_peer(self):
+        self.populate()
+        coordinator = self.primaries()[0]
+        sleeper = threading.Thread(
+            target=lambda: self.new_client_for_primary(1).execute_command('DEBUG', 'SLEEP', 1))
+        result = {}
+
+        def run_mrange():
+            result['reply'] = self.new_client_for_primary(0).execute_command(
+                'TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
+
+        sleeper.start()
+        time.sleep(0.2)
+        query = threading.Thread(target=run_mrange)
+        query.start()
+        try:
+            wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') != [])
+            [entry] = coordinator.execute_command('TS._DEBUG', 'INFLIGHT')
+            fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
+            assert list(fields) == ['id', 'command', 'ageMs', 'remoteTargets', 'outstanding']
+            assert fields['command'] == b'mrange'
+            assert int(fields['id'])
+            assert fields['remoteTargets'] == self.CLUSTER_SIZE - 1
+            assert 1 <= fields['outstanding'] <= self.CLUSTER_SIZE - 1
+            assert fields['ageMs'] >= 0
+            assert debug_stats(coordinator, 'fanout')['fanout_inflight'] == 1
+        finally:
+            sleeper.join()
+            query.join()
+        assert len(result['reply']) == 3 * self.CLUSTER_SIZE
+        wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') == [])
+        assert debug_stats(coordinator, 'fanout')['fanout_inflight'] == 0
+
+    def test_cluster_map_metrics(self):
+        coordinator = self.primaries()[0]
+        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+
+        stats = debug_stats(coordinator, 'clustermap')
+        assert stats['clustermap_refreshes_total'] >= 1
+        assert stats['clustermap_refreshes_total'] == (
+            stats['clustermap_refresh_changed_total']
+            + stats['clustermap_refresh_unchanged_total']
+            + stats['clustermap_refresh_failures_total'])
+        assert stats['clustermap_refresh_failures_total'] == 0
+        assert float(stats['clustermap_age_seconds']) >= 0
+        assert float(stats['clustermap_refresh_interval_seconds']) > 0
 
 
 def server_major_version():

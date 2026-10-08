@@ -44,6 +44,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `STATS`           | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
 | `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_memory`) |
+| `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
 | `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
 | `PANIC_NEXT_ANALYSIS_JOB` | Make the next background analysis job (`TS.OUTLIERS` on a large range) panic, to test that its client still gets an error reply |
@@ -137,29 +138,108 @@ unit (durations are in seconds).
 scraper expects). It records them as a baseline, and `STATS` reports counters and histograms
 relative to it.
 
-| Name                           | Kind      | Description                                                                          |
-|--------------------------------|-----------|--------------------------------------------------------------------------------------|
-| `cron_interval_seconds`        | gauge     | Time between cron ticks, derived from the server's `hz` (a double)                    |
-| `cron_tick_duration_seconds`   | histogram | Main-thread time per cron tick spent dispatching background tasks                    |
-| `cron_ticks_total`             | counter   | Cron ticks that ran the background-task scheduler                                    |
-| `cron_ticks_skipped_total`     | counter   | Cron ticks skipped because the server was loading or shutting down                   |
-| `exec_fanout_queued`           | gauge     | Jobs waiting for a worker on the `ts-fanout-request` lane (peer requests and local fan-out shares) |
-| `exec_fanout_running`          | gauge     | Jobs a worker is running on the `ts-fanout-request` lane                             |
-| `exec_fanout_rejected_total`   | counter   | Jobs refused because the `ts-fanout-request` queue was full (answered as busy)       |
-| `exec_analysis_queued`         | gauge     | Jobs waiting for a worker on the `ts-analysis` lane                                  |
-| `exec_analysis_running`        | gauge     | Jobs a worker is running on the `ts-analysis` lane                                   |
-| `exec_analysis_rejected_total` | counter   | Jobs refused because the `ts-analysis` queue was full                                |
-| `fanout_requests_sent_total`   | counter   | Fanout requests sent to peers over the cluster bus, one per peer                     |
-| `fanout_request_sent_bytes_total` | counter | Payload bytes of those requests                                                      |
-| `fanout_responses_sent_total`  | counter   | Fanout responses sent back to coordinators                                           |
-| `fanout_response_sent_bytes_total` | counter | Payload bytes of those responses                                                    |
-| `fanout_error_responses_sent_total` | counter | Fanout error responses sent back to coordinators                                   |
-| `fanout_error_response_sent_bytes_total` | counter | Payload bytes of those error responses                                       |
+Metrics are grouped in sections; each name starts with its section.
 
-The `fanout_*` byte counts are the payloads this node handed to the cluster bus, counted by the
-sender: a request to several peers counts once per peer, and the cluster bus's own framing is
-not included. A fan-out's local share never crosses the bus and is not counted. On a standalone
-server they stay at zero.
+#### `clustermap`
+
+The cluster map fan-outs choose their targets from. Empty-handed on a standalone server: the
+counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `clustermap_refreshes_total` | counter | Rebuilds from `CLUSTER NODES`, whatever their outcome |
+| `clustermap_refresh_changed_total` | counter | Rebuilds that published a new map |
+| `clustermap_refresh_unchanged_total` | counter | Rebuilds that found the topology unchanged (expiry extended) |
+| `clustermap_refresh_failures_total` | counter | Rebuilds that failed, leaving the previous map in place |
+| `clustermap_forced_refreshes_total` | counter | Rebuilds forced by a peer request carrying a different fingerprint |
+| `clustermap_stale_marks_total` | counter | Times a peer's cluster-map mismatch error marked this node's map stale |
+| `clustermap_refresh_interval_seconds` | gauge | Current adaptive refresh interval (doubles while the topology is stable, up to 5 s) |
+| `clustermap_age_seconds` | gauge | Time since the map was last built or confirmed unchanged |
+
+#### `cron`
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `cron_interval_seconds` | gauge | Time between cron ticks, derived from the server's `hz` (a double) |
+| `cron_tick_duration_seconds` | histogram | Main-thread time per cron tick spent dispatching background tasks |
+| `cron_ticks_total` | counter | Cron ticks that ran the background-task scheduler |
+| `cron_ticks_skipped_total` | counter | Cron ticks skipped because the server was loading or shutting down |
+
+#### `exec`
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `exec_fanout_queued` | gauge | Jobs waiting for a worker on the `ts-fanout-request` lane (peer requests and local fan-out shares) |
+| `exec_fanout_running` | gauge | Jobs a worker is running on the `ts-fanout-request` lane |
+| `exec_fanout_rejected_total` | counter | Jobs refused because the `ts-fanout-request` queue was full (answered as busy) |
+| `exec_analysis_queued` | gauge | Jobs waiting for a worker on the `ts-analysis` lane |
+| `exec_analysis_running` | gauge | Jobs a worker is running on the `ts-analysis` lane |
+| `exec_analysis_rejected_total` | counter | Jobs refused because the `ts-analysis` queue was full |
+
+#### `fanout`
+
+Counted on the node where the event happens: operations, timeouts and shard errors on the
+coordinator; `served_*` and `rejected_*` on the peer answering it; message and byte counts on
+the sender. A fan-out whose only target is the coordinator itself is an operation (and
+`local_only`) but sends nothing.
+
+As coordinator:
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `fanout_operations_total` | counter | Fan-out operations started, one per command that fans out |
+| `fanout_targets_total` | counter | Targets of those operations, the local node included |
+| `fanout_local_only_total` | counter | Operations whose only target was this node (no RPC) |
+| `fanout_duration_seconds` | histogram | Time from the start of an operation to its result |
+| `fanout_inflight` | gauge | RPCs with remote shares outstanding (see `TS._DEBUG INFLIGHT`) |
+| `fanout_errors_<kind>_total` | counter | Shard errors by kind, the local share included. Kinds: `invalid_message`, `node_unreachable`, `timeout`, `unknown_message_type`, `permissions`, `key_permissions`, `serialization`, `bad_request_id`, `internal`, `cluster_map_mismatch`, `unsupported_features`, `invalid_db`, `busy`, `custom` |
+| `fanout_aborts_total` | counter | Operations ended early by an error returned as it is: a cluster-map mismatch, a permission denial, a busy shard |
+| `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
+| `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |
+| `fanout_rpc_timeouts_total` | counter | RPCs whose timer fired with remote shares outstanding |
+| `fanout_setup_failures_total` | counter | Operations that failed before any remote request was sent |
+| `fanout_blocking_denied_total` | counter | Commands refused because the client could not be blocked (MULTI, a script, a module call) |
+| `fanout_send_failures_total` | counter | Requests the cluster bus refused to send |
+| `fanout_local_share_busy_total` | counter | Local shares refused because the fan-out lane's queue was full |
+| `fanout_local_share_expired_total` | counter | Local shares that waited in the queue past the deadline |
+| `fanout_error_decode_failures_total` | counter | Error responses from peers that could not be decoded |
+| `fanout_ignored_unknown_request_total` | counter | Peer answers dropped because their request is no longer in flight (it timed out, say) |
+| `fanout_ignored_unknown_sender_total` | counter | Peer answers dropped because their sender is not a remote target of the request |
+| `fanout_ignored_duplicate_total` | counter | Peer answers dropped because their sender had already answered |
+| `fanout_ignored_after_completion_total` | counter | Shard answers dropped because the operation had already completed (after an abort, say) |
+| `fanout_pushdown_fallback_series_total` | counter | `TS.MRANGE` series aggregated on the coordinator because their shard ignored aggregation push-down (an older peer) |
+| `fanout_pushdown_group_fallback_series_total` | counter | `TS.MRANGE` series reduced on the coordinator because their shard ignored group-reduce push-down |
+
+One timed-out fan-out usually counts once in both `client_timeouts` and `rpc_timeouts` (whichever
+deadline reaches the client first wins), so don't add them. Local-only fan-outs have no RPC, so
+only `client_timeouts` can count them.
+
+As a peer serving a coordinator:
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `fanout_served_ok_total` | counter | Requests served successfully |
+| `fanout_served_errors_total` | counter | Requests whose handler failed (answered with an error response) |
+| `fanout_reply_send_failures_total` | counter | Successful answers the cluster bus refused to send back |
+| `fanout_rejected_parse_total` | counter | Requests that could not be parsed |
+| `fanout_rejected_unsupported_features_total` | counter | Requests demanding envelope features this node lacks |
+| `fanout_rejected_no_handler_total` | counter | Requests for an operation this node has no handler for |
+| `fanout_rejected_busy_total` | counter | Requests refused because the fan-out lane's queue was full |
+| `fanout_rejected_cluster_map_mismatch_total` | counter | Requests rejected because the sender's cluster map disagrees with this node's |
+
+On the wire (counted by the sender):
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `fanout_requests_sent_total` | counter | Requests sent to peers, one per peer |
+| `fanout_request_sent_bytes_total` | counter | Payload bytes of those requests |
+| `fanout_responses_sent_total` | counter | Responses sent back to coordinators |
+| `fanout_response_sent_bytes_total` | counter | Payload bytes of those responses |
+| `fanout_error_responses_sent_total` | counter | Error responses sent back to coordinators |
+| `fanout_error_response_sent_bytes_total` | counter | Payload bytes of those error responses |
+
+The byte counts are the payloads this node handed to the cluster bus: the bus's own framing is
+not included, and a fan-out's local share never crosses the bus.
 
 ### Examples
 
@@ -191,6 +271,36 @@ Start a clean window, then read one section with descriptions:
 TS._DEBUG STATS RESET
 TS._DEBUG STATS exec VERBOSE
 ```
+
+---
+
+### TS._DEBUG INFLIGHT
+
+Lists the fan-out requests this node is coordinating that still wait on remote shards, oldest
+first. The tool for "a fan-out is hung": which command, how long, how many peers have yet to
+answer.
+
+### Syntax
+
+```bash
+TS._DEBUG INFLIGHT
+```
+
+### Return Value
+
+An array with one flat array of 10 alternating key/value fields per request:
+
+| Field           | Type    | Description                                                             |
+|-----------------|---------|-------------------------------------------------------------------------|
+| `id`            | string  | The request id (a string: ids span the full unsigned 64-bit range)      |
+| `command`       | string  | The fan-out operation, such as `mrange`                                 |
+| `ageMs`         | integer | Milliseconds since the request was sent                                 |
+| `remoteTargets` | integer | Peers the request was sent to                                           |
+| `outstanding`   | integer | Peers that have not answered yet                                        |
+
+Node-local: a request is in flight only on the node coordinating it. A fan-out whose only target
+is this node never appears (it has no remote request), and a request leaves the list as soon as
+its timeout fires. On a standalone server the list is always empty.
 
 ---
 

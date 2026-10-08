@@ -11,15 +11,21 @@ pub mod serialization;
 mod utils;
 mod workers;
 
+use crate::common::metrics::clustermap as metrics;
+use crate::common::time::current_time_millis;
 use crate::config::CLUSTER_MAP_EXPIRATION_MS;
 use ahash::HashSet;
 use arc_swap::{ArcSwap, Guard};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use metered::Counter;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use valkey_module::Context;
 use valkey_module::logging::{log_notice, log_warning};
 
 use super::fanout::cluster_rpc::register_cluster_message_handlers;
+pub use acl::*;
+pub(crate) use cluster_rpc::{inflight_request_count, inflight_requests};
 pub use fanout_client_command::*;
 pub use fanout_command::*;
 pub use fanout_context::FanoutContext;
@@ -60,6 +66,29 @@ const CLUSTER_MAP_BACKOFF_CAP_MS: u64 = 5_000;
 /// topology churn is re-checked at the configured floor.
 static CLUSTER_MAP_REFRESH_INTERVAL_MS: AtomicU64 = AtomicU64::new(0);
 
+/// When a refresh last built the cluster map or confirmed it unchanged, in ms since the epoch;
+/// 0 before the first. Reported as `clustermap_age_seconds`: the map's expiry can't stand in for
+/// it, because the expiry's TTL is adaptive.
+static CLUSTER_MAP_VERIFIED_AT_MS: AtomicI64 = AtomicI64::new(0);
+
+/// The current adaptive refresh interval, in ms (0 until the first refresh).
+pub(crate) fn cluster_map_refresh_interval_ms() -> u64 {
+    CLUSTER_MAP_REFRESH_INTERVAL_MS.load(Ordering::Relaxed)
+}
+
+/// How long since a refresh last built the cluster map or confirmed it unchanged; `None` before
+/// the first.
+pub(crate) fn cluster_map_age() -> Option<Duration> {
+    let verified_at = CLUSTER_MAP_VERIFIED_AT_MS.load(Ordering::Relaxed);
+    (verified_at > 0).then(|| {
+        Duration::from_millis(current_time_millis().saturating_sub(verified_at).max(0) as u64)
+    })
+}
+
+fn mark_cluster_map_verified() {
+    CLUSTER_MAP_VERIFIED_AT_MS.store(current_time_millis(), Ordering::Relaxed);
+}
+
 /// Double the adaptive refresh interval and return the new value, clamped to
 /// [configured floor, cap]. Called when a refresh confirmed the topology
 /// unchanged. A floor configured above the cap wins: the operator asked for a
@@ -87,6 +116,7 @@ pub fn get_cluster_map() -> Guard<Arc<ClusterMap>> {
 
 /// Mark the local cluster map as stale so it is rebuilt on next use.
 pub fn mark_cluster_map_stale() {
+    metrics::STALE_MARKS.incr();
     CLUSTER_MAP_STALE.store(true, Ordering::Release);
 }
 
@@ -136,6 +166,7 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
 // `ClusterNodesSource`).
 pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) {
     log_notice("Refreshing cluster map...");
+    metrics::REFRESHES.incr();
     match ClusterMap::create(ctx) {
         Some(new_map) => {
             let current_map = CLUSTER_MAP.load();
@@ -144,15 +175,19 @@ pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) {
                 && new_map.same_topology(&current_map)
             {
                 current_map.extend_expiration(grow_refresh_interval());
+                metrics::REFRESH_UNCHANGED.incr();
                 log_notice("Cluster map unchanged; extended expiration");
             } else {
                 drop(current_map);
                 reset_refresh_interval();
                 update_cluster_map(new_map);
+                metrics::REFRESH_CHANGED.incr();
                 log_notice("Cluster map refreshed");
             }
+            mark_cluster_map_verified();
         }
         None => {
+            metrics::REFRESH_FAILURES.incr();
             reset_refresh_interval();
             log_warning("Failed to build cluster map; keeping the previous map and retrying later");
         }
