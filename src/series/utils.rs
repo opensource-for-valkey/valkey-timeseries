@@ -212,9 +212,12 @@ pub fn create_and_store_series<'a>(
     explicit_create: bool,
     add_compactions: bool,
 ) -> ValkeyResult<SeriesGuardMut<'a>> {
+    // Check before anything is stored, replicated or notified: a denial after
+    // the create would leave the key behind.
+    check_key_permissions(ctx, key, &AclPermissions::INSERT)?;
     create_and_store_internal(ctx, key, options, explicit_create, explicit_create)?;
 
-    let mut series = get_timeseries_mut(ctx, key, Some(AclPermissions::INSERT))?;
+    let mut series = get_timeseries_mut(ctx, key, None)?;
 
     if add_compactions {
         // If compactions are enabled, add the default compaction rules
