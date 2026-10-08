@@ -1,8 +1,9 @@
 use super::stats_fanout_command::{ClusterReading, ClusterValue, StatsFanoutCommand};
+use super::ts_debug::require_cluster;
 use crate::commands::CommandArgIterator;
 use crate::common::metrics::{self, MetricReading, MetricValue, Section};
 use crate::common::replies::*;
-use crate::fanout::{FanoutClientCommand, is_clustered};
+use crate::fanout::FanoutClientCommand;
 use metered::{HistogramSnapshot, Scalar};
 use valkey_module::{Context, ValkeyError, ValkeyResult};
 
@@ -136,8 +137,10 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// Reports module metrics, or starts them over.
 ///
 /// Syntax:
-/// - `TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]`
-/// - `TS._DEBUG STATS RESET [LOCAL]`
+/// - `TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]`
+/// - `TS._DEBUG STATS RESET [CLUSTER]`
+///
+/// Both read, or reset, the connected node alone unless `CLUSTER` is given.
 ///
 /// Without `VERBOSE`, replies with a `name => value` map covering the named sections
 /// (every section when none is given), section by section and by name within each. Counters
@@ -148,26 +151,26 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
 /// gauges alone. It is not replicated.
 ///
-/// In cluster mode both fan out to every node, replicas included (see [`StatsFanoutCommand`]):
+/// With `CLUSTER` both fan out to every node, replicas included (see [`StatsFanoutCommand`]):
 /// counters and histograms are summed, and each gauge's value becomes an `address => value`
-/// map, one entry per node. `LOCAL` reports, or resets, the connected node alone, in the
-/// single-node layout.
+/// map, one entry per node. `CLUSTER` on a standalone server is an error.
 pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     if args
         .peek()
         .is_some_and(|arg| is_keyword(arg.as_slice(), b"RESET"))
     {
         args.next();
-        let local = match args.next() {
+        let cluster = match args.next() {
             None => false,
-            Some(arg) if is_keyword(arg.as_slice(), b"LOCAL") && args.peek().is_none() => true,
+            Some(arg) if is_keyword(arg.as_slice(), b"CLUSTER") && args.peek().is_none() => true,
             Some(_) => {
                 return Err(ValkeyError::Str(
-                    "TSDB: STATS RESET takes no further arguments but LOCAL",
+                    "TSDB: STATS RESET takes no further arguments but CLUSTER",
                 ));
             }
         };
-        if !local && is_clustered(ctx) {
+        if cluster {
+            require_cluster(ctx)?;
             StatsFanoutCommand::reset().exec(ctx)?;
             return Ok(());
         }
@@ -177,14 +180,14 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
     }
 
     let mut verbose = false;
-    let mut local = false;
+    let mut cluster = false;
     let mut sections = Vec::new();
     for arg in args.by_ref() {
         let arg = arg.as_slice();
         if is_keyword(arg, b"VERBOSE") {
             verbose = true;
-        } else if is_keyword(arg, b"LOCAL") {
-            local = true;
+        } else if is_keyword(arg, b"CLUSTER") {
+            cluster = true;
         } else {
             let section = Section::parse(arg)
                 .ok_or_else(|| unknown_section(&String::from_utf8_lossy(arg)))?;
@@ -194,7 +197,8 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
         }
     }
 
-    if !local && is_clustered(ctx) {
+    if cluster {
+        require_cluster(ctx)?;
         StatsFanoutCommand::report(sections, verbose).exec(ctx)?;
         return Ok(());
     }

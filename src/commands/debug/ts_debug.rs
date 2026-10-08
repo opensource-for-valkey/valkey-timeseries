@@ -56,20 +56,30 @@ fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
     reply_with_usize(ctx, entry.allocated as usize);
 }
 
-/// Returns statistics about the string pool.
+/// Fails a `CLUSTER` request on a standalone server. The keyword, not the server mode, picks the
+/// reply layout, so a request never quietly gets the single-node one instead.
+pub(super) fn require_cluster(ctx: &Context) -> ValkeyResult<()> {
+    if is_clustered(ctx) {
+        Ok(())
+    } else {
+        Err(ValkeyError::Str(error_consts::DEBUG_CLUSTER_NOT_ENABLED))
+    }
+}
+
+/// Returns statistics about this node's string pool, or the cluster's with `CLUSTER`.
 ///
-/// TS._DEBUG STRINGPOOLSTATS [k] [LOCAL]
+/// TS._DEBUG STRINGPOOLSTATS [k] [CLUSTER]
 ///
-/// In cluster mode the statistics are summed over one primary per shard (see
-/// [`StringPoolSummary`] for what the sums mean); `LOCAL` reports this node's pool alone.
+/// `CLUSTER` sums the statistics over one primary per shard (see [`StringPoolSummary`] for what
+/// the sums mean).
 fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     // Parse optional k parameter (default: 0 for backward compatibility)
     let k = match args.peek() {
-        Some(arg) if !arg.as_slice().eq_ignore_ascii_case(b"LOCAL") => args.next_u64()? as usize,
+        Some(arg) if !arg.as_slice().eq_ignore_ascii_case(b"CLUSTER") => args.next_u64()? as usize,
         _ => 0,
     };
-    let local = match args.peek() {
-        Some(arg) if arg.as_slice().eq_ignore_ascii_case(b"LOCAL") => {
+    let cluster = match args.peek() {
+        Some(arg) if arg.as_slice().eq_ignore_ascii_case(b"CLUSTER") => {
             args.next();
             true
         }
@@ -78,7 +88,8 @@ fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
 
     args.done()?;
 
-    if !local && is_clustered(ctx) {
+    if cluster {
+        require_cluster(ctx)?;
         StringPoolStatsFanoutCommand::new(k).exec(ctx)?;
         return Ok(());
     }
@@ -158,28 +169,29 @@ pub(super) fn reply_with_string_pool_stats(
     }
 }
 
-/// Returns the label index's heap footprint for the selected database, or summed over every
-/// database with `ALLDBS`.
+/// Returns the heap footprint of this node's label index for the selected database, or summed
+/// over every database with `ALLDBS`.
 ///
-/// TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]
+/// TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]
 ///
-/// In cluster mode the footprint is summed over one node per shard, a replica where the shard
-/// has one (see [`IndexMemoryFanoutCommand`]); `LOCAL` reports this node's index alone.
+/// `CLUSTER` sums the footprint over one node per shard, a replica where the shard has one (see
+/// [`IndexMemoryFanoutCommand`]).
 fn index_memory(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     let mut all_dbs = false;
-    let mut local = false;
+    let mut cluster = false;
     for arg in args.by_ref() {
         let arg = arg.as_slice();
         if arg.eq_ignore_ascii_case(b"ALLDBS") && !all_dbs {
             all_dbs = true;
-        } else if arg.eq_ignore_ascii_case(b"LOCAL") && !local {
-            local = true;
+        } else if arg.eq_ignore_ascii_case(b"CLUSTER") && !cluster {
+            cluster = true;
         } else {
             return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
         }
     }
 
-    if !local && is_clustered(ctx) {
+    if cluster {
+        require_cluster(ctx)?;
         IndexMemoryFanoutCommand::new(all_dbs).exec(ctx)?;
         return Ok(());
     }
@@ -267,24 +279,24 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 
     const HELP_TEXT: &[(&str, &str)] = &[
         (
-            "TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]",
-            "Show module metrics, optionally for the named sections only (VERBOSE adds kind and description); in cluster mode counters and histograms are summed over every node and gauges listed per node, unless LOCAL",
+            "TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]",
+            "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node",
         ),
         (
-            "TS._DEBUG STATS RESET [LOCAL]",
-            "Start metric counters and histograms over (gauges are left alone), on every node in cluster mode unless LOCAL",
+            "TS._DEBUG STATS RESET [CLUSTER]",
+            "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER",
         ),
         (
             "TS._DEBUG INFLIGHT",
             "List this node's fanout requests with remote shares outstanding, oldest first",
         ),
         (
-            "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]",
-            "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)",
+            "TS._DEBUG STRINGPOOLSTATS [TOPK] [CLUSTER]",
+            "Show this node's String Interner Stats (CLUSTER sums them over shard primaries)",
         ),
         (
-            "TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]",
-            "Show label index heap usage for the selected db, or every db with ALLDBS (summed over one node per shard, replicas preferred, in cluster mode unless LOCAL)",
+            "TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]",
+            "Show this node's label index heap usage for the selected db, or every db with ALLDBS (CLUSTER sums it over one node per shard, replicas preferred)",
         ),
         (
             "TS._DEBUG QUERYINDEX <filter> [<filter> ...]",

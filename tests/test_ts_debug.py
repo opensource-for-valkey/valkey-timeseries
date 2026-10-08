@@ -29,8 +29,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert any(b'STRINGPOOLSTATS' in cmd for cmd in commands)
         assert any(b'LIST_CONFIGS' in cmd for cmd in commands)
         assert any(b'INDEXMEMORY' in cmd for cmd in commands)
-        assert b'TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]' in commands
-        assert b'TS._DEBUG STATS RESET [LOCAL]' in commands
+        assert b'TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]' in commands
+        assert b'TS._DEBUG STATS RESET [CLUSTER]' in commands
         assert b'TS._DEBUG INFLIGHT' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
@@ -85,18 +85,15 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         with pytest.raises(ResponseError, match="wrong number of arguments"):
             self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 10, 'bah')
 
-    def test_debug_stringpoolstats_local(self):
-        """LOCAL is accepted outside cluster mode, alone or after k, and reports the same pool"""
+    def test_debug_stringpoolstats_cluster_needs_cluster_mode(self):
+        """CLUSTER is refused outside cluster mode, alone or after k"""
         self.set_debug_mode()
-        self.client.execute_command('TS.CREATE', 'ts_local', 'LABELS', 'sensor', 'temp')
-
-        plain = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
-        local = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'local')
-        assert local == plain
-
-        with_top_k = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 3, 'LOCAL')
-        assert len(with_top_k) == 6
-        assert with_top_k[:4] == plain
+        for args in (('CLUSTER',), ('cluster',), (3, 'CLUSTER')):
+            with pytest.raises(ResponseError, match="CLUSTER requires cluster mode"):
+                self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', *args)
+        # LOCAL is gone: the default already reports this node.
+        with pytest.raises(ResponseError):
+            self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'LOCAL')
 
     def test_debug_replies_are_not_followed_by_a_stray_null(self):
         """Each subcommand writes its own reply; the handler must not add a Null after it"""
@@ -911,9 +908,10 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
         assert reply['series'] == 70
         assert reply['databases'] == 2
         assert reply['nodes'] == 1
-        # LOCAL is the same thing on a standalone server, in either order.
-        assert self.index_memory(client, 'ALLDBS', 'LOCAL') == reply
-        assert self.index_memory(client, 'local', 'alldbs') == reply
+        # CLUSTER is refused on a standalone server, in either order.
+        for args in (('ALLDBS', 'CLUSTER'), ('cluster', 'alldbs')):
+            with pytest.raises(ResponseError, match="CLUSTER requires cluster mode"):
+                client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
 
     def test_defaults_to_the_selected_db(self):
         client = self.server.get_new_client()
@@ -941,9 +939,10 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
         assert self.index_memory(client, 'ALLDBS')['databases'] == 1
 
     @pytest.mark.parametrize('args', [
-        ('LOCAL', 'extra'),
+        ('CLUSTER', 'extra'),
         ('ALLDBS', 'ALLDBS'),
-        ('LOCAL', 'LOCAL'),
+        ('CLUSTER', 'CLUSTER'),
+        ('LOCAL',),
     ])
     def test_rejects_bad_arguments(self, args):
         client = self.server.get_new_client()
@@ -1074,7 +1073,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > after['cron_ticks_total'])
 
     def test_reset_takes_no_arguments(self):
-        with pytest.raises(ResponseError, match="no further arguments but LOCAL"):
+        with pytest.raises(ResponseError, match="no further arguments but CLUSTER"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
 
     def test_verbose(self):
@@ -1104,14 +1103,17 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert [e[1].decode() for e in cron] == self.CRON_METRICS
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'
 
-    def test_local_is_the_same_on_a_standalone_server(self):
-        assert list(self.stats('cron', 'LOCAL')) == self.CRON_METRICS
-        assert list(self.stats('local')) == list(self.stats())
-        assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+    def test_cluster_needs_cluster_mode(self):
+        for args in (('CLUSTER',), ('cron', 'cluster'), ('VERBOSE', 'CLUSTER'), ('RESET', 'CLUSTER')):
+            with pytest.raises(ResponseError, match="CLUSTER requires cluster mode"):
+                self.client.execute_command('TS._DEBUG', 'STATS', *args)
+        # LOCAL is gone: the default already reports this node.
+        with pytest.raises(ResponseError, match="unknown STATS section 'LOCAL'"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'LOCAL')
 
-    def test_reset_takes_only_local(self):
-        with pytest.raises(ResponseError, match="no further arguments but LOCAL"):
-            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL', 'LOCAL')
+    def test_reset_takes_only_cluster(self):
+        with pytest.raises(ResponseError, match="no further arguments but CLUSTER"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER', 'CLUSTER')
 
     def test_inflight_is_empty_on_a_standalone_server(self):
         assert self.client.execute_command('TS._DEBUG', 'INFLIGHT') == []

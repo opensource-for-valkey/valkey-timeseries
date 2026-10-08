@@ -1,6 +1,7 @@
 """
-TS._DEBUG in cluster mode: STRINGPOOLSTATS sums every primary's string pool, and INDEXMEMORY sums
-one node per shard's label index, preferring replicas.
+TS._DEBUG in cluster mode. Every subcommand reports the connected node unless given CLUSTER: then
+STRINGPOOLSTATS sums every primary's string pool, INDEXMEMORY sums one node per shard's label
+index, preferring replicas, and STATS covers every node.
 """
 
 import threading
@@ -48,7 +49,7 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
                     'LABELS', 'env', 'prod', 'host', f'host-{i}-{"x" * (40 + i)}-{j}')
 
     def local_stats(self, k):
-        return [self.client_for_primary(i).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', k, 'LOCAL')
+        return [self.client_for_primary(i).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', k)
                 for i in range(self.CLUSTER_SIZE)]
 
     def test_sums_every_primary(self):
@@ -56,7 +57,7 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         self.populate(cluster_client)
 
         locals_ = self.local_stats(0)
-        merged = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
+        merged = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'CLUSTER')
         assert len(merged) == 4
 
         total = bucket_fields(merged[0])
@@ -85,7 +86,7 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         k = 50
 
         locals_ = self.local_stats(k)
-        merged = self.client_for_primary(1).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', k)
+        merged = self.client_for_primary(1).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', k, 'CLUSTER')
         assert len(merged) == 6
 
         by_ref = top_k_entries(merged[4])
@@ -100,12 +101,12 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         longest = {e['value'].decode() for e in by_size if b'x' * 40 in e['value']}
         assert len(longest) == 2 * self.CLUSTER_SIZE
 
-    def test_local_reports_one_node(self):
+    def test_default_reports_one_node(self):
         cluster_client = self.new_cluster_client()
         self.populate(cluster_client)
 
-        local = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'LOCAL')
-        merged = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
+        local = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
+        merged = self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'CLUSTER')
         assert bucket_fields(local[0])['count'] < bucket_fields(merged[0])['count']
 
     def test_peer_with_debug_mode_off_fails_the_command(self):
@@ -113,7 +114,7 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
         try:
             with pytest.raises(ResponseError):
-                self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS')
+                self.client_for_primary(0).execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'CLUSTER')
         finally:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
@@ -143,8 +144,8 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
     def test_sums_one_node_per_shard(self):
         self.populate()
 
-        locals_ = [index_memory(self.client_for_primary(i), 'LOCAL') for i in range(self.CLUSTER_SIZE)]
-        merged = index_memory(self.client_for_primary(0))
+        locals_ = [index_memory(self.client_for_primary(i)) for i in range(self.CLUSTER_SIZE)]
+        merged = index_memory(self.client_for_primary(0), 'CLUSTER')
 
         assert merged['nodes'] == self.CLUSTER_SIZE
         assert merged['series'] == 60
@@ -157,8 +158,8 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
     def test_replica_mirrors_its_primary(self):
         self.populate()
         for i in range(self.CLUSTER_SIZE):
-            primary = index_memory(self.client_for_primary(i), 'LOCAL')
-            replica = index_memory(self.replica(i), 'LOCAL')
+            primary = index_memory(self.client_for_primary(i))
+            replica = index_memory(self.replica(i))
             for field in self.EXACT_FIELDS:
                 assert replica[field] == primary[field], (i, field)
 
@@ -169,7 +170,7 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         for peer in peers:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
         try:
-            merged = index_memory(self.client_for_primary(0))
+            merged = index_memory(self.client_for_primary(0), 'CLUSTER')
             assert merged['nodes'] == self.CLUSTER_SIZE
             assert merged['series'] == 60
         finally:
@@ -181,21 +182,21 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
         try:
             with pytest.raises(ResponseError):
-                index_memory(self.client_for_primary(0))
+                index_memory(self.client_for_primary(0), 'CLUSTER')
         finally:
             replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
-    def test_local_reports_one_node(self):
+    def test_default_reports_one_node(self):
         self.populate()
-        local = index_memory(self.client_for_primary(0), 'LOCAL')
-        merged = index_memory(self.client_for_primary(0))
+        local = index_memory(self.client_for_primary(0))
+        merged = index_memory(self.client_for_primary(0), 'CLUSTER')
         assert local['nodes'] == 1
         assert local['series'] < merged['series']
 
 
 def fanout_stats(client):
     """This node's own `fanout` section of TS._DEBUG STATS, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout', 'LOCAL')
+    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -215,7 +216,7 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
 
     def mrange(self, *filters):
         """Runs TS.MRANGE with node 0 as coordinator; returns each node's fanout stats."""
@@ -259,7 +260,7 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
         try:
             with pytest.raises(ResponseError):
-                self.client_for_primary(0).execute_command('TS._DEBUG', 'INDEXMEMORY')
+                self.client_for_primary(0).execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
         finally:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
@@ -271,7 +272,7 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 def debug_stats(client, *sections):
     """This node's own TS._DEBUG STATS for the given sections, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', *sections, 'LOCAL')
+    flat = client.execute_command('TS._DEBUG', 'STATS', *sections)
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -294,7 +295,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
 
     def tag_per_primary(self):
         """One hash tag per primary, in primary order."""
@@ -362,7 +363,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
         try:
             with pytest.raises(ResponseError, match='Internal error in fanout operation'):
-                coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+                coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
         finally:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
@@ -456,7 +457,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_cluster_map_metrics(self):
         coordinator = self.primaries()[0]
-        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
 
         stats = debug_stats(coordinator, 'clustermap')
         assert stats['clustermap_refreshes_total'] >= 1
@@ -470,8 +471,8 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 
 def cluster_stats(client, *args):
-    """TS._DEBUG STATS across the cluster (no LOCAL), as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', *args)
+    """TS._DEBUG STATS across the cluster, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', *args, 'CLUSTER')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -481,7 +482,7 @@ def per_node(gauge):
 
 
 class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
-    """TS._DEBUG STATS without LOCAL: every node, replicas included, summed or listed per node."""
+    """TS._DEBUG STATS CLUSTER: every node, replicas included, summed or listed per node."""
 
     REPLICAS_COUNT = 1
 
@@ -504,8 +505,8 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
     def test_counters_and_histograms_sum_over_every_node(self):
         coordinator = self.client_for_primary(0)
         for client in self.all_nodes():
-            client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL')
-        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY')
+            client.execute_command('TS._DEBUG', 'STATS', 'RESET')
+        coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
 
         local = [debug_stats(client, 'fanout', 'cron') for client in self.all_nodes()]
         cluster = cluster_stats(coordinator, 'fanout', 'cron')
@@ -534,7 +535,7 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
     def test_resp3_gauges_are_maps_of_nodes(self):
         server = self.replication_groups[0].primary.server
         resp3 = Valkey(host=server.bind_ip, port=server.port, protocol=3)
-        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'cron')
+        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'cron', 'CLUSTER')
 
         assert isinstance(cluster, dict)
         values = cluster[b'cron_interval_seconds']
@@ -542,14 +543,14 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert {int(address.decode().rsplit(':', 1)[1]) for address in values} == self.node_ports()
         assert all(isinstance(value, float) for value in values.values())
 
-    def test_local_reports_one_node_in_the_single_node_layout(self):
+    def test_default_reports_one_node_in_the_single_node_layout(self):
         local = debug_stats(self.client_for_primary(0), 'cron')
         assert float(local['cron_interval_seconds']) > 0  # a scalar, not a per-node list
 
     def test_verbose_and_section_order_match_a_single_node(self):
         coordinator = self.client_for_primary(0)
         local_names = list(debug_stats(coordinator))
-        entries = coordinator.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
+        entries = coordinator.execute_command('TS._DEBUG', 'STATS', 'VERBOSE', 'CLUSTER')
         assert [e[1].decode() for e in entries] == local_names
         for entry in entries:
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
@@ -557,21 +558,21 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             if fields['kind'] == b'gauge':
                 assert len(per_node(fields['value'])) == len(self.node_ports()), fields['name']
 
-    def test_reset_starts_every_node_over(self):
+    def test_reset_cluster_starts_every_node_over(self):
         coordinator = self.client_for_primary(0)
         wait_for_true(lambda: all(debug_stats(c, 'cron')['cron_ticks_total'] >= 20
                                   for c in self.all_nodes()))
 
-        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER') == b'OK'
 
         for client in self.all_nodes():
             assert debug_stats(client, 'cron')['cron_ticks_total'] < 10
 
-    def test_reset_local_starts_only_this_node_over(self):
+    def test_reset_starts_only_this_node_over(self):
         coordinator, peer = self.client_for_primary(0), self.client_for_primary(1)
         wait_for_true(lambda: debug_stats(peer, 'cron')['cron_ticks_total'] >= 20)
 
-        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
 
         assert debug_stats(coordinator, 'cron')['cron_ticks_total'] < 10
         assert debug_stats(peer, 'cron')['cron_ticks_total'] >= 20
@@ -582,7 +583,7 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         try:
             with pytest.raises(ResponseError):
                 cluster_stats(self.client_for_primary(0))
-            # LOCAL needs only this node.
+            # Without CLUSTER, only this node is asked.
             assert debug_stats(self.client_for_primary(0), 'cron')
         finally:
             replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
@@ -630,8 +631,8 @@ class TestIndexMemoryMultiDbCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         replies = {}
         for db in self.SERIES_PER_SHARD:
             coordinator.select(db)
-            replies[db] = index_memory(coordinator)
-        all_dbs = index_memory(coordinator, 'ALLDBS')
+            replies[db] = index_memory(coordinator, 'CLUSTER')
+        all_dbs = index_memory(coordinator, 'ALLDBS', 'CLUSTER')
 
         for db, count in self.SERIES_PER_SHARD.items():
             assert replies[db]['series'] == count * self.CLUSTER_SIZE, db
@@ -644,4 +645,4 @@ class TestIndexMemoryMultiDbCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         # An empty database reports zero everywhere.
         coordinator.select(5)
-        assert index_memory(coordinator)['series'] == 0
+        assert index_memory(coordinator, 'CLUSTER')['series'] == 0

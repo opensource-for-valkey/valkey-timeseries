@@ -54,6 +54,14 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 Replies made of named fields are RESP3 maps. A RESP2 client gets the same pairs as a flat array
 of alternating keys and values, in the same order. Over RESP2, doubles arrive as bulk strings.
 
+### Cluster scope
+
+Every subcommand reports, or acts on, the node you are connected to. `STATS`, `STATS RESET`,
+`STRINGPOOLSTATS` and `INDEXMEMORY` also take a `CLUSTER` keyword, which fans the request out
+and combines the answers as each subcommand describes. Every node asked must have `debug-mode`
+enabled, or the command fails. On a standalone server `CLUSTER` is an error
+(`TSDB: CLUSTER requires cluster mode`), so a given request always gets the same reply layout.
+
 ---
 
 ### TS._DEBUG HELP
@@ -77,12 +85,10 @@ TS._DEBUG HELP
 ```
 
 ```
- 1) "TS._DEBUG STATS [section ...] [VERBOSE]"
- 2) "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description)"
- 3) "TS._DEBUG STATS RESET"
- 4) "Zero this node's metric counters and histograms (gauges are left alone)"
- 5) "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]"
- 6) "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)"
+ 1) "TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]"
+ 2) "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node"
+ 3) "TS._DEBUG STATS RESET [CLUSTER]"
+ 4) "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER"
  ...
 ```
 
@@ -94,11 +100,11 @@ Reports module metrics: events that happen inside a command or in background wor
 server's own `INFO commandstats` / `latencystats` cannot see. Counters are collected whether or
 not `debug-mode` is on; only reading them needs it.
 
-Each node counts what happens on it. In cluster mode the command fans out to every node,
-replicas included, and combines their metrics: counters and histograms are summed, and each
-gauge's value becomes a list with one value per node (summing refresh intervals or queue depths
-across nodes would hide which node they describe). `LOCAL` reports the connected node alone.
-Every node must have `debug-mode` enabled, or the command fails.
+Each node counts what happens on it, and `STATS` reports the connected node's metrics. With
+`CLUSTER` the command fans out to every node, replicas included, and combines their metrics:
+counters and histograms are summed, and each gauge's value becomes a map with one value per node
+(summing refresh intervals or queue depths across nodes would hide which node they describe).
+Every node must have `debug-mode` enabled, or a `CLUSTER` request fails.
 
 The cluster view counts itself: the fan-out that collects it is an operation on the coordinator,
 like any other. A reply is not an atomic snapshot, on one node or across nodes: two values may
@@ -107,8 +113,8 @@ straddle an update.
 ### Syntax
 
 ```bash
-TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL]
-TS._DEBUG STATS RESET [LOCAL]
+TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]
+TS._DEBUG STATS RESET [CLUSTER]
 ```
 
 ### Arguments
@@ -117,8 +123,8 @@ TS._DEBUG STATS RESET [LOCAL]
 |-----------|----------|-----------------------------------------------------------------------------------------------|
 | `section` | No       | Report only these sections (case-insensitive, repeatable). An unknown name is an error that lists the valid ones |
 | `VERBOSE` | No       | Report each metric's section, kind and description alongside its value                         |
-| `RESET`   | No       | Start every counter and histogram over from zero, on every node in cluster mode. Gauges are left alone. Takes no other argument but `LOCAL` |
-| `LOCAL`   | No       | In cluster mode, report (or reset) the connected node alone, in the single-node layout          |
+| `RESET`   | No       | Start the connected node's counters and histograms over from zero. Gauges are left alone. Takes no other argument but `CLUSTER` |
+| `CLUSTER` | No       | Report (or reset) every node, replicas included, instead of the connected one. An error on a standalone server |
 
 ### Return Value
 
@@ -134,7 +140,7 @@ the unit is fractional (seconds). A histogram's value is a map:
 
 The `+Inf` bucket is not listed: its count is `count`.
 
-**In cluster mode** (without `LOCAL`) the layout is the same, except that a gauge's value is a
+**With `CLUSTER`** the layout is the same, except that a gauge's value is a
 map from node address (`host:port`) to value, one entry per node, sorted by address.
 Counters and histogram counts are summed over the nodes. A histogram whose buckets differ from the others' (a node on another version) is left out of the sum, with a warning in
 that coordinator's log. Duration histograms are in seconds,
@@ -325,14 +331,14 @@ its timeout fires. On a standalone server the list is always empty.
 Returns memory usage and efficiency statistics for the global string interning pool. The pool deduplicates repeated
 label names and values across all time series.
 
-In cluster mode the command fans out to one primary per shard and sums their pools; pass `LOCAL`
-to report the node you are connected to alone. Every primary must have `debug-mode` enabled, or
-the command fails. See **Cluster mode** below for how the sums read.
+The command reports the pool of the node you are connected to. With `CLUSTER` it fans out to one
+primary per shard and sums their pools; every primary must have `debug-mode` enabled, or the
+command fails. See **With `CLUSTER`** below for how the sums read.
 
 ### Syntax
 
 ```bash
-TS._DEBUG STRINGPOOLSTATS [k] [LOCAL]
+TS._DEBUG STRINGPOOLSTATS [k] [CLUSTER]
 ```
 
 ### Arguments
@@ -340,7 +346,7 @@ TS._DEBUG STRINGPOOLSTATS [k] [LOCAL]
 | Argument | Type    | Required | Description                                                                             |
 |----------|---------|----------|-----------------------------------------------------------------------------------------|
 | `k`      | integer | No       | If provided and greater than `0`, include top-K entries ranked by ref count and by size |
-| `LOCAL`  | keyword | No       | In cluster mode, report this node's pool only instead of summing every primary's         |
+| `CLUSTER` | keyword | No      | Sum every shard primary's pool instead of reporting this node's. An error on a standalone server |
 
 ### Return Value
 
@@ -415,7 +421,7 @@ Each `TopKEntry` is a map of 4 fields:
 | `bytes`     | integer | Logical byte length of the string                                  |
 | `allocated` | integer | Total allocated memory for this string (Arc overhead + data)       |
 
-#### Cluster mode
+#### With `CLUSTER`
 
 Each node has its own pool, and replicas are left out because they mirror their primary's
 labels. The reply has the same shape as on a single node, with these meanings:
@@ -442,10 +448,10 @@ Statistics with top 10 strings by ref count and size:
 TS._DEBUG STRINGPOOLSTATS 10
 ```
 
-The same, for the connected node only in cluster mode:
+The same, summed over the cluster's shard primaries:
 
 ```aiignore
-TS._DEBUG STRINGPOOLSTATS 10 LOCAL
+TS._DEBUG STRINGPOOLSTATS 10 CLUSTER
 ```
 
 ---

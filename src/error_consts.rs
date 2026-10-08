@@ -46,6 +46,7 @@ pub const MISSING_DUPLICATE_POLICY: &str = "TSDB: Couldn't parse DUPLICATE_POLIC
 pub const NO_REPLY_WRITTEN: &str =
     "TSDB: internal error: the command failed before replying; see the server log";
 pub const DEBUG_MODE_DISABLED: &str = "TSDB: TS._DEBUG is disabled. Set the 'ts.debug-mode' configuration parameter to yes to enable it";
+pub const DEBUG_CLUSTER_NOT_ENABLED: &str = "TSDB: CLUSTER requires cluster mode";
 pub const INVALID_DURATION: &str = "TSDB: invalid duration";
 pub const INVALID_INTEGER: &str = "TSDB: invalid integer";
 pub const INVALID_JOIN_KEY: &str = "TSDB: invalid join key";

@@ -1,8 +1,9 @@
 //! `TS._DEBUG`: internal, undocumented-API introspection, gated on `debug-mode`.
 //!
 //! [`ts_debug`] holds the entry point and dispatcher; each larger subcommand has its own module.
-//! `STATS`, `STRINGPOOLSTATS` and `INDEXMEMORY` fan out across the cluster, so their fanout
-//! commands live here too and are registered with the rest in `commands::register_fanout_operations`.
+//! `STATS`, `STRINGPOOLSTATS` and `INDEXMEMORY` report this node unless given `CLUSTER`, which
+//! fans them out across the cluster; their fanout commands live here too and are registered with
+//! the rest in `commands::register_fanout_operations`.
 
 mod configs;
 mod index_memory_fanout_command;

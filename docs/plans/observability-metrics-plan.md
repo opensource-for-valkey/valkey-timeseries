@@ -20,8 +20,8 @@ subcommand. What exists today:
 | Surface | Exposes | Gap |
 |---|---|---|
 | `INFO ts_memory` ([module_info.rs:25-53](../../src/common/module_info.rs#L25-L53)) | index bytes by component, term/series/db counts, interner count and bytes | memory only. **Not O(1) any more**: `index_memory_usage()` ([memory.rs:203-209](../../src/series/index/memory.rs#L203-L209)) walks every term and every id→key entry in 250 µs lock-released slices |
-| `TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL]` ([ts_debug.rs:163-213](../../src/commands/debug/ts_debug.rs#L163-L213)) | same walk as `INFO ts_memory`, camelCase keys | fans out cluster-wide by default (`ReplicaPerShard`, summed) |
-| `TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]` | interner distribution, top-K | O(pool) walk; fans out by default |
+| `TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]` ([ts_debug.rs:163-213](../../src/commands/debug/ts_debug.rs#L163-L213)) | same walk as `INFO ts_memory`, camelCase keys | node-local; `CLUSTER` fans out (`ReplicaPerShard`, summed) |
+| `TS._DEBUG STRINGPOOLSTATS [TOPK] [CLUSTER]` | interner distribution, top-K | O(pool) walk; node-local, `CLUSTER` fans out |
 | `TS._DEBUG QUERYINDEX` | node-local index query | test hook, not a metric |
 | `TS._DEBUG LIST_CONFIGS [VERBOSE]` | config roster from `CONFIGS` | not metrics. HELP advertises `[APP\|DEV\|HIDDEN]`, which [debug/configs.rs:68-77](../../src/commands/debug/configs.rs#L68-L77) rejects |
 | `TS._DEBUG HELP` ([ts_debug.rs:238-260](../../src/commands/debug/ts_debug.rs#L238-L260)) | advertises `SHOW_INFO` | **`SHOW_INFO` still has no implementation**; the dispatcher ([:290-306](../../src/commands/debug/ts_debug.rs#L290-L306)) returns "Unknown subcommand" |
@@ -106,9 +106,9 @@ Counters are always collected; only the read surface is gated (`INFO ts_stats` l
 a curated subset).
 
 **Counted per node, viewed per cluster.** Every value is counted on the node where the event
-happens, replicas included. `TS._DEBUG STATS` fans out to every node by default, following the
-`STRINGPOOLSTATS`/`INDEXMEMORY` pattern (`LOCAL` opt-out): counters and histograms sum, gauges
-are reported per node (Phase 6).
+happens, replicas included. `TS._DEBUG STATS` reports the connected node; with `CLUSTER` it fans
+out to every node, following the `STRINGPOOLSTATS`/`INDEXMEMORY` pattern: counters and histograms
+sum, gauges are reported per node (Phase 6).
 
 **Count where the parent process can see it.** `rdb_save`, the index aux save
 (`build_aux_payload`), and `aof_rewrite` run in the `BGSAVE` / AOF-rewrite fork child — and the ASM
@@ -655,8 +655,11 @@ As built: the `cmd::debug_stats` fanout op ([stats_fanout_command.rs](../../src/
 - **Targets are every node** (`FanoutTarget::All`), not one per shard as for `INDEXMEMORY`: each
   node counts only what happened on it, and a replica's counts (replicated writes, fanout
   requests it served) are not its primary's.
-- **`RESET` fans out too**, with the same `LOCAL` opt-out, so a cluster read after a cluster
-  reset is coherent.
+- **`RESET` fans out too** with `CLUSTER`, so a cluster read after a cluster reset is coherent.
+  Like every `TS._DEBUG` subcommand it is node-local by default: a debug read must still answer
+  when a peer is down or the fanout itself is the problem, it should not count itself into the
+  fanout metrics it reports, and a reset that wipes every node's window should be asked for.
+  `CLUSTER` on a standalone server is an error, so the keyword alone picks the reply layout.
 - **Gauges** reply as an `address => value` map per metric, sorted by address — the same
   reply layout otherwise, so `VERBOSE` and section filters work unchanged.
 - **Version skew:** each metric travels by name. A section a node doesn't know is skipped; a
@@ -664,11 +667,11 @@ As built: the `cmd::debug_stats` fanout op ([stats_fanout_command.rs](../../src/
   doesn't know it, sorted last); a histogram with different bounds, or a name whose kind differs
   between nodes, is left out of the merge with a warning in the coordinator's log.
 - The cluster view counts itself (its fan-out is an operation on the coordinator). Tests that
-  read one node's own counters use `LOCAL`.
+  read one node's own counters leave `CLUSTER` off.
 
 Original sketch:
 
-`STATS` fans out by default with a `LOCAL` opt-out, following
+`STATS` fans out by default with a `LOCAL` opt-out (since flipped: node-local, `CLUSTER` to fan out), following
 `commands/debug/index_memory_fanout_command.rs`: counters and histograms summed, gauges reported per node. Adds
 an eleventh fanout op and a proto message (regenerate under `proto/v1/generated/`).
 
