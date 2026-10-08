@@ -1,5 +1,6 @@
 use super::fanout_codec::generated::StringPoolTopKEntry;
 use super::ts_debug_configs::list_configs_cmd;
+use super::ts_debug_stats::stats_cmd;
 use super::ts_index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_memory};
 use super::ts_string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
 use crate::commands::CommandArgIterator;
@@ -236,7 +237,14 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     args.done()?;
 
     const HELP_TEXT: &[(&str, &str)] = &[
-        ("TS._DEBUG SHOW_INFO", "Show Info Variable Information"),
+        (
+            "TS._DEBUG STATS [section ...] [VERBOSE]",
+            "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description)",
+        ),
+        (
+            "TS._DEBUG STATS RESET",
+            "Zero this node's metric counters and histograms (gauges are left alone)",
+        ),
         (
             "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]",
             "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)",
@@ -250,8 +258,8 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
             "Query this node's local index only (no cluster fanout)",
         ),
         (
-            "TS._DEBUG LIST_CONFIGS [VERBOSE] [APP|DEV|HIDDEN]",
-            "List config names (default) or VERBOSE details, optionally filtered by visibility",
+            "TS._DEBUG LIST_CONFIGS [VERBOSE]",
+            "List config names (default) or VERBOSE details",
         ),
         (
             "TS._DEBUG PANIC_NEXT_ANALYSIS_JOB",
@@ -292,6 +300,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let keyword = itr.next_str()?.to_ascii_uppercase();
 
     let result = match keyword.as_str() {
+        "STATS" => stats_cmd(ctx, &mut itr),
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),

@@ -41,7 +41,10 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | Subcommand        | Description                                             |
 |-------------------|---------------------------------------------------------|
 | `HELP`            | Display available subcommands and brief descriptions    |
+| `STATS`           | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
+| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_memory`) |
+| `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
 | `PANIC_NEXT_ANALYSIS_JOB` | Make the next background analysis job (`TS.OUTLIERS` on a large range) panic, to test that its client still gets an error reply |
 
@@ -68,12 +71,125 @@ TS._DEBUG HELP
 ```
 
 ```
-1) "TS._DEBUG SHOW_INFO"
-2) "Show Info Variable Information"
-3) "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]"
-4) "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)"
-5) "TS._DEBUG LIST_CONFIGS [VERBOSE] [APP|DEV|HIDDEN]"
-6) "List config names (default) or VERBOSE details, optionally filtered by visibility"
+ 1) "TS._DEBUG STATS [section ...] [VERBOSE]"
+ 2) "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description)"
+ 3) "TS._DEBUG STATS RESET"
+ 4) "Zero this node's metric counters and histograms (gauges are left alone)"
+ 5) "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL]"
+ 6) "Show String Interner Stats (summed over shard primaries in cluster mode unless LOCAL)"
+ ...
+```
+
+---
+
+### TS._DEBUG STATS
+
+Reports module metrics for the node you are connected to: events that happen inside a command
+or in background work, which the server's own `INFO commandstats` / `latencystats` cannot see.
+Counters are collected whether or not `debug-mode` is on; only reading them needs it.
+
+Values are node-local, including in cluster mode. A reply is not an atomic snapshot: two values
+in one reply may straddle an update.
+
+### Syntax
+
+```bash
+TS._DEBUG STATS [section ...] [VERBOSE]
+TS._DEBUG STATS RESET
+```
+
+### Arguments
+
+| Argument  | Required | Description                                                                                   |
+|-----------|----------|-----------------------------------------------------------------------------------------------|
+| `section` | No       | Report only these sections (case-insensitive, repeatable). An unknown name is an error that lists the valid ones |
+| `VERBOSE` | No       | Report each metric's section, kind and description alongside its value                         |
+| `RESET`   | No       | Start every counter and histogram on this node over from zero. Gauges are left alone. Takes no other argument |
+
+### Return Value
+
+**Without `VERBOSE`:** a flat array of alternating metric name and value, in a fixed order
+(by section, then by name within a section). Counters are integers; gauges are integers, or doubles when
+the unit is fractional (seconds). A histogram's value is a flat key/value array:
+
+| Field     | Type    | Description                                                                         |
+|-----------|---------|-------------------------------------------------------------------------------------|
+| `count`   | integer | Number of observations                                                              |
+| `sum`     | double  | Sum of the observations, in the metric's unit                                       |
+| `buckets` | array   | `[le, count]` pairs for the finite bounds; `le` is a double, `count` is cumulative (observations `<= le`) |
+
+The `+Inf` bucket is not listed: its count is `count`. Duration histograms are in seconds,
+with 24 bounds at powers of two from 1 µs (`0.000001`) to 2²³ µs (about 8.4 s).
+
+Over RESP2, doubles arrive as bulk strings.
+
+**With `VERBOSE`:** an array with one flat array of 10 alternating key/value fields per metric:
+`name`, `section`, `kind` (`counter`, `gauge` or `histogram`), `value`, `description`.
+
+**`RESET`:** `OK`.
+
+### Metrics
+
+Names follow OpenMetrics conventions: counters end in `_total`, and a unit suffix names the
+unit (durations are in seconds).
+
+`RESET` does not change the values underneath, which only ever increase (as a Prometheus-style
+scraper expects). It records them as a baseline, and `STATS` reports counters and histograms
+relative to it.
+
+| Name                           | Kind      | Description                                                                          |
+|--------------------------------|-----------|--------------------------------------------------------------------------------------|
+| `cron_interval_seconds`        | gauge     | Time between cron ticks, derived from the server's `hz` (a double)                    |
+| `cron_tick_duration_seconds`   | histogram | Main-thread time per cron tick spent dispatching background tasks                    |
+| `cron_ticks_total`             | counter   | Cron ticks that ran the background-task scheduler                                    |
+| `cron_ticks_skipped_total`     | counter   | Cron ticks skipped because the server was loading or shutting down                   |
+| `exec_fanout_queued`           | gauge     | Jobs waiting for a worker on the `ts-fanout-request` lane (peer requests and local fan-out shares) |
+| `exec_fanout_running`          | gauge     | Jobs a worker is running on the `ts-fanout-request` lane                             |
+| `exec_fanout_rejected_total`   | counter   | Jobs refused because the `ts-fanout-request` queue was full (answered as busy)       |
+| `exec_analysis_queued`         | gauge     | Jobs waiting for a worker on the `ts-analysis` lane                                  |
+| `exec_analysis_running`        | gauge     | Jobs a worker is running on the `ts-analysis` lane                                   |
+| `exec_analysis_rejected_total` | counter   | Jobs refused because the `ts-analysis` queue was full                                |
+| `fanout_requests_sent_total`   | counter   | Fanout requests sent to peers over the cluster bus, one per peer                     |
+| `fanout_request_sent_bytes_total` | counter | Payload bytes of those requests                                                      |
+| `fanout_responses_sent_total`  | counter   | Fanout responses sent back to coordinators                                           |
+| `fanout_response_sent_bytes_total` | counter | Payload bytes of those responses                                                    |
+| `fanout_error_responses_sent_total` | counter | Fanout error responses sent back to coordinators                                   |
+| `fanout_error_response_sent_bytes_total` | counter | Payload bytes of those error responses                                       |
+
+The `fanout_*` byte counts are the payloads this node handed to the cluster bus, counted by the
+sender: a request to several peers counts once per peer, and the cluster bus's own framing is
+not included. A fan-out's local share never crosses the bus and is not counted. On a standalone
+server they stay at zero.
+
+### Examples
+
+```
+TS._DEBUG STATS cron
+```
+
+```
+1) "cron_interval_seconds"
+2) "0.1"
+3) "cron_tick_duration_seconds"
+4) 1) "count"
+   2) (integer) 1843
+   3) "sum"
+   4) "4.16291e-4"
+   5) "buckets"
+   6)  1) 1) "0.000001"
+          2) (integer) 512
+       ...
+5) "cron_ticks_total"
+6) (integer) 1843
+7) "cron_ticks_skipped_total"
+8) (integer) 0
+```
+
+Start a clean window, then read one section with descriptions:
+
+```
+TS._DEBUG STATS RESET
+TS._DEBUG STATS exec VERBOSE
 ```
 
 ---
@@ -204,19 +320,6 @@ The same, for the connected node only in cluster mode:
 
 ```aiignore
 TS._DEBUG STRINGPOOLSTATS 10 LOCAL
-```
-
----
-
-### TS._DEBUG LIST_CONFIGS
-
-Lists the module's configuration parameters. In compact mode (default), returns only parameter names. In verbose mode,
-returns detailed metadata and the current runtime value for each parameter.
-
-### Syntax
-
-```bash
-TS._DEBUG LIST_CONFIGS
 ```
 
 ---

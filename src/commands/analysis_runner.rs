@@ -30,6 +30,11 @@ static ANALYSIS_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
 /// Integration tests use it to check that a failed job still answers its client.
 static PANIC_NEXT_ANALYSIS_JOB: AtomicBool = AtomicBool::new(false);
 
+/// The load on the analysis lane, for `TS._DEBUG STATS`. Never starts the workers.
+pub(crate) fn analysis_lane_stats() -> ExecutorStats {
+    ANALYSIS_EXECUTOR.stats()
+}
+
 /// Makes the next job on the analysis lane panic. For tests; see [`PANIC_NEXT_ANALYSIS_JOB`].
 pub(crate) fn panic_next_analysis_job() {
     PANIC_NEXT_ANALYSIS_JOB.store(true, Ordering::Relaxed);

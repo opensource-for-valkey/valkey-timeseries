@@ -46,6 +46,7 @@ mod ts_create;
 mod ts_createrule;
 mod ts_debug;
 mod ts_debug_configs;
+mod ts_debug_stats;
 mod ts_del;
 mod ts_deleterule;
 mod ts_get;
@@ -83,6 +84,7 @@ mod utils;
 // re-exported here for the positional command table. Cross-module parser helpers are imported
 // via their defining module path (e.g. `crate::commands::ts_create::parse_series_options`).
 // Only modules whose items are consumed through `crate::commands::*` are re-exported below.
+pub(crate) use analysis_runner::analysis_lane_stats;
 pub use command_parser::*;
 pub use ts_debug::*;
 pub use ts_mget::*;

@@ -22,6 +22,9 @@ hashify = { version = "0.3" }
 itertools = "0.15.0"
 linkme = "0.3"
 logos = "0.16"
+# Module metrics (`common::metrics`, `TS._DEBUG STATS`). Pinned: 0.10 is a release candidate,
+# and its API differs wholesale from 0.9's.
+metered = "=0.10.0-rc.1"
 # `persistent-pool-rayon`: run `.par()` on a dedicated rayon-core pool that orx builds lazily
 # (the module's shared pool: `common::threads` sends `join` and the `*_rayon` adapters there too;
 # sized to `ORX_NUM_THREADS` from `ts-num-threads`, capped at the core count). 4.0's default persistent pool blocks callers without helping, so the nested

@@ -5,10 +5,11 @@
 //! commands or peer requests cannot create a thread per request. The GIL serializes most of this work anyway,
 //! so a handful of workers keeps the part that runs outside it (decoding, encoding) parallel.
 //!
-//! Two lanes, so that neither kind of work can starve the other: a node flooded with its own
-//! clients' fan-outs still answers the requests its peers are waiting on, and the reverse.
+//! One lane carries both kinds of work: requests from peer coordinators and this node's own
+//! share of a fan-out it coordinates, so the local share runs on the same kind of worker as
+//! the remote ones.
 
-use crate::common::threads::{BoundedExecutor, Capacity, lane_workers};
+use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
 
 /// Queued jobs per lane before submissions are rejected as busy. A client has at most one
 /// blocked fan-out at a time, so this is only reached by a burst from that many clients (or
@@ -21,3 +22,8 @@ pub(super) static PEER_REQUEST_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     lane_workers,
     Capacity::Fixed(QUEUE_CAPACITY),
 );
+
+/// The load on the fan-out lane, for `TS._DEBUG STATS`. Never starts the workers.
+pub(crate) fn request_lane_stats() -> ExecutorStats {
+    PEER_REQUEST_EXECUTOR.stats()
+}

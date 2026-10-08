@@ -28,6 +28,13 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         commands = [result[i] for i in range(0, len(result), 2)]
         assert any(b'STRINGPOOLSTATS' in cmd for cmd in commands)
         assert any(b'LIST_CONFIGS' in cmd for cmd in commands)
+        assert any(b'INDEXMEMORY' in cmd for cmd in commands)
+        assert b'TS._DEBUG STATS [section ...] [VERBOSE]' in commands
+        assert b'TS._DEBUG STATS RESET' in commands
+        # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
+        # and LIST_CONFIGS arguments it rejects.
+        assert not any(b'SHOW_INFO' in cmd for cmd in commands)
+        assert not any(b'HIDDEN' in cmd for cmd in commands)
 
     def test_debug_help_no_extra_args(self):
         """Test TS._DEBUG HELP rejects extra arguments"""
@@ -93,7 +100,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
     def test_debug_replies_are_not_followed_by_a_stray_null(self):
         """Each subcommand writes its own reply; the handler must not add a Null after it"""
         self.set_debug_mode()
-        for args in (('STRINGPOOLSTATS',), ('STRINGPOOLSTATS', 2), ('HELP',), ('LIST_CONFIGS',)):
+        for args in (('STRINGPOOLSTATS',), ('STRINGPOOLSTATS', 2), ('HELP',), ('LIST_CONFIGS',),
+                     ('STATS',), ('STATS', 'cron', 'VERBOSE'), ('STATS', 'RESET')):
             self.client.execute_command('TS._DEBUG', *args)
             # A stray Null would be read as the reply to the next command.
             assert self.client.execute_command('PING') is True, args
@@ -293,6 +301,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
                 ('LIST_CONFIGS',),
                 ('LIST_CONFIGS', 'VERBOSE'),
                 ('STRINGPOOLSTATS',),
+                ('STATS',),
+                ('STATS', 'RESET'),
                 ('INVALID_SUBCOMMAND',),
                 (),
             ):
@@ -897,3 +907,134 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
         client = self.server.get_new_client()
         with pytest.raises(ResponseError):
             client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
+
+
+class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
+    """TS._DEBUG STATS: the module metrics registries."""
+
+    # Within a section, metrics are sorted by family name (a counter's name before `_total`).
+    CRON_METRICS = ['cron_interval_seconds', 'cron_tick_duration_seconds', 'cron_ticks_total',
+                    'cron_ticks_skipped_total']
+    EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
+                    'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
+    FANOUT_METRICS = ['fanout_error_response_sent_bytes_total', 'fanout_error_responses_sent_total',
+                      'fanout_request_sent_bytes_total', 'fanout_requests_sent_total',
+                      'fanout_response_sent_bytes_total', 'fanout_responses_sent_total']
+    ALL_METRICS = CRON_METRICS + EXEC_METRICS + FANOUT_METRICS
+    HISTOGRAMS = {'cron_tick_duration_seconds'}
+    DOUBLE_GAUGES = {'cron_interval_seconds'}
+    DURATION_BUCKETS = 24
+
+    def stats(self, *args):
+        flat = self.client.execute_command('TS._DEBUG', 'STATS', *args)
+        assert len(flat) % 2 == 0, flat
+        names = [flat[i].decode() for i in range(0, len(flat), 2)]
+        assert len(names) == len(set(names)), names
+        return {name: flat[i * 2 + 1] for i, name in enumerate(names)}
+
+    @staticmethod
+    def histogram(value):
+        """Parses a histogram reply. Doubles arrive as bulk strings over RESP2."""
+        fields = {value[i].decode(): value[i + 1] for i in range(0, len(value), 2)}
+        assert sorted(fields) == ['buckets', 'count', 'sum'], fields
+        return {
+            'count': fields['count'],
+            'sum': float(fields['sum']),
+            'buckets': [(float(le), count) for le, count in fields['buckets']],
+        }
+
+    def test_reports_sections_in_order_and_metrics_by_name(self):
+        flat = self.client.execute_command('TS._DEBUG', 'STATS')
+        names = [flat[i].decode() for i in range(0, len(flat), 2)]
+        assert names == self.ALL_METRICS
+
+    def test_section_filter(self):
+        assert list(self.stats('cron')) == self.CRON_METRICS
+        assert list(self.stats('EXEC')) == self.EXEC_METRICS
+        assert list(self.stats('fanout')) == self.FANOUT_METRICS
+        # Request order and repeats don't change the reply.
+        assert list(self.stats('exec', 'cron', 'exec')) == self.CRON_METRICS + self.EXEC_METRICS
+
+    def test_unknown_section_lists_valid_ones(self):
+        with pytest.raises(ResponseError, match="unknown STATS section 'bogus'.*cron, exec, fanout"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'bogus')
+
+    def test_value_types(self):
+        stats = self.stats()
+        for name, value in stats.items():
+            if name in self.HISTOGRAMS:
+                self.histogram(value)
+            elif name in self.DOUBLE_GAUGES:
+                assert float(value) > 0, (name, value)
+            else:
+                assert isinstance(value, int), (name, value)
+                assert value >= 0, (name, value)
+        # Nothing has been sent to either lane, and a standalone server has no cluster bus.
+        assert stats['exec_fanout_rejected_total'] == 0
+        assert stats['exec_analysis_rejected_total'] == 0
+        assert all(stats[name] == 0 for name in self.FANOUT_METRICS)
+
+    def test_cron_ticks_advance(self):
+        start = self.stats('cron')['cron_ticks_total']
+        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > start + 2)
+
+    def test_histogram_shape(self):
+        tick_duration = lambda: self.histogram(self.stats('cron')['cron_tick_duration_seconds'])
+        wait_for_true(lambda: tick_duration()['count'] > 0)
+        hist = tick_duration()
+        buckets = hist['buckets']
+        assert len(buckets) == self.DURATION_BUCKETS
+        # Powers of two from 1 us, in seconds.
+        for i, (le, _) in enumerate(buckets):
+            assert le == pytest.approx((1 << i) / 1e6), (i, le)
+        counts = [count for _, count in buckets]
+        assert counts == sorted(counts), 'bucket counts must be cumulative'
+        # Observations above the last bound make up the difference from count.
+        assert counts[-1] <= hist['count']
+        assert hist['sum'] >= 0
+
+    def test_reset_starts_counters_and_histograms_over_but_not_gauges(self):
+        # Let the counter build up enough that a reset is unmistakable.
+        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] >= 20)
+        before = self.stats('cron')
+
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+        after = self.stats('cron')
+
+        # The cron keeps ticking, so allow the few ticks between the reset and the read.
+        assert after['cron_ticks_total'] < before['cron_ticks_total']
+        assert after['cron_ticks_total'] < 10
+        assert self.histogram(after['cron_tick_duration_seconds'])['count'] < 10
+        assert after['cron_interval_seconds'] == before['cron_interval_seconds']
+        # The reset is a view: the cron's own schedule carries on, and so does the count.
+        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > after['cron_ticks_total'])
+
+    def test_reset_takes_no_arguments(self):
+        with pytest.raises(ResponseError, match="no further arguments"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
+
+    def test_verbose(self):
+        entries = self.client.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
+        assert len(entries) == len(self.ALL_METRICS)
+        for entry in entries:
+            assert len(entry) == 10, entry
+            fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
+            assert list(fields) == ['name', 'section', 'kind', 'value', 'description']
+            name = fields['name'].decode()
+            section = fields['section'].decode()
+            kind = fields['kind'].decode()
+            assert name.startswith(section + '_')
+            assert kind in ('counter', 'gauge', 'histogram')
+            assert name.endswith('_total') == (kind == 'counter'), name
+            assert fields['description'], name
+            if kind == 'histogram':
+                self.histogram(fields['value'])
+            elif name in self.DOUBLE_GAUGES:
+                float(fields['value'])
+            else:
+                assert isinstance(fields['value'], int), name
+
+        # VERBOSE combines with a section filter, in either position.
+        cron = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'cron')
+        assert [e[1].decode() for e in cron] == self.CRON_METRICS
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'

@@ -1,5 +1,6 @@
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_debug;
+use crate::common::metrics::{CRON_TICK_DURATION, CRON_TICKS_SKIPPED};
 use crate::is_shutting_down;
 use crate::series::index::TIMESERIES_INDEX;
 use crate::series::index::persistence::is_loading_active;
@@ -8,7 +9,7 @@ use crate::series::tasks::{
 };
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use valkey_module::Context;
 use valkey_module_macros::cron_event_handler;
 
@@ -27,9 +28,16 @@ pub enum TaskType {
     TrimUnusedDbs,
 }
 
-static CRON_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Cron ticks that ran the scheduler since module load. The scheduler reads it to decide which
+/// tasks are due, and `common::metrics` reports it as `cron_ticks_total`.
+pub(crate) static CRON_TICKS: AtomicU64 = AtomicU64::new(0);
 static CRON_INTERVAL_MS: AtomicU64 = AtomicU64::new(100);
 static DISPATCH_MAP: LazyLock<DispatchMap> = LazyLock::new(DispatchMap::default);
+
+/// Milliseconds between cron ticks. Reported, in seconds, as `cron_interval_seconds`.
+pub(crate) fn cron_interval_ms() -> u64 {
+    CRON_INTERVAL_MS.load(Ordering::Relaxed)
+}
 
 pub(crate) fn init_background_tasks(ctx: &Context) {
     let interval_ms = get_ticks_interval(ctx);
@@ -147,9 +155,11 @@ fn dispatch_background_task(task: TaskType) {
 #[cron_event_handler]
 fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     if is_shutting_down() || is_loading_active() {
+        CRON_TICKS_SKIPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
+    let start = Instant::now();
     let ticks = CRON_TICKS.fetch_add(1, Ordering::Relaxed);
     let map = DISPATCH_MAP.pin();
 
@@ -160,6 +170,7 @@ fn __cron_event_handler(_ctx: &Context, _hz: u64) {
             }
         }
     }
+    CRON_TICK_DURATION.observe_duration(start.elapsed());
 }
 
 fn get_hz(ctx: &Context) -> u64 {

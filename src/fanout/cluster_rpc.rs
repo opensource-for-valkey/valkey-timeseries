@@ -6,6 +6,9 @@ use super::utils::{is_clustered, is_multi_or_lua};
 use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
+use crate::common::metrics::{
+    FANOUT_ERROR_RESPONSES_SENT, FANOUT_REQUESTS_SENT, FANOUT_RESPONSES_SENT, WireCounters,
+};
 use crate::common::pool::get_pooled_buffer;
 use crate::common::sync::lock;
 use crate::common::threads::LockGil;
@@ -535,20 +538,31 @@ pub fn send_cluster_message(
     msg_type: u8,
     message_body: &[u8],
 ) -> Status {
-    unsafe {
-        if ValkeyModule_SendClusterMessage
-            .expect("ValkeyModule_SendClusterMessage is not available")(
+    let sent = unsafe {
+        ValkeyModule_SendClusterMessage.expect("ValkeyModule_SendClusterMessage is not available")(
             ctx.ctx as *mut ValkeyModuleCtx,
             target_node_id,
             msg_type,
             message_body.as_ptr().cast::<c_char>(),
             message_body.len() as u32,
         ) == VALKEYMODULE_OK as c_int
-        {
-            Status::Ok
-        } else {
-            Status::Err
-        }
+    };
+    if !sent {
+        return Status::Err;
+    }
+    if let Some(wire) = wire_counters(msg_type) {
+        wire.record(message_body.len());
+    }
+    Status::Ok
+}
+
+/// Where a sent message of `msg_type` is counted (`TS._DEBUG STATS fanout`).
+fn wire_counters(msg_type: u8) -> Option<&'static WireCounters> {
+    match msg_type {
+        FANOUT_REQUEST_MESSAGE => Some(&FANOUT_REQUESTS_SENT),
+        FANOUT_RESPONSE_MESSAGE => Some(&FANOUT_RESPONSES_SENT),
+        FANOUT_ERROR_MESSAGE => Some(&FANOUT_ERROR_RESPONSES_SENT),
+        _ => None,
     }
 }
 

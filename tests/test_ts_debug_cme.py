@@ -189,6 +189,82 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert local['series'] < merged['series']
 
 
+def fanout_stats(client):
+    """This node's `fanout` section of TS._DEBUG STATS, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout')
+    return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+
+class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """Fanout messages and payload bytes are counted by the node that sends them."""
+
+    def populate(self, samples):
+        cluster_client = self.new_cluster_client()
+        for i in range(30):
+            key = f'wire:{i}'
+            cluster_client.execute_command('TS.CREATE', key, 'LABELS', 'env', 'prod', 'uniq', f's{i}')
+            for ts in range(1, samples + 1):
+                cluster_client.execute_command('TS.ADD', key, ts, ts * 1.5)
+
+    def primaries(self):
+        return [self.client_for_primary(i) for i in range(self.CLUSTER_SIZE)]
+
+    def reset_all(self):
+        for client in self.primaries():
+            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+
+    def mrange(self, *filters):
+        """Runs TS.MRANGE with node 0 as coordinator; returns each node's fanout stats."""
+        self.reset_all()
+        self.client_for_primary(0).execute_command('TS.MRANGE', '-', '+', 'FILTER', *filters)
+        return [fanout_stats(client) for client in self.primaries()]
+
+    def test_requests_and_responses_are_counted_where_they_are_sent(self):
+        self.populate(samples=5)
+        coordinator, *peers = self.mrange('env=prod')
+
+        # One request to each peer; the local share never touches the bus.
+        assert coordinator['fanout_requests_sent_total'] == self.CLUSTER_SIZE - 1
+        assert coordinator['fanout_request_sent_bytes_total'] > 0
+        assert coordinator['fanout_responses_sent_total'] == 0
+        assert coordinator['fanout_response_sent_bytes_total'] == 0
+
+        for peer in peers:
+            assert peer['fanout_requests_sent_total'] == 0
+            assert peer['fanout_responses_sent_total'] == 1
+            assert peer['fanout_response_sent_bytes_total'] > 0
+            assert peer['fanout_error_responses_sent_total'] == 0
+
+    def test_bytes_follow_the_payload(self):
+        self.populate(samples=200)
+        empty = self.mrange('env=nowhere')
+        full = self.mrange('env=prod')
+
+        # The same query shape costs the same to send, whatever it matches.
+        assert full[0]['fanout_request_sent_bytes_total'] == pytest.approx(
+            empty[0]['fanout_request_sent_bytes_total'], abs=16)
+        # Answers carrying samples cost more than empty ones.
+        for i in range(1, self.CLUSTER_SIZE):
+            assert full[i]['fanout_response_sent_bytes_total'] > \
+                empty[i]['fanout_response_sent_bytes_total'] + 100, i
+
+    def test_error_responses_are_counted_apart(self):
+        """A peer with debug-mode off answers TS._DEBUG INDEXMEMORY with an error."""
+        self.reset_all()
+        peer = self.client_for_primary(1)
+        peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            with pytest.raises(ResponseError):
+                self.client_for_primary(0).execute_command('TS._DEBUG', 'INDEXMEMORY')
+        finally:
+            peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+        stats = fanout_stats(peer)
+        assert stats['fanout_error_responses_sent_total'] == 1
+        assert stats['fanout_error_response_sent_bytes_total'] > 0
+        assert stats['fanout_responses_sent_total'] == 0
+
+
 def server_major_version():
     """`unstable` is ahead of every release."""
     head = SERVER_VERSION.split('.')[0]
