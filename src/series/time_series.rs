@@ -633,7 +633,7 @@ impl TimeSeries {
         samples: &[Sample],
         policy_override: Option<DuplicatePolicy>,
     ) -> TsdbResult<Vec<SampleAddResult>> {
-        let results = self.merge_samples_deferring_retention(samples, policy_override)?;
+        let results = self.merge_samples_deferring_retention(samples, policy_override);
         // Eager retention trim, as in `add` — a batch can advance the window too.
         self.apply_retention();
         Ok(results)
@@ -646,10 +646,7 @@ impl TimeSeries {
         &mut self,
         samples: &[Sample],
         policy_override: Option<DuplicatePolicy>,
-    ) -> TsdbResult<Vec<SampleAddResult>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
+    ) -> Vec<SampleAddResult> {
         merge_samples(self, samples, policy_override)
     }
 

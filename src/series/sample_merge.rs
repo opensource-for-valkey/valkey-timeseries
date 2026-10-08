@@ -1,13 +1,12 @@
 use crate::common::context::key_for_display;
+use crate::common::logging::log_warning;
 use crate::common::threads::ParMutRayon;
 use crate::common::{Sample, Timestamp};
-use crate::error::TsdbResult;
 use crate::series::bulk_add::merge_samples_into_series;
 use crate::series::{DuplicatePolicy, SampleAddResult, TimeSeries};
 use orx_parallel::Par;
-use orx_parallel::ParResult;
 use smallvec::{SmallVec, smallvec};
-use valkey_module::{Context, ValkeyError, ValkeyResult};
+use valkey_module::Context;
 
 pub struct IndexedSample {
     pub index: usize,
@@ -84,20 +83,26 @@ impl<'a> PerSeriesSamples<'a> {
 ///
 /// ### Returns
 ///
-/// A result containing a vector of `SampleAddResult` with the outcome for each sample.
+/// A vector of `SampleAddResult` with the outcome for each sample.
 ///
 pub(super) fn merge_samples(
     series: &mut TimeSeries,
     samples: &[Sample],
     policy_override: Option<DuplicatePolicy>,
-) -> TsdbResult<Vec<SampleAddResult>> {
+) -> Vec<SampleAddResult> {
     if samples.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
     let results = merge_samples_into_series(series, samples, policy_override);
-    series.split_chunks_if_needed()?;
-    Ok(results)
+    // The samples are stored by now and a failed split only leaves a chunk oversized, so it is
+    // logged rather than returned (as in `bulk_insert_samples`): an error would make TS.MADD
+    // skip compaction, the retention trim and replication for samples the series keeps.
+    if let Err(e) = series.split_chunks_if_needed() {
+        let key = key_for_display(&series.key);
+        log_warning(format!("TSDB: failed to split chunks for key '{key}': {e}"));
+    }
+    results
 }
 
 /// Merges samples across multiple series, supporting parallel processing when applicable.
@@ -115,31 +120,29 @@ pub(super) fn merge_samples(
 /// every series afterwards (see the note at the end of the body).
 ///
 /// ### Returns
-/// Returns a `ValkeyResult` containing a `SmallVec` of tuples (group index, SampleAddResult) on success.:
-/// - The second element is the result of processing the samples for that series.
+/// A `SmallVec` of tuples (input index, SampleAddResult), one per sample.
 ///
 ///
 pub fn multi_series_merge_samples(
     groups: Vec<PerSeriesSamples>,
     ctx: Option<&Context>,
-) -> ValkeyResult<SmallVec<[(usize, SampleAddResult); 8]>> {
+) -> SmallVec<[(usize, SampleAddResult); 8]> {
     if groups.is_empty() {
-        return Ok(smallvec![]);
+        return smallvec![];
     }
     let mut groups = groups;
 
     let res = if groups.len() == 1 {
-        add_samples_internal(&mut groups[0])?
+        add_samples_internal(&mut groups[0])
     } else {
         groups
             .par_mut_rayon()
             .map(add_samples_internal)
-            .into_fallible()
             .reduce(|mut acc, item| {
                 acc.extend(item);
                 acc
-            })?
-            .unwrap()
+            })
+            .unwrap_or_default()
     };
 
     if let Some(ctx) = ctx {
@@ -157,12 +160,10 @@ pub fn multi_series_merge_samples(
     // Deferring it does *not* leak expired samples into the destination buckets: compaction
     // aggregates through the retention-clamped `range_iter`, so a sample the trim is about to
     // evict is already invisible to the bucket recalculation.
-    Ok(res)
+    res
 }
 
-fn add_samples_internal(
-    input: &mut PerSeriesSamples,
-) -> ValkeyResult<SmallVec<[(usize, SampleAddResult); 8]>> {
+fn add_samples_internal(input: &mut PerSeriesSamples) -> SmallVec<[(usize, SampleAddResult); 8]> {
     input.prev_last = input.series.last_sample.map(|s| s.timestamp);
 
     if input.samples.len() == 1 {
@@ -176,7 +177,7 @@ fn add_samples_internal(
             input.added_order.push(added.timestamp);
         }
 
-        return Ok(smallvec![(index, result)]);
+        return smallvec![(index, result)];
     }
 
     // In-batch duplicate timestamps: RTS applies each MADD item as an independent, sequential
@@ -185,7 +186,7 @@ fn add_samples_internal(
     // assumes unique timestamps per batch, so fall back to sequential single-sample add() in
     // input order, which reproduces RTS exactly.
     if has_in_batch_duplicate(&input.samples) {
-        return Ok(add_group_sequentially(input));
+        return add_group_sequentially(input);
     }
 
     // Keep the samples in INPUT order: `normalize_batch`'s retention gate is input-order
@@ -201,8 +202,7 @@ fn add_samples_internal(
 
     let add_results = input
         .series
-        .merge_samples_deferring_retention(&samples, None)
-        .map_err(|e| ValkeyError::String(format!("{e}")))?;
+        .merge_samples_deferring_retention(&samples, None);
 
     // Accepted samples feed batch compaction, which requires them ascending by timestamp.
     // `add_results` is parallel to `samples`, i.e. still in input order, so the order is
@@ -230,7 +230,7 @@ fn add_samples_internal(
         result.push(item);
     }
 
-    Ok(result)
+    result
 }
 
 /// True if two samples in the group share a timestamp (checked over a sorted copy of the

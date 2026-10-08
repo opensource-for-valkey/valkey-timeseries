@@ -164,23 +164,23 @@ fn handle_add(
     // the appropriate threshold.
     // If there's not a change, we don't want to run compaction.
     // Question: should we replicate the command in this case?
+    //
+    // The sample is already stored, so a compaction failure is logged rather than returned (as
+    // TS.MADD and TS.ADDBULK do): an error here would skip replication and leave the replica
+    // without a sample the primary keeps. The replica re-runs the same compaction on replay.
     if !ignored && !series.rules.is_empty() {
         let sample = Sample::new(ts, value);
-        if is_upsert {
-            if let Err(res) = series.upsert_compaction(ctx, sample) {
-                let msg = format!(
-                    "TSDB: error running compaction upsert for key '{}': {}",
-                    args[1], res
-                );
-                return Err(ValkeyError::String(msg));
-            }
-            // Fall through to replicate_and_notify: an upsert is still a
-            // successful TS.ADD — it must replicate and emit `ts.add` like
-            // any other add.
+        let result = if is_upsert {
+            series.upsert_compaction(ctx, sample)
         } else {
-            let sample = series.last_sample.unwrap_or(Sample::new(ts, value));
-            // If the sample is not an upsert, we run compaction
-            series.run_compaction(ctx, sample)?;
+            let sample = series.last_sample.unwrap_or(sample);
+            series.run_compaction(ctx, sample)
+        };
+        if let Err(err) = result {
+            let key = &args[1];
+            ctx.log_warning(&format!(
+                "TSDB: error running compaction for key '{key}': {err}"
+            ));
         }
     }
 

@@ -167,7 +167,7 @@ fn handle_update(
             // An increment is a write like any other and must drive the series'
             // compaction rules; without this a counter maintained by
             // TS.INCRBY/TS.DECRBY never reaches its downstream series.
-            run_compaction_for_increment(ctx, series, key_name, added, prev_last_ts)?;
+            run_compaction_for_increment(ctx, series, key_name, added, prev_last_ts);
             // An increment at the last timestamp updates in place and adds nothing readable, so
             // only an append wakes blocked `TS.READ` readers. Not a `total_samples` comparison:
             // the retention trim that follows an append can drop more than it added.
@@ -199,15 +199,18 @@ fn handle_update(
 /// new value being streamed into the open bucket as an additional sample — otherwise the old
 /// and new values are both aggregated (e.g. `TS.ADD k 0 0` then `TS.INCRBY k 1 TIMESTAMP 0`
 /// gave an `avg` rollup of 0.5 instead of 1). Mirrors the is_upsert split in TS.ADD.
+///
+/// A failure is logged, not returned: the increment is already stored, and an error would
+/// skip replication, leaving the replica without it (see TS.ADD).
 fn run_compaction_for_increment(
     ctx: &Context,
     series: &mut TimeSeries,
     key_name: &ValkeyString,
     added: Sample,
     prev_last_ts: Option<Timestamp>,
-) -> ValkeyResult<()> {
+) {
     if series.rules.is_empty() {
-        return Ok(());
+        return;
     }
     let is_upsert = prev_last_ts.is_some_and(|last_ts| added.timestamp <= last_ts);
     let result = if is_upsert {
@@ -216,11 +219,11 @@ fn run_compaction_for_increment(
         let sample = series.last_sample.unwrap_or(added);
         series.run_compaction(ctx, sample)
     };
-    result.map_err(|err| {
-        ValkeyError::String(format!(
+    if let Err(err) = result {
+        ctx.log_warning(&format!(
             "TSDB: error running compaction for key '{key_name}': {err}"
-        ))
-    })
+        ));
+    }
 }
 
 /// Propagate the increment with the timestamp the primary actually used.
