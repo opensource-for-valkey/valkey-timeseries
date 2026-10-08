@@ -12,7 +12,7 @@ description = "A Timeseries data type for Valkey"
 ahash = { version = "0.8", features = ["std"] }
 arc-swap = "1.9"
 blart = "0.6"
-bon = { version = "3.10.1", optional = true }
+bon = { version = "3.10.2", optional = true }
 byte-pool = "0.2.4"
 croaring = "2.8.0"
 enquote = "1.1.0"
@@ -70,6 +70,7 @@ proptest = "1"
 [build-dependencies]
 prost-build = "0.14"
 protox = "0.10.0"
+protox = "0.10"
 
 [lib]
 name = "valkey_timeseries"
