@@ -4,7 +4,6 @@
 
 use crate::analysis::math::BetaDistribution;
 use crate::analysis::quantile_estimators::{QuantileEstimator, Samples};
-use std::f64;
 
 pub struct HarrellDavisQuantileEstimator;
 

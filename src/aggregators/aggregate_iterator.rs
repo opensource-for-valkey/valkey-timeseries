@@ -712,8 +712,6 @@ mod tests {
 
     #[test]
     fn test_sum_with_nans() {
-        use std::f64;
-
         let samples = vec![
             Sample::new(10, 1.0),
             Sample::new(15, f64::NAN),
