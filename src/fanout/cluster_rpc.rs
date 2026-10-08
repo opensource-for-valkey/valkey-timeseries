@@ -110,7 +110,7 @@ impl InFlightRequest {
             .get_target_node_opt(sender_id)
             .filter(|node| !node.is_local())
         else {
-            metrics::IGNORED_UNKNOWN_SENDER.incr();
+            metrics::FANOUT_IGNORED_UNKNOWN_SENDER.incr();
             ctx.log_warning(&format!(
                 "cluster rpc: ignoring response for request {} from unknown sender {sender}",
                 self.id
@@ -118,7 +118,7 @@ impl InFlightRequest {
             return false;
         };
         if !lock(&self.responded).insert(sender) {
-            metrics::IGNORED_DUPLICATE.incr();
+            metrics::FANOUT_IGNORED_DUPLICATE.incr();
             ctx.log_warning(&format!(
                 "cluster rpc: ignoring duplicate response for request {} from {sender}",
                 self.id
@@ -247,7 +247,7 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
             return;
         }
 
-        metrics::RPC_TIMEOUTS.incr();
+        metrics::FANOUT_RPC_TIMEOUTS.incr();
         request.deliver_timeout();
 
         map.remove(&id);
@@ -255,7 +255,7 @@ fn on_request_timeout(_ctx: &Context, id: u64) {
 }
 
 fn dispatch_send_failure(ctx: &Context, request_id: u64, target_node_id: *const c_char) {
-    metrics::SEND_FAILURES.incr();
+    metrics::FANOUT_SEND_FAILURES.incr();
     with_inflight_request(ctx, request_id, |ctx, request| {
         let err = FanoutError::custom("Failed to send fanout request to target node");
         request.handle_response(ctx, Err(err), target_node_id)
@@ -522,7 +522,7 @@ fn process_request_message(
     // GIL only for the call itself. The aggregate result would otherwise be
     // built from inconsistent per-node views.
     if !cluster_fingerprint_matches(&MODULE_CONTEXT, header.cluster_fingerprint) {
-        metrics::REJECTED_CLUSTER_MAP_MISMATCH.incr();
+        metrics::FANOUT_REJECTED_CLUSTER_MAP_MISMATCH.incr();
         let ctx = MODULE_CONTEXT.lock_gil();
         let msg = format!(
             "cluster rpc: rejecting request {request_id} from node {sender_id}: cluster-map fingerprint mismatch"
@@ -545,7 +545,7 @@ fn process_request_message(
     let fanout_ctx = FanoutContext::new(header.user, header.db);
     match handler(&fanout_ctx, request_buf, &mut dest) {
         Ok(()) => {
-            metrics::SERVED_OK.incr();
+            metrics::FANOUT_SERVED_OK.incr();
             let ctx = MODULE_CONTEXT.lock_gil();
             if send_response_message(
                 &ctx,
@@ -556,14 +556,14 @@ fn process_request_message(
                 &dest,
             ) == Status::Err
             {
-                metrics::REPLY_SEND_FAILURES.incr();
+                metrics::FANOUT_REPLY_SEND_FAILURES.incr();
                 let msg = format!("Failed to send response message to node {sender_id:?}");
                 // send error ???
                 ctx.log_warning(&msg);
             }
         }
         Err(e) => {
-            metrics::SERVED_ERRORS.incr();
+            metrics::FANOUT_SERVED_ERRORS.incr();
             let msg = e.to_string();
             MODULE_CONTEXT.log_warning(&msg);
             let ctx = MODULE_CONTEXT.lock_gil();
@@ -610,9 +610,9 @@ pub fn send_cluster_message(
 /// Where a sent message of `msg_type` is counted (`TS._DEBUG STATS fanout`).
 fn wire_counters(msg_type: u8) -> Option<&'static WireCounters> {
     match msg_type {
-        FANOUT_REQUEST_MESSAGE => Some(&metrics::REQUESTS_SENT),
-        FANOUT_RESPONSE_MESSAGE => Some(&metrics::RESPONSES_SENT),
-        FANOUT_ERROR_MESSAGE => Some(&metrics::ERROR_RESPONSES_SENT),
+        FANOUT_REQUEST_MESSAGE => Some(&metrics::FANOUT_REQUESTS_SENT),
+        FANOUT_RESPONSE_MESSAGE => Some(&metrics::FANOUT_RESPONSES_SENT),
+        FANOUT_ERROR_MESSAGE => Some(&metrics::FANOUT_ERROR_RESPONSES_SENT),
         _ => None,
     }
 }
@@ -627,7 +627,7 @@ extern "C" fn on_request_received(
 ) {
     let ctx = Context::new(ctx as *mut RedisModuleCtx);
     let Some(mut message) = parse_fanout_message(&ctx, sender_id, payload, len) else {
-        metrics::REJECTED_PARSE.incr();
+        metrics::FANOUT_REJECTED_PARSE.incr();
         return;
     };
 
@@ -635,7 +635,7 @@ extern "C" fn on_request_received(
     // reject explicitly (addressable, fast) rather than mis-process the
     // request. See docs/fanout-compatibility-handshake.md.
     if has_unsupported_features(message.required_features) {
-        metrics::REJECTED_UNSUPPORTED_FEATURES.incr();
+        metrics::FANOUT_REJECTED_UNSUPPORTED_FEATURES.incr();
         let e = FanoutError::unsupported_features();
         send_error_response(&ctx, message.request_id, message.db, sender_id, e);
         let msg = format!(
@@ -649,7 +649,7 @@ extern "C" fn on_request_received(
     }
 
     let Some(handler) = get_fanout_request_handler(&message.handler) else {
-        metrics::REJECTED_NO_HANDLER.incr();
+        metrics::FANOUT_REJECTED_NO_HANDLER.incr();
         let e = FanoutError::invalid_message();
         send_error_response(&ctx, message.request_id, message.db, sender_id, e);
         let msg = format!(
@@ -684,7 +684,7 @@ extern "C" fn on_request_received(
         process_request_message(header, handler, &buf, sender);
     });
     if queued.is_err() {
-        metrics::REJECTED_BUSY.incr();
+        metrics::FANOUT_REJECTED_BUSY.incr();
         // Answer now rather than leave the requester waiting out its timeout.
         send_error_response(&ctx, request_id, db, sender_id, FanoutError::busy());
         let msg = format!("Rejecting fanout request {request_id} from node {sender}: workers busy");
@@ -701,7 +701,7 @@ where
 {
     let map = INFLIGHT_REQUESTS.pin();
     let Some(request) = map.get(&request_id) else {
-        metrics::IGNORED_UNKNOWN_REQUEST.incr();
+        metrics::FANOUT_IGNORED_UNKNOWN_REQUEST.incr();
         ctx.log_warning(&format!(
             "Failed to find inflight request for id {request_id}. Possible timeout.",
         ));
@@ -777,7 +777,7 @@ extern "C" fn on_error_received(
                 request.handle_response(ctx, Err(error), sender_id)
             }
             Err(_) => {
-                metrics::ERROR_DECODE_FAILURES.incr();
+                metrics::FANOUT_ERROR_DECODE_FAILURES.incr();
                 ctx.log_warning("Failed to deserialize error response");
                 let err = FanoutError::invalid_message();
                 request.handle_response(ctx, Err(err), sender_id)

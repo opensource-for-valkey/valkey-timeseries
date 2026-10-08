@@ -178,7 +178,7 @@ extern "C" fn timeout_callback(
     _argv: *mut *mut ValkeyModuleString,
     _argc: c_int,
 ) -> c_int {
-    metrics::CLIENT_TIMEOUTS.incr();
+    metrics::FANOUT_CLIENT_TIMEOUTS.incr();
     let ctx = ReplyContext::new(ctx as *mut raw::RedisModuleCtx);
     ctx.reply_error_string(TIMEOUT_ERROR) as c_int
 }
