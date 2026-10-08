@@ -35,7 +35,7 @@ fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
     reply_with_double(ctx, bucket.get_avg_allocated());
 
     let utilization = bucket.get_utilization() * 100.0;
-    reply_with_str(ctx, "utilization");
+    reply_with_str(ctx, "utilizationPct");
     reply_with_usize(ctx, utilization as usize);
 }
 

@@ -70,7 +70,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'avgSize' in stat_keys
         assert 'allocated' in stat_keys
         assert 'avgAllocated' in stat_keys
-        assert 'utilization' in stat_keys
+        assert 'utilizationPct' in stat_keys
 
         # Second element: ByRefcount - array of (refcount, bucket) pairs
         by_refcount = result[1]

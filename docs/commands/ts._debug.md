@@ -54,6 +54,12 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 Replies made of named fields are RESP3 maps. A RESP2 client gets the same pairs as a flat array
 of alternating keys and values, in the same order. Over RESP2, doubles arrive as bulk strings.
 
+Field names are camelCase, like `TS.INFO`'s. Sizes are in bytes, and a percentage (0–100) ends in
+`Pct`; any other unit is named at the end of the field (`ageMs`). Metric names in `STATS` are not
+field names but [OpenMetrics](https://prometheus.io/docs/practices/naming/) identifiers,
+snake_case with a unit suffix (`_seconds`, `_bytes`) and `_total` on counters. They are the same
+everywhere a metric appears, including the `name` field of a `VERBOSE` entry.
+
 ### Cluster scope
 
 Every subcommand reports, or acts on, the node you are connected to. `STATS`, `STATS RESET`,
@@ -377,7 +383,7 @@ Each `BucketStats` entry is a map of 6 fields:
 | `avgSize`      | float   | Average logical byte length per string                   |
 | `allocated`    | integer | Total allocated memory (including Arc overhead) in bytes |
 | `avgAllocated` | float   | Average allocated memory per string                      |
-| `utilization`  | integer | Ratio of used bytes to allocated bytes, as a percentage  |
+| `utilizationPct` | integer | Ratio of used bytes to allocated bytes, as a percentage |
 
 #### MemorySavings fields
 
