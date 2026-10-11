@@ -1,13 +1,14 @@
 use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
+use crate::promql::deadline::{Deadline, SERIES_WORK};
 use crate::promql::engine::label_profile::LabelProfile;
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::exec::pipeline::for_each_step_sample;
 use crate::promql::functions::RollupKind;
 use crate::promql::{
-    ExprResult, PromqlResult, QueryError, QueryOptions,
+    EvalResult, ExprResult, PromqlResult, QueryError, QueryOptions,
     model::{InstantSample, RangeSample},
 };
 use orx_parallel::Par;
@@ -193,6 +194,14 @@ impl GridSeries {
         }
     }
 
+    /// How many points the entries hold.
+    pub(in crate::promql) fn points(&self) -> usize {
+        match self {
+            GridSeries::Stepped(series) => series.iter().map(|s| s.points.len()).sum(),
+            GridSeries::Rolled(series) => series.iter().map(|s| s.samples.len()).sum(),
+        }
+    }
+
     /// Every entry as sparse `(step, value)` samples, whichever stage made it.
     pub(in crate::promql) fn into_step_values(self) -> Vec<RangeSample<EvalLabels>> {
         match self {
@@ -205,10 +214,25 @@ impl GridSeries {
     }
 }
 
+impl From<GridSeries> for GridOutcome {
+    fn from(series: GridSeries) -> Self {
+        match series {
+            GridSeries::Stepped(series) => GridOutcome::Stepped(series),
+            GridSeries::Rolled(series) => GridOutcome::Rolled(series),
+        }
+    }
+}
+
 impl GridRequest {
     /// The window ends to evaluate at, in ascending order.
     pub(in crate::promql) fn window_ends(&self) -> Vec<i64> {
-        grid_window_ends(
+        self.window_ends_iter().collect()
+    }
+
+    /// [`Self::window_ends`] without collecting them, for a caller that only
+    /// walks or compares them once.
+    pub(in crate::promql) fn window_ends_iter(&self) -> impl Iterator<Item = Timestamp> + use<> {
+        grid_window_ends_iter(
             self.step_ms,
             self.query_start,
             self.query_end,
@@ -228,7 +252,11 @@ impl GridRequest {
     /// The span of raw samples this request's windows cover, or `None` when it
     /// describes no windows at all.
     pub(in crate::promql) fn fetch_bounds(&self) -> Option<(Timestamp, Timestamp)> {
-        grid_fetch_bounds(&self.window_ends(), self.backward_ms())
+        // Only the first and last ends matter: walk them, never collect them.
+        let mut ends = self.window_ends_iter();
+        let first = ends.next()?;
+        let last = ends.last().unwrap_or(first);
+        Some(fetch_span(first, last, self.backward_ms()))
     }
 
     /// Apply the per-series stage — stepped selection, or the rollup — to raw
@@ -309,31 +337,6 @@ impl GridRequest {
             .collect()
     }
 
-    /// Apply this request's fused aggregation to per-series `(step, value)`
-    /// output, or pass it through when the request carries none.
-    pub(in crate::promql) fn group(
-        &self,
-        series: Vec<RangeSample<EvalLabels>>,
-    ) -> PromqlResult<Vec<RangeSample<EvalLabels>>> {
-        let Some(aggregation) = self.aggregation.as_ref() else {
-            return Ok(series);
-        };
-        match aggregation.strategy() {
-            PushdownStrategy::Reduce => {
-                let mut partials = SteppedPartialGroups::new(aggregation.kind);
-                partials.accumulate(aggregation.modifier.as_ref(), series);
-                Ok(partials.finalize())
-            }
-            PushdownStrategy::Select | PushdownStrategy::CountValues => {
-                let mut selection = SteppedSelection::new(aggregation.clone());
-                selection
-                    .apply(series)
-                    .and_then(|()| selection.finalize())
-                    .map_err(|e| QueryError::Execution(e.to_string()))
-            }
-        }
-    }
-
     /// Everything this request asks for, over raw spans: the per-series stage,
     /// then the fused aggregation when there is one. Never answers
     /// [`GridOutcome::Raw`].
@@ -342,22 +345,214 @@ impl GridRequest {
     /// — a single node, which has nothing to push down to, or the series a
     /// shard chose to ship raw. It runs the same kernels a shard would, so the
     /// answer does not depend on who did the work.
+    ///
+    /// The stage runs a chunk at a time ([`Self::per_series_chunked`]), each
+    /// chunk's output into a [`GridSink`]. What the sink keeps of a chunk is
+    /// passed to `charge` as the chunk is taken, for what it holds beyond the
+    /// raw samples the chunk was built from: one sample in a long window
+    /// answers at every step, so what is kept can dwarf the span that was
+    /// charged for it, and a query over its budget must stop at the chunk that
+    /// crossed it rather than after building the whole grid. That holds for a
+    /// fused request too: its per-series output is dropped once folded, but
+    /// the groups' `(group, step)` states or a selection's candidates it is
+    /// folded into stay until the end, and grow with every chunk.
     pub(in crate::promql) fn evaluate(
         &self,
         series: Vec<RangeSample<EvalLabels>>,
+        deadline: &Deadline,
+        charge: &mut dyn FnMut(usize) -> PromqlResult<()>,
     ) -> PromqlResult<GridOutcome> {
-        let per_series = self.per_series(&self.window_ends(), series);
-        if self.aggregation.is_some() {
-            return self
-                .group(per_series.into_step_values())
-                .map(GridOutcome::Reduced);
+        let window_ends = self.window_ends();
+        let mut sink = GridSink::for_request(self);
+        self.per_series_chunked(&window_ends, series, deadline, |output, read| {
+            let added = sink.take(self, output, deadline)?;
+            charge(added.saturating_sub(read))
+        })?;
+        sink.finish(deadline).map_err(QueryError::from)
+    }
+
+    /// Run the per-series stage over `series` a chunk at a time, `deadline`
+    /// checked before each, handing `sink` each chunk's output along with the
+    /// raw samples it was built from.
+    ///
+    /// A chunk is sized by the larger of what its series read and what they
+    /// can produce ([`output_bound`]), since a sparse series under a wide
+    /// window produces a point per step from a sample or two. So no chunk
+    /// produces much more than [`EVALUATE_CHUNK_WORK`] points, however sparse
+    /// its input: what one series alone can produce is bounded by the step
+    /// cap. A chunk is still evaluated in parallel, and the stage's loops over
+    /// one series' windows are left alone.
+    pub(in crate::promql) fn per_series_chunked(
+        &self,
+        window_ends: &[Timestamp],
+        series: Vec<RangeSample<EvalLabels>>,
+        deadline: &Deadline,
+        mut sink: impl FnMut(GridSeries, usize) -> PromqlResult<()>,
+    ) -> PromqlResult<()> {
+        let backward_ms = self.backward_ms();
+        let mut pending = series.into_iter();
+        loop {
+            // Never `take_while`: it consumes, and drops, the series that ends a chunk.
+            let mut chunk = Vec::new();
+            let (mut work, mut read) = (0usize, 0usize);
+            while work < EVALUATE_CHUNK_WORK {
+                let Some(s) = pending.next() else {
+                    break;
+                };
+                let bound = output_bound(window_ends, backward_ms, &s.samples);
+                work += s.samples.len().max(bound) + SERIES_WORK;
+                read += s.samples.len();
+                chunk.push(s);
+            }
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            deadline.check()?;
+            sink(self.per_series(window_ends, chunk), read)?;
         }
-        Ok(match per_series {
-            GridSeries::Stepped(series) => GridOutcome::Stepped(series),
-            GridSeries::Rolled(series) => GridOutcome::Rolled(series),
+    }
+
+    /// The per-series stage's output over no series, of the kind this request
+    /// produces.
+    pub(in crate::promql) fn empty_output(&self) -> GridSeries {
+        match self.rollup {
+            Some(_) => GridSeries::Rolled(Vec::new()),
+            None => GridSeries::Stepped(Vec::new()),
+        }
+    }
+}
+
+/// Where a [`GridRequest`]'s per-series output goes once the stage has made
+/// it: kept, as the entries an unfused request answers with, or folded into
+/// the fused aggregation the request carries and dropped. It is the one fold
+/// for the three places stage output arises — a shard staging its own batches
+/// (`ShardGrid`), a coordinator finishing what its shards sent
+/// (`GridFanoutCommand::into_result`), and a node evaluating a raw span
+/// ([`GridRequest::evaluate`]) — so each is written once and the answer does
+/// not depend on who did the work.
+pub(in crate::promql) enum GridSink {
+    /// Per-series output, kept whole: an unfused request's answer.
+    Series(GridSeries),
+    /// A fused reduction's per-`(group, step)` partials. Output is folded in
+    /// as it arrives, so nothing larger than the groups outlives a batch.
+    Partials(SteppedPartialGroups),
+    /// A fused selecting or counting operator's per-step candidates. Output
+    /// is run through the operator as it arrives and only its picks (or
+    /// counts) are kept; [`Self::finish`] re-selects over their union, as the
+    /// coordinator does over its shards' candidates. The top-k of a union lies
+    /// within the union of the parts' top-k's, and counts add, so the answer
+    /// is the one a single pass over everything would give.
+    Selection(SteppedSelection),
+}
+
+impl GridSink {
+    /// The sink `request`'s output belongs in.
+    pub(in crate::promql) fn for_request(request: &GridRequest) -> Self {
+        match request.aggregation.as_ref() {
+            None => GridSink::Series(request.empty_output()),
+            Some(aggregation) => match aggregation.strategy() {
+                PushdownStrategy::Reduce => {
+                    GridSink::Partials(SteppedPartialGroups::new(aggregation.kind))
+                }
+                PushdownStrategy::Select | PushdownStrategy::CountValues => {
+                    GridSink::Selection(SteppedSelection::new(aggregation.clone()))
+                }
+            },
+        }
+    }
+
+    /// Take one batch of the stage's output, run here over raw spans, returning
+    /// how much more the sink holds for it — points kept, `(group, step)`
+    /// states, or selection candidates: what a caller bounding its memory
+    /// charges. Fails when `deadline` passes while it folds, or a selection's
+    /// operator refuses its parameter.
+    ///
+    /// Only a selection differs from [`Self::merge`]: the operator has yet to
+    /// run over this output, so it runs here.
+    pub(in crate::promql) fn take(
+        &mut self,
+        request: &GridRequest,
+        output: GridSeries,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
+        match self {
+            GridSink::Selection(selection) => selection.apply(output.into_step_values(), deadline),
+            GridSink::Series(_) | GridSink::Partials(_) => self.merge(request, output, deadline),
+        }
+    }
+
+    /// Take a batch another party already staged — a shard's per-series
+    /// entries, or the candidates its own run of the operator picked — so the
+    /// operator is not run over it again here, returning how much more the sink
+    /// holds for it. Fails when `deadline` passes while it folds.
+    pub(in crate::promql) fn merge(
+        &mut self,
+        request: &GridRequest,
+        output: GridSeries,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
+        Ok(match self {
+            GridSink::Series(series) => {
+                let added = output.points();
+                series.append(output);
+                added
+            }
+            GridSink::Partials(partials) => Self::fold(partials, request, output, deadline)?,
+            GridSink::Selection(selection) => {
+                selection.merge(output.into_step_values(), deadline)?
+            }
+        })
+    }
+
+    fn fold(
+        partials: &mut SteppedPartialGroups,
+        request: &GridRequest,
+        output: GridSeries,
+        deadline: &Deadline,
+    ) -> EvalResult<usize> {
+        let modifier = request
+            .aggregation
+            .as_ref()
+            .and_then(|aggregation| aggregation.modifier.as_ref());
+        partials.accumulate(modifier, output.into_step_values(), deadline)
+    }
+
+    /// Everything taken, as the request's outcome. A fused sink walks every
+    /// state or candidate it accumulated to finalize them, `deadline` checked
+    /// as it goes.
+    pub(in crate::promql) fn finish(self, deadline: &Deadline) -> EvalResult<GridOutcome> {
+        Ok(match self {
+            GridSink::Series(series) => series.into(),
+            GridSink::Partials(partials) => GridOutcome::Reduced(partials.finalize(deadline)?),
+            GridSink::Selection(selection) => GridOutcome::Reduced(selection.finalize(deadline)?),
         })
     }
 }
+
+/// The most points the per-series stage can produce from `samples` over
+/// `window_ends`: a window `(end - backward_ms, end]` answers only when it
+/// holds a sample — a rollup reduces nothing to nothing, and a stepped pick
+/// needs a sample inside the lookback — so only the ends in
+/// `[first, last + backward_ms)` can. Two binary searches, so a chunk can be
+/// sized by it before any of its windows is evaluated.
+pub(in crate::promql) fn output_bound(
+    window_ends: &[Timestamp],
+    backward_ms: i64,
+    samples: &[Sample],
+) -> usize {
+    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+        return 0;
+    };
+    let reach = last.timestamp.saturating_add(backward_ms);
+    let lo = window_ends.partition_point(|&end| end < first.timestamp);
+    let hi = window_ends.partition_point(|&end| end < reach);
+    hi.saturating_sub(lo)
+}
+
+/// Work, in samples or output points (a series counting [`SERIES_WORK`]), that
+/// [`GridRequest::per_series_chunked`] runs between two deadline checks: a few
+/// milliseconds of the per-series stage, and about 16 MiB of its output.
+const EVALUATE_CHUNK_WORK: usize = 1 << 20;
 
 /// The window ends a grid request describes, in ascending order.
 ///
@@ -371,10 +566,21 @@ pub(in crate::promql) fn grid_window_ends(
     query_end: Timestamp,
     range_end_ms: Timestamp,
 ) -> Vec<Timestamp> {
-    if step_ms <= 0 {
-        return vec![range_end_ms];
-    }
-    crate::promql::time::step_times(query_start, query_end, step_ms).collect()
+    grid_window_ends_iter(step_ms, query_start, query_end, range_end_ms).collect()
+}
+
+/// [`grid_window_ends`], uncollected: the one definition of a request's
+/// windows, so a caller that only walks them need not allocate them.
+pub(in crate::promql) fn grid_window_ends_iter(
+    step_ms: i64,
+    query_start: Timestamp,
+    query_end: Timestamp,
+    range_end_ms: Timestamp,
+) -> impl Iterator<Item = Timestamp> + use<> {
+    let single = (step_ms <= 0).then_some(range_end_ms);
+    let stepped =
+        (step_ms > 0).then(|| crate::promql::time::step_times(query_start, query_end, step_ms));
+    single.into_iter().chain(stepped.into_iter().flatten())
 }
 
 /// The inclusive `[start, end]` span of raw samples `window_ends` covers, for
@@ -388,7 +594,11 @@ pub(in crate::promql) fn grid_fetch_bounds(
     backward_ms: i64,
 ) -> Option<(Timestamp, Timestamp)> {
     let (&first, &last) = (window_ends.first()?, window_ends.last()?);
-    Some((first.saturating_sub(backward_ms).saturating_add(1), last))
+    Some(fetch_span(first, last, backward_ms))
+}
+
+fn fetch_span(first: Timestamp, last: Timestamp, backward_ms: i64) -> (Timestamp, Timestamp) {
+    (first.saturating_sub(backward_ms).saturating_add(1), last)
 }
 
 /// What a data source made of a [`GridRequest`]. Every variant tells the
@@ -602,6 +812,384 @@ pub(crate) mod test_utils {
 
         pub(crate) fn build(self) -> MemorySeriesQuerier {
             self.reader
+        }
+    }
+}
+
+#[cfg(test)]
+mod evaluate_chunk_tests {
+    use super::*;
+    use crate::common::Sample;
+    use crate::common::time::current_time_millis;
+    use crate::promql::QueryOptions;
+    use crate::promql::engine::sample_budget::SampleBudget;
+
+    fn stepped_request() -> GridRequest {
+        GridRequest {
+            step_ms: 1_000,
+            query_start: 0,
+            query_end: 9_000,
+            range_end_ms: 9_000,
+            lookback_delta_ms: 300_000,
+            rollup: None,
+            aggregation: None,
+            sample_timestamps: false,
+        }
+    }
+
+    /// Enough series for two chunks: each costs `SERIES_WORK` and its ten steps.
+    fn many_series() -> Vec<RangeSample<EvalLabels>> {
+        let count = EVALUATE_CHUNK_WORK / (SERIES_WORK + 10) + 10_000;
+        (0..count)
+            .map(|i| RangeSample {
+                labels: EvalLabels::from_pairs(&[("i", &i.to_string())]),
+                samples: vec![Sample::new(0, i as f64)],
+            })
+            .collect()
+    }
+
+    fn picks(outcome: GridOutcome) -> Vec<(String, usize)> {
+        let GridOutcome::Stepped(series) = outcome else {
+            panic!("a stepped request answers stepped");
+        };
+        series
+            .into_iter()
+            .map(|s| (s.labels.to_string(), s.points.len()))
+            .collect()
+    }
+
+    /// The uncollected window ends, and the bounds walked from them, are exactly
+    /// what the collected ends give — at a single evaluation, an empty grid, a
+    /// one-step grid, and a grid that ends against `i64::MAX`.
+    #[test]
+    fn walked_window_ends_and_bounds_match_the_collected_ones() {
+        let shapes = [
+            (1_000, 0, 9_000, 9_000),
+            (0, 0, 9_000, 4_000),
+            (-1, 0, 9_000, 4_000),
+            (1_000, 9_000, 0, 0),
+            (1_000, 5_000, 5_000, 5_000),
+            (10, i64::MAX - 25, i64::MAX, i64::MAX),
+        ];
+        for (step_ms, query_start, query_end, range_end_ms) in shapes {
+            let request = GridRequest {
+                step_ms,
+                query_start,
+                query_end,
+                range_end_ms,
+                ..stepped_request()
+            };
+            let collected = request.window_ends();
+            let shape = format!("{step_ms} {query_start}..={query_end} @{range_end_ms}");
+            assert_eq!(
+                request.window_ends_iter().collect::<Vec<_>>(),
+                collected,
+                "{shape}"
+            );
+            assert_eq!(
+                request.fetch_bounds(),
+                grid_fetch_bounds(&collected, request.backward_ms()),
+                "{shape}"
+            );
+        }
+    }
+
+    /// Chunking is invisible: every series comes out once, in order, exactly as from
+    /// one call over all of them.
+    #[test]
+    fn a_chunked_evaluation_matches_one_over_every_series() {
+        let request = stepped_request();
+        let series = many_series();
+        let whole = match request.per_series(&request.window_ends(), series.clone()) {
+            GridSeries::Stepped(series) => GridOutcome::Stepped(series),
+            GridSeries::Rolled(_) => unreachable!(),
+        };
+        let chunked = request
+            .evaluate(series.clone(), &Deadline::default(), &mut |_| Ok(()))
+            .unwrap();
+        let (whole, chunked) = (picks(whole), picks(chunked));
+        assert_eq!(
+            chunked.len(),
+            series.len(),
+            "no series lost at a chunk boundary"
+        );
+        assert_eq!(chunked, whole);
+    }
+
+    #[test]
+    fn a_passed_deadline_stops_the_evaluation_between_chunks() {
+        let options = QueryOptions {
+            deadline: Some(current_time_millis() - 1),
+            ..QueryOptions::default()
+        };
+        let err = stepped_request()
+            .evaluate(
+                many_series(),
+                &Deadline::from_options(&options),
+                &mut |_| Ok(()),
+            )
+            .err()
+            .expect("stopped at the first chunk");
+        assert!(matches!(err, crate::promql::QueryError::Timeout), "{err}");
+    }
+
+    const STEPS: usize = 10_000;
+
+    /// A rollup over windows wider than the whole range, so a series' one
+    /// sample answers at every one of [`STEPS`] steps — reporting its value.
+    fn expanding_request(aggregation: Option<GridAggregation>) -> GridRequest {
+        let last = (STEPS as i64 - 1) * 1_000;
+        GridRequest {
+            step_ms: 1_000,
+            query_start: 0,
+            query_end: last,
+            range_end_ms: last,
+            lookback_delta_ms: 300_000,
+            rollup: Some(GridRollup {
+                kind: RollupKind::SumOverTime,
+                range_ms: STEPS as i64 * 1_000,
+                param: None,
+            }),
+            aggregation,
+            sample_timestamps: false,
+        }
+    }
+
+    /// One-sample series: one chunk by what they read, three by what they produce.
+    fn sparse_series() -> Vec<RangeSample<EvalLabels>> {
+        (0..3 * EVALUATE_CHUNK_WORK / STEPS)
+            .map(|i| RangeSample {
+                labels: EvalLabels::from_pairs(&[("i", &i.to_string())]),
+                samples: vec![Sample::new(0, i as f64)],
+            })
+            .collect()
+    }
+
+    fn rendered(groups: Vec<RangeSample<EvalLabels>>) -> Vec<(String, Vec<(i64, u64)>)> {
+        let mut out: Vec<_> = groups
+            .into_iter()
+            .map(|g| {
+                let points = g.samples.iter().map(|p| (p.timestamp, p.value.to_bits()));
+                (g.labels.to_string(), points.collect())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn the_output_bound_covers_every_window_that_can_answer() {
+        let request = GridRequest {
+            rollup: Some(GridRollup {
+                kind: RollupKind::CountOverTime,
+                range_ms: 3_000,
+                param: None,
+            }),
+            ..stepped_request()
+        };
+        let window_ends = request.window_ends();
+        // (sample timestamps, bound): the windows `(end - 3s, end]` over ends 0s..=9s.
+        let cases: [(&[i64], usize); 7] = [
+            (&[], 0),
+            (&[5_000], 3),
+            (&[2_500, 2_600], 3),
+            (&[0, 9_000], 10),
+            (&[-3_000], 0),
+            (&[-2_999], 1),
+            (&[20_000], 0),
+        ];
+        for (timestamps, want) in cases {
+            let samples: Vec<Sample> = timestamps.iter().map(|&t| Sample::new(t, 1.0)).collect();
+            let bound = output_bound(&window_ends, request.backward_ms(), &samples);
+            assert_eq!(bound, want, "{timestamps:?}");
+            let series = RangeSample {
+                labels: EvalLabels::from_pairs(&[("i", "0")]),
+                samples,
+            };
+            let produced = request.per_series(&window_ends, vec![series]).points();
+            assert!(produced <= bound, "{timestamps:?}: {produced} > {bound}");
+            if timestamps.len() == 1 {
+                assert_eq!(produced, bound, "one sample answers every window it is in");
+            }
+        }
+    }
+
+    /// One-sample series are chunked by what they expand to, not what they
+    /// read, and each chunk's expansion is charged as it is built.
+    #[test]
+    fn a_sparse_expansion_is_chunked_and_charged_by_its_output() {
+        let series = sparse_series();
+        let count = series.len();
+        let mut charges = Vec::new();
+        let outcome = expanding_request(None)
+            .evaluate(series, &Deadline::default(), &mut |expanded| {
+                charges.push(expanded);
+                Ok(())
+            })
+            .unwrap();
+        let GridOutcome::Rolled(rolled) = outcome else {
+            panic!("a rollup request answers Rolled");
+        };
+        assert_eq!(rolled.len(), count);
+        assert!(rolled.iter().all(|s| s.samples.len() == STEPS));
+        assert!(charges.len() >= 3, "one charge per chunk: {charges:?}");
+        assert!(
+            charges.iter().all(|&n| n <= EVALUATE_CHUNK_WORK + STEPS),
+            "no chunk produces much more than the chunk work: {charges:?}"
+        );
+        // Everything past the one raw sample each, which the caller charged.
+        assert_eq!(charges.iter().sum::<usize>(), count * (STEPS - 1));
+    }
+
+    #[test]
+    fn a_budget_stops_the_expansion_at_the_chunk_that_crosses_it() {
+        let budget = SampleBudget::new(EVALUATE_CHUNK_WORK / 2);
+        let err = expanding_request(None)
+            .evaluate(sparse_series(), &Deadline::default(), &mut |expanded| {
+                budget.charge(expanded)
+            })
+            .err()
+            .expect("over budget");
+        assert!(matches!(err, QueryError::TooManySamples { .. }), "{err}");
+        assert!(
+            budget.loaded() <= EVALUATE_CHUNK_WORK + STEPS,
+            "stopped after the first chunk, not the whole grid: {}",
+            budget.loaded()
+        );
+    }
+
+    /// The aggregations a fused request can carry, one per strategy, each
+    /// keeping a state or candidate per series per step over [`sparse_series`]:
+    /// grouped by the label every series differs in, or counting its values,
+    /// which differ too.
+    fn per_series_aggregations() -> [GridAggregation; 3] {
+        let by_i = || {
+            Some(LabelModifier::Include(promql_parser::label::Labels::new(
+                vec!["i"],
+            )))
+        };
+        [
+            GridAggregation {
+                kind: AggregationKind::Sum,
+                modifier: by_i(),
+                param: None,
+            },
+            GridAggregation {
+                kind: AggregationKind::Topk,
+                modifier: by_i(),
+                param: Some(AggregationParam::Scalar(1.0)),
+            },
+            GridAggregation {
+                kind: AggregationKind::CountValues,
+                modifier: None,
+                param: Some(AggregationParam::Label("v".to_string())),
+            },
+        ]
+    }
+
+    /// What a fused request's groups or candidates hold past the raw samples
+    /// they were folded from is charged as they grow, chunk by chunk, exactly
+    /// as an unfused request's kept output is: the per-series output is
+    /// dropped once folded, but what it was folded into stays.
+    #[test]
+    fn a_fused_accumulation_is_charged_as_it_grows() {
+        for aggregation in per_series_aggregations() {
+            let kind = aggregation.kind;
+            let series = sparse_series();
+            let count = series.len();
+            let mut charges = Vec::new();
+            let GridOutcome::Reduced(groups) = expanding_request(Some(aggregation))
+                .evaluate(series, &Deadline::default(), &mut |expanded| {
+                    charges.push(expanded);
+                    Ok(())
+                })
+                .unwrap()
+            else {
+                panic!("a fused request answers Reduced");
+            };
+            assert_eq!(groups.len(), count, "{kind:?}");
+            assert!(
+                charges.len() >= 3,
+                "{kind:?}: one charge per chunk: {charges:?}"
+            );
+            assert_eq!(
+                charges.iter().sum::<usize>(),
+                count * (STEPS - 1),
+                "{kind:?}: everything held past the one raw sample each"
+            );
+        }
+    }
+
+    /// A budget stops a fused accumulation at the chunk that crosses it, not
+    /// once every group is whole.
+    #[test]
+    fn a_budget_stops_a_fused_accumulation_at_the_chunk_that_crosses_it() {
+        for aggregation in per_series_aggregations() {
+            let kind = aggregation.kind;
+            let budget = SampleBudget::new(EVALUATE_CHUNK_WORK / 2);
+            let err = expanding_request(Some(aggregation))
+                .evaluate(sparse_series(), &Deadline::default(), &mut |expanded| {
+                    budget.charge(expanded)
+                })
+                .err()
+                .unwrap_or_else(|| panic!("{kind:?}: over budget"));
+            assert!(
+                matches!(err, QueryError::TooManySamples { .. }),
+                "{kind:?}: {err}"
+            );
+            assert!(
+                budget.loaded() <= EVALUATE_CHUNK_WORK + STEPS,
+                "{kind:?}: stopped after the first chunk, not the whole grid: {}",
+                budget.loaded()
+            );
+        }
+    }
+
+    /// A fused request folds chunk by chunk, as a shard folds its own series:
+    /// the answer is the one fold over every series' output would give.
+    #[test]
+    fn a_fused_evaluation_folds_chunks_into_the_whole_answer() {
+        let aggregations = [
+            (AggregationKind::Sum, None),
+            (AggregationKind::Topk, Some(AggregationParam::Scalar(2.0))),
+            (
+                AggregationKind::CountValues,
+                Some(AggregationParam::Label("v".to_string())),
+            ),
+        ];
+        for (kind, param) in aggregations {
+            let aggregation = GridAggregation {
+                kind,
+                modifier: None,
+                param,
+            };
+            let request = expanding_request(Some(aggregation.clone()));
+            let series = sparse_series();
+            let GridOutcome::Reduced(chunked) = request
+                .evaluate(series.clone(), &Deadline::default(), &mut |_| Ok(()))
+                .unwrap()
+            else {
+                panic!("a fused request answers Reduced");
+            };
+
+            let whole = request
+                .per_series(&request.window_ends(), series)
+                .into_step_values();
+            let want = match aggregation.strategy() {
+                PushdownStrategy::Reduce => {
+                    let mut partials = SteppedPartialGroups::new(kind);
+                    partials
+                        .accumulate(None, whole, &Deadline::default())
+                        .unwrap();
+                    partials.finalize(&Deadline::default()).unwrap()
+                }
+                _ => {
+                    let mut selection = SteppedSelection::new(aggregation);
+                    selection.apply(whole, &Deadline::default()).unwrap();
+                    selection.finalize(&Deadline::default()).unwrap()
+                }
+            };
+            assert_eq!(rendered(chunked), rendered(want), "{kind:?}");
         }
     }
 }

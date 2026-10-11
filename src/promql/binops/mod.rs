@@ -19,10 +19,10 @@ pub(in crate::promql) use labels::*;
 /// Re-exported for the external Criterion benchmark crates (`benches/fast_path.rs`),
 /// which reach these through `promql::binops`.
 #[cfg(feature = "bench")]
-pub use bench::{GroupLeftCase, OnMatchCase, VectorVectorCase, VectorVectorShape};
-
-#[cfg(feature = "bench")]
-pub use binop_vector_scalar::{BenchOp, LabelMode, VectorScalarCase, VectorScalarInput};
+pub use bench::{
+    BenchOp, GroupLeftCase, LabelMode, OnMatchCase, VectorScalarCase, VectorScalarInput,
+    VectorVectorCase, VectorVectorShape,
+};
 
 pub(crate) fn eval_binary_expr(
     expr: &BinaryExpr,

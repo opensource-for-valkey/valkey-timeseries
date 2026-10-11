@@ -3,7 +3,7 @@ use crate::common::Timestamp;
 use crate::fanout::{FanoutCommand, FanoutCommandResult, FanoutContext, NodeInfo};
 use crate::labels::HasFingerprint;
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::fanout::query_utils::handle_instant_query;
+use crate::promql::engine::fanout::query_utils::{handle_instant_query, shard_read};
 use crate::promql::engine::promql_config;
 use crate::promql::generated::{
     InstantQuery, InstantQueryResponse, SeriesSelector as ProtoSeriesSelector,
@@ -93,6 +93,8 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             });
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
+        // The response is the samples read, so the budget is held until it is returned.
+        let read = shard_read(ctx)?;
         // Locks per batch of matched series, not for the whole read.
         handle_instant_query(
             ctx,
@@ -101,6 +103,7 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             req.lookback_delta,
             req.max_series,
             req.max_points_per_series,
+            &read,
         )
     }
 
@@ -116,7 +119,12 @@ impl FanoutCommand for InstantVectorSelectorFanoutCommand {
             lookback_delta: self.lookback_delta,
             max_series: self.max_series,
             max_points_per_series: self.max_points_per_series,
+            time_budget_ms: super::time_budget_to_wire(self.timeout),
         }
+    }
+
+    fn time_budget(req: &InstantQuery) -> Option<Duration> {
+        super::time_budget_from_wire(req.time_budget_ms)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

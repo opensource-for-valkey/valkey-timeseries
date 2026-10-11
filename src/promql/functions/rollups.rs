@@ -21,10 +21,11 @@
 
 use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
+use crate::promql::deadline::SERIES_WORK;
 use crate::promql::functions::types::RollupWindow;
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples};
 use num_traits::Zero;
-use orx_parallel::Par;
+use orx_parallel::{Par, ParResult};
 
 /// Evaluate `rollup_fn` over each series' window, one value per series.
 ///
@@ -41,12 +42,17 @@ pub(super) fn eval_rollups(
     optional_param: Option<f64>,
     rollup_fn: fn(&RollupWindow, Option<f64>) -> f64,
 ) -> EvalResult<Vec<EvalSample>> {
-    let results = range_vec
+    // Checked per series, weighted by its samples, outside the rollup's own loop over them.
+    let deadline = ctx.deadline;
+    range_vec
         .into_par_rayon()
-        .filter_map(|series| exec_series_rollup(ctx, series, optional_param, rollup_fn))
-        .collect();
-
-    Ok(results)
+        .map(|series| -> EvalResult<Option<EvalSample>> {
+            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
+            Ok(exec_series_rollup(ctx, series, optional_param, rollup_fn))
+        })
+        .into_fallible()
+        .filter_map(|sample| sample)
+        .collect::<Vec<_>>()
 }
 
 /// Evaluate one series' rollup at the end of the window the selector loaded.
@@ -229,23 +235,31 @@ pub(super) fn eval_rollups_basic<F>(
     ctx: &EvalContext,
     series_data: Vec<EvalSamples>,
     f: F,
-) -> Vec<EvalSample>
+) -> EvalResult<Vec<EvalSample>>
 where
     F: Fn(&[Sample]) -> f64 + Sync,
 {
+    // Checked per series, weighted by its samples, outside `f`'s loop over them.
+    let deadline = ctx.deadline;
     series_data
         .into_par_rayon()
-        .filter_map(|series| {
-            let window = window_samples(&series.values, series.range_end_ms, series.range_ms)?;
+        .map(|series| -> EvalResult<Option<EvalSample>> {
+            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
+            let Some(window) = window_samples(&series.values, series.range_end_ms, series.range_ms)
+            else {
+                return Ok(None);
+            };
 
-            Some(EvalSample {
+            Ok(Some(EvalSample {
                 timestamp_ms: ctx.evaluation_ts,
                 value: f(window),
                 labels: series.labels,
                 drop_name: series.drop_name,
-            })
+            }))
         })
-        .collect()
+        .into_fallible()
+        .filter_map(|sample| sample)
+        .collect::<Vec<_>>()
 }
 
 /// The samples of `series` inside `(window_end - window_ms, window_end]`, or

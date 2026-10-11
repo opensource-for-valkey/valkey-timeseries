@@ -245,3 +245,30 @@ class TestBatchedLocalCopyBudget(ValkeyTimeSeriesTestCaseBase):
         finally:
             self.client.execute_command(
                 'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', '50000000')
+
+    def test_sample_limit_spent_exactly_skips_series_empty_in_the_window(self):
+        """A series whose one chunk straddles the window, with nothing inside
+        it, charges nothing: a read already at its limit must skip it, not
+        refuse with `1 > 1`. One series has the window's only sample; the
+        others each overlap it with a chunk spanning T0..T0+100. Decode order
+        is the pool's, so the query is repeated to reach the order where the
+        sample is charged first."""
+        self.client.execute_command('TS.CREATE', 'gap:hit', 'METRIC', 'gap{k="hit"}')
+        self.client.execute_command('TS.ADD', 'gap:hit', (T0 + 50) * 1000, 1)
+        for n in range(16):
+            key = f'gap:miss{n}'
+            self.client.execute_command('TS.CREATE', key, 'METRIC', f'gap{{k="miss{n}"}}')
+            self.client.execute_command('TS.MADD', key, T0 * 1000, 1, key, (T0 + 100) * 1000, 2)
+        # The window (T0+30, T0+70] holds one sample in all.
+        query, at = 'gap[40s]', T0 + 70
+        try:
+            for limit in ('1', '2', '0'):
+                self.client.execute_command(
+                    'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', limit)
+                for _ in range(10):
+                    result = self.instant_query(query, at)
+                    assert result.is_matrix() and len(result.result) == 1, limit
+                    assert len(result.result[0].values) == 1, limit
+        finally:
+            self.client.execute_command(
+                'CONFIG', 'SET', 'ts.ts-promql-max-samples-per-query', '50000000')

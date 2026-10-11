@@ -460,7 +460,7 @@ fn eval_arith_ops(
     }
 
     let (one_vec, many_vec) = ctx.sides.one_and_many(left_vector, right_vector);
-    let result = eval_arith_ops_hash_join(&ctx, one_vec, many_vec)?;
+    let result = eval_arith_ops_internal(&ctx, one_vec, many_vec)?;
     Ok(ExprResult::InstantVector(result))
 }
 
@@ -500,7 +500,7 @@ enum OneSlot {
 ///   the same either way. A *filled* unmatched repeat does emit, once per
 ///   series; the result-wide duplicate check rejects it only if those series
 ///   collide.
-fn eval_arith_ops_hash_join(
+fn eval_arith_ops_internal(
     ctx: &ArithOpContext<'_>,
     one_vec: Vec<EvalSample>,
     many_vec: Vec<EvalSample>,

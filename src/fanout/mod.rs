@@ -38,6 +38,7 @@ pub(crate) use workers::request_lane_stats;
 pub(crate) use cluster_map::NUM_SLOTS;
 pub use cluster_map::{ClusterMap, ClusterNodesSource, FanoutTarget, NodeInfo};
 pub use registry::register_fanout_operation;
+pub(crate) use workers::hold_request_lane;
 
 pub(crate) fn init_fanout(ctx: &Context) {
     if !is_clustered(ctx) {

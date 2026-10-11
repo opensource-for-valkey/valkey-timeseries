@@ -1,6 +1,6 @@
 use crate::common::Timestamp;
 use crate::common::context::{get_current_db, set_current_db};
-use crate::common::logging::log_warning;
+use crate::common::logging::{log_debug, log_warning};
 use crate::common::threads::{
     IntoParRayon, LockGil, MATERIALIZE_POOL, ThreadRole, check_may_block, panic_message,
     run_on_pool_cold, set_thread_role,
@@ -10,18 +10,20 @@ use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_
 use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
+use crate::promql::deadline::Deadline;
 use crate::promql::engine::label_profile::{
     LabelProfile, LabelProfileBuilder, profiled_series_cap,
 };
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
-use crate::promql::engine::sample_budget::{SampleBudget, too_many_samples, validate_max_samples};
+use crate::promql::engine::sample_budget::{SampleBudget, validate_max_samples};
 use crate::promql::engine::{
     AggregationFanoutCommand, GridFanoutCommand, InstantVectorParams,
     InstantVectorSelectorFanoutCommand, LabelProfileFanoutCommand,
     RangeVectorSelectorFanoutCommand, WireRangeResponse, check_unique_series, decode_range_series,
-    get_snapshot_range, instant_lookback_start_ms, validate_max_points, validate_max_series,
+    decode_within_budget, exceeds_max_series, get_snapshot_range, instant_lookback_start_ms,
+    validate_max_points, validate_max_series,
 };
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::chunks::ChunkOps;
@@ -89,14 +91,18 @@ enum SelectorTaskKind {
 }
 
 impl SelectorTaskKind {
-    fn db(&self) -> i32 {
+    fn options(&self) -> &QueryOptions {
         match self {
-            SelectorTaskKind::Vector(iqc) => iqc.options.db,
-            SelectorTaskKind::Range(rc) => rc.options.db,
-            SelectorTaskKind::Aggregation(ac) => ac.options.db,
-            SelectorTaskKind::Grid(gc) => gc.options.db,
-            SelectorTaskKind::Profile(pc) => pc.options.db,
+            SelectorTaskKind::Vector(iqc) => &iqc.options,
+            SelectorTaskKind::Range(rc) => &rc.options,
+            SelectorTaskKind::Aggregation(ac) => &ac.options,
+            SelectorTaskKind::Grid(gc) => &gc.options,
+            SelectorTaskKind::Profile(pc) => &pc.options,
         }
+    }
+
+    fn db(&self) -> i32 {
+        self.options().db
     }
 }
 
@@ -461,6 +467,7 @@ impl SelectorBatchExecutor {
         hash_tags: Arc<[String]>,
     ) -> QueryResult<SelectorOutput> {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let wait_limit = calculate_timeout(command.options()) + RESULT_WAIT_GRACE;
         let task = SelectorTask {
             kind: command,
             caller_user,
@@ -478,11 +485,9 @@ impl SelectorBatchExecutor {
             ));
         }
 
-        match wait_for_result(&result_rx) {
-            Ok(res) => match res {
-                Ok(val) => Ok(val),
-                Err(err) => Err(err),
-            },
+        match wait_for_result(&result_rx, wait_limit) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(QueryError::Timeout),
             Err(e) => {
                 let msg = format!("Failed to receive query response: {}", e);
                 Err(QueryError::Execution(msg))
@@ -491,13 +496,27 @@ impl SelectorBatchExecutor {
     }
 }
 
-/// Wait for a selector result. A plain blocking wait, on a pool worker too: the processor
-/// needs nothing from this thread's pool to answer (see the type-level docs), and a wait
-/// that ran other jobs meanwhile would stack one blocking wait per stolen closure.
+/// How long past the read's own time limit its caller waits for the answer. The limit is
+/// the fan-out's deadline, whose timeout is the answer due then; the margin lets that
+/// richer path answer first when the main thread runs its timer a little late.
+const RESULT_WAIT_GRACE: Duration = Duration::from_millis(250);
+
+/// Wait up to `limit` for a selector result. A plain blocking wait, on a pool worker too: the
+/// processor needs nothing from this thread's pool to answer (see the type-level docs), and a
+/// wait that ran other jobs meanwhile would stack one blocking wait per stolen closure.
+///
+/// Bounded, though the read it waits for is too, as a backstop: a wait with no limit kept a
+/// query (and its worker) past its deadline whenever the read's own bound failed to end it —
+/// a fan-out to the local node alone has no RPC timer, and its share can sit queued on a busy
+/// worker lane for as long as the lane takes to get to it. A read answered after its caller
+/// stopped waiting is dropped (see [`deliver_task_result`]).
 #[track_caller]
-fn wait_for_result<T>(rx: &mpsc::Receiver<T>) -> Result<T, mpsc::RecvError> {
+fn wait_for_result<T>(
+    rx: &mpsc::Receiver<T>,
+    limit: Duration,
+) -> Result<T, mpsc::RecvTimeoutError> {
     check_may_block();
-    rx.recv()
+    rx.recv_timeout(limit)
 }
 
 /// Start one task's cluster fan-out, under the module lock, as the task's
@@ -544,9 +563,28 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     }
 }
 
+/// How long a fan-out for this query may take: its timeout, but never past the query's
+/// deadline. A query's fan-outs run one after another (a preload, then the reads the step
+/// loop falls back to), and arming each with the whole timeout let the last of them outlive
+/// the query by up to a full timeout, and its shards with it. This is also the time budget
+/// the request carries, so the shards stop when the coordinator does.
 fn calculate_timeout(opts: &QueryOptions) -> Duration {
-    opts.timeout.unwrap_or_else(get_cluster_command_timeout)
-    // todo: cap with promql config max query duration
+    remaining_budget(
+        opts.timeout.unwrap_or_else(get_cluster_command_timeout),
+        opts.deadline,
+        current_time_millis(),
+    )
+}
+
+/// `timeout`, cut to what is left before `deadline` (epoch ms) at `now`. At least 1 ms,
+/// so a query already past its deadline gets a fan-out that times out at once rather than
+/// one with no limit.
+fn remaining_budget(timeout: Duration, deadline: Option<Timestamp>, now: Timestamp) -> Duration {
+    let Some(deadline) = deadline.filter(|&d| d > 0) else {
+        return timeout;
+    };
+    let left = Duration::from_millis(deadline.saturating_sub(now).max(1) as u64);
+    timeout.min(left)
 }
 
 fn validate_max_series_(series_count: usize, max_series: usize) -> QueryResult<()> {
@@ -576,7 +614,8 @@ fn deliver_task_result(
     result: QueryResult<SelectorOutput>,
 ) {
     if responder.send(result).is_err() {
-        log_warning("promql: failed to send query response to requester");
+        // Its caller stopped waiting (see `wait_for_result`), and has answered without it.
+        log_debug("promql: selector result arrived after its caller stopped waiting");
     }
 }
 
@@ -713,7 +752,8 @@ fn execute_cluster_aggregation(
         max_series: ac.options.max_series as u64,
         max_points_per_series: ac.options.max_points_per_series.unwrap_or(0) as u64,
     };
-    let cmd = AggregationFanoutCommand::new(vector, ac.aggregation, timeout);
+    let deadline = Deadline::from_options(&ac.options);
+    let cmd = AggregationFanoutCommand::new(vector, ac.aggregation, timeout, deadline);
 
     let max_series = ac.options.max_series;
     let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
@@ -777,12 +817,16 @@ fn execute_cluster_grid(
     let timeout = calculate_timeout(&gc.options);
     let max_series = gc.options.max_series;
     let max_points_per_series = gc.options.max_points_per_series;
+    let max_samples = gc.options.max_samples;
+    let deadline = Deadline::from_options(&gc.options);
     let cmd = GridFanoutCommand::new(
         gc.matchers,
         gc.request,
         max_series as u64,
         max_points_per_series.unwrap_or(0) as u64,
+        max_samples,
         timeout,
+        deadline,
     );
 
     let targets = compute_hash_tag_fanout_target(ctx, hash_tags);
@@ -791,8 +835,8 @@ fn execute_cluster_grid(
 
     let handler = move |cmd: GridFanoutCommand, result: FanoutCommandResult| {
         let peer_unsupported = cmd.peer_unsupported();
-        let query_result = match result.and_then(|()| cmd.into_result()) {
-            Ok(outcome) => {
+        let query_result = match result {
+            Ok(()) => cmd.into_result().and_then(|outcome| {
                 // The grid output, not the input, is what these bound: one
                 // entry per series (or group), one point per step that produced
                 // one.
@@ -803,13 +847,12 @@ fn execute_cluster_grid(
                     | GridOutcome::Raw(series) => series.iter().map(|s| s.samples.len()).collect(),
                     GridOutcome::Unsupported => Vec::new(),
                 };
-                validate_max_series_(points.len(), max_series).and_then(|_| {
-                    for count in points {
-                        validate_max_points_per_series(count, max_points_per_series)?;
-                    }
-                    Ok(SelectorOutput::Grid(outcome))
-                })
-            }
+                validate_max_series_(points.len(), max_series)?;
+                for count in points {
+                    validate_max_points_per_series(count, max_points_per_series)?;
+                }
+                Ok(SelectorOutput::Grid(outcome))
+            }),
             Err(e) if peer_unsupported => {
                 log_warning(format!(
                     "promql: grid push-down unsupported by a peer, evaluating without it: {e}"
@@ -980,12 +1023,10 @@ fn run_local_batch(tasks: Vec<SelectorTask>) {
                 read.finish();
                 return false;
             }
-            if read
-                .options
-                .deadline
-                .is_some_and(|d| current_time_millis() > d)
-            {
-                read.fail(QueryError::Timeout);
+            // Past its deadline, its client gone, or memory past the limit: the
+            // next hold would take the lock for nobody, or add to the pressure.
+            if let Err(err) = Deadline::from_options(&read.options).check() {
+                read.fail(err);
                 return false;
             }
             true
@@ -1165,6 +1206,7 @@ impl LocalRead {
             return Ok(None);
         }
         let _ = set_current_db(ctx, self.cursor.db());
+        let max_series = self.options.max_series;
         let Self { cursor, state, .. } = self;
         // Kept apart from the read's own errors, which become `Execution`: this
         // one must reach the caller as the budget error `decode` would raise.
@@ -1182,20 +1224,42 @@ impl LocalRead {
                     // the first hold: a batch `Vec` per hold, and the answer
                     // doubling across holds, left macOS's allocator holding
                     // 300 MB it no longer used under four concurrent queries.
+                    // Never past one over the series limit, where the read stops.
                     if samples.capacity() == 0 {
-                        samples.reserve_exact(cursor.remaining());
+                        let planned = cursor.remaining();
+                        samples.reserve_exact(if max_series > 0 {
+                            planned.min(max_series + 1)
+                        } else {
+                            planned
+                        });
                     }
                     cursor.next_batch(ctx, share, &mut |_, batch| {
-                        samples.extend(batch.iter().filter_map(|(s, _)| {
-                            let sample = s.last_sample_in_range(start, end)?;
-                            Some(InstantSample {
-                                timestamp_ms: sample.timestamp,
-                                value: sample.value,
-                                labels: EvalLabels::interned(&s.labels),
-                            })
-                        }));
+                        // One past the limit is enough to refuse the read: stop there,
+                        // mid-batch, rather than look up the rest of the hold's samples.
+                        let room = if max_series > 0 {
+                            (max_series + 1).saturating_sub(samples.len())
+                        } else {
+                            usize::MAX
+                        };
+                        samples.extend(
+                            batch
+                                .iter()
+                                .filter_map(|(s, _)| {
+                                    let sample = s.last_sample_in_range(start, end)?;
+                                    Some(InstantSample {
+                                        timestamp_ms: sample.timestamp,
+                                        value: sample.value,
+                                        labels: EvalLabels::interned(&s.labels),
+                                    })
+                                })
+                                .take(room),
+                        );
                         Ok(())
                     })?;
+                    if exceeds_max_series(samples.len(), max_series) {
+                        // `finish` refuses the read whatever the rest holds.
+                        cursor.finish();
+                    }
                     None
                 }
                 ReadState::Range {
@@ -1264,7 +1328,13 @@ impl LocalRead {
             return;
         };
         match decode_snapshot_batch(batch, &self.options, budget) {
-            Ok(decoded) => ranges.extend(decoded),
+            Ok(decoded) => {
+                ranges.extend(decoded);
+                if exceeds_max_series(ranges.len(), self.options.max_series) {
+                    // `finish` refuses the read whatever the rest holds: copy no more.
+                    self.cursor.finish();
+                }
+            }
             Err(err) => self.fail(err),
         }
     }
@@ -1338,8 +1408,10 @@ fn decode_snapshot_batch(
     series
         .into_par_on(&MATERIALIZE_POOL)
         .filter_map(|(labels, snapshot)| {
-            if budget.exhausted() {
-                return Some(Err(too_many_samples(budget.loaded(), budget.limit())));
+            match decode_within_budget(budget, &snapshot) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(err) => return Some(Err(err)),
             }
             let samples = match get_snapshot_range(&snapshot, max_points) {
                 Ok(samples) => samples,
@@ -1419,7 +1491,9 @@ mod selector_batch_executor_tests {
         callers.spawn_broadcast(move |_| {
             let (tx, rx) = mpsc::sync_channel(1);
             task_tx.send(tx).unwrap();
-            done_tx.send(wait_for_result(&rx)).unwrap();
+            done_tx
+                .send(wait_for_result(&rx, Duration::from_secs(10)))
+                .unwrap();
         });
         for _ in 0..2 {
             let answer = done_rx
@@ -1430,12 +1504,53 @@ mod selector_batch_executor_tests {
     }
 
     #[test]
+    fn a_fan_out_never_outlives_its_query() {
+        use super::remaining_budget;
+        let thirty = Duration::from_secs(30);
+        // No deadline: the timeout as configured.
+        assert_eq!(remaining_budget(thirty, None, 1_000), thirty);
+        assert_eq!(remaining_budget(thirty, Some(0), 1_000), thirty);
+        // A deadline further off than the timeout leaves it alone.
+        assert_eq!(remaining_budget(thirty, Some(100_000), 1_000), thirty);
+        // Closer: what is left of the query.
+        assert_eq!(
+            remaining_budget(thirty, Some(5_000), 1_000),
+            Duration::from_millis(4_000)
+        );
+        // Past it: a fan-out that times out at once, not an unlimited one.
+        assert_eq!(
+            remaining_budget(thirty, Some(1_000), 2_000),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
     fn wait_for_result_off_the_pool_is_a_plain_recv() {
+        let limit = Duration::from_secs(5);
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send("x").unwrap();
-        assert_eq!(wait_for_result(&rx), Ok("x"));
+        assert_eq!(wait_for_result(&rx, limit), Ok("x"));
         drop(tx);
-        assert!(wait_for_result(&rx).is_err());
+        assert_eq!(
+            wait_for_result(&rx, limit),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+    }
+
+    /// A read that is never answered — its fan-out stuck behind a busy worker lane, say —
+    /// releases its caller at the limit instead of holding it, and its query worker, forever.
+    #[test]
+    fn wait_for_result_gives_up_at_its_limit() {
+        let (tx, rx) = mpsc::sync_channel::<u32>(1);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            wait_for_result(&rx, Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        // The late answer is refused, not left for the next read on this channel.
+        drop(rx);
+        assert!(tx.send(1).is_err());
     }
 
     #[test]

@@ -18,6 +18,11 @@ pub enum QueryError {
     #[error("query timed out")]
     Timeout,
 
+    /// The client disconnected while its query waited or ran, so it was abandoned. The
+    /// reply, if any, goes nowhere: this is for logs and counters.
+    #[error("query cancelled: the client disconnected")]
+    Cancelled,
+
     /// An error occurred during query execution.
     #[error("execution error: {0}")]
     Execution(String),
@@ -31,6 +36,35 @@ pub enum QueryError {
         prefix = crate::error_consts::PROMQL_TOO_MANY_SAMPLES_ERROR
     )]
     TooManySamples { loaded: usize, limit: usize },
+
+    /// This node, or a shard the query reads from, refuses PromQL work for load: see
+    /// [`crate::error_consts::PROMQL_OVERLOADED_ERROR`]. The text says which limit and why.
+    #[error("{0}")]
+    Overloaded(String),
+
+    /// The reply, estimated before any of it is written, is larger than
+    /// `ts-promql-max-reply-bytes`.
+    #[error(
+        "{prefix}: about {bytes} bytes > {limit} (ts-promql-max-reply-bytes)",
+        prefix = crate::error_consts::PROMQL_REPLY_TOO_LARGE_ERROR
+    )]
+    ReplyTooLarge { bytes: usize, limit: usize },
+}
+
+impl QueryError {
+    /// Whether this error ends the query rather than downgrading a best-effort read: a
+    /// passed deadline, a client that has gone, a sample budget already spent, or a node
+    /// refusing for load. Each only gets worse, so the reads a declined preload falls back
+    /// to would be refused one by one.
+    pub fn ends_query(&self) -> bool {
+        matches!(
+            self,
+            QueryError::Timeout
+                | QueryError::Cancelled
+                | QueryError::TooManySamples { .. }
+                | QueryError::Overloaded(_)
+        )
+    }
 }
 
 impl From<EvaluationError> for QueryError {

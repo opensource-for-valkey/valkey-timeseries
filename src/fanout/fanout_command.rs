@@ -4,7 +4,7 @@ use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
 use crate::common::metrics::fanout as metrics;
 use crate::common::sync::lock;
-use crate::common::threads::Rejected;
+use crate::common::threads::{BoundedExecutor, Rejected};
 use crate::fanout::fanout_context::FanoutContext;
 use crate::fanout::serialization::{Deserialized, Serializable};
 use crate::fanout::workers::PEER_REQUEST_EXECUTOR;
@@ -16,7 +16,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use valkey_module::{Context, ValkeyResult};
 
-pub(super) type FanoutResponseCallback = Box<dyn Fn(FanoutResult<&[u8]>, &NodeInfo) + Send + Sync>;
+/// Where a fan-out stands once a shard's answer has been handed to it — what the RPC layer
+/// checks before it stops the deadline timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FanoutProgress {
+    /// The fan-out has completed: nothing it runs still needs the deadline.
+    Done,
+    /// The fan-out has not completed. After the last remote answer, that means work for it
+    /// still waits on the worker lane — a deferred decode, or the local share — and only the
+    /// deadline timer can end it if the lane is slow to get there.
+    Pending,
+}
+
+pub(super) type FanoutResponseCallback =
+    Box<dyn Fn(FanoutResult<&[u8]>, &NodeInfo) -> FanoutProgress + Send + Sync>;
 
 pub type FanoutCommandResult<T = ()> = Result<T, FanoutError>;
 
@@ -54,6 +67,17 @@ pub trait FanoutCommand: Default + Send + 'static {
     /// locking and build the response after releasing, so the server stays
     /// responsive while the shard-local reply is materialized.
     fn get_local_response(ctx: &FanoutContext, req: Self::Request) -> ValkeyResult<Self::Response>;
+
+    /// How long the requester of `req` waits for its answer, if the request says.
+    ///
+    /// A receiving node counts it from when the request arrived: a request still queued
+    /// past it is dropped unrun, and a read past it stops between batches. Measured from
+    /// arrival rather than carried as a time of day, so it needs no clock agreement, and
+    /// the receiver's deadline can only fall later than the requester's, never earlier.
+    /// `None` (the default) never expires.
+    fn time_budget(_req: &Self::Request) -> Option<Duration> {
+        None
+    }
 
     /// Return the timeout duration for the entire fanout operation.
     /// This timeout applies to the overall operation, not individual RPC calls.
@@ -219,6 +243,91 @@ where
     }
 
     Ok(())
+}
+
+/// The smallest shard response decoded off the main thread. A smaller one decodes in
+/// well under the ~50 µs a hand-off to a worker costs; at this size decoding is about
+/// 0.1 ms, and a range or grid response can be megabytes.
+///
+/// A deferred response counts as its shard's answer as soon as it arrives, but the fan-out
+/// is not done with it until the decode has run, so the RPC keeps its deadline timer armed
+/// meanwhile (see [`FanoutProgress`]): a lane too busy to reach the decode in time ends the
+/// fan-out with a timeout at its deadline, not whenever the lane's queue drains.
+const DEFERRED_DECODE_MIN_BYTES: usize = 64 * 1024;
+
+/// The RPC layer's handler for one fan-out's remote answers, and for its deadline. Runs on
+/// the main thread, inside the cluster-bus callback or the timeout timer.
+fn rpc_response_handler<OP, F>(
+    state: Arc<FanoutState<OP, F>>,
+    lane: &'static BoundedExecutor,
+    deadline: Instant,
+) -> impl Fn(FanoutResult<&[u8]>, &NodeInfo) -> FanoutProgress + Send + Sync + 'static
+where
+    OP: FanoutCommand + 'static,
+    F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
+{
+    move |res, target| {
+        // Already answered (a deadline, a fail-fast error): nothing would read this one, so
+        // don't decode it either.
+        if state.is_completed() {
+            return FanoutProgress::Done;
+        }
+        match res {
+            Err(err) => state.on_error(err, target),
+            Ok(buf) if buf.len() >= DEFERRED_DECODE_MIN_BYTES => {
+                // Decoding and merging a large response here stalls every client of the
+                // node for as long as they take; copying it out is a fraction of that.
+                if defer_response(lane, Arc::clone(&state), buf, *target, deadline).is_ok() {
+                    return FanoutProgress::Pending;
+                }
+                // The lane is full: decode here, as before, rather than fail the fan-out.
+                deliver_response(&state, buf, target);
+            }
+            Ok(buf) => deliver_response(&state, buf, target),
+        }
+        state.progress()
+    }
+}
+
+/// Queue a shard's response for decoding on `lane`. A decode that is only reached past the
+/// fan-out's `deadline`, or after the fan-out has ended, is dropped unread (see
+/// [`FanoutState::still_wanted`]).
+///
+/// On `Err` nothing was queued — or copied: the place in the queue is claimed first.
+fn defer_response<OP, F>(
+    lane: &'static BoundedExecutor,
+    state: Arc<FanoutState<OP, F>>,
+    buf: &[u8],
+    target: NodeInfo,
+    deadline: Instant,
+) -> Result<(), Rejected>
+where
+    OP: FanoutCommand + 'static,
+    F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
+{
+    let slot = lane.try_reserve()?;
+    let owned = buf.to_vec();
+    slot.spawn(move || {
+        if state.still_wanted(deadline, &target) {
+            deliver_response(&state, &owned, &target);
+        }
+    });
+    Ok(())
+}
+
+/// Decode one shard's response and hand it to the fan-out.
+fn deliver_response<OP, F>(state: &FanoutState<OP, F>, buf: &[u8], target: &NodeInfo)
+where
+    OP: FanoutCommand + 'static,
+    F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
+{
+    match OP::Response::deserialize(buf) {
+        Ok(resp) => state.on_response(resp, target),
+        Err(e) => {
+            let err = FanoutError::serialization(format!("Failed to deserialize response: {e}"));
+            state.on_error(err, target);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +555,29 @@ where
         lock(&self.inner).lifecycle == FanoutLifecycleState::Completed
     }
 
+    fn progress(&self) -> FanoutProgress {
+        if self.is_completed() {
+            FanoutProgress::Done
+        } else {
+            FanoutProgress::Pending
+        }
+    }
+
+    /// Whether work queued for this fan-out — the local share, a deferred decode — is still
+    /// wanted when a worker gets to it. Not once the fan-out has completed (a deadline or a
+    /// fail-fast error), and not past `deadline`, where it ends the fan-out with the timeout
+    /// instead: the requester has its answer, or is owed that one.
+    fn still_wanted(&self, deadline: Instant, target: &NodeInfo) -> bool {
+        if self.is_completed() {
+            return false;
+        }
+        if Instant::now() >= deadline {
+            self.on_error(FanoutError::timeout(), target);
+            return false;
+        }
+        true
+    }
+
     fn on_response(&self, resp: OP::Response, target: &NodeInfo) {
         let mut inner = lock(&self.inner);
         inner.on_response(resp, target);
@@ -488,9 +620,229 @@ where
             return;
         }
         let fanout_ctx = FanoutContext::new(user, db);
+        // Past it the fan-out has answered with a timeout, so a long read stops there.
+        fanout_ctx.set_deadline(deadline);
         match OP::get_local_response(&fanout_ctx, req) {
             Ok(response) => state.on_response(response, &target),
             Err(err) => state.on_error(err.into(), &target),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::threads::Capacity;
+    use crate::promql::generated::LabelProfileQuery;
+    use std::sync::mpsc;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// Counts the responses it was handed.
+    #[derive(Default)]
+    struct Counting {
+        responses: usize,
+    }
+
+    impl FanoutCommand for Counting {
+        type Request = LabelProfileQuery;
+        type Response = LabelProfileQuery;
+
+        fn name() -> &'static str {
+            "test-counting"
+        }
+
+        fn get_local_response(
+            _ctx: &FanoutContext,
+            _req: LabelProfileQuery,
+        ) -> ValkeyResult<LabelProfileQuery> {
+            unreachable!("no local share in these tests")
+        }
+
+        fn generate_request(&self) -> LabelProfileQuery {
+            LabelProfileQuery::default()
+        }
+
+        fn on_response(&mut self, _: LabelProfileQuery, _: &NodeInfo) -> FanoutCommandResult {
+            self.responses += 1;
+            Ok(())
+        }
+    }
+
+    /// What the fan-out completed with: how many responses it took in, and the error kind if
+    /// it failed.
+    type Outcome = (usize, Option<ErrorKind>);
+
+    type Completion = Box<dyn FnOnce(Counting, FanoutCommandResult) + Send>;
+
+    /// A one-shard fan-out whose completion is sent to the returned receiver.
+    fn fanout() -> (
+        Arc<FanoutState<Counting, Completion>>,
+        mpsc::Receiver<Outcome>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let completion: Completion = Box::new(move |op, res| {
+            let _ = tx.send((op.responses, res.err().map(|e| e.kind)));
+        });
+        (
+            Arc::new(FanoutState::new(Counting::default(), 1, completion)),
+            rx,
+        )
+    }
+
+    /// A valid response of at least `len` bytes: one unknown field, which decoding skips.
+    fn response_of(len: usize) -> Vec<u8> {
+        const UNKNOWN_BYTES_FIELD: u8 = (15 << 3) | 2;
+        let mut buf = vec![UNKNOWN_BYTES_FIELD];
+        prost::encoding::encode_varint(len as u64, &mut buf);
+        buf.resize(buf.len() + len, 0);
+        buf
+    }
+
+    fn large_response() -> Vec<u8> {
+        response_of(DEFERRED_DECODE_MIN_BYTES)
+    }
+
+    fn one() -> usize {
+        1
+    }
+
+    /// Occupies `lane`'s only worker until the returned sender is dropped.
+    fn occupy(lane: &'static BoundedExecutor) -> mpsc::Sender<()> {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        lane.try_spawn(move || {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+        entered_rx.recv_timeout(WAIT).unwrap();
+        release_tx
+    }
+
+    /// Waits until every job queued on `lane` before this call has run.
+    fn drain(lane: &'static BoundedExecutor) {
+        let (tx, rx) = mpsc::channel();
+        lane.try_spawn(move || tx.send(()).unwrap()).unwrap();
+        rx.recv_timeout(WAIT).unwrap();
+    }
+
+    fn target() -> NodeInfo {
+        NodeInfo::for_test(7001)
+    }
+
+    #[test]
+    fn a_small_response_is_delivered_inline() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-inline", one, Capacity::Fixed(4));
+        let (state, done) = fanout();
+        let handler = rpc_response_handler(state, &LANE, Instant::now() + WAIT);
+
+        assert_eq!(
+            handler(Ok(&response_of(16)), &target()),
+            FanoutProgress::Done
+        );
+        assert_eq!(done.try_recv(), Ok((1, None)));
+    }
+
+    #[test]
+    fn a_large_response_is_decoded_on_the_lane() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-deferred", one, Capacity::Fixed(4));
+        let (state, done) = fanout();
+        let handler = rpc_response_handler(state, &LANE, Instant::now() + WAIT);
+
+        // Answered, but not yet done with: the RPC must keep the deadline armed.
+        assert_eq!(
+            handler(Ok(&large_response()), &target()),
+            FanoutProgress::Pending
+        );
+        assert_eq!(done.recv_timeout(WAIT), Ok((1, None)));
+    }
+
+    /// With the lane occupied, the RPC's deadline timer stays armed for a deferred response:
+    /// firing ends the fan-out with a timeout while the decode is still queued, and the
+    /// decode, when the lane does reach it, is dropped unread.
+    #[test]
+    fn the_deadline_ends_a_fanout_whose_decode_is_stuck_behind_a_busy_lane() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-busy", one, Capacity::Fixed(4));
+        let release = occupy(&LANE);
+        let (state, done) = fanout();
+        let handler = rpc_response_handler(state, &LANE, Instant::now() + WAIT);
+
+        assert_eq!(
+            handler(Ok(&large_response()), &target()),
+            FanoutProgress::Pending
+        );
+        assert!(done.try_recv().is_err(), "the decode cannot have run yet");
+
+        // The timer fires (as `InFlightRequest::deliver_timeout` delivers it).
+        assert_eq!(
+            handler(Err(FanoutError::timeout()), &target()),
+            FanoutProgress::Done
+        );
+        assert_eq!(
+            done.try_recv(),
+            Ok((0, Some(ErrorKind::Timeout))),
+            "answered at the deadline, with the lane still occupied"
+        );
+
+        drop(release);
+        drain(&LANE);
+        assert!(done.try_recv().is_err(), "completed exactly once");
+    }
+
+    #[test]
+    fn a_decode_the_lane_reaches_past_the_deadline_is_timed_out_unread() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-expired", one, Capacity::Fixed(4));
+        let release = occupy(&LANE);
+        let (state, done) = fanout();
+        // Already due by the time the lane gets to the decode.
+        let handler = rpc_response_handler(state, &LANE, Instant::now());
+
+        assert_eq!(
+            handler(Ok(&large_response()), &target()),
+            FanoutProgress::Pending
+        );
+        drop(release);
+        // A valid response: had it been decoded, the fan-out would have succeeded with it.
+        assert_eq!(done.recv_timeout(WAIT), Ok((0, Some(ErrorKind::Timeout))));
+    }
+
+    #[test]
+    fn a_full_lane_decodes_inline() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-full", one, Capacity::Fixed(1));
+        let release = occupy(&LANE);
+        LANE.try_spawn(|| {}).unwrap();
+        let (state, done) = fanout();
+        let handler = rpc_response_handler(state, &LANE, Instant::now() + WAIT);
+
+        assert_eq!(
+            handler(Ok(&large_response()), &target()),
+            FanoutProgress::Done
+        );
+        assert_eq!(done.try_recv(), Ok((1, None)));
+        drop(release);
+    }
+
+    #[test]
+    fn an_answer_for_a_completed_fanout_is_not_decoded() {
+        static LANE: BoundedExecutor =
+            BoundedExecutor::new("test-fanout-late", one, Capacity::Fixed(4));
+        let (state, done) = fanout();
+        let handler = rpc_response_handler(state, &LANE, Instant::now() + WAIT);
+        handler(Err(FanoutError::timeout()), &target());
+        assert_eq!(done.try_recv(), Ok((0, Some(ErrorKind::Timeout))));
+
+        // Late, and large: nothing is queued for it.
+        assert_eq!(
+            handler(Ok(&large_response()), &target()),
+            FanoutProgress::Done
+        );
+        assert_eq!(LANE.stats().queued, 0);
+        assert!(done.try_recv().is_err());
+    }
 }

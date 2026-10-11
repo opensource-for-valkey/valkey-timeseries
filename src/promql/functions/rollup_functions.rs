@@ -336,7 +336,9 @@ pub(super) fn exec_basic_rollup_fn(
 ) -> EvalResult<ExprResult> {
     expect_exact_arg_count(name, 1, args.len())?;
     let range = args.swap_remove(0).into_range_vector()?;
-    Ok(ExprResult::InstantVector(eval_rollups_basic(ctx, range, f)))
+    Ok(ExprResult::InstantVector(eval_rollups_basic(
+        ctx, range, f,
+    )?))
 }
 
 macro_rules! make_rollup_function {

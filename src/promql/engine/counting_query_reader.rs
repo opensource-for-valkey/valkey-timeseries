@@ -1,7 +1,9 @@
 //! A counting decorator over [`QueryReader`], for asserting how many reader
 //! calls a query evaluation performs.
 //!
-//! Phase 0 of `docs/plans/promql-execution-optimization-plan.md`: the plan's
+//! Phase 0 of the PromQL execution optimization plan, since removed as
+//! outdated (read it with `git show
+//! d9d07430c^:docs/plans/promql-execution-optimization-plan.md`): the plan's
 //! Tier 1 findings are all forms of reader-call amplification (per-step window
 //! re-fetches, per-inner-step subquery requests), so its later phases are
 //! verified by *counting reader calls*, not by timing. This wrapper is that
@@ -146,8 +148,8 @@ impl QueryReader for CountingQueryReader {
     }
 }
 
-/// Pin the reader-call counts of the query shapes named in
-/// `docs/plans/promql-execution-optimization-plan.md`.
+/// Pin the reader-call counts of the query shapes named in the execution
+/// optimization plan (see the module docs for where to read it).
 ///
 /// These tests assert *current* behavior, including the request amplification
 /// the plan's Tier 1 targets. When a later phase lands, the affected
@@ -999,6 +1001,333 @@ mod tests {
         const RAW: usize = 3 * 30;
         try_range(reader.clone(), "rate(a[1m])", RAW).expect("the raw span fits the budget");
         try_range(reader, "rate(a[1m])", RAW - 1).expect_err("one sample short of the span");
+    }
+
+    /// One sample per series under a lookback that covers every step fills a
+    /// grid slot at every step. The read decoded three samples; the grids hold
+    /// 30,000 points, and those are what the query is charged: each series
+    /// costs the larger of its span and its grid.
+    #[test]
+    fn a_sparse_series_is_charged_for_the_grid_it_fills() {
+        const STEPS: i64 = 10_000;
+        let querier = MemorySeriesQuerier::new();
+        for l in 0..3 {
+            let labels = Labels::from_pairs(&[("__name__", "sparse"), ("l", &l.to_string())]);
+            querier.add_sample(&labels, Sample::new(0, 1.0));
+        }
+        let reader: Arc<dyn QueryReader> = Arc::new(querier);
+        let run = |max_samples: usize| {
+            let start = 1_000;
+            let end = start + (STEPS - 1) * 1_000;
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("sparse").unwrap(),
+                start: ms(start),
+                end: ms(end),
+                interval: Duration::from_secs(1),
+                // Reaches back to the one sample from the last step.
+                lookback_delta: Duration::from_millis(end as u64 + 1),
+            };
+            let options = QueryOptions {
+                max_samples,
+                ..options()
+            };
+            evaluate_range(reader.clone(), stmt, options)
+        };
+
+        let grids = 3 * STEPS as usize;
+        let result = run(grids).expect("exactly the grids fits");
+        assert_eq!(result.iter().map(|s| s.samples.len()).sum::<usize>(), grids);
+        let err = run(grids - 1).expect_err("the grids, not the three raw samples, are charged");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+        assert!(run(0).is_ok(), "0 is unlimited");
+    }
+
+    /// The same for a rollup: one sample per series in a window that spans
+    /// every step answers at every step. The expansion is charged as the
+    /// rollup builds it, and the grid only for what it adds past that, so the
+    /// query costs its grids exactly once.
+    #[test]
+    fn a_sparse_rollup_is_charged_once_for_the_grid_it_fills() {
+        const STEPS: i64 = 10_000;
+        let querier = MemorySeriesQuerier::new();
+        for l in 0..3 {
+            let labels = Labels::from_pairs(&[("__name__", "sparse"), ("l", &l.to_string())]);
+            querier.add_sample(&labels, Sample::new(0, 1.0));
+        }
+        let reader: Arc<dyn QueryReader> = Arc::new(querier);
+        let run = |max_samples: usize| {
+            let start = 1_000;
+            let end = start + (STEPS - 1) * 1_000;
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("count_over_time(sparse[1d])").unwrap(),
+                start: ms(start),
+                end: ms(end),
+                interval: Duration::from_secs(1),
+                lookback_delta: options().lookback_delta,
+            };
+            let options = QueryOptions {
+                max_samples,
+                ..options()
+            };
+            evaluate_range(reader.clone(), stmt, options)
+        };
+
+        let grids = 3 * STEPS as usize;
+        let result = run(grids).expect("exactly the grids fits");
+        assert_eq!(result.iter().map(|s| s.samples.len()).sum::<usize>(), grids);
+        let err = run(grids - 1).expect_err("the expansion, not the three raw samples, is charged");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+        assert!(run(0).is_ok(), "0 is unlimited");
+    }
+
+    /// An expression that reads nothing still returns samples, and a range
+    /// query keeps every step's: the result is charged for what it holds past
+    /// what the query loaded, so a generator cannot get past the budget.
+    #[test]
+    fn generated_range_results_are_charged() {
+        let (_, reader) = build_reader();
+        for query in [
+            "1",
+            "vector(1)",
+            "absent(nonexistent)",
+            // Builds 3 points per evaluation: under the per-evaluation subquery
+            // cap at every limit here, so the result is what is charged.
+            "sum_over_time(vector(1)[3s:1s])",
+        ] {
+            let err = try_range(reader.clone(), query, 1).expect_err(query);
+            assert!(
+                err.to_string().contains("too many samples"),
+                "{query}: {err}"
+            );
+            try_range(reader.clone(), query, RANGE_STEPS)
+                .unwrap_or_else(|err| panic!("{query}: one sample per step fits: {err}"));
+            try_range(reader.clone(), query, RANGE_STEPS - 1).expect_err(query);
+        }
+        try_range(reader, "vector(1)", 0).expect("0 is unlimited");
+    }
+
+    /// An instant query returning a subquery returns its whole grid.
+    #[test]
+    fn a_generated_instant_result_is_charged() {
+        let (_, reader) = build_reader();
+        let run = |max_samples: usize| {
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("vector(1)[1m:1s]").unwrap(),
+                start: ms(RANGE_END_MS),
+                end: ms(RANGE_END_MS),
+                interval: Duration::ZERO,
+                lookback_delta: options().lookback_delta,
+            };
+            let options = QueryOptions {
+                max_samples,
+                ..options()
+            };
+            evaluate_instant(reader.clone(), stmt, ms(RANGE_END_MS), options)
+        };
+        let Ok(crate::promql::QueryValue::Matrix(series)) = run(0) else {
+            panic!("a subquery answers a matrix");
+        };
+        let points: usize = series.iter().map(|s| s.samples.len()).sum();
+        assert!(points >= 60, "{points}");
+        run(points).expect("exactly the grid fits");
+        let err = run(points - 1).expect_err("one sample short of the grid");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+    }
+
+    /// A subquery's result is built whole for each outer step, then reduced by
+    /// the function around it, so the query's own result never sees it. It is
+    /// capped per evaluation — at most what one outer step builds — not summed
+    /// over the outer steps.
+    #[test]
+    fn a_subquerys_materialization_is_capped_per_evaluation() {
+        let (_, reader) = build_reader();
+        let instant = |query: &str, max_samples: usize| {
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse(query).unwrap(),
+                start: ms(RANGE_END_MS),
+                end: ms(RANGE_END_MS),
+                interval: Duration::ZERO,
+                lookback_delta: options().lookback_delta,
+            };
+            let options = QueryOptions {
+                max_samples,
+                ..options()
+            };
+            evaluate_instant(reader.clone(), stmt, ms(RANGE_END_MS), options)
+        };
+        // What one evaluation of the subquery builds.
+        let Ok(crate::promql::QueryValue::Matrix(grid)) = instant("vector(1)[1m:1s]", 0) else {
+            panic!("a subquery answers a matrix");
+        };
+        let built: usize = grid.iter().map(|s| s.samples.len()).sum();
+
+        // One point returned, `built` built: the cap is what refuses it.
+        const SUMMED: &str = "sum_over_time(vector(1)[1m:1s])";
+        instant(SUMMED, built).expect("one evaluation's worth fits");
+        let err = instant(SUMMED, built - 1).expect_err("one sample short of the subquery");
+        assert!(err.to_string().contains("too many samples"), "{err}");
+
+        // Every outer step builds it again; only one evaluation's worth counts.
+        try_range(reader.clone(), SUMMED, built).expect("per evaluation, not per query");
+        try_range(reader.clone(), SUMMED, built - 1).expect_err("each evaluation is capped");
+
+        try_range(reader, SUMMED, 0).expect("0 is unlimited");
+    }
+
+    /// The reply's size is checked as the range result grows, from a floor on
+    /// the final estimate: a result that will be refused stops early, and one
+    /// the final check admits is never refused by the floor.
+    #[test]
+    fn a_range_reply_too_large_stops_while_it_is_built() {
+        use crate::promql::engine::admission::{
+            estimate_range_reply_bytes, range_reply_bytes_floor,
+        };
+        let (_, reader) = build_reader();
+        let run = |end_ms: i64, max_reply_bytes: usize| {
+            let stmt = EvalStmt {
+                expr: promql_parser::parser::parse("vector(1)").unwrap(),
+                start: ms(0),
+                end: ms(end_ms),
+                interval: Duration::from_secs(1),
+                lookback_delta: options().lookback_delta,
+            };
+            let options = QueryOptions {
+                max_reply_bytes,
+                ..options()
+            };
+            evaluate_range(reader.clone(), stmt, options)
+        };
+
+        const STEPS: usize = 100_000;
+        let err = run((STEPS as i64 - 1) * 1_000, 64 * 1024).expect_err("past the limit");
+        let crate::promql::QueryError::ReplyTooLarge { bytes, limit } = err else {
+            panic!("refused for its reply size: {err}");
+        };
+        assert_eq!(limit, 64 * 1024);
+        assert!(
+            bytes < range_reply_bytes_floor(1, STEPS) / 10,
+            "stopped near the limit, not after the whole result: {bytes}"
+        );
+
+        let small = run(9_000, 0).expect("unlimited");
+        let exact = estimate_range_reply_bytes(&small);
+        run(9_000, exact).expect("the floor never refuses what the final estimate admits");
+    }
+
+    /// `ts-promql-max-response-series` bounds what the query returns, not only
+    /// each read: an `or` of two three-series reads returns six.
+    #[test]
+    fn the_result_is_bounded_by_max_series_not_only_each_read() {
+        // `or` matches label sets without `__name__`, so `a or b` would keep only
+        // `a`'s three: the right side gets a label of its own.
+        const OR6: &str = r#"a or label_replace(b, "src", "b", "", "")"#;
+        let (_, reader) = build_reader();
+        let parse = |q: &str| promql_parser::parser::parse(q).unwrap();
+        let with_max_series = |max_series| QueryOptions {
+            max_series,
+            ..options()
+        };
+        let range = |query: &str, max_series| {
+            let stmt = EvalStmt {
+                expr: parse(query),
+                start: ms(RANGE_START_MS),
+                end: ms(RANGE_END_MS),
+                interval: STEP,
+                lookback_delta: options().lookback_delta,
+            };
+            evaluate_range(reader.clone(), stmt, with_max_series(max_series))
+        };
+        let instant = |query: &str, max_series| {
+            let stmt = EvalStmt {
+                expr: parse(query),
+                start: ms(RANGE_END_MS),
+                end: ms(RANGE_END_MS),
+                interval: Duration::ZERO,
+                lookback_delta: options().lookback_delta,
+            };
+            evaluate_instant(
+                reader.clone(),
+                stmt,
+                ms(RANGE_END_MS),
+                with_max_series(max_series),
+            )
+        };
+
+        assert_eq!(range(OR6, 6).unwrap().len(), 6);
+        let err = range(OR6, 4).expect_err("six series returned, each read three");
+        assert!(
+            err.to_string().ends_with("max series limit: 6 > 4"),
+            "{err}"
+        );
+        assert!(instant(OR6, 6).is_ok());
+        let err = instant(OR6, 4).expect_err("the instant result too");
+        assert!(
+            err.to_string().ends_with("max series limit: 6 > 4"),
+            "{err}"
+        );
+        assert!(range(OR6, 0).is_ok(), "0 is unlimited");
+
+        // Series a range query accumulates across steps: every series holds the
+        // same value at a step and a new one at the next, so `count_values` makes
+        // one series per step, five in all, from a single series per step.
+        assert_eq!(
+            range("count_values(\"v\", a)", 5).unwrap().len(),
+            RANGE_STEPS
+        );
+        let err = range("count_values(\"v\", a)", 4).expect_err("one series per step");
+        assert!(err.to_string().contains("max series limit"), "{err}");
+    }
+
+    /// A query whose client disconnected stops at its next deadline check
+    /// with `Cancelled`, instead of running on for a reply that goes nowhere.
+    #[test]
+    fn a_disconnected_clients_query_is_cancelled() {
+        use crate::common::replies::TestClient;
+        use crate::promql::QueryError;
+        let (_, reader) = build_reader();
+        let client = TestClient::new();
+        let with_token = QueryOptions {
+            cancel: client.token(),
+            ..options()
+        };
+        let stmt = |query: &str, start: i64, end: i64, step: Duration| EvalStmt {
+            expr: promql_parser::parser::parse(query).unwrap(),
+            start: ms(start),
+            end: ms(end),
+            interval: step,
+            lookback_delta: options().lookback_delta,
+        };
+        // A subquery checks the deadline at its own steps too.
+        let query = "max_over_time(rate(a[1m])[2m:10s])";
+        let range = || {
+            evaluate_range(
+                reader.clone(),
+                stmt(query, RANGE_START_MS, RANGE_END_MS, STEP),
+                with_token,
+            )
+        };
+        let instant = || {
+            let at = RANGE_END_MS;
+            evaluate_instant(
+                reader.clone(),
+                stmt(query, at, at, Duration::ZERO),
+                ms(at),
+                with_token,
+            )
+        };
+
+        assert!(range().is_ok() && instant().is_ok(), "connected: evaluates");
+        client.disconnect();
+        assert!(
+            matches!(range(), Err(QueryError::Cancelled)),
+            "{:?}",
+            range().err()
+        );
+        assert!(
+            matches!(instant(), Err(QueryError::Cancelled)),
+            "{:?}",
+            instant().err()
+        );
     }
 
     #[test]

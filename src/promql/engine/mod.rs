@@ -1,3 +1,4 @@
+pub(crate) mod admission;
 #[cfg(test)]
 mod counting_query_reader;
 pub mod derived_filters;
@@ -22,6 +23,7 @@ pub mod sample_budget;
 mod selector_batch_executor;
 
 use crate::common::Timestamp;
+use crate::common::replies::CancelToken;
 use crate::common::time::current_time_millis;
 use crate::promql::time::duration_ms;
 pub(crate) use fanout::*;
@@ -54,8 +56,8 @@ pub struct QueryOptions {
     /// The maximum number of data points to return per series for each series. This is to help guard against
     /// OOMs and accidental self-DOS, especially in cluster mode.
     pub max_points_per_series: Option<usize>,
-    /// The maximum number of samples this query may load into memory across
-    /// all its reads (`ts-promql-max-samples-per-query`). 0 = unlimited.
+    /// The maximum number of samples this query may load across all its reads,
+    /// as a running total (`ts-promql-max-samples-per-query`). 0 = unlimited.
     pub max_samples: usize,
     /// Enable experimental functions for the current request
     pub enable_experimental_functions: bool,
@@ -68,6 +70,20 @@ pub struct QueryOptions {
     pub derived_filter_pushdown: bool,
     /// The db in which to execute the query
     pub db: i32,
+    /// Set once the client that sent the query disconnects; checked wherever the deadline is.
+    pub cancel: CancelToken,
+    /// The process-wide sample limit this query's budget also counts toward
+    /// (`ts-promql-max-samples-in-flight`). 0 = unlimited.
+    pub max_samples_in_flight: usize,
+    /// Stop the query while memory use is at or past this percentage of `maxmemory`
+    /// (`ts-promql-max-memory-percent`); checked wherever the deadline is. 0 = never.
+    pub max_memory_percent: u32,
+    /// The most subquery steps the query may evaluate in all
+    /// (`ts-promql-max-subquery-steps`); see `check_subquery_cost`. 0 = unlimited.
+    pub max_subquery_steps: u64,
+    /// The largest reply the query may produce, as `admission::estimate_reply_bytes`
+    /// sizes it (`ts-promql-max-reply-bytes`). 0 = unlimited.
+    pub max_reply_bytes: usize,
 }
 
 impl Default for QueryOptions {
@@ -93,6 +109,11 @@ impl Default for QueryOptions {
             optimize_queries: config.optimize_queries,
             derived_filter_pushdown: config.derived_filter_pushdown,
             db: 0,
+            cancel: CancelToken::default(),
+            max_samples_in_flight: config.max_samples_in_flight,
+            max_memory_percent: config.max_memory_percent,
+            max_subquery_steps: config.max_subquery_steps,
+            max_reply_bytes: config.max_reply_bytes,
         }
     }
 }

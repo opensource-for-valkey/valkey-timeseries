@@ -149,10 +149,11 @@ pub(super) const BUSY_ERROR: &str =
 pub(super) const QUERY_LIMIT_ERROR: &str = "Query resource limit exceeded";
 /// The texts every query-limit refusal starts with. They carry the observed count and the
 /// limit after the text, so they are matched by prefix rather than by equality.
-const QUERY_LIMIT_ERROR_PREFIXES: [&str; 3] = [
+const QUERY_LIMIT_ERROR_PREFIXES: [&str; 4] = [
     error_consts::PROMQL_MAX_SERIES_ERROR,
     error_consts::PROMQL_MAX_POINTS_PER_SERIES_ERROR,
     error_consts::PROMQL_TOO_MANY_SAMPLES_ERROR,
+    error_consts::PROMQL_OVERLOADED_ERROR,
 ];
 
 impl ErrorKind {

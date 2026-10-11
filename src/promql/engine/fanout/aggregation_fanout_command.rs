@@ -25,7 +25,8 @@ use crate::fanout::{
     get_cluster_command_timeout, log_fanout_failure,
 };
 use crate::labels::filters::SeriesSelector;
-use crate::promql::engine::fanout::query_utils::local_instant_eval_samples;
+use crate::promql::deadline::{Deadline, SERIES_WORK};
+use crate::promql::engine::fanout::query_utils::{local_instant_eval_samples, shard_read};
 use crate::promql::engine::fanout::type_conversions::{
     aggregation_param_from_wire, aggregation_param_to_wire, decode_peer_partial,
     decode_pushdown_kind, wrong_payload,
@@ -39,11 +40,11 @@ use crate::promql::generated::{
     AggregationQueryResponse, InstantQuery, InstantSample as ProtoInstantSample,
     SeriesSelector as ProtoSeriesSelector,
 };
-use crate::promql::{EvalResult, EvalSample};
+use crate::promql::{EvalResult, EvalSample, QueryError};
 use promql_parser::label::Matchers;
 use promql_parser::parser::LabelModifier;
 use std::time::Duration;
-use valkey_module::{ValkeyError, ValkeyResult};
+use valkey_module::ValkeyResult;
 
 /// The instant-vector half of the request: what to select, and when.
 #[derive(Debug, Clone)]
@@ -89,6 +90,13 @@ pub(in crate::promql) struct AggregationFanoutCommand {
     /// no aggregation push-down at all. The caller retries without push-down
     /// rather than failing the query.
     unsupported_peer: bool,
+    /// The query's: checked as the shards' output is merged, and as it is
+    /// reduced to the answer ([`Self::into_result`]).
+    deadline: Deadline,
+    /// Why merging stopped, when `deadline` passed during it: every later
+    /// response is dropped unread, and [`Self::into_result`] reports this, in
+    /// its own words, rather than a fan-out failure.
+    stopped: Option<QueryError>,
 }
 
 impl Default for AggregationFanoutCommand {
@@ -111,6 +119,8 @@ impl Default for AggregationFanoutCommand {
             samples: Vec::new(),
             raw: Vec::new(),
             unsupported_peer: false,
+            deadline: Deadline::default(),
+            stopped: None,
         }
     }
 }
@@ -124,6 +134,7 @@ impl AggregationFanoutCommand {
         vector: InstantVectorParams,
         aggregation: AggregationRequest,
         timeout: Duration,
+        deadline: Deadline,
     ) -> Self {
         let strategy = aggregation
             .kind
@@ -144,6 +155,8 @@ impl AggregationFanoutCommand {
             samples: Vec::new(),
             raw: Vec::new(),
             unsupported_peer: false,
+            deadline,
+            stopped: None,
         }
     }
 
@@ -155,6 +168,10 @@ impl AggregationFanoutCommand {
 
     /// Reduce the shards' output to the final instant vector.
     pub fn into_result(mut self) -> EvalResult<Vec<EvalSample>> {
+        if let Some(err) = self.stopped.take() {
+            return Err(err.into());
+        }
+        let deadline = &self.deadline;
         let AggregationRequest {
             kind,
             ref modifier,
@@ -168,7 +185,7 @@ impl AggregationFanoutCommand {
                 // A shard that shipped raw samples is compensated by running
                 // the shard-side accumulation here.
                 if !raw.is_empty() {
-                    self.partials.accumulate(modifier.as_ref(), raw);
+                    self.partials.accumulate(modifier.as_ref(), raw, deadline)?;
                 }
                 Ok(self.partials.finalize(eval_time))
             }
@@ -183,6 +200,7 @@ impl AggregationFanoutCommand {
                     param.as_ref().map(AggregationParam::to_expr_result),
                     candidates,
                     eval_time,
+                    deadline,
                 )
             }
             PushdownStrategy::CountValues => {
@@ -195,6 +213,7 @@ impl AggregationFanoutCommand {
                         param.as_ref().map(AggregationParam::to_expr_result),
                         raw,
                         eval_time,
+                        deadline,
                     )?);
                 }
                 Ok(merge_count_values(counts))
@@ -216,6 +235,10 @@ impl AggregationFanoutCommand {
                 format_args!("a pushed-down {:?} reduction", self.aggregation.kind),
             )?;
             self.partials.merge(labels, state);
+            if let Err(err) = self.deadline.checkpoint(SERIES_WORK) {
+                self.stopped = Some(err);
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -246,6 +269,9 @@ impl FanoutCommand for AggregationFanoutCommand {
             return Ok(AggregationQueryResponse::default());
         };
         let series_selector: SeriesSelector = (&selector).try_into()?;
+        // Held to the end, through the aggregation: the coordinator counts only the groups
+        // that come back, so this is all that counts the input while it is held here.
+        let read = shard_read(ctx)?;
         // Locks per batch of matched series, not for the whole read.
         let samples = local_instant_eval_samples(
             ctx,
@@ -253,6 +279,7 @@ impl FanoutCommand for AggregationFanoutCommand {
             query.timestamp,
             query.lookback_delta,
             query.max_series,
+            &read,
         )?;
 
         // An unrecognized operator means the coordinator is newer than this
@@ -270,16 +297,26 @@ impl FanoutCommand for AggregationFanoutCommand {
         match strategy {
             PushdownStrategy::Reduce => {
                 let mut groups = PartialGroups::new(kind);
-                groups.accumulate(modifier.as_ref(), samples);
+                groups
+                    .accumulate(modifier.as_ref(), samples, &read.deadline)
+                    .map_err(super::shard_error)?;
                 Ok(partials_response(groups))
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
                 let param = aggregation_param_from_wire(req.scalar_param, req.label_param)
                     .as_ref()
                     .map(AggregationParam::to_expr_result);
-                let aggregated =
-                    apply_aggregation(kind, modifier.as_ref(), param, samples, req.eval_timestamp)
-                        .map_err(|e| ValkeyError::String(e.to_string()))?;
+                let aggregated = apply_aggregation(
+                    kind,
+                    modifier.as_ref(),
+                    param,
+                    samples,
+                    req.eval_timestamp,
+                    // Its read stops between batches once the requester gives up or
+                    // memory runs short; so does the aggregation over what it read.
+                    &read.deadline,
+                )
+                .map_err(super::shard_error)?;
                 Ok(samples_response(aggregated, true))
             }
         }
@@ -289,6 +326,10 @@ impl FanoutCommand for AggregationFanoutCommand {
         self.timeout
     }
 
+    fn time_budget(req: &AggregationQuery) -> Option<Duration> {
+        super::time_budget_from_wire(req.query.as_ref()?.time_budget_ms)
+    }
+
     fn generate_request(&self) -> AggregationQuery {
         let query = InstantQuery {
             selector: Some(ProtoSeriesSelector::from(&self.vector.matchers)),
@@ -296,6 +337,7 @@ impl FanoutCommand for AggregationFanoutCommand {
             lookback_delta: self.vector.lookback_delta,
             max_series: self.vector.max_series,
             max_points_per_series: self.vector.max_points_per_series,
+            time_budget_ms: super::time_budget_to_wire(self.timeout),
         };
 
         let (scalar_param, label_param) =
@@ -312,6 +354,9 @@ impl FanoutCommand for AggregationFanoutCommand {
     }
 
     fn on_response(&mut self, mut resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
+        if self.stopped.is_some() {
+            return Ok(());
+        }
         let labels = resp.labels.take().unwrap_or_default();
         let mut resolver = symbol_table::EvalLabelResolver::new(&labels);
         let samples = std::mem::take(&mut resp.samples)
@@ -451,11 +496,18 @@ mod tests {
     }
 
     fn command(aggregation: AggregationRequest) -> AggregationFanoutCommand {
+        command_until(aggregation, Deadline::default())
+    }
+
+    fn command_until(
+        aggregation: AggregationRequest,
+        deadline: Deadline,
+    ) -> AggregationFanoutCommand {
         let vector = InstantVectorParams {
             timestamp: EVAL_TS,
             ..Default::default()
         };
-        AggregationFanoutCommand::new(vector, aggregation, Duration::from_secs(1))
+        AggregationFanoutCommand::new(vector, aggregation, Duration::from_secs(1), deadline)
     }
 
     /// One shard's response, produced the way `get_local_response` produces it.
@@ -468,7 +520,9 @@ mod tests {
         match kind.pushdown_strategy().unwrap() {
             PushdownStrategy::Reduce => {
                 let mut groups = PartialGroups::new(kind);
-                groups.accumulate(modifier, samples);
+                groups
+                    .accumulate(modifier, samples, &Deadline::default())
+                    .unwrap();
                 partials_response(groups)
             }
             PushdownStrategy::Select | PushdownStrategy::CountValues => {
@@ -476,8 +530,15 @@ mod tests {
                     .param
                     .as_ref()
                     .map(AggregationParam::to_expr_result);
-                let aggregated =
-                    apply_aggregation(kind, modifier, param, samples, EVAL_TS).unwrap();
+                let aggregated = apply_aggregation(
+                    kind,
+                    modifier,
+                    param,
+                    samples,
+                    EVAL_TS,
+                    &Deadline::default(),
+                )
+                .unwrap();
                 samples_response(aggregated, true)
             }
         }
@@ -510,6 +571,7 @@ mod tests {
                 param,
                 samples,
                 EVAL_TS,
+                &Deadline::default(),
             )
             .unwrap(),
         )
@@ -670,7 +732,12 @@ mod tests {
             param: Some(AggregationParam::Scalar(5.0)),
             eval_timestamp: EVAL_TS,
         };
-        let cmd = AggregationFanoutCommand::new(vector, aggregation, Duration::from_secs(1));
+        let cmd = AggregationFanoutCommand::new(
+            vector,
+            aggregation,
+            Duration::from_secs(1),
+            Deadline::default(),
+        );
 
         let request = cmd.generate_request();
         let mut buf = Vec::new();
@@ -834,5 +901,71 @@ mod tests {
         let mut cmd = command(params(AggregationKind::Sum, None));
         cmd.on_error(FanoutError::timeout(), &node(7000));
         assert!(!cmd.peer_unsupported());
+    }
+
+    /// The coordinator's merge walks every partial, candidate or raw sample
+    /// the shards sent, so it stops once the query's deadline has passed: a
+    /// stop while merging partials is latched and later responses are dropped
+    /// unread, and the query is refused with its own reason.
+    #[test]
+    fn test_merging_stops_at_a_passed_deadline() {
+        // Enough groups for several deadline checkpoints, each its own value
+        // so `count_values` keeps a count per sample too.
+        let samples: Vec<EvalSample> = (0..5_000)
+            .map(|i| sample(&[("instance", &i.to_string())], i as f64))
+            .collect();
+        let by_instance = || {
+            Some(LabelModifier::Include(ModifierLabels::new(vec![
+                "instance",
+            ])))
+        };
+        let topk = AggregationRequest {
+            param: Some(AggregationParam::Scalar(1.0)),
+            ..params(AggregationKind::Topk, by_instance())
+        };
+        let count_values = AggregationRequest {
+            param: Some(AggregationParam::Label("v".to_string())),
+            ..params(AggregationKind::CountValues, None)
+        };
+        let cases = [
+            (
+                "sum, staged",
+                params(AggregationKind::Sum, by_instance()),
+                true,
+            ),
+            (
+                "sum, raw",
+                params(AggregationKind::Sum, by_instance()),
+                false,
+            ),
+            ("topk, staged", topk.clone(), true),
+            ("topk, raw", topk, false),
+            ("count_values, raw", count_values, false),
+        ];
+        for (what, aggregation, staged) in cases {
+            let arrived = if staged {
+                shard_response(&aggregation, samples.clone())
+            } else {
+                raw_response(samples.clone())
+            };
+
+            let mut live = command(aggregation.clone());
+            live.on_response(arrived.clone(), &node(7000)).unwrap();
+            assert!(live.into_result().is_ok(), "{what}");
+
+            let passed = Deadline::until(Some(std::time::Instant::now()));
+            let mut late = command_until(aggregation, passed);
+            late.on_response(arrived.clone(), &node(7000)).unwrap();
+            late.on_response(arrived, &node(7001))
+                .expect("dropped unread once stopped");
+            let err = late
+                .into_result()
+                .err()
+                .unwrap_or_else(|| panic!("{what}: past its deadline"));
+            assert!(
+                matches!(QueryError::from(err), QueryError::Timeout),
+                "{what}"
+            );
+        }
     }
 }

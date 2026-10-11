@@ -52,6 +52,14 @@ impl FanoutOperationRegistry {
         {
             match OP::Request::deserialize(req_buf) {
                 Ok(request) => {
+                    if let Some(budget) = OP::time_budget(&request) {
+                        // Counted from arrival: a request that waited out its budget in
+                        // the queue is answered at once, unrun.
+                        ctx.set_deadline(ctx.received() + budget);
+                        if ctx.expired() {
+                            return Err(FanoutError::timeout());
+                        }
+                    }
                     let response = OP::get_local_response(ctx, request)?;
                     response.serialize(dest);
                 }
@@ -99,4 +107,67 @@ where
 
 pub(super) fn get_fanout_request_handler(name: &str) -> Option<RequestHandlerCallback> {
     FANOUT_REGISTRY.get_operation_by_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fanout::{ErrorKind, FanoutCommandResult, NodeInfo};
+    use crate::promql::generated::LabelProfileQuery;
+    use std::time::{Duration, Instant};
+
+    /// A command whose shard-side read must never run: it panics if it does.
+    #[derive(Default)]
+    struct NeverRuns;
+
+    impl FanoutCommand for NeverRuns {
+        type Request = LabelProfileQuery;
+        type Response = LabelProfileQuery;
+
+        fn name() -> &'static str {
+            "test-never-runs"
+        }
+
+        fn get_local_response(
+            _ctx: &FanoutContext,
+            _req: LabelProfileQuery,
+        ) -> ValkeyResult<LabelProfileQuery> {
+            panic!("a request past its time budget was run");
+        }
+
+        fn time_budget(req: &LabelProfileQuery) -> Option<Duration> {
+            (req.time_budget_ms > 0).then(|| Duration::from_millis(req.time_budget_ms))
+        }
+
+        fn generate_request(&self) -> LabelProfileQuery {
+            LabelProfileQuery::default()
+        }
+
+        fn on_response(&mut self, _: LabelProfileQuery, _: &NodeInfo) -> FanoutCommandResult {
+            Ok(())
+        }
+    }
+
+    /// A request that waited in the lane's queue past its time budget is answered with a
+    /// timeout and never run: its requester has already answered without it. The budget
+    /// counts from arrival, not from when a worker picked the request up.
+    #[test]
+    fn a_request_that_outwaited_its_budget_in_the_queue_is_not_run() {
+        let registry = FanoutOperationRegistry::new();
+        registry.register::<NeverRuns>().unwrap();
+        let handler = registry.get_operation_by_name(NeverRuns::name()).unwrap();
+
+        let mut request = Vec::new();
+        LabelProfileQuery {
+            time_budget_ms: 5,
+            ..Default::default()
+        }
+        .serialize(&mut request);
+        let ctx =
+            FanoutContext::new(None, 0).received_at(Instant::now() - Duration::from_millis(50));
+
+        let err = handler(&ctx, &request, &mut Vec::new()).expect_err("refused unrun");
+        assert_eq!(err.kind, ErrorKind::Timeout);
+        assert!(ctx.expired(), "the deadline is recorded for the read too");
+    }
 }

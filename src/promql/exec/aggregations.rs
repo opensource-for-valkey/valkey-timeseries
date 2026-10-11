@@ -2,6 +2,7 @@ use crate::common::Timestamp;
 use crate::common::hash::IntMap;
 use crate::common::math::{kahan_avg, kahan_std_dev, kahan_sum, kahan_variance, quantile};
 use crate::labels::{HasFingerprint, SeriesFingerprint};
+use crate::promql::deadline::{Deadline, SERIES_WORK};
 use crate::promql::exec::types::EvalLabels;
 use crate::promql::functions::utils::is_valid_label_name;
 use crate::promql::hashers::FingerprintHashMap;
@@ -123,9 +124,17 @@ pub(super) fn eval_aggregation(
     samples: Vec<EvalSample>,
     param: Option<ExprResult>,
     eval_time: Timestamp,
+    deadline: &Deadline,
 ) -> EvalResult<ExprResult> {
     let kind = AggregationKind::try_from(expr.op)?;
-    let samples = apply_aggregation(kind, expr.modifier.as_ref(), param, samples, eval_time)?;
+    let samples = apply_aggregation(
+        kind,
+        expr.modifier.as_ref(),
+        param,
+        samples,
+        eval_time,
+        deadline,
+    )?;
     Ok(ExprResult::InstantVector(samples))
 }
 
@@ -137,18 +146,26 @@ pub(super) fn eval_aggregation(
 /// of the input, and the coordinator re-applies the selection operators to the
 /// union of the shards' candidates
 /// (see `crate::promql::engine::AggregationFanoutCommand`).
+///
+/// `deadline` is checked on entry and, through [`Deadline::checkpoint`], every few
+/// thousand series while the input is grouped: the one pass over every input series.
+/// Never inside the per-group reductions, whose loops over plain values are the ones
+/// the compiler vectorizes. A shard's push-down passes the default, which stops nothing:
+/// its reads already stop at their requester's time budget.
 pub(in crate::promql) fn apply_aggregation(
     kind: AggregationKind,
     modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     eval_time: Timestamp,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     if samples.is_empty() {
         // A shard with no matching series still reports a bad parameter.
         check_aggregation_param(kind, param.as_ref())?;
         return Ok(Vec::new());
     }
+    deadline.check()?;
 
     // A pending `__name__` drop is *not* materialized here. Prometheus removes
     // the name only when the final result is rendered, so an aggregation groups
@@ -171,19 +188,25 @@ pub(in crate::promql) fn apply_aggregation(
         | AggregationKind::Count
         | AggregationKind::Group
         | AggregationKind::Stddev
-        | AggregationKind::Stdvar => Ok(eval_reduction_aggregation(
-            modifier, kind, samples, eval_time,
-        )),
-        AggregationKind::Quantile => eval_quantile(modifier, param, samples, eval_time),
-        AggregationKind::CountValues => eval_count_values(modifier, param, samples, eval_time),
+        | AggregationKind::Stdvar => {
+            eval_reduction_aggregation(modifier, kind, samples, eval_time, deadline)
+        }
+        AggregationKind::Quantile => eval_quantile(modifier, param, samples, eval_time, deadline),
+        AggregationKind::CountValues => {
+            eval_count_values(modifier, param, samples, eval_time, deadline)
+        }
         AggregationKind::Topk => {
-            eval_top_bottom_k(modifier, param, samples, KAggregationOrder::Top)
+            eval_top_bottom_k(modifier, param, samples, KAggregationOrder::Top, deadline)
         }
-        AggregationKind::Bottomk => {
-            eval_top_bottom_k(modifier, param, samples, KAggregationOrder::Bottom)
-        }
-        AggregationKind::Limitk => eval_limit_k(modifier, param, samples),
-        AggregationKind::LimitRatio => eval_limit_ratio(modifier, param, samples),
+        AggregationKind::Bottomk => eval_top_bottom_k(
+            modifier,
+            param,
+            samples,
+            KAggregationOrder::Bottom,
+            deadline,
+        ),
+        AggregationKind::Limitk => eval_limit_k(modifier, param, samples, deadline),
+        AggregationKind::LimitRatio => eval_limit_ratio(modifier, param, samples, deadline),
     }
 }
 
@@ -235,6 +258,7 @@ fn eval_count_values(
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     let label_name = count_values_label(param)?;
 
@@ -264,6 +288,7 @@ fn eval_count_values(
     }
     let mut buckets: IntMap<u64, Bucket> = IntMap::default();
     for sample in samples {
+        deadline.checkpoint(SERIES_WORK)?;
         let value_key = count_values_key(sample.value);
         let key = count_values_bucket_key(sample.labels.compute_grouping_key(grouping), value_key);
         let bucket = buckets.entry(key).or_insert_with(|| Bucket {
@@ -435,6 +460,7 @@ fn eval_top_bottom_k(
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     order: KAggregationOrder,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     let name = if order == KAggregationOrder::Top {
         "topk"
@@ -452,7 +478,7 @@ fn eval_top_bottom_k(
     }
 
     // Serial: see `eval_reduction_aggregation` for the measurements.
-    let out: Vec<EvalSample> = group_samples(modifier, samples)
+    let out: Vec<EvalSample> = group_samples(modifier, samples, deadline)?
         .into_iter()
         .flat_map(|(_, group)| select_k_from_group(group.members, k, order))
         .collect();
@@ -483,13 +509,14 @@ fn eval_limit_k(
     modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     let k = get_k_param(param, samples.len(), "limitk")?;
 
     // For each group take the k samples with the smallest label hashes, then
     // flatten the per-group selections into the output vector.
     // Serial: see `eval_reduction_aggregation` for the measurements.
-    let out: Vec<EvalSample> = group_samples(modifier, samples)
+    let out: Vec<EvalSample> = group_samples(modifier, samples, deadline)?
         .into_iter()
         .flat_map(|(_, group)| select_limitk(group.members, k))
         .collect();
@@ -501,10 +528,11 @@ fn eval_limit_ratio(
     modifier: Option<&LabelModifier>,
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     let k = get_param_as_scalar(param, "limit_ratio")?;
 
-    let groups = group_samples(modifier, samples);
+    let groups = group_samples(modifier, samples, deadline)?;
     let mut out = Vec::new();
 
     // todo: parallelize
@@ -520,11 +548,12 @@ fn eval_quantile(
     param: Option<ExprResult>,
     samples: Vec<EvalSample>,
     eval_time: Timestamp,
+    deadline: &Deadline,
 ) -> EvalResult<Vec<EvalSample>> {
     // Out-of-range phi is not an error: `quantile` answers -Inf below 0, +Inf
     // above 1 and NaN for NaN, as Prometheus does.
     let phi = get_param_as_scalar(param, "quantile")?;
-    let groups = group_samples(modifier, samples);
+    let groups = group_samples(modifier, samples, deadline)?;
 
     // Serial: see `eval_reduction_aggregation` for the measurements.
     let out: Vec<EvalSample> = groups
@@ -556,8 +585,9 @@ fn eval_reduction_aggregation(
     kind: AggregationKind,
     samples: Vec<EvalSample>,
     timestamp_ms: Timestamp,
-) -> Vec<EvalSample> {
-    let groups = group_sample_values(modifier, samples);
+    deadline: &Deadline,
+) -> EvalResult<Vec<EvalSample>> {
+    let groups = group_sample_values(modifier, samples, deadline)?;
 
     // Serial, like every other per-group step in this file. These four sites
     // (this one, `eval_quantile`, `eval_top_bottom_k`, `eval_limit_k`) used to
@@ -595,7 +625,7 @@ fn eval_reduction_aggregation(
     // counters. `EvalLabels::interned` now shares the series' own slice
     // instead, which removed that cost outright (group_samples 22k-sample
     // shapes -26..-37%); the fan-out has even less to split than before.
-    groups
+    Ok(groups
         .into_iter()
         .map(|(_, group)| {
             let value = aggregate_group(kind, &group.members);
@@ -606,7 +636,7 @@ fn eval_reduction_aggregation(
                 drop_name: group.drop_name,
             }
         })
-        .collect()
+        .collect())
 }
 
 fn aggregate_group(kind: AggregationKind, samples: &[f64]) -> f64 {
@@ -673,9 +703,11 @@ impl<T> Group<T> {
 fn group_samples(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<Group<EvalSample>> {
+    deadline: &Deadline,
+) -> EvalResult<FingerprintHashMap<Group<EvalSample>>> {
     let mut groups: FingerprintHashMap<Group<EvalSample>> = FingerprintHashMap::default();
     for sample in samples {
+        deadline.checkpoint(SERIES_WORK)?;
         let key = sample.labels.compute_grouping_key(modifier);
         let entry = groups
             .entry(key)
@@ -683,16 +715,18 @@ fn group_samples(
         entry.drop_name |= sample.drop_name;
         entry.members.push(sample);
     }
-    groups
+    Ok(groups)
 }
 
 fn group_sample_values(
     modifier: Option<&LabelModifier>,
     samples: Vec<EvalSample>,
-) -> FingerprintHashMap<Group<f64>> {
+    deadline: &Deadline,
+) -> EvalResult<FingerprintHashMap<Group<f64>>> {
     let mut groups: FingerprintHashMap<Group<f64>> = FingerprintHashMap::default();
 
     for sample in samples {
+        deadline.checkpoint(SERIES_WORK)?;
         // Key every sample without allocating; build the group's label set
         // only when the group is new. See `compute_grouping_key`.
         let key = sample.labels.compute_grouping_key(modifier);
@@ -704,7 +738,7 @@ fn group_sample_values(
         entry.members.push(sample.value);
     }
 
-    groups
+    Ok(groups)
 }
 
 fn sample_value_label(value: f64) -> String {
@@ -995,6 +1029,7 @@ mod count_values_tests {
             Some(ExprResult::String("v".to_string())),
             values.iter().copied().map(sample).collect(),
             0,
+            &Deadline::default(),
         )
         .unwrap();
         let mut by_label = BTreeMap::new();
@@ -1061,6 +1096,7 @@ mod count_values_tests {
             Some(ExprResult::String(label.to_string())),
             samples,
             0,
+            &Deadline::default(),
         )
         .unwrap()
         .into_iter()

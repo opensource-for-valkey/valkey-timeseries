@@ -1,7 +1,8 @@
+use super::client_cancellation::{CancelToken, Registration, mark_disconnected};
 use crate::common::replies::{IntoRawCtx, ReplyContext, reply};
 use crate::error_consts;
+use std::cell::Cell;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
 
 /// A lightweight "fork" of the BlockedClient in `valkey_module` to allow raw client replies from background threads
@@ -17,6 +18,8 @@ pub struct BlockedClient {
     pub(crate) inner: *mut raw::RedisModuleBlockedClient,
     /// Whether a reply has been written or handed to a writer.
     answered: bool,
+    /// Set by [`Self::cancel_on_disconnect`]; dropped before the client is unblocked.
+    cancellation: Option<Registration>,
 }
 
 // We need to be able to send the inner pointer to another thread
@@ -27,12 +30,42 @@ impl BlockedClient {
         Self {
             inner,
             answered: false,
+            cancellation: None,
         }
     }
+
+    /// Have the server report this client's disconnect, and return the token that reads it.
+    ///
+    /// Call on the main thread, straight after blocking: the callback is installed on the
+    /// handle, and the server only calls it from the main thread. The registration lives as
+    /// long as this handle and is removed before the client is unblocked.
+    pub(crate) fn cancel_on_disconnect(&mut self) -> CancelToken {
+        if let Some(registration) = &self.cancellation {
+            return registration.token();
+        }
+        let registration = Registration::new(self.inner as u64);
+        let token = registration.token();
+        self.cancellation = Some(registration);
+        unsafe {
+            raw::RedisModule_SetDisconnectCallback.unwrap()(self.inner, Some(on_disconnect));
+        }
+        token
+    }
+}
+
+/// The server's disconnect callback: runs on the main thread while `bc` is still blocked.
+extern "C" fn on_disconnect(
+    _ctx: *mut raw::RedisModuleCtx,
+    bc: *mut raw::RedisModuleBlockedClient,
+) {
+    mark_disconnected(bc as u64);
 }
 
 impl Drop for BlockedClient {
     fn drop(&mut self) {
+        // Before the unblock below: once unblocked the server may reuse the handle's address
+        // for another blocked client, which must not find this one's registration.
+        drop(self.cancellation.take());
         if self.inner.is_null() {
             return;
         }
@@ -68,7 +101,10 @@ pub struct ThreadSafeReplyContext {
     ///
     /// A writer that panics after starting its reply leaves a partial reply that nothing
     /// here can repair; this covers the far likelier failure, before any reply.
-    answered: AtomicBool,
+    ///
+    /// A `Cell`: the context is `Send` but not `Sync`, so only its owning thread reads or
+    /// sets this, and a move to another thread already synchronizes.
+    answered: Cell<bool>,
 }
 
 /// SAFETY: a thread-safe context belongs to one blocked client and may be used from any one
@@ -85,7 +121,7 @@ impl ThreadSafeReplyContext {
         Self {
             ctx,
             blocked_client,
-            answered: AtomicBool::new(false),
+            answered: Cell::new(false),
         }
     }
 
@@ -93,20 +129,20 @@ impl ThreadSafeReplyContext {
     /// so we pass through its functionality directly.
     #[allow(clippy::must_use_candidate)]
     pub fn reply(&self, r: ValkeyResult) -> raw::Status {
-        self.answered.store(true, Ordering::Relaxed);
+        self.answered.set(true);
         reply(self.ctx, r)
     }
 
     /// A context to write the reply through. The caller takes responsibility for writing it.
     pub fn get_reply_context(&self) -> ReplyContext {
-        self.answered.store(true, Ordering::Relaxed);
+        self.answered.set(true);
         ReplyContext::new(self.ctx)
     }
 }
 
 impl Drop for ThreadSafeReplyContext {
     fn drop(&mut self) {
-        if !self.answered.load(Ordering::Relaxed) {
+        if !self.answered.get() {
             reply(
                 self.ctx,
                 Err(ValkeyError::Str(error_consts::NO_REPLY_WRITTEN)),
@@ -122,7 +158,7 @@ impl IntoRawCtx for &ThreadSafeReplyContext {
     /// Writing through the raw context is answering too: the caller takes responsibility for
     /// the reply, so the drop must not add an error after it.
     fn into_raw(self) -> *mut raw::RedisModuleCtx {
-        self.answered.store(true, Ordering::Relaxed);
+        self.answered.set(true);
         self.ctx
     }
 }

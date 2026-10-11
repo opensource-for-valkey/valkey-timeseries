@@ -133,6 +133,8 @@ fn trim_unused_dbs() {
 
 #[cron_event_handler]
 fn __cron_event_handler(_ctx: &Context, _hz: u64) {
+    // Every tick, loading or not: queries read the last sample when they check their deadline.
+    crate::promql::engine::admission::sample_memory();
     if is_shutting_down() || is_loading_active() {
         return;
     }

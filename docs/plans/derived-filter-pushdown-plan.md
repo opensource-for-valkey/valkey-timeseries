@@ -199,8 +199,8 @@ is cheap (labels only, no samples), keeps preload parallel, and applies uniforml
 - **Errors.** A read that would have failed on a series the derived matcher excludes
   (`max_series`, an unauthorized key in cluster mode) now succeeds without touching it.
   The static rewrite and the instant runtime path already behave this way for written
-  matchers; the cluster ACL suite must be checked to be asserting on shapes where nothing
-  is derived (bare selectors), and the fail-closed rule itself is unchanged.
+  matchers; the cluster ACL suite asserts only on shapes where nothing is derived (checked
+  2026-10-11, §7), and the fail-closed rule itself is unchanged.
 - **`__name__`** is never derived (binop matching ignores it), the 60-value cap holds, and
   `count_values`/`label_replace`/`label_join` synthesized labels are dropped by the
   existing structural rules before they reach a leaf.
@@ -280,60 +280,92 @@ generalization, one for tests, half to measure.
 
 ## 7. Open questions
 
-- **In-range profiles — evaluated 2026-09-26, not started.** Profiling each leaf over the
-  window its reads cover, not the whole index, would drop retired series (a rolled-out
-  pod, a region that stopped reporting). That tightens three things: the derived filters,
-  `retain_pruning` on the target, and `short_circuit_empty_operands`, which would then
-  also fire on selectors that match only retired series. It stays sound. A series with no
-  sample in a leaf's window adds nothing to that leaf's read at any step, so an in-range
-  profile is still a superset of every step's series. The payoff is churn. With pod
-  churn, `pod` collects values without bound and overflows the 60-value cap in an index
-  profile, while the pods live in the window can stay under it. That is what an
-  `on(pod) group_left` join needs. The earlier note's "at no extra cost" is wrong for the
-  obvious call, `series_by_selectors(…, Some(range))` (step 4). Steps:
+Re-checked against the code on 2026-10-11. One item is open; the rest are settled.
+
+- **In-range profiles — evaluated 2026-09-26, steps restated 2026-10-11, not started.**
+  Profiling each leaf over the window its reads cover, not the whole index, would drop
+  retired series (a rolled-out pod, a region that stopped reporting). That tightens three
+  things: the derived filters, `retain_pruning` on the target, and
+  `short_circuit_empty_operands`, which would then also fire on selectors that match only
+  retired series. It stays sound. A series with no sample in a leaf's window adds nothing
+  to that leaf's read at any step, so an in-range profile is still a superset of every
+  step's series. The payoff is churn. With pod churn, `pod` collects values without bound
+  and overflows the 60-value cap in an index profile, while the pods live in the window
+  can stay under it. That is what an `on(pod) group_left` join needs. Passing the range to
+  the index walk is not free (step 4), so the obvious call is the wrong one.
 
   1. **A window per leaf.** `collect_operand_leaves`/`collect_all_selectors`
      ([derived_filters.rs](../../src/promql/engine/derived_filters.rs)) walk the tree
-     without any time context. The walk has to carry the evaluation window down the tree
-     the way `preload_ranges_inner` ([time.rs](../../src/promql/time.rs)) does: offset,
-     `@` (fixed, `start()`, `end()`), matrix range versus lookback, and each enclosing
-     subquery's own window. Each leaf then comes out as `(leaf, (earliest, latest))`.
-     Turn `preload_ranges_inner` into a visitor that both walks share, rather than adding
-     a third copy of those rules, and widen `selector_bounds` from `pub(super)`.
-     `evaluate_range` already builds its `EvalContext` before calling
-     `derive_filters_in_place`, so the call only needs the extra argument.
+     without any time context. The walk has to carry a `PreloadGrid`
+     ([planner.rs](../../src/promql/exec/planner.rs)) down the tree, starting from
+     `PreloadGrid::for_range` on the `EvalContext` that `evaluate_range` already builds
+     before it calls `derive_filters_in_place`. The rules already exist in two places, and
+     the walk should call them rather than restate them:
+     - **A leaf** comes out as `(leaf, selector_bounds(at, offset, grid.at_start_ms,
+       grid.at_end_ms, grid.start_ms, grid.end_ms, backward))`
+       ([time.rs](../../src/promql/time.rs)). `backward` is the matrix range for a leaf
+       under a matrix selector and `grid.lookback_delta_ms` otherwise. `selector_bounds`
+       is `pub(super)` in `crate::promql`, so `engine` can already call it. Its window is
+       inclusive at both ends, where a matrix window is open at the bottom. That is one
+       millisecond looser, which is sound.
+     - **A subquery** gets the union grid that `Preloader::preload_subqueries`
+       ([preload.rs](../../src/promql/exec/evaluator/preload.rs)) builds:
+       `apply_time_modifiers_ms` at the first and last outer step, minus the subquery's
+       range, aligned with `compute_subquery_alignment`. Move that computation into a
+       `PreloadGrid::for_subquery_union(subquery, grid)` helper that both callers use. The
+       walk needs only the grid's endpoints, never its steps, so the `MAX_GRID_STEPS` skip
+       stays in the preloader. Every `@`/`offset` shift is monotone in the step time, so
+       the endpoints bound every step's window.
   2. **Still one profile per selector: take the hull of its windows.** `SelectorKey`
      leaves out offset and `@`, so `cpu - cpu offset 5m` needs a single profile today.
      Keying by (selector, window) would make that two, and in cluster mode that is one
      more label fan-out, ≈0.5–1 ms (measured below). Instead, merge each key's windows
-     into their hull and profile once. The hull covers every occurrence's window, so
-     soundness holds, and the counting-reader tests keep their numbers. Tightening is
-     lost only when occurrences sit far apart (`x - x offset 1w`), and even then, series
-     retired before the earliest window are still dropped.
-  3. **Reader and wire.** `QueryReader::label_profile` takes the range. That touches
-     every implementation: `ValkeySeriesQuerier`, `ConcreteSeriesQuerier`,
-     `CountingQueryReader` and its test wrapper, `MemorySeriesQuerier`, and the
-     `derived_filters` test mock. `ProfileSelectorCommand` and
-     `LabelProfileFanoutCommand` carry it too. `LabelProfileQuery` gets a field of the
-     `MetaDateRangeFilter` message the other fan-outs already use, followed by
-     `VALKEY_TS_PROTO_REGEN=1 cargo build`. The codebase is pre-release, so no version-skew
-     handling is needed.
-  4. **The walk, locally and on each shard.** Don't pass the range to
-     `series_by_selectors`, for two reasons. Its `filter_series_by_date_range` calls
-     `has_samples_in_range`, which decodes into a chunk to find a sample. It also runs
-     that filter on the global rayon pool, and `local_label_profile` runs on a thread
-     that holds `MODULE_CONTEXT`, the combination the request-pool rule forbids. Instead,
-     `local_label_profile` checks each series inside its builder loop with a new O(1),
-     retention-aware `TimeSeries` predicate: not empty,
-     `last_timestamp >= start`, and `max(first_timestamp, get_min_timestamp()) <= end`.
-     It is looser than `has_samples_in_range` only for a series whose gap spans the whole
-     window. Looser is sound, and that is not the case this item targets.
-     `MemorySeriesQuerier` uses the same predicate.
-  5. **What the series cap counts.** `local_label_profile` compares the matched count
-     with the cap only after `series_by_selectors` has opened every key, so the cap
-     already limits the label walk, not the key opening. Count the in-range series (the
-     ones walked) against it. Otherwise a churny selector such as 60 000 matched, 5 000
-     live is never profiled, and that is exactly the dataset this item is for.
+     into their hull in `ProfiledLeaves::collect` and profile once. The hull covers every
+     occurrence's window, so soundness holds, and the counting-reader tests keep their
+     numbers. Tightening is lost only when occurrences sit far apart (`x - x offset 1w`),
+     and even then, series retired before the earliest window are still dropped.
+  3. **Reader and wire.** `QueryReader::label_profile` takes the range (its default stays
+     `Ok(None)`). That touches every implementation and override:
+     `ValkeySeriesQuerier` and `ConcreteSeriesQuerier`
+     ([querier.rs](../../src/promql/engine/querier.rs)), the `Arc<dyn QueryReader>`
+     forwarder ([query_reader.rs](../../src/promql/engine/query_reader.rs)),
+     `CountingQueryReader` and the span-limited wrapper in its tests,
+     `MemorySeriesQuerier`, and the mocks in `grid_fallback_tests.rs` and
+     `derived_filters.rs`. `ProfileSelectorCommand`
+     ([selector_batch_executor.rs](../../src/promql/engine/selector_batch_executor.rs))
+     and `LabelProfileFanoutCommand` carry it to `local_label_profile`.
+     `LabelProfileQuery` in [promql.proto](../../proto/v1/promql.proto) gets
+     `optional int64 start_ms` and `optional int64 end_ms`, in the plain-millisecond form
+     the other PromQL push-down messages use, followed by `VALKEY_TS_PROTO_REGEN=1 cargo
+     build`. Unset means the whole index. A shard that predates the fields ignores them and
+     answers with an index profile, which is looser and still sound, so no
+     version handling is needed.
+  4. **The walk, locally and on each shard: filter in the callback.**
+     `local_label_profile`
+     ([query_utils.rs](../../src/promql/engine/fanout/query_utils.rs)) streams the
+     matched series through `for_each_series` and passes `None` for the range. Keep it
+     that way. Passing `Some(range)` sends every opened series through
+     `matches_date_range` → `TimeSeries::has_samples_in_range`
+     ([batched_querier.rs](../../src/series/index/batched_querier.rs) `visit_batch`),
+     which decodes into a chunk to find a sample, under the module lock. Instead, the
+     callback skips a series that fails a new O(1) `TimeSeries` predicate:
+     ```
+     !is_empty() && last_timestamp() >= start
+         && max(first_timestamp, get_min_timestamp()) <= end
+     ```
+     That is `TimeSeries::overlaps` with the start clamped to retention:
+     `first_timestamp` is the earliest *stored* sample, which under lazy retention
+     trimming can be an expired one. Don't use `visible_first_timestamp`, which iterates
+     samples to find the answer. The predicate is looser than `has_samples_in_range`
+     only for a series whose gap spans the whole window. Looser is sound, and that is not
+     the case this item targets. `MemorySeriesQuerier` applies the same rule to its
+     in-memory series.
+  5. **What the series cap counts.** The walk already stops as soon as `matched` passes
+     the cap. Raise `matched` only for series that pass the predicate, so the cap counts
+     the series the profile describes. Otherwise a churny selector such as 60 000 matched,
+     5 000 live is never profiled, and that is exactly the dataset this item is for. Keys
+     that fail the predicate are still opened, as a read of the same selector opens them.
+     The per-series deadline checkpoint keeps the walk bounded.
   6. **Text to restate.** §2.1 ("time-agnostic") and §3 *Results* ("over the index")
      should describe the leaf's window instead of the whole index. The short-circuit
      entry below should say "no series with a sample in its window". §3 *Errors* grows:
@@ -344,13 +376,15 @@ generalization, one for tests, half to measure.
      empty. That costs a small read and never gives a wrong result.
   7. **Tests.**
      - Unit tests for window collection: offset; `@` fixed, `start()` and `end()`;
-       matrix range versus lookback; nested subqueries; and the hull for
-       `x - x offset 1h`.
+       matrix range versus lookback; nested subqueries, checked against the union grid
+       `preload_subqueries` builds for the same tree; and the hull for `x - x offset 1h`.
      - A `derived_filters` case with a retired `region="eu"` series. An index profile
        finds nothing common, and an in-range profile derives `region="us"`.
      - A short-circuit on a selector that matches only retired series.
-     - The predicate itself: retention, empty series, and a window that only touches
-       one end.
+     - The predicate itself: retention not yet trimmed, empty series, and a window that
+       only touches one end.
+     - The cap: a selector over the cap in the index and under it in the window is
+       profiled.
      - Counting-reader counts stay as they are.
      - The `eval range` promqltest parity stays as it is (it already runs with the pass
        on).
@@ -358,15 +392,17 @@ generalization, one for tests, half to measure.
        `test_ts_query_derived_filter_pushdown_cme.py`, check on/off parity, and repeat
        the `ts-promql-max-response-series` proof on a churn shape.
   8. **Measure.** In the 3-node harness every series spans the whole range, so it can
-     only show the overhead. Expect noise, since the predicate is two comparisons per key
-     that is opened anyway. Showing a gain needs a churn fixture: live series plus retired
-     generations with different `pod` values, queried as
+     only show the overhead. Expect noise, since the predicate is a few comparisons per
+     key that is opened anyway. Showing a gain needs a churn fixture: live series plus
+     retired generations with different `pod` values, queried as
      `info * on(pod) group_left live{namespace="x"}`.
 
-  Estimate: ≈1–1.5 days. Half of that goes to the window threading and the hull, the only
-  part with subtle rules. A quarter goes to the reader, proto and walk plumbing, and the
-  rest to tests and the churn fixture. Worth doing once a churn workload matters. Without
-  churn the change is neutral, so it can wait until then without cost.
+  Estimate: ≈1 day. About half goes to the window walk and the hull, the only part with
+  subtle rules. The reader, proto and walk plumbing is smaller than when this was first
+  written, because the local walk already streams and stops at the cap. The rest goes to
+  tests and the churn fixture. Worth doing once a churn workload matters. Without churn
+  the change is neutral, so it can wait until then without cost.
+
 - **Empty operand short-circuit — done (2026-09-13).** `short_circuit_empty_operands`
   runs before the rewrite: where a profile proves an operand's selector matches no
   series and the operand's shape passes emptiness through (aggregations,
@@ -379,11 +415,21 @@ generalization, one for tests, half to measure.
   8.0–8.7 → 1.1–1.2 ms. The quiet runs also put a number on the profile overhead for a
   non-narrowable join: `cpu / on(host) group_left cpu offset 5m` 38.1–38.2 → 38.7–39.7
   ms, i.e. ≈1 ms for one 500-series profile fan-out.
-- **Instant queries — measured and declined (2026-09-13).** Wiring the pass into
-  `evaluate_instant` (two interleaved cluster pairs, p50): `cpu - cpu{region="us"}
-  offset 5m` 2.26 → 1.76 ms (the case it exists for), but `cpu{region="us"} - cpu
-  offset 5m` 1.25 → 1.77 ms, `cpu - cpu offset 5m` 3.6 → 3.9 ms and `cpu and on(region)
-  cpu{region=~"us|eu"}` 2.1 → 3.1 ms. A ≈0.5 ms profile round trip is a large share of a
-  1–4 ms instant query, and the runtime push-down already narrows the operand evaluated
-  second, so the pass only pays when the *first* operand is the wide one. Not wired;
-  instant queries keep the runtime path alone.
+- **Instant queries — measured and declined (2026-09-13); still declined (2026-10-11).**
+  Wiring the pass into `evaluate_instant` (two interleaved cluster pairs, p50): `cpu -
+  cpu{region="us"} offset 5m` 2.26 → 1.76 ms (the case it exists for), but
+  `cpu{region="us"} - cpu offset 5m` 1.25 → 1.77 ms, `cpu - cpu offset 5m` 3.6 → 3.9 ms
+  and `cpu and on(region) cpu{region=~"us|eu"}` 2.1 → 3.1 ms. A ≈0.5 ms profile round
+  trip is a large share of a 1–4 ms instant query, and the runtime push-down already
+  narrows the operand evaluated second, so the pass only pays when the *first* operand is
+  the wide one. Not wired; instant queries keep the runtime path alone. Nothing since has
+  changed either side of that trade.
+- **Cluster ACL suite vs. §3 *Errors* — checked (2026-10-11).** The tests that run
+  per-key ACLs against PromQL (`test_ts_acls_cme.py`, and
+  `test_ts_query_batched_selector_cme.py::test_acl_identity_holds_in_every_batch`) issue
+  instant `TS.QUERY` calls on bare selectors. The pass never runs on those, and would
+  derive nothing from them if it did, so their fail-closed assertions hold as written.
+  No test pins the deliberate change itself: a derived matcher that excludes an
+  unauthorized key turns a failing range query into a succeeding one. Worth a case in
+  `test_ts_query_derived_filter_pushdown_cme.py` if that behaviour is ever questioned;
+  not otherwise.

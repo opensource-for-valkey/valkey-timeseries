@@ -14,9 +14,30 @@ from valkey.connection import Connection
 from typing import List, Tuple
 from common import VALKEY_SERVER_PATH, LOGS_DIR, ValkeyInfo, CompactionRule, parse_info_response, TEST_DIR, \
     MODULE_PATH as DEFAULT_MODULE_PATH, get_module_path
+import functools
 import random
+import re
 import string
+import subprocess
 import logging
+
+
+@functools.lru_cache(maxsize=None)
+def server_binary_version() -> Tuple[int, int, int]:
+    """The (major, minor, patch) of the valkey-server binary under test, read from
+    `--version` because node config files are written before any server is running.
+    An `unstable` build reports 255.255.255."""
+    out = subprocess.run([VALKEY_SERVER_PATH, "--version"], capture_output=True, text=True, check=True).stdout
+    match = re.search(r"v=(\d+)\.(\d+)\.(\d+)", out)
+    if not match:
+        raise RuntimeError(f"cannot parse valkey-server version from {out!r}")
+    return tuple(int(part) for part in match.groups())
+
+
+def supports_cluster_databases() -> bool:
+    """`cluster-databases` (more than DB 0 in cluster mode) arrived in Valkey 9.0;
+    older servers reject the directive and refuse to start."""
+    return server_binary_version() >= (9, 0, 0)
 
 
 class Node:

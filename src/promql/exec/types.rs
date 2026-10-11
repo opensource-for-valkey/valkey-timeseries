@@ -846,6 +846,17 @@ pub(in crate::promql) enum StepGrid<T> {
     },
 }
 
+impl<T> StepGrid<T> {
+    /// How many step slots the grid stores: from its first present step to its
+    /// last, holes included. What it costs against the sample budget, since a
+    /// hole takes a slot as surely as a value does.
+    pub(in crate::promql) fn stored_len(&self) -> usize {
+        match self {
+            StepGrid::Dense { values, .. } | StepGrid::Sparse { values, .. } => values.len(),
+        }
+    }
+}
+
 impl<T: Copy> StepGrid<T> {
     /// The value at `step`, or `None` when that step holds nothing.
     ///
@@ -1200,6 +1211,27 @@ impl ExprResult {
         match self {
             ExprResult::InstantVector(samples) => samples,
             _ => panic!("{}", msg),
+        }
+    }
+
+    /// How many series the result holds, as `ts-promql-max-response-series` counts them: an
+    /// instant vector's samples, a range vector's series; none for a scalar or a string.
+    pub(crate) fn series_count(&self) -> usize {
+        match self {
+            ExprResult::InstantVector(samples) => samples.len(),
+            ExprResult::RangeVector(series) => series.len(),
+            ExprResult::Scalar(_) | ExprResult::String(_) => 0,
+        }
+    }
+
+    /// How many samples the result holds, as the sample budget counts them: a scalar is one
+    /// sample, a string none.
+    pub(crate) fn point_count(&self) -> usize {
+        match self {
+            ExprResult::InstantVector(samples) => samples.len(),
+            ExprResult::RangeVector(series) => series.iter().map(|s| s.values.len()).sum(),
+            ExprResult::Scalar(_) => 1,
+            ExprResult::String(_) => 0,
         }
     }
 

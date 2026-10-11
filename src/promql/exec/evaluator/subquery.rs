@@ -137,11 +137,22 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             }
         };
 
+        // The subquery's result is built whole for each outer step and dropped
+        // once the enclosing function has reduced it, so it is capped per
+        // evaluation at `ts-promql-max-samples-per-query` rather than charged to
+        // the query: charged, every outer step's copy would add up, though only
+        // the steps being evaluated at once hold one. A result built from reads
+        // is no larger than the grids it was read from, which the query was
+        // charged already, so the cap binds only what the inner expression
+        // generates — `vector(1)[1d:1s]` — and counts each batch before it is
+        // merged.
+        let materialized = SampleBudget::new(self.options.max_samples);
         let mut series_map = SubquerySeriesMap::default();
         if expected_steps < PARALLEL_SUBQUERY_STEP_THRESHOLD {
             for current_time_ms in steps {
                 let (current_time_ms, samples) =
                     sub.eval_subquery_step(subquery, ctx, current_time_ms)?;
+                materialized.charge(samples.len())?;
                 merge_step_into_subquery_map(&mut series_map, current_time_ms, samples);
             }
         } else {
@@ -158,6 +169,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .map(|eval_ts| sub.eval_subquery_step(subquery, ctx, eval_ts))
                     .into_fallible()
                     .collect()?;
+                materialized.charge(step_results.iter().map(|(_, s)| s.len()).sum())?;
                 // Parallel collection preserves batch input order, and batches
                 // are consumed chronologically, so series values stay sorted.
                 for (current_time_ms, samples) in step_results {
@@ -234,6 +246,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // evaluation, not the grid — the grid lives in the preloaded data,
             // which carries its own `eval_start_ms`/`step_ms`.
             step_ms: 0,
+            deadline: ctx.deadline,
         };
 
         // Preload-eligible against *this* evaluator's maps, which cover the

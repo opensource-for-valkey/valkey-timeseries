@@ -1780,6 +1780,7 @@ mod tests {
             evaluation_ts: query_time_ms,
             step_ms: 0,
             lookback_delta_ms: 0,
+            ..Default::default()
         };
 
         let result = evaluator
@@ -1895,6 +1896,7 @@ mod tests {
             evaluation_ts: end_time_ms,
             step_ms: 60_000,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
 
         let result = evaluator.evaluate_call(&call, &ctx, false).unwrap();
@@ -1948,6 +1950,7 @@ mod tests {
             evaluation_ts: end_time_ms,
             step_ms: 60_000,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         let result = evaluator.evaluate_call(&call, &ctx, false).unwrap();
         match result {
@@ -2088,6 +2091,7 @@ mod tests {
             evaluation_ts,
             step_ms: 15_000,
             lookback_delta_ms: 5_000,
+            ..Default::default()
         };
 
         let pipeline_result = evaluator.evaluate_expr(&expr, &ctx, false).unwrap();
@@ -2302,6 +2306,7 @@ mod tests {
             evaluation_ts: query_time,
             step_ms: 0, // ??
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         let result = evaluator
             .evaluate_matrix_selector(&matrix_selector, &ctx, true)
@@ -2370,6 +2375,7 @@ mod tests {
             evaluation_ts: query_end,
             lookback_delta_ms: 300_000,
             step_ms: 0,
+            ..Default::default()
         };
 
         let result_start = evaluator
@@ -3442,6 +3448,7 @@ mod tests {
             evaluation_ts: eval_time_ms,
             step_ms: 0, // instant query context
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         let result = evaluator.evaluate_subquery(&subquery, &ctx);
 
@@ -3493,6 +3500,7 @@ mod tests {
             evaluation_ts: eval_time_ms,
             step_ms: 0,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
 
         let result = evaluator.evaluate_subquery(&subquery, &ctx).unwrap();
@@ -4598,7 +4606,11 @@ mod tests {
             // Evaluate here, exactly as a shard does — through the request's
             // own kernels, so this stands in for the shard rather than
             // imitating it.
-            request.evaluate(spans)
+            request.evaluate(
+                spans,
+                &crate::promql::deadline::Deadline::default(),
+                &mut |_| Ok(()),
+            )
         }
     }
 
@@ -4905,6 +4917,7 @@ mod tests {
             evaluation_ts: 120_000,
             step_ms: 30_000,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         evaluator.evaluate_with_context(&expr, ctx).unwrap();
 
@@ -4950,6 +4963,7 @@ mod tests {
             evaluation_ts: start_ms,
             step_ms,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
 
         // `Local` is the baseline: no preload, so every step evaluates live.
@@ -5950,6 +5964,7 @@ mod tests {
                     evaluation_ts: 60_000,
                     step_ms: 30_000,
                     lookback_delta_ms: 30_000,
+                    ..Default::default()
                 };
                 if answer != GridAnswer::Local {
                     evaluator.preload_for_range(&expr, &base).unwrap();

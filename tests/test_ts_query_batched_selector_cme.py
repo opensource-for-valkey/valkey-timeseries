@@ -251,6 +251,65 @@ class TestBatchedSelectorReadsCluster(ValkeyTimeSeriesClusterTestCase):
         with pytest.raises(ResponseError, match='(?i)permission'):
             self.instant_query('wide', client=user)
 
+    def test_coordinator_charges_the_grid_holes_it_builds(self):
+        """Two samples per series, 3,000 steps apart, under a one-second
+        lookback: each series is present at two steps, and its grid holds
+        3,000 slots, holes included. A shard ships so sparse a series raw and
+        the coordinator builds the grid; it used to charge the 2 points per
+        series that arrived and now charges the 3 x 3,000 slots."""
+        shard = self.new_client_for_primary(1)
+        first = T0 * 1000
+        last = first + 2_999_000
+        for i in range(3):
+            key = f'sparse:{i}:{{{WIDE_TAG}}}'
+            shard.execute_command('TS.CREATE', key, 'METRIC', f'sparse{{i="{i}"}}')
+            shard.execute_command('TS.ADD', key, first, 1)
+            shard.execute_command('TS.ADD', key, last, 1)
+        query = ('TS.QUERYRANGE', 'sparse', 'START', str(first), 'END', str(last),
+                 'STEP', '1s', 'LOOKBACK_DELTA', '1s')
+        try:
+            self.set_config(MAX_SAMPLES_CONFIG, '8999')
+            with pytest.raises(ResponseError, match='too many samples'):
+                self.coordinator().execute_command(*query)
+            self.set_config(MAX_SAMPLES_CONFIG, '9000')
+            result = QueryResult.from_raw(self.coordinator().execute_command(*query))
+            assert sum(len(series.values) for series in result.result) == 6
+        finally:
+            self.set_config(MAX_SAMPLES_CONFIG, '50000000')
+
+    def test_series_limit_stops_the_shard_walk(self, aggregation_pushdown, rollup_pushdown):
+        """A shard refusing its share for `ts-promql-max-response-series` stops walking at
+        the series that takes it over the limit, or for a range read at the end of that
+        batch, instead of opening all 1,300 of its matched series first. The refusal
+        reports the count at which it stopped. Covers the instant selector, the
+        aggregation push-down (and the selector it falls back to), the raw range read,
+        and the grid push-down (and the raw read it falls back to)."""
+        import re
+        self.setup_fleet()
+        self.set_config(MAX_RESPONSE_SERIES_CONFIG, '100')
+        try:
+            def refused_at(command) -> int:
+                with pytest.raises(ResponseError) as err:
+                    self.coordinator().execute_command(*command)
+                found = re.search(r'max series limit: (\d+) > 100', str(err.value))
+                assert found, str(err.value)
+                return int(found.group(1))
+
+            # Per series: exactly one past the limit.
+            assert refused_at(('TS.QUERY', 'wide', 'TIME', str(END))) == 101
+            assert refused_at(('TS.QUERY', 'sum(wide)', 'TIME', str(END))) == 101
+            # Per batch (512 series): past the limit, short of the shard's 1,300.
+            for command in (
+                ('TS.QUERY', 'wide[2m]', 'TIME', str(END)),
+                ('TS.QUERYRANGE', 'wide', 'START', str(T0 * 1000), 'END', str(END * 1000),
+                 'STEP', '30s'),
+                ('TS.QUERYRANGE', 'sum_over_time(wide[1m])', 'START', str(T0 * 1000),
+                 'END', str(END * 1000), 'STEP', '30s'),
+            ):
+                assert 100 < refused_at(command) < WIDE_COUNT, command
+        finally:
+            self.set_config(MAX_RESPONSE_SERIES_CONFIG, '0')
+
 
 # ── Heavy series: batches bounded by copied bytes, not just series ────────
 
@@ -343,6 +402,38 @@ class TestBatchedCopyBudgetCluster(ValkeyTimeSeriesClusterTestCase):
                 with pytest.raises(ResponseError,
                                    match=f'too many samples.*: {samples} > {samples - 1}'):
                     self.instant_query(query, at)
+        finally:
+            self.set_config(MAX_SAMPLES_CONFIG, '50000000')
+
+    def test_sample_limit_spent_exactly_skips_series_empty_in_the_window(self):
+        """A shard read already at its limit skips a series whose chunk only
+        straddles the window, rather than refusing with `1 > 1`: on the raw
+        range read and on the grid push-down. All the series are on one shard,
+        so its budget is the one spent; decode order is the pool's, so each
+        query is repeated to reach the order where the sample is charged first."""
+        shard = self.new_client_for_primary(1)
+        hit = f'gap:hit:{{{WIDE_TAG}}}'
+        shard.execute_command('TS.CREATE', hit, 'METRIC', 'gap{k="hit"}')
+        shard.execute_command('TS.ADD', hit, (T0 + 50) * 1000, 1)
+        for n in range(16):
+            key = f'gap:miss{n}:{{{WIDE_TAG}}}'
+            shard.execute_command('TS.CREATE', key, 'METRIC', f'gap{{k="miss{n}"}}')
+            shard.execute_command('TS.MADD', key, T0 * 1000, 1, key, (T0 + 100) * 1000, 2)
+        # The window (T0+30, T0+70] holds one sample in all.
+        at = T0 + 70
+        client = self.new_client_for_primary(0)
+        try:
+            for limit in ('1', '2', '0'):
+                self.set_config(MAX_SAMPLES_CONFIG, limit)
+                for _ in range(10):
+                    result = self.instant_query('gap[40s]', at)
+                    assert result.is_matrix() and len(result.result) == 1, limit
+                    assert len(result.result[0].values) == 1, limit
+
+                    result = QueryResult.from_raw(client.execute_command(
+                        'TS.QUERYRANGE', 'count_over_time(gap[40s])',
+                        'START', str(at * 1000), 'END', str(at * 1000), 'STEP', '10s'))
+                    assert len(result.result) == 1, limit
         finally:
             self.set_config(MAX_SAMPLES_CONFIG, '50000000')
 

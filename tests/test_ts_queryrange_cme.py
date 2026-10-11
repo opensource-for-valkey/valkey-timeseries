@@ -4,7 +4,7 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
+from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase, supports_cluster_databases
 from query_result import QueryResult
 
 # Hash tags whose slots land on primaries 0, 1 and 2 of the 3-node test cluster,
@@ -18,7 +18,8 @@ class TestTsQueryRangeCluster(ValkeyTimeSeriesClusterTestCase):
 
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         # The selected-DB test needs a second database in cluster mode.
-        return super().get_config_file_lines(test_dir, port) + ["cluster-databases 16"]
+        lines = super().get_config_file_lines(test_dir, port)
+        return lines + ["cluster-databases 16"] if supports_cluster_databases() else lines
 
     def node_client(self, node: int, db: int = 0):
         """A connection to primary `node`, with database `db` selected."""
@@ -48,6 +49,7 @@ class TestTsQueryRangeCluster(ValkeyTimeSeriesClusterTestCase):
         )
         return QueryResult.from_raw(result)
 
+    @pytest.mark.skipif(not supports_cluster_databases(), reason="cluster-databases requires Valkey >= 9.0")
     def test_queryrange_fanout_respects_selected_db(self):
         """Fanout range queries should use the caller DB across all shards."""
         t0 = "2026-04-06T20:00:00Z"

@@ -69,6 +69,9 @@ Accepts a duration string (e.g., `30s`, `5m`, `1h30m`) or an integer number of m
 
 **Default:** `ts-promql-lookback-delta` (5m).
 
+**Limit:** at most `ts-promql-max-lookback` (1h by default; `0` lifts it). A lookback no longer than
+`ts-promql-lookback-delta` is always allowed.
+
 </details>
 
 <details open><summary><code>TIMEOUT duration</code></summary>
@@ -155,8 +158,8 @@ that cannot block.
 
 At most `ts-promql-max-concurrent-queries` (default 8) queries run at once; up to `ts-promql-max-queued-queries`
 (default 128) more wait for a worker, and further queries are refused on arrival. A result with more series than
-`ts-promql-max-response-series` (default 1000) is an error, as is a query that would load more than
-`ts-promql-max-samples-per-query` samples (default 50,000,000). See
+`ts-promql-max-response-series` (default 1000) is an error, whether a read or an operator produced them, as is a
+query that would load more than `ts-promql-max-samples-per-query` samples (default 50,000,000). See
 [Configuration and safeguards](../topics/promql.md#configuration-and-safeguards).
 
 ### Errors
@@ -168,11 +171,16 @@ At most `ts-promql-max-concurrent-queries` (default 8) queries run at once; up t
 | An unknown option | `TSDB: invalid query argument '<arg>'` |
 | `TIME` cannot be parsed | `TSDB: invalid TIME timestamp` |
 | `LOOKBACK_DELTA` or `TIMEOUT` cannot be parsed | `TSDB: couldn't parse <OPTION> duration` |
+| `LOOKBACK_DELTA` is longer than `ts-promql-max-lookback` | `TSDB: LOOKBACK_DELTA <lookback> exceeds the <limit> allowed by ts-promql-max-lookback` |
 | `HASHTAG` is missing or has an empty tag | `TSDB: missing HASHTAG argument` |
 | Called inside `MULTI`, a script, or a context that cannot block | `TSDB: TS.QUERY and TS.QUERYRANGE are not allowed inside MULTI, EVAL, or a deny-blocking context` |
-| More series than `ts-promql-max-response-series` | `execution error: the query returns more than the configured max series limit: <n> > <limit>` |
+| More series than `ts-promql-max-response-series` | `execution error: the query returns more than the configured max series limit: <n> > <limit>`, where `<n>` is the count at which the read stopped, not the total the selector matches |
 | A subquery grid with more than 1,000,000 steps | `execution error: PromQL argument error: subquery has too many steps: ...` |
+| All subqueries together would evaluate more than `ts-promql-max-subquery-steps` steps | `execution error: PromQL argument error: subqueries would evaluate more than <limit> steps (ts-promql-max-subquery-steps); ...` |
 | The query ran past its `TIMEOUT` | `query timed out` |
+| The running sample totals of all running queries would together pass `ts-promql-max-samples-in-flight` | `PromQL query refused while the node is overloaded: running PromQL queries would have charged <n> > <limit> samples (ts-promql-max-samples-in-flight)` |
+| Memory use is at or past `ts-promql-max-memory-percent` of `maxmemory` | `PromQL query refused while the node is overloaded: memory use is <n>% of maxmemory, at or past ts-promql-max-memory-percent (<limit>%)` |
+| The reply would be larger than `ts-promql-max-reply-bytes` | `the query's reply would be too large: about <n> bytes > <limit> (ts-promql-max-reply-bytes)` |
 
 ---
 

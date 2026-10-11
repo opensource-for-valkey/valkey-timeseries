@@ -1,5 +1,6 @@
 pub mod binops;
 mod common;
+pub(crate) mod deadline;
 pub mod engine;
 mod error;
 mod exec;

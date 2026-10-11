@@ -139,6 +139,9 @@ pub(crate) struct EvalContext {
     pub evaluation_ts: Timestamp,
     pub step_ms: i64,
     pub lookback_delta_ms: i64,
+    /// When the evaluation must stop, for kernels to check between series. Set by
+    /// `Evaluator::evaluate_with_context`; the default stops nothing.
+    pub deadline: crate::promql::deadline::Deadline,
 }
 
 impl EvalContext {
@@ -150,6 +153,7 @@ impl EvalContext {
             evaluation_ts: query_time,
             step_ms: 0,
             lookback_delta_ms,
+            deadline: Default::default(),
         }
     }
 }
@@ -169,6 +173,7 @@ impl Default for EvalContext {
             lookback_delta_ms: lookback,
             step_ms: 0,
             evaluation_ts,
+            deadline: Default::default(),
         }
     }
 }
@@ -186,6 +191,7 @@ impl From<&EvalStmt> for EvalContext {
             evaluation_ts,
             lookback_delta_ms,
             step_ms: interval_ms,
+            deadline: Default::default(),
         }
     }
 }

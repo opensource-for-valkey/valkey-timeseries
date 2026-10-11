@@ -5,7 +5,7 @@ import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
+from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase, supports_cluster_databases
 from query_result import (
     QueryResult,
 )
@@ -25,7 +25,8 @@ class TestTsQueryCluster(ValkeyTimeSeriesClusterTestCase):
 
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         # The selected-DB test needs a second database in cluster mode.
-        return super().get_config_file_lines(test_dir, port) + ["cluster-databases 16"]
+        lines = super().get_config_file_lines(test_dir, port)
+        return lines + ["cluster-databases 16"] if supports_cluster_databases() else lines
 
     def node_client(self, node: int, db: int = 0):
         """A connection to primary `node`, with database `db` selected."""
@@ -136,6 +137,7 @@ class TestTsQueryCluster(ValkeyTimeSeriesClusterTestCase):
         with pytest.raises(ResponseError):
             self.node_client(0).execute_command('TS.QUERY', 'invalid {[}')
 
+    @pytest.mark.skipif(not supports_cluster_databases(), reason="cluster-databases requires Valkey >= 9.0")
     def test_query_fanout_respects_selected_db(self):
         """Fanout instant queries should execute in the caller-selected DB on every shard."""
         t0 = "2026-04-06T20:00:00Z"

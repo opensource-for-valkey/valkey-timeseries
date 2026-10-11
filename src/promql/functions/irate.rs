@@ -9,7 +9,7 @@ pub(in crate::promql) struct IRateFunction;
 impl PromQLFunction for IRateFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, rollup_irate))
+        eval_range(ctx, samples, rollup_irate)
     }
 }
 

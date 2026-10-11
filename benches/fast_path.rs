@@ -90,9 +90,7 @@ fn bench_on_match(c: &mut Criterion) {
     }
     group.finish();
 }
-/// A/B the vector-scalar loop: the current implementation, which hoists the
-/// comparison branch out of the loop and skips `retain_mut` when nothing can be
-/// filtered, against the pre-split `retain_mut`-for-everything version.
+/// The vector-scalar loop across operator shapes, pass ratios and sizes.
 ///
 /// Input construction is kept out of the timed region via `iter_batched`, and
 /// the result is returned so Criterion frees it untimed as well: at ~3 heap
@@ -114,45 +112,25 @@ fn bench_vector_scalar(c: &mut Criterion) {
         for (name, op, pass_ratio) in cases {
             let case = VectorScalarCase::new(op, size, pass_ratio, false);
 
-            group.bench_with_input(
-                BenchmarkId::new(format!("{name}/new"), size),
-                &size,
-                |b, _| {
-                    b.iter_batched(
-                        || case.input(),
-                        |input| case.run(input),
-                        BatchSize::SmallInput,
-                    )
-                },
-            );
-
-            group.bench_with_input(
-                BenchmarkId::new(format!("{name}/legacy"), size),
-                &size,
-                |b, _| {
-                    b.iter_batched(
-                        || case.input(),
-                        |input| case.run_legacy(input),
-                        BatchSize::SmallInput,
-                    )
-                },
-            );
-        }
-
-        // The scalar-on-the-left function got the same treatment; spot-check it
-        // at one shape rather than duplicating the whole matrix.
-        let swapped = VectorScalarCase::new(BenchOp::Add, size, 1.0, true);
-        group.bench_with_input(
-            BenchmarkId::new("add_scalar_left/new", size),
-            &size,
-            |b, _| {
+            group.bench_with_input(BenchmarkId::new(name, size), &size, |b, _| {
                 b.iter_batched(
-                    || swapped.input(),
-                    |input| swapped.run(input),
+                    || case.input(),
+                    |input| case.run(input),
                     BatchSize::SmallInput,
                 )
-            },
-        );
+            });
+        }
+
+        // Spot-check the scalar-on-the-left function at one shape rather than
+        // duplicating the whole matrix.
+        let swapped = VectorScalarCase::new(BenchOp::Add, size, 1.0, true);
+        group.bench_with_input(BenchmarkId::new("add_scalar_left", size), &size, |b, _| {
+            b.iter_batched(
+                || swapped.input(),
+                |input| swapped.run(input),
+                BatchSize::SmallInput,
+            )
+        });
     }
 
     group.finish();

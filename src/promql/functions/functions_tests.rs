@@ -47,6 +47,7 @@ mod tests {
                 evaluation_ts: eval_timestamp_ms,
                 step_ms: 0,
                 lookback_delta_ms: 0,
+                ..Default::default()
             };
             let range_ms = range.as_millis() as i64;
             for s in &mut samples {
@@ -1153,6 +1154,7 @@ mod tests {
             evaluation_ts: 30_000,
             step_ms: 10_000,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         let func = resolve_function("end").unwrap();
 
@@ -1172,6 +1174,7 @@ mod tests {
             evaluation_ts: i64::MAX,
             step_ms: 1_000,
             lookback_delta_ms: 300_000,
+            ..Default::default()
         };
         let func = resolve_function("range").unwrap();
 

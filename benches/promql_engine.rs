@@ -302,6 +302,10 @@ fn bench_range_query(c: &mut Criterion) {
         timeout: None,
         deadline: None,
         enable_experimental_functions: true,
+        // These measure evaluation, not the limits: `count_values` returns
+        // ~110k series, past the default `max_response_series`.
+        max_series: 0,
+        max_samples: 0,
         ..QueryOptions::default()
     };
 
@@ -438,8 +442,9 @@ fn bench_join_query(c: &mut Criterion) {
 
 /// Benchmark: Phase 0 baselines for the execution optimization plan.
 ///
-/// Focused range-query cases pinning the shapes named in
-/// `docs/plans/promql-execution-optimization-plan.md` §3 Phase 0, so later
+/// The plan has since been removed as outdated; read it with `git show
+/// d9d07430c^:docs/plans/promql-execution-optimization-plan.md`. These
+/// focused range-query cases pin the shapes named in its §3 Phase 0, so later
 /// phases have a stable before/after comparison:
 ///
 /// - (a) `non_pushable_rollup`: `predict_linear` is outside `RollupKind`, so
@@ -517,7 +522,8 @@ fn bench_phase0_baseline(c: &mut Criterion) {
 /// and `topk`/`bottomk` when they carry a `by`/`without` modifier — note
 /// `topk(k, v)` *without* a modifier short-circuits past it, which is why the
 /// existing `topk(1, a_X)` cases never exercised this and it went unprofiled
-/// through Phase 3 (see docs/plans/promql-execution-optimization-plan.md).
+/// through Phase 3 of the execution optimization plan (see
+/// [`bench_phase0_baseline`] for where to read it).
 ///
 /// Swept across cardinality because that is the open question: keying the
 /// samples was parallel before Phase 3 and is sequential now, and a fan-out
@@ -552,6 +558,10 @@ fn bench_group_samples(c: &mut Criterion) {
         timeout: None,
         deadline: None,
         enable_experimental_functions: true,
+        // These measure grouping, not the limits: `without (le)` over g_large
+        // returns 2,000 series, past the default `max_response_series`.
+        max_series: 0,
+        max_samples: 0,
         ..QueryOptions::default()
     };
     let query_time = ms_to_system_time((NUM_INTERVALS as i64 - 1) * INTERVAL_MS);

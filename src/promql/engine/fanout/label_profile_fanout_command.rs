@@ -19,6 +19,7 @@ use crate::fanout::{
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_label_profile;
 use crate::promql::engine::label_profile::{LabelProfile, LabelProfileBuilder, LabelValueProfile};
+use crate::promql::engine::promql_config;
 use crate::promql::generated::{
     LabelProfileQuery, LabelProfileResponse, LabelValueProfile as ProtoLabelValueProfile,
     SeriesSelector as ProtoSeriesSelector,
@@ -124,7 +125,12 @@ impl FanoutCommand for LabelProfileFanoutCommand {
         let series_selector: SeriesSelector = (&selector).try_into()?;
         // Locks per batch of matched series, not for the whole read.
         Ok(
-            match local_label_profile(ctx, series_selector, req.max_series as usize)? {
+            match local_label_profile(
+                ctx,
+                series_selector,
+                req.max_series as usize,
+                &super::shard_deadline(ctx, promql_config().max_memory_percent),
+            )? {
                 Some(profile) => profile.into(),
                 None => LabelProfileResponse {
                     overflow: true,
@@ -142,7 +148,12 @@ impl FanoutCommand for LabelProfileFanoutCommand {
         LabelProfileQuery {
             selector: Some(ProtoSeriesSelector::from(&self.matchers)),
             max_series: self.max_series,
+            time_budget_ms: super::time_budget_to_wire(self.timeout),
         }
+    }
+
+    fn time_budget(req: &LabelProfileQuery) -> Option<Duration> {
+        super::time_budget_from_wire(req.time_budget_ms)
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

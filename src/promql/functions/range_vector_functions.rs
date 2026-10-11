@@ -1,8 +1,9 @@
 use crate::common::Sample;
 use crate::common::threads::IntoParRayon;
+use crate::promql::deadline::SERIES_WORK;
 use crate::promql::functions::types::{PromQLArg, PromQLFunction};
 use crate::promql::{EvalContext, EvalResult, EvalSample, EvalSamples, ExprResult};
-use orx_parallel::Par;
+use orx_parallel::{Par, ParResult};
 
 /// Generic aggregator for range vector functions. As opposed to `aggr_over_time`, this operates
 /// over the entire range rather than bucketed windows.
@@ -11,27 +12,40 @@ use orx_parallel::Par;
 /// - Each input series is reduced to a single output sample at eval_timestamp_ms.
 /// - Empty series are skipped (matching Prometheus behavior).
 /// - Aggregation function `f` must implement PromQL float semantics exactly.
-pub(super) fn eval_range<F>(series: Vec<EvalSamples>, eval_timestamp_ms: i64, f: F) -> ExprResult
+///
+/// The deadline is checked per series, weighted by its samples, before `f` runs over them:
+/// never inside `f`, whose loop over one series' samples is the one the compiler vectorizes.
+pub(super) fn eval_range<F>(
+    ctx: &EvalContext,
+    series: Vec<EvalSamples>,
+    f: F,
+) -> EvalResult<ExprResult>
 where
     F: Fn(&[Sample]) -> Option<f64> + Send + Sync,
 {
+    let (deadline, eval_timestamp_ms) = (ctx.deadline, ctx.evaluation_ts);
     let res = series
         .into_par_rayon()
-        .filter_map(|series| {
+        .map(|series| -> EvalResult<Option<EvalSample>> {
+            deadline.checkpoint(series.values.len() + SERIES_WORK)?;
             if series.values.is_empty() {
-                return None;
+                return Ok(None);
             }
-            let value = f(&series.values)?;
-            Some(EvalSample {
+            let Some(value) = f(&series.values) else {
+                return Ok(None);
+            };
+            Ok(Some(EvalSample {
                 timestamp_ms: eval_timestamp_ms,
                 value,
                 labels: series.labels,
                 drop_name: series.drop_name,
-            })
+            }))
         })
-        .collect::<Vec<_>>();
+        .into_fallible()
+        .filter_map(|sample| sample)
+        .collect::<Vec<_>>()?;
 
-    ExprResult::InstantVector(res)
+    Ok(ExprResult::InstantVector(res))
 }
 
 /// Returns the number of counter-resets within the provided time range as an instant vector. Any decrease in the value
@@ -42,7 +56,7 @@ pub(in crate::promql) struct ResetsFunction;
 impl PromQLFunction for ResetsFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, rollup_resets))
+        eval_range(ctx, samples, rollup_resets)
     }
 }
 
@@ -78,7 +92,7 @@ pub(in crate::promql) struct ChangesFunction;
 impl PromQLFunction for ChangesFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, rollup_changes))
+        eval_range(ctx, samples, rollup_changes)
     }
 }
 

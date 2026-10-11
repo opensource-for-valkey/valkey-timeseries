@@ -5,10 +5,11 @@ use crate::common::Timestamp;
 use crate::common::logging::log_debug;
 use crate::common::threads::join;
 use crate::common::threads::{IntoParRayon, ParCollectionRayon};
-use crate::common::time::{current_time_millis, system_time_to_millis};
+use crate::common::time::system_time_to_millis;
 use crate::promql::binops::{
     can_push_down_common_filters, ensure_unique_labelsets, eval_binary_expr, push_down_filters,
 };
+use crate::promql::deadline::Deadline;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationParam, AggregationRequest, GridAggregation, GridOutcome,
     GridRequest, GridRollup,
@@ -45,7 +46,6 @@ use crate::promql::types::{PreloadedInstantData, PreloadedInstantSeries};
 use crate::promql::utils::{check_subquery_steps, subquery_step_ms};
 use crate::promql::{
     EvalResult, EvalSample, EvalSamples, EvaluationError, ExprResult, InstantSample, PreloadMap,
-    QueryError,
 };
 use ahash::AHashSet;
 use orx_parallel::Par;
@@ -144,14 +144,10 @@ fn node_addr<T>(node: &T) -> usize {
     node as *const T as usize
 }
 
-/// Errors that end the query rather than downgrade a best-effort preload: a
-/// passed deadline, or a sample budget already spent (it only grows, so every
-/// later read would be refused too).
+/// Errors that end the query rather than downgrade a best-effort preload: see
+/// [`QueryError::ends_query`].
 fn is_query_ending(err: &EvaluationError) -> bool {
-    matches!(
-        err,
-        EvaluationError::Query(QueryError::Timeout | QueryError::TooManySamples { .. })
-    )
+    matches!(err, EvaluationError::Query(err) if err.ends_query())
 }
 
 pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
@@ -183,6 +179,10 @@ pub(crate) struct Evaluator<'reader, R: QueryReader + ?Sized> {
     /// Per-node lookup keys; see [`NodeKeys`].
     node_keys: Arc<OnceLock<NodeKeys>>,
     options: QueryOptions,
+    /// When the evaluation must stop, from `options`: checked between preload
+    /// requests and subquery steps, and stamped into every [`EvalContext`] for
+    /// the kernels.
+    deadline: Deadline,
 }
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
@@ -190,7 +190,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         Self::with_prepared(
             reader,
             options,
-            PreparedQuery::sharing(Arc::new(SampleBudget::new(options.max_samples))),
+            PreparedQuery::sharing(Arc::new(SampleBudget::counted(
+                options.max_samples,
+                options.max_samples_in_flight,
+            ))),
         )
     }
 
@@ -209,6 +212,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             any_preloaded: prepared.any_preloaded,
             node_keys: prepared.node_keys,
             options,
+            deadline: Deadline::from_options(&options),
         }
     }
 
@@ -230,6 +234,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             any_preloaded: Arc::clone(&prepared.any_preloaded),
             node_keys: Arc::clone(&prepared.node_keys),
             options,
+            deadline: Deadline::from_options(&options),
         }
     }
 
@@ -314,37 +319,65 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             .unwrap_or_else(|| PreloadKey::from_selector(vs))
     }
 
-    /// Count `samples` against the query's budget; fails the query once the
-    /// total it has loaded passes `ts-promql-max-samples-per-query`.
+    /// Count `samples` against the query's budget; fails the query once its
+    /// running total, dropped samples included, passes
+    /// `ts-promql-max-samples-per-query`.
     fn charge_samples(&self, samples: usize) -> EvalResult<()> {
         Ok(self.budget.charge(samples)?)
+    }
+
+    /// Count a step grid the preloader built — its stored slots, holes
+    /// included — beyond `covered` samples already charged for the raw span it
+    /// was built from.
+    ///
+    /// Charged as it is built, one series at a time, because a grid can dwarf
+    /// the read that fed it (see [`sample_budget`](crate::promql::engine::sample_budget)).
+    /// Building stops at the grid that crosses the limit.
+    ///
+    /// Only the excess over `covered`, so a series costs the larger of its span
+    /// and its grid rather than their sum: for ordinary data the grid is the
+    /// smaller (a sample every 10 s under a 15 s step), and a query is charged
+    /// what it decoded.
+    fn charge_grid<T>(&self, grid: &StepGrid<T>, covered: usize) -> EvalResult<()> {
+        self.charge_samples(grid.stored_len().saturating_sub(covered))
+    }
+
+    /// Fail if the budget is already past its limit, before building more: for
+    /// grids built in parallel, where another series' grid may have crossed it.
+    /// At the limit exactly is not past it, so an empty grid is still admitted.
+    fn check_budget(&self) -> EvalResult<()> {
+        Ok(self.budget.check_ahead(0)?)
     }
 
     fn charge_range_samples(&self, series: &[RangeSample<EvalLabels>]) -> EvalResult<()> {
         self.charge_samples(series.iter().map(|s| s.samples.len()).sum())
     }
 
-    /// Charge what a live (non-preloaded) selector read materialized.
-    fn charge_result(&self, result: &ExprResult) -> EvalResult<()> {
-        match result {
-            ExprResult::InstantVector(samples) => self.charge_samples(samples.len()),
-            ExprResult::RangeVector(series) => {
-                self.charge_samples(series.iter().map(|s| s.values.len()).sum())
-            }
-            _ => Ok(()),
-        }
+    /// Charge a result of `points` samples for whatever it exceeds the query's
+    /// running total by, so the query costs the larger of everything it has
+    /// charged and what it returns. The result is held until the reply; much of
+    /// what the total counts may already have been dropped.
+    ///
+    /// Reads alone are not enough: an expression that reads nothing — a
+    /// literal, `vector(1)`, `absent(m)`, a subquery over either — generates
+    /// its samples, and a range query keeps every step's. A result built from
+    /// reads is no larger than they were, so it costs nothing more here.
+    /// Called with a running count as the result grows; each call charges only
+    /// the new excess, since earlier calls' charges are part of the total.
+    pub(crate) fn charge_result_points(&self, points: usize) -> EvalResult<()> {
+        self.charge_samples(points.saturating_sub(self.budget.loaded()))
     }
 
-    /// Fail fast once the query deadline has passed, so a preload phase that
-    /// issues several requests stops scheduling more of them.
+    /// Charge what a live (non-preloaded) selector read materialized.
+    fn charge_result(&self, result: &ExprResult) -> EvalResult<()> {
+        self.charge_samples(result.point_count())
+    }
+
+    /// Fail fast once the query deadline has passed, its client has gone, or the
+    /// server's memory use is past `ts-promql-max-memory-percent`, so a preload
+    /// phase that issues several requests stops scheduling more of them.
     fn check_deadline(&self) -> EvalResult<()> {
-        if let Some(deadline) = self.options.deadline
-            && deadline > 0
-            && current_time_millis() > deadline
-        {
-            return Err(EvaluationError::Query(QueryError::Timeout));
-        }
-        Ok(())
+        Ok(self.deadline.check()?)
     }
 
     pub(crate) fn evaluate(&self, stmt: EvalStmt) -> EvalResult<ExprResult> {
@@ -361,6 +394,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             evaluation_ts: system_time_to_millis(stmt.end),
             lookback_delta_ms: duration_ms(stmt.lookback_delta),
             step_ms: duration_ms(stmt.interval),
+            deadline: self.deadline,
         };
 
         self.evaluate_with_context(&stmt.expr, ctx)
@@ -371,6 +405,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         expr: &Expr,
         ctx: EvalContext,
     ) -> EvalResult<ExprResult> {
+        // Every evaluation passes through here — each step, each subquery step — so
+        // this is where the context picks up the deadline its kernels check.
+        let ctx = EvalContext {
+            deadline: self.deadline,
+            ..ctx
+        };
         let mut result = self.evaluate_expr(expr, &ctx, true)?;
 
         // Deferred __name__ cleanup (mirrors Prometheus cleanupMetricLabels)
@@ -875,7 +915,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // Use the evaluation_ts time as the timestamp for the aggregated result
         let timestamp_ms = ctx.evaluation_ts;
 
-        eval_aggregation(aggregate, samples, param, timestamp_ms)
+        eval_aggregation(aggregate, samples, param, timestamp_ms, &ctx.deadline)
     }
 }
 

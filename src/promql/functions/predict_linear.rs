@@ -31,7 +31,7 @@ impl PromQLFunction for PredictLinearFunction {
         // from the output. Counting the series instead would suppress the whole
         // result whenever the selector matched a single series.
         let eval_time = ctx.evaluation_ts as f64 / 1000_f64;
-        let result = eval_range(series, ctx.evaluation_ts, |samples| {
+        eval_range(ctx, series, |samples| {
             let (slope, intercept) = sample_regression(samples)?;
 
             let origin = samples
@@ -44,8 +44,6 @@ impl PromQLFunction for PredictLinearFunction {
             let value = slope * x + intercept;
 
             Some(value)
-        });
-
-        Ok(result)
+        })
     }
 }

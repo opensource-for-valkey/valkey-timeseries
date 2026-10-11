@@ -1,4 +1,4 @@
-use super::apply_binary_op;
+use super::binary_op_fn;
 use super::labels::changes_metric_schema;
 use crate::promql::{EvalResult, EvalSamples, ExprResult};
 use promql_parser::parser::BinaryExpr;
@@ -15,7 +15,8 @@ pub(super) fn eval_binop_range_scalar(
     scalar: f64,
 ) -> EvalResult<ExprResult> {
     // Samples are the left operand.
-    eval_range(expr, range, |value| apply_binary_op(expr.op, value, scalar))
+    let apply = binary_op_fn(expr.op)?;
+    Ok(eval_range(expr, range, |value| apply(value, scalar)))
 }
 
 /// Evaluate binary operations where the left side is a scalar and the right
@@ -27,18 +28,20 @@ pub(super) fn eval_binop_scalar_range(
     range: Vec<EvalSamples>,
 ) -> EvalResult<ExprResult> {
     // Scalar is the left operand.
-    eval_range(expr, range, |value| apply_binary_op(expr.op, scalar, value))
+    let apply = binary_op_fn(expr.op)?;
+    Ok(eval_range(expr, range, |value| apply(scalar, value)))
 }
 
 /// Shared body for both operand orders. `apply` is generic rather than a
 /// runtime `scalar_left` flag so each caller gets its own monomorphized
-/// per-sample loop with the operand order already resolved.
+/// per-sample loop with the operand order already resolved. Callers resolve
+/// the operator before getting here, so `apply` cannot fail.
 ///
 /// Series that end up empty are removed from the result. Series that were
 /// already empty on input are removed too, matching prior behavior.
-fn eval_range<F>(expr: &BinaryExpr, range: Vec<EvalSamples>, apply: F) -> EvalResult<ExprResult>
+fn eval_range<F>(expr: &BinaryExpr, range: Vec<EvalSamples>, apply: F) -> ExprResult
 where
-    F: Fn(f64) -> EvalResult<f64>,
+    F: Fn(f64) -> f64,
 {
     // With `bool` modifier, comparison ops return 0/1 for all pairs instead of filtering
     let return_bool = expr.return_bool();
@@ -49,54 +52,33 @@ where
         // `drop_name` is left alone here: a comparison operator is never one of the
         // schema-changing arithmetic ops, so `changes_metric_schema` is false, and
         // `return_bool` is false by the branch condition.
-        let mut first_err = None;
         result.retain_mut(|series| {
+            // A passing sample keeps its original value. Only `bool`
+            // comparisons rewrite values to 0/1.
             series
                 .values
                 .to_mut()
-                .retain_mut(|sample| match apply(sample.value) {
-                    Ok(0.0) => false,
-                    // The sample passed: keep its original value. Only `bool`
-                    // comparisons rewrite values to 0/1.
-                    Ok(_) => true,
-                    Err(e) => {
-                        first_err.get_or_insert(e);
-                        false
-                    }
-                });
+                .retain(|sample| apply(sample.value) != 0.0);
             !series.is_empty()
         });
-        if let Some(e) = first_err {
-            return Err(e);
-        }
     } else {
         // Every sample survives, so walk each series in place rather than paying
         // for a per-sample `retain_mut`. The outer `retain_mut` is per series and
         // only there to drop series that were empty on input.
         let should_drop_name = changes_metric_schema(expr.op) || return_bool;
-        let mut first_err = None;
         result.retain_mut(|series| {
             if series.is_empty() {
                 return false;
             }
             for sample in series.values.to_mut() {
-                match apply(sample.value) {
-                    Ok(value) => sample.value = value,
-                    Err(e) => {
-                        first_err.get_or_insert(e);
-                        return false;
-                    }
-                }
+                sample.value = apply(sample.value);
             }
             series.drop_name |= should_drop_name;
             true
         });
-        if let Some(e) = first_err {
-            return Err(e);
-        }
     }
 
-    Ok(ExprResult::RangeVector(result))
+    ExprResult::RangeVector(result)
 }
 
 #[cfg(test)]
@@ -239,7 +221,7 @@ mod tests {
         assert_eq!(values(&out[0]), vec![2.0]);
     }
 
-    /// An operator `apply_binary_op` can't evaluate must surface as an error
+    /// An operator `binary_op_fn` can't resolve must surface as an error
     /// rather than an empty result, on both the filtering and plain paths.
     #[test]
     fn unsupported_operator_is_an_error_not_an_empty_result() {

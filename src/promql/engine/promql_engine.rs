@@ -1,7 +1,10 @@
 use crate::common::threads::IntoParRayon;
 use crate::common::time::{current_time_millis, system_time_to_millis};
 use crate::common::{Sample, Timestamp};
+use crate::promql::deadline::Deadline;
+use crate::promql::engine::admission::{check_reply_size, range_reply_bytes_floor};
 use crate::promql::engine::derived_filters::derive_filters_in_place;
+use crate::promql::engine::validate_max_series;
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
 use crate::promql::exec::planner::PlannedQuery;
@@ -62,14 +65,18 @@ fn optimize_statement(
 /// rather than materializing every step at once (see `evaluate_range`).
 const STEP_MERGE_CHUNK_SIZE: usize = 64;
 
-fn resolve_deadline_ms(opts: QueryOptions) -> i64 {
-    if let Some(deadline) = opts.deadline {
-        return deadline;
-    }
-    if let Some(timeout) = opts.timeout {
-        return current_time_millis().saturating_add(duration_ms(timeout));
-    }
-    0
+/// `opts` with its deadline resolved: a `timeout` given without a `deadline`
+/// becomes one, counted from now. Done once, at the top of an evaluation, so
+/// every check below it — the step loop's, the evaluator's, the kernels' and
+/// the selector reads' — reads the same deadline from the options. (The
+/// command handlers always set `deadline`; a caller passing only `timeout` is
+/// an embedding or a test.)
+fn with_resolved_deadline(opts: QueryOptions) -> QueryOptions {
+    let deadline = opts.deadline.or_else(|| {
+        opts.timeout
+            .map(|timeout| current_time_millis().saturating_add(duration_ms(timeout)))
+    });
+    QueryOptions { deadline, ..opts }
 }
 
 #[cfg(test)]
@@ -136,21 +143,22 @@ pub fn evaluate_instant(
     query_time: SystemTime,
     opts: QueryOptions,
 ) -> Result<QueryValue, QueryError> {
+    let opts = with_resolved_deadline(opts);
     optimize_statement(&mut stmt, &opts, true)?;
-    check_subquery_cost(&stmt.expr, 1).map_err(QueryError::from)?;
-    let deadline = resolve_deadline_ms(opts);
+    check_subquery_cost(&stmt.expr, 1, opts.max_subquery_steps).map_err(QueryError::from)?;
+    let deadline = Deadline::from_options(&opts);
     let evaluator = Evaluator::new(&reader, opts);
 
-    // Best-effort timeout: compute a deadline if set and check before/after heavy ops
-    if deadline > 0 && current_time_millis() > deadline {
-        return Err(QueryError::Timeout);
-    }
-
+    // Before and after the evaluation: the deadline, the client, and memory.
+    deadline.check()?;
     let result = evaluator.evaluate(stmt)?;
+    deadline.check()?;
 
-    if deadline > 0 && current_time_millis() > deadline {
-        return Err(QueryError::Timeout);
-    }
+    // The result, not only each read: an operator can return more series than
+    // any read did (`a or b`, `count_values`, `label_replace`).
+    validate_max_series(result.series_count(), opts.max_series).map_err(QueryError::Execution)?;
+    // What the query returns, past what it loaded: see `charge_result_points`.
+    evaluator.charge_result_points(result.point_count())?;
 
     match result {
         ExprResult::Scalar(value) => {
@@ -221,11 +229,13 @@ pub fn evaluate_range(
     )
     .map_err(QueryError::from)?;
 
-    let deadline = resolve_deadline_ms(opts);
+    let opts = with_resolved_deadline(opts);
+    let deadline = Deadline::from_options(&opts);
 
     let step_ms = duration_ms(step);
     // Every outer step evaluates each subquery in full.
-    check_subquery_cost(&stmt.expr, grid_step_count(start_ms, end_ms, step_ms))
+    let outer_steps = grid_step_count(start_ms, end_ms, step_ms);
+    check_subquery_cost(&stmt.expr, outer_steps, opts.max_subquery_steps)
         .map_err(QueryError::from)?;
     let lookback_delta_ms = duration_ms(lookback_delta);
     let range_ctx = crate::promql::EvalContext {
@@ -234,6 +244,7 @@ pub fn evaluate_range(
         evaluation_ts: end_ms,
         lookback_delta_ms,
         step_ms,
+        deadline,
     };
     // Before planning, so the tree that is preloaded and the tree that is
     // stepped over are the same narrowed one: see `derived_filters`.
@@ -247,22 +258,15 @@ pub fn evaluate_range(
         .map_err(QueryError::from)?;
     let evaluator = Evaluator::with_prepared(reader.as_ref(), opts, prepared);
 
-    if deadline > 0 && current_time_millis() > deadline {
-        return Err(QueryError::Timeout);
-    }
+    deadline.check()?;
 
     let eval_step = |t: Timestamp| -> QueryResult<(Timestamp, ExprResult)> {
-        // Best-effort per-step timeout check.
-        if deadline > 0 && current_time_millis() > deadline {
-            return Err(QueryError::Timeout);
-        }
+        // Per step: the deadline, the client, and memory.
+        deadline.check()?;
 
         let ctx = crate::promql::EvalContext {
-            query_start: start_ms,
-            query_end: end_ms,
             evaluation_ts: t,
-            lookback_delta_ms,
-            step_ms,
+            ..range_ctx
         };
 
         let result = evaluator
@@ -281,6 +285,8 @@ pub fn evaluate_range(
     // sample vectors stay chronologically sorted without an extra sort.
     let mut step_ts = step_times(start_ms, end_ms, step_ms);
     let mut series_map = SeriesMap::default();
+    // Samples merged into the result so far: what the query returns.
+    let mut points = 0usize;
 
     loop {
         let chunk: Vec<Timestamp> = step_ts.by_ref().take(STEP_MERGE_CHUNK_SIZE).collect();
@@ -293,6 +299,15 @@ pub fn evaluate_range(
             .map(eval_step)
             .into_fallible()
             .collect()?;
+
+        // Charged before it is merged: the result holds every step's samples
+        // until the reply, and an expression that reads nothing (`vector(1)`,
+        // a literal) generates them uncharged by any read.
+        points += chunk_results
+            .iter()
+            .map(|(_, result)| result.point_count())
+            .sum::<usize>();
+        evaluator.charge_result_points(points)?;
 
         for (current_time, result) in chunk_results {
             match result {
@@ -317,6 +332,19 @@ pub fn evaluate_range(
                 }
             }
         }
+        // `ts-promql-max-response-series` bounds the series the query returns.
+        // Each read is bounded on its own, but the steps of a range query
+        // accumulate series no single step had: `count_values` over a thousand
+        // series makes one per distinct value per step. Checked per chunk, so a
+        // query past it stops evaluating instead of finishing first.
+        validate_max_series(series_map.len(), opts.max_series).map_err(QueryError::Execution)?;
+        // The reply's size is checked once more, exactly, when the result is
+        // whole; this floor stops a result that will be refused then from
+        // being built to the end first.
+        check_reply_size(
+            range_reply_bytes_floor(series_map.len(), points),
+            opts.max_reply_bytes,
+        )?;
     }
 
     let mut result: Vec<RangeSample> = series_map

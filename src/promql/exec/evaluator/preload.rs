@@ -5,6 +5,20 @@
 use super::subquery::subquery_key;
 use super::*;
 use crate::promql::utils::subquery_step_ms;
+use itertools::Itertools;
+
+/// What a caller of [`Evaluator::finish_grid`] holds on to, which decides what
+/// is charged for a pushed-down answer. A raw answer is charged for its span and
+/// expansion either way: it was decoded here.
+#[derive(Clone, Copy)]
+pub(super) enum Keeps {
+    /// The points as they are: they are charged.
+    Points,
+    /// A step grid scattered from the points, which the caller charges as it
+    /// builds it ([`Evaluator::charge_grid`]): the grid is what stays, and
+    /// charging the points too would count every one twice.
+    Grid,
+}
 
 impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     #[cfg(test)]
@@ -351,7 +365,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     .insert(key, PreloadedMatrixData { series });
                 self.note_preloaded();
             }
-            Err(err @ QueryError::TooManySamples { .. }) => return Err(err.into()),
+            Err(err) if err.ends_query() => return Err(err.into()),
             Err(err) => {
                 log_debug(format!(
                     "matrix preload failed; falling back to per-step windows: {err}"
@@ -421,21 +435,44 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         else {
             return Ok(());
         };
-        let rolled = self.finish_grid(&request, outcome)?;
-
-        let series = rolled
-            .into_iter()
-            .map(|s| PreloadedGridSeries {
-                labels: s.labels,
-                values: scatter_onto_grid(
-                    &window_ends,
-                    s.samples.iter().map(|p| (p.timestamp, p.value)),
-                ),
-            })
-            .collect();
-
+        let (rolled, charged) = self.finish_grid(&request, outcome, Keeps::Grid)?;
+        let series = self.scatter_charged(&window_ends, rolled, charged)?;
         self.cache_preloaded_grid(key, grid, series);
         Ok(())
+    }
+
+    /// Scatter each entry's `(window end, value)` points onto the step grid,
+    /// charging every grid to the budget as it is built ([`Self::charge_grid`]).
+    ///
+    /// `charged` is what [`Self::finish_grid`] already charged for the entries
+    /// — the raw span they were computed from and the points that span
+    /// expanded to, or 0 for a pushed-down answer: the grids are charged only
+    /// past it, for the holes they add, so the request costs the larger of its
+    /// span and its grids.
+    ///
+    /// How much of `charged` each grid may spend: see [`GridCover`].
+    pub(super) fn scatter_charged(
+        &self,
+        window_ends: &[Timestamp],
+        entries: Vec<RangeSample<EvalLabels>>,
+        charged: usize,
+    ) -> EvalResult<Vec<PreloadedGridSeries>> {
+        let mut cover = GridCover::new(charged, &entries);
+        entries
+            .into_iter()
+            .map(|s| {
+                let values = scatter_onto_grid(
+                    window_ends,
+                    s.samples.iter().map(|p| (p.timestamp, p.value)),
+                );
+                let used = cover.spend(s.samples.len(), values.stored_len());
+                self.charge_grid(&values, used)?;
+                Ok(PreloadedGridSeries {
+                    labels: s.labels,
+                    values,
+                })
+            })
+            .collect()
     }
 
     /// The grid request for `vs` over `grid`, with `@`/`offset` resolved into
@@ -470,9 +507,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             sample_timestamps: grid.sample_timestamps,
         };
 
-        let mut resolved = window_ends.clone();
-        resolved.dedup();
-        (request.window_ends() == resolved).then_some((request, window_ends))
+        let derives_same = window_ends
+            .iter()
+            .copied()
+            .dedup()
+            .eq(request.window_ends_iter());
+        derives_same.then_some((request, window_ends))
     }
 
     /// A rollup or fused request's answer as per-entry `(step, value)` points,
@@ -481,27 +521,43 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// A source that answered raw is compensated with the request's own
     /// kernels — the same ones a shard runs — after its span is charged to the
     /// budget. The stepped shape is not an answer to these requests at all.
+    ///
+    /// `keeps` says what the caller holds on to, which is what is charged for a
+    /// pushed-down answer: see [`Keeps`].
+    ///
+    /// Alongside the points comes everything charged for them here: for a
+    /// caller that keeps a grid, what [`Self::scatter_charged`] charges the
+    /// grid past.
     pub(super) fn finish_grid(
         &self,
         request: &GridRequest,
         outcome: GridOutcome,
-    ) -> EvalResult<Vec<RangeSample<EvalLabels>>> {
-        // Charged here, whatever the answer's shape, so every caller pays the
-        // same for the same request: a raw span for what was decoded (before
-        // the evaluation turns it into one point per step), a pushed-down
-        // answer for the points that arrived — its source charged the span
-        // against its own budget.
+        keeps: Keeps,
+    ) -> EvalResult<(Vec<RangeSample<EvalLabels>>, usize)> {
+        // A raw span is charged here, whatever the caller does with it: it was
+        // decoded on this node. So is whatever the evaluation expands it to
+        // beyond that, chunk by chunk as it is built — one sample in a long
+        // window answers at every step, and a grid that crosses the budget has
+        // to stop there, not be refused once it is whole. A pushed-down answer
+        // is charged for the points that arrived, unless the caller charges the
+        // grid it builds from them — its source charged the span against its
+        // own budget.
+        let mut charged = 0;
         let outcome = match outcome {
             GridOutcome::Raw(series) => {
-                self.charge_range_samples(&series)?;
-                request.evaluate(series)?
+                charged = series.iter().map(|s| s.samples.len()).sum();
+                self.charge_samples(charged)?;
+                request.evaluate(series, &self.deadline, &mut |expanded| {
+                    charged += expanded;
+                    self.budget.charge(expanded)
+                })?
             }
             GridOutcome::Rolled(series) => {
-                self.charge_range_samples(&series)?;
+                charged = self.charge_kept_points(keeps, &series)?;
                 GridOutcome::Rolled(series)
             }
             GridOutcome::Reduced(groups) => {
-                self.charge_range_samples(&groups)?;
+                charged = self.charge_kept_points(keeps, &groups)?;
                 GridOutcome::Reduced(groups)
             }
             other => other,
@@ -511,11 +567,29 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             request.rollup.is_some(),
             request.aggregation.is_some(),
         ) {
-            (GridOutcome::Rolled(series), true, false) => Ok(series),
-            (GridOutcome::Reduced(groups), _, true) => Ok(groups),
+            (GridOutcome::Rolled(series), true, false) => Ok((series, charged)),
+            (GridOutcome::Reduced(groups), _, true) => Ok((groups, charged)),
             _ => Err(EvaluationError::InternalError(
                 "grid request answered with the wrong shape".to_string(),
             )),
+        }
+    }
+
+    /// Charge a pushed-down answer's points when the caller keeps them as they
+    /// are, returning what was charged: nothing for a caller that charges the
+    /// grid it builds from them instead.
+    fn charge_kept_points(
+        &self,
+        keeps: Keeps,
+        entries: &[RangeSample<EvalLabels>],
+    ) -> EvalResult<usize> {
+        match keeps {
+            Keeps::Points => {
+                let points = entries.iter().map(|s| s.samples.len()).sum();
+                self.charge_samples(points)?;
+                Ok(points)
+            }
+            Keeps::Grid => Ok(0),
         }
     }
 
@@ -600,7 +674,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         let mut options = self.options;
         options.lookback_delta = Duration::from_millis(grid.lookback_delta_ms as u64);
 
-        let groups = match self.reader.query_grid(vs, &request, options)? {
+        let (groups, charged) = match self.reader.query_grid(vs, &request, options)? {
             // Nothing was pushed down: the span is here. Grouping it once per
             // step from a stepped grid — in parallel across steps, as the step
             // loop does — beats folding every point through one map on this
@@ -610,20 +684,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             // A peer without grid push-down: not cached, so the selector is
             // preloaded on its own and the aggregation runs per step.
             GridOutcome::Unsupported => return Ok(()),
-            outcome => self.finish_grid(&request, outcome)?,
+            outcome => self.finish_grid(&request, outcome, Keeps::Grid)?,
         };
-
-        let series = groups
-            .into_iter()
-            .map(|s| PreloadedGridSeries {
-                labels: s.labels,
-                values: scatter_onto_grid(
-                    &window_ends,
-                    s.samples.iter().map(|p| (p.timestamp, p.value)),
-                ),
-            })
-            .collect();
-
+        let series = self.scatter_charged(&window_ends, groups, charged)?;
         self.cache_preloaded_grid(key, grid, series);
         Ok(())
     }
@@ -653,17 +716,23 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                 options.lookback_delta = Duration::from_millis(lookback_delta_ms as u64);
                 match self.reader.query_grid(vs, &request, options)? {
                     GridOutcome::Stepped(series) => {
-                        self.charge_samples(series.iter().map(|s| s.points.len()).sum())?;
+                        // Charged as the grids they become, holes included: a
+                        // source can ship a few points per series that span
+                        // the whole grid.
                         let preloaded_series = series
                             .into_iter()
-                            .map(|s| PreloadedInstantSeries {
-                                labels: s.labels,
-                                values: scatter_onto_grid(
+                            .map(|s| {
+                                let values = scatter_onto_grid(
                                     &window_ends,
                                     s.points.iter().map(|p| (p.step_ts, p.sample)),
-                                ),
+                                );
+                                self.charge_grid(&values, 0)?;
+                                Ok(PreloadedInstantSeries {
+                                    labels: s.labels,
+                                    values,
+                                })
                             })
-                            .collect();
+                            .collect::<EvalResult<Vec<_>>>()?;
                         self.cache_preloaded_series(vs, eval_start_ms, step_ms, preloaded_series);
                         return Ok(());
                     }
@@ -708,6 +777,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
     /// Bucket a selector's raw span to one sample per step — the last sample
     /// inside the lookback window — and cache it for the step loop.
+    ///
+    /// The span is charged as it arrives, and each series' grid as it is built
+    /// for whatever it stores beyond that series' span, so a series costs the
+    /// larger of the two. The grid is the larger whenever the lookback outlasts
+    /// the gap between samples: one sample a day under a one-day lookback fills
+    /// every step.
     pub(super) fn cache_stepped_span(
         &self,
         vs: &VectorSelector,
@@ -728,7 +803,10 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         // ── Per-series step-bucketing ─────────────────
         let preloaded_series: Vec<PreloadedInstantSeries> = raw_series
             .into_par_rayon()
-            .map(|RangeSample { labels, samples }| {
+            .map(|RangeSample { labels, samples }| -> EvalResult<_> {
+                // Another series' grid may already have spent the budget.
+                self.check_budget()?;
+                let decoded = samples.len();
                 // Per-step instant stmt sets query_start = query_end = eval_ts for the evaluation
                 // timestamp; however, when resolving `@ start()` / `@ end()` inside the
                 // preloading phase we must use the enclosing query's bounds so that
@@ -752,10 +830,12 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
                     values.push(latest.copied());
                 });
                 let values = values.finish();
+                self.charge_grid(&values, decoded)?;
 
-                PreloadedInstantSeries { labels, values }
+                Ok(PreloadedInstantSeries { labels, values })
             })
-            .collect();
+            .into_fallible()
+            .collect()?;
 
         self.cache_preloaded_series(vs, eval_start_ms, step_ms, preloaded_series);
 
@@ -779,5 +859,114 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         cache.insert(key, data);
         drop(cache);
         self.note_preloaded();
+    }
+}
+
+/// What has already been charged for a batch of entries, spent on their grids
+/// as [`Evaluator::scatter_charged`] builds them one at a time.
+///
+/// A grid spends only what is left beyond the points of the entries still to
+/// come, which stay live until their own grids are built. So what has been
+/// charged never falls below what is held — the grids built so far and the
+/// points not yet scattered — even when one grid has many more holes than
+/// points (two points far apart, or one pinned by `@` to every step) and would
+/// otherwise spend what still pays for the later entries.
+struct GridCover {
+    /// Charged and not yet spent on a grid.
+    covered: usize,
+    /// The points of the entries not yet scattered.
+    pending: usize,
+}
+
+impl GridCover {
+    fn new(charged: usize, entries: &[RangeSample<EvalLabels>]) -> Self {
+        Self {
+            covered: charged,
+            pending: entries.iter().map(|s| s.samples.len()).sum(),
+        }
+    }
+
+    /// How much of a grid of `stored` slots, built from an entry of `points`,
+    /// is already paid for; the rest is the grid's to charge.
+    fn spend(&mut self, points: usize, stored: usize) -> usize {
+        self.pending -= points;
+        let used = stored.min(self.covered.saturating_sub(self.pending));
+        self.covered -= used;
+        used
+    }
+}
+
+#[cfg(test)]
+mod grid_cover_tests {
+    use super::*;
+    use crate::common::Sample;
+
+    fn entries(points: &[usize]) -> Vec<RangeSample<EvalLabels>> {
+        points
+            .iter()
+            .map(|&n| RangeSample {
+                labels: EvalLabels::empty(),
+                samples: (0..n as i64).map(|t| Sample::new(t, 0.0)).collect(),
+            })
+            .collect()
+    }
+
+    /// Replays a scatter, returning the total charged after each grid and what
+    /// is held then: the grids built so far and the points not yet scattered.
+    fn replay(charged: usize, shapes: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let points: Vec<usize> = shapes.iter().map(|&(points, _)| points).collect();
+        let mut cover = GridCover::new(charged, &entries(&points));
+        let (mut total, mut grids) = (charged, 0);
+        let mut pending: usize = points.iter().sum();
+        shapes
+            .iter()
+            .map(|&(points, stored)| {
+                total += stored - cover.spend(points, stored);
+                grids += stored;
+                pending -= points;
+                (total, grids + pending)
+            })
+            .collect()
+    }
+
+    /// A first grid with far more holes than points does not spend what still
+    /// pays for the second entry's points: they are held while it is built.
+    #[test]
+    fn a_holey_grid_does_not_spend_what_pays_for_later_points() {
+        // Two points at the ends of a thousand steps, then a dense entry.
+        let steps = replay(1_002, &[(2, 1_000), (1_000, 1_000)]);
+        assert_eq!(steps, vec![(2_000, 2_000), (2_000, 2_000)]);
+    }
+
+    /// A raw span charged beyond the points it rolled up to was dropped once
+    /// evaluated, so the grids may spend it.
+    #[test]
+    fn a_freed_raw_span_pays_for_grids() {
+        let steps = replay(10_000, &[(10, 10), (10, 1_000)]);
+        assert_eq!(steps, vec![(10_000, 20), (10_000, 1_010)]);
+    }
+
+    /// A pushed-down answer whose points were never charged covers nothing:
+    /// every grid is charged in full.
+    #[test]
+    fn uncharged_points_cover_nothing() {
+        let steps = replay(0, &[(2, 1_000), (1_000, 1_000)]);
+        assert_eq!(steps, vec![(1_000, 2_000), (2_000, 2_000)]);
+    }
+
+    /// Whatever the shapes, what has been charged never falls below what is
+    /// held, once the entries' points were charged.
+    #[test]
+    fn charged_never_falls_below_held() {
+        let shapes = [(1, 500), (300, 300), (2, 900), (50, 60), (700, 700), (1, 1)];
+        let points: usize = shapes.iter().map(|&(points, _)| points).sum();
+        for extra in [0, 1, 100, 10_000] {
+            for (step, (total, held)) in replay(points + extra, &shapes).into_iter().enumerate() {
+                assert!(
+                    total >= held,
+                    "extra {extra}, grid {step}: {total} < {held}"
+                );
+            }
+        }
     }
 }

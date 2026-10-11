@@ -504,6 +504,12 @@ pub struct InstantQuery {
     pub max_series: u64,
     #[prost(uint64, tag = "5")]
     pub max_points_per_series: u64,
+    /// / How long the requester waits for this answer, in milliseconds from when
+    /// / it sent the request. The receiver drops the request, or stops reading,
+    /// / once that long has passed since it received it: by then the requester has
+    /// / answered without it. 0 means no limit (as from every older requester).
+    #[prost(uint64, tag = "6")]
+    pub time_budget_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct InstantQueryResponse {
@@ -546,6 +552,12 @@ pub struct RangeQuery {
     pub max_series: u64,
     #[prost(uint64, tag = "5")]
     pub max_points_per_series: u64,
+    /// / How long the requester waits for this answer, in milliseconds from when
+    /// / it sent the request. The receiver drops the request, or stops reading,
+    /// / once that long has passed since it received it: by then the requester has
+    /// / answered without it. 0 means no limit (as from every older requester).
+    #[prost(uint64, tag = "6")]
+    pub time_budget_ms: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RangeQueryResponse {
@@ -720,6 +732,12 @@ pub struct GridQuery {
     /// / the query asks.
     #[prost(bool, tag = "11")]
     pub sample_timestamps: bool,
+    /// / How long the requester waits for this answer, in milliseconds from when
+    /// / it sent the request. The receiver drops the request, or stops reading,
+    /// / once that long has passed since it received it: by then the requester has
+    /// / answered without it. 0 means no limit (as from every older requester).
+    #[prost(uint64, tag = "12")]
+    pub time_budget_ms: u64,
 }
 /// / One series' stepped or rolled-up output, in columns.
 /// /
@@ -809,6 +827,12 @@ pub struct LabelProfileQuery {
     /// / walking further; the coordinator then leaves the selector as written.
     #[prost(uint64, tag = "2")]
     pub max_series: u64,
+    /// / How long the requester waits for this answer, in milliseconds from when
+    /// / it sent the request. The receiver drops the request, or stops reading,
+    /// / once that long has passed since it received it: by then the requester has
+    /// / answered without it. 0 means no limit (as from every older requester).
+    #[prost(uint64, tag = "3")]
+    pub time_budget_ms: u64,
 }
 /// / One label over the matched series.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

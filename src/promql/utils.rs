@@ -111,28 +111,28 @@ pub(crate) fn subquery_step_ms(subquery: &SubqueryExpr) -> i64 {
         .map_or(DEFAULT_EVALUATION_INTERVAL_MS, duration_ms)
 }
 
-/// The most subquery steps one query may evaluate, summed over every subquery
-/// and multiplied through the ones that enclose it and the query's own steps.
+/// Rejects a query whose subqueries would evaluate more than `max_steps` steps
+/// in total (`ts-promql-max-subquery-steps`; 0 = no limit), when the query
+/// itself is evaluated at `outer_steps` points (1 for an instant query).
 ///
-/// [`check_subquery_steps`] bounds each subquery grid alone, but nesting
-/// multiplies them: every step of an outer subquery evaluates the whole inner
-/// one, so `max_over_time((...)[1m:10s])` nested 10 deep is up to 7^10 ≈ 280
-/// million steps. Measured 2026-09-29 (debug build, `vector(1)` leaf) it ran for
-/// 55 s. The subquery step loop now checks the deadline, but a query like that
-/// still holds a query worker and the evaluation pool for the whole
-/// `ts-promql-max-query-duration`; this rejects it before any work. A hundred
-/// million leaves room for real queries: a 1,000-point range query over a 7-day
-/// subquery at a 1-minute step is about 10 million.
-pub(crate) const MAX_SUBQUERY_STEP_EVALUATIONS: u64 = 100 * MAX_GRID_STEPS;
-
-/// Rejects a query whose subqueries would evaluate more than
-/// [`MAX_SUBQUERY_STEP_EVALUATIONS`] steps in total, when the query itself is
-/// evaluated at `outer_steps` points (1 for an instant query).
+/// The steps are summed over every subquery and multiplied through the ones
+/// that enclose it and the query's own steps. [`check_subquery_steps`] bounds
+/// each subquery grid alone, but nesting multiplies them: every step of an
+/// outer subquery evaluates the whole inner one, so `max_over_time((...)[1m:10s])`
+/// nested 10 deep is up to 7^10 ≈ 280 million steps. The deadline stops such a
+/// query, but only after it has held a query worker and the evaluation pool for
+/// its whole `TIMEOUT`; this rejects it before any work.
+///
+/// The limit counts steps, not what a step costs, and a subquery whose inner
+/// expression reads nothing is invisible to every sample budget. The default of
+/// 20 million admits a 1,000-point range query over a 7-day subquery at a
+/// 1-minute step (10.08 million); the timings behind it are in
+/// `docs/plans/promql-resource-exhaustion-plan.md` (F8, D8).
 ///
 /// Counted from the query text alone, before anything is read: a subquery's
 /// range and step are literals, and its grid has at most `range / step + 1`
 /// steps wherever it is aligned.
-pub(crate) fn check_subquery_cost(expr: &Expr, outer_steps: u64) -> EvalResult<()> {
+pub(crate) fn check_subquery_cost(expr: &Expr, outer_steps: u64, max_steps: u64) -> EvalResult<()> {
     let mut total: u64 = 0;
     let mut pending: Vec<(&Expr, u64)> = vec![(expr, outer_steps.max(1))];
     while let Some((expr, evaluations)) = pending.pop() {
@@ -143,11 +143,11 @@ pub(crate) fn check_subquery_cost(expr: &Expr, outer_steps: u64) -> EvalResult<(
             check_subquery_steps(0, range_ms, step_ms)?;
             child_evaluations = evaluations.saturating_mul(grid_step_count(0, range_ms, step_ms));
             total = total.saturating_add(child_evaluations);
-            if total > MAX_SUBQUERY_STEP_EVALUATIONS {
+            if max_steps > 0 && total > max_steps {
                 return Err(EvaluationError::ArgumentError(format!(
-                    "subqueries would evaluate more than {MAX_SUBQUERY_STEP_EVALUATIONS} steps; \
-                     nested subqueries multiply their steps, so reduce the nesting, \
-                     a subquery's range, or use a coarser subquery step"
+                    "subqueries would evaluate more than {max_steps} steps \
+                     (ts-promql-max-subquery-steps); nested subqueries multiply their steps, \
+                     so reduce the nesting, a subquery's range, or use a coarser subquery step"
                 )));
             }
         }
@@ -383,11 +383,38 @@ mod max_points_tests {
 mod subquery_cost_tests {
     use super::*;
 
+    /// The limit these tests' boundaries were worked out for: the cap before it
+    /// became `ts-promql-max-subquery-steps`. They test the counting, which does not
+    /// depend on the value.
+    const LIMIT: u64 = 100 * MAX_GRID_STEPS;
+
     fn cost(query: &str, outer_steps: u64) -> EvalResult<()> {
+        cost_within(query, outer_steps, LIMIT)
+    }
+
+    fn cost_within(query: &str, outer_steps: u64, max_steps: u64) -> EvalResult<()> {
         check_subquery_cost(
             &promql_parser::parser::parse(query).expect("valid query"),
             outer_steps,
+            max_steps,
         )
+    }
+
+    #[test]
+    fn the_default_admits_a_week_long_subquery_under_a_dashboard_range() {
+        let default = crate::config::PROMQL_MAX_SUBQUERY_STEPS_DEFAULT as u64;
+        // [7d:1m] is 10,081 steps; 1,000 outer points make 10.08 million.
+        cost_within("max_over_time(m[7d:1m])", 1_000, default).unwrap();
+        // Three nested [7m:1s] (421 steps each, 75 million) is refused.
+        let nested = "max_over_time(max_over_time(max_over_time(m[7m:1s])[7m:1s])[7m:1s])";
+        let err = cost_within(nested, 1, default).unwrap_err();
+        assert!(
+            err.to_string().contains("ts-promql-max-subquery-steps"),
+            "{err}"
+        );
+        // 0 lifts the limit; each grid's own 1,000,000-step limit still applies.
+        cost_within(nested, 1, 0).unwrap();
+        cost_within("max_over_time(m[30d:1s])", 1, 0).unwrap_err();
     }
 
     /// `m` wrapped in `depth` subqueries of seven steps each (`[1m:10s]`).
@@ -400,7 +427,7 @@ mod subquery_cost_tests {
     #[test]
     fn nesting_multiplies_the_steps() {
         // 7^9 ≈ 40 million is under the cap, 7^10 ≈ 282 million over it.
-        assert!(7u64.pow(9) + 7u64.pow(8) < MAX_SUBQUERY_STEP_EVALUATIONS);
+        assert!(7u64.pow(9) + 7u64.pow(8) < LIMIT);
         cost(&nested(9), 1).unwrap();
         cost(&nested(10), 1).unwrap_err();
     }

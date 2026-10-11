@@ -77,9 +77,12 @@ fn old_selector(alt: &str) -> Option<SeriesSelector> {
     Some(SeriesSelector::And(filters))
 }
 
+/// A label-value shape: its name, and the generator of its `i`th value.
+type ValueShape = (&'static str, fn(usize) -> String);
+
 /// The most values of each shape whose alternation the bounded compiler accepts.
 fn probe_compile_limit() {
-    let shapes: [(&str, fn(usize) -> String); 5] = [
+    let shapes: [ValueShape; 5] = [
         ("region (us-east-1)", |i| format!("region-{i}")),
         ("pod (api-7f9c-xk2p)", |i| {
             format!("api-7f9c{i:02x}-xk{i:03}")

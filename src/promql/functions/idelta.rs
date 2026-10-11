@@ -8,7 +8,7 @@ pub(in crate::promql) struct IDeltaFunction;
 impl PromQLFunction for IDeltaFunction {
     fn apply(&self, arg: PromQLArg, ctx: &EvalContext) -> EvalResult<ExprResult> {
         let samples = arg.into_range_vector()?;
-        Ok(eval_range(samples, ctx.evaluation_ts, rollup_idelta))
+        eval_range(ctx, samples, rollup_idelta)
     }
 }
 

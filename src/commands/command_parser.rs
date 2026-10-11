@@ -1,6 +1,7 @@
 use crate::aggregators::{AggregationType, BucketAlignment, BucketTimestamp};
 use crate::common::Timestamp;
 use crate::common::binop::ComparisonOperator;
+use crate::common::humanize::humanize_duration;
 use crate::common::logging::log_debug;
 use crate::common::rounding::{
     MAX_DECIMAL_DIGITS, MAX_SIGNIFICANT_DIGITS, MIN_SIGNIFICANT_DIGITS, RoundingStrategy,
@@ -34,7 +35,7 @@ use promql_parser::parser::{EvalStmt, Expr};
 use smallvec::SmallVec;
 use std::fmt::Display;
 use std::iter::{Peekable, Skip};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::vec::IntoIter;
 use valkey_module::{NextArg, ValkeyError, ValkeyResult, ValkeyString};
 
@@ -1815,7 +1816,10 @@ fn parse_limit_value(val: &str) -> ValkeyResult<Option<usize>> {
     Ok(Some(limit as usize))
 }
 
-fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> {
+/// The checks on a PromQL query's text that cost O(length): what the command handler applies
+/// on the main thread. Everything costlier is in [`parse_promql_query`], which runs on the
+/// query worker.
+fn check_promql_query_text(query: &str, config: &PromqlConfig) -> ValkeyResult<()> {
     if query.is_empty() {
         return Err(ValkeyError::Str(error_consts::MISSING_QUERY));
     }
@@ -1823,6 +1827,16 @@ fn parse_promql_query(query: &str, config: &PromqlConfig) -> ValkeyResult<Expr> 
         let msg = "TSDB: query too long"; // todo: better error
         return Err(ValkeyError::Str(msg));
     }
+    Ok(())
+}
+
+/// Parse a PromQL query whose text [`check_promql_query_text`] admitted.
+///
+/// Not for the main thread. Parsing grows faster than the text: measured with promql-parser
+/// 0.11.0 (release, Apple M2), a chain of 4,000 unary minus signs took 54 ms and one of
+/// 16,000 took 0.76 s, and the depth check that refuses both runs only after the parse. The
+/// regex pre-check costs up to about 75 ms on its own.
+fn parse_promql_query(query: &str) -> ValkeyResult<Expr> {
     // Before parsing: the parser compiles every regex matcher without a size limit.
     validate_query_regexes(query).map_err(ValkeyError::String)?;
     // TODO: it may be helpful to return the exact error
@@ -1856,9 +1870,39 @@ fn parse_duration_internal(arg: Option<ValkeyString>, token_name: &str) -> Valke
 /// it selects which peers the coordinator contacts and is never part of
 /// evaluation.
 pub(super) struct ParsedPromqlQuery {
-    pub eval_stmt: EvalStmt,
+    pub statement: PromqlStatement,
     pub options: crate::promql::QueryOptions,
     pub hash_tags: Vec<String>,
+}
+
+/// A `TS.QUERY` / `TS.QUERYRANGE` statement whose arguments are resolved but whose query text
+/// is not yet parsed: the command handler builds it on the main thread, and the query worker
+/// parses it ([`Self::parse`]). The text has passed [`check_promql_query_text`].
+pub(super) struct PromqlStatement {
+    query: String,
+    start: SystemTime,
+    end: SystemTime,
+    interval: Duration,
+    lookback_delta: Duration,
+}
+
+impl PromqlStatement {
+    /// The evaluation time of an instant query; the start of a range query.
+    pub fn start(&self) -> SystemTime {
+        self.start
+    }
+
+    /// Parse the query text into the statement to evaluate. An error is the command's reply
+    /// as it stands, with the same text it had when the handler parsed.
+    pub fn parse(self) -> ValkeyResult<EvalStmt> {
+        Ok(EvalStmt {
+            expr: parse_promql_query(&self.query)?,
+            start: self.start,
+            end: self.end,
+            interval: self.interval,
+            lookback_delta: self.lookback_delta,
+        })
+    }
 }
 
 fn set_query_timeout(
@@ -1888,7 +1932,7 @@ pub(super) fn parse_query_range_command_args(
     let mut hash_tags: Vec<String> = Vec::new();
     let mut options = crate::promql::QueryOptions::default();
 
-    let expr = parse_promql_query(&query, config)?;
+    check_promql_query_text(&query, config)?;
 
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
@@ -1929,6 +1973,12 @@ pub(super) fn parse_query_range_command_args(
         return Err(ValkeyError::Str("TSDB: missing query STEP argument"));
     };
 
+    // `ts-promql-set-lookback-to-step` ignores the option, so there is nothing to refuse.
+    if let Some(requested) = lookback_delta
+        && !config.set_lookback_to_step
+    {
+        check_requested_lookback(config, requested, step)?;
+    }
     let lookback_delta = normalize_lookback(config, lookback_delta, step);
 
     let end_given = end_value.is_some();
@@ -1963,8 +2013,8 @@ pub(super) fn parse_query_range_command_args(
         }));
     }
 
-    let eval_stmt = EvalStmt {
-        expr,
+    let statement = PromqlStatement {
+        query,
         start: timestamp_to_system_time(start),
         end: timestamp_to_system_time(end),
         interval: step,
@@ -1972,7 +2022,7 @@ pub(super) fn parse_query_range_command_args(
     };
 
     Ok(ParsedPromqlQuery {
-        eval_stmt,
+        statement,
         options,
         hash_tags,
     })
@@ -1998,6 +2048,36 @@ fn normalize_lookback(
     }
 }
 
+/// Refuse a `LOOKBACK_DELTA` longer than `ts-promql-max-lookback` (0: no limit).
+///
+/// The lookback is how far behind each step a selector reads, so it sets both how much history
+/// a range read fetches before `START` and how many steps one sample is repeated across. With
+/// no cap, `LOOKBACK_DELTA 10y` read every matched series' whole history.
+///
+/// Two lookbacks are always allowed, because neither costs more than the query would anyway:
+/// the server's own default (`ts-promql-lookback-delta`), and, for a range query, one no longer
+/// than `step`, which reads at most one step further back and never repeats a sample across
+/// steps. Rejected rather than clamped: a shorter lookback changes which series are stale, so a
+/// clamped query would answer a different question without saying so.
+fn check_requested_lookback(
+    config: &PromqlConfig,
+    requested: Duration,
+    step: Duration,
+) -> ValkeyResult<()> {
+    if config.max_lookback.is_zero() {
+        return Ok(());
+    }
+    let allowed = config.max_lookback.max(config.lookback_delta).max(step);
+    if requested <= allowed {
+        return Ok(());
+    }
+    Err(ValkeyError::String(format!(
+        "TSDB: LOOKBACK_DELTA {} exceeds the {} allowed by ts-promql-max-lookback",
+        humanize_duration(&requested),
+        humanize_duration(&allowed),
+    )))
+}
+
 pub(super) fn parse_query_command_args(
     config: &PromqlConfig,
     args: &mut CommandArgIterator,
@@ -2009,7 +2089,7 @@ pub(super) fn parse_query_command_args(
     let mut hash_tags: Vec<String> = Vec::new();
     let mut options = crate::promql::QueryOptions::default();
 
-    let expr = parse_promql_query(&query, config)?;
+    check_promql_query_text(&query, config)?;
 
     while let Some(arg) = args.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
@@ -2023,6 +2103,7 @@ pub(super) fn parse_query_command_args(
             }
             CommandArgToken::LookbackDelta => {
                 lookback_delta = parse_duration_internal(args.next(), token.as_str())?;
+                check_requested_lookback(config, lookback_delta, Duration::ZERO)?;
             }
             CommandArgToken::Timeout => {
                 let timeout = parse_duration_internal(args.next(), token.as_str())?;
@@ -2041,8 +2122,8 @@ pub(super) fn parse_query_command_args(
 
     let query_time = timestamp_to_system_time(evaluation_ts.as_timestamp(None));
 
-    let eval_stmt = EvalStmt {
-        expr,
+    let statement = PromqlStatement {
+        query,
         start: query_time,
         end: query_time,
         interval: Duration::from_secs(0),
@@ -2050,7 +2131,7 @@ pub(super) fn parse_query_command_args(
     };
 
     Ok(ParsedPromqlQuery {
-        eval_stmt,
+        statement,
         options,
         hash_tags,
     })
@@ -2060,6 +2141,134 @@ pub(super) fn parse_query_command_args(
 mod tests {
     use super::*;
     use strum::IntoEnumIterator;
+
+    fn statement(query: &str) -> PromqlStatement {
+        PromqlStatement {
+            query: query.to_string(),
+            start: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+            end: SystemTime::UNIX_EPOCH + Duration::from_secs(70),
+            interval: Duration::from_secs(15),
+            lookback_delta: Duration::from_secs(300),
+        }
+    }
+
+    fn error_text(err: ValkeyError) -> String {
+        err.to_string()
+    }
+
+    /// The handler's own checks are the cheap ones: an empty or over-long query is refused
+    /// there, and anything else is admitted unparsed, however wrong or deep.
+    #[test]
+    fn the_handler_checks_only_what_costs_o_length() {
+        let config = PromqlConfig {
+            max_query_len: 1024,
+            ..Default::default()
+        };
+        let empty = check_promql_query_text("", &config).unwrap_err();
+        assert_eq!(error_text(empty), error_consts::MISSING_QUERY);
+        let long = check_promql_query_text(&"u".repeat(1025), &config).unwrap_err();
+        assert_eq!(error_text(long), "TSDB: query too long");
+        assert!(check_promql_query_text(&"u".repeat(1024), &config).is_ok());
+
+        let deep = format!("{}up", "-".repeat(1000));
+        for admitted in ["invalid {[}", r#"up{a=~"[a-z]{3000}"}"#, deep.as_str()] {
+            assert!(
+                check_promql_query_text(admitted, &config).is_ok(),
+                "{admitted}"
+            );
+        }
+    }
+
+    /// The worker's parse refuses what the handler used to, with the same reply text.
+    #[test]
+    fn the_worker_parse_keeps_the_handler_error_texts() {
+        let invalid = statement("invalid {[}").parse().unwrap_err();
+        assert_eq!(error_text(invalid), error_consts::INVALID_QUERY);
+
+        let regex = statement(r#"up{server=~"[a-z]{3000}"}"#)
+            .parse()
+            .unwrap_err();
+        assert!(
+            error_text(regex).contains("regex for label 'server'"),
+            "regex error names the label"
+        );
+
+        // Past `MAX_QUERY_DEPTH` (500): each `+u` nests one level.
+        let chain = format!("u{}", "+u".repeat(600));
+        let deep = statement(&chain).parse().unwrap_err();
+        assert!(error_text(deep).contains("nested too deeply"));
+    }
+
+    fn lookback_config(max_lookback: Duration) -> PromqlConfig {
+        PromqlConfig {
+            lookback_delta: Duration::from_secs(5 * 60),
+            max_lookback,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_lookback_past_the_cap_is_refused_with_both_values() {
+        let config = lookback_config(Duration::from_secs(3600));
+        let hour = Duration::from_secs(3600);
+        assert!(check_requested_lookback(&config, hour, Duration::ZERO).is_ok());
+        let err =
+            check_requested_lookback(&config, hour + Duration::from_millis(1), Duration::ZERO)
+                .unwrap_err();
+        assert_eq!(
+            error_text(err),
+            "TSDB: LOOKBACK_DELTA 1h1ms exceeds the 1h allowed by ts-promql-max-lookback"
+        );
+    }
+
+    #[test]
+    fn zero_lifts_the_lookback_cap() {
+        let config = lookback_config(Duration::ZERO);
+        let decade = Duration::from_secs(10 * 365 * 24 * 3600);
+        assert!(check_requested_lookback(&config, decade, Duration::ZERO).is_ok());
+    }
+
+    /// The server's own default, and a range query's step, are allowed past the cap: neither
+    /// reads more than the query would without the option.
+    #[test]
+    fn the_default_lookback_and_the_step_are_always_allowed() {
+        let mut config = lookback_config(Duration::from_secs(60));
+        config.lookback_delta = Duration::from_secs(600);
+        let ten_minutes = Duration::from_secs(600);
+        assert!(check_requested_lookback(&config, ten_minutes, Duration::ZERO).is_ok());
+        assert!(
+            check_requested_lookback(
+                &config,
+                ten_minutes + Duration::from_secs(1),
+                Duration::ZERO
+            )
+            .is_err()
+        );
+
+        let day = Duration::from_secs(24 * 3600);
+        assert!(check_requested_lookback(&config, day, day).is_ok());
+        assert!(check_requested_lookback(&config, day + Duration::from_secs(1), day).is_err());
+    }
+
+    #[test]
+    fn the_engine_default_matches_the_registered_default() {
+        assert_eq!(
+            PromqlConfig::default().max_lookback,
+            Duration::from_millis(crate::config::PROMQL_MAX_LOOKBACK_DEFAULT_MS as u64)
+        );
+    }
+
+    #[test]
+    fn the_worker_parse_keeps_the_resolved_arguments() {
+        let stmt = statement("rate(up[5m])").parse().unwrap();
+        let expected = statement("rate(up[5m])");
+        assert_eq!(stmt.start, expected.start);
+        assert_eq!(stmt.end, expected.end);
+        assert_eq!(stmt.interval, expected.interval);
+        assert_eq!(stmt.lookback_delta, expected.lookback_delta);
+        assert_eq!(stmt.expr.to_string(), "rate(up[5m])");
+        assert_eq!(expected.start(), expected.start);
+    }
 
     #[test]
     fn explicit_timeout_replaces_the_default_deadline() {

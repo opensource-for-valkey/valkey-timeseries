@@ -63,8 +63,10 @@ fn range(query: &str, opts: QueryOptions) -> Result<(), QueryError> {
     evaluate_range(reader(), stmt, opts).map(|_| ())
 }
 
-/// Nine levels is about 40 million steps: under the up-front cap, and several seconds of work in a
-/// debug build, so a 100 ms deadline is only met if evaluation checks it as it goes.
+/// Nine levels is about 40 million steps: several seconds of work in a debug build, so a 100 ms
+/// deadline is only met if evaluation checks it as it goes. That is over the default
+/// `ts-promql-max-subquery-steps` (20 million), so the deadline test lifts the cap: what it pins
+/// is the check during evaluation, for an operator who raised the cap or set it to 0.
 const DEEP: usize = 9;
 const DEADLINE_MS: i64 = 100;
 /// Generous for a loaded machine, and still far below the unchecked run.
@@ -90,12 +92,12 @@ fn nested_subqueries_stop_at_the_deadline() {
     // front: in none of them is a read left to notice the deadline during the step walk.
     for leaf in ["vector(1)", "m", "rate(m[1m])"] {
         let query = nested(leaf, DEEP);
-        assert_times_out(&format!("instant {leaf}"), || {
-            instant(&query, options(Some(DEADLINE_MS)))
-        });
-        assert_times_out(&format!("range {leaf}"), || {
-            range(&query, options(Some(DEADLINE_MS)))
-        });
+        let uncapped = || QueryOptions {
+            max_subquery_steps: 0,
+            ..options(Some(DEADLINE_MS))
+        };
+        assert_times_out(&format!("instant {leaf}"), || instant(&query, uncapped()));
+        assert_times_out(&format!("range {leaf}"), || range(&query, uncapped()));
     }
 }
 
@@ -108,7 +110,8 @@ fn nested_subqueries_evaluate_when_cheap() {
 
 #[test]
 fn a_subquery_tree_too_large_to_start_is_rejected_before_any_work() {
-    // Ten levels is about 280 million steps, over the cap. No deadline, so only the cap stops it.
+    // Ten levels is about 280 million steps, far over the default cap. No deadline, so only the
+    // cap stops it.
     let query = nested("vector(1)", 10);
     let started = Instant::now();
     for result in [instant(&query, options(None)), range(&query, options(None))] {

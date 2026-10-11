@@ -52,6 +52,11 @@ message InstantQuery {
   uint64 lookback_delta = 3;
   uint64 max_series = 4;
   uint64 max_points_per_series = 5;
+  /// How long the requester waits for this answer, in milliseconds from when
+  /// it sent the request. The receiver drops the request, or stops reading,
+  /// once that long has passed since it received it: by then the requester has
+  /// answered without it. 0 means no limit (as from every older requester).
+  uint64 time_budget_ms = 6;
 }
 
 message InstantQueryResponse {
@@ -83,6 +88,11 @@ message RangeQuery {
   int64 end_time = 3;
   uint64 max_series = 4;
   uint64 max_points_per_series = 5;
+  /// How long the requester waits for this answer, in milliseconds from when
+  /// it sent the request. The receiver drops the request, or stops reading,
+  /// once that long has passed since it received it: by then the requester has
+  /// answered without it. 0 means no limit (as from every older requester).
+  uint64 time_budget_ms = 6;
 }
 
 message RangeQueryResponse {
@@ -280,6 +290,11 @@ message GridQuery {
   /// consumer stamps a value with its step, so the column is left out unless
   /// the query asks.
   bool sample_timestamps = 11;
+  /// How long the requester waits for this answer, in milliseconds from when
+  /// it sent the request. The receiver drops the request, or stops reading,
+  /// once that long has passed since it received it: by then the requester has
+  /// answered without it. 0 means no limit (as from every older requester).
+  uint64 time_budget_ms = 12;
 }
 
 /// One series' stepped or rolled-up output, in columns.
@@ -352,6 +367,11 @@ message LabelProfileQuery {
   /// Past this many matching series the node answers `overflow` rather than
   /// walking further; the coordinator then leaves the selector as written.
   uint64 max_series = 2;
+  /// How long the requester waits for this answer, in milliseconds from when
+  /// it sent the request. The receiver drops the request, or stops reading,
+  /// once that long has passed since it received it: by then the requester has
+  /// answered without it. 0 means no limit (as from every older requester).
+  uint64 time_budget_ms = 3;
 }
 
 /// One label over the matched series.
