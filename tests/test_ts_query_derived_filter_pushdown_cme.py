@@ -25,9 +25,16 @@ What this file is for:
   `... or mem_usage` either way, because `or` may not be narrowed — and it
   never fires for `no_such_metric - mem_usage`, whose empty left operand makes
   the right one's read unnecessary.
+* Churn. Each operand is profiled over the window its reads cover, not the
+  whole index, so a series that stopped reporting before the query does not
+  widen what is derived from it. `app_info` has a series for every instance,
+  but only the api ones still report: narrowed by it, `mem_usage and
+  on(instance) app_info` reads the three api gauges, where a whole-index
+  profile would name all six and narrow nothing.
 
 The fixture is the stepped selector suite's: six `mem_usage` gauges over two
-jobs, each series on a known primary, both jobs straddling shards.
+jobs, each series on a known primary, both jobs straddling shards. The churn
+tests add `app_info` (`setup_app_info`).
 """
 
 from typing import List
@@ -40,14 +47,23 @@ from query_result import QueryResult
 from test_ts_query_selector_pushdown_cme import (
     END,
     GAUGE_SERIES,
+    SAMPLE_OFFSETS,
     T0,
     SelectorPushdownClusterBase,
     _job_sum,
+    _rfc3339,
 )
 
 # The default 60s grid over T0..T0+120 picks sample index 0, 2 and 4.
 STEPS = (T0, T0 + 60, T0 + 120)
 STEP_INDEX = (0, 2, 4)
+
+# instance -> hash tag, for `app_info`: one series per gauge instance, the api
+# ones reporting across the query, the web ones retired an hour before it.
+# Each generation straddles shards.
+APP_INFO_LIVE = {'api-1': 'h0', 'api-2': 'h1', 'api-3': 'h2'}
+APP_INFO_RETIRED = {'web-1': 'h1', 'web-2': 'h2', 'web-3': 'h0'}
+RETIRED_T0 = T0 - 3600
 
 
 def _instances(job: str) -> List[str]:
@@ -76,6 +92,20 @@ class DerivedFilterPushdownBase(SelectorPushdownClusterBase):
 
     def by_instance(self, query: str, **kwargs) -> dict:
         return self.points_by_label(self.range_query(query, **kwargs), 'instance')
+
+    def setup_app_info(self):
+        """`app_info{instance=...}` for all six gauge instances: the api ones
+        sample alongside the gauges, the web ones only an hour earlier, at
+        the same offsets — so `offset 1h` lands on them step for step."""
+        cluster_client = self.new_cluster_client()
+        for generation, start in ((APP_INFO_LIVE, T0), (APP_INFO_RETIRED, RETIRED_T0)):
+            for instance, tag in generation.items():
+                key = f'info:{instance}:{{{tag}}}'
+                cluster_client.execute_command(
+                    'TS.CREATE', key, 'METRIC', f'app_info{{instance="{instance}"}}')
+                for offset in SAMPLE_OFFSETS:
+                    cluster_client.execute_command(
+                        'TS.ADD', key, _rfc3339(start + offset), 1)
 
 
 class DerivedFilterShapes:
@@ -161,6 +191,26 @@ class DerivedFilterShapes:
         expected = {i: [(step, 1.0) for step in STEPS] for i in _instances('api')}
         self.assert_steps_exact(got, expected, 'rollup self-join')
 
+    # ── churn ──────────────────────────────────────────────────────────
+
+    def test_a_retired_series_does_not_change_the_answer(self):
+        """`app_info` names all six instances, but over the query only the
+        api ones report: `and` keeps the api gauges, with their own values."""
+        self.setup_fleet()
+        self.setup_app_info()
+        got = self.by_instance('mem_usage and on(instance) app_info')
+        expected = {i: _series_points(i) for i in _instances('api')}
+        self.assert_steps_exact(got, expected, 'and on(instance) live app_info')
+
+    def test_an_offset_reaching_a_retired_generation_sees_it(self):
+        """An hour back only the web instances reported, so they are what
+        `app_info offset 1h` matches the gauges on."""
+        self.setup_fleet()
+        self.setup_app_info()
+        got = self.by_instance('mem_usage and on(instance) app_info offset 1h')
+        expected = {i: _series_points(i) for i in _instances('web')}
+        self.assert_steps_exact(got, expected, 'and on(instance) retired app_info')
+
     # ── edges ──────────────────────────────────────────────────────────
 
     def test_an_operand_matching_nothing_is_harmless(self):
@@ -239,6 +289,34 @@ class TestPromQLDerivedFilterPushdownLimitsCluster(DerivedFilterPushdownBase):
         with pytest.raises(ResponseError, match='max series'):
             self.range_query('mem_usage{job="api"} or mem_usage')
 
+    def test_a_churned_operand_narrows_the_other_over_its_window(self):
+        """Over the whole index `app_info` is six series, past this
+        limit, and would name all six instances anyway; over the query it is
+        the three api ones. So `mem_usage` is read for three instances, not
+        six, and the query fits the limit."""
+        self.setup_fleet()
+        self.setup_app_info()
+        got = self.by_instance('mem_usage and on(instance) app_info')
+        expected = {i: _series_points(i) for i in _instances('api')}
+        self.assert_steps_exact(got, expected, 'narrowed by live app_info')
+
+    def test_a_mostly_retired_operand_past_the_key_cap_is_read_as_written(self):
+        """A profile's walk opens at most four keys per series it may be
+        built from, retired ones included: sixteen per shard under this
+        limit. Seventeen more retired `app_info` series on one shard pass
+        that, so `app_info` goes unprofiled rather than walked whole, and
+        `mem_usage` is read in full and refused, as with the push-down off."""
+        self.setup_fleet()
+        self.setup_app_info()
+        cluster_client = self.new_cluster_client()
+        for n in range(17):
+            key = f'info:old-{n}:{{h0}}'
+            cluster_client.execute_command(
+                'TS.CREATE', key, 'METRIC', f'app_info{{instance="old-{n}"}}')
+            cluster_client.execute_command('TS.ADD', key, _rfc3339(RETIRED_T0), 1)
+        with pytest.raises(ResponseError, match='max series'):
+            self.range_query('mem_usage and on(instance) app_info')
+
 
 class TestPromQLDerivedFilterPushdownOffLimitsCluster(DerivedFilterPushdownBase):
     """The same limit with the push-down off refuses the wide operand."""
@@ -255,3 +333,9 @@ class TestPromQLDerivedFilterPushdownOffLimitsCluster(DerivedFilterPushdownBase)
         self.setup_fleet()
         with pytest.raises(ResponseError, match='max series'):
             self.range_query('no_such_metric - mem_usage')
+
+    def test_a_churned_operand_does_not_spare_the_wide_read(self):
+        self.setup_fleet()
+        self.setup_app_info()
+        with pytest.raises(ResponseError, match='max series'):
+            self.range_query('mem_usage and on(instance) app_info')

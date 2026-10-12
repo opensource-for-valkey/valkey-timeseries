@@ -914,6 +914,20 @@ impl TimeSeries {
         !self.is_empty() && self.last_timestamp() >= start_ts && self.first_timestamp <= end_ts
     }
 
+    /// Whether the span reads can see — from the retention floor to the last sample — meets
+    /// `[start_ts, end_ts]`. [`Self::overlaps`] with its start clamped to retention, so an
+    /// expired sample the write path has not trimmed yet does not count.
+    ///
+    /// O(1) and decodes nothing, unlike [`Self::has_samples_in_range`], which it bounds from
+    /// above: it differs only where the window falls in a gap between visible samples,
+    /// including the stretch from the retention floor to the first one while an expired
+    /// prefix is still stored.
+    pub fn overlaps_retained(&self, start_ts: Timestamp, end_ts: Timestamp) -> bool {
+        !self.is_empty()
+            && self.last_timestamp() >= start_ts
+            && self.first_timestamp.max(self.get_min_timestamp()) <= end_ts
+    }
+
     pub fn is_older_than_retention(&self, timestamp: Timestamp) -> bool {
         if self.retention.is_zero() {
             return false;

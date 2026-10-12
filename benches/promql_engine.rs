@@ -440,6 +440,121 @@ fn bench_join_query(c: &mut Criterion) {
     group.finish();
 }
 
+const CHURN_NAMESPACES: usize = 10;
+const CHURN_PODS: usize = 20;
+const CHURN_RETIRED_GENERATIONS: usize = 5;
+
+/// A pod fleet with churn: `info` and `live` for `CHURN_PODS` pods in each of
+/// `CHURN_NAMESPACES` namespaces, reporting across the query, plus
+/// `CHURN_RETIRED_GENERATIONS` earlier generations of `live` whose pods were
+/// rolled out an hour or more before it. `steady` is `live` without the
+/// retired generations, as a control.
+///
+/// Over the whole index `live{namespace="ns-0"}` carries 120 `pod` values,
+/// past the derived filter push-down's 60; over the query, 20.
+fn setup_churn_test_data(interval_ms: i64, start_ms: i64, end_ms: i64) -> Arc<dyn QueryReader> {
+    let querier = MemorySeriesQuerier::new();
+    let pod_labels = |metric: &str, namespace: usize, pod: String| {
+        Labels::from_pairs(&[
+            ("__name__", metric),
+            ("namespace", &format!("ns-{namespace}")),
+            ("pod", &pod),
+        ])
+    };
+    let hour_ms = 3_600_000;
+    for namespace in 0..CHURN_NAMESPACES {
+        for pod in 0..CHURN_PODS {
+            let current = format!("pod-{namespace}-{pod}-g0");
+            let series = [
+                pod_labels("info", namespace, current.clone()),
+                pod_labels("live", namespace, current.clone()),
+                pod_labels("steady", namespace, current),
+            ];
+            let mut ts = start_ms - hour_ms;
+            while ts <= end_ms {
+                for labels in &series {
+                    querier.add_sample(labels, Sample::new(ts, (pod + 1) as f64));
+                }
+                ts += interval_ms;
+            }
+            for generation in 1..=CHURN_RETIRED_GENERATIONS {
+                let retired = pod_labels(
+                    "live",
+                    namespace,
+                    format!("pod-{namespace}-{pod}-g{generation}"),
+                );
+                let retired_end = start_ms - (generation as i64) * hour_ms;
+                let mut ts = retired_end - hour_ms;
+                while ts <= retired_end - hour_ms / 2 {
+                    querier.add_sample(&retired, Sample::new(ts, 1.0));
+                    ts += interval_ms;
+                }
+            }
+        }
+    }
+    Arc::new(querier)
+}
+
+/// Benchmark: a join narrowed by a churned operand (derived filter push-down
+/// over each leaf's read window). `live` and `steady` are the same 20 pods in
+/// `ns-0` over the query; only `live` has retired generations in the index.
+fn bench_churn_join(c: &mut Criterion) {
+    const INTERVAL_MS: i64 = 10_000;
+    const STEPS: u64 = 360;
+
+    let start_ms: i64 = 10 * 3_600_000;
+    let end_ms = start_ms + (STEPS as i64 - 1) * INTERVAL_MS;
+    let reader = setup_churn_test_data(INTERVAL_MS, start_ms, end_ms);
+
+    let cases = [
+        (
+            "churned",
+            r#"info * on(pod) group_left live{namespace="ns-0"}"#,
+            true,
+        ),
+        (
+            "steady",
+            r#"info * on(pod) group_left steady{namespace="ns-0"}"#,
+            true,
+        ),
+        (
+            "churned,pushdown=off",
+            r#"info * on(pod) group_left live{namespace="ns-0"}"#,
+            false,
+        ),
+    ];
+
+    let mut group = c.benchmark_group("churn_join");
+    if use_flat_sampling() {
+        group.sampling_mode(SamplingMode::Flat);
+    }
+
+    for (name, query, derived) in cases {
+        let opts = QueryOptions {
+            timeout: None,
+            deadline: None,
+            derived_filter_pushdown: derived,
+            ..QueryOptions::default()
+        };
+        let ast = parse(query).expect("valid churn benchmark query");
+        group.bench_with_input(BenchmarkId::new("churn_join", name), &ast, |b, ast| {
+            b.iter(|| {
+                let stmt = EvalStmt {
+                    expr: ast.clone(),
+                    start: ms_to_system_time(start_ms),
+                    end: ms_to_system_time(end_ms),
+                    interval: Duration::from_millis(INTERVAL_MS as u64),
+                    lookback_delta: opts.lookback_delta,
+                };
+                let result = evaluate_range(reader.clone(), stmt, opts)
+                    .expect("churn benchmark should evaluate");
+                black_box(result);
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Benchmark: Phase 0 baselines for the execution optimization plan.
 ///
 /// The plan has since been removed as outdated; read it with `git show
@@ -607,6 +722,6 @@ fn bench_group_samples(c: &mut Criterion) {
 criterion_group!(
     name = promql_engine_benches;
     config = benchmark_config();
-    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline, bench_group_samples
+    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline, bench_group_samples, bench_churn_join
 );
 criterion_main!(promql_engine_benches);

@@ -1,6 +1,6 @@
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
-use crate::promql::engine::label_profile::LabelProfile;
+use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 #[cfg(test)]
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
@@ -135,11 +135,13 @@ impl QueryReader for ValkeySeriesQuerier {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> QueryResult<Option<LabelProfile>> {
         let matchers: Matchers = normalize_selector(selector);
         SERIES_SELECTOR.label_profile(
             matchers,
+            window,
             options,
             self.caller_user.clone(),
             self.hash_tags.clone(),
@@ -304,12 +306,13 @@ impl QueryReader for ConcreteSeriesQuerier {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
         match self {
-            ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, options),
+            ConcreteSeriesQuerier::Actual(local) => local.label_profile(selector, window, options),
             #[cfg(test)]
-            ConcreteSeriesQuerier::Mock(mock) => mock.label_profile(selector, options),
+            ConcreteSeriesQuerier::Mock(mock) => mock.label_profile(selector, window, options),
         }
     }
 }

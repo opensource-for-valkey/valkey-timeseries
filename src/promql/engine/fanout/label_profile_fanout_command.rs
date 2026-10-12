@@ -8,6 +8,9 @@
 //! the merge; the value sets union, and either side's overflow is the
 //! whole's. No sample is read anywhere.
 //!
+//! With a window, each shard counts only its series with a retained sample in
+//! it; the merge is the same.
+//!
 //! A shard that matched more series than the request's cap says so rather
 //! than answering, and the merged profile is then unavailable: the
 //! coordinator leaves the selector as written, which is always safe.
@@ -18,7 +21,9 @@ use crate::fanout::{
 };
 use crate::labels::filters::SeriesSelector;
 use crate::promql::engine::fanout::query_utils::local_label_profile;
-use crate::promql::engine::label_profile::{LabelProfile, LabelProfileBuilder, LabelValueProfile};
+use crate::promql::engine::label_profile::{
+    LabelProfile, LabelProfileBuilder, LabelValueProfile, ProfileWindow,
+};
 use crate::promql::engine::promql_config;
 use crate::promql::generated::{
     LabelProfileQuery, LabelProfileResponse, LabelValueProfile as ProtoLabelValueProfile,
@@ -30,6 +35,7 @@ use valkey_module::ValkeyResult;
 
 pub struct LabelProfileFanoutCommand {
     matchers: Matchers,
+    window: Option<ProfileWindow>,
     max_series: u64,
     timeout: Duration,
     merged: LabelProfileBuilder,
@@ -40,14 +46,20 @@ pub struct LabelProfileFanoutCommand {
 
 impl Default for LabelProfileFanoutCommand {
     fn default() -> Self {
-        Self::new(Matchers::empty(), 0, get_cluster_command_timeout())
+        Self::new(Matchers::empty(), None, 0, get_cluster_command_timeout())
     }
 }
 
 impl LabelProfileFanoutCommand {
-    pub fn new(matchers: Matchers, max_series: u64, timeout: Duration) -> Self {
+    pub fn new(
+        matchers: Matchers,
+        window: Option<ProfileWindow>,
+        max_series: u64,
+        timeout: Duration,
+    ) -> Self {
         Self {
             matchers,
+            window,
             max_series,
             timeout,
             merged: LabelProfileBuilder::new(),
@@ -62,6 +74,15 @@ impl LabelProfileFanoutCommand {
             return None;
         }
         Some(self.merged.finish())
+    }
+}
+
+/// The request's window: none unless both ends are set, as from a requester
+/// that predates them.
+fn window_from_wire(req: &LabelProfileQuery) -> Option<ProfileWindow> {
+    match (req.start_ms, req.end_ms) {
+        (Some(start_ms), Some(end_ms)) => Some(ProfileWindow::new(start_ms, end_ms)),
+        _ => None,
     }
 }
 
@@ -116,6 +137,7 @@ impl FanoutCommand for LabelProfileFanoutCommand {
         ctx: &FanoutContext,
         req: LabelProfileQuery,
     ) -> ValkeyResult<LabelProfileResponse> {
+        let window = window_from_wire(&req);
         let Some(selector) = req.selector else {
             ctx.log_warning(
                 "Received label profile query with no selector, returning empty response",
@@ -128,6 +150,7 @@ impl FanoutCommand for LabelProfileFanoutCommand {
             match local_label_profile(
                 ctx,
                 series_selector,
+                window,
                 req.max_series as usize,
                 &super::shard_deadline(ctx, promql_config().max_memory_percent),
             )? {
@@ -149,6 +172,8 @@ impl FanoutCommand for LabelProfileFanoutCommand {
             selector: Some(ProtoSeriesSelector::from(&self.matchers)),
             max_series: self.max_series,
             time_budget_ms: super::time_budget_to_wire(self.timeout),
+            start_ms: self.window.map(|w| w.start_ms),
+            end_ms: self.window.map(|w| w.end_ms),
         }
     }
 
@@ -191,7 +216,7 @@ mod tests {
     }
 
     fn command(max_series: u64) -> LabelProfileFanoutCommand {
-        LabelProfileFanoutCommand::new(Matchers::empty(), max_series, Duration::from_secs(1))
+        LabelProfileFanoutCommand::new(Matchers::empty(), None, max_series, Duration::from_secs(1))
     }
 
     #[test]
@@ -299,10 +324,25 @@ mod tests {
             "region",
             "us",
         )]);
-        let cmd = LabelProfileFanoutCommand::new(matchers, 7, Duration::from_secs(1));
+        let window = ProfileWindow::new(-5, 1_000);
+        let cmd = LabelProfileFanoutCommand::new(matchers, Some(window), 7, Duration::from_secs(1));
         let req = cmd.generate_request();
         assert_eq!(req.max_series, 7);
+        assert_eq!(window_from_wire(&req), Some(window));
         let selector: SeriesSelector = (&req.selector.unwrap()).try_into().unwrap();
         assert_eq!(selector.to_string(), r#"{region="us"}"#);
+    }
+
+    #[test]
+    fn a_request_without_both_ends_profiles_the_whole_index() {
+        let req = command(0).generate_request();
+        assert_eq!((req.start_ms, req.end_ms), (None, None));
+        assert_eq!(window_from_wire(&req), None);
+        // As from an older requester, or a malformed one: half a window is none.
+        let half = LabelProfileQuery {
+            start_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(window_from_wire(&half), None);
     }
 }

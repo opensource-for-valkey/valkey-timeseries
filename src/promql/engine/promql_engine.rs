@@ -7,7 +7,7 @@ use crate::promql::engine::derived_filters::derive_filters_in_place;
 use crate::promql::engine::validate_max_series;
 use crate::promql::engine::{QueryOptions, QueryReader};
 use crate::promql::error::QueryError;
-use crate::promql::exec::planner::PlannedQuery;
+use crate::promql::exec::planner::{PlannedQuery, PreloadGrid};
 use crate::promql::exec::preloader::Preloader;
 use crate::promql::exec::types::{EvalLabels, SeriesMap};
 use crate::promql::exec::utils::merge_step_into_series_map;
@@ -249,7 +249,12 @@ pub fn evaluate_range(
     // Before planning, so the tree that is preloaded and the tree that is
     // stepped over are the same narrowed one: see `derived_filters`.
     if opts.derived_filter_pushdown {
-        derive_filters_in_place(&mut stmt.expr, reader.as_ref(), opts)?;
+        derive_filters_in_place(
+            &mut stmt.expr,
+            reader.as_ref(),
+            &PreloadGrid::for_range(&range_ctx),
+            opts,
+        )?;
     }
 
     let plan = PlannedQuery::for_range(&stmt.expr, &range_ctx);

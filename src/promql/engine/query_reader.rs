@@ -2,7 +2,7 @@ use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::promql::EvalLabels;
 use crate::promql::deadline::{Deadline, SERIES_WORK};
-use crate::promql::engine::label_profile::LabelProfile;
+use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::{SteppedPartialGroups, SteppedSelection};
 use crate::promql::exec::pipeline::for_each_step_sample;
@@ -696,13 +696,15 @@ pub trait QueryReader: Send + Sync {
     }
 
     /// The labels of the series `selector` matches, from the index rather
-    /// than from a read — see [`LabelProfile`]. `None` when the source cannot
-    /// say (no index, or more series than it will profile), in which case
-    /// the caller treats the selector as it would without a profile. Purely
-    /// an optimization: the default declines.
+    /// than from a read — see [`LabelProfile`]. With a `window`, only the
+    /// series with a retained sample in it count ([`ProfileWindow::admits`]).
+    /// `None` when the source cannot say (no index, or more series than it
+    /// will profile), in which case the caller treats the selector as it
+    /// would without a profile. Purely an optimization: the default declines.
     fn label_profile(
         &self,
         _selector: &VectorSelector,
+        _window: Option<ProfileWindow>,
         _options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
         Ok(None)
@@ -753,9 +755,10 @@ impl QueryReader for Arc<dyn QueryReader> {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
-        self.as_ref().label_profile(selector, options)
+        self.as_ref().label_profile(selector, window, options)
     }
 }
 

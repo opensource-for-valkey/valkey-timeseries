@@ -20,44 +20,54 @@
 //! The second is what keeps `a - b` — where both sides carry the same values
 //! — a byte-identical tree.
 //!
-//! A profile is a superset of what any read will return (the index is
-//! time-agnostic, and unauthorized series are counted too), and the
-//! structural rules were sound for written matchers: a derived filter never
-//! excludes a series that could have matched at any step. Where a profile is
-//! unavailable, the leaf behaves exactly as in the static pass.
+//! A profile is a superset of what any read will return, and the structural
+//! rules were sound for written matchers: a derived filter never excludes a
+//! series that could have matched at any step. It covers the window the
+//! selector's reads span over the whole query — offset, `@`, lookback or
+//! matrix range, and each enclosing subquery's grid applied — so a series
+//! that stopped reporting before it (a rolled-out pod) is left out, but one
+//! with a sample anywhere in it is in, at whichever step. A selector that
+//! occurs more than once is profiled once, over the hull of its windows.
+//! Unauthorized series are counted too. Where a profile is unavailable, the
+//! leaf behaves exactly as in the static pass.
 
 use crate::common::logging::log_debug;
 use crate::common::threads::IntoParRayon;
 use crate::promql::binops::can_push_down_common_filters;
-use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile};
+use crate::promql::engine::label_profile::{LabelProfile, LabelValueProfile, ProfileWindow};
 use crate::promql::engine::{QueryOptions, QueryReader};
+use crate::promql::exec::planner::PreloadGrid;
 use crate::promql::hashers::SelectorKey;
 use crate::promql::optimizer::pushdown::{LeafFilters, pushdown_filters_in_place_with};
+use crate::promql::time::{duration_ms, selector_bounds};
+use crate::promql::utils::subquery_step_ms;
 use crate::promql::{PromqlResult, QueryError};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use orx_parallel::{Par, ParResult};
 use promql_parser::label::{METRIC_NAME, MatchOp, Matcher};
 use promql_parser::parser::token::{T_LOR, T_LUNLESS};
 use promql_parser::parser::value::ValueType;
-use promql_parser::parser::{BinaryExpr, Expr, VectorSelector};
+use promql_parser::parser::{BinaryExpr, Expr, SubqueryExpr, VectorSelector};
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 
 /// Narrow the selectors of `expr`'s binary operations by what the index
 /// knows about their operands' series. A no-op, without touching `reader`,
 /// for an expression with no binary operation the push-down applies to.
 ///
-/// Meant to run on the tree a range query will plan and evaluate, after the
-/// static optimizer (if enabled) and before preloading.
-pub fn derive_filters_in_place<R: QueryReader + ?Sized>(
+/// Meant to run on the tree a range query will plan and evaluate over `grid`,
+/// after the static optimizer (if enabled) and before preloading.
+pub(crate) fn derive_filters_in_place<R: QueryReader + ?Sized>(
     expr: &mut Expr,
     reader: &R,
+    grid: &PreloadGrid,
     options: QueryOptions,
 ) -> PromqlResult<()> {
-    let mut leaves = ProfiledLeaves::collect(expr, reader, options)?;
+    let mut leaves = ProfiledLeaves::collect(expr, reader, grid, options)?;
     if leaves.is_empty() {
         return Ok(());
     }
-    short_circuit_empty_operands(expr, &mut leaves);
+    short_circuit_empty_operands(expr, Some(grid), &mut leaves);
     pushdown_filters_in_place_with(expr, &leaves);
     Ok(())
 }
@@ -68,12 +78,26 @@ pub fn derive_filters_in_place<R: QueryReader + ?Sized>(
 /// (and, for `unless`, only when the left side is), so reading the other
 /// operand is wasted work. It is replaced by that empty selector: nothing
 /// more is read, and `empty op empty` is the same empty result.
-fn short_circuit_empty_operands(expr: &mut Expr, leaves: &mut ProfiledLeaves) {
+///
+/// The selector is planted bare, without the subquery, `offset`, `@` or
+/// matrix range it sat under, and is read over the window of its new place
+/// (`grid`, the grid `expr` is evaluated over). It is planted only where that
+/// window lies within the one it was proved empty over; elsewhere it could
+/// read live series the original never did (`max_over_time(a[5m:1m] offset
+/// 1h) + b` would read today's `a`), which costs samples, never a result.
+fn short_circuit_empty_operands(
+    expr: &mut Expr,
+    grid: Option<&PreloadGrid>,
+    leaves: &mut ProfiledLeaves,
+) {
     match expr {
         Expr::Binary(be) => {
             if can_short_circuit(be) {
-                let lhs_empty = empty_selector_of(&be.lhs, leaves).map(|vs| leaves.detach(vs));
-                let rhs_empty = empty_selector_of(&be.rhs, leaves).map(|vs| leaves.detach(vs));
+                let plantable = |vs: &VectorSelector| leaves.reads_nothing_at(vs, grid);
+                let lhs_empty =
+                    empty_selector_of(&be.lhs, leaves, &plantable).map(|vs| leaves.detach(vs));
+                let rhs_empty =
+                    empty_selector_of(&be.rhs, leaves, &plantable).map(|vs| leaves.detach(vs));
                 match (lhs_empty, rhs_empty) {
                     (Some(_), Some(_)) | (None, None) => {}
                     (Some(empty), None) => leaves.replace_with_empty(&mut be.rhs, empty),
@@ -83,23 +107,26 @@ fn short_circuit_empty_operands(expr: &mut Expr, leaves: &mut ProfiledLeaves) {
                     (None, Some(_)) => {}
                 }
             }
-            short_circuit_empty_operands(&mut be.lhs, leaves);
-            short_circuit_empty_operands(&mut be.rhs, leaves);
+            short_circuit_empty_operands(&mut be.lhs, grid, leaves);
+            short_circuit_empty_operands(&mut be.rhs, grid, leaves);
         }
         Expr::Aggregate(agg) => {
-            short_circuit_empty_operands(&mut agg.expr, leaves);
+            short_circuit_empty_operands(&mut agg.expr, grid, leaves);
             if let Some(param) = agg.param.as_mut() {
-                short_circuit_empty_operands(param, leaves);
+                short_circuit_empty_operands(param, grid, leaves);
             }
         }
         Expr::Call(call) => {
             for arg in call.args.args.iter_mut() {
-                short_circuit_empty_operands(arg, leaves);
+                short_circuit_empty_operands(arg, grid, leaves);
             }
         }
-        Expr::Unary(u) => short_circuit_empty_operands(&mut u.expr, leaves),
-        Expr::Paren(p) => short_circuit_empty_operands(&mut p.expr, leaves),
-        Expr::Subquery(s) => short_circuit_empty_operands(&mut s.expr, leaves),
+        Expr::Unary(u) => short_circuit_empty_operands(&mut u.expr, grid, leaves),
+        Expr::Paren(p) => short_circuit_empty_operands(&mut p.expr, grid, leaves),
+        Expr::Subquery(s) => {
+            let inner = subquery_grid(s, grid);
+            short_circuit_empty_operands(&mut s.expr, inner.as_ref(), leaves)
+        }
         Expr::VectorSelector(_)
         | Expr::MatrixSelector(_)
         | Expr::NumberLiteral(_)
@@ -132,15 +159,28 @@ fn has_fill(be: &BinaryExpr) -> bool {
 /// vector (`scalar()` of nothing is NaN, not empty), functions without a
 /// vector argument and `fill()` operations (they synthesize the missing side)
 /// are the shapes that do not.
-fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a VectorSelector> {
-    let empty = |vs: &'a VectorSelector| leaves.profile(vs).filter(|p| p.series == 0).map(|_| vs);
+///
+/// Only a selector `plantable` accepts is returned; an `or` side that makes
+/// no selector available still counts as empty.
+fn empty_selector_of<'a>(
+    expr: &'a Expr,
+    leaves: &ProfiledLeaves,
+    plantable: &dyn Fn(&VectorSelector) -> bool,
+) -> Option<&'a VectorSelector> {
+    let empty = |vs: &'a VectorSelector| {
+        leaves
+            .profile(vs)
+            .filter(|p| p.series == 0 && plantable(vs))
+            .map(|_| vs)
+    };
+    let is_empty = |expr: &Expr| empty_selector_of(expr, leaves, &|_| true).is_some();
     match expr {
         Expr::VectorSelector(vs) => empty(vs),
         Expr::MatrixSelector(ms) => empty(&ms.vs),
-        Expr::Paren(p) => empty_selector_of(&p.expr, leaves),
-        Expr::Unary(u) => empty_selector_of(&u.expr, leaves),
-        Expr::Subquery(s) => empty_selector_of(&s.expr, leaves),
-        Expr::Aggregate(agg) => empty_selector_of(&agg.expr, leaves),
+        Expr::Paren(p) => empty_selector_of(&p.expr, leaves, plantable),
+        Expr::Unary(u) => empty_selector_of(&u.expr, leaves, plantable),
+        Expr::Subquery(s) => empty_selector_of(&s.expr, leaves, plantable),
+        Expr::Aggregate(agg) => empty_selector_of(&agg.expr, leaves, plantable),
         Expr::Call(call) => {
             if call.func.return_type != ValueType::Vector
                 || matches!(call.func.name, "absent" | "absent_over_time")
@@ -152,14 +192,18 @@ fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a 
                 .arg_types
                 .iter()
                 .position(|&arg| arg != ValueType::Scalar && arg != ValueType::String)?;
-            empty_selector_of(call.args.args.get(pos)?, leaves)
+            empty_selector_of(call.args.args.get(pos)?, leaves, plantable)
         }
         Expr::Binary(be) if has_fill(be) => None,
         Expr::Binary(be) => match be.op.id() {
-            T_LOR => empty_selector_of(&be.lhs, leaves)
-                .filter(|_| empty_selector_of(&be.rhs, leaves).is_some()),
-            T_LUNLESS => empty_selector_of(&be.lhs, leaves),
-            _ => empty_selector_of(&be.lhs, leaves).or_else(|| empty_selector_of(&be.rhs, leaves)),
+            T_LOR if is_empty(&be.lhs) && is_empty(&be.rhs) => {
+                empty_selector_of(&be.lhs, leaves, plantable)
+                    .or_else(|| empty_selector_of(&be.rhs, leaves, plantable))
+            }
+            T_LOR => None,
+            T_LUNLESS => empty_selector_of(&be.lhs, leaves, plantable),
+            _ => empty_selector_of(&be.lhs, leaves, plantable)
+                .or_else(|| empty_selector_of(&be.rhs, leaves, plantable)),
         },
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => None,
     }
@@ -174,6 +218,8 @@ fn empty_selector_of<'a>(expr: &'a Expr, leaves: &ProfiledLeaves) -> Option<&'a 
 struct ProfiledLeaves {
     by_node: AHashMap<usize, SelectorKey>,
     profiles: AHashMap<SelectorKey, LabelProfile>,
+    /// The window each profile covers; `None` for the whole index.
+    windows: AHashMap<SelectorKey, Option<ProfileWindow>>,
     /// Each profile's derived filters, built on first use: a nested operation
     /// asks for a leaf's filters at every level above it, and building them
     /// compiles a regex per multi-valued label.
@@ -184,39 +230,58 @@ impl ProfiledLeaves {
     fn collect<R: QueryReader + ?Sized>(
         expr: &Expr,
         reader: &R,
+        grid: &PreloadGrid,
         options: QueryOptions,
     ) -> PromqlResult<Self> {
         let mut leaves = Vec::new();
-        collect_operand_leaves(expr, &mut leaves);
+        collect_operand_leaves(expr, Some(grid), &mut leaves);
 
         let mut by_node = AHashMap::with_capacity(leaves.len());
-        let mut seen = AHashSet::new();
-        let mut unique = Vec::new();
-        for vs in leaves {
+        // Per key, the selector and the hull of its occurrences' windows:
+        // `SelectorKey` leaves out offset and `@`, so `cpu - cpu offset 5m` is
+        // one profile over both windows rather than one fan-out each.
+        let mut unique: AHashMap<SelectorKey, (VectorSelector, Option<ProfileWindow>)> =
+            AHashMap::new();
+        for (vs, window) in leaves {
             // The pass folds a `__name__="m"` matcher into the selector's
             // name before any lookup, so key the normalized form.
             let normalized = normalized(vs);
             let key = SelectorKey::from_selector(&normalized);
             by_node.insert(node_id(vs), key);
-            if seen.insert(key) {
-                unique.push((key, normalized));
+            match unique.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert((normalized, window));
+                }
+                Entry::Occupied(mut entry) => {
+                    let hull = &mut entry.get_mut().1;
+                    *hull = (*hull).zip(window).map(|(a, b)| a.hull(b));
+                }
             }
         }
+        let windows = unique
+            .iter()
+            .map(|(key, (_, window))| (*key, *window))
+            .collect();
 
         let profiles: Vec<(SelectorKey, Option<LabelProfile>)> = unique
+            .into_iter()
+            .map(|(key, (vs, window))| (key, vs, window))
+            .collect::<Vec<_>>()
             .into_par_rayon()
-            .map(|(key, vs)| match reader.label_profile(&vs, options) {
-                Ok(profile) => Ok((key, profile)),
-                Err(QueryError::Timeout) => Err(QueryError::Timeout),
-                // The read that follows will report whatever is wrong; a
-                // profile is only ever an optimization.
-                Err(err) => {
-                    log_debug(format!(
-                        "label profile unavailable; selector left as written: {err}"
-                    ));
-                    Ok((key, None))
-                }
-            })
+            .map(
+                |(key, vs, window)| match reader.label_profile(&vs, window, options) {
+                    Ok(profile) => Ok((key, profile)),
+                    Err(QueryError::Timeout) => Err(QueryError::Timeout),
+                    // The read that follows will report whatever is wrong; a
+                    // profile is only ever an optimization.
+                    Err(err) => {
+                        log_debug(format!(
+                            "label profile unavailable; selector left as written: {err}"
+                        ));
+                        Ok((key, None))
+                    }
+                },
+            )
             .into_fallible()
             .collect()?;
 
@@ -226,6 +291,7 @@ impl ProfiledLeaves {
                 .into_iter()
                 .filter_map(|(key, profile)| profile.map(|p| (key, p)))
                 .collect(),
+            windows,
             derived: RefCell::default(),
         })
     }
@@ -254,6 +320,23 @@ impl ProfiledLeaves {
         **operand = Expr::VectorSelector(empty);
         if let (Expr::VectorSelector(vs), Some(key)) = (operand.as_ref(), key) {
             self.by_node.insert(node_id(vs), key);
+        }
+    }
+
+    /// Whether `vs`, read as written over `grid`, falls within the window
+    /// its profile covers — so, when that profile counted no series, reads
+    /// nothing there either.
+    fn reads_nothing_at(&self, vs: &VectorSelector, grid: Option<&PreloadGrid>) -> bool {
+        let Some(proven) = self
+            .by_node
+            .get(&node_id(vs))
+            .and_then(|key| self.windows.get(key))
+        else {
+            return false;
+        };
+        match proven {
+            None => true,
+            Some(proven) => leaf_window(vs, grid, None).is_some_and(|w| proven.contains(w)),
         }
     }
 
@@ -343,31 +426,36 @@ fn normalized(vs: &VectorSelector) -> VectorSelector {
     vs
 }
 
-/// Every selector under a binary operation the push-down applies to.
-fn collect_operand_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
+/// A selector, with the window its reads cover over the whole query; `None`
+/// where that is not known, which profiles it over the whole index.
+type Leaf<'a> = (&'a VectorSelector, Option<ProfileWindow>);
+
+/// Every selector under a binary operation the push-down applies to, in an
+/// expression evaluated over `grid`.
+fn collect_operand_leaves<'a>(expr: &'a Expr, grid: Option<&PreloadGrid>, out: &mut Vec<Leaf<'a>>) {
     match expr {
         Expr::Binary(be) if can_push_down_common_filters(be) || can_short_circuit(be) => {
-            collect_all_selectors(&be.lhs, out);
-            collect_all_selectors(&be.rhs, out);
+            collect_all_selectors(&be.lhs, grid, out);
+            collect_all_selectors(&be.rhs, grid, out);
         }
         Expr::Binary(be) => {
-            collect_operand_leaves(&be.lhs, out);
-            collect_operand_leaves(&be.rhs, out);
+            collect_operand_leaves(&be.lhs, grid, out);
+            collect_operand_leaves(&be.rhs, grid, out);
         }
         Expr::Aggregate(agg) => {
-            collect_operand_leaves(&agg.expr, out);
+            collect_operand_leaves(&agg.expr, grid, out);
             if let Some(param) = &agg.param {
-                collect_operand_leaves(param, out);
+                collect_operand_leaves(param, grid, out);
             }
         }
         Expr::Call(call) => {
             for arg in &call.args.args {
-                collect_operand_leaves(arg, out);
+                collect_operand_leaves(arg, grid, out);
             }
         }
-        Expr::Unary(u) => collect_operand_leaves(&u.expr, out),
-        Expr::Paren(p) => collect_operand_leaves(&p.expr, out),
-        Expr::Subquery(s) => collect_operand_leaves(&s.expr, out),
+        Expr::Unary(u) => collect_operand_leaves(&u.expr, grid, out),
+        Expr::Paren(p) => collect_operand_leaves(&p.expr, grid, out),
+        Expr::Subquery(s) => collect_operand_leaves(&s.expr, subquery_grid(s, grid).as_ref(), out),
         Expr::VectorSelector(_)
         | Expr::MatrixSelector(_)
         | Expr::NumberLiteral(_)
@@ -376,36 +464,76 @@ fn collect_operand_leaves<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>)
     }
 }
 
-fn collect_all_selectors<'a>(expr: &'a Expr, out: &mut Vec<&'a VectorSelector>) {
+fn collect_all_selectors<'a>(expr: &'a Expr, grid: Option<&PreloadGrid>, out: &mut Vec<Leaf<'a>>) {
     match expr {
-        Expr::VectorSelector(vs) => out.push(vs),
-        Expr::MatrixSelector(ms) => out.push(&ms.vs),
+        Expr::VectorSelector(vs) => out.push((vs, leaf_window(vs, grid, None))),
+        Expr::MatrixSelector(ms) => out.push((
+            &ms.vs,
+            leaf_window(&ms.vs, grid, Some(duration_ms(ms.range))),
+        )),
         Expr::Binary(be) => {
-            collect_all_selectors(&be.lhs, out);
-            collect_all_selectors(&be.rhs, out);
+            collect_all_selectors(&be.lhs, grid, out);
+            collect_all_selectors(&be.rhs, grid, out);
         }
         Expr::Aggregate(agg) => {
-            collect_all_selectors(&agg.expr, out);
+            collect_all_selectors(&agg.expr, grid, out);
             if let Some(param) = &agg.param {
-                collect_all_selectors(param, out);
+                collect_all_selectors(param, grid, out);
             }
         }
         Expr::Call(call) => {
             for arg in &call.args.args {
-                collect_all_selectors(arg, out);
+                collect_all_selectors(arg, grid, out);
             }
         }
-        Expr::Unary(u) => collect_all_selectors(&u.expr, out),
-        Expr::Paren(p) => collect_all_selectors(&p.expr, out),
-        Expr::Subquery(s) => collect_all_selectors(&s.expr, out),
+        Expr::Unary(u) => collect_all_selectors(&u.expr, grid, out),
+        Expr::Paren(p) => collect_all_selectors(&p.expr, grid, out),
+        Expr::Subquery(s) => collect_all_selectors(&s.expr, subquery_grid(s, grid).as_ref(), out),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
     }
+}
+
+/// The grid `s`'s inner expression is evaluated over, across every step of
+/// `grid`: the union the preload reads it over too.
+fn subquery_grid(s: &SubqueryExpr, grid: Option<&PreloadGrid>) -> Option<PreloadGrid> {
+    grid?.subquery_union(s, subquery_step_ms(s))
+}
+
+/// The span `vs` reads over `grid`: every step with `@` and `offset` applied,
+/// widened back by the matrix range for a range selector (`range_ms`) and by
+/// the lookback for an instant one. The same bounds a preload of it reads.
+/// Inclusive at the bottom, where a window is open there: a millisecond
+/// looser, which is sound.
+fn leaf_window(
+    vs: &VectorSelector,
+    grid: Option<&PreloadGrid>,
+    range_ms: Option<i64>,
+) -> Option<ProfileWindow> {
+    let grid = grid?;
+    // A grid with no step reads nothing; no window describes that better
+    // than the whole index does.
+    grid.last_step()?;
+    let (start_ms, end_ms) = selector_bounds(
+        vs.at.as_ref(),
+        vs.offset.as_ref(),
+        grid.at_start_ms,
+        grid.at_end_ms,
+        grid.start_ms,
+        grid.end_ms,
+        range_ms.unwrap_or(grid.lookback_delta_ms),
+    );
+    Some(ProfileWindow::new(start_ms, end_ms))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::promql::engine::label_profile::{LabelProfileBuilder, join_regexp_values};
+    use crate::common::Sample;
+    use crate::labels::Labels;
+    use crate::promql::engine::label_profile::{
+        LabelProfileBuilder, ProfileWindow, join_regexp_values,
+    };
+    use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
     use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
     use crate::promql::exec::types::EvalLabels;
     use crate::promql::model::{InstantSample, RangeSample};
@@ -414,10 +542,12 @@ mod tests {
     /// A selector's series, as label pairs.
     type SeriesTable<'a> = &'a [&'a [(&'a str, &'a str)]];
 
-    /// A reader that answers profiles from a table and records what was asked.
+    /// A reader that answers profiles from a table and records what was asked,
+    /// and over which window.
     struct TableReader {
         profiles: AHashMap<String, LabelProfile>,
         asked: Mutex<Vec<String>>,
+        windows: Mutex<AHashMap<String, Option<ProfileWindow>>>,
     }
 
     impl TableReader {
@@ -435,6 +565,7 @@ mod tests {
             Self {
                 profiles,
                 asked: Mutex::new(Vec::new()),
+                windows: Mutex::default(),
             }
         }
     }
@@ -472,6 +603,7 @@ mod tests {
         fn label_profile(
             &self,
             selector: &VectorSelector,
+            window: Option<ProfileWindow>,
             _: QueryOptions,
         ) -> PromqlResult<Option<LabelProfile>> {
             let mut stripped = selector.clone();
@@ -479,6 +611,10 @@ mod tests {
             stripped.at = None;
             let rendered = stripped.to_string();
             self.asked.lock().unwrap().push(rendered.clone());
+            self.windows
+                .lock()
+                .unwrap()
+                .insert(rendered.clone(), window);
             Ok(self.profiles.get(&rendered).cloned())
         }
     }
@@ -491,9 +627,25 @@ mod tests {
         }
     }
 
+    /// An hour at one-minute steps, with the default five-minute lookback.
+    fn grid() -> PreloadGrid {
+        PreloadGrid {
+            start_ms: HOUR,
+            end_ms: 2 * HOUR,
+            step_ms: 60_000,
+            at_start_ms: HOUR,
+            at_end_ms: 2 * HOUR,
+            lookback_delta_ms: LOOKBACK,
+            sample_timestamps: false,
+        }
+    }
+
+    const HOUR: i64 = 3_600_000;
+    const LOOKBACK: i64 = 300_000;
+
     fn rewrite(query: &str, reader: &TableReader) -> String {
         let mut expr = promql_parser::parser::parse(query).unwrap();
-        derive_filters_in_place(&mut expr, reader, options()).unwrap();
+        derive_filters_in_place(&mut expr, reader, &grid(), options()).unwrap();
         expr.to_string()
     }
 
@@ -616,7 +768,7 @@ mod tests {
         let rewrite_simplified = |query: &str| {
             let expr = promql_parser::parser::parse(query).unwrap();
             let mut expr = crate::promql::optimizer::simplify_expr(expr).unwrap();
-            derive_filters_in_place(&mut expr, &reader, options()).unwrap();
+            derive_filters_in_place(&mut expr, &reader, &grid(), options()).unwrap();
             expr.to_string()
         };
 
@@ -1055,5 +1207,282 @@ mod tests {
             rewrite(r#"{__name__="cpu",region="us"} - cpu"#, &reader),
             r#"cpu{region="us"} - cpu{host=~"a|b",region="us"}"#
         );
+    }
+
+    /// The window each selector of `query` was profiled over, `(start, end)`
+    /// in ms.
+    fn windows(query: &str) -> Vec<(String, Option<(i64, i64)>)> {
+        let reader = TableReader::new(vec![]);
+        rewrite(query, &reader);
+        let mut windows: Vec<_> = reader
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(selector, w)| (selector.clone(), w.map(|w| (w.start_ms, w.end_ms))))
+            .collect();
+        windows.sort();
+        windows
+    }
+
+    fn window(selector: &str, start_ms: i64, end_ms: i64) -> (String, Option<(i64, i64)>) {
+        (selector.to_string(), Some((start_ms, end_ms)))
+    }
+
+    #[test]
+    fn a_selector_is_profiled_over_the_span_its_reads_cover() {
+        // Lookback for an instant selector, the matrix range for a range one.
+        assert_eq!(
+            windows("a - b"),
+            vec![
+                window("a", HOUR - LOOKBACK, 2 * HOUR),
+                window("b", HOUR - LOOKBACK, 2 * HOUR)
+            ]
+        );
+        assert_eq!(
+            windows("rate(a[10m]) - rate(b[2m])"),
+            vec![
+                window("a", HOUR - 600_000, 2 * HOUR),
+                window("b", HOUR - 120_000, 2 * HOUR)
+            ]
+        );
+        // `offset` shifts the span; `@ <t>` pins it to one evaluation time.
+        assert_eq!(
+            windows("a - b offset 1h"),
+            vec![
+                window("a", HOUR - LOOKBACK, 2 * HOUR),
+                window("b", -LOOKBACK, HOUR)
+            ]
+        );
+        assert_eq!(
+            windows("a - b @ 1800"),
+            vec![
+                window("a", HOUR - LOOKBACK, 2 * HOUR),
+                window("b", 1_800_000 - LOOKBACK, 1_800_000)
+            ]
+        );
+        assert_eq!(
+            windows("a - b @ 1800 offset -10m"),
+            vec![
+                window("a", HOUR - LOOKBACK, 2 * HOUR),
+                window("b", 2_400_000 - LOOKBACK, 2_400_000)
+            ]
+        );
+        // `@ start()` / `@ end()` are evaluated at every step of a range
+        // query, so they cover the whole range, as the preload does.
+        for at in ["start()", "end()"] {
+            assert_eq!(
+                windows(&format!("a - b @ {at}")),
+                vec![
+                    window("a", HOUR - LOOKBACK, 2 * HOUR),
+                    window("b", HOUR - LOOKBACK, 2 * HOUR)
+                ],
+                "@ {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selector_under_a_subquery_is_profiled_over_its_union_grid() {
+        let query = "max_over_time((a - b offset 5m)[30m:1m])";
+        let Expr::Call(call) = promql_parser::parser::parse(query).unwrap() else {
+            unreachable!()
+        };
+        let Expr::Subquery(sq) = call.args.args[0].as_ref() else {
+            unreachable!()
+        };
+        // What the preload reads the subquery over.
+        let union = grid().subquery_union(sq, 60_000).unwrap();
+        assert_eq!(
+            (union.start_ms, union.end_ms),
+            (HOUR - 29 * 60_000, 2 * HOUR)
+        );
+        assert_eq!(
+            windows(query),
+            vec![
+                window("a", union.start_ms - LOOKBACK, union.end_ms),
+                window(
+                    "b",
+                    union.start_ms - 300_000 - LOOKBACK,
+                    union.end_ms - 300_000
+                )
+            ]
+        );
+
+        // Nested: the outer subquery's union grid is the inner one's outer grid.
+        let nested = "max_over_time(rate((a - b)[10m:1m])[30m:5m])";
+        let Expr::Call(outer) = promql_parser::parser::parse(nested).unwrap() else {
+            unreachable!()
+        };
+        let Expr::Subquery(outer_sq) = outer.args.args[0].as_ref() else {
+            unreachable!()
+        };
+        let Expr::Call(rate) = outer_sq.expr.as_ref() else {
+            unreachable!()
+        };
+        let Expr::Subquery(inner_sq) = rate.args.args[0].as_ref() else {
+            unreachable!()
+        };
+        let inner = grid()
+            .subquery_union(outer_sq, 300_000)
+            .unwrap()
+            .subquery_union(inner_sq, 60_000)
+            .unwrap();
+        assert_eq!(
+            windows(nested),
+            vec![
+                window("a", inner.start_ms - LOOKBACK, inner.end_ms),
+                window("b", inner.start_ms - LOOKBACK, inner.end_ms)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selector_occurring_twice_is_profiled_once_over_the_hull() {
+        let reader = TableReader::new(vec![]);
+        rewrite("x - x offset 1h", &reader);
+        assert_eq!(reader.asked.lock().unwrap().len(), 1);
+        assert_eq!(
+            windows("x - x offset 1h"),
+            vec![window("x", -LOOKBACK, 2 * HOUR)]
+        );
+    }
+
+    /// `m{region="eu"}` stopped reporting ten minutes in; `m{region="us"}`
+    /// and both regions' `info` report across the query's hour.
+    fn retired_eu() -> MemorySeriesQuerier {
+        let querier = MemorySeriesQuerier::new();
+        let m_eu = Labels::from_pairs(&[("__name__", "m"), ("region", "eu")]);
+        let m_us = Labels::from_pairs(&[("__name__", "m"), ("region", "us")]);
+        let info_eu = Labels::from_pairs(&[("__name__", "info"), ("region", "eu")]);
+        let info_us = Labels::from_pairs(&[("__name__", "info"), ("region", "us")]);
+        for minute in 0..10 {
+            querier.add_sample(&m_eu, Sample::new(minute * 60_000, 1.0));
+        }
+        for minute in 60..=120 {
+            let t = minute * 60_000;
+            for labels in [&m_us, &info_eu, &info_us] {
+                querier.add_sample(labels, Sample::new(t, 1.0));
+            }
+        }
+        querier
+    }
+
+    fn rewrite_with(query: &str, reader: &MemorySeriesQuerier) -> String {
+        let mut expr = promql_parser::parser::parse(query).unwrap();
+        derive_filters_in_place(&mut expr, reader, &grid(), options()).unwrap();
+        expr.to_string()
+    }
+
+    #[test]
+    fn a_retired_series_does_not_widen_the_filters() {
+        let reader = retired_eu();
+        // Over the whole index `m` carries both regions, which prunes nothing
+        // from `info`; over the hour only `us` reports.
+        assert_eq!(
+            rewrite_with("info - m", &reader),
+            r#"info{region="us"} - m"#
+        );
+        // An offset back into the first ten minutes sees `eu` again.
+        assert_eq!(
+            rewrite_with("info - m offset 55m", &reader),
+            "info - m offset 55m"
+        );
+    }
+
+    #[test]
+    fn an_operand_of_retired_series_only_short_circuits_the_other() {
+        let reader = retired_eu();
+        assert_eq!(
+            rewrite_with(r#"info - m{region="eu"}"#, &reader),
+            r#"m{region="eu"} - m{region="eu"}"#
+        );
+        // An hour back it reports, so it narrows `info` instead.
+        assert_eq!(
+            rewrite_with(r#"info - m{region="eu"} offset 1h"#, &reader),
+            r#"info{region="eu"} - m{region="eu"} offset 1h"#
+        );
+    }
+
+    /// Two `a` series reporting three minutes before the query's end and one
+    /// `b` reporting at it; nothing earlier.
+    fn current_only() -> MemorySeriesQuerier {
+        let querier = MemorySeriesQuerier::new();
+        for i in ["1", "2"] {
+            let a = Labels::from_pairs(&[("__name__", "a"), ("i", i)]);
+            querier.add_sample(&a, Sample::new(2 * HOUR - 180_000, 1.0));
+        }
+        let b = Labels::from_pairs(&[("__name__", "b")]);
+        querier.add_sample(&b, Sample::new(2 * HOUR, 1.0));
+        querier
+    }
+
+    /// The empty operand's selector is planted bare, without the subquery,
+    /// `@`, `offset` or matrix range around it: it is only planted where its
+    /// own reads there fall within the window it was proved empty over.
+    #[test]
+    fn an_empty_selector_is_planted_only_where_it_still_reads_nothing() {
+        let reader = current_only();
+        // The query's last step only, as the evaluation below runs it.
+        let at_end = PreloadGrid {
+            start_ms: 2 * HOUR,
+            at_start_ms: 2 * HOUR,
+            ..grid()
+        };
+        let normalized = |q: &str| promql_parser::parser::parse(q).unwrap().to_string();
+        let rewrite = |q: &str| {
+            let mut expr = promql_parser::parser::parse(q).unwrap();
+            derive_filters_in_place(&mut expr, &reader, &at_end, options()).unwrap();
+            expr.to_string()
+        };
+        for query in [
+            "max_over_time(a[5m:1m] offset 1h) + b",
+            "max_over_time(a[5m:1m] @ 3600) + b",
+            "rate(a[1m]) + b",
+        ] {
+            assert_eq!(rewrite(query), normalized(query), "{query}");
+        }
+        // A subquery's grid reaches further back than the lookback, so its
+        // own `offset` selector read bare covers no more than it was proved
+        // empty over.
+        assert_eq!(
+            rewrite("max_over_time(b offset 1h [5m:1m]) + a"),
+            normalized("max_over_time(b offset 1h [5m:1m]) + b offset 1h")
+        );
+    }
+
+    /// Whatever the pass plants, the query reads no more than the original:
+    /// a one-sample budget the original fits in is not exceeded.
+    #[test]
+    fn a_short_circuit_reads_nothing_the_original_does_not() {
+        use crate::promql::engine::evaluate_range;
+        use promql_parser::parser::EvalStmt;
+        use std::sync::Arc;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let reader: Arc<dyn QueryReader> = Arc::new(current_only());
+        for query in [
+            "max_over_time(a[5m:1m] offset 1h) + b",
+            "max_over_time(a[5m:1m] @ 3600) + b",
+            "rate(a[1m]) + b",
+        ] {
+            for derived in [false, true] {
+                let opts = QueryOptions {
+                    derived_filter_pushdown: derived,
+                    max_samples: 1,
+                    ..options()
+                };
+                let stmt = EvalStmt {
+                    expr: promql_parser::parser::parse(query).unwrap(),
+                    start: UNIX_EPOCH + Duration::from_millis(2 * HOUR as u64),
+                    end: UNIX_EPOCH + Duration::from_millis(2 * HOUR as u64),
+                    interval: Duration::from_secs(60),
+                    lookback_delta: opts.lookback_delta,
+                };
+                let result = evaluate_range(reader.clone(), stmt, opts)
+                    .unwrap_or_else(|e| panic!("{query} (derived={derived}): {e}"));
+                assert!(result.is_empty(), "{query} (derived={derived}): {result:?}");
+            }
+        }
     }
 }

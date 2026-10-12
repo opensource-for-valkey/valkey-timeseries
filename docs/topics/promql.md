@@ -291,7 +291,10 @@ do this, and they differ in where the label values come from:
   for each selector under such an operation, the engine asks which labels every one of
   its series carries (in a cluster, one `label-profile` fan-out per distinct selector,
   no samples read) and adds them to the other operand's selectors only where they
-  provably exclude series. Operands whose series carry the same values — `cpu - cpu
+  provably exclude series. Only the series with a sample in the span the selector reads
+  — after `offset`, `@`, lookback or range, and any enclosing subquery — count, so a
+  series that stopped reporting before the query (a rolled-out pod, a retired region)
+  does not widen the filters. Operands whose series carry the same values — `cpu - cpu
   offset 5m` — are left untouched. `or`, fill modifiers and label-less aggregations
   are never narrowed. An operand whose selector matches no series at all makes the
   operation's result empty (for every operator but `or`, and for `unless` only on the
@@ -304,8 +307,9 @@ do this, and they differ in where the label values come from:
 
 Both are exact: a filter only ever removes series that could not have matched at any
 step. A selector matching more than 50 000 series (or the query's
-`ts-promql-max-response-series`, whichever is lower) is left as written, as is a label
-with more than 60 distinct values.
+`ts-promql-max-response-series`, whichever is lower) is left as written, as is one
+matching more than four times that many series in total, counting those that stopped
+reporting before the query, and a label with more than 60 distinct values.
 
 ## Configuration and safeguards
 

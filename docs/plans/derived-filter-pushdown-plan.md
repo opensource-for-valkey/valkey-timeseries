@@ -90,11 +90,19 @@ it is marked `truncated` — and neither cap costs a common filter while the fir
 fit: a label every series carries is carried by the first one added, which normally has at most
 128 labels (`TS.CREATE … LABELS` does not enforce that; past it a common label can be missed,
 costing a push-down, never a result). So a profile, and a shard's reply, stays within about 1 MiB. A profile is **unavailable** when `|S|`
-exceeds `MAX_PROFILED_SERIES` (min of `options.max_series` and 50 000) or the source cannot
-answer; unavailable means "derive nothing from this leaf", never an error.
+exceeds `MAX_PROFILED_SERIES` (min of `options.max_series` and 50 000), when the walk opens
+more than `MAX_PROFILED_KEYS_PER_SERIES` (4) times that many matched keys, retired ones outside
+the window included (`ProfileWalk`; added 2026-10-11, since a series outside the window does
+not count toward `|S|` and a selector of millions of retired keys was otherwise walked whole),
+or when the source cannot answer. Unavailable means "derive nothing from this leaf", never an
+error.
 
-The profile is time-agnostic (the index, not the query range). That is a superset of the
-series the reads will return, which only loosens the derived filters — see §3. It is also
+The profile covers the leaf's window: the span its reads cover over the whole query
+(offset, `@`, lookback or matrix range, and each enclosing subquery's grid applied), and
+only series with a retained sample in it count — §7, *In-range profiles*. A selector that
+occurs more than once is profiled once, over the hull of its windows. That is a superset
+of the series the reads will return, which only loosens the derived filters — see §3. It
+was the whole index until 2026-10-11. It is also
 ACL-agnostic: unauthorized series can only add values or remove a common label, and the
 matchers derived are internal, never surfaced.
 
@@ -189,7 +197,8 @@ is cheap (labels only, no samples), keeps preload parallel, and applies uniforml
 
 - **Results.** For every accepted binop, a derived matcher on the target side excludes a
   series only if no series on the source side could match it at any step: the source's
-  common label values over the index are a superset of its values at any step, and the
+  common label values over its window are a superset of its values at any step (a
+  series with no sample in the window contributes nothing at any step), and the
   `on()`/`ignoring()`/`group_*` trimming is the static optimizer's, already relied on. The
   unrewritten and rewritten trees therefore evaluate identically on the same data; this is
   the invariant every test below asserts (push-down on vs. off, cluster and single node).
@@ -200,12 +209,22 @@ is cheap (labels only, no samples), keeps preload parallel, and applies uniforml
   (`max_series`, an unauthorized key in cluster mode) now succeeds without touching it.
   The static rewrite and the instant runtime path already behave this way for written
   matchers; the cluster ACL suite asserts only on shapes where nothing is derived (checked
-  2026-10-11, §7), and the fail-closed rule itself is unchanged.
+  2026-10-11, §7), and the fail-closed rule itself is unchanged. With windowed profiles a
+  wide operand whose read would have failed is also skipped when the other side matches
+  only series retired before its window (the short-circuit below). The empty operand
+  itself stays in the tree, so the result is right. The copy planted in the other
+  operand's place is the bare selector, read over that position's window, so it is
+  planted only where that window lies within the one it was proved empty over (2026-10-11).
+  Before that, `max_over_time(a[5m:1m] offset 1h) + b` planted today's `a` for `b`, which
+  read live series the original never did and could fail a query that fit
+  `ts-promql-max-samples-per-query`. An enclosing subquery's `offset`/`@`, or a matrix
+  range shorter than the lookback, now keeps the other operand as written.
 - **`__name__`** is never derived (binop matching ignores it), the 60-value cap holds, and
   `count_values`/`label_replace`/`label_join` synthesized labels are dropped by the
   existing structural rules before they reach a leaf.
 - **Budgets.** Profiles are not samples: nothing is charged to
-  `ts-promql-max-samples-per-query`; `max_series` bounds the walk via `MAX_PROFILED_SERIES`.
+  `ts-promql-max-samples-per-query`; `max_series` bounds the walk via `MAX_PROFILED_SERIES`,
+  and the keys it opens to 4× that.
 
 ## 4. Configuration
 
@@ -280,9 +299,37 @@ generalization, one for tests, half to measure.
 
 ## 7. Open questions
 
-Re-checked against the code on 2026-10-11. One item is open; the rest are settled.
+Re-checked against the code on 2026-10-11; every item below is settled.
 
-- **In-range profiles — evaluated 2026-09-26, steps restated 2026-10-11, not started.**
+- **In-range profiles — done (2026-10-11).** Landed as steps 1–8 below, with two
+  differences from the text. Both local walks needed the check: the single-node
+  executor read (`ReadState::Profile` in `selector_batch_executor.rs`) as well as the
+  shard-side `local_label_profile`. And `derive_filters_in_place` became `pub(crate)`,
+  since it now takes the crate-private `PreloadGrid`. Measured single node, criterion
+  `promql_engine`, three interleaved pairs of two binaries (the commit before the
+  change against the one after, same bench source), Apple M2:
+
+  | case | before | after | after/before per pair |
+  |---|---|---|---|
+  | `churn_join/churned` — `info * on(pod) group_left live{namespace="ns-0"}`, 360 steps | 4.54–5.12 ms | 2.28–2.39 ms | 0.50, 0.45, 0.50 |
+  | `churn_join/steady` — same, no retired generations | 2.30–2.39 ms | 2.30–2.38 ms | 1.01, 0.98, 1.00 |
+  | `churn_join/churned,pushdown=off` | 4.31–4.53 ms | 4.31–4.74 ms | 1.00, 1.03, 1.05 |
+  | `range_query` `a_hundred - b_hundred`, 1000 steps | 16.8–17.9 ms | 16.9–17.7 ms | 1.04, 0.95, 1.03 |
+  | `range_query` `a_hundred and b_hundred{l=~'.*[0-4]$'}` | 5.53–5.68 ms | 5.60–6.13 ms | 0.99, 1.07, 1.09; re-run 1.03, 1.02, 1.00 |
+  | `range_query` `a_hundred and b_hundred{l='notfound'}` | 0.61–0.66 ms | 0.61–0.66 ms | 1.00, 0.92, 1.08 |
+  | `range_query` `rate(a_hundred[1m]) + rate(b_hundred[1m])` | 17.7–19.2 ms | 17.7–19.3 ms | 1.00, 1.03, 1.01 |
+  | `range_query` `a_hundred + on(l) group_right a_one` | 4.91–4.96 ms | 4.88–5.15 ms | 0.99, 0.98, 1.05 |
+
+  The churn fixture is 10 namespaces × 20 pods, plus five retired generations of `live`:
+  over the index `live{namespace="ns-0"}` carries 120 `pod` values, past the 60-value
+  cap, so before the change nothing was derived and `info` was read for all 200 pods.
+  Over the window it carries 20, and `churned` now runs as fast as `steady`. Every
+  shape without churn is within noise. The first `and`-regex pass had one noisy head
+  run (CI 5.7–6.8 ms); three more pairs read 1.00–1.03, and both builds do the same work
+  for it, since all its series are live. Not measured on the cluster harness, where
+  every series spans the range and the change can only show overhead. The original
+  text follows as the record of the design.
+
   Profiling each leaf over the window its reads cover, not the whole index, would drop
   retired series (a rolled-out pod, a region that stopped reporting). That tightens three
   things: the derived filters, `retain_pruning` on the target, and
@@ -405,7 +452,7 @@ Re-checked against the code on 2026-10-11. One item is open; the rest are settle
 
 - **Empty operand short-circuit — done (2026-09-13).** `short_circuit_empty_operands`
   runs before the rewrite: where a profile proves an operand's selector matches no
-  series and the operand's shape passes emptiness through (aggregations,
+  series with a sample in its window and the operand's shape passes emptiness through (aggregations,
   series-to-series functions, rollups, subqueries, nested operations other than `or`;
   not `absent`/`absent_over_time`), the other operand is replaced by that empty
   selector for every operator but `or` — and for `unless` only when the left side is

@@ -118,47 +118,15 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             if self.preloaded_subqueries.read().unwrap().contains_key(&key) {
                 continue;
             }
-            // The union of the windows: modifiers shift (or, with `@`,
-            // collapse) every window end the same way, so the extremes of the
-            // shifted outer bounds bound them all.
-            let (Some(first), Some(last)) = (grid.steps().next(), grid.steps().last()) else {
+            let Some(union) = grid.subquery_union(subquery, step_ms) else {
                 continue;
             };
-            let resolve = |ts: Timestamp| {
-                apply_time_modifiers_ms(
-                    subquery.at.as_ref(),
-                    subquery.offset.as_ref(),
-                    grid.at_start_ms,
-                    grid.at_end_ms,
-                    ts,
-                )
-            };
-            let (first_end, last_end) = (resolve(first), resolve(last));
-            let (earliest_end, latest_end) = (first_end.min(last_end), first_end.max(last_end));
-            let range_ms = duration_ms(subquery.range);
-            let (aligned_start_ms, _, _, _) = compute_subquery_alignment(
-                earliest_end.saturating_sub(range_ms),
-                latest_end,
-                step_ms,
-                0,
-            );
             // The union spans every outer step, so it can pass the ceiling
             // where each step's own grid does not. Those steps then prepare
             // their own grids, and each is checked there.
-            if grid_step_count(aligned_start_ms, latest_end, step_ms) > MAX_GRID_STEPS {
+            if grid_step_count(union.start_ms, union.end_ms, union.step_ms) > MAX_GRID_STEPS {
                 continue;
             }
-            let union = PreloadGrid {
-                start_ms: aligned_start_ms,
-                end_ms: latest_end,
-                step_ms,
-                at_start_ms: grid.at_start_ms,
-                at_end_ms: grid.at_end_ms,
-                lookback_delta_ms: grid.lookback_delta_ms,
-                // The sub-evaluator's preload decides this from the inner
-                // expression itself.
-                sample_timestamps: false,
-            };
             let plan = PlannedQuery::for_grid(&subquery.expr, union);
             match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
                 .prepare(plan)

@@ -833,6 +833,14 @@ pub struct LabelProfileQuery {
     /// / answered without it. 0 means no limit (as from every older requester).
     #[prost(uint64, tag = "3")]
     pub time_budget_ms: u64,
+    /// / Count only the series with a retained sample in `\[start_ms, end_ms\]`
+    /// / (milliseconds, both inclusive). Unless both are set, every matching
+    /// / series counts, as from every older requester; a node that predates the
+    /// / fields does the same, which can only cost a push-down, never a result.
+    #[prost(int64, optional, tag = "4")]
+    pub start_ms: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "5")]
+    pub end_ms: ::core::option::Option<i64>,
 }
 /// / One label over the matched series.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

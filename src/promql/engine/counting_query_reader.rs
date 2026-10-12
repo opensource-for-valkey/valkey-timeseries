@@ -17,7 +17,7 @@
 
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
-use crate::promql::engine::label_profile::LabelProfile;
+use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
 };
@@ -141,10 +141,11 @@ impl QueryReader for CountingQueryReader {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
         self.label_profile_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner.label_profile(selector, options)
+        self.inner.label_profile(selector, window, options)
     }
 }
 
@@ -972,9 +973,10 @@ mod tests {
         fn label_profile(
             &self,
             selector: &VectorSelector,
+            window: Option<ProfileWindow>,
             options: QueryOptions,
         ) -> PromqlResult<Option<LabelProfile>> {
-            self.inner.label_profile(selector, options)
+            self.inner.label_profile(selector, window, options)
         }
     }
 

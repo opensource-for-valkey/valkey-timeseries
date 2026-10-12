@@ -161,7 +161,12 @@ push-down (`ts-promql-derived-filter-pushdown`): before a range query with a
 binary operation is planned, the coordinator asks every shard which labels the
 series of each operand's selector carry — per label, how many series and which
 distinct values — and narrows the *other* operand's selectors by what every
-series is known to satisfy. No sample is read for it. The response is
+series is known to satisfy. No sample is read for it. The request's optional
+`start_ms`/`end_ms` (both inclusive) restrict the profile to the series whose
+retained span meets that window: the span the selector's reads cover, so a
+series that stopped reporting before the query is left out. Unless both are
+set, every matching series counts. An older shard ignores them and profiles
+its whole index, which is looser and still safe. The response is
 self-describing in the same sense as the grid's: a shard that matched more
 series than the request's `max_series` answers `overflow` instead of a profile,
 and the coordinator then leaves the selector as written, which is always safe.

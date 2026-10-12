@@ -6,7 +6,7 @@
 //! source that answers the grid requests itself.
 use crate::common::Sample;
 use crate::labels::Labels;
-use crate::promql::engine::label_profile::LabelProfile;
+use crate::promql::engine::label_profile::{LabelProfile, ProfileWindow};
 use crate::promql::engine::memory_series_querier::MemorySeriesQuerier;
 use crate::promql::engine::query_reader::{
     AggregationOutcome, AggregationRequest, GridOutcome, GridRequest,
@@ -69,9 +69,10 @@ impl QueryReader for NoGridPushdown {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
-        self.inner.label_profile(selector, options)
+        self.inner.label_profile(selector, window, options)
     }
 }
 

@@ -2176,6 +2176,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_overlaps_retained_is_false_for_an_empty_series() {
+        let ts = TimeSeries::new();
+        assert!(!ts.overlaps_retained(i64::MIN, i64::MAX));
+    }
+
+    #[test]
+    fn test_overlaps_retained_includes_both_ends() {
+        let mut ts = TimeSeries::new();
+        for t in [100, 200, 300] {
+            assert!(ts.add(t, 1.0, None).is_ok());
+        }
+        assert!(ts.overlaps_retained(0, 100));
+        assert!(ts.overlaps_retained(300, 400));
+        assert!(ts.overlaps_retained(150, 250));
+        assert!(!ts.overlaps_retained(0, 99));
+        assert!(!ts.overlaps_retained(301, 400));
+    }
+
+    #[test]
+    fn test_overlaps_retained_ignores_an_untrimmed_expired_prefix() {
+        let (ts, _) = series_with_lazy_expired_head();
+        let floor = ts.get_min_timestamp();
+        let first = ts.chunks[0].first_timestamp();
+        assert!(
+            first < floor,
+            "the head chunk must still hold expired samples"
+        );
+
+        // `overlaps` still counts the stored, expired samples; reads do not.
+        assert!(ts.overlaps(first, floor - 1));
+        assert!(!ts.overlaps_retained(first, floor - 1));
+        assert!(!ts.has_samples_in_range(first, floor - 1));
+        // The floor itself is retained.
+        assert!(ts.overlaps_retained(first, floor));
+    }
+
+    #[test]
+    fn test_overlaps_retained_is_looser_from_the_floor_to_the_first_retained_sample() {
+        // Stored {100, 1000} with a floor of 800: the span reads can see starts at the floor,
+        // but the first sample in it is 1000.
+        let mut ts = TimeSeries::new();
+        for t in [100, 1_000] {
+            assert!(ts.add(t, 1.0, None).is_ok());
+        }
+        // Retention is set only now, so no write has trimmed against it yet.
+        ts.retention = Duration::from_millis(200);
+        assert_eq!(ts.get_min_timestamp(), 800);
+        assert_eq!(
+            ts.first_timestamp, 100,
+            "the expired sample is still stored"
+        );
+
+        assert!(ts.overlaps_retained(850, 900));
+        assert!(!ts.has_samples_in_range(850, 900));
+        // Nothing before the floor counts.
+        assert!(!ts.overlaps_retained(100, 799));
+    }
+
+    #[test]
+    fn test_overlaps_retained_bounds_has_samples_in_range() {
+        // Samples at 0..10 and 1000..1010: the windows inside the gap are where the cheap
+        // answer is looser than the decoding one, and nowhere else.
+        let mut ts = TimeSeries::new();
+        for t in (0..10).chain(1_000..1_010) {
+            assert!(ts.add(t, 1.0, None).is_ok());
+        }
+        for (start, end) in [
+            (-5, 3),
+            (5, 500),
+            (20, 900),
+            (500, 1_005),
+            (1_009, 2_000),
+            (2_000, 3_000),
+        ] {
+            let cheap = ts.overlaps_retained(start, end);
+            let exact = ts.has_samples_in_range(start, end);
+            assert!(
+                cheap || !exact,
+                "[{start}, {end}]: has samples but reported none"
+            );
+            assert_eq!(
+                cheap && !exact,
+                (start, end) == (20, 900),
+                "[{start}, {end}]"
+            );
+        }
+    }
+
     /// A compressed series whose sealed head chunk holds an untrimmed expired prefix, a fifth
     /// of its span: under the quarter at which the write path re-encodes it. Samples sit on
     /// even timestamps, so odd ones are free for out-of-order inserts. Returns the series and

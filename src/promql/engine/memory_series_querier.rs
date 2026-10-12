@@ -6,7 +6,7 @@ use crate::labels::{Labels, SeriesFingerprint};
 use crate::promql::EvalLabels;
 use crate::promql::engine::QueryReader;
 use crate::promql::engine::label_profile::{
-    LabelProfile, LabelProfileBuilder, profiled_series_cap,
+    LabelProfile, LabelProfileBuilder, ProfileStep, ProfileWalk, ProfileWindow, profiled_series_cap,
 };
 use crate::promql::engine::query_reader::{AggregationOutcome, AggregationRequest};
 use crate::promql::model::InstantSample;
@@ -217,6 +217,7 @@ impl QueryReader for MemorySeriesQuerier {
     fn label_profile(
         &self,
         selector: &VectorSelector,
+        window: Option<ProfileWindow>,
         options: QueryOptions,
     ) -> PromqlResult<Option<LabelProfile>> {
         let inner = self.inner.read().unwrap();
@@ -225,16 +226,128 @@ impl QueryReader for MemorySeriesQuerier {
             .postings
             .postings_for_selectors(&[selector])
             .map_err(|e| QueryError::Execution(e.to_string()))?;
-        let cap = profiled_series_cap(&options);
+        let mut walk = ProfileWalk::new(window, profiled_series_cap(&options));
         let mut builder = LabelProfileBuilder::new();
         for id in ids.iter() {
-            if builder.series() as usize >= cap {
-                return Ok(None);
-            }
-            if let Some(series) = inner.series.get(&id) {
-                builder.add_series(series.labels.iter().map(|l| (l.name, l.value)));
+            let Some(series) = inner.series.get(&id) else {
+                continue;
+            };
+            match walk.step(series) {
+                ProfileStep::Skip => {}
+                ProfileStep::Stop => return Ok(None),
+                ProfileStep::Take => {
+                    builder.add_series(series.labels.iter().map(|l| (l.name, l.value)))
+                }
             }
         }
         Ok(Some(builder.finish()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::promql::engine::label_profile::MAX_PROFILED_KEYS_PER_SERIES;
+    use promql_parser::parser::{Expr, parse};
+
+    fn selector(query: &str) -> VectorSelector {
+        match parse(query).unwrap() {
+            Expr::VectorSelector(vs) => vs,
+            other => panic!("not a selector: {other:?}"),
+        }
+    }
+
+    /// `m{region="eu"}` stopped reporting at 10 ms; `m{region="us"}` reports from 1 s on.
+    fn retired_and_live() -> MemorySeriesQuerier {
+        let querier = MemorySeriesQuerier::new();
+        let retired = Labels::from_pairs(&[("__name__", "m"), ("region", "eu")]);
+        let live = Labels::from_pairs(&[("__name__", "m"), ("region", "us")]);
+        for t in 0..10 {
+            querier.add_sample(&retired, Sample::new(t, 1.0));
+            querier.add_sample(&live, Sample::new(1_000 + t, 1.0));
+        }
+        querier
+    }
+
+    fn options(max_series: usize) -> QueryOptions {
+        QueryOptions {
+            max_series,
+            ..QueryOptions::default()
+        }
+    }
+
+    fn filters(profile: &LabelProfile) -> Vec<String> {
+        profile
+            .common_filters()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_window_profiles_only_the_series_with_a_sample_in_it() {
+        let querier = retired_and_live();
+        let m = selector("m");
+
+        let index = querier
+            .label_profile(&m, None, options(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.series, 2);
+        assert_eq!(filters(&index), vec![r#"region=~"eu|us""#]);
+
+        let live = ProfileWindow::new(500, 2_000);
+        let windowed = querier
+            .label_profile(&m, Some(live), options(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(windowed.series, 1);
+        assert_eq!(filters(&windowed), vec![r#"region="us""#]);
+
+        let none = ProfileWindow::new(100, 200);
+        let empty = querier
+            .label_profile(&m, Some(none), options(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.series, 0);
+    }
+
+    #[test]
+    fn the_cap_counts_only_the_series_in_the_window() {
+        let querier = retired_and_live();
+        let m = selector("m");
+        assert_eq!(querier.label_profile(&m, None, options(1)).unwrap(), None);
+        let windowed = querier
+            .label_profile(&m, Some(ProfileWindow::new(500, 2_000)), options(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(windowed.series, 1);
+    }
+
+    /// `n` series of `m` retired at 10 ms, then one live from 1 s on.
+    fn mostly_retired(n: usize) -> MemorySeriesQuerier {
+        let querier = MemorySeriesQuerier::new();
+        for i in 0..n {
+            let retired = Labels::from_pairs(&[("__name__", "m"), ("gen", &i.to_string())]);
+            querier.add_sample(&retired, Sample::new(10, 1.0));
+        }
+        let live = Labels::from_pairs(&[("__name__", "m"), ("gen", "live")]);
+        querier.add_sample(&live, Sample::new(1_000, 1.0));
+        querier
+    }
+
+    #[test]
+    fn retired_series_count_against_the_keys_a_profile_opens() {
+        let m = selector("m");
+        let live = Some(ProfileWindow::new(500, 2_000));
+        // A cap of one series opens at most four keys: three retired and the
+        // live one are profiled, a fourth retired one gives the profile up.
+        let fits = mostly_retired(MAX_PROFILED_KEYS_PER_SERIES - 1);
+        let profile = fits.label_profile(&m, live, options(1)).unwrap().unwrap();
+        assert_eq!(profile.series, 1);
+        assert_eq!(filters(&profile), vec![r#"gen="live""#]);
+
+        let past = mostly_retired(MAX_PROFILED_KEYS_PER_SERIES);
+        assert_eq!(past.label_profile(&m, live, options(1)).unwrap(), None);
     }
 }
