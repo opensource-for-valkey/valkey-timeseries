@@ -4,6 +4,7 @@ pub mod label;
 pub mod labels_struct;
 mod metric_name;
 mod regex;
+mod regex_cache;
 mod regex_utils;
 
 pub use crate::parser::series_selector::*;
@@ -17,3 +18,4 @@ pub(crate) use metric_name::*;
 pub(crate) use regex::build_with_repeat_fallback;
 pub use regex::compile_literal_set;
 pub use regex_utils::{compile_regex, is_match_all_regex_pattern, literal_alternatives};
+pub(crate) use regex_utils::{try_regex_predicate, validate_query_regexes};

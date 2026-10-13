@@ -8,8 +8,7 @@ use crate::labels::filters::{
     FilterList, LabelFilter, OrFiltersList, PredicateMatch, PredicateValue, RegexMatcher,
     SeriesSelector,
 };
-use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, literal_alternatives};
-use crate::parser::parse_error::ParseError;
+use crate::labels::{InternedLabel, Label, Labels, MetricName, SeriesLabel, try_regex_predicate};
 use crate::promql::engine::query_reader::AggregationParam;
 use crate::promql::exec::aggregations::{AggregationKind, PushdownStrategy};
 use crate::promql::exec::partial_aggregation::AggregationPartial;
@@ -248,77 +247,14 @@ fn literal_value(value: &str) -> PredicateValue {
 /// per value rather than a regex run over every value of the label.
 ///
 /// `parsed` is the regex promql-parser compiled for the same text. It is used
-/// only if the module's own compile fails, which [`validate_query_regexes`]
+/// only if the module's own compile fails, which
+/// [`validate_query_regexes`](crate::labels::validate_query_regexes)
 /// rules out for every query a command accepts; falling back keeps this
 /// conversion infallible instead of panicking on a selector that got past it.
 fn regex_predicate(value: &str, parsed: &Regex) -> PredicateMatch {
     try_regex_predicate(value).unwrap_or_else(|_| {
         PredicateMatch::RegexEqual(RegexMatcher::new(parsed.clone(), value.to_string()))
     })
-}
-
-/// The `=~` predicate for `value`, compiled with the module's size limits.
-fn try_regex_predicate(value: &str) -> Result<PredicateMatch, ParseError> {
-    // The anchored empty regex matches only the empty value, which is what
-    // `=""` means: the label is absent.
-    if value.is_empty() {
-        return Ok(PredicateMatch::Equal(PredicateValue::Empty));
-    }
-    if let Some(mut values) = literal_alternatives(value) {
-        let value = if values.len() == 1 {
-            PredicateValue::String(values.swap_remove(0))
-        } else {
-            PredicateValue::from(values)
-        };
-        return Ok(PredicateMatch::Equal(value));
-    }
-    RegexMatcher::create(value).map(PredicateMatch::RegexEqual)
-}
-
-/// Rejects a query whose regex matchers the module cannot compile, before
-/// the query is parsed.
-///
-/// promql-parser compiles each `=~`/`!~` with the regex crate's defaults (a
-/// 10 MiB program), on the thread that parses the command, and carries on
-/// after one fails. A heavy matcher such as `\w{2000}` takes about 100 ms to
-/// build or refuse, so a 4 KiB query of them held the event loop for about
-/// 30 s. Under the module's 64 KiB limit the same matcher is refused in well
-/// under a millisecond, and the check stops at the first refusal; what it
-/// admits is small enough that the parser's second compile stays cheap.
-///
-/// Uses promql-parser's own lexer, so strings and comments are tokenized
-/// exactly as the parser will see them. Input the lexer rejects is left for
-/// the parser to report: it fails before compiling any regex.
-pub(crate) fn validate_query_regexes(query: &str) -> Result<(), String> {
-    use lrpar::{Lexeme, Lexer, NonStreamingLexer, Span};
-    use promql_parser::parser::token::{T_EQL_REGEX, T_NEQ_REGEX, T_STRING, TokenId};
-    use promql_parser::util::unquote_string;
-
-    let Ok(lexer) = promql_parser::parser::lexer(query) else {
-        return Ok(());
-    };
-    // The previous token (the operator, when the current one is a regex) and
-    // the one before it (the label name).
-    let mut previous: Option<(TokenId, Span)> = None;
-    let mut label_span: Option<Span> = None;
-    for lexeme in lexer.iter().flatten() {
-        let token = lexeme.tok_id();
-        if token == T_STRING
-            && matches!(previous, Some((T_EQL_REGEX | T_NEQ_REGEX, _)))
-            // Unquoting only fails on input the parser rejects as well.
-            && let Ok(pattern) = unquote_string(lexer.span_str(lexeme.span()))
-            && try_regex_predicate(&pattern).is_err()
-        {
-            let label = label_span.map_or("", |span| lexer.span_str(span));
-            let label = unquote_string(label).unwrap_or_else(|_| label.to_string());
-            return Err(format!(
-                "TSDB: the regex for label '{label}' is invalid or too large"
-            ));
-        }
-        label_span = previous.map(|(_, span)| span);
-        previous = Some((token, lexeme.span()));
-    }
-    Ok(())
 }
 
 impl From<Matchers> for SeriesSelector {
@@ -917,10 +853,11 @@ mod tests {
 
     /// A pattern promql-parser accepts under the regex crate's 10 MiB default
     /// but the module's 64 KiB limit refuses used to panic in the conversion.
-    /// A command now rejects it at parse time, and the conversion itself falls
-    /// back to the parser's regex rather than panicking.
+    /// A command now rejects it at parse time (see `validate_query_regexes`'s
+    /// tests in `labels::regex_utils`), and the conversion itself falls back to
+    /// the parser's regex rather than panicking.
     #[test]
-    fn test_regex_over_the_module_size_limit() {
+    fn test_regex_over_the_module_size_limit_falls_back_to_the_parsers() {
         let query = r#"up{host=~"[a-z]{3000}"}"#;
         let matchers = parsed_matchers(query);
         assert!(
@@ -932,68 +869,6 @@ mod tests {
         assert_eq!(filter.op(), MatchOp::RegexEqual);
         assert!(filter.matches(&"a".repeat(3000)));
         assert!(!filter.matches("a"));
-
-        let err = validate_query_regexes(query).expect_err("rejected before parsing");
-        assert_eq!(
-            err,
-            "TSDB: the regex for label 'host' is invalid or too large"
-        );
-
-        // Inside a range selector, a subquery, an `or` branch; negated; single-quoted,
-        // backquoted and quoted-name forms; and not the first matcher.
-        for query in [
-            r#"rate(up{host=~"[a-z]{3000}"}[5m])"#,
-            r#"max_over_time(sum(up{host=~"[a-z]{3000}"})[10m:1m])"#,
-            r#"up{job="a"} or on() up{host!~"[a-z]{3000}"}"#,
-            r#"up{host=~'[a-z]{3000}'}"#,
-            r#"up{host=~`[a-z]{3000}`}"#,
-            r#"{"host"=~"[a-z]{3000}"}"#,
-            r#"up{job="a", host=~"[a-z]{3000}"}"#,
-        ] {
-            let err = validate_query_regexes(query).expect_err(query);
-            assert!(err.contains("'host'"), "{query}: {err}");
-        }
-        // The same text where it is not a matcher: an ordinary string argument, a
-        // comment, and a string that merely contains `=~`.
-        for query in [
-            r#"up{host=~"a|b", job=~""}"#,
-            r#"rate(up{host=~"web-[0-9]+"}[5m])"#,
-            r#"label_replace(up, "dst", "$1", "src", "[a-z]{3000}")"#,
-            "up # host=~\"[a-z]{3000}\"",
-            r#"label_join(up, "dst", "=~", "[a-z]{3000}")"#,
-        ] {
-            assert!(validate_query_regexes(query).is_ok(), "{query}");
-        }
-        // Everyday Unicode classes fit the 64 KiB limit (16 KiB refused them); two
-        // unbounded `\w` runs still do not.
-        for pattern in [r"\w+", r"\pL+", r"(?i)\w+", r"\b\w+\b", r"web_stg_\w+"] {
-            let query = format!(r#"up{{host=~"{}"}}"#, pattern.replace('\\', r"\\"));
-            assert!(validate_query_regexes(&query).is_ok(), "{query}");
-        }
-        assert!(validate_query_regexes(r#"up{host=~"\\w+-\\w+"}"#).is_err());
-
-        // Input the lexer rejects is left for the parser to report.
-        assert!(validate_query_regexes(r#"up{host=~"unterminated}"#).is_ok());
-    }
-
-    /// A 4 KiB query of heavy matchers used to hold the parsing thread for about
-    /// 30 s (each one ~100 ms to build or refuse under the parser's 10 MiB
-    /// default). The check refuses the first one and stops.
-    #[test]
-    fn test_heavy_regex_matchers_are_refused_quickly() {
-        let matcher = r#"a=~"\\w{2000}""#;
-        let query = format!(
-            "up{{{}}}",
-            vec![matcher; 4000 / (matcher.len() + 1)].join(",")
-        );
-        assert!(query.len() <= 4096);
-        let started = std::time::Instant::now();
-        assert!(validate_query_regexes(&query).is_err());
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "took {:?}",
-            started.elapsed()
-        );
     }
 
     #[test]

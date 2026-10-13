@@ -1,5 +1,7 @@
+use crate::labels::regex_cache::{REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN, RegexCache};
 use crate::parser::ParseError;
 use regex::{Regex, RegexBuilder};
+use std::sync::LazyLock;
 
 /// Sets the approximate size limit, in bytes, of the compiled regex.
 ///
@@ -112,8 +114,22 @@ fn build(re: &str) -> Result<Regex, regex::Error> {
 
 /// Compiles `re`, retrying with Go-style `{...}` repeats escaped if the first attempt fails to
 /// parse. Both attempts go through `build`, so the size limit applies on the retry too.
+///
+/// Always compiles: label matchers go through [`build_cached`] instead. This uncached form is
+/// for `label_replace`, which keeps its own per-thread cache (see `regex_cache`).
 pub(crate) fn build_with_repeat_fallback(re: &str) -> Result<Regex, regex::Error> {
     build(re).or_else(|_| build(&try_escape_for_repeat_re(re)))
+}
+
+/// Label-matcher regexes compiled so far, keyed by their anchored source: see `regex_cache`.
+static COMPILED_MATCHERS: LazyLock<RegexCache> =
+    LazyLock::new(|| RegexCache::new(REGEX_CACHE_CAPACITY, REGEX_CACHE_MAX_PATTERN_LEN));
+
+/// [`build_with_repeat_fallback`] through the process-wide cache of compiled label matchers:
+/// the same regex, compiled once per distinct `re` while it stays cached. Callers must only
+/// call `is_match` on it (see `regex_cache` for why `captures` callers keep their own cache).
+pub(crate) fn build_cached(re: &str) -> Result<Regex, regex::Error> {
+    COMPILED_MATCHERS.get_or_compile(re, build_with_repeat_fallback)
 }
 
 /// The anchored regex for `alternation`, a `|`-joined list of escaped literals
@@ -132,7 +148,7 @@ pub fn compile_literal_set(alternation: &str) -> Result<Regex, regex::Error> {
 fn try_parse_re(original_re: &str) -> Result<Regex, ParseError> {
     let re = format!("^(?:{original_re})$",);
 
-    build_with_repeat_fallback(&re).map_err(|_| ParseError::InvalidRegex(original_re.to_string()))
+    build_cached(&re).map_err(|_| ParseError::InvalidRegex(original_re.to_string()))
 }
 
 pub fn parse_regex_anchored(value: &str) -> Result<(Regex, &str), ParseError> {

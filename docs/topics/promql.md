@@ -323,6 +323,8 @@ at startup.
 | --- | ---: | --- |
 | `ts-promql-max-concurrent-queries` | 8 | Evaluations running at once; further queries wait for a free worker. Immutable after startup. |
 | `ts-promql-max-queued-queries` | 128 | Queries that may wait for a worker; further ones are refused on arrival with an error. `0` means unbounded. |
+| `ts-promql-query-cache-max-entries` | 1024 | Parsed queries kept for reuse by later queries with the same text. `0` disables the cache. |
+| `ts-promql-query-cache-max-bytes` | 67108864 (64 MiB) | Estimated memory the parsed-query cache may hold. One query may take at most a sixteenth of it. `0` disables the cache. |
 | `ts-promql-max-query-len` | 4096 bytes | Maximum query string length. |
 | `ts-promql-max-response-series` | 1000 | Maximum returned series, checked on the query's result as well as on each read; `0` means unlimited. A read stops as soon as it passes the limit, without opening the rest of the matched series. |
 | `ts-promql-max-points-per-timeseries` | 0 | Maximum points a range query generates per series, at most 1000000; `0` leaves only that built-in ceiling. |
@@ -382,6 +384,21 @@ cumulative `ts_queries_rejected`, and `ts_queries_cancelled`, the queries abando
 their client disconnected. `ts_samples_in_flight` is what running queries, and the shard reads
 this node serves for other nodes, have charged against `ts-promql-max-samples-in-flight`: their
 running totals, which include samples already dropped, not the samples resident now.
+
+A worker keeps each query it parses, keyed by the exact query text, from the second time that
+text is seen, and reuses it for later queries with the same text from either command, skipping the regex check, the parse and the
+regex compiles the parser does. Only the parsed expression is kept, never data or results:
+every query still reads current data with its own time range, database, `HASHTAG` scope and
+permissions, and still goes through the optional rewrites, so nothing a write, a deletion or a
+configuration change does needs to clear it. Queries that fail to parse are not kept, and a
+text seen only once is remembered only as a hash, so one-off queries cost no more than without
+the cache and cannot push out the queries that repeat. The cache
+is bounded by `ts-promql-query-cache-max-entries` and `ts-promql-query-cache-max-bytes`,
+evicting the least recently used queries; lowering either trims it at once, and `0` empties
+and disables it. Its size is an estimate of the memory the parsed queries hold, compiled regex
+programs included, not an exact figure. `INFO ts_promql` reports it as `ts_query_cache_entries`
+and `ts_query_cache_bytes`, with the cumulative `ts_query_cache_hits`, `ts_query_cache_misses`
+and `ts_query_cache_evictions`. Text that differs only in spacing is a different entry.
 
 The per-query limits bound each query alone. Three limits bound what all of them take
 together, and each refuses rather than waits, since a query that waited mid-evaluation would

@@ -261,6 +261,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-num-threads',
             'ts-promql-max-concurrent-queries',
             'ts-promql-max-queued-queries',
+            'ts-promql-query-cache-max-entries',
+            'ts-promql-query-cache-max-bytes',
             'ts-fanout-command-timeout',
             'ts-cluster-map-expiration-ms',
             'ts-index-build-max-memory',

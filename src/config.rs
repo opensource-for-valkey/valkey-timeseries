@@ -85,6 +85,14 @@ pub const MAX_QUEUED_QUERIES: i64 = 1 << 16;
 /// of after each query's `TIMEOUT` expires in the queue. 0 = unbounded.
 pub const DEFAULT_QUEUED_QUERIES: i64 = 128;
 
+pub const MAX_QUERY_CACHE_ENTRIES: i64 = 1 << 16;
+/// A few dashboards' worth of distinct query texts. 0 disables the cache.
+pub const DEFAULT_QUERY_CACHE_MAX_ENTRIES: i64 = 1024;
+/// Far above what [`DEFAULT_QUERY_CACHE_MAX_ENTRIES`] typical templates take (0.5–15 KB
+/// each), so the entry count binds first; this bounds pathological templates. 0 disables
+/// the cache.
+pub const DEFAULT_QUERY_CACHE_MAX_BYTES: i64 = 64 * 1024 * 1024;
+
 pub const RETENTION_POLICY_MIN: i64 = 0;
 pub const RETENTION_POLICY_MAX: i64 = 10 * ONE_YEAR_MS; // 10 years
 
@@ -374,6 +382,22 @@ pub static MAX_QUEUED_QUERIES_CELL: AtomicI64 = AtomicI64::new(DEFAULT_QUEUED_QU
 
 pub fn max_queued_queries() -> usize {
     MAX_QUEUED_QUERIES_CELL.load(Ordering::Relaxed) as usize
+}
+
+/// `ts-promql-query-cache-max-entries` and `ts-promql-query-cache-max-bytes`: the bounds of
+/// the parsed-query cache (`promql::engine::query_cache`). The cache reads them itself when
+/// it admits a query, and a change trims it at once (see `after_config_set`), so they are not
+/// copied into the PromQL engine's configuration snapshot.
+pub static QUERY_CACHE_MAX_ENTRIES_CELL: AtomicI64 =
+    AtomicI64::new(DEFAULT_QUERY_CACHE_MAX_ENTRIES);
+pub static QUERY_CACHE_MAX_BYTES_CELL: AtomicI64 = AtomicI64::new(DEFAULT_QUERY_CACHE_MAX_BYTES);
+
+pub fn query_cache_max_entries() -> usize {
+    QUERY_CACHE_MAX_ENTRIES_CELL.load(Ordering::Relaxed) as usize
+}
+
+pub fn query_cache_max_bytes() -> usize {
+    QUERY_CACHE_MAX_BYTES_CELL.load(Ordering::Relaxed) as usize
 }
 
 pub const DEFAULT_FANOUT_COMMAND_TIMEOUT_MS: u64 = 5000;
@@ -975,6 +999,14 @@ fn read_max_queued_queries() -> ConfigValue {
     ConfigValue::Integer(MAX_QUEUED_QUERIES_CELL.load(Ordering::Relaxed))
 }
 
+fn read_query_cache_max_entries() -> ConfigValue {
+    ConfigValue::Integer(QUERY_CACHE_MAX_ENTRIES_CELL.load(Ordering::Relaxed))
+}
+
+fn read_query_cache_max_bytes() -> ConfigValue {
+    ConfigValue::Integer(QUERY_CACHE_MAX_BYTES_CELL.load(Ordering::Relaxed))
+}
+
 fn read_fanout_command_timeout() -> ConfigValue {
     ConfigValue::DurationMs(FANOUT_COMMAND_TIMEOUT.load(Ordering::Relaxed) as i64)
 }
@@ -1295,6 +1327,34 @@ pub static CONFIGS: &[ConfigDesc] = &[
         description: "Number of PromQL queries that may wait for a free worker; further queries are refused at once (0 = unbounded)",
         storage: ConfigStorage::I64 {
             cell: || &MAX_QUEUED_QUERIES_CELL,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-promql-query-cache-max-entries",
+        read: read_query_cache_max_entries,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(DEFAULT_QUERY_CACHE_MAX_ENTRIES),
+        min: Some(ConfigValue::Integer(0)),
+        max: Some(ConfigValue::Integer(MAX_QUERY_CACHE_ENTRIES)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Number of parsed PromQL queries kept for reuse by later identical queries (0 = no cache)",
+        storage: ConfigStorage::I64 {
+            cell: || &QUERY_CACHE_MAX_ENTRIES_CELL,
+            validate: None,
+        },
+    },
+    ConfigDesc {
+        name: "ts-promql-query-cache-max-bytes",
+        read: read_query_cache_max_bytes,
+        kind: ConfigType::Integer,
+        default: ConfigValue::Integer(DEFAULT_QUERY_CACHE_MAX_BYTES),
+        min: Some(ConfigValue::Integer(0)),
+        max: Some(ConfigValue::Integer(i64::MAX)),
+        flags: ConfigurationFlags::DEFAULT,
+        description: "Estimated memory, in bytes, the parsed PromQL query cache may hold (0 = no cache)",
+        storage: ConfigStorage::I64 {
+            cell: || &QUERY_CACHE_MAX_BYTES_CELL,
             validate: None,
         },
     },
@@ -1819,6 +1879,11 @@ fn after_config_set(name: &str, value: &str) {
     if feeds_promql_config(name) {
         sync_promql_config();
     }
+    if name.eq_ignore_ascii_case("ts-promql-query-cache-max-entries")
+        || name.eq_ignore_ascii_case("ts-promql-query-cache-max-bytes")
+    {
+        crate::promql::engine::query_cache::apply_limits();
+    }
 }
 
 #[cfg(test)]
@@ -1858,6 +1923,8 @@ mod tests {
         ("ts-num-threads", "4"),
         ("ts-promql-max-concurrent-queries", "8"),
         ("ts-promql-max-queued-queries", "128"),
+        ("ts-promql-query-cache-max-entries", "1024"),
+        ("ts-promql-query-cache-max-bytes", "67108864"),
         ("ts-fanout-command-timeout", "5000"),
         ("ts-cluster-map-expiration-ms", "750"),
         ("ts-index-build-max-memory", "268435456"),

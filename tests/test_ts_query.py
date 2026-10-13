@@ -954,3 +954,128 @@ class TestQueryAdmission(ValkeyTimeSeriesTestCaseBase):
             assert self.client.execute_command(*query), "0 lifts the limit"
         finally:
             self._set('ts.ts-promql-max-subquery-steps', '20000000')
+
+
+class TestQueryCache(ValkeyTimeSeriesTestCaseBase):
+    """Parsed queries are cached by their text, from the second time it is seen, and reused
+    by later identical queries from either command. What is cached is the expression, never
+    data, so a hit still sees every change to the series."""
+
+    def _set(self, name, value):
+        self.client.execute_command('CONFIG', 'SET', name, value)
+
+    def _cache(self) -> dict:
+        info = self.client.info('ts_promql')
+        return {key[len('ts_query_cache_'):]: value for key, value in info.items()
+                if key.startswith('ts_query_cache_')}
+
+    def _add(self, key, labels, samples):
+        args = ['TS.CREATE', key, 'LABELS']
+        for name, value in labels.items():
+            args += [name, value]
+        self.client.execute_command(*args)
+        for ts, value in samples:
+            self.client.execute_command('TS.ADD', key, ts, value)
+
+    def test_a_repeated_query_is_served_from_the_cache(self):
+        self._add('qc:1', {'__name__': 'qc', 'job': 'api'}, [(1000, 1), (2000, 2)])
+        # TIME is in seconds: 2 s is the second sample's 2000 ms.
+        query = ('TS.QUERY', 'sum(qc{job=~"a.*"})', 'TIME', '2')
+        before = self._cache()
+        first = self.client.execute_command(*query)
+        once = self._cache()
+        assert once['entries'] == before['entries'], "a first sighting is not kept"
+
+        second = self.client.execute_command(*query)
+        third = self.client.execute_command(*query)
+        after = self._cache()
+
+        assert first == second == third
+        assert QueryResult.from_raw(first).result[0].value.value == 2
+        assert after['misses'] - before['misses'] == 2
+        assert after['hits'] - before['hits'] == 1
+        assert after['entries'] == before['entries'] + 1
+        assert after['bytes'] > before['bytes']
+
+    def test_both_commands_share_an_entry(self):
+        self._add('qc:1', {'__name__': 'qc', 'job': 'api'}, [(1000, 1), (2000, 2)])
+        text = 'rate(qc{job="api"}[5s])'
+        for _ in range(2):
+            self.client.execute_command('TS.QUERY', text, 'TIME', '2')
+        before = self._cache()
+        self.client.execute_command('TS.QUERYRANGE', text, 'START', '1000', 'END', '2000',
+                                    'STEP', '1s')
+        after = self._cache()
+        assert after['hits'] - before['hits'] == 1
+        assert after['entries'] == before['entries']
+
+    def test_a_cached_query_sees_changed_data(self):
+        self._add('qc:1', {'__name__': 'qc', 'job': 'api'}, [(1000, 1)])
+        query = ('TS.QUERY', 'sum(qc{job=~"api|web"})', 'TIME', '5')
+        for _ in range(2):
+            assert QueryResult.from_raw(self.client.execute_command(*query)).result[0].value.value == 1
+
+        self.client.execute_command('TS.ADD', 'qc:1', 4000, 10)
+        self._add('qc:2', {'__name__': 'qc', 'job': 'web'}, [(4000, 5)])
+        before = self._cache()
+        result = QueryResult.from_raw(self.client.execute_command(*query))
+        assert self._cache()['hits'] - before['hits'] == 1
+        assert result.result[0].value.value == 15
+
+        self.client.execute_command('DEL', 'qc:2')
+        assert QueryResult.from_raw(self.client.execute_command(*query)).result[0].value.value == 10
+
+    def test_a_rewrite_of_one_request_does_not_reach_the_next(self):
+        """The derived-filter pass narrows a range query's tree by the label values the
+        other operand holds in the query's window. Each request rewrites its own copy: a
+        cached tree narrowed to one window's hosts would return nothing for another's."""
+        self._add('qc:x:a', {'__name__': 'qcx', 'host': 'a'}, [(1000 * t, t) for t in range(1, 6)])
+        self._add('qc:y:a', {'__name__': 'qcy', 'host': 'a'}, [(1000 * t, 1) for t in range(1, 6)])
+        self._add('qc:x:b', {'__name__': 'qcx', 'host': 'b'}, [(1000 * t, t) for t in range(100, 106)])
+        self._add('qc:y:b', {'__name__': 'qcy', 'host': 'b'}, [(1000 * t, 2) for t in range(100, 106)])
+        text = 'qcx * on(host) qcy'
+
+        def hosts(start, end):
+            raw = self.client.execute_command('TS.QUERYRANGE', text, 'START', str(start),
+                                              'END', str(end), 'STEP', '1s',
+                                              'LOOKBACK_DELTA', '1s')
+            return sorted(series.metric['host'] for series in QueryResult.from_raw(raw).result)
+
+        # The second request caches the text, the third reuses it.
+        assert hosts(1000, 5000) == ['a']
+        assert hosts(100000, 105000) == ['b']
+        before = self._cache()
+        assert hosts(1000, 5000) == ['a']
+        assert hosts(100000, 105000) == ['b']
+        assert self._cache()['hits'] - before['hits'] == 2
+
+    def test_a_failed_query_is_not_cached(self):
+        before = self._cache()
+        for _ in range(2):
+            with pytest.raises(ResponseError):
+                self.client.execute_command('TS.QUERY', 'sum(', 'TIME', '1')
+        after = self._cache()
+        assert after['entries'] == before['entries']
+        assert after['misses'] - before['misses'] == 2
+        assert after['hits'] == before['hits']
+
+    def test_lowering_a_limit_trims_the_cache_and_zero_disables_it(self):
+        for i in range(3):
+            for _ in range(2):
+                self.client.execute_command('TS.QUERY', f'vector({i})', 'TIME', '1')
+        assert self._cache()['entries'] >= 3
+        try:
+            self._set('ts.ts-promql-query-cache-max-entries', '1')
+            assert self._cache()['entries'] == 1
+
+            self._set('ts.ts-promql-query-cache-max-bytes', '0')
+            stats = self._cache()
+            assert (stats['entries'], stats['bytes']) == (0, 0)
+            for _ in range(3):
+                self.client.execute_command('TS.QUERY', 'vector(1)', 'TIME', '1')
+            after = self._cache()
+            assert after['entries'] == 0
+            assert (after['hits'], after['misses']) == (stats['hits'], stats['misses'])
+        finally:
+            self._set('ts.ts-promql-query-cache-max-entries', '1024')
+            self._set('ts.ts-promql-query-cache-max-bytes', '67108864')
