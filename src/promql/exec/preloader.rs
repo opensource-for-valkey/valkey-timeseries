@@ -28,7 +28,7 @@ impl<'reader, R: QueryReader + ?Sized> Preloader<'reader, R> {
             }
             None => Evaluator::new(self.reader, self.options),
         };
-        evaluator.preload_grid(plan.expr, &plan.grid)?;
+        evaluator.preload_grid(plan.expr, &plan.twins, &plan.grid)?;
         Ok(evaluator.into_prepared())
     }
 

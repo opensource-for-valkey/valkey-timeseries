@@ -2,7 +2,7 @@
 //! lookup rather than a read. Covers selectors, matrices, subquery unions, and the rollups and
 //! stepped aggregations a source answers over the whole grid.
 
-use super::subquery::subquery_key;
+use super::subquery::SubqueryKey;
 use super::*;
 use crate::promql::utils::subquery_step_ms;
 use itertools::Itertools;
@@ -30,16 +30,19 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
         expr: &Expr,
         ctx: &EvalContext,
     ) -> EvalResult<()> {
-        self.preload_grid(expr, &PreloadGrid::for_range(ctx))
+        self.preload_grid(expr, &[], &PreloadGrid::for_range(ctx))
     }
 
     /// Fill every preload map for one step grid.
     ///
     /// Shared by the outer range query and by subquery sub-evaluators — the
     /// grid, not the enclosing [`EvalContext`], says which steps to cover.
+    /// `twins` are nodes with `expr`'s content that will be evaluated here too
+    /// (see [`PlannedQuery::twins`]): reading for `expr` covers them.
     pub(in crate::promql) fn preload_grid(
         &self,
         expr: &Expr,
+        twins: &[&Expr],
         grid: &PreloadGrid,
     ) -> EvalResult<()> {
         // A stepped selection ships each pick's own timestamp only when
@@ -84,9 +87,9 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         self.preload_rollups(expr, grid)?;
         self.preload_matrices(expr, grid)?;
-        self.preload_subqueries(expr, grid)?;
+        self.preload_subqueries(expr, twins, grid)?;
 
-        self.fill_node_keys(expr);
+        self.fill_node_keys(expr, twins);
         Ok(())
     }
 
@@ -104,17 +107,41 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     /// Done here, on the thread driving the range query, rather than lazily by
     /// the first outer step to need it: the outer steps run as pool jobs, and a
     /// pool job must not block others on a lock while it waits on the pool.
-    pub(super) fn preload_subqueries(&self, expr: &Expr, grid: &PreloadGrid) -> EvalResult<()> {
+    ///
+    /// Identical subqueries — in `expr` or across `twins` — share one union:
+    /// the first is prepared, and the rest are its twins, which every outer
+    /// step evaluates over that union's evaluator. They are handed to it so its
+    /// [`NodeKeys`] covers their nodes too, nested subqueries included.
+    pub(super) fn preload_subqueries(
+        &self,
+        expr: &Expr,
+        twins: &[&Expr],
+        grid: &PreloadGrid,
+    ) -> EvalResult<()> {
         if grid.step_ms <= 0 {
             return Ok(());
         }
-        for subquery in collect_subqueries(expr) {
-            self.check_deadline()?;
-            let step_ms = subquery_step_ms(subquery);
-            if step_ms <= 0 {
+        let mut groups: Vec<(SubqueryKey, &SubqueryExpr, Vec<&Expr>)> = Vec::new();
+        let mut group_of: ahash::AHashMap<SubqueryKey, usize> = ahash::AHashMap::new();
+        for subquery in std::iter::once(expr)
+            .chain(twins.iter().copied())
+            .flat_map(collect_subqueries)
+        {
+            if subquery_step_ms(subquery) <= 0 {
                 continue;
             }
-            let key = subquery_key(subquery, step_ms);
+            let key = SubqueryKey::of(subquery);
+            match group_of.get(&key) {
+                Some(&group) => groups[group].2.push(&subquery.expr),
+                None => {
+                    group_of.insert(key.clone(), groups.len());
+                    groups.push((key, subquery, Vec::new()));
+                }
+            }
+        }
+        for (key, subquery, subquery_twins) in groups {
+            self.check_deadline()?;
+            let step_ms = subquery_step_ms(subquery);
             if self.preloaded_subqueries.read().unwrap().contains_key(&key) {
                 continue;
             }
@@ -127,7 +154,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
             if grid_step_count(union.start_ms, union.end_ms, union.step_ms) > MAX_GRID_STEPS {
                 continue;
             }
-            let plan = PlannedQuery::for_grid(&subquery.expr, union);
+            let plan = PlannedQuery::for_grid(&subquery.expr, union).with_twins(subquery_twins);
             match Preloader::sharing(self.reader, self.options, Arc::clone(&self.budget))
                 .prepare(plan)
             {

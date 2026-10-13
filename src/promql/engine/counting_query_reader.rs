@@ -907,8 +907,8 @@ mod tests {
     #[test]
     fn range_subqueries_under_a_binary_op_keep_their_preloads() {
         let (counting, reader) = build_reader();
-        // The per-step filter push-down rewrites a copy of an operand, and the
-        // subquery preloads are keyed by node address: the copy missed its
+        // The per-step filter push-down rewrites a copy of an operand, whose
+        // rewritten matchers change its subquery's key: the copy missed its
         // union and every outer step prepared its own grid again.
         run_range(
             reader,
@@ -917,6 +917,23 @@ mod tests {
         let counts = counting.counts();
         assert_eq!(counts.query_grid, 2, "one union per subquery: {counts:?}");
         assert_eq!(counts.query + counts.query_range, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn range_identical_subqueries_share_one_union() {
+        for twin in ["(a)[4m:1m]", "rate(a[2m])[4m:1m]"] {
+            let (counting, reader) = build_reader();
+            run_range(
+                reader,
+                &format!("max_over_time({twin}) - min_over_time({twin})"),
+            );
+            let counts = counting.counts();
+            assert_eq!(
+                counts.query_grid, 1,
+                "{twin}: one union for both: {counts:?}"
+            );
+            assert_eq!(counts.query + counts.query_range, 0, "{twin}: {counts:?}");
+        }
     }
 
     /// Refuses, as a shard over its own per-read limit would, any grid

@@ -631,6 +631,74 @@ fn bench_phase0_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: identical subqueries in one range query.
+///
+/// A range query prepares each subquery once for the union of its outer steps'
+/// grids. Those unions are cached by the subquery's content, so a twin —
+/// `max_over_time(s) - min_over_time(s)` for the same `s` — reuses the first
+/// one's rather than reading and gridding the same span again. `single` is the
+/// one-subquery baseline a twin should cost little more than; it also measures
+/// the per-step key lookup on the path every subquery takes.
+fn bench_subquery_twins(c: &mut Criterion) {
+    const INTERVAL_MS: i64 = 10_000; // 10s scrape interval
+    const NUM_INTERVALS: usize = 8640 + 1000; // a day of history + query headroom
+
+    let reader = setup_range_query_test_data(INTERVAL_MS, NUM_INTERVALS);
+
+    let step = Duration::from_secs(60);
+    let end = SystemTime::UNIX_EPOCH + Duration::from_secs((NUM_INTERVALS - 1) as u64 * 10);
+    let start = end - Duration::from_secs(120 * 60);
+
+    let rollup = "rate(a_hundred[1m])[10m:1m]";
+    let nested = "max_over_time(rate(a_ten[1m])[5m:1m])[30m:5m]";
+    let paren = "(a_hundred)[10m:1m]";
+    let cases = [
+        ("single", format!("max_over_time({rollup})")),
+        (
+            "twin",
+            format!("max_over_time({rollup}) - min_over_time({rollup})"),
+        ),
+        (
+            "nested_twin",
+            format!("max_over_time({nested}) - min_over_time({nested})"),
+        ),
+        (
+            "selector_twin",
+            format!("max_over_time({paren}) - min_over_time({paren})"),
+        ),
+    ];
+
+    let opts = QueryOptions {
+        timeout: None,
+        deadline: None,
+        ..QueryOptions::default()
+    };
+
+    let mut group = c.benchmark_group("subquery_twins");
+    if use_flat_sampling() {
+        group.sampling_mode(SamplingMode::Flat);
+    }
+
+    for (name, query) in cases {
+        let ast = parse(&query).expect("valid subquery benchmark query");
+        group.bench_with_input(BenchmarkId::new("query", name), &ast, |b, ast| {
+            b.iter(|| {
+                let stmt = EvalStmt {
+                    expr: ast.clone(),
+                    start,
+                    end,
+                    interval: step,
+                    lookback_delta: opts.lookback_delta,
+                };
+                let result = evaluate_range(reader.clone(), stmt, opts)
+                    .expect("subquery benchmark should evaluate");
+                black_box(result);
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Benchmark: the grouping path behind PromQL's *selection* operators.
 ///
 /// `group_samples` serves `quantile`, `limitk` and `limit_ratio` unconditionally
@@ -722,6 +790,6 @@ fn bench_group_samples(c: &mut Criterion) {
 criterion_group!(
     name = promql_engine_benches;
     config = benchmark_config();
-    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline, bench_group_samples, bench_churn_join
+    targets = bench_evaluate_instant, bench_range_query, bench_join_query, bench_phase0_baseline, bench_subquery_twins, bench_group_samples, bench_churn_join
 );
 criterion_main!(promql_engine_benches);

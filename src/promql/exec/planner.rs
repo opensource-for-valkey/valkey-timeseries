@@ -123,18 +123,28 @@ impl PreloadGrid {
 pub(crate) struct PlannedQuery<'expr> {
     pub(crate) expr: &'expr Expr,
     pub(crate) grid: PreloadGrid,
+    /// Other nodes with `expr`'s content — twin subqueries' inner expressions —
+    /// that will be evaluated over the same preloaded data. Nothing is read for
+    /// them; they only get their own per-node keys, so a twin's lookups do not
+    /// miss.
+    pub(crate) twins: Vec<&'expr Expr>,
 }
 
 impl<'expr> PlannedQuery<'expr> {
     pub(crate) fn for_range(expr: &'expr Expr, ctx: &EvalContext) -> Self {
-        Self {
-            expr,
-            grid: PreloadGrid::for_range(ctx),
-        }
+        Self::for_grid(expr, PreloadGrid::for_range(ctx))
     }
 
     pub(crate) fn for_grid(expr: &'expr Expr, grid: PreloadGrid) -> Self {
-        Self { expr, grid }
+        Self {
+            expr,
+            grid,
+            twins: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_twins(self, twins: Vec<&'expr Expr>) -> Self {
+        Self { twins, ..self }
     }
 }
 

@@ -1,4 +1,4 @@
-//! Subqueries: per-step evaluation, the vector-selector fast path, and the keys their
+//! Subqueries: per-step evaluation, the vector-selector fast path, and the key their
 //! union preload is cached under.
 
 use super::*;
@@ -35,12 +35,7 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         // The union of every outer step's grid, prepared up front for a range
         // query (`preload_subqueries`); see the per-step preload below.
-        let union = self
-            .preloaded_subqueries
-            .read()
-            .unwrap()
-            .get(&subquery_key(subquery, step_ms))
-            .cloned();
+        let union = self.prepared_union(subquery);
 
         // Fast path: if inner expression is a pure VectorSelector, evaluate over range once.
         //
@@ -262,8 +257,81 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
 
         Ok((current_time_ms, samples))
     }
+
+    /// The union `preload_subqueries` prepared for `subquery`, if any: by the
+    /// key [`NodeKeys`] memoized for the node, else by one built here — for a
+    /// node built during evaluation.
+    fn prepared_union(&self, subquery: &SubqueryExpr) -> Option<Arc<PreparedQuery>> {
+        let unions = self.preloaded_subqueries.read().unwrap();
+        // An instant query, or a range query without subquery unions: not worth
+        // formatting a key to miss.
+        if unions.is_empty() {
+            return None;
+        }
+        let memo = self
+            .node_keys
+            .get()
+            .and_then(|keys| keys.subqueries.get(&node_addr(subquery)));
+        match memo {
+            Some(key) => unions.get(key).cloned(),
+            None => unions.get(&SubqueryKey::of(subquery)).cloned(),
+        }
+    }
 }
 
-pub(super) fn subquery_key(subquery: &SubqueryExpr, step_ms: i64) -> (usize, i64) {
-    (subquery as *const SubqueryExpr as usize, step_ms)
+/// What a subquery's union preload is cached under: the subquery's content.
+///
+/// Its whole subtree, through the AST's derived `Debug`, which prints every
+/// field — range, step, modifiers, matchers, grouping — and each float literal
+/// in its shortest round-trip form, which tells every value apart (NaNs aside,
+/// which no query can tell apart either):
+/// `-0.0` from `0.0`, where `PartialEq` merges them and `x / -0` is not
+/// `x / 0`. The step is not keyed separately: it is part of the content.
+///
+/// Content rather than the node's address, so that identical subqueries share
+/// one union; see [`SubqueryPreloadMap`]. Nested subqueries are keyed the same
+/// way, so a twin evaluated over another twin's union finds that union's
+/// nested preloads too, rather than preparing them again at every outer step.
+///
+/// The step loop looks a union up at every outer step, so a lookup must not
+/// cost the subtree's size: the text is hashed once, here, and [`Hash`] feeds
+/// the map that one word. Equality checks identity first — [`NodeKeys`] holds
+/// the map's own copy of each key — and compares text only on a hash match
+/// between separate copies (a node [`NodeKeys`] has no entry for).
+#[derive(Clone)]
+pub(super) struct SubqueryKey {
+    hash: u64,
+    text: Arc<str>,
+}
+
+impl SubqueryKey {
+    pub(super) fn of(subquery: &SubqueryExpr) -> Self {
+        let text: Arc<str> = format!("{subquery:?}").into();
+        // Fixed keys: every key must hash alike, and the map rehashes the word.
+        let hash = std::hash::BuildHasher::hash_one(
+            &std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default(),
+            &*text,
+        );
+        Self { hash, text }
+    }
+
+    /// Whether `self` and `other` are copies of one key, not merely equal.
+    #[cfg(test)]
+    pub(super) fn same_copy(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.text, &other.text)
+    }
+}
+
+impl PartialEq for SubqueryKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.text, &other.text) || (self.hash == other.hash && self.text == other.text)
+    }
+}
+
+impl Eq for SubqueryKey {}
+
+impl std::hash::Hash for SubqueryKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }

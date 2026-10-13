@@ -5410,6 +5410,179 @@ mod tests {
         );
     }
 
+    /// Identical subqueries share one union preload: one request, not one each.
+    ///
+    /// The union is cached by the subquery's content, so the second twin finds
+    /// the first's rather than preparing the same grid again.
+    #[test]
+    fn identical_subqueries_share_one_union_preload() {
+        let twin = "sum_over_time(metric[1m])[2m:1m]";
+        let query = format!("max_over_time({twin}) - min_over_time({twin})");
+        let (steps, offered) =
+            evaluate_range_with_pushdown(&query, 120_000, 240_000, 60_000, GridAnswer::Evaluated);
+        assert_eq!(
+            offered.len(),
+            1,
+            "one request for both twins, got {offered:?}"
+        );
+
+        let (local, _) =
+            evaluate_range_with_pushdown(&query, 120_000, 240_000, 60_000, GridAnswer::Local);
+        assert_eq!(rendered_steps(steps), rendered_steps(local), "{query}");
+    }
+
+    /// A nested subquery is content-keyed too. The second twin is evaluated over
+    /// the first twin's union, whose nested preload is keyed by the first twin's
+    /// nested node; keyed by address, the second twin would miss it and prepare
+    /// the nested grid again at every one of its steps.
+    #[test]
+    fn identical_nested_subqueries_share_one_union_preload() {
+        let twin = "max_over_time(sum_over_time(metric[1m])[2m:1m])[4m:2m]";
+        let query = format!("max_over_time({twin}) - min_over_time({twin})");
+        let (steps, offered) =
+            evaluate_range_with_pushdown(&query, 120_000, 240_000, 60_000, GridAnswer::Evaluated);
+        assert_eq!(
+            offered.len(),
+            1,
+            "one request for both twins, got {offered:?}"
+        );
+
+        let (local, _) =
+            evaluate_range_with_pushdown(&query, 120_000, 240_000, 60_000, GridAnswer::Local);
+        assert_eq!(rendered_steps(steps), rendered_steps(local), "{query}");
+    }
+
+    /// A second twin is evaluated over the first's union, so that union's
+    /// node table covers the second twin's nodes too, its nested subquery
+    /// included; without them every lookup there formatted the subtree again.
+    /// Each memoized subquery key is the union map's own copy, so a lookup
+    /// compares by identity, not by text.
+    #[test]
+    fn twin_subqueries_are_memoized_in_the_union_they_share() {
+        use super::super::{PreparedQuery, SubqueryKey, node_addr};
+        use crate::promql::exec::utils::collect_subqueries;
+        use std::sync::Arc;
+
+        let twin = "max_over_time(sum_over_time(metric[1m])[2m:1m])[4m:2m]";
+        let query = format!("max_over_time({twin}) - min_over_time({twin})");
+        let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Raw);
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
+        let expr = promql_parser::parser::parse(&query).unwrap();
+        let ctx = crate::promql::EvalContext {
+            query_start: 120_000,
+            query_end: 240_000,
+            evaluation_ts: 120_000,
+            step_ms: 60_000,
+            lookback_delta_ms: 300_000,
+            ..Default::default()
+        };
+        evaluator.preload_for_range(&expr, &ctx).unwrap();
+
+        // The union `evaluator`'s table memoizes `node`'s key for, checking
+        // that the key is the union map's own copy.
+        fn memoized_union<R: QueryReader + ?Sized>(
+            evaluator: &Evaluator<'_, R>,
+            node: &promql_parser::parser::SubqueryExpr,
+        ) -> Arc<PreparedQuery> {
+            let keys = evaluator.node_keys.get().expect("node keys filled");
+            let memo = keys
+                .subqueries
+                .get(&node_addr(node))
+                .expect("subquery node memoized");
+            let unions = evaluator.preloaded_subqueries.read().unwrap();
+            let (shared, union) = unions.get_key_value(memo).expect("a prepared union");
+            assert!(
+                memo.same_copy(shared),
+                "memoized a separate copy of the key"
+            );
+            assert!(*memo == SubqueryKey::of(node));
+            Arc::clone(union)
+        }
+
+        let twins = collect_subqueries(&expr);
+        assert_eq!(twins.len(), 2);
+        let union = memoized_union(&evaluator, twins[0]);
+        assert!(Arc::ptr_eq(&union, &memoized_union(&evaluator, twins[1])));
+
+        let over_union = Evaluator::with_shared(&reader, rollup_test_options(), union);
+        let nested: Vec<_> = twins
+            .iter()
+            .map(|twin| {
+                let [nested] = collect_subqueries(&twin.expr)[..] else {
+                    panic!("one nested subquery");
+                };
+                memoized_union(&over_union, nested)
+            })
+            .collect();
+        assert!(Arc::ptr_eq(&nested[0], &nested[1]));
+    }
+
+    /// Samples the preload phase charges to the query's budget for `query`.
+    fn preload_charge(query: &str) -> usize {
+        let reader = GridPushdownReader::new(rollup_reader(), GridAnswer::Raw);
+        let evaluator = Evaluator::new(&reader, rollup_test_options());
+        let expr = promql_parser::parser::parse(query).unwrap();
+        let ctx = crate::promql::EvalContext {
+            query_start: 120_000,
+            query_end: 240_000,
+            evaluation_ts: 120_000,
+            step_ms: 60_000,
+            lookback_delta_ms: 300_000,
+            ..Default::default()
+        };
+        evaluator
+            .preload_for_range(&expr, &ctx)
+            .unwrap_or_else(|e| panic!("{query}: preload failed: {e}"));
+        evaluator.budget.loaded()
+    }
+
+    /// A twin subquery adds nothing to `ts-promql-max-samples-per-query`: its
+    /// union was read, and charged, for the first.
+    #[test]
+    fn identical_subqueries_charge_the_budget_once() {
+        for twin in [
+            "(metric)[2m:30s]",
+            "sum_over_time(metric[1m])[2m:1m]",
+            "max_over_time(sum_over_time(metric[1m])[2m:1m])[4m:2m]",
+        ] {
+            let once = preload_charge(&format!("max_over_time({twin})"));
+            assert!(once > 0, "{twin}: the union preload charged nothing");
+            let twice = preload_charge(&format!("max_over_time({twin}) - min_over_time({twin})"));
+            assert_eq!(twice, once, "{twin}: the twin was charged again");
+        }
+    }
+
+    /// Subqueries that differ only in a literal's sign keep their own unions:
+    /// `PartialEq` takes `-0` for `0`, but `x / -0` is `-Inf` where `x / 0` is
+    /// `+Inf`.
+    #[test]
+    fn subqueries_differing_in_zero_sign_keep_their_own_unions() {
+        let parse_subquery = |q: &str| match promql_parser::parser::parse(q).unwrap() {
+            Expr::Subquery(subquery) => subquery,
+            other => panic!("{q}: not a subquery: {other:?}"),
+        };
+        let pos = parse_subquery("(metric / 0)[2m:30s]");
+        let neg = parse_subquery("(metric / -0)[2m:30s]");
+        assert!(
+            super::super::SubqueryKey::of(&pos) != super::super::SubqueryKey::of(&neg),
+            "`/ 0` and `/ -0` share a key"
+        );
+        assert!(super::super::SubqueryKey::of(&pos) == super::super::SubqueryKey::of(&pos.clone()));
+
+        // `+Inf - -Inf` is `+Inf`; one shared union would make it `NaN`.
+        let query = "max_over_time((metric / 0)[2m:30s]) - max_over_time((metric / -0)[2m:30s])";
+        let (steps, _) =
+            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, GridAnswer::Raw);
+        let (local, _) =
+            evaluate_range_with_pushdown(query, 120_000, 240_000, 60_000, GridAnswer::Local);
+        let steps = rendered_steps(steps);
+        assert_eq!(steps, rendered_steps(local), "{query}");
+        assert!(
+            !steps.is_empty() && steps.iter().all(|(_, _, value)| value == "inf"),
+            "{steps:?}"
+        );
+    }
+
     // ── Fusion with an outer aggregation ────────────────────────────────
     //
     // `sum by (job) (rate(m[5m]))` is one request: the source reduces each
