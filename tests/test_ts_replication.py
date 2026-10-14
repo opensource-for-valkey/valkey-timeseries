@@ -5,14 +5,32 @@ import time
 from typing import List
 
 import pytest
+from valkey.exceptions import ResponseError
 
-from common import SERVER_PATH, get_module_path, parse_info_response
-from valkeytestframework.conftest import resource_port_tracker
-from valkeytestframework.valkey_test_case import ReplicationTestCase
+hypothesis = pytest.importorskip("hypothesis")
+from hypothesis import HealthCheck, given, settings  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
+
+from common import SERVER_PATH, get_module_path, parse_info_response  # noqa: E402
+from valkeytestframework.conftest import resource_port_tracker  # noqa: E402
+from valkeytestframework.valkey_test_case import ReplicationTestCase  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 REPLICATION_TIMEOUT = 3
+
+FUZZ_SRC, FUZZ_MID, FUZZ_TOP = "ts:fuzz:src", "ts:fuzz:mid", "ts:fuzz:top"
+
+_sample = st.tuples(
+    st.integers(0, 4000),
+    st.floats(-1000, 1000, allow_nan=False, allow_infinity=False),
+)
+_fuzz_op = st.one_of(
+    st.tuples(st.just("ADD"), _sample),
+    st.tuples(st.just("MADD"), st.lists(_sample, min_size=1, max_size=5)),
+    st.tuples(st.just("ADDBULK"), st.lists(_sample, min_size=1, max_size=8, unique_by=lambda s: s[0])),
+    st.tuples(st.just("DEL"), st.integers(0, 4000), st.integers(0, 4000)),
+)
 
 
 class TestTimeSeriesReplication(ReplicationTestCase):
@@ -1009,3 +1027,43 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert new_primary.execute_command("TS.RANGE", dst, "-", "+") == [[0, b"27.625"], [1000, b"9"]]
         self.wait_caught_up(new_primary, new_replica)
         self.assert_equivalent_between(new_primary, new_replica, src, dst)
+
+    def apply_fuzz_op(self, op):
+        kind = op[0]
+        try:
+            if kind == "ADD":
+                ts, value = op[1]
+                self.client.execute_command("TS.ADD", FUZZ_SRC, ts, value)
+            elif kind == "MADD":
+                args = [arg for ts, value in op[1] for arg in (FUZZ_SRC, ts, value)]
+                self.client.execute_command("TS.MADD", *args)
+            elif kind == "ADDBULK":
+                payload = json.dumps({"timestamps": [ts for ts, _ in op[1]], "values": [v for _, v in op[1]]})
+                self.client.execute_command("TS.ADDBULK", FUZZ_SRC, payload, "ON_DUPLICATE", "LAST")
+            else:
+                lo, hi = sorted(op[1:])
+                self.client.execute_command("TS.DEL", FUZZ_SRC, lo, hi)
+        except ResponseError:
+            pass  # a rejected input is part of the space; the replica must reject it the same way
+
+    @settings(
+        max_examples=40,
+        deadline=None,
+        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+    )
+    @given(ops=st.lists(_fuzz_op, min_size=1, max_size=30))
+    def test_replication_compaction_random_sequences(self, ops):
+        """Replica oracle: any sequence of writes and deletes through a two-level chain leaves the
+        replica with the primary's destinations. A failure is a determinism bug in the engine:
+        promote Hypothesis's shrunk example into a named test next to this one."""
+        self.client.execute_command("FLUSHALL")
+        self.wait_for_replication()
+        self.client.execute_command("TS.CREATE", FUZZ_SRC, "DUPLICATE_POLICY", "LAST")
+        self.client.execute_command("TS.CREATE", FUZZ_MID)
+        self.client.execute_command("TS.CREATE", FUZZ_TOP)
+        self.client.execute_command("TS.CREATERULE", FUZZ_SRC, FUZZ_MID, "AGGREGATION", "sum", 1000)
+        self.client.execute_command("TS.CREATERULE", FUZZ_MID, FUZZ_TOP, "AGGREGATION", "avg", 2000)
+        for op in ops:
+            self.apply_fuzz_op(op)
+        self.assert_compaction_equivalent(FUZZ_SRC, FUZZ_MID, FUZZ_TOP)
+        self.assert_rule_state_equivalent(FUZZ_SRC, FUZZ_MID)
