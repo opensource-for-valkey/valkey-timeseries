@@ -5,7 +5,6 @@ import time
 from typing import List
 
 import pytest
-from valkey.exceptions import ResponseError
 
 hypothesis = pytest.importorskip("hypothesis")
 from hypothesis import HealthCheck, given, settings  # noqa: E402
@@ -1029,22 +1028,21 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.assert_equivalent_between(new_primary, new_replica, src, dst)
 
     def apply_fuzz_op(self, op):
+        """Apply one generated op to the primary. Every generated op is valid, so a rejection is a
+        regression and must fail the example, not be swallowed."""
         kind = op[0]
-        try:
-            if kind == "ADD":
-                ts, value = op[1]
-                self.client.execute_command("TS.ADD", FUZZ_SRC, ts, value)
-            elif kind == "MADD":
-                args = [arg for ts, value in op[1] for arg in (FUZZ_SRC, ts, value)]
-                self.client.execute_command("TS.MADD", *args)
-            elif kind == "ADDBULK":
-                payload = json.dumps({"timestamps": [ts for ts, _ in op[1]], "values": [v for _, v in op[1]]})
-                self.client.execute_command("TS.ADDBULK", FUZZ_SRC, payload, "ON_DUPLICATE", "LAST")
-            else:
-                lo, hi = sorted(op[1:])
-                self.client.execute_command("TS.DEL", FUZZ_SRC, lo, hi)
-        except ResponseError:
-            pass  # a rejected input is part of the space; the replica must reject it the same way
+        if kind == "ADD":
+            ts, value = op[1]
+            self.client.execute_command("TS.ADD", FUZZ_SRC, ts, value)
+        elif kind == "MADD":
+            args = [arg for ts, value in op[1] for arg in (FUZZ_SRC, ts, value)]
+            self.client.execute_command("TS.MADD", *args)
+        elif kind == "ADDBULK":
+            payload = json.dumps({"timestamps": [ts for ts, _ in op[1]], "values": [v for _, v in op[1]]})
+            self.client.execute_command("TS.ADDBULK", FUZZ_SRC, payload, "ON_DUPLICATE", "LAST")
+        else:
+            lo, hi = sorted(op[1:])
+            self.client.execute_command("TS.DEL", FUZZ_SRC, lo, hi)
 
     @settings(
         max_examples=40,
