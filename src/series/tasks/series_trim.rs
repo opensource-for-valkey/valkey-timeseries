@@ -24,6 +24,16 @@ static SERIES_TRIM_CURSORS: LazyLock<Mutex<TrimContext>> =
 /// Held while a trim run is queued or running.
 static TRIM_RUN: SingleFlight = SingleFlight::new();
 
+/// Physically drops expired samples that the write path left behind (see
+/// `TimeSeries::trim_lazily`).
+///
+/// Runs on every node, primaries and replicas alike, and is deliberately not replicated. The
+/// retention floor is derived from the series' own last sample, not the clock, so a replica
+/// that has applied the same stream computes the same floor, and the trim removes only
+/// samples that reads already hide on both sides. Nodes may differ in what they *store*
+/// between runs, never in what they return. A role check here would need a replicated
+/// trim command to go with it; without one, replicas would hold on to every head-chunk
+/// prefix the write path deferred.
 pub fn process_series_trim() {
     if is_shutting_down() {
         return;

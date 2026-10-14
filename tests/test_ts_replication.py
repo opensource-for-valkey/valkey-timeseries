@@ -654,3 +654,75 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         )
         for field in ("firstTimestamp", "lastTimestamp", "totalSamples"):
             assert replica_info[field] == primary_info[field], field
+
+    @staticmethod
+    def stored_chunks(client, key):
+        """Per-chunk `TS.INFO DEBUG` entries: what the node stores, expired samples included."""
+        flat = client.execute_command("TS.INFO", key, "DEBUG")
+        info = {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+        return [{c[i]: c[i + 1] for i in range(0, len(c), 2)} for c in info[b"Chunks"]]
+
+    def test_replication_retention_trim_cron(self):
+        """The retention-trim cron runs on every node and is not replicated, so each node
+        trims on its own schedule. That is safe only because the retention floor follows
+        the series' last sample rather than the clock: both nodes must hide, and eventually
+        drop, exactly the same samples.
+
+        The write path defers re-encoding a compressed head chunk until a quarter of its
+        span has expired, so the expired prefix here stays stored until the cron removes it.
+        If the cron were ever restricted to primaries without a replicated trim, the replica
+        would keep that prefix and the wait below would time out.
+        """
+        key = "ts:trim_cron"
+        retention = 10_000
+        last_ts = 12_000
+        floor = last_ts - retention
+
+        assert self.client.execute_command(
+            f"TS.CREATE {key} RETENTION {retention} ENCODING COMPRESSED CHUNK_SIZE 16384"
+        ) == b"OK"
+        pipe = self.client.pipeline(transaction=False)
+        for ts in range(0, last_ts + 1, 100):
+            pipe.execute_command("TS.ADD", key, ts, ts // 100)
+        pipe.execute()
+
+        samples = self.assert_series_matches_replica(key)
+        assert samples[0][0] == floor
+        assert len(samples) == (last_ts - floor) // 100 + 1
+
+        # Precondition: one compressed chunk whose expired prefix the write path kept.
+        # (The cron fires every 10 s, so it could in principle land between the adds and
+        # this check; the window is a few milliseconds.)
+        chunks = self.stored_chunks(self.client, key)
+        assert len(chunks) == 1
+        assert chunks[0][b"startTimestamp"] < floor
+
+        replica = self.replicas[0].client
+
+        def assert_nodes_agree():
+            primary_info = parse_info_response(self.client.execute_command(f"TS.INFO {key}"))
+            replica_info = parse_info_response(replica.execute_command(f"TS.INFO {key}"))
+            for field in ("firstTimestamp", "lastTimestamp", "totalSamples"):
+                assert replica_info[field] == primary_info[field], field
+            assert primary_info["firstTimestamp"] == floor
+            assert replica.execute_command(f"TS.RANGE {key} - +") == samples
+            assert self.client.execute_command(f"TS.RANGE {key} - +") == samples
+            assert replica.execute_command("DEBUG", "DIGEST-VALUE", key) == \
+                self.client.execute_command("DEBUG", "DIGEST-VALUE", key)
+
+        assert_nodes_agree()
+
+        # The cron runs every 10 s, and a run that finds the db cursor exhausted only resets
+        # it, so the series may not be reached until the second run after it was written.
+        deadline = time.time() + 30
+        while True:
+            trimmed = [
+                self.stored_chunks(client, key)[0][b"startTimestamp"] >= floor
+                for client in (self.client, replica)
+            ]
+            if all(trimmed):
+                break
+            assert time.time() < deadline, f"trim cron did not run (primary, replica) = {trimmed}"
+            time.sleep(0.5)
+
+        assert_nodes_agree()
