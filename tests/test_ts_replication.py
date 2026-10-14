@@ -70,6 +70,10 @@ class TestTimeSeriesReplication(ReplicationTestCase):
 
     def wait_for_replication(self):
         self.waitForReplicaToSyncUp(self.replicas[0])
+        # The link being up says nothing about the replica having applied the primary's latest
+        # writes; WAIT blocks until the replica acknowledges the primary's current offset.
+        assert self.client.execute_command("WAIT", 1, 5000) == 1, \
+            "replica did not acknowledge the primary's offset within 5 s"
 
     def test_basic_replication(self):
         """Test that basic time series operations replicate to replicas"""
@@ -449,6 +453,7 @@ class TestTimeSeriesReplication(ReplicationTestCase):
     def assert_rule_state_equivalent(self, *keys):
         """The replica's open-bucket state (TS.INFO DEBUG rulesState) matches the primary's.
         Replicas recompute, so this always holds; a mismatch is a determinism bug in the engine."""
+        self.wait_for_replication()
         replica = self.replicas[0].client
         for key in keys:
             assert self.info_debug(replica, key)[b"rulesState"] == \
