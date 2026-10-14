@@ -411,6 +411,69 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert replica_samples == primary_samples
         return primary_samples
 
+    # --- compaction equivalence helpers (docs/plans/2026-10-14-compaction-refactor.md)
+
+    @staticmethod
+    def info_debug(client, key):
+        """`TS.INFO key DEBUG` as a dict (the RESP2 flat list, pairwise)."""
+        flat = client.execute_command("TS.INFO", key, "DEBUG")
+        return {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+
+    def set_compat_mode(self, mode):
+        for client in (self.client, self.replicas[0].client):
+            client.execute_command("CONFIG", "SET", "ts.ts-compatibility-mode", mode)
+
+    def rule(self, src, dst, agg="sum", bucket=1000, align=None, src_options=()):
+        """Create `src` (with `src_options`), `dst`, and a rule between them on the primary."""
+        self.client.execute_command("TS.CREATE", src, *src_options)
+        self.client.execute_command("TS.CREATE", dst)
+        args = ["TS.CREATERULE", src, dst, "AGGREGATION", agg, bucket]
+        if align is not None:
+            args.append(align)
+        assert self.client.execute_command(*args) == b"OK"
+
+    def assert_compaction_equivalent(self, *keys):
+        """The replica holds the same stored data as the primary for every key: digest, samples,
+        TS.GET, and the open bucket as TS.GET … LATEST reports it."""
+        self.wait_for_replication()
+        replica = self.replicas[0].client
+        for key in keys:
+            for cmd in (
+                ("DEBUG", "DIGEST-VALUE", key),
+                ("TS.RANGE", key, "-", "+"),
+                ("TS.GET", key),
+                ("TS.GET", key, "LATEST"),
+            ):
+                assert replica.execute_command(*cmd) == self.client.execute_command(*cmd), (key, cmd)
+
+    def assert_rule_state_equivalent(self, *keys):
+        """The replica's open-bucket state (TS.INFO DEBUG rulesState) matches the primary's.
+        Replicas recompute, so this always holds; a mismatch is a determinism bug in the engine."""
+        replica = self.replicas[0].client
+        for key in keys:
+            assert self.info_debug(replica, key)[b"rulesState"] == \
+                self.info_debug(self.client, key)[b"rulesState"], key
+
+    @staticmethod
+    def wait_link_up(client, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            info = client.info("replication")
+            if info.get("master_link_status") == "up" and not info.get("master_sync_in_progress", 0):
+                return
+            time.sleep(0.1)
+        raise AssertionError("replica link did not come up")
+
+    def force_full_resync(self):
+        """Detach the replica, wipe it, re-attach it: with a new replication id the next link-up
+        is a full sync of the primary's current snapshot, never a partial one."""
+        replica = self.replicas[0].client
+        replica.execute_command("REPLICAOF", "NO", "ONE")
+        replica.execute_command("FLUSHALL")
+        replica.execute_command("REPLICAOF", self.server.bind_ip, self.server.port)
+        self.wait_link_up(replica)
+        self.wait_for_replication()
+
     def await_propagated_command(self, monitor, name, deadline_seconds=5):
         """Return the first command MONITOR reports on the replica whose name is `name`."""
         deadline = time.time() + deadline_seconds
@@ -726,3 +789,158 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             time.sleep(0.5)
 
         assert_nodes_agree()
+
+    def test_replication_compaction_add_paths(self):
+        """TS.ADD-fed rule: append, same-timestamp upsert, back-fill into a closed bucket, and a
+        back-fill two buckets back leave identical destination data and open-bucket state."""
+        src, dst = "ts:comp_add:src", "ts:comp_add:dst"
+        self.rule(src, dst, "avg", 1000, src_options=("DUPLICATE_POLICY", "LAST"))
+        for ts, value in ((0, 1), (500, 2), (1000, 3), (1500, 4), (2500, 5)):
+            self.client.execute_command("TS.ADD", src, ts, value)
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+        self.client.execute_command("TS.ADD", src, 2500, 50)   # upsert in the open bucket
+        self.client.execute_command("TS.ADD", src, 1200, 60)   # back-fill the closed bucket 1000
+        self.client.execute_command("TS.ADD", src, 10, 70)     # back-fill two buckets back
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+
+    def test_replication_compaction_madd(self):
+        """TS.MADD: out-of-order items, in-batch duplicates under each duplicate policy, and a
+        BLOCK-rejected duplicate (which the primary leaves out of the propagated TS.MADD)."""
+        pairs = []
+        for policy in ("BLOCK", "SUM", "LAST", "MIN"):
+            src, dst = f"ts:comp_madd:{policy}:src", f"ts:comp_madd:{policy}:dst"
+            self.rule(src, dst, "sum", 1000, src_options=("DUPLICATE_POLICY", policy))
+            pairs.append((src, dst))
+        for src, _ in pairs:
+            self.client.execute_command("TS.MADD", src, 0, 1, src, 2000, 2, src, 1000, 3)
+            self.client.execute_command("TS.MADD", src, 500, 4, src, 500, 5, src, 2500, 6)
+            self.client.execute_command("TS.MADD", src, 2500, 7, src, 3100, 8)
+        keys = [key for pair in pairs for key in pair]
+        self.assert_compaction_equivalent(*keys)
+        self.assert_rule_state_equivalent(*[src for src, _ in pairs])
+
+    def test_replication_compaction_del(self):
+        """TS.DEL: a partial bucket, fully covered middle buckets, and a trailing removal that
+        re-opens an already published bucket."""
+        src, dst = "ts:comp_del:src", "ts:comp_del:dst"
+        self.rule(src, dst, "sum", 1000)
+        for ts in range(0, 6000, 100):
+            self.client.execute_command("TS.ADD", src, ts, 1)
+        self.assert_compaction_equivalent(src, dst)
+        assert self.client.execute_command("TS.DEL", src, 1200, 1400) == 3      # partial bucket
+        self.assert_compaction_equivalent(src, dst)
+        assert self.client.execute_command("TS.DEL", src, 1900, 4100) == 23     # boundaries + middle
+        self.assert_compaction_equivalent(src, dst)
+        assert self.client.execute_command("TS.DEL", src, 4500, 6000) == 15     # trailing: re-opens 4000
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+        self.client.execute_command("TS.ADD", src, 7000, 9)                    # closes it again
+        self.assert_compaction_equivalent(src, dst)
+
+    def test_replication_compaction_chain_and_diamond(self):
+        """A three-level chain, and a source with two rules."""
+        self.rule("ts:chain:src", "ts:chain:mid", "sum", 1000)
+        self.client.execute_command("TS.CREATE", "ts:chain:top")
+        self.client.execute_command("TS.CREATERULE", "ts:chain:mid", "ts:chain:top", "AGGREGATION", "avg", 2000)
+        self.client.execute_command("TS.CREATE", "ts:chain:max")
+        self.client.execute_command("TS.CREATERULE", "ts:chain:src", "ts:chain:max", "AGGREGATION", "max", 500)
+        for ts in range(0, 9000, 250):
+            self.client.execute_command("TS.ADD", "ts:chain:src", ts, ts % 7)
+        self.client.execute_command("TS.ADD", "ts:chain:src", 1255, 100)   # back-fill cascades mid -> top
+        self.client.execute_command("TS.DEL", "ts:chain:src", 3000, 4999)  # removal cascades
+        keys = ("ts:chain:src", "ts:chain:mid", "ts:chain:top", "ts:chain:max")
+        self.assert_compaction_equivalent(*keys)
+        self.assert_rule_state_equivalent("ts:chain:src", "ts:chain:mid")
+
+    def test_replication_compaction_createrule_on_existing_data(self):
+        src, dst = "ts:late_rule:src", "ts:late_rule:dst"
+        self.client.execute_command("TS.CREATE", src)
+        for ts in range(0, 3500, 500):
+            self.client.execute_command("TS.ADD", src, ts, 1)
+        self.client.execute_command("TS.CREATE", dst)
+        self.client.execute_command("TS.CREATERULE", src, dst, "AGGREGATION", "sum", 1000)
+        self.client.execute_command("TS.ADD", src, 3500, 1)
+        self.client.execute_command("TS.ADD", src, 4000, 1)
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+
+    def test_replication_compaction_deleterule_mid_bucket_then_recreate(self):
+        src, dst = "ts:rerule:src", "ts:rerule:dst"
+        self.rule(src, dst, "sum", 1000)
+        for ts in (0, 500, 1000, 1200):
+            self.client.execute_command("TS.ADD", src, ts, 1)
+        assert self.client.execute_command("TS.DELETERULE", src, dst) == b"OK"
+        self.client.execute_command("TS.ADD", src, 1500, 1)
+        self.client.execute_command("TS.CREATERULE", src, dst, "AGGREGATION", "sum", 1000)
+        self.client.execute_command("TS.ADD", src, 2000, 1)
+        self.client.execute_command("TS.ADD", src, 3000, 1)
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+
+    def test_replication_compaction_direct_dest_writes(self):
+        """A client may write straight to a destination; a source TS.DEL covering that bucket
+        recalculates it from the source and erases the direct write (DIV-0021 model)."""
+        src, dst = "ts:direct:src", "ts:direct:dst"
+        self.rule(src, dst, "sum", 1000)
+        # dst already holds the compaction's own sample at 0, so the direct write is an upsert
+        self.client.execute_command("TS.ALTER", dst, "DUPLICATE_POLICY", "LAST")
+        for ts in (0, 500, 1000, 1500, 2000):
+            self.client.execute_command("TS.ADD", src, ts, 1)
+        self.client.execute_command("TS.ADD", dst, 0, 99)      # direct destination write
+        self.client.execute_command("TS.ADD", dst, 5000, 42)   # direct write ahead of the source
+        self.assert_compaction_equivalent(src, dst)
+        self.client.execute_command("TS.DEL", src, 0, 999)
+        self.assert_compaction_equivalent(src, dst)
+
+    def test_replication_compaction_source_retention(self):
+        """Retention on the source sets the recalculation floor; both nodes must use the same."""
+        src, dst = "ts:ret_rule:src", "ts:ret_rule:dst"
+        self.rule(src, dst, "sum", 1000, src_options=("RETENTION", 2500))
+        for ts in range(0, 6000, 250):
+            self.client.execute_command("TS.ADD", src, ts, 1)
+        self.client.execute_command("TS.ADD", src, 3300, 10)    # back-fill at the window's edge
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="compaction-replication-plan.md section 3.8: policy-created rules are attached in "
+        "per-process HashSet order, so the source's rule order (and DEBUG DIGEST-VALUE) differs "
+        "between primary and replica",
+    )
+    def test_replication_compaction_policy_rules(self):
+        """Rules created by ts-compaction-policy, with the same policy on both nodes.
+
+        Six rules, so that two independently shuffled rule orders coincide with probability
+        1/720 and the strict xfail above is not itself flaky."""
+        policy = "max:1M:1h;avg:2M:1h;min:1M:1h;sum:2M:1h;count:1M:1h;last:2M:1h"
+        for client in (self.client, self.replicas[0].client):
+            client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", policy)
+        # TS.CREATE never applies the policy; the auto-creating TS.ADD does.
+        self.client.execute_command("TS.ADD", "ts:policy:src", 10_000, 10_000, "LABELS", "a", "b")
+        for ts in range(20_000, 300_000, 10_000):
+            self.client.execute_command("TS.ADD", "ts:policy:src", ts, ts)
+        rules = parse_info_response(self.client.execute_command("TS.INFO", "ts:policy:src"))["rules"]
+        dests = [r.dest_key for r in rules]
+        assert len(dests) == 6
+        self.assert_compaction_equivalent("ts:policy:src", *dests)
+        self.assert_rule_state_equivalent("ts:policy:src")
+
+    def test_replication_compaction_full_resync_mid_bucket(self):
+        """A full sync taken mid-bucket ships the open-bucket state in the RDB; the stream after
+        it must continue from exactly that state."""
+        src, dst = "ts:resync:src", "ts:resync:dst"
+        self.rule(src, dst, "avg", 1000)
+        for ts, value in ((0, 1), (300, 2.5), (450, 7), (1000, 9), (1200, 3)):
+            self.client.execute_command("TS.ADD", src, ts, value)
+        self.force_full_resync()
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+        self.client.execute_command("TS.ADD", src, 1700, 5)   # same open bucket as the snapshot
+        self.client.execute_command("TS.ADD", src, 2000, 5)   # closes it
+        self.client.execute_command("TS.ADD", src, 200, 100)  # back-fill
+        self.client.execute_command("TS.DEL", src, 1100, 2100)
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
