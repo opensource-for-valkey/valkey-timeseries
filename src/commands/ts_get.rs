@@ -38,7 +38,7 @@ pub fn ts_get_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         if latest && let Some(value) = get_latest_compaction_sample(ctx, series) {
             Ok(Some(value))
         } else {
-            Ok(series.reported_last_sample())
+            Ok(series.last_sample)
         }
     })?;
 

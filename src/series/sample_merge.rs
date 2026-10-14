@@ -22,8 +22,8 @@ pub struct PerSeriesSamples<'a> {
     /// compaction pass.
     added: SmallVec<[Sample; 8]>,
     /// The accepted timestamps in the order the caller supplied them (MADD argument order),
-    /// which `added` discards by sorting. Only the DIV-0023 forward-close marker needs it —
-    /// see `last_forward_close_in_input_order`.
+    /// which `added` discards by sorting. Batch compaction replays it to classify back-fills
+    /// (see `CompactionOp::AddBatch`).
     added_order: SmallVec<[Timestamp; 8]>,
     /// The series' last timestamp before the merge: batch compaction uses it to tell
     /// guaranteed-fresh appends apart from samples that may have replaced existing values.
@@ -206,7 +206,7 @@ fn add_samples_internal(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sampl
 
     // Accepted samples feed batch compaction, which requires them ascending by timestamp.
     // `add_results` is parallel to `samples`, i.e. still in input order, so the order is
-    // captured before sorting (the DIV-0023 forward-close marker depends on it).
+    // captured before sorting (batch compaction replays it to classify back-fills).
     let mut added: SmallVec<[Sample; 8]> = add_results
         .iter()
         .filter_map(|res| {

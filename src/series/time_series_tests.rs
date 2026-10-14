@@ -2232,28 +2232,4 @@ mod tests {
         assert!(ts.chunks[0].first_timestamp() >= floor);
         assert_eq!(ts.iter().count(), ts.visible_total_samples());
     }
-
-    #[test]
-    fn test_forward_close_marker_is_ignored_once_expired() {
-        let mut ts = retained_series(ChunkEncoding::Chimp, 0);
-        for i in (0..2_000).step_by(2) {
-            ts.add(i, i as f64, None);
-        }
-        let marker = ts.get_sample(0).unwrap().unwrap();
-        ts.last_forward_close = Some(marker);
-        assert_eq!(ts.live_forward_close(), Some(marker));
-
-        // A floor a tenth of the way in: the head chunk keeps the expired marker sample
-        // stored, but it is outside the window and must not be reported.
-        let last = ts.last_timestamp();
-        ts.retention = Duration::from_millis((last - 200) as u64);
-        assert_eq!(ts.get_sample(0).unwrap(), Some(marker), "still stored");
-        assert_eq!(ts.live_forward_close(), None);
-
-        // A marker at the floor itself is still live.
-        let floor = ts.get_min_timestamp();
-        let at_floor = ts.get_sample(floor).unwrap().unwrap();
-        ts.last_forward_close = Some(at_floor);
-        assert_eq!(ts.live_forward_close(), Some(at_floor));
-    }
 }

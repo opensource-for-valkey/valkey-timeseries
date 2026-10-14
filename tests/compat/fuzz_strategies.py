@@ -31,7 +31,8 @@ drown the fuzz signal. Concretely the generator never emits:
   - a compaction destination in a `TS.NRANGE`/`TS.NREVRANGE` key list, except forward over
     a non-variance rule (see `programs`);
   - `EMPTY` on a *reverse* read that can reach a compaction destination (the second symptom
-    of DIV-0030/0031 — the reference repeats the whole bucket run).
+    of DIV-0030/0031 — the reference repeats the whole bucket run);
+  - `TS.GET`/`TS.MGET` without `LATEST` once a rollup exists (DIV-0023, ungated).
 
 Everything a command emits is a `str`, so a shrunk failing example round-trips
 losslessly into a JSON corpus file (see corpus/ and test_compat_corpus.py).
@@ -437,7 +438,10 @@ def _read_op(
                                     aggregators=aggregators, empty_allowed=empty_allowed)))
     if kind == "GET":
         key = draw(st.sampled_from(keys))
-        opt = ["LATEST"] if draw(st.booleans()) else []
+        # DIV-0023 (ungated): without LATEST a back-filled destination reports a different
+        # sample on each engine in both modes, so a rollup is only ever read with LATEST,
+        # where the engines agree. LATEST is a no-op on a series that is not a compaction.
+        opt = ["LATEST"] if key == ROLLUP_KEY or draw(st.booleans()) else []
         return ("TS.GET", key, *opt)
     if kind in ("MRANGE", "MREVRANGE"):
         frm, to = draw(_bounds())
@@ -475,6 +479,8 @@ def _read_op(
                 *draw(_nrange_options((frm, to), len(key_list), aggregators=aggregators)))
     if kind == "MGET":
         opts = ["WITHLABELS"] if draw(st.booleans()) else []
+        if ROLLUP_KEY in keys:
+            opts.append("LATEST")  # DIV-0023, as for TS.GET above
         return ("TS.MGET", *opts, "FILTER", *draw(_filter()))
     if kind == "QUERYLABELS":
         # FILTER is optional; the fuzzer never emits a bare metric-name matcher, so

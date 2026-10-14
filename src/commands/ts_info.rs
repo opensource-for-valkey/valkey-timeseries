@@ -161,11 +161,7 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
         "firstTimestamp".into(),
         ValkeyValue::Integer(ts.visible_first_timestamp()),
     );
-    // `reported_last_sample`, not `last_sample`: under `ts-compatibility-mode strict` a
-    // compaction destination reports the last bucket closed by forward progress, and
-    // TS.INFO must agree with the TS.GET/TS.MGET it gates (DIV-0023). Extended mode is
-    // unaffected — there the two are the same sample.
-    if let Some(last_sample) = ts.reported_last_sample() {
+    if let Some(last_sample) = ts.last_sample {
         map.insert(
             "lastTimestamp".into(),
             ValkeyValue::Integer(last_sample.timestamp),

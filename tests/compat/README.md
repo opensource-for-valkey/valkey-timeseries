@@ -165,7 +165,7 @@ COMPAT_FUZZ=1 COMPAT_REFERENCE_URL=redis://127.0.0.1:16379 \
 ```
 
 Note that a subject in the default `extended` mode fails on the first *gated*
-intentional divergence (e.g. DIV-0023) and Hypothesis stops there, so a soak run
+intentional divergence (e.g. DIV-0014) and Hypothesis stops there, so a soak run
 wants `CONFIG SET ts.ts-compatibility-mode strict` on the subject first.
 `fuzz.sh` (at the repository root) does all of the above — dependencies,
 builds, both servers, strict mode, and rounds until a wall-clock budget is spent:

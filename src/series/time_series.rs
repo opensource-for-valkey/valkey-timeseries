@@ -97,20 +97,6 @@ pub struct TimeSeries {
     /// This is not part of the time series data itself, nor is it stored to rdb.
     /// `None` means the series is currently unassigned to a local db.
     pub(crate) _db: Option<i32>,
-    /// Strict-mode emulation state for DIV-0023, on a compaction *destination*: the
-    /// sample published by the most recent bucket close driven by forward progress.
-    ///
-    /// Back-filling a bucket older than the open one materializes a downstream sample
-    /// without refreshing this, which is exactly what RedisTimeSeries reports from
-    /// `TS.GET`/`TS.MGET` — a cached destination last-sample that back-fill does not
-    /// advance, so its reply disagrees with its own `TS.RANGE`. Only read when
-    /// `ts-compatibility-mode` is `strict`; `extended` always reports the true last
-    /// sample.
-    ///
-    /// Like `_db`, this is runtime-only and never stored to rdb: after a reload it is
-    /// `None` and the gate falls back to the true last sample (documented in
-    /// tests/compat/divergences.yml, DIV-0023).
-    pub(crate) last_forward_close: Option<Sample>,
 }
 
 impl TimeSeries {
@@ -1222,44 +1208,6 @@ impl TimeSeries {
         self.src_series.is_some()
     }
 
-    /// The sample `TS.GET` / `TS.MGET` report when `LATEST` is not given.
-    ///
-    /// In `extended` mode (the default) that is simply the series' last sample. In
-    /// `ts-compatibility-mode strict` a compaction destination instead reports the
-    /// last bucket published by forward progress, matching RedisTimeSeries: it caches
-    /// a destination last-sample that back-filling an older bucket does not refresh,
-    /// so its reply disagrees with its own `TS.RANGE` (DIV-0023). `LATEST` is
-    /// unaffected — both engines already agree there.
-    ///
-    /// Falls back to the true last sample when no forward close has been recorded:
-    /// nothing published yet, or after a reload, since the marker is runtime-only.
-    ///
-    /// The marker is also only honored while the destination still holds that bucket.
-    /// `TS.DEL` on the source (or retention) can drop it, and RedisTimeSeries then
-    /// reports the destination as empty rather than naming a sample that is gone —
-    /// so the stored sample is re-read and the marker ignored when it has vanished.
-    pub fn reported_last_sample(&self) -> Option<Sample> {
-        if crate::config::is_strict_rts_compat()
-            && self.is_compaction()
-            && !self.is_empty()
-            && let Some(current) = self.live_forward_close()
-        {
-            return Some(current);
-        }
-        self.last_sample
-    }
-
-    /// The stored sample at the forward-close marker, if it is still inside the retention
-    /// window. `get_sample` alone is not enough: the head chunk can still hold samples below
-    /// the floor that the write path has not trimmed yet (see [`Self::trim_lazily`]).
-    pub(super) fn live_forward_close(&self) -> Option<Sample> {
-        let published = self.last_forward_close?;
-        if self.is_older_than_retention(published.timestamp) {
-            return None;
-        }
-        self.get_sample(published.timestamp).ok().flatten()
-    }
-
     pub(crate) fn debug_digest(&self, digest: &mut Digest) {
         // hash labels
         calc_metric_name_digest(&self.labels, digest);
@@ -1332,7 +1280,6 @@ impl Default for TimeSeries {
             src_series: None,
             rules: vec![],
             _db: None,
-            last_forward_close: None,
         }
     }
 }

@@ -189,13 +189,8 @@ The same reasoning excludes the reverse direction. Where Valkey TimeSeries is *s
 | Divergence | `extended` (default) | `strict` |
 | ---------- | -------------------- | -------- |
 | A repeated option on the range family — `TS.RANGE`, `TS.REVRANGE`, `TS.MRANGE`, `TS.MREVRANGE` (e.g. `COUNT 5 COUNT 2`, or a duplicated `AGGREGATION` / `FILTER` / `FILTER_BY_TS` / `FILTER_BY_VALUE` / `GROUPBY` / `SELECTED_LABELS`) | The **last** occurrence wins. | The **first** occurrence wins, as in RedisTimeSeries. |
-| `TS.GET` / `TS.MGET` (without `LATEST`) on a compaction destination whose *older* bucket was back-filled (DIV-0023) | The last sample the destination actually holds. | RedisTimeSeries's cached destination last-sample, which back-filling does not refresh. |
 
 Both engines accept a duplicated option and neither errors, so the only difference is which silent resolution applies — the defining shape of this class. A query builder that appends an option twice is the realistic way to reach it. The duplicate's operands are still parsed in both modes, so a malformed operand remains an error either way.
-
-The back-fill case has the same shape: both engines store identical downstream data — `TS.RANGE` and `TS.GET ... LATEST` agree in either mode — and differ only in which stored sample `TS.GET` names, with no error to signal it. RedisTimeSeries reports a cached last-sample that a back-filled older bucket does not advance, so its own `TS.GET` and `TS.RANGE` disagree; `strict` reproduces that, and `extended` reports the sample the series actually holds.
-
-One limitation is specific to this gate: the marker it reads is runtime-only, so after a reload or restart a destination with a pending back-fill reports its true last sample again until the next forward bucket close. Matching RedisTimeSeries across a reload would mean persisting a value that contradicts the series' own chunk data, which is deliberately out of scope.
 
 ### Divergences that qualify but are not yet gated
 
@@ -208,6 +203,7 @@ These meet the criterion — both engines accept, values differ — but are not 
 | `std.p` / `std.s` / `var.p` / `var.s` — overflow above ~1.34e154 (DIV-0022), and cancellation on large-magnitude, small-spread samples at any magnitude (DIV-0024…DIV-0029) | RedisTimeSeries computes variance with the unstable `E[x²] − E[x]²` identity, which yields `NaN` on overflow and exactly `0` (or a value wrong in its leading digits) when the two terms cancel. Matching means adopting a numerically unstable accumulation to reproduce an arithmetic error — there is no second *intended* behavior to select between. The divergence can only turn a `NaN` or a cancelled `0` into a usable number, never the reverse. See [Variance and standard-deviation aggregations](#variance-and-standard-deviation-aggregations). |
 | `sum` / `avg` over a bucket that mixes magnitudes (DIV-0039) | RedisTimeSeries accumulates naively, absorbing small terms into the rounding of large ones; Valkey TimeSeries uses compensated summation. There is no stable value to match — the RedisTimeSeries result depends on an accumulation order neither module specifies. See [Sum and average accumulation](#sum-and-average-accumulation). |
 | `EMPTY` fill on a bucket grid that extends below timestamp 0 — an `ALIGN` offset that is not a multiple of the bucket duration, with data within one bucket of the epoch (DIV-0054) | RedisTimeSeries suppresses the leading and trailing empty-bucket fill in that state only, and disagrees with itself doing so: its own `TS.REVRANGE` returns the bucket its `TS.RANGE` drops, and its `TS.RANGE` returns that bucket as soon as it holds a sample. Matching means dropping in-range buckets to reproduce an inconsistency; every non-negative grid agrees exactly, boundary buckets included. |
+| `TS.GET` / `TS.MGET` / `TS.INFO lastTimestamp` (without `LATEST`) on a compaction destination whose *older* bucket was back-filled (DIV-0023) | RedisTimeSeries reports a cached last-sample that back-filling does not refresh, so its reply contradicts its own `TS.RANGE`. Reproducing it needs per-destination write history that no stored data determines. Valkey TimeSeries reports the last sample the destination holds, in both modes; `TS.RANGE` and `TS.GET ... LATEST` agree with RedisTimeSeries. |
 
 ### What `strict` never affects
 

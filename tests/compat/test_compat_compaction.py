@@ -417,7 +417,7 @@ def strict_subject(diff):
 
 
 class TestOutOfOrderBackfill:
-    """DIV-0023: TS.GET on a destination whose *older* bucket was back-filled.
+    """DIV-0023 (ungated): TS.GET on a destination whose *older* bucket was back-filled.
 
     Pinned per-engine rather than via `diff`: the only registry regex able to match it
     would cover "reference=<ts> subject=<ts>" on TS.GET/TS.MGET and absorb any real
@@ -469,31 +469,16 @@ class TestOutOfOrderBackfill:
             == diff.subject.execute_command("TS.GET", "c:bdst", "LATEST")
         )
 
-    def test_strict_mode_reports_the_stale_bucket_like_rts(self, strict_subject):
-        """DIV-0023 gated: in `ts-compatibility-mode strict` TS.GET/TS.MGET report
-        RTS's cached destination last-sample instead of the last stored bucket.
-
-        Per-engine assertions for the same reason as the sibling test above.
-        """
+    def test_strict_mode_reports_the_stored_bucket_too(self, strict_subject):
+        """DIV-0023 is not gated: even in `ts-compatibility-mode strict` we report the last sample
+        the destination holds, which RTS's own TS.RANGE agrees with, rather than RTS's cached
+        last-sample. Per-engine assertions for the same reason as the sibling test above."""
         diff = strict_subject
         self._backfill(diff.reference)
         self._backfill(diff.subject)
 
-        ref_get = diff.reference.execute_command("TS.GET", "c:bdst")
-        sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
-        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
-        assert sub_get[0] == 0, f"expected the stale bucket under strict, got {sub_get!r}"
-
-        # TS.MGET rides on the same accessor. Cross-series order is undefined
-        # (COMPATIBILITY.md), so normalize it — `diff` would, this raw compare must too.
-        def by_key(reply):
-            return reply if isinstance(reply, dict) else sorted(reply, key=lambda e: e[0])
-
-        assert by_key(diff.reference.execute_command("TS.MGET", "FILTER", "grp=bf")) == by_key(
-            diff.subject.execute_command("TS.MGET", "FILTER", "grp=bf")
-        )
-
-        # The gate touches neither LATEST nor the stored data.
+        assert diff.reference.execute_command("TS.GET", "c:bdst")[0] == 0
+        assert diff.subject.execute_command("TS.GET", "c:bdst")[0] == 500
         assert (
             diff.reference.execute_command("TS.GET", "c:bdst", "LATEST")
             == diff.subject.execute_command("TS.GET", "c:bdst", "LATEST")
@@ -502,146 +487,6 @@ class TestOutOfOrderBackfill:
             diff.reference.execute_command("TS.RANGE", "c:bdst", "-", "+")
             == diff.subject.execute_command("TS.RANGE", "c:bdst", "-", "+")
         )
-
-    @staticmethod
-    def _backfill_one_madd(client):
-        """The same three writes as `_backfill`, but as ONE out-of-order TS.MADD."""
-        client.execute_command("TS.CREATE", "c:msrc", "LABELS", "grp", "mbf")
-        client.execute_command("TS.CREATE", "c:mdst", "LABELS", "grp", "mbf")
-        client.execute_command(
-            "TS.CREATERULE", "c:msrc", "c:mdst", "AGGREGATION", "avg", 500
-        )
-        # Argument order matters: 1000 closes [0,500) by forward progress, then 500
-        # back-fills the skipped [500,1000).
-        client.execute_command(
-            "TS.MADD", "c:msrc", 0, 0, "c:msrc", 1000, 0, "c:msrc", 500, 0
-        )
-
-    def test_strict_mode_honors_madd_argument_order(self, strict_subject):
-        """A single TS.MADD carrying both the closing sample and the back-fill must
-        land on the same cached last-sample as the equivalent TS.ADD sequence.
-
-        We merge a MADD as one sorted run, which is right for the stored data but
-        erases which closes were forward — sorted, this looks like two forward closes
-        and the marker would advance to 500 where RTS reports 0. Regression test for
-        the input-order fix in `last_forward_close_in_input_order`; found by the
-        Tier C fuzzer. Per-engine assertions for the same reason as the siblings above.
-        """
-        diff = strict_subject
-        self._backfill_one_madd(diff.reference)
-        self._backfill_one_madd(diff.subject)
-
-        ref_get = diff.reference.execute_command("TS.GET", "c:mdst")
-        sub_get = diff.subject.execute_command("TS.GET", "c:mdst")
-        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
-        assert sub_get[0] == 0, f"expected the forward-closed bucket, got {sub_get!r}"
-
-        # TS.INFO reads the same accessor and must not disagree with TS.GET.
-        def last_ts(client):
-            reply = client.execute_command("TS.INFO", "c:mdst")
-            items = reply.items() if isinstance(reply, dict) else zip(reply[::2], reply[1::2])
-            fields = {
-                (k.decode() if isinstance(k, bytes) else k): v for k, v in items
-            }
-            return fields["lastTimestamp"]
-
-        assert last_ts(diff.subject) == last_ts(diff.reference)
-
-        # Stored data is unaffected by the marker.
-        assert (
-            diff.reference.execute_command("TS.RANGE", "c:mdst", "-", "+")
-            == diff.subject.execute_command("TS.RANGE", "c:mdst", "-", "+")
-        )
-
-    @staticmethod
-    def _delete_then_recreate(client):
-        """Forward-close a bucket, delete it, then write past it and re-create it."""
-        client.execute_command("TS.CREATE", "c:rsrc", "LABELS", "grp", "res")
-        client.execute_command("TS.CREATE", "c:rdst", "LABELS", "grp", "res")
-        client.execute_command(
-            "TS.CREATERULE", "c:rsrc", "c:rdst", "AGGREGATION", "avg", 500
-        )
-        client.execute_command("TS.ADD", "c:rsrc", 0, 0)
-        client.execute_command("TS.MADD", "c:rsrc", 1000, 0)  # closes [0,500) -> dst(0)
-        client.execute_command("TS.DEL", "c:rsrc", 0, 0)      # dst(0) recalculated away
-        client.execute_command("TS.ADD", "c:rsrc", 500, 0)    # back-fills dst(500)
-        client.execute_command("TS.ADD", "c:rsrc", 0, 0)      # re-creates dst(0)
-
-    def test_strict_mode_does_not_resurrect_a_deleted_marker(self, strict_subject):
-        """A cached last-sample whose bucket was deleted must stay dead.
-
-        Leaving it set lets a later write that re-creates the same timestamp make it
-        readable again, dragging the reported last-sample backwards to a bucket the
-        reference stopped reporting once it was removed. Regression test for the
-        marker-liveness check in `add_dest_bucket`; found by the Tier C fuzzer.
-        """
-        diff = strict_subject
-        self._delete_then_recreate(diff.reference)
-        self._delete_then_recreate(diff.subject)
-
-        ref_get = diff.reference.execute_command("TS.GET", "c:rdst")
-        sub_get = diff.subject.execute_command("TS.GET", "c:rdst")
-        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
-        assert sub_get[0] == 500, f"expected the bucket written after the delete, got {sub_get!r}"
-
-        assert (
-            diff.reference.execute_command("TS.RANGE", "c:rdst", "-", "+")
-            == diff.subject.execute_command("TS.RANGE", "c:rdst", "-", "+")
-        )
-
-    @staticmethod
-    def _backfill_then_delete_then_recreate(client):
-        """Like `_delete_then_recreate`, but the back-fill lands BEFORE the delete, so a
-        newer bucket survives it."""
-        client.execute_command("TS.CREATE", "c:vsrc", "LABELS", "grp", "surv")
-        client.execute_command("TS.CREATE", "c:vdst", "LABELS", "grp", "surv")
-        client.execute_command(
-            "TS.CREATERULE", "c:vsrc", "c:vdst", "AGGREGATION", "avg", 500
-        )
-        client.execute_command("TS.ADD", "c:vsrc", 0, 0)
-        client.execute_command("TS.MADD", "c:vsrc", 1000, 0)  # closes [0,500) -> dst(0)
-        client.execute_command("TS.ADD", "c:vsrc", 500, 0)    # back-fills dst(500)
-        client.execute_command("TS.DEL", "c:vsrc", 0, 0)      # removes dst(0); dst(500) lives
-        client.execute_command("TS.ADD", "c:vsrc", 0, 0)      # re-creates dst(0)
-
-    def test_strict_mode_falls_back_to_the_surviving_bucket(self, strict_subject):
-        """When the marker's bucket is removed, the cache falls to what the destination
-        still holds — not to whatever is written next.
-
-        The sibling test above leaves the destination empty, so "next write" and
-        "surviving last sample" coincide and cannot tell the two rules apart. Here a newer
-        bucket survives the delete, so claiming the marker for the next write (which
-        re-creates the *older* timestamp) would report it and diverge.
-        """
-        diff = strict_subject
-        self._backfill_then_delete_then_recreate(diff.reference)
-        self._backfill_then_delete_then_recreate(diff.subject)
-
-        ref_get = diff.reference.execute_command("TS.GET", "c:vdst")
-        sub_get = diff.subject.execute_command("TS.GET", "c:vdst")
-        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
-        assert sub_get[0] == 500, f"expected the surviving bucket, got {sub_get!r}"
-
-        assert (
-            diff.reference.execute_command("TS.RANGE", "c:vdst", "-", "+")
-            == diff.subject.execute_command("TS.RANGE", "c:vdst", "-", "+")
-        )
-
-    def test_strict_mode_advances_on_the_next_forward_close(self, strict_subject):
-        """The cached last-sample is stale only until forward progress closes the
-        next bucket — at which point strict tracks RTS again."""
-        diff = strict_subject
-        self._backfill(diff.reference)
-        self._backfill(diff.subject)
-
-        # Closes [1000,1500), which both engines publish downstream.
-        diff.reference.execute_command("TS.ADD", "c:bsrc", 2000, 0)
-        diff.subject.execute_command("TS.ADD", "c:bsrc", 2000, 0)
-
-        ref_get = diff.reference.execute_command("TS.GET", "c:bdst")
-        sub_get = diff.subject.execute_command("TS.GET", "c:bdst")
-        assert sub_get == ref_get, f"strict should match RTS, got {sub_get!r} vs {ref_get!r}"
-        assert ref_get[0] == 1000, f"expected the newly closed bucket, got {ref_get!r}"
 
 
 class TestReverseLatestAggregationOnDestination:
