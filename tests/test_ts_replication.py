@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -558,3 +559,98 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.assert_series_matches_replica(source_key)
         dest_samples = self.assert_series_matches_replica(dest_key)
         assert len(dest_samples) > 0
+
+    def test_replication_ts_addbulk_autocreate(self):
+        """An auto-creating TS.ADDBULK builds the same series, options and samples on the replica."""
+        key = "ts:addbulk_autocreate"
+        # Unsorted on purpose: the replica must sort the replayed payload the same way.
+        payload = json.dumps({"timestamps": [3000, 1000, 2000], "values": [3.5, 1.25, 2]})
+
+        assert self.client.execute_command(
+            "TS.ADDBULK", key, payload,
+            "RETENTION", 500000, "DUPLICATE_POLICY", "LAST", "LABELS", "sensor", "temp",
+        ) == [3, 3]
+
+        samples = self.assert_series_matches_replica(key)
+        assert [ts for ts, _ in samples] == [1000, 2000, 3000]
+
+        info = parse_info_response(self.replicas[0].client.execute_command(f"TS.INFO {key}"))
+        assert info["retentionTime"] == 500000
+        assert info["duplicatePolicy"] == "last"
+        assert info["labels"] == {"sensor": "temp"}
+
+    def test_replication_ts_addbulk_duplicates(self):
+        """Samples a duplicate policy rejects or merges end up the same on the replica.
+
+        The replica replays the payload against its own copy of the series, so a rejected
+        sample must be rejected there too, and an ON_DUPLICATE SUM must be applied once.
+        """
+        blocked = "ts:addbulk_block"
+        summed = "ts:addbulk_sum"
+        for key in (blocked, summed):
+            assert self.client.execute_command(
+                f"TS.CREATE {key} DUPLICATE_POLICY BLOCK"
+            ) == b"OK"
+            self.client.execute_command(f"TS.ADD {key} 1000 5")
+
+        payload = json.dumps({"timestamps": [1000, 2000], "values": [3, 7]})
+        assert self.client.execute_command("TS.ADDBULK", blocked, payload) == [1, 2]
+        assert self.client.execute_command(
+            "TS.ADDBULK", summed, payload, "ON_DUPLICATE", "SUM"
+        ) == [2, 2]
+
+        assert self.assert_series_matches_replica(blocked) == [[1000, b"5"], [2000, b"7"]]
+        assert self.assert_series_matches_replica(summed) == [[1000, b"8"], [2000, b"7"]]
+
+    def test_replication_ts_addbulk_compaction(self):
+        """Compaction fed by TS.ADDBULK produces the same destination series on the replica,
+        including a closed bucket that a later out-of-order batch makes recalculate."""
+        src = "ts:addbulk_comp_src"
+        dest = "ts:addbulk_comp_dst"
+
+        assert self.client.execute_command(f"TS.CREATE {src}") == b"OK"
+        assert self.client.execute_command(f"TS.CREATE {dest}") == b"OK"
+        assert self.client.execute_command(
+            f"TS.CREATERULE {src} {dest} AGGREGATION sum 10"
+        ) == b"OK"
+
+        timestamps = list(range(0, 100))
+        payload = json.dumps({"timestamps": timestamps, "values": [1] * len(timestamps)})
+        assert self.client.execute_command("TS.ADDBULK", src, payload) == [100, 100]
+
+        # Lands in the already-closed bucket 0, which must be recalculated on both sides.
+        late = json.dumps({"timestamps": [5], "values": [100]})
+        assert self.client.execute_command(
+            "TS.ADDBULK", src, late, "ON_DUPLICATE", "SUM"
+        ) == [1, 1]
+
+        self.assert_series_matches_replica(src)
+        dest_samples = self.assert_series_matches_replica(dest)
+        assert dest_samples[0] == [0, b"110"]
+        assert len(dest_samples) == 9  # bucket 90 is still open
+
+        replica = self.replicas[0].client
+        assert replica.execute_command(f"TS.GET {dest} LATEST") == self.client.execute_command(
+            f"TS.GET {dest} LATEST"
+        )
+
+    def test_replication_ts_addbulk_retention(self):
+        """Retention trimming driven by a large TS.ADDBULK leaves the same window on the replica."""
+        key = "ts:addbulk_retention"
+        assert self.client.execute_command(
+            f"TS.CREATE {key} RETENTION 1000 ENCODING UNCOMPRESSED CHUNK_SIZE 128"
+        ) == b"OK"
+
+        timestamps = list(range(0, 10_000, 10))
+        payload = json.dumps({"timestamps": timestamps, "values": [1.0] * len(timestamps)})
+        assert self.client.execute_command("TS.ADDBULK", key, payload) == [1000, 1000]
+
+        samples = self.assert_series_matches_replica(key)
+        assert len(samples) == 101
+
+        primary_info = parse_info_response(self.client.execute_command(f"TS.INFO {key}"))
+        replica_info = parse_info_response(
+            self.replicas[0].client.execute_command(f"TS.INFO {key}")
+        )
+        for field in ("firstTimestamp", "lastTimestamp", "totalSamples"):
+            assert replica_info[field] == primary_info[field], field
