@@ -72,6 +72,39 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         self.add_sample(src, 1000, 7.0)  # closes bucket 0
         assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 1000, 1, b"7"]]
 
+    # Every aggregator a rule accepts. The conditional ones take an inline condition.
+    RULE_AGGREGATORS = [
+        "avg", "sum", "min", "max", "range", "count", "countall", "countnan", "first", "last",
+        "std.p", "std.s", "var.p", "var.s", "rate", "irate", "increase",
+        "sum<100", "count<100", "all<100", "any<100", "none<100", "share<100",
+    ]
+
+    @pytest.mark.parametrize("agg", RULE_AGGREGATORS)
+    def test_rule_state_survives_reload(self, agg):
+        """Mid-bucket rule state round-trips through RDB for every aggregator: the observable
+        state is unchanged by DEBUG RELOAD, and closing the bucket afterwards publishes the same
+        value as a twin rule created *after* the reload and fed the whole sequence."""
+        c = self.client
+        samples = ((0, 1), (300, 150), (450, 7), (700, 2))
+        c.execute_command("TS.CREATE", "rl:src")
+        c.execute_command("TS.CREATE", "rl:dst")
+        c.execute_command("TS.CREATERULE", "rl:src", "rl:dst", "AGGREGATION", agg, 1000)
+        for ts, value in samples:
+            c.execute_command("TS.ADD", "rl:src", ts, value)
+        before = self.info_debug(c, "rl:src")[b"rulesState"]
+
+        c.execute_command("DEBUG", "RELOAD")
+        assert self.info_debug(c, "rl:src")[b"rulesState"] == before, agg
+
+        c.execute_command("TS.CREATE", "rl:twin:src")
+        c.execute_command("TS.CREATE", "rl:twin:dst")
+        c.execute_command("TS.CREATERULE", "rl:twin:src", "rl:twin:dst", "AGGREGATION", agg, 1000)
+        for ts, value in samples + ((1000, 5),):
+            c.execute_command("TS.ADD", "rl:twin:src", ts, value)
+        c.execute_command("TS.ADD", "rl:src", 1000, 5)   # closes bucket 0 on the reloaded rule
+        assert c.execute_command("TS.RANGE", "rl:dst", "-", "+") == \
+            c.execute_command("TS.RANGE", "rl:twin:dst", "-", "+"), agg
+
     def get_samples(
         self, key: str, start_ts: int = 0, end_ts: int = None
     ) -> List[Tuple[int, float]]:

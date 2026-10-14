@@ -105,7 +105,9 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
         original_avg_info = self.ts_info('avg_1min')
         original_max_info = self.ts_info('max_5min')
 
-        # Get digests for aggregated series (not source, as it has transient compaction state)
+        # Digests for every series, the source included: its rule state (open bucket, accumulator)
+        # is part of the RDB payload the rewrite embeds, so it round-trips too.
+        original_source_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'source_ts')
         original_avg_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'avg_1min')
         original_max_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'max_5min')
 
@@ -125,14 +127,11 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
         restored_avg_info = self.ts_info('avg_1min')
         restored_max_info = self.ts_info('max_5min')
 
-        # Note: We don't compare digests for series with compaction rules because
-        # the bucket_start field (transient aggregation state) may differ after restart.
-        # Instead, we verify the actual data and properties are correct.
-
-        # Verify per-object digests for aggregated series (these should match)
+        restored_source_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'source_ts')
         restored_avg_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'avg_1min')
         restored_max_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'max_5min')
 
+        assert restored_source_digest == original_source_digest, "source_ts digest mismatch"
         assert restored_avg_digest == original_avg_digest, "avg_1min digest mismatch"
         assert restored_max_digest == original_max_digest, "max_5min digest mismatch"
 
