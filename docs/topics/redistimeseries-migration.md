@@ -307,13 +307,13 @@ commands — it rewrites no stored state, so switching either direction is safe.
 | Case | `extended` | `strict` |
 |---|---|---|
 | A repeated option on the range family (e.g. `COUNT 5 COUNT 2`, duplicated `AGGREGATION` / `FILTER` / `GROUPBY` / …) | **Last** occurrence wins | **First** occurrence wins |
-| `TS.GET` / `TS.MGET` without `LATEST` on a compaction destination whose *older* bucket was back-filled | The last sample the destination actually holds | RedisTimeSeries's cached last-sample, which back-filling does not refresh |
 
-The back-fill gate has one limitation: its marker is runtime-only, so after a reload or
-restart the destination reports its true last sample again until the next forward bucket
-close.
-
-**What it does not gate:** the numeric divergences above; anything where
+**What it does not gate:** the numeric divergences above; the last sample reported for a
+compaction destination whose *older* bucket was back-filled (DIV-0023). Without `LATEST`,
+`TS.GET`, `TS.MGET`, and `TS.INFO lastTimestamp` report the last sample the destination
+holds in both modes, whereas RedisTimeSeries reports a cached last-sample that
+back-filling does not refresh, so its reply contradicts its own `TS.RANGE`; `TS.RANGE`
+and `TS.GET … LATEST` agree on both engines. Also not gated: anything where
 valkey-timeseries accepts input RedisTimeSeries rejects (relative range bounds like `-1h`
 and `*`, cascading compaction rules, complement filters, bare metric-name selectors, and
 the valkey-timeseries-only commands all stay available in both modes); anything where
