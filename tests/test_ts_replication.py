@@ -479,6 +479,33 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.wait_link_up(replica)
         self.wait_for_replication()
 
+    @staticmethod
+    def wait_caught_up(primary, replica, timeout=10):
+        """`replica` has applied everything `primary` has propagated (offset comparison; the
+        framework's waiter only knows the original primary/replica pair)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            target = primary.info("replication")["master_repl_offset"]
+            if replica.info("replication")["master_repl_offset"] >= target:
+                return
+            time.sleep(0.05)
+        raise AssertionError("replica did not catch up")
+
+    def promote_replica(self):
+        """Swap roles: the replica becomes primary and the old primary follows it. Returns
+        (new_primary_client, new_replica_client). The helpers above keep pointing at
+        `self.client`/`self.replicas[0]`, so compare explicitly after this."""
+        replica = self.replicas[0]
+        replica.client.execute_command("REPLICAOF", "NO", "ONE")
+        self.client.execute_command("REPLICAOF", replica.bind_ip, replica.port)
+        self.wait_link_up(self.client)
+        return replica.client, self.client
+
+    def assert_equivalent_between(self, a, b, *keys):
+        for key in keys:
+            for cmd in (("DEBUG", "DIGEST-VALUE", key), ("TS.RANGE", key, "-", "+"), ("TS.GET", key, "LATEST")):
+                assert a.execute_command(*cmd) == b.execute_command(*cmd), (key, cmd)
+
     def await_propagated_command(self, monitor, name, deadline_seconds=5):
         """Return the first command MONITOR reports on the replica whose name is `name`."""
         deadline = time.time() + deadline_seconds
@@ -949,3 +976,36 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.client.execute_command("TS.DEL", src, 1100, 2100)
         self.assert_compaction_equivalent(src, dst)
         self.assert_rule_state_equivalent(src)
+
+    def test_replication_compaction_reload_mid_sequence(self):
+        """DEBUG RELOAD on the primary mid-bucket: its rule state round-trips through its own RDB
+        while the replica keeps its in-memory copy; the two must still agree afterwards."""
+        src, dst = "ts:reload:src", "ts:reload:dst"
+        self.rule(src, dst, "std.s", 1000)
+        for ts, value in ((0, 1), (300, 2.5), (450, 7)):
+            self.client.execute_command("TS.ADD", src, ts, value)
+        self.client.execute_command("DEBUG", "RELOAD")
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+        for ts, value in ((800, 2), (1000, 9), (100, 4)):
+            self.client.execute_command("TS.ADD", src, ts, value)
+        self.assert_compaction_equivalent(src, dst)
+        self.assert_rule_state_equivalent(src)
+
+    def test_replication_compaction_promotion(self):
+        """Promote the replica mid-bucket, keep writing on it, and check the old primary (now a
+        replica) converges. The values are exact: avg(9, 3) = 6 closes bucket 1000; the back-fill
+        makes bucket 0 avg(1, 2.5, 7, 100) = 27.625; the delete of 1200 recalculates 1000 to 9."""
+        src, dst = "ts:promote:src", "ts:promote:dst"
+        self.rule(src, dst, "avg", 1000)
+        for ts, value in ((0, 1), (300, 2.5), (450, 7), (1000, 9)):
+            self.client.execute_command("TS.ADD", src, ts, value)
+        self.assert_compaction_equivalent(src, dst)
+
+        new_primary, new_replica = self.promote_replica()
+        for ts, value in ((1200, 3), (2000, 5), (100, 100)):   # same open bucket, close, back-fill
+            new_primary.execute_command("TS.ADD", src, ts, value)
+        new_primary.execute_command("TS.DEL", src, 1100, 1300)
+        assert new_primary.execute_command("TS.RANGE", dst, "-", "+") == [[0, b"27.625"], [1000, b"9"]]
+        self.wait_caught_up(new_primary, new_replica)
+        self.assert_equivalent_between(new_primary, new_replica, src, dst)
