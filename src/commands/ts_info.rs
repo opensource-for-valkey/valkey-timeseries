@@ -1,3 +1,4 @@
+use crate::aggregators::AggregationHandler;
 use crate::common::replies::ReplyContext;
 use crate::common::replies::is_resp3_client;
 use crate::common::rounding::RoundingStrategy;
@@ -89,8 +90,36 @@ const INFO_FIELD_ORDER: &[&str] = &[
     "ignoreMaxValDiff",
     "rounding",
     "keySelfName",
+    "rulesState",
     "Chunks",
 ];
+
+/// Per-rule aggregation state for `TS.INFO … DEBUG`: one `[destKey, bucketStart, hasSamples,
+/// current]` entry per rule, in rule order. `bucketStart` and `current` are nil while the rule
+/// has no open bucket. This is the state a primary and its replica must agree on, and it is
+/// otherwise invisible — a wrong open bucket only shows up downstream, one bucket later.
+fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
+    let entries = ts
+        .rules
+        .iter()
+        .map(|rule| {
+            let current = if rule.has_samples {
+                AggregationHandler::current(&rule.aggregator)
+                    .map_or(ValkeyValue::Null, ValkeyValue::Float)
+            } else {
+                ValkeyValue::Null
+            };
+            ValkeyValue::Array(vec![
+                ValkeyValue::BulkString(String::from_utf8_lossy(rule.dest.key()).into_owned()),
+                rule.bucket_start
+                    .map_or(ValkeyValue::Null, ValkeyValue::Integer),
+                ValkeyValue::Integer(i64::from(rule.has_samples)),
+                current,
+            ])
+        })
+        .collect();
+    ValkeyValue::Array(entries)
+}
 
 /// `Chunks` for TS.INFO DEBUG: one map per chunk, its fields in a fixed order.
 fn reply_with_chunks_info(reply: &ReplyContext, ts: &TimeSeries) {
@@ -212,6 +241,7 @@ fn get_ts_info(ctx: &Context, ts: &TimeSeries, debug: bool, key: &ValkeyString) 
 
     if debug {
         map.insert("keySelfName".into(), ValkeyValue::from(key));
+        map.insert("rulesState".into(), get_rules_state(ts));
         // yes, I know its title case, but that's what redis does. Written by
         // `reply_with_chunks_info`; only the key is needed here, for its place in the reply.
         map.insert("Chunks".into(), ValkeyValue::Null);

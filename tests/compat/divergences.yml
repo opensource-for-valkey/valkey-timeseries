@@ -1269,3 +1269,17 @@
   rationale: see DIV-0057 (registry matching is per-command, so the entry is duplicated
     rather than shared; delete both together if the decision is ever reversed)
   since: 0.1.0
+
+# DIV-0059 is the DEBUG-only sibling of DIV-0001: `TS.INFO key DEBUG` also reports `rulesState`,
+# which the replication tests read to compare a primary's and a replica's open-bucket state.
+- id: DIV-0059
+  command: TS.INFO
+  kind: reply-superset
+  description: >
+    TS.INFO key DEBUG returns an additional rulesState field, one
+    [destKey, bucketStart, hasSamples, current] entry per compaction rule, beyond the
+    RedisTimeSeries 8.10 DEBUG field set.
+  rationale: debug-only extension metadata; additive and invisible to map-parsing clients,
+    and absent from the reply unless the caller asks for DEBUG
+  since: 0.1.0
+  details_regex: '^\$\.rulesState\b'

@@ -49,6 +49,29 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         """Helper to add a sample to a series"""
         self.client.execute_command("TS.ADD", key, timestamp, value)
 
+    @staticmethod
+    def info_debug(client, key):
+        """`TS.INFO key DEBUG` as a dict (the RESP2 flat list, pairwise)."""
+        flat = client.execute_command("TS.INFO", key, "DEBUG")
+        return {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+
+    def test_info_debug_reports_rule_state(self):
+        """The open-bucket state a rule carries is otherwise invisible: a wrong accumulator only
+        shows downstream, one bucket later. DEBUG exposes it so tests can compare nodes."""
+        src, dst = "state:src", "state:dst"
+        self.create_source_and_dest_series(src, dst)
+        self.add_compaction_rule(src, dst, "sum", 1000)
+
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), None, 0, None]]
+        assert self.info_debug(self.client, dst)[b"rulesState"] == []
+
+        self.add_sample(src, 100, 1.5)
+        self.add_sample(src, 200, 2.0)
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 0, 1, b"3.5"]]
+
+        self.add_sample(src, 1000, 7.0)  # closes bucket 0
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 1000, 1, b"7"]]
+
     def get_samples(
         self, key: str, start_ts: int = 0, end_ts: int = None
     ) -> List[Tuple[int, float]]:
