@@ -79,17 +79,42 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         "sum<100", "count<100", "all<100", "any<100", "none<100", "share<100",
     ]
 
+    # Per aggregator: (samples fed before DEBUG RELOAD, the one in-bucket sample fed after it).
+    # The sequence must leave state that shows in the bucket's published value, and state that
+    # only a later update of the reloaded rule can expose:
+    #   - Unconditional aggregators: a NaN (countnan counts it, the rest skip it), and a counter
+    #     that never decreases (a reset leaves irate with dt = 0, so no value). The post-reload
+    #     sample reads last_value (increase, rate) and last_sample (irate).
+    #   - Conditional aggregators: no NaN, since all/any/none count it as a non-match and one in
+    #     the prefix would pin `all` at false. The post-reload sample is above the comparand, so
+    #     a lost or reset filter (the default one matches everything) changes the outcome:
+    #     sum/count/share/all start with matching values (`all` is still true, to be flipped),
+    #     any/none with non-matching ones (`any` is still false, `none` still true).
+    UNCONDITIONAL_SAMPLES = (((0, 1), (300, 50), (450, "nan"), (700, 60)), (900, 150))
+    MATCHING_FIRST_SAMPLES = (((0, 1), (300, 50), (700, 60)), (900, 150))
+    NON_MATCHING_FIRST_SAMPLES = (((0, 200), (300, 150), (700, 120)), (900, 150))
+    RULE_SAMPLES = {
+        "sum<100": MATCHING_FIRST_SAMPLES,
+        "count<100": MATCHING_FIRST_SAMPLES,
+        "share<100": MATCHING_FIRST_SAMPLES,
+        "all<100": MATCHING_FIRST_SAMPLES,
+        "any<100": NON_MATCHING_FIRST_SAMPLES,
+        "none<100": NON_MATCHING_FIRST_SAMPLES,
+    }
+
     @pytest.mark.parametrize("agg", RULE_AGGREGATORS)
     def test_rule_state_survives_reload(self, agg):
         """Mid-bucket rule state round-trips through RDB for every aggregator: the observable
-        state is unchanged by DEBUG RELOAD, and closing the bucket afterwards publishes the same
-        value as a twin rule created *after* the reload and fed the whole sequence."""
+        state is unchanged by DEBUG RELOAD, and after one more sample lands in the reloaded rule's
+        open bucket, closing it publishes the same value as a twin rule created *after* the
+        reload and fed the whole sequence."""
         c = self.client
-        samples = ((0, 1), (300, 150), (450, 7), (700, 2))
+        pre_samples, post_sample = self.RULE_SAMPLES.get(agg, self.UNCONDITIONAL_SAMPLES)
+        closing_sample = (1000, 5)
         c.execute_command("TS.CREATE", "rl:src")
         c.execute_command("TS.CREATE", "rl:dst")
         c.execute_command("TS.CREATERULE", "rl:src", "rl:dst", "AGGREGATION", agg, 1000)
-        for ts, value in samples:
+        for ts, value in pre_samples:
             c.execute_command("TS.ADD", "rl:src", ts, value)
         before = self.info_debug(c, "rl:src")[b"rulesState"]
 
@@ -99,11 +124,15 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         c.execute_command("TS.CREATE", "rl:twin:src")
         c.execute_command("TS.CREATE", "rl:twin:dst")
         c.execute_command("TS.CREATERULE", "rl:twin:src", "rl:twin:dst", "AGGREGATION", agg, 1000)
-        for ts, value in samples + ((1000, 5),):
+        for ts, value in pre_samples + (post_sample, closing_sample):
             c.execute_command("TS.ADD", "rl:twin:src", ts, value)
-        c.execute_command("TS.ADD", "rl:src", 1000, 5)   # closes bucket 0 on the reloaded rule
-        assert c.execute_command("TS.RANGE", "rl:dst", "-", "+") == \
-            c.execute_command("TS.RANGE", "rl:twin:dst", "-", "+"), agg
+        # The reloaded rule keeps aggregating its open bucket (state that only later updates
+        # read: a filter's operator and comparand, a counter's last value), then closes it.
+        c.execute_command("TS.ADD", "rl:src", *post_sample)
+        c.execute_command("TS.ADD", "rl:src", *closing_sample)
+        twin_range = c.execute_command("TS.RANGE", "rl:twin:dst", "-", "+")
+        assert twin_range, f"{agg}: the twin published nothing, so the comparison would be vacuous"
+        assert c.execute_command("TS.RANGE", "rl:dst", "-", "+") == twin_range, agg
 
     def get_samples(
         self, key: str, start_ts: int = 0, end_ts: int = None
