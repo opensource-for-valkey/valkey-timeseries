@@ -1,6 +1,11 @@
 use get_size2::GetSize;
 use std::fmt::Display;
 
+/// The `DECIMAL_DIGITS` operand that means "no rounding", overriding any configured
+/// `ts-decimal-digits`/`ts-significant-digits` default. (`DECIMAL_DIGITS 0` is whole-number
+/// rounding, not this.) It is also how a replicated `TS.CREATE` spells a series without rounding.
+pub const NO_ROUNDING_KEYWORD: &str = "none";
+
 /// Largest accepted `SIGNIFICANT_DIGITS` value.
 ///
 /// Note this is a cap, not the largest *effective* value: [`round_to_sig_figs`] leaves values

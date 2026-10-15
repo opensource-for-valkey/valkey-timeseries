@@ -1,6 +1,6 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::{create_key_string, get_current_db, notify_keyspace_event};
-use crate::common::rounding::RoundingStrategy;
+use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label, MetricName};
 use crate::parser::metric_name::parse_metric_name;
@@ -170,7 +170,6 @@ pub fn create_and_store_internal(
     ctx: &Context,
     key: &ValkeyString,
     options: TimeSeriesOptions,
-    replicate: bool,
     notify: bool,
 ) -> ValkeyResult<()> {
     let _key = ValkeyKeyWritable::open(ctx.ctx, key);
@@ -182,9 +181,6 @@ pub fn create_and_store_internal(
     let ts = create_series(key, options, ctx)?;
     _key.set_value(&VK_TIME_SERIES_TYPE, ts)?;
 
-    if replicate {
-        ctx.replicate_verbatim();
-    }
     // Only an explicit TS.CREATE emits `ts.create`; auto-creating write
     // commands (TS.ADD/TS.MADD/TS.INCRBY/...) emit just their own write
     // event, matching RedisTimeSeries (compat plan §7.3).
@@ -199,11 +195,15 @@ pub fn create_and_store_internal(
 /// `explicit_create` distinguishes a client-issued `TS.CREATE` from the
 /// auto-create performed by write commands (TS.ADD/TS.INCRBY/TS.ADDBULK):
 ///
-/// - explicit: this call replicates verbatim and emits `ts.create`.
-/// - auto-create: no `ts.create` event; the series itself is replicated as a resolved
-///   `TS.CREATE` (see the body), and the calling command replicates its own write. (The old
-///   corner case — a command erroring after the auto-create left the primary with an empty
-///   series the replica never saw — is gone: the `TS.CREATE` is already queued.)
+/// - explicit: emits `ts.create`.
+/// - auto-create: no `ts.create` event; the calling command replicates its own write.
+///
+/// Either way the series itself is replicated as a resolved `TS.CREATE` (see the body), never
+/// the client's own argv: a bare `TS.CREATE` takes retention, encoding and chunk size from the
+/// node it runs on, so replaying it verbatim on a replica with a different configuration builds
+/// a different series. (The old corner case — a command erroring after an auto-create left the
+/// primary with an empty series the replica never saw — is gone: the `TS.CREATE` is already
+/// queued.)
 pub fn create_and_store_series<'a>(
     ctx: &'a Context,
     key: &ValkeyString,
@@ -214,22 +214,20 @@ pub fn create_and_store_series<'a>(
     // Check before anything is stored, replicated or notified: a denial after
     // the create would leave the key behind.
     check_key_permissions(ctx, key, &AclPermissions::INSERT)?;
-    create_and_store_internal(ctx, key, options, explicit_create, explicit_create)?;
+    create_and_store_internal(ctx, key, options, explicit_create)?;
 
     let mut series = get_timeseries_mut(ctx, key, None)?;
 
-    if !explicit_create {
-        // Auto-create: replicate the series as the primary built it, defaults materialized, ahead
-        // of the write command's own propagation (`alsoPropagate` keeps call order). The replica's
-        // replayed write then finds the series and its inline creation options are inert, exactly
-        // as on the primary when the series already exists. `TS.CREATE` here, not
-        // `replicate_verbatim`: that would copy the *write's* argv and apply it twice.
-        let create_args = resolved_create_args(ctx, &series);
-        let mut replication_args: Vec<&ValkeyString> = Vec::with_capacity(create_args.len() + 1);
-        replication_args.push(key);
-        replication_args.extend(create_args.iter());
-        ctx.replicate("TS.CREATE", replication_args.as_slice());
-    }
+    // Replicate the series as the primary built it, defaults materialized. For an auto-create
+    // this goes ahead of the write command's own propagation (`alsoPropagate` keeps call order),
+    // and the replica's replayed write then finds the series, its inline creation options inert,
+    // exactly as on the primary when the series already exists. `TS.CREATE` here, not
+    // `replicate_verbatim`: that would copy the *write's* argv and apply it twice.
+    let create_args = resolved_create_args(ctx, &series);
+    let mut replication_args: Vec<&ValkeyString> = Vec::with_capacity(create_args.len() + 1);
+    replication_args.push(key);
+    replication_args.extend(create_args.iter());
+    ctx.replicate("TS.CREATE", replication_args.as_slice());
 
     if add_compactions {
         // If compactions are enabled, add the default compaction rules
@@ -239,19 +237,16 @@ pub fn create_and_store_series<'a>(
 }
 
 /// `TS.CREATE` options that recreate `series` exactly, every configuration-derived default
-/// materialized. An auto-creating write replicates this ahead of itself so a replica (or an AOF
-/// replay) builds the series from the primary's configuration, not its own: `ts-retention-policy`,
-/// `ts-encoding` and the chunk size are per node, and a retention mismatch changes recalculation
-/// floors and therefore compaction output.
+/// materialized. Creating a series replicates this (an auto-creating write ahead of itself) so a
+/// replica or an AOF replay builds the series from the primary's configuration, not its own:
+/// `ts-retention-policy`, `ts-encoding` and the chunk size are per node, and a retention mismatch
+/// changes recalculation floors and therefore compaction output.
 ///
-/// `DUPLICATE_POLICY` is only emitted when the series pins one: an unset policy follows the
-/// node's `ts-duplicate-policy` at write time, and pinning it here would change that.
-///
-/// `TS.CREATE` starts from the receiving node's configured defaults, so an option that is *absent*
-/// here falls back to the replica's own value. That is harmless for the ones omitted above, and
-/// `IGNORE` is therefore always written. Rounding is the one exception: there is no `TS.CREATE`
-/// spelling for "no rounding", so a series without it is created with whatever the replica's
-/// `ts-decimal-digits`/`ts-significant-digits` say.
+/// `TS.CREATE` starts from the receiving node's configured defaults, so an option that is
+/// *absent* falls back to the replica's own value. Everything is therefore written out: `IGNORE`
+/// with its zeros, and "no rounding" as `DECIMAL_DIGITS none`. The one omission is
+/// `DUPLICATE_POLICY` for a series that pins none, which a created series always does (creation
+/// starts from the configured policy).
 ///
 /// A series with a `__name__` label is re-created through `METRIC` when that text parses back to
 /// exactly the same label set, and through `LABELS` otherwise. `LABELS __name__ …` is accepted
@@ -294,7 +289,11 @@ fn create_option_strings(series: &TimeSeries) -> Vec<String> {
             args.push("DECIMAL_DIGITS".into());
             args.push(digits.to_string());
         }
-        None => {}
+        // Spelled out like the rest: absent, the receiving node's configured default would apply.
+        None => {
+            args.push("DECIMAL_DIGITS".into());
+            args.push(NO_ROUNDING_KEYWORD.into());
+        }
     }
     if series.labels.get_value(METRIC_NAME_LABEL).is_some()
         && let Some(metric) = metric_text(series)
@@ -473,15 +472,23 @@ mod tests {
         for keyword in ["DUPLICATE_POLICY", "LABELS", "METRIC"] {
             assert!(!args.iter().any(|a| a == keyword), "{keyword} in {args:?}");
         }
-        assert!(
-            !args
-                .iter()
-                .any(|a| a == "SIGNIFICANT_DIGITS" || a == "DECIMAL_DIGITS"),
-            "{args:?}"
-        );
+        assert!(!args.iter().any(|a| a == "SIGNIFICANT_DIGITS"), "{args:?}");
         // A zero retention is pinned too: omitting it would let the replica apply its own.
         assert_eq!(operands(&args, "RETENTION", 1), ["0"]);
         assert_eq!(operands(&args, "CHUNK_SIZE", 1), ["128"]);
+    }
+
+    /// There is no way to say "no rounding" by leaving the option out: the receiving node would
+    /// apply its configured `ts-decimal-digits`/`ts-significant-digits`. So it is spelled out.
+    #[test]
+    fn test_no_rounding_is_spelled_out() {
+        let series = series_with(TimeSeriesOptions {
+            rounding: None,
+            ..Default::default()
+        });
+        let args = create_option_strings(&series);
+        assert_eq!(operands(&args, "DECIMAL_DIGITS", 1), [NO_ROUNDING_KEYWORD]);
+        assert!(!args.iter().any(|a| a == "SIGNIFICANT_DIGITS"), "{args:?}");
     }
 
     #[test]

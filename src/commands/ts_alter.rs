@@ -112,11 +112,15 @@ fn update_series(
     }
 
     // SIGNIFICANT_DIGITS / DECIMAL_DIGITS only affect values written after the
-    // change; samples already stored are left as they are.
+    // change; samples already stored are left as they are. `DECIMAL_DIGITS none` switches
+    // rounding off.
     if let Some(rounding) = options.rounding
         && Some(rounding) != series.rounding
     {
         series.rounding = Some(rounding);
+        has_changed = true;
+    } else if options.no_rounding && series.rounding.is_some() {
+        series.rounding = None;
         has_changed = true;
     }
 

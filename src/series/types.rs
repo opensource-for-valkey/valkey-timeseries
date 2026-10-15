@@ -363,6 +363,10 @@ pub struct TimeSeriesOptions {
     pub ignore: Option<(u64, f64)>,
     pub labels: Option<Vec<Label>>,
     pub rounding: Option<RoundingStrategy>,
+    /// `DECIMAL_DIGITS none`: the command asked for no rounding. `rounding` is `None` then, which
+    /// `TS.ALTER` (parsing onto [`TimeSeriesOptions::empty`]) would read as "not named"; this is
+    /// what tells the two apart. On create it overrides a configured rounding default.
+    pub no_rounding: bool,
     pub on_duplicate: Option<DuplicatePolicy>,
 }
 
@@ -414,6 +418,7 @@ impl Default for TimeSeriesOptions {
             ignore: None,
             labels: None,
             rounding: None,
+            no_rounding: false,
             on_duplicate: None,
         }
     }

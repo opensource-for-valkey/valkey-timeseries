@@ -9,6 +9,7 @@ TS.CREATE key
   [CHUNK_SIZE chunkSize]
   [DUPLICATE_POLICY policy]
   [DEDUPE_INTERVAL duplicateTimediff]
+  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS <decimalDigits|none>]
   [[LABELS [label value ...] | METRIC metricName]
 ```
 #### Options
@@ -16,6 +17,10 @@ TS.CREATE key
   `COMPRESSED` (an alias for the configured default compressed encoding). Default is `COMPRESSED`,
   which resolves to `CHIMP` unless `ts-encoding` says otherwise.
 - **DUPLICATE_POLICY**: The policy to use for duplicate samples. Default is `BLOCK`.
+- **SIGNIFICANT_DIGITS** / **DECIMAL_DIGITS**: Round sample values to 1-16 significant digits, or to 0-16
+  decimal places (`0` rounds to whole numbers). The two are mutually exclusive. `DECIMAL_DIGITS none` means
+  *no rounding*, and takes precedence over a configured `ts-decimal-digits` / `ts-significant-digits` default:
+  a series created without either option takes the configured default, which is rounding off unless configured.
 
 ### Required arguments
 

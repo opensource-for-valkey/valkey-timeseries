@@ -14,7 +14,7 @@ TS.DECRBY key value
   [CHUNK_SIZE chunkSize]
   [METRIC metric | LABELS labelName labelValue ...]
   [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
-  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS <decimalDigits|none>]
 ```
 
 ## Required arguments
@@ -37,7 +37,7 @@ TS.DECRBY key value
 | `LABELS labelName labelValue ...` | Label name-value pairs for a newly created series. |—|
 | `IGNORE ignoreMaxTimediff ignoreMaxValDiff` | Ignore the update when it is within both the time and value thresholds. | No filtering |
 | `SIGNIFICANT_DIGITS significantDigits` | Round values to 1–16 significant digits. | No rounding |
-| `DECIMAL_DIGITS decimalDigits` | Round values to 0–16 decimal places. `0` rounds to whole numbers. | No rounding |
+| `DECIMAL_DIGITS decimalDigits` | Round values to 0–16 decimal places. `0` rounds to whole numbers; `none` turns rounding off. | No rounding |
 
 `SIGNIFICANT_DIGITS` and `DECIMAL_DIGITS` are mutually exclusive. Creation
 options are used only when `TS.DECRBY` auto-creates the series; they do not

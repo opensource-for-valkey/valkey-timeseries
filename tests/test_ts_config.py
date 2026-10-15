@@ -515,6 +515,63 @@ class TestTimeseriesRoundingConfig(ValkeyTimeSeriesTestCaseBase):
         finally:
             self.set_config("ts-decimal-digits", "none")
 
+    def test_decimal_digits_none_means_no_rounding_over_a_configured_default(self):
+        """`DECIMAL_DIGITS none` switches rounding off for the series, whatever the node's
+        configured default is, and is a rounding choice like the other two."""
+        for config, value in (("ts-decimal-digits", "2"), ("ts-significant-digits", "3")):
+            self.set_config(config, value)
+            try:
+                self.client.execute_command("TS.CREATE", f"none_create:{config}", "DECIMAL_DIGITS", "none")
+                self.client.execute_command("TS.ADD", f"none_create:{config}", 1000, 3.7654321)
+                assert self.sample_value(f"none_create:{config}") == 3.7654321
+
+                self.client.execute_command("TS.ADD", f"none_add:{config}", 1000, 3.7654321, "DECIMAL_DIGITS", "NONE")
+                assert self.sample_value(f"none_add:{config}") == 3.7654321
+
+                # A series created without it still takes the configured default.
+                self.client.execute_command("TS.CREATE", f"none_absent:{config}")
+                self.client.execute_command("TS.ADD", f"none_absent:{config}", 1000, 3.7654321)
+                assert self.sample_value(f"none_absent:{config}") != 3.7654321
+
+                for args in (
+                    ("DECIMAL_DIGITS", "none", "SIGNIFICANT_DIGITS", 3),
+                    ("SIGNIFICANT_DIGITS", 3, "DECIMAL_DIGITS", "none"),
+                    ("DECIMAL_DIGITS", "none", "DECIMAL_DIGITS", 2),
+                    ("DECIMAL_DIGITS", 2, "DECIMAL_DIGITS", "none"),
+                ):
+                    with pytest.raises(ResponseError, match="rounding already set"):
+                        self.client.execute_command("TS.CREATE", "none_both", *args)
+                assert self.client.execute_command("EXISTS", "none_both") == 0
+
+                # Only the keyword is special: anything else must still be a digit count.
+                for bad in ("nonee", "no", "-1", "17"):
+                    with pytest.raises(ResponseError):
+                        self.client.execute_command("TS.CREATE", "none_bad", "DECIMAL_DIGITS", bad)
+            finally:
+                self.set_config(config, "none")
+
+    def test_alter_decimal_digits_none_clears_rounding(self):
+        self.client.execute_command("TS.CREATE", "alter_none", "DECIMAL_DIGITS", 1)
+        self.client.execute_command("TS.ADD", "alter_none", 1000, 3.76)
+        assert self.sample_value("alter_none") == 3.8
+
+        assert self.client.execute_command("TS.ALTER", "alter_none", "DECIMAL_DIGITS", "none") == b"OK"
+        self.client.execute_command("TS.ADD", "alter_none", 2000, 3.76)
+        assert self.sample_value("alter_none") == 3.76
+        # The sample stored before the change keeps what it was stored as.
+        assert self.client.execute_command("TS.RANGE", "alter_none", 1000, 1000) == [[1000, b"3.8"]]
+
+        # Idempotent, and naming it on a series without rounding is not an error.
+        assert self.client.execute_command("TS.ALTER", "alter_none", "DECIMAL_DIGITS", "none") == b"OK"
+        # An ALTER that does not name rounding leaves it alone.
+        self.client.execute_command("TS.ALTER", "alter_none", "DECIMAL_DIGITS", 1)
+        self.client.execute_command("TS.ALTER", "alter_none", "RETENTION", 0)
+        self.client.execute_command("TS.ADD", "alter_none", 3000, 3.76)
+        assert self.sample_value("alter_none") == 3.8
+
+        with pytest.raises(ResponseError, match="rounding already set"):
+            self.client.execute_command("TS.ALTER", "alter_none", "DECIMAL_DIGITS", "none", "SIGNIFICANT_DIGITS", 3)
+
     def test_zero_significant_digits_rejected_on_both_paths(self):
         """Zero significant digits is not a quantity, so neither path accepts it."""
         with pytest.raises(ResponseError):

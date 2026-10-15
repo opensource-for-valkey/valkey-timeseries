@@ -831,12 +831,17 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             "LABELS", "a", "b",
         )
         self.client.execute_command("TS.ADD", "ts:opt:metric", 1000, 1.234, "METRIC", 'cpu{host="a"}')
+        # No rounding over the primary's configured default; the replica has a different default.
+        self.client.execute_command("TS.ADD", "ts:opt:norounding", 1000, 1.23456789, "DECIMAL_DIGITS", "none")
         # `LABELS __name__ …` is accepted, and can spell what the METRIC grammar cannot.
         self.client.execute_command("TS.ADD", "ts:opt:odd", 1000, 1.234, "LABELS", "__name__", "cpu total", "1x", "a")
         self.client.execute_command("TS.INCRBY", "ts:opt:incr", 1.234, "TIMESTAMP", 1000, "LABELS", "k", "v")
         self.client.execute_command("TS.DECRBY", "ts:opt:decr", 1.234, "TIMESTAMP", 1000)
         self.client.execute_command("TS.ADDBULK", "ts:opt:bulk", payload, "LABELS", "k", "v")
-        keys = ["ts:opt:add", "ts:opt:inline", "ts:opt:metric", "ts:opt:odd", "ts:opt:incr", "ts:opt:decr", "ts:opt:bulk"]
+        keys = [
+            "ts:opt:add", "ts:opt:inline", "ts:opt:metric", "ts:opt:norounding", "ts:opt:odd", "ts:opt:incr",
+            "ts:opt:decr", "ts:opt:bulk",
+        ]
 
         self.assert_compaction_equivalent(*keys)
         for key in keys:
@@ -844,21 +849,21 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         # The primary's retention, not the replica's 100, and its rounding, not the replica's.
         assert parse_info_response(replica.execute_command("TS.INFO", "ts:opt:add"))["retentionTime"] == 7000
         assert replica.execute_command("TS.GET", "ts:opt:add") == [1000, b"1.23"]
+        assert replica.execute_command("TS.GET", "ts:opt:norounding") == [1000, b"1.23456789"]
         assert parse_info_response(replica.execute_command("TS.INFO", "ts:opt:inline"))["retentionTime"] == 9000
 
-        # The other direction: the primary is back on its defaults (no retention, no ignore, ...), so
-        # nothing in the replicated create may be left for the replica's non-default config to fill in.
+        # The other direction: the primary is back on its defaults (no retention, no ignore, no
+        # rounding, ...) while the replica keeps its non-default ones, including a rounding default.
+        # Nothing in the replicated create may be left for the replica's configuration to fill in.
         for name, default in (
             ("ts-encoding", "compressed"), ("ts-chunk-size-bytes", 4096), ("ts-duplicate-policy", "block"),
             ("ts-retention-policy", 0), ("ts-ignore-max-time-diff", 0), ("ts-ignore-max-val-diff", 0),
             ("ts-decimal-digits", "none"),
         ):
             self.client.execute_command("CONFIG", "SET", f"ts.{name}", default)
-        # TS.CREATE has no spelling for "no rounding", so the replica's own would apply.
-        replica.execute_command("CONFIG", "SET", "ts.ts-significant-digits", "none")
 
-        self.client.execute_command("TS.ADD", "ts:opt:defaults", 1000, 1.234)
-        self.client.execute_command("TS.INCRBY", "ts:opt:defaults:incr", 1.234, "TIMESTAMP", 1000)
+        self.client.execute_command("TS.ADD", "ts:opt:defaults", 1000, 1.23456789)
+        self.client.execute_command("TS.INCRBY", "ts:opt:defaults:incr", 1.23456789, "TIMESTAMP", 1000)
         self.assert_compaction_equivalent("ts:opt:defaults", "ts:opt:defaults:incr")
         for key in ("ts:opt:defaults", "ts:opt:defaults:incr"):
             assert self.info_without_memory(replica, key) == self.info_without_memory(self.client, key), key
@@ -866,7 +871,54 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert defaults["retentionTime"] == 0
         assert defaults["chunkSize"] == 4096
         assert defaults["duplicatePolicy"] == "block"
-        assert replica.execute_command("TS.GET", "ts:opt:defaults") == [1000, b"1.234"]
+        # Unrounded on the primary, so unrounded on the replica, whose ts-significant-digits is 4.
+        assert replica.execute_command("TS.GET", "ts:opt:defaults") == [1000, b"1.23456789"]
+
+    def test_replication_explicit_create_pins_primary_defaults(self):
+        """An explicit TS.CREATE is replicated resolved too: a bare one takes retention, encoding,
+        chunk size and rounding from the primary's configuration, not the replica's."""
+        replica = self.replicas[0].client
+        keys = []
+
+        def create_and_fill(prefix):
+            for suffix, options in (
+                ("bare", ()),
+                ("labels", ("LABELS", "a", "b")),
+                ("metric", ("METRIC", 'cpu{host="' + prefix + '"}')),
+                ("override", ("RETENTION", 9000, "DUPLICATE_POLICY", "sum")),
+            ):
+                key = f"ts:explicit:{prefix}:{suffix}"
+                self.client.execute_command("TS.CREATE", key, *options)
+                # The series exists, so these are plain writes: nothing here creates anything.
+                self.client.execute_command("TS.ADD", key, 1000, 1.23456789)
+                self.client.execute_command("TS.ADD", key, 3500, 2.3456789)
+                keys.append(key)
+
+        # The primary has a retention and a rounding default; the replica a different retention
+        # and none.
+        self.client.execute_command("CONFIG", "SET", "ts.ts-retention-policy", 3000)
+        self.client.execute_command("CONFIG", "SET", "ts.ts-decimal-digits", 2)
+        replica.execute_command("CONFIG", "SET", "ts.ts-retention-policy", 500)
+        create_and_fill("rounded")
+
+        # And the other way round: the replica has a rounding default, the primary none.
+        self.client.execute_command("CONFIG", "SET", "ts.ts-decimal-digits", "none")
+        replica.execute_command("CONFIG", "SET", "ts.ts-significant-digits", 4)
+        create_and_fill("plain")
+
+        self.assert_compaction_equivalent(*keys)
+        for key in keys:
+            assert self.info_without_memory(replica, key) == self.info_without_memory(self.client, key), key
+        bare = parse_info_response(replica.execute_command("TS.INFO", "ts:explicit:rounded:bare"))
+        assert bare["retentionTime"] == 3000
+        # Under the primary's 3000 ms window the first sample is still in range; under the
+        # replica's own 500 ms it would be gone.
+        assert len(replica.execute_command("TS.RANGE", "ts:explicit:rounded:bare", "-", "+")) == 2
+        assert replica.execute_command("TS.GET", "ts:explicit:rounded:bare") == [3500, b"2.35"]
+        assert parse_info_response(
+            replica.execute_command("TS.INFO", "ts:explicit:rounded:override")
+        )["retentionTime"] == 9000
+        assert replica.execute_command("TS.GET", "ts:explicit:plain:bare") == [3500, b"2.3456789"]
 
     @staticmethod
     def stored_chunks(client, key):

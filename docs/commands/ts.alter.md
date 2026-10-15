@@ -12,7 +12,7 @@ TS.ALTER key
   [DUPLICATE_POLICY policy]
   [METRIC metric | LABELS labelName labelValue ...]
   [IGNORE ignoreMaxTimediff ignoreMaxValDiff]
-  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS <decimalDigits|none>]
 ```
 
 ## Arguments
@@ -26,6 +26,7 @@ TS.ALTER key
 - `IGNORE ignoreMaxTimediff ignoreMaxValDiff` — Ignore incoming samples within both the time and value thresholds.
 - `SIGNIFICANT_DIGITS significantDigits` — Round values to 1–16 significant digits.
 - `DECIMAL_DIGITS decimalDigits` — Round values to 0–16 decimal places. `0` rounds to whole numbers.
+  `DECIMAL_DIGITS none` switches rounding off (and is a no-op on a series without rounding).
 
 `SIGNIFICANT_DIGITS` and `DECIMAL_DIGITS` are mutually exclusive. Options
 not included in the command remain unchanged. `ENCODING`, `ON_DUPLICATE`, and

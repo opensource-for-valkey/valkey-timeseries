@@ -3,6 +3,7 @@ use crate::commands::command_parser::{
     parse_decimal_digit_rounding, parse_duplicate_policy, parse_ignore_options, parse_metric_name,
     parse_retention, parse_significant_digit_rounding,
 };
+use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
 use crate::labels::Label;
 use crate::series::chunks::ChunkEncoding;
@@ -126,12 +127,9 @@ pub fn parse_series_options_onto(
     // included, unvalidated) and discarded rather than overwriting the value.
     let mut seen: Vec<CommandArgToken> = Vec::new();
 
-    // DECIMAL_DIGITS and SIGNIFICANT_DIGITS exclude each other *within the command*. Rounding
-    // already on `base` (the configured `ts-decimal-digits`/`ts-significant-digits` default) is
-    // not "set": naming one here overrides it. Otherwise a node with a configured default could
-    // not create a series with any other rounding — including a replica applying the
-    // `TS.CREATE` an auto-creating primary replicates, which spells the rounding out.
-    let mut rounding_set = false;
+    // Rounding already on `base` (the configured `ts-decimal-digits`/`ts-significant-digits`
+    // default) is not "named": a rounding option here overrides it. See `RoundingChoice`.
+    let mut rounding = RoundingChoice::default();
 
     while let Some(arg) = args_iter.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
@@ -187,12 +185,17 @@ pub fn parse_series_options_onto(
                 options.chunk_encoding = ChunkEncoding::Uncompressed;
             }
             CommandArgToken::DecimalDigits => {
-                if rounding_set {
-                    return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
-                }
-                rounding_set = true;
-                let rounding = parse_decimal_digit_rounding(&mut args_iter)?;
-                options.rounding = Some(rounding);
+                rounding.claim()?;
+                // `none` is the operand that means "no rounding", as opposed to `0` digits.
+                let strategy = if args_iter
+                    .next_if(|arg| is_no_rounding_keyword(arg.as_slice()))
+                    .is_some()
+                {
+                    None
+                } else {
+                    Some(parse_decimal_digit_rounding(&mut args_iter)?)
+                };
+                rounding.apply(&mut options, strategy);
             }
             CommandArgToken::DuplicatePolicy => {
                 let Some(arg) = args_iter.next() else {
@@ -220,11 +223,9 @@ pub fn parse_series_options_onto(
             }
             CommandArgToken::Retention => options.retention(parse_retention(&mut args_iter)?),
             CommandArgToken::SignificantDigits => {
-                if rounding_set {
-                    return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
-                }
-                rounding_set = true;
-                options.rounding = Some(parse_significant_digit_rounding(&mut args_iter)?);
+                rounding.claim()?;
+                let strategy = parse_significant_digit_rounding(&mut args_iter)?;
+                rounding.apply(&mut options, Some(strategy));
             }
             _ => {
                 return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
@@ -233,6 +234,43 @@ pub fn parse_series_options_onto(
     }
 
     Ok(options)
+}
+
+/// The rounding options of one command: `DECIMAL_DIGITS` and `SIGNIFICANT_DIGITS` exclude each
+/// other, and `DECIMAL_DIGITS none` is a choice too (no rounding).
+///
+/// Exclusion is *within the command*. Rounding already on the baseline — the configured
+/// `ts-decimal-digits`/`ts-significant-digits` default — does not count as named, so naming one
+/// here overrides it. Otherwise a node with a configured default could not create a series with
+/// any other rounding, nor without any, which is exactly what a replica applying the `TS.CREATE`
+/// an auto-creating primary replicates has to do.
+#[derive(Debug, Default)]
+struct RoundingChoice {
+    named: bool,
+}
+
+impl RoundingChoice {
+    /// Records that a rounding option was named, or errors if one already was. Called before the
+    /// option's operand is read, so a second rounding option is reported as such even when its
+    /// operand is malformed.
+    fn claim(&mut self) -> ValkeyResult<()> {
+        if self.named {
+            return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
+        }
+        self.named = true;
+        Ok(())
+    }
+
+    /// Sets the chosen rounding (`None`: no rounding at all) on `options`.
+    fn apply(&self, options: &mut TimeSeriesOptions, strategy: Option<RoundingStrategy>) {
+        options.rounding = strategy;
+        options.no_rounding = strategy.is_none();
+    }
+}
+
+/// Whether a `DECIMAL_DIGITS` operand is the `none` keyword (any case).
+fn is_no_rounding_keyword(arg: &[u8]) -> bool {
+    arg.eq_ignore_ascii_case(NO_ROUNDING_KEYWORD.as_bytes())
 }
 
 /// Operand count for the options RedisTimeSeries resolves first-occurrence-wins,
@@ -321,4 +359,97 @@ fn parse_labels(args: &[ValkeyString]) -> ValkeyResult<Vec<Label>> {
     }
 
     Ok(labels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rounding_already_set(result: ValkeyResult<()>) -> bool {
+        matches!(
+            result,
+            Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET))
+        )
+    }
+
+    /// Options as `TS.CREATE` starts them: the configured rounding default already in place.
+    fn configured(rounding: Option<RoundingStrategy>) -> TimeSeriesOptions {
+        TimeSeriesOptions {
+            rounding,
+            ..TimeSeriesOptions::empty()
+        }
+    }
+
+    #[test]
+    fn test_none_is_a_keyword_in_any_case_and_nothing_else() {
+        for arg in ["none", "NONE", "None", "nOnE"] {
+            assert!(is_no_rounding_keyword(arg.as_bytes()), "{arg}");
+        }
+        for arg in ["", "0", "1", "nonee", "no", "nul", "-1", " none"] {
+            assert!(!is_no_rounding_keyword(arg.as_bytes()), "{arg:?}");
+        }
+    }
+
+    #[test]
+    fn test_none_alone_means_no_rounding() {
+        let mut options = TimeSeriesOptions::empty();
+        let mut choice = RoundingChoice::default();
+        choice.claim().unwrap();
+        choice.apply(&mut options, None);
+        assert_eq!(options.rounding, None);
+        assert!(options.no_rounding);
+    }
+
+    #[test]
+    fn test_none_overrides_a_configured_default() {
+        for default in [
+            RoundingStrategy::DecimalDigits(2),
+            RoundingStrategy::SignificantDigits(4),
+        ] {
+            let mut options = configured(Some(default));
+            let mut choice = RoundingChoice::default();
+            choice.claim().expect("the configured default is not named");
+            choice.apply(&mut options, None);
+            assert_eq!(options.rounding, None, "{default}");
+            assert!(options.no_rounding, "{default}");
+        }
+    }
+
+    #[test]
+    fn test_digits_override_a_configured_default() {
+        let mut options = configured(Some(RoundingStrategy::DecimalDigits(2)));
+        let mut choice = RoundingChoice::default();
+        choice.claim().unwrap();
+        choice.apply(&mut options, Some(RoundingStrategy::SignificantDigits(3)));
+        assert_eq!(
+            options.rounding,
+            Some(RoundingStrategy::SignificantDigits(3))
+        );
+        assert!(!options.no_rounding);
+    }
+
+    #[test]
+    fn test_none_conflicts_with_significant_digits_in_either_order() {
+        let mut options = TimeSeriesOptions::empty();
+
+        // DECIMAL_DIGITS none SIGNIFICANT_DIGITS 3
+        let mut choice = RoundingChoice::default();
+        choice.claim().unwrap();
+        choice.apply(&mut options, None);
+        assert!(rounding_already_set(choice.claim()));
+
+        // SIGNIFICANT_DIGITS 3 DECIMAL_DIGITS none
+        let mut choice = RoundingChoice::default();
+        choice.claim().unwrap();
+        choice.apply(&mut options, Some(RoundingStrategy::SignificantDigits(3)));
+        assert!(rounding_already_set(choice.claim()));
+    }
+
+    #[test]
+    fn test_repeating_a_rounding_option_is_rejected() {
+        let mut choice = RoundingChoice::default();
+        choice.claim().unwrap();
+        assert!(rounding_already_set(choice.claim()));
+        assert!(rounding_already_set(choice.claim()));
+    }
 }

@@ -14,7 +14,7 @@ TS.ADDBULK key data
   [CHUNK_SIZE chunkSize] 
   [METRIC metric | LABELS labelName labelValue ...] 
   [IGNORE ignoreMaxTimediff ignoreMaxValDiff] 
-  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits]
+  [SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS <decimalDigits|none>]
 ```
 
 ### Required arguments
@@ -101,7 +101,7 @@ Samples exceeding either threshold are dropped.
 
 </summary>
 
-<summary><code>SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS decimalDigits</code>
+<summary><code>SIGNIFICANT_DIGITS significantDigits | DECIMAL_DIGITS <decimalDigits|none></code>
 
 Value precision control (mutually exclusive):
 
@@ -109,7 +109,8 @@ Value precision control (mutually exclusive):
   significant digits" is not a quantity. 16 is accepted but rounds nothing, being at the edge
   of a 64-bit float's precision; 15 is the largest effective value.
 - `DECIMAL_DIGITS` - Number of decimal places (0-16). `0` rounds to whole numbers; omit the
-  argument for no rounding.
+  argument for no rounding, or pass `none` to switch off a rounding default configured through
+  `ts-decimal-digits` / `ts-significant-digits`.
 
 </summary>
 
