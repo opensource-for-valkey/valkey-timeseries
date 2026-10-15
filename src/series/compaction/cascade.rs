@@ -59,6 +59,8 @@ struct RuleOutcome {
     /// (blocked readers are woken on `written`). A back-fill
     /// into an already-closed bucket sets `written` but not this.
     closed_bucket: bool,
+    /// The span of `dest` a `RemoveRange` rewrote — the range `dest`'s own rules resync next.
+    rewritten: Option<(Timestamp, Timestamp)>,
 }
 
 /// Sorts and deduplicates a rule's written samples for use as the next cascade level's batch.
@@ -114,10 +116,11 @@ impl Visited {
 /// cascading through chained compaction series (a destination that itself has rules).
 ///
 /// Cascading strategy differs by operation:
-/// - `RemoveRange` reapplies the *same* absolute `[start, end]` range at every level. This is
-///   correct regardless of chain depth because each level's recalculation reads directly from
-///   its own immediate parent (already updated by the level above), never from a value carried
-///   across levels.
+/// - `RemoveRange` hands each level the span of its parent that the level above rewrote, and
+///   the level recomputes its overlapping buckets from that parent as it now stands. Reapplying
+///   the original range instead misses a parent bucket that starts before it (recalculated
+///   because the removal reached into it) whenever the child's buckets do not nest in the
+///   parent's.
 /// - `Ingest` instead feeds each destination's own *written* samples — the
 ///   values actually committed to it — as an `Ingest` into that destination's rules. This
 ///   makes every rule aggregate over its declared source series, matching a rule's own
@@ -157,8 +160,9 @@ fn process_series_with_compaction(
     // the failure — still cascades into the destinations' own rules, and still notifies: those
     // destinations were written, and a rule below one that skipped its cascade would take the
     // next sample for an append on state that never saw this one, with nothing marking it
-    // `dirty`. A failed `RemoveRange` cascades its range too: each level recalculates from what
-    // its parent actually holds. The first error is returned once the pass has run to its end.
+    // `dirty`. A failed `RemoveRange` cascades its span too: a level recomputes from what its
+    // parent actually holds, so an unchanged parent leaves it unchanged. The first error is
+    // returned once the pass has run to its end.
     let AppliedRules {
         outcomes,
         error: mut first_error,
@@ -166,15 +170,13 @@ fn process_series_with_compaction(
 
     match op {
         CompactionOp::RemoveRange { .. } => {
-            let mut pending: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = outcomes
-                .iter()
-                .filter_map(|o| keys[o.rule_index].take())
-                .collect();
+            let mut pending: SmallVec<[PendingRemoval; TEMP_VEC_LEN]> = SmallVec::new();
+            queue_rewritten_outcomes(&mut keys, &outcomes, &mut pending);
             if !pending.is_empty() {
                 visited.insert(&series.key);
             }
 
-            while let Some(child_key) = pending.pop() {
+            while let Some((child_key, (start, end))) = pending.pop() {
                 if visited.contains(child_key.as_slice()) {
                     continue;
                 }
@@ -194,14 +196,11 @@ fn process_series_with_compaction(
                     keys: mut child_keys,
                     series: child_guards,
                 } = child_destinations;
+                let child_op = CompactionOp::RemoveRange { start, end };
                 let AppliedRules { outcomes, error } =
-                    apply_rules_on_destinations(&mut child, child_guards, op);
+                    apply_rules_on_destinations(&mut child, child_guards, child_op);
                 first_error = first_error.or(error);
-                pending.extend(
-                    outcomes
-                        .iter()
-                        .filter_map(|o| child_keys[o.rule_index].take()),
-                );
+                queue_rewritten_outcomes(&mut child_keys, &outcomes, &mut pending);
             }
         }
         _ => {
@@ -290,6 +289,24 @@ fn queue_written_outcomes(
     }
 }
 
+/// A cascaded removal: (destination key, the span of it the level above rewrote).
+type PendingRemoval = (ValkeyString, (Timestamp, Timestamp));
+
+/// Queues every destination that a removal rewrote for the next cascade level, with its span.
+fn queue_rewritten_outcomes(
+    keys: &mut [Option<ValkeyString>],
+    outcomes: &[RuleOutcome],
+    pending: &mut SmallVec<[PendingRemoval; TEMP_VEC_LEN]>,
+) {
+    for outcome in outcomes {
+        if let Some(span) = outcome.rewritten
+            && let Some(dest_key) = keys[outcome.rule_index].take()
+        {
+            pending.push((dest_key, span));
+        }
+    }
+}
+
 /// What one pass of a series' rules produced: the outcome of every rule that ran, and the first
 /// error among them. A failed rule's outcome is kept too, holding whatever it committed before
 /// failing — one rule failing must hide neither what the others committed nor what it did.
@@ -364,18 +381,19 @@ fn apply_rules_internal(
             // An application can fail after committing buckets to `dest` (an `Ingest` streams
             // sample by sample), so its outcome is kept either way: `dest` holds those samples,
             // and its own rules must still see them.
-            let (error, written, closed_bucket) = if take_injected_failure() {
+            let (error, written, closed_bucket, rewritten) = if take_injected_failure() {
                 (
                     Some(TsdbError::General(
                         "injected compaction failure".to_string(),
                     )),
                     Vec::new(),
                     false,
+                    None,
                 )
             } else {
                 let mut cctx = CompactionContext::new(series, dest_guard, rule);
                 let error = apply_op(&mut cctx, op).err();
-                (error, cctx.written, cctx.closed_bucket)
+                (error, cctx.written, cctx.closed_bucket, cctx.rewritten)
             };
             rule.dirty = error.is_some();
             let outcome = RuleOutcome {
@@ -383,6 +401,7 @@ fn apply_rules_internal(
                 dest_prev_last,
                 written,
                 closed_bucket,
+                rewritten,
             };
             (outcome, error)
         })

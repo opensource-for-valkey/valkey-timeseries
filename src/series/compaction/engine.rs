@@ -21,6 +21,10 @@ pub(super) struct CompactionContext<'a> {
     /// not `written`, decides the `ts.add:dest` notification: a back-fill that rewrites an
     /// already-closed bucket also lands in `written` (so it still cascades) but is silent.
     pub(super) closed_bucket: bool,
+    /// The span `[start, end]` of `dest` a [`CompactionOp::RemoveRange`] rewrote: recomputed from
+    /// the parent, or retracted as re-opened. It is the range `dest`'s own rules must resync, set
+    /// before any of it is touched so a removal that fails partway still names it.
+    pub(super) rewritten: Option<(Timestamp, Timestamp)>,
 }
 
 impl<'a> CompactionContext<'a> {
@@ -35,6 +39,7 @@ impl<'a> CompactionContext<'a> {
             rule,
             written: Vec::new(),
             closed_bucket: false,
+            rewritten: None,
         }
     }
 
@@ -72,7 +77,9 @@ pub enum CompactionOp<'a> {
         prev_last: Option<Timestamp>,
         input_order: &'a [Timestamp],
     },
-    /// Remove a range from source and reflect it into destinations (and ongoing aggregation state)
+    /// The parent changed within `[start, end]` (samples removed from the source, or a cascaded
+    /// level's destination rewritten): recompute every destination bucket overlapping it from
+    /// what the parent holds now, and the rule's open bucket.
     RemoveRange { start: Timestamp, end: Timestamp },
 }
 
@@ -422,86 +429,86 @@ where
     Ok(())
 }
 
-/// When a range of samples is removed, we need to remove samples in the corresponding
-/// rule destination series that overlap with the range.
+/// Reflect a change to the parent within `[start, end]` into the destination: every destination
+/// bucket overlapping it is recomputed from what the parent holds now, and the open bucket is
+/// re-established.
 ///
-/// We need to handle the following scenarios:
-/// - `Single Bucket Partial Removal`: When the removal range affects only part of a single aggregation bucket,
-///   it recalculates the aggregation for the remaining samples.
-/// - `Multiple Bucket Removal`: When the removal spans multiple buckets, we need to handle each bucket appropriately:
-///   completely removing middle buckets and recalculating partial buckets at the boundaries.
-/// - `Complete Bucket Removal`: When entire buckets are removed, remove the corresponding aggregated
-///   samples from the destination series.
-/// - `Current Aggregation State`: If there's an ongoing aggregation (indicated by `hi_ts`), adjust the
-///   current aggregation state to account for the removed samples.
-/// - `Error Handling`: Properly handle cases where destination series are missing or inaccessible.
-///
+/// The parent is read as it is, never on the assumption that `[start, end]` is now empty. At the
+/// source that is the same thing — the removal is committed before compaction runs — but a
+/// cascaded level is not: a parent bucket the removal only partly covered was recalculated and
+/// survives with its timestamp inside the range, and a parent whose own application failed still
+/// holds everything. Skipping the range there dropped live parent samples from the destination.
 fn handle_compaction_range_removal(
     ctx: &mut CompactionContext,
     start: Timestamp,
     end: Timestamp,
 ) -> TsdbResult<()> {
-    // Update destination series buckets that overlap with [start, end].
-    //
-    // Only the first and last bucket can be partially covered; every bucket strictly between
-    // them is fully covered by definition (the removal spans them end to end), so they are
-    // dropped from the destination with a single range removal. Walking bucket by bucket
-    // instead made the cost scale with the *number of buckets in the range* rather than with
-    // the data actually stored: `TS.DEL key 0 <huge>` on a rule with a small bucketDuration
-    // spins for billions of iterations and blocks the server (a 1e10-bucket range took ~13s
-    // against RTS's 0.02s for the same two samples).
     let first_bucket_start = ctx.rule.calc_bucket_start(start);
     let last_bucket_start = ctx.rule.calc_bucket_start(end);
+    let last_bucket_end = ctx.rule.bucket_end(last_bucket_start);
+    // `bucket_end` saturates, so the last representable bucket runs to the end of time.
+    let span_end = if last_bucket_end > last_bucket_start {
+        last_bucket_end - 1
+    } else {
+        Timestamp::MAX
+    };
+    ctx.rewritten = Some((first_bucket_start, span_end));
 
-    remove_or_recalculate_bucket(ctx, first_bucket_start, start, end)?;
-
-    if last_bucket_start != first_bucket_start {
-        let middle_start = ctx.rule.bucket_end(first_bucket_start);
-        if middle_start < last_bucket_start && !ctx.dest.is_empty() {
-            // Buckets tile the range, so the fully covered middle is exactly
-            // [middle_start, last_bucket_start).
-            ctx.dest.remove_range(middle_start, last_bucket_start - 1)?;
+    // Buckets from the one holding the parent's last sample onwards are open, not published: the
+    // resync below retracts and rebuilds them. With an empty parent it clears everything.
+    if let Some(last) = ctx.parent.last_sample {
+        let open_start = ctx.rule.calc_bucket_start(last.timestamp);
+        if first_bucket_start < open_start {
+            recompute_closed_buckets(ctx, first_bucket_start, span_end.min(open_start - 1))?;
         }
-        remove_or_recalculate_bucket(ctx, last_bucket_start, start, end)?;
     }
 
-    // Re-establish the open bucket from what the source still holds, retracting any
-    // destination bucket the removal re-opened.
-    resync_open_bucket_after_removal(ctx)?;
+    if let Some(retracted_from) = resync_open_bucket_after_removal(ctx)? {
+        ctx.rewritten = Some((first_bucket_start.min(retracted_from), Timestamp::MAX));
+    }
 
     Ok(())
 }
 
-/// Apply a removal of `[start, end]` to the single destination bucket starting at `bucket_start`:
-/// drop it outright when the removal covers it entirely, otherwise recalculate it from the
-/// surviving source samples.
-fn remove_or_recalculate_bucket(
+/// Rewrite the destination's buckets in `[from, to]` — whole buckets, all closed — from the
+/// parent's current samples: drop them, then re-aggregate what the parent holds there, bucket by
+/// bucket.
+///
+/// One pass over the parent's samples in the span, so the cost follows the stored data rather
+/// than the number of buckets: `TS.DEL key 0 <huge>` on a rule with a small bucketDuration once
+/// walked every bucket in the range and blocked the server (a 1e10-bucket range took ~13s
+/// against RTS's 0.02s for the same two samples).
+fn recompute_closed_buckets(
     ctx: &mut CompactionContext,
-    bucket_start: Timestamp,
-    start: Timestamp,
-    end: Timestamp,
+    from: Timestamp,
+    to: Timestamp,
 ) -> TsdbResult<()> {
-    // The rule's still-open bucket has no destination entry yet and must not gain one: a bucket
-    // only reaches the destination when it closes. Recalculating it here would publish a bucket
-    // that is still accepting samples (RTS reports nothing for it). Its aggregator is rebuilt by
-    // `resync_open_bucket_after_removal`, which runs after this, so leave it untouched.
-    if ctx.rule.bucket_start == Some(bucket_start) {
-        return Ok(());
+    if !ctx.dest.is_empty() {
+        ctx.dest.remove_range(from, to)?;
     }
 
-    let bucket_end = ctx.rule.bucket_end(bucket_start);
-
-    if start <= bucket_start && end >= bucket_end {
-        if !ctx.dest.is_empty() {
-            ctx.dest.remove_range(bucket_start, bucket_end - 1)?;
+    let parent = ctx.parent;
+    let min_ts = parent.get_min_timestamp();
+    let mut aggregator = ctx.rule.aggregator.clone();
+    // The bucket being aggregated, and whether any of its samples counted.
+    let mut current: Option<(Timestamp, bool)> = None;
+    for sample in parent.stored_range_iter(from.max(min_ts), to) {
+        let bucket_start = ctx.rule.calc_bucket_start(sample.timestamp);
+        if current.is_none_or(|(open, _)| open != bucket_start) {
+            if let Some((open, true)) = current {
+                add_dest_bucket(ctx, open, AggregationHandler::finalize(&mut aggregator))?;
+            }
+            AggregationHandler::reset(&mut aggregator);
+            current = Some((bucket_start, false));
         }
-    } else {
-        // Recalculate this bucket excluding removed timestamps.
-        // If destination has no flushed buckets yet, this still correctly maintains the aggregator state.
-        let min_ts = ctx.parent.get_min_timestamp();
-        recalculate_bucket(ctx, bucket_start, bucket_end, min_ts, |ts| {
-            ts < start || ts > end
-        })?;
+        if AggregationHandler::update(&mut aggregator, sample.timestamp, sample.value)
+            && let Some((_, counted)) = current.as_mut()
+        {
+            *counted = true;
+        }
+    }
+    if let Some((open, true)) = current {
+        add_dest_bucket(ctx, open, AggregationHandler::finalize(&mut aggregator))?;
     }
 
     Ok(())
@@ -524,23 +531,33 @@ fn remove_or_recalculate_bucket(
 /// Recomputing the aggregation state from the source (rather than patching it against the
 /// removed range) is also what makes the re-opened bucket publish the right value when a later
 /// write closes it again: its surviving samples are simply re-aggregated.
-fn resync_open_bucket_after_removal(ctx: &mut CompactionContext<'_>) -> TsdbResult<()> {
+///
+/// Returns where the retraction started when it removed any destination sample.
+fn resync_open_bucket_after_removal(
+    ctx: &mut CompactionContext<'_>,
+) -> TsdbResult<Option<Timestamp>> {
     let Some(last_sample) = ctx.parent.last_sample else {
         // Source is empty, so no bucket can ever have closed: the destination holds nothing
         // valid and there is no aggregation in progress.
         ctx.rule.reset();
-        if !ctx.dest.is_empty() {
-            ctx.dest.remove_range(Timestamp::MIN, Timestamp::MAX)?;
-        }
-        return Ok(());
+        let removed = if ctx.dest.is_empty() {
+            0
+        } else {
+            ctx.dest.remove_range(Timestamp::MIN, Timestamp::MAX)?
+        };
+        // Timestamps are non-negative, so 0 is where the retraction starts — and, unlike
+        // `Timestamp::MIN`, a bound the next level's bucket arithmetic can take.
+        return Ok((removed > 0).then_some(0));
     };
 
     let (open_start, open_end) = ctx.rule.get_bucket_range(last_sample.timestamp);
 
     // The re-opened bucket and anything after it are no longer closed.
-    if !ctx.dest.is_empty() {
-        ctx.dest.remove_range(open_start, Timestamp::MAX)?;
-    }
+    let removed = if ctx.dest.is_empty() {
+        0
+    } else {
+        ctx.dest.remove_range(open_start, Timestamp::MAX)?
+    };
 
     let mut aggregator = ctx.rule.aggregator.clone();
     AggregationHandler::reset(&mut aggregator);
@@ -557,7 +574,7 @@ fn resync_open_bucket_after_removal(ctx: &mut CompactionContext<'_>) -> TsdbResu
     ctx.rule.has_samples = has_samples;
     ctx.rule.bucket_start = Some(open_start);
 
-    Ok(())
+    Ok((removed > 0).then_some(open_start))
 }
 
 /// Write one aggregated bucket to the destination.
@@ -853,35 +870,205 @@ mod tests {
                     ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
                 }
             }
-
-            let mut by_bucket: BTreeMap<Timestamp, (Aggregator, bool)> = BTreeMap::new();
-            for sample in parent.iter() {
-                let start = rule.calc_bucket_start(sample.timestamp);
-                let (aggregator, counted) = by_bucket
-                    .entry(start)
-                    .or_insert_with(|| (fresh_rule(agg, bucket).aggregator, false));
-                if AggregationHandler::update(aggregator, sample.timestamp, sample.value) {
-                    *counted = true;
-                }
-            }
-            let open = rule.calc_bucket_start(parent.last_sample.unwrap().timestamp);
-            let mut expected = Vec::new();
-            let mut open_expected = (Some(open), false, None);
-            for (start, (mut aggregator, counted)) in by_bucket {
-                if start < open {
-                    if counted {
-                        expected.push((start, AggregationHandler::finalize(&mut aggregator).to_bits()));
-                    }
-                } else if counted {
-                    open_expected = (
-                        Some(open),
-                        true,
-                        AggregationHandler::current(&aggregator).map(f64::to_bits),
-                    );
-                }
-            }
-            prop_assert_eq!(dest_samples(&dest), expected);
-            prop_assert_eq!(open_state(&rule), open_expected);
+            prop_assert_eq!(rule_view(&dest, &rule), recompute(&parent, agg, bucket));
         }
+
+        /// A removal anywhere in `src → mid → dst` leaves every level equal to a recomputation
+        /// from its own parent, the cascade handing each level the span the level above
+        /// rewrote. Covers a `dst` whose buckets do not nest in `mid`'s (300, 700), whose
+        /// recalculated parent bucket can start before the removal, and a `dst` resynced over a
+        /// `mid` that did not change — what it sees when `mid`'s own application failed.
+        #[test]
+        fn removal_cascade_matches_a_recomputation_from_each_parent(
+            agg in prop::sample::select(RULE_TYPES),
+            mid_bucket in prop::sample::select(&[500u64, 1000][..]),
+            dst_bucket in prop::sample::select(&[300u64, 700, 2000][..]),
+            writes in prop::collection::vec((0i64..5000, -100i32..100), 1..40),
+            removal in (0i64..5500, 0i64..2000),
+        ) {
+            let mut chain = Chain::new(agg, mid_bucket, dst_bucket);
+            for (ts, value) in writes {
+                chain.ingest(ts, value as f64);
+            }
+            chain.check()?;
+
+            let (start, end) = (removal.0, removal.0 + removal.1);
+            {
+                let mut cctx = CompactionContext::new(&chain.mid, &mut chain.dst, &mut chain.to_dst);
+                apply_op(&mut cctx, CompactionOp::RemoveRange { start, end }).unwrap();
+            }
+            chain.check()?;
+
+            chain.remove(start, end);
+            chain.check()?;
+        }
+    }
+
+    /// A rule's destination samples and open state, as [`recompute`] reports them.
+    type RuleView = (
+        Vec<(Timestamp, u64)>,
+        (Option<Timestamp>, bool, Option<u64>),
+    );
+
+    fn rule_view(dest: &TimeSeries, rule: &CompactionRule) -> RuleView {
+        (dest_samples(dest), open_state(rule))
+    }
+
+    /// What a rule over `parent` must hold, without retention: the destination holds exactly the
+    /// buckets strictly older than the one containing the parent's last sample that received at
+    /// least one counted sample, each the aggregate of the parent's samples in timestamp order,
+    /// and the open bucket is the aggregate of the newest bucket.
+    fn recompute(parent: &TimeSeries, agg: AggregationType, bucket: u64) -> RuleView {
+        let rule = fresh_rule(agg, bucket);
+        let Some(last) = parent.last_sample else {
+            return (Vec::new(), (None, false, None));
+        };
+        let mut by_bucket: BTreeMap<Timestamp, (Aggregator, bool)> = BTreeMap::new();
+        for sample in parent.iter() {
+            let start = rule.calc_bucket_start(sample.timestamp);
+            let (aggregator, counted) = by_bucket
+                .entry(start)
+                .or_insert_with(|| (fresh_rule(agg, bucket).aggregator, false));
+            if AggregationHandler::update(aggregator, sample.timestamp, sample.value) {
+                *counted = true;
+            }
+        }
+        let open = rule.calc_bucket_start(last.timestamp);
+        let mut expected = Vec::new();
+        let mut open_expected = (Some(open), false, None);
+        for (start, (mut aggregator, counted)) in by_bucket {
+            if start < open {
+                if counted {
+                    expected.push((
+                        start,
+                        AggregationHandler::finalize(&mut aggregator).to_bits(),
+                    ));
+                }
+            } else if counted {
+                open_expected = (
+                    Some(open),
+                    true,
+                    AggregationHandler::current(&aggregator).map(f64::to_bits),
+                );
+            }
+        }
+        (expected, open_expected)
+    }
+
+    /// `src → mid → dst`, driven the way `cascade::process_series_with_compaction` drives it.
+    struct Chain {
+        agg: AggregationType,
+        mid_bucket: u64,
+        dst_bucket: u64,
+        src: TimeSeries,
+        mid: TimeSeries,
+        dst: TimeSeries,
+        to_mid: CompactionRule,
+        to_dst: CompactionRule,
+    }
+
+    impl Chain {
+        fn new(agg: AggregationType, mid_bucket: u64, dst_bucket: u64) -> Self {
+            Self {
+                agg,
+                mid_bucket,
+                dst_bucket,
+                src: TimeSeries::new(),
+                mid: TimeSeries::new(),
+                dst: TimeSeries::new(),
+                to_mid: fresh_rule(agg, mid_bucket),
+                to_dst: fresh_rule(agg, dst_bucket),
+            }
+        }
+
+        /// One write to `src`, cascading what `mid` committed (sorted, the last write of each
+        /// timestamp winning, as `dedupe_written_samples` does).
+        fn ingest(&mut self, ts: Timestamp, value: f64) {
+            let prev_last = self.src.last_sample.map(|s| s.timestamp);
+            let SampleAddResult::Ok(stored) =
+                self.src.add(ts, value, Some(DuplicatePolicy::KeepLast))
+            else {
+                return;
+            };
+            let mid_prev_last = self.mid.last_sample.map(|s| s.timestamp);
+            let written = {
+                let samples = [stored];
+                let order = [stored.timestamp];
+                let mut cctx = CompactionContext::new(&self.src, &mut self.mid, &mut self.to_mid);
+                let op = CompactionOp::Ingest {
+                    samples: &samples,
+                    prev_last,
+                    input_order: &order,
+                };
+                apply_op(&mut cctx, op).unwrap();
+                std::mem::take(&mut cctx.written)
+            };
+            let mut by_ts: BTreeMap<Timestamp, Sample> = BTreeMap::new();
+            for sample in written {
+                by_ts.insert(sample.timestamp, sample);
+            }
+            if by_ts.is_empty() {
+                return;
+            }
+            let samples: Vec<Sample> = by_ts.into_values().collect();
+            let order: Vec<Timestamp> = samples.iter().map(|s| s.timestamp).collect();
+            let mut cctx = CompactionContext::new(&self.mid, &mut self.dst, &mut self.to_dst);
+            let op = CompactionOp::Ingest {
+                samples: &samples,
+                prev_last: mid_prev_last,
+                input_order: &order,
+            };
+            apply_op(&mut cctx, op).unwrap();
+        }
+
+        /// `TS.DEL src start end`: remove from `src`, then cascade each level's rewritten span.
+        fn remove(&mut self, start: Timestamp, end: Timestamp) {
+            self.src.remove_range(start, end).unwrap();
+            let span = {
+                let mut cctx = CompactionContext::new(&self.src, &mut self.mid, &mut self.to_mid);
+                apply_op(&mut cctx, CompactionOp::RemoveRange { start, end }).unwrap();
+                cctx.rewritten
+            };
+            let (start, end) = span.expect("a removal names the span it rewrote");
+            let mut cctx = CompactionContext::new(&self.mid, &mut self.dst, &mut self.to_dst);
+            apply_op(&mut cctx, CompactionOp::RemoveRange { start, end }).unwrap();
+        }
+
+        fn check(&self) -> Result<(), TestCaseError> {
+            prop_assert_eq!(
+                rule_view(&self.mid, &self.to_mid),
+                recompute(&self.src, self.agg, self.mid_bucket),
+                "mid"
+            );
+            prop_assert_eq!(
+                rule_view(&self.dst, &self.to_dst),
+                recompute(&self.mid, self.agg, self.dst_bucket),
+                "dst"
+            );
+            Ok(())
+        }
+    }
+
+    /// `src → mid SUM/1000 → dst SUM/2000`, and a removal reaching
+    /// into mid's bucket 1000 without covering it. mid recalculates that bucket and keeps it; dst
+    /// must still count it, although its timestamp lies inside the removed range.
+    #[test]
+    fn removal_keeps_a_recalculated_parent_bucket_inside_the_range() {
+        let mut chain = Chain::new(AggregationType::Sum, 1000, 2000);
+        for (ts, value) in [
+            (0, 1.0),
+            (1000, 2.0),
+            (1600, 32.0),
+            (2000, 4.0),
+            (3000, 8.0),
+            (4000, 16.0),
+        ] {
+            chain.ingest(ts, value);
+        }
+        chain.remove(500, 1500);
+        let mid: Vec<_> = chain.mid.iter().map(|s| (s.timestamp, s.value)).collect();
+        let dst: Vec<_> = chain.dst.iter().map(|s| (s.timestamp, s.value)).collect();
+        assert_eq!(mid, [(0, 1.0), (1000, 32.0), (2000, 4.0), (3000, 8.0)]);
+        assert_eq!(dst, [(0, 33.0)]);
     }
 }

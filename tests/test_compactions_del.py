@@ -366,3 +366,39 @@ class TestTsDelCompaction(ValkeyTimeSeriesTestCaseBase):
         # Verify remaining data integrity
         source_samples = self.client.execute_command('TS.RANGE', source_key, 0, '+')
         assert len(source_samples) > 0  # Should still have data outside the deleted range
+    def build_chain(self, prefix, mid_bucket, dst_bucket, samples):
+        """src -> mid (sum) -> dst (sum), fed `samples` through src."""
+        src, mid, dst = (f"{prefix}:{n}" for n in ("src", "mid", "dst"))
+        for key in (src, mid, dst):
+            self.client.execute_command('TS.CREATE', key)
+        self.add_compaction_rule(src, mid, 'sum', mid_bucket)
+        self.add_compaction_rule(mid, dst, 'sum', dst_bucket)
+        for ts, value in samples:
+            self.client.execute_command('TS.ADD', src, ts, value)
+        return src, mid, dst
+
+    def test_del_cascade_keeps_a_recalculated_bucket_inside_the_range(self):
+        """The delete reaches into mid's bucket 1000 without covering it: mid recalculates that
+        bucket (to 32) and keeps it, with its timestamp inside the deleted range. dst must still
+        count it — a level recomputes from its parent as it stands, not on the assumption that
+        the range is now empty there."""
+        src, mid, dst = self.build_chain('cas:partial', 1000, 2000, [
+            (0, 1), (1000, 2), (1600, 32), (2000, 4), (3000, 8), (4000, 16)])
+        assert self.get_compacted_samples(dst) == [[0, b'35']]
+
+        assert self.client.execute_command('TS.DEL', src, 500, 1500) == 1
+        assert self.get_compacted_samples(mid) == [[0, b'1'], [1000, b'32'], [2000, b'4'], [3000, b'8']]
+        assert self.get_compacted_samples(dst) == [[0, b'33']]
+
+    def test_del_cascade_with_buckets_that_do_not_nest(self):
+        """dst's 300 ms buckets do not nest in mid's 500 ms ones. Deleting src 400 changes mid's
+        bucket 0, which sits in dst's bucket 0 — not in dst's bucket 300, where the deleted
+        timestamp falls. Each level is handed the span its parent actually rewrote."""
+        src, mid, dst = self.build_chain('cas:nest', 500, 300, [
+            (0, 1), (400, 2), (600, 4), (1000, 8), (1500, 16), (2000, 32)])
+        assert self.get_compacted_samples(mid) == [[0, b'3'], [500, b'4'], [1000, b'8'], [1500, b'16']]
+        assert self.get_compacted_samples(dst) == [[0, b'3'], [300, b'4'], [900, b'8']]
+
+        assert self.client.execute_command('TS.DEL', src, 400, 400) == 1
+        assert self.get_compacted_samples(mid) == [[0, b'1'], [500, b'4'], [1000, b'8'], [1500, b'16']]
+        assert self.get_compacted_samples(dst) == [[0, b'1'], [300, b'4'], [900, b'8']]

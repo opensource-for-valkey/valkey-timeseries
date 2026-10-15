@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2495f211a7b1631a96d0b6db46edf3e889a170bd8d75116aa259ee23da900362 # shrinks to agg = IRate, bucket = 500, writes = [(3500, 0), (3799, 0), (4000, 0), (3500, 1)]
+cc 46e215006d4086a1853017787fdec78d584fb078e54d369c8025701dd8e6503a # shrinks to agg = First, mid_bucket = 500, dst_bucket = 300, writes = [(2289, 0), (2500, 0)], removal = (533, 1967)
+cc a73d06239318791cc4a3f8d20d0aad8d51aed2620fc715ebe5717335c6d96f41 # shrinks to agg = Avg, mid_bucket = 500, dst_bucket = 300, writes = [(3500, 0), (2320, 0), (2999, 0)], removal = (2100, 220)

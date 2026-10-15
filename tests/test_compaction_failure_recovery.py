@@ -157,3 +157,24 @@ class TestCompactionFailureRecovery(ValkeyTimeSeriesTestCaseDebugMode):
         states = sorted((self.info_debug(c, key)[b"rulesState"][0] for key in keys), key=lambda r: r[4])
         # One rule failed (stale 7, dirty); the other resynced from the source (1 + 4).
         assert [(s[3], s[4]) for s in states] == [(b"5", 0), (b"7", 1)]
+
+    def test_a_failed_removal_leaves_the_next_level_alone(self):
+        """src -> mid fails on TS.DEL src 0 0, so mid keeps its bucket 0. dst must keep counting
+        it: a level recomputes from what its parent holds, so an unchanged parent leaves it
+        unchanged, and its own rule stays clean."""
+        c = self.client
+        for key in ("fc:src", "fc:mid", "fc:dst"):
+            c.execute_command("TS.CREATE", key)
+        c.execute_command("TS.CREATERULE", "fc:src", "fc:mid", "AGGREGATION", "sum", 1000)
+        c.execute_command("TS.CREATERULE", "fc:mid", "fc:dst", "AGGREGATION", "sum", 2000)
+        for ts, value in ((0, 1), (1000, 2), (2000, 4), (3000, 8), (4000, 16)):
+            c.execute_command("TS.ADD", "fc:src", ts, value)
+        mid_before = c.execute_command("TS.RANGE", "fc:mid", "-", "+")
+        assert c.execute_command("TS.RANGE", "fc:dst", "-", "+") == [[0, b"3"]]
+
+        c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+        assert c.execute_command("TS.DEL", "fc:src", 0, 0) == 1
+        assert self.info_debug(c, "fc:src")[b"rulesState"][0][4] == 1
+        assert c.execute_command("TS.RANGE", "fc:mid", "-", "+") == mid_before
+        assert c.execute_command("TS.RANGE", "fc:dst", "-", "+") == [[0, b"3"]]
+        assert self.info_debug(c, "fc:mid")[b"rulesState"][0][4] == 0
