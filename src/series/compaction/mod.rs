@@ -44,7 +44,10 @@ pub struct CompactionRule {
     pub has_samples: bool,
     /// Set when the rule's last application returned an error, so its open-bucket state may not
     /// reflect every sample the source stored. The next `Ingest` rebuilds the open bucket from the
-    /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. Node-local:
+    /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. The rebuild
+    /// covers the open bucket only: destination buckets the failed application lost or left stale
+    /// (a bucket it should have closed, or one a failed removal should have recalculated) are not
+    /// repaired — `ts_compaction_failures` is how an operator learns of them. Node-local:
     /// persisted, so a restart does not forget it, but not hashed into the digest, because a
     /// replica's application of the same write may well have succeeded.
     pub dirty: bool,

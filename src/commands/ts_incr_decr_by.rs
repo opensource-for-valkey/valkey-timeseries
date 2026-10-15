@@ -59,9 +59,10 @@ fn incr_decr(ctx: &Context, args: Vec<ValkeyString>, is_increment: bool) -> Valk
     let timestamp = handle_parse_timestamp(&mut args)?;
 
     // Captured for replication before the create path consumes `args`. `TIMESTAMP` has
-    // already been stripped above, so `create_options` holds only the auto-creation
-    // arguments (RETENTION, LABELS, CHUNK_SIZE, ...) that a replica needs to build the
-    // same series.
+    // already been stripped above, so `create_options` holds only the caller's auto-creation
+    // arguments (RETENTION, LABELS, CHUNK_SIZE, ...), re-emitted verbatim after the propagated
+    // TS.INCRBY/TS.DECRBY. A replica does not need them to build the series: an auto-create is
+    // replicated first as a resolved TS.CREATE.
     let key_name = args[1].clone();
     let delta_arg = args[2].clone();
     let create_options = args[3..].to_vec();
@@ -222,9 +223,9 @@ fn run_compaction_for_increment(
 /// Verbatim replication is wrong here: without an explicit `TIMESTAMP`, a replica (or an
 /// AOF reload) re-derives "now" and lands the increment on a different timestamp than the
 /// primary. That diverges the sample set outright, and then diverges retention trimming
-/// and compaction-bucket assignment on top of it. Sending the resolved timestamp — plus
-/// the original auto-creation options, so a replica that has to create the series gets the
-/// same retention, labels and chunk size — makes the write deterministic.
+/// and compaction-bucket assignment on top of it. Sending the resolved timestamp makes the
+/// write deterministic. The caller's auto-creation options ride along verbatim, but the series
+/// itself reaches a replica through the resolved `TS.CREATE` the create path propagated first.
 fn replicate_and_notify(
     ctx: &Context,
     key_name: &ValkeyString,

@@ -451,7 +451,7 @@ traffic grows by at most the number of destination buckets touched per write (on
 close per rule; ≤ 3 commands per rule per level for a `TS.DEL`); §3.1a–c and §3.2 still need
 A.1–A.3 because they concern snapshots and creation, not effects.
 
-### Option C — B plus A.1–A.4 (recommended)
+### Option C — B plus A.1–A.4 (recommended at the time; not taken — see "Adopted" below)
 
 A.1–A.4 are needed under either model (they fix snapshot and creation paths, and A.4 is what
 makes B safe at promotion). B is the architectural change. Together they move the replica from

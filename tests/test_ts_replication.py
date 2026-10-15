@@ -793,8 +793,9 @@ class TestTimeSeriesReplication(ReplicationTestCase):
                 assert replica_info[field] == primary_info[field], (key, field)
             assert primary_info["retentionTime"] == 3000, key
 
-        # The destination is an explicit TS.CREATE, which replicates verbatim: left bare it would
-        # pick up the replica's own retention (500) and trim the rollup differently. Pin it.
+        # The destination is an explicit TS.CREATE, which now replicates resolved (with the
+        # primary's retention spelled out), so the replica's own default (500) cannot leak in. The
+        # explicit RETENTION keeps the rollup's window independent of any module default.
         self.client.execute_command("TS.CREATE", "ts:auto:dst", "RETENTION", 3000)
         self.client.execute_command("TS.CREATERULE", "ts:auto:plain", "ts:auto:dst", "AGGREGATION", "sum", 1000)
         for ts in range(500, 6000, 500):

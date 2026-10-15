@@ -83,11 +83,15 @@ written during the mixed-version window may differ in their last digits between 
 **Mixed versions.** The replicated stream and the AOF changed with this release: creations are
 now spelled out as a resolved `TS.CREATE` (including `DECIMAL_DIGITS none`), and policy
 destinations arrive as explicit `TS.CREATE` + `TS.CREATERULE` pairs. A replica or AOF loader
-running an older module build cannot parse that stream. In the other direction, an AOF tail or
-replication stream written by a build from before this release replays its auto-creates without
-the policy rules, because the new loader no longer applies the policy itself. Upgrade the primary
-and its replicas together, and rewrite the AOF (`BGREWRITEAOF`) after upgrading so no old tail is
-left to replay.
+running an older module build cannot parse that stream — in particular, an older build rejects the
+`DECIMAL_DIGITS none` token. In the other direction, an AOF tail or replication stream written by a
+build from before this release replays its auto-creates without the policy rules, because the new
+loader no longer applies the policy itself. Upgrade the primary and its replicas together, and
+rewrite the AOF (`BGREWRITEAOF`) after upgrading so no old tail is left to replay. Persisted
+series are not portable across that boundary either: an RDB file, a `DUMP` payload, or an AOF
+rewrite preamble written by a build from before this release cannot be loaded by this build,
+because a compaction rule's payload gained a field (`dirty`) in place without an encoding-version
+bump (no release had shipped).
 
 **Keyspace events.** A replica fires `ts.create` for every replicated creation, and
 `ts.createrule:src` / `ts.createrule:dest` for the rules of policy destinations. The primary

@@ -12,9 +12,10 @@ pub(super) struct CompactionContext<'a> {
     pub(super) dest: &'a mut TimeSeries,
     pub(super) rule: &'a mut CompactionRule,
     /// Samples actually committed to `dest` during this operation (the stored, rounded
-    /// values), in the order they were written. Used both to decide whether to notify on
-    /// `dest`, and to cascade into `dest`'s own compaction rules — see
-    /// [`process_series_with_compaction`].
+    /// values), in the order they were written. Drives the cascade into `dest`'s own compaction
+    /// rules and the wake-up of blocked `TS.READ` readers on `dest` (see
+    /// `cascade::process_series_with_compaction`); the `ts.add:dest` notification is keyed on
+    /// [`Self::closed_bucket`] instead.
     pub(super) written: Vec<Sample>,
     /// Whether an append closed a bucket and stored it in `dest` during this operation. This,
     /// not `written`, decides the `ts.add:dest` notification: a back-fill that rewrites an

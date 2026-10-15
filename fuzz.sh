@@ -18,7 +18,7 @@
 #
 # Step 4 is the point of the script. The fuzzer diffs every reply against
 # RedisTimeSeries, so a subject left in the default `extended` mode fails on the
-# first *intentional* gated divergence (e.g. DIV-0023) and Hypothesis stops the
+# first *intentional* gated divergence (e.g. DIV-0014) and Hypothesis stops the
 # test there — a "soak" that dies in seconds having explored a few hundred
 # examples. `strict` selects the RedisTimeSeries side of those gated cases, so a
 # failure means an *unregistered* divergence: a real finding.

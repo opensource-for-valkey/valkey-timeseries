@@ -55,7 +55,8 @@ struct RuleOutcome {
     /// Samples committed to `dest` by this operation, in commit order (not necessarily
     /// sorted or unique — see [`dedupe_written_samples`]).
     written: Vec<Sample>,
-    /// Whether an append closed a bucket into `dest` — the only thing that notifies. A back-fill
+    /// Whether an append closed a bucket into `dest` — the only thing that emits `ts.add:dest`
+    /// (blocked readers are woken on `written`). A back-fill
     /// into an already-closed bucket sets `written` but not this.
     closed_bucket: bool,
 }
