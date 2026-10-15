@@ -1523,6 +1523,15 @@ Run: `cargo test --features enable-system-alloc` — Expected: PASS (including b
 Run: `TEST_PATTERN="compaction or incrby or test_ts_add or createrule or test_replication_compaction_ or test_replication_ts_incrby" SERVER_VERSION=unstable ./build.sh` — Expected: PASS.
 Run: `RTS_COMPAT=1 TEST_PATTERN="compaction or add or incrby" SERVER_VERSION=unstable ./build.sh` — Expected: PASS, including all four `first_write` cases.
 
+> **Outcome (gate breached; recovered by Task 10).** As landed (095869509) this task was over
+> budget: interleaved per-pair minimum against the Task 8 baseline was `sum` +14.2 %, `avg`
+> +15.9 %, `std.s` +8.5 %, `rate` +0.3 %. It was accepted by a controller ruling recorded only in
+> the commit body, not raised with the owner as this step requires, and the fallback was not
+> built. Re-measured 2026-10-15 (three-way rotation of separately built bench binaries — Task 8
+> baseline d08347be7, this commit, and branch HEAD b3bc6338f — min vs min): this commit
+> reproduces at `sum` +13.2 %, `avg` +14.0 %, `std.s` +6.7 %, `rate` +6.0 %, so the breach was
+> real, not noise. HEAD is within budget; see the Task 10 outcome.
+
 - [ ] **Step 5: Lint and commit**
 
 Record the four criterion `change` lines in the commit body.
@@ -1617,6 +1626,16 @@ Run: `cargo test --features enable-system-alloc` — Expected: PASS.
 Run: `TEST_PATTERN="compaction or createrule or deleterule or incrby or test_ts_add or test_ts_madd or test_ts_addbulk or test_ts_del or test_ts_mdel or test_replication" SERVER_VERSION=unstable ./build.sh` — Expected: PASS.
 Run: `RTS_COMPAT=1 TEST_PATTERN="compaction" SERVER_VERSION=unstable ./build.sh` — Expected: PASS.
 Run: `cargo bench --bench compaction_ingest --features enable-system-alloc -- --baseline pre-unify` — Expected: within the Task 9 budget.
+
+> **Outcome (gate met at HEAD, 2026-10-15).** This re-run was not recorded when the task landed
+> (733445ea1), and the `pre-unify` baseline was lost with `target/`. Re-measured by building the
+> Task 8 baseline (d08347be7) and branch HEAD (b3bc6338f) as separate bench binaries and running
+> them interleaved, judged min vs min over three rounds (5 + 5 + 4 pairs): `sum` +3.1 / +5.4 /
+> +5.6 %, `avg` +7.6 / +7.1 / +7.7 %, `std.s` +6.3 / +6.2 / +8.5 %, `rate` +2.8 / +3.2 / +5.0 %.
+> Every benchmark is within the ≤ +10 % budget in every round (the largest residual, `avg`, is
+> ≈ 0.5 ns per append), so the Task 9 fallback is not needed. The recovery from Task 9's
+> +13–14 % most likely comes from this task — `CompactionOp` shrank from four variants to two and
+> the single-sample handlers were deleted — but the commits in between were not bisected.
 
 - [ ] **Step 4: Commit**
 
