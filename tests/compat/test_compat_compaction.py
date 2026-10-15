@@ -25,6 +25,8 @@ observation of the reference server. Do NOT consult RedisTimeSeries source or
 test code (see tests/compat/README.md).
 """
 
+import math
+
 import pytest
 from valkey.exceptions import ResponseError
 
@@ -534,6 +536,64 @@ class TestOutOfOrderBackfill:
             diff.reference.execute_command("TS.RANGE", "c:bdst", "-", "+")
             == diff.subject.execute_command("TS.RANGE", "c:bdst", "-", "+")
         )
+
+
+def _float_samples(reply):
+    """`[[ts, value], ...]` as `(int, float)` pairs, whatever each engine's RESP2/RESP3 encoding
+    (`b"NaN"` vs `b"nan"`, `b"1E308"` vs `b"1e+308"`, or a RESP3 double)."""
+    return [(int(ts), float(value)) for ts, value in reply]
+
+
+def _same_samples(a, b):
+    return len(a) == len(b) and all(
+        ta == tb and (va == vb or (math.isnan(va) and math.isnan(vb)))
+        for (ta, va), (tb, vb) in zip(a, b)
+    )
+
+
+class TestNanBackfillOnDestination:
+    """DIV-0060 (ungated): a back-fill that turns a published bucket's aggregate into NaN.
+
+    `std.s` over `±1e308` overflows to NaN. RTS keeps the stale published value in the
+    destination although its own `TS.RANGE ... AGGREGATION std.s` over the source says NaN; we
+    replace it with the recomputed NaN. Pinned per-engine: as with DIV-0023, a registry regex
+    able to match it ("reference=0 subject=nan" on TS.RANGE/TS.GET) would absorb any real
+    NaN-propagation bug.
+    """
+
+    @staticmethod
+    def _backfill(client):
+        client.execute_command("TS.CREATE", "c:nbsrc", "DUPLICATE_POLICY", "LAST")
+        client.execute_command("TS.CREATE", "c:nbdst")
+        client.execute_command(
+            "TS.CREATERULE", "c:nbsrc", "c:nbdst", "AGGREGATION", "std.s", 1000
+        )
+        client.execute_command("TS.ADD", "c:nbsrc", 0, "1e308")
+        client.execute_command("TS.ADD", "c:nbsrc", 1000, 1)  # publishes [0, 0]
+        for ts, value in ((100, "1e308"), (200, "-1e308"), (300, "-1e308")):
+            client.execute_command("TS.ADD", "c:nbsrc", ts, value)  # back-fill bucket 0
+
+    def test_destination_holds_the_recomputed_nan(self, diff):
+        self._backfill(diff.reference)
+        self._backfill(diff.subject)
+
+        def both(*args):
+            return (
+                _float_samples(diff.reference.execute_command(*args)),
+                _float_samples(diff.subject.execute_command(*args)),
+            )
+
+        # Identical stored source data, and both engines aggregate it to NaN.
+        ref_src, sub_src = both("TS.RANGE", "c:nbsrc", "-", "+")
+        assert _same_samples(ref_src, sub_src), (ref_src, sub_src)
+        ref_agg, sub_agg = both("TS.RANGE", "c:nbsrc", 0, 999, "AGGREGATION", "std.s", 1000)
+        assert _same_samples(ref_agg, sub_agg), (ref_agg, sub_agg)
+        assert len(sub_agg) == 1 and math.isnan(sub_agg[0][1]), sub_agg
+
+        # The destination: RTS keeps the stale bucket, we hold the recomputation.
+        ref_dst, sub_dst = both("TS.RANGE", "c:nbdst", "-", "+")
+        assert ref_dst == [(0, 0.0)], f"expected RTS to keep the stale bucket, got {ref_dst!r}"
+        assert len(sub_dst) == 1 and sub_dst[0][0] == 0 and math.isnan(sub_dst[0][1]), sub_dst
 
 
 class TestReverseLatestAggregationOnDestination:

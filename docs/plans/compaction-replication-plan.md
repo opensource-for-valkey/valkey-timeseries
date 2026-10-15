@@ -307,7 +307,7 @@ our `TS.MADD` keeps an older back-filled bucket open until the next forward clos
 reference publishes it at once — only an intermediate `TS.RANGE`/`TS.GET` (non-`LATEST`) before
 that close shows the difference.
 
-### 3.10 Found by the recomputation oracle — a NaN bucket never replaced a published one (fixed, 2026-10-14)
+### 3.10 Found by the recomputation oracle — a NaN bucket never replaced a published one (fixed; diverges from the reference, DIV-0060, 2026-10-14)
 
 `series::compaction::engine::tests::destination_matches_a_recomputation_from_the_source` (the
 permanent oracle from the refactor's Task 8) shrank to: `irate`, bucket 500, writes
@@ -321,11 +321,23 @@ module: `TS.CREATERULE s d AGGREGATION irate 500`, `TS.ADD s 3500 0`, `3799 5`, 
 (`d` = `[3500, 16.72…]`), `TS.ADD s 3500 9 ON_DUPLICATE LAST` → `d` stayed `16.72…` while
 `TS.RANGE s 3500 3999 AGGREGATION irate 500` says `nan`.
 
-Reachable only through the extension aggregators that finalize to NaN (`irate`, `rate`,
-`increase`): no RTS aggregator finalizes a counted bucket to NaN — black-box, `var.s`/`std.s`
-over one surviving sample report `0`, and `avg`/`sum`/`max`/`last` skip a NaN back-fill — so the
-reference cannot be asked and nothing changes on the shared surface. Fix: `add_dest_bucket` clears
-the bucket's existing destination entry before writing a NaN. Regression test:
+Reachable on the shared RTS surface — an earlier version of this section said otherwise, which
+was wrong. Besides the extension aggregators that finalize to NaN over a counter reset (`irate`,
+`rate`, `increase`), `std.p`/`std.s`/`var.p`/`var.s` finalize to NaN when their accumulation
+overflows on values near `1e308` (found in review, black-box): rule `std.s 1000` (source
+`DUPLICATE_POLICY LAST`); `TS.ADD s 0 1e308`, `TS.ADD s 1000 1` (publishes `[0, 0]`); back-fill
+`TS.ADD s 100 1e308`, `200 -1e308`, `300 -1e308`. Both engines store the same source data and both
+report `TS.RANGE s 0 999 AGGREGATION std.s 1000` = NaN, but the reference's `TS.RANGE d - +` stays
+`[[0, 0]]` — stale, contradicting its own aggregation of the source — while ours is `[[0, nan]]`
+(`[[0, 0]]` before the fix: the `LAST` duplicate rule kept the old value).
+
+Fix: `add_dest_bucket` clears the bucket's existing destination entry before writing a NaN.
+**Ruling (2026-10-14): keep the fix for every aggregator** — a destination bucket must equal a fresh
+computation of its source bucket; we decline to reproduce the reference contradicting its own
+`TS.RANGE`, the same policy as DIV-0023 and DIV-0024..DIV-0029. Registered as **DIV-0060**
+(`behavior`, documentation-only, ungated; `COMPATIBILITY.md` "Divergences that qualify but are not
+yet gated"), pinned per-engine by
+`tests/compat/test_compat_compaction.py::TestNanBackfillOnDestination`. Regression test:
 `backfill_turning_a_published_bucket_into_nan_replaces_it` (both ingest paths); proptest seed in
 `proptest-regressions/series/compaction/engine.txt`.
 

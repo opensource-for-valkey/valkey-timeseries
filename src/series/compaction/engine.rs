@@ -568,13 +568,17 @@ fn resync_open_bucket_after_removal(ctx: &mut CompactionContext<'_>) -> TsdbResu
 /// Write one aggregated bucket to the destination.
 ///
 /// The write replaces whatever the destination holds for the bucket — including with NaN, which
-/// a recalculated bucket can finalize to (`irate`/`rate`/`increase` over a counter reset). The
-/// duplicate policy cannot express that: every non-`BLOCK` policy, `LAST` included, keeps the
-/// old value when the new one is NaN (`DuplicatePolicy::duplicate_value`), yet `add` still
-/// reports the NaN as written. A back-fill that turned a published bucket's aggregate into NaN
-/// therefore left the stale value in the destination while cascading the NaN downstream. So a
+/// a recalculated bucket can finalize to: `std.p`/`std.s`/`var.p`/`var.s` when their
+/// accumulation overflows on values near `f64::MAX`, and `irate`/`rate`/`increase` over a counter
+/// reset. The duplicate policy cannot express that: every non-`BLOCK` policy, `LAST` included,
+/// keeps the old value when the new one is NaN (`DuplicatePolicy::duplicate_value`), yet `add`
+/// still reports the NaN as written. A back-fill that turned a published bucket's aggregate into
+/// NaN therefore left the stale value in the destination while cascading the NaN downstream. So a
 /// NaN first clears the bucket's existing entry and is then written as a fresh sample. Found by
 /// `destination_matches_a_recomputation_from_the_source`.
+///
+/// This deliberately diverges from the reference (DIV-0060), which keeps the stale value although
+/// its own `TS.RANGE ... AGGREGATION` over the source reports NaN for the bucket.
 fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> TsdbResult<()> {
     let bucket_start = ctx.rule.calc_bucket_start(ts);
     if value.is_nan() && !ctx.dest.is_empty() {

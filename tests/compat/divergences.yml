@@ -1276,3 +1276,37 @@
     and absent from the reply unless the caller asks for DEBUG
   since: 0.1.0
   details_regex: '^\$\.rulesState\b'
+
+# DIV-0060 was found by the compaction engine's recomputation oracle (property test
+# `destination_matches_a_recomputation_from_the_source`, 2026-10-14) and confirmed black-box,
+# pinned per-engine in tests/compat/test_compat_compaction.py. Not registry-matchable: the regex
+# would have to cover "reference=0 subject=nan" on TS.RANGE/TS.GET, absorbing any real
+# NaN-propagation bug.
+#
+# ⚠️ `behavior`-kind: needs owner sign-off in the PR that introduces it (§5.3).
+
+- id: DIV-0060
+  command: TS.RANGE
+  kind: behavior
+  documentation_only: true
+  description: >
+    When an out-of-order write back-fills a compaction bucket that was already published and
+    the bucket's recomputed aggregate is NaN, we replace the destination value with NaN; RTS
+    keeps the stale published value. Reachable on the shared surface through std.p / std.s /
+    var.p / var.s, whose accumulation overflows to NaN on values near DBL_MAX, and on ours also
+    through the extension aggregators irate / rate / increase over a counter reset. Both engines
+    store identical source data and RTS's own `TS.RANGE src ... AGGREGATION std.s` reports NaN
+    for the bucket, so RTS's destination contradicts its own aggregation of the source.
+    Reproducer: rule `AGGREGATION std.s 1000` on src (DUPLICATE_POLICY LAST); `TS.ADD src 0 1e308`,
+    `TS.ADD src 1000 1` (publishes [0, 0]), then back-fill `TS.ADD src 100 1e308`,
+    `TS.ADD src 200 -1e308`, `TS.ADD src 300 -1e308` — `TS.RANGE dst - +` is `[[0, 0]]` on RTS
+    and `[[0, nan]]` for us.
+  rationale: >
+    Not reproduced in either mode (owner ruling 2026-10-14, compaction refactor Task 8): a
+    destination bucket must equal a fresh computation of its source bucket, and RTS's reply
+    contradicts its own TS.RANGE — the same policy as DIV-0023 and DIV-0024..DIV-0029. The stale
+    value comes from writing the recomputed bucket under the LAST duplicate policy, which keeps
+    the old value when the new one is NaN; the engine now clears the bucket before writing a NaN
+    (docs/plans/compaction-replication-plan.md §3.10). Pinned by
+    TestNanBackfillOnDestination::test_destination_holds_the_recomputed_nan.
+  since: 0.1.0
