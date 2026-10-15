@@ -4,7 +4,9 @@ pytest==7.4.3
 # Serial runs are unaffected: without -n the plugin is inert.
 pytest-xdist>=3.5.0
 PyYAML
-# Compat suite only: PyYAML powers the divergence registry (tests/compat), and
-# hypothesis drives the opt-in differential fuzzer (tests/compat/test_compat_fuzz.py,
-# COMPAT_FUZZ=1). Both are skipped gracefully when absent.
+# PyYAML powers the compat suite's divergence registry (tests/compat). hypothesis
+# drives the opt-in differential fuzzer (tests/compat/test_compat_fuzz.py,
+# COMPAT_FUZZ=1) and the replica-oracle test in tests/test_ts_replication.py
+# (test_replication_compaction_random_sequences). Both are skipped gracefully when
+# absent: only the tests that need them skip.
 hypothesis

@@ -6,13 +6,18 @@ from typing import List
 
 import pytest
 
-hypothesis = pytest.importorskip("hypothesis")
-from hypothesis import HealthCheck, given, settings  # noqa: E402
-from hypothesis import strategies as st  # noqa: E402
+# Hypothesis drives one test here (the replica-oracle fuzzer); without it only that test skips.
+try:
+    from hypothesis import HealthCheck, given, settings
+    from hypothesis import strategies as st
 
-from common import SERVER_PATH, get_module_path, parse_info_response  # noqa: E402
-from valkeytestframework.conftest import resource_port_tracker  # noqa: E402
-from valkeytestframework.valkey_test_case import ReplicationTestCase  # noqa: E402
+    HAVE_HYPOTHESIS = True
+except ImportError:
+    HAVE_HYPOTHESIS = False
+
+from common import SERVER_PATH, get_module_path, parse_info_response
+from valkeytestframework.conftest import resource_port_tracker
+from valkeytestframework.valkey_test_case import ReplicationTestCase
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +25,17 @@ REPLICATION_TIMEOUT = 3
 
 FUZZ_SRC, FUZZ_MID, FUZZ_TOP = "ts:fuzz:src", "ts:fuzz:mid", "ts:fuzz:top"
 
-_sample = st.tuples(
-    st.integers(0, 4000),
-    st.floats(-1000, 1000, allow_nan=False, allow_infinity=False),
-)
-_fuzz_op = st.one_of(
-    st.tuples(st.just("ADD"), _sample),
-    st.tuples(st.just("MADD"), st.lists(_sample, min_size=1, max_size=5)),
-    st.tuples(st.just("ADDBULK"), st.lists(_sample, min_size=1, max_size=8, unique_by=lambda s: s[0])),
-    st.tuples(st.just("DEL"), st.integers(0, 4000), st.integers(0, 4000)),
-)
+if HAVE_HYPOTHESIS:
+    _sample = st.tuples(
+        st.integers(0, 4000),
+        st.floats(-1000, 1000, allow_nan=False, allow_infinity=False),
+    )
+    _fuzz_op = st.one_of(
+        st.tuples(st.just("ADD"), _sample),
+        st.tuples(st.just("MADD"), st.lists(_sample, min_size=1, max_size=5)),
+        st.tuples(st.just("ADDBULK"), st.lists(_sample, min_size=1, max_size=8, unique_by=lambda s: s[0])),
+        st.tuples(st.just("DEL"), st.integers(0, 4000), st.integers(0, 4000)),
+    )
 
 
 class TestTimeSeriesReplication(ReplicationTestCase):
@@ -1322,13 +1328,7 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             lo, hi = sorted(op[1:])
             self.client.execute_command("TS.DEL", FUZZ_SRC, lo, hi)
 
-    @settings(
-        max_examples=40,
-        deadline=None,
-        suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
-    )
-    @given(ops=st.lists(_fuzz_op, min_size=1, max_size=30))
-    def test_replication_compaction_random_sequences(self, ops):
+    def run_random_sequence(self, ops):
         """Replica oracle: any sequence of writes and deletes through a two-level chain leaves the
         replica with the primary's destinations. A failure is a determinism bug in the engine:
         promote Hypothesis's shrunk example into a named test next to this one."""
@@ -1343,3 +1343,17 @@ class TestTimeSeriesReplication(ReplicationTestCase):
             self.apply_fuzz_op(op)
         self.assert_compaction_equivalent(FUZZ_SRC, FUZZ_MID, FUZZ_TOP)
         self.assert_rule_state_equivalent(FUZZ_SRC, FUZZ_MID)
+
+    if HAVE_HYPOTHESIS:
+        @settings(
+            max_examples=40,
+            deadline=None,
+            suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+        )
+        @given(ops=st.lists(_fuzz_op, min_size=1, max_size=30))
+        def test_replication_compaction_random_sequences(self, ops):
+            self.run_random_sequence(ops)
+    else:
+        @pytest.mark.skip(reason="hypothesis is not installed")
+        def test_replication_compaction_random_sequences(self):
+            pass
