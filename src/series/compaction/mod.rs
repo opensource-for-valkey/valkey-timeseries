@@ -210,25 +210,11 @@ impl TimeSeries {
         self.batch_compaction(ctx, &[stored], prev_last, &[stored.timestamp])
     }
 
-    pub fn run_compaction(&mut self, ctx: &Context, value: Sample) -> TsdbResult<()> {
-        if self.rules.is_empty() {
-            return Ok(());
-        }
-        apply_compaction(ctx, self, CompactionOp::AddNew(value))
-    }
-
-    pub fn upsert_compaction(&mut self, ctx: &Context, value: Sample) -> TsdbResult<()> {
-        if self.rules.is_empty() {
-            return Ok(());
-        }
-        apply_compaction(ctx, self, CompactionOp::Upsert(value))
-    }
-
     /// Propagate a batch of samples that were already merged into this series.
     ///
     /// `samples` must be sorted by timestamp ascending (unique timestamps) and `prev_last`
     /// must be this series' last timestamp from before the batch was merged. See
-    /// [`CompactionOp::AddBatch`].
+    /// [`CompactionOp::Ingest`].
     pub fn batch_compaction(
         &mut self,
         ctx: &Context,
@@ -242,7 +228,7 @@ impl TimeSeries {
         apply_compaction(
             ctx,
             self,
-            CompactionOp::AddBatch {
+            CompactionOp::Ingest {
                 samples,
                 prev_last,
                 input_order,

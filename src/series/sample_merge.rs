@@ -23,7 +23,7 @@ pub struct PerSeriesSamples<'a> {
     added: SmallVec<[Sample; 8]>,
     /// The accepted timestamps in the order the caller supplied them (MADD argument order),
     /// which `added` discards by sorting. Batch compaction replays it to classify back-fills
-    /// (see `CompactionOp::AddBatch`).
+    /// (see `CompactionOp::Ingest`).
     added_order: SmallVec<[Timestamp; 8]>,
     /// The series' last timestamp before the merge: batch compaction uses it to tell
     /// guaranteed-fresh appends apart from samples that may have replaced existing values.

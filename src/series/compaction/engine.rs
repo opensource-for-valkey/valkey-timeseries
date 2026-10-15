@@ -50,22 +50,18 @@ impl<'a> CompactionContext<'a> {
 /// Single entry point for all compaction-related mutations.
 #[derive(Debug, Clone, Copy)]
 pub enum CompactionOp<'a> {
-    /// Handle compaction for a genuinely new sample (timestamp > last sample timestamp)
-    AddNew(Sample),
-    /// Handle compaction for an upsert (timestamp <= last sample timestamp)
-    Upsert(Sample),
-    /// Propagate a batch of samples that were already merged into the source series.
+    /// Samples just merged into the source series — one (`TS.ADD`, `TS.INCRBY`) or many
+    /// (`TS.MADD`, `TS.ADDBULK`, a cascade level).
     ///
     /// `samples` must be sorted by timestamp ascending with unique timestamps and hold the
     /// stored (rounded) values. `prev_last` is the source series' last timestamp from before
-    /// the batch was merged: samples above it are guaranteed fresh appends, samples at or
-    /// below it may have replaced existing values and are treated as upserts.
+    /// the samples were merged.
     ///
     /// `input_order` holds the accepted timestamps in the order the caller supplied them
     /// (MADD argument order), which sorting `samples` discards. Back-fill classification replays
     /// it: an item at or below the running maximum *when it was applied* is a back-fill, which a
     /// comparison against `prev_last` alone cannot tell.
-    AddBatch {
+    Ingest {
         samples: &'a [Sample],
         prev_last: Option<Timestamp>,
         input_order: &'a [Timestamp],
@@ -87,9 +83,7 @@ fn null_ts_filter(_ts: Timestamp) -> bool {
 
 pub(super) fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> TsdbResult<()> {
     match op {
-        CompactionOp::AddNew(sample) => handle_sample_compaction(ctx, sample),
-        CompactionOp::Upsert(sample) => handle_compaction_upsert(ctx, sample),
-        CompactionOp::AddBatch {
+        CompactionOp::Ingest {
             samples,
             prev_last,
             input_order,
@@ -101,6 +95,42 @@ pub(super) fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> Tsd
 }
 
 /// Propagate a batch of samples (already merged into the source) through one rule.
+///
+/// An input that is all appends — the common case, every in-order `TS.ADD`/`TS.INCRBY` and
+/// in-order `TS.MADD`/`TS.ADDBULK` — streams straight through the open-bucket aggregator. Anything
+/// else is delegated to [`handle_mixed_batch_compaction`].
+#[inline]
+fn handle_batch_compaction(
+    ctx: &mut CompactionContext,
+    samples: &[Sample],
+    prev_last: Option<Timestamp>,
+    input_order: &[Timestamp],
+) -> TsdbResult<()> {
+    debug_assert!(
+        samples.is_sorted_by_key(|s| s.timestamp),
+        "batch compaction requires samples sorted by timestamp"
+    );
+
+    // Fast path: an input that is strictly increasing and starts above `prev_last` is all
+    // appends — the general path's classification would put every sample in `appends` and none
+    // in `upserts` — so stream it directly. This is every in-order `TS.ADD`/`TS.INCRBY`, and
+    // in-order `TS.MADD`/`TS.ADDBULK`, and skips the replay's bookkeeping.
+    let all_appends = input_order
+        .first()
+        .is_some_and(|&first| prev_last.is_none_or(|last| first > last))
+        && input_order.windows(2).all(|w| w[0] < w[1]);
+    if all_appends {
+        for sample in samples {
+            handle_sample_compaction(ctx, *sample)?;
+        }
+        return Ok(());
+    }
+    handle_mixed_batch_compaction(ctx, samples, prev_last, input_order)
+}
+
+/// The general case of [`handle_batch_compaction`]: back-fills, repeats or out-of-order items
+/// mixed in with appends. Kept out of line so the one-sample append — every in-order `TS.ADD` —
+/// doesn't pay this function's stack frame and register saves on its way to the fast path.
 ///
 /// Appends stream through the open-bucket aggregator in O(1) each, exactly like sequential
 /// single-sample adds. Back-fills may have replaced existing values, so their buckets are
@@ -121,38 +151,6 @@ pub(super) fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> Tsd
 /// count them twice. If an append closes a bucket that a pending upsert also touched, the
 /// destination value is first written from the (stale) aggregator and then overwritten by the
 /// recalculation (destination adds use KeepLast), keeping the batch self-correcting.
-#[inline]
-fn handle_batch_compaction(
-    ctx: &mut CompactionContext,
-    samples: &[Sample],
-    prev_last: Option<Timestamp>,
-    input_order: &[Timestamp],
-) -> TsdbResult<()> {
-    debug_assert!(
-        samples.is_sorted_by_key(|s| s.timestamp),
-        "batch compaction requires samples sorted by timestamp"
-    );
-
-    // Fast path: an input that is strictly increasing and starts above `prev_last` is all
-    // appends — the classification below would put every sample in `appends` and none in
-    // `upserts` — so stream it directly. This is every in-order `TS.ADD`/`TS.INCRBY`, and
-    // in-order `TS.MADD`/`TS.ADDBULK`, and skips the replay's bookkeeping.
-    let all_appends = input_order
-        .first()
-        .is_some_and(|&first| prev_last.is_none_or(|last| first > last))
-        && input_order.windows(2).all(|w| w[0] < w[1]);
-    if all_appends {
-        for sample in samples {
-            handle_sample_compaction(ctx, *sample)?;
-        }
-        return Ok(());
-    }
-    handle_mixed_batch_compaction(ctx, samples, prev_last, input_order)
-}
-
-/// The general case of [`handle_batch_compaction`]: back-fills, repeats or out-of-order items
-/// mixed in with appends. Kept out of line so the one-sample append — every in-order `TS.ADD` —
-/// doesn't pay this function's stack frame and register saves on its way to the fast path.
 #[inline(never)]
 fn handle_mixed_batch_compaction(
     ctx: &mut CompactionContext,
@@ -264,8 +262,8 @@ fn handle_mixed_batch_compaction(
     //
     // A bucket only reaches the destination when it closes, so `recalculate_bucket` (which
     // writes) is for buckets the rule has already moved past. When the rule has no open bucket
-    // at all this upsert is opening it, exactly as the single-sample path does for its own
-    // "no current bucket" case — publishing here would expose a bucket still accepting samples.
+    // at all this upsert is opening it, as `handle_sample_compaction` does for a rule's first
+    // sample — publishing here would expose a bucket still accepting samples.
     // A batch reaches that state whenever a timestamp appears twice in the caller's order: the
     // repeat reads as a back-fill, `samples` carries the timestamp once, so it is classified as
     // an upsert and never streams through the append path that would have opened the bucket.
@@ -351,48 +349,6 @@ fn finalize_current_bucket(
     ctx.start_bucket(new_bucket_start, new_sample);
 
     Ok(())
-}
-
-/// Handle upsert compaction for a destination series
-/// This is called when a sample is being inserted/updated with a timestamp that's <= the last sample timestamp
-fn handle_compaction_upsert(ctx: &mut CompactionContext, sample: Sample) -> TsdbResult<()> {
-    let ts = sample.timestamp;
-    let bucket_start = ctx.rule.calc_bucket_start(ts);
-
-    // Check if this affects the current ongoing aggregation bucket
-    let Some(current_bucket_start) = ctx.rule.bucket_start else {
-        // No current bucket, this is the first sample for this rule
-        ctx.start_bucket(bucket_start, sample);
-        return Ok(());
-    };
-
-    let bucket_end = ctx.rule.bucket_end(current_bucket_start);
-
-    if bucket_start == current_bucket_start {
-        // This sample belongs to the current aggregation bucket
-        // We need to recalculate the entire bucket since we don't know what changed
-        recalculate_current_bucket(
-            ctx,
-            current_bucket_start,
-            bucket_end,
-            ctx.parent.get_min_timestamp(),
-        )?;
-        return Ok(());
-    }
-
-    // This is a historical upsert — recalculate the affected (closed) bucket.
-    // The recompute range must be that bucket's own span; `bucket_end` above
-    // belongs to the *current* open bucket, and using it here would fold every
-    // sample between the historical bucket and the open one into the recompute.
-    let historical_bucket_end = ctx.rule.bucket_end(bucket_start);
-    let min_ts = ctx.parent.get_min_timestamp();
-    recalculate_bucket(
-        ctx,
-        bucket_start,
-        historical_bucket_end,
-        min_ts,
-        null_ts_filter,
-    )
 }
 
 /// Recalculate the current ongoing aggregation bucket
@@ -694,7 +650,7 @@ pub fn bench_ingest_one(
     let samples = [sample];
     let order = [sample.timestamp];
     let mut cctx = CompactionContext::new(parent, dest, rule);
-    let op = CompactionOp::AddBatch {
+    let op = CompactionOp::Ingest {
         samples: &samples,
         prev_last,
         input_order: &order,
@@ -709,7 +665,6 @@ mod tests {
     use crate::series::{DuplicatePolicy, SampleAddResult, SeriesLink};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
-    use std::time::Duration;
 
     /// Every aggregator a rule accepts without an inline condition.
     const RULE_TYPES: &[AggregationType] = &[
@@ -762,26 +717,7 @@ mod tests {
         (rule.bucket_start, rule.has_samples, current)
     }
 
-    /// `TS.ADD`'s path before Task 9: `Upsert` at or below the previous last timestamp,
-    /// otherwise `AddNew` with the stored last sample.
-    fn ingest_single_path(
-        parent: &TimeSeries,
-        dest: &mut TimeSeries,
-        rule: &mut CompactionRule,
-        stored: Sample,
-        prev_last: Option<Timestamp>,
-    ) {
-        let is_upsert = prev_last.is_some_and(|last| stored.timestamp <= last);
-        let op = if is_upsert {
-            CompactionOp::Upsert(stored)
-        } else {
-            CompactionOp::AddNew(parent.last_sample.unwrap_or(stored))
-        };
-        let mut cctx = CompactionContext::new(parent, dest, rule);
-        apply_op(&mut cctx, op).unwrap();
-    }
-
-    /// The path every write takes from Task 9 on.
+    /// The path every write takes: a one-item batch.
     fn ingest_batch_of_one(
         parent: &TimeSeries,
         dest: &mut TimeSeries,
@@ -792,7 +728,7 @@ mod tests {
         let samples = [stored];
         let order = [stored.timestamp];
         let mut cctx = CompactionContext::new(parent, dest, rule);
-        let op = CompactionOp::AddBatch {
+        let op = CompactionOp::Ingest {
             samples: &samples,
             prev_last,
             input_order: &order,
@@ -831,7 +767,7 @@ mod tests {
                     let mut dest = TimeSeries::new();
                     let mut rule = fresh_rule(agg, 500);
                     let mut cctx = CompactionContext::new(&parent, &mut dest, &mut rule);
-                    let op = CompactionOp::AddBatch {
+                    let op = CompactionOp::Ingest {
                         samples: &samples,
                         prev_last,
                         input_order: order,
@@ -859,68 +795,32 @@ mod tests {
     /// `3500=1, 3799=0` is a counter reset with no rate.
     #[test]
     fn backfill_turning_a_published_bucket_into_nan_replaces_it() {
-        for single_path in [false, true] {
-            let mut parent = TimeSeries::new();
-            let mut dest = TimeSeries::new();
-            let mut rule = fresh_rule(AggregationType::IRate, 500);
-            for (ts, value) in [(3500, 0.0), (3799, 0.0), (4000, 0.0), (3500, 1.0)] {
-                let prev_last = parent.last_sample.map(|s| s.timestamp);
-                let SampleAddResult::Ok(stored) =
-                    parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
-                else {
-                    panic!("sample @{ts} rejected");
-                };
-                if single_path {
-                    ingest_single_path(&parent, &mut dest, &mut rule, stored, prev_last);
-                } else {
-                    ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
-                }
-            }
-            let samples: Vec<Sample> = dest.iter().collect();
-            assert_eq!(samples.len(), 1, "single_path={single_path}: {samples:?}");
-            assert_eq!(samples[0].timestamp, 3500);
-            assert!(
-                samples[0].value.is_nan(),
-                "single_path={single_path}: bucket 3500 kept {}",
-                samples[0].value
-            );
+        let mut parent = TimeSeries::new();
+        let mut dest = TimeSeries::new();
+        let mut rule = fresh_rule(AggregationType::IRate, 500);
+        for (ts, value) in [(3500, 0.0), (3799, 0.0), (4000, 0.0), (3500, 1.0)] {
+            let prev_last = parent.last_sample.map(|s| s.timestamp);
+            let SampleAddResult::Ok(stored) =
+                parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
+            else {
+                panic!("sample @{ts} rejected");
+            };
+            ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
         }
+        let samples: Vec<Sample> = dest.iter().collect();
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(samples[0].timestamp, 3500);
+        assert!(
+            samples[0].value.is_nan(),
+            "bucket 3500 kept {}",
+            samples[0].value
+        );
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// Transitional (deleted in Task 10): on a rule that has seen every write since the
-        /// source was empty, a one-item batch leaves exactly the destination and open-bucket
-        /// state the single-sample path does — for every aggregator, with and without a
-        /// retention window shorter than a bucket.
-        #[test]
-        fn batch_of_one_matches_the_single_sample_path(
-            agg in prop::sample::select(RULE_TYPES),
-            bucket in prop::sample::select(&[500u64, 1000][..]),
-            retention in prop::sample::select(&[0u64, 700, 2500][..]),
-            writes in prop::collection::vec((0i64..5000, -100i32..100), 1..40),
-        ) {
-            let mut parent = TimeSeries::new();
-            parent.retention = Duration::from_millis(retention);
-            let (mut dest_a, mut dest_b) = (TimeSeries::new(), TimeSeries::new());
-            let (mut rule_a, mut rule_b) = (fresh_rule(agg, bucket), fresh_rule(agg, bucket));
-
-            for (ts, value) in writes {
-                let prev_last = parent.last_sample.map(|s| s.timestamp);
-                let SampleAddResult::Ok(stored) =
-                    parent.add(ts, value as f64, Some(DuplicatePolicy::KeepLast))
-                else {
-                    continue; // TS.ADD runs no compaction for a rejected sample
-                };
-                ingest_single_path(&parent, &mut dest_a, &mut rule_a, stored, prev_last);
-                ingest_batch_of_one(&parent, &mut dest_b, &mut rule_b, stored, prev_last);
-                prop_assert_eq!(dest_samples(&dest_a), dest_samples(&dest_b), "after write {}", ts);
-                prop_assert_eq!(open_state(&rule_a), open_state(&rule_b), "after write {}", ts);
-            }
-        }
-
-        /// Permanent: without retention, the destination holds exactly the buckets strictly older
+        /// Without retention, the destination holds exactly the buckets strictly older
         /// than the one containing the source's last sample that received at least one counted
         /// sample, each the aggregate of the source's samples in timestamp order, and the rule's
         /// open bucket is the aggregate of the newest bucket. A failure is an engine bug.

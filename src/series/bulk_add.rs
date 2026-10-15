@@ -589,7 +589,7 @@ pub fn bulk_insert_samples(
         // `results` follow the caller's input order; batch compaction needs ascending
         // timestamps. TS.ADDBULK pre-sorts its input, so this is normally a no-op check.
         // The pre-sort order is kept separately: back-fill classification replays it (see
-        // `CompactionOp::AddBatch`).
+        // `CompactionOp::Ingest`).
         let input_order: Vec<Timestamp> = added.iter().map(|s| s.timestamp).collect();
         if !added.is_sorted_by_key(|s| s.timestamp) {
             added.sort_unstable_by_key(|s| s.timestamp);

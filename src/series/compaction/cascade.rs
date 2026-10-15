@@ -30,7 +30,7 @@ struct RuleOutcome {
     /// [`Destinations`] the rules were applied to.
     rule_index: usize,
     /// `dest`'s last timestamp *before* this operation ran — the `prev_last` a cascaded
-    /// `AddBatch` into `dest`'s own rules must use.
+    /// `Ingest` into `dest`'s own rules must use.
     dest_prev_last: Option<Timestamp>,
     /// Samples committed to `dest` by this operation, in commit order (not necessarily
     /// sorted or unique — see [`dedupe_written_samples`]).
@@ -39,12 +39,12 @@ struct RuleOutcome {
 
 /// Sorts and deduplicates a rule's written samples for use as the next cascade level's batch.
 ///
-/// A single [`CompactionOp::AddBatch`] application can write the same bucket twice: once from
+/// A single [`CompactionOp::Ingest`] application can write the same bucket twice: once from
 /// the streaming append path, then again when a same-batch historical upsert recalculates that
 /// bucket (see `handle_batch_compaction`). The recalculation is authoritative and always runs
 /// after the streaming write, so a stable sort followed by keeping the last of each duplicate
 /// timestamp preserves the correct (final) value while producing the sorted, unique-timestamp
-/// sequence `AddBatch` requires downstream.
+/// sequence `Ingest` requires downstream.
 fn dedupe_written_samples(mut samples: Vec<Sample>) -> Vec<Sample> {
     if samples.len() < 2 {
         return samples;
@@ -94,8 +94,8 @@ impl Visited {
 ///   correct regardless of chain depth because each level's recalculation reads directly from
 ///   its own immediate parent (already updated by the level above), never from a value carried
 ///   across levels.
-/// - `AddNew`/`Upsert`/`AddBatch` instead feed each destination's own *written* samples — the
-///   values actually committed to it — as an `AddBatch` into that destination's rules. This
+/// - `Ingest` instead feeds each destination's own *written* samples — the
+///   values actually committed to it — as an `Ingest` into that destination's rules. This
 ///   makes every rule aggregate over its declared source series, matching a rule's own
 ///   definition (e.g. `mid -> dest AVG` averages `mid`'s stored samples, not the top-level raw
 ///   stream). Reusing the original op across levels would instead feed the *raw* top-level
@@ -112,7 +112,7 @@ fn process_series_with_compaction(
     // upsert into an already-closed bucket recomputes the destination
     // silently, and a TS.DEL propagated into destinations emits only the
     // source's `ts.del`.
-    let notify_destinations = matches!(op, CompactionOp::AddNew(_) | CompactionOp::AddBatch { .. });
+    let notify_destinations = matches!(op, CompactionOp::Ingest { .. });
     let mut notified: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = SmallVec::new();
     let mut visited = Visited::default();
 
@@ -202,7 +202,7 @@ fn process_series_with_compaction(
                 // in bucket order — so input order and sorted order coincide.
                 let cascade_order: SmallVec<[Timestamp; TEMP_VEC_LEN]> =
                     samples.iter().map(|s| s.timestamp).collect();
-                let batch_op = CompactionOp::AddBatch {
+                let batch_op = CompactionOp::Ingest {
                     samples: &samples,
                     prev_last,
                     input_order: &cascade_order,
@@ -271,9 +271,8 @@ fn runs_rules_in_parallel(op: &CompactionOp, rule_count: usize) -> bool {
         return false;
     }
     match op {
-        CompactionOp::AddBatch { samples, .. } => samples.len() > 1,
+        CompactionOp::Ingest { samples, .. } => samples.len() > 1,
         CompactionOp::RemoveRange { .. } => true,
-        CompactionOp::AddNew(_) | CompactionOp::Upsert(_) => false,
     }
 }
 
@@ -456,12 +455,12 @@ mod tests {
     fn a_single_sample_never_runs_rules_in_parallel() {
         let one = [Sample::new(1, 1.0)];
         let two = [Sample::new(1, 1.0), Sample::new(2, 1.0)];
-        let single = CompactionOp::AddBatch {
+        let single = CompactionOp::Ingest {
             samples: &one,
             prev_last: None,
             input_order: &[1],
         };
-        let batch = CompactionOp::AddBatch {
+        let batch = CompactionOp::Ingest {
             samples: &two,
             prev_last: None,
             input_order: &[1, 2],
