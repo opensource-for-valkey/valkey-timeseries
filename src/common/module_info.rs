@@ -1,4 +1,4 @@
-//! The module's `INFO` sections.
+//! The module's `INFO` sections: `ts_memory` and `ts_compaction`.
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`/`INFO all`,
 //! or `INFO <section>` — never for a bare `INFO` — which is what makes it acceptable for the
@@ -6,13 +6,19 @@
 
 use crate::common::string_interner::InternedString;
 use crate::series::index::index_memory_usage;
+use crate::series::{COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS};
 use valkey_module::{InfoContext, ValkeyResult};
 use valkey_module_macros::info_command_handler;
 
-/// `INFO ts_memory`: the module's global heap, which no per-key figure can show.
+/// `INFO ts_memory` and `INFO ts_compaction`.
 ///
-/// The section is declared as `memory`; the server prefixes it with the module name, so it lands
-/// as `# ts_memory` with every field prefixed `ts_`.
+/// `ts_memory` is the module's global heap, which no per-key figure can show.
+/// `ts_compaction` counts the compaction rule applications that failed and the dirty rules that
+/// were rebuilt afterwards, since module start.
+///
+/// The sections are declared as `memory` and `compaction`; the server prefixes each with the
+/// module name, so they land as `# ts_memory` and `# ts_compaction` with every field prefixed
+/// `ts_`.
 ///
 /// `MEMORY USAGE <key>` and `TS.INFO memoryUsage` report one series: its chunks, its labels'
 /// amortized share of the interner, and its own struct. The label index is not attached to any
@@ -23,7 +29,7 @@ use valkey_module_macros::info_command_handler;
 /// `terms_bytes` and `id_to_key_bytes` count the entries an adaptive radix tree and a `BTreeMap`
 /// hold without their internal node overhead, so the totals are a floor.
 #[info_command_handler]
-fn memory_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
+fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
     let index = index_memory_usage();
 
     ctx.builder()
@@ -46,6 +52,16 @@ fn memory_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
         .field(
             "interned_strings_bytes",
             InternedString::memory_used() as u64,
+        )?
+        .build_section()?
+        .add_section("compaction")
+        .field(
+            "compaction_failures",
+            COMPACTION_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
+        )?
+        .field(
+            "compaction_state_rebuilds",
+            COMPACTION_STATE_REBUILDS.load(std::sync::atomic::Ordering::Relaxed),
         )?
         .build_section()?
         .build_info()?;

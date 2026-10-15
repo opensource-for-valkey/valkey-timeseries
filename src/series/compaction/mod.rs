@@ -16,6 +16,7 @@ use crate::error::TsdbResult;
 use crate::error_consts;
 use crate::series::{SeriesLink, TimeSeries};
 use get_size2::GetSize;
+use std::sync::atomic::AtomicU64;
 use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
 
 mod cascade;
@@ -23,6 +24,7 @@ mod engine;
 mod links;
 
 pub use cascade::apply_compaction;
+pub(crate) use cascade::fail_next_compaction;
 pub use engine::CompactionOp;
 #[cfg(feature = "test-utils")]
 pub use engine::{bench_ingest_one, bench_rule};
@@ -40,6 +42,12 @@ pub struct CompactionRule {
     pub align_timestamp: Timestamp,
     pub bucket_start: Option<Timestamp>,
     pub has_samples: bool,
+    /// Set when the rule's last application returned an error, so its open-bucket state may not
+    /// reflect every sample the source stored. The next `Ingest` rebuilds the open bucket from the
+    /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. Node-local:
+    /// persisted, so a restart does not forget it, but not hashed into the digest, because a
+    /// replica's application of the same write may well have succeeded.
+    pub dirty: bool,
 }
 
 impl GetSize for CompactionRule {
@@ -50,6 +58,7 @@ impl GetSize for CompactionRule {
             + size_of::<Timestamp>() // align_timestamp
             + size_of::<Option<Timestamp>>() // bucket_start
             + size_of::<bool>() // has_samples
+            + size_of::<bool>() // dirty
     }
 }
 
@@ -96,6 +105,7 @@ impl RdbSerializable for CompactionRule {
         rdb_save_timestamp(rdb, self.align_timestamp);
         rdb_save_timestamp(rdb, self.bucket_start.unwrap_or(-1));
         rdb_save_bool(rdb, self.has_samples);
+        rdb_save_bool(rdb, self.dirty);
     }
 
     fn rdb_load(rdb: *mut raw::RedisModuleIO) -> ValkeyResult<Self> {
@@ -109,6 +119,7 @@ impl RdbSerializable for CompactionRule {
         let align_timestamp = rdb_load_timestamp(rdb)?;
         let start_ts = rdb_load_timestamp(rdb)?;
         let has_samples = rdb_load_bool(rdb)?;
+        let dirty = rdb_load_bool(rdb)?;
         let bucket_start = if start_ts == -1 { None } else { Some(start_ts) };
 
         validate_restored_rule_parameters(bucket_duration, align_timestamp)?;
@@ -120,9 +131,43 @@ impl RdbSerializable for CompactionRule {
             align_timestamp,
             bucket_start,
             has_samples,
+            dirty,
         })
     }
 }
+
+/// Rebuild `rule`'s open-bucket state from the source as it stood when its last timestamp was
+/// `as_of`: the bucket containing `as_of`, aggregated over the stored samples in that bucket at or
+/// below `as_of`. Anything above it is the current write's own append, already stored, which the
+/// engine is about to stream in. `None` means the source was empty: no open bucket.
+///
+/// An approximation of the state a rule maintains by streaming — exact for every aggregator whose
+/// bucket value depends only on the bucket's samples, but `rate`/`increase` and a retention window
+/// shorter than a bucket can differ — so it runs only to recover a `dirty` rule.
+pub(super) fn rebuild_open_bucket_as_of(
+    parent: &TimeSeries,
+    rule: &mut CompactionRule,
+    as_of: Option<Timestamp>,
+) {
+    rule.reset();
+    let Some(as_of) = as_of else {
+        return;
+    };
+    let (start, end) = rule.get_bucket_range(as_of);
+    rule.bucket_start = Some(start);
+    for sample in parent.range_iter(start, end - 1) {
+        if sample.timestamp > as_of {
+            break;
+        }
+        rule.update(sample.timestamp, sample.value);
+    }
+}
+
+/// Rule applications that returned an error (`INFO ts_compaction` → `ts_compaction_failures`).
+/// Non-zero means a destination may be missing a bucket its source should have produced.
+pub static COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds`).
+pub static COMPACTION_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
 
 fn validate_restored_rule_parameters(
     bucket_duration: u64,
@@ -239,8 +284,50 @@ impl TimeSeries {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_restored_rule_parameters;
-    use crate::common::Timestamp;
+    use super::*;
+    use crate::aggregators::AggregationType;
+
+    fn rule(agg: AggregationType, bucket: u64) -> CompactionRule {
+        CompactionRule {
+            dest: SeriesLink::from("dst"),
+            aggregator: agg.into(),
+            bucket_duration: bucket,
+            align_timestamp: 0,
+            bucket_start: None,
+            has_samples: false,
+            dirty: false,
+        }
+    }
+
+    fn series_with(samples: &[(Timestamp, f64)]) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        for &(ts, value) in samples {
+            assert!(series.add(ts, value, None).is_ok(), "fixture add {ts}");
+        }
+        series
+    }
+
+    #[test]
+    fn rebuild_stops_at_as_of_so_the_pending_append_is_not_counted_twice() {
+        // 1700 is the current write's own append, already stored; the append path streams it next.
+        let series = series_with(&[(1000, 9.0), (1200, 3.0), (1700, 100.0)]);
+        let mut rebuilt = rule(AggregationType::Sum, 1000);
+        rebuild_open_bucket_as_of(&series, &mut rebuilt, Some(1200));
+        assert_eq!(rebuilt.bucket_start, Some(1000));
+        assert!(rebuilt.has_samples);
+        assert_eq!(AggregationHandler::current(&rebuilt.aggregator), Some(12.0));
+    }
+
+    #[test]
+    fn rebuild_for_an_empty_source_clears_the_bucket() {
+        let series = series_with(&[(1000, 9.0)]);
+        let mut rebuilt = rule(AggregationType::Sum, 1000);
+        rebuilt.bucket_start = Some(1000);
+        rebuilt.update(1000, 9.0);
+        rebuild_open_bucket_as_of(&series, &mut rebuilt, None);
+        assert_eq!(rebuilt.bucket_start, None);
+        assert!(!rebuilt.has_samples);
+    }
 
     #[test]
     fn restored_rule_rejects_zero_bucket_duration() {

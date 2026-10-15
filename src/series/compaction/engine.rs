@@ -642,6 +642,7 @@ pub fn bench_rule(agg: crate::aggregators::AggregationType, bucket_ms: u64) -> C
         align_timestamp: 0,
         bucket_start: None,
         has_samples: false,
+        dirty: false,
     }
 }
 
@@ -708,6 +709,7 @@ mod tests {
             align_timestamp: 0,
             bucket_start: None,
             has_samples: false,
+            dirty: false,
         }
     }
 

@@ -144,5 +144,6 @@ fn parse_args(args: &mut CommandArgIterator, dest: SeriesLink) -> ValkeyResult<C
         align_timestamp,
         bucket_start: None,
         has_samples: false,
+        dirty: false,
     })
 }

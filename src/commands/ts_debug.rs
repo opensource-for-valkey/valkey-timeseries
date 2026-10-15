@@ -257,6 +257,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
             "TS._DEBUG PANIC_NEXT_ANALYSIS_JOB",
             "Make the next job on the analysis lane panic (tests the error reply)",
         ),
+        (
+            "TS._DEBUG FAIL_NEXT_COMPACTION",
+            "Make the next compaction rule application fail (tests dirty-rule recovery)",
+        ),
     ];
 
     reply_with_array(ctx, HELP_TEXT.len() * 2);
@@ -296,6 +300,12 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         "PANIC_NEXT_ANALYSIS_JOB" => {
             itr.done()?;
             panic_next_analysis_job();
+            reply_with_str(ctx, "OK");
+            Ok(())
+        }
+        "FAIL_NEXT_COMPACTION" => {
+            itr.done()?;
+            crate::series::fail_next_compaction();
             reply_with_str(ctx, "OK");
             Ok(())
         }

@@ -1,5 +1,8 @@
 use super::engine::{CompactionContext, CompactionOp, apply_op};
-use super::{CompactionRule, TEMP_VEC_LEN};
+use super::{
+    COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS, CompactionRule, TEMP_VEC_LEN,
+    rebuild_open_bucket_as_of,
+};
 use crate::common::block_on_keys::signal_timeseries_ready;
 use crate::common::context::notify_keyspace_event;
 use crate::common::logging::log_warning;
@@ -9,9 +12,26 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::series::{SeriesGuardMut, TimeSeries, try_get_timeseries_mut};
 use orx_parallel::Par;
 use smallvec::SmallVec;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use valkey_module::{Context, ValkeyString};
 
 const PARALLEL_THRESHOLD: usize = 2;
+
+/// Set by `TS._DEBUG FAIL_NEXT_COMPACTION` (debug mode only): the next rule application fails
+/// without running, exactly as an internal error would leave it.
+static FAIL_NEXT_COMPACTION: AtomicBool = AtomicBool::new(false);
+
+/// Makes the next rule application fail. For tests; see [`FAIL_NEXT_COMPACTION`].
+pub(crate) fn fail_next_compaction() {
+    FAIL_NEXT_COMPACTION.store(true, AtomicOrdering::Relaxed);
+}
+
+/// Consumes the flag [`fail_next_compaction`] set. Every rule application of every write asks, so
+/// the common answer, no, costs a load rather than the read-modify-write a bare `swap` would.
+fn take_injected_failure() -> bool {
+    FAIL_NEXT_COMPACTION.load(AtomicOrdering::Relaxed)
+        && FAIL_NEXT_COMPACTION.swap(false, AtomicOrdering::Relaxed)
+}
 
 pub fn apply_compaction(
     ctx: &Context,
@@ -306,12 +326,33 @@ fn apply_rules_internal(
         .map(|(rule_index, rule, dest_guard)| {
             let rule_index = *rule_index;
             let dest_prev_last = dest_guard.last_sample.map(|s| s.timestamp);
-            let mut cctx = CompactionContext::new(series, dest_guard, rule);
-            apply_op(&mut cctx, op).map(|_| RuleOutcome {
+            if rule.dirty {
+                // A failed application left the open bucket short of samples the source stored.
+                // A removal rebuilds it anyway; an ingest does so here, before it streams in.
+                if let CompactionOp::Ingest { prev_last, .. } = op {
+                    rebuild_open_bucket_as_of(series, rule, prev_last);
+                }
+                COMPACTION_STATE_REBUILDS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let (result, written, closed_bucket) = if take_injected_failure() {
+                (
+                    Err(TsdbError::General(
+                        "injected compaction failure".to_string(),
+                    )),
+                    Vec::new(),
+                    false,
+                )
+            } else {
+                let mut cctx = CompactionContext::new(series, dest_guard, rule);
+                let result = apply_op(&mut cctx, op);
+                (result, cctx.written, cctx.closed_bucket)
+            };
+            rule.dirty = result.is_err();
+            result.map(|_| RuleOutcome {
                 rule_index,
                 dest_prev_last,
-                written: cctx.written,
-                closed_bucket: cctx.closed_bucket,
+                written,
+                closed_bucket,
             })
         })
         .collect();
@@ -328,6 +369,7 @@ fn apply_rules_internal(
                 }
                 let msg = format!("Failed to handle compaction rule for series: {error}");
                 log_warning(msg);
+                COMPACTION_FAILURES.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
     }

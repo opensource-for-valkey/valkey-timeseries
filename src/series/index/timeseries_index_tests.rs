@@ -737,6 +737,7 @@ mod tests {
             align_timestamp: 0,
             bucket_start: None,
             has_samples: false,
+            dirty: false,
         }
     }
 

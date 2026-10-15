@@ -62,15 +62,15 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         self.create_source_and_dest_series(src, dst)
         self.add_compaction_rule(src, dst, "sum", 1000)
 
-        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), None, 0, None]]
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), None, 0, None, 0]]
         assert self.info_debug(self.client, dst)[b"rulesState"] == []
 
         self.add_sample(src, 100, 1.5)
         self.add_sample(src, 200, 2.0)
-        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 0, 1, b"3.5"]]
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 0, 1, b"3.5", 0]]
 
         self.add_sample(src, 1000, 7.0)  # closes bucket 0
-        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 1000, 1, b"7"]]
+        assert self.info_debug(self.client, src)[b"rulesState"] == [[dst.encode(), 1000, 1, b"7", 0]]
 
     # Every aggregator a rule accepts. The conditional ones take an inline condition.
     RULE_AGGREGATORS = [

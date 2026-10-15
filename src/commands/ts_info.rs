@@ -70,7 +70,8 @@ pub fn ts_info_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 }
 
 /// The order TS.INFO reports its fields in: the reference's, with this module's additions
-/// (`encoding`, `metric`, `rounding`) beside their nearest relatives. DEBUG adds the last two.
+/// (`encoding`, `metric`, `rounding`) beside their nearest relatives. DEBUG adds the last three
+/// (`keySelfName`, `rulesState`, `Chunks`).
 const INFO_FIELD_ORDER: &[&str] = &[
     "totalSamples",
     "memoryUsage",
@@ -95,9 +96,11 @@ const INFO_FIELD_ORDER: &[&str] = &[
 ];
 
 /// Per-rule aggregation state for `TS.INFO … DEBUG`: one `[destKey, bucketStart, hasSamples,
-/// current]` entry per rule, in rule order. `bucketStart` and `current` are nil while the rule
-/// has no open bucket. This is the state a primary and its replica must agree on, and it is
-/// otherwise invisible — a wrong open bucket only shows up downstream, one bucket later.
+/// current, dirty]` entry per rule, in rule order. `bucketStart` and `current` are nil while the
+/// rule has no open bucket; `dirty` is 1 while a failed application is waiting for the next write
+/// to rebuild the open bucket. This is the state a primary and its replica must agree on, and it
+/// is otherwise invisible — a wrong open bucket only shows up downstream, one bucket later. (A
+/// healthy pair agrees on `dirty` too, but a failure is node-local, so it may differ after one.)
 fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
     let entries = ts
         .rules
@@ -115,6 +118,7 @@ fn get_rules_state(ts: &TimeSeries) -> ValkeyValue {
                     .map_or(ValkeyValue::Null, ValkeyValue::Integer),
                 ValkeyValue::Integer(i64::from(rule.has_samples)),
                 current,
+                ValkeyValue::Integer(i64::from(rule.dirty)),
             ])
         })
         .collect();
