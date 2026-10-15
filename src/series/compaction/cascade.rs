@@ -263,6 +263,20 @@ fn apply_rules_on_destinations(
     result
 }
 
+/// Whether `op` is worth spreading across rules. One sample is O(1) aggregator work per rule —
+/// far less than a pool handoff — so `TS.ADD` into a source with several rules stays on the
+/// command thread; batches and removals, which can recalculate many buckets, fan out.
+fn runs_rules_in_parallel(op: &CompactionOp, rule_count: usize) -> bool {
+    if rule_count < PARALLEL_THRESHOLD {
+        return false;
+    }
+    match op {
+        CompactionOp::AddBatch { samples, .. } => samples.len() > 1,
+        CompactionOp::RemoveRange { .. } => true,
+        CompactionOp::AddNew(_) | CompactionOp::Upsert(_) => false,
+    }
+}
+
 /// Internal function that handles execution of compaction rules. `child_series` holds one
 /// entry per rule, in rule order; a rule whose entry is `None` is skipped.
 fn apply_rules_internal(
@@ -281,15 +295,7 @@ fn apply_rules_internal(
         return Ok(Vec::new());
     }
 
-    // Rules run in parallel only for the multi-sample operations. For a single added or
-    // upserted sample each rule does O(1) aggregator work (or recomputes one bucket), far less
-    // than the thread spawns a parallel pass costs — which every TS.ADD to a source with two or
-    // more rules used to pay.
-    let parallel = destinations.len() >= PARALLEL_THRESHOLD
-        && matches!(
-            op,
-            CompactionOp::AddBatch { .. } | CompactionOp::RemoveRange { .. }
-        );
+    let parallel = runs_rules_in_parallel(&op, destinations.len());
     let results: Vec<Result<RuleOutcome, TsdbError>> = destinations
         .par_mut_rayon()
         .num_threads(if parallel { 0 } else { 1 }) // 0 is shorthand for Auto
@@ -438,5 +444,34 @@ fn notify_compaction(ctx: &Context, keys: &[ValkeyString]) {
         // the one place both direct and cascaded compaction output can wake a `TS.READ`
         // reader blocked on a rollup key.
         signal_timeseries_ready(ctx, key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::Sample;
+
+    #[test]
+    fn a_single_sample_never_runs_rules_in_parallel() {
+        let one = [Sample::new(1, 1.0)];
+        let two = [Sample::new(1, 1.0), Sample::new(2, 1.0)];
+        let single = CompactionOp::AddBatch {
+            samples: &one,
+            prev_last: None,
+            input_order: &[1],
+        };
+        let batch = CompactionOp::AddBatch {
+            samples: &two,
+            prev_last: None,
+            input_order: &[1, 2],
+        };
+        assert!(!runs_rules_in_parallel(&single, 8));
+        assert!(runs_rules_in_parallel(&batch, 2));
+        assert!(!runs_rules_in_parallel(&batch, 1));
+        assert!(runs_rules_in_parallel(
+            &CompactionOp::RemoveRange { start: 0, end: 1 },
+            2
+        ));
     }
 }

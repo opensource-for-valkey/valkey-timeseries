@@ -191,6 +191,25 @@ impl TimeSeries {
         Ok(deleted_count)
     }
 
+    /// Drive this series' rules for one sample just stored at `sample.timestamp`, as a one-item
+    /// batch. `prev_last` is the series' last timestamp from *before* the write: at or below it
+    /// the write is a back-fill (or an in-place update) and the bucket is recalculated from the
+    /// source, above it the sample streams into the open bucket.
+    pub fn compact_sample(
+        &mut self,
+        ctx: &Context,
+        sample: Sample,
+        prev_last: Option<Timestamp>,
+    ) -> TsdbResult<()> {
+        // For an append the stored (rounded) value is the last sample; a back-fill only uses the
+        // timestamp, since its bucket is re-read from the source.
+        let stored = match self.last_sample {
+            Some(last) if last.timestamp == sample.timestamp => last,
+            _ => sample,
+        };
+        self.batch_compaction(ctx, &[stored], prev_last, &[stored.timestamp])
+    }
+
     pub fn run_compaction(&mut self, ctx: &Context, value: Sample) -> TsdbResult<()> {
         if self.rules.is_empty() {
             return Ok(());

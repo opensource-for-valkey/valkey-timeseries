@@ -620,3 +620,26 @@ class TestCompactionAdd(ValkeyTimeSeriesTestCaseBase):
         for ts, value in ((900, 15), (1100, 20)):
             c.execute_command("TS.ADD", "rate:src", ts, value)
         assert c.execute_command("TS.RANGE", "rate:dst", "-", "+") == [[0, b"10"], [500, b"10"]]
+
+    def test_incrby_at_the_last_timestamp_recalculates_the_bucket(self):
+        """Review focus 3: an in-place increment of the last sample is an upsert; streaming it
+        as a new sample would average 0 and 1 to 0.5."""
+        c = self.client
+        self.create_source_and_dest_series("inc:src", "inc:dst")
+        self.add_compaction_rule("inc:src", "inc:dst", "avg", 1000)
+        c.execute_command("TS.ADD", "inc:src", 0, 0)
+        c.execute_command("TS.INCRBY", "inc:src", 1, "TIMESTAMP", 0)
+        assert c.execute_command("TS.GET", "inc:dst", "LATEST") == [0, b"1"]
+        c.execute_command("TS.ADD", "inc:src", 1000, 5)
+        assert c.execute_command("TS.RANGE", "inc:dst", "-", "+") == [[0, b"1"]]
+
+    def test_ignored_sample_runs_no_compaction(self):
+        """Review focus 4: a sample IGNORE suppresses must not reach the rule."""
+        c = self.client
+        c.execute_command("TS.CREATE", "ign:src", "DUPLICATE_POLICY", "LAST", "IGNORE", 10, 0.5)
+        c.execute_command("TS.CREATE", "ign:dst")
+        self.add_compaction_rule("ign:src", "ign:dst", "sum", 1000)
+        c.execute_command("TS.ADD", "ign:src", 0, 1)
+        c.execute_command("TS.ADD", "ign:src", 5, 1.2)   # within both thresholds: ignored
+        c.execute_command("TS.ADD", "ign:src", 1000, 2)
+        assert c.execute_command("TS.RANGE", "ign:dst", "-", "+") == [[0, b"1"]]

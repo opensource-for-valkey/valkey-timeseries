@@ -193,12 +193,10 @@ fn handle_update(
 
 /// Drive the series' compaction rules after a successful increment.
 ///
-/// TS.INCRBY/TS.DECRBY reject a timestamp *older* than the last sample, but not one equal
-/// to it: `TS.INCRBY key <d> TIMESTAMP <last_ts>` updates the existing sample in place. That
-/// is an upsert, so the affected bucket must be recalculated from the source instead of the
-/// new value being streamed into the open bucket as an additional sample — otherwise the old
-/// and new values are both aggregated (e.g. `TS.ADD k 0 0` then `TS.INCRBY k 1 TIMESTAMP 0`
-/// gave an `avg` rollup of 0.5 instead of 1). Mirrors the is_upsert split in TS.ADD.
+/// `TS.INCRBY key <d> TIMESTAMP <last_ts>` updates the existing sample in place; `prev_last_ts`
+/// makes that a back-fill, so the bucket is recalculated from the source rather than the new
+/// value streamed in as an additional sample (`TS.ADD k 0 0` then `TS.INCRBY k 1 TIMESTAMP 0`
+/// must give an `avg` rollup of 1, not 0.5).
 ///
 /// A failure is logged, not returned: the increment is already stored, and an error would
 /// skip replication, leaving the replica without it (see TS.ADD).
@@ -212,14 +210,7 @@ fn run_compaction_for_increment(
     if series.rules.is_empty() {
         return;
     }
-    let is_upsert = prev_last_ts.is_some_and(|last_ts| added.timestamp <= last_ts);
-    let result = if is_upsert {
-        series.upsert_compaction(ctx, added)
-    } else {
-        let sample = series.last_sample.unwrap_or(added);
-        series.run_compaction(ctx, sample)
-    };
-    if let Err(err) = result {
+    if let Err(err) = series.compact_sample(ctx, added, prev_last_ts) {
         ctx.log_warning(&format!(
             "TSDB: error running compaction for key '{key_name}': {err}"
         ));

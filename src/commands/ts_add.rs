@@ -154,12 +154,6 @@ fn handle_add(
         }
     };
 
-    let is_upsert = if let Some(last_ts) = last_ts {
-        ts <= last_ts
-    } else {
-        false
-    };
-
     // `ignored` is true when the sample is not added because the timestamp or value delta is below
     // the appropriate threshold.
     // If there's not a change, we don't want to run compaction.
@@ -168,20 +162,14 @@ fn handle_add(
     // The sample is already stored, so a compaction failure is logged rather than returned (as
     // TS.MADD and TS.ADDBULK do): an error here would skip replication and leave the replica
     // without a sample the primary keeps. The replica re-runs the same compaction on replay.
-    if !ignored && !series.rules.is_empty() {
-        let sample = Sample::new(ts, value);
-        let result = if is_upsert {
-            series.upsert_compaction(ctx, sample)
-        } else {
-            let sample = series.last_sample.unwrap_or(sample);
-            series.run_compaction(ctx, sample)
-        };
-        if let Err(err) = result {
-            let key = &args[1];
-            ctx.log_warning(&format!(
-                "TSDB: error running compaction for key '{key}': {err}"
-            ));
-        }
+    if !ignored
+        && !series.rules.is_empty()
+        && let Err(err) = series.compact_sample(ctx, Sample::new(ts, value), last_ts)
+    {
+        let key = &args[1];
+        ctx.log_warning(&format!(
+            "TSDB: error running compaction for key '{key}': {err}"
+        ));
     }
 
     if inserted {

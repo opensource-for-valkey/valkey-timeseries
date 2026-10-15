@@ -121,6 +121,7 @@ pub(super) fn apply_op(ctx: &mut CompactionContext<'_>, op: CompactionOp) -> Tsd
 /// count them twice. If an append closes a bucket that a pending upsert also touched, the
 /// destination value is first written from the (stale) aggregator and then overwritten by the
 /// recalculation (destination adds use KeepLast), keeping the batch self-correcting.
+#[inline]
 fn handle_batch_compaction(
     ctx: &mut CompactionContext,
     samples: &[Sample],
@@ -132,6 +133,33 @@ fn handle_batch_compaction(
         "batch compaction requires samples sorted by timestamp"
     );
 
+    // Fast path: an input that is strictly increasing and starts above `prev_last` is all
+    // appends — the classification below would put every sample in `appends` and none in
+    // `upserts` — so stream it directly. This is every in-order `TS.ADD`/`TS.INCRBY`, and
+    // in-order `TS.MADD`/`TS.ADDBULK`, and skips the replay's bookkeeping.
+    let all_appends = input_order
+        .first()
+        .is_some_and(|&first| prev_last.is_none_or(|last| first > last))
+        && input_order.windows(2).all(|w| w[0] < w[1]);
+    if all_appends {
+        for sample in samples {
+            handle_sample_compaction(ctx, *sample)?;
+        }
+        return Ok(());
+    }
+    handle_mixed_batch_compaction(ctx, samples, prev_last, input_order)
+}
+
+/// The general case of [`handle_batch_compaction`]: back-fills, repeats or out-of-order items
+/// mixed in with appends. Kept out of line so the one-sample append — every in-order `TS.ADD` —
+/// doesn't pay this function's stack frame and register saves on its way to the fast path.
+#[inline(never)]
+fn handle_mixed_batch_compaction(
+    ctx: &mut CompactionContext,
+    samples: &[Sample],
+    prev_last: Option<Timestamp>,
+    input_order: &[Timestamp],
+) -> TsdbResult<()> {
     // Replay the caller's order to find the back-fills — items at or below the running maximum
     // by the time they are applied — and, with each, the series' last timestamp at that moment.
     // That timestamp fixes the retention floor the recalculation must read the source through:
@@ -266,6 +294,7 @@ fn handle_batch_compaction(
 }
 
 /// Handle compaction for a genuinely new sample (timestamp > last sample timestamp)
+#[inline(always)]
 fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> TsdbResult<()> {
     let ts = sample.timestamp;
     let sample_bucket_start = ctx.rule.calc_bucket_start(ts);
@@ -651,8 +680,8 @@ pub fn bench_rule(agg: crate::aggregators::AggregationType, bucket_ms: u64) -> C
     }
 }
 
-/// One stored sample through one rule, exactly as `TS.ADD` drives it. The body changes in
-/// Task 9; the benchmark IDs do not, so criterion compares the two paths across the switch.
+/// One stored sample through one rule, exactly as `TS.ADD` drives it (a one-item batch). The
+/// benchmark IDs predate the switch to that path, so criterion compares the two across it.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub fn bench_ingest_one(
@@ -662,13 +691,14 @@ pub fn bench_ingest_one(
     sample: Sample,
     prev_last: Option<Timestamp>,
 ) {
-    let is_upsert = prev_last.is_some_and(|last| sample.timestamp <= last);
-    let op = if is_upsert {
-        CompactionOp::Upsert(sample)
-    } else {
-        CompactionOp::AddNew(parent.last_sample.unwrap_or(sample))
-    };
+    let samples = [sample];
+    let order = [sample.timestamp];
     let mut cctx = CompactionContext::new(parent, dest, rule);
+    let op = CompactionOp::AddBatch {
+        samples: &samples,
+        prev_last,
+        input_order: &order,
+    };
     let _ = apply_op(&mut cctx, op);
 }
 
@@ -768,6 +798,60 @@ mod tests {
             input_order: &order,
         };
         apply_op(&mut cctx, op).unwrap();
+    }
+
+    /// The all-appends fast path must leave exactly what the general path leaves. A trailing
+    /// repeat of the last timestamp is a duplicate-policy fold into the open bucket, not a
+    /// back-fill, so it classifies every sample as an append like the fast path does while
+    /// defeating the strictly-increasing check and forcing the replay.
+    #[test]
+    fn all_appends_fast_path_matches_the_general_path() {
+        let samples: Vec<Sample> = [
+            (100, 1.0),
+            (300, 4.0),
+            (450, 2.5),
+            (600, 8.0),
+            (1100, 3.0),
+            (1700, 0.5),
+        ]
+        .into_iter()
+        .map(|(ts, value)| Sample::new(ts, value))
+        .collect();
+        let fast_order: Vec<Timestamp> = samples.iter().map(|s| s.timestamp).collect();
+        let mut slow_order = fast_order.clone();
+        slow_order.push(*fast_order.last().unwrap());
+
+        let mut published_any = false;
+        for &agg in RULE_TYPES {
+            // Once into a fresh series, once on top of an earlier write the batch sits above.
+            for prev_last in [None, Some(50)] {
+                let parent = TimeSeries::new();
+                let mut results = Vec::new();
+                for order in [&fast_order, &slow_order] {
+                    let mut dest = TimeSeries::new();
+                    let mut rule = fresh_rule(agg, 500);
+                    let mut cctx = CompactionContext::new(&parent, &mut dest, &mut rule);
+                    let op = CompactionOp::AddBatch {
+                        samples: &samples,
+                        prev_last,
+                        input_order: order,
+                    };
+                    apply_op(&mut cctx, op).unwrap();
+                    let written = cctx
+                        .written
+                        .iter()
+                        .map(|s| (s.timestamp, s.value.to_bits()));
+                    let written: Vec<_> = written.collect();
+                    results.push((dest_samples(&dest), open_state(&rule), written));
+                }
+                assert_eq!(
+                    results[0], results[1],
+                    "{agg:?}, prev_last={prev_last:?}: fast path diverged from the general path"
+                );
+                published_any |= !results[0].0.is_empty();
+            }
+        }
+        assert!(published_any, "the batch should close at least one bucket");
     }
 
     /// Regression (oracle shrink): a back-fill that turns a published bucket's aggregate into NaN

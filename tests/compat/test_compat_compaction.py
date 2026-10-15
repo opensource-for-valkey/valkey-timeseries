@@ -283,10 +283,7 @@ class TestRuleLifecycle:
 
     @pytest.mark.parametrize(
         "write",
-        [
-            pytest.param("TS.ADD", marks=pytest.mark.xfail(strict=True, reason="fixed by Task 9")),
-            "TS.MADD",
-        ],
+        ["TS.ADD", "TS.MADD"],
     )
     def test_backfill_behind_the_open_bucket_as_first_write(self, diff, write):
         """Same, but the first write back-fills a bucket *older* than the one holding the
