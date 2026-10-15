@@ -153,11 +153,12 @@ fn process_series_with_compaction(
         series: guards,
     } = destinations;
 
-    // A rule that fails does not end the pass. Its siblings' outcomes still cascade into their
-    // destinations' own rules, and still notify: those destinations were written, and a rule
-    // below one that skipped its cascade would take the next sample for an append on state that
-    // never saw this one, with nothing marking it `dirty`. Only the failing rule's own branch
-    // stops, and the first error is returned once the pass has run to its end.
+    // A rule that fails does not end the pass. Every outcome — its siblings', and its own up to
+    // the failure — still cascades into the destinations' own rules, and still notifies: those
+    // destinations were written, and a rule below one that skipped its cascade would take the
+    // next sample for an append on state that never saw this one, with nothing marking it
+    // `dirty`. A failed `RemoveRange` cascades its range too: each level recalculates from what
+    // its parent actually holds. The first error is returned once the pass has run to its end.
     let AppliedRules {
         outcomes,
         error: mut first_error,
@@ -289,9 +290,9 @@ fn queue_written_outcomes(
     }
 }
 
-/// What one pass of a series' rules produced: the outcome of every rule that succeeded, and the
-/// first error of those that did not. Both are kept — one rule failing must not hide what the
-/// others committed.
+/// What one pass of a series' rules produced: the outcome of every rule that ran, and the first
+/// error among them. A failed rule's outcome is kept too, holding whatever it committed before
+/// failing — one rule failing must hide neither what the others committed nor what it did.
 struct AppliedRules {
     outcomes: Vec<RuleOutcome>,
     error: Option<TsdbError>,
@@ -324,7 +325,8 @@ fn runs_rules_in_parallel(op: &CompactionOp, rule_count: usize) -> bool {
 /// Internal function that handles execution of compaction rules. `child_series` holds one
 /// entry per rule, in rule order; a rule whose entry is `None` is skipped.
 ///
-/// Each failing rule is logged and counted once, here, and is left `dirty`.
+/// Each failing rule is logged and counted once, here, and is left `dirty`; its outcome is still
+/// returned with the samples it committed before failing.
 fn apply_rules_internal(
     series: &TimeSeries,
     rules: &mut [CompactionRule],
@@ -345,7 +347,7 @@ fn apply_rules_internal(
     }
 
     let parallel = runs_rules_in_parallel(&op, destinations.len());
-    let results: Vec<Result<RuleOutcome, TsdbError>> = destinations
+    let results = destinations
         .par_mut_rayon()
         .num_threads(if parallel { 0 } else { 1 }) // 0 is shorthand for Auto
         .map(|(rule_index, rule, dest_guard)| {
@@ -359,9 +361,12 @@ fn apply_rules_internal(
                 }
                 COMPACTION_STATE_REBUILDS.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            let (result, written, closed_bucket) = if take_injected_failure() {
+            // An application can fail after committing buckets to `dest` (an `Ingest` streams
+            // sample by sample), so its outcome is kept either way: `dest` holds those samples,
+            // and its own rules must still see them.
+            let (error, written, closed_bucket) = if take_injected_failure() {
                 (
-                    Err(TsdbError::General(
+                    Some(TsdbError::General(
                         "injected compaction failure".to_string(),
                     )),
                     Vec::new(),
@@ -369,34 +374,31 @@ fn apply_rules_internal(
                 )
             } else {
                 let mut cctx = CompactionContext::new(series, dest_guard, rule);
-                let result = apply_op(&mut cctx, op);
-                (result, cctx.written, cctx.closed_bucket)
+                let error = apply_op(&mut cctx, op).err();
+                (error, cctx.written, cctx.closed_bucket)
             };
-            rule.dirty = result.is_err();
-            result.map(|_| RuleOutcome {
+            rule.dirty = error.is_some();
+            let outcome = RuleOutcome {
                 rule_index,
                 dest_prev_last,
                 written,
                 closed_bucket,
-            })
+            };
+            (outcome, error)
         })
-        .collect();
+        .collect::<Vec<(RuleOutcome, Option<TsdbError>)>>();
 
     let mut outcomes = Vec::with_capacity(results.len());
     let mut first_error: Option<TsdbError> = None;
 
-    for r in results {
-        match r {
-            Ok(outcome) => outcomes.push(outcome),
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error.clone());
-                }
-                let msg = format!("Failed to handle compaction rule for series: {error}");
-                log_warning(msg);
-                COMPACTION_FAILURES.fetch_add(1, AtomicOrdering::Relaxed);
-            }
+    for (outcome, error) in results {
+        if let Some(error) = error {
+            let msg = format!("Failed to handle compaction rule for series: {error}");
+            log_warning(msg);
+            COMPACTION_FAILURES.fetch_add(1, AtomicOrdering::Relaxed);
+            first_error.get_or_insert(error);
         }
+        outcomes.push(outcome);
     }
 
     AppliedRules {
