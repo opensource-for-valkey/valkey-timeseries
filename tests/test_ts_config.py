@@ -359,49 +359,57 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
         """A filtered aggregation without its inline condition (or a condition on an aggregator
         that takes none) is refused at CONFIG SET, alone or within a mixed policy, and the
         previous policy stays in effect."""
-        self.set_compaction_policy("max:1M:1h")
-        for policy in ("countif:1M:1h", "sumif:1M:1h", "all:1M:1h", "any:1M:1h", "share:1M:1h",
-                       "none:1M:1h", "avg:1M:1h;countif:2M:1h", "min:1M:1h|^cpu;sumif:1M:1h|^cpu"):
-            with pytest.raises(ResponseError, match="requires a condition"):
-                self.set_compaction_policy(policy)
-            assert self.get_config("ts-compaction-policy") == b"max:1M:1h", policy
-        for policy in ("avg>0:1M:1h", "countif>:1M:1h", "countif>x:1M:1h"):
-            with pytest.raises(ResponseError):
-                self.set_compaction_policy(policy)
-            assert self.get_config("ts-compaction-policy") == b"max:1M:1h", policy
+        original = self.get_config("ts-compaction-policy")
+        try:
+            self.set_compaction_policy("max:1M:1h")
+            for policy in ("countif:1M:1h", "sumif:1M:1h", "all:1M:1h", "any:1M:1h", "share:1M:1h",
+                           "none:1M:1h", "avg:1M:1h;countif:2M:1h", "min:1M:1h|^cpu;sumif:1M:1h|^cpu"):
+                with pytest.raises(ResponseError, match="requires a condition"):
+                    self.set_compaction_policy(policy)
+                assert self.get_config("ts-compaction-policy") == b"max:1M:1h", policy
+            for policy in ("avg>0:1M:1h", "countif>:1M:1h", "countif>x:1M:1h"):
+                with pytest.raises(ResponseError):
+                    self.set_compaction_policy(policy)
+                assert self.get_config("ts-compaction-policy") == b"max:1M:1h", policy
 
-        self.client.execute_command("TS.ADD", "policy:after_rejected", 0, 1)
-        self.assert_compaction_rule("policy:after_rejected", "max", 60000, expected_rule_count=1)
+            self.client.execute_command("TS.ADD", "policy:after_rejected", 0, 1)
+            self.assert_compaction_rule("policy:after_rejected", "max", 60000, expected_rule_count=1)
+        finally:
+            self.set_compaction_policy(original)
 
     def test_policy_filtered_aggregations_with_a_condition(self):
         """With an inline condition (`countif>5`, the TS.CREATERULE syntax) every filtered
         aggregation is accepted and builds a rule applying that condition."""
-        self.set_compaction_policy(
-            "countif>5:1M:1h;sumif<=2:1M:1h;all>=0:1M:1h;any==3:1M:1h;share!=0:1M:1h;none<0:1M:1h;"
-            "count>5:2M:1h"
-        )
-        for ts, value in enumerate([1, 2, 3, 6, 7, 8]):
-            self.client.execute_command("TS.ADD", "policy:filtered", ts * 1000, value)
-        self.client.execute_command("TS.ADD", "policy:filtered", 120_000, 0)  # closes both buckets
+        original = self.get_config("ts-compaction-policy")
+        try:
+            self.set_compaction_policy(
+                "countif>5:1M:1h;sumif<=2:1M:1h;all>=0:1M:1h;any==3:1M:1h;share!=0:1M:1h;none<0:1M:1h;"
+                "count>5:2M:1h"
+            )
+            for ts, value in enumerate([1, 2, 3, 6, 7, 8]):
+                self.client.execute_command("TS.ADD", "policy:filtered", ts * 1000, value)
+            self.client.execute_command("TS.ADD", "policy:filtered", 120_000, 0)  # closes both buckets
 
-        info = self.ts_info("policy:filtered")
-        assert sorted(r.aggregation.lower() for r in info["rules"]) == \
-            ["all", "any", "countif", "countif", "none", "share", "sumif"]
-        expected = {
-            "policy:filtered_COUNTIF_GT_5_60000": b"3",
-            "policy:filtered_SUMIF_LTE_2_60000": b"3",
-            "policy:filtered_ALL_GTE_0_60000": b"1",
-            "policy:filtered_ANY_EQ_3_60000": b"1",
-            "policy:filtered_SHARE_NE_0_60000": b"1",
-            "policy:filtered_NONE_LT_0_60000": b"1",
-            # count>5 runs as countif>5, and is named so.
-            "policy:filtered_COUNTIF_GT_5_120000": b"3",
-        }
-        for dest, value in expected.items():
-            assert self.client.execute_command("TS.RANGE", dest, "-", "+") == [[0, value]], dest
-        labels = self.ts_info("policy:filtered_SUMIF_LTE_2_60000")["labels"]
-        assert labels["aggregation"] == "sumif"
-        assert labels["condition"] == "<=2"
+            info = self.ts_info("policy:filtered")
+            assert sorted(r.aggregation.lower() for r in info["rules"]) == \
+                ["all", "any", "countif", "countif", "none", "share", "sumif"]
+            expected = {
+                "policy:filtered_COUNTIF_GT_5_60000": b"3",
+                "policy:filtered_SUMIF_LTE_2_60000": b"3",
+                "policy:filtered_ALL_GTE_0_60000": b"1",
+                "policy:filtered_ANY_EQ_3_60000": b"1",
+                "policy:filtered_SHARE_NE_0_60000": b"1",
+                "policy:filtered_NONE_LT_0_60000": b"1",
+                # count>5 runs as countif>5, and is named so.
+                "policy:filtered_COUNTIF_GT_5_120000": b"3",
+            }
+            for dest, value in expected.items():
+                assert self.client.execute_command("TS.RANGE", dest, "-", "+") == [[0, value]], dest
+            labels = self.ts_info("policy:filtered_SUMIF_LTE_2_60000")["labels"]
+            assert labels["aggregation"] == "sumif"
+            assert labels["condition"] == "<=2"
+        finally:
+            self.set_compaction_policy(original)
 
     def test_mixed_global_and_filtered_policies(self):
         """Test combination of global and filtered policies"""
