@@ -355,6 +355,19 @@ class TestTimeseriesConfig(ValkeyTimeSeriesTestCaseBase):
         for key in post_policy_non_matching:
             self.assert_no_compaction_rules(key)
 
+    def test_policy_rejects_filtered_aggregations(self):
+        """A filtered aggregation needs a condition the policy grammar cannot carry: CONFIG SET
+        refuses it (alone or within a mixed policy) and the previous policy stays in effect."""
+        self.set_compaction_policy("max:1M:1h")
+        for policy in ("countif:1M:1h", "sumif:1M:1h", "all:1M:1h", "any:1M:1h", "share:1M:1h",
+                       "none:1M:1h", "avg:1M:1h;countif:2M:1h", "min:1M:1h|^cpu;sumif:1M:1h|^cpu"):
+            with pytest.raises(ResponseError, match="requires a condition"):
+                self.set_compaction_policy(policy)
+            assert self.get_config("ts-compaction-policy") == b"max:1M:1h", policy
+
+        self.client.execute_command("TS.ADD", "policy:after_rejected", 0, 1)
+        self.assert_compaction_rule("policy:after_rejected", "max", 60000, expected_rule_count=1)
+
     def test_mixed_global_and_filtered_policies(self):
         """Test combination of global and filtered policies"""
 

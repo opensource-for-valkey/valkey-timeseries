@@ -277,6 +277,19 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
         return Err(ValkeyError::String(msg));
     }
     let aggregator = AggregationType::try_from(args[0])?;
+    // The policy grammar has no place for a condition, and a filtered aggregation without one
+    // is what `TS.CREATERULE` rejects (`AggregatorConfig::new`, same predicate). Accepting it
+    // here would store a rule with a filter nobody wrote, which a replica or an AOF replay —
+    // receiving it as `TS.CREATERULE` — then refuses.
+    if aggregator.is_filtered() {
+        return Err(ValkeyError::String(format!(
+            "TSDB: compaction policy aggregation '{}' requires a condition, which \
+             ts-compaction-policy cannot carry; use TS.CREATERULE with an inline condition \
+             (e.g. '{}>0') instead",
+            aggregator.name(),
+            aggregator.name(),
+        )));
+    }
     let Ok(bucket_duration_ms) = parse_duration(args[1]) else {
         return Err(ValkeyError::String(
             "TSDB: invalid bucket duration in compaction policy".to_string(),
@@ -890,6 +903,55 @@ mod rts_grammar_parity {
             assert!(
                 parse_compaction_policies(s).is_ok(),
                 "RTS accepts {s:?}; our parser rejected it"
+            );
+        }
+    }
+
+    const FILTERED_AGGREGATIONS: [&str; 6] = ["all", "any", "countif", "sumif", "share", "none"];
+
+    #[test]
+    fn rejects_every_filtered_aggregation() {
+        for name in FILTERED_AGGREGATIONS {
+            let agg = AggregationType::try_from(name).unwrap();
+            assert!(agg.is_filtered(), "{name} is expected to need a condition");
+            for policy in [format!("{name}:1M:1h"), format!("{name}:1M:1h|^cpu")] {
+                let err = parse_compaction_policies(&policy)
+                    .expect_err("a filtered aggregation must be rejected")
+                    .to_string();
+                assert!(err.contains(name), "{policy}: {err}");
+                assert!(err.contains("requires a condition"), "{policy}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_aggregation_rejects_the_whole_policy() {
+        let mut config = PolicyConfig::new();
+        config
+            .add_policies_from_config("max:1M:1h", true)
+            .expect("valid policy");
+        assert!(
+            config
+                .add_policies_from_config("avg:1M:1h;countif:2M:1h;min:1M:1h", true)
+                .is_err()
+        );
+        // Parsing fails before anything is replaced: the previous policy stays in effect.
+        let rules = config
+            .create_compaction_rules("k")
+            .expect("previous policy kept");
+        assert_eq!(rules.keys().collect::<Vec<_>>(), vec!["k_MAX_60000"]);
+    }
+
+    #[test]
+    fn accepts_every_unfiltered_aggregation() {
+        for name in [
+            "avg", "count", "countall", "countnan", "first", "increase", "irate", "last", "min",
+            "max", "range", "rate", "std.s", "std.p", "sum", "var.s", "var.p",
+        ] {
+            assert!(!AggregationType::try_from(name).unwrap().is_filtered());
+            assert!(
+                parse_compaction_policies(&format!("{name}:1M:1h")).is_ok(),
+                "{name} should be accepted"
             );
         }
     }

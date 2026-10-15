@@ -67,6 +67,11 @@ skipped (with a warning naming both keys), on every node alike. `ts-compatibilit
 consulted by the node answering a read, so it must be set identically on every node of a
 replication group.
 
+`ts-compaction-policy` (`agg:bucket:retention[:align][|regex];…`) accepts only aggregations that
+take no condition: `all`, `any`, `countif`, `sumif`, `share` and `none` are rejected (at
+`CONFIG SET` and at module load), since the policy grammar cannot carry their condition. Create
+such rules with `TS.CREATERULE` and an inline condition (e.g. `countif>5`) instead.
+
 ### Metadata & Indexing
 
 * `TS.INFO`: Retrieve detailed information and statistics about a specific time series.
