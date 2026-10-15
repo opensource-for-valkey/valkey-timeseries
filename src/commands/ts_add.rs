@@ -82,8 +82,8 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let on_duplicate = options.on_duplicate;
 
     let key = &original_args[1];
-    // Auto-create: no ts.create event (RTS parity) and no replication from
-    // the create helper — this command replicates itself.
+    // Auto-create: no ts.create event (RTS parity). The create helper replicates the new series
+    // as a resolved `TS.CREATE`; this command then replicates itself.
     let mut series = create_and_store_series(ctx, key, options, false, true)?;
 
     handle_add(

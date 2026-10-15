@@ -54,9 +54,8 @@ pub fn ts_addbulk_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return process_series(ctx, &mut guard, samples, on_duplicate);
     }
 
-    // Auto-create: no ts.create event and no replication from the create
-    // helper — consistent with the TS.ADD family; this command replicates
-    // itself.
+    // Auto-create: no ts.create event. The create helper replicates the new series as a resolved
+    // `TS.CREATE`, as for the TS.ADD family; this command then replicates itself.
     let mut series = create_and_store_series(ctx, &key, options, false, true)?;
     process_series(ctx, &mut series, samples, on_duplicate)
 }

@@ -1,7 +1,9 @@
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::{create_key_string, get_current_db, notify_keyspace_event};
+use crate::common::rounding::RoundingStrategy;
 use crate::error_consts;
-use crate::labels::{InternedLabel, Label};
+use crate::labels::{InternedLabel, Label, MetricName};
+use crate::parser::metric_name::parse_metric_name;
 use crate::series::acl::{KeyAccess, check_key_permissions};
 use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
@@ -195,16 +197,13 @@ pub fn create_and_store_internal(
 }
 
 /// `explicit_create` distinguishes a client-issued `TS.CREATE` from the
-/// auto-create performed by write commands (TS.ADD/TS.MADD/TS.INCRBY/...):
+/// auto-create performed by write commands (TS.ADD/TS.INCRBY/TS.ADDBULK):
 ///
 /// - explicit: this call replicates verbatim and emits `ts.create`.
-/// - auto-create: neither — the calling command replicates *itself*, and the
-///   replica re-creates the series by re-running that command. Replicating
-///   here as well would propagate the write twice (`alsoPropagate` queues
-///   every call), which doubles non-idempotent effects like TS.INCRBY on
-///   replicas. (Corner case accepted: if the command errors *after* the
-///   auto-create, nothing propagates and the primary keeps an empty series
-///   the replica never sees.)
+/// - auto-create: no `ts.create` event; the series itself is replicated as a resolved
+///   `TS.CREATE` (see the body), and the calling command replicates its own write. (The old
+///   corner case — a command erroring after the auto-create left the primary with an empty
+///   series the replica never saw — is gone: the `TS.CREATE` is already queued.)
 pub fn create_and_store_series<'a>(
     ctx: &'a Context,
     key: &ValkeyString,
@@ -219,11 +218,104 @@ pub fn create_and_store_series<'a>(
 
     let mut series = get_timeseries_mut(ctx, key, None)?;
 
+    if !explicit_create {
+        // Auto-create: replicate the series as the primary built it, defaults materialized, ahead
+        // of the write command's own propagation (`alsoPropagate` keeps call order). The replica's
+        // replayed write then finds the series and its inline creation options are inert, exactly
+        // as on the primary when the series already exists. `TS.CREATE` here, not
+        // `replicate_verbatim`: that would copy the *write's* argv and apply it twice.
+        let create_args = resolved_create_args(ctx, &series);
+        let mut replication_args: Vec<&ValkeyString> = Vec::with_capacity(create_args.len() + 1);
+        replication_args.push(key);
+        replication_args.extend(create_args.iter());
+        ctx.replicate("TS.CREATE", replication_args.as_slice());
+    }
+
     if add_compactions {
         // If compactions are enabled, add the default compaction rules
         add_default_compactions(ctx, &mut series, key)?
     }
     Ok(series)
+}
+
+/// `TS.CREATE` options that recreate `series` exactly, every configuration-derived default
+/// materialized. An auto-creating write replicates this ahead of itself so a replica (or an AOF
+/// replay) builds the series from the primary's configuration, not its own: `ts-retention-policy`,
+/// `ts-encoding` and the chunk size are per node, and a retention mismatch changes recalculation
+/// floors and therefore compaction output.
+///
+/// `DUPLICATE_POLICY` is only emitted when the series pins one: an unset policy follows the
+/// node's `ts-duplicate-policy` at write time, and pinning it here would change that.
+///
+/// `TS.CREATE` starts from the receiving node's configured defaults, so an option that is *absent*
+/// here falls back to the replica's own value. That is harmless for the ones omitted above, and
+/// `IGNORE` is therefore always written. Rounding is the one exception: there is no `TS.CREATE`
+/// spelling for "no rounding", so a series without it is created with whatever the replica's
+/// `ts-decimal-digits`/`ts-significant-digits` say.
+///
+/// A series with a `__name__` label is re-created through `METRIC` when that text parses back to
+/// exactly the same label set, and through `LABELS` otherwise. `LABELS __name__ …` is accepted
+/// too, so a series can hold a name or label names the metric grammar cannot spell
+/// (`cpu total`, `1x`); `METRIC`, in turn, is the only way to spell an empty label value.
+pub(crate) fn resolved_create_args(ctx: &Context, series: &TimeSeries) -> Vec<ValkeyString> {
+    create_option_strings(series)
+        .into_iter()
+        .map(|arg| ctx.create_string(arg.as_bytes()))
+        .collect()
+}
+
+/// The text of [`resolved_create_args`], separated so the rendering can be tested against the
+/// option parsers without a server (building a `ValkeyString` needs one).
+fn create_option_strings(series: &TimeSeries) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "RETENTION".into(),
+        series.retention.as_millis().to_string(),
+        "ENCODING".into(),
+        series.chunk_encoding.name().to_string(),
+        "CHUNK_SIZE".into(),
+        series.chunk_size_bytes.to_string(),
+    ];
+    if let Some(policy) = series.sample_duplicates.policy {
+        args.push("DUPLICATE_POLICY".into());
+        args.push(policy.as_str().to_string());
+    }
+    // Always spelled out, zeros included: `TS.CREATE` starts from the node's configured
+    // `ts-ignore-max-*` defaults, so omitting a zero would let the replica's own apply.
+    let dup = &series.sample_duplicates;
+    args.push("IGNORE".into());
+    args.push(dup.max_time_delta.to_string());
+    args.push(dup.max_value_delta.to_string());
+    match series.rounding {
+        Some(RoundingStrategy::SignificantDigits(digits)) => {
+            args.push("SIGNIFICANT_DIGITS".into());
+            args.push(digits.to_string());
+        }
+        Some(RoundingStrategy::DecimalDigits(digits)) => {
+            args.push("DECIMAL_DIGITS".into());
+            args.push(digits.to_string());
+        }
+        None => {}
+    }
+    if series.labels.get_value(METRIC_NAME_LABEL).is_some()
+        && let Some(metric) = metric_text(series)
+    {
+        args.push("METRIC".into());
+        args.push(metric);
+    } else if !series.labels.is_empty() {
+        args.push("LABELS".into());
+        for label in series.labels.iter() {
+            args.push(label.name.to_string());
+            args.push(label.value.to_string());
+        }
+    }
+    args
+}
+
+/// The `METRIC` operand for `series`, if `TS.CREATE` would read it back as the same label set.
+fn metric_text(series: &TimeSeries) -> Option<String> {
+    let text = series.prometheus_metric_name();
+    let parsed = parse_metric_name(&text).ok()?;
+    (MetricName::new(&parsed) == series.labels).then_some(text)
 }
 
 fn add_default_compactions(
@@ -302,5 +394,329 @@ pub fn get_series_labels<'a>(
             .iter()
             .map(|name| series.get_label(name))
             .collect::<Vec<_>>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::command_parser::{
+        parse_chunk_size, parse_duration, parse_duration_ms,
+        parse_metric_name as parse_create_metric,
+    };
+    use crate::parser::number::parse_number;
+    use crate::series::DuplicatePolicy;
+    use crate::series::chunks::ChunkEncoding;
+
+    fn series_with(options: TimeSeriesOptions) -> TimeSeries {
+        TimeSeries::with_options(options).expect("valid options")
+    }
+
+    /// The operand(s) following `keyword`, which must appear exactly once in the option list.
+    fn operands<'a>(args: &'a [String], keyword: &str, count: usize) -> &'a [String] {
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| arg.as_str() == keyword)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "{keyword} in {args:?}");
+        &args[positions[0] + 1..positions[0] + 1 + count]
+    }
+
+    #[test]
+    fn test_renders_every_resolved_default() {
+        let series = series_with(TimeSeriesOptions {
+            retention: Some(Duration::from_millis(3000)),
+            chunk_encoding: ChunkEncoding::Gorilla,
+            chunk_size: Some(4096),
+            duplicate_policy: Some(DuplicatePolicy::Sum),
+            ignore: Some((10, 0.5)),
+            rounding: Some(RoundingStrategy::DecimalDigits(2)),
+            labels: Some(vec![Label::new("sensor", "temp"), Label::new("room", "r1")]),
+            ..Default::default()
+        });
+        assert_eq!(
+            create_option_strings(&series),
+            [
+                "RETENTION",
+                "3000",
+                "ENCODING",
+                "gorilla",
+                "CHUNK_SIZE",
+                "4096",
+                "DUPLICATE_POLICY",
+                "sum",
+                "IGNORE",
+                "10",
+                "0.5",
+                "DECIMAL_DIGITS",
+                "2",
+                "LABELS",
+                "room",
+                "r1",
+                "sensor",
+                "temp",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unset_options_are_not_pinned() {
+        let series = series_with(TimeSeriesOptions {
+            retention: Some(Duration::ZERO),
+            chunk_size: Some(128),
+            duplicate_policy: None,
+            ..Default::default()
+        });
+        let args = create_option_strings(&series);
+        for keyword in ["DUPLICATE_POLICY", "LABELS", "METRIC"] {
+            assert!(!args.iter().any(|a| a == keyword), "{keyword} in {args:?}");
+        }
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "SIGNIFICANT_DIGITS" || a == "DECIMAL_DIGITS"),
+            "{args:?}"
+        );
+        // A zero retention is pinned too: omitting it would let the replica apply its own.
+        assert_eq!(operands(&args, "RETENTION", 1), ["0"]);
+        assert_eq!(operands(&args, "CHUNK_SIZE", 1), ["128"]);
+    }
+
+    #[test]
+    fn test_rounding_strategies_render_their_own_keyword() {
+        for (rounding, keyword, digits) in [
+            (
+                RoundingStrategy::SignificantDigits(5),
+                "SIGNIFICANT_DIGITS",
+                "5",
+            ),
+            (RoundingStrategy::DecimalDigits(0), "DECIMAL_DIGITS", "0"),
+        ] {
+            let series = series_with(TimeSeriesOptions {
+                rounding: Some(rounding),
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            assert_eq!(operands(&args, keyword, 1), [digits]);
+        }
+    }
+
+    #[test]
+    fn test_every_encoding_name_is_accepted_by_ts_create() {
+        for encoding in [
+            ChunkEncoding::Uncompressed,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Chimp,
+        ] {
+            let series = series_with(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            let name = &operands(&args, "ENCODING", 1)[0];
+            assert_eq!(ChunkEncoding::try_from(name.as_str()).unwrap(), encoding);
+        }
+    }
+
+    #[test]
+    fn test_every_duplicate_policy_name_is_accepted_by_ts_create() {
+        for policy in [
+            DuplicatePolicy::Block,
+            DuplicatePolicy::KeepFirst,
+            DuplicatePolicy::KeepLast,
+            DuplicatePolicy::Min,
+            DuplicatePolicy::Max,
+            DuplicatePolicy::Sum,
+        ] {
+            let series = series_with(TimeSeriesOptions {
+                duplicate_policy: Some(policy),
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            let name = &operands(&args, "DUPLICATE_POLICY", 1)[0];
+            assert_eq!(
+                DuplicatePolicy::try_from(name.as_bytes()).unwrap(),
+                policy,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retention_and_chunk_size_parse_back_exactly() {
+        for retention_ms in [0_u64, 1, 500, 3000, 86_400_000, 31_536_000_000, 1 << 40] {
+            let series = series_with(TimeSeriesOptions {
+                retention: Some(Duration::from_millis(retention_ms)),
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            let rendered = &operands(&args, "RETENTION", 1)[0];
+            assert_eq!(
+                parse_duration(rendered).unwrap(),
+                Duration::from_millis(retention_ms),
+                "{rendered}"
+            );
+        }
+        for chunk_size in [48_usize, 128, 4096, 1_048_576] {
+            let series = series_with(TimeSeriesOptions {
+                chunk_size: Some(chunk_size),
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            let rendered = &operands(&args, "CHUNK_SIZE", 1)[0];
+            assert_eq!(
+                parse_chunk_size(rendered).unwrap(),
+                chunk_size,
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ignore_operands_parse_back_to_the_same_values() {
+        let values = [
+            0.0,
+            0.1,
+            0.5,
+            1.0,
+            0.300_000_000_000_000_04,
+            1e-9,
+            123_456_789.123_456_79,
+            1e15,
+            1e300,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for (time_delta, value_delta) in
+            values
+                .iter()
+                .map(|&v| (1_u64, v))
+                .chain([(0, 0.25), (60_000, 0.0), (1 << 40, 2.0)])
+        {
+            let series = series_with(TimeSeriesOptions {
+                ignore: Some((time_delta, value_delta)),
+                ..Default::default()
+            });
+            let args = create_option_strings(&series);
+            let [time, value] = operands(&args, "IGNORE", 2) else {
+                unreachable!()
+            };
+            assert_eq!(
+                parse_duration_ms(time).unwrap(),
+                time_delta as i64,
+                "{time}"
+            );
+            assert_eq!(
+                parse_number(value).unwrap().to_bits(),
+                value_delta.to_bits(),
+                "{value}"
+            );
+        }
+    }
+
+    /// Zeros are written too: `TS.CREATE` starts from the node's configured `ts-ignore-max-*`
+    /// defaults, so leaving them out would let a replica's own non-zero ones apply.
+    #[test]
+    fn test_zero_ignore_is_pinned() {
+        let series = series_with(TimeSeriesOptions {
+            ignore: Some((0, 0.0)),
+            ..Default::default()
+        });
+        let args = create_option_strings(&series);
+        assert_eq!(operands(&args, "IGNORE", 2), ["0", "0"]);
+    }
+
+    fn render_labels(labels: &[Label]) -> (TimeSeries, Vec<String>) {
+        let series = series_with(TimeSeriesOptions {
+            labels: Some(labels.to_vec()),
+            ..Default::default()
+        });
+        let args = create_option_strings(&series);
+        (series, args)
+    }
+
+    #[test]
+    fn test_metric_round_trips_through_the_metric_parser() {
+        let cases: Vec<Vec<Label>> = vec![
+            vec![Label::new("__name__", "cpu")],
+            vec![Label::new("__name__", "cpu"), Label::new("host", "a")],
+            vec![
+                Label::new("__name__", "http_requests_total"),
+                Label::new("method", "POST"),
+                Label::new("status", "500"),
+            ],
+            vec![Label::new("__name__", "a:b:c"), Label::new("l", "v")],
+            vec![
+                Label::new("__name__", "cpu"),
+                Label::new("quote", "say \"hi\""),
+                Label::new("slash", "a\\b"),
+                Label::new("newline", "a\nb"),
+                Label::new("braces", "{x=\"y\"},z"),
+                Label::new("unicode", "caf\u{e9} \u{1f600}"),
+                Label::new("spaces", "  padded  "),
+            ],
+            // An empty value can only be spelled through METRIC.
+            vec![Label::new("__name__", "cpu"), Label::new("a", "")],
+        ];
+        for labels in &cases {
+            let (series, args) = render_labels(labels);
+            assert!(
+                !args.contains(&"LABELS".to_string()),
+                "{labels:?}: {args:?}"
+            );
+            let metric = &operands(&args, "METRIC", 1)[0];
+            let parsed = parse_create_metric(metric).expect("TS.CREATE METRIC accepts it");
+            assert_eq!(MetricName::new(&parsed), series.labels, "{metric}");
+        }
+    }
+
+    /// `LABELS __name__ …` is accepted by `TS.CREATE`/`TS.ALTER`, so a series can hold a name or
+    /// label names the metric grammar cannot spell. Those fall back to `LABELS`, which keeps
+    /// `__name__` as an ordinary pair; rendering them through `METRIC` would make the replica's
+    /// `TS.CREATE` fail and rebuild the series from its own defaults.
+    #[test]
+    fn test_labels_the_metric_grammar_cannot_spell_fall_back_to_labels() {
+        let cases: Vec<Vec<Label>> = vec![
+            vec![Label::new("__name__", "cpu total"), Label::new("1x", "a")],
+            vec![Label::new("__name__", "cpu"), Label::new("caf\u{e9}", "a")],
+            vec![Label::new("__name__", "9cpu")],
+            vec![Label::new("__name__", "cpu"), Label::new("a b", "c")],
+        ];
+        for labels in &cases {
+            let (series, args) = render_labels(labels);
+            assert!(
+                !args.contains(&"METRIC".to_string()),
+                "{labels:?}: {args:?}"
+            );
+            let pos = args.iter().position(|a| a == "LABELS").unwrap();
+            let pairs: Vec<Label> = args[pos + 1..]
+                .chunks(2)
+                .map(|pair| Label::new(&pair[0], &pair[1]))
+                .collect();
+            assert_eq!(MetricName::new(&pairs), series.labels, "{args:?}");
+            assert!(args.contains(&"__name__".to_string()), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn test_plain_labels_render_in_name_order() {
+        let series = series_with(TimeSeriesOptions {
+            labels: Some(vec![
+                Label::new("b", "2"),
+                Label::new("a", "1"),
+                Label::new("caf\u{e9}", "\u{1f600}"),
+            ]),
+            ..Default::default()
+        });
+        let args = create_option_strings(&series);
+        let pos = args.iter().position(|a| a == "LABELS").unwrap();
+        assert_eq!(
+            args[pos + 1..],
+            ["a", "1", "b", "2", "caf\u{e9}", "\u{1f600}"]
+        );
     }
 }

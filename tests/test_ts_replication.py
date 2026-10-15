@@ -767,6 +767,107 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         for field in ("firstTimestamp", "lastTimestamp", "totalSamples"):
             assert replica_info[field] == primary_info[field], field
 
+    def test_replication_autocreate_pins_primary_defaults(self):
+        """An auto-created series is replicated with the primary's resolved defaults ahead of the
+        write, so a replica whose ts-retention-policy differs still builds the same series — and
+        a rule fed by it uses the same retention floor."""
+        replica = self.replicas[0].client
+        replica.execute_command("CONFIG", "SET", "ts.ts-retention-policy", 500)
+        self.client.execute_command("CONFIG", "SET", "ts.ts-retention-policy", 3000)
+
+        self.client.execute_command("TS.ADD", "ts:auto:plain", 0, 1)
+        self.client.execute_command("TS.ADD", "ts:auto:metric", 0, 1, "METRIC", 'cpu{host="a"}')
+        self.client.execute_command("TS.INCRBY", "ts:auto:incr", 1, "LABELS", "k", "v")
+        self.client.execute_command("TS.ADDBULK", "ts:auto:bulk", json.dumps({"timestamps": [0, 1000], "values": [1, 2]}))
+        self.wait_for_replication()
+        for key in ("ts:auto:plain", "ts:auto:metric", "ts:auto:incr", "ts:auto:bulk"):
+            primary_info = parse_info_response(self.client.execute_command("TS.INFO", key))
+            replica_info = parse_info_response(replica.execute_command("TS.INFO", key))
+            for field in ("retentionTime", "chunkSize", "labels", "duplicatePolicy"):
+                assert replica_info[field] == primary_info[field], (key, field)
+            assert primary_info["retentionTime"] == 3000, key
+
+        # The destination is an explicit TS.CREATE, which replicates verbatim: left bare it would
+        # pick up the replica's own retention (500) and trim the rollup differently. Pin it.
+        self.client.execute_command("TS.CREATE", "ts:auto:dst", "RETENTION", 3000)
+        self.client.execute_command("TS.CREATERULE", "ts:auto:plain", "ts:auto:dst", "AGGREGATION", "sum", 1000)
+        for ts in range(500, 6000, 500):
+            self.client.execute_command("TS.ADD", "ts:auto:plain", ts, 1)
+        self.client.execute_command("TS.ADD", "ts:auto:plain", 2600, 10)   # back-fill near the floor
+        self.assert_compaction_equivalent("ts:auto:plain", "ts:auto:dst")
+
+    @staticmethod
+    def info_without_memory(client, key):
+        """`TS.INFO key` as a dict, minus `memoryUsage` (an allocator detail, not series state)."""
+        flat = client.execute_command("TS.INFO", key)
+        info = {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+        info.pop(b"memoryUsage")
+        return info
+
+    def test_replication_autocreate_materializes_every_option(self):
+        """Every configuration-derived option an auto-create resolves reaches the replica,
+        whichever command created the series and whichever way the two nodes' configs differ."""
+        replica = self.replicas[0].client
+        primary_config = {
+            "ts-encoding": "gorilla", "ts-chunk-size-bytes": 1024, "ts-duplicate-policy": "last",
+            "ts-retention-policy": 7000, "ts-ignore-max-time-diff": 5, "ts-ignore-max-val-diff": "0.5",
+            "ts-decimal-digits": 2,
+        }
+        replica_config = {
+            "ts-encoding": "uncompressed", "ts-chunk-size-bytes": 2048, "ts-duplicate-policy": "sum",
+            "ts-retention-policy": 100, "ts-ignore-max-time-diff": 9, "ts-ignore-max-val-diff": "0.9",
+            "ts-significant-digits": 4,
+        }
+        for name, value in primary_config.items():
+            self.client.execute_command("CONFIG", "SET", f"ts.{name}", value)
+        for name, value in replica_config.items():
+            replica.execute_command("CONFIG", "SET", f"ts.{name}", value)
+
+        payload = json.dumps({"timestamps": [1000, 2000], "values": [1.234, 2.345]})
+        self.client.execute_command("TS.ADD", "ts:opt:add", 1000, 1.234)
+        self.client.execute_command(
+            "TS.ADD", "ts:opt:inline", 1000, 1.234,
+            "RETENTION", 9000, "ENCODING", "uncompressed", "CHUNK_SIZE", 256, "DUPLICATE_POLICY", "max",
+            "LABELS", "a", "b",
+        )
+        self.client.execute_command("TS.ADD", "ts:opt:metric", 1000, 1.234, "METRIC", 'cpu{host="a"}')
+        # `LABELS __name__ …` is accepted, and can spell what the METRIC grammar cannot.
+        self.client.execute_command("TS.ADD", "ts:opt:odd", 1000, 1.234, "LABELS", "__name__", "cpu total", "1x", "a")
+        self.client.execute_command("TS.INCRBY", "ts:opt:incr", 1.234, "TIMESTAMP", 1000, "LABELS", "k", "v")
+        self.client.execute_command("TS.DECRBY", "ts:opt:decr", 1.234, "TIMESTAMP", 1000)
+        self.client.execute_command("TS.ADDBULK", "ts:opt:bulk", payload, "LABELS", "k", "v")
+        keys = ["ts:opt:add", "ts:opt:inline", "ts:opt:metric", "ts:opt:odd", "ts:opt:incr", "ts:opt:decr", "ts:opt:bulk"]
+
+        self.assert_compaction_equivalent(*keys)
+        for key in keys:
+            assert self.info_without_memory(replica, key) == self.info_without_memory(self.client, key), key
+        # The primary's retention, not the replica's 100, and its rounding, not the replica's.
+        assert parse_info_response(replica.execute_command("TS.INFO", "ts:opt:add"))["retentionTime"] == 7000
+        assert replica.execute_command("TS.GET", "ts:opt:add") == [1000, b"1.23"]
+        assert parse_info_response(replica.execute_command("TS.INFO", "ts:opt:inline"))["retentionTime"] == 9000
+
+        # The other direction: the primary is back on its defaults (no retention, no ignore, ...), so
+        # nothing in the replicated create may be left for the replica's non-default config to fill in.
+        for name, default in (
+            ("ts-encoding", "compressed"), ("ts-chunk-size-bytes", 4096), ("ts-duplicate-policy", "block"),
+            ("ts-retention-policy", 0), ("ts-ignore-max-time-diff", 0), ("ts-ignore-max-val-diff", 0),
+            ("ts-decimal-digits", "none"),
+        ):
+            self.client.execute_command("CONFIG", "SET", f"ts.{name}", default)
+        # TS.CREATE has no spelling for "no rounding", so the replica's own would apply.
+        replica.execute_command("CONFIG", "SET", "ts.ts-significant-digits", "none")
+
+        self.client.execute_command("TS.ADD", "ts:opt:defaults", 1000, 1.234)
+        self.client.execute_command("TS.INCRBY", "ts:opt:defaults:incr", 1.234, "TIMESTAMP", 1000)
+        self.assert_compaction_equivalent("ts:opt:defaults", "ts:opt:defaults:incr")
+        for key in ("ts:opt:defaults", "ts:opt:defaults:incr"):
+            assert self.info_without_memory(replica, key) == self.info_without_memory(self.client, key), key
+        defaults = parse_info_response(replica.execute_command("TS.INFO", "ts:opt:defaults"))
+        assert defaults["retentionTime"] == 0
+        assert defaults["chunkSize"] == 4096
+        assert defaults["duplicatePolicy"] == "block"
+        assert replica.execute_command("TS.GET", "ts:opt:defaults") == [1000, b"1.234"]
+
     @staticmethod
     def stored_chunks(client, key):
         """Per-chunk `TS.INFO DEBUG` entries: what the node stores, expired samples included."""

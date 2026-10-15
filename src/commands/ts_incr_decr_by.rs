@@ -108,9 +108,9 @@ fn create_series_and_update(
     const INVALID_ARGS: &[CommandArgToken] = &[CommandArgToken::OnDuplicate];
 
     let options = parse_series_options(args, 2, INVALID_ARGS)?;
-    // Auto-create: no ts.create event (RTS parity) and no replication from
-    // the create helper — this command replicates itself (a second
-    // propagation would double the increment on replicas).
+    // Auto-create: no ts.create event (RTS parity). The create helper replicates the new series
+    // as a resolved `TS.CREATE` (never this command, whose second propagation would double the
+    // increment on replicas); this command then replicates itself.
     let mut series = create_and_store_series(ctx, &key_name, options, false, true)?;
 
     handle_update(ctx, &mut series, &key_name, timestamp, delta, is_increment)
