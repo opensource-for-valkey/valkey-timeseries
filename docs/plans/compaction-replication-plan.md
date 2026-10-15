@@ -1,10 +1,15 @@
 # Compaction under replication: analysis and remediation plan
 
-Status: analysis complete, remediation **not started**; a model decision (§5) is pending.
-Implementation plan: `docs/plans/2026-10-14-compaction-effects-replication.md` (Parts 0–2 are
-the committed fix; Part 3 is Option C, conditional on the checkpoint). Reference behavior
-checked 2026-10-14 (§3.7): the reference recomputes on the replica and persists its marker.
-Written 2026-10-14 against `dos-defense` at `f4f44d482`. Evidence in §3 comes from reading
+Status: Approach 1 adopted and implemented (`docs/plans/2026-10-14-compaction-refactor.md`,
+branch `compaction-refactor`): recompute on every node, DIV-0023 emulation dropped, inputs pinned,
+dirty-rule recovery. Option A (§5) was adopted by the owner on 2026-10-14; the effects-replication
+Option C was not taken, and its plan (`docs/plans/2026-10-14-compaction-effects-replication.md`)
+is superseded and kept only as the record of that design. §3–§6 below are kept as the analysis
+that led here; the notes marked "Resolved", "Adopted" and "Landed in" say what became of each item.
+Reference behavior checked 2026-10-14 (§3.7): the reference recomputes on the replica and persists
+its marker.
+Written 2026-10-14 against `dos-defense` at `f4f44d482` (`src/series/compaction.rs` has since been
+split into the `src/series/compaction/` module directory). Evidence in §3 comes from reading
 `src/series/compaction.rs`, `sample_merge.rs`, `bulk_add.rs`, `serialization.rs`, `utils.rs`
 and the write-command handlers, plus a primary/replica probe (§3.6) run against the built module.
 
@@ -69,6 +74,17 @@ The statement is accurate but understates the problem in two ways.
 
 Classified by cause. "Proven" = reproduced in §3.6; "structural" = follows from the code
 without a reproduction; "suspected" = needs a probe before it is claimed.
+
+What became of each class (all landed on branch `compaction-refactor`; task numbers refer to
+`docs/plans/2026-10-14-compaction-refactor.md`): §3.1a policy destinations and §3.8 rule order →
+Task 12; §3.1c auto-create defaults → Task 11 (which also replicates an explicit `TS.CREATE` with
+the primary's resolved options); §3.1b `ts-compatibility-mode` → an operator rule in
+`docs/overview.md` (it is read by the answering node, so it must match across the group); §3.2
+the strict-mode marker → removed with the DIV-0023 emulation, Task 6; §3.3 version skew →
+documented operational rule (Task 14) and a per-aggregator persistence test (Task 5); §3.4
+failure paths → `dirty` rules rebuild their open bucket, plus failure counters (Task 13); §3.5
+blocked-duplicate `TS.MADD` → the marker it concerned is gone (Task 6). §3.6–§3.10 are findings
+recorded as history.
 
 ### 3.1 Inputs that are per-node configuration (structural)
 
@@ -222,8 +238,9 @@ the other). `PolicyConfig::create_compaction_rules` (`src/series/compaction_poli
 rules keyed by destination in a `std::collections::HashMap`, whose iteration order is seeded per
 process, and `add_default_compactions` (`src/series/utils.rs`) iterates that map and pushes the
 rules in its order. (`match_policy`'s `HashSet` is seeded per process too, but its order is lost
-when the rules are re-keyed into the map.) Each node therefore builds its own order. Rule order is observable (it is hashed into the digest
-and printed by `TS.INFO`) and decides the order in which the rules of one source are applied.
+when the rules are re-keyed into the map.) Each node therefore builds its own order. Rule order
+is observable (it is hashed into the digest and printed by `TS.INFO`) and decides the order in
+which the rules of one source are applied.
 
 Consequence for the suite: with two rules the failure is a coin flip, so the scenario uses six
 (1/720 chance that two shuffles coincide) and is marked `xfail(strict=True)`. Whichever task makes
@@ -245,6 +262,10 @@ one write (branch A, `sum` 8), or from what the source holds (branch B, `sum` 14
 pinned `redis:8.10` (timeseries 81000), via `redis-cli`. Every scenario starts from
 `TS.CREATE src`, `TS.ADD src 0 1`, `TS.ADD src 1200 2`, `TS.ADD src 1500 4`, `TS.CREATE dst`,
 `TS.CREATERULE src dst AGGREGATION <agg> 1000`.
+
+The "Ours" columns and the variants below were measured on 2026-10-14, before refactor Task 9
+routed `TS.ADD` and `TS.INCRBY` through the batch path; since then `TS.ADD` behaves as the
+`TS.MADD` column (see "Current state" at the end of this section).
 
 **Back-fill into the source's last bucket** (`tests/compat/test_compat_compaction.py::
 test_backfill_as_first_write_after_createrule`; `TS.ADD` and one-item `TS.MADD` reply identically
@@ -311,6 +332,17 @@ the batch path; the reference's fold of the unpublished bucket into the next one
 our `TS.MADD` keeps an older back-filled bucket open until the next forward close, where the
 reference publishes it at once — only an intermediate `TS.RANGE`/`TS.GET` (non-`LATEST`) before
 that close shows the difference.
+
+**Current state (after refactor Task 9, 2026-10-15).** `TS.ADD` and `TS.MADD` now take the same
+batch path and agree with each other; the "Ours, `TS.ADD`" column and variants V1–V8 above describe
+the retired single-sample path and are history. In
+`tests/compat/test_compat_compaction.py`, `test_backfill_as_first_write_after_createrule` (the
+back-fill into the source's last bucket) is `xfail(strict=True)` for both `TS.ADD` and `TS.MADD`,
+citing this section — ours recalculates the bucket from the source, the reference folds it into the
+next one — and `test_backfill_behind_the_open_bucket_as_first_write` passes for both. No
+`divergences.yml` entry covers either case. **Open (owner):** keep the two strict xfails or
+register a divergence for the fold; neither the tests nor `divergences.yml` were changed for it by
+the refactor.
 
 ### 3.10 Found by the recomputation oracle — a NaN bucket never replaced a published one (fixed; diverges from the reference, DIV-0060, 2026-10-14)
 
@@ -438,16 +470,29 @@ stronger guarantee at the cost of a mechanism the reference does not have in its
 AOF. Decide at the Phase 1 checkpoint, after Phase 0 and Phase 2 have landed — the work up to
 there is identical under both.
 
+**Adopted:** Option A, extended by the compaction refactor — `last_forward_close` removed (DIV-0023
+ungated), one ingest operation, module split, `dirty` instead of `applied_through`. Option C was not
+taken: the version-skew case is handled by the operational rule in `docs/overview.md` (upgrade the
+primary and its replicas together and full-resync them when a release changes aggregation results),
+and a node-local failure heals through the `dirty` rebuild instead of effects replication.
+
 ## 6. Plan
 
 Phases are ordered so that each is independently landable. Phase 0 is no-regret under either
 option and should start now; Phase 1 is the decision.
+
+Outcome: Phases 0 and 2 landed on branch `compaction-refactor`; Phase 1 was decided for Option A;
+Phase 3 was not taken. Each item below ends with a "Landed in" note naming the task of
+`docs/plans/2026-10-14-compaction-refactor.md` that did it (or why nothing did).
 
 ### Phase 0 — observe, pin, and test (either option)
 
 0.1 **Expose the hidden state.** `TS.INFO key DEBUG` (or `TS._DEBUG COMPACTION key`) reports,
 per rule: `bucket_start`, `has_samples`, `applied_through`, an aggregator snapshot, and on a
 destination the marker. Tests and operators need this to say *where* two nodes differ.
+*Landed in Task 1* as `TS.INFO key DEBUG` → `rulesState`, one `[destKey, bucketStart, hasSamples,
+current]` entry per rule (a fifth element, `dirty`, since Task 13); there is no `applied_through`
+and no marker any more.
 
 0.2 **Replica-oracle equivalence suite** in `tests/test_ts_replication.py`, each scenario
 ending with `DEBUG DIGEST-VALUE` on every source and destination on both nodes plus the
@@ -459,25 +504,37 @@ re-opened bucket; three-level chain and a diamond; `TS.CREATERULE` on a source w
 `TS.DELETERULE` mid-bucket then re-create; direct destination writes erased by a source
 `TS.DEL` (DIV-0021 model); retention on the source under a rule; policy-created rules; and a
 full resync taken mid-bucket followed by the sequence above. Run with both nodes strict.
+*Landed in Task 2* (`test_replication_compaction_*` in `tests/test_ts_replication.py`, with a real
+`WAIT` barrier in the helpers).
 
 0.3 **Restart and promotion variants** of 0.2: `DEBUG RELOAD` on the primary mid-sequence;
 promote the replica, continue the sequence on it, re-attach the old primary and compare.
+*Landed in Task 3.*
 
 0.4 **Random-sequence oracle.** A Hypothesis strategy over `{ADD, MADD, ADDBULK, DEL,
 CREATERULE, DELETERULE}` on a small key set (reuse `tests/compat/fuzz_strategies.py`), driving
 the primary and comparing digests on the replica after catch-up, with periodic reload and
 resync. Promote every shrunk failure into a deterministic test.
+*Landed in Task 4* (`test_replication_compaction_random_sequences`).
 
 0.5 **Per-aggregator persistence property test** (Rust): for all 23 `Aggregator` variants,
 random update sequences → `rdb_save`/`rdb_load` → identical `Hash` and identical `finalize()`.
+*Landed in Task 5* as an integration test, not a Rust property test:
+`tests/test_compactions_add.py::test_rule_state_survives_reload` runs once per aggregator (all 23),
+reloads the server mid-bucket and compares the rule's published value with a twin rule created
+after the reload and fed the whole sequence.
 
 0.6 **Fix the stale AOF-rewrite assertion**: compare the source digest too.
+*Landed in Task 5* (`tests/test_ts_aofrewrite.py`).
 
 0.7 **Observability**: a compaction-failure counter and a rule-state-rebuild counter in the
 module `INFO` section; warnings name the source and destination keys.
+*Landed in Task 13*: `INFO ts_compaction` → `ts_compaction_failures`, `ts_compaction_state_rebuilds`.
 
 0.8 **Document** in `docs/` that `ts-compatibility-mode` and `ts-compaction-policy` must match
 across nodes, pending A.2.
+*Landed in Task 12* (`docs/overview.md` *Replication*), extended in Task 14 with the version-skew,
+mixed-version, keyspace-event and failure-recovery notes.
 
 ### Phase 1 — decide A or C (owner sign-off)
 
@@ -485,19 +542,30 @@ Inputs: Phase 0 results (any further reproduced divergences), stream-traffic est
 a realistic rule fan-out (`tools/fleet_loader` fleet with the default policy), and the
 rolling-upgrade policy the project wants.
 
+*Decided:* Option A (owner, 2026-10-14). Option C was not taken (§5, "Adopted").
+
 ### Phase 2 — A.1–A.4 (either option)
 
 2.1 Persist the marker (in-place format change, encoding version unchanged — pre-release);
 extend 0.2's full-resync and reload scenarios to assert the strict-mode reply.
+*Obsolete:* the marker was removed with the DIV-0023 emulation in Task 6, so there is nothing to
+persist.
 2.2 Replicate policy-created destinations and rules; gate policy application on
 `is_real_user_client`; fix the dropped-rule branch; test with mismatched configs on the two
 nodes.
+*Landed in Task 12.*
 2.3 Resolve auto-create defaults into propagated `TS.ADD`/`TS.MADD`/`TS.ADDBULK`.
+*Landed in Task 11*, as a resolved `TS.CREATE` replicated ahead of the write (not resolved options
+inside the write), and also for an explicit `TS.CREATE`.
 2.4 `applied_through` and the rebuild-on-mismatch check. The rebuild must reproduce the
 fresh-rule semantics pinned by `test_createrule_on_a_source_that_already_has_data` — define
 what `applied_through` is at rule creation before implementing.
+*Landed in Task 13*, as a persisted `dirty` flag set when a rule application fails, not an
+`applied_through` comparison: the next write rebuilds the open bucket only for a dirty rule.
 
 ### Phase 3 — effects replication (Option C only)
+
+*Not taken* (§5, "Adopted"); the items below are the record of the design.
 
 3.1 `TS._COMPACT` internal command (positional registration next to `TS._RESTORE`; refuse real
 user clients outside debug mode).
@@ -514,6 +582,8 @@ the target (`tests/test_ts_asm.py`).
 
 Record the outcome in `proposal.md` / `proposal-complete.md` §3.5 and the readiness criteria,
 and add a `COMPATIBILITY.md` note if any replica-visible behavior differs from RedisTimeSeries.
+*Landed in Task 14* (the proposals, this document and `docs/overview.md`); the `COMPATIBILITY.md`
+entries are DIV-0023 (ungated, Task 6) and DIV-0060 (Task 8).
 
 ## 7. Out of scope here
 
