@@ -42,7 +42,13 @@ impl ValueComparisonFilter {
 impl Hash for ValueComparisonFilter {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.operator.hash(state);
-        hash_f64(self.value, state);
+        // `eq` compares with `==`, under which `-0.0` equals `0.0` (and every comparison against
+        // the two agrees), so they must hash alike or `countif>0` and `countif>-0` both survive a
+        // policy set's dedupe. Normalized here rather than in `hash_f64`, which also digests
+        // stored samples, where a stored `-0.0` and `0.0` are different values. NaN is already
+        // canonicalized by `hash_f64`, matching `eq`'s NaN == NaN.
+        let value = if self.value == 0.0 { 0.0 } else { self.value };
+        hash_f64(value, state);
     }
 }
 

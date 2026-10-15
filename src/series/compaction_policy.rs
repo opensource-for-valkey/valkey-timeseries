@@ -451,6 +451,8 @@ pub fn create_compaction_rules_from_config(
 mod tests {
     use super::*;
     use crate::aggregators::AggregationType;
+    use crate::common::binop::ComparisonOperator;
+    use crate::series::request_types::ValueComparisonFilter;
 
     fn create_policy(
         aggregator: AggregationType,
@@ -463,6 +465,56 @@ mod tests {
             retention_ms: 0, // Not used in format_key
             bucket_alignment: align_timestamp,
         }
+    }
+
+    fn hash_of<T: std::hash::Hash>(value: &T) -> u64 {
+        use std::hash::{BuildHasher, RandomState};
+        // One `RandomState` for every value compared, so equal values hash equal.
+        static STATE: std::sync::LazyLock<RandomState> = std::sync::LazyLock::new(RandomState::new);
+        STATE.hash_one(value)
+    }
+
+    #[test]
+    fn equal_conditions_hash_alike_so_a_policy_set_dedupes_them() {
+        let policies: Vec<CompactionPolicy> =
+            parse_compaction_policies("countif>0:1M:1h;countif>-0:1M:1h;countif>0.0:1M:1h")
+                .unwrap()
+                .into_iter()
+                .map(|(policy, _)| policy)
+                .collect();
+        assert!(policies.windows(2).all(|w| w[0] == w[1]));
+        assert!(
+            policies
+                .windows(2)
+                .all(|w| hash_of(&w[0]) == hash_of(&w[1]))
+        );
+        assert_eq!(policies.iter().copied().collect::<HashSet<_>>().len(), 1);
+
+        // NaN equals itself under the filter's `eq`, so it must hash alike too; distinct values
+        // and operators still differ.
+        let nan = ValueComparisonFilter {
+            operator: ComparisonOperator::Equal,
+            value: f64::NAN,
+        };
+        let other_nan = ValueComparisonFilter {
+            value: -f64::NAN,
+            ..nan
+        };
+        assert_eq!(nan, other_nan);
+        assert_eq!(hash_of(&nan), hash_of(&other_nan));
+        let one = ValueComparisonFilter {
+            operator: ComparisonOperator::GreaterThan,
+            value: 1.0,
+        };
+        let zero = ValueComparisonFilter { value: 0.0, ..one };
+        assert_ne!(one, zero);
+        assert_ne!(
+            zero,
+            ValueComparisonFilter {
+                operator: ComparisonOperator::LessThan,
+                ..zero
+            }
+        );
     }
 
     #[test]
