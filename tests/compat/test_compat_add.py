@@ -221,6 +221,22 @@ class TestDuplicatePolicy:
         with pytest.raises(ResponseError):
             diff("TS.ADD", "d:od:novalue", 100, 1.0, "ON_DUPLICATE")
 
+    def test_on_duplicate_is_read_inside_labels_only_on_an_existing_series(self, diff):
+        """Creating, the LABELS list runs to the end, so `ON_DUPLICATE` there is a label
+        value. On an existing series both engines scan every argument for the keyword,
+        LABELS included: a dangling one errors, and a policy after it applies. Pinned so
+        the existing-key scan is not "fixed" to stop at LABELS — that would accept what
+        the reference rejects. (Replication sidesteps the asymmetry: an auto-creating
+        TS.ADD propagates itself without its options.)"""
+        diff("TS.ADD", "d:od:labels", 100, 1.0, "LABELS", "tag", "ON_DUPLICATE")
+        diff("TS.INFO", "d:od:labels")
+        with pytest.raises(ResponseError):
+            diff("TS.ADD", "d:od:labels", 200, 1.0, "LABELS", "tag", "ON_DUPLICATE")
+        with pytest.raises(ResponseError):
+            diff("TS.ADD", "d:od:labels", 200, 1.0, "LABELS", "x", "ON_DUPLICATE", "y", "z")
+        diff("TS.ADD", "d:od:labels", 100, 5.0, "LABELS", "x", "ON_DUPLICATE", "MAX", "q")
+        diff("TS.RANGE", "d:od:labels", "-", "+")
+
     def test_duplicate_of_a_non_last_sample(self, diff):
         """Upsert into the middle of the series, not just onto the last sample."""
         diff("TS.CREATE", "d:dp:mid", "DUPLICATE_POLICY", "SUM")

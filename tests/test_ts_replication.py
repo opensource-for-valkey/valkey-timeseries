@@ -803,6 +803,29 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.client.execute_command("TS.ADD", "ts:auto:plain", 2600, 10)   # back-fill near the floor
         self.assert_compaction_equivalent("ts:auto:plain", "ts:auto:dst")
 
+    def test_replication_autocreate_with_keyword_looking_labels(self):
+        """An auto-creating TS.ADD whose LABELS hold `ON_DUPLICATE` is accepted (the label list
+        runs to the end), but on an existing series the same argv is scanned for ON_DUPLICATE
+        and rejected. The replica receives the series first, as a TS.CREATE, so the write must
+        reach it without its options or the replica drops the sample the primary kept."""
+        writes = {
+            "ts:kw:dangling": (0, 1, "LABELS", "tag", "ON_DUPLICATE"),
+            "ts:kw:invalid": (0, 1, "LABELS", "x", "ON_DUPLICATE", "y", "z"),
+            "ts:kw:policy": (0, 1, "LABELS", "x", "ON_DUPLICATE", "MAX", "q"),
+            "ts:kw:star": ("*", 1, "LABELS", "tag", "ON_DUPLICATE"),
+        }
+        for key, args in writes.items():
+            self.client.execute_command("TS.ADD", key, *args)
+        # A later write to an existing series still replicates verbatim.
+        self.client.execute_command("TS.ADD", "ts:kw:policy", 1000, 2, "ON_DUPLICATE", "LAST")
+
+        assert self.client.execute_command("TS.RANGE", "ts:kw:dangling", "-", "+") == [[0, b"1"]]
+        self.assert_compaction_equivalent(*writes)
+        replica = self.replicas[0].client
+        for key in writes:
+            assert replica.execute_command("TS.RANGE", key, "-", "+") != [], key
+            assert self.info_without_memory(replica, key) == self.info_without_memory(self.client, key), key
+
     @staticmethod
     def info_without_memory(client, key):
         """`TS.INFO key` as a dict, minus `memoryUsage` (an allocator detail, not series state)."""

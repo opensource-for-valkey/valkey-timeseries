@@ -222,9 +222,11 @@ pub fn create_and_store_series<'a>(
 
     // Replicate the series as the primary built it, defaults materialized. For an auto-create
     // this goes ahead of the write command's own propagation (`alsoPropagate` keeps call order),
-    // and the replica's replayed write then finds the series, its inline creation options inert,
-    // exactly as on the primary when the series already exists. `TS.CREATE` here, not
-    // `replicate_verbatim`: that would copy the *write's* argv and apply it twice.
+    // so the replica's replayed write runs on the existing-key path. Its inline creation options
+    // are inert there, but they are still scanned: an auto-creating write must propagate a form
+    // that path reads as the create path did (TS.ADD sends itself bare, see its
+    // `replicate_and_notify`). `TS.CREATE` here, not `replicate_verbatim`: that would copy the
+    // *write's* argv and apply it twice.
     let create_args = resolved_create_args(ctx, &series);
     let mut replication_args: Vec<&ValkeyString> = Vec::with_capacity(create_args.len() + 1);
     replication_args.push(key);

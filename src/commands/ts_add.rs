@@ -72,6 +72,7 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             timestamp_str,
             value,
             on_duplicate,
+            false,
         );
     }
 
@@ -94,6 +95,7 @@ pub fn ts_add_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         timestamp_str,
         value,
         on_duplicate,
+        true,
     )
 }
 
@@ -122,6 +124,7 @@ fn handle_add(
     timestamp_str: &str,
     value: f64,
     on_duplicate: Option<DuplicatePolicy>,
+    created: bool,
 ) -> ValkeyResult {
     let mut ignored = false;
 
@@ -176,23 +179,37 @@ fn handle_add(
         signal_timeseries_ready(ctx, &args[1]);
     }
 
-    replicate_and_notify(ctx, args, replication_timestamp);
+    replicate_and_notify(ctx, &args, replication_timestamp, created);
     Ok(ValkeyValue::Integer(ts))
 }
 
-fn replicate_and_notify(ctx: &Context, args: Vec<ValkeyString>, timestamp: Option<Timestamp>) {
-    if let Some(ts) = timestamp {
-        // "*" could have a completely different value on a replica, so send the current value instead
-        let ts_str = ts.to_string();
-        let mut args = args;
-        args.remove(0);
-        args[1] = ctx.create_string(ts_str.as_bytes());
-        let replication_args = args.iter().collect::<Vec<_>>();
+/// Propagates the write. `timestamp` is the resolved timestamp when the client sent `*`, which
+/// could resolve differently on a replica.
+///
+/// A write that `created` its series is propagated bare, as `TS.ADD key timestamp value`: the
+/// series has already gone out as a resolved `TS.CREATE`, so the replayed write runs on the
+/// existing-key path, which scans the arguments for `ON_DUPLICATE` without stopping at `LABELS`
+/// (as the reference does). Verbatim, `LABELS tag ON_DUPLICATE` — a label the create path
+/// accepted — would fail there and drop the sample on every replica and AOF replay. Nothing
+/// the bare form omits matters: the creation options travel in the `TS.CREATE`, and neither
+/// `ON_DUPLICATE` nor `IGNORE` can affect the first sample of an empty series.
+fn replicate_and_notify(
+    ctx: &Context,
+    args: &[ValkeyString],
+    timestamp: Option<Timestamp>,
+    created: bool,
+) {
+    let key = &args[1];
+    let resolved_ts = timestamp.map(|ts| ctx.create_string(ts.to_string().as_bytes()));
+    let ts_arg = resolved_ts.as_ref().unwrap_or(&args[2]);
+    if created {
+        ctx.replicate("TS.ADD", &[key, ts_arg, &args[3]]);
+    } else if resolved_ts.is_some() {
+        let mut replication_args = args[1..].iter().collect::<Vec<_>>();
+        replication_args[1] = ts_arg;
         ctx.replicate("TS.ADD", &*replication_args);
-        let key = args.swap_remove(0);
-        notify_keyspace_event(ctx, c"ts.add", &key);
     } else {
         ctx.replicate_verbatim();
-        notify_keyspace_event(ctx, c"ts.add", &args[1]);
     }
+    notify_keyspace_event(ctx, c"ts.add", key);
 }

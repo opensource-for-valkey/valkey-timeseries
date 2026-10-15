@@ -452,6 +452,35 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
         assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
         assert snapshot() == before
 
+    def test_autocreate_with_keyword_looking_labels_survives_aof_replay(self):
+        """An auto-creating TS.ADD whose LABELS hold `ON_DUPLICATE` reaches the AOF as a resolved
+        TS.CREATE plus a bare TS.ADD. Replaying its original argv against the now-existing series
+        would read ON_DUPLICATE out of LABELS and fail, losing the sample while LOADAOF succeeds.
+        Replays the AOF tail, not a rewrite: a rewrite is built from state and would hide it."""
+        client = self.client
+        client.config_set('appendonly', 'yes')
+        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=30)
+
+        writes = {
+            'aof:kw:dangling': (0, 1, 'LABELS', 'tag', 'ON_DUPLICATE'),
+            'aof:kw:invalid': (0, 1, 'LABELS', 'x', 'ON_DUPLICATE', 'y', 'z'),
+            'aof:kw:star': ('*', 1, 'LABELS', 'tag', 'ON_DUPLICATE'),
+        }
+        for key, args in writes.items():
+            client.execute_command('TS.ADD', key, *args)
+
+        def snapshot():
+            return {key: (client.execute_command('TS.RANGE', key, '-', '+'),
+                          self.ts_info(key)['labels'],
+                          client.execute_command('DEBUG', 'DIGEST-VALUE', key))
+                    for key in writes}
+
+        before = snapshot()
+        for samples, _, _ in before.values():
+            assert len(samples) == 1
+        assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
+        assert snapshot() == before
+
     def test_filtered_policy_destinations_survive_aof_replay(self):
         """A filtered policy rule (countif>N, …) reaches the AOF as TS.CREATERULE with its
         condition inline, so replay rebuilds the same rule instead of refusing it. The source's
