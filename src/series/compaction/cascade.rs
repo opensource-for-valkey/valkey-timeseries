@@ -44,7 +44,7 @@ struct RuleOutcome {
 ///
 /// A single [`CompactionOp::Ingest`] application can write the same bucket twice: once from
 /// the streaming append path, then again when a same-batch historical upsert recalculates that
-/// bucket (see `handle_batch_compaction`). The recalculation is authoritative and always runs
+/// bucket (see `handle_mixed_batch_compaction`). The recalculation is authoritative and always runs
 /// after the streaming write, so a stable sort followed by keeping the last of each duplicate
 /// timestamp preserves the correct (final) value while producing the sorted, unique-timestamp
 /// sequence `Ingest` requires downstream.
@@ -116,7 +116,11 @@ fn process_series_with_compaction(
     // recomputes the destination silently, and a TS.DEL propagated into
     // destinations emits only the source's `ts.del`. Every `Ingest` level —
     // the source's rules and each cascaded level — follows the same rule.
-    let mut notified: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = SmallVec::new();
+    //
+    // Blocked `TS.READ` readers are woken on a different, wider condition: every
+    // destination that materialized a sample, close or not, because a back-fill
+    // into a bucket the rule skipped creates a destination sample too.
+    let mut written: SmallVec<[WrittenDestination; TEMP_VEC_LEN]> = SmallVec::new();
     let mut visited = Visited::default();
 
     let destinations = get_compaction_series(ctx, series, &visited);
@@ -170,7 +174,7 @@ fn process_series_with_compaction(
         }
         _ => {
             let mut pending: SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]> = SmallVec::new();
-            queue_written_outcomes(&mut keys, outcomes, &mut notified, &mut pending);
+            queue_written_outcomes(&mut keys, outcomes, &mut written, &mut pending);
             if !pending.is_empty() {
                 visited.insert(&series.key);
             }
@@ -207,30 +211,31 @@ fn process_series_with_compaction(
                 };
                 let child_outcomes =
                     apply_rules_on_destinations(&mut child, child_guards, batch_op)?;
-                queue_written_outcomes(
-                    &mut child_keys,
-                    child_outcomes,
-                    &mut notified,
-                    &mut pending,
-                );
+                queue_written_outcomes(&mut child_keys, child_outcomes, &mut written, &mut pending);
             }
         }
     }
 
-    if !notified.is_empty() {
-        notify_compaction(ctx, &notified);
+    if !written.is_empty() {
+        notify_compaction(ctx, &written);
     }
 
     Ok(())
 }
 
+/// A destination that compaction committed at least one sample to, for [`notify_compaction`].
+struct WrittenDestination {
+    key: ValkeyString,
+    /// An append closed a bucket there: the `ts.add:dest` condition, narrower than "written".
+    closed_bucket: bool,
+}
+
 /// Queues every destination that `outcomes` wrote to for the next cascade level — a back-fill
-/// must still cascade — and the ones where an append closed a bucket for a `ts.add:dest`
-/// notification.
+/// must still cascade — and records it in `written` for [`notify_compaction`].
 fn queue_written_outcomes(
     keys: &mut [Option<ValkeyString>],
     outcomes: Vec<RuleOutcome>,
-    notified: &mut SmallVec<[ValkeyString; TEMP_VEC_LEN]>,
+    written: &mut SmallVec<[WrittenDestination; TEMP_VEC_LEN]>,
     pending: &mut SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]>,
 ) {
     for outcome in outcomes {
@@ -240,9 +245,10 @@ fn queue_written_outcomes(
         let Some(dest_key) = keys[outcome.rule_index].take() else {
             continue;
         };
-        if outcome.closed_bucket {
-            notified.push(dest_key.clone());
-        }
+        written.push(WrittenDestination {
+            key: dest_key.clone(),
+            closed_bucket: outcome.closed_bucket,
+        });
         pending.push((
             dest_key,
             dedupe_written_samples(outcome.written),
@@ -436,13 +442,21 @@ fn resolve_destination<'a>(
     Resolved::Open(dest_key, dest)
 }
 
-fn notify_compaction(ctx: &Context, keys: &[ValkeyString]) {
-    for key in keys {
-        notify_keyspace_event(ctx, c"ts.add:dest", key);
-        // Callers only reach here for destinations that materialized a sample, so this is
-        // the one place both direct and cascaded compaction output can wake a `TS.READ`
-        // reader blocked on a rollup key.
-        signal_timeseries_ready(ctx, key);
+/// Announces what compaction wrote to each destination: the `ts.add:dest` keyspace event for
+/// those where an append closed a bucket, and a wake-up for every destination that materialized
+/// a sample.
+///
+/// The two conditions differ. A back-fill into an already-closed bucket recomputes it silently
+/// (no event), but a back-fill into a bucket the rule skipped creates a new destination sample,
+/// which a `TS.READ` reader blocked on the rollup key may be waiting for. Waking a reader that
+/// has nothing new is harmless — its callback re-checks its cursor and threshold. This is the
+/// one place both direct and cascaded compaction output can wake such a reader.
+fn notify_compaction(ctx: &Context, destinations: &[WrittenDestination]) {
+    for dest in destinations {
+        if dest.closed_bucket {
+            notify_keyspace_event(ctx, c"ts.add:dest", &dest.key);
+        }
+        signal_timeseries_ready(ctx, &dest.key);
     }
 }
 

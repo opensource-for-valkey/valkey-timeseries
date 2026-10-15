@@ -663,6 +663,35 @@ class TestTsReadWakeupPaths(TsReadTestBase):
         finally:
             reader.close(self.client)
 
+    def test_compaction_destination_gap_bucket_backfill(self):
+        """A back-fill that creates a destination sample without closing a bucket still wakes
+        a reader: signalling follows "a sample was materialized", not the `ts.add:dest` event."""
+        self.client.execute_command("TS.CREATE", "src")
+        self.client.execute_command("TS.CREATE", "dest")
+        self.client.execute_command(
+            "TS.CREATERULE", "src", "dest", "AGGREGATION", "sum", 100
+        )
+        # 450 closes bucket 100 and 750 closes bucket 400, leaving 700 open. Bucket 200 had no
+        # source samples when the rule moved past it, so the destination has no sample there.
+        for ts in [100, 450, 750]:
+            self.client.execute_command("TS.ADD", "src", ts, 1.0)
+        assert self.timestamps(self.client.execute_command("TS.RANGE", "dest", "-", "+")) == [
+            100,
+            400,
+        ]
+
+        reader = self.reader("TS.READ", "dest", "-", "BLOCK", LONG_BLOCK_MS, 3)
+        try:
+            # Back-fills the skipped bucket: creates dest[200] without closing anything.
+            self.client.execute_command("TS.ADD", "src", 250, 1.0)
+            # A reader that is not woken only returns at its BLOCK timeout, and that reply would
+            # hold the same three samples (it re-reads the key), so the wake-up itself is what
+            # is asserted: the reply must arrive well before the timeout.
+            woken_within = LONG_BLOCK_MS / 1000 / 2
+            assert self.timestamps(reader.result(timeout=woken_within)) == [100, 200, 400]
+        finally:
+            reader.close(self.client)
+
     def test_cascaded_compaction_destination(self):
         """A rollup of a rollup wakes its own readers, not just the first level."""
         self.client.execute_command("TS.CREATE", "src")
