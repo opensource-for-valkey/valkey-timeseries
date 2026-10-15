@@ -5,8 +5,7 @@ mod tests {
     use crate::labels::Label;
     use crate::labels::filters::{LabelFilter, SeriesSelector};
     use crate::series::index::{
-        PostingStat, TimeSeriesIndex, index_imported_series, index_loaded_series,
-        next_timeseries_id,
+        PostingStat, TimeSeriesIndex, index_loaded_series, next_timeseries_id,
     };
     use crate::series::time_series::TimeSeries;
     use crate::series::{CompactionRule, SeriesLink};
@@ -675,18 +674,13 @@ mod tests {
         index.index_timeseries(&original, b"a");
 
         let mut copy = original.clone();
-        copy.src_series = Some(SeriesLink::from_key(b"src"));
-        copy.rules.push(test_rule(b"dst"));
         {
             let mut postings = index.get_postings_mut();
             index_loaded_series(&mut postings, &mut copy, b"b");
         }
 
         assert_ne!(copy.id, original.id, "the copy must get a fresh id");
-        assert!(
-            copy.src_series.is_none() && copy.rules.is_empty(),
-            "compaction linkage belongs to the original"
-        );
+        assert_eq!(copy.key.as_ref(), b"b");
         assert_eq!(index.count(), 2);
         let postings = index.get_postings();
         assert_eq!(
@@ -700,8 +694,9 @@ mod tests {
     }
 
     #[test]
-    fn test_index_imported_series_remaps_a_colliding_id_but_keeps_its_links() {
-        // A slot import brings `b` with an id that a different local key already owns.
+    fn test_index_loaded_series_keeps_its_links_through_an_id_remap() {
+        // A series migrated to another node (slot import, or a per-key `MIGRATE`) whose id a
+        // different local key already owns. Its links name keys, so the remap leaves them alone.
         let index = TimeSeriesIndex::new();
         let local = create_series_from_metric_name(r#"latency{region="us-east-1"}"#);
         index.index_timeseries(&local, b"a");
@@ -712,7 +707,7 @@ mod tests {
         imported.rules.push(test_rule(b"{t}dst"));
         {
             let mut postings = index.get_postings_mut();
-            index_imported_series(&mut postings, &mut imported, b"b");
+            index_loaded_series(&mut postings, &mut imported, b"b");
         }
 
         assert_ne!(

@@ -6,6 +6,7 @@ is deleted and re-created, overwritten by RENAME, or re-pointed at another sourc
 compaction output meant for another series. RENAME re-points the partners of the renamed key.
 """
 
+from valkey.exceptions import ResponseError
 from valkeytestframework.conftest import resource_port_tracker
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
@@ -160,4 +161,44 @@ class TestCompactionLinks(ValkeyTimeSeriesTestCaseBase):
         self.add('src:copy', (1000, 100), (2000, 100))
         self.add('src', (500, 2), (1000, 5))
         assert self.dest_samples('dst') == [(0, 3.0)]
+        assert self.source_key('dst') == 'src'
+
+    def test_createrule_replaces_a_stale_source_link(self):
+        """`dst` still carries a link to its deleted source; that must not block a new rule."""
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        self.client.delete('src')
+
+        self.create_rule('other', 'dst', aggregation='max')
+
+        assert self.source_key('dst') == 'other'
+        self.add('other', (0, 5), (1000, 7))
+        assert self.dest_samples('dst') == [(0, 5.0)]
+
+    def test_restored_copy_of_a_destination_accepts_a_rule(self):
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        self.client.restore('dst:copy', 0, self.client.dump('dst'))
+
+        # The copy's link names `src`, which feeds `dst`, not the copy.
+        self.create_rule('other', 'dst:copy', aggregation='max')
+
+        assert self.source_key('dst:copy') == 'other'
+        assert self.source_key('dst') == 'src'
+        self.add('src', (0, 1), (1000, 2))
+        self.add('other', (0, 10), (1000, 20))
+        assert self.dest_samples('dst') == [(0, 1.0)]
+        assert self.dest_samples('dst:copy') == [(0, 10.0)]
+
+    def test_createrule_rejects_a_destination_with_a_live_source(self):
+        for key in ('src', 'dst', 'other'):
+            self.client.execute_command('TS.CREATE', key)
+        self.create_rule('src', 'dst')
+        try:
+            self.create_rule('other', 'dst')
+            assert False, 'expected the second source to be refused'
+        except ResponseError as e:
+            assert 'already has a src rule' in str(e)
         assert self.source_key('dst') == 'src'

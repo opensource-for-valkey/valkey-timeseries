@@ -53,7 +53,9 @@ storage and analysis.
 ## Constraints
 
 - **sourceKey** and **destKey** must be different.
-- The destination key must not already have a compaction rule as its source.
+- The destination key must not already be fed by another rule. A destination whose source key
+  was deleted or overwritten, or a copy of a destination restored under another key, is no longer
+  fed and accepts a new rule.
 - The destination key cannot be a compaction rule itself (no chaining).
 - Circular dependencies are not allowed.
 

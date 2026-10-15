@@ -20,7 +20,7 @@ use crate::common::context::{get_current_db, is_real_user_client};
 use crate::config::is_debug_mode_enabled;
 use crate::series::TimeSeries;
 use crate::series::index::asm::{add_delayed_indexing_key, is_key_in_slot_import};
-use crate::series::index::index_imported_series_by_key;
+use crate::series::index::index_series_by_key;
 use crate::series::series_data_type::{VK_TIME_SERIES_TYPE, is_supported_encoding_version};
 use std::os::raw::c_void;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue, raw};
@@ -99,7 +99,7 @@ pub fn ts_restore_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if is_key_in_slot_import(key.as_slice()) {
         add_delayed_indexing_key(db, key.as_slice());
     } else {
-        index_imported_series_by_key(ctx, key.as_slice());
+        index_series_by_key(ctx, key.as_slice());
     }
 
     Ok(ValkeyValue::SimpleStringStatic("OK"))

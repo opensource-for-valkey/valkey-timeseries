@@ -9,7 +9,7 @@ use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{
     CompactionRule, SeriesLink, check_new_rule_circular_dependency, get_timeseries,
-    get_timeseries_mut,
+    get_timeseries_mut, live_source_key,
 };
 use std::ffi::CStr;
 use valkey_module::{
@@ -64,7 +64,10 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         let source_series = get_timeseries(ctx, &source_key, Some(AclPermissions::UPDATE))?;
         let dest_series = get_timeseries(ctx, &dest_key, Some(AclPermissions::UPDATE))?;
 
-        if dest_series.is_compaction() {
+        // A source link whose source no longer has a rule for this key (the source was deleted
+        // or overwritten, or this key is a `RESTORE`d copy of a destination) is stale, and is
+        // replaced below rather than blocking the new rule.
+        if live_source_key(ctx, &dest_series).is_some() {
             return Err(ValkeyError::Str(
                 "TSDB: the destination key already has a src rule",
             ));

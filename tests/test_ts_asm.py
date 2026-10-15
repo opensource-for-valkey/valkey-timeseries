@@ -839,8 +839,9 @@ class TestAtomicSlotMigration(ValkeyTimeSeriesClusterTestCaseDebugMode):
         """A rule survives a migration whose imported destination's id is taken on the target.
 
         Series ids are only probabilistically unique across nodes, and an imported series whose
-        id is already used by a different key on the target is given a fresh id. The rule's
-        other end still refers to the old id, which on the target belongs to an unrelated key.
+        id is already used by a different key on the target is given a fresh id. Rules link
+        their ends by key, so the remap must leave the rule intact -- and must not route output
+        to the unrelated key that owns the old id on the target.
 
         The collision is forced deterministically: the destination is DUMPed on the source
         right after creation, and that payload is RESTOREd on the target under an unrelated key

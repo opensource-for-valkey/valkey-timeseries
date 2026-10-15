@@ -29,7 +29,7 @@ pub use engine::CompactionOp;
 #[cfg(feature = "test-utils")]
 pub use engine::{bench_ingest_one, bench_rule};
 pub use links::check_new_rule_circular_dependency;
-pub(crate) use links::{get_latest_compaction_sample, relink_renamed_series};
+pub(crate) use links::{get_latest_compaction_sample, live_source_key, relink_renamed_series};
 
 const TEMP_VEC_LEN: usize = 6;
 

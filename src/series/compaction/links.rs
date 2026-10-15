@@ -4,6 +4,24 @@ use crate::error_consts;
 use crate::series::{SeriesLink, TimeSeries, try_get_timeseries, try_get_timeseries_mut};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
+/// The key of the series that feeds `series`, while that source still has a rule for it.
+///
+/// `src_series` alone does not make `series` a compaction destination: the source may since
+/// have been deleted or overwritten, or `series` may be a `RESTORE`d copy of a destination,
+/// whose link still names the original's source. Like compaction itself, anything that asks
+/// whether a series has a source must check the back-link.
+pub(crate) fn live_source_key(ctx: &Context, series: &TimeSeries) -> Option<ValkeyString> {
+    let source_key = series.src_series.as_ref()?.to_key_string(ctx);
+    let feeds_series = matches!(
+        try_get_timeseries(ctx, &source_key, None),
+        Ok(Some(source)) if source
+            .rules
+            .iter()
+            .any(|rule| rule.dest.points_to(&series.key))
+    );
+    feeds_series.then_some(source_key)
+}
+
 /// The still-open bucket of the rule that feeds `series`, a compaction destination (`LATEST`).
 pub(crate) fn get_latest_compaction_sample(ctx: &Context, series: &TimeSeries) -> Option<Sample> {
     let parent_key = series.src_series.as_ref()?.to_key_string(ctx);
