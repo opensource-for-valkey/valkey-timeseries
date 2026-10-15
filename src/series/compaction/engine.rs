@@ -566,8 +566,20 @@ fn resync_open_bucket_after_removal(ctx: &mut CompactionContext<'_>) -> TsdbResu
 }
 
 /// Write one aggregated bucket to the destination.
+///
+/// The write replaces whatever the destination holds for the bucket — including with NaN, which
+/// a recalculated bucket can finalize to (`irate`/`rate`/`increase` over a counter reset). The
+/// duplicate policy cannot express that: every non-`BLOCK` policy, `LAST` included, keeps the
+/// old value when the new one is NaN (`DuplicatePolicy::duplicate_value`), yet `add` still
+/// reports the NaN as written. A back-fill that turned a published bucket's aggregate into NaN
+/// therefore left the stale value in the destination while cascading the NaN downstream. So a
+/// NaN first clears the bucket's existing entry and is then written as a fresh sample. Found by
+/// `destination_matches_a_recomputation_from_the_source`.
 fn add_dest_bucket(ctx: &mut CompactionContext, ts: Timestamp, value: f64) -> TsdbResult<()> {
     let bucket_start = ctx.rule.calc_bucket_start(ts);
+    if value.is_nan() && !ctx.dest.is_empty() {
+        ctx.dest.remove_range(bucket_start, bucket_start)?;
+    }
     match ctx
         .dest
         .add(bucket_start, value, Some(DuplicatePolicy::KeepLast))
@@ -615,4 +627,261 @@ where
         }
     }
     has_samples
+}
+
+/// A fresh rule for the `compaction_ingest` benchmark.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn bench_rule(agg: crate::aggregators::AggregationType, bucket_ms: u64) -> CompactionRule {
+    let mut aggregator: crate::aggregators::Aggregator = agg.into();
+    if let crate::aggregators::Aggregator::Rate(r) = &mut aggregator {
+        r.set_window_ms(bucket_ms);
+    }
+    CompactionRule {
+        dest: crate::series::SeriesLink::from("bench:dst"),
+        aggregator,
+        bucket_duration: bucket_ms,
+        align_timestamp: 0,
+        bucket_start: None,
+        has_samples: false,
+    }
+}
+
+/// One stored sample through one rule, exactly as `TS.ADD` drives it. The body changes in
+/// Task 9; the benchmark IDs do not, so criterion compares the two paths across the switch.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn bench_ingest_one(
+    parent: &TimeSeries,
+    dest: &mut TimeSeries,
+    rule: &mut CompactionRule,
+    sample: Sample,
+    prev_last: Option<Timestamp>,
+) {
+    let is_upsert = prev_last.is_some_and(|last| sample.timestamp <= last);
+    let op = if is_upsert {
+        CompactionOp::Upsert(sample)
+    } else {
+        CompactionOp::AddNew(parent.last_sample.unwrap_or(sample))
+    };
+    let mut cctx = CompactionContext::new(parent, dest, rule);
+    let _ = apply_op(&mut cctx, op);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregators::{AggregationHandler, AggregationType, Aggregator};
+    use crate::series::{DuplicatePolicy, SampleAddResult, SeriesLink};
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    /// Every aggregator a rule accepts without an inline condition.
+    const RULE_TYPES: &[AggregationType] = &[
+        AggregationType::Avg,
+        AggregationType::Sum,
+        AggregationType::Min,
+        AggregationType::Max,
+        AggregationType::Range,
+        AggregationType::Count,
+        AggregationType::CountAll,
+        AggregationType::CountNan,
+        AggregationType::First,
+        AggregationType::Last,
+        AggregationType::StdP,
+        AggregationType::StdS,
+        AggregationType::VarP,
+        AggregationType::VarS,
+        AggregationType::Rate,
+        AggregationType::IRate,
+        AggregationType::Increase,
+    ];
+
+    fn fresh_rule(agg: AggregationType, bucket: u64) -> CompactionRule {
+        let mut aggregator: Aggregator = agg.into();
+        if let Aggregator::Rate(r) = &mut aggregator {
+            r.set_window_ms(bucket);
+        }
+        CompactionRule {
+            dest: SeriesLink::from("dst"),
+            aggregator,
+            bucket_duration: bucket,
+            align_timestamp: 0,
+            bucket_start: None,
+            has_samples: false,
+        }
+    }
+
+    fn dest_samples(dest: &TimeSeries) -> Vec<(Timestamp, u64)> {
+        dest.iter()
+            .map(|s| (s.timestamp, s.value.to_bits()))
+            .collect()
+    }
+
+    fn open_state(rule: &CompactionRule) -> (Option<Timestamp>, bool, Option<u64>) {
+        let current = if rule.has_samples {
+            AggregationHandler::current(&rule.aggregator).map(f64::to_bits)
+        } else {
+            None
+        };
+        (rule.bucket_start, rule.has_samples, current)
+    }
+
+    /// `TS.ADD`'s path before Task 9: `Upsert` at or below the previous last timestamp,
+    /// otherwise `AddNew` with the stored last sample.
+    fn ingest_single_path(
+        parent: &TimeSeries,
+        dest: &mut TimeSeries,
+        rule: &mut CompactionRule,
+        stored: Sample,
+        prev_last: Option<Timestamp>,
+    ) {
+        let is_upsert = prev_last.is_some_and(|last| stored.timestamp <= last);
+        let op = if is_upsert {
+            CompactionOp::Upsert(stored)
+        } else {
+            CompactionOp::AddNew(parent.last_sample.unwrap_or(stored))
+        };
+        let mut cctx = CompactionContext::new(parent, dest, rule);
+        apply_op(&mut cctx, op).unwrap();
+    }
+
+    /// The path every write takes from Task 9 on.
+    fn ingest_batch_of_one(
+        parent: &TimeSeries,
+        dest: &mut TimeSeries,
+        rule: &mut CompactionRule,
+        stored: Sample,
+        prev_last: Option<Timestamp>,
+    ) {
+        let samples = [stored];
+        let order = [stored.timestamp];
+        let mut cctx = CompactionContext::new(parent, dest, rule);
+        let op = CompactionOp::AddBatch {
+            samples: &samples,
+            prev_last,
+            input_order: &order,
+        };
+        apply_op(&mut cctx, op).unwrap();
+    }
+
+    /// Regression (oracle shrink): a back-fill that turns a published bucket's aggregate into NaN
+    /// must replace the destination value, not leave the stale one behind. `irate` over
+    /// `3500=1, 3799=0` is a counter reset with no rate.
+    #[test]
+    fn backfill_turning_a_published_bucket_into_nan_replaces_it() {
+        for single_path in [false, true] {
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(AggregationType::IRate, 500);
+            for (ts, value) in [(3500, 0.0), (3799, 0.0), (4000, 0.0), (3500, 1.0)] {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                let SampleAddResult::Ok(stored) =
+                    parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
+                else {
+                    panic!("sample @{ts} rejected");
+                };
+                if single_path {
+                    ingest_single_path(&parent, &mut dest, &mut rule, stored, prev_last);
+                } else {
+                    ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+                }
+            }
+            let samples: Vec<Sample> = dest.iter().collect();
+            assert_eq!(samples.len(), 1, "single_path={single_path}: {samples:?}");
+            assert_eq!(samples[0].timestamp, 3500);
+            assert!(
+                samples[0].value.is_nan(),
+                "single_path={single_path}: bucket 3500 kept {}",
+                samples[0].value
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Transitional (deleted in Task 10): on a rule that has seen every write since the
+        /// source was empty, a one-item batch leaves exactly the destination and open-bucket
+        /// state the single-sample path does — for every aggregator, with and without a
+        /// retention window shorter than a bucket.
+        #[test]
+        fn batch_of_one_matches_the_single_sample_path(
+            agg in prop::sample::select(RULE_TYPES),
+            bucket in prop::sample::select(&[500u64, 1000][..]),
+            retention in prop::sample::select(&[0u64, 700, 2500][..]),
+            writes in prop::collection::vec((0i64..5000, -100i32..100), 1..40),
+        ) {
+            let mut parent = TimeSeries::new();
+            parent.retention = Duration::from_millis(retention);
+            let (mut dest_a, mut dest_b) = (TimeSeries::new(), TimeSeries::new());
+            let (mut rule_a, mut rule_b) = (fresh_rule(agg, bucket), fresh_rule(agg, bucket));
+
+            for (ts, value) in writes {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                let SampleAddResult::Ok(stored) =
+                    parent.add(ts, value as f64, Some(DuplicatePolicy::KeepLast))
+                else {
+                    continue; // TS.ADD runs no compaction for a rejected sample
+                };
+                ingest_single_path(&parent, &mut dest_a, &mut rule_a, stored, prev_last);
+                ingest_batch_of_one(&parent, &mut dest_b, &mut rule_b, stored, prev_last);
+                prop_assert_eq!(dest_samples(&dest_a), dest_samples(&dest_b), "after write {}", ts);
+                prop_assert_eq!(open_state(&rule_a), open_state(&rule_b), "after write {}", ts);
+            }
+        }
+
+        /// Permanent: without retention, the destination holds exactly the buckets strictly older
+        /// than the one containing the source's last sample that received at least one counted
+        /// sample, each the aggregate of the source's samples in timestamp order, and the rule's
+        /// open bucket is the aggregate of the newest bucket. A failure is an engine bug.
+        #[test]
+        fn destination_matches_a_recomputation_from_the_source(
+            agg in prop::sample::select(RULE_TYPES),
+            bucket in prop::sample::select(&[500u64, 1000][..]),
+            writes in prop::collection::vec((0i64..5000, -100i32..100), 1..40),
+        ) {
+            let mut parent = TimeSeries::new();
+            let mut dest = TimeSeries::new();
+            let mut rule = fresh_rule(agg, bucket);
+            for (ts, value) in writes {
+                let prev_last = parent.last_sample.map(|s| s.timestamp);
+                if let SampleAddResult::Ok(stored) =
+                    parent.add(ts, value as f64, Some(DuplicatePolicy::KeepLast))
+                {
+                    ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+                }
+            }
+
+            let mut by_bucket: BTreeMap<Timestamp, (Aggregator, bool)> = BTreeMap::new();
+            for sample in parent.iter() {
+                let start = rule.calc_bucket_start(sample.timestamp);
+                let (aggregator, counted) = by_bucket
+                    .entry(start)
+                    .or_insert_with(|| (fresh_rule(agg, bucket).aggregator, false));
+                if AggregationHandler::update(aggregator, sample.timestamp, sample.value) {
+                    *counted = true;
+                }
+            }
+            let open = rule.calc_bucket_start(parent.last_sample.unwrap().timestamp);
+            let mut expected = Vec::new();
+            let mut open_expected = (Some(open), false, None);
+            for (start, (mut aggregator, counted)) in by_bucket {
+                if start < open {
+                    if counted {
+                        expected.push((start, AggregationHandler::finalize(&mut aggregator).to_bits()));
+                    }
+                } else if counted {
+                    open_expected = (
+                        Some(open),
+                        true,
+                        AggregationHandler::current(&aggregator).map(f64::to_bits),
+                    );
+                }
+            }
+            prop_assert_eq!(dest_samples(&dest), expected);
+            prop_assert_eq!(open_state(&rule), open_expected);
+        }
+    }
 }

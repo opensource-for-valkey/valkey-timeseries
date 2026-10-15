@@ -87,6 +87,10 @@ harness = false
 name = "query_scan"
 harness = false
 
+[[bench]]
+name = "compaction_ingest"
+harness = false
+
 [[bin]]
 name = "compression_report"
 path = "tools/compression_report.rs"

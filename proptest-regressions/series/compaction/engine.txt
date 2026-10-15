@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2495f211a7b1631a96d0b6db46edf3e889a170bd8d75116aa259ee23da900362 # shrinks to agg = IRate, bucket = 500, writes = [(3500, 0), (3799, 0), (4000, 0), (3500, 1)]

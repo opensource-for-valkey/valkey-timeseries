@@ -229,6 +229,106 @@ Consequence for the suite: with two rules the failure is a coin flip, so the sce
 rule creation order deterministic (e.g. sort by `(bucket_duration, aggregation)` before pushing, or
 replicate the rules instead of re-deriving them) must remove the marker.
 
+### 3.9 Rule created on existing data (reference does neither, 2026-10-14)
+
+(The refactor plan's Task 8 names this "§3.8"; that number was already taken above.)
+
+The batch-of-one switch (`docs/plans/2026-10-14-compaction-refactor.md`, Task 8) asked the
+reference one question: a rule created on a source that already holds samples, whose first write
+is a back-fill into the bucket holding the source's last sample — does the bucket open from that
+one write (branch A, `sum` 8), or from what the source holds (branch B, `sum` 14)? Black-box,
+pinned `redis:8.10` (timeseries 81000), via `redis-cli`. Every scenario starts from
+`TS.CREATE src`, `TS.ADD src 0 1`, `TS.ADD src 1200 2`, `TS.ADD src 1500 4`, `TS.CREATE dst`,
+`TS.CREATERULE src dst AGGREGATION <agg> 1000`.
+
+**Back-fill into the source's last bucket** (`tests/compat/test_compat_compaction.py::
+test_backfill_as_first_write_after_createrule`; `TS.ADD` and one-item `TS.MADD` reply identically
+on the reference):
+
+| Step | Reference | Ours, `TS.ADD` | Ours, `TS.MADD` |
+|---|---|---|---|
+| write `src 1300 8`, then `TS.GET dst LATEST` | `[]` | `[1000, 8]` | `[1000, 14]` |
+| `TS.GET dst` / `TS.RANGE dst - +` | `[]` / `[]` | `[]` / `[]` | `[]` / `[]` |
+| `TS.ADD src 2000 16`, then `TS.GET dst LATEST` | `[2000, 30]` | `[2000, 16]` | `[2000, 16]` |
+| `TS.RANGE dst - +` | `[]` | `[[1000, 8]]` | `[[1000, 14]]` |
+| `TS.ADD src 3000 32`, then `TS.RANGE dst - +` | `[[2000, 30]]` | `[[1000, 8], [2000, 16]]` | `[[1000, 14], [2000, 16]]` |
+
+**Back-fill into an older bucket** (`test_backfill_behind_the_open_bucket_as_first_write`, write
+`src 300 8`; `TS.ADD` and `TS.MADD` identical on the reference):
+
+| Step | Reference | Ours, `TS.ADD` | Ours, `TS.MADD` |
+|---|---|---|---|
+| `TS.GET dst LATEST` | `[0, 9]` | `[0, 8]` | `[0, 9]` |
+| `TS.GET dst` / `TS.RANGE dst - +` | `[0, 9]` / `[[0, 9]]` | `[]` / `[]` | `[]` / `[]` |
+| `TS.ADD src 2000 16`, `TS.ADD src 3000 32`, `TS.RANGE dst - +` | `[[0, 9], [2000, 16]]` | `[[0, 8], [2000, 16]]` | `[[0, 9], [2000, 16]]` |
+
+**Variants** (all `TS.ADD`; `dst` after the listed writes, then `TS.ADD src 3000 32` or as noted):
+
+| Variant | Reference | Ours |
+|---|---|---|
+| V1 `sum`: back-fill 1300=8, append 1600=64, `GET LATEST` | `[1000, 78]` | `[1000, 72]` |
+| V1 cont.: 2000=16, 3000 → `RANGE` | `[[1000, 78], [2000, 16]]` | `[[1000, 72], [2000, 16]]` |
+| V2 `count`: back-fill 1300, `GET LATEST`; 2000, 3000 → `RANGE` | `[]`; `[[2000, 4]]` | `[1000, 1]`; `[[1000, 1], [2000, 1]]` |
+| V3 `sum`: overwrite 1500=8 (`ON_DUPLICATE LAST`); 2000, 3000 | `[]`; `[[2000, 26]]` | `[1000, 8]`; `[[1000, 8], [2000, 16]]` |
+| V4 `sum`: plain append 1600=8 (control) | `[1000, 8]`; `[[1000, 8], [2000, 16]]` | identical |
+| V5 `sum`: back-fill 1300=8, 1400=100; 2000, 3000 | `[]`; `[[2000, 130]]` | `[1000, 114]`; `[[1000, 114], [2000, 16]]` |
+| V6 `sum`: back-fill 1300=8; append 5000=16, 6000 | `[5000, 30]`; `[[5000, 30]]` | `[5000, 16]`; `[[1000, 8], [5000, 16]]` |
+| V7 `max`: back-fill 1300=8; 2000=1, 3000 | `[2000, 8]`; `[[2000, 8]]` | `[2000, 1]`; `[[1000, 8], [2000, 1]]` |
+| V8 `sum`: back-fill 300=8, then 1300=100; 2000, 3000 | `[0, 9]`; `[[0, 9], [2000, 122]]` | `[0, 8]`; `[[0, 8], [1000, 106], [2000, 16]]` |
+
+**Reading (black-box).** On a rule with no open bucket:
+
+- A back-fill into an *older* bucket than the source's last one is recalculated from the source
+  and published at once (`[0, 9]`), and leaves the rule without an open bucket — that is branch B's
+  value, though our batch path *opens* bucket 0 instead of publishing it (visible only to a
+  non-`LATEST` read before the next closing write).
+- A back-fill into the source's *last* bucket recalculates that bucket from the source into the
+  rule's running aggregate (V1: `78 = 2+8+4+64`; V2 count 3) but does not mark the bucket open
+  (`TS.GET … LATEST` is `[]`). The next append that lands in the same bucket opens it and keeps
+  the recalculated state — correct, and branch B's result (V1). The next append that lands in a
+  *later* bucket opens that bucket **without resetting the aggregate**: bucket 1000 is never
+  published and its contents are folded into the new bucket (`30 = 14+16`, `count` 4, `max` 8,
+  V8 `122 = 2+4+100+16`). That is neither A nor B — the reference loses a bucket and corrupts the
+  next one.
+
+So branch C. `TS.ADD` and `TS.MADD` agree with each other on the reference in every case; ours
+disagree with each other and with the reference. Undecided (owner): whether to keep the existing
+behavior pending a ruling, emulate any part of the reference (the publish-at-once for an older
+bucket is a plausible target; the leaked aggregate is not), or register a divergence. Note for the
+xfail marks the brief prescribes for C: `test_backfill_behind_the_open_bucket_as_first_write
+[TS.MADD]` **passes** today (the probes it issues don't see the open-vs-published difference), so
+`xfail(strict=True)` on it would XPASS and fail.
+
+**Ruling (2026-10-14):** keep the batch path's semantics (recalculate the bucket from the source;
+branch B) — no engine change, so `TS.ADD` and `TS.MADD` agree once Task 9 routes `TS.ADD` through
+the batch path; the reference's fold of the unpublished bucket into the next one is not reproduced
+(both `test_backfill_as_first_write_after_createrule` cases are `xfail(strict=True)`). Residual:
+our `TS.MADD` keeps an older back-filled bucket open until the next forward close, where the
+reference publishes it at once — only an intermediate `TS.RANGE`/`TS.GET` (non-`LATEST`) before
+that close shows the difference.
+
+### 3.10 Found by the recomputation oracle — a NaN bucket never replaced a published one (fixed, 2026-10-14)
+
+`series::compaction::engine::tests::destination_matches_a_recomputation_from_the_source` (the
+permanent oracle from the refactor's Task 8) shrank to: `irate`, bucket 500, writes
+`[(3500, 0), (3799, 0), (4000, 0), (3500, 1)]` (duplicate policy `LAST`). The fourth write
+back-fills the published bucket 3500, whose recalculation over `3500=1, 3799=0` is a counter reset
+and finalizes to NaN; the destination kept the stale `0`. Cause: `add_dest_bucket` writes with
+`DuplicatePolicy::KeepLast`, and `DuplicatePolicy::duplicate_value` keeps the old value whenever the
+new one is NaN — for every non-`BLOCK` policy, `LAST` included — while `add` still reports the NaN
+as written (so the cascade forwarded a NaN the destination itself never stored). Live repro on the
+module: `TS.CREATERULE s d AGGREGATION irate 500`, `TS.ADD s 3500 0`, `3799 5`, `4000 0`
+(`d` = `[3500, 16.72…]`), `TS.ADD s 3500 9 ON_DUPLICATE LAST` → `d` stayed `16.72…` while
+`TS.RANGE s 3500 3999 AGGREGATION irate 500` says `nan`.
+
+Reachable only through the extension aggregators that finalize to NaN (`irate`, `rate`,
+`increase`): no RTS aggregator finalizes a counted bucket to NaN — black-box, `var.s`/`std.s`
+over one surviving sample report `0`, and `avg`/`sum`/`max`/`last` skip a NaN back-fill — so the
+reference cannot be asked and nothing changes on the shared surface. Fix: `add_dest_bucket` clears
+the bucket's existing destination entry before writing a NaN. Regression test:
+`backfill_turning_a_published_bucket_into_nan_replaces_it` (both ingest paths); proptest seed in
+`proptest-regressions/series/compaction/engine.txt`.
+
 ## 4. Why it is built this way — and what that buys
 
 The design has real merits that any remediation must keep:

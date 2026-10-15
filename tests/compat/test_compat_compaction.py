@@ -32,6 +32,11 @@ from compat_helpers import AGGREGATORS, mk_series
 
 BUCKET = 1000
 
+_FOLDS_UNPUBLISHED = (
+    "reference folds the unpublished bucket into the next one; "
+    "see compaction-replication-plan.md §3.9"
+)
+
 
 def _rule(diff, src, dst, aggregator="sum", bucket=BUCKET, *extra):
     """Source + destination + rule, with all engine defaults pinned."""
@@ -251,6 +256,48 @@ class TestRuleLifecycle:
         diff("TS.RANGE", "c:pre:dst", "-", "+")
         diff("TS.ADD", "c:pre:src", 2000, 8.0)
         _probe(diff, "c:pre:src", "c:pre:dst")
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            pytest.param("TS.ADD", marks=pytest.mark.xfail(strict=True, reason=_FOLDS_UNPUBLISHED)),
+            pytest.param("TS.MADD", marks=pytest.mark.xfail(strict=True, reason=_FOLDS_UNPUBLISHED)),
+        ],
+    )
+    def test_backfill_as_first_write_after_createrule(self, diff, write):
+        """A rule created on a source that already holds samples, whose first write is a
+        back-fill into the bucket holding the source's last sample: does the bucket open from
+        that one write, or from what the source holds? Decides the batch-of-one unification
+        (docs/plans/2026-10-14-compaction-refactor.md, Task 8)."""
+        diff("TS.CREATE", "c:cbf:src")
+        for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
+            diff("TS.ADD", "c:cbf:src", ts, value)
+        diff("TS.CREATE", "c:cbf:dst")
+        diff("TS.CREATERULE", "c:cbf:src", "c:cbf:dst", "AGGREGATION", "sum", 1000)
+        diff(write, "c:cbf:src", 1300, 8.0)      # back-fill; the rule has no open bucket yet
+        diff("TS.GET", "c:cbf:dst", "LATEST")
+        diff("TS.ADD", "c:cbf:src", 2000, 16.0)  # closes bucket 1000
+        diff("TS.RANGE", "c:cbf:dst", "-", "+")
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            pytest.param("TS.ADD", marks=pytest.mark.xfail(strict=True, reason="fixed by Task 9")),
+            "TS.MADD",
+        ],
+    )
+    def test_backfill_behind_the_open_bucket_as_first_write(self, diff, write):
+        """Same, but the first write back-fills a bucket *older* than the one holding the
+        source's last sample."""
+        diff("TS.CREATE", "c:cbo:src")
+        for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
+            diff("TS.ADD", "c:cbo:src", ts, value)
+        diff("TS.CREATE", "c:cbo:dst")
+        diff("TS.CREATERULE", "c:cbo:src", "c:cbo:dst", "AGGREGATION", "sum", 1000)
+        diff(write, "c:cbo:src", 300, 8.0)
+        diff("TS.GET", "c:cbo:dst", "LATEST")
+        diff("TS.ADD", "c:cbo:src", 2000, 16.0)
+        diff("TS.RANGE", "c:cbo:dst", "-", "+")
 
     def test_deleterule_stops_compaction_and_keeps_data(self, diff):
         _rule(diff, "c:drule:src", "c:drule:dst")
