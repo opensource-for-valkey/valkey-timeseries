@@ -329,9 +329,15 @@ xfail marks the brief prescribes for C: `test_backfill_behind_the_open_bucket_as
 branch B) — no engine change, so `TS.ADD` and `TS.MADD` agree once Task 9 routes `TS.ADD` through
 the batch path; the reference's fold of the unpublished bucket into the next one is not reproduced
 (both `test_backfill_as_first_write_after_createrule` cases are `xfail(strict=True)`). Residual:
-our `TS.MADD` keeps an older back-filled bucket open until the next forward close, where the
-reference publishes it at once — only an intermediate `TS.RANGE`/`TS.GET` (non-`LATEST`) before
-that close shows the difference.
+ours (now `TS.ADD` as well as `TS.MADD`) keeps an older back-filled bucket open until the next
+forward close, where the reference publishes it at once. An intermediate `TS.RANGE`/`TS.GET`
+(non-`LATEST`) before that close shows the difference; worse, a `TS.DEL` that removes the source's
+tail before that close makes the removal resync (`resync_open_bucket_after_removal`) rebuild the
+open bucket as the one now holding the source's last sample, discarding the back-filled bucket the
+reference had already published — a lost destination bucket. Both are pinned as
+`xfail(strict=True)` in `tests/compat/test_compat_compaction.py`
+(`test_backfill_behind_the_open_bucket_is_published_at_once`,
+`test_backfill_behind_the_open_bucket_then_tail_delete`); undecided (owner).
 
 **Current state (after refactor Task 9, 2026-10-15).** `TS.ADD` and `TS.MADD` now take the same
 batch path and agree with each other; the "Ours, `TS.ADD`" column and variants V1–V8 above describe

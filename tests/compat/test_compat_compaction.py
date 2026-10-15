@@ -38,6 +38,11 @@ _FOLDS_UNPUBLISHED = (
     "reference folds the unpublished bucket into the next one; "
     "see compaction-replication-plan.md §3.9"
 )
+_OPENS_INSTEAD_OF_PUBLISHING = (
+    "reference publishes an older back-filled bucket at once, ours keeps it open until the next "
+    "forward close (and a TS.DEL of the source's tail before then discards it); undecided, "
+    "see compaction-replication-plan.md §3.9"
+)
 
 
 def _rule(diff, src, dst, aggregator="sum", bucket=BUCKET, *extra):
@@ -297,6 +302,36 @@ class TestRuleLifecycle:
         diff("TS.GET", "c:cbo:dst", "LATEST")
         diff("TS.ADD", "c:cbo:src", 2000, 16.0)
         diff("TS.RANGE", "c:cbo:dst", "-", "+")
+
+    @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
+    @pytest.mark.xfail(strict=True, reason=_OPENS_INSTEAD_OF_PUBLISHING)
+    def test_backfill_behind_the_open_bucket_is_published_at_once(self, diff, write):
+        """The §3.9 residual of the test above: right after the back-fill, a non-`LATEST` read of
+        the destination. The reference has already published bucket 0; ours holds it as the
+        rule's open bucket, so the destination is still empty."""
+        diff("TS.CREATE", "c:cbp:src")
+        for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
+            diff("TS.ADD", "c:cbp:src", ts, value)
+        diff("TS.CREATE", "c:cbp:dst")
+        diff("TS.CREATERULE", "c:cbp:src", "c:cbp:dst", "AGGREGATION", "sum", 1000)
+        diff(write, "c:cbp:src", 300, 8.0)
+        diff("TS.RANGE", "c:cbp:dst", "-", "+")
+
+    @pytest.mark.parametrize("write", ["TS.ADD", "TS.MADD"])
+    @pytest.mark.xfail(strict=True, reason=_OPENS_INSTEAD_OF_PUBLISHING)
+    def test_backfill_behind_the_open_bucket_then_tail_delete(self, diff, write):
+        """The same back-fill, then a `TS.DEL` of the source's last sample before any forward
+        close. Ours resyncs the open bucket to the one now holding the source's last sample
+        (1000), discarding the back-filled bucket 0 it never published; the reference keeps it."""
+        diff("TS.CREATE", "c:cbd:src")
+        for ts, value in ((0, 1.0), (1200, 2.0), (1500, 4.0)):
+            diff("TS.ADD", "c:cbd:src", ts, value)
+        diff("TS.CREATE", "c:cbd:dst")
+        diff("TS.CREATERULE", "c:cbd:src", "c:cbd:dst", "AGGREGATION", "sum", 1000)
+        diff(write, "c:cbd:src", 300, 8.0)
+        diff("TS.DEL", "c:cbd:src", 1500, 1500)
+        diff("TS.ADD", "c:cbd:src", 2000, 16.0)   # closes bucket 1000
+        diff("TS.RANGE", "c:cbd:dst", "-", "+")
 
     def test_deleterule_stops_compaction_and_keeps_data(self, diff):
         _rule(diff, "c:drule:src", "c:drule:dst")
