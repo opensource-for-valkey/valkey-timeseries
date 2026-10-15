@@ -351,6 +351,9 @@ fn add_default_compactions(
         let mut labels = series.labels.to_label_vec();
 
         labels.push(Label::new("aggregation", agg_type.name()));
+        if let Some(condition) = rule.aggregator.condition() {
+            labels.push(Label::new("condition", &condition.to_string()));
+        }
         let duration_str = bucket_duration.to_string();
         labels.push(Label::new("time_bucket", &duration_str));
 
@@ -415,7 +418,13 @@ fn replicate_policy_destination(
     ctx.replicate("TS.CREATE", args.as_slice());
 
     let aggregation = ctx.create_string("AGGREGATION");
-    let agg_name = ctx.create_string(rule.aggregator.aggregation_type().name().as_bytes());
+    // A filtered aggregator carries its condition inline (`countif>5`): the replica's
+    // TS.CREATERULE refuses one without it.
+    let mut agg_spec = rule.aggregator.aggregation_type().name().to_string();
+    if let Some(condition) = rule.aggregator.condition() {
+        agg_spec.push_str(&condition.to_string());
+    }
+    let agg_name = ctx.create_string(agg_spec.as_bytes());
     let duration = ctx.create_string(rule.bucket_duration.to_string().as_bytes());
     let align = ctx.create_string(rule.align_timestamp.to_string().as_bytes());
     ctx.replicate(

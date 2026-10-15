@@ -11,6 +11,7 @@ use crate::common::rdb::{
     RdbSerializable, rdb_load_bool, rdb_load_optional_f64, rdb_load_u8, rdb_load_usize,
     rdb_save_bool, rdb_save_optional_f64, rdb_save_u8, rdb_save_usize,
 };
+use crate::series::request_types::ValueComparisonFilter;
 use enum_dispatch::enum_dispatch;
 use get_size2::GetSize;
 use std::fmt::Display;
@@ -1241,6 +1242,19 @@ impl Aggregator {
             Aggregator::VarS(_) => AggregationType::VarS,
             Aggregator::Sum(_) => AggregationType::Sum,
             Aggregator::SumIf(_) => AggregationType::SumIf,
+        }
+    }
+
+    /// The condition a filtered aggregator (`countif>5`, …) applies; `None` for the rest.
+    pub fn condition(&self) -> Option<ValueComparisonFilter> {
+        match self {
+            Aggregator::All(a) => Some(a.condition()),
+            Aggregator::Any(a) => Some(a.condition()),
+            Aggregator::CountIf(a) => Some(a.condition()),
+            Aggregator::None(a) => Some(a.condition()),
+            Aggregator::Share(a) => Some(a.condition()),
+            Aggregator::SumIf(a) => Some(a.condition()),
+            _ => None,
         }
     }
 

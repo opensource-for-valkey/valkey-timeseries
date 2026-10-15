@@ -474,7 +474,7 @@ type AggregationListElement = (AggregationType, Option<ValueComparisonFilter>);
 /// condition at all (`avg`) yields `None`. No aggregator name contains `<`,
 /// `>`, `=`, or `!`, so the first such character unambiguously marks where the
 /// name ends.
-pub(super) fn split_aggregator_condition(part: &str) -> ValkeyResult<(&str, Option<&str>)> {
+pub(crate) fn split_aggregator_condition(part: &str) -> ValkeyResult<(&str, Option<&str>)> {
     match part.find(['<', '>', '=', '!']) {
         Some(0) => Err(ValkeyError::Str(error_consts::INVALID_AGGREGATION_LIST)),
         Some(op) => Ok((&part[..op], Some(&part[op..]))),
@@ -496,7 +496,7 @@ fn split_condition_operator(cond_str: &str) -> Option<(ComparisonOperator, &str)
 
 /// Parse the suffix of an inline per-aggregator condition, e.g. `>5` or
 /// `<=2.5` (the part following the name in `countif>5`).
-pub(super) fn parse_inline_condition(cond_str: &str) -> ValkeyResult<ValueComparisonFilter> {
+pub(crate) fn parse_inline_condition(cond_str: &str) -> ValkeyResult<ValueComparisonFilter> {
     let (operator, value_str) = split_condition_operator(cond_str).ok_or(ValkeyError::Str(
         error_consts::INVALID_AGGREGATION_CONDITION,
     ))?;

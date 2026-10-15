@@ -451,3 +451,42 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
 
         assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
         assert snapshot() == before
+
+    def test_filtered_policy_destinations_survive_aof_replay(self):
+        """A filtered policy rule (countif>N, …) reaches the AOF as TS.CREATERULE with its
+        condition inline, so replay rebuilds the same rule instead of refusing it. The source's
+        digest covers each rule's filter."""
+        client = self.client
+        client.execute_command('CONFIG', 'SET', 'ts.ts-compaction-policy',
+                               'countif>150000:1M:1h;share<=100000:2M:1h;none==0:1M:1h')
+        client.config_set('appendonly', 'yes')
+        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=30)
+
+        client.execute_command('TS.ADD', 'aof:fpol', 0, 1, 'LABELS', 'a', 'b')
+        for ts in range(10_000, 300_000, 10_000):
+            client.execute_command('TS.ADD', 'aof:fpol', ts, ts)
+
+        def snapshot():
+            rules = [(r.dest_key, r.bucket_duration, r.aggregation.lower())
+                     for r in self.ts_info('aof:fpol')['rules']]
+            return {
+                'rules': rules,
+                'source': client.execute_command('DEBUG', 'DIGEST-VALUE', 'aof:fpol'),
+                'rulesState': self.ts_info('aof:fpol', debug=True).get('rulesState'),
+                'dests': {dest: (self.ts_info(dest)['labels'],
+                                 client.execute_command('TS.RANGE', dest, '-', '+'))
+                          for dest, *_ in rules},
+            }
+
+        before = snapshot()
+        assert sorted(dest for dest, *_ in before['rules']) == [
+            'aof:fpol_COUNTIF_GT_150000_60000',
+            'aof:fpol_NONE_EQ_0_60000',
+            'aof:fpol_SHARE_LTE_100000_120000',
+        ]
+        for labels, samples in before['dests'].values():
+            assert samples != []
+            assert 'condition' in labels
+
+        assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
+        assert snapshot() == before

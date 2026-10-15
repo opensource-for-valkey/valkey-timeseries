@@ -273,6 +273,10 @@ impl ShareAggregator {
     pub fn share(&self) -> f64 {
         self.0.share()
     }
+
+    pub fn condition(&self) -> ValueComparisonFilter {
+        self.0.filter
+    }
 }
 
 impl RdbSerializable for ShareAggregator {
@@ -471,6 +475,10 @@ macro_rules! impl_conditional_aggregator {
         impl $name {
             pub fn new(op: ComparisonOperator, comparand: f64) -> Self {
                 Self(Box::new(<$state>::new(op, comparand)))
+            }
+
+            pub fn condition(&self) -> ValueComparisonFilter {
+                self.0.filter
             }
 
             pub fn reset(&mut self) {

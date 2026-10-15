@@ -53,6 +53,44 @@ impl PartialEq for ValueComparisonFilter {
     }
 }
 
+// Reflexive: `eq` treats a NaN comparand as equal to itself.
+impl Eq for ValueComparisonFilter {}
+
+/// The inline-condition suffix `parse_inline_condition` accepts (`>5`, `!=-1.5`); the value
+/// round-trips exactly, so a replica parsing it rebuilds the same filter.
+impl Display for ValueComparisonFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.operator, format_comparand(self.value))
+    }
+}
+
+impl ValueComparisonFilter {
+    /// A key-name fragment for this condition, e.g. `GT_5` for `>5`: the operator spelled out
+    /// so a derived key holds no comparison characters.
+    pub fn key_fragment(&self) -> String {
+        let op = match self.operator {
+            ComparisonOperator::Equal => "EQ",
+            ComparisonOperator::NotEqual => "NE",
+            ComparisonOperator::GreaterThan => "GT",
+            ComparisonOperator::GreaterThanOrEqual => "GTE",
+            ComparisonOperator::LessThan => "LT",
+            ComparisonOperator::LessThanOrEqual => "LTE",
+        };
+        format!("{op}_{}", format_comparand(self.value))
+    }
+}
+
+/// Shortest exact rendering of a condition value: plain decimal (`5`, `0.25`), or exponent form
+/// where the decimal would run to hundreds of digits (`1e300`). Both parse back as the same f64.
+fn format_comparand(value: f64) -> String {
+    let debug = format!("{value:?}");
+    if debug.contains('e') {
+        debug
+    } else {
+        format!("{value}")
+    }
+}
+
 impl Default for ValueComparisonFilter {
     fn default() -> Self {
         Self {
@@ -68,7 +106,7 @@ impl ValueComparisonFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct AggregatorConfig {
     pub(crate) aggregation: AggregationType,
     pub(crate) value_filter: Option<ValueComparisonFilter>,
@@ -133,6 +171,18 @@ impl AggregatorConfig {
         } else {
             aggr_type.into()
         }
+    }
+}
+
+/// The `AGGREGATION` argument that recreates this config: `avg`, or `countif>5` with its
+/// inline condition.
+impl Display for AggregatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.aggregation.name())?;
+        if let Some(filter) = &self.value_filter {
+            write!(f, "{filter}")?;
+        }
+        Ok(())
     }
 }
 

@@ -1,6 +1,8 @@
 use crate::aggregators::AggregationType;
+use crate::commands::command_parser::{parse_inline_condition, split_aggregator_condition};
 use crate::common::Timestamp;
 use crate::parser::parse_positive_duration_value;
+use crate::series::request_types::AggregatorConfig;
 use crate::series::{CompactionRule, SeriesLink};
 use ahash::{HashSet, HashSetExt};
 use regex::RegexSet;
@@ -11,15 +13,28 @@ use valkey_module::{ValkeyError, ValkeyResult};
 
 #[derive(Debug, Copy, Clone, PartialEq, Hash, Eq)]
 pub struct CompactionPolicy {
-    pub aggregator: AggregationType,
+    /// The aggregator and, for a filtered one (`countif>5`), its condition.
+    pub aggregator: AggregatorConfig,
     pub bucket_duration_ms: u64,
     pub retention_ms: u64,
     pub bucket_alignment: Timestamp,
 }
 
 impl CompactionPolicy {
+    /// The destination key: `{key}_{AGG}_{bucket}[_{align}]` (`cpu_MAX_60000`, the reference
+    /// naming), or `{key}_{AGG}_{OP}_{value}_{bucket}[_{align}]` for a filtered aggregator
+    /// (`cpu_COUNTIF_GT_5_60000`). The condition is part of the key so policies differing only
+    /// by condition get distinct destinations rather than colliding on one.
     pub fn format_key(&self, key: &str) -> String {
-        let mut result = format!("{key}_{}", self.aggregator.name().to_ascii_uppercase());
+        let name = self.aggregator.aggregation_name();
+        let mut result = match self.aggregator.filter() {
+            Some(filter) => format!(
+                "{key}_{}_{}",
+                name.to_ascii_uppercase(),
+                filter.key_fragment()
+            ),
+            None => format!("{key}_{}", name.to_ascii_uppercase()),
+        };
 
         if self.bucket_duration_ms > 0 {
             let msg = format!("_{}", self.bucket_duration_ms);
@@ -40,9 +55,7 @@ impl Display for CompactionPolicy {
         write!(
             f,
             "{}:{}:{}",
-            self.aggregator.name(),
-            self.bucket_duration_ms,
-            self.retention_ms,
+            self.aggregator, self.bucket_duration_ms, self.retention_ms,
         )?;
         if self.bucket_alignment > 0 {
             write!(f, ":{}", self.bucket_alignment)
@@ -216,7 +229,7 @@ impl PolicyConfig {
             let rule_key = policy.format_key(key);
             let rule = CompactionRule {
                 dest: SeriesLink::from_key(rule_key.as_bytes()),
-                aggregator: policy.aggregator.into(),
+                aggregator: policy.aggregator.create_aggregator(),
                 bucket_duration: policy.bucket_duration_ms,
                 align_timestamp: policy.bucket_alignment,
                 bucket_start: None, // End timestamp is not set initially
@@ -261,10 +274,11 @@ fn parse_duration(val: &str) -> ValkeyResult<u64> {
 /// The value from configuration is expected to be in the format:
 ///  `aggregation_type:bucket_duration:retention:[align_timestamp]`
 ///
-/// E.g., `avg:60:2h:0`
+/// E.g., `avg:60:2h:0`, `countif>5:1M:1h`
 ///
 /// Where:
-///  - `aggregation_type` is the type of aggregation to use (e.g., `avg`, `sum`, etc.)
+///  - `aggregation_type` is the type of aggregation to use (e.g., `avg`, `sum`, etc.), with the
+///    same inline condition `TS.CREATERULE` takes (`countif>5`) for a filtered aggregator
 ///  - `bucket_duration` is the duration of each bucket in seconds
 ///  - `retention` is the retention period in seconds
 ///  - The `align_timestamp` is optional and defaults to 0 if not provided.
@@ -277,20 +291,7 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
         );
         return Err(ValkeyError::String(msg));
     }
-    let aggregator = AggregationType::try_from(args[0])?;
-    // The policy grammar has no place for a condition, and a filtered aggregation without one
-    // is what `TS.CREATERULE` rejects (`AggregatorConfig::new`, same predicate). Accepting it
-    // here would store a rule with a filter nobody wrote, which a replica or an AOF replay —
-    // receiving it as `TS.CREATERULE` — then refuses.
-    if aggregator.is_filtered() {
-        return Err(ValkeyError::String(format!(
-            "TSDB: compaction policy aggregation '{}' requires a condition, which \
-             ts-compaction-policy cannot carry; use TS.CREATERULE with an inline condition \
-             (e.g. '{}>0') instead",
-            aggregator.name(),
-            aggregator.name(),
-        )));
-    }
+    let aggregator = parse_policy_aggregator(args[0])?;
     let Ok(bucket_duration_ms) = parse_duration(args[1]) else {
         return Err(ValkeyError::String(
             "TSDB: invalid bucket duration in compaction policy".to_string(),
@@ -329,6 +330,33 @@ fn parse_compaction_policy(val: &str) -> ValkeyResult<CompactionPolicy> {
         retention_ms,
         bucket_alignment,
     })
+}
+
+/// Parse a policy's aggregator field with the grammar `TS.CREATERULE` uses: a bare name (`avg`)
+/// or one carrying an inline condition (`countif>5`). A filtered aggregator needs its condition
+/// here — the rule is replicated as `TS.CREATERULE`, which refuses one without — and an
+/// aggregator that takes none must not carry one (`AggregatorConfig::new` enforces both).
+fn parse_policy_aggregator(val: &str) -> ValkeyResult<AggregatorConfig> {
+    let (name, cond_str) = split_aggregator_condition(val)?;
+    let mut aggregation = AggregationType::try_from(name)?;
+    let condition = cond_str.map(parse_inline_condition).transpose()?;
+    if aggregation.is_filtered() && condition.is_none() {
+        let name = aggregation.name();
+        return Err(ValkeyError::String(format!(
+            "TSDB: compaction policy aggregation '{name}' requires a condition \
+             (e.g. '{name}>0')"
+        )));
+    }
+    // `count>5`/`sum>5` run as countif/sumif; name them so, as the rule (and its destination key
+    // and labels) will.
+    if condition.is_some() {
+        aggregation = match aggregation {
+            AggregationType::Count => AggregationType::CountIf,
+            AggregationType::Sum => AggregationType::SumIf,
+            other => other,
+        };
+    }
+    AggregatorConfig::new(aggregation, condition)
 }
 
 /// Parse a single compaction policy with optional regex filter
@@ -430,7 +458,7 @@ mod tests {
         align_timestamp: i64,
     ) -> CompactionPolicy {
         CompactionPolicy {
-            aggregator,
+            aggregator: aggregator.into(),
             bucket_duration_ms,
             retention_ms: 0, // Not used in format_key
             bucket_alignment: align_timestamp,
@@ -460,7 +488,7 @@ mod tests {
     #[test]
     fn test_parse_policy_without_filter() {
         let (policy, filter) = parse_compaction_policy_with_filter("avg:5M:2h:10s").unwrap();
-        assert_eq!(policy.aggregator, AggregationType::Avg);
+        assert_eq!(policy.aggregator, AggregationType::Avg.into());
         assert_eq!(policy.bucket_duration_ms, 300000);
         assert!(filter.is_none());
     }
@@ -469,7 +497,7 @@ mod tests {
     fn test_parse_policy_with_filter() {
         let (policy, filter) =
             parse_compaction_policy_with_filter("sum:30s:1h|^metrics\\..*").unwrap();
-        assert_eq!(policy.aggregator, AggregationType::Sum);
+        assert_eq!(policy.aggregator, AggregationType::Sum.into());
         assert_eq!(policy.bucket_duration_ms, 30000);
         assert_eq!(filter.unwrap(), "^metrics\\..*");
     }
@@ -911,13 +939,31 @@ mod rts_grammar_parity {
     const FILTERED_AGGREGATIONS: [&str; 6] = ["all", "any", "countif", "sumif", "share", "none"];
 
     #[test]
-    fn rejects_every_filtered_aggregation() {
+    fn accepts_every_filtered_aggregation_with_a_condition() {
         for name in FILTERED_AGGREGATIONS {
             let agg = AggregationType::try_from(name).unwrap();
             assert!(agg.is_filtered(), "{name} is expected to need a condition");
+            for (spec, policy) in [
+                (format!("{name}>5"), format!("{name}>5:1M:1h")),
+                (format!("{name}<=-2.5"), format!("{name}<=-2.5:1M:1h|^cpu")),
+            ] {
+                let parsed =
+                    parse_compaction_policies(&policy).unwrap_or_else(|e| panic!("{policy}: {e}"));
+                let config = parsed[0].0.aggregator;
+                assert_eq!(config.aggregation_type(), agg, "{policy}");
+                assert!(config.filter().is_some(), "{policy}");
+                // Display renders the AGGREGATION argument the rule replicates with.
+                assert_eq!(config.to_string(), spec, "{policy}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_filtered_aggregation_without_condition() {
+        for name in FILTERED_AGGREGATIONS {
             for policy in [format!("{name}:1M:1h"), format!("{name}:1M:1h|^cpu")] {
                 let err = parse_compaction_policies(&policy)
-                    .expect_err("a filtered aggregation must be rejected")
+                    .expect_err("a filtered aggregation needs a condition")
                     .to_string();
                 assert!(err.contains(name), "{policy}: {err}");
                 assert!(err.contains("requires a condition"), "{policy}: {err}");
@@ -926,7 +972,7 @@ mod rts_grammar_parity {
     }
 
     #[test]
-    fn filtered_aggregation_rejects_the_whole_policy() {
+    fn filtered_aggregation_without_condition_rejects_the_whole_policy() {
         let mut config = PolicyConfig::new();
         config
             .add_policies_from_config("max:1M:1h", true)
@@ -941,6 +987,83 @@ mod rts_grammar_parity {
             .create_compaction_rules("k")
             .expect("previous policy kept");
         assert_eq!(rules.keys().collect::<Vec<_>>(), vec!["k_MAX_60000"]);
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_conditions() {
+        for policy in [
+            "avg>5:1M:1h",     // avg takes no condition
+            "max<=0:1M:1h",    // nor does max
+            "countif>:1M:1h",  // missing value
+            "countif>x:1M:1h", // non-numeric value
+            "countif=5:1M:1h", // `=` is not an operator (`==` is)
+            ">5:1M:1h",        // condition without an aggregator
+        ] {
+            assert!(
+                parse_compaction_policies(policy).is_err(),
+                "{policy} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_count_and_sum_become_their_if_variants() {
+        for (policy, expected) in [
+            ("count>0:1M:1h", AggregationType::CountIf),
+            ("sum!=0:1M:1h", AggregationType::SumIf),
+        ] {
+            let parsed = parse_compaction_policies(policy).unwrap();
+            assert_eq!(
+                parsed[0].0.aggregator.aggregation_type(),
+                expected,
+                "{policy}"
+            );
+        }
+        // Spelled either way, the policy is the same one.
+        assert_eq!(
+            parse_compaction_policies("count>0:1M:1h").unwrap()[0].0,
+            parse_compaction_policies("countif>0:1M:1h").unwrap()[0].0,
+        );
+    }
+
+    #[test]
+    fn filtered_policy_builds_a_rule_with_its_condition() {
+        let mut config = PolicyConfig::new();
+        config
+            .add_policies_from_config("countif>5:1M:1h;countif<0:1M:1h;share>=1e300:1M:1h", true)
+            .expect("valid policy");
+        let rules = config.create_compaction_rules("k").expect("rules");
+        let mut keys: Vec<_> = rules.keys().cloned().collect();
+        keys.sort();
+        // Policies differing only by condition get distinct destinations.
+        assert_eq!(
+            keys,
+            vec![
+                "k_COUNTIF_GT_5_60000",
+                "k_COUNTIF_LT_0_60000",
+                "k_SHARE_GTE_1e300_60000",
+            ]
+        );
+        let (rule, retention) = &rules["k_COUNTIF_GT_5_60000"];
+        assert_eq!(*retention, 3_600_000);
+        assert_eq!(rule.aggregator.aggregation_type(), AggregationType::CountIf);
+        let condition = rule.aggregator.condition().expect("a condition");
+        assert_eq!(condition.to_string(), ">5");
+    }
+
+    #[test]
+    fn filtered_condition_round_trips_through_its_rendering() {
+        // The replicated TS.CREATERULE carries the rendered condition; a replica parsing it
+        // must rebuild exactly the primary's filter.
+        for value in [5.0, -2.5, 0.1, 1e300, 1e-300, f64::MAX, f64::MIN_POSITIVE] {
+            let policy = format!("sumif>={value:?}:1M:1h");
+            let config = parse_compaction_policies(&policy).unwrap()[0].0.aggregator;
+            let rendered = config.to_string();
+            let (_, cond) = split_aggregator_condition(&rendered).unwrap();
+            let reparsed = parse_inline_condition(cond.unwrap()).unwrap();
+            assert_eq!(reparsed.value.to_bits(), value.to_bits(), "{rendered}");
+            assert_eq!(Some(reparsed), config.filter(), "{rendered}");
+        }
     }
 
     #[test]

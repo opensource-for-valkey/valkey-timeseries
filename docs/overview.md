@@ -109,10 +109,13 @@ closed bucket lost to the failure is not repaired. `INFO ts_compaction` reports 
 each entry is the `dirty` flag). A non-zero failure counter is the signal that a destination may
 be missing a bucket.
 
-`ts-compaction-policy` (`agg:bucket:retention[:align][|regex];…`) accepts only aggregations that
-take no condition: `all`, `any`, `countif`, `sumif`, `share` and `none` are rejected (at
-`CONFIG SET` and at module load), since the policy grammar cannot carry their condition. Create
-such rules with `TS.CREATERULE` and an inline condition (e.g. `countif>5`) instead.
+`ts-compaction-policy` (`agg:bucket:retention[:align][|regex];…`) takes the filtered aggregations
+`all`, `any`, `countif`, `sumif`, `share` and `none` with the same inline condition as
+`TS.CREATERULE` (e.g. `countif>5:1M:1h`); one without its condition is rejected at `CONFIG SET`
+and at module load. `count>5`/`sum>5` run as `countif`/`sumif`. The condition is part of the
+destination key (`{key}_COUNTIF_GT_5_60000`, operators spelled `EQ`/`NE`/`GT`/`GTE`/`LT`/`LTE`) and
+of the destination's labels (`aggregation=countif`, `condition=>5`), and it is replicated inline
+with the rule.
 
 ### Metadata & Indexing
 

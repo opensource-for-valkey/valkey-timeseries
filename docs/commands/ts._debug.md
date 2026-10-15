@@ -261,7 +261,7 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | `ts-encoding`                  | enum     | `COMPRESSED`    | Default chunk encoding: `CHIMP`, `GORILLA` or `UNCOMPRESSED`                            |
 | `ts-duplicate-policy`          | enum     | `BLOCK`         | Policy for handling duplicate timestamps: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, `SUM` |
 | `ts-retention-policy`          | duration | `0` (no expiry) | Default retention period (milliseconds)                                                 |
-| `ts-compaction-policy`         | string   | `None`          | Default compaction rules applied to all new time series. Filtered aggregations (`all`, `any`, `countif`, `sumif`, `share`, `none`) are rejected; use `TS.CREATERULE` for those |
+| `ts-compaction-policy`         | string   | `None`          | Default compaction rules applied to all new time series. Filtered aggregations (`all`, `any`, `countif`, `sumif`, `share`, `none`) need an inline condition, e.g. `countif>5:1M:1h` |
 | `ts-compatibility-mode`        | enum     | `EXTENDED`      | Which side of a value divergence from RedisTimeSeries to take: `EXTENDED` or `STRICT`   |
 | `ts-decimal-digits`            | integer  | `none`          | Round sample values to N decimal places; `none` disables rounding                       |
 | `ts-significant-digits`        | integer  | `none`          | Round sample values to N significant digits; `none` disables rounding                   |

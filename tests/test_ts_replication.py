@@ -1165,6 +1165,35 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.assert_compaction_equivalent("ts:policy:src", *dests)
         self.assert_rule_state_equivalent("ts:policy:src")
 
+    def test_replication_filtered_compaction_policy_rules(self):
+        """Filtered aggregators in ts-compaction-policy replicate with their condition inline
+        (TS.CREATERULE … countif>150000): a replica refuses the rule without one. The source's
+        digest covers each rule's filter, so a replica that rebuilt a different condition fails
+        the equivalence check, and so does a missing rule."""
+        policy = ("countif>150000:1M:1h;countif<=50000:1M:1h;sumif!=0:2M:1h;share>=1e5:1M:1h;"
+                  "all>0:2M:1h;any<0:1M:1h;none==0:1M:1h")
+        self.client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", policy)
+        self.client.execute_command("TS.ADD", "ts:fpol:src", 10_000, 10_000, "LABELS", "a", "b")
+        for ts in range(20_000, 300_000, 10_000):
+            self.client.execute_command("TS.ADD", "ts:fpol:src", ts, ts)
+        rules = parse_info_response(self.client.execute_command("TS.INFO", "ts:fpol:src"))["rules"]
+        dests = sorted(r.dest_key for r in rules)
+        # The condition is part of the destination name, so the two countif rules don't collide.
+        assert dests == sorted(f"ts:fpol:src_{suffix}" for suffix in (
+            "COUNTIF_GT_150000_60000", "COUNTIF_LTE_50000_60000", "SUMIF_NE_0_120000",
+            "SHARE_GTE_100000_60000", "ALL_GT_0_120000", "ANY_LT_0_60000", "NONE_EQ_0_60000",
+        ))
+        self.assert_compaction_equivalent("ts:fpol:src", *dests)
+        self.assert_rule_state_equivalent("ts:fpol:src")
+
+        replica = self.replicas[0].client
+        dest = "ts:fpol:src_COUNTIF_GT_150000_60000"
+        labels = parse_info_response(replica.execute_command("TS.INFO", dest))["labels"]
+        assert labels["aggregation"] == "countif"
+        assert labels["condition"] == ">150000"
+        # Only samples above 150000 were counted: 160000..170000 close the [120000, 180000) bucket.
+        assert replica.execute_command("TS.RANGE", dest, 120_000, 120_000) == [[120_000, b"2"]]
+
     POLICY_SOURCES = ("ts:pol:add", "ts:pol:incrby", "ts:pol:addbulk")
 
     def auto_create_policy_sources(self):
