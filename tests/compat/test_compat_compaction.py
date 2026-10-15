@@ -242,6 +242,18 @@ class TestRetentionInteraction:
             diff("TS.ADD", "c:ret:src", ts, value)
         _probe(diff, "c:ret:src", "c:ret:dst")
 
+    @pytest.mark.parametrize("aggregator", ["sum", "avg", "count", "last"])
+    def test_rejected_duplicate_after_a_close_recalculates_nothing(self, diff, aggregator):
+        """A BLOCK duplicate in TS.MADD is rejected and stores nothing, so it must not count as a
+        back-fill. `2500` closes bucket 1000 and lifts the retention floor to 1500; replaying the
+        rejected `1800` as a back-fill recalculated the bucket under that floor and dropped
+        `1100` from it."""
+        _rule(diff, "c:rejdup:src", "c:rejdup:dst", aggregator)
+        diff("TS.ALTER", "c:rejdup:src", "RETENTION", 1000)
+        diff("TS.MADD", "c:rejdup:src", 1100, 1, "c:rejdup:src", 1800, 2,
+             "c:rejdup:src", 2500, 4, "c:rejdup:src", 1800, 8)
+        _probe(diff, "c:rejdup:src", "c:rejdup:dst")
+
     def test_retention_on_the_destination(self, diff):
         mk_series(diff, "c:retd:src")
         mk_series(diff, "c:retd:dst")

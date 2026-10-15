@@ -261,12 +261,15 @@ fn add_group_sequentially(input: &mut PerSeriesSamples) -> SmallVec<[(usize, Sam
         let res = input
             .series
             .add_deferring_retention(item.timestamp, item.value, None);
+        // Accepted items only. A rejected one — a BLOCK duplicate included — stores nothing, and
+        // RedisTimeSeries runs no compaction for it. Replayed, a rejected repeat whose bucket a
+        // later item had closed read as a back-fill and recalculated that bucket under the
+        // retention floor in force, dropping its older samples (`RETENTION 1000`, sum/1000,
+        // `TS.MADD k 1100 1 k 1800 2 k 2500 4 k 1800 8` published 2, not 3). It also made the
+        // primary disagree with its replicas, which never see the rejected item: the
+        // propagated TS.MADD carries accepted items only.
         if res.is_ok() {
             touched.push(item.timestamp);
-            input.added_order.push(item.timestamp);
-        } else if matches!(res, SampleAddResult::Duplicate) {
-            // Input order, duplicates included: a repeated timestamp does not advance the
-            // running max, so it reads as a back-fill exactly as RTS applies it.
             input.added_order.push(item.timestamp);
         }
         result.push((item.index, res));

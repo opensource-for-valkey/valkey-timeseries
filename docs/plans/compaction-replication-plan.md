@@ -83,8 +83,8 @@ the primary's resolved options); §3.1b `ts-compatibility-mode` → an operator 
 the strict-mode marker → removed with the DIV-0023 emulation, Task 6; §3.3 version skew →
 documented operational rule (Task 14) and a per-aggregator persistence test (Task 5); §3.4
 failure paths → `dirty` rules rebuild their open bucket, plus failure counters (Task 13); §3.5
-blocked-duplicate `TS.MADD` → the marker it concerned is gone (Task 6). §3.6–§3.10 are findings
-recorded as history.
+blocked-duplicate `TS.MADD` → outlived the marker: the rejected item still changed compaction on
+the primary, fixed 2026-10-15 (see §3.5). §3.6–§3.10 are findings recorded as history.
 
 ### 3.1 Inputs that are per-node configuration (structural)
 
@@ -166,15 +166,26 @@ nothing repairs them: no counter, no metric, no repair command. Errors here are 
 ones, but the point is categorical: recompute turns every transient local failure into a
 permanent divergence.
 
-### 3.5 Suspected — `TS.MADD` with a blocked duplicate (unverified)
+### 3.5 `TS.MADD` with a blocked duplicate (proven and fixed, 2026-10-15)
 
 `handle_replication` propagates only items whose result `is_ok()`. On the primary,
-`add_group_sequentially` pushes a `Duplicate`-rejected timestamp into `added_order` because "a
+`add_group_sequentially` pushed a `Duplicate`-rejected timestamp into `added_order` because "a
 repeated timestamp does not advance the running max, so it reads as a back-fill". If rejected
 items are dropped from the propagated `TS.MADD`, the replica's `input_order` differs from the
 primary's. Stored data is unaffected (the item was rejected on both), but
 `trace_dest_cache_in_input_order` could place the marker differently. Needs a probe under
 strict mode before it is counted.
+
+*Outcome.* Removing the marker (Task 6) did not close it: the batch replay itself classifies
+items from `input_order`. A rejected repeat whose bucket a later item had closed read as a
+back-fill, and the primary recalculated that bucket under the retention floor then in force,
+while the replica streamed it. Black-box probe: `RETENTION 1000`, rule `sum 1000`, BLOCK,
+`TS.MADD k 1100 1 k 1800 2 k 2500 4 k 1800 8` — the reference publishes `[1000, 3]` (as does our
+replica), the primary published `[1000, 2]`, having dropped `1100` below the floor 1500 (`avg`
+2 vs 1.5, `count` 1 vs 2). The rejected item stores nothing and the reference runs no
+compaction for it, so it no longer enters `added_order`. Pinned by
+`test_rejected_duplicate_after_a_close_recalculates_nothing` (compat, against the reference)
+and `test_replication_compaction_madd_rejected_duplicate_under_retention`.
 
 ### 3.6 Probe (2026-10-14)
 

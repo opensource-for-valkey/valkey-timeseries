@@ -1053,6 +1053,23 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.assert_compaction_equivalent(*keys)
         self.assert_rule_state_equivalent(*[src for src, _ in pairs])
 
+    def test_replication_compaction_madd_rejected_duplicate_under_retention(self):
+        """A BLOCK-rejected duplicate whose bucket a later item closed. The replica never sees the
+        rejected item, so the primary must not let it change compaction either: replayed as a
+        back-fill, it recalculated bucket 1000 under the retention floor `2500` set and dropped
+        `1100` — the primary published 2 where the replica (and the reference) publish 3."""
+        pairs = []
+        for agg in ("sum", "avg", "count", "last"):
+            src, dst = f"ts:madd_rejdup:{agg}:src", f"ts:madd_rejdup:{agg}:dst"
+            self.rule(src, dst, agg, 1000, src_options=("RETENTION", 1000))
+            pairs.append((src, dst))
+        for src, _ in pairs:
+            self.client.execute_command("TS.MADD", src, 1100, 1, src, 1800, 2, src, 2500, 4, src, 1800, 8)
+        assert self.client.execute_command("TS.RANGE", "ts:madd_rejdup:sum:dst", "-", "+") == [[1000, b"3"]]
+        keys = [key for pair in pairs for key in pair]
+        self.assert_compaction_equivalent(*keys)
+        self.assert_rule_state_equivalent(*[src for src, _ in pairs])
+
     def test_replication_compaction_del(self):
         """TS.DEL: a partial bucket, fully covered middle buckets, and a trailing removal that
         re-opens an already published bucket."""
