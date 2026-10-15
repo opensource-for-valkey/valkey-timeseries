@@ -806,11 +806,11 @@ impl TimeSeries {
     /// Iterate the samples physically stored in `[start, end]`, **without** clamping `start`
     /// to the current retention window the way [`Self::range_iter`] does.
     ///
-    /// Compaction recalculation needs the clamp to be explicit rather than implicit. Both batch
-    /// ingest paths run the retention trim only after compaction, and a batch is applied as one
-    /// sorted run, so this series' *current* window is not the one that was in force when a
-    /// given item would have been applied sequentially. `handle_batch_compaction` therefore
-    /// reconstructs the floor per back-filled item and clamps `start` itself. Query paths keep
+    /// Compaction recalculation needs the clamp to be explicit rather than implicit. Every write
+    /// runs the retention trim only after compaction, and a batch is applied as one sorted run,
+    /// so this series' *current* window is not the one that was in force when a given item would
+    /// have been applied sequentially. `handle_mixed_batch_compaction` therefore reconstructs
+    /// the floor per back-filled item and clamps `start` itself. Query paths keep
     /// [`Self::range_iter`] — an untrimmed but expired sample must stay invisible to reads.
     pub(super) fn stored_range_iter(
         &self,

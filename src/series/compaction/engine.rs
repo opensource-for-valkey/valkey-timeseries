@@ -16,6 +16,10 @@ pub(super) struct CompactionContext<'a> {
     /// `dest`, and to cascade into `dest`'s own compaction rules — see
     /// [`process_series_with_compaction`].
     pub(super) written: Vec<Sample>,
+    /// Whether an append closed a bucket and stored it in `dest` during this operation. This,
+    /// not `written`, decides the `ts.add:dest` notification: a back-fill that rewrites an
+    /// already-closed bucket also lands in `written` (so it still cascades) but is silent.
+    pub(super) closed_bucket: bool,
 }
 
 impl<'a> CompactionContext<'a> {
@@ -29,6 +33,7 @@ impl<'a> CompactionContext<'a> {
             dest,
             rule,
             written: Vec::new(),
+            closed_bucket: false,
         }
     }
 
@@ -341,7 +346,11 @@ fn finalize_current_bucket(
             "finalize_current_bucket should be called when current bucket start is already set",
         );
 
+        let stored_before = ctx.written.len();
         add_dest_bucket(ctx, current_bucket_start, aggregated_value)?;
+        // A bucket the destination refused (a duplicate it ignored, or one below its retention
+        // window) was not published, so it does not count as a close.
+        ctx.closed_bucket |= ctx.written.len() > stored_before;
     }
     ctx.rule.reset();
 

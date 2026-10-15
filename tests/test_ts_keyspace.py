@@ -395,6 +395,69 @@ class TestNotifications(ValkeyTimeSeriesTestCaseBase):
         assert len(
             compaction_notifications) >= 1, f"Expected compaction notification for '{dest_key}', got: {notifications}"
 
+    def test_compaction_backfill_into_closed_bucket_is_silent(self):
+        """A back-fill into an already-closed bucket recomputes the destination silently: the
+        source emits `ts.add`, but `ts.add:dest` fires only when an append closes a bucket."""
+
+        self.create_subscribe_clients()
+
+        source_key = "ts:parent:backfill"
+        dest_key = "ts:compaction:backfill"
+        self.create_ts_with_compaction_rule(source_key, dest_key)
+        self.collect_notifications(timeout=0.5)
+
+        # Control: 61000 closes the first 60s bucket, which does notify.
+        self.client.execute_command("TS.ADD", source_key, 1000, 1.0)
+        self.client.execute_command("TS.ADD", source_key, 61000, 3.0)
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add:dest", dest_key)
+
+        # TS.ADD back-fill into the closed bucket.
+        self.client.execute_command("TS.ADD", source_key, 1500, 4.5)
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add", source_key)
+        assert not any(n['data'] == 'ts.add:dest' for n in notifications), notifications
+
+        # TS.MADD back-fill into the closed bucket.
+        assert self.client.execute_command("TS.MADD", source_key, 2000, 9.0) == [2000]
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add", source_key)
+        assert not any(n['data'] == 'ts.add:dest' for n in notifications), notifications
+
+        # Silent is not a skip: the closed bucket was recomputed from all three samples.
+        dest = self.client.execute_command("TS.RANGE", dest_key, 0, 59999)
+        assert len(dest) == 1 and dest[0][0] == 0
+        assert float(dest[0][1]) == pytest.approx((1.0 + 4.5 + 9.0) / 3)
+
+    def test_compaction_chain_notifies_on_close_only(self):
+        """The close-only rule holds at every cascade level: a back-fill that rewrites closed
+        buckets in a chain emits no `ts.add:dest` for any level, a close does."""
+
+        self.create_subscribe_clients()
+
+        source_key = "ts:parent:chain"
+        mid_key = "ts:compaction:chain:mid"
+        top_key = "ts:compaction:chain:top"
+        self.create_ts_with_compaction_rule(source_key, mid_key, "sum", 1000)
+        self.client.execute_command("TS.CREATE", top_key, "LABELS", "type", "compaction")
+        assert self.client.execute_command(
+            "TS.CREATERULE", mid_key, top_key, "AGGREGATION", "sum", 10000) == b'OK'
+        self.collect_notifications(timeout=0.5)
+
+        # 1100 closes mid bucket 0; 10100 closes mid bucket 1000; 20100 closes mid bucket 10000,
+        # which carries the top bucket 0 closed.
+        for ts in (100, 1100, 10100, 20100):
+            self.client.execute_command("TS.ADD", source_key, ts, 1.0)
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add:dest", mid_key)
+        assert_message(notifications, "ts.add:dest", top_key)
+
+        # Back-fill into closed mid bucket 0, which also rewrites the closed top bucket 0.
+        self.client.execute_command("TS.ADD", source_key, 500, 1.0)
+        notifications = self.collect_notifications(timeout=1.0)
+        assert_message(notifications, "ts.add", source_key)
+        assert not any(n['data'] == 'ts.add:dest' for n in notifications), notifications
+
     def create_subscribe_clients(self):
         self.keyspace_client = self.server.get_new_client()
         self.keyspace_client_subscribe = self.keyspace_client.pubsub()

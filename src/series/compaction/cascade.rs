@@ -35,6 +35,9 @@ struct RuleOutcome {
     /// Samples committed to `dest` by this operation, in commit order (not necessarily
     /// sorted or unique — see [`dedupe_written_samples`]).
     written: Vec<Sample>,
+    /// Whether an append closed a bucket into `dest` — the only thing that notifies. A back-fill
+    /// into an already-closed bucket sets `written` but not this.
+    closed_bucket: bool,
 }
 
 /// Sorts and deduplicates a rule's written samples for use as the next cascade level's batch.
@@ -108,11 +111,11 @@ fn process_series_with_compaction(
     op: CompactionOp,
 ) -> TsdbResult<()> {
     // `ts.add:dest` fires only when compaction appends new bucket data to a
-    // downstream series (a bucket close). Reference-observed (§7.3): an
-    // upsert into an already-closed bucket recomputes the destination
-    // silently, and a TS.DEL propagated into destinations emits only the
-    // source's `ts.del`.
-    let notify_destinations = matches!(op, CompactionOp::Ingest { .. });
+    // downstream series (a bucket close, `RuleOutcome::closed_bucket`).
+    // Reference-observed (§7.3): a back-fill into an already-closed bucket
+    // recomputes the destination silently, and a TS.DEL propagated into
+    // destinations emits only the source's `ts.del`. Every `Ingest` level —
+    // the source's rules and each cascaded level — follows the same rule.
     let mut notified: SmallVec<[ValkeyString; TEMP_VEC_LEN]> = SmallVec::new();
     let mut visited = Visited::default();
 
@@ -167,12 +170,7 @@ fn process_series_with_compaction(
         }
         _ => {
             let mut pending: SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]> = SmallVec::new();
-            queue_written_outcomes(
-                &mut keys,
-                outcomes,
-                notify_destinations.then_some(&mut notified),
-                &mut pending,
-            );
+            queue_written_outcomes(&mut keys, outcomes, &mut notified, &mut pending);
             if !pending.is_empty() {
                 visited.insert(&series.key);
             }
@@ -212,7 +210,7 @@ fn process_series_with_compaction(
                 queue_written_outcomes(
                     &mut child_keys,
                     child_outcomes,
-                    notify_destinations.then_some(&mut notified),
+                    &mut notified,
                     &mut pending,
                 );
             }
@@ -226,12 +224,13 @@ fn process_series_with_compaction(
     Ok(())
 }
 
-/// Queues every destination that `outcomes` wrote to for the next cascade level, and for a
-/// `ts.add:dest` notification when `notified` is given.
+/// Queues every destination that `outcomes` wrote to for the next cascade level — a back-fill
+/// must still cascade — and the ones where an append closed a bucket for a `ts.add:dest`
+/// notification.
 fn queue_written_outcomes(
     keys: &mut [Option<ValkeyString>],
     outcomes: Vec<RuleOutcome>,
-    mut notified: Option<&mut SmallVec<[ValkeyString; TEMP_VEC_LEN]>>,
+    notified: &mut SmallVec<[ValkeyString; TEMP_VEC_LEN]>,
     pending: &mut SmallVec<[PendingCompactionWrite; TEMP_VEC_LEN]>,
 ) {
     for outcome in outcomes {
@@ -241,7 +240,7 @@ fn queue_written_outcomes(
         let Some(dest_key) = keys[outcome.rule_index].take() else {
             continue;
         };
-        if let Some(notified) = notified.as_deref_mut() {
+        if outcome.closed_bucket {
             notified.push(dest_key.clone());
         }
         pending.push((
@@ -306,6 +305,7 @@ fn apply_rules_internal(
                 rule_index,
                 dest_prev_last,
                 written: cctx.written,
+                closed_bucket: cctx.closed_bucket,
             })
         })
         .collect();
