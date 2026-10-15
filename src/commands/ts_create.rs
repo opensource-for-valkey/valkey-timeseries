@@ -126,6 +126,13 @@ pub fn parse_series_options_onto(
     // included, unvalidated) and discarded rather than overwriting the value.
     let mut seen: Vec<CommandArgToken> = Vec::new();
 
+    // DECIMAL_DIGITS and SIGNIFICANT_DIGITS exclude each other *within the command*. Rounding
+    // already on `base` (the configured `ts-decimal-digits`/`ts-significant-digits` default) is
+    // not "set": naming one here overrides it. Otherwise a node with a configured default could
+    // not create a series with any other rounding — including a replica applying the
+    // `TS.CREATE` an auto-creating primary replicates, which spells the rounding out.
+    let mut rounding_set = false;
+
     while let Some(arg) = args_iter.next() {
         let token = parse_command_arg_token(arg.as_slice()).unwrap_or_default();
         if invalid_args.contains(&token) {
@@ -180,9 +187,10 @@ pub fn parse_series_options_onto(
                 options.chunk_encoding = ChunkEncoding::Uncompressed;
             }
             CommandArgToken::DecimalDigits => {
-                if options.rounding.is_some() {
+                if rounding_set {
                     return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
                 }
+                rounding_set = true;
                 let rounding = parse_decimal_digit_rounding(&mut args_iter)?;
                 options.rounding = Some(rounding);
             }
@@ -212,9 +220,10 @@ pub fn parse_series_options_onto(
             }
             CommandArgToken::Retention => options.retention(parse_retention(&mut args_iter)?),
             CommandArgToken::SignificantDigits => {
-                if options.rounding.is_some() {
+                if rounding_set {
                     return Err(ValkeyError::Str(error_consts::ROUNDING_ALREADY_SET));
                 }
+                rounding_set = true;
                 options.rounding = Some(parse_significant_digit_rounding(&mut args_iter)?);
             }
             _ => {

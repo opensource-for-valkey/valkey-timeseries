@@ -487,6 +487,34 @@ class TestTimeseriesRoundingConfig(ValkeyTimeSeriesTestCaseBase):
 
         assert self.sample_value("round_from_config") == self.sample_value("round_from_arg") == 4.0
 
+    def test_explicit_rounding_overrides_the_configured_default(self):
+        """A configured default is a default, not a rounding the command has already set: naming
+        DECIMAL_DIGITS or SIGNIFICANT_DIGITS replaces it. (Replicating an auto-created series
+        spells its rounding out in a TS.CREATE, which a node with the same configured default
+        would otherwise reject.) Naming both in one command is still an error."""
+        self.set_config("ts-decimal-digits", "2")
+        try:
+            self.client.execute_command("TS.CREATE", "round_over_dec", "DECIMAL_DIGITS", 1)
+            self.client.execute_command("TS.ADD", "round_over_dec", 1000, 3.76)
+            assert self.sample_value("round_over_dec") == 3.8
+
+            self.client.execute_command("TS.CREATE", "round_over_sig", "SIGNIFICANT_DIGITS", 3)
+            self.client.execute_command("TS.ADD", "round_over_sig", 1000, 3.7654)
+            assert self.sample_value("round_over_sig") == 3.77
+
+            self.client.execute_command("TS.ADD", "round_over_add", 1000, 3.76, "DECIMAL_DIGITS", 1)
+            assert self.sample_value("round_over_add") == 3.8
+
+            for args in (
+                ("DECIMAL_DIGITS", 1, "SIGNIFICANT_DIGITS", 3),
+                ("SIGNIFICANT_DIGITS", 3, "DECIMAL_DIGITS", 1),
+                ("DECIMAL_DIGITS", 1, "DECIMAL_DIGITS", 2),
+            ):
+                with pytest.raises(ResponseError, match="rounding already set"):
+                    self.client.execute_command("TS.CREATE", "round_over_both", *args)
+        finally:
+            self.set_config("ts-decimal-digits", "none")
+
     def test_zero_significant_digits_rejected_on_both_paths(self):
         """Zero significant digits is not a quantity, so neither path accepts it."""
         with pytest.raises(ResponseError):
