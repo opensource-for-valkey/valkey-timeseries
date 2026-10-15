@@ -17,7 +17,7 @@ use crate::error_consts;
 use crate::series::{SeriesLink, TimeSeries};
 use get_size2::GetSize;
 use std::sync::atomic::AtomicU64;
-use valkey_module::{Context, ValkeyError, ValkeyResult, raw};
+use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, raw};
 
 mod cascade;
 mod engine;
@@ -169,6 +169,24 @@ pub static COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds`).
 pub static COMPACTION_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
 
+/// Resync `series`' rules after `[start, end]` was removed from it (stored under `key`). The
+/// removal is already committed, so a rule failure is logged rather than returned — see
+/// [`TimeSeries::remove_range_with_compaction`]. The cascade has already marked the rule `dirty`
+/// and counted the failure.
+pub(crate) fn resync_rules_after_removal(
+    ctx: &Context,
+    key: &ValkeyString,
+    series: &mut TimeSeries,
+    start: Timestamp,
+    end: Timestamp,
+) {
+    if let Err(err) = apply_compaction(ctx, series, CompactionOp::RemoveRange { start, end }) {
+        ctx.log_warning(&format!(
+            "TSDB: error running compaction after deleting from key '{key}': {err}"
+        ));
+    }
+}
+
 fn validate_restored_rule_parameters(
     bucket_duration: u64,
     align_timestamp: Timestamp,
@@ -213,24 +231,24 @@ impl TimeSeries {
         Some(self.rules.remove(index))
     }
 
+    /// Remove `[start_ts, end_ts]` from this series (`key`), then resync its rules.
+    ///
+    /// Only the source removal can fail the call. Once it is committed, a rule failure is logged
+    /// and swallowed, as the write path does (`TS.ADD`/`TS.MADD`/`TS.ADDBULK`): an error here
+    /// would skip the caller's replication and keyspace event, leaving the replica and the AOF
+    /// with samples this node deleted. The failing rule is left `dirty` and counted in
+    /// `ts_compaction_failures` by the cascade.
     pub fn remove_range_with_compaction(
         &mut self,
         ctx: &Context,
+        key: &ValkeyString,
         start_ts: Timestamp,
         end_ts: Timestamp,
     ) -> TsdbResult<usize> {
-        // Then remove the actual data from the source series
         let deleted_count = self.remove_range(start_ts, end_ts)?;
 
-        if deleted_count > 0 && !self.rules.is_empty() {
-            apply_compaction(
-                ctx,
-                self,
-                CompactionOp::RemoveRange {
-                    start: start_ts,
-                    end: end_ts,
-                },
-            )?;
+        if deleted_count > 0 {
+            resync_rules_after_removal(ctx, key, self, start_ts, end_ts);
         }
 
         Ok(deleted_count)

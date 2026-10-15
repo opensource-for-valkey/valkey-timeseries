@@ -113,3 +113,47 @@ class TestCompactionFailureRecovery(ValkeyTimeSeriesTestCaseDebugMode):
             assert c.execute_command("TS.RANGE", injected, "-", "+") == c.execute_command(
                 "TS.RANGE", twin, "-", "+"
             )
+
+    def test_a_failed_removal_still_deletes_and_succeeds(self):
+        """The source delete is committed before the rules run, so TS.DEL must not turn a rule's
+        failure into an error reply: that would skip replication and the `ts.del` event, and a
+        replica (or the AOF) would keep samples the primary deleted. The rule is left dirty."""
+        c = self.client
+        self.make_rule("fd:src", "fd:dst")
+        for ts, value in ((0, 1), (300, 2), (600, 4)):
+            c.execute_command("TS.ADD", "fd:src", ts, value)
+        failures, rebuilds = self.counters()
+
+        c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+        assert c.execute_command("TS.DEL", "fd:src", 300, 300) == 1
+        assert c.execute_command("TS.RANGE", "fd:src", "-", "+") == [[0, b"1"], [600, b"4"]]
+        assert self.counters() == (failures + 1, rebuilds)
+        # The failed resync left the streamed state (1 + 2 + 4) and marked the rule dirty.
+        assert self.info_debug(c, "fd:src")[b"rulesState"][0] == [b"fd:dst", 0, 1, b"7", 1]
+
+        c.execute_command("TS.ADD", "fd:src", 1000, 8)  # rebuilds (1 + 4), then closes bucket 0
+        assert self.counters() == (failures + 1, rebuilds + 1)
+        assert c.execute_command("TS.RANGE", "fd:dst", "-", "+") == [[0, b"5"]]
+
+    def test_a_failed_removal_does_not_stop_mdel(self):
+        """TS.MDEL keeps going past a series whose rule fails: every matching series is deleted
+        from, and the other series' rule still resyncs its open bucket."""
+        c = self.client
+        keys = ("md:a", "md:b")
+        for key in keys:
+            c.execute_command("TS.CREATE", key, "LABELS", "group", "fail_mdel")
+            c.execute_command("TS.CREATE", f"{key}:dst")
+            c.execute_command("TS.CREATERULE", key, f"{key}:dst", "AGGREGATION", "sum", 1000)
+            for ts, value in ((0, 1), (300, 2), (600, 4)):
+                c.execute_command("TS.ADD", key, ts, value)
+        failures, rebuilds = self.counters()
+
+        c.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+        assert c.execute_command("TS.MDEL", 300, 300, "FILTER", "group=fail_mdel") == 2
+        for key in keys:
+            assert c.execute_command("TS.RANGE", key, "-", "+") == [[0, b"1"], [600, b"4"]]
+        assert self.counters() == (failures + 1, rebuilds)
+
+        states = sorted((self.info_debug(c, key)[b"rulesState"][0] for key in keys), key=lambda r: r[4])
+        # One rule failed (stale 7, dirty); the other resynced from the source (1 + 4).
+        assert [(s[3], s[4]) for s in states] == [(b"5", 0), (b"7", 1)]

@@ -6,8 +6,7 @@ use crate::labels::filters::SeriesSelector;
 use crate::series::acl::KeyAccess;
 use crate::series::index::{PostingsBitmap, get_timeseries_index, with_timeseries_postings};
 use crate::series::{
-    CompactionOp, SeriesGuardMut, SeriesRef, TimestampRange, apply_compaction,
-    try_get_timeseries_mut,
+    SeriesGuardMut, SeriesRef, TimestampRange, resync_rules_after_removal, try_get_timeseries_mut,
 };
 use blart::AsBytes;
 use croaring::bitmap64::Bitmap64Iterator;
@@ -143,15 +142,9 @@ fn delete_range_batch(
 
             total_deleted += *deleted;
             notify_keyspace_event(ctx, c"ts.del", &keys[i]);
-            // run compaction if needed
-            apply_compaction(
-                ctx,
-                ts,
-                CompactionOp::RemoveRange {
-                    start: start_ts,
-                    end: end_ts,
-                },
-            )?;
+            // The removal is committed: a rule failure is logged and the batch carries on, so
+            // this series and every later one is still replicated.
+            resync_rules_after_removal(ctx, &keys[i], ts, start_ts, end_ts);
             // Propagate the resolved effect; see `delete_series_by_selectors`.
             ctx.replicate("TS.DEL", &[&keys[i], &start_arg, &end_arg]);
         }

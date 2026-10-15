@@ -43,7 +43,7 @@ pub fn ts_del_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             // already-expired time). Rejecting it here was an over-strict divergence found by
             // the differential fuzzer.
             let count = series
-                .remove_range_with_compaction(ctx, start_ts, end_ts)
+                .remove_range_with_compaction(ctx, &key, start_ts, end_ts)
                 .map_err(|_e| ValkeyError::String("TSDB: error deleting range".to_string()))?;
             // todo: better error
             Ok((count, start_ts, end_ts))

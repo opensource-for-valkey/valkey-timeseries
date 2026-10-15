@@ -97,8 +97,9 @@ the same subscription on the primary.
 
 **Failure recovery.** A rule application that fails (for example, an error while writing to its
 destination) marks the rule `dirty`; the next write to the source rebuilds the rule's open bucket
-from the source samples before applying itself. A closed bucket lost to the failure is not
-repaired. `INFO ts_compaction` reports `ts_compaction_failures` (applications that failed) and
+from the source samples before applying itself. The command that hit the failure still succeeds
+and replicates — its write to the source is already committed — and the failure is logged. A
+closed bucket lost to the failure is not repaired. `INFO ts_compaction` reports `ts_compaction_failures` (applications that failed) and
 `ts_compaction_state_rebuilds` (dirty rules rebuilt), both since module start, and
 `TS.INFO key DEBUG` shows each rule's open-bucket state under `rulesState` (the last element of
 each entry is the `dirty` flag). A non-zero failure counter is the signal that a destination may

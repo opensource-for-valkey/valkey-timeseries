@@ -1041,6 +1041,37 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.client.execute_command("TS.ADD", src, 7000, 9)                    # closes it again
         self.assert_compaction_equivalent(src, dst)
 
+    def test_replication_ts_del_after_compaction_failure(self):
+        """A rule failing on the primary does not stop TS.DEL from replicating: the source delete
+        is already committed, so the command must reply with the count and propagate the resolved
+        TS.DEL (seen via MONITOR on the replica), or the replica keeps samples the primary deleted.
+        `TS._DEBUG` is enabled on the primary only, so the replica's own application succeeds."""
+        src, dst = "ts:comp_del_fail:src", "ts:comp_del_fail:dst"
+        self.client.execute_command("CONFIG", "SET", "ts.debug-mode", "yes")
+        try:
+            self.rule(src, dst, "sum", 1000)
+            for ts, value in ((0, 1), (300, 2), (600, 4)):
+                self.client.execute_command("TS.ADD", src, ts, value)
+            self.wait_for_replication()
+
+            monitor_client = self.replicas[0].get_new_client()
+            monitor_client.connection_pool.connection_kwargs["socket_timeout"] = 5
+            with monitor_client.monitor() as monitor:
+                self.client.execute_command("TS._DEBUG", "FAIL_NEXT_COMPACTION")
+                assert self.client.execute_command("TS.DEL", src, 300, 300) == 1
+                propagated = self.await_propagated_command(monitor, "ts.del")
+            assert [p.strip('"') for p in propagated.split()[1:]] == [src, "300", "300"]
+
+            self.wait_for_replication()
+            replica = self.replicas[0].client
+            expected = [[0, b"1"], [600, b"4"]]
+            assert self.client.execute_command("TS.RANGE", src, "-", "+") == expected
+            assert replica.execute_command("TS.RANGE", src, "-", "+") == expected
+            assert self.info_debug(self.client, src)[b"rulesState"][0][4] == 1   # primary: dirty
+            assert self.info_debug(replica, src)[b"rulesState"][0][4] == 0       # replica: applied
+        finally:
+            self.client.execute_command("CONFIG", "SET", "ts.debug-mode", "no")
+
     def test_replication_compaction_chain_and_diamond(self):
         """A three-level chain, and a source with two rules."""
         self.rule("ts:chain:src", "ts:chain:mid", "sum", 1000)
