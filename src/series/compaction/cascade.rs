@@ -152,7 +152,15 @@ fn process_series_with_compaction(
         series: guards,
     } = destinations;
 
-    let outcomes = apply_rules_on_destinations(series, guards, op)?;
+    // A rule that fails does not end the pass. Its siblings' outcomes still cascade into their
+    // destinations' own rules, and still notify: those destinations were written, and a rule
+    // below one that skipped its cascade would take the next sample for an append on state that
+    // never saw this one, with nothing marking it `dirty`. Only the failing rule's own branch
+    // stops, and the first error is returned once the pass has run to its end.
+    let AppliedRules {
+        outcomes,
+        error: mut first_error,
+    } = apply_rules_on_destinations(series, guards, op);
 
     match op {
         CompactionOp::RemoveRange { .. } => {
@@ -184,9 +192,11 @@ fn process_series_with_compaction(
                     keys: mut child_keys,
                     series: child_guards,
                 } = child_destinations;
-                let child_outcomes = apply_rules_on_destinations(&mut child, child_guards, op)?;
+                let AppliedRules { outcomes, error } =
+                    apply_rules_on_destinations(&mut child, child_guards, op);
+                first_error = first_error.or(error);
                 pending.extend(
-                    child_outcomes
+                    outcomes
                         .iter()
                         .filter_map(|o| child_keys[o.rule_index].take()),
                 );
@@ -229,9 +239,10 @@ fn process_series_with_compaction(
                     prev_last,
                     input_order: &cascade_order,
                 };
-                let child_outcomes =
-                    apply_rules_on_destinations(&mut child, child_guards, batch_op)?;
-                queue_written_outcomes(&mut child_keys, child_outcomes, &mut written, &mut pending);
+                let AppliedRules { outcomes, error } =
+                    apply_rules_on_destinations(&mut child, child_guards, batch_op);
+                first_error = first_error.or(error);
+                queue_written_outcomes(&mut child_keys, outcomes, &mut written, &mut pending);
             }
         }
     }
@@ -240,7 +251,7 @@ fn process_series_with_compaction(
         notify_compaction(ctx, &written);
     }
 
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// A destination that compaction committed at least one sample to, for [`notify_compaction`].
@@ -277,11 +288,19 @@ fn queue_written_outcomes(
     }
 }
 
+/// What one pass of a series' rules produced: the outcome of every rule that succeeded, and the
+/// first error of those that did not. Both are kept — one rule failing must not hide what the
+/// others committed.
+struct AppliedRules {
+    outcomes: Vec<RuleOutcome>,
+    error: Option<TsdbError>,
+}
+
 fn apply_rules_on_destinations(
     series: &mut TimeSeries,
     destinations: SmallVec<[Option<SeriesGuardMut>; TEMP_VEC_LEN]>,
     op: CompactionOp,
-) -> TsdbResult<Vec<RuleOutcome>> {
+) -> AppliedRules {
     let mut rules = std::mem::take(&mut series.rules);
     let result = apply_rules_internal(series, &mut rules, destinations, op);
     series.rules = rules;
@@ -303,12 +322,14 @@ fn runs_rules_in_parallel(op: &CompactionOp, rule_count: usize) -> bool {
 
 /// Internal function that handles execution of compaction rules. `child_series` holds one
 /// entry per rule, in rule order; a rule whose entry is `None` is skipped.
+///
+/// Each failing rule is logged and counted once, here, and is left `dirty`.
 fn apply_rules_internal(
     series: &TimeSeries,
     rules: &mut [CompactionRule],
     child_series: SmallVec<[Option<SeriesGuardMut>; TEMP_VEC_LEN]>,
     op: CompactionOp,
-) -> TsdbResult<Vec<RuleOutcome>> {
+) -> AppliedRules {
     let mut destinations = rules
         .iter_mut()
         .zip(child_series)
@@ -316,7 +337,10 @@ fn apply_rules_internal(
         .filter_map(|(index, (rule, dest))| dest.map(|dest| (index, rule, dest)))
         .collect::<Vec<_>>();
     if destinations.is_empty() {
-        return Ok(Vec::new());
+        return AppliedRules {
+            outcomes: Vec::new(),
+            error: None,
+        };
     }
 
     let parallel = runs_rules_in_parallel(&op, destinations.len());
@@ -374,10 +398,9 @@ fn apply_rules_internal(
         }
     }
 
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(outcomes)
+    AppliedRules {
+        outcomes,
+        error: first_error,
     }
 }
 
