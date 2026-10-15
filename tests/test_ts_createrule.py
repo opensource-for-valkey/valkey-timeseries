@@ -408,6 +408,73 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         )
         assert result == b"OK"
 
+    MAX_CHAIN = 8
+
+    def chain(self, prefix, rules):
+        """`rules` rules in a row: prefix:0 -> prefix:1 -> ... -> prefix:<rules>."""
+        keys = [f"{prefix}:{i}" for i in range(rules + 1)]
+        for key in keys:
+            self.create_test_series(key)
+        for source, dest in zip(keys, keys[1:]):
+            assert self.client.execute_command(
+                "TS.CREATERULE", source, dest, "AGGREGATION", "sum", 1000) == b"OK"
+        return keys
+
+    def test_chain_length_is_capped_at_eight_rules(self):
+        """A chain may hold 8 rules; a 9th is refused at either end, and when joining two
+        chains, and the refusal leaves both series untouched."""
+        keys = self.chain("cap", self.MAX_CHAIN)
+        self.create_test_series("cap:tail")
+        self.create_test_series("cap:head")
+        for source, dest in ((keys[-1], "cap:tail"), ("cap:head", keys[0])):
+            with pytest.raises(ResponseError, match="chain of 9 rules; at most 8"):
+                self.client.execute_command("TS.CREATERULE", source, dest, "AGGREGATION", "sum", 1000)
+        assert self.ts_info(keys[-1])["rules"] == []
+        assert self.ts_info("cap:head")["rules"] == []
+
+        # Joining: 4 rules above, the new one, 4 below is 9; 3 + 1 + 4 is 8.
+        upper = self.chain("cap:up", 4)
+        lower = self.chain("cap:low", 4)
+        with pytest.raises(ResponseError, match="chain of 9 rules"):
+            self.client.execute_command("TS.CREATERULE", upper[-1], lower[0], "AGGREGATION", "sum", 1000)
+        assert self.client.execute_command(
+            "TS.CREATERULE", upper[-2], lower[0], "AGGREGATION", "sum", 1000) == b"OK"
+
+    def test_chain_cap_counts_the_longest_branch_below(self):
+        """A fan-out below the destination counts its longest branch, not its width."""
+        lower = self.chain("fan:low", 6)
+        for i in range(3):
+            self.create_test_series(f"fan:side{i}")
+            self.client.execute_command("TS.CREATERULE", lower[0], f"fan:side{i}", "AGGREGATION", "sum", 1000)
+        self.create_test_series("fan:a")
+        self.create_test_series("fan:b")
+        assert self.client.execute_command(
+            "TS.CREATERULE", "fan:b", lower[0], "AGGREGATION", "sum", 1000) == b"OK"   # 1 + 6 = 7
+        assert self.client.execute_command(
+            "TS.CREATERULE", "fan:a", "fan:b", "AGGREGATION", "sum", 1000) == b"OK"    # 8
+        self.create_test_series("fan:c")
+        with pytest.raises(ResponseError, match="chain of 9 rules"):
+            self.client.execute_command("TS.CREATERULE", "fan:c", "fan:a", "AGGREGATION", "sum", 1000)
+
+    def test_a_stale_link_does_not_count_toward_the_cap(self):
+        """Re-creating a key in the middle of a full chain cuts it there: keys[3]'s rule for the
+        new keys[4] is stale, and so is keys[5]'s back-link to it. A rule at either end is then
+        measured against its own half only."""
+        keys = self.chain("stale", self.MAX_CHAIN)
+        self.create_test_series("stale:head")
+        self.create_test_series("stale:tail")
+        with pytest.raises(ResponseError, match="chain of 9 rules"):
+            self.client.execute_command("TS.CREATERULE", "stale:head", keys[0], "AGGREGATION", "sum", 1000)
+
+        self.client.execute_command("DEL", keys[4])
+        self.create_test_series(keys[4])
+        # head -> keys[0..3]: 1 + 3 rules below (keys[3] -> keys[4] is not an edge).
+        assert self.client.execute_command(
+            "TS.CREATERULE", "stale:head", keys[0], "AGGREGATION", "sum", 1000) == b"OK"
+        # keys[5..8] -> tail: 3 rules above (keys[5]'s source no longer feeds it) + 1.
+        assert self.client.execute_command(
+            "TS.CREATERULE", keys[-1], "stale:tail", "AGGREGATION", "sum", 1000) == b"OK"
+
     def test_create_compaction_chain_success(self):
         """Test creating a valid chain of compactions (A -> B -> C)"""
         raw_key = "test:raw_data"

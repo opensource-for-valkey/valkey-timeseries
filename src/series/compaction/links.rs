@@ -2,6 +2,7 @@ use crate::aggregators::AggregationHandler;
 use crate::common::Sample;
 use crate::error_consts;
 use crate::series::{SeriesLink, TimeSeries, try_get_timeseries, try_get_timeseries_mut};
+use std::collections::HashSet;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// The key of the series that feeds `series`, while that source still has a rule for it.
@@ -73,66 +74,258 @@ pub(crate) fn relink_renamed_series(ctx: &Context, series: &TimeSeries, old_key:
     }
 }
 
-/// Check if adding a new compaction rule would create a circular dependency
-pub fn check_new_rule_circular_dependency(
+/// The longest chain of compaction rules `TS.CREATERULE` builds: the number of rules from a
+/// series with no source down to its furthest destination. Every write, delete and replicated
+/// command walks the chain below the series it touches, so its length bounds that work.
+pub const MAX_COMPACTION_CHAIN_LENGTH: usize = 8;
+
+/// Checks that a new `source -> dest` rule keeps the rules a forest of short chains: it must not
+/// close a cycle, and the chain through it must hold at most [`MAX_COMPACTION_CHAIN_LENGTH`] rules.
+pub fn check_new_rule_links(
     ctx: &Context,
     source_key: &ValkeyString,
     dest_key: &ValkeyString,
 ) -> ValkeyResult<()> {
-    // Adding source -> destination creates a cycle exactly when the
-    // destination can already reach the source. Traverse with read-only
-    // guards: callers acquire mutable guards only after this check, so a
-    // path that reaches the source cannot alias an existing mutable borrow.
-    if dependency_reaches(
-        ctx,
-        dest_key,
-        None,
-        source_key.as_slice(),
-        &mut std::collections::HashSet::new(),
-    )? {
+    // Read-only guards: callers acquire mutable guards only after this check, so a path that
+    // reaches the source cannot alias an existing mutable borrow.
+    let node = |key: &[u8]| rule_node(ctx, key);
+
+    // Adding source -> dest creates a cycle exactly when dest can already reach the source.
+    let below = walk_downstream(dest_key.as_slice(), source_key.as_slice(), node)?;
+    if below.reaches_target {
         return Err(ValkeyError::Str(
             error_consts::COMPACTION_CIRCULAR_DEPENDENCY,
         ));
     }
 
+    // Each series has at most one live source, so the chain through the new rule is the one
+    // above `source`, the rule itself, and the longest branch below `dest`.
+    let length = rules_above(source_key.as_slice(), node)? + 1 + below.longest;
+    if length > MAX_COMPACTION_CHAIN_LENGTH {
+        return Err(ValkeyError::String(format!(
+            "TSDB: compaction rule would make a chain of {length} rules; at most \
+             {MAX_COMPACTION_CHAIN_LENGTH} are allowed"
+        )));
+    }
     Ok(())
 }
 
-/// Whether `current` reaches `target` through live rules. `from` is the source whose rule led
-/// to `current` (`None` for the starting series).
-fn dependency_reaches(
-    ctx: &Context,
-    current: &ValkeyString,
-    from: Option<&[u8]>,
-    target: &[u8],
-    visited: &mut std::collections::HashSet<Vec<u8>>,
-) -> ValkeyResult<bool> {
-    let Some(series) = try_get_timeseries(ctx, current, None)? else {
-        return Ok(false);
-    };
-    // Follow a rule only while its destination names the rule's owner as its source. A stale
-    // rule (the destination was deleted and re-created, overwritten...) is not an edge, and
-    // must be checked before the target: the target itself may be the re-created key.
-    if let Some(from) = from
-        && !series
-            .src_series
-            .as_ref()
-            .is_some_and(|src| src.points_to(from))
-    {
-        return Ok(false);
-    }
-    if current.as_slice() == target {
-        return Ok(true);
-    }
-    if !visited.insert(current.as_slice().to_vec()) {
-        return Ok(false);
-    }
+/// One series as the rule-graph walks see it.
+#[derive(Clone, Debug, Default)]
+struct RuleNode {
+    /// The source its back-link names, if any.
+    source: Option<Vec<u8>>,
+    /// The destination keys of its rules.
+    dests: Vec<Vec<u8>>,
+}
 
-    for rule in &series.rules {
-        let dest_key = rule.dest.to_key_string(ctx);
-        if dependency_reaches(ctx, &dest_key, Some(&*series.key), target, visited)? {
-            return Ok(true);
+fn rule_node(ctx: &Context, key: &[u8]) -> ValkeyResult<Option<RuleNode>> {
+    let key = ctx.create_string(key);
+    Ok(try_get_timeseries(ctx, &key, None)?.map(|series| RuleNode {
+        source: series.src_series.as_ref().map(|link| link.key().to_vec()),
+        dests: series
+            .rules
+            .iter()
+            .map(|rule| rule.dest.key().to_vec())
+            .collect(),
+    }))
+}
+
+/// What [`walk_downstream`] found below its start.
+#[derive(Debug, PartialEq)]
+struct Downstream {
+    /// The target is reachable through live rules (the walk stops there).
+    reaches_target: bool,
+    /// The most rules between the start and any series below it.
+    longest: usize,
+}
+
+/// Walks the live rules below `start`, looking for `target`.
+///
+/// Iterative, with an explicit stack: a chain is created at most
+/// [`MAX_COMPACTION_CHAIN_LENGTH`] rules long, but one restored or loaded from data written
+/// before the cap is not, and a recursive walk spends a stack frame per rule — enough of them
+/// overflows the stack, which aborts the server.
+///
+/// A rule is an edge only while its destination's back-link names the rule's owner. A stale rule
+/// (the destination was deleted and re-created, overwritten...) is not, and is checked before the
+/// target: the target itself may be the re-created key.
+fn walk_downstream(
+    start: &[u8],
+    target: &[u8],
+    node: impl Fn(&[u8]) -> ValkeyResult<Option<RuleNode>>,
+) -> ValkeyResult<Downstream> {
+    let mut visited: HashSet<Vec<u8>> = HashSet::new();
+    let mut longest = 0;
+    // (series, the source whose rule led to it, rules between `start` and it)
+    let mut stack: Vec<(Vec<u8>, Option<Vec<u8>>, usize)> = vec![(start.to_vec(), None, 0)];
+    while let Some((key, from, depth)) = stack.pop() {
+        let Some(series) = node(&key)? else {
+            continue;
+        };
+        if let Some(from) = &from
+            && series.source.as_deref() != Some(from.as_slice())
+        {
+            continue;
+        }
+        if key == target {
+            return Ok(Downstream {
+                reaches_target: true,
+                longest,
+            });
+        }
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        longest = longest.max(depth);
+        for dest in series.dests {
+            stack.push((dest, Some(key.clone()), depth + 1));
         }
     }
-    Ok(false)
+    Ok(Downstream {
+        reaches_target: false,
+        longest,
+    })
+}
+
+/// How many rules feed `start` from above: the length of its chain of live sources. A source
+/// is live while it still has a rule for the series below it (see [`live_source_key`]).
+fn rules_above(
+    start: &[u8],
+    node: impl Fn(&[u8]) -> ValkeyResult<Option<RuleNode>>,
+) -> ValkeyResult<usize> {
+    let mut visited: HashSet<Vec<u8>> = HashSet::new();
+    let mut current = start.to_vec();
+    let Some(mut series) = node(&current)? else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    while let Some(source) = series.source.take() {
+        let Some(parent) = node(&source)? else {
+            break;
+        };
+        if !parent.dests.contains(&current) {
+            break;
+        }
+        // Rule creation refuses cycles; this only keeps corrupt links from looping.
+        if !visited.insert(std::mem::replace(&mut current, source)) {
+            break;
+        }
+        count += 1;
+        series = parent;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A rule graph from `source -> dest` edges, every key with a live back-link to its source.
+    fn graph(edges: &[(String, String)]) -> HashMap<Vec<u8>, RuleNode> {
+        let mut nodes: HashMap<Vec<u8>, RuleNode> = HashMap::new();
+        for (source, dest) in edges {
+            let (source, dest) = (source.as_bytes().to_vec(), dest.as_bytes().to_vec());
+            nodes
+                .entry(source.clone())
+                .or_default()
+                .dests
+                .push(dest.clone());
+            nodes.entry(dest).or_default().source = Some(source);
+        }
+        nodes
+    }
+
+    fn lookup(
+        nodes: &HashMap<Vec<u8>, RuleNode>,
+    ) -> impl Fn(&[u8]) -> ValkeyResult<Option<RuleNode>> + '_ {
+        |key| Ok(nodes.get(key).cloned())
+    }
+
+    fn edges(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(s, d)| (s.to_string(), d.to_string()))
+            .collect()
+    }
+
+    /// Far deeper than any thread's stack would allow one frame per rule (a test thread's is
+    /// 2 MiB): the walks must not recurse.
+    #[test]
+    fn a_very_long_chain_walks_without_recursing() {
+        const LINKS: usize = 200_000;
+        let chain: Vec<(String, String)> = (0..LINKS)
+            .map(|i| (format!("k{i}"), format!("k{}", i + 1)))
+            .collect();
+        let nodes = graph(&chain);
+        let below = walk_downstream(b"k0", b"elsewhere", lookup(&nodes)).unwrap();
+        assert_eq!(
+            below,
+            Downstream {
+                reaches_target: false,
+                longest: LINKS
+            }
+        );
+        let tail = format!("k{LINKS}");
+        assert_eq!(rules_above(tail.as_bytes(), lookup(&nodes)).unwrap(), LINKS);
+        let reaches = walk_downstream(b"k0", tail.as_bytes(), lookup(&nodes)).unwrap();
+        assert!(reaches.reaches_target);
+    }
+
+    #[test]
+    fn a_rule_back_up_the_chain_reaches_its_source() {
+        let nodes = graph(&edges(&[("a", "b"), ("b", "c")]));
+        // c -> a would close a -> b -> c -> a.
+        assert!(
+            walk_downstream(b"a", b"c", lookup(&nodes))
+                .unwrap()
+                .reaches_target
+        );
+        assert!(
+            !walk_downstream(b"c", b"a", lookup(&nodes))
+                .unwrap()
+                .reaches_target
+        );
+    }
+
+    #[test]
+    fn the_longest_branch_counts_below_a_fan_out() {
+        let nodes = graph(&edges(&[("a", "b"), ("a", "c"), ("c", "d"), ("d", "e")]));
+        let below = walk_downstream(b"a", b"x", lookup(&nodes)).unwrap();
+        assert_eq!(below.longest, 3);
+        assert_eq!(rules_above(b"e", lookup(&nodes)).unwrap(), 3);
+        assert_eq!(rules_above(b"b", lookup(&nodes)).unwrap(), 1);
+        assert_eq!(rules_above(b"a", lookup(&nodes)).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_stale_rule_is_not_an_edge_in_either_direction() {
+        let mut nodes = graph(&edges(&[("a", "b"), ("b", "c")]));
+        // b was re-created: it no longer names a as its source, though a still has a rule for it.
+        nodes.get_mut(b"b".as_slice()).unwrap().source = Some(b"other".to_vec());
+        let below = walk_downstream(b"a", b"c", lookup(&nodes)).unwrap();
+        assert_eq!(
+            below,
+            Downstream {
+                reaches_target: false,
+                longest: 0
+            }
+        );
+        // c's source b is live, but b's own source link is not.
+        assert_eq!(rules_above(b"c", lookup(&nodes)).unwrap(), 1);
+        // A back-link whose source dropped the rule is stale too.
+        nodes.get_mut(b"a".as_slice()).unwrap().dests.clear();
+        nodes.get_mut(b"b".as_slice()).unwrap().source = Some(b"a".to_vec());
+        assert_eq!(rules_above(b"c", lookup(&nodes)).unwrap(), 1);
+    }
+
+    #[test]
+    fn corrupt_links_that_loop_do_not_hang() {
+        let mut nodes = graph(&edges(&[("a", "b"), ("b", "a")]));
+        nodes.get_mut(b"a".as_slice()).unwrap().source = Some(b"b".to_vec());
+        assert!(rules_above(b"a", lookup(&nodes)).unwrap() <= 2);
+        let below = walk_downstream(b"a", b"x", lookup(&nodes)).unwrap();
+        assert!(!below.reaches_target);
+    }
 }

@@ -12,6 +12,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::series::{SeriesGuardMut, TimeSeries, try_get_timeseries_mut};
 use orx_parallel::Par;
 use smallvec::SmallVec;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use valkey_module::{Context, ValkeyString};
 
@@ -96,19 +97,33 @@ type PendingCompactionWrite = (ValkeyString, Vec<Sample>, Option<Timestamp>);
 /// Keys of the series whose rules a compaction pass has already run: the series it started
 /// from (recorded once the pass cascades), plus every cascaded series.
 ///
-/// Rule creation rejects circular chains (`check_new_rule_circular_dependency`), but the
+/// Rule creation rejects circular chains (`check_new_rule_links`), but the
 /// traversal keeps this guard anyway so a corrupted topology can neither loop forever nor open
 /// a series that is already borrowed further up the pass.
+///
+/// A pass usually visits a handful of series, which a linear scan serves best. A wide fan-out
+/// does not: every removal cascades to every level, and scanning a list per cascaded series made
+/// a `TS.DEL` over thousands of destinations quadratic on the main thread. Past
+/// [`VISITED_LINEAR_MAX`] keys, the rest go to a hash set.
 #[derive(Default)]
-struct Visited(SmallVec<[Box<[u8]>; TEMP_VEC_LEN]>);
+struct Visited {
+    linear: SmallVec<[Box<[u8]>; TEMP_VEC_LEN]>,
+    hashed: HashSet<Box<[u8]>>,
+}
+
+const VISITED_LINEAR_MAX: usize = 16;
 
 impl Visited {
     fn contains(&self, key: &[u8]) -> bool {
-        self.0.iter().any(|k| k.as_ref() == key)
+        self.linear.iter().any(|k| k.as_ref() == key) || self.hashed.contains(key)
     }
 
     fn insert(&mut self, key: &[u8]) {
-        self.0.push(key.into());
+        if self.linear.len() < VISITED_LINEAR_MAX {
+            self.linear.push(key.into());
+        } else {
+            self.hashed.insert(key.into());
+        }
     }
 }
 
@@ -589,6 +604,21 @@ mod tests {
     use crate::common::Sample;
     use crate::series::SeriesLink;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn visited_finds_keys_on_both_sides_of_the_linear_limit() {
+        let mut visited = Visited::default();
+        let keys: Vec<Vec<u8>> = (0..VISITED_LINEAR_MAX * 3)
+            .map(|i| format!("k{i}").into_bytes())
+            .collect();
+        for key in &keys {
+            assert!(!visited.contains(key));
+            visited.insert(key);
+        }
+        assert!(keys.iter().all(|key| visited.contains(key)));
+        assert!(!visited.contains(b"absent"));
+        assert_eq!(visited.linear.len(), VISITED_LINEAR_MAX);
+    }
 
     fn series_with_rules(dests: &[&str]) -> TimeSeries {
         let mut series = TimeSeries::new();

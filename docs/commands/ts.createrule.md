@@ -56,7 +56,11 @@ storage and analysis.
 - The destination key must not already be fed by another rule. A destination whose source key
   was deleted or overwritten, or a copy of a destination restored under another key, is no longer
   fed and accepts a new rule.
-- The destination key cannot be a compaction rule itself (no chaining).
+- A destination may itself be the source of further rules (`raw -> 1m -> 1h`), but a chain may
+  hold at most **8 rules**, counted from the series at its top to its furthest destination. A rule
+  that would make a longer chain — at either end, or by joining two chains — is refused with
+  `TSDB: compaction rule would make a chain of N rules; at most 8 are allowed`. RedisTimeSeries
+  does not allow chaining at all.
 - Circular dependencies are not allowed.
 
 ## Return Value

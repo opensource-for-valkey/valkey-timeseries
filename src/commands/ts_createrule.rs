@@ -8,8 +8,8 @@ use crate::error_consts;
 use crate::parser::timestamp::parse_timestamp;
 use crate::series::request_types::AggregatorConfig;
 use crate::series::{
-    CompactionRule, SeriesLink, check_new_rule_circular_dependency, get_timeseries,
-    get_timeseries_mut, live_source_key,
+    CompactionRule, SeriesLink, check_new_rule_links, get_timeseries, get_timeseries_mut,
+    live_source_key,
 };
 use std::ffi::CStr;
 use valkey_module::{
@@ -79,7 +79,7 @@ pub fn ts_createrule_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         parse_args(&mut args, SeriesLink::from_key(dest_key.as_slice()))?
     };
 
-    check_new_rule_circular_dependency(ctx, &source_key, &dest_key)?;
+    check_new_rule_links(ctx, &source_key, &dest_key)?;
 
     let mut source_series = get_timeseries_mut(ctx, &source_key, Some(AclPermissions::UPDATE))?;
     let mut dest_series = get_timeseries_mut(ctx, &dest_key, Some(AclPermissions::UPDATE))?;

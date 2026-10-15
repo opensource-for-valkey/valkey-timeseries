@@ -28,7 +28,7 @@ pub(crate) use cascade::fail_next_compaction;
 pub use engine::CompactionOp;
 #[cfg(feature = "test-utils")]
 pub use engine::{bench_ingest_one, bench_rule};
-pub use links::check_new_rule_circular_dependency;
+pub use links::{MAX_COMPACTION_CHAIN_LENGTH, check_new_rule_links};
 pub(crate) use links::{get_latest_compaction_sample, live_source_key, relink_renamed_series};
 
 const TEMP_VEC_LEN: usize = 6;

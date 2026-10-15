@@ -307,8 +307,10 @@
   rationale: >
     Accepted (owner sign-off 2026-07-29, §5.3): chaining is a deliberate extension —
     cascading rollups (raw -> 1m -> 1h) without a second write path — and the
-    circular-dependency guard (check_new_rule_circular_dependency) is what keeps it
-    safe. Accepted-input superset, so no rule valid on RTS behaves differently here.
+    circular-dependency guard (check_new_rule_links) is what keeps it
+    safe; the same check caps a chain at 8 rules (2026-10-15), which bounds the work every
+    write, delete and replicated command does walking it. Accepted-input superset, so no rule
+    valid on RTS behaves differently here.
     Pinned by TestRuleLifecycle::test_rule_on_rule_is_an_accepted_input_superset.
   since: 0.1.0
 
