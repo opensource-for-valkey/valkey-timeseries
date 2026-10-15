@@ -1315,6 +1315,12 @@
     TestNanBackfillOnDestination::test_destination_holds_the_recomputed_nan.
   since: 0.1.0
 
+# DIV-0061 came with the port of main's 219c723ca (rules survive DUMP/RESTORE), black-box
+# probed against the reference, which drops the rule on both ends.
+#
+# ⚠️ `behavior`-kind: owner sign-off 2026-10-15 — accepted as an intentional divergence in both
+# compatibility modes (strict included).
+
 - id: DIV-0061
   command: RESTORE
   kind: behavior
@@ -1327,8 +1333,9 @@
     its partner, and nothing more reaches the destination. A copy restored under a different
     key is inert on both engines: its links name keys that do not name it back.
   rationale: >
-    Owner sign-off pending (behavior kind, §5.3). Rules link their ends by key so that a
-    series keeps its compaction wiring wherever its key goes — slot migration (ASM, and the
+    Accepted (owner sign-off 2026-10-15, §5.3), in both compatibility modes, strict included.
+    Rules link their ends by key so that a series keeps its compaction wiring wherever its
+    key goes — slot migration (ASM, and the
     MIGRATE-based resharding that predates it), TS._RESTORE, AOF replay. Dropping the rule on
     RESTORE would silently stop a rollup whenever a slot moves. Pinned by
     TestRestoreKeepsRules::test_rule_survives_restore_under_the_same_key.

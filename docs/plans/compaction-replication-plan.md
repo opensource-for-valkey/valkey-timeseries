@@ -600,7 +600,8 @@ the target (`tests/test_ts_asm.py`).
 Record the outcome in `proposal.md` / `proposal-complete.md` §3.5 and the readiness criteria,
 and add a `COMPATIBILITY.md` note if any replica-visible behavior differs from RedisTimeSeries.
 *Landed in Task 14* (the proposals, this document and `docs/overview.md`); the `COMPATIBILITY.md`
-entries are DIV-0023 (ungated, Task 6) and DIV-0060 (Task 8).
+entries are DIV-0023 (ungated, Task 6), DIV-0060 (Task 8) and DIV-0061 (rules survive
+`DUMP`/`RESTORE`, ported from main; owner sign-off 2026-10-15).
 
 ## 7. Out of scope here
 
