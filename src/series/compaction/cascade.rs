@@ -320,10 +320,45 @@ fn apply_rules_on_destinations(
     destinations: SmallVec<[Option<SeriesGuardMut>; TEMP_VEC_LEN]>,
     op: CompactionOp,
 ) -> AppliedRules {
-    let mut rules = std::mem::take(&mut series.rules);
-    let result = apply_rules_internal(series, &mut rules, destinations, op);
-    series.rules = rules;
-    result
+    with_rules_taken(series, |series, rules| {
+        apply_rules_internal(series, rules, destinations, op)
+    })
+}
+
+/// Runs `f` with `series`' rules moved out of it, so the rules can be mutated (in parallel) while
+/// the series is read, and puts them back however `f` ends.
+///
+/// Putting them back after `f` returns is not enough: a panic in a rule application unwinds past
+/// it. A command handler aborts the server on that, but the fanout workers that run `TS.MDEL`'s
+/// shard share catch it, so the series would live on with no rules — `TS.INFO` no longer lists
+/// them, writes stop compacting, and the next save persists the loss while the replica, which
+/// applies the propagated `TS.DEL` on the command path, keeps compacting. On a panic every rule
+/// is also marked `dirty`: one may be part-way through an update, and the next write rebuilds its
+/// open bucket from the source.
+fn with_rules_taken<R>(
+    series: &mut TimeSeries,
+    f: impl FnOnce(&TimeSeries, &mut [CompactionRule]) -> R,
+) -> R {
+    struct RestoreRules<'a> {
+        series: &'a mut TimeSeries,
+        rules: Vec<CompactionRule>,
+    }
+
+    impl Drop for RestoreRules<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                for rule in &mut self.rules {
+                    rule.dirty = true;
+                }
+            }
+            self.series.rules = std::mem::take(&mut self.rules);
+        }
+    }
+
+    let rules = std::mem::take(&mut series.rules);
+    let mut guard = RestoreRules { series, rules };
+    // Distinct fields of the guard: the series is read while the rules are mutated.
+    f(&*guard.series, &mut guard.rules)
 }
 
 /// Whether `op` is worth spreading across rules. One sample is O(1) aggregator work per rule —
@@ -550,7 +585,72 @@ fn notify_compaction(ctx: &Context, destinations: &[WrittenDestination]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregators::AggregationType;
     use crate::common::Sample;
+    use crate::series::SeriesLink;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn series_with_rules(dests: &[&str]) -> TimeSeries {
+        let mut series = TimeSeries::new();
+        series.rules = dests
+            .iter()
+            .map(|dest| CompactionRule {
+                dest: SeriesLink::from(*dest),
+                aggregator: AggregationType::Sum.into(),
+                bucket_duration: 1000,
+                align_timestamp: 0,
+                bucket_start: None,
+                has_samples: false,
+                dirty: false,
+            })
+            .collect();
+        series
+    }
+
+    fn dests(series: &TimeSeries) -> Vec<Vec<u8>> {
+        series.rules.iter().map(|r| r.dest.key().to_vec()).collect()
+    }
+
+    #[test]
+    fn a_panic_in_a_rule_application_puts_the_rules_back_dirty() {
+        let mut series = series_with_rules(&["a", "b"]);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            with_rules_taken(&mut series, |series, rules| {
+                assert!(
+                    series.rules.is_empty(),
+                    "the rules are moved out while applied"
+                );
+                rules[0].update(0, 1.0);
+                panic!("rule application failed part-way");
+            })
+        }));
+        assert!(caught.is_err());
+        assert_eq!(dests(&series), [b"a".to_vec(), b"b".to_vec()]);
+        assert!(
+            series.rules.iter().all(|r| r.dirty),
+            "a half-applied rule must be rebuilt"
+        );
+        assert!(
+            series.rules[0].has_samples,
+            "the state itself is kept for the rebuild"
+        );
+    }
+
+    #[test]
+    fn rules_come_back_unchanged_in_dirtiness_when_nothing_panics() {
+        let mut series = series_with_rules(&["a", "b"]);
+        series.rules[1].dirty = true;
+        let n = with_rules_taken(&mut series, |_, rules| {
+            rules[0].update(0, 1.0);
+            rules.len()
+        });
+        assert_eq!(n, 2);
+        assert_eq!(dests(&series), [b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(
+            series.rules.iter().map(|r| r.dirty).collect::<Vec<_>>(),
+            [false, true]
+        );
+    }
 
     #[test]
     fn a_single_sample_never_runs_rules_in_parallel() {
