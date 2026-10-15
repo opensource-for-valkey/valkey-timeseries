@@ -401,3 +401,53 @@ class TestTimeseriesAofRewrite(ValkeyTimeSeriesTestCaseBase):
         assert new_info['totalSamples'] == 1
 
         client.execute_command('DEL', 'empty_ts')
+
+    def test_policy_destinations_survive_aof_replay(self):
+        """A series auto-created under ts-compaction-policy replays from the AOF with the same
+        rules, destinations and compacted samples: the AOF carries the destinations as explicit
+        TS.CREATE + TS.CREATERULE commands, and replay never applies the policy itself."""
+        client = self.client
+        client.execute_command('CONFIG', 'SET', 'ts.ts-compaction-policy', 'max:1M:1h;avg:2M:1h')
+        client.config_set('appendonly', 'yes')
+        # The rewrite that enabling AOF starts snapshots an empty keyspace, so everything below
+        # reaches the AOF as the commands this node propagated.
+        wait_for_equal(lambda: client.info('persistence')['aof_rewrite_in_progress'], 0, timeout=30)
+
+        client.execute_command('TS.ADD', 'aof:pol', 0, 1, 'LABELS', 'a', 'b')
+        for ts in range(10_000, 300_000, 10_000):
+            client.execute_command('TS.ADD', 'aof:pol', ts, ts)
+        # An explicit create never gets policy rules, before or after replay.
+        client.execute_command('TS.CREATE', 'aof:explicit', 'LABELS', 'a', 'b')
+
+        def snapshot():
+            info = self.ts_info('aof:pol')
+            rules = [(r.dest_key, r.bucket_duration, r.aggregation.lower(), r.alignment) for r in info['rules']]
+            dests = {}
+            for dest, *_ in rules:
+                dest_info = self.ts_info(dest)
+                dests[dest] = (
+                    client.execute_command('EXISTS', dest),
+                    dest_info['sourceKey'],
+                    dest_info['retentionTime'],
+                    dest_info['labels'],
+                    client.execute_command('TS.RANGE', dest, '-', '+'),
+                    client.execute_command('DEBUG', 'DIGEST-VALUE', dest),
+                )
+            return {
+                'rules': rules,
+                'dests': dests,
+                'source': client.execute_command('DEBUG', 'DIGEST-VALUE', 'aof:pol'),
+                'rulesState': self.ts_info('aof:pol', debug=True).get('rulesState'),
+                'explicit_rules': self.ts_info('aof:explicit')['rules'],
+            }
+
+        before = snapshot()
+        assert sorted((agg, bucket) for _, bucket, agg, _ in before['rules']) == [('avg', 120_000), ('max', 60_000)]
+        for exists, source_key, _, _, samples, _ in before['dests'].values():
+            assert exists == 1
+            assert source_key == 'aof:pol'
+            assert samples != []
+        assert before['explicit_rules'] == []
+
+        assert client.execute_command('DEBUG', 'LOADAOF') == b'OK'
+        assert snapshot() == before

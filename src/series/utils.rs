@@ -1,5 +1,7 @@
 use crate::common::constants::METRIC_NAME_LABEL;
-use crate::common::context::{create_key_string, get_current_db, notify_keyspace_event};
+use crate::common::context::{
+    create_key_string, get_current_db, is_real_user_client, notify_keyspace_event,
+};
 use crate::common::rounding::{NO_ROUNDING_KEYWORD, RoundingStrategy};
 use crate::error_consts;
 use crate::labels::{InternedLabel, Label, MetricName};
@@ -9,7 +11,7 @@ use crate::series::chunks::ChunkEncoding;
 use crate::series::index::{get_db_index, next_timeseries_id};
 use crate::series::series_data_type::VK_TIME_SERIES_TYPE;
 use crate::series::{
-    SeriesGuard, SeriesGuardMut, SeriesLink, TimeSeries, TimeSeriesOptions,
+    CompactionRule, SeriesGuard, SeriesGuardMut, SeriesLink, TimeSeries, TimeSeriesOptions,
     create_compaction_rules_from_config,
 };
 use std::ops::Deref;
@@ -317,11 +319,21 @@ fn metric_text(series: &TimeSeries) -> Option<String> {
     (MetricName::new(&parsed) == series.labels).then_some(text)
 }
 
+/// Applies `ts-compaction-policy` to a series a write command just auto-created: creates each
+/// destination the policy names and attaches its rule, replicating both as the explicit
+/// `TS.CREATE` + `TS.CREATERULE` a client would have issued.
 fn add_default_compactions(
     ctx: &Context,
     series: &mut TimeSeries,
     key: &ValkeyString,
 ) -> ValkeyResult<()> {
+    // A replica or an AOF replay never applies the policy itself: the primary that created the
+    // series replicated the destinations and rules it built (below), so they come from the
+    // primary's configuration and in the primary's rule order, not this node's.
+    if !is_real_user_client(ctx) {
+        return Ok(());
+    }
+
     let key_str = key.to_string_lossy();
     let Some(compaction_rules) = create_compaction_rules_from_config(&key_str) else {
         // No compaction rules available for this key
@@ -332,7 +344,6 @@ fn add_default_compactions(
     base_config.chunk_encoding = ChunkEncoding::Uncompressed;
 
     // create a new series for each compaction rule
-    let mut rules = Vec::with_capacity(compaction_rules.len());
     for (dest_key, (rule, retention)) in compaction_rules.into_iter() {
         let bucket_duration = rule.bucket_duration;
         let agg_type = rule.aggregator.aggregation_type();
@@ -353,7 +364,14 @@ fn add_default_compactions(
 
         let value_key = ValkeyKeyWritable::open(ctx.ctx, &child_key);
         if !value_key.is_empty() {
-            let msg = format!("TSDB: compaction series for key '{child_key}' already exists.");
+            // Not ours to write into (adopting it would accept input RTS rejects). Skipped on
+            // every node alike — a replica applies no policy and receives no rule for it — so
+            // the nodes stay consistent; the warning is the only trace, and an operator who
+            // wants the rule frees the key and re-creates the source.
+            let msg = format!(
+                "TSDB: compaction series for key '{child_key}' already exists; policy rule for \
+                 '{key_str}' skipped."
+            );
             ctx.log_warning(&msg);
             continue;
         }
@@ -368,13 +386,49 @@ fn add_default_compactions(
             }
         };
 
+        // Rendered before the value moves into the key.
+        let create_args = resolved_create_args(ctx, &destination);
         value_key.set_value(&VK_TIME_SERIES_TYPE, destination)?;
+        replicate_policy_destination(ctx, key, &child_key, &rule, &create_args);
 
-        rules.push(rule);
+        // The same insertion `TS.CREATERULE` performs on a replica, so the stored rule matches.
+        series.add_compaction_rule(rule);
     }
-    series.rules = rules;
 
     Ok(())
+}
+
+/// Replicate a policy-created destination and its rule as the explicit commands a client would
+/// have issued, so a replica or an AOF replay rebuilds exactly this pair without a policy of its
+/// own. Queued after the source's own resolved `TS.CREATE` (so the rule's source exists when the
+/// replica applies it) and before the write command's own propagation.
+fn replicate_policy_destination(
+    ctx: &Context,
+    source_key: &ValkeyString,
+    dest_key: &ValkeyString,
+    rule: &CompactionRule,
+    create_args: &[ValkeyString],
+) {
+    let mut args: Vec<&ValkeyString> = Vec::with_capacity(create_args.len() + 1);
+    args.push(dest_key);
+    args.extend(create_args.iter());
+    ctx.replicate("TS.CREATE", args.as_slice());
+
+    let aggregation = ctx.create_string("AGGREGATION");
+    let agg_name = ctx.create_string(rule.aggregator.aggregation_type().name().as_bytes());
+    let duration = ctx.create_string(rule.bucket_duration.to_string().as_bytes());
+    let align = ctx.create_string(rule.align_timestamp.to_string().as_bytes());
+    ctx.replicate(
+        "TS.CREATERULE",
+        &[
+            source_key,
+            dest_key,
+            &aggregation,
+            &agg_name,
+            &duration,
+            &align,
+        ],
+    );
 }
 
 pub fn get_series_labels<'a>(

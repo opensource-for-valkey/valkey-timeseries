@@ -52,6 +52,21 @@ The command set generally follows the `TS.<COMMAND>` pattern.
   buckets.
 * `TS.DELETERULE`: Remove an existing compaction rule.
 
+### Replication
+
+Series and compaction destinations are shaped by the primary. Every series creation — an
+explicit `TS.CREATE` or the auto-create of a write command (`TS.ADD`, `TS.INCRBY`/`TS.DECRBY`,
+`TS.ADDBULK`) — is replicated as a `TS.CREATE` carrying the primary's resolved options (retention,
+encoding, chunk size, duplicate policy, `IGNORE`, rounding, labels), ahead of the write. The
+destinations `ts-compaction-policy` creates for an auto-created series are replicated as explicit
+`TS.CREATE` + `TS.CREATERULE` pairs, in the primary's rule order, before the write; a replica or
+an AOF replay never applies the policy itself. A replica's own `ts-compaction-policy`,
+`ts-retention-policy`, `ts-encoding`, chunk size and rounding defaults therefore never shape
+replicated data. A policy destination key that already exists is left untouched and its rule
+skipped (with a warning naming both keys), on every node alike. `ts-compatibility-mode` is
+consulted by the node answering a read, so it must be set identically on every node of a
+replication group.
+
 ### Metadata & Indexing
 
 * `TS.INFO`: Retrieve detailed information and statistics about a specific time series.

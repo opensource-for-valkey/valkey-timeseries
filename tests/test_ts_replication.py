@@ -1106,17 +1106,14 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         self.assert_compaction_equivalent(src, dst)
         self.assert_rule_state_equivalent(src)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="compaction-replication-plan.md section 3.8: policy-created rules are attached in "
-        "per-process HashSet order, so the source's rule order (and DEBUG DIGEST-VALUE) differs "
-        "between primary and replica",
-    )
     def test_replication_compaction_policy_rules(self):
         """Rules created by ts-compaction-policy, with the same policy on both nodes.
 
-        Six rules, so that two independently shuffled rule orders coincide with probability
-        1/720 and the strict xfail above is not itself flaky."""
+        The primary attaches policy rules in its own HashMap iteration order; the replica gets
+        them as TS.CREATERULE commands in that same order (it never applies the policy itself),
+        so the source's rule order and DEBUG DIGEST-VALUE match. Six rules, so that two
+        independently built orders would coincide only with probability 1/720
+        (compaction-replication-plan.md section 3.8)."""
         policy = "max:1M:1h;avg:2M:1h;min:1M:1h;sum:2M:1h;count:1M:1h;last:2M:1h"
         for client in (self.client, self.replicas[0].client):
             client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", policy)
@@ -1129,6 +1126,103 @@ class TestTimeSeriesReplication(ReplicationTestCase):
         assert len(dests) == 6
         self.assert_compaction_equivalent("ts:policy:src", *dests)
         self.assert_rule_state_equivalent("ts:policy:src")
+
+    POLICY_SOURCES = ("ts:pol:add", "ts:pol:incrby", "ts:pol:addbulk")
+
+    def auto_create_policy_sources(self):
+        """Create every POLICY_SOURCES key through a different auto-creating write."""
+        self.client.execute_command("TS.ADD", "ts:pol:add", 0, 1, "LABELS", "a", "b")
+        self.client.execute_command("TS.INCRBY", "ts:pol:incrby", 1, "TIMESTAMP", 0, "LABELS", "a", "b")
+        self.client.execute_command(
+            "TS.ADDBULK", "ts:pol:addbulk", json.dumps({"timestamps": [0], "values": [1]}),
+            "LABELS", "a", "b",
+        )
+
+    def test_replication_policy_destinations_come_from_the_primary(self):
+        """Policy-created destinations are replicated as explicit creates and rules; the replica's
+        own ts-compaction-policy never shapes replicated data."""
+        replica = self.replicas[0].client
+        self.client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", "max:1M:1h;avg:2M:1h")
+        replica.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", "min:5M:1h")
+
+        # An explicit TS.CREATE never applies the policy, on either node.
+        self.client.execute_command("TS.CREATE", "ts:pol:explicit", "LABELS", "a", "b")
+        self.auto_create_policy_sources()
+        self.wait_for_replication()
+
+        describe = lambda rules: [(r.dest_key, r.bucket_duration, r.aggregation.lower(), r.alignment) for r in rules]
+        for client in (self.client, replica):
+            assert parse_info_response(client.execute_command("TS.INFO", "ts:pol:explicit"))["rules"] == []
+        for src in self.POLICY_SOURCES:
+            primary_rules = parse_info_response(self.client.execute_command("TS.INFO", src))["rules"]
+            replica_rules = parse_info_response(replica.execute_command("TS.INFO", src))["rules"]
+            # Same rules in the same order: the order is part of the stored value.
+            assert describe(replica_rules) == describe(primary_rules), src
+            assert sorted((r.aggregation.lower(), r.bucket_duration) for r in primary_rules) == \
+                [("avg", 120_000), ("max", 60_000)], src
+            for r in primary_rules:
+                assert replica.execute_command("EXISTS", r.dest_key) == 1, r.dest_key
+                primary_dest = parse_info_response(self.client.execute_command("TS.INFO", r.dest_key))
+                replica_dest = parse_info_response(replica.execute_command("TS.INFO", r.dest_key))
+                assert replica_dest["sourceKey"] == primary_dest["sourceKey"] == src
+                for field in ("retentionTime", "chunkSize", "labels", "duplicatePolicy"):
+                    assert replica_dest[field] == primary_dest[field], (r.dest_key, field)
+        assert replica.execute_command("TS.QUERYINDEX", "aggregation=min") == []
+
+        # Writes after creation compact identically on both nodes.
+        dests = []
+        for src in self.POLICY_SOURCES:
+            for ts in range(10_000, 300_000, 10_000):
+                self.client.execute_command("TS.ADD", src, ts, ts)
+            dests += [r.dest_key for r in parse_info_response(self.client.execute_command("TS.INFO", src))["rules"]]
+        assert all(self.client.execute_command("TS.RANGE", d, "-", "+") != [] for d in dests)
+        self.assert_compaction_equivalent(*self.POLICY_SOURCES, *dests)
+        self.assert_rule_state_equivalent(*self.POLICY_SOURCES)
+
+    def test_replication_policy_destination_stream_order(self):
+        """What reaches the replica for a policy auto-create: the source's TS.CREATE, then each
+        destination's TS.CREATE followed by its TS.CREATERULE, then the write itself."""
+        self.client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", "max:1M:1h;avg:2M:1h")
+        monitor_client = self.replicas[0].get_new_client()
+        monitor_client.connection_pool.connection_kwargs["socket_timeout"] = 5
+
+        seen = []
+        with monitor_client.monitor() as monitor:
+            self.client.execute_command("TS.ADD", "ts:pol:order", 0, 1, "LABELS", "a", "b")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                entry = monitor.next_command()
+                if entry is None:
+                    continue
+                parts = [p.strip('"') for p in entry.get("command", "").split()]
+                if not parts or not parts[0].lower().startswith("ts."):
+                    continue
+                seen.append((parts[0].lower(), parts[1], parts[2] if len(parts) > 2 else None))
+                if parts[0].lower() == "ts.add":
+                    break
+
+        rules = parse_info_response(self.client.execute_command("TS.INFO", "ts:pol:order"))["rules"]
+        expected = [("ts.create", "ts:pol:order")]
+        for r in rules:
+            expected += [("ts.create", r.dest_key), ("ts.createrule", "ts:pol:order")]
+        expected.append(("ts.add", "ts:pol:order"))
+        assert [(cmd, key) for cmd, key, _ in seen] == expected, seen
+        # Each TS.CREATERULE names the destination created just before it, in rule order.
+        assert [dest for cmd, _, dest in seen if cmd == "ts.createrule"] == [r.dest_key for r in rules]
+
+    def test_replication_policy_destination_already_exists_is_skipped(self):
+        """A policy destination key that already exists is left alone on both nodes: no rule,
+        no replicated create, the existing value untouched."""
+        replica = self.replicas[0].client
+        self.client.execute_command("CONFIG", "SET", "ts.ts-compaction-policy", "max:1M:1h;avg:2M:1h")
+        self.client.execute_command("SET", "ts:pol:taken_MAX_60000", "mine")
+        self.client.execute_command("TS.ADD", "ts:pol:taken", 0, 1)
+        self.wait_for_replication()
+        for client in (self.client, replica):
+            rules = parse_info_response(client.execute_command("TS.INFO", "ts:pol:taken"))["rules"]
+            assert [(r.aggregation.lower(), r.bucket_duration) for r in rules] == [("avg", 120_000)]
+            assert client.execute_command("GET", "ts:pol:taken_MAX_60000") == b"mine"
+        assert self.server.verify_string_in_logfile("ts:pol:taken_MAX_60000")
 
     def test_replication_compaction_full_resync_mid_bucket(self):
         """A full sync taken mid-bucket ships the open-bucket state in the RDB; the stream after

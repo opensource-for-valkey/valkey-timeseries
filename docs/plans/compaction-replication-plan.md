@@ -218,16 +218,21 @@ Every destination holds identical samples, `TS.GET` and `TS.GET … LATEST` on b
 `rulesState` agrees once sorted — but the **source's `DEBUG DIGEST-VALUE` differs** on roughly
 half the runs (3 of 6 in a manual loop with a two-rule policy). `TS.INFO key DEBUG` shows why:
 the same two rules in opposite order (`[…_MAX_1, …_AVG_2]` on one node, `[…_AVG_2, …_MAX_1]` on
-the other). `CompactionPolicyConfig::match_policy` (`src/series/compaction_policy.rs`) collects the
-matching policies into a `std::collections::HashSet`, whose iteration order is seeded per
-process, and `add_default_compactions` (`src/series/utils.rs`) pushes the rules in that order.
-Each node therefore builds its own order. Rule order is observable (it is hashed into the digest
+the other). `PolicyConfig::create_compaction_rules` (`src/series/compaction_policy.rs`) returns the
+rules keyed by destination in a `std::collections::HashMap`, whose iteration order is seeded per
+process, and `add_default_compactions` (`src/series/utils.rs`) iterates that map and pushes the
+rules in its order. (`match_policy`'s `HashSet` is seeded per process too, but its order is lost
+when the rules are re-keyed into the map.) Each node therefore builds its own order. Rule order is observable (it is hashed into the digest
 and printed by `TS.INFO`) and decides the order in which the rules of one source are applied.
 
 Consequence for the suite: with two rules the failure is a coin flip, so the scenario uses six
 (1/720 chance that two shuffles coincide) and is marked `xfail(strict=True)`. Whichever task makes
 rule creation order deterministic (e.g. sort by `(bucket_duration, aggregation)` before pushing, or
 replicate the rules instead of re-deriving them) must remove the marker.
+
+**Resolved by refactor Task 12:** the primary replicates each policy destination as `TS.CREATE` +
+`TS.CREATERULE` in its own rule order and a replica / AOF replay never applies the policy, so the
+order is the primary's everywhere; the `xfail` marker is removed.
 
 ### 3.9 Rule created on existing data (reference does neither, 2026-10-14)
 
