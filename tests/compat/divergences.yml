@@ -468,14 +468,14 @@
   documentation_only: true
   description: >
     After an out-of-order write back-fills a compaction bucket *older* than the currently
-    open one, TS.GET / TS.MGET without LATEST report the newly materialized downstream
-    bucket for us, but the previous (stale) bucket on RTS. Both engines store identical
-    downstream data — TS.RANGE returns the same samples on each, and TS.GET ... LATEST
-    agrees too — so RTS's reply contradicts its own TS.RANGE: it does not advance the
-    destination's cached last-sample when an older bucket is filled in. Reproducer: rule
-    `AGGREGATION avg 500` on src; `TS.ADD src 0 0`, `TS.ADD src 1000 0` (closes bucket 0),
-    then `TS.ADD src 500 0` — RANGE is `[[0,0],[500,0]]` on both, but TS.GET is `[500,0]`
-    for us and `[0,0]` on RTS.
+    open one, TS.GET / TS.MGET without LATEST and TS.INFO's lastTimestamp report the newly
+    materialized downstream bucket for us, but the previous (stale) bucket on RTS. Both
+    engines store identical downstream data — TS.RANGE returns the same samples on each,
+    and TS.GET ... LATEST agrees too — so RTS's reply contradicts its own TS.RANGE: it does
+    not advance the destination's cached last-sample when an older bucket is filled in.
+    Reproducer: rule `AGGREGATION avg 500` on src; `TS.ADD src 0 0`, `TS.ADD src 1000 0`
+    (closes bucket 0), then `TS.ADD src 500 0` — RANGE is `[[0,0],[500,0]]` on both, but
+    TS.GET is `[500,0]` and TS.INFO lastTimestamp `500` for us, `[0,0]` and `0` on RTS.
   rationale: >
     Not reproduced in either mode (ungated 2026-10-14, owner sign-off). RTS's reply
     contradicts its own TS.RANGE, and reproducing it needs per-destination history that no
