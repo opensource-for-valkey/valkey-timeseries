@@ -70,21 +70,27 @@ impl CompactionRule {
         calc_bucket_start(ts, self.align_timestamp, self.bucket_duration)
     }
 
-    /// Exclusive end of the bucket that starts at `bucket_start` (a [`Self::calc_bucket_start`]
-    /// result).
+    /// Last timestamp (inclusive) of the bucket that starts at `bucket_start` (a
+    /// [`Self::calc_bucket_start`] result).
     ///
-    /// Not `bucket_start + bucket_duration`: with a non-zero align timestamp the first bucket's
-    /// true start is negative and `calc_bucket_start` clamps it to 0, so that bucket is shorter
-    /// than a full duration — `[0, align % duration)`. Adding a whole duration to it swept the
-    /// next bucket's samples into its recomputation, double-counting them. The start of the
-    /// bucket one duration on is the end in both cases.
-    pub(crate) fn bucket_end(&self, bucket_start: Timestamp) -> Timestamp {
-        self.calc_bucket_start(bucket_start.saturating_add_unsigned(self.bucket_duration))
+    /// Not `bucket_start + bucket_duration - 1`: with a non-zero align timestamp the first
+    /// bucket's true start is negative and `calc_bucket_start` clamps it to 0, so that bucket is
+    /// shorter than a full duration — `[0, align % duration)`. Adding a whole duration to it swept
+    /// the next bucket's samples into its recomputation, double-counting them. The bucket ends
+    /// just before the start of the bucket one duration on.
+    ///
+    /// Inclusive because the last representable bucket has no exclusive end: one duration on
+    /// overflows, and a saturated end equal to the start read as an empty bucket.
+    pub(crate) fn bucket_last(&self, bucket_start: Timestamp) -> Timestamp {
+        bucket_start
+            .checked_add_unsigned(self.bucket_duration)
+            .map_or(Timestamp::MAX, |next| self.calc_bucket_start(next) - 1)
     }
 
+    /// The bucket holding `ts`, as inclusive `(first, last)` timestamps.
     pub(super) fn get_bucket_range(&self, ts: Timestamp) -> (Timestamp, Timestamp) {
         let start = self.calc_bucket_start(ts);
-        (start, self.bucket_end(start))
+        (start, self.bucket_last(start))
     }
 
     pub(super) fn reset(&mut self) {
@@ -156,9 +162,9 @@ pub(super) fn rebuild_open_bucket_as_of(
     let Some(as_of) = as_of else {
         return;
     };
-    let (start, end) = rule.get_bucket_range(as_of);
+    let (start, last) = rule.get_bucket_range(as_of);
     rule.bucket_start = Some(start);
-    for sample in parent.range_iter(start, end - 1) {
+    for sample in parent.range_iter(start, last) {
         if sample.timestamp > as_of {
             break;
         }
@@ -336,6 +342,37 @@ mod tests {
         rebuild_open_bucket_as_of(&series, &mut rebuilt, Some(1200));
         assert_eq!(rebuilt.bucket_start, Some(1000));
         assert!(rebuilt.has_samples);
+        assert_eq!(AggregationHandler::current(&rebuilt.aggregator), Some(12.0));
+    }
+
+    #[test]
+    fn bucket_last_is_inclusive_and_covers_the_terminal_bucket() {
+        let mut aligned = rule(AggregationType::Sum, 1000);
+        assert_eq!(aligned.bucket_last(2000), 2999);
+        // align 300: the first bucket is clamped to [0, 300).
+        aligned.align_timestamp = 300;
+        assert_eq!(aligned.bucket_last(0), 299);
+        assert_eq!(aligned.bucket_last(300), 1299);
+        // One duration on overflows: the last bucket runs to i64::MAX.
+        aligned.align_timestamp = 0;
+        assert_eq!(
+            aligned.bucket_last(9_223_372_036_854_775_000),
+            Timestamp::MAX
+        );
+        assert_eq!(
+            aligned.bucket_last(9_223_372_036_854_774_000),
+            9_223_372_036_854_774_999
+        );
+    }
+
+    #[test]
+    fn rebuild_covers_the_terminal_bucket() {
+        // [i64::MAX - 807, i64::MAX] at 1000 ms: the last bucket has no exclusive end.
+        let start = 9_223_372_036_854_775_000;
+        let series = series_with(&[(start + 1, 5.0), (Timestamp::MAX - 1, 7.0)]);
+        let mut rebuilt = rule(AggregationType::Sum, 1000);
+        rebuild_open_bucket_as_of(&series, &mut rebuilt, Some(Timestamp::MAX - 1));
+        assert_eq!(rebuilt.bucket_start, Some(start));
         assert_eq!(AggregationHandler::current(&rebuilt.aggregator), Some(12.0));
     }
 

@@ -293,11 +293,11 @@ fn handle_mixed_batch_compaction(
     }
 
     for &(bucket_start, min_ts) in buckets.iter().rev() {
-        let bucket_end = ctx.rule.bucket_end(bucket_start);
+        let bucket_last = ctx.rule.bucket_last(bucket_start);
         if ctx.rule.bucket_start.is_none() || ctx.rule.bucket_start == Some(bucket_start) {
-            recalculate_current_bucket(ctx, bucket_start, bucket_end, min_ts)?;
+            recalculate_current_bucket(ctx, bucket_start, bucket_last, min_ts)?;
         } else {
-            recalculate_bucket(ctx, bucket_start, bucket_end, min_ts, null_ts_filter)?;
+            recalculate_bucket(ctx, bucket_start, bucket_last, min_ts, null_ts_filter)?;
         }
     }
 
@@ -326,12 +326,12 @@ fn handle_sample_compaction(ctx: &mut CompactionContext, sample: Sample) -> Tsdb
             finalize_current_bucket(ctx, sample, sample_bucket_start)?;
         }
         Ordering::Less => {
-            let bucket_end = ctx.rule.bucket_end(sample_bucket_start);
+            let bucket_last = ctx.rule.bucket_last(sample_bucket_start);
             // Sample is in an older bucket (shouldn't happen for new samples, but handle gracefully)
             recalculate_bucket(
                 ctx,
                 sample_bucket_start,
-                bucket_end,
+                bucket_last,
                 ctx.parent.get_min_timestamp(),
                 null_ts_filter,
             )?;
@@ -368,11 +368,11 @@ fn finalize_current_bucket(
     Ok(())
 }
 
-/// Recalculate the current ongoing aggregation bucket
+/// Recalculate the current ongoing aggregation bucket, `[bucket_start, bucket_last]`.
 fn recalculate_current_bucket(
     ctx: &mut CompactionContext,
     bucket_start: Timestamp,
-    bucket_end: Timestamp,
+    bucket_last: Timestamp,
     min_ts: Timestamp,
 ) -> TsdbResult<()> {
     // Reset the aggregator and recalculate from all samples in the bucket
@@ -380,7 +380,7 @@ fn recalculate_current_bucket(
         ctx.parent,
         &mut ctx.rule.aggregator,
         bucket_start,
-        bucket_end - 1,
+        bucket_last,
         min_ts,
         null_ts_filter,
     );
@@ -393,11 +393,12 @@ fn recalculate_current_bucket(
     Ok(())
 }
 
-/// Recalculate a historical bucket and update the destination series
+/// Recalculate a historical bucket, `[bucket_start, bucket_last]`, and update the destination
+/// series
 fn recalculate_bucket<F>(
     ctx: &mut CompactionContext,
     bucket_start: Timestamp,
-    bucket_end: Timestamp,
+    bucket_last: Timestamp,
     min_ts: Timestamp,
     filter: F,
 ) -> TsdbResult<()>
@@ -413,7 +414,7 @@ where
         ctx.parent,
         &mut bucket_aggregator,
         bucket_start,
-        bucket_end - 1,
+        bucket_last,
         min_ts,
         &filter,
     );
@@ -423,7 +424,7 @@ where
         add_dest_bucket(ctx, bucket_start, aggregated_value)?;
     } else {
         // No samples in this bucket anymore, remove it from destination
-        ctx.dest.remove_range(bucket_start, bucket_end - 1)?;
+        ctx.dest.remove_range(bucket_start, bucket_last)?;
     }
 
     Ok(())
@@ -445,13 +446,7 @@ fn handle_compaction_range_removal(
 ) -> TsdbResult<()> {
     let first_bucket_start = ctx.rule.calc_bucket_start(start);
     let last_bucket_start = ctx.rule.calc_bucket_start(end);
-    let last_bucket_end = ctx.rule.bucket_end(last_bucket_start);
-    // `bucket_end` saturates, so the last representable bucket runs to the end of time.
-    let span_end = if last_bucket_end > last_bucket_start {
-        last_bucket_end - 1
-    } else {
-        Timestamp::MAX
-    };
+    let span_end = ctx.rule.bucket_last(last_bucket_start);
     ctx.rewritten = Some((first_bucket_start, span_end));
 
     // Buckets from the one holding the parent's last sample onwards are open, not published: the
@@ -550,7 +545,7 @@ fn resync_open_bucket_after_removal(
         return Ok((removed > 0).then_some(0));
     };
 
-    let (open_start, open_end) = ctx.rule.get_bucket_range(last_sample.timestamp);
+    let (open_start, open_last) = ctx.rule.get_bucket_range(last_sample.timestamp);
 
     // The re-opened bucket and anything after it are no longer closed.
     let removed = if ctx.dest.is_empty() {
@@ -562,9 +557,8 @@ fn resync_open_bucket_after_removal(
     let mut aggregator = ctx.rule.aggregator.clone();
     AggregationHandler::reset(&mut aggregator);
 
-    // `open_end - 1`: buckets are [start, end) but `range_iter` is inclusive on both bounds.
     let mut has_samples = false;
-    for sample in ctx.parent.range_iter(open_start, open_end - 1) {
+    for sample in ctx.parent.range_iter(open_start, open_last) {
         if AggregationHandler::update(&mut aggregator, sample.timestamp, sample.value) {
             has_samples = true;
         }
@@ -1070,5 +1064,47 @@ mod tests {
         let dst: Vec<_> = chain.dst.iter().map(|s| (s.timestamp, s.value)).collect();
         assert_eq!(mid, [(0, 1.0), (1000, 32.0), (2000, 4.0), (3000, 8.0)]);
         assert_eq!(dst, [(0, 33.0)]);
+    }
+
+    /// The last representable bucket (`[i64::MAX - 807, i64::MAX]` at 1000 ms) has no exclusive
+    /// end; recomputing it — for an upsert, or after a removal — must still cover its samples,
+    /// not an empty range that clears the open aggregate.
+    #[test]
+    fn terminal_bucket_recalculates_over_its_samples() {
+        const START: Timestamp = 9_223_372_036_854_775_000;
+        let mut parent = TimeSeries::new();
+        let mut dest = TimeSeries::new();
+        let mut rule = fresh_rule(AggregationType::Sum, 1000);
+        for (ts, value) in [
+            (START + 1, 5.0),
+            (Timestamp::MAX - 1, 7.0),
+            (Timestamp::MAX - 1, 9.0),
+        ] {
+            let prev_last = parent.last_sample.map(|s| s.timestamp);
+            let SampleAddResult::Ok(stored) =
+                parent.add(ts, value, Some(DuplicatePolicy::KeepLast))
+            else {
+                panic!("sample @{ts} rejected");
+            };
+            ingest_batch_of_one(&parent, &mut dest, &mut rule, stored, prev_last);
+        }
+        assert_eq!(
+            open_state(&rule),
+            (Some(START), true, Some(14f64.to_bits()))
+        );
+
+        let removed = Timestamp::MAX - 1;
+        parent.remove_range(removed, removed).unwrap();
+        let mut cctx = CompactionContext::new(&parent, &mut dest, &mut rule);
+        apply_op(
+            &mut cctx,
+            CompactionOp::RemoveRange {
+                start: removed,
+                end: removed,
+            },
+        )
+        .unwrap();
+        assert_eq!(open_state(&rule), (Some(START), true, Some(5f64.to_bits())));
+        assert!(dest.is_empty());
     }
 }
