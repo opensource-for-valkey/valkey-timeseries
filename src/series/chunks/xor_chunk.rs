@@ -46,7 +46,9 @@ pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// The encoding this codec implements.
     const ENCODING: ChunkEncoding;
 
-    /// An empty codec whose stream will not allocate past `max_size` (plus slack).
+    /// An empty codec whose stream will not allocate past `max_size` (plus a few bytes of
+    /// slack) while the payload stays within budget; past it, growth resumes doubling. See
+    /// `BitStream::set_soft_cap`.
     fn with_soft_cap(max_size: usize) -> Self;
     /// Set the allocation budget of a codec loaded from storage.
     fn set_soft_cap(&mut self, max_size: usize);
