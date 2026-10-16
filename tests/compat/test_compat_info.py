@@ -152,6 +152,21 @@ class TestDebugVariant:
         mk_series(diff, "h:dbg:empty")
         diff("TS.INFO", "h:dbg:empty", "DEBUG")
 
+    def test_debug_on_an_empty_uncompressed_series(self, diff):
+        """An empty chunk reports 0 for both boundaries whatever the encoding.
+
+        Our uncompressed chunk used to report `i64::MAX` as the end of an empty chunk;
+        `mk_series` forces COMPRESSED, so create the series directly.
+        """
+        diff(
+            "TS.CREATE", "h:dbg:empty:unc",
+            "RETENTION", 0,
+            "CHUNK_SIZE", 4096,
+            "ENCODING", "UNCOMPRESSED",
+            "DUPLICATE_POLICY", "BLOCK",
+        )
+        diff("TS.INFO", "h:dbg:empty:unc", "DEBUG")
+
     def test_debug_on_a_populated_series(self, diff):
         mk_populated(diff, "h:dbg", [(100, 1.0), (200, 2.0), (300, 3.0)])
         diff("TS.INFO", "h:dbg", "DEBUG")
