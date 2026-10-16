@@ -50,15 +50,15 @@ pub type SeriesRef = u64;
 /// nor pays for the shrink. An in-order `merge_samples` into a sealed chunk does append in place
 /// and will regrow, but from a smaller base and still by doubling, so the cost stays amortized
 /// O(1) per byte.
-/// A chunk is split only once it exceeds `max_size` by more than `max_size / SPLIT_SLACK_DIVISOR`
-/// (see [`TimeSeries::needs_split`]).
-pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
-
 pub(crate) fn seal_chunk(chunk: &mut TimeSeriesChunk) {
     if let Err(e) = chunk.optimize() {
         logging::log_warning(format!("TSDB: Error compacting a sealed chunk: {e:?}"));
     }
 }
+
+/// A chunk is split only once it exceeds `max_size` by more than `max_size / SPLIT_SLACK_DIVISOR`
+/// (see [`TimeSeries::needs_split`]).
+pub(crate) const SPLIT_SLACK_DIVISOR: usize = 4;
 
 /// Represents a time series consisting of chunks of samples, each with a timestamp and value.
 #[derive(Clone, Debug, Hash, PartialEq, GetSize)]
@@ -500,6 +500,9 @@ impl TimeSeries {
     /// half-empty chunks, once per chunk-full of appends. Only a chunk that a merge has grown
     /// past `max_size + max_size / SPLIT_SLACK_DIVISOR` is split; bulk ingest plans its
     /// overfill below that line (see `bulk_add`).
+    ///
+    /// This is the merge-path split rule; the upsert path uses `TimeSeriesChunk::should_split`.
+    /// See the `# Capacity` section on [`ChunkOps`](crate::series::chunks::ChunkOps).
     pub(crate) fn needs_split(chunk: &TimeSeriesChunk) -> bool {
         let max = chunk.max_size();
         chunk.is_full() && chunk.size() > max + max / SPLIT_SLACK_DIVISOR

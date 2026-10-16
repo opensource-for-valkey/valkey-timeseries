@@ -179,6 +179,8 @@ impl TimeSeriesChunk {
         size_of::<Self>() + self.get_heap_size()
     }
 
+    /// The upsert-path split rule: `utilization() >= SPLIT_FACTOR`. The merge path uses
+    /// `TimeSeries::needs_split` instead. See the `# Capacity` section on [`ChunkOps`].
     pub fn should_split(&self) -> bool {
         self.utilization() >= SPLIT_FACTOR
     }
