@@ -119,9 +119,15 @@ struct RuleNode {
     dests: Vec<Vec<u8>>,
 }
 
+/// A key that holds no series is no node, whether missing or overwritten with another type: a
+/// link to it is stale, and the walks skip it rather than fail the new rule with `WRONGTYPE`.
 fn rule_node(ctx: &Context, key: &[u8]) -> ValkeyResult<Option<RuleNode>> {
     let key = ctx.create_string(key);
-    Ok(try_get_timeseries(ctx, &key, None)?.map(|series| RuleNode {
+    let series = match try_get_timeseries(ctx, &key, None) {
+        Err(ValkeyError::WrongType) => return Ok(None),
+        other => other?,
+    };
+    Ok(series.map(|series| RuleNode {
         source: series.src_series.as_ref().map(|link| link.key().to_vec()),
         dests: series
             .rules

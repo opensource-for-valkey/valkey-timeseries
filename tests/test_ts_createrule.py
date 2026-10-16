@@ -475,6 +475,24 @@ class TestTSCreateRule(ValkeyTimeSeriesTestCaseBase):
         assert self.client.execute_command(
             "TS.CREATERULE", keys[-1], "stale:tail", "AGGREGATION", "sum", 1000) == b"OK"
 
+    def test_a_link_to_an_overwritten_key_is_stale(self):
+        """A rule partner overwritten with a non-series value is a stale link, like a deleted
+        one: the walks above the source and below the destination skip it instead of failing
+        the new rule with WRONGTYPE."""
+        for key in ("wt:a", "wt:b", "wt:c", "wt:d", "wt:e", "wt:f"):
+            self.create_test_series(key)
+        self.client.execute_command("TS.CREATERULE", "wt:a", "wt:b", "AGGREGATION", "sum", 1000)
+        self.client.execute_command("TS.CREATERULE", "wt:e", "wt:f", "AGGREGATION", "sum", 1000)
+        self.client.execute_command("SET", "wt:a", "not a series")
+        self.client.execute_command("SET", "wt:f", "not a series")
+
+        # Upstream: wt:b's back-link names wt:a, now a string.
+        assert self.client.execute_command(
+            "TS.CREATERULE", "wt:b", "wt:c", "AGGREGATION", "sum", 1000) == b"OK"
+        # Downstream: wt:e's rule names wt:f, now a string.
+        assert self.client.execute_command(
+            "TS.CREATERULE", "wt:d", "wt:e", "AGGREGATION", "sum", 1000) == b"OK"
+
     def test_create_compaction_chain_success(self):
         """Test creating a valid chain of compactions (A -> B -> C)"""
         raw_key = "test:raw_data"
