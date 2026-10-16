@@ -2,8 +2,8 @@ use super::lex::{Token, expect_one_of_tokens, expect_token, get_next_token};
 use super::parse_error::unexpected;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::labels::Label;
-use crate::parser::ParseResult;
 use crate::parser::utils::extract_string_value;
+use crate::parser::{ParseError, ParseResult};
 use logos::{Lexer, Logos};
 
 /// specialized parser for a `Prometheus` compatible metric name (as opposed to a metric selector).
@@ -25,6 +25,17 @@ pub fn parse_metric_name(s: &str) -> ParseResult<Vec<Label>> {
     }
     if res.0 == Token::LeftBrace {
         parse_label_filters(&mut lex, &mut labels)?;
+        // The measurement is the `__name__`; a second one would override it, with any value —
+        // including ones (empty, not an identifier) that no metric name renders back to.
+        if labels[1..]
+            .iter()
+            .any(|label| label.name == METRIC_NAME_LABEL)
+        {
+            return Err(ParseError::General(format!(
+                "{METRIC_NAME_LABEL} label conflicts with the measurement `{}`",
+                labels[0].value
+            )));
+        }
     }
     // todo: expect eof
     Ok(labels)
@@ -120,6 +131,19 @@ mod tests {
             let mut got = parse_metric_name(input).unwrap();
             got.sort();
             assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_metric_name_rejects_name_label() {
+        // The measurement is `__name__`; a second one in the label set is an error, empty or not.
+        for input in [
+            r#"cpu{__name__="other"}"#,
+            r#"cpu{__name__="cpu"}"#,
+            r#"cpu{__name__=""}"#,
+            r#"cpu{a="1",__name__="9cpu",b=""}"#,
+        ] {
+            assert!(parse_metric_name(input).is_err(), "{input}");
         }
     }
 }

@@ -217,6 +217,16 @@ class TestTimeSeriesBasic(ValkeyTimeSeriesTestCaseBase):
             with pytest.raises(ResponseError):
                 self.client.execute_command("TS.CREATE", f"nanret:{value}", "RETENTION", value)
 
+    def test_create_metric_with_name_label_rejected(self):
+        """The measurement is the metric's `__name__`, so a `__name__` label beside it is an
+        error. Accepted, it overrode the measurement and could leave a name (`""`, `9cpu`) that
+        the replicated TS.CREATE cannot express, so replicas never created the key."""
+        for i, metric in enumerate(('cpu{__name__="other"}', 'cpu{__name__=""}',
+                                    'cpu{__name__="9cpu",a=""}', 'cpu{a="1",__name__="cpu"}')):
+            with pytest.raises(ResponseError, match="invalid metric name"):
+                self.client.execute_command("TS.CREATE", f"metric:name:{i}", "METRIC", metric)
+            assert self.client.exists(f"metric:name:{i}") == 0
+
     def test_create_metric_given_twice_rejected(self):
         """A second METRIC used to replace the first silently; it is rejected like a second
         rounding option."""
