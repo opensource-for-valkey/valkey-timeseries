@@ -1077,6 +1077,34 @@ mod tests {
         assert_eq!(result, Ok(None));
     }
 
+    /// `SampleIter::fold` dispatches once and hands the loop to the inner iterator, so
+    /// fold-driven consumers (`for_each`, `collect`, `extend`) must see exactly the samples
+    /// that `next` yields, for every variant a chunk can produce.
+    #[test]
+    fn test_sample_iter_fold_matches_next_for_every_encoding() {
+        let samples = generate_random_samples(200);
+        let (lo, hi) = (samples[37].timestamp, samples[151].timestamp);
+        for chunk_type in CHUNK_TYPES {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 64 * 1024);
+            chunk.set_data(&samples).unwrap();
+            for (start, end) in [
+                (i64::MIN, i64::MAX),
+                (lo, hi),
+                (hi, lo),
+                (i64::MAX - 1, i64::MAX),
+            ] {
+                // A `for` loop drives `next`, never `fold`.
+                let mut by_next = Vec::new();
+                for s in chunk.range_iter(start, end) {
+                    by_next.push(s);
+                }
+                let mut by_fold = Vec::new();
+                chunk.range_iter(start, end).for_each(|s| by_fold.push(s));
+                assert_eq!(by_fold, by_next, "{chunk_type:?} [{start}, {end}]");
+            }
+        }
+    }
+
     #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {

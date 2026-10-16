@@ -38,6 +38,22 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Empty => None,
         }
     }
+
+    /// Dispatch on the variant once, then let the inner iterator drive the loop. Without
+    /// this, `for_each`/`collect`/`extend` re-match the variant on every sample, which
+    /// costs a slice-backed scan more than the copy it avoids.
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        match self {
+            SampleIter::Slice(slice) => slice.copied().fold(init, f),
+            SampleIter::Gorilla(iter) => iter.fold(init, f),
+            SampleIter::Chimp(iter) => iter.fold(init, f),
+            SampleIter::Range(range) => range.fold(init, f),
+            SampleIter::Empty => init,
+        }
+    }
 }
 
 impl<'a> From<GorillaChunkIterator<'a>> for SampleIter<'a> {
