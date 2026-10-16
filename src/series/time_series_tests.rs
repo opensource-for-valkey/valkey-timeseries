@@ -1849,12 +1849,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Every chunk but the tail must be holding a tight buffer.
-    ///
-    /// A compressed chunk's bit stream grows by doubling, so a chunk that has just filled to
-    /// `chunk_size_bytes` is sitting on up to twice that in allocation -- measured at 1.90x over
-    /// a 20,000-sample series before `seal_chunk` was wired into the append path. The tail is
-    /// deliberately left alone: it is still the append target.
+    /// An out-of-order add grows `total_samples` by one in every encoding; a duplicate add
+    /// under `KEEP_LAST` leaves it unchanged.
     #[test]
     fn test_total_samples_tracks_out_of_order_and_duplicate_adds_per_encoding() {
         for encoding in [
@@ -1876,6 +1872,12 @@ mod tests {
         }
     }
 
+    /// Every chunk but the tail must be holding a tight buffer.
+    ///
+    /// A compressed chunk's bit stream grows by doubling, so a chunk that has just filled to
+    /// `chunk_size_bytes` is sitting on up to twice that in allocation -- measured at 1.90x over
+    /// a 20,000-sample series before `seal_chunk` was wired into the append path. The tail is
+    /// deliberately left alone: it is still the append target.
     #[test]
     fn test_sealed_chunks_do_not_hold_spare_capacity() {
         for encoding in [
