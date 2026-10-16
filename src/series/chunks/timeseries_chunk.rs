@@ -121,6 +121,9 @@ impl TimeSeriesChunk {
 
     // NOTE! this function assumes that timestamps are sorted ascending and de-duped
     pub fn samples_by_timestamps(&self, timestamps: &[Timestamp]) -> TsdbResult<Vec<Sample>> {
+        if let TimeSeriesChunk::Uncompressed(c) = self {
+            return c.samples_by_timestamps(timestamps);
+        }
         if self.len() == 0 || timestamps.is_empty() {
             return Ok(vec![]);
         }
@@ -170,25 +173,6 @@ impl TimeSeriesChunk {
         }
 
         Ok(samples)
-    }
-
-    /// Merge a range of samples into this chunk.
-    /// If the chunk is full or the other chunk is empty, it returns 0.
-    /// Duplicate values are handled according to `duplicate_policy`.
-    /// Samples with timestamps before `retention_threshold` will be ignored, whether
-    /// they fall with the given range [start_ts..end_ts].
-    /// Returns the number of samples merged.
-    pub fn merge_range(
-        &mut self,
-        sample_iter: impl Iterator<Item = Sample>,
-        duplicate_policy: Option<DuplicatePolicy>,
-    ) -> TsdbResult<usize> {
-        if self.is_full() {
-            return Ok(0);
-        }
-        let samples = sample_iter.collect::<Vec<Sample>>();
-        let res = self.merge_samples(&samples, duplicate_policy)?;
-        Ok(res.iter().filter(|s| s.is_ok()).count())
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -261,10 +245,7 @@ impl Default for TimeSeriesChunk {
 }
 
 impl Chunk for TimeSeriesChunk {
-    fn split(&mut self) -> TsdbResult<Self>
-    where
-        Self: Sized,
-    {
+    fn split(&mut self) -> TsdbResult<Self> {
         use TimeSeriesChunk::*;
         match self {
             Uncompressed(chunk) => Ok(Uncompressed(chunk.split()?)),
@@ -351,10 +332,4 @@ impl Chunk for TimeSeriesChunk {
 fn save_chunk_type(chunk: &TimeSeriesChunk, rdb: *mut RedisModuleIO) {
     let chunk_type: u8 = chunk.get_encoding() as u8;
     rdb_save_u8(rdb, chunk_type);
-}
-
-impl PartialOrd for TimeSeriesChunk {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.first_timestamp().partial_cmp(&other.first_timestamp())
-    }
 }

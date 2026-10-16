@@ -44,15 +44,6 @@ impl GorillaChunk {
         Ok(())
     }
 
-    pub fn compression_ratio(&self) -> f64 {
-        if self.is_empty() {
-            return 0.0;
-        }
-        let compressed_size = self.encoder.buf().len();
-        let uncompressed_size = self.len() * (size_of::<i64>() + size_of::<f64>());
-        (uncompressed_size / compressed_size) as f64
-    }
-
     /// Bytes of encoded data. This is what `max_size` bounds, what `TS.INFO DEBUG` reports as a
     /// chunk's `size`, and what `bytes_per_sample` amortizes.
     ///
@@ -66,27 +57,6 @@ impl GorillaChunk {
     /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
     pub fn data_size(&self) -> usize {
         self.encoder.buf().len()
-    }
-
-    /// estimate remaining capacity based on the current data size and chunk max_size
-    pub fn remaining_capacity(&self) -> usize {
-        // Saturating: a merge can push a chunk past `max_size`, and a plain subtraction would
-        // wrap (this crate builds release without `overflow-checks`). `ChimpChunk` already
-        // saturated here.
-        self.max_size.saturating_sub(self.data_size())
-    }
-
-    /// Estimate the number of samples that can be stored in the remaining capacity
-    /// Note that for low sample counts this will be very inaccurate
-    pub fn remaining_samples(&self) -> usize {
-        if self.len() == 0 {
-            return 0;
-        }
-        self.remaining_capacity() / self.bytes_per_sample()
-    }
-
-    pub fn memory_usage(&self) -> usize {
-        size_of::<Self>() + self.get_heap_size()
     }
 
     /// How many of this chunk's samples fall in `[start, end]`, assuming they are spread
@@ -127,9 +97,6 @@ impl ChunkOps for GorillaChunk {
     }
     fn len(&self) -> usize {
         self.encoder.num_samples
-    }
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
     fn last_value(&self) -> f64 {
         self.encoder.last_value
@@ -299,10 +266,7 @@ impl ChunkOps for GorillaChunk {
 }
 
 impl Chunk for GorillaChunk {
-    fn split(&mut self) -> TsdbResult<Self>
-    where
-        Self: Sized,
-    {
+    fn split(&mut self) -> TsdbResult<Self> {
         let mut left_chunk = GorillaEncoder::with_soft_cap(self.max_size);
         // `with_max_size`, not `default()`: the upper half has to inherit the budget the series
         // was created with. `default()` stamps `DEFAULT_CHUNK_SIZE_BYTES` on it, silently

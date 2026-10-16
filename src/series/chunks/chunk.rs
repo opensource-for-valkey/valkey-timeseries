@@ -1,4 +1,3 @@
-use crate::common::hash::DeterministicHasher;
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
@@ -6,7 +5,6 @@ use crate::series::{DuplicatePolicy, SampleAddResult};
 use enum_dispatch::enum_dispatch;
 use get_size2::GetSize;
 use std::fmt::Display;
-use std::hash::{BuildHasher, Hash, Hasher};
 use valkey_module::digest::Digest;
 use valkey_module::{ValkeyError, ValkeyResult, raw};
 
@@ -169,22 +167,7 @@ pub trait Chunk: ChunkOps + Sized {
 
     fn deserialize(buf: &[u8]) -> TsdbResult<Self>;
 
-    fn debug_digest(&self, dig: &mut Digest)
-    where
-        Self: Hash,
-    {
-        // Default implementation for Chunk types that implement Hash + GetSize.
-
-        // Include type name to differentiate implementations
-        dig.add_string_buffer(std::any::type_name::<Self>().as_bytes());
-
-        // Compute a deterministic hash of the chunk's contents and add it to the digest.
-        // Use DeterministicHasher (wraps ahash RandomState with fixed seeds) so the hash is deterministic across runs.
-        let mut hasher = DeterministicHasher::default().build_hasher();
-        Hash::hash(self, &mut hasher);
-        let h = hasher.finish();
-        dig.add_string_buffer(h.to_le_bytes().as_ref());
-    }
+    fn debug_digest(&self, dig: &mut Digest);
 }
 
 /// Validates a configured chunk size (in bytes).

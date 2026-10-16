@@ -51,18 +51,6 @@ impl ChimpChunk {
         Ok(())
     }
 
-    pub fn compression_ratio(&self) -> f64 {
-        if self.is_empty() {
-            return 0.0;
-        }
-        let compressed_size = self.encoder.bytes().len();
-        if compressed_size == 0 {
-            return 0.0;
-        }
-        let uncompressed_size = self.len() * (size_of::<i64>() + size_of::<f64>());
-        uncompressed_size as f64 / compressed_size as f64
-    }
-
     /// Bytes of encoded data. This is what `max_size` bounds, what `TS.INFO DEBUG` reports as a
     /// chunk's `size`, and what `bytes_per_sample` amortizes.
     ///
@@ -76,25 +64,6 @@ impl ChimpChunk {
     /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
     pub fn data_size(&self) -> usize {
         self.encoder.bytes().len()
-    }
-
-    /// Estimate the remaining capacity based on the current data size and `max_size`.
-    pub fn remaining_capacity(&self) -> usize {
-        self.max_size.saturating_sub(self.data_size())
-    }
-
-    /// Estimate how many more samples fit in the remaining capacity.
-    ///
-    /// Very inaccurate at low sample counts, where header overhead dominates.
-    pub fn remaining_samples(&self) -> usize {
-        if self.len() == 0 {
-            return 0;
-        }
-        self.remaining_capacity() / self.bytes_per_sample()
-    }
-
-    pub fn memory_usage(&self) -> usize {
-        size_of::<Self>() + self.get_heap_size()
     }
 
     pub fn iter(&'_ self) -> SampleIter<'_> {
@@ -117,10 +86,6 @@ impl ChunkOps for ChimpChunk {
 
     fn len(&self) -> usize {
         self.encoder.count() as usize
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     fn last_value(&self) -> f64 {

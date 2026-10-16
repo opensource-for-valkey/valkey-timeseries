@@ -1319,10 +1319,11 @@ mod tests {
                 chunk.add_sample(sample).unwrap();
             }
 
-            // Test with a mix of present and absent timestamps
+            // A mix of present and absent timestamps, sorted and de-duplicated as
+            // `samples_by_timestamps` requires. Samples sit on a 1000 ms grid, so +500 misses.
             let timestamps = vec![
                 samples[5].timestamp,
-                2000, // not present
+                samples[10].timestamp + 500, // not present
                 samples[15].timestamp,
             ];
             let expected_samples = vec![samples[5], samples[15]];
@@ -1403,9 +1404,10 @@ mod tests {
 
     /// A compressed chunk pushed past `max_size` must not wrap its remaining capacity.
     ///
-    /// `GorillaChunk::remaining_capacity` was a plain `max_size - data_size()`, and this crate
-    /// builds release without `overflow-checks`, so an over-full chunk wrapped to a `usize` near
-    /// `usize::MAX` — which `remaining_samples` then divided into a huge sample estimate.
+    /// This crate builds release without `overflow-checks`, so a plain `max_size - size()` on an
+    /// over-full chunk wraps to a `usize` near `usize::MAX` and turns into a huge sample estimate
+    /// (the bug the old `GorillaChunk::remaining_capacity` had).
+    /// `estimate_remaining_sample_capacity` guards `used >= total` and must report zero.
     #[test]
     fn test_remaining_capacity_saturates_on_an_over_full_chunk() {
         for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
@@ -1418,12 +1420,11 @@ mod tests {
                 "{chunk_type:?}: chunk never exceeded max_size, the guard is untested",
             );
 
-            let remaining = match &chunk {
-                TimeSeriesChunk::Gorilla(c) => c.remaining_capacity(),
-                TimeSeriesChunk::Chimp(c) => c.remaining_capacity(),
-                TimeSeriesChunk::Uncompressed(_) => unreachable!(),
-            };
-            assert_eq!(remaining, 0, "{chunk_type:?}: remaining capacity wrapped");
+            assert_eq!(
+                chunk.estimate_remaining_sample_capacity(),
+                0,
+                "{chunk_type:?}: remaining capacity wrapped"
+            );
         }
     }
 

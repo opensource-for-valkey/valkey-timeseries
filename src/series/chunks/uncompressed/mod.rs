@@ -319,7 +319,7 @@ impl ChunkOps for UncompressedChunk {
 
     fn add_sample(&mut self, sample: &Sample) -> TsdbResult<()> {
         if self.is_full() {
-            return Err(TsdbError::CapacityFull(MAX_UNCOMPRESSED_SAMPLES));
+            return Err(TsdbError::CapacityFull(self.max_elements));
         }
         self.samples.push(*sample);
         Ok(())
@@ -428,10 +428,7 @@ impl ChunkOps for UncompressedChunk {
 }
 
 impl Chunk for UncompressedChunk {
-    fn split(&mut self) -> TsdbResult<Self>
-    where
-        Self: Sized,
-    {
+    fn split(&mut self) -> TsdbResult<Self> {
         if self.samples.is_empty() {
             return Ok(self.clone());
         }
