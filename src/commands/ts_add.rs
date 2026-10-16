@@ -154,7 +154,7 @@ fn handle_add(
     // without a sample the primary keeps. The replica re-runs the same compaction on replay.
     if !ignored
         && !series.rules.is_empty()
-        && let Err(err) = series.compact_sample(ctx, Sample::new(ts, value), last_ts)
+        && let Err(err) = series.compact_sample(ctx, sample, last_ts)
     {
         let key = &args[1];
         ctx.log_warning(&format!(
@@ -167,7 +167,7 @@ fn handle_add(
     }
 
     replicate_and_notify(ctx, &args, replication_timestamp, created);
-    Ok(ValkeyValue::Integer(ts))
+    Ok(ValkeyValue::Integer(sample.timestamp))
 }
 
 /// Propagates the write. `timestamp` is the resolved timestamp when the client sent `*`, which
