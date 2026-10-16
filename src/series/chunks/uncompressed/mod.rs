@@ -332,7 +332,7 @@ impl ChunkOps for UncompressedChunk {
             .unwrap_or_default())
     }
 
-    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<usize> {
+    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<bool> {
         let ts = sample.timestamp;
 
         let count = self.samples.len();
@@ -348,13 +348,7 @@ impl ChunkOps for UncompressedChunk {
             }
         }
 
-        // The chunk's *new* sample count, not the delta: callers derive the delta themselves by
-        // subtracting the length they observed beforehand (see `Chunk::upsert_sample`, and
-        // `TimeSeries::upsert_sample` which does `size - old_size`). Returning the delta here
-        // made that subtraction yield 0, so an out-of-order insert into an UNCOMPRESSED series
-        // never incremented `total_samples` — the series eventually reported itself empty while
-        // still holding samples, and TS.DEL then silently skipped them.
-        Ok(self.len())
+        Ok(self.len() > count)
     }
 
     fn merge_samples(
@@ -879,8 +873,8 @@ mod tests {
         ];
         let mut chunk = UncompressedChunk::new(1000, &samples);
 
-        // `upsert_sample` returns the chunk's sample count *after* the upsert (see the
-        // `Chunk` trait), so a duplicate leaves it unchanged rather than reporting 0.
+        // `upsert_sample` returns `true` for an insert and `false` for an update of an
+        // existing timestamp; `len()` is checked alongside.
         // Test 1: Upsert a new sample at the end
         let result = chunk
             .upsert_sample(
@@ -891,7 +885,8 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 4);
+        assert!(result);
+        assert_eq!(chunk.len(), 4);
         assert_eq!(
             chunk.samples,
             vec![
@@ -924,7 +919,8 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 5);
+        assert!(result);
+        assert_eq!(chunk.len(), 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -961,7 +957,8 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 5);
+        assert!(!result);
+        assert_eq!(chunk.len(), 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -998,7 +995,8 @@ mod tests {
                 DuplicatePolicy::KeepFirst,
             )
             .unwrap();
-        assert_eq!(result, 5);
+        assert!(!result);
+        assert_eq!(chunk.len(), 5);
         assert_eq!(
             chunk.samples,
             vec![
@@ -1035,7 +1033,8 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 6);
+        assert!(result);
+        assert_eq!(chunk.len(), 6);
         assert_eq!(
             chunk.samples,
             vec![
@@ -1077,7 +1076,8 @@ mod tests {
                 DuplicatePolicy::KeepLast,
             )
             .unwrap();
-        assert_eq!(result, 1);
+        assert!(result);
+        assert_eq!(empty_chunk.len(), 1);
         assert_eq!(
             empty_chunk.samples,
             vec![Sample {

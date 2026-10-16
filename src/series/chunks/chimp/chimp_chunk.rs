@@ -131,13 +131,13 @@ impl ChunkOps for ChimpChunk {
         Ok(self.range_iter(start, end).collect())
     }
 
-    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<usize> {
+    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<bool> {
         let ts = sample.timestamp;
         let mut duplicate_found = false;
         let count = self.len();
         if count == 0 {
             self.add_sample(&sample)?;
-            return Ok(1);
+            return Ok(true);
         }
 
         let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
@@ -176,8 +176,7 @@ impl ChunkOps for ChimpChunk {
         }
 
         self.encoder = encoder;
-        let size = if duplicate_found { count } else { count + 1 };
-        Ok(size)
+        Ok(!duplicate_found)
     }
 
     fn merge_samples(

@@ -1856,6 +1856,27 @@ mod tests {
     /// a 20,000-sample series before `seal_chunk` was wired into the append path. The tail is
     /// deliberately left alone: it is still the append target.
     #[test]
+    fn test_total_samples_tracks_out_of_order_and_duplicate_adds_per_encoding() {
+        for encoding in [
+            ChunkEncoding::Uncompressed,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Chimp,
+        ] {
+            let mut ts = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                ..Default::default()
+            })
+            .unwrap();
+            ts.add(100, 1.0, None);
+            ts.add(300, 3.0, None);
+            ts.add(200, 2.0, None);
+            assert_eq!(ts.total_samples, 3, "{encoding:?}: out-of-order add");
+            ts.add(200, 9.0, Some(DuplicatePolicy::KeepLast));
+            assert_eq!(ts.total_samples, 3, "{encoding:?}: duplicate add");
+        }
+    }
+
+    #[test]
     fn test_sealed_chunks_do_not_hold_spare_capacity() {
         for encoding in [
             ChunkEncoding::Gorilla,

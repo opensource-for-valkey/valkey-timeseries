@@ -187,11 +187,14 @@ impl TimeSeriesChunk {
         &mut self,
         sample: Sample,
         policy: DuplicatePolicy,
-    ) -> (usize, SampleAddResult) {
+    ) -> (bool, SampleAddResult) {
         match self.upsert_sample(sample, policy) {
-            Ok(size) => (size, SampleAddResult::Ok(sample)),
-            Err(TsdbError::DuplicateSample(_)) => (0, SampleAddResult::Duplicate),
-            Err(_) => (0, SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE)),
+            Ok(inserted) => (inserted, SampleAddResult::Ok(sample)),
+            Err(TsdbError::DuplicateSample(_)) => (false, SampleAddResult::Duplicate),
+            Err(_) => (
+                false,
+                SampleAddResult::Error(error_consts::CANNOT_ADD_SAMPLE),
+            ),
         }
     }
 

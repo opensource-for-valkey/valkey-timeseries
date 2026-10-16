@@ -118,12 +118,13 @@ fn test_upsert_duplicate_applies_policy() {
         timestamp: samples[4].timestamp,
         value: 12345.678,
     };
-    assert_eq!(
-        chunk
+    assert!(
+        !chunk
             .upsert_sample(replacement, DuplicatePolicy::KeepLast)
             .unwrap(),
-        samples.len()
+        "replacing an existing timestamp is an update, not an insert"
     );
+    assert_eq!(chunk.len(), samples.len());
 
     let decoded = decompress(&chunk);
     assert_eq!(decoded.len(), samples.len());

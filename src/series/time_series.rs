@@ -435,10 +435,9 @@ impl TimeSeries {
 
         // if chunk can accept the sample without splitting, do it directly
         if !chunk.should_split() {
-            let old_size = chunk.len();
-            let (size, res) = chunk.upsert(sample, duplicate_policy);
+            let (inserted, res) = chunk.upsert(sample, duplicate_policy);
             if res.is_ok() {
-                self.total_samples += size.saturating_sub(old_size);
+                self.total_samples += usize::from(inserted);
                 if is_last {
                     self.update_last_sample();
                 }
@@ -457,14 +456,10 @@ impl TimeSeries {
                 // An empty upper half (splitting a single-sample chunk) owns nothing.
                 let into_new =
                     new_chunk.len() > 0 && sample.timestamp >= new_chunk.first_timestamp();
-                let (added, res) = if into_new {
-                    let old_size = new_chunk.len();
-                    let (size, res) = new_chunk.upsert(sample, duplicate_policy);
-                    (size.saturating_sub(old_size), res)
+                let (inserted, res) = if into_new {
+                    new_chunk.upsert(sample, duplicate_policy)
                 } else {
-                    let old_size = chunk.len();
-                    let (size, res) = chunk.upsert(sample, duplicate_policy);
-                    (size.saturating_sub(old_size), res)
+                    chunk.upsert(sample, duplicate_policy)
                 };
                 // `chunk`'s borrow ends here; `self` is usable again below.
 
@@ -487,7 +482,7 @@ impl TimeSeries {
                 // make its expired prefix due, so a trim here could drop more samples than this
                 // insert adds — hiding the insert from the count comparisons that wake
                 // `TS.READ` readers, and trimming ahead of batch compaction.
-                self.total_samples += added;
+                self.total_samples += usize::from(inserted);
                 // The insert above shifts chunk positions, so recompute both ends rather than
                 // relying on the pre-split `is_last`.
                 self.update_first_last_timestamps();

@@ -1123,6 +1123,36 @@ mod tests {
     }
 
     #[test]
+    fn test_upsert_reports_insert_versus_update() {
+        for chunk_type in CHUNK_TYPES {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            let policy = DuplicatePolicy::KeepLast;
+            assert!(
+                chunk.upsert_sample(Sample::new(100, 1.0), policy).unwrap(),
+                "{chunk_type:?}"
+            );
+            assert!(
+                chunk.upsert_sample(Sample::new(300, 3.0), policy).unwrap(),
+                "{chunk_type:?}"
+            );
+            assert!(
+                chunk.upsert_sample(Sample::new(200, 2.0), policy).unwrap(),
+                "{chunk_type:?}"
+            );
+            assert!(
+                !chunk.upsert_sample(Sample::new(200, 9.0), policy).unwrap(),
+                "{chunk_type:?}"
+            );
+            assert_eq!(chunk.len(), 3, "{chunk_type:?}");
+            assert_eq!(
+                chunk.get_range(200, 200).unwrap()[0].value,
+                9.0,
+                "{chunk_type:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {
             let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);

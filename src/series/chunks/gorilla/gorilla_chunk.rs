@@ -158,13 +158,13 @@ impl ChunkOps for GorillaChunk {
         Ok(samples)
     }
 
-    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<usize> {
+    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<bool> {
         let ts = sample.timestamp;
         let mut duplicate_found = false;
         let count = self.len();
         if count == 0 {
             self.add_sample(&sample)?;
-            return Ok(1);
+            return Ok(true);
         }
         let mut xor_encoder = GorillaEncoder::with_soft_cap(self.max_size);
         let mut iter = self.encoder.iter();
@@ -205,8 +205,7 @@ impl ChunkOps for GorillaChunk {
         }
 
         self.encoder = xor_encoder;
-        let size = if duplicate_found { count } else { count + 1 };
-        Ok(size)
+        Ok(!duplicate_found)
     }
 
     fn merge_samples(
