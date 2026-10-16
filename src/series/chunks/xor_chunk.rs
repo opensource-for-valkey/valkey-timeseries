@@ -27,6 +27,15 @@ use std::mem::size_of;
 use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyResult};
 
+/// The most a partial range read reserves before decoding, in samples (4 KiB).
+///
+/// A partial window's size is estimated from its share of the chunk's time span, which
+/// assumes evenly spread samples. Uneven timestamps break that: a window inside a long gap
+/// holds nothing yet covers most of the span, and an uncapped estimate reserved ~1.28 MB for
+/// an empty result on a 64 KiB chunk. Past the cap the vector grows by doubling, so a large
+/// partial read pays a few amortized regrowths instead of a worst-case speculative reserve.
+pub const PARTIAL_RANGE_RESERVE_CAP: usize = 256;
+
 /// A sequential sample codec: what a compressed encoding supplies to [`XorChunk`].
 pub trait SampleCodec: Clone + Debug + PartialEq + Hash + GetSize + Sized {
     /// Decodes every sample from the start of the stream, reporting errors in-band.
@@ -197,18 +206,31 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
     }
 
     fn get_range(&self, start: Timestamp, end: Timestamp) -> TsdbResult<Vec<Sample>> {
-        if self.is_empty() {
+        // A window that misses the chunk needs neither a decode nor an allocation.
+        if self.is_empty()
+            || start > end
+            || end < self.first_timestamp()
+            || start > self.last_timestamp()
+        {
             return Ok(vec![]);
         }
 
-        // Size the result from the requested window's share of the chunk's span, so a
-        // full-chunk read allocates exactly once instead of regrowing ~10 times.
+        // A full-chunk read reserves exactly the sample count, so it allocates once instead
+        // of regrowing ~10 times. A partial read only knows an estimate, which uneven
+        // timestamps can inflate up to the whole chunk, so it reserves at most
+        // `PARTIAL_RANGE_RESERVE_CAP` and grows from there.
         //
         // The sample count is persisted, so a corrupt RDB or serialized chunk can carry an
         // absurd count. `Vec::with_capacity` aborts the process on capacity overflow or
         // allocation failure; `try_reserve_exact` turns both into a decoding error that
         // `load_rdb`, `deserialize` and the range readers already propagate.
-        let estimate = self.estimate_samples_in(start, end);
+        let covers_chunk = start <= self.first_timestamp() && end >= self.last_timestamp();
+        let estimate = if covers_chunk {
+            self.len()
+        } else {
+            self.estimate_samples_in(start, end)
+                .min(PARTIAL_RANGE_RESERVE_CAP)
+        };
         let mut samples = Vec::new();
         samples.try_reserve_exact(estimate).map_err(|e| {
             TsdbError::DecodingError(format!(

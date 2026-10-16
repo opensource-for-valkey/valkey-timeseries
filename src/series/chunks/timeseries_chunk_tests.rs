@@ -7,7 +7,10 @@ mod tests {
     use crate::series::chunks::merge::merge_by_capacity;
     use crate::series::{
         DuplicatePolicy, SampleAddResult,
-        chunks::{Chunk, ChunkEncoding, ChunkOps, MIN_CHUNK_SIZE, TimeSeriesChunk},
+        chunks::{
+            Chunk, ChunkEncoding, ChunkOps, MIN_CHUNK_SIZE, PARTIAL_RANGE_RESERVE_CAP,
+            TimeSeriesChunk,
+        },
     };
     use crate::tests::chunk_utils::encoded_size;
     use crate::tests::generators::{DataGenerator, ValueWorkload};
@@ -1163,6 +1166,83 @@ mod tests {
                 "{chunk_type:?}"
             );
             assert_eq!(chunk.iter().count(), 64, "{chunk_type:?}");
+        }
+    }
+
+    /// Two dense clusters, 1 ms apart inside each, separated by an ~11-day gap: the shape that
+    /// defeats an evenly-spread density estimate.
+    fn clustered_samples() -> Vec<Sample> {
+        let left = (0..40_000i64).map(|i| Sample::new(1_000 + i, 1.0));
+        let right = (0..40_000i64).map(|i| Sample::new(1_000_000_000 + i, 1.0));
+        left.chain(right).collect()
+    }
+
+    /// A window inside the gap holds no samples, but covers almost all of the chunk's span. A
+    /// density estimate reserved ~1.28 MB here for an empty result; partial reads may only
+    /// reserve speculatively up to `PARTIAL_RANGE_RESERVE_CAP`.
+    #[test]
+    fn test_gap_window_range_read_reserves_at_most_the_cap() {
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 64 * 1024);
+            chunk.set_data(&clustered_samples()).unwrap();
+            let (lo, hi) = (
+                chunk.first_timestamp() + 40_000,
+                chunk.last_timestamp() - 40_000,
+            );
+
+            let got = chunk.get_range(lo, hi).unwrap();
+
+            assert!(got.is_empty(), "{chunk_type:?}");
+            assert!(
+                got.capacity() <= PARTIAL_RANGE_RESERVE_CAP,
+                "{chunk_type:?}: reserved {} samples for an empty gap window",
+                got.capacity()
+            );
+        }
+    }
+
+    /// A full-chunk read keeps its exact, single allocation.
+    #[test]
+    fn test_full_window_range_read_reserves_exactly_the_sample_count() {
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 64 * 1024);
+            chunk.set_data(&clustered_samples()).unwrap();
+
+            let got = chunk.get_range(i64::MIN, i64::MAX).unwrap();
+
+            assert_eq!(got.len(), chunk.len(), "{chunk_type:?}");
+            assert_eq!(got.capacity(), chunk.len(), "{chunk_type:?}");
+        }
+    }
+
+    /// Capping the reservation must not change what a partial read returns, whether the
+    /// window misses the chunk, straddles a cluster edge, or spans more than the cap.
+    #[test]
+    fn test_partial_range_reads_return_the_samples_in_the_window() {
+        let samples = clustered_samples();
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 64 * 1024);
+            chunk.set_data(&samples).unwrap();
+            for (lo, hi) in [
+                (0, 999),                  // before the chunk
+                (2_000_000_000, i64::MAX), // after the chunk
+                (40_000, 999_999_999),     // inside the gap
+                (40_900, 1_000_000_099),   // straddles both cluster edges
+                (5_000, 25_000),           // well past the cap
+                (500, 1_009),              // clips the first sample
+                (20_000, 10_000),          // inverted
+            ] {
+                let expected: Vec<Sample> = samples
+                    .iter()
+                    .copied()
+                    .filter(|s| s.timestamp >= lo && s.timestamp <= hi)
+                    .collect();
+                assert_eq!(
+                    chunk.get_range(lo, hi).unwrap(),
+                    expected,
+                    "{chunk_type:?} [{lo}, {hi}]"
+                );
+            }
         }
     }
 

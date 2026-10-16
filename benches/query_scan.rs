@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::time::Duration;
-use valkey_timeseries::common::Timestamp;
+use valkey_timeseries::common::{Sample, Timestamp};
 use valkey_timeseries::series::ValueFilter;
-use valkey_timeseries::series::chunks::{ChunkEncoding, ChunkOps};
+use valkey_timeseries::series::chunks::{ChunkEncoding, ChunkOps, TimeSeriesChunk};
 
 mod support;
 
@@ -157,5 +157,58 @@ fn bench_filtered_scan(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_scan, bench_filtered_scan);
+/// Samples per cluster in the `range_gap` dataset.
+const GAP_CLUSTER_SAMPLES: i64 = 8_000;
+/// Where the second cluster starts: ~11.6 days after the first, at a 1 s cadence.
+const GAP_RIGHT_START: Timestamp = 1_000_000_000;
+
+/// `range_gap` group: `get_range` on a chunk whose samples sit in two dense clusters with a
+/// long gap between them, the shape that defeats a density estimate based on time span.
+///
+/// - `gap`: a window inside the gap, so the result is empty.
+/// - `edge`: a window straddling the start of the second cluster (100 samples).
+/// - `cluster`: the whole first cluster plus most of the gap, a large partial read.
+/// - `full`: the whole chunk.
+///
+/// Times only; the allocation bound is pinned by
+/// `test_gap_window_range_read_reserves_at_most_the_cap`.
+fn bench_range_gap(c: &mut Criterion) {
+    let mut group = c.benchmark_group("range_gap");
+    group.measurement_time(Duration::from_secs(2));
+
+    let samples: Vec<Sample> = (0..GAP_CLUSTER_SAMPLES)
+        .map(|i| (i * 1000, i))
+        .chain((0..GAP_CLUSTER_SAMPLES).map(|i| (GAP_RIGHT_START + i * 1000, i)))
+        .map(|(timestamp, i)| Sample::new(timestamp, 100.0 + (i % 97) as f64 * 0.25))
+        .collect();
+    let left_end = (GAP_CLUSTER_SAMPLES - 1) * 1000;
+    let cases: [(&str, Timestamp, Timestamp); 4] = [
+        ("gap", left_end + 1, GAP_RIGHT_START - 1),
+        ("edge", GAP_RIGHT_START - 50_000, GAP_RIGHT_START + 99_000),
+        ("cluster", 0, GAP_RIGHT_START - 1),
+        ("full", Timestamp::MIN, Timestamp::MAX),
+    ];
+
+    for encoding in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+        let mut chunk = TimeSeriesChunk::new(encoding, CHUNK_SIZE_64K);
+        chunk.set_data(&samples).expect("gap dataset should encode");
+
+        for (case, start, end) in cases {
+            let bench_id = format!("{}/two_clusters/64k/{case}", encoding.name());
+            group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
+                b.iter(|| {
+                    std::hint::black_box(
+                        chunk
+                            .get_range(start, end)
+                            .expect("get_range should succeed"),
+                    )
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_scan, bench_filtered_scan, bench_range_gap);
 criterion_main!(benches);
