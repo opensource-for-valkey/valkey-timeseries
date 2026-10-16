@@ -266,7 +266,6 @@ impl ChunkOps for ChimpChunk {
     }
 
     fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()> {
-        debug_assert!(!samples.is_empty());
         self.compress(samples)
     }
 }

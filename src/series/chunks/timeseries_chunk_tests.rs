@@ -1078,6 +1078,55 @@ mod tests {
     }
 
     #[test]
+    fn test_set_data_with_empty_slice_empties_the_chunk() {
+        for chunk_type in CHUNK_TYPES {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            chunk.set_data(&generate_random_samples(50)).unwrap();
+            chunk.set_data(&[]).unwrap();
+            assert!(chunk.is_empty(), "{chunk_type:?}");
+            assert_eq!(chunk.len(), 0, "{chunk_type:?}");
+        }
+    }
+
+    /// `merge_by_capacity`'s partial branch: the retention floor clips the source to fewer
+    /// samples than `dest` can take, so `split_at` leaves nothing for `src.set_data`.
+    #[test]
+    fn test_merge_by_capacity_partial_merge_with_clipped_source() {
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut dest = TimeSeriesChunk::new(chunk_type, 4096);
+            let mut ts = 1000i64;
+            loop {
+                dest.add_sample(&Sample {
+                    timestamp: ts,
+                    value: (ts % 97) as f64 * 1.37,
+                })
+                .unwrap();
+                ts += 1000;
+                let r = dest.estimate_remaining_sample_capacity();
+                if dest.len() >= 16 && (4..=40).contains(&r) {
+                    break;
+                }
+                assert!(!dest.is_full());
+            }
+            let r = dest.estimate_remaining_sample_capacity();
+            let n = 2 * r; // r < n and r > n / 4: partial branch
+            let mut src = TimeSeriesChunk::new(chunk_type, 4096);
+            for i in 0..n {
+                src.add_sample(&Sample {
+                    timestamp: ts + i as i64 * 1000,
+                    value: i as f64,
+                })
+                .unwrap();
+            }
+            let keep = (r / 2).max(1); // survivors fit entirely in dest
+            let min_timestamp = ts + (n - keep) as i64 * 1000;
+            let merged = merge_by_capacity(&mut dest, &mut src, min_timestamp, None).unwrap();
+            assert_eq!(merged, Some(keep), "{chunk_type:?}");
+            assert!(src.is_empty(), "{chunk_type:?}: source should be drained");
+        }
+    }
+
+    #[test]
     fn test_merge_by_capacity_partial_merge() {
         let mut dest_chunk = TimeSeriesChunk::new(ChunkEncoding::Uncompressed, 1024);
         let mut src_chunk = TimeSeriesChunk::new(ChunkEncoding::Uncompressed, 1024);

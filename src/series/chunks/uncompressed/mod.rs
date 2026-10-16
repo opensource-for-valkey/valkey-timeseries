@@ -431,7 +431,6 @@ impl ChunkOps for UncompressedChunk {
 
     fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()> {
         self.samples = samples.to_vec();
-        // todo: complain if size > max_size
         Ok(())
     }
 }

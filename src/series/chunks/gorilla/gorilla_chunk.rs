@@ -294,10 +294,7 @@ impl ChunkOps for GorillaChunk {
     }
 
     fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()> {
-        debug_assert!(!samples.is_empty());
-        self.compress(samples)?;
-        // todo: complain if size > max_size
-        Ok(())
+        self.compress(samples)
     }
 }
 

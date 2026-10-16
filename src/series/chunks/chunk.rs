@@ -149,6 +149,8 @@ pub trait ChunkOps {
     /// should fall back to a conservative constant in that case.
     fn bytes_per_sample(&self) -> usize;
     fn clear(&mut self);
+    /// Replace the chunk's contents with `samples` (sorted ascending, may be empty — an empty
+    /// slice empties the chunk). `max_size` is not enforced here; see `TimeSeries::needs_split`.
     fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()>;
 }
 
