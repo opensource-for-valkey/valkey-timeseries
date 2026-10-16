@@ -1,338 +1,80 @@
+//! Gorilla XOR encoding as a [`SampleCodec`]; the chunk itself is [`XorChunk`].
+
 use super::{GorillaEncoder, GorillaIterator};
-use crate::common::encoding::{try_read_uvarint, write_uvarint};
-use crate::common::logging::log_warning;
-use crate::common::rdb::{rdb_load_usize, rdb_save_usize};
 use crate::common::{Sample, Timestamp};
-use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
-use crate::error::{TsdbError, TsdbResult};
+use crate::error::TsdbResult;
 use crate::iterators::SampleIter;
-use crate::series::chunks::chunk::{Chunk, ChunkOps};
-use crate::series::chunks::merge::{append_samples, merge_chunk_samples};
+use crate::series::chunks::chunk::ChunkEncoding;
 use crate::series::chunks::range_iter::RangeFiltered;
-use crate::series::{DuplicatePolicy, SampleAddResult};
-use get_size2::GetSize;
-use std::mem::size_of;
+use crate::series::chunks::xor_chunk::{SampleCodec, XorChunk};
 use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyResult};
 
-/// `GorillaChunk` is a chunk of timeseries data encoded using Gorilla XOR encoding.
-#[derive(Debug, Clone, PartialEq, Hash, GetSize)]
-pub struct GorillaChunk {
-    pub(crate) encoder: GorillaEncoder,
-    pub max_size: usize,
-}
-
-impl Default for GorillaChunk {
-    fn default() -> Self {
-        Self::with_max_size(DEFAULT_CHUNK_SIZE_BYTES)
-    }
-}
-
-impl GorillaChunk {
-    pub fn with_max_size(max_size: usize) -> Self {
-        Self {
-            encoder: GorillaEncoder::with_soft_cap(max_size),
-            max_size,
-        }
-    }
-
-    fn compress(&mut self, samples: &[Sample]) -> TsdbResult {
-        let mut encoder = GorillaEncoder::with_soft_cap(self.max_size);
-        for sample in samples {
-            push_sample(&mut encoder, sample)?;
-        }
-        self.encoder = encoder;
-        Ok(())
-    }
-
-    /// Bytes of encoded data. This is what `max_size` bounds, what `TS.INFO DEBUG` reports as a
-    /// chunk's `size`, and what `bytes_per_sample` amortizes.
-    ///
-    /// It deliberately excludes the writer's spare capacity and the encoder's own stack bytes.
-    /// The bit stream grows by doubling, so counting `Vec::capacity` reported up to ~2x the data
-    /// actually held: a chunk created with `CHUNK_SIZE 4096` reported 8288. `is_full` has always
-    /// measured the payload, and `UncompressedChunk::size` is likewise `len`-based, so the three
-    /// now agree. It also fed `utilization`, and so `should_split` -- which only governs an
-    /// upsert into an already-sealed chunk; the append path is gated by `is_full` and was
-    /// unaffected. The full allocation is still reported by `memory_usage`, which is what
-    /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
-    pub fn data_size(&self) -> usize {
-        self.encoder.buf().len()
-    }
-
-    /// How many of this chunk's samples fall in `[start, end]`, assuming they are spread
-    /// evenly over its span. Exact for a window that covers the chunk; an estimate for a
-    /// partial one, and never more than `len`.
-    fn estimate_samples_in(&self, start: Timestamp, end: Timestamp) -> usize {
-        let len = self.len();
-        let first = self.first_timestamp();
-        let last = self.last_timestamp();
-        if start <= first && end >= last {
-            return len;
-        }
-        let lo = start.max(first);
-        let hi = end.min(last);
-        if lo > hi {
-            return 0;
-        }
-        let span = last.saturating_sub(first).max(1) as u128;
-        let part = (hi - lo) as u128 + 1;
-        ((len as u128 * part / span) as usize + 1).min(len)
-    }
-}
-
-impl ChunkOps for GorillaChunk {
-    fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        GorillaChunkIterator::new(self.encoder.iter(), start_ts, end_ts).into()
-    }
-
-    fn first_timestamp(&self) -> Timestamp {
-        self.encoder.first_ts
-    }
-    fn last_timestamp(&self) -> Timestamp {
-        self.encoder.last_ts
-    }
-    fn len(&self) -> usize {
-        self.encoder.num_samples
-    }
-    fn last_value(&self) -> f64 {
-        self.encoder.last_value
-    }
-    fn size(&self) -> usize {
-        self.data_size()
-    }
-    fn max_size(&self) -> usize {
-        self.max_size
-    }
-
-    fn remove_range(&mut self, start_ts: Timestamp, end_ts: Timestamp) -> TsdbResult<usize> {
-        if self.is_empty() || start_ts > self.last_timestamp() || end_ts < self.first_timestamp() {
-            return Ok(0);
-        }
-
-        let mut new_encoder = GorillaEncoder::with_soft_cap(self.max_size);
-        let saved_count = self.len();
-
-        for value in self.encoder.iter() {
-            let sample = value?;
-            if sample.timestamp >= start_ts && sample.timestamp <= end_ts {
-                continue;
-            }
-            push_sample(&mut new_encoder, &sample)?;
-        }
-
-        self.encoder = new_encoder;
-        Ok(saved_count - self.len())
-    }
-
-    fn add_sample(&mut self, sample: &Sample) -> TsdbResult {
-        // if self.is_full() {
-        //     return Err(TsdbError::CapacityFull(self.max_size));
-        // }
-        push_sample(&mut self.encoder, sample)
-    }
-
-    fn get_range(&self, start: Timestamp, end: Timestamp) -> TsdbResult<Vec<Sample>> {
-        if self.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Size the result from the requested window's share of the chunk's span, so a
-        // full-chunk read allocates exactly once instead of regrowing ~10 times.
-        //
-        // `num_samples` is persisted, so a corrupt RDB or serialized chunk can carry an
-        // absurd count. `Vec::with_capacity` aborts the process on capacity overflow or
-        // allocation failure; `try_reserve_exact` turns both into a decoding error that
-        // `load_rdb`, `deserialize` and the range readers already propagate.
-        let estimate = self.estimate_samples_in(start, end);
-        let mut samples = Vec::new();
-        samples.try_reserve_exact(estimate).map_err(|e| {
-            TsdbError::DecodingError(format!(
-                "cannot reserve {estimate} samples for gorilla chunk range: {e}"
-            ))
-        })?;
-        samples.extend(self.range_iter(start, end));
-        Ok(samples)
-    }
-
-    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<bool> {
-        let ts = sample.timestamp;
-        let mut duplicate_found = false;
-        let count = self.len();
-        if count == 0 {
-            self.add_sample(&sample)?;
-            return Ok(true);
-        }
-        let mut xor_encoder = GorillaEncoder::with_soft_cap(self.max_size);
-        let mut iter = self.encoder.iter();
-        if ts < self.first_timestamp() {
-            // add a sample to the beginning
-            push_sample(&mut xor_encoder, &sample)?;
-            // Add all existing samples after the new one
-            for item in iter {
-                let current = item?;
-                push_sample(&mut xor_encoder, &current)?;
-            }
-        } else {
-            let mut current = Sample::default();
-            // add previous samples
-            for item in iter.by_ref() {
-                current = item?;
-                if current.timestamp >= ts {
-                    break;
-                }
-                push_sample(&mut xor_encoder, &current)?;
-            }
-            if current.timestamp == ts {
-                duplicate_found = true;
-                current.value = dp_policy.duplicate_value(ts, current.value, sample.value)?;
-                push_sample(&mut xor_encoder, &current)?;
-            } else {
-                push_sample(&mut xor_encoder, &sample)?;
-                // Add the current sample that caused the break (if it exists and is valid)
-                if current.timestamp > ts {
-                    push_sample(&mut xor_encoder, &current)?;
-                }
-            }
-
-            for item in iter {
-                let current = item?;
-                push_sample(&mut xor_encoder, &current)?;
-            }
-        }
-
-        self.encoder = xor_encoder;
-        Ok(!duplicate_found)
-    }
-
-    fn merge_samples(
-        &mut self,
-        samples: &[Sample],
-        dp_policy: Option<DuplicatePolicy>,
-    ) -> TsdbResult<Vec<SampleAddResult>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // We assume that samples are sorted. Try to optimize by seeing if all samples are past the
-        // current chunk's last timestamp.
-        let first = samples[0];
-        if self.is_empty() || first.timestamp > self.last_timestamp() {
-            return append_samples(self, samples);
-        }
-
-        let mut encoder = GorillaEncoder::with_soft_cap(self.max_size);
-        let result = merge_chunk_samples(self.iter(), samples, dp_policy, |sample| {
-            push_sample(&mut encoder, &sample)
-        })?;
-
-        self.encoder = encoder;
-        Ok(result)
-    }
-
-    fn optimize(&mut self) -> TsdbResult {
-        self.encoder.shrink_to_fit();
-        Ok(())
-    }
-
-    fn is_full(&self) -> bool {
-        let data_size = self.encoder.buf().len();
-        data_size >= self.max_size
-    }
-
-    fn bytes_per_sample(&self) -> usize {
-        use crate::series::chunks::MIN_SAMPLES_FOR_BPS_ESTIMATE;
-        let count = self.len();
-        if count < MIN_SAMPLES_FOR_BPS_ESTIMATE {
-            return size_of::<Sample>() / 2;
-        }
-        // At least one byte: a flat series compresses to well under a byte per sample, and a
-        // ratio floored to zero made every capacity estimate zero — so each MADD/ADDBULK batch
-        // on such a series opened a chunk of its own.
-        (self.data_size() / count).max(1)
-    }
-
-    fn clear(&mut self) {
-        self.encoder.clear();
-    }
-
-    fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()> {
-        self.compress(samples)
-    }
-}
-
-impl Chunk for GorillaChunk {
-    fn split(&mut self) -> TsdbResult<Self> {
-        let mut left_chunk = GorillaEncoder::with_soft_cap(self.max_size);
-        // `with_max_size`, not `default()`: the upper half has to inherit the budget the series
-        // was created with. `default()` stamps `DEFAULT_CHUNK_SIZE_BYTES` on it, silently
-        // discarding the user's `CHUNK_SIZE` -- and `save_rdb` writes `max_size` out, so the
-        // wrong budget survives a reload. `ChimpChunk::split` already inherits it.
-        let mut right_chunk = GorillaChunk::with_max_size(self.max_size);
-
-        if self.is_empty() {
-            return Ok(self.clone());
-        }
-
-        let mid = self.len() / 2;
-        for (i, value) in self.encoder.iter().enumerate() {
-            let sample = value?;
-            if i < mid {
-                // todo: handle min and max timestamps
-                push_sample(&mut left_chunk, &sample)?;
-            } else {
-                push_sample(&mut right_chunk.encoder, &sample)?;
-            }
-        }
-        self.encoder = left_chunk;
-        Ok(right_chunk)
-    }
-
-    fn save_rdb(&self, rdb: *mut RedisModuleIO) {
-        rdb_save_usize(rdb, self.max_size);
-        self.encoder.rdb_save(rdb);
-    }
-
-    fn load_rdb(rdb: *mut RedisModuleIO, _enc_ver: i32) -> ValkeyResult<Self> {
-        let max_size = rdb_load_usize(rdb)?;
-        let mut encoder = GorillaEncoder::rdb_load(rdb)?;
-        encoder.set_soft_cap(max_size);
-        let chunk = GorillaChunk { encoder, max_size };
-        Ok(chunk)
-    }
-
-    fn serialize(&self, dest: &mut Vec<u8>) {
-        write_uvarint(dest, self.max_size as u64);
-        self.encoder.serialize(dest);
-    }
-
-    fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
-        let mut buf = buf;
-        let max_size = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
-        let mut encoder = GorillaEncoder::deserialize(buf)?;
-        encoder.set_soft_cap(max_size as usize);
-        Ok(GorillaChunk {
-            encoder,
-            max_size: max_size as usize,
-        })
-    }
-
-    fn debug_digest(&self, dig: &mut Digest) {
-        self.encoder.debug_digest(dig);
-        dig.add_long_long(self.max_size as i64);
-    }
-}
-
-#[inline]
-fn push_sample(encoder: &mut GorillaEncoder, sample: &Sample) -> TsdbResult {
-    encoder.add_sample(sample).map_err(|e| {
-        // replace debug stderr output with structured logging
-        log_warning(format!("Error adding sample: {e:?}"));
-        TsdbError::CannotAddSample(*sample)
-    })
-}
+/// A chunk of timeseries data encoded using Gorilla XOR encoding.
+pub type GorillaChunk = XorChunk<GorillaEncoder>;
 
 pub type GorillaChunkIterator<'a> = RangeFiltered<GorillaIterator<'a>>;
+
+impl SampleCodec for GorillaEncoder {
+    type Iter<'a> = GorillaIterator<'a>;
+    const ENCODING: ChunkEncoding = ChunkEncoding::Gorilla;
+
+    fn with_soft_cap(max_size: usize) -> Self {
+        GorillaEncoder::with_soft_cap(max_size)
+    }
+    fn set_soft_cap(&mut self, max_size: usize) {
+        GorillaEncoder::set_soft_cap(self, max_size)
+    }
+    #[inline]
+    fn push(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.add_sample(sample)
+    }
+    fn iter(&self) -> GorillaIterator<'_> {
+        GorillaEncoder::iter(self)
+    }
+    fn bytes(&self) -> &[u8] {
+        self.buf()
+    }
+    fn len(&self) -> usize {
+        self.num_samples
+    }
+    fn first_timestamp(&self) -> Timestamp {
+        self.first_ts
+    }
+    fn last_timestamp(&self) -> Timestamp {
+        self.last_ts
+    }
+    fn last_value(&self) -> f64 {
+        self.last_value
+    }
+    fn clear(&mut self) {
+        GorillaEncoder::clear(self)
+    }
+    fn shrink_to_fit(&mut self) {
+        GorillaEncoder::shrink_to_fit(self)
+    }
+    fn rdb_save(&self, rdb: *mut RedisModuleIO) {
+        GorillaEncoder::rdb_save(self, rdb)
+    }
+    fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
+        Ok(GorillaEncoder::rdb_load(rdb)?)
+    }
+    fn serialize(&self, dest: &mut Vec<u8>) {
+        GorillaEncoder::serialize(self, dest)
+    }
+    fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
+        GorillaEncoder::deserialize(buf)
+    }
+    fn debug_digest(&self, dig: &mut Digest) {
+        GorillaEncoder::debug_digest(self, dig)
+    }
+    fn into_sample_iter<'a>(iter: RangeFiltered<GorillaIterator<'a>>) -> SampleIter<'a>
+    where
+        Self: 'a,
+    {
+        SampleIter::Gorilla(iter)
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,299 +1,80 @@
 //! `ChimpChunk`: a timeseries chunk whose values go through the ELF erasing
 //! layer on top of the Chimp XOR codec, with delta-of-delta timestamps
-//! interleaved in the same bit stream.
-//!
-//! The codec is sequential, so every mutation (`remove_range`, `upsert`,
-//! `merge`, `split`) re-encodes from an iterator rather than patching in place.
+//! interleaved in the same bit stream. The codec is a [`SampleCodec`]; the chunk
+//! itself is [`XorChunk`].
 
 use super::chimp_iterator::ChimpIterator;
 use super::compressor::ChimpCompressor;
-use crate::common::encoding::{try_read_uvarint, write_uvarint};
-use crate::common::logging::log_warning;
-use crate::common::rdb::{rdb_load_usize, rdb_save_usize};
 use crate::common::{Sample, Timestamp};
-use crate::config::DEFAULT_CHUNK_SIZE_BYTES;
-use crate::error::{TsdbError, TsdbResult};
+use crate::error::TsdbResult;
 use crate::iterators::SampleIter;
-use crate::series::chunks::chunk::{Chunk, ChunkOps};
-use crate::series::chunks::merge::{append_samples, merge_chunk_samples};
+use crate::series::chunks::chunk::ChunkEncoding;
 use crate::series::chunks::range_iter::RangeFiltered;
-use crate::series::{DuplicatePolicy, SampleAddResult};
-use get_size2::GetSize;
-use std::mem::size_of;
+use crate::series::chunks::xor_chunk::{SampleCodec, XorChunk};
 use valkey_module::digest::Digest;
 use valkey_module::{RedisModuleIO, ValkeyResult};
 
-#[derive(Debug, Clone, PartialEq, Hash, GetSize)]
-pub struct ChimpChunk {
-    pub(crate) encoder: ChimpCompressor,
-    pub max_size: usize,
-}
-
-impl Default for ChimpChunk {
-    fn default() -> Self {
-        Self::with_max_size(DEFAULT_CHUNK_SIZE_BYTES)
-    }
-}
-
-impl ChimpChunk {
-    pub fn with_max_size(max_size: usize) -> Self {
-        Self {
-            encoder: ChimpCompressor::with_soft_cap(max_size),
-            max_size,
-        }
-    }
-
-    fn compress(&mut self, samples: &[Sample]) -> TsdbResult {
-        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
-        for sample in samples {
-            push_sample(&mut encoder, sample)?;
-        }
-        self.encoder = encoder;
-        Ok(())
-    }
-
-    /// Bytes of encoded data. This is what `max_size` bounds, what `TS.INFO DEBUG` reports as a
-    /// chunk's `size`, and what `bytes_per_sample` amortizes.
-    ///
-    /// It deliberately excludes the writer's spare capacity and the encoder's own stack bytes.
-    /// The bit stream grows by doubling, so counting `Vec::capacity` reported up to ~2x the data
-    /// actually held: a chunk created with `CHUNK_SIZE 4096` reported 8288. `is_full` has always
-    /// measured the payload, and `UncompressedChunk::size` is likewise `len`-based, so the three
-    /// now agree. It also fed `utilization`, and so `should_split` -- which only governs an
-    /// upsert into an already-sealed chunk; the append path is gated by `is_full` and was
-    /// unaffected. The full allocation is still reported by `memory_usage`, which is what
-    /// `MEMORY USAGE` and `TS.INFO memoryUsage` read.
-    pub fn data_size(&self) -> usize {
-        self.encoder.bytes().len()
-    }
-}
-
-impl ChunkOps for ChimpChunk {
-    fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        ChimpChunkIterator::new(self.encoder.iter(), start_ts, end_ts).into()
-    }
-
-    fn first_timestamp(&self) -> Timestamp {
-        self.encoder.first_timestamp()
-    }
-
-    fn last_timestamp(&self) -> Timestamp {
-        self.encoder.last_timestamp()
-    }
-
-    fn len(&self) -> usize {
-        self.encoder.count() as usize
-    }
-
-    fn last_value(&self) -> f64 {
-        self.encoder.last_value()
-    }
-
-    fn size(&self) -> usize {
-        self.data_size()
-    }
-
-    fn max_size(&self) -> usize {
-        self.max_size
-    }
-
-    fn remove_range(&mut self, start_ts: Timestamp, end_ts: Timestamp) -> TsdbResult<usize> {
-        if self.is_empty() || start_ts > self.last_timestamp() || end_ts < self.first_timestamp() {
-            return Ok(0);
-        }
-
-        let mut new_encoder = ChimpCompressor::with_soft_cap(self.max_size);
-        let saved_count = self.len();
-
-        for value in self.encoder.iter() {
-            let sample = value?;
-            if sample.timestamp >= start_ts && sample.timestamp <= end_ts {
-                continue;
-            }
-            push_sample(&mut new_encoder, &sample)?;
-        }
-
-        self.encoder = new_encoder;
-        Ok(saved_count - self.len())
-    }
-
-    fn add_sample(&mut self, sample: &Sample) -> TsdbResult {
-        push_sample(&mut self.encoder, sample)
-    }
-
-    fn get_range(&self, start: Timestamp, end: Timestamp) -> TsdbResult<Vec<Sample>> {
-        if self.is_empty() {
-            return Ok(vec![]);
-        }
-        Ok(self.range_iter(start, end).collect())
-    }
-
-    fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<bool> {
-        let ts = sample.timestamp;
-        let mut duplicate_found = false;
-        let count = self.len();
-        if count == 0 {
-            self.add_sample(&sample)?;
-            return Ok(true);
-        }
-
-        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
-        let mut iter = self.encoder.iter();
-
-        if ts < self.first_timestamp() {
-            push_sample(&mut encoder, &sample)?;
-            for item in iter {
-                let current = item?;
-                push_sample(&mut encoder, &current)?;
-            }
-        } else {
-            let mut current = Sample::default();
-            for item in iter.by_ref() {
-                current = item?;
-                if current.timestamp >= ts {
-                    break;
-                }
-                push_sample(&mut encoder, &current)?;
-            }
-            if current.timestamp == ts {
-                duplicate_found = true;
-                current.value = dp_policy.duplicate_value(ts, current.value, sample.value)?;
-                push_sample(&mut encoder, &current)?;
-            } else {
-                push_sample(&mut encoder, &sample)?;
-                if current.timestamp > ts {
-                    push_sample(&mut encoder, &current)?;
-                }
-            }
-
-            for item in iter {
-                let current = item?;
-                push_sample(&mut encoder, &current)?;
-            }
-        }
-
-        self.encoder = encoder;
-        Ok(!duplicate_found)
-    }
-
-    fn merge_samples(
-        &mut self,
-        samples: &[Sample],
-        dp_policy: Option<DuplicatePolicy>,
-    ) -> TsdbResult<Vec<SampleAddResult>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Samples are assumed sorted; the common append-only case skips the
-        // full re-encode.
-        let first = samples[0];
-        if self.is_empty() || first.timestamp > self.last_timestamp() {
-            return append_samples(self, samples);
-        }
-
-        let mut encoder = ChimpCompressor::with_soft_cap(self.max_size);
-        let result = merge_chunk_samples(self.iter(), samples, dp_policy, |sample| {
-            push_sample(&mut encoder, &sample)
-        })?;
-
-        self.encoder = encoder;
-        Ok(result)
-    }
-
-    fn optimize(&mut self) -> TsdbResult {
-        self.encoder.shrink_to_fit();
-        Ok(())
-    }
-
-    fn is_full(&self) -> bool {
-        self.encoder.bytes().len() >= self.max_size
-    }
-
-    fn bytes_per_sample(&self) -> usize {
-        use crate::series::chunks::MIN_SAMPLES_FOR_BPS_ESTIMATE;
-        let count = self.len();
-        if count < MIN_SAMPLES_FOR_BPS_ESTIMATE {
-            return size_of::<Sample>() / 2;
-        }
-        // At least one byte: a flat series compresses to well under a byte per sample, and a
-        // ratio floored to zero made every capacity estimate zero — so each MADD/ADDBULK batch
-        // on such a series opened a chunk of its own.
-        (self.data_size() / count).max(1)
-    }
-
-    fn clear(&mut self) {
-        self.encoder.clear();
-    }
-
-    fn set_data(&mut self, samples: &[Sample]) -> TsdbResult<()> {
-        self.compress(samples)
-    }
-}
-
-impl Chunk for ChimpChunk {
-    fn split(&mut self) -> TsdbResult<Self> {
-        if self.is_empty() {
-            return Ok(self.clone());
-        }
-
-        let mut left = ChimpCompressor::with_soft_cap(self.max_size);
-        let mut right = ChimpChunk::with_max_size(self.max_size);
-
-        let mid = self.len() / 2;
-        for (i, value) in self.encoder.iter().enumerate() {
-            let sample = value?;
-            if i < mid {
-                push_sample(&mut left, &sample)?;
-            } else {
-                push_sample(&mut right.encoder, &sample)?;
-            }
-        }
-
-        self.encoder = left;
-        Ok(right)
-    }
-
-    fn save_rdb(&self, rdb: *mut RedisModuleIO) {
-        rdb_save_usize(rdb, self.max_size);
-        self.encoder.rdb_save(rdb);
-    }
-
-    fn load_rdb(rdb: *mut RedisModuleIO, _enc_ver: i32) -> ValkeyResult<Self> {
-        let max_size = rdb_load_usize(rdb)?;
-        let mut encoder = ChimpCompressor::rdb_load(rdb)?;
-        encoder.set_soft_cap(max_size);
-        Ok(ChimpChunk { encoder, max_size })
-    }
-
-    fn serialize(&self, dest: &mut Vec<u8>) {
-        write_uvarint(dest, self.max_size as u64);
-        self.encoder.serialize(dest);
-    }
-
-    fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
-        let mut buf = buf;
-        let max_size = try_read_uvarint(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
-        let mut encoder = ChimpCompressor::deserialize(buf)?;
-        encoder.set_soft_cap(max_size as usize);
-        Ok(ChimpChunk {
-            encoder,
-            max_size: max_size as usize,
-        })
-    }
-
-    fn debug_digest(&self, dig: &mut Digest) {
-        self.encoder.debug_digest(dig);
-        dig.add_long_long(self.max_size as i64);
-    }
-}
-
-#[inline]
-fn push_sample(encoder: &mut ChimpCompressor, sample: &Sample) -> TsdbResult {
-    encoder.add(*sample).map_err(|e| {
-        log_warning(format!("chimp: error adding sample: {e:?}"));
-        TsdbError::CannotAddSample(*sample)
-    })
-}
+pub type ChimpChunk = XorChunk<ChimpCompressor>;
 
 pub type ChimpChunkIterator<'a> = RangeFiltered<ChimpIterator<'a>>;
+
+impl SampleCodec for ChimpCompressor {
+    type Iter<'a> = ChimpIterator<'a>;
+    const ENCODING: ChunkEncoding = ChunkEncoding::Chimp;
+
+    fn with_soft_cap(max_size: usize) -> Self {
+        ChimpCompressor::with_soft_cap(max_size)
+    }
+    fn set_soft_cap(&mut self, max_size: usize) {
+        ChimpCompressor::set_soft_cap(self, max_size)
+    }
+    #[inline]
+    fn push(&mut self, sample: &Sample) -> std::io::Result<()> {
+        self.add(*sample)
+    }
+    fn iter(&self) -> ChimpIterator<'_> {
+        ChimpCompressor::iter(self)
+    }
+    fn bytes(&self) -> &[u8] {
+        ChimpCompressor::bytes(self)
+    }
+    fn len(&self) -> usize {
+        self.count() as usize
+    }
+    fn first_timestamp(&self) -> Timestamp {
+        ChimpCompressor::first_timestamp(self)
+    }
+    fn last_timestamp(&self) -> Timestamp {
+        ChimpCompressor::last_timestamp(self)
+    }
+    fn last_value(&self) -> f64 {
+        ChimpCompressor::last_value(self)
+    }
+    fn clear(&mut self) {
+        ChimpCompressor::clear(self)
+    }
+    fn shrink_to_fit(&mut self) {
+        ChimpCompressor::shrink_to_fit(self)
+    }
+    fn rdb_save(&self, rdb: *mut RedisModuleIO) {
+        ChimpCompressor::rdb_save(self, rdb)
+    }
+    fn rdb_load(rdb: *mut RedisModuleIO) -> ValkeyResult<Self> {
+        Ok(ChimpCompressor::rdb_load(rdb)?)
+    }
+    fn serialize(&self, dest: &mut Vec<u8>) {
+        ChimpCompressor::serialize(self, dest)
+    }
+    fn deserialize(buf: &[u8]) -> TsdbResult<Self> {
+        ChimpCompressor::deserialize(buf)
+    }
+    fn debug_digest(&self, dig: &mut Digest) {
+        ChimpCompressor::debug_digest(self, dig)
+    }
+    fn into_sample_iter<'a>(iter: RangeFiltered<ChimpIterator<'a>>) -> SampleIter<'a>
+    where
+        Self: 'a,
+    {
+        SampleIter::Chimp(Box::new(iter))
+    }
+}
