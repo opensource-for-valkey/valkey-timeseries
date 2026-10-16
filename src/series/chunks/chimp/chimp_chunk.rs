@@ -16,6 +16,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::iterators::SampleIter;
 use crate::series::chunks::chunk::{Chunk, ChunkOps};
 use crate::series::chunks::merge::{append_samples, merge_chunk_samples};
+use crate::series::chunks::range_iter::RangeFiltered;
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use get_size2::GetSize;
 use std::mem::size_of;
@@ -65,17 +66,13 @@ impl ChimpChunk {
     pub fn data_size(&self) -> usize {
         self.encoder.bytes().len()
     }
-
-    pub fn iter(&'_ self) -> SampleIter<'_> {
-        self.range_iter(i64::MIN, i64::MAX)
-    }
-
-    pub fn range_iter(&'_ self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        ChimpChunkIterator::new(self, start_ts, end_ts).into()
-    }
 }
 
 impl ChunkOps for ChimpChunk {
+    fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
+        ChimpChunkIterator::new(self.encoder.iter(), start_ts, end_ts).into()
+    }
+
     fn first_timestamp(&self) -> Timestamp {
         self.encoder.first_timestamp()
     }
@@ -299,61 +296,4 @@ fn push_sample(encoder: &mut ChimpCompressor, sample: &Sample) -> TsdbResult {
     })
 }
 
-pub struct ChimpChunkIterator<'a> {
-    inner: ChimpIterator<'a>,
-    start: Timestamp,
-    end: Timestamp,
-    init: bool,
-}
-
-impl<'a> ChimpChunkIterator<'a> {
-    pub fn new(chunk: &'a ChimpChunk, start: Timestamp, end: Timestamp) -> Self {
-        Self {
-            inner: ChimpIterator::new(&chunk.encoder),
-            start,
-            end,
-            init: false,
-        }
-    }
-
-    fn next_internal(&mut self) -> Option<Sample> {
-        match self.inner.next() {
-            Some(Ok(sample)) => {
-                if sample.timestamp > self.end {
-                    return None;
-                }
-                Some(sample)
-            }
-            #[cfg(debug_assertions)]
-            Some(Err(err)) => {
-                log_warning(format!("chimp: error decoding sample: {err:?}"));
-                None
-            }
-            #[cfg(not(debug_assertions))]
-            Some(Err(_)) => None,
-            None => None,
-        }
-    }
-}
-
-impl Iterator for ChimpChunkIterator<'_> {
-    type Item = Sample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.init {
-            self.init = true;
-
-            while let Some(sample) = self.next_internal() {
-                if sample.timestamp < self.start {
-                    continue;
-                }
-                if sample.timestamp <= self.end {
-                    return Some(sample);
-                }
-            }
-
-            return None;
-        }
-        self.next_internal()
-    }
-}
+pub type ChimpChunkIterator<'a> = RangeFiltered<ChimpIterator<'a>>;

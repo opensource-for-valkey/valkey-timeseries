@@ -98,12 +98,6 @@ impl UncompressedChunk {
         Ok(())
     }
 
-    pub fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        self.get_range_as_ref(start_ts, end_ts)
-            .map(SampleIter::slice)
-            .unwrap_or_default()
-    }
-
     pub fn samples_by_timestamps(&self, timestamps: &[Timestamp]) -> TsdbResult<Vec<Sample>> {
         if self.len() == 0 || timestamps.is_empty() {
             return Ok(vec![]);
@@ -276,6 +270,12 @@ fn get_sample_index(samples: &[Sample], ts: Timestamp) -> (usize, bool) {
 }
 
 impl ChunkOps for UncompressedChunk {
+    fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
+        self.get_range_as_ref(start_ts, end_ts)
+            .map(SampleIter::slice)
+            .unwrap_or_default()
+    }
+
     fn first_timestamp(&self) -> Timestamp {
         if self.samples.is_empty() {
             return 0;

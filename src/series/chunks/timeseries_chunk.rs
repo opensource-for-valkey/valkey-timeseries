@@ -106,19 +106,6 @@ impl TimeSeriesChunk {
         false
     }
 
-    pub fn iter(&self) -> SampleIter<'_> {
-        self.range_iter(i64::MIN, i64::MAX)
-    }
-
-    pub fn range_iter(&'_ self, start: Timestamp, end: Timestamp) -> SampleIter<'_> {
-        use TimeSeriesChunk::*;
-        match self {
-            Uncompressed(chunk) => chunk.range_iter(start, end),
-            Gorilla(chunk) => chunk.range_iter(start, end),
-            Chimp(chunk) => chunk.range_iter(start, end),
-        }
-    }
-
     // NOTE! this function assumes that timestamps are sorted ascending and de-duped
     pub fn samples_by_timestamps(&self, timestamps: &[Timestamp]) -> TsdbResult<Vec<Sample>> {
         if let TimeSeriesChunk::Uncompressed(c) = self {

@@ -39,6 +39,16 @@ impl Iterator for SampleIter<'_> {
         }
     }
 
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            SampleIter::Slice(slice) => slice.size_hint(),
+            SampleIter::Gorilla(iter) => iter.size_hint(),
+            SampleIter::Chimp(iter) => iter.size_hint(),
+            SampleIter::Range(range) => range.size_hint(),
+            SampleIter::Empty => (0, Some(0)),
+        }
+    }
+
     /// Dispatch on the variant once, then let the inner iterator drive the loop. Without
     /// this, `for_each`/`collect`/`extend` re-match the variant on every sample, which
     /// costs a slice-backed scan more than the copy it avoids.

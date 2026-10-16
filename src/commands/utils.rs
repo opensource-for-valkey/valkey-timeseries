@@ -8,6 +8,7 @@ use crate::common::replies::{
 };
 use crate::fanout::{FanoutTarget, client_allows_replica_fanout, compute_query_fanout_mode};
 use crate::labels::Label;
+use crate::series::chunks::ChunkOps;
 use crate::series::request_types::{MRangeOptions, MRangeSeriesResult, SeriesResultData};
 use valkey_module::{Context, Status, ValkeyResult, ValkeyValue, raw};
 

@@ -1153,6 +1153,20 @@ mod tests {
     }
 
     #[test]
+    fn test_range_iter_upper_size_hint_is_the_chunk_length() {
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            chunk.set_data(&generate_random_samples(64)).unwrap();
+            assert_eq!(
+                chunk.range_iter(i64::MIN, i64::MAX).size_hint().1,
+                Some(64),
+                "{chunk_type:?}"
+            );
+            assert_eq!(chunk.iter().count(), 64, "{chunk_type:?}");
+        }
+    }
+
+    #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {
             let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);

@@ -8,6 +8,7 @@ use crate::error::{TsdbError, TsdbResult};
 use crate::iterators::SampleIter;
 use crate::series::chunks::chunk::{Chunk, ChunkOps};
 use crate::series::chunks::merge::{append_samples, merge_chunk_samples};
+use crate::series::chunks::range_iter::RangeFiltered;
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use get_size2::GetSize;
 use std::mem::size_of;
@@ -78,17 +79,13 @@ impl GorillaChunk {
         let part = (hi - lo) as u128 + 1;
         ((len as u128 * part / span) as usize + 1).min(len)
     }
-
-    pub fn iter(&'_ self) -> SampleIter<'_> {
-        self.range_iter(i64::MIN, i64::MAX)
-    }
-
-    pub fn range_iter(&'_ self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        GorillaChunkIterator::new(self, start_ts, end_ts).into()
-    }
 }
 
 impl ChunkOps for GorillaChunk {
+    fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
+        GorillaChunkIterator::new(self.encoder.iter(), start_ts, end_ts).into()
+    }
+
     fn first_timestamp(&self) -> Timestamp {
         self.encoder.first_ts
     }
@@ -335,66 +332,7 @@ fn push_sample(encoder: &mut GorillaEncoder, sample: &Sample) -> TsdbResult {
     })
 }
 
-pub struct GorillaChunkIterator<'a> {
-    inner: GorillaIterator<'a>,
-    start: Timestamp,
-    end: Timestamp,
-    init: bool,
-}
-
-impl<'a> GorillaChunkIterator<'a> {
-    pub fn new(chunk: &'a GorillaChunk, start: Timestamp, end: Timestamp) -> Self {
-        let inner = GorillaIterator::new(&chunk.encoder);
-        Self {
-            inner,
-            start,
-            end,
-            init: false,
-        }
-    }
-
-    fn next_internal(&mut self) -> Option<Sample> {
-        match self.inner.next() {
-            Some(Ok(sample)) => {
-                if sample.timestamp > self.end {
-                    return None;
-                }
-                Some(sample)
-            }
-            #[cfg(debug_assertions)]
-            Some(Err(err)) => {
-                // use structured logging instead of printing to stderr in debug builds
-                log_warning(format!("Error decoding sample: {err:?}"));
-                None
-            }
-            #[cfg(not(debug_assertions))]
-            Some(Err(_)) => None,
-            None => None,
-        }
-    }
-}
-
-impl Iterator for GorillaChunkIterator<'_> {
-    type Item = Sample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.init {
-            self.init = true;
-
-            while let Some(sample) = self.next_internal() {
-                if sample.timestamp < self.start {
-                    continue;
-                }
-                if sample.timestamp <= self.end {
-                    return Some(sample);
-                }
-            }
-
-            return None;
-        }
-        self.next_internal()
-    }
-}
+pub type GorillaChunkIterator<'a> = RangeFiltered<GorillaIterator<'a>>;
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,7 @@
 use crate::common::{Sample, Timestamp};
 use crate::error::{TsdbError, TsdbResult};
 use crate::error_consts;
+use crate::iterators::SampleIter;
 use crate::series::{DuplicatePolicy, SampleAddResult};
 use enum_dispatch::enum_dispatch;
 use get_size2::GetSize;
@@ -115,6 +116,13 @@ fn parse_encoding(encoding: &str) -> Option<ChunkEncoding> {
 ///   keeping two is recorded; they are a candidate for unification.
 #[enum_dispatch]
 pub trait ChunkOps {
+    /// The chunk's samples with timestamps in `[start, end]`, ascending. A decode error ends
+    /// the iteration early (logged in debug builds).
+    fn range_iter(&self, start: Timestamp, end: Timestamp) -> SampleIter<'_>;
+    /// Every sample in the chunk, ascending.
+    fn iter(&self) -> SampleIter<'_> {
+        self.range_iter(i64::MIN, i64::MAX)
+    }
     /// `0` when the chunk is empty; check `is_empty()` before relying on it.
     fn first_timestamp(&self) -> Timestamp;
     /// `0` when the chunk is empty; check `is_empty()` before relying on it.
