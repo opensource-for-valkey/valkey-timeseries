@@ -81,17 +81,17 @@ impl TimeSeriesChunk {
     }
 
     pub fn is_timestamp_in_range(&self, ts: Timestamp) -> bool {
-        ts >= self.first_timestamp() && ts <= self.last_timestamp()
+        !self.is_empty() && ts >= self.first_timestamp() && ts <= self.last_timestamp()
     }
 
     pub fn is_contained_by_range(&self, start_ts: Timestamp, end_ts: Timestamp) -> bool {
-        self.first_timestamp() >= start_ts && self.last_timestamp() <= end_ts
+        !self.is_empty() && self.first_timestamp() >= start_ts && self.last_timestamp() <= end_ts
     }
 
     pub fn overlaps(&self, start_time: i64, end_time: i64) -> bool {
-        let first_time = self.first_timestamp();
-        let last_time = self.last_timestamp();
-        first_time <= end_time && last_time >= start_time
+        !self.is_empty()
+            && self.first_timestamp() <= end_time
+            && self.last_timestamp() >= start_time
     }
 
     pub fn has_samples_in_range(&self, start_time: Timestamp, end_time: Timestamp) -> bool {

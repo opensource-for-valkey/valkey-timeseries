@@ -285,7 +285,7 @@ impl ChunkOps for UncompressedChunk {
 
     fn last_timestamp(&self) -> Timestamp {
         if self.samples.is_empty() {
-            return i64::MAX;
+            return 0;
         }
         self.samples[self.samples.len() - 1].timestamp
     }
@@ -296,7 +296,7 @@ impl ChunkOps for UncompressedChunk {
 
     fn last_value(&self) -> f64 {
         if self.samples.is_empty() {
-            return f64::MAX;
+            return 0.0;
         }
         self.samples[self.samples.len() - 1].value
     }

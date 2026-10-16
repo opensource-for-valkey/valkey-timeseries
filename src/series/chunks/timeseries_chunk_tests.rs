@@ -1106,6 +1106,23 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_chunk_contract_is_the_same_for_every_encoding() {
+        for chunk_type in CHUNK_TYPES {
+            let chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            assert_eq!(chunk.first_timestamp(), 0, "{chunk_type:?}");
+            assert_eq!(chunk.last_timestamp(), 0, "{chunk_type:?}");
+            assert_eq!(chunk.last_value(), 0.0, "{chunk_type:?}");
+            assert!(chunk.last_sample().is_none(), "{chunk_type:?}");
+            assert!(!chunk.overlaps(i64::MIN, i64::MAX), "{chunk_type:?}");
+            assert!(!chunk.is_timestamp_in_range(0), "{chunk_type:?}");
+            assert!(
+                !chunk.is_contained_by_range(i64::MIN, i64::MAX),
+                "{chunk_type:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {
             let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
