@@ -98,13 +98,10 @@ impl UncompressedChunk {
         Ok(())
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = Sample> + '_ {
-        self.samples.iter().cloned()
-    }
-
     pub fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
-        let slice = self.get_range_slice(start_ts, end_ts);
-        SampleIter::vec(slice)
+        self.get_range_as_ref(start_ts, end_ts)
+            .map(SampleIter::slice)
+            .unwrap_or_default()
     }
 
     pub fn samples_by_timestamps(&self, timestamps: &[Timestamp]) -> TsdbResult<Vec<Sample>> {
@@ -130,13 +127,6 @@ impl UncompressedChunk {
 
     fn get_sample_index(&self, ts: Timestamp) -> (usize, bool) {
         get_sample_index(&self.samples, ts)
-    }
-
-    fn get_range_slice(&self, start_ts: Timestamp, end_ts: Timestamp) -> Vec<Sample> {
-        let Some(res) = self.get_range_as_ref(start_ts, end_ts) else {
-            return Vec::new();
-        };
-        res.to_vec()
     }
 
     pub(crate) fn get_range_as_ref(
@@ -336,8 +326,10 @@ impl ChunkOps for UncompressedChunk {
     }
 
     fn get_range(&self, start: Timestamp, end: Timestamp) -> TsdbResult<Vec<Sample>> {
-        let slice = self.get_range_slice(start, end);
-        Ok(slice)
+        Ok(self
+            .get_range_as_ref(start, end)
+            .map(<[Sample]>::to_vec)
+            .unwrap_or_default())
     }
 
     fn upsert_sample(&mut self, sample: Sample, dp_policy: DuplicatePolicy) -> TsdbResult<usize> {
@@ -536,8 +528,30 @@ impl Chunk for UncompressedChunk {
 #[cfg(test)]
 mod tests {
     use crate::common::{SAMPLE_SIZE, Sample};
+    use crate::iterators::SampleIter;
     use crate::series::chunks::{Chunk, ChunkOps, UncompressedChunk};
     use crate::series::{DuplicatePolicy, SampleAddResult};
+
+    #[test]
+    fn test_range_iter_borrows_the_sample_slice() {
+        let samples: Vec<Sample> = (0..100).map(|i| Sample::new(i * 10, i as f64)).collect();
+        let chunk = UncompressedChunk::new(4096, &samples);
+        assert!(matches!(
+            chunk.range_iter(samples[10].timestamp, samples[20].timestamp),
+            SampleIter::Slice(_)
+        ));
+        assert!(matches!(chunk.range_iter(40, 20), SampleIter::Empty));
+        assert!(matches!(
+            chunk.range_iter(i64::MAX - 1, i64::MAX),
+            SampleIter::Empty
+        ));
+        assert_eq!(
+            chunk
+                .range_iter(samples[10].timestamp, samples[20].timestamp)
+                .count(),
+            11
+        );
+    }
 
     #[test]
     fn test_get_range_slice_start_equals_end() {
@@ -564,7 +578,7 @@ mod tests {
             },
         ];
         let chunk = UncompressedChunk::new(1000, &samples);
-        let result = chunk.get_range_slice(30, 30);
+        let result = chunk.get_range(30, 30).unwrap();
         assert_eq!(
             result,
             vec![Sample {
@@ -599,7 +613,7 @@ mod tests {
             },
         ];
         let chunk = UncompressedChunk::new(1000, &samples);
-        let result = chunk.get_range_slice(20, 40);
+        let result = chunk.get_range(20, 40).unwrap();
         assert_eq!(
             result,
             vec![
@@ -644,7 +658,7 @@ mod tests {
             },
         ];
         let chunk = UncompressedChunk::new(1000, &samples);
-        let result = chunk.get_range_slice(60, 70);
+        let result = chunk.get_range(60, 70).unwrap();
         assert!(result.is_empty());
     }
 
@@ -673,7 +687,7 @@ mod tests {
             },
         ];
         let chunk = UncompressedChunk::new(1000, &samples);
-        let result = chunk.get_range_slice(35, 45);
+        let result = chunk.get_range(35, 45).unwrap();
         assert_eq!(
             result,
             vec![Sample {
@@ -686,7 +700,7 @@ mod tests {
     #[test]
     fn test_get_range_slice_empty_chunk() {
         let chunk = UncompressedChunk::default();
-        let result = chunk.get_range_slice(10, 20);
+        let result = chunk.get_range(10, 20).unwrap();
         assert!(result.is_empty());
     }
 
@@ -716,7 +730,7 @@ mod tests {
         ];
         let chunk = UncompressedChunk::new(1000, &samples);
 
-        assert!(chunk.get_range_slice(40, 20).is_empty());
+        assert!(chunk.get_range(40, 20).unwrap().is_empty());
         assert!(chunk.get_range_as_ref(40, 20).is_none());
     }
 

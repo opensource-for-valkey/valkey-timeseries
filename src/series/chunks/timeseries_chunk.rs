@@ -106,14 +106,8 @@ impl TimeSeriesChunk {
         false
     }
 
-    // todo: make this a trait method
-    pub fn iter(&self) -> Box<dyn Iterator<Item = Sample> + '_> {
-        use TimeSeriesChunk::*;
-        match self {
-            Uncompressed(chunk) => Box::new(chunk.iter()),
-            Gorilla(chunk) => Box::new(chunk.iter()),
-            Chimp(chunk) => Box::new(chunk.iter()),
-        }
+    pub fn iter(&self) -> SampleIter<'_> {
+        self.range_iter(i64::MIN, i64::MAX)
     }
 
     pub fn range_iter(&'_ self, start: Timestamp, end: Timestamp) -> SampleIter<'_> {

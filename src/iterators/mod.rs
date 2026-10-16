@@ -10,7 +10,6 @@ mod sample_reducer;
 mod timeseries_range_iterator;
 mod timestamp_filter_iterator;
 mod utils;
-mod vec_sample_iterator;
 
 pub use filtered_sample_iterator::FilteredSampleIterator;
 pub use multi_series_row_iter::MultiSeriesRowIter;
