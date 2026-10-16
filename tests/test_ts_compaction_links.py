@@ -33,6 +33,13 @@ class TestCompactionLinks(ValkeyTimeSeriesTestCaseBase):
         for ts, value in samples:
             self.client.execute_command('TS.ADD', key, ts, value)
 
+    def raw_rule_dests(self, key):
+        """Every rule `key` holds, from `TS.INFO DEBUG`'s `rulesState`. Unlike `TS.INFO`'s `rules`,
+        it lists self-rules too."""
+        flat = self.client.execute_command('TS.INFO', key, 'DEBUG')
+        info = {flat[i]: flat[i + 1] for i in range(0, len(flat), 2)}
+        return [_decode(state[0]) for state in info[b'rulesState']]
+
     def dest_samples(self, key):
         return [(int(ts), float(v)) for ts, v in self.client.execute_command('TS.RANGE', key, '-', '+')]
 
@@ -159,8 +166,13 @@ class TestCompactionLinks(ValkeyTimeSeriesTestCaseBase):
         self.create_rule('src', 'dst')
 
         self.client.rename('src', 'dst')
+        # Checked before TS.CREATERULE runs: it drops a stale rule for the same destination
+        # before adding the new one, which would hide a self-rule left behind.
+        assert self.raw_rule_dests('dst') == []
         self.client.execute_command('DEBUG', 'RELOAD')
+        assert self.raw_rule_dests('dst') == []
         self.client.rename('dst', 'src')
+        assert self.raw_rule_dests('src') == []
         self.client.execute_command('TS.CREATE', 'dst')
 
         self.create_rule('src', 'dst')
