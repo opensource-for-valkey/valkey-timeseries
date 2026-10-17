@@ -72,7 +72,9 @@ impl<'a> SeriesSampleIterator<'a> {
         if self.is_reverse {
             loop {
                 let chunk = &self.series.chunks[self.chunk_index];
-                if chunk.last_timestamp() < self.start {
+                // An empty chunk reports `last_timestamp() == 0`, which is not "before the
+                // window": skip it below instead of ending the scan, as the forward arm does.
+                if !chunk.is_empty() && chunk.last_timestamp() < self.start {
                     self.chunks_done = true;
                     return None;
                 }
@@ -477,6 +479,43 @@ mod tests {
         let got: Vec<Sample> =
             SeriesSampleIterator::from_range_options(&series, &opts, false).collect();
         assert!(got.is_empty());
+    }
+
+    /// An empty chunk must be skipped in both directions. The reverse arm used to read an empty
+    /// chunk's `last_timestamp()` (0) as "before the window" and end the whole scan, so a
+    /// trailing empty chunk made a reverse range return nothing. No command builds that state,
+    /// but an RDB or RESTORE payload can carry it.
+    #[test]
+    fn reverse_iteration_skips_a_trailing_empty_chunk() {
+        use crate::series::TimeSeriesOptions;
+        use crate::series::chunks::{ChunkEncoding, TimeSeriesChunk};
+        for encoding in [
+            ChunkEncoding::Uncompressed,
+            ChunkEncoding::Gorilla,
+            ChunkEncoding::Chimp,
+        ] {
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                ..Default::default()
+            })
+            .unwrap();
+            for i in 1..=10 {
+                series.add(i * 100, i as f64, None);
+            }
+            series.chunks.push(TimeSeriesChunk::new(encoding, 4096));
+
+            let forward: Vec<Sample> =
+                SeriesSampleIterator::new(&series, 100, 1000, false).collect();
+            let mut reverse: Vec<Sample> =
+                SeriesSampleIterator::new(&series, 100, 1000, true).collect();
+            reverse.reverse();
+
+            assert_eq!(forward.len(), 10, "{encoding:?}");
+            assert_eq!(
+                reverse, forward,
+                "{encoding:?}: reverse scan stopped at the empty chunk"
+            );
+        }
     }
 
     mod next_chunk_tests {
