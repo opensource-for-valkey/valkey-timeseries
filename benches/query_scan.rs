@@ -215,7 +215,7 @@ fn bench_range_gap(c: &mut Criterion) {
 /// path take this shape; `scan` (`for_each`) only measures the fold path.
 ///
 /// Read with care: this bare single-chunk loop is sensitive to whole-program inlining. On
-/// uncompressed chunks it measured ~55 % slower after `621138eae` with identical `next` code,
+/// uncompressed chunks it measured ~55 % slower after `9ddbe9da0` with identical `next` code,
 /// while the same scan through `TimeSeries::range_iter` (`series_scan`) got faster.
 fn bench_scan_next(c: &mut Criterion) {
     let registry = DatasetRegistry::new();

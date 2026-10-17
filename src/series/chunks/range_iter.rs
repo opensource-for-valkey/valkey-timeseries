@@ -75,7 +75,7 @@ where
                 }
                 // Always true: `next_in_window` already stops past `end`. Kept from the
                 // per-codec wrappers because this loop's shape is measurement-sensitive
-                // (`17f1e9844`); removing it needs a decode A/B.
+                // (`42a67eea0`); removing it needs a decode A/B.
                 if sample.timestamp <= self.end {
                     return Some(sample);
                 }
