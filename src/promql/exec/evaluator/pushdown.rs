@@ -352,15 +352,21 @@ impl<'reader, R: QueryReader + ?Sized> Evaluator<'reader, R> {
     ///
     /// * the function can be evaluated from one series' window alone — see
     ///   [`RollupKind`];
-    /// * this is a single evaluation (`step_ms == 0`). A range query's whole
-    ///   step grid is pushed in a later phase; until then its steps stay local
-    ///   so that both paths cannot disagree about the grid;
+    /// * this is a single evaluation (`step_ms == 0`): an instant query, or a
+    ///   subquery step no preloaded grid covered. A range query's rollups are
+    ///   pushed over the whole step grid once, before the step loop, in
+    ///   `preload_rollups`; a step that reaches here without a slice stays
+    ///   local, so a per-step fan-out can neither multiply round trips nor
+    ///   disagree with the preloaded geometry its neighbours used;
     /// * the argument is a bare matrix selector. A subquery brings its own step
     ///   grid, and anything else has to be evaluated before the rollup can see
     ///   it;
-    /// * the function parameter, if any, is a literal scalar that can be
-    ///   shipped;
-    /// * and the source says it can do it (only a cluster can).
+    /// * the function parameter, if any, is an expression that evaluates to a
+    ///   scalar here — see [`Self::rollup_arguments`]. Unlike the range path,
+    ///   it need not be a literal: this one evaluation has one value for it;
+    /// * and the source does not decline it. A single node answers locally
+    ///   with the raw span and the kernels run here; only a peer without grid
+    ///   support declines.
     pub(super) fn evaluate_pushed_down_rollup(
         &self,
         call: &Call,
