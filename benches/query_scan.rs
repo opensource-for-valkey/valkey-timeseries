@@ -210,5 +210,115 @@ fn bench_range_gap(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_scan, bench_filtered_scan, bench_range_gap);
+/// `scan_next` group: the `scan` cases consumed by a `for` loop, which drives `next()` per
+/// sample instead of `fold`. `Vec`'s `collect`/`extend` and every `for` loop in the command
+/// path take this shape; `scan` (`for_each`) only measures the fold path.
+///
+/// Read with care: this bare single-chunk loop is sensitive to whole-program inlining. On
+/// uncompressed chunks it measured ~55 % slower after `621138eae` with identical `next` code,
+/// while the same scan through `TimeSeries::range_iter` (`series_scan`) got faster.
+fn bench_scan_next(c: &mut Criterion) {
+    let registry = DatasetRegistry::new();
+    let mut group = c.benchmark_group("scan_next");
+    group.measurement_time(Duration::from_secs(2));
+
+    let key = DatasetKey::new(ValueWorkload::Drift, TimestampModel::Regular);
+    let dataset = registry.dataset(key);
+    for encoding in encodings() {
+        for chunk_size in SCAN_CHUNK_SIZES {
+            let chunk = build_chunk(encoding, chunk_size, dataset);
+            for (case, start, end) in
+                selectivity_cases(chunk.first_timestamp(), chunk.last_timestamp())
+            {
+                if case != "full" && case != "mid_10pct" {
+                    continue;
+                }
+                let bench_id = format!(
+                    "{}/{}/{}/{case}",
+                    encoding.name(),
+                    ValueWorkload::Drift.id(),
+                    chunk_size_id(chunk_size),
+                );
+                group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
+                    b.iter(|| {
+                        for s in chunk.range_iter(start, end) {
+                            std::hint::black_box((s.timestamp, s.value));
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+/// Samples per series in `series_scan`.
+const SERIES_SCAN_SAMPLES: usize = 20_000;
+
+/// `series_scan` group: a `for` loop over `TimeSeries::range_iter`, the forward scan behind
+/// `TS.RANGE`, `TS.READ` and compaction, over a multi-chunk series per encoding and chunk size.
+fn bench_series_scan(c: &mut Criterion) {
+    use valkey_timeseries::series::{TimeSeries, TimeSeriesOptions};
+
+    let registry = DatasetRegistry::new();
+    let mut group = c.benchmark_group("series_scan");
+    group.measurement_time(Duration::from_secs(2));
+
+    let key = DatasetKey::new(ValueWorkload::Drift, TimestampModel::Regular);
+    let dataset = registry.dataset(key);
+    let samples = &dataset[..SERIES_SCAN_SAMPLES.min(dataset.len())];
+    let first = samples[0].timestamp;
+    let last = samples[samples.len() - 1].timestamp;
+    let span = last - first;
+    let cases: [(&str, Timestamp, Timestamp); 2] = [
+        ("full", first, last),
+        (
+            "mid_10pct",
+            first + span * 45 / 100,
+            first + span * 55 / 100,
+        ),
+    ];
+
+    for encoding in encodings() {
+        for chunk_size in SCAN_CHUNK_SIZES {
+            let mut series = TimeSeries::with_options(TimeSeriesOptions {
+                chunk_encoding: encoding,
+                chunk_size: Some(chunk_size),
+                ..Default::default()
+            })
+            .expect("valid series options");
+            for s in samples {
+                series.add(s.timestamp, s.value, None);
+            }
+
+            for (case, start, end) in cases {
+                let bench_id = format!(
+                    "{}/{}/{}/{case}",
+                    encoding.name(),
+                    ValueWorkload::Drift.id(),
+                    chunk_size_id(chunk_size),
+                );
+                group.bench_function(BenchmarkId::from_parameter(&bench_id), |b| {
+                    b.iter(|| {
+                        for s in series.range_iter(start, end) {
+                            std::hint::black_box((s.timestamp, s.value));
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_scan,
+    bench_scan_next,
+    bench_series_scan,
+    bench_filtered_scan,
+    bench_range_gap
+);
 criterion_main!(benches);
