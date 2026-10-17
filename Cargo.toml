@@ -37,11 +37,11 @@ prost = "0.14"
 rand = { version = "0.10" }
 rand_distr = { version = "0.6", optional = true }
 smallvec = "1.16"
-speedate = "0.17"
+speedate = "0.18"
 thiserror = "2.0"
-valkey-module = "0.1.14"
-valkey-module-macros = "0.1.14"
-range-set-blaze = "0.7.0"
+valkey-module = "0.1.15"
+valkey-module-macros = "0.1.15"
+range-set-blaze = "0.8"
 # Client for tools/fleet_loader only; never linked into the module.
 redis = { version = "1.7", optional = true, default-features = false, features = ["cluster"] }
 rayon-core = "1.13"
@@ -66,7 +66,7 @@ proptest = "1"
 
 [build-dependencies]
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10.0"
 
 [lib]
 name = "valkey_timeseries"
