@@ -75,6 +75,6 @@ impl SampleCodec for ChimpCompressor {
     where
         Self: 'a,
     {
-        SampleIter::Chimp(Box::new(iter))
+        SampleIter::Chimp(iter)
     }
 }

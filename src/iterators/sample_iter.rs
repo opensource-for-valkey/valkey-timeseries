@@ -6,7 +6,7 @@ use crate::series::chunks::{ChimpChunkIterator, GorillaChunkIterator};
 pub enum SampleIter<'a> {
     Slice(std::slice::Iter<'a, Sample>),
     Gorilla(GorillaChunkIterator<'a>),
-    Chimp(Box<ChimpChunkIterator<'a>>),
+    Chimp(ChimpChunkIterator<'a>),
     Range(TimeSeriesRangeIterator<'a>),
     #[default]
     Empty,
