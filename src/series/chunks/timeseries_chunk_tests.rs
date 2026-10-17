@@ -1246,6 +1246,43 @@ mod tests {
         }
     }
 
+    /// A window that misses a compressed chunk yields `SampleIter::Empty` without decoding the
+    /// stream (the codecs decode from the start, so a miss used to read the whole chunk).
+    #[test]
+    fn test_out_of_window_range_iter_is_empty_for_compressed_chunks() {
+        use crate::iterators::SampleIter;
+        let samples = generate_random_samples(100);
+        let (first, last) = (samples[0].timestamp, samples[99].timestamp);
+        for chunk_type in [ChunkEncoding::Gorilla, ChunkEncoding::Chimp] {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            chunk.set_data(&samples).unwrap();
+            for (start, end) in [(0, first - 1), (last + 1, i64::MAX), (last, first)] {
+                assert!(
+                    matches!(chunk.range_iter(start, end), SampleIter::Empty),
+                    "{chunk_type:?} [{start}, {end}]"
+                );
+            }
+            assert_eq!(chunk.range_iter(first, last).count(), 100, "{chunk_type:?}");
+        }
+    }
+
+    /// A filter can drop every sample, so it cannot promise its inner iterator's lower bound.
+    #[test]
+    fn test_filtered_iter_size_hint_has_no_lower_bound() {
+        use crate::series::types::ValueFilter;
+        for chunk_type in CHUNK_TYPES {
+            let mut chunk = TimeSeriesChunk::new(chunk_type, 4096);
+            chunk.set_data(&generate_random_samples(50)).unwrap();
+            let filter = ValueFilter {
+                min: 1e300,
+                max: 1e301,
+            };
+            let iter = chunk.filtered_iter(i64::MIN, i64::MAX, None, Some(filter));
+            assert_eq!(iter.size_hint().0, 0, "{chunk_type:?}");
+            assert_eq!(iter.count(), 0, "{chunk_type:?}");
+        }
+    }
+
     #[test]
     fn test_set_data_with_empty_slice_empties_the_chunk() {
         for chunk_type in CHUNK_TYPES {

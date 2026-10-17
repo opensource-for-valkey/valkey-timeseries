@@ -156,6 +156,15 @@ impl<C: SampleCodec> XorChunk<C> {
 
 impl<C: SampleCodec> ChunkOps for XorChunk<C> {
     fn range_iter(&self, start_ts: Timestamp, end_ts: Timestamp) -> SampleIter<'_> {
+        // The codecs decode from the start of the stream, so a window that misses the chunk
+        // would otherwise read every sample to find nothing.
+        if self.is_empty()
+            || start_ts > end_ts
+            || end_ts < self.first_timestamp()
+            || start_ts > self.last_timestamp()
+        {
+            return SampleIter::Empty;
+        }
         C::into_sample_iter(RangeFiltered::new(self.encoder.iter(), start_ts, end_ts))
     }
 
@@ -175,6 +184,7 @@ impl<C: SampleCodec> ChunkOps for XorChunk<C> {
         self.encoder.last_value()
     }
 
+    /// The trait's name for [`data_size`](XorChunk::data_size), which documents what it counts.
     fn size(&self) -> usize {
         self.data_size()
     }
@@ -353,11 +363,7 @@ impl<C: SampleCodec> Chunk for XorChunk<C> {
         }
 
         let mut left = C::with_soft_cap(self.max_size);
-        // `with_max_size`, not `default()`: the upper half has to inherit the budget the series
-        // was created with. `default()` stamps `DEFAULT_CHUNK_SIZE_BYTES` on it, silently
-        // discarding the user's `CHUNK_SIZE` -- and `save_rdb` writes `max_size` out, so the
-        // wrong budget survives a reload.
-        let mut right = Self::with_max_size(self.max_size);
+        let mut right = C::with_soft_cap(self.max_size);
 
         let mid = self.len() / 2;
         for (i, value) in self.encoder.iter().enumerate() {
@@ -365,12 +371,17 @@ impl<C: SampleCodec> Chunk for XorChunk<C> {
             if i < mid {
                 push_sample(&mut left, &sample)?;
             } else {
-                push_sample(&mut right.encoder, &sample)?;
+                push_sample(&mut right, &sample)?;
             }
         }
 
         self.encoder = left;
-        Ok(right)
+        // The upper half inherits this chunk's `max_size`, not `DEFAULT_CHUNK_SIZE_BYTES`:
+        // `save_rdb` writes it out, so a wrong budget would survive a reload.
+        Ok(Self {
+            encoder: right,
+            max_size: self.max_size,
+        })
     }
 
     fn save_rdb(&self, rdb: *mut RedisModuleIO) {

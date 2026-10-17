@@ -62,6 +62,7 @@ impl<TIterator: Iterator<Item = Sample>> Iterator for FilteredSampleIterator<TIt
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        // A filter can drop every sample, so only the upper bound carries over.
+        (0, self.inner.size_hint().1)
     }
 }

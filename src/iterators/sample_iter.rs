@@ -17,13 +17,6 @@ impl<'a> SampleIter<'a> {
         let iter = slice.iter();
         SampleIter::Slice(iter)
     }
-
-    pub fn gorilla(iter: GorillaChunkIterator<'a>) -> Self {
-        SampleIter::Gorilla(iter)
-    }
-    pub fn chimp(iter: ChimpChunkIterator<'a>) -> Self {
-        SampleIter::Chimp(Box::new(iter))
-    }
 }
 
 impl Iterator for SampleIter<'_> {
@@ -63,17 +56,5 @@ impl Iterator for SampleIter<'_> {
             SampleIter::Range(range) => range.fold(init, f),
             SampleIter::Empty => init,
         }
-    }
-}
-
-impl<'a> From<GorillaChunkIterator<'a>> for SampleIter<'a> {
-    fn from(value: GorillaChunkIterator<'a>) -> Self {
-        Self::Gorilla(value)
-    }
-}
-
-impl<'a> From<ChimpChunkIterator<'a>> for SampleIter<'a> {
-    fn from(value: ChimpChunkIterator<'a>) -> Self {
-        Self::Chimp(Box::new(value))
     }
 }

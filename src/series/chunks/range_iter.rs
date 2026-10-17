@@ -12,8 +12,11 @@ use crate::error::TsdbResult;
 /// sample past `end` or the first decode error (logged in debug builds); like the per-codec
 /// wrappers it replaces it is not fused, so callers stop at the first `None`.
 ///
-/// The loop shape mirrors those wrappers on purpose: a variant with a `done` flag measured
-/// 5-19 % slower on Chimp decode.
+/// Polling past the first `None` keeps decoding, one sample per call. After a sample past
+/// `end` that is harmless (every later sample is past it too), but after a decode error the
+/// codec iterators can resume from a corrupt position and yield `Some` again. So this cannot
+/// implement `FusedIterator` without a `done` flag, and the loop shape mirrors those wrappers on
+/// purpose: a variant with a `done` flag measured 5-19 % slower on Chimp decode.
 pub struct RangeFiltered<I> {
     inner: I,
     start: Timestamp,
@@ -70,6 +73,9 @@ where
                 if sample.timestamp < self.start {
                     continue;
                 }
+                // Always true: `next_in_window` already stops past `end`. Kept from the
+                // per-codec wrappers because this loop's shape is measurement-sensitive
+                // (`17f1e9844`); removing it needs a decode A/B.
                 if sample.timestamp <= self.end {
                     return Some(sample);
                 }
