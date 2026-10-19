@@ -2,7 +2,7 @@ use crate::commands::CommandArgIterator;
 use crate::common::humanize::humanize_duration;
 use crate::common::replies::{
     reply_with_array, reply_with_bulk_string, reply_with_double, reply_with_integer,
-    reply_with_simple_string,
+    reply_with_map, reply_with_simple_string,
 };
 use crate::config::{CONFIG_VALUE_NONE, CONFIGS, ConfigDesc, ConfigValue};
 use std::time::Duration;

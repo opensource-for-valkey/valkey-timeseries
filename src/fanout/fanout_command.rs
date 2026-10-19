@@ -190,22 +190,8 @@ where
     };
 
     let state = Arc::new(FanoutState::new(op, outstanding, f, started));
-
-    let rpc_state = state.clone();
-    let response_handler = move |res: Result<&[u8], FanoutError>, target: &NodeInfo| {
-        let Ok(buf) = res else {
-            rpc_state.on_error(res.err().unwrap(), target);
-            return;
-        };
-        match OP::Response::deserialize(buf) {
-            Ok(resp) => rpc_state.on_response(resp, target),
-            Err(e) => {
-                let err =
-                    FanoutError::serialization(format!("Failed to deserialize response: {e}"));
-                rpc_state.on_error(err, target);
-            }
-        }
-    };
+    let response_handler =
+        rpc_response_handler(Arc::clone(&state), &PEER_REQUEST_EXECUTOR, deadline);
 
     if let Err(e) = invoke_rpc(
         ctx,
@@ -615,6 +601,7 @@ where
         // A share that waited in the queue may no longer be wanted: the fanout
         // already completed (an RPC timeout or a fail-fast error), or its
         // deadline passed and the blocked client has had the timeout error.
+        // `FanoutState::still_wanted`, inline, to count the expiry.
         if state.is_completed() {
             return;
         }
@@ -689,7 +676,12 @@ mod tests {
             let _ = tx.send((op.responses, res.err().map(|e| e.kind)));
         });
         (
-            Arc::new(FanoutState::new(Counting::default(), 1, completion)),
+            Arc::new(FanoutState::new(
+                Counting::default(),
+                1,
+                completion,
+                Instant::now(),
+            )),
             rx,
         )
     }

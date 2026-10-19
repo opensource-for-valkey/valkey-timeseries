@@ -66,13 +66,13 @@ pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes
 
     reply_with_map(ctx, bytes.len() * 2 + counts.len());
     for (name, human_name, value) in bytes {
-        reply_with_str(ctx, name);
+        reply_with_simple_string(ctx, name);
         reply_with_usize(ctx, value);
-        reply_with_str(ctx, human_name);
+        reply_with_simple_string(ctx, human_name);
         reply_with_bulk_string(ctx, &bytes_to_human(value as u64));
     }
     for (name, value) in counts {
-        reply_with_str(ctx, name);
+        reply_with_simple_string(ctx, name);
         reply_with_usize(ctx, value);
     }
 }

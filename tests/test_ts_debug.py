@@ -1163,11 +1163,12 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         stats = self.debug_metrics('fanout')
         errors = [n for n in stats
                   if n.startswith('fanout_errors_') and n != 'fanout_errors_total']
-        assert len(errors) == 15, errors
+        assert len(errors) == 16, errors
         assert stats['fanout_errors_total'] == sum(stats[n] for n in errors)
         assert 'fanout_errors_timeout_total' in errors
         assert 'fanout_errors_database_swapped_total' in errors
         assert 'fanout_errors_key_permissions_total' in errors
+        assert 'fanout_errors_query_limit_total' in errors
 
     def test_asm_section(self):
         """Both ASM tasks carry the full task lifecycle under `asm_`, next to their work

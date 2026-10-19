@@ -247,7 +247,7 @@ As coordinator:
 | `fanout_duration_seconds` | histogram | Time from the start of an operation to its result |
 | `fanout_inflight` | gauge | RPCs with remote shares outstanding (see `TS._DEBUG INFLIGHT`) |
 | `fanout_errors_total` | counter | Shard errors of every kind, the local share included: the sum of the `fanout_errors_<kind>_total` counters |
-| `fanout_errors_<kind>_total` | counter | Shard errors by kind, the local share included. Kinds: `invalid_message`, `node_unreachable`, `timeout`, `unknown_message_type`, `permissions`, `key_permissions`, `serialization`, `bad_request_id`, `internal`, `cluster_map_mismatch`, `unsupported_features`, `invalid_db`, `busy`, `database_swapped`, `custom` |
+| `fanout_errors_<kind>_total` | counter | Shard errors by kind, the local share included. Kinds: `invalid_message`, `node_unreachable`, `timeout`, `unknown_message_type`, `permissions`, `key_permissions`, `serialization`, `bad_request_id`, `internal`, `cluster_map_mismatch`, `unsupported_features`, `invalid_db`, `busy`, `database_swapped`, `query_limit`, `custom` |
 | `fanout_aborts_total` | counter | Operations ended early by an error returned as it is: a cluster-map mismatch, a permission denial, a busy shard |
 | `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
 | `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |

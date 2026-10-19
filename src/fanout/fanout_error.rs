@@ -74,7 +74,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in the order `TS._DEBUG METRICS fanout` reports `fanout_errors_<kind>_total`.
-    pub(crate) const ALL: [ErrorKind; 15] = [
+    pub(crate) const ALL: [ErrorKind; 16] = [
         ErrorKind::InvalidMessage,
         ErrorKind::NodeUnreachable,
         ErrorKind::Timeout,
@@ -89,6 +89,7 @@ impl ErrorKind {
         ErrorKind::InvalidDb,
         ErrorKind::Busy,
         ErrorKind::DatabaseSwapped,
+        ErrorKind::QueryLimit,
         ErrorKind::Custom,
     ];
 
@@ -110,7 +111,8 @@ impl ErrorKind {
             ErrorKind::InvalidDb => 11,
             ErrorKind::Busy => 12,
             ErrorKind::DatabaseSwapped => 13,
-            ErrorKind::Custom => 14,
+            ErrorKind::QueryLimit => 14,
+            ErrorKind::Custom => 15,
         }
     }
 
@@ -131,6 +133,7 @@ impl ErrorKind {
             ErrorKind::InvalidDb => "invalid_db",
             ErrorKind::Busy => "busy",
             ErrorKind::DatabaseSwapped => "database_swapped",
+            ErrorKind::QueryLimit => "query_limit",
             ErrorKind::Custom => "custom",
         }
     }

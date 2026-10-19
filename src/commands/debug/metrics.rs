@@ -22,11 +22,11 @@ fn reply_histogram(ctx: &Context, snapshot: &HistogramSnapshot) {
         .filter(|bucket| bucket.le.is_finite())
         .collect();
     reply_with_map(ctx, 3);
-    reply_with_str(ctx, "count");
+    reply_with_simple_string(ctx, "count");
     reply_with_integer(ctx, saturating_i64(snapshot.count));
-    reply_with_str(ctx, "sum");
+    reply_with_simple_string(ctx, "sum");
     reply_with_double(ctx, snapshot.sum);
-    reply_with_str(ctx, "buckets");
+    reply_with_simple_string(ctx, "buckets");
     reply_with_array(ctx, finite.len());
     for bucket in finite {
         reply_with_array(ctx, 2);
@@ -132,19 +132,19 @@ fn reply_cluster_human_value(ctx: &Context, value: &ClusterValue) {
 fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
     let human = shows_human(reading.is_bytes, reading.kind);
     reply_with_map(ctx, if human { 6 } else { 5 });
-    reply_with_str(ctx, "name");
+    reply_with_simple_string(ctx, "name");
     reply_with_bulk_string(ctx, &reading.name);
-    reply_with_str(ctx, "section");
+    reply_with_simple_string(ctx, "section");
     reply_with_bulk_string(ctx, reading.section.as_str());
-    reply_with_str(ctx, "kind");
-    reply_with_str(ctx, reading.kind.as_str());
-    reply_with_str(ctx, "value");
+    reply_with_simple_string(ctx, "kind");
+    reply_with_simple_string(ctx, reading.kind.as_str());
+    reply_with_simple_string(ctx, "value");
     reply_metric_value(ctx, &reading.value);
     if human {
-        reply_with_str(ctx, "valueHuman");
+        reply_with_simple_string(ctx, "valueHuman");
         reply_human_value(ctx, &reading.value);
     }
-    reply_with_str(ctx, "description");
+    reply_with_simple_string(ctx, "description");
     reply_with_bulk_string(ctx, &reading.help);
 }
 
@@ -160,19 +160,19 @@ pub(super) fn reply_cluster_metrics(ctx: &Context, readings: &[ClusterReading], 
             };
             let human = shows_human(reading.is_bytes, reading.kind);
             reply_with_map(ctx, if human { 6 } else { 5 });
-            reply_with_str(ctx, "name");
+            reply_with_simple_string(ctx, "name");
             reply_with_bulk_string(ctx, &reading.name);
-            reply_with_str(ctx, "section");
+            reply_with_simple_string(ctx, "section");
             reply_with_bulk_string(ctx, section);
-            reply_with_str(ctx, "kind");
-            reply_with_str(ctx, reading.kind.as_str());
-            reply_with_str(ctx, "value");
+            reply_with_simple_string(ctx, "kind");
+            reply_with_simple_string(ctx, reading.kind.as_str());
+            reply_with_simple_string(ctx, "value");
             reply_cluster_value(ctx, &reading.value);
             if human {
-                reply_with_str(ctx, "valueHuman");
+                reply_with_simple_string(ctx, "valueHuman");
                 reply_cluster_human_value(ctx, &reading.value);
             }
-            reply_with_str(ctx, "description");
+            reply_with_simple_string(ctx, "description");
             reply_with_bulk_string(ctx, &reading.help);
         }
     } else {
@@ -247,7 +247,7 @@ pub(super) fn metrics_cmd(ctx: &Context, args: &mut CommandArgIterator) -> Valke
             return Ok(());
         }
         metrics::reset();
-        reply_with_str(ctx, "OK");
+        reply_with_simple_string(ctx, "OK");
         return Ok(());
     }
 

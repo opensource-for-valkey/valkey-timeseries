@@ -218,6 +218,8 @@ where
         let _flight = flight;
         job(run);
     });
+}
+
 /// Runs `work` on the evaluation pool and waits for it: the one sanctioned way in, because it
 /// checks R2 first. Every parallel entry point `work` reaches resolves to that pool (R4).
 #[track_caller]

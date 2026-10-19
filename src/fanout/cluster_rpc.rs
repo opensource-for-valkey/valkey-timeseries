@@ -847,6 +847,9 @@ mod tests {
     fn request(targets: HashSet<NodeInfo>, seen: Arc<Mutex<Vec<ErrorKind>>>) -> InFlightRequest {
         InFlightRequest {
             id: 1,
+            command: "test",
+            started: Instant::now(),
+            remote_targets: targets.len(),
             targets: Arc::new(targets),
             response_handler: Box::new(move |res, _node| {
                 if let Err(err) = res {

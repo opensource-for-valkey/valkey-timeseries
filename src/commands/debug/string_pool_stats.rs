@@ -12,23 +12,23 @@ use valkey_module::{Context, NextArg, ValkeyResult};
 fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
     reply_with_map(ctx, 6);
 
-    reply_with_str(ctx, "count");
+    reply_with_simple_string(ctx, "count");
     reply_with_usize(ctx, bucket.count);
 
-    reply_with_str(ctx, "bytes");
+    reply_with_simple_string(ctx, "bytes");
     reply_with_usize(ctx, bucket.bytes);
 
-    reply_with_str(ctx, "avgSize");
+    reply_with_simple_string(ctx, "avgSize");
     reply_with_double(ctx.ctx, bucket.get_avg_size());
 
-    reply_with_str(ctx, "allocated");
+    reply_with_simple_string(ctx, "allocated");
     reply_with_usize(ctx, bucket.allocated);
 
-    reply_with_str(ctx, "avgAllocated");
+    reply_with_simple_string(ctx, "avgAllocated");
     reply_with_double(ctx, bucket.get_avg_allocated());
 
     let utilization = bucket.get_utilization() * 100.0;
-    reply_with_str(ctx, "utilizationPct");
+    reply_with_simple_string(ctx, "utilizationPct");
     reply_with_usize(ctx, utilization as usize);
 }
 
@@ -36,24 +36,24 @@ fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
 fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
     reply_with_map(ctx, 4);
 
-    reply_with_str(ctx, "value");
+    reply_with_simple_string(ctx, "value");
     reply_with_bulk_string(ctx, &entry.value);
 
-    reply_with_str(ctx, "refCount");
+    reply_with_simple_string(ctx, "refCount");
     reply_with_usize(ctx, entry.ref_count as usize);
 
-    reply_with_str(ctx, "bytes");
+    reply_with_simple_string(ctx, "bytes");
     reply_with_usize(ctx, entry.bytes as usize);
 
-    reply_with_str(ctx, "allocated");
+    reply_with_simple_string(ctx, "allocated");
     reply_with_usize(ctx, entry.allocated as usize);
 }
 
 /// Writes a `<name>` byte count and a `<name>Human` rendering of it, two map entries.
 fn reply_with_bytes(ctx: &Context, name: &str, bytes: usize) {
-    reply_with_str(ctx, name);
+    reply_with_simple_string(ctx, name);
     reply_with_usize(ctx, bytes);
-    reply_with_str(ctx, &format!("{name}Human"));
+    reply_with_simple_string(ctx, &format!("{name}Human"));
     reply_with_bulk_string(ctx, &bytes_to_human(bytes as u64));
 }
 
@@ -124,16 +124,16 @@ pub(super) fn reply_with_string_pool_stats(
     let total_storage_bytes = stats.total_storage_bytes();
     reply_with_map(ctx, 9);
     reply_with_bytes(ctx, "memorySavedBytes", stats.memory_saved_bytes);
-    reply_with_str(ctx, "memorySavedPct");
+    reply_with_simple_string(ctx, "memorySavedPct");
     reply_with_double(
         ctx.ctx,
         saved_pct(stats.memory_saved_bytes, stats.total.allocated),
     );
-    reply_with_str(ctx, "holders");
+    reply_with_simple_string(ctx, "holders");
     reply_with_usize(ctx, stats.holder_count);
     reply_with_bytes(ctx, "holderSlotBytes", stats.holder_slot_bytes);
     reply_with_bytes(ctx, "totalStorageBytes", total_storage_bytes);
-    reply_with_str(ctx, "storageSavedPct");
+    reply_with_simple_string(ctx, "storageSavedPct");
     reply_with_double(
         ctx.ctx,
         saved_pct(stats.memory_saved_bytes, total_storage_bytes),

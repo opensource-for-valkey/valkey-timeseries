@@ -6,7 +6,7 @@ use crate::commands::fanout_codec::generated::{
 };
 use crate::common::logging::log_warning;
 use crate::common::metrics::{self, MetricKind, MetricReading, MetricValue, Section};
-use crate::common::replies::{ReplyContext, reply_with_str};
+use crate::common::replies::{ReplyContext, reply_with_simple_string};
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
@@ -321,7 +321,7 @@ impl FanoutClientCommand for MetricsFanoutCommand {
     fn reply(&mut self, ctx: &ReplyContext) -> Status {
         let ctx = ctx.context();
         if self.reset {
-            reply_with_str(ctx, "OK");
+            reply_with_simple_string(ctx, "OK");
             return Status::Ok;
         }
         let local = metrics::snapshot(&self.sections);

@@ -81,6 +81,16 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
     forked `aof_rewrite` child can't take the module GIL, so it serializes via `rdb_save` and emits
     the internal `TS._RESTORE key <blob>` command instead of `DUMP`/normal commands; the
     destination replays it like a replication feed (`src/commands/ts_restore.rs`).
+- `src/promql/` — registered via `register_promql()` when clustered.
+  - `engine/` — query dispatch: `promql_engine.rs`/`querier.rs`, `query_workers.rs` (dedicated
+    thread pool for `TS.QUERY`/`TS.QUERYRANGE`, sized by `ts-promql-max-concurrent-queries` — plain
+    threads, not rayon, because evaluation blocks on fan-outs), `selector_batch_executor.rs` (its own
+    private rayon-backed materialization pool), `engine/fanout/` (PromQL's own cluster push-down
+    commands — a separate registry from the TS.* fanout ops).
+  - `exec/` — `planner.rs`, `preloader.rs` (preloads the evaluation grid once per subquery, shared
+    across the whole outer range query), `evaluator.rs`, `aggregations.rs`.
+  - `optimizer/` (const folding, selector push-down), `binops/`, `functions/`, `promqltest/` (conformance
+    DSL/runner).
 - `src/fanout/` + `src/commands/**/*_fanout_command.rs` — cluster fanout over the protobuf
   contract in `proto/v1/`, registered via `register_fanout_operations` (11 ops: LabelStats, Card,
   LabelSearch, MDel, MGet, MRange, QueryIndex, QueryLabels, StringPoolStats, IndexMemory, DebugMetrics

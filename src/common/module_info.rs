@@ -1,5 +1,5 @@
 //! The module's `INFO` sections: `ts_index`, `ts_compaction`, `ts_rdb`, `ts_blocked_read`,
-//! `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation` and `ts_fanout`.
+//! `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation`, `ts_fanout` and `ts_promql`.
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`, or
 //! `INFO <section>`; bare `INFO` and `INFO all` omit them. Section selection is checked before
@@ -7,6 +7,7 @@
 
 use crate::common::humanize::bytes_to_human;
 use crate::common::metrics::{self, MetricValue, Section};
+use crate::promql::engine::{admission, query_cache, query_workers};
 use crate::series::index::index_memory_usage;
 use crate::series::{COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS};
 use metered::Scalar;
@@ -137,6 +138,43 @@ fn info_value(value: &MetricValue) -> Option<InfoValue> {
         MetricValue::Gauge(Scalar::Float(v)) => InfoValue::F64(v),
         MetricValue::Histogram(_) => return None,
     })
+}
+
+/// `INFO ts_promql`: the `TS.QUERY` / `TS.QUERYRANGE` worker pool.
+///
+/// `queries_running` is at most `ts-promql-max-concurrent-queries`; `queries_queued` is
+/// at most `ts-promql-max-queued-queries`. `queries_rejected` counts, since startup, the
+/// queries refused on arrival because the backlog was full, and `queries_cancelled` those
+/// abandoned, queued or running, because their client disconnected. `samples_in_flight` is
+/// what running queries and the shard reads served for them have charged against
+/// `ts-promql-max-samples-in-flight`: running totals, not samples resident now. A non-zero,
+/// growing `queries_queued` with `queries_rejected` climbing is the pool being overrun:
+/// either the queries are too slow or there are too few workers for the load.
+///
+/// The `query_cache_*` fields describe the parsed-query cache: `entries` and `bytes` (the
+/// estimated memory charged for them) now, and since startup the `hits` and `misses` of
+/// lookups made while it was enabled and the `evictions` that kept it within its limits.
+#[info_command_handler]
+fn promql_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
+    let pool = query_workers::stats();
+    let cache = query_cache::stats();
+
+    ctx.builder()
+        .add_section("promql")
+        .field("queries_running", pool.running as u64)?
+        .field("queries_queued", pool.queued as u64)?
+        .field("queries_rejected", pool.rejected)?
+        .field("queries_cancelled", query_workers::cancelled_count())?
+        .field("samples_in_flight", admission::samples_in_flight() as u64)?
+        .field("query_cache_entries", cache.entries as u64)?
+        .field("query_cache_bytes", cache.bytes as u64)?
+        .field("query_cache_hits", cache.hits)?
+        .field("query_cache_misses", cache.misses)?
+        .field("query_cache_evictions", cache.evictions)?
+        .build_section()?
+        .build_info()?;
+
+    Ok(())
 }
 
 #[cfg(test)]

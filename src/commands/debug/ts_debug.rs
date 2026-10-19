@@ -7,8 +7,10 @@ use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
-use crate::fanout::inflight_requests;
+use crate::fanout::{hold_request_lane, inflight_requests};
+use crate::promql::engine::query_workers::panic_next_evaluation;
 use crate::series::index::series_keys_by_selectors;
+use std::time::Duration;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 /// Lists this node's fanout RPCs that still have remote shares outstanding, oldest first: one
@@ -26,15 +28,15 @@ fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     reply_with_array(ctx, requests.len());
     for request in &requests {
         reply_with_map(ctx, 5);
-        reply_with_str(ctx, "id");
+        reply_with_simple_string(ctx, "id");
         reply_with_bulk_string(ctx, &request.id.to_string());
-        reply_with_str(ctx, "command");
-        reply_with_str(ctx, request.command);
-        reply_with_str(ctx, "ageMs");
+        reply_with_simple_string(ctx, "command");
+        reply_with_simple_string(ctx, request.command);
+        reply_with_simple_string(ctx, "ageMs");
         reply_with_integer(ctx, request.age.as_millis().min(i64::MAX as u128) as i64);
-        reply_with_str(ctx, "remoteTargets");
+        reply_with_simple_string(ctx, "remoteTargets");
         reply_with_usize(ctx, request.remote_targets);
-        reply_with_str(ctx, "outstanding");
+        reply_with_simple_string(ctx, "outstanding");
         reply_with_integer(ctx, request.outstanding.min(i64::MAX as u64) as i64);
     }
     Ok(())
@@ -90,12 +92,20 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
             "Query this node's local index only (no cluster fanout)",
         ),
         (
+            "TS._DEBUG PANIC_NEXT_EVALUATION",
+            "Make the next PromQL evaluation panic (tests that a failed query still answers)",
+        ),
+        (
             "TS._DEBUG LIST_CONFIGS [VERBOSE]",
             "List config names (default) or VERBOSE details",
         ),
         (
             "TS._DEBUG PANIC_NEXT_ANALYSIS_JOB",
             "Make the next job on the analysis lane panic (tests the error reply)",
+        ),
+        (
+            "TS._DEBUG HOLD_FANOUT_LANE <milliseconds>",
+            "Occupy every fan-out request worker for that long (tests deadlines under a busy lane)",
         ),
         (
             "TS._DEBUG FAIL_NEXT_COMPACTION",
@@ -109,6 +119,25 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         reply_with_bulk_string(ctx, description);
     }
 
+    Ok(())
+}
+
+/// The longest `HOLD_FANOUT_LANE` takes: long enough for any deadline test, short enough that
+/// a mistyped argument does not leave a node unable to answer its peers.
+const MAX_LANE_HOLD_MS: u64 = 60_000;
+
+/// `TS._DEBUG HOLD_FANOUT_LANE <milliseconds>`: replies with how many workers it occupied.
+fn hold_fanout_lane(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+    let millis = args.next_u64()?;
+    args.done()?;
+    if millis == 0 || millis > MAX_LANE_HOLD_MS {
+        return Err(ValkeyError::String(format!(
+            "TSDB: hold must be between 1 and {MAX_LANE_HOLD_MS} milliseconds"
+        )));
+    }
+    let workers = hold_request_lane(Duration::from_millis(millis))
+        .map_err(|rejected| ValkeyError::String(format!("TSDB: {rejected}")))?;
+    reply_with_usize(ctx, workers);
     Ok(())
 }
 
@@ -136,16 +165,23 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),
         "LIST_CONFIGS" => list_configs_cmd(ctx, &mut itr),
+        "PANIC_NEXT_EVALUATION" => {
+            itr.done()?;
+            panic_next_evaluation();
+            reply_with_simple_string(ctx, "OK");
+            Ok(())
+        },
         "PANIC_NEXT_ANALYSIS_JOB" => {
             itr.done()?;
             panic_next_analysis_job();
-            reply_with_str(ctx, "OK");
+            reply_with_simple_string(ctx, "OK");
             Ok(())
         },
+        "HOLD_FANOUT_LANE" => hold_fanout_lane(ctx, &mut itr),
         "FAIL_NEXT_COMPACTION" => {
             itr.done()?;
             crate::series::fail_next_compaction();
-            reply_with_str(ctx, "OK");
+            reply_with_simple_string(ctx, "OK");
             Ok(())
         },
         _ => Err(ValkeyError::String(format!(
