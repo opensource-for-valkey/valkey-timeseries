@@ -357,13 +357,13 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             panic_next_analysis_job();
             reply_with_str(ctx, "OK");
             Ok(())
-        }
+        },
         "FAIL_NEXT_COMPACTION" => {
             itr.done()?;
             crate::series::fail_next_compaction();
             reply_with_str(ctx, "OK");
             Ok(())
-        }
+        },
         _ => Err(ValkeyError::String(format!(
             "Unknown subcommand: {} try HELP subcommand",
             keyword

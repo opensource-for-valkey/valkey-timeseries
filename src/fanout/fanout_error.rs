@@ -68,7 +68,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in the order `TS._DEBUG STATS fanout` reports `fanout_errors_<kind>_total`.
-    pub(crate) const ALL: [ErrorKind; 14] = [
+    pub(crate) const ALL: [ErrorKind; 15] = [
         ErrorKind::InvalidMessage,
         ErrorKind::NodeUnreachable,
         ErrorKind::Timeout,
@@ -82,6 +82,7 @@ impl ErrorKind {
         ErrorKind::UnsupportedFeatures,
         ErrorKind::InvalidDb,
         ErrorKind::Busy,
+        ErrorKind::DatabaseSwapped,
         ErrorKind::Custom,
     ];
 
@@ -102,7 +103,8 @@ impl ErrorKind {
             ErrorKind::UnsupportedFeatures => 10,
             ErrorKind::InvalidDb => 11,
             ErrorKind::Busy => 12,
-            ErrorKind::Custom => 13,
+            ErrorKind::DatabaseSwapped => 13,
+            ErrorKind::Custom => 14,
         }
     }
 
@@ -122,6 +124,7 @@ impl ErrorKind {
             ErrorKind::UnsupportedFeatures => "unsupported_features",
             ErrorKind::InvalidDb => "invalid_db",
             ErrorKind::Busy => "busy",
+            ErrorKind::DatabaseSwapped => "database_swapped",
             ErrorKind::Custom => "custom",
         }
     }

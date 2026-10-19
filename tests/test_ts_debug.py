@@ -1033,8 +1033,9 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_fanout_metrics_cover_every_error_kind(self):
         errors = [n for n in self.stats('fanout') if n.startswith('fanout_errors_')]
-        assert len(errors) == 14, errors
+        assert len(errors) == 15, errors
         assert 'fanout_errors_timeout_total' in errors
+        assert 'fanout_errors_database_swapped_total' in errors
         assert 'fanout_errors_key_permissions_total' in errors
 
     def test_cron_ticks_advance(self):

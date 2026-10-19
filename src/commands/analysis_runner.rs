@@ -8,7 +8,7 @@
 use crate::common::acl::caller_user_name;
 use crate::common::context::{get_current_db, is_blocking_denied};
 use crate::common::replies::{ReplyContext, ThreadSafeReplyContext, block_client};
-use crate::common::threads::{BoundedExecutor, Capacity, lane_workers};
+use crate::common::threads::{BoundedExecutor, Capacity, ExecutorStats, lane_workers};
 use crate::fanout::FanoutContext;
 use crate::series::index::{
     SeriesCursor, SeriesSelection, get_db_index, plan_if_cheap, series_read_exceeds_inline_budget,
