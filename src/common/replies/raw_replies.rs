@@ -4,8 +4,8 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_long};
 use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{
-    Context, ContextFlags, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN,
-    ValkeyModule_ReplySetArrayLength, ValkeyModuleCtx, ValkeyResult, raw,
+    Context, ContextFlags, Status, VALKEYMODULE_POSTPONED_ARRAY_LEN, ValkeyError,
+    ValkeyModule_ReplySetArrayLength, ValkeyModuleCtx, ValkeyResult, ValkeyValue, raw,
 };
 
 /// True when the client this reply targets negotiated RESP3 (HELLO 3).
@@ -34,15 +34,6 @@ impl IntoRawCtx for &Context {
     fn into_raw(self) -> *mut raw::RedisModuleCtx {
         self.ctx
     }
-}
-
-pub fn reply_with_str(ctx: &Context, s: &str) -> Status {
-    let msg = CString::new(s).unwrap_or_else(|_| {
-        // Remove any interior NUL bytes to ensure CString::new cannot fail here.
-        let sanitized: String = s.chars().filter(|c| *c != '\0').collect();
-        CString::new(sanitized).unwrap()
-    });
-    raw::reply_with_simple_string(ctx.ctx, msg.as_ptr())
 }
 
 /// Reply with a borrowed byte slice, without copying into a [`ValkeyValue`].

@@ -21,7 +21,9 @@ use crate::promql::generated::{
 };
 use crate::promql::hashers::FingerprintHashSet;
 use crate::promql::{EvalSample, RangeSample};
-use crate::series::chunks::{TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless};
+use crate::series::chunks::{
+    ChunkOps, TimeSeriesChunk, UncompressedChunk, samples_to_chunk_lossless,
+};
 use promql_parser::label::{Labels as ModifierLabels, MatchOp as PromMatchOp, Matcher, Matchers};
 use promql_parser::parser::{LabelModifier, VectorSelector};
 use regex::Regex;

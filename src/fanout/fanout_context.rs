@@ -3,6 +3,7 @@ use crate::common::context::set_current_db;
 use crate::common::threads::{GilSource, LockGil};
 use std::sync::OnceLock;
 use std::time::Instant;
+use valkey_module::logging::ValkeyLogLevel;
 use valkey_module::{DetachedContext, MODULE_CONTEXT, Status, ValkeyError, ValkeyResult};
 
 /// The shard-local side of one fan-out request: the ACL user it executes as,
@@ -26,6 +27,8 @@ pub struct FanoutContext {
     user: Option<String>,
     db: i32,
     ctx: &'static DetachedContext,
+    /// When the request reached this node: what its time budget counts from.
+    received: Instant,
     /// When the requester stops waiting, if it said ([`Self::set_deadline`]).
     deadline: OnceLock<Instant>,
 }
@@ -41,19 +44,35 @@ impl FanoutContext {
             user,
             db,
             ctx: &MODULE_CONTEXT,
+            received: Instant::now(),
             deadline: OnceLock::new(),
         }
+    }
+
+    /// The request reached this node at `received`, earlier than it was picked up: a
+    /// peer's request waits in the fan-out lane's queue, and that wait counts against
+    /// its time budget.
+    pub fn received_at(mut self, received: Instant) -> Self {
+        self.received = received;
+        self
+    }
+
+    /// When the request reached this node.
+    pub fn received(&self) -> Instant {
+        self.received
     }
 
     /// Record when the requester stops waiting for this answer. Reads walking the
     /// keyspace for it stop between batches from then on ([`Self::expired`]). Only the
     /// first call counts.
-    ///
-    /// Nothing on this branch sets one yet: the PromQL fan-out does, from its
-    /// request's time budget. Until then [`Self::expired`] is always false.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_deadline(&self, deadline: Instant) {
         let _ = self.deadline.set(deadline);
+    }
+
+    /// When the requester stops waiting, if it said: for work that checks it in its own
+    /// terms, as a PromQL kernel's deadline does.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline.get().copied()
     }
 
     /// Whether the requester has stopped waiting: its answer would arrive after it gave up.
@@ -96,6 +115,11 @@ impl FanoutContext {
         // next step rather than finishing with rights it no longer has.
         AclContextGuard::for_user(self.user.as_deref(), ctx)
     }
+
+    /// Log a warning without taking the GIL.
+    pub fn log_warning(&self, message: &str) {
+        self.ctx.log(ValkeyLogLevel::Warning, message);
+    }
 }
 
 /// A shard-local fan-out share: each lock re-selects the request's database and re-installs
@@ -115,11 +139,6 @@ impl GilSource for FanoutContext {
 
     fn expired(&self) -> bool {
         FanoutContext::expired(self)
-    }
-
-    /// Log a warning without taking the GIL.
-    pub fn log_warning(&self, message: &str) {
-        self.ctx.log(ValkeyLogLevel::Warning, message);
     }
 }
 

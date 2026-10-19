@@ -225,9 +225,36 @@ fn thread_acl_scope_active() -> bool {
 /// `RM_Call` without the `C` flag runs on and which no ACL rule applies to. The wire has no way
 /// to say "root", so the receiving side then checks as its own context's user (the `default`
 /// user on a fan-out shard), which may be stricter: such a call fails closed rather than open.
+///
+/// A thread running under a [`ThreadAclScope`] works for that scope's user, whatever its
+/// context's own client is, so the scope's name wins: PromQL's selector executor fans out
+/// from a query worker on `MODULE_CONTEXT`, whose client has no user of its own.
 pub(crate) fn caller_user_name(ctx: &Context) -> Option<String> {
+    if let Some(identity) = thread_identity()
+        && identity.user.is_some()
+    {
+        return Some(identity.name.to_string());
+    }
     let user = current_user_name(ctx)?.to_string();
     (!user.is_empty()).then_some(user)
+}
+
+/// Run `f` with this thread's checks running as `user`, under a module lock the caller
+/// already holds.
+///
+/// The coordinator-side counterpart of `FanoutContext::lock`, for code that already holds
+/// the lock (the main thread, or a query worker on `MODULE_CONTEXT`) and must read or fan
+/// out as the caller: the PromQL selector executor. `None` or an empty name runs `f` as the
+/// context's own user. The scope drops when `f` returns, before the caller releases the lock.
+pub(crate) fn with_acl_user<T, F>(ctx: &Context, user: Option<&str>, f: F) -> ValkeyResult<T>
+where
+    F: FnOnce(&Context) -> ValkeyResult<T>,
+{
+    let _scope = match user.filter(|name| !name.is_empty()) {
+        Some(name) => Some(ThreadAclScope::enter_as(name)?),
+        None => None,
+    };
+    f(ctx)
 }
 
 /// Whether key checks apply to `ctx` at all.

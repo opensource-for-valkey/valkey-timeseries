@@ -49,7 +49,6 @@ rand = { version = "0.10" }
 rand_distr = { version = "0.6", optional = true }
 smallvec = "1.16"
 speedate = "0.18"
-speedate = "0.17"
 strum = { version = "0.28", features = ["derive"] }
 strum_macros = "0.28"
 thiserror = "2.0"

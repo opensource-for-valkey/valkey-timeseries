@@ -3,8 +3,6 @@ use valkey_module::{
     ValkeyString, raw,
 };
 
-use crate::fanout::FANOUT_ACL_USER;
-
 /// Build a `ValkeyString` from raw key bytes without going through `CString`.
 ///
 /// `Context::create_string` funnels its argument through `CString::new(..).unwrap()`, so any
@@ -81,37 +79,6 @@ pub fn is_replica(ctx: &Context) -> bool {
 #[inline]
 pub fn is_blocking_denied(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::DENY_BLOCKING)
-}
-
-pub fn get_server_info(ctx: &Context, section: &str) -> *mut ValkeyModuleServerInfoData {
-#[inline]
-pub fn is_acl_enforced(ctx: &Context) -> bool {
-    // Replicated (master-link) and AOF-applied commands must not trigger ACL checks:
-    // the originating primary already enforced ACLs on the real client, and the
-    // replication/AOF apply context has no current user. Enforcing here would call
-    // the ACL API with a NULL username string, dereferencing a null pointer inside
-    // `RedisModule_GetModuleUserFromUserName` and crashing the server. `is_real_user_client`
-    // already excludes client_id == 0 (internal/module contexts), the AOF sentinel,
-    // and the REPLICATED flag.
-    //
-    // Fan-out request handlers run on the detached `MODULE_CONTEXT`, whose client is a
-    // real (fake-flagged) client with a non-zero id and no REPLICATED flag, so they are
-    // enforced by this same test; the fan-out ACL scope only supplies *which* user to
-    // check (see `get_acl_user`), never *whether* to check.
-    is_real_user_client(ctx)
-}
-
-pub fn get_acl_user(ctx: &Context) -> valkey_module::ValkeyString {
-    // A detached/thread-safe context has no client, so `get_current_user` reads
-    // `ctx->client->user->name` and returns empty. Background selector work
-    // (PromQL) carries the caller's identity in the thread-local fanout scope
-    // instead, so prefer it whenever that scope is active — including on a
-    // single node, not just in cluster fanout.
-    let fanout_identity = FANOUT_ACL_USER.with(|u| u.borrow().clone());
-    if let Some(identity) = fanout_identity {
-        return ctx.create_string(identity.name.as_str());
-    }
-    ctx.get_current_user()
 }
 
 pub fn register_server_event_handler(

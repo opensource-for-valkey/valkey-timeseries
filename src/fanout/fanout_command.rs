@@ -1,4 +1,4 @@
-use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc};
+use super::cluster_rpc::{get_cluster_command_timeout, invoke_rpc, validate_cluster_exec};
 use super::fanout_error::{ErrorKind, FanoutError};
 use crate::common::acl::caller_user_name;
 use crate::common::context::get_current_db;
@@ -419,13 +419,17 @@ where
         // stop waiting on the remaining shards. A shard that was too busy to take
         // its share, or whose database `SWAPDB` kept exchanging under its read,
         // likewise leaves the result incomplete, and the client should see that it
-        // can retry rather than a generic aggregate error.
+        // can retry rather than a generic aggregate error. A query limit a shard
+        // enforced on its share is surfaced the same way: its message names the
+        // limit and both numbers, and the other shards' answers cannot rescue a read
+        // that is already refused.
         if matches!(
             error.kind,
             ErrorKind::KeyPermissions
                 | ErrorKind::Permissions
                 | ErrorKind::Busy
                 | ErrorKind::DatabaseSwapped
+                | ErrorKind::QueryLimit
         ) {
             self.abort_error = Some(error);
             self.on_completion();

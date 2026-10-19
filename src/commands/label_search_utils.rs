@@ -8,7 +8,8 @@ use crate::common::SortDir;
 use crate::common::constants::METRIC_NAME_LABEL;
 use crate::common::context::{get_current_db, is_blocking_denied};
 use crate::common::replies::{
-    reply_with_array, reply_with_bool, reply_with_bulk_string, reply_with_integer, reply_with_map,
+    IntoRawCtx, reply_with_array, reply_with_bool, reply_with_bulk_string, reply_with_integer,
+    reply_with_map,
 };
 use crate::common::threads::GilSource;
 use crate::error_consts;
@@ -371,8 +372,8 @@ fn process_label_search_with_hints<S: GilSource + ?Sized>(
     }
 }
 
-pub(super) fn reply_with_label_search_result(
-    ctx: &Context,
+pub(super) fn reply_with_label_search_result<C: IntoRawCtx + Copy>(
+    ctx: C,
     query_result: LabelQueryResult,
     include_meta: bool,
 ) -> ValkeyResult {

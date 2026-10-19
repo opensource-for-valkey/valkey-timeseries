@@ -1,8 +1,7 @@
 use super::fanout_codec::{KeyListResponse, MetaQueryRequest};
 use super::fanout_codec::{deserialize_match_filter_options, serialize_match_filter_options};
-use super::utils::get_multi_command_targets;
 use crate::common::replies::{ReplyContext, reply_with_slice};
-use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo};
+use crate::fanout::{FanoutClientCommand, FanoutTarget, NodeInfo, compute_hash_tag_fanout_target};
 use crate::fanout::{FanoutCommandResult, FanoutContext};
 use crate::series::index::series_keys_by_selectors;
 use crate::series::request_types::MatchFilterOptions;

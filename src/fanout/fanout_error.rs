@@ -62,6 +62,12 @@ pub enum ErrorKind {
     /// attempt the read makes. Retryable. A peer too old to know this kind reports it as an
     /// invalid message.
     DatabaseSwapped = 13,
+    /// A node refused its share for exceeding a PromQL query limit (max series, max points
+    /// per series, max samples per query). Its own kind so the coordinator can surface the
+    /// node's message verbatim: the message names the limit and both numbers, which is the
+    /// whole point of the error, and the generic aggregate error would discard them. A peer
+    /// too old to know this kind reports it as an invalid message.
+    QueryLimit = 14,
 
     Custom = 255,
 }
@@ -173,6 +179,7 @@ impl ErrorKind {
             Self::InvalidDb => INVALID_DB_ERROR,
             Self::Busy => BUSY_ERROR,
             Self::DatabaseSwapped => error_consts::DATABASE_SWAPPED_DURING_READ,
+            Self::QueryLimit => QUERY_LIMIT_ERROR,
             Self::Custom => "Custom error",
         }
     }
@@ -303,6 +310,7 @@ impl TryFrom<u8> for ErrorKind {
             11 => Ok(ErrorKind::InvalidDb),
             12 => Ok(ErrorKind::Busy),
             13 => Ok(ErrorKind::DatabaseSwapped),
+            14 => Ok(ErrorKind::QueryLimit),
             255 => Ok(ErrorKind::Custom),
             _ => {
                 let msg = format!("Invalid error kind: {value}");
@@ -541,6 +549,7 @@ mod tests {
             ErrorKind::InvalidDb,
             ErrorKind::Busy,
             ErrorKind::DatabaseSwapped,
+            ErrorKind::QueryLimit,
             ErrorKind::Custom,
         ];
 
@@ -714,6 +723,7 @@ mod tests {
         assert_eq!(ErrorKind::InvalidDb as u8, 11);
         assert_eq!(ErrorKind::Busy as u8, 12);
         assert_eq!(ErrorKind::DatabaseSwapped as u8, 13);
+        assert_eq!(ErrorKind::QueryLimit as u8, 14);
         assert_eq!(ErrorKind::Custom as u8, 255);
     }
 

@@ -10,6 +10,10 @@ well as provide a superset of the _RedisTimeSeries_ API.
 - Configurable encoding
 - Single sample and range queries
 - Supports [Metadata](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metadata) like queries
+- PromQL querying with the `TS.QUERY` and `TS.QUERYRANGE` commands, which
+  support [instant and range queries](https://victoriametrics.com/blog/prometheus-monitoring-instant-range-query/)
+  respectively. See the [PromQL overview](docs/topics/promql.md) for language coverage,
+  execution behavior, and configuration.
 - Advanced [Label and Metric Discovery](docs/topics/label-discovery.md) with fuzzy matching, server-side filtering, and result limits applied after ranking
 - Anomaly detection using multiple algorithms, including [ZScore](https://en.wikipedia.org/wiki/Standard_score), [IQR](https://en.wikipedia.org/wiki/Interquartile_range), [MAD](https://crispinagar.github.io/blogs/mad-anomaly-detection.html), and [Random Cut Forest](https://christianalexander.com/2023/08/06/random-cut-forests-in-elixir/)
 - Compatibility with the [RedisTimeSeries](https://oss.redislabs.com/redistimeseries/) API.

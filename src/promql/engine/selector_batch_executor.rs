@@ -1,4 +1,5 @@
 use crate::common::Timestamp;
+use crate::common::acl::with_acl_user;
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::{log_debug, log_warning};
 use crate::common::threads::{
@@ -7,7 +8,7 @@ use crate::common::threads::{
 };
 use crate::common::time::current_time_millis;
 use crate::fanout::{FanoutCommandResult, FanoutError, exec_command, get_cluster_command_timeout};
-use crate::fanout::{compute_hash_tag_fanout_target, is_clustered, with_fanout_user};
+use crate::fanout::{compute_hash_tag_fanout_target, is_clustered};
 use crate::labels::filters::SeriesSelector;
 use crate::promql::EvalLabels;
 use crate::promql::deadline::Deadline;
@@ -28,7 +29,7 @@ use crate::promql::engine::{
 use crate::promql::{InstantSample, QueryError, QueryOptions, QueryResult, RangeSample};
 use crate::series::chunks::ChunkOps;
 use crate::series::index::{
-    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, SeriesCursor,
+    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, SeriesCursor, SeriesSelection,
 };
 use crate::series::{RangeSnapshot, TimeSeries};
 use orx_parallel::Par;
@@ -545,7 +546,7 @@ fn execute_selector_task(ctx: &Context, task: SelectorTask) {
     let error_responder = responder.clone();
     // The fanout command captures the authenticated user while this scope is
     // active and propagates it to every shard.
-    let result = with_fanout_user(ctx, caller_user.as_deref(), |ctx| {
+    let result = with_acl_user(ctx, caller_user.as_deref(), |ctx| {
         execute_selector_task_cluster(
             ctx,
             SelectorTask {
@@ -1183,7 +1184,7 @@ impl LocalRead {
             return None;
         }
         let selector = SeriesSelector::from(matchers);
-        match SeriesCursor::plan(db, &[selector], None) {
+        match SeriesCursor::plan(db, SeriesSelection::Matching(&[selector]), None) {
             Ok(cursor) => Some(Self {
                 cursor,
                 caller_user,
@@ -1218,7 +1219,7 @@ impl LocalRead {
         // Kept apart from the read's own errors, which become `Execution`: this
         // one must reach the caller as the budget error `decode` would raise.
         let mut over_budget = None;
-        let copied = with_fanout_user(ctx, self.caller_user.as_deref(), |ctx| {
+        let copied = with_acl_user(ctx, self.caller_user.as_deref(), |ctx| {
             Ok(match state {
                 ReadState::Instant {
                     start,

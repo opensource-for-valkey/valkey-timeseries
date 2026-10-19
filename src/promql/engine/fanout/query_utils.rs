@@ -1,5 +1,6 @@
 use crate::commands::fanout_codec::chunks::serialize_chunk;
 use crate::commands::fanout_codec::symbol_table;
+use crate::common::threads::GilSource;
 use crate::common::threads::IntoParRayon;
 use crate::common::{Sample, Timestamp};
 use crate::fanout::FanoutContext;
@@ -22,7 +23,7 @@ use crate::promql::generated::{
 };
 use crate::series::chunks::samples_to_chunk_lossless;
 use crate::series::index::{
-    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, GilSource, for_each_series,
+    BatchLimit, DEFAULT_BATCH_COPY_BYTES, DEFAULT_SERIES_BATCH_SIZE, for_each_series,
     for_each_series_batch_then,
 };
 use crate::series::{RangeSnapshot, TimeSeries};
