@@ -1,7 +1,15 @@
 use super::ts_card_fanout_command::CardFanoutCommand;
+use crate::commands::analysis_runner::{
+    SeriesReadPlacement, run_read_on_analysis_lane, schedule_series_read,
+};
 use crate::commands::command_parser::parse_metadata_command_args;
+use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::index::count_matched_series;
+use crate::series::index::{
+    SeriesCursor, SeriesSelection, count_matched_series, count_series_by_selectors,
+    count_series_by_selectors_planned,
+};
+use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 acl_categories!(TS_CARD, "ts.card", "read timeseries");
@@ -32,7 +40,35 @@ pub fn ts_card_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return operation.exec(ctx);
     }
 
-    let counter = count_matched_series(ctx, options.date_range, &options.matchers)?;
+    // Index-only counts do not open series, so they stay inline, as does an invalid
+    // range-only request so it keeps its ordinary error.
+    if options.date_range.is_none() || options.matchers.is_empty() {
+        return count_matched_series(ctx, options.date_range, &options.matchers)
+            .map(ValkeyValue::from);
+    }
 
-    Ok(ValkeyValue::from(counter))
+    let selection = SeriesSelection::Matching(&options.matchers);
+    match schedule_series_read(ctx, selection, options.date_range)? {
+        SeriesReadPlacement::Background(plan) => run_read_on_analysis_lane(
+            ctx,
+            "series count",
+            move |src| read_count(src, plan, &options),
+            |reply_ctx, count| {
+                reply_ctx.reply_with_integer(count as i64);
+            },
+        ),
+        SeriesReadPlacement::Inline(plan) => read_count(ctx, plan, &options).map(ValkeyValue::from),
+    }
+}
+
+/// The batched count itself: over `plan` when the command planned it, otherwise planned here.
+fn read_count<S: GilSource + ?Sized>(
+    src: &S,
+    plan: Option<SeriesCursor>,
+    options: &MatchFilterOptions,
+) -> ValkeyResult<usize> {
+    match plan {
+        Some(cursor) => count_series_by_selectors_planned(src, cursor),
+        None => count_series_by_selectors(src, &options.matchers, options.date_range),
+    }
 }

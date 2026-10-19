@@ -31,12 +31,13 @@
 //!   `join` and `*_rayon` work still steals while it waits, by design: that work stays on the
 //!   pool (R4).
 //!
-//!   Waiting for a data lock is allowed, not an exception, as long as R5 holds for it. A
-//!   shared-pool job that reads an index's postings (`TS.LABELSTATS` does) may wait for a writer
-//!   to finish: index updates, the stale-id sweep, `optimize_indices`. Those writers hold the
-//!   postings lock for one bounded batch, and never wait on a pool or take the GIL while they
-//!   hold it, so the wait always ends. `std`'s `RwLock` also queues a new reader behind a
-//!   waiting writer, so a GIL holder that waits on such jobs can stall for one writer batch.
+//!   Waiting for a data lock is allowed, not an exception, as long as R5 holds for it. No
+//!   shared-pool job reads an index's postings today; one that does may wait for a postings
+//!   writer to finish: index updates, the stale-id sweep, `optimize_indices`. Those writers
+//!   hold the postings lock for one bounded batch, and never wait on a pool or take the GIL
+//!   while they hold it, so the wait always ends. `std`'s `RwLock` also queues a new reader
+//!   behind a waiting writer, so a GIL holder that waits on such jobs can stall for one writer
+//!   batch.
 //! - **R2.** A GIL holder waits only on a pool that obeys R1 without exception: the shared pool
 //!   or an isolated pool, never a blocking pool.
 //! - **R3.** Only blocking threads and blocking-pool workers wait for another thread's answer,
@@ -77,8 +78,8 @@ mod single_flight;
 
 pub use executor::{BoundedExecutor, Capacity, ExecutorStats, Rejected, Reservation};
 pub use gil::{
-    GilGuard, GilToken, LockGil, check_holds_gil, check_may_block, check_may_wait_on_blocking_pool,
-    holds_gil,
+    GilGuard, GilSource, GilToken, LockGil, YieldMode, check_holds_gil, check_may_block,
+    check_may_wait_on_blocking_pool, holds_gil, yield_gil,
 };
 pub use orx_pool::{
     IntoParRayon, IterIntoParRayon, ModulePool, ParCollectionRayon, ParMutRayon, ParRayon,

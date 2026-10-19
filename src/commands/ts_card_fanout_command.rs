@@ -41,8 +41,9 @@ impl FanoutClientCommand for CardFanoutCommand {
         req: MetaQueryRequest,
     ) -> ValkeyResult<CountResponse> {
         let options = deserialize_match_filter_options(req.range, Some(req.filters))?;
-        let ctx = ctx.lock()?;
-        let count = count_matched_series(&ctx, options.date_range, &options.matchers)? as u64;
+        // Range-filtered counts take the lock a batch at a time; index-only counts retain
+        // their bitmap-cardinality fast path.
+        let count = count_matched_series(ctx, options.date_range, &options.matchers)? as u64;
         Ok(CountResponse { count })
     }
 

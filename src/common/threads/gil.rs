@@ -7,14 +7,18 @@
 //! with a backtrace and carries on.
 
 use super::role::{ThreadRole, current_role, on_pool_worker};
+use crate::common::context::get_current_db;
 use crate::common::logging::log_warning;
 use std::backtrace::Backtrace;
 use std::cell::Cell;
+use std::ffi::{CStr, c_int};
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
-use valkey_module::{Context, DetachedContext, DetachedContextGuard, ValkeyLockIndicator};
+use valkey_module::{
+    Context, DetachedContext, DetachedContextGuard, ValkeyLockIndicator, ValkeyResult, raw,
+};
 
 thread_local! {
     /// Whether this thread holds a [`GilToken`]. The main thread holds the GIL without one.
@@ -93,6 +97,49 @@ impl LockGil for DetachedContext {
     }
 }
 
+/// Where a multi-step read gets the module lock from, one batch at a time.
+pub trait GilSource {
+    /// The lock for one batch; the series opened under it live no longer than it does.
+    type Guard<'s>: Deref<Target = Context>
+    where
+        Self: 's;
+
+    /// Take the lock for one batch.
+    fn lock(&self) -> ValkeyResult<Self::Guard<'_>>;
+
+    /// The database the read runs against.
+    fn db(&self) -> i32;
+
+    /// Whether the lock can be given back between batches. A caller that already holds it
+    /// (the main thread) cannot, and is read in a single batch.
+    fn can_release(&self) -> bool {
+        true
+    }
+
+    /// Whether whoever asked for the read has stopped waiting for it, so the next batch
+    /// would be read for nobody. Checked before each batch after the first.
+    fn expired(&self) -> bool {
+        false
+    }
+}
+
+/// A caller already holding the lock: the read is one batch, as `series_by_selectors` is.
+impl GilSource for Context {
+    type Guard<'s> = &'s Context;
+
+    fn lock(&self) -> ValkeyResult<&Context> {
+        Ok(self)
+    }
+
+    fn db(&self) -> i32 {
+        get_current_db(self)
+    }
+
+    fn can_release(&self) -> bool {
+        false
+    }
+}
+
 /// Whether the calling thread holds the GIL: the main thread, or a live [`GilToken`].
 pub fn holds_gil() -> bool {
     HOLDS_GIL.with(Cell::get) || current_role() == ThreadRole::Main
@@ -121,6 +168,54 @@ pub fn check_holds_gil() {
     if !holds_gil() {
         violated(Rule::GilRequired);
     }
+}
+
+/// What the server may do during [`yield_gil`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YieldMode {
+    /// Background work only: client commands wait until the caller finishes.
+    Events,
+    /// Client commands too, but only those flagged `allow-busy` (`AUTH`, `MULTI`, `SHUTDOWN`
+    /// and a few more) run; every other command is refused with `-BUSY`. No `TS.*` command
+    /// is `allow-busy`, and neither is anything that deletes or writes a key.
+    Clients,
+}
+
+/// Lets the server process events while this thread holds the GIL through a long operation:
+/// a wrapper over `RedisModule_Yield`. Call it periodically from the operation's loop.
+///
+/// `ctx` is the context the GIL is held through: the running command's context on the main
+/// thread, or a thread-safe context while locked. `busy_reply` replaces the text after
+/// `-BUSY` in the replies refused under [`YieldMode::Clients`] (`None` keeps the server's own
+/// text); the server reads it only during the call.
+///
+/// The server yields only once `busy-reply-threshold` (default 5 s) has passed since `ctx` was
+/// created, and then at most once per threshold; every other call returns after reading a
+/// clock, so calling often is cheap. A context created long ago, such as the module's
+/// detached context, yields on its first call. A call made during another yield returns at
+/// once. While loading, the server processes events on its own schedule and refuses commands
+/// with `-LOADING`.
+///
+/// What may change across the call depends on the thread:
+/// - On the main thread, the server processes pending client I/O, and under
+///   [`YieldMode::Clients`] runs the `allow-busy` commands above. No timer runs: the
+///   module's cron and fan-out timeouts are time events, which a yield does not process.
+/// - Off the main thread, the server may release the GIL, let the main thread run, and take
+///   the GIL back before returning. Anything read under the GIL before the call — a series
+///   pointer, a key handle, an index lookup — must be read again afterwards.
+#[track_caller]
+pub fn yield_gil(ctx: &Context, mode: YieldMode, busy_reply: Option<&CStr>) {
+    check_holds_gil();
+    let flags = match mode {
+        YieldMode::Events => raw::REDISMODULE_YIELD_FLAG_NONE,
+        YieldMode::Clients => raw::REDISMODULE_YIELD_FLAG_CLIENTS,
+    };
+    let busy_reply = busy_reply.map_or(std::ptr::null(), CStr::as_ptr);
+    let yield_fn = unsafe { raw::RedisModule_Yield }.expect("RedisModule_Yield is not available");
+    // SAFETY: `ctx` is live, and this thread holds the GIL (checked above), as the call
+    // requires. `busy_reply` is null or a C string that outlives the call, after which the
+    // server no longer reads it.
+    unsafe { yield_fn(ctx.ctx, flags as c_int, busy_reply) }
 }
 
 /// R2: the caller is about to wait on a blocking pool, whose workers park on blocking
@@ -258,6 +353,20 @@ mod tests {
             .build()
             .unwrap();
         assert!(!blocking.install(|| panics(check_may_block)));
+    }
+
+    #[test]
+    fn yielding_requires_the_gil() {
+        std::thread::spawn(|| {
+            // Refused before the server is called: the context is never read.
+            let ctx = Context::new(std::ptr::null_mut());
+            let payload = std::panic::catch_unwind(|| yield_gil(&ctx, YieldMode::Events, None))
+                .expect_err("yielding without the GIL is a broken rule");
+            let message = crate::common::threads::panic_message(payload.as_ref());
+            assert!(message.contains("R6"), "{message}");
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

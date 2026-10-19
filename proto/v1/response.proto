@@ -68,6 +68,12 @@ message MultiRangeResponse {
   repeated string symbol_table_values = 7;
 }
 
+// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.
+message KeyListResponse {
+  repeated bytes keys = 1;
+}
+
+// QUERYLABELS returns UTF-8 label names or values.
 message StringListResponse {
   repeated string values = 1;
 }

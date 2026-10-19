@@ -9,7 +9,7 @@ pub(super) fn find_next_db(current: i32) -> Option<i32> {
     index.keys().filter(|&&db| db > current).min().copied()
 }
 
-const SERIES_TRIM_BATCH_SIZE: usize = 25;
+const SERIES_TRIM_BATCH_SIZE: usize = 256;
 const SERIES_TRIM_SCAN_ROUNDS: usize = 3;
 
 pub(super) fn fetch_series_batch(

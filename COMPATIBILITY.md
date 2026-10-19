@@ -42,6 +42,9 @@ Samples within a single series are always returned in timestamp order (ascending
 
 ### Data model
 
+`TS.QUERYINDEX` preserves key names as raw bytes in both standalone and cluster replies,
+including invalid UTF-8 and interior NUL bytes. Distinct byte strings remain distinct keys.
+
 The data model — series identified by a Valkey key, each holding a sequence of (timestamp, value) samples plus a set of label name/value pairs, governed by per-series properties such as retention period, chunk size, chunk encoding (`COMPRESSED` / `UNCOMPRESSED`), duplicate-sample policy, and rounding (`DECIMAL_DIGITS` / significant digits) — is expected to match RedisTimeSeries. Compaction rules created with `TS.CREATERULE` (the aggregation type, bucket duration, and alignment) and the label semantics used to select series in queries are expected to behave the same way. Series and rules configured for RedisTimeSeries should produce equivalent behavior when created against Valkey TimeSeries.
 
 ### A note on stricter input validation
@@ -86,11 +89,31 @@ This section describes areas where Valkey TimeSeries intentionally diverges from
 - Valkey TimeSeries bounds each fan-out with the `ts-fanout-command-timeout` configurable and returns an error when a consistent cluster-wide view cannot be established within it. This is a reply an equivalent RedisTimeSeries deployment need not produce.
 - ACL keyspace restrictions are enforced on the fanned-out result (see _Security Architecture_ under Non-Goals).
 
+Valkey TimeSeries reads each shard's `TS.QUERYINDEX` and `TS.QUERYLABELS` matches in batches,
+releasing the module lock between batches. This is not a point-in-time snapshot of a shard:
+later batches can see renames and sample writes, deleted series are skipped, and series created
+after planning are not included. Large standalone `TS.QUERYINDEX` and `TS.QUERYLABELS` reads,
+and range-filtered `TS.CARD` counts, are read the same way on background workers (see
+_Standalone background reads_ below).
+
 Requirements common to both modules are unchanged and are not part of this divergence: a compaction rule is a two-key operation whose source and destination must occupy the same hash slot (`TS.CREATERULE`, `TS.DELETERULE`, and any default compaction policy in a clustered deployment), and `TS.MADD` operates within a single slot. Hash tags remain the mechanism for both.
 
 **Why.** Using the cluster bus keeps fan-out inside the machinery an operator already runs, secures, and monitors, rather than introducing a parallel transport with its own ports and credentials to distribute. The timeout is the consequence of that choice being made explicit: a scatter/gather across shards can fail partially, and reporting that as an error is preferred to returning a silently incomplete result set.
 
-**Migration impact.** For deployments on a current RedisTimeSeries, there is generally no application-side fan-out to remove — the module was already doing it. What may exist is *workarounds*: per-shard query-and-merge logic written against a pre-1.6 deployment, or hash-tag co-location adopted solely to keep a multi-series query on one shard. Neither breaks, and both can be retired. Two things do need attention: any `OSS_GLOBAL_PASSWORD` provisioning is obsolete and should be removed from deployment automation, and callers of multi-series commands must handle the fan-out timeout error rather than treating it as an empty result. Deployments with cluster mode disabled are unaffected, regardless of whether they are a single node or a primary with replicas.
+**Migration impact.** For deployments on a current RedisTimeSeries, there is generally no application-side fan-out to remove — the module was already doing it. What may exist is *workarounds*: per-shard query-and-merge logic written against a pre-1.6 deployment, or hash-tag co-location adopted solely to keep a multi-series query on one shard. Neither breaks, and both can be retired. Two things do need attention: any `OSS_GLOBAL_PASSWORD` provisioning is obsolete and should be removed from deployment automation, and callers of multi-series commands must handle the fan-out timeout error rather than treating it as an empty result. Deployments with cluster mode disabled are unaffected by the fan-out behavior, regardless of whether they are a single node or a primary with replicas; large `TS.QUERYINDEX`, `TS.QUERYLABELS` and range-filtered `TS.CARD` reads on such a deployment have a difference of their own, described under _Standalone background reads_.
+
+### Standalone background reads (`TS.QUERYINDEX`, `TS.QUERYLABELS`, `TS.CARD`)
+
+**What differs.** On a server with cluster mode disabled, a `TS.QUERYINDEX` or `TS.QUERYLABELS` read of more than 512 series, or a `TS.CARD FILTER_BY_RANGE` count of more than 512 series, runs on a bounded pool of background workers instead of on the main thread. When every selector is an `=` or `!=` match on non-empty values (or, for `TS.QUERYLABELS`, `FILTER` is omitted), the match count is exact. Other selectors (regular expressions, prefix and substring matches, empty values) are sized by how many series the database indexes. A background read releases the module lock between batches of series, which has two observable consequences:
+
+- The reply is not a point-in-time snapshot of the database. Later batches can see renames and sample writes, deleted series are skipped, and series created after the read was planned are not included. Access checks are unchanged: `TS.QUERYLABELS` still omits series the caller may not read, `TS.QUERYINDEX` without `FILTER_BY_RANGE` still lists every matching key, and `FILTER_BY_RANGE` still requires read access to every matching series.
+- The command can fail when the workers' queue is full, with `TSDB: <read>: too many queued jobs (limit 256)`, where `<read>` is `series query` (`TS.QUERYINDEX`), `label query` (`TS.QUERYLABELS`) or `series count` (`TS.CARD`). The queue is shared with `TS.OUTLIERS` and the label-search extensions, so long outlier jobs can delay a large read or cause it to be refused. This is a reply an equivalent RedisTimeSeries deployment need not produce.
+
+Smaller reads, `TS.CARD` without `FILTER_BY_RANGE`, and any of these commands issued inside `MULTI`, a script, or a module call, run inline on the main thread in one lock hold, as before.
+
+**Why.** A read that resolves or opens every matching series holds the server for as long as it runs; on a large database that stalls every other client. Moving it off the main thread, a batch at a time, keeps the server responsive. The bounded queue is the consequence of doing so without letting a burst of large reads queue without limit.
+
+**Migration impact.** Applications that issue these commands against large standalone deployments should treat the queue-full error as transient and retry, rather than as an empty result. Applications that need the reply to reflect a single instant should issue the command inside `MULTI`, which keeps it in one lock hold. Small datasets, and filters narrow enough to match at most 512 series by equality, are unaffected.
 
 ### Persistence and on-disk format
 
@@ -216,7 +239,7 @@ These meet the criterion — both engines accept, values differ — but are not 
 
 ### What `strict` never affects
 
-The intentional incompatibilities listed above — configuration surface, `INFO` / `TS.INFO` metrics, cluster fan-out, persistence format, and log messages — are unchanged in either mode, as is error message *text*, which is not part of the compatibility contract. RESP2 floating-point *formatting* (DIV-0002…DIV-0007) is likewise out of scope: the parsed values are bit-identical, so it is a formatting difference rather than a value divergence.
+The intentional incompatibilities listed above — configuration surface, `INFO` / `TS.INFO` metrics, cluster fan-out, standalone background reads, persistence format, and log messages — are unchanged in either mode, as is error message *text*, which is not part of the compatibility contract. RESP2 floating-point *formatting* (DIV-0002…DIV-0007) is likewise out of scope: the parsed values are bit-identical, so it is a formatting difference rather than a value divergence.
 
 `ts-compatibility-mode` is orthogonal to `ts-emulate-release` below: this setting selects between two behaviors that are *both intended*, while `ts-emulate-release` preserves a behavior that was *wrong* so that fixing it does not break SemVer.
 
@@ -275,6 +298,10 @@ This step applies only to applications that use a variance-family aggregator, ei
 ### 11. Re-baseline `sum` / `avg` over series that mix magnitudes
 
 This step applies only to applications that sum or average buckets whose samples span widely different magnitudes — a large baseline with small increments, values at epoch-nanosecond scale, or large positive and negative values that cancel. Valkey TimeSeries returns the small residual that RedisTimeSeries's naive accumulation absorbed, most visibly as a non-zero value where RedisTimeSeries returned exactly `0` (see _Sum and average accumulation_ above). Identify the read paths and compaction rules that aggregate such series, then re-tune any threshold or alert calibrated against a RedisTimeSeries value, and expect a step change at the migration boundary in a compaction destination whose history was materialized under RedisTimeSeries. As with the variance family, `ts-compatibility-mode strict` does not restore the RedisTimeSeries values. Applications whose sampled values stay within a few orders of magnitude of each other can skip this step.
+
+### 12. Handle the queue-full error from large standalone `TS.QUERYLABELS`
+
+On a deployment with cluster mode disabled, a `TS.QUERYINDEX`, `TS.QUERYLABELS` or range-filtered `TS.CARD` that reads more than 512 series runs on background workers and can be refused when their queue is full (see _Standalone background reads_ above). Make sure callers treat that error as transient and retry it, rather than treating it as an empty result. Where a caller relies on the reply reflecting a single instant, issue the command inside `MULTI`. As with any error (step 6), branch on the failed command and its context rather than on the error text.
 
 ## Compatibility Defects
 

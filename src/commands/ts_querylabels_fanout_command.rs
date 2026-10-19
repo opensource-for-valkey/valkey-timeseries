@@ -55,13 +55,12 @@ impl FanoutClientCommand for QueryLabelsFanoutCommand {
             Some(req.label)
         };
 
-        let ctx = ctx.lock()?;
+        // No lock is taken here: the read takes it a batch at a time, giving it back between.
         let values = match subtype {
-            QueryLabelsSubtype::Labels => query_labels_distinct(&ctx, &matchers, None)?,
-            QueryLabelsSubtype::Values => query_labels_distinct(&ctx, &matchers, label.as_deref())?,
+            QueryLabelsSubtype::Labels => query_labels_distinct(ctx, &matchers, None)?,
+            QueryLabelsSubtype::Values => query_labels_distinct(ctx, &matchers, label.as_deref())?,
             QueryLabelsSubtype::Unspecified => return Err(invalid_subtype()),
         };
-        drop(ctx);
 
         Ok(StringListResponse {
             values: values.into_iter().collect(),

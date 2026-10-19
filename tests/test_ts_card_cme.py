@@ -186,6 +186,40 @@ class TestTsCardClusterCME(ValkeyTimeSeriesClusterTestCase):
         result = node0.execute_command('TS.CARD', 'FILTER_BY_RANGE', 'NOT', 2000, '+', 'FILTER', 'type=test', 'timing!=late')
         assert result == 1  # Only early series (excludes middle and late which have data at/after 2000)
 
+    def test_card_date_range_spans_batches_on_every_shard(self):
+        """Fully filtered batches must not hide later matches; NOT includes empty series."""
+        cluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster)
+        pipe = cluster.pipeline(transaction=False)
+        for tag in tags:
+            for i in range(1100):
+                # Two full 512-id batches miss the range on each shard.
+                timestamp = 1000 if i < 1024 else 2000
+                pipe.execute_command(
+                    'TS.ADD', f'card:batch:{{{tag}}}:{i}', timestamp, i,
+                    'LABELS', 'fleet', 'card-batch',
+                )
+            pipe.execute_command(
+                'TS.CREATE', f'card:batch:{{{tag}}}:empty', 'LABELS', 'fleet', 'card-batch',
+            )
+        pipe.execute()
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self.client_for_primary(coordinator)
+            assert client.execute_command('TS.CARD', 'FILTER', 'fleet=card-batch') == 1101 * len(tags)
+            assert client.execute_command(
+                'TS.CARD', 'FILTER_BY_RANGE', 2000, 2000, 'FILTER', 'fleet=card-batch',
+            ) == 76 * len(tags)
+            assert client.execute_command(
+                'TS.CARD', 'FILTER_BY_RANGE', 'NOT', 2000, 2000, 'FILTER', 'fleet=card-batch',
+            ) == 1025 * len(tags)
+            assert client.execute_command(
+                'TS.CARD', 'FILTER_BY_RANGE', 3000, 4000, 'FILTER', 'fleet=card-batch',
+            ) == 0
+            assert client.execute_command(
+                'TS.CARD', 'FILTER_BY_RANGE', 2000, 2000, 'FILTER', 'fleet=missing',
+            ) == 0
+
     def test_cluster_complex_label_queries(self):
         """Test complex label filtering patterns for cluster deployment"""
         cluster: ValkeyCluster = self.new_cluster_client()

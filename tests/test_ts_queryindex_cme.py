@@ -322,6 +322,69 @@ class TestTsQueryIndex(ValkeyTimeSeriesClusterTestCase):
         result = client.execute_command('TS.QUERYINDEX', 'FILTER_BY_RANGE', 'NOT', 500, 1500, 'name=cpu')
         assert result == [TS2]
 
+    def test_queryindex_spans_batches_on_every_shard(self):
+        cluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster)
+        all_keys, in_range, outside = [], [], []
+        pipe = cluster.pipeline(transaction=False)
+        for tag in tags:
+            for i in range(1100):
+                key = f'qi:batch:{{{tag}}}:{i}'.encode()
+                all_keys.append(key)
+                (outside if i < 1024 else in_range).append(key)
+                pipe.execute_command(
+                    'TS.ADD', key, 1000 if i < 1024 else 2000, i,
+                    'LABELS', 'fleet', 'queryindex-batch',
+                )
+            empty_key = f'qi:batch:{{{tag}}}:empty'.encode()
+            all_keys.append(empty_key)
+            outside.append(empty_key)
+            pipe.execute_command('TS.CREATE', empty_key, 'LABELS', 'fleet', 'queryindex-batch')
+        pipe.execute()
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self.client_for_primary(coordinator)
+            assert client.execute_command('TS.QUERYINDEX', 'fleet=queryindex-batch') == sorted(all_keys)
+            # The first two full batches on each shard contain no range matches.
+            assert client.execute_command(
+                'TS.QUERYINDEX', 'FILTER_BY_RANGE', 2000, 2000, 'fleet=queryindex-batch',
+            ) == sorted(in_range)
+            assert client.execute_command(
+                'TS.QUERYINDEX', 'FILTER_BY_RANGE', 'NOT', 2000, 2000, 'fleet=queryindex-batch',
+            ) == sorted(outside)
+            assert client.execute_command(
+                'TS.QUERYINDEX', 'HASHTAG', tags[0], 'fleet=queryindex-batch',
+            ) == sorted(k for k in all_keys if f'{{{tags[0]}}}'.encode() in k)
+            assert client.execute_command(
+                'TS.QUERYINDEX', 'FILTER_BY_RANGE', 3000, 4000, 'fleet=queryindex-batch',
+            ) == []
+            assert client.execute_command('TS.QUERYINDEX', 'fleet=missing') == []
+
+    @pytest.mark.parametrize('protocol', [2, 3])
+    def test_queryindex_preserves_binary_keys_across_shards(self, protocol):
+        cluster = self.new_cluster_client()
+        keys = []
+        # FF, FE and the valid UTF-8 replacement character all collide under lossy decoding.
+        suffixes = [b'\xff', b'\xfe', b'\xef\xbf\xbd', b'\x00tail', b'ascii', b'\xc3\xa9']
+        for tag in self.tag_per_primary(cluster):
+            for suffix in suffixes:
+                key = f'qi:binary:{{{tag}}}:'.encode() + suffix
+                keys.append(key)
+                cluster.execute_command('TS.ADD', key, 1000, 1, 'LABELS', 'fleet', 'binary')
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            primary = self.get_primary(coordinator)
+            client = Valkey(host=primary.bind_ip, port=primary.port, protocol=protocol)
+            try:
+                for range_args in [(), ('FILTER_BY_RANGE', 1000, 1000),
+                                   ('FILTER_BY_RANGE', 'NOT', 2000, 2000)]:
+                    assert client.execute_command('TS.QUERYINDEX', *range_args, 'fleet=binary') == sorted(keys)
+                assert client.execute_command(
+                    'TS.QUERYINDEX', 'FILTER_BY_RANGE', 'NOT', 1000, 1000, 'fleet=binary',
+                ) == []
+            finally:
+                client.close()
+
     def tag_per_primary(self, cluster_client: ValkeyCluster):
         """Return one hash tag per primary, each owned by a different node.
 

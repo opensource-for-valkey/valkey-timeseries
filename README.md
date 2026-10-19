@@ -10,7 +10,7 @@ well as provide a superset of the _RedisTimeSeries_ API.
 - Configurable encoding
 - Single sample and range queries
 - Supports [Metadata](https://prometheus.io/docs/prometheus/latest/querying/api/#querying-metadata) like queries
-- Advanced [Label and Metric Discovery](docs/topics/label-discovery.md) with fuzzy matching and server-side filtering
+- Advanced [Label and Metric Discovery](docs/topics/label-discovery.md) with fuzzy matching, server-side filtering, and result limits applied after ranking
 - Anomaly detection using multiple algorithms, including [ZScore](https://en.wikipedia.org/wiki/Standard_score), [IQR](https://en.wikipedia.org/wiki/Interquartile_range), [MAD](https://crispinagar.github.io/blogs/mad-anomaly-detection.html), and [Random Cut Forest](https://christianalexander.com/2023/08/06/random-cut-forests-in-elixir/)
 - Compatibility with the [RedisTimeSeries](https://oss.redislabs.com/redistimeseries/) API.
 
@@ -31,6 +31,8 @@ valkey-timeseries achieves high performance by storing series data in-memory and
 - **Parallelism:** Low-overhead threading model that enables concurrent lock-free reads across series and chunks.
 - **CPU Cache Efficiency:** Modern, cache-friendly algorithms for data and index storage.
 - **Memory Efficiency:** Uses string interning for label-value pairs.
+- **Background Index Reads:** Large standalone label discovery (`TS.LABELNAMES`, `TS.LABELVALUES`, `TS.METRICNAMES`, `TS.QUERYLABELS`) and range-filtered `TS.CARD` reads run on bounded background workers, releasing the module lock between batches so writes and other clients are not stalled. See [Command List](docs/COMMANDS.md) for when a request runs inline.
+
 ## Commands
 
 Command names and option names are case-insensitive.

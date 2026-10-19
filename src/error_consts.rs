@@ -137,6 +137,11 @@ pub const CANNOT_PARSE_COUNT: &str = "TSDB: Couldn't parse COUNT";
 pub const ROUNDING_ALREADY_SET: &str = "TSDB: rounding already set";
 pub const DUPLICATE_SAMPLE_BLOCKED: &str = "TSDB: Error at upsert, duplicate sample blocked";
 pub const PERMISSION_DENIED: &str = "TSDB: current user doesn't have read permission to one or more keys that match the specified filter";
+/// A read that gives the postings lock back between batches saw `SWAPDB` exchange the
+/// database under it on every attempt. Retryable. A fan-out share that returns it fails the
+/// whole command with this message (`ErrorKind::DatabaseSwapped`).
+pub const DATABASE_SWAPPED_DURING_READ: &str =
+    "TSDB: the database was swapped while it was being read; retry the command";
 pub const COMMAND_SERIALIZATION_ERROR: &str = "TSDB: command serialization error";
 pub const COMMAND_DESERIALIZATION_ERROR: &str = "TSDB: command deserialization error";
 pub const CLUSTER_MODE_ERROR: &str = "TSDB: cluster mode not supported";
@@ -166,6 +171,12 @@ pub const READ_BLOCKING_NOT_ALLOWED: &str = "TSDB: blocking TS.READ (with BLOCK)
 // clause-named style of the probed constants above. A bad operator reuses
 // INVALID_COMPARISON_OPERATOR, which `ComparisonOperator::try_from` already returns.
 pub const READ_CONDITION_VALUE_MUST_BE_A_NUMBER: &str = "TSDB: CONDITION value must be a number";
+
+// Fan-out
+/// A fan-out share stopped because its requester's time budget ran out: the requester
+/// has already answered its client without it.
+pub const FANOUT_REQUESTER_GAVE_UP: &str =
+    "TSDB: fan-out request abandoned: the requester's time budget ran out";
 
 // TS.QUERYLABELS
 pub const UNKNOWN_QUERY_LABELS_SUBTYPE: &str =

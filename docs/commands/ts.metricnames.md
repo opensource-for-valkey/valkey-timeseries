@@ -31,6 +31,16 @@ TS.METRICNAMES
 - `FILTER` applies one or more series selectors.
 - In cluster mode this command fans out to all shards and merges results.
 
+### Notes
+
+- `SORTBY score DESC` and `SORTBY cardinality DESC` select the highest-ranked metric names
+  before applying `LIMIT`. Equal scores or cardinalities are ordered by metric name ascending.
+- On standalone servers, a search that would read many index entries runs on a bounded pool of
+  background workers, shared with `TS.OUTLIERS`, and gives the index back to writers between
+  batches. Small searches, and any search inside `MULTI`, a script or a module call, run inline.
+  A background search is not a snapshot: it can observe changes made while it runs. When the
+  workers' queue is full, the search fails with `TSDB: label search: too many queued jobs (limit 256)`.
+
 ### Return
 
 Map reply with the following fields:

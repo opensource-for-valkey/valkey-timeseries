@@ -4,7 +4,7 @@ Returns the distinct label names, or the distinct values of a single label, acro
 series matching a filter list.
 
 ```
-TS.QUERYLABELS <LABELS | VALUES label> [FILTER selector [selector ...]]
+TS.QUERYLABELS <LABELS | VALUES label> [HASHTAG hash_tag,...] [FILTER selector [selector ...]]
 ```
 
 `LABELS` returns the distinct label names carried by the matching series. `VALUES label`
@@ -26,6 +26,12 @@ the distinct values of the single label name given as the next argument.
 
 ### Optional arguments
 
+<details open><summary><code>HASHTAG hash_tag,...</code></summary>
+In cluster mode, restricts fan-out to the nodes owning the comma-separated hash tags. It must
+come before `FILTER`. It has no effect on a standalone server and does not filter label names,
+values or series keys.
+</details>
+
 <details open><summary><code>selector</code></summary>
 Repeated series selector that restricts which series are considered. See
 [filter syntax](../topics/filter-syntax.md). At least one selector must follow `FILTER`.
@@ -44,13 +50,30 @@ Returns an error reply in the following cases:
 - The subtype is missing or is neither `LABELS` nor `VALUES` —
   `TSDB: unknown subtype, must be one of LABELS|VALUES`.
 - `VALUES` is given without a label name — wrong number of arguments.
-- A token other than `FILTER` follows the subtype —
-  `TSDB: unknown argument, expected FILTER`.
+- A token other than `HASHTAG` or `FILTER` follows the subtype, or a token other than `FILTER`
+  follows the `HASHTAG` list — `TSDB: unknown argument, expected FILTER`.
 - `FILTER` is given with no selectors —
   `TSDB: FILTER given with no filter expressions`.
 - A selector is malformed — `TSDB: series selector is invalid`.
 - Every selector is negative (for example only `label!=value`), so the list is unbounded —
   `TSDB: please provide at least one matcher`.
+
+#### Notes
+
+- On a standalone server, a read of more than 512 series runs on a bounded pool of background
+  workers, shared with `TS.OUTLIERS`, and gives the server back to other clients between
+  batches of series. When every selector is an `=` or `!=` match on non-empty values, the
+  series it matches are counted exactly, so a narrow filter on a large database is read
+  inline. Other selectors (regular expressions, prefix and substring matches, empty values) are
+  sized by how many series the database indexes. Any call inside `MULTI`, a script or a module
+  call is read inline. Unreadable series are omitted either way.
+- A background read is not a snapshot: it can observe changes made while it runs. The set of
+  series it visits is fixed when it is planned: when every selector is an `=` or `!=` match on
+  non-empty values, that is when the command arrives, otherwise when the read starts. A read that waits in the queue therefore
+  misses series created in the meantime, while series deleted before their batch is read are
+  omitted. When the workers' queue is full, the command fails with
+  `TSDB: label query: too many queued jobs (limit 256)`.
+- In cluster mode, each shard reads its share in batches in the same way.
 
 #### Examples
 

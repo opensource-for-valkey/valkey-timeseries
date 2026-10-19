@@ -3,7 +3,7 @@ from valkey import ResponseError, Valkey, ValkeyCluster
 
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCase
 from valkeytestframework.conftest import resource_port_tracker
-from common import LabelSearchResponse
+from common import LabelSearchResponse, parse_stats_response
 
 
 # Keys placed deterministically on distinct shards of a 3-primary cluster.
@@ -38,8 +38,9 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
 
     2. **Shard-side enforcement** - each fanout command applies the documented
        ACL policy on every shard:
-         * TS.QUERYINDEX / TS.CARD  -> index lookups, reveal matches regardless
-           of the caller's per-key read access.
+         * TS.QUERYINDEX / TS.CARD without range filters -> index lookups, reveal
+           matches regardless of the caller's per-key read access.
+         * TS.CARD with FILTER_BY_RANGE -> fail closed on unreadable matches.
          * TS.MGET / TS.MRANGE / TS.MREVRANGE -> data-returning, fail closed if
            the filter matches any key the caller cannot read.
          * TS.MDEL -> destructive, fails closed if the filter matches any key the
@@ -209,6 +210,69 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
         q = self._get_primary_user_client(0, "q", "pw")
         assert int(q.execute_command("TS.CARD", "FILTER", "name=cpu")) == 3
 
+    def test_queryindex_preserves_acl_policy_across_batches(self):
+        cluster = self.new_cluster_client()
+        pipe = cluster.pipeline(transaction=False)
+        allowed = [f'qi:allowed:{{3}}:{i}'.encode() for i in range(1024)]
+        denied = b'qi:denied:{3}:last'
+        for key in allowed:
+            pipe.execute_command(
+                'TS.ADD', key, 1000, 1, 'LABELS', 'fleet', 'queryindex-acl', 'access', 'allowed',
+            )
+        pipe.execute_command(
+            'TS.ADD', denied, 5000, 1, 'LABELS', 'fleet', 'queryindex-acl', 'access', 'denied',
+        )
+        pipe.execute()
+        self._create_user_on_all_primaries('qi-reader', 'pw', '+ts.queryindex', '~qi:allowed:*')
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            reader = self._get_primary_user_client(coordinator, 'qi-reader', 'pw')
+            assert reader.execute_command('TS.QUERYINDEX', 'fleet=queryindex-acl') == sorted(allowed + [denied])
+            assert reader.execute_command(
+                'TS.QUERYINDEX', 'FILTER_BY_RANGE', 1000, 1000,
+                'fleet=queryindex-acl', 'access=allowed',
+            ) == sorted(allowed)
+            for modifier in [(), ('NOT',)]:
+                with pytest.raises(ResponseError, match='permission'):
+                    reader.execute_command(
+                        'TS.QUERYINDEX', 'FILTER_BY_RANGE', *modifier, 1000, 1000,
+                        'fleet=queryindex-acl',
+                    )
+
+    def test_card_date_range_enforces_acl_after_first_batch(self):
+        """Range counts check access before the date predicate, including in later batches."""
+        cluster = self.new_cluster_client()
+        pipe = cluster.pipeline(transaction=False)
+        # One shard holds two full batches the reader may access, followed by a denied key.
+        for i in range(1024):
+            pipe.execute_command(
+                'TS.ADD', f'card:allowed:{{3}}:{i}', 1000, i,
+                'LABELS', 'fleet', 'card-acl', 'access', 'allowed',
+            )
+        pipe.execute_command(
+            'TS.ADD', 'card:denied:{3}:last', 5000, 1,
+            'LABELS', 'fleet', 'card-acl', 'access', 'denied',
+        )
+        pipe.execute()
+        self._create_user_on_all_primaries(
+            'card-reader', 'pw', '+ts.card', '~card:allowed:*',
+        )
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            reader = self._get_primary_user_client(coordinator, 'card-reader', 'pw')
+            # The index-only count still reveals every match.
+            assert reader.execute_command('TS.CARD', 'FILTER', 'fleet=card-acl') == 1025
+            assert reader.execute_command(
+                'TS.CARD', 'FILTER_BY_RANGE', 1000, 1000,
+                'FILTER', 'fleet=card-acl', 'access=allowed',
+            ) == 1024
+            for modifier in [(), ('NOT',)]:
+                with pytest.raises(ResponseError, match='permission'):
+                    reader.execute_command(
+                        'TS.CARD', 'FILTER_BY_RANGE', *modifier, 1000, 1000,
+                        'FILTER', 'fleet=card-acl',
+                    )
+
     def test_mget_returns_data_when_all_matched_keys_authorized(self):
         """TS.MGET succeeds when the filter matches only keys the caller can read,
         even if the sole match lives on a remote shard."""
@@ -271,6 +335,28 @@ class TestTimeSeriesAclCluster(ValkeyTimeSeriesClusterTestCase):
         # must still exist.
         assert cluster.execute_command("EXISTS", KEY_SHARD0) == 1
         assert cluster.execute_command("EXISTS", KEY_SHARD2) == 1
+
+    def test_labelstats_checks_metadata_permissions_on_every_shard(self):
+        cluster = self.new_cluster_client()
+        self._setup_per_shard_data(cluster)
+        self._create_user_on_all_primaries('stats-reader', 'pw', '+ts.labelstats', '~*')
+        # The coordinators on shards 0 and 2 admit the request; shard 1 must reject its share.
+        self.client_for_primary(1).execute_command(
+            'ACL', 'SETUSER', 'stats-reader', 'RESETKEYS', PATTERN_SHARD1,
+        )
+        for coordinator in range(self.CLUSTER_SIZE):
+            reader = self._get_primary_user_client(coordinator, 'stats-reader', 'pw')
+            try:
+                with pytest.raises(ResponseError, match='permission'):
+                    reader.execute_command('TS.LABELSTATS', 'FILTER', 'name=cpu')
+            finally:
+                reader.close()
+        self.client_for_primary(1).execute_command('ACL', 'SETUSER', 'stats-reader', '~*')
+        reader = self._get_primary_user_client(0, 'stats-reader', 'pw')
+        try:
+            assert parse_stats_response(reader.execute_command('TS.LABELSTATS'))['totalSeries'] == 3
+        finally:
+            reader.close()
 
     def test_labelvalues_requires_all_keys_read_permission(self):
         """TS.LABELVALUES exposes metadata that could leak across keys, so it

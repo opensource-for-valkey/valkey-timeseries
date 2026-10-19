@@ -62,6 +62,47 @@ class TestTsStatsCluster(ValkeyTimeSeriesClusterTestCase):
             f'found tags for only {len(by_node)} of {self.CLUSTER_SIZE} primaries'
         return [by_node[node] for node in sorted(by_node)]
 
+    def test_stats_counts_and_distinct_totals_span_multiple_postings_batches(self):
+        cluster = self.new_cluster_client()
+        tags = self.tag_per_primary(cluster)
+        pipe = cluster.pipeline(transaction=False)
+        for tag in tags:
+            for i in range(1100):
+                pipe.execute_command(
+                    'TS.CREATE', f'stats:batch:{{{tag}}}:{i}', 'LABELS',
+                    '__name__', 'cpu', 'scope', 'keep', 'host', f'h{i:04}',
+                )
+            pipe.execute_command(
+                'TS.CREATE', f'stats:batch:{{{tag}}}:excluded', 'LABELS',
+                '__name__', 'other', 'scope', 'excluded', 'private', tag,
+            )
+        pipe.execute()
+
+        for coordinator in range(self.CLUSTER_SIZE):
+            client = self.client_for_primary(coordinator)
+            stats = parse_stats_response(client.execute_command('TS.LABELSTATS'))
+            assert stats['totalSeries'] == 1101 * len(tags)
+            assert stats['totalLabels'] == 4
+            assert stats['totalLabelValuePairs'] == 1104 + len(tags)
+
+            stats = parse_stats_response(client.execute_command(
+                'TS.LABELSTATS', 'LABEL', 'host', 'LIMIT', 1000, 'FILTER', 'scope=keep',
+            ))
+            assert stats['totalSeries'] == 1100 * len(tags)
+            assert stats['totalLabels'] == 3
+            assert stats['totalLabelValuePairs'] == 1102
+            assert dict(stats['seriesCountByMetricName']) == {'cpu': 1100 * len(tags)}
+            focus = {value.decode(): count for value, count in stats['seriesCountByFocusLabelValue']}
+            assert len(focus) == 1000
+            assert all(value.startswith('h') and count == len(tags) for value, count in focus.items())
+            assert dict(stats['labelValueCountByLabelName']) == {
+                '__name__': 1100 * len(tags), 'scope': 1100 * len(tags), 'host': 1100 * len(tags),
+            }
+            empty = parse_stats_response(client.execute_command(
+                'TS.LABELSTATS', 'FILTER', 'scope=missing',
+            ))
+            assert (empty['totalSeries'], empty['totalLabels'], empty['totalLabelValuePairs']) == (0, 0, 0)
+
     def test_labelstats_hashtag_scopes_cluster_fanout(self):
         """HASHTAG queries only the slot(s) selected by the supplied hash tag."""
         cluster: ValkeyCluster = self.new_cluster_client()

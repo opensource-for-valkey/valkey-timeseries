@@ -128,10 +128,9 @@ impl FanoutClientCommand for LabelSearchFanoutCommand {
             tags: Vec::new(),
         };
 
-        let results = {
-            let ctx = ctx.lock()?;
-            process_label_search_request(&ctx, &parsed)?
-        };
+        // Not under one lock hold: the search takes the lock a batch of matched series at a
+        // time, so a broad selector does not stall the main thread for the whole read.
+        let results = process_label_search_request(ctx, &parsed)?;
 
         Ok(LabelSearchResponse {
             has_more: results.has_more,

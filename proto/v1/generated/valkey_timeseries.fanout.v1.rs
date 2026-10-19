@@ -805,6 +805,13 @@ pub struct MultiRangeResponse {
     #[prost(string, repeated, tag = "7")]
     pub symbol_table_values: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// QUERYINDEX returns key names verbatim, including invalid UTF-8 and interior NULs.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KeyListResponse {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub keys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+}
+/// QUERYLABELS returns UTF-8 label names or values.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StringListResponse {
     #[prost(string, repeated, tag = "1")]

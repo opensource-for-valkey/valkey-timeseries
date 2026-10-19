@@ -52,6 +52,15 @@ instead of over the whole index.
   `totalLabels`, `totalLabelValuePairs`, nor any of the top-K sections. When nothing matches,
   every count is zero and every section is empty.
 
+## Notes
+
+- In cluster mode, each shard checks the caller's metadata permissions under the module lock,
+  then releases it before planning selectors and scanning the postings. Cardinality counts and
+  distinct-label totals come from the same scan, which gives the postings lock back between
+  batches.
+- Writes can affect later batches, so a cluster report is not a point-in-time snapshot of a
+  shard. A standalone report retains the module lock for the whole read.
+
 ## Return
 
 A map containing the following fields.

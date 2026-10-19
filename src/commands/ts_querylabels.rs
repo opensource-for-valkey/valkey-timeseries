@@ -1,8 +1,15 @@
-use crate::commands::command_parser::parse_query_labels_command_args;
+use crate::commands::analysis_runner::{
+    SeriesReadPlacement, run_read_on_analysis_lane, schedule_series_read,
+};
+use crate::commands::command_parser::{QueryLabelsOptions, parse_query_labels_command_args};
 use crate::commands::ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
 use crate::common::replies::reply_with_string_set;
+use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::index::query_labels_distinct;
+use crate::series::index::{
+    SeriesCursor, query_labels_distinct, query_labels_distinct_planned, query_labels_selection,
+};
+use std::collections::BTreeSet;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -37,11 +44,35 @@ pub fn ts_querylabels_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResul
         return operation.exec(ctx);
     }
 
-    // Deduplicate while collecting; `BTreeSet` also gives the stable, sorted emission
-    // order the reply serializer relies on (the docs leave the order undefined, but a
-    // deterministic reply keeps the compat diff and tests reproducible).
-    let values = query_labels_distinct(ctx, &options.matchers, options.label.as_deref())?;
-    let values: Vec<String> = values.into_iter().collect();
-    reply_with_string_set(ctx, &values);
-    Ok(ValkeyValue::NoReply)
+    // A large read runs on the analysis lane, which gives the module lock back between
+    // batches, so the main thread keeps serving other clients. The lane reads through the
+    // caller's ACL user, so unreadable series are omitted per series exactly as inline.
+    match schedule_series_read(ctx, query_labels_selection(&options.matchers), None)? {
+        SeriesReadPlacement::Background(plan) => run_read_on_analysis_lane(
+            ctx,
+            "label query",
+            move |src| read_labels(src, plan, &options),
+            |reply_ctx, values| {
+                reply_with_string_set(reply_ctx, &values);
+            },
+        ),
+        SeriesReadPlacement::Inline(plan) => {
+            let values = read_labels(ctx, plan, &options)?;
+            reply_with_string_set(ctx, &values);
+            Ok(ValkeyValue::NoReply)
+        }
+    }
+}
+
+/// The read itself: over `plan` when the command planned it, otherwise planned here.
+fn read_labels<S: GilSource + ?Sized>(
+    src: &S,
+    plan: Option<SeriesCursor>,
+    options: &QueryLabelsOptions,
+) -> ValkeyResult<BTreeSet<String>> {
+    let label = options.label.as_deref();
+    match plan {
+        Some(cursor) => query_labels_distinct_planned(src, cursor, label),
+        None => query_labels_distinct(src, &options.matchers, label),
+    }
 }

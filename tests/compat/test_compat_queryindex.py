@@ -65,6 +65,17 @@ class TestFilterMatrix:
 
 
 class TestOrdering:
+    def test_binary_key_names(self, diff):
+        for key in (b"q:binary:\x00", b"q:binary:\xff", b"q:binary:\xfe",
+                    b"q:binary:\xef\xbf\xbd", b"q:binary:ascii"):
+            diff("TS.CREATE", key, "LABELS", "grp", "binary")
+        diff("TS.QUERYINDEX", "grp=binary")
+
+    def test_more_matches_than_one_key_batch(self, diff):
+        for i in range(1100):
+            diff("TS.CREATE", f"q:batch:{i}", "LABELS", "grp", "batch")
+        diff("TS.QUERYINDEX", "grp=batch")
+
     def test_result_order_is_normalized(self, diff):
         """RTS makes no cross-key order guarantee; the harness sorts before
         comparing. A larger match set makes any ordering difference visible."""

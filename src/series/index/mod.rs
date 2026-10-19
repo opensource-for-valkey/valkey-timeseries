@@ -1,6 +1,8 @@
 use std::ops::Deref;
+mod batched_querier;
 pub(crate) mod bulk_build;
 mod index_key;
+mod key_list;
 mod memory;
 mod posting_stats;
 mod postings;
@@ -18,7 +20,9 @@ use crate::common::logging::log_warning;
 use crate::series::index::postings::Postings;
 use crate::series::request_types::MatchFilterOptions;
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
+pub use batched_querier::*;
 pub use index_key::IndexKey;
+pub use key_list::KeyList;
 pub use memory::{IndexMemory, db_index_memory_usage, index_memory_usage};
 pub use posting_stats::*;
 pub use postings::PostingsBitmap;

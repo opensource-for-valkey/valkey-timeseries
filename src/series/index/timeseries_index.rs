@@ -1,6 +1,7 @@
 use ahash::AHashMap;
 use std::collections::BTreeSet;
 use std::hash::BuildHasher;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
 use super::posting_stats::{PostingStat, PostingsStats, StatsMaxHeap};
@@ -64,8 +65,45 @@ impl<'a> DerefMut for PostingsWriteGuard<'a> {
     }
 }
 
+/// Source of [`TimeSeriesIndex::generation`] values: global, so an index created to replace a
+/// flushed one never repeats the generation of the index it replaces.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The distinct label names and `name=value` pairs a statistics scan observed, as hashed
+/// fingerprints. A fan-out share ships these to the coordinator, which unions the bitmaps and
+/// counts their cardinality: a term present on several shards is then counted once, without
+/// shipping the terms themselves.
+///
+/// The hasher lives here rather than beside the scan, so it exists only when fingerprints are
+/// asked for: the standalone `stats` family passes `None` and hashes nothing.
+#[derive(Default)]
+struct TermFingerprints {
+    hasher: DeterministicHasher,
+    names: Bitmap64,
+    pairs: Bitmap64,
+}
+
+impl TermFingerprints {
+    fn add(&mut self, key: &IndexKey, name: &str) {
+        self.names.add(self.hasher.hash_one(name));
+        self.pairs.add(self.hasher.hash_one(key));
+    }
+}
+
+/// How many times [`TimeSeriesIndex::read_without_swap`] runs a read that `SWAPDB` keeps
+/// exchanging the database under before it gives up. One swap during a read is rare; three
+/// in a row is not a workload worth more attempts.
+const SWAP_RETRY_ATTEMPTS: usize = 3;
+
 pub struct TimeSeriesIndex {
     pub(crate) inner: RwLock<Postings>,
+    /// Changes whenever this index's contents are exchanged for another database's (`SWAPDB`).
+    /// See [`Self::generation`].
+    generation: AtomicU64,
 }
 
 impl Default for TimeSeriesIndex {
@@ -78,16 +116,28 @@ impl Clone for TimeSeriesIndex {
     fn clone(&self) -> Self {
         let inner = read_lock(&self.inner);
         let new_inner = inner.clone();
-        TimeSeriesIndex {
-            inner: RwLock::new(new_inner),
-        }
+        Self::from_postings(new_inner)
     }
 }
 impl TimeSeriesIndex {
     pub fn new() -> Self {
+        Self::from_postings(Postings::default())
+    }
+
+    pub(crate) fn from_postings(postings: Postings) -> Self {
         TimeSeriesIndex {
-            inner: RwLock::new(Postings::default()),
+            inner: RwLock::new(postings),
+            generation: AtomicU64::new(next_generation()),
         }
+    }
+
+    /// Identifies which database's contents this index holds. A scan that gives the postings
+    /// lock back between holds compares it before and after: if it changed, a `SWAPDB` moved
+    /// another database's postings in mid-scan, and the scan must be run again rather than
+    /// return a mix of the two. A flushed database's index is replaced by a new one, which has
+    /// a generation of its own.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     #[allow(dead_code)]
@@ -117,6 +167,10 @@ impl TimeSeriesIndex {
         let mut first_inner = write_lock(&first.inner);
         let mut second_inner = write_lock(&second.inner);
         first_inner.swap(&mut second_inner);
+        // Under the write locks, so a scan's next hold cannot see the swapped postings with
+        // the old generation.
+        first.generation.store(next_generation(), Ordering::SeqCst);
+        second.generation.store(next_generation(), Ordering::SeqCst);
     }
 
     pub fn index_timeseries(&self, ts: &TimeSeries, key: &[u8]) {
@@ -346,8 +400,7 @@ impl TimeSeriesIndex {
     /// The series matching every one of `selectors` (AND-ed together), or `None` when `selectors`
     /// is empty and nothing is being restricted.
     ///
-    /// The distinction matters to [`TimeSeriesIndex::stats_restricted`] and
-    /// [`TimeSeriesIndex::label_bitmaps_restricted`]: `None` means "the whole index", while
+    /// For statistics, `None` means "the whole index", while
     /// `Some(empty)` means "a filter was applied and nothing matched".
     pub fn matching_postings(
         &self,
@@ -360,12 +413,54 @@ impl TimeSeriesIndex {
         Ok(Some(inner.postings_for_selectors(selectors)?.into_owned()))
     }
 
+    /// Counts and distinct-label fingerprints from one scan with bounded postings-lock
+    /// holds and no module lock required. Both use the same filter and observed terms.
+    pub fn stats_and_label_bitmaps_by_selectors(
+        &self,
+        selectors: &[SeriesSelector],
+        label: &str,
+        limit: usize,
+    ) -> ValkeyResult<(PostingsStats, (Bitmap64, Bitmap64))> {
+        self.read_without_swap(|| {
+            let matching = self.matching_postings(selectors)?;
+            let mut fingerprints = TermFingerprints::default();
+            let stats =
+                self.collect_stats(matching.as_ref(), label, limit, Some(&mut fingerprints));
+            Ok((stats, (fingerprints.names, fingerprints.pairs)))
+        })
+    }
+
+    /// Run `read`, a read that gives the postings lock back between holds, again if `SWAPDB`
+    /// exchanged this index's contents while it ran (see [`Self::generation`]). Such a read
+    /// resumes in the other database's postings, so it would return one database's entries up
+    /// to that point and the other's after it.
+    ///
+    /// Every label scan and statistics read that releases the postings lock goes through
+    /// here, so all of them answer the same way. `read` must do all of its work again, planning
+    /// included: a bitmap planned against the old database cannot restrict the new one. After
+    /// [`SWAP_RETRY_ATTEMPTS`] swapped attempts the read fails with
+    /// [`error_consts::DATABASE_SWAPPED_DURING_READ`] rather than return mixed data; a fan-out
+    /// reports that as retryable.
+    pub(crate) fn read_without_swap<T>(
+        &self,
+        mut read: impl FnMut() -> ValkeyResult<T>,
+    ) -> ValkeyResult<T> {
+        for _ in 0..SWAP_RETRY_ATTEMPTS {
+            let generation = self.generation();
+            let result = read()?;
+            if self.generation() == generation {
+                return Ok(result);
+            }
+        }
+        Err(ValkeyError::Str(error_consts::DATABASE_SWAPPED_DURING_READ))
+    }
+
     /// Cardinality statistics over the whole index.
     ///
     /// `label` names the label whose values are broken out in `series_count_by_focus_label_value`
     /// (the metric name when empty), and `limit` bounds the length of each top-N list.
     pub fn stats(&self, label: &str, limit: usize) -> PostingsStats {
-        self.collect_stats(None, label, limit)
+        self.collect_stats(None, label, limit, None)
     }
 
     /// [`TimeSeriesIndex::stats`], restricted to the series matching `filters` (AND-ed together).
@@ -414,6 +509,19 @@ impl TimeSeriesIndex {
         label: &str,
         limit: usize,
     ) -> PostingsStats {
+        self.collect_stats(matching, label, limit, None)
+    }
+
+    /// The shared body of the `stats` family. When `matching` is given, each posting list is
+    /// counted through its intersection with that set. Optional fingerprints are collected
+    /// alongside the counts so a fan-out reply cannot describe two different sets of terms.
+    fn collect_stats(
+        &self,
+        matching: Option<&PostingsBitmap>,
+        label: &str,
+        limit: usize,
+        mut fingerprints: Option<&mut TermFingerprints>,
+    ) -> PostingsStats {
         if matching.is_some_and(PostingsBitmap::is_empty) {
             // A filter matched nothing, so there are no series, no labels and no label-value pairs
             // to report. Still report the (empty) focus-label list, as the unfiltered path does.
@@ -422,17 +530,6 @@ impl TimeSeriesIndex {
                 ..Default::default()
             };
         }
-        self.collect_stats(matching, label, limit)
-    }
-
-    /// The shared body of the `stats` family. When `matching` is given, each posting list is
-    /// counted through its intersection with that set.
-    fn collect_stats(
-        &self,
-        matching: Option<&PostingsBitmap>,
-        label: &str,
-        limit: usize,
-    ) -> PostingsStats {
         let mut per_label_counts: AHashMap<String, u64> = AHashMap::new();
 
         let mut metric_name_counts = StatsMaxHeap::new(limit);
@@ -463,6 +560,9 @@ impl TimeSeriesIndex {
         while !iterator.is_complete() {
             iterator.next_batch(|key, _, count| {
                 if let Some((name, value)) = key.split() {
+                    if let Some(fingerprints) = fingerprints.as_mut() {
+                        fingerprints.add(key, name);
+                    }
                     match per_label_counts.get_mut(name) {
                         Some(existing_count) => {
                             *existing_count = existing_count.saturating_add(count);
@@ -515,61 +615,6 @@ impl TimeSeriesIndex {
             label_count,
             series_count,
         }
-    }
-
-    /// Returns two bitmaps: one for label names and one for label name=value pairs.
-    /// The bitmaps are constructed by hashing the label names and label name=value pairs using a deterministic hasher.
-    ///
-    /// The use-case for this function is to efficiently determine which label names and label value pairs are present in the index,
-    /// especially in the case of cross-shard queries in a clustered environment, where we want to minimize the amount of data
-    /// transferred between nodes.
-    ///
-    /// A practical example is summing the total number of unique key=value pairs across the cluster. A naive first attempt
-    /// would be to simply count the total number of key=value pairs on each node and sum them up, but this would lead to
-    /// double-counting pairs that exist on multiple nodes.
-    ///
-    /// We instead can use the label-value pair bitmap to get a unique fingerprint of all the pairs on each node, and then
-    /// merge these bitmaps across nodes using a bitwise OR operation. The cardinality of the resulting bitmap will give us
-    /// the total number of unique key=value pairs across the cluster without double-counting.
-    pub fn get_label_bitmaps(&self) -> (Bitmap64, Bitmap64) {
-        self.label_bitmaps_restricted(None)
-    }
-
-    /// [`TimeSeriesIndex::get_label_bitmaps`] over a pre-resolved set of series — see
-    /// [`TimeSeriesIndex::matching_postings`]. Label names and pairs carried only by series outside
-    /// `matching` are left out of both fingerprints, which keeps a cluster-wide distinct count
-    /// consistent with the per-shard counts computed over the same set.
-    pub fn label_bitmaps_restricted(
-        &self,
-        matching: Option<&PostingsBitmap>,
-    ) -> (Bitmap64, Bitmap64) {
-        const BATCH_SIZE: usize = 512;
-
-        let mut label_names_bitmap = Bitmap64::default();
-        let mut label_value_pairs_bitmap = Bitmap64::default();
-
-        if matching.is_some_and(PostingsBitmap::is_empty) {
-            return (label_names_bitmap, label_value_pairs_bitmap);
-        }
-
-        let hasher = DeterministicHasher::default();
-
-        let mut iterator = BatchIterator::restricted(self, BATCH_SIZE, matching);
-
-        while !iterator.is_complete() {
-            iterator.next_batch(|key, _bitmap, _| {
-                if let Some((name, _value)) = key.split() {
-                    let name_hash = hasher.hash_one(name);
-                    label_names_bitmap.add(name_hash);
-
-                    let key_hash = hasher.hash_one(key);
-                    label_value_pairs_bitmap.add(key_hash);
-                }
-                ControlFlow::Continue(())
-            });
-        }
-
-        (label_names_bitmap, label_value_pairs_bitmap)
     }
 
     pub fn count(&self) -> usize {
@@ -773,10 +818,94 @@ mod tests {
 
     fn index_with_posting(id: SeriesRef, label: &str, value: &str) -> TimeSeriesIndex {
         let index = TimeSeriesIndex::new();
+        {
+            let mut postings = index.get_postings_mut();
+            postings.add_posting_for_label_value(id, label, value);
+            postings
+                .id_to_key
+                .insert(id, format!("key{id}").into_bytes().into_boxed_slice());
+        }
         index
-            .get_postings_mut()
-            .add_posting_for_label_value(id, label, value);
-        index
+    }
+
+    #[test]
+    fn stats_and_fingerprints_share_the_filter_and_stale_id_mask() {
+        let index = index_with_posting(1, "host", "a");
+        {
+            let mut postings = index.get_postings_mut();
+            postings.add_posting_for_label_value(1, "scope", "yes");
+            postings.add_posting_for_label_value(2, "host", "b");
+            postings
+                .id_to_key
+                .insert(2, b"key2".to_vec().into_boxed_slice());
+            postings.add_posting_for_label_value(2, "scope", "no");
+            postings.add_posting_for_label_value(2, "hidden", "private");
+            postings.add_posting_for_label_value(3, "host", "stale");
+            postings.mark_id_as_stale(3);
+        }
+        for (selector, expected) in [
+            (None, (2, 3, 5)),
+            (Some("scope=yes"), (1, 2, 2)),
+            (Some("scope=missing"), (0, 0, 0)),
+        ] {
+            let selectors: Vec<_> = selector
+                .map(|s| SeriesSelector::parse(s).unwrap())
+                .into_iter()
+                .collect();
+            let (stats, (names, pairs)) = index
+                .stats_and_label_bitmaps_by_selectors(&selectors, "host", 10)
+                .unwrap();
+            assert_eq!(
+                (
+                    stats.series_count,
+                    stats.label_count,
+                    stats.total_label_value_pairs
+                ),
+                expected
+            );
+            assert_eq!(names.cardinality(), stats.label_count as u64);
+            assert_eq!(pairs.cardinality(), stats.total_label_value_pairs as u64);
+        }
+    }
+
+    #[test]
+    fn a_statistics_read_restarts_after_swapdb() {
+        let index = index_with_posting(1, "host", "a");
+        let other = index_with_posting(2, "host", "b");
+        let mut attempts = 0;
+        let stats = index
+            .read_without_swap(|| {
+                let stats = index.stats("host", 10);
+                attempts += 1;
+                if attempts == 1 {
+                    index.swap(&other);
+                }
+                Ok(stats)
+            })
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            stats.series_count_by_focus_label_value.unwrap()[0].name,
+            "b"
+        );
+    }
+
+    #[test]
+    fn repeated_swapdb_fails_a_statistics_read_instead_of_returning_mixed_data() {
+        let index = index_with_posting(1, "host", "a");
+        let other = index_with_posting(2, "host", "b");
+        let mut attempts = 0;
+        let result = index.read_without_swap(|| {
+            attempts += 1;
+            index.swap(&other);
+            Ok(())
+        });
+        assert_eq!(attempts, 3);
+        // The fan-out classifies this text as a retryable failure, so it must not drift.
+        let Err(ValkeyError::Str(message)) = result else {
+            panic!("expected the swapped-database error, got {result:?}");
+        };
+        assert_eq!(message, error_consts::DATABASE_SWAPPED_DURING_READ);
     }
 
     #[test]

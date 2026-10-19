@@ -1,8 +1,16 @@
+use crate::commands::analysis_runner::{
+    SeriesReadPlacement, run_read_on_analysis_lane, schedule_series_read,
+};
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::commands::ts_queryindex_fanout_command::QueryIndexFanoutCommand;
-use crate::common::replies::{reply_with_array, reply_with_valkey_string};
+use crate::common::replies::{IntoRawCtx, reply_with_array, reply_with_slice};
+use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::index::series_keys_by_selectors;
+use crate::series::index::{
+    KeyList, SeriesCursor, SeriesSelection, series_keys_by_selectors,
+    series_keys_by_selectors_planned,
+};
+use crate::series::request_types::MatchFilterOptions;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -39,14 +47,41 @@ pub fn ts_queryindex_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult
         return operation.exec(ctx);
     }
 
-    let mut keys = series_keys_by_selectors(ctx, &options.matchers, options.date_range)?;
+    // A large read runs on the analysis lane. Only resolving keys needs the module lock, and
+    // that is done in batches; building the reply and freeing the keys then leave the main
+    // thread entirely. Keys are replied in index order: the contract leaves order undefined,
+    // and sorting cost a large read about 40%.
+    let selection = SeriesSelection::Matching(&options.matchers);
+    match schedule_series_read(ctx, selection, options.date_range)? {
+        SeriesReadPlacement::Background(plan) => run_read_on_analysis_lane(
+            ctx,
+            "series query",
+            move |src| read_keys(src, plan, &options),
+            |reply_ctx, keys| reply_with_keys(reply_ctx, &keys),
+        ),
+        SeriesReadPlacement::Inline(plan) => {
+            let keys = read_keys(ctx, plan, &options)?;
+            reply_with_keys(ctx, &keys);
+            Ok(ValkeyValue::NoReply)
+        }
+    }
+}
 
-    keys.sort_unstable();
+/// The read itself: over `plan` when the command planned it, otherwise planned here.
+fn read_keys<S: GilSource + ?Sized>(
+    src: &S,
+    plan: Option<SeriesCursor>,
+    options: &MatchFilterOptions,
+) -> ValkeyResult<KeyList> {
+    match plan {
+        Some(cursor) => series_keys_by_selectors_planned(src, cursor),
+        None => series_keys_by_selectors(src, &options.matchers, options.date_range),
+    }
+}
 
+fn reply_with_keys<C: IntoRawCtx + Copy>(ctx: C, keys: &KeyList) {
     reply_with_array(ctx, keys.len());
     for key in keys.iter() {
-        reply_with_valkey_string(ctx, key);
+        reply_with_slice(ctx, key);
     }
-
-    Ok(ValkeyValue::NoReply)
 }

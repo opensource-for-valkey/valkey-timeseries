@@ -54,13 +54,46 @@ expression. A query made only from negative or unbounded matchers is rejected.
 ## Return value
 
 Returns an array of matching time-series key names. The array is empty when
-no series matches. Reply ordering is not part of the command contract.
+no series matches. Reply ordering is not part of the command contract. Key
+names are binary-safe in standalone and cluster replies: invalid UTF-8 and
+interior NUL bytes are preserved, and distinct byte strings remain distinct
+results.
 
-Without `FILTER_BY_RANGE`, `TS.QUERYINDEX` answers from the label index alone
-and never reads sample data. With `FILTER_BY_RANGE`, each candidate series is
-opened and the chunks that overlap the range are checked for a sample.
+What the query reads, and whose access it checks, depends on `FILTER_BY_RANGE`:
+
+- **Without it**, the answer comes from the label index alone. No key is
+  opened and no sample data is read. Matching key names are returned whatever
+  the caller's per-key read access.
+- **With it**, each matching series is opened, and the chunks that overlap
+  the range are checked for a sample. Every matching series must be readable,
+  even one the range would exclude. If any is not, the query fails with a
+  permission error.
+
 In clustered deployments, the query is sent to all shards and the matching
 keys are merged into one reply.
+
+## Notes
+
+- In cluster mode, each shard reads its matches in batches and releases the
+  module lock between batches. A shard's answer is therefore not a
+  point-in-time snapshot:
+  - a series renamed before its batch is read is returned under its new name;
+  - a deleted series is skipped;
+  - a series created after the query was planned is not included;
+  - range checks in later batches can see writes made in between.
+- On a standalone server, a query estimated to match more than 512 series runs
+  on a bounded pool of background workers, shared with `TS.OUTLIERS` and
+  label-discovery reads, and reads in batches in the same way. When every
+  selector is an `=` or `!=` match on non-empty values, the estimate is the
+  exact match count, so a narrow query on a large database stays on the main
+  thread. Other selectors (regular expressions, prefix and substring matches,
+  empty values) are sized by how many series the database indexes. Building
+  the reply happens on the worker too. When the workers' queue is full, the
+  command fails with
+  `TSDB: series query: too many queued jobs (limit 256)`.
+- Smaller queries, and any query inside `MULTI`, a script or a module call,
+  hold the module lock for the whole read. Use `MULTI` when the reply must
+  reflect a single instant.
 
 ## Examples
 

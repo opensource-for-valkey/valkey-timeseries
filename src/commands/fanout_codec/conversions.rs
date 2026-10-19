@@ -158,7 +158,7 @@ impl From<PostingsStats> for StatsResponse {
             series_count: value.series_count,
             // Left empty here on purpose: `PostingsStats` does not carry the
             // bitmaps. `LabelStatsFanoutCommand::get_local_response` fills both
-            // in from `index.get_label_bitmaps()` right after this conversion,
+            // in from the combined postings scan right after this conversion,
             // and the coordinator unions them across shards to avoid
             // double-counting. They are live wire fields, not vestigial ones.
             labels_bitmap: vec![],

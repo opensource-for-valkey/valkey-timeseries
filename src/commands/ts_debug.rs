@@ -226,7 +226,7 @@ fn local_query_index(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResu
 
     reply_with_array(ctx, keys.len());
     for key in keys.iter() {
-        reply_with_valkey_string(ctx, key);
+        reply_with_slice(ctx, key);
     }
     Ok(())
 }

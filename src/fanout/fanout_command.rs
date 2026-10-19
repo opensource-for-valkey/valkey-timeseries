@@ -274,11 +274,15 @@ where
         // silently drop keys the caller cannot read. Surface the shard's permission
         // error to the client verbatim (bypassing the generic aggregate error) and
         // stop waiting on the remaining shards. A shard that was too busy to take
-        // its share likewise leaves the result incomplete, and the client should
-        // see that it can retry.
+        // its share, or whose database `SWAPDB` kept exchanging under its read,
+        // likewise leaves the result incomplete, and the client should see that it
+        // can retry rather than a generic aggregate error.
         if matches!(
             error.kind,
-            ErrorKind::KeyPermissions | ErrorKind::Permissions | ErrorKind::Busy
+            ErrorKind::KeyPermissions
+                | ErrorKind::Permissions
+                | ErrorKind::Busy
+                | ErrorKind::DatabaseSwapped
         ) {
             self.abort_error = Some(error);
             self.on_completion();

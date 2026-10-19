@@ -6,17 +6,15 @@ use crate::commands::ts_labelstats::reply_with_postings_stats;
 use crate::commands::utils::get_multi_command_targets;
 use crate::common::acl::check_metadata_permissions;
 use crate::common::replies::ReplyContext;
-use crate::common::threads::join;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
 use crate::series::index::{
-    PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap,
-    get_timeseries_index, serialize_bitmap,
+    PostingStat, PostingsBitmap, PostingsStats, StatsMaxHeap, deserialize_bitmap, get_db_index,
+    serialize_bitmap,
 };
 use ahash::AHashMap;
 use std::default::Default;
-use std::ops::Deref;
 use valkey_module::{Context, Status, ValkeyResult};
 
 #[derive(Default)]
@@ -71,24 +69,14 @@ impl FanoutClientCommand for LabelStatsFanoutCommand {
         let label = req.selected_label.as_deref().unwrap_or("");
         let matchers = deserialize_matchers_list(Some(req.filters))?;
 
-        let (stats, (labels_bitmap, label_value_pairs_bitmap)) = {
+        {
             let ctx = ctx.lock()?;
             // The coordinator checked its own node; each shard enforces its own ACL rules.
             check_metadata_permissions(&ctx)?;
-            let index_guard = get_timeseries_index(&ctx);
-            let index = index_guard.deref();
-
-            // Resolve the filter once: the counts and the label fingerprints have to be taken over
-            // the same set of series, or the coordinator's distinct totals would cover series that
-            // contributed nothing to the counts.
-            let matching = index.matching_postings(&matchers)?;
-            let matching = matching.as_ref();
-
-            join(
-                || index.stats_restricted(matching, label, limit),
-                || index.label_bitmaps_restricted(matching),
-            )
-        };
+        }
+        // Only index data below: planning, batched counts and fingerprinting need no GIL.
+        let (stats, (labels_bitmap, label_value_pairs_bitmap)) =
+            get_db_index(ctx.db()).stats_and_label_bitmaps_by_selectors(&matchers, label, limit)?;
 
         let mut response: StatsResponse = stats.into();
         response.labels_bitmap = serialize_bitmap(&labels_bitmap);

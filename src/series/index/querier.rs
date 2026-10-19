@@ -15,43 +15,43 @@
 //! Query bridge between command handlers and the low-level postings planner.
 //!
 //! This module is responsible for translating selector-oriented command workflows into
-//! series IDs/keys/guards by delegating bitmap planning to [`Postings`].
+//! series IDs/keys/guards by delegating bitmap planning to [`Postings`](super::postings::Postings).
 //! It owns cross-cutting concerns that sit above raw index lookups, such as ACL checks,
 //! date-range filtering, and materializing time-series references from posting IDs.
 //!
 //! For label-centric exploration and ranking APIs (for example, fuzzy/similarity label
 //! discovery), see `label_querier.rs`, which composes this module and `Postings`.
 
-use super::postings::{EMPTY_BITMAP, Postings};
-use super::{PostingsBitmap, get_db_index, get_timeseries_index};
+use super::{
+    DEFAULT_SERIES_BATCH_SIZE, KeyList, SeriesCursor, SeriesSelection, collect_indexed_keys,
+    for_each_planned_series, get_db_index, get_timeseries_index,
+};
 use crate::common::Timestamp;
 use crate::common::acl::KeyAccess;
 use crate::common::context::{create_key_string, get_current_db};
 use crate::common::hash::IntMap;
+use crate::common::threads::GilSource;
 use crate::common::threads::IterIntoParRayon;
 use crate::error_consts;
 use crate::labels::filters::SeriesSelector;
 use crate::series::request_types::MetaDateRangeFilter;
-use crate::series::{
-    SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries, try_get_timeseries_as,
-};
+use crate::series::{SeriesGuard, SeriesRef, TimeSeries, try_get_timeseries_as};
 use blart::AsBytes;
 use orx_parallel::Par;
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::ops::ControlFlow;
 use valkey_module::{AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString};
 
 /// Series IDs found to have no backing key during a query, accumulated under the postings
 /// read lock and flushed once the guard is released. Stale IDs are rare, so the inline
 /// capacity keeps the common (empty) case off the heap.
-type StaleIds = SmallVec<[SeriesRef; 8]>;
+pub(super) type StaleIds = SmallVec<[SeriesRef; 8]>;
 
 /// Series ids paired with the key each resolved to, captured under the postings read lock.
 type ResolvedKeys = Vec<(SeriesRef, ValkeyString)>;
 
-/// Turn posting ids into key names while the caller holds the postings read guard, recording
-/// ids that resolve to nothing as stale.
+/// Turn selectors into key names, recording ids that resolve to nothing as stale.
 ///
 /// Every query in this module is split around this call for one reason: **no series key may be
 /// opened while the postings lock is held.** `RM_OpenKey` runs the server's lazy-expiry check,
@@ -66,22 +66,60 @@ type ResolvedKeys = Vec<(SeriesRef, ValkeyString)>;
 ///       -> module unlink callback -> remove_series_from_index -> write_lock   [blocks forever]
 /// ```
 ///
-/// Resolving to owned `ValkeyString`s first lets the guard drop before any key is touched.
-fn resolve_series_keys(
+/// So this takes the postings read lock itself and returns owned `ValkeyString`s, with the
+/// lock already released: callers open the keys afterwards. `f` runs under the read lock and
+/// must not touch the keyspace or the index.
+///
+/// The lock is taken once to plan and then once per [`DEFAULT_SERIES_BATCH_SIZE`] ids to
+/// resolve, rather than held across the whole match. Callers hold the module lock throughout,
+/// so this does not shorten a main-thread stall; what it bounds is how long a thread that
+/// writes the index without the module lock (the stale-id sweep, the posting-list
+/// optimizer) waits behind a broad selector. Planning copies the matched bitmap so the
+/// lock can be released between batches.
+fn resolve_series_keys<F, T>(
     ctx: &Context,
-    postings: &Postings,
-    ids: impl Iterator<Item = SeriesRef>,
+    selectors: &[SeriesSelector],
     stale: &mut StaleIds,
-) -> ResolvedKeys {
-    let capacity_estimate = ids.size_hint().1.unwrap_or(8);
-    let mut resolved = Vec::with_capacity(capacity_estimate);
-    for id in ids {
-        match postings.get_key_by_id(id) {
-            Some(key) => resolved.push((id, create_key_string(ctx, key.as_bytes()))),
-            None => stale.push(id),
+    mut f: F,
+) -> ValkeyResult<Vec<T>>
+where
+    F: FnMut(SeriesRef, ValkeyString) -> T,
+{
+    let index = get_db_index(get_current_db(ctx));
+
+    let series_refs = {
+        let postings = index.get_postings();
+        postings.postings_for_selectors(selectors)?.into_owned()
+    };
+
+    let mut resolved = Vec::with_capacity(series_refs.cardinality() as usize);
+
+    let mut cursor = series_refs.cursor();
+    // 4 KiB on the stack: one batch of ids, reused for every batch.
+    let mut batch = [0; DEFAULT_SERIES_BATCH_SIZE.get()];
+    loop {
+        let count = cursor.read_many(&mut batch);
+        if count == 0 {
+            break;
+        }
+        let postings = index.get_postings();
+        for &id in &batch[..count] {
+            match postings.get_key_by_id(id) {
+                Some(key) => resolved.push(f(id, create_key_string(ctx, key.as_bytes()))),
+                None => stale.push(id),
+            }
         }
     }
-    resolved
+
+    Ok(resolved)
+}
+
+/// Record the ids a query found with no backing key. Must run with the postings lock released:
+/// it takes the write lock.
+fn mark_stale(ctx: &Context, stale: &StaleIds) {
+    if !stale.is_empty() {
+        get_db_index(get_current_db(ctx)).mark_ids_as_stale(stale);
+    }
 }
 
 pub fn series_by_selectors<'a>(
@@ -93,20 +131,11 @@ pub fn series_by_selectors<'a>(
         return Ok(Vec::new());
     }
 
-    let db = get_current_db(ctx);
-    let index = get_db_index(db);
-
     let mut stale = StaleIds::new();
-    // The read guard is confined to this block: neither opening the keys below nor recording
-    // the stale ids afterwards may happen while it is held. See [`resolve_series_keys`].
-    let resolved = {
-        let postings = index.get_postings();
-        let series_refs = postings.postings_for_selectors(selectors)?;
-        resolve_series_keys(ctx, &postings, series_refs.iter(), &mut stale)
-    };
+    let resolved = resolve_series_keys(ctx, selectors, &mut stale, |id, key| (id, key))?;
 
     let result = collect_series_from_postings(ctx, resolved, range, &mut stale);
-    index.mark_ids_as_stale(&stale);
+    mark_stale(ctx, &stale);
     result
 }
 
@@ -118,222 +147,140 @@ pub fn series_by_selectors<'a>(
 /// unlike the coarse all-or-nothing gate the label-search commands apply, this applies
 /// per-series `ACCESS` checks and *silently omits* series the caller may not read, so
 /// names/values belonging only to unreadable series never appear in the result.
-pub fn query_labels_distinct(
-    ctx: &Context,
+///
+/// The series are read through the batched reader ([`for_each_planned_series`], with the
+/// plan set to skip unreadable series): only the
+/// names or values not yet seen are copied out under the module lock. On a fan-out share
+/// the lock is given back between batches; a caller on the main thread already holds it and
+/// reads in one batch. Must not be called while holding the lock through a [`GilSource`]
+/// that releases it.
+pub fn query_labels_distinct<S: GilSource + ?Sized>(
+    src: &S,
     selectors: &[SeriesSelector],
     label: Option<&str>,
 ) -> ValkeyResult<BTreeSet<String>> {
-    let db = get_current_db(ctx);
-    let index = get_db_index(db);
+    let cursor = SeriesCursor::plan(src.db(), query_labels_selection(selectors), None)?;
+    query_labels_distinct_planned(src, cursor, label)
+}
 
-    let mut stale = StaleIds::new();
-    // Resolve under the guard, open afterwards. See [`resolve_series_keys`].
-    let resolved = {
-        let postings = index.get_postings();
-        if selectors.is_empty() {
-            // Iterate the bitmap in place: collecting it first would allocate a `Vec` holding
-            // every series id in the database before a single key is resolved.
-            resolve_series_keys(ctx, &postings, postings.all_postings.iter(), &mut stale)
-        } else {
-            let refs = postings.postings_for_selectors(selectors)?;
-            resolve_series_keys(ctx, &postings, refs.iter(), &mut stale)
-        }
-    };
-
-    let mut result: BTreeSet<String> = BTreeSet::new();
-    let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
-    for (id, k) in resolved {
-        // TS.QUERYLABELS contract: silently omit series the caller may not read rather
-        // than erroring on the first unreadable match (that is the coarse gate the
-        // label-search commands use, and it is deliberately not applied here).
-        if !access.allows(&k) {
-            continue;
-        }
-        // No `ACCESS` permission is passed here: the read check above already ran, and
-        // passing it would turn an unreadable key into a hard error instead of a skip.
-        let Some(guard) = try_get_timeseries(ctx, &k, None)? else {
-            stale.push(id);
-            continue;
-        };
-        let ts = guard.as_ref();
-        match label {
-            None => {
-                for lbl in ts.labels.iter() {
-                    result.insert(lbl.name.to_string());
-                }
-            }
-            Some(name) => {
-                if let Some(lbl) = ts.get_label(name) {
-                    result.insert(lbl.value.to_string());
-                }
-            }
-        }
+/// The series `TS.QUERYLABELS` reads for `selectors`: every indexed series when there are
+/// none. Plan it with no date range.
+pub fn query_labels_selection(selectors: &[SeriesSelector]) -> SeriesSelection<'_> {
+    if selectors.is_empty() {
+        SeriesSelection::All
+    } else {
+        SeriesSelection::Matching(selectors)
     }
+}
 
-    index.mark_ids_as_stale(&stale);
+/// [`query_labels_distinct`] over a read planned already, from [`query_labels_selection`].
+/// Unreadable series are omitted whatever the cursor was planned with.
+pub fn query_labels_distinct_planned<S: GilSource + ?Sized>(
+    src: &S,
+    cursor: SeriesCursor,
+    label: Option<&str>,
+) -> ValkeyResult<BTreeSet<String>> {
+    let mut result: BTreeSet<String> = BTreeSet::new();
+    // TS.QUERYLABELS contract: series the caller may not read are skipped, not an error on
+    // the first one (that is the coarse gate the label-search commands use, and it is
+    // deliberately not applied here).
+    for_each_planned_series(
+        src,
+        cursor.skip_unreadable(),
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_ctx, ts, _key| {
+            // Looked up before inserting: `insert(x.to_string())` would allocate for every
+            // label, seen or not.
+            match label {
+                None => {
+                    for lbl in ts.labels.iter() {
+                        if !result.contains(lbl.name) {
+                            result.insert(lbl.name.to_string());
+                        }
+                    }
+                }
+                Some(name) => {
+                    if let Some(lbl) = ts.get_label(name)
+                        && !result.contains(lbl.value)
+                    {
+                        result.insert(lbl.value.to_string());
+                    }
+                }
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     Ok(result)
 }
 
-#[allow(dead_code)]
-pub(super) fn series_posting_ids_by_selectors<'a>(
-    ctx: &Context,
-    selectors: &[SeriesSelector],
-    date_range: Option<MetaDateRangeFilter>,
-) -> ValkeyResult<Cow<'a, PostingsBitmap>> {
-    if selectors.is_empty() {
-        return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-    }
-    let db = get_current_db(ctx);
-    let index = get_db_index(db);
-
-    let mut stale = StaleIds::new();
-    let resolved = {
-        let postings = index.get_postings();
-        let series_ids = postings.postings_for_selectors(selectors)?;
-        if series_ids.is_empty() {
-            return Ok(Cow::Borrowed(&*EMPTY_BITMAP));
-        }
-        if date_range.is_none() {
-            return Ok(Cow::Owned(series_ids.into_owned()));
-        }
-        resolve_series_keys(ctx, &postings, series_ids.iter(), &mut stale)
-    };
-
-    let result = collect_series_from_postings(ctx, resolved, date_range, &mut stale);
-    index.mark_ids_as_stale(&stale);
-
-    let id_iter = result?.into_iter().map(|(guard, _)| guard.id);
-    Ok(Cow::Owned(PostingsBitmap::from_iter(id_iter)))
-}
-
-pub fn series_keys_by_selectors(
-    ctx: &Context,
+/// Matching key names, copied out so they can outlive each batch's lock.
+/// Without a range this reads only the index and reveals matches regardless of key ACLs;
+/// with a range it opens each series and fails on the first unreadable match.
+/// A fan-out share releases the module lock between batches; a main-thread caller keeps it.
+/// Must not be called while holding the lock through a releasing [`GilSource`].
+pub fn series_keys_by_selectors<S: GilSource + ?Sized>(
+    src: &S,
     selectors: &[SeriesSelector],
     range: Option<MetaDateRangeFilter>,
-) -> ValkeyResult<Vec<ValkeyString>> {
-    if selectors.is_empty() {
-        return Ok(Vec::new());
+) -> ValkeyResult<KeyList> {
+    let cursor = SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range)?;
+    series_keys_by_selectors_planned(src, cursor)
+}
+
+/// [`series_keys_by_selectors`] over a read planned already
+/// ([`plan_if_cheap`](super::plan_if_cheap)). A plan with a date range opens and checks every
+/// key as [`for_each_series`](super::for_each_series) does; otherwise the keys are what the
+/// index lists.
+pub fn series_keys_by_selectors_planned<S: GilSource + ?Sized>(
+    src: &S,
+    cursor: SeriesCursor,
+) -> ValkeyResult<KeyList> {
+    if !cursor.has_date_range() {
+        return collect_indexed_keys(src, cursor, DEFAULT_SERIES_BATCH_SIZE);
     }
-
-    let db = get_current_db(ctx);
-    let index = get_db_index(db);
-
-    let mut stale = StaleIds::new();
-    let resolved = {
-        let postings = index.get_postings();
-        let series_refs = postings.postings_for_selectors(selectors)?;
-        resolve_series_keys(ctx, &postings, series_refs.iter(), &mut stale)
-    };
-
-    let result = collect_series_keys(ctx, resolved, range, &mut stale);
-    index.mark_ids_as_stale(&stale);
-    result
+    let mut keys = KeyList::new();
+    for_each_planned_series(
+        src,
+        cursor,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_ctx, _series, key| {
+            keys.push(key.as_slice());
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    Ok(keys)
 }
 
 /// Cardinality-only counterpart of [`series_by_selectors`].
 ///
-/// Applies the same posting lookup, ACL (`ACCESS`) filtering, and date-range predicate, but
-/// never materializes the `(guard, key)` pairs the caller would otherwise discard. Without a
-/// date range no series state is needed at all, so keys are only probed for existence.
-pub fn count_series_by_selectors(
-    ctx: &Context,
+/// Applies the same posting lookup, ACL (`ACCESS`) checks, and date-range predicate through
+/// the batched reader. A background caller gives the module lock back between batches and
+/// retains only the running count; a main-thread caller keeps its single lock hold.
+pub fn count_series_by_selectors<S: GilSource + ?Sized>(
+    src: &S,
     selectors: &[SeriesSelector],
     range: Option<MetaDateRangeFilter>,
 ) -> ValkeyResult<usize> {
-    if selectors.is_empty() {
-        return Ok(0);
-    }
-
-    let db = get_current_db(ctx);
-    let index = get_db_index(db);
-
-    let mut stale = StaleIds::new();
-    let resolved = {
-        let postings = index.get_postings();
-        let series_refs = postings.postings_for_selectors(selectors)?;
-        resolve_series_keys(ctx, &postings, series_refs.iter(), &mut stale)
-    };
-
-    let result = count_series_from_postings(ctx, resolved, range, &mut stale);
-    index.mark_ids_as_stale(&stale);
-    result
+    let cursor = SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range)?;
+    count_series_by_selectors_planned(src, cursor)
 }
 
-fn count_series_from_postings(
-    ctx: &Context,
-    resolved: ResolvedKeys,
-    date_range: Option<MetaDateRangeFilter>,
-    stale: &mut StaleIds,
+/// [`count_series_by_selectors`] using the same plan that sized the read for scheduling.
+pub fn count_series_by_selectors_planned<S: GilSource + ?Sized>(
+    src: &S,
+    cursor: SeriesCursor,
 ) -> ValkeyResult<usize> {
-    // Without a date range, nothing about the series contents matters: open each key just long
-    // enough to confirm it still exists and the caller may read it.
-    let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
-    let Some(date_range) = date_range else {
-        let mut count = 0usize;
-        for (id, k) in resolved {
-            if try_get_timeseries_as(ctx, &k, &access)?.is_some() {
-                count += 1;
-            } else {
-                stale.push(id);
-            }
-        }
-        return Ok(count);
-    };
-
-    // With a date range we need the series state, so hold the guards (bare pointers, no
-    // per-key `ValkeyString` retained) long enough to evaluate the predicate.
-    let mut guards: Vec<SeriesGuard> = Vec::with_capacity(resolved.len());
-    for (id, k) in resolved {
-        if let Some(guard) = try_get_timeseries_as(ctx, &k, &access)? {
-            guards.push(guard);
-        } else {
-            stale.push(id);
-        }
-    }
-
-    if guards.is_empty() {
-        return Ok(0);
-    }
-
-    let (start, end) = date_range.range();
-    let exclude = date_range.is_exclude();
-
-    if guards.len() == 1 {
-        // SAFETY: we have already checked above that we have at least one element.
-        let ts = unsafe { guards.get_unchecked(0).as_ref() };
-        return Ok(matches_date_range(ts, start, end, exclude) as usize);
-    }
-
-    // Mirrors `filter_series_by_date_range`: the guards borrow the non-`Send` `Context`, so we
-    // hand the parallel iterator plain `&TimeSeries` references instead.
-    let count = guards
-        .iter()
-        .map(|guard| guard.as_ref())
-        .iter_into_par_rayon()
-        .filter(|ts| matches_date_range(ts, start, end, exclude))
-        .count();
-
+    let mut count = 0;
+    for_each_planned_series(
+        src,
+        cursor,
+        DEFAULT_SERIES_BATCH_SIZE,
+        |_ctx, _series, _key| {
+            count += 1;
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
     Ok(count)
-}
-
-fn collect_series_keys(
-    ctx: &Context,
-    resolved: ResolvedKeys,
-    date_range: Option<MetaDateRangeFilter>,
-    stale: &mut StaleIds,
-) -> ValkeyResult<Vec<ValkeyString>> {
-    if let Some(date_range) = date_range {
-        let series = collect_series_from_postings(ctx, resolved, Some(date_range), stale)?;
-        let keys = series.into_iter().map(|g| g.1).collect();
-        return Ok(keys);
-    }
-
-    // TS.QUERYINDEX is a pure index lookup: it returns every series matching the
-    // filter regardless of the caller's per-key read access. Command-level ACL
-    // (can the user run TS.QUERYINDEX at all) is already enforced by the server,
-    // so we must NOT drop keys the caller lacks read (ACCESS) permission on here.
-    // Ids that resolved to no key were already recorded by `resolve_series_keys`.
-    Ok(resolved.into_iter().map(|(_, key)| key).collect())
 }
 
 fn collect_series_from_postings<'a>(
@@ -364,17 +311,41 @@ fn get_multi_series_by_id<'a>(
     let mut result = Vec::with_capacity(resolved.len());
     let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
     for (id, k) in resolved {
-        if let Some(guard) = try_get_timeseries_as(ctx, &k, &access)? {
+        if let Some(guard) = open_resolved_series(ctx, &access, id, &k, stale)? {
             result.push((guard, k));
-        } else {
-            stale.push(id);
         }
     }
     Ok(result)
 }
 
+/// Opens `key`, the key `id` resolved to, as the series `id` names. `None` when the key no
+/// longer holds a series, which records `id` as stale, or when it holds a different series,
+/// which an index out of step with the keyspace can map it to.
+///
+/// A key holding another id is skipped, not marked stale: the id may live on under another
+/// key, and marking it would drop a live series from the index. The batched reader
+/// (`batched_querier::visit_batch`) applies the same rule, so batched and unbatched reads over
+/// one selector agree. It also keeps one series from being returned under two keys, which the
+/// id-keyed date-range filter below cannot tell apart.
+fn open_resolved_series<'a>(
+    ctx: &'a Context,
+    access: &KeyAccess,
+    id: SeriesRef,
+    key: &ValkeyString,
+    stale: &mut StaleIds,
+) -> ValkeyResult<Option<SeriesGuard<'a>>> {
+    match try_get_timeseries_as(ctx, key, access)? {
+        Some(guard) if guard.id == id => Ok(Some(guard)),
+        Some(_) => Ok(None),
+        None => {
+            stale.push(id);
+            Ok(None)
+        }
+    }
+}
+
 #[inline(always)]
-fn matches_date_range(
+pub(super) fn matches_date_range(
     series: &TimeSeries,
     start: Timestamp,
     end: Timestamp,
@@ -441,32 +412,34 @@ fn filter_series_by_date_range<'a>(
     }
 }
 
-pub fn count_matched_series(
-    ctx: &Context,
+pub fn count_matched_series<S: GilSource + ?Sized>(
+    src: &S,
     date_range: Option<MetaDateRangeFilter>,
     matchers: &[SeriesSelector],
 ) -> ValkeyResult<usize> {
     let count = match (date_range, matchers.is_empty()) {
         (None, true) => {
+            let ctx = src.lock()?;
             // check to see if the user can read all keys, otherwise error
             // a bare TS.CARD is a request for the cardinality of the entire index. Reuses a
             // fan-out request's already-resolved identity, when there is one, instead of
             // resolving the ACL user by name here.
-            let access = KeyAccess::new(ctx, AclPermissions::ACCESS);
+            let access = KeyAccess::new(&ctx, AclPermissions::ACCESS);
             if !access.is_unrestricted() {
                 return Err(ValkeyError::Str(
                     error_consts::ALL_KEYS_READ_PERMISSION_ERROR,
                 ));
             }
-            let index = get_timeseries_index(ctx);
+            let index = get_timeseries_index(&ctx);
             index.count()
         }
         (None, false) => {
             // if we don't have a date range, we can simply count postings...
-            let index = get_timeseries_index(ctx);
+            let ctx = src.lock()?;
+            let index = get_timeseries_index(&ctx);
             index.get_cardinality_by_selectors(matchers)?
         }
-        (Some(range), false) => count_series_by_selectors(ctx, matchers, Some(range))?,
+        (Some(range), false) => count_series_by_selectors(src, matchers, Some(range))?,
         _ => {
             // if we don't have a date range, we need at least one matcher, otherwise we
             // end up scanning the entire index

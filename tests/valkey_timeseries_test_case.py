@@ -686,6 +686,10 @@ class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
 
     MODULE_ARGS = "debug-mode yes"
 
+    def arm_analysis_job_panic(self, client):
+        """Arm the server's next analysis job, across all connections and databases."""
+        client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')
+
     def get_config_file_lines(self, test_dir, port) -> List[str]:
         return EnableDebugMode(super(ValkeyTimeSeriesTestCaseDebugMode, self).get_config_file_lines(test_dir, port))
 

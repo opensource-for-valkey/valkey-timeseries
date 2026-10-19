@@ -120,13 +120,38 @@ with the rule.
 ### Metadata & Indexing
 
 * `TS.INFO`: Retrieve detailed information and statistics about a specific time series.
-* `TS.QUERYINDEX`: Retrieve all series keys matching a label filter.
+* `TS.QUERYINDEX`: Retrieve all series keys matching a label filter, preserving binary key names.
+  Cluster queries read each shard in batches and can observe intervening writes.
+  Index-only queries reveal all matching keys; `FILTER_BY_RANGE` requires read access to every
+  matching series.
 * `TS.QUERYLABELS`: Retrieve all label names, or all values of a given label, for series matching a filter.
-* `TS.CARD`: Get the cardinality of the index for a specific label filter.
+* `TS.CARD`: Get the cardinality of the index for a specific label filter. `FILTER_BY_RANGE`
+  reads in batches in cluster mode and for large standalone reads, releasing the module lock
+  between batches; later batches can observe intervening writes. Range-filtered counts require
+  read access to every matching series. Filtered index-only counts have no per-key read checks;
+  bare counts require read access to all keys.
 * `TS.LABELNAMES`: Get all label names used in the index.
 * `TS.METRICNAMES`: Search metric names with substring and optional fuzzy matching.
 * `TS.LABELVALUES`: Get all values for a specific label name in the index.
-* `TS.LABELSTATS`: Get statistics about label usage in the index.
+* `TS.LABELSTATS`: Get statistics about label usage in the index. Cluster reads release the
+  module lock after checking permissions, then compute counts and distinct-label totals in
+  one batched scan. Writes can affect later batches, so the result is not a database snapshot.
+
+Ranked label-value and metric-name searches select the best results before applying `LIMIT`.
+Descending score and cardinality orderings break ties by value ascending.
+
+On standalone servers, `TS.LABELNAMES`, `TS.LABELVALUES`, `TS.METRICNAMES` and
+`TS.QUERYLABELS` run on a bounded pool of background workers when the index size and query
+options suggest substantial work, and give the server back to other clients between batches.
+`TS.CARD FILTER_BY_RANGE` shares these workers when estimated to read more than 512 series;
+cheap filters use their exact match count, while expensive selectors use the database size.
+The pool and its queue (256 jobs) are shared with `TS.OUTLIERS`, so long outlier jobs can delay
+large reads and the reverse. Small reads, transactions and scripts run inline, as do standalone
+`TS.CARD` counts without a range filter. Background reads can observe changes between batches
+rather than a database snapshot. A read of series fixes which series it visits when it is
+planned, on arrival for cheap filters, so one that waits in the queue misses series created in
+the meantime. If the queue is full, a large read returns an error so queued
+requests stay bounded.
 
 ### Anomaly Detection
 

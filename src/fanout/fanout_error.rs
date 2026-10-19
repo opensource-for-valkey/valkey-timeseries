@@ -58,6 +58,11 @@ pub enum ErrorKind {
     /// A peer too old to know this kind reports it as an invalid message.
     Busy = 12,
 
+    /// A node's database was exchanged by `SWAPDB` while its share was being read, on every
+    /// attempt the read makes. Retryable. A peer too old to know this kind reports it as an
+    /// invalid message.
+    DatabaseSwapped = 13,
+
     Custom = 255,
 }
 
@@ -94,6 +99,7 @@ impl ErrorKind {
             Self::UnsupportedFeatures => UNSUPPORTED_FEATURES_ERROR,
             Self::InvalidDb => INVALID_DB_ERROR,
             Self::Busy => BUSY_ERROR,
+            Self::DatabaseSwapped => error_consts::DATABASE_SWAPPED_DURING_READ,
             Self::Custom => "Custom error",
         }
     }
@@ -199,6 +205,7 @@ impl TryFrom<u8> for ErrorKind {
             10 => Ok(ErrorKind::UnsupportedFeatures),
             11 => Ok(ErrorKind::InvalidDb),
             12 => Ok(ErrorKind::Busy),
+            13 => Ok(ErrorKind::DatabaseSwapped),
             255 => Ok(ErrorKind::Custom),
             _ => {
                 let msg = format!("Invalid error kind: {value}");
@@ -284,6 +291,7 @@ fn convert_from_string(err: &str) -> FanoutError {
         UNSUPPORTED_FEATURES_ERROR => ErrorKind::UnsupportedFeatures.into(),
         INVALID_DB_ERROR => ErrorKind::InvalidDb.into(),
         BUSY_ERROR => ErrorKind::Busy.into(),
+        error_consts::DATABASE_SWAPPED_DURING_READ => ErrorKind::DatabaseSwapped.into(),
         NODE_UNREACHABLE_ERROR => ErrorKind::NodeUnreachable.into(),
         UNKNOWN_MESSAGE_TYPE_ERROR => ErrorKind::UnknownMessageType.into(),
         SERIALIZATION_ERROR => FanoutError::serialization(String::new()),
@@ -413,6 +421,7 @@ mod tests {
             ErrorKind::UnsupportedFeatures,
             ErrorKind::InvalidDb,
             ErrorKind::Busy,
+            ErrorKind::DatabaseSwapped,
             ErrorKind::Custom,
         ];
 
@@ -554,6 +563,21 @@ mod tests {
         );
     }
 
+    /// A shard whose read kept seeing `SWAPDB` fails the fan-out with a retryable kind and its
+    /// own message, not the generic aggregate error. The shard's `ValkeyError` reaches here
+    /// directly for the local share and with an "ERR " prefix after the RPC round trip.
+    #[test]
+    fn a_swapped_database_is_classified_as_retryable() {
+        let message = error_consts::DATABASE_SWAPPED_DURING_READ;
+        for error in [
+            FanoutError::from(ValkeyError::Str(message)),
+            convert_from_string(&format!("ERR {message}")),
+        ] {
+            assert_eq!(error.kind, ErrorKind::DatabaseSwapped);
+            assert_eq!(error.to_string(), message);
+        }
+    }
+
     #[test]
     fn test_error_kind_repr_u8() {
         // Test that the repr(u8) values match what we expect
@@ -569,6 +593,8 @@ mod tests {
         assert_eq!(ErrorKind::ClusterMapMismatch as u8, 9);
         assert_eq!(ErrorKind::UnsupportedFeatures as u8, 10);
         assert_eq!(ErrorKind::InvalidDb as u8, 11);
+        assert_eq!(ErrorKind::Busy as u8, 12);
+        assert_eq!(ErrorKind::DatabaseSwapped as u8, 13);
         assert_eq!(ErrorKind::Custom as u8, 255);
     }
 }
