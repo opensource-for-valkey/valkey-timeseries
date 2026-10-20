@@ -263,6 +263,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             'ts-index-build-max-memory',
             'ts-fanout-aggregation-pushdown',
             'ts-index-persist',
+            'ts-info-developer-visible',
             'debug-mode',
         ]
 

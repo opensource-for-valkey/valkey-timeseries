@@ -514,6 +514,7 @@ TS._DEBUG LIST_CONFIGS [VERBOSE]
 | `ts-fanout-command-timeout`    | duration | —               | Timeout (ms) for fanout (cluster scatter/gather) commands                               |
 | `ts-cluster-map-expiration-ms` | duration | —               | How long (ms) cluster slot-map entries are cached; `0` disables caching                 |
 | `ts-fanout-aggregation-pushdown` | boolean | `yes`          | Shard-side aggregation/reduce push-down for clustered MRANGE. Not needed for rolling upgrades (version skew is handled automatically); disable only as an emergency/diagnostic revert to the coordinator-side path |
+| `ts-info-developer-visible`    | boolean  | `no`            | Include developer-only fields in `TS.INFO` output                                       |
 
 ### Examples
 
