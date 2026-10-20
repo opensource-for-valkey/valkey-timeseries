@@ -1034,7 +1034,7 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout']
+    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout', 'read']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     CRON_METRICS = ['cron_interval_seconds', 'cron_tick_duration_seconds', 'cron_ticks_total',
                     'cron_ticks_skipped_total']
@@ -1088,7 +1088,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout"):
+                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout, read"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'bogus')
 
     def test_value_types(self):

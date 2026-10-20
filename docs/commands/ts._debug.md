@@ -273,6 +273,28 @@ On the wire (counted by the sender):
 The byte counts are the payloads this node handed to the cluster bus: the bus's own framing is
 not included, and a fan-out's local share never crosses the bus.
 
+#### `read`
+
+Blocking reads (`TS.READ ... BLOCK`), counted on the node serving the client. A read without
+`BLOCK` counts nothing.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `read_blocked_total` | counter | Reads the server blocked on a key |
+| `read_served_without_block_total` | counter | `BLOCK` reads served at once because enough qualifying samples already existed |
+| `read_block_refused_total` | counter | `BLOCK` reads that had to wait but could not: a context that forbids blocking (`MULTI`, a script), or the server declining to block the client |
+| `read_block_timeouts_total` | counter | Blocked reads released by the timeout callback: a deadline, or `CLIENT UNBLOCK ... TIMEOUT` |
+| `read_spurious_wakeups_total` | counter | Wakeups after which a blocked read re-checked its key and stayed blocked (a write that left it below `min_count`, or a condition no new sample met) |
+| `read_unblocked_by_delete_total` | counter | Blocked reads released with an empty reply because their key was deleted |
+| `read_blocked_clients` | gauge | Blocked reads the server still holds state for |
+
+A blocked read ends in a reply from a wakeup, a timeout, a deletion, an error,
+`CLIENT UNBLOCK ... ERROR`, or a disconnect. Timeouts and deletions have counters of their own; the
+rest don't, so `read_blocked_total` is not the sum of the others. `read_blocked_clients` is moved
+by the server's free callback, which runs once per block however it ended, so it returns to 0 in
+all of those cases. It can differ from the `blocked_clients` of `INFO clients`, which counts every
+blocked client of any command.
+
 ### Examples
 
 ```

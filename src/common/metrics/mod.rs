@@ -35,6 +35,7 @@ pub mod clustermap;
 pub mod cron;
 pub mod exec;
 pub mod fanout;
+pub mod read;
 
 use crate::common::sync::lock;
 use metered::{
@@ -76,6 +77,9 @@ pub enum Section {
     /// Cluster fanout: operations this node coordinates, requests it serves for peers, and the
     /// messages and bytes exchanged over the cluster bus.
     Fanout,
+    /// Blocking reads (`TS.READ ... BLOCK`): how many blocked, why they came back, how many
+    /// are still waiting.
+    Read,
 }
 
 impl Section {
@@ -85,6 +89,7 @@ impl Section {
         Section::Cron,
         Section::Exec,
         Section::Fanout,
+        Section::Read,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -93,6 +98,7 @@ impl Section {
             Section::Cron => "cron",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
+            Section::Read => "read",
         }
     }
 
@@ -113,6 +119,7 @@ fn build_registry(section: Section) -> Registry<'static> {
         Section::Cron => cron::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),
+        Section::Read => read::register(&mut registry),
     }
     registry
 }

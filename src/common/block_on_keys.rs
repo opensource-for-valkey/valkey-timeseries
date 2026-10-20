@@ -15,9 +15,11 @@
 //! is undefined behavior. Private data is a `Box` whose ownership passes to the server at block
 //! time and comes back exactly once, through `free_privdata`.
 
+use crate::common::metrics::read::{BLOCK_TIMEOUTS, BLOCKED, BLOCKED_CLIENTS};
 use crate::common::replies::ReplyContext;
 use std::os::raw::{c_int, c_longlong, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::Ordering;
 use valkey_module::{Context, ValkeyString, raw};
 
 /// Status the server expects back from a block-on-keys reply callback: `Ok` means "I have replied,
@@ -137,6 +139,8 @@ pub(crate) fn block_client_on_key<H: BlockedKeyHandler>(
         drop(unsafe { Box::from_raw(privdata.cast::<H>()) });
         return false;
     }
+    BLOCKED.fetch_add(1, Ordering::Relaxed);
+    BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -184,6 +188,7 @@ unsafe extern "C" fn timeout_callback<H: BlockedKeyHandler>(
     _argv: *mut *mut raw::RedisModuleString,
     _argc: c_int,
 ) -> c_int {
+    BLOCK_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
     let reply_ctx = ReplyContext::new(ctx);
     let Some(handler) = (unsafe { handler_from_ctx::<H>(ctx) }) else {
         reply_ctx.log_warning("TS.READ: timed-out client has no private data");
@@ -202,7 +207,8 @@ unsafe extern "C" fn timeout_callback<H: BlockedKeyHandler>(
 /// reply, timeout, `CLIENT UNBLOCK`, disconnect, or shutdown.
 ///
 /// The context passed here may carry a NULL client if the client was already destroyed, so this
-/// callback must not touch client, ACL, or protocol state — dropping the box is all it does.
+/// callback must not touch client, ACL, or protocol state — dropping the box and settling the
+/// blocked-clients gauge (an atomic) is all it does.
 unsafe extern "C" fn free_privdata_callback<H: BlockedKeyHandler>(
     _ctx: *mut raw::RedisModuleCtx,
     privdata: *mut c_void,
@@ -210,6 +216,7 @@ unsafe extern "C" fn free_privdata_callback<H: BlockedKeyHandler>(
     if privdata.is_null() {
         return;
     }
+    BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     let handler = unsafe { Box::from_raw(privdata.cast::<H>()) };
     // A Drop impl on H could panic; it must not unwind into C.
     let _ = catch_unwind(AssertUnwindSafe(move || drop(handler)));

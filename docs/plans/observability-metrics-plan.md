@@ -564,7 +564,29 @@ and write to the source → `compaction_rules_pruned_missing_total` = 1; a repli
 
 ### Phase 2 — index, read
 
-Sections 3.6, 3.7. Tests: regex filter over N label values → `index_label_values_scanned_total` +N;
+**§3.7 (`read`) done 2026-10-20**; §3.6 (`index`) is open.
+
+As built for §3.7: [metrics/read.rs](../../src/common/metrics/read.rs), hooks in
+[block_on_keys.rs](../../src/common/block_on_keys.rs) (`read_blocked_total`,
+`read_block_timeouts_total`, `read_blocked_clients`) and [ts_read.rs](../../src/commands/ts_read.rs)
+(the rest); `TestTsReadMetrics` in [tests/test_ts_read.py](../../tests/test_ts_read.py). Differences
+from §3.7:
+
+- `read_blocked_clients` is a std `AtomicI64` registered as a gauge, so the plan's "+1 at block
+  success" is a `fetch_add` after the null check in `block_client_on_key`, and the "-1" a
+  `fetch_sub` in `free_privdata_callback` (not on the null-privdata early return).
+- `read_block_timeouts_total` is counted on entry to `timeout_callback`, before the private data is
+  looked up, so a timed-out client with no private data still counts.
+- `read_spurious_wakeups_total` covers both `NotReady` arms of `on_ready`: a key that exists but
+  is empty for this cursor, and fewer qualifying samples than `min_count`. A reply with an error
+  (wrong type, revoked ACL) is neither.
+- `read_block_refused_total`'s server-refusal arm (`block_client_on_key` returning `false`) has no
+  integration test: the server only declines in conditions the test harness can't produce. The
+  deny-blocking arm is tested through `MULTI` and Lua.
+- `read_served_without_block_total` counts only reads that carried `BLOCK`; a plain `TS.READ` counts
+  nothing.
+
+Original test list for §3.6 and §3.7. Tests: regex filter over N label values → `index_label_values_scanned_total` +N;
 `FILTER a=b c!=d` → `index_all_postings_base_total` ≥ 1; a literal set (`a=(x,y)`) does **not**
 move the scan counter; delete a key underneath the index and query → some
 `index_stale_ids_marked_*_total` ≥ 1 and `index_stale_ids_pending` eventually back to 0 (assert ≥,

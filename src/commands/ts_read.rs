@@ -8,11 +8,15 @@ use crate::commands::parse_duration_ms;
 use crate::common::binop::ComparisonOperator;
 use crate::common::block_on_keys::{BlockedKeyHandler, ReadyStatus, block_client_on_key};
 use crate::common::context::is_blocking_denied;
+use crate::common::metrics::read::{
+    BLOCK_REFUSED, SERVED_WITHOUT_BLOCK, SPURIOUS_WAKEUPS, UNBLOCKED_BY_DELETE,
+};
 use crate::common::replies::{ReplyContext, reply_with_samples};
 use crate::common::{Sample, Timestamp};
 use crate::error_consts;
 use crate::series::request_types::ValueComparisonFilter;
 use crate::series::{TimeSeries, try_get_timeseries};
+use std::sync::atomic::Ordering;
 use valkey_module::raw::KeyType;
 use valkey_module::{
     AclPermissions, Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
@@ -342,8 +346,10 @@ impl BlockedKeyHandler for PendingRead {
             Ok(ReadOutcome::Empty) => {
                 if key_exists(ctx, &self.key) {
                     // The key is still there and simply has nothing for us yet.
+                    SPURIOUS_WAKEUPS.fetch_add(1, Ordering::Relaxed);
                     ReadyStatus::NotReady
                 } else {
+                    UNBLOCKED_BY_DELETE.fetch_add(1, Ordering::Relaxed);
                     reply_with_samples(ctx.raw(), std::iter::empty());
                     ReadyStatus::Replied
                 }
@@ -352,7 +358,10 @@ impl BlockedKeyHandler for PendingRead {
                 reply_with_samples(ctx.raw(), samples.into_iter());
                 ReadyStatus::Replied
             }
-            Ok(ReadOutcome::Insufficient(_)) => ReadyStatus::NotReady,
+            Ok(ReadOutcome::Insufficient(_)) => {
+                SPURIOUS_WAKEUPS.fetch_add(1, Ordering::Relaxed);
+                ReadyStatus::NotReady
+            }
             Err(e) => {
                 // Wrong type, or ACL revoked while blocked. Either way the client cannot be
                 // served by waiting longer.
@@ -439,6 +448,7 @@ pub fn ts_read_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         // satisfiable TS.READ inside MULTI or Lua succeeds rather than erroring, matching the
         // reference.
         ReadOutcome::Samples(samples) => {
+            SERVED_WITHOUT_BLOCK.fetch_add(1, Ordering::Relaxed);
             reply_with_samples(ctx, samples.into_iter());
             Ok(ValkeyValue::NoReply)
         }
@@ -447,6 +457,7 @@ pub fn ts_read_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             // this check is necessary, not defensive: blocking a deny-blocking client trips a
             // serverAssert and takes the process down.
             if is_blocking_denied(ctx) {
+                BLOCK_REFUSED.fetch_add(1, Ordering::Relaxed);
                 return Err(ValkeyError::Str(error_consts::READ_BLOCKING_NOT_ALLOWED));
             }
 
@@ -459,6 +470,7 @@ pub fn ts_read_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 Ok(ValkeyValue::NoReply)
             } else {
                 // The server refused to block; we still owe a reply.
+                BLOCK_REFUSED.fetch_add(1, Ordering::Relaxed);
                 ctx.log_warning("TS.READ: failed to block client; replying with current data");
                 reply_with_samples(ctx, std::iter::empty());
                 Ok(ValkeyValue::NoReply)
