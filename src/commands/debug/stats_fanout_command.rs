@@ -79,6 +79,8 @@ pub(super) struct ClusterReading {
     pub kind: MetricKind,
     /// From this node's registry; empty for a metric it does not know.
     pub help: String,
+    /// From this node's registry; `false` for a metric it does not know.
+    pub is_bytes: bool,
     pub value: ClusterValue,
 }
 
@@ -156,13 +158,11 @@ impl ClusterStats {
     }
 
     /// The merged metrics in reporting order — by section, then by family name, as a single
-    /// node reports them — with this node's kind and help. Metrics this node does not know go
+    /// node reports them — with this node's help and unit. Metrics this node does not know go
     /// last, by name.
     fn into_readings(self, local: &[MetricReading]) -> Vec<ClusterReading> {
-        let help: AHashMap<&str, &str> = local
-            .iter()
-            .map(|r| (r.name.as_str(), r.help.as_str()))
-            .collect();
+        let local: AHashMap<&str, &MetricReading> =
+            local.iter().map(|r| (r.name.as_str(), r)).collect();
         let mut readings: Vec<_> = self
             .values
             .into_iter()
@@ -173,8 +173,10 @@ impl ClusterStats {
                 let section = name
                     .split_once('_')
                     .and_then(|(prefix, _)| Section::parse(prefix.as_bytes()));
+                let known = local.get(name.as_str());
                 ClusterReading {
-                    help: help.get(name.as_str()).copied().unwrap_or("").to_owned(),
+                    help: known.map(|r| r.help.clone()).unwrap_or_default(),
+                    is_bytes: known.is_some_and(|r| r.is_bytes),
                     section,
                     kind: value.kind(),
                     name,
@@ -322,6 +324,7 @@ mod tests {
             section: Section::Fanout,
             kind,
             help: format!("help for {name}"),
+            is_bytes: false,
             value,
         }
     }

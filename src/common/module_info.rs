@@ -4,6 +4,7 @@
 //! or `INFO <section>` — never for a bare `INFO` — which is what makes it acceptable for the
 //! memory section to walk the term dictionary.
 
+use crate::common::humanize::bytes_to_human;
 use crate::common::string_interner::InternedString;
 use crate::series::index::index_memory_usage;
 use crate::series::{COMPACTION_FAILURES, COMPACTION_STATE_REBUILDS};
@@ -28,17 +29,29 @@ use valkey_module_macros::info_command_handler;
 ///
 /// `terms_bytes` and `id_to_key_bytes` count the entries an adaptive radix tree and a `BTreeMap`
 /// hold without their internal node overhead, so the totals are a floor.
+///
+/// Each `*_bytes` field is followed by a `*_bytes_human` rendering of it (`1.21M`), formatted
+/// as the server formats `used_memory_human`.
 #[info_command_handler]
 fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
     let index = index_memory_usage();
+    let interned_bytes = InternedString::memory_used();
 
     ctx.builder()
         .add_section("memory")
         .field("index_total_bytes", index.total_bytes() as u64)?
+        .field("index_total_bytes_human", human(index.total_bytes()))?
         .field("index_terms_bytes", index.terms_bytes as u64)?
+        .field("index_terms_bytes_human", human(index.terms_bytes))?
         .field("index_postings_bytes", index.postings_bytes as u64)?
+        .field("index_postings_bytes_human", human(index.postings_bytes))?
         .field("index_id_to_key_bytes", index.id_to_key_bytes as u64)?
+        .field("index_id_to_key_bytes_human", human(index.id_to_key_bytes))?
         .field("index_bookkeeping_bytes", index.bookkeeping_bytes as u64)?
+        .field(
+            "index_bookkeeping_bytes_human",
+            human(index.bookkeeping_bytes),
+        )?
         .field("index_terms", index.term_count as u64)?
         .field("index_series", index.series_count as u64)?
         .field("index_databases", index.db_count as u64)?
@@ -49,10 +62,8 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
         // Both of these are O(1) reads. `TS._DEBUG STRINGPOOLSTATS` has the distribution and the
         // savings figure, which cost a walk of the pool.
         .field("interned_strings", InternedString::interned_count() as u64)?
-        .field(
-            "interned_strings_bytes",
-            InternedString::memory_used() as u64,
-        )?
+        .field("interned_strings_bytes", interned_bytes as u64)?
+        .field("interned_strings_bytes_human", human(interned_bytes))?
         .build_section()?
         .add_section("compaction")
         .field(
@@ -67,4 +78,8 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
         .build_info()?;
 
     Ok(())
+}
+
+fn human(bytes: usize) -> String {
+    bytes_to_human(bytes as u64)
 }

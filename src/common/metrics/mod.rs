@@ -39,7 +39,7 @@ pub mod fanout;
 use crate::common::sync::lock;
 use metered::{
     Bucket, BucketHistogram, Buckets, HistogramData, HistogramSnapshot, MetricSampleValue,
-    MetricType, MetricValues, Registry, Scalar,
+    MetricType, MetricValues, Registry, Scalar, Unit,
 };
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
@@ -167,6 +167,8 @@ pub struct MetricReading {
     pub section: Section,
     pub kind: MetricKind,
     pub help: String,
+    /// Whether the family's declared unit is bytes.
+    pub is_bytes: bool,
     pub value: MetricValue,
 }
 
@@ -237,6 +239,7 @@ fn read_registry(section: Section, registry: &Registry<'static>) -> Vec<MetricRe
                     .as_ref()
                     .map(|help| help.as_str().to_owned())
                     .unwrap_or_default(),
+                is_bytes: family.unit == Some(Unit::Bytes),
                 value,
             })
         })

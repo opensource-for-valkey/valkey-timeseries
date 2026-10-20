@@ -20,6 +20,7 @@ Y) rather than pinned to byte counts, which are a function of struct layout.
 """
 import pytest
 from valkeytestframework.conftest import resource_port_tracker
+from common import bytes_to_human
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
 
 CHUNK_SIZE = 4096
@@ -200,6 +201,13 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
             + filled["ts_index_id_to_key_bytes"]
             + filled["ts_index_bookkeeping_bytes"]
         )
+
+        # Every byte field has a `_human` twin rendering it as `used_memory_human` does.
+        info = client.execute_command("INFO", "ts_memory")
+        byte_fields = [k for k in filled if k.endswith("_bytes")]
+        assert "ts_interned_strings_bytes" in byte_fields
+        for field in byte_fields:
+            assert info[field + "_human"] == bytes_to_human(filled[field]), field
 
     def test_index_memory_is_released_on_flush(self):
         client = self.server.get_new_client()

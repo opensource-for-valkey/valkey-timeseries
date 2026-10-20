@@ -2,6 +2,7 @@ import pytest
 from valkey import ResponseError, Valkey
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
+from common import bytes_to_human
 from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseDebugMode
 
 
@@ -620,14 +621,21 @@ def _parse_bucket_stats(bucket: list) -> dict:
 
 
 def _parse_memory_savings(result: list) -> dict:
-    """Parse the flat 12-element MemorySavings array (result[3]) into a dict."""
+    """Parse the flat 18-element MemorySavings array (result[3]) into a dict. Each `*Human`
+    field is checked against the byte count it renders and kept as a str."""
     savings = result[3]
-    assert len(savings) == 12, f"Expected 12 elements in MemorySavings, got {len(savings)}"
+    assert len(savings) == 18, f"Expected 18 elements in MemorySavings, got {len(savings)}"
     floats = {"memorySavedPct", "storageSavedPct"}
     parsed = {}
     for i in range(0, len(savings), 2):
         key = savings[i].decode()
-        parsed[key] = float(savings[i + 1]) if key in floats else int(savings[i + 1])
+        if key.endswith("Human"):
+            parsed[key] = savings[i + 1].decode()
+        else:
+            parsed[key] = float(savings[i + 1]) if key in floats else int(savings[i + 1])
+    for key, value in parsed.items():
+        if key.endswith("Human"):
+            assert value == bytes_to_human(parsed[key[:-len("Human")]]), key
     return parsed
 
 
@@ -749,14 +757,17 @@ class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
         self._setup_large_pool()
         result = self._stats(self.K)
         savings = _parse_memory_savings(result)
-        assert set(savings.keys()) == {
+        assert list(savings.keys()) == [
             "memorySavedBytes",
+            "memorySavedBytesHuman",
             "memorySavedPct",
             "holders",
             "holderSlotBytes",
+            "holderSlotBytesHuman",
             "totalStorageBytes",
+            "totalStorageBytesHuman",
             "storageSavedPct",
-        }, f"Unexpected keys: {savings.keys()}"
+        ], f"Unexpected keys: {savings.keys()}"
 
     def test_holder_slots_are_eight_bytes_each(self):
         """Every live reference pays for one pointer-sized slot, shared bytes or not."""
@@ -926,6 +937,10 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
         info = client.execute_command('INFO', 'ts_memory')
         for field, info_field in self.INFO_FIELDS:
             assert reply[field] == int(info[info_field]), field
+            if field.endswith('Bytes'):
+                human = bytes_to_human(reply[field])
+                assert reply[field + 'Human'].decode() == human, field
+                assert info[info_field + '_human'] == human, info_field
         assert reply['series'] == 70
         assert reply['databases'] == 2
         assert reply['nodes'] == 1
@@ -1039,6 +1054,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     @staticmethod
     def family(name):
+        name = name.removesuffix('_human')
         return name[:-len('_total')] if name.endswith('_total') else name
 
     @staticmethod
@@ -1078,7 +1094,9 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     def test_value_types(self):
         stats = self.stats()
         for name, value in stats.items():
-            if name in self.HISTOGRAMS:
+            if name.endswith('_human'):
+                assert value.decode() == bytes_to_human(stats[name.removesuffix('_human')]), name
+            elif name in self.HISTOGRAMS:
                 self.histogram(value)
             elif name in self.DOUBLE_GAUGES:
                 float(value)
@@ -1092,7 +1110,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert stats['exec_analysis_rejected_total'] == 0
         for name, value in stats.items():
             if name.startswith('fanout_') and name not in self.HISTOGRAMS:
-                assert value == 0, name
+                assert value == (b'0B' if name.endswith('_human') else 0), name
         assert self.histogram(stats['fanout_duration_seconds'])['count'] == 0
         assert float(stats['clustermap_age_seconds']) == -1
         assert float(stats['clustermap_refresh_interval_seconds']) == 0
@@ -1144,14 +1162,20 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
 
     def test_verbose(self):
-        names = list(self.stats())
+        stats = self.stats()
+        names = [n for n in stats if not n.endswith('_human')]
         entries = self.client.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
         assert [e[1].decode() for e in entries] == names
         for entry in entries:
-            assert len(entry) == 10, entry
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
-            assert list(fields) == ['name', 'section', 'kind', 'value', 'description']
             name = fields['name'].decode()
+            # A byte metric renders its value as the flat reply's `<name>_human` entry does.
+            if name + '_human' in stats:
+                assert list(fields) == ['name', 'section', 'kind', 'value', 'valueHuman',
+                                        'description'], name
+                assert fields['valueHuman'] == stats[name + '_human'], name
+            else:
+                assert list(fields) == ['name', 'section', 'kind', 'value', 'description'], name
             section = fields['section'].decode()
             kind = fields['kind'].decode()
             assert name.startswith(section + '_')

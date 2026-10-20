@@ -43,7 +43,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `HELP`            | Display available subcommands and brief descriptions    |
 | `STATS`           | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
-| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_memory`) |
+| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_memory`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`) |
 | `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
 | `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
@@ -136,7 +136,9 @@ TS._DEBUG STATS RESET [CLUSTER]
 
 **Without `VERBOSE`:** a map from metric name to value, in a fixed order
 (by section, then by name within a section). Counters are integers; gauges are integers, or doubles when
-the unit is fractional (seconds). A histogram's value is a map:
+the unit is fractional (seconds). A counter or gauge whose unit is bytes is followed by a
+`<name>_human` entry, a string rendering it as `INFO` renders `used_memory_human` (`925B`, `1.21K`,
+`3.50M`). A histogram's value is a map:
 
 | Field     | Type    | Description                                                                         |
 |-----------|---------|-------------------------------------------------------------------------------------|
@@ -147,13 +149,15 @@ the unit is fractional (seconds). A histogram's value is a map:
 The `+Inf` bucket is not listed: its count is `count`.
 
 **With `CLUSTER`** the layout is the same, except that a gauge's value is a
-map from node address (`host:port`) to value, one entry per node, sorted by address.
+map from node address (`host:port`) to value, one entry per node, sorted by address (a byte
+gauge's `_human` entry is the same map of renderings).
 Counters and histogram counts are summed over the nodes. A histogram whose buckets differ from the others' (a node on another version) is left out of the sum, with a warning in
 that coordinator's log. Duration histograms are in seconds,
 with 24 bounds at powers of two from 1 µs (`0.000001`) to 2²³ µs (about 8.4 s).
 
 **With `VERBOSE`:** an array with one map of 5 fields per metric:
-`name`, `section`, `kind` (`counter`, `gauge` or `histogram`), `value`, `description`.
+`name`, `section`, `kind` (`counter`, `gauge` or `histogram`), `value`, `description`. A byte
+metric's map has a sixth, `valueHuman`, after `value`; there is no separate `_human` entry.
 
 **`RESET`:** `OK`.
 
@@ -387,16 +391,19 @@ Each `BucketStats` entry is a map of 6 fields:
 
 #### MemorySavings fields
 
-A map of 6 fields:
+A map of 9 fields:
 
-| Field               | Type    | Description                                                                    |
-|---------------------|---------|--------------------------------------------------------------------------------|
-| `memorySavedBytes`  | integer | Bytes saved by sharing interned strings across multiple references             |
-| `memorySavedPct`    | float   | `memorySavedBytes` as a share of the pool's cost without interning             |
-| `holders`           | integer | Live references to interned strings, one per outstanding slot                  |
-| `holderSlotBytes`   | integer | Bytes those references spend on slots (8 bytes each), with or without interning |
-| `totalStorageBytes` | integer | What interned strings cost in total: pool `allocated` plus `holderSlotBytes`   |
-| `storageSavedPct`   | float   | `memorySavedBytes` as a share of `totalStorageBytes` without interning         |
+| Field                    | Type    | Description                                                                    |
+|--------------------------|---------|--------------------------------------------------------------------------------|
+| `memorySavedBytes`       | integer | Bytes saved by sharing interned strings across multiple references             |
+| `memorySavedBytesHuman`  | string  | `memorySavedBytes` in human-readable form, e.g. `1.21M`                         |
+| `memorySavedPct`         | float   | `memorySavedBytes` as a share of the pool's cost without interning             |
+| `holders`                | integer | Live references to interned strings, one per outstanding slot                  |
+| `holderSlotBytes`        | integer | Bytes those references spend on slots (8 bytes each), with or without interning |
+| `holderSlotBytesHuman`   | string  | `holderSlotBytes` in human-readable form                                       |
+| `totalStorageBytes`      | integer | What interned strings cost in total: pool `allocated` plus `holderSlotBytes`   |
+| `totalStorageBytesHuman` | string  | `totalStorageBytes` in human-readable form                                     |
+| `storageSavedPct`        | float   | `memorySavedBytes` as a share of `totalStorageBytes` without interning         |
 
 The two percentages answer different questions and the gap between them is often wide.
 

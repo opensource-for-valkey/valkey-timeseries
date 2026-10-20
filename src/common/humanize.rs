@@ -79,41 +79,21 @@ pub fn humanize_duration(v: &Duration) -> String {
     humanize_duration_ms(v.as_millis().try_into().unwrap_or(i64::MAX))
 }
 
-pub fn humanize_bytes(size: f64) -> String {
-    let mut suffix: &str = "";
-    let mut size = size;
-    for p in ["ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi", "Yi"] {
-        if size.abs() < 1024f64 {
-            break;
-        }
-        suffix = p;
-        size /= 1024.0
+/// Renders a byte count the way the server's own `INFO` fields (`used_memory_human`) do: whole
+/// bytes below 1 KiB, then two decimals of K, M, G, T or P, each a power of 1024 (`925B`,
+/// `1.21K`, `3.50M`). Past the petabytes it falls back to whole bytes, as the server does.
+pub fn bytes_to_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes}B");
     }
-    format!("{size:.4}{suffix}")
-}
-
-const TB: u64 = 1 << 40;
-const GB: u64 = 1 << 30;
-const MB: u64 = 1 << 20;
-const KB: u64 = 1 << 10;
-
-/// Present size in human-readable form
-pub fn human_readable_size(size: usize) -> String {
-    let size = size as u64;
-    let (value, unit) = {
-        if size >= 2 * TB {
-            (size as f64 / TB as f64, "TB")
-        } else if size >= 2 * GB {
-            (size as f64 / GB as f64, "GB")
-        } else if size >= 2 * MB {
-            (size as f64 / MB as f64, "MB")
-        } else if size >= 2 * KB {
-            (size as f64 / KB as f64, "KB")
-        } else {
-            (size as f64, "B")
+    let mut scale = 1024u64;
+    for unit in ["K", "M", "G", "T", "P"] {
+        if bytes / scale < 1024 {
+            return format!("{:.2}{unit}", bytes as f64 / scale as f64);
         }
-    };
-    format!("{value:.1} {unit}")
+        scale *= 1024;
+    }
+    format!("{bytes}B")
 }
 
 #[cfg(test)]
@@ -199,5 +179,27 @@ mod tests {
         assert_eq!(humanize_duration(&Duration::from_millis(750)), "750ms");
         assert_eq!(humanize_duration(&Duration::from_secs(3600)), "1h");
         assert_eq!(humanize_duration(&Duration::ZERO), "0ms");
+    }
+
+    #[test]
+    fn bytes_to_human_switches_unit_at_each_power_of_1024() {
+        assert_eq!(bytes_to_human(0), "0B");
+        assert_eq!(bytes_to_human(925), "925B");
+        assert_eq!(bytes_to_human(1023), "1023B");
+        assert_eq!(bytes_to_human(1024), "1.00K");
+        assert_eq!(bytes_to_human(1240), "1.21K");
+        assert_eq!(bytes_to_human((1 << 20) - 1), "1024.00K");
+        assert_eq!(bytes_to_human(1 << 20), "1.00M");
+        assert_eq!(bytes_to_human(3 * (1 << 20) + (1 << 19)), "3.50M");
+        assert_eq!(bytes_to_human(1 << 30), "1.00G");
+        assert_eq!(bytes_to_human(1 << 40), "1.00T");
+        assert_eq!(bytes_to_human(1 << 50), "1.00P");
+        assert_eq!(bytes_to_human((1 << 60) - 1), "1024.00P");
+    }
+
+    #[test]
+    fn bytes_to_human_falls_back_to_bytes_past_petabytes() {
+        assert_eq!(bytes_to_human(1 << 60), "1152921504606846976B");
+        assert_eq!(bytes_to_human(u64::MAX), "18446744073709551615B");
     }
 }

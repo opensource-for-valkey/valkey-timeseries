@@ -1,7 +1,8 @@
 use super::stats_fanout_command::{ClusterReading, ClusterValue, StatsFanoutCommand};
 use super::target::{parse_node_target, resolve_node_target};
 use crate::commands::CommandArgIterator;
-use crate::common::metrics::{self, MetricReading, MetricValue, Section};
+use crate::common::humanize::bytes_to_human;
+use crate::common::metrics::{self, MetricKind, MetricReading, MetricValue, Section};
 use crate::common::replies::*;
 use crate::fanout::{FanoutClientCommand, FanoutTarget};
 use metered::{HistogramSnapshot, Scalar};
@@ -76,9 +77,61 @@ fn reply_cluster_value(ctx: &Context, value: &ClusterValue) {
     }
 }
 
-/// Emits one metric in verbose format as a map, like `LIST_CONFIGS VERBOSE`.
+/// Whether a metric's reply carries a human-readable rendering of its value as well: a counter
+/// or gauge of bytes. A histogram of bytes has no single figure to render.
+fn shows_human(is_bytes: bool, kind: MetricKind) -> bool {
+    is_bytes && kind != MetricKind::Histogram
+}
+
+fn scalar_bytes(value: &Scalar) -> u64 {
+    match value {
+        Scalar::Int(v) => u64::try_from(*v).unwrap_or(0),
+        Scalar::UInt(v) => *v,
+        Scalar::Float(v) => *v as u64,
+    }
+}
+
+/// Emits a byte counter or gauge as [`bytes_to_human`] renders it (`1.21M`). [`shows_human`]
+/// keeps histograms away; one would get a null.
+fn reply_human_value(ctx: &Context, value: &MetricValue) {
+    match value {
+        MetricValue::Counter(v) => {
+            reply_with_bulk_string(ctx, &bytes_to_human(*v));
+        }
+        MetricValue::Gauge(v) => {
+            reply_with_bulk_string(ctx, &bytes_to_human(scalar_bytes(v)));
+        }
+        MetricValue::Histogram(_) => {
+            reply_with_null(ctx);
+        }
+    }
+}
+
+/// As [`reply_human_value`], except that a gauge is a map from node address to rendering, as in
+/// [`reply_cluster_value`].
+fn reply_cluster_human_value(ctx: &Context, value: &ClusterValue) {
+    match value {
+        ClusterValue::Counter(v) => {
+            reply_with_bulk_string(ctx, &bytes_to_human(*v));
+        }
+        ClusterValue::Gauge(per_node) => {
+            reply_with_map(ctx, per_node.len());
+            for (node, v) in per_node {
+                reply_with_bulk_string(ctx, node);
+                reply_with_bulk_string(ctx, &bytes_to_human(scalar_bytes(v)));
+            }
+        }
+        ClusterValue::Histogram(_) => {
+            reply_with_null(ctx);
+        }
+    }
+}
+
+/// Emits one metric in verbose format as a map, like `LIST_CONFIGS VERBOSE`. A byte metric
+/// carries a `valueHuman` field after `value`.
 fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
-    reply_with_map(ctx, 5);
+    let human = shows_human(reading.is_bytes, reading.kind);
+    reply_with_map(ctx, if human { 6 } else { 5 });
     reply_with_str(ctx, "name");
     reply_with_bulk_string(ctx, &reading.name);
     reply_with_str(ctx, "section");
@@ -87,6 +140,10 @@ fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
     reply_with_str(ctx, reading.kind.as_str());
     reply_with_str(ctx, "value");
     reply_metric_value(ctx, &reading.value);
+    if human {
+        reply_with_str(ctx, "valueHuman");
+        reply_human_value(ctx, &reading.value);
+    }
     reply_with_str(ctx, "description");
     reply_with_bulk_string(ctx, &reading.help);
 }
@@ -101,7 +158,8 @@ pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], ve
                 Some(section) => section.as_str(),
                 None => reading.name.split('_').next().unwrap_or_default(),
             };
-            reply_with_map(ctx, 5);
+            let human = shows_human(reading.is_bytes, reading.kind);
+            reply_with_map(ctx, if human { 6 } else { 5 });
             reply_with_str(ctx, "name");
             reply_with_bulk_string(ctx, &reading.name);
             reply_with_str(ctx, "section");
@@ -110,14 +168,26 @@ pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], ve
             reply_with_str(ctx, reading.kind.as_str());
             reply_with_str(ctx, "value");
             reply_cluster_value(ctx, &reading.value);
+            if human {
+                reply_with_str(ctx, "valueHuman");
+                reply_cluster_human_value(ctx, &reading.value);
+            }
             reply_with_str(ctx, "description");
             reply_with_bulk_string(ctx, &reading.help);
         }
     } else {
-        reply_with_map(ctx, readings.len());
+        let humans = readings
+            .iter()
+            .filter(|r| shows_human(r.is_bytes, r.kind))
+            .count();
+        reply_with_map(ctx, readings.len() + humans);
         for reading in readings {
             reply_with_bulk_string(ctx, &reading.name);
             reply_cluster_value(ctx, &reading.value);
+            if shows_human(reading.is_bytes, reading.kind) {
+                reply_with_bulk_string(ctx, &format!("{}_human", reading.name));
+                reply_cluster_human_value(ctx, &reading.value);
+            }
         }
     }
 }
@@ -147,8 +217,9 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// Without `VERBOSE`, replies with a `name => value` map covering the named sections
 /// (every section when none is given), section by section and by name within each. Counters
 /// are integers, gauges integers or doubles; a histogram's value is a nested map (see
-/// [`reply_histogram`]). With `VERBOSE`, replies with one map per metric: name,
-/// section, kind, value, description.
+/// [`reply_histogram`]). A counter or gauge of bytes is followed by a `<name>_human` entry
+/// rendering it as `INFO` does (`1.21M`). With `VERBOSE`, replies with one map per metric: name,
+/// section, kind, value, `valueHuman` for a byte metric, description.
 ///
 /// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
 /// gauges alone. It is not replicated.
@@ -210,10 +281,18 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
             reply_metric_verbose(ctx, reading);
         }
     } else {
-        reply_with_map(ctx, readings.len());
+        let humans = readings
+            .iter()
+            .filter(|r| shows_human(r.is_bytes, r.kind))
+            .count();
+        reply_with_map(ctx, readings.len() + humans);
         for reading in &readings {
             reply_with_bulk_string(ctx, &reading.name);
             reply_metric_value(ctx, &reading.value);
+            if shows_human(reading.is_bytes, reading.kind) {
+                reply_with_bulk_string(ctx, &format!("{}_human", reading.name));
+                reply_human_value(ctx, &reading.value);
+            }
         }
     }
     Ok(())

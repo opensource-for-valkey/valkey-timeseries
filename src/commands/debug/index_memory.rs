@@ -2,6 +2,7 @@ use super::index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_m
 use super::target::{parse_node_target, resolve_node_target};
 use crate::commands::CommandArgIterator;
 use crate::common::context::get_current_db;
+use crate::common::humanize::bytes_to_human;
 use crate::common::replies::*;
 use crate::error_consts;
 use crate::fanout::{FanoutClientCommand, FanoutTarget};
@@ -42,22 +43,35 @@ pub(super) fn index_memory(ctx: &Context, args: &mut CommandArgIterator) -> Valk
 
 /// Writes a `TS._DEBUG INDEXMEMORY` reply. Shared by the local path and the cluster fan-out, so
 /// both reply with the same shape. The fields are those of `INFO ts_memory`'s `index_*` group;
-/// `nodes` is how many nodes the figures were summed over.
+/// `nodes` is how many nodes the figures were summed over. Each `*Bytes` field is followed by a
+/// `*BytesHuman` string rendering it as `INFO` does (`1.21M`).
 pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes: usize) {
-    let fields = [
-        ("totalBytes", memory.total_bytes()),
-        ("termsBytes", memory.terms_bytes),
-        ("postingsBytes", memory.postings_bytes),
-        ("idToKeyBytes", memory.id_to_key_bytes),
-        ("bookkeepingBytes", memory.bookkeeping_bytes),
+    let bytes = [
+        ("totalBytes", "totalBytesHuman", memory.total_bytes()),
+        ("termsBytes", "termsBytesHuman", memory.terms_bytes),
+        ("postingsBytes", "postingsBytesHuman", memory.postings_bytes),
+        ("idToKeyBytes", "idToKeyBytesHuman", memory.id_to_key_bytes),
+        (
+            "bookkeepingBytes",
+            "bookkeepingBytesHuman",
+            memory.bookkeeping_bytes,
+        ),
+    ];
+    let counts = [
         ("terms", memory.term_count),
         ("series", memory.series_count),
         ("databases", memory.db_count),
         ("nodes", nodes),
     ];
 
-    reply_with_map(ctx, fields.len());
-    for (name, value) in fields {
+    reply_with_map(ctx, bytes.len() * 2 + counts.len());
+    for (name, human_name, value) in bytes {
+        reply_with_str(ctx, name);
+        reply_with_usize(ctx, value);
+        reply_with_str(ctx, human_name);
+        reply_with_bulk_string(ctx, &bytes_to_human(value as u64));
+    }
+    for (name, value) in counts {
         reply_with_str(ctx, name);
         reply_with_usize(ctx, value);
     }

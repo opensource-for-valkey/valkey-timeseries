@@ -2,6 +2,7 @@ use super::string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, Stri
 use super::target::{is_target_keyword, parse_node_target, resolve_node_target};
 use crate::commands::CommandArgIterator;
 use crate::commands::fanout_codec::generated::StringPoolTopKEntry;
+use crate::common::humanize::bytes_to_human;
 use crate::common::replies::*;
 use crate::common::string_interner::{BucketStats, saved_pct};
 use crate::fanout::{FanoutClientCommand, FanoutTarget};
@@ -46,6 +47,14 @@ fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
 
     reply_with_str(ctx, "allocated");
     reply_with_usize(ctx, entry.allocated as usize);
+}
+
+/// Writes a `<name>` byte count and a `<name>Human` rendering of it, two map entries.
+fn reply_with_bytes(ctx: &Context, name: &str, bytes: usize) {
+    reply_with_str(ctx, name);
+    reply_with_usize(ctx, bytes);
+    reply_with_str(ctx, &format!("{name}Human"));
+    reply_with_bulk_string(ctx, &bytes_to_human(bytes as u64));
 }
 
 /// Returns statistics about this node's string pool, or the cluster's with `CLUSTER`.
@@ -108,12 +117,13 @@ pub(super) fn reply_with_string_pool_stats(
     //
     // `memorySavedPct` compares the pool against one allocation per reference and nothing else,
     // so it reads near 100% on any label set worth interning. The holder slot is what a
-    // reference costs whether or not the bytes behind it are shared, so the four fields after
-    // it restate the same saving against total string storage; see `Stats` for the split.
+    // reference costs whether or not the bytes behind it are shared, so the fields after it
+    // restate the same saving against total string storage; see `Stats` for the split.
+    //
+    // Each `*Bytes` field is followed by a `*BytesHuman` string rendering it as `INFO` does.
     let total_storage_bytes = stats.total_storage_bytes();
-    reply_with_map(ctx, 6);
-    reply_with_str(ctx, "memorySavedBytes");
-    reply_with_usize(ctx, stats.memory_saved_bytes);
+    reply_with_map(ctx, 9);
+    reply_with_bytes(ctx, "memorySavedBytes", stats.memory_saved_bytes);
     reply_with_str(ctx, "memorySavedPct");
     reply_with_double(
         ctx.ctx,
@@ -121,10 +131,8 @@ pub(super) fn reply_with_string_pool_stats(
     );
     reply_with_str(ctx, "holders");
     reply_with_usize(ctx, stats.holder_count);
-    reply_with_str(ctx, "holderSlotBytes");
-    reply_with_usize(ctx, stats.holder_slot_bytes);
-    reply_with_str(ctx, "totalStorageBytes");
-    reply_with_usize(ctx, total_storage_bytes);
+    reply_with_bytes(ctx, "holderSlotBytes", stats.holder_slot_bytes);
+    reply_with_bytes(ctx, "totalStorageBytes", total_storage_bytes);
     reply_with_str(ctx, "storageSavedPct");
     reply_with_double(
         ctx.ctx,

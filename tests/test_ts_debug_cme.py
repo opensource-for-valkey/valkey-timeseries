@@ -10,7 +10,7 @@ import time
 import pytest
 from valkey import ResponseError, Valkey, ValkeyCluster
 
-from common import SERVER_VERSION
+from common import SERVER_VERSION, bytes_to_human
 from valkey_timeseries_test_case import ValkeyTimeSeriesClusterTestCaseDebugMode
 from valkeytestframework.conftest import resource_port_tracker
 from valkeytestframework.util.waiters import wait_for_true
@@ -67,6 +67,8 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         savings = bucket_fields(merged[3])
         for field in ('memorySavedBytes', 'holders', 'holderSlotBytes', 'totalStorageBytes'):
             assert savings[field] == sum(bucket_fields(r[3])[field] for r in locals_), field
+        for field in ('memorySavedBytes', 'holderSlotBytes', 'totalStorageBytes'):
+            assert savings[field + 'Human'].decode() == bytes_to_human(savings[field]), field
         # Ratios are recomputed from the sums, not summed.
         saved = savings['memorySavedBytes']
         expected_pct = saved / (saved + savings['totalStorageBytes']) * 100.0 if saved else 0.0
@@ -177,6 +179,9 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert merged['totalBytes'] == (
             merged['termsBytes'] + merged['postingsBytes']
             + merged['idToKeyBytes'] + merged['bookkeepingBytes'])
+        # The human renderings are of the merged sums, not merged themselves.
+        for field in ('totalBytes', 'termsBytes', 'postingsBytes', 'idToKeyBytes', 'bookkeepingBytes'):
+            assert merged[field + 'Human'].decode() == bytes_to_human(merged[field]), field
 
     def test_replica_mirrors_its_primary(self):
         self.populate()
@@ -290,6 +295,8 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         # One request to each peer; the local share never touches the bus.
         assert coordinator['fanout_requests_sent_total'] == self.CLUSTER_SIZE - 1
         assert coordinator['fanout_request_sent_bytes_total'] > 0
+        assert coordinator['fanout_request_sent_bytes_total_human'].decode() == bytes_to_human(
+            coordinator['fanout_request_sent_bytes_total'])
         assert coordinator['fanout_responses_sent_total'] == 0
         assert coordinator['fanout_response_sent_bytes_total'] == 0
 
@@ -576,6 +583,10 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         served = sum(stats['fanout_served_ok_total'] for stats in local)
         assert served == self.CLUSTER_SIZE
         assert cluster['fanout_served_ok_total'] == served
+        # A byte counter's rendering is of the cluster-wide sum.
+        sent = cluster['fanout_response_sent_bytes_total']
+        assert sent >= sum(s['fanout_response_sent_bytes_total'] for s in local)
+        assert cluster['fanout_response_sent_bytes_total_human'].decode() == bytes_to_human(sent)
         # The cron keeps ticking between the reads, so the cluster view can only be ahead.
         assert cluster['cron_ticks_total'] >= sum(s['cron_ticks_total'] for s in local)
         assert histogram_count(cluster['cron_tick_duration_seconds']) >= sum(
@@ -608,12 +619,14 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_verbose_and_section_order_match_a_single_node(self):
         coordinator = self.client_for_primary(0)
-        local_names = list(debug_stats(coordinator))
+        local_names = [n for n in debug_stats(coordinator) if not n.endswith('_human')]
         entries = coordinator.execute_command('TS._DEBUG', 'STATS', 'VERBOSE', 'CLUSTER')
         assert [e[1].decode() for e in entries] == local_names
         for entry in entries:
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
             assert fields['description'], fields['name']
+            if fields['name'].endswith(b'_bytes_total'):
+                assert fields['valueHuman'].decode() == bytes_to_human(fields['value'])
             if fields['kind'] == b'gauge':
                 assert len(per_node(fields['value'])) == len(self.node_ports()), fields['name']
 

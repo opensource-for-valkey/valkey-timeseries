@@ -501,3 +501,14 @@ class LabelSearchResponse:
         # Legacy response: assume plain list of bulkstrings -> no has_more
         results = LabelValue.parse_response(response)
         return cls(has_more=False, results=results)
+
+
+def bytes_to_human(n: int) -> str:
+    """The module's `*Human`/`*_human` rendering of a byte count, as the server renders
+    `used_memory_human`: whole bytes below 1 KiB, then two decimals of K/M/G/T/P."""
+    if n < 1024:
+        return f"{n}B"
+    for exp, unit in enumerate("KMGTP", start=1):
+        if n < 1024 ** (exp + 1):
+            return f"{n / 1024 ** exp:.2f}{unit}"
+    return f"{n}B"
