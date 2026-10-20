@@ -1,17 +1,16 @@
-use super::ts_debug::reply_with_string_pool_stats;
+use super::ensure_debug_enabled;
+use super::string_pool_stats::reply_with_string_pool_stats;
 use crate::commands::fanout_codec::generated::{
     StringPoolBucket, StringPoolStatsRequest, StringPoolStatsResponse, StringPoolTopKEntry,
 };
 use crate::common::replies::ReplyContext;
 use crate::common::string_interner::{BucketStats, InternedString, Stats, TopKEntry};
-use crate::config::is_debug_mode_enabled;
-use crate::error_consts;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
 use ahash::AHashMap;
 use std::collections::BTreeMap;
-use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
+use valkey_module::{Context, Status, ValkeyResult};
 
 /// String pool statistics summed over one or more nodes, in the shape `TS._DEBUG
 /// STRINGPOOLSTATS` replies with.
@@ -158,13 +157,15 @@ impl From<Stats> for StringPoolStatsResponse {
 #[derive(Default)]
 pub struct StringPoolStatsFanoutCommand {
     top_k: usize,
+    target: FanoutTarget,
     summary: StringPoolSummary,
 }
 
 impl StringPoolStatsFanoutCommand {
-    pub fn new(top_k: usize) -> Self {
+    pub fn new(top_k: usize, target: FanoutTarget) -> Self {
         Self {
             top_k,
+            target,
             summary: StringPoolSummary::default(),
         }
     }
@@ -184,9 +185,7 @@ impl FanoutClientCommand for StringPoolStatsFanoutCommand {
         req: StringPoolStatsRequest,
     ) -> ValkeyResult<StringPoolStatsResponse> {
         // Each node gates its own internals, as it would for a direct TS._DEBUG call.
-        if !is_debug_mode_enabled() {
-            return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
-        }
+        ensure_debug_enabled()?;
         Ok(InternedString::get_stats_with_top_k(req.top_k as usize).into())
     }
 
@@ -199,7 +198,7 @@ impl FanoutClientCommand for StringPoolStatsFanoutCommand {
     /// Replicas hold a copy of their primary's labels, so including them would count each
     /// shard's pool twice.
     fn get_targets(&self, _ctx: &Context) -> FanoutTarget {
-        FanoutTarget::Primary
+        self.target.clone()
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

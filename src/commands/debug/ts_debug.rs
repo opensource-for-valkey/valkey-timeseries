@@ -1,228 +1,15 @@
 use super::configs::list_configs_cmd;
-use super::index_memory_fanout_command::{IndexMemoryFanoutCommand, local_index_memory};
+use super::ensure_debug_enabled;
+use super::index_memory::index_memory;
 use super::stats::stats_cmd;
-use super::string_pool_stats_fanout_command::{StringPoolStatsFanoutCommand, StringPoolSummary};
+use super::string_pool_stats::string_pool_stats;
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
-use crate::commands::fanout_codec::generated::StringPoolTopKEntry;
-use crate::common::context::get_current_db;
 use crate::common::replies::*;
-use crate::common::string_interner::{BucketStats, saved_pct};
-use crate::config::is_debug_mode_enabled;
-use crate::error_consts;
-use crate::fanout::{FanoutClientCommand, inflight_requests, is_clustered};
-use crate::series::index::{IndexMemory, series_keys_by_selectors};
+use crate::fanout::inflight_requests;
+use crate::series::index::series_keys_by_selectors;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
-
-/// Dumps a bucket's statistics to the reply.
-fn dump_bucket(ctx: &Context, bucket: &BucketStats) {
-    reply_with_map(ctx, 6);
-
-    reply_with_str(ctx, "count");
-    reply_with_usize(ctx, bucket.count);
-
-    reply_with_str(ctx, "bytes");
-    reply_with_usize(ctx, bucket.bytes);
-
-    reply_with_str(ctx, "avgSize");
-    reply_with_double(ctx.ctx, bucket.get_avg_size());
-
-    reply_with_str(ctx, "allocated");
-    reply_with_usize(ctx, bucket.allocated);
-
-    reply_with_str(ctx, "avgAllocated");
-    reply_with_double(ctx, bucket.get_avg_allocated());
-
-    let utilization = bucket.get_utilization() * 100.0;
-    reply_with_str(ctx, "utilizationPct");
-    reply_with_usize(ctx, utilization as usize);
-}
-
-/// Dumps a top-K entry to the reply.
-fn dump_top_k_entry(ctx: &Context, entry: &StringPoolTopKEntry) {
-    reply_with_map(ctx, 4);
-
-    reply_with_str(ctx, "value");
-    reply_with_bulk_string(ctx, &entry.value);
-
-    reply_with_str(ctx, "refCount");
-    reply_with_usize(ctx, entry.ref_count as usize);
-
-    reply_with_str(ctx, "bytes");
-    reply_with_usize(ctx, entry.bytes as usize);
-
-    reply_with_str(ctx, "allocated");
-    reply_with_usize(ctx, entry.allocated as usize);
-}
-
-/// Fails a `CLUSTER` request on a standalone server. The keyword, not the server mode, picks the
-/// reply layout, so a request never quietly gets the single-node one instead.
-pub(super) fn require_cluster(ctx: &Context) -> ValkeyResult<()> {
-    if is_clustered(ctx) {
-        Ok(())
-    } else {
-        Err(ValkeyError::Str(error_consts::DEBUG_CLUSTER_NOT_ENABLED))
-    }
-}
-
-/// Returns statistics about this node's string pool, or the cluster's with `CLUSTER`.
-///
-/// TS._DEBUG STRINGPOOLSTATS [k] [CLUSTER]
-///
-/// `CLUSTER` sums the statistics over one primary per shard (see [`StringPoolSummary`] for what
-/// the sums mean).
-fn string_pool_stats(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
-    // Parse optional k parameter (default: 0 for backward compatibility)
-    let k = match args.peek() {
-        Some(arg) if !arg.as_slice().eq_ignore_ascii_case(b"CLUSTER") => args.next_u64()? as usize,
-        _ => 0,
-    };
-    let cluster = match args.peek() {
-        Some(arg) if arg.as_slice().eq_ignore_ascii_case(b"CLUSTER") => {
-            args.next();
-            true
-        }
-        _ => false,
-    };
-
-    args.done()?;
-
-    if cluster {
-        require_cluster(ctx)?;
-        StringPoolStatsFanoutCommand::new(k).exec(ctx)?;
-        return Ok(());
-    }
-
-    reply_with_string_pool_stats(ctx, &StringPoolSummary::local(k), k > 0);
-    Ok(())
-}
-
-/// Writes a `TS._DEBUG STRINGPOOLSTATS` reply. Shared by the local path and the cluster fan-out,
-/// so both reply with the same shape.
-pub(super) fn reply_with_string_pool_stats(
-    ctx: &Context,
-    stats: &StringPoolSummary,
-    with_top_k: bool,
-) {
-    let arr_len = if with_top_k { 6 } else { 4 };
-    reply_with_array(ctx, arr_len);
-
-    // Reply[0] -> GlobalStats
-    dump_bucket(ctx, &stats.total);
-
-    // Reply[1] -> ByRefcount
-    reply_with_array(ctx, stats.by_ref_count.len());
-    for (&ref_count, bucket) in &stats.by_ref_count {
-        reply_with_array(ctx, 2);
-        reply_with_usize(ctx, ref_count);
-        dump_bucket(ctx, bucket);
-    }
-
-    // Reply[2] -> BySize
-    reply_with_array(ctx, stats.by_size.len());
-    for (&size, bucket) in &stats.by_size {
-        reply_with_array(ctx, 2);
-        reply_with_usize(ctx, size);
-        dump_bucket(ctx, bucket);
-    }
-
-    // Reply[3] -> MemorySavings
-    //
-    // `memorySavedPct` compares the pool against one allocation per reference and nothing else,
-    // so it reads near 100% on any label set worth interning. The holder slot is what a
-    // reference costs whether or not the bytes behind it are shared, so the four fields after
-    // it restate the same saving against total string storage; see `Stats` for the split.
-    let total_storage_bytes = stats.total_storage_bytes();
-    reply_with_map(ctx, 6);
-    reply_with_str(ctx, "memorySavedBytes");
-    reply_with_usize(ctx, stats.memory_saved_bytes);
-    reply_with_str(ctx, "memorySavedPct");
-    reply_with_double(
-        ctx.ctx,
-        saved_pct(stats.memory_saved_bytes, stats.total.allocated),
-    );
-    reply_with_str(ctx, "holders");
-    reply_with_usize(ctx, stats.holder_count);
-    reply_with_str(ctx, "holderSlotBytes");
-    reply_with_usize(ctx, stats.holder_slot_bytes);
-    reply_with_str(ctx, "totalStorageBytes");
-    reply_with_usize(ctx, total_storage_bytes);
-    reply_with_str(ctx, "storageSavedPct");
-    reply_with_double(
-        ctx.ctx,
-        saved_pct(stats.memory_saved_bytes, total_storage_bytes),
-    );
-
-    if with_top_k {
-        // Reply[4] -> TopK by RefCount
-        reply_with_array(ctx, stats.top_k_by_ref.len());
-        for entry in &stats.top_k_by_ref {
-            dump_top_k_entry(ctx, entry);
-        }
-
-        // Reply[5] -> TopK by Size
-        reply_with_array(ctx, stats.top_k_by_size.len());
-        for entry in &stats.top_k_by_size {
-            dump_top_k_entry(ctx, entry);
-        }
-    }
-}
-
-/// Returns the heap footprint of this node's label index for the selected database, or summed
-/// over every database with `ALLDBS`.
-///
-/// TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]
-///
-/// `CLUSTER` sums the footprint over one node per shard, a replica where the shard has one (see
-/// [`IndexMemoryFanoutCommand`]).
-fn index_memory(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
-    let mut all_dbs = false;
-    let mut cluster = false;
-    for arg in args.by_ref() {
-        let arg = arg.as_slice();
-        if arg.eq_ignore_ascii_case(b"ALLDBS") && !all_dbs {
-            all_dbs = true;
-        } else if arg.eq_ignore_ascii_case(b"CLUSTER") && !cluster {
-            cluster = true;
-        } else {
-            return Err(ValkeyError::Str(error_consts::INVALID_ARGUMENT));
-        }
-    }
-
-    if cluster {
-        require_cluster(ctx)?;
-        IndexMemoryFanoutCommand::new(all_dbs).exec(ctx)?;
-        return Ok(());
-    }
-
-    let memory = local_index_memory(get_current_db(ctx), all_dbs);
-    reply_with_index_memory(ctx, &memory, 1);
-    Ok(())
-}
-
-/// Writes a `TS._DEBUG INDEXMEMORY` reply. Shared by the local path and the cluster fan-out, so
-/// both reply with the same shape. The fields are those of `INFO ts_memory`'s `index_*` group;
-/// `nodes` is how many nodes the figures were summed over.
-pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes: usize) {
-    let fields = [
-        ("totalBytes", memory.total_bytes()),
-        ("termsBytes", memory.terms_bytes),
-        ("postingsBytes", memory.postings_bytes),
-        ("idToKeyBytes", memory.id_to_key_bytes),
-        ("bookkeepingBytes", memory.bookkeeping_bytes),
-        ("terms", memory.term_count),
-        ("series", memory.series_count),
-        ("databases", memory.db_count),
-        ("nodes", nodes),
-    ];
-
-    reply_with_map(ctx, fields.len());
-    for (name, value) in fields {
-        reply_with_str(ctx, name);
-        reply_with_usize(ctx, value);
-    }
-}
 
 /// Lists this node's fanout RPCs that still have remote shares outstanding, oldest first: one
 /// map per request with `id` (a string: ids span the full `u64` range),
@@ -279,24 +66,24 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 
     const HELP_TEXT: &[(&str, &str)] = &[
         (
-            "TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]",
-            "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node",
+            "TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node (PRIMARY over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
         ),
         (
-            "TS._DEBUG STATS RESET [CLUSTER]",
-            "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER",
+            "TS._DEBUG STATS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER (PRIMARY: shard primaries; HASHTAG: the primaries of the shards owning those tags)",
         ),
         (
             "TS._DEBUG INFLIGHT",
             "List this node's fanout requests with remote shares outstanding, oldest first",
         ),
         (
-            "TS._DEBUG STRINGPOOLSTATS [TOPK] [CLUSTER]",
-            "Show this node's String Interner Stats (CLUSTER sums them over shard primaries)",
+            "TS._DEBUG STRINGPOOLSTATS [TOPK] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "Show this node's String Interner Stats (CLUSTER or PRIMARY sums them over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
         ),
         (
-            "TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]",
-            "Show this node's label index heap usage for the selected db, or every db with ALLDBS (CLUSTER sums it over one node per shard, replicas preferred)",
+            "TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "Show this node's label index heap usage for the selected db, or every db with ALLDBS (CLUSTER sums it over one node per shard, replicas preferred; PRIMARY over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
         ),
         (
             "TS._DEBUG QUERYINDEX <filter> [<filter> ...]",
@@ -335,10 +122,7 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 /// Every subcommand writes its own reply, so success maps to `NoReply`: `Ok(())` would convert
 /// to a Null reply and send it after the real one, desynchronizing the client.
 pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if !is_debug_mode_enabled() {
-        return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
-    }
-
+    ensure_debug_enabled()?;
     // skip the command name and parse the subcommand keyword
     let mut itr = args.into_iter().skip(1).peekable();
 

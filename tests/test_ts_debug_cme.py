@@ -101,6 +101,29 @@ class TestStringPoolStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         longest = {e['value'].decode() for e in by_size if b'x' * 40 in e['value']}
         assert len(longest) == 2 * self.CLUSTER_SIZE
 
+    def test_primary_and_hashtag_targets(self):
+        cluster_client = self.new_cluster_client()
+        self.populate(cluster_client)
+        coordinator = self.client_for_primary(0)
+
+        cluster = coordinator.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'CLUSTER')
+        assert coordinator.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'PRIMARY') == cluster
+
+        tags = self.tag_per_primary(cluster_client)
+        totals = [bucket_fields(stats[0]) for stats in self.local_stats(0)]
+        # Every primary holds the same number of strings, but the long host label differs in
+        # length, so `bytes` tells the primaries apart.
+        assert len({t['bytes'] for t in totals}) == self.CLUSTER_SIZE
+
+        # HASHTAG always asks the owning shard's primary (the coordinator's own for tags[0]),
+        # never a replica or another shard, so each answer is that primary's own and does not
+        # change from one run to the next.
+        for _ in range(5):
+            for i, tag in enumerate(tags):
+                one = bucket_fields(
+                    coordinator.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'HASHTAG', tag)[0])
+                assert (one['count'], one['bytes']) == (totals[i]['count'], totals[i]['bytes']), i
+
     def test_default_reports_one_node(self):
         cluster_client = self.new_cluster_client()
         self.populate(cluster_client)
@@ -192,6 +215,42 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         merged = index_memory(self.client_for_primary(0), 'CLUSTER')
         assert local['nodes'] == 1
         assert local['series'] < merged['series']
+        assert index_memory(self.client_for_primary(0), 'LOCAL') == local
+
+    def test_primary_target_reads_primaries(self):
+        """With debug-mode off on a replica, PRIMARY still answers: it never asks a replica."""
+        self.populate()
+        replica = self.replica(1)
+        replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            merged = index_memory(self.client_for_primary(0), 'ALLDBS', 'PRIMARY')
+            assert merged['nodes'] == self.CLUSTER_SIZE
+            assert merged['series'] == 60
+        finally:
+            replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+    def test_hashtag_target_reads_the_owning_primary(self):
+        self.populate()
+        locals_ = [index_memory(self.client_for_primary(i))['series'] for i in range(self.CLUSTER_SIZE)]
+        owner = self.new_cluster_client().get_node_from_key('{idxmem}').port
+        owner_shard = next(i for i in range(self.CLUSTER_SIZE) if self.get_primary_port(i) == owner)
+        for _ in range(10):
+            reply = index_memory(self.client_for_primary(0), 'HASHTAG', 'idxmem')
+            assert reply['nodes'] == 1
+            assert reply['series'] == locals_[owner_shard]
+
+    def test_hashtag_target_never_asks_a_replica(self):
+        """With debug-mode off on every replica, HASHTAG still answers: it asks the primary."""
+        self.populate()
+        replicas = [self.replica(i) for i in range(self.CLUSTER_SIZE)]
+        for replica in replicas:
+            replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            for _ in range(10):
+                assert index_memory(self.client_for_primary(0), 'HASHTAG', 'idxmem')['nodes'] == 1
+        finally:
+            for replica in replicas:
+                replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
 
 def fanout_stats(client):
@@ -585,8 +644,46 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
                 cluster_stats(self.client_for_primary(0))
             # Without CLUSTER, only this node is asked.
             assert debug_stats(self.client_for_primary(0), 'cron')
+            # PRIMARY never asks a replica.
+            targeted = self.targeted_stats(self.client_for_primary(0), 'PRIMARY', 'cron')
+            assert len(per_node(targeted['cron_interval_seconds'])) == self.CLUSTER_SIZE
         finally:
             replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
+
+    @staticmethod
+    def targeted_stats(client, *args):
+        flat = client.execute_command('TS._DEBUG', 'STATS', *args)
+        return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+    def test_primary_target_lists_primaries_only(self):
+        stats = self.targeted_stats(self.client_for_primary(0), 'cron', 'PRIMARY')
+        ports = {int(a.rsplit(':', 1)[1]) for a in per_node(stats['cron_interval_seconds'])}
+        assert ports == {self.get_primary_port(i) for i in range(self.CLUSTER_SIZE)}
+
+    def test_hashtag_target_asks_the_owning_primary(self):
+        owner = self.new_cluster_client().get_node_from_key('{stats}').port
+        for _ in range(10):
+            stats = self.targeted_stats(self.client_for_primary(0), 'HASHTAG', 'stats', 'cron')
+            nodes = per_node(stats['cron_interval_seconds'])
+            assert [int(a.rsplit(':', 1)[1]) for a in nodes] == [owner]
+
+    def test_local_target_reports_this_node(self):
+        local = debug_stats(self.client_for_primary(0), 'cron', 'LOCAL')
+        assert float(local['cron_interval_seconds']) > 0  # the single-node layout
+
+    def test_reset_primary_leaves_replicas_alone(self):
+        coordinator = self.client_for_primary(0)
+        replicas = [self.get_replication_group(i).get_replica_connection(0)
+                    for i in range(self.CLUSTER_SIZE)]
+        wait_for_true(lambda: all(debug_stats(c, 'cron')['cron_ticks_total'] >= 20
+                                  for c in self.all_nodes()))
+
+        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'PRIMARY') == b'OK'
+
+        for i in range(self.CLUSTER_SIZE):
+            assert debug_stats(self.client_for_primary(i), 'cron')['cron_ticks_total'] < 10
+        for replica in replicas:
+            assert debug_stats(replica, 'cron')['cron_ticks_total'] >= 20
 
 
 def server_major_version():

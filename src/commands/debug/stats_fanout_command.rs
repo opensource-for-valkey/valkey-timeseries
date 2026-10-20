@@ -1,3 +1,4 @@
+use super::ensure_debug_enabled;
 use super::stats::reply_cluster_stats;
 use crate::commands::fanout_codec::generated::debug_stats_metric::Value;
 use crate::commands::fanout_codec::generated::{
@@ -6,14 +7,12 @@ use crate::commands::fanout_codec::generated::{
 use crate::common::logging::log_warning;
 use crate::common::metrics::{self, MetricKind, MetricReading, MetricValue, Section};
 use crate::common::replies::{ReplyContext, reply_with_str};
-use crate::config::is_debug_mode_enabled;
-use crate::error_consts;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
 use ahash::AHashMap;
 use metered::{Bucket, HistogramSnapshot, Scalar};
-use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
+use valkey_module::{Context, Status, ValkeyResult};
 
 impl From<&MetricReading> for DebugStatsMetric {
     fn from(reading: &MetricReading) -> Self {
@@ -201,10 +200,11 @@ impl ClusterStats {
     }
 }
 
-/// `TS._DEBUG STATS` (and `STATS RESET`) across the cluster: every node, replicas included,
-/// reports its own metrics, since each counts only what happened on it. The coordinator sums
-/// counters and histograms, and lists each gauge per node: a sum of refresh intervals or ages
-/// means nothing, and a per-node queue depth says where the queue is.
+/// `TS._DEBUG STATS` (and `STATS RESET`) across the cluster: each `target` node reports its own
+/// metrics, since each counts only what happened on it, so `CLUSTER` asks every node, replicas
+/// included. The coordinator sums counters and histograms, and lists each gauge per node: a sum
+/// of refresh intervals or ages means nothing, and a per-node queue depth says where the queue
+/// is.
 ///
 /// Each node gates its own internals on `debug-mode`, as for a direct `TS._DEBUG` call, so one
 /// node with it off fails the command.
@@ -213,21 +213,24 @@ pub struct StatsFanoutCommand {
     sections: Vec<Section>,
     verbose: bool,
     reset: bool,
+    target: FanoutTarget,
     stats: ClusterStats,
 }
 
 impl StatsFanoutCommand {
-    pub fn report(sections: Vec<Section>, verbose: bool) -> Self {
+    pub fn report(sections: Vec<Section>, verbose: bool, target: FanoutTarget) -> Self {
         Self {
             sections,
             verbose,
+            target,
             ..Default::default()
         }
     }
 
-    pub fn reset() -> Self {
+    pub fn reset(target: FanoutTarget) -> Self {
         Self {
             reset: true,
+            target,
             ..Default::default()
         }
     }
@@ -246,9 +249,7 @@ impl FanoutClientCommand for StatsFanoutCommand {
         _ctx: &FanoutContext,
         req: DebugStatsRequest,
     ) -> ValkeyResult<DebugStatsResponse> {
-        if !is_debug_mode_enabled() {
-            return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
-        }
+        ensure_debug_enabled()?;
         if req.reset {
             metrics::reset();
             return Ok(DebugStatsResponse::default());
@@ -283,7 +284,7 @@ impl FanoutClientCommand for StatsFanoutCommand {
     }
 
     fn get_targets(&self, _ctx: &Context) -> FanoutTarget {
-        FanoutTarget::All
+        self.target.clone()
     }
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {

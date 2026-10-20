@@ -29,8 +29,8 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert any(b'STRINGPOOLSTATS' in cmd for cmd in commands)
         assert any(b'LIST_CONFIGS' in cmd for cmd in commands)
         assert any(b'INDEXMEMORY' in cmd for cmd in commands)
-        assert b'TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]' in commands
-        assert b'TS._DEBUG STATS RESET [CLUSTER]' in commands
+        assert b'TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]' in commands
+        assert b'TS._DEBUG STATS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]' in commands
         assert b'TS._DEBUG INFLIGHT' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
@@ -88,12 +88,32 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
     def test_debug_stringpoolstats_cluster_needs_cluster_mode(self):
         """CLUSTER is refused outside cluster mode, alone or after k"""
         self.set_debug_mode()
-        for args in (('CLUSTER',), ('cluster',), (3, 'CLUSTER')):
-            with pytest.raises(ResponseError, match="CLUSTER requires cluster mode"):
+        # The error names the keyword that was given.
+        for args, keyword in ((('CLUSTER',), 'CLUSTER'), (('cluster',), 'CLUSTER'),
+                              ((3, 'CLUSTER'), 'CLUSTER'), (('PRIMARY',), 'PRIMARY'),
+                              ((3, 'HASHTAG', 'a,b'), 'HASHTAG')):
+            with pytest.raises(ResponseError, match=f"{keyword} requires cluster mode"):
                 self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', *args)
-        # LOCAL is gone: the default already reports this node.
+        # LOCAL reports this node, as the default does.
+        local = self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'LOCAL')
+        assert len(local) == 4
+        assert len(self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 3, 'local')) == 6
+        for args in (('LOCAL', 'CLUSTER'), ('CLUSTER', 'CLUSTER'), (3, 'PRIMARY', 'HASHTAG', 'a')):
+            with pytest.raises(ResponseError, match="only one node target"):
+                self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', *args)
+        for args in (('HASHTAG',), ('HASHTAG', 'ALLDBS'), ('HASHTAG', 'cluster')):
+            with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+                self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', *args)
         with pytest.raises(ResponseError):
-            self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'LOCAL')
+            self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', 'LOCAL', 3)
+
+    @pytest.mark.parametrize('k', ['abc', '-1', '1.5', '99999999999999999999'])
+    def test_debug_stringpoolstats_malformed_k_is_a_parse_error(self, k):
+        """A k that is neither a number nor a node target reports itself, not the arity"""
+        self.set_debug_mode()
+        with pytest.raises(ResponseError) as err:
+            self.client.execute_command('TS._DEBUG', 'STRINGPOOLSTATS', k)
+        assert 'wrong number of arguments' not in str(err.value)
 
     def test_debug_replies_are_not_followed_by_a_stray_null(self):
         """Each subcommand writes its own reply; the handler must not add a Null after it"""
@@ -941,12 +961,57 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
     @pytest.mark.parametrize('args', [
         ('CLUSTER', 'extra'),
         ('ALLDBS', 'ALLDBS'),
-        ('CLUSTER', 'CLUSTER'),
-        ('LOCAL',),
+        ('HASHTAG', ''),
+        ('HASHTAG', 'a,,b'),
+        ('NODES',),
     ])
     def test_rejects_bad_arguments(self, args):
         client = self.server.get_new_client()
         with pytest.raises(ResponseError):
+            client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
+
+    @pytest.mark.parametrize('args', [
+        ('CLUSTER', 'CLUSTER'),
+        ('LOCAL', 'CLUSTER'),
+        ('PRIMARY', 'LOCAL'),
+        ('ALLDBS', 'PRIMARY', 'HASHTAG', 'a'),
+    ])
+    def test_rejects_a_second_target(self, args):
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError, match="only one node target"):
+            client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
+
+    @pytest.mark.parametrize('args', [
+        ('HASHTAG',),
+        ('HASHTAG', 'ALLDBS'),
+        ('hashtag', 'alldbs'),
+        ('HASHTAG', 'LOCAL'),
+        ('ALLDBS', 'HASHTAG', 'CLUSTER'),
+    ])
+    def test_hashtag_value_is_never_an_option_keyword(self, args):
+        """`HASHTAG ALLDBS` is a missing tag; it must not hash "ALLDBS" and drop the option"""
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
+
+    def test_local_target_answers_alone(self):
+        client = self.server.get_new_client()
+        self.populate(client, 0, 50)
+        self.populate(client, 1, 20)
+        client.select(0)
+        assert self.index_memory(client, 'LOCAL') == self.index_memory(client)
+        assert self.index_memory(client, 'local', 'alldbs') == self.index_memory(client, 'ALLDBS')
+
+    @pytest.mark.parametrize('args, keyword', [
+        (('PRIMARY',), 'PRIMARY'),
+        (('ALLDBS', 'primary'), 'PRIMARY'),
+        (('HASHTAG', 'a,b'), 'HASHTAG'),
+        (('HASHTAG', 'a', 'ALLDBS'), 'HASHTAG'),
+    ])
+    def test_cluster_targets_need_cluster_mode(self, args, keyword):
+        """The refusal names the keyword that was given, not CLUSTER"""
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError, match=f"{keyword} requires cluster mode"):
             client.execute_command('TS._DEBUG', 'INDEXMEMORY', *args)
 
 
@@ -1074,7 +1139,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > after['cron_ticks_total'])
 
     def test_reset_takes_no_arguments(self):
-        with pytest.raises(ResponseError, match="no further arguments but CLUSTER"):
+        with pytest.raises(ResponseError, match="no further arguments but a node target"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
 
     def test_verbose(self):
@@ -1105,16 +1170,48 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'
 
     def test_cluster_needs_cluster_mode(self):
-        for args in (('CLUSTER',), ('cron', 'cluster'), ('VERBOSE', 'CLUSTER'), ('RESET', 'CLUSTER')):
-            with pytest.raises(ResponseError, match="CLUSTER requires cluster mode"):
+        # The error names the keyword that was given.
+        for args, keyword in ((('CLUSTER',), 'CLUSTER'), (('cron', 'cluster'), 'CLUSTER'),
+                              (('VERBOSE', 'CLUSTER'), 'CLUSTER'), (('RESET', 'CLUSTER'), 'CLUSTER'),
+                              (('PRIMARY',), 'PRIMARY'), (('cron', 'HASHTAG', 'a,b'), 'HASHTAG'),
+                              (('RESET', 'primary'), 'PRIMARY'), (('RESET', 'HASHTAG', 'a'), 'HASHTAG')):
+            with pytest.raises(ResponseError, match=f"{keyword} requires cluster mode"):
                 self.client.execute_command('TS._DEBUG', 'STATS', *args)
-        # LOCAL is gone: the default already reports this node.
-        with pytest.raises(ResponseError, match="unknown STATS section 'LOCAL'"):
-            self.client.execute_command('TS._DEBUG', 'STATS', 'LOCAL')
 
-    def test_reset_takes_only_cluster(self):
-        with pytest.raises(ResponseError, match="no further arguments but CLUSTER"):
-            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER', 'CLUSTER')
+    def test_local_target_reports_this_node(self):
+        assert list(self.stats('LOCAL', 'cron')) == self.CRON_METRICS
+        assert list(self.stats('cron', 'local')) == self.CRON_METRICS
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
+
+    @pytest.mark.parametrize('args', [
+        ('CLUSTER', 'CLUSTER'),
+        ('LOCAL', 'CLUSTER'),
+        ('PRIMARY', 'HASHTAG', 'a'),
+        ('cron', 'LOCAL', 'VERBOSE', 'primary'),
+    ])
+    def test_rejects_a_second_target(self, args):
+        """The second target is reported as such, not as an unknown STATS section"""
+        with pytest.raises(ResponseError, match="only one node target") as err:
+            self.client.execute_command('TS._DEBUG', 'STATS', *args)
+        assert 'unknown STATS section' not in str(err.value)
+
+    @pytest.mark.parametrize('args', [
+        ('HASHTAG',),
+        ('cron', 'HASHTAG', ''),
+        ('HASHTAG', 'VERBOSE'),
+        ('hashtag', 'verbose', 'cron'),
+        ('HASHTAG', 'CLUSTER'),
+        ('cron', 'HASHTAG', 'RESET'),
+    ])
+    def test_hashtag_value_is_never_an_option_keyword(self, args):
+        """`HASHTAG VERBOSE` is a missing tag; it must not hash "VERBOSE" and drop the option"""
+        with pytest.raises(ResponseError, match="missing HASHTAG argument"):
+            self.client.execute_command('TS._DEBUG', 'STATS', *args)
+
+    def test_reset_takes_only_a_target(self):
+        for args in (('CLUSTER', 'CLUSTER'), ('LOCAL', 'cron')):
+            with pytest.raises(ResponseError, match="no further arguments but a node target"):
+                self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', *args)
 
     def test_inflight_is_empty_on_a_standalone_server(self):
         assert self.client.execute_command('TS._DEBUG', 'INFLIGHT') == []

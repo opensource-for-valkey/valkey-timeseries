@@ -1,13 +1,12 @@
-use super::ts_debug::reply_with_index_memory;
+use super::ensure_debug_enabled;
+use super::index_memory::reply_with_index_memory;
 use crate::commands::fanout_codec::generated::{IndexMemoryRequest, IndexMemoryResponse};
 use crate::common::replies::ReplyContext;
-use crate::config::is_debug_mode_enabled;
-use crate::error_consts;
 use crate::fanout::{
     FanoutClientCommand, FanoutCommandResult, FanoutContext, FanoutTarget, NodeInfo,
 };
 use crate::series::index::{IndexMemory, db_index_memory_usage, index_memory_usage};
-use valkey_module::{Context, Status, ValkeyError, ValkeyResult};
+use valkey_module::{Context, Status, ValkeyResult};
 
 impl From<IndexMemory> for IndexMemoryResponse {
     fn from(memory: IndexMemory) -> Self {
@@ -63,12 +62,14 @@ pub struct IndexMemoryFanoutCommand {
     all_dbs: bool,
     memory: IndexMemory,
     nodes: usize,
+    target: FanoutTarget,
 }
 
 impl IndexMemoryFanoutCommand {
-    pub fn new(all_dbs: bool) -> Self {
+    pub fn new(all_dbs: bool, target: FanoutTarget) -> Self {
         Self {
             all_dbs,
+            target,
             ..Default::default()
         }
     }
@@ -89,9 +90,7 @@ impl FanoutClientCommand for IndexMemoryFanoutCommand {
         req: IndexMemoryRequest,
     ) -> ValkeyResult<IndexMemoryResponse> {
         // Each node gates its own internals, as it would for a direct TS._DEBUG call.
-        if !is_debug_mode_enabled() {
-            return Err(ValkeyError::Str(error_consts::DEBUG_MODE_DISABLED));
-        }
+        ensure_debug_enabled()?;
         Ok(local_index_memory(ctx.db(), req.all_dbs).into())
     }
 
@@ -102,7 +101,7 @@ impl FanoutClientCommand for IndexMemoryFanoutCommand {
     }
 
     fn get_targets(&self, _ctx: &Context) -> FanoutTarget {
-        FanoutTarget::ReplicaPerShard
+        self.target.clone()
     }
 
     fn on_response(&mut self, resp: Self::Response, _target: &NodeInfo) -> FanoutCommandResult {

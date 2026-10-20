@@ -1,11 +1,11 @@
 use super::stats_fanout_command::{ClusterReading, ClusterValue, StatsFanoutCommand};
-use super::ts_debug::require_cluster;
+use super::target::{parse_node_target, resolve_node_target};
 use crate::commands::CommandArgIterator;
 use crate::common::metrics::{self, MetricReading, MetricValue, Section};
 use crate::common::replies::*;
-use crate::fanout::FanoutClientCommand;
+use crate::fanout::{FanoutClientCommand, FanoutTarget};
 use metered::{HistogramSnapshot, Scalar};
-use valkey_module::{Context, ValkeyError, ValkeyResult};
+use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult};
 
 fn saturating_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -137,10 +137,12 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// Reports module metrics, or starts them over.
 ///
 /// Syntax:
-/// - `TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]`
-/// - `TS._DEBUG STATS RESET [CLUSTER]`
+/// - `TS._DEBUG STATS [section ...] [VERBOSE] [<target>]`
+/// - `TS._DEBUG STATS RESET [<target>]`
 ///
-/// Both read, or reset, the connected node alone unless `CLUSTER` is given.
+/// where `<target>` is `LOCAL`, `PRIMARY`, `CLUSTER` or `HASHTAG <tag>[,<tag>...]`, at most once
+/// and, for the report, in any position. Both read, or reset, the connected node alone without
+/// a target or with `LOCAL`.
 ///
 /// Without `VERBOSE`, replies with a `name => value` map covering the named sections
 /// (every section when none is given), section by section and by name within each. Counters
@@ -151,27 +153,26 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
 /// gauges alone. It is not replicated.
 ///
-/// With `CLUSTER` both fan out to every node, replicas included (see [`StatsFanoutCommand`]):
-/// counters and histograms are summed, and each gauge's value becomes an `address => value`
-/// map, one entry per node. `CLUSTER` on a standalone server is an error.
+/// With any other target both fan out to those nodes (see [`StatsFanoutCommand`]); `CLUSTER`
+/// asks every node, replicas included, `PRIMARY` the shard primaries, and `HASHTAG` the primaries
+/// of the shards owning those tags. Counters and histograms are summed, and each gauge's value becomes an
+/// `address => value` map, one entry per node. Any target but `LOCAL` on a standalone server is
+/// an error.
 pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     if args
         .peek()
         .is_some_and(|arg| is_keyword(arg.as_slice(), b"RESET"))
     {
         args.next();
-        let cluster = match args.next() {
-            None => false,
-            Some(arg) if is_keyword(arg.as_slice(), b"CLUSTER") && args.peek().is_none() => true,
-            Some(_) => {
-                return Err(ValkeyError::Str(
-                    "TSDB: STATS RESET takes no further arguments but CLUSTER",
-                ));
-            }
-        };
-        if cluster {
-            require_cluster(ctx)?;
-            StatsFanoutCommand::reset().exec(ctx)?;
+        let mut target = None;
+        parse_node_target(args, &mut target)?;
+        if args.peek().is_some() {
+            return Err(ValkeyError::Str(
+                "TSDB: STATS RESET takes no further arguments but a node target",
+            ));
+        }
+        if let Some(target) = resolve_node_target(ctx, target, FanoutTarget::All)? {
+            StatsFanoutCommand::reset(target).exec(ctx)?;
             return Ok(());
         }
         metrics::reset();
@@ -180,15 +181,15 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
     }
 
     let mut verbose = false;
-    let mut cluster = false;
+    let mut target = None;
     let mut sections = Vec::new();
-    for arg in args.by_ref() {
-        let arg = arg.as_slice();
-        if is_keyword(arg, b"VERBOSE") {
+    while let Some(arg) = args.peek() {
+        if is_keyword(arg.as_slice(), b"VERBOSE") {
+            args.next();
             verbose = true;
-        } else if is_keyword(arg, b"CLUSTER") {
-            cluster = true;
-        } else {
+        } else if !parse_node_target(args, &mut target)? {
+            let arg = args.next_arg()?;
+            let arg = arg.as_slice();
             let section = Section::parse(arg)
                 .ok_or_else(|| unknown_section(&String::from_utf8_lossy(arg)))?;
             if !sections.contains(&section) {
@@ -197,9 +198,8 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
         }
     }
 
-    if cluster {
-        require_cluster(ctx)?;
-        StatsFanoutCommand::report(sections, verbose).exec(ctx)?;
+    if let Some(target) = resolve_node_target(ctx, target, FanoutTarget::All)? {
+        StatsFanoutCommand::report(sections, verbose, target).exec(ctx)?;
         return Ok(());
     }
 
