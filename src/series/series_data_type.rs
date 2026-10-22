@@ -6,6 +6,7 @@ use valkey_module::{
 use valkey_module::{RedisModuleIO, RedisModuleTypeMethods, logging, raw};
 
 use crate::common::logging::log_debug;
+use crate::common::metrics::rdb::LOAD_FAILURE;
 use crate::series::TimeSeries;
 use crate::series::defrag_series;
 use crate::series::index::persistence::{load_index_from_rdb, save_index_to_rdb};
@@ -131,6 +132,7 @@ unsafe extern "C" fn aux_load(rdb: *mut RedisModuleIO, encver: c_int, when: c_in
             "Refusing TSDB-TYPE aux RDB payload with encoding version {encver} \
              (this module writes version {TIMESERIES_TYPE_ENCODING_VERSION})"
         ));
+        LOAD_FAILURE.fetch_add(1, Ordering::Relaxed);
         return raw::Status::Err as c_int;
     }
     load_index_from_rdb(rdb)

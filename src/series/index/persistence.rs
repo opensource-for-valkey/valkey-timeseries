@@ -18,6 +18,7 @@ use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
+use crate::common::metrics::rdb::{LOAD_FAILURE, LOAD_SUCCESS, save_counters};
 use crate::common::sync::{read_lock, write_lock};
 use crate::common::threads::LockGil;
 use crate::config::is_index_persist_enabled;
@@ -130,10 +131,10 @@ fn deserialize_postings_section(buf: &mut &[u8]) -> PayloadResult<(i32, Postings
     Ok((db, postings))
 }
 
-/// Serializes every non-empty db index into a single payload buffer.
-/// Returns `None` if any db's postings lock is contended (possible fork-time writer:
+/// Serializes every non-empty db index into a single payload buffer, or `None` if there is no
+/// series to persist. Fails if any db's postings lock is contended (possible fork-time writer:
 /// skip persisting entirely rather than risk deadlock or write a torn snapshot).
-fn build_aux_payload() -> Option<Vec<u8>> {
+fn build_aux_payload() -> PayloadResult<Option<Vec<u8>>> {
     let map = TIMESERIES_INDEX.pin();
     let mut dbs: Vec<i32> = map.keys().copied().collect();
     dbs.sort_unstable();
@@ -146,10 +147,9 @@ fn build_aux_payload() -> Option<Vec<u8>> {
             continue;
         };
         let Ok(postings) = index.inner.try_read() else {
-            log_warning(format!(
-                "Postings lock for db {db} contended at aux save time; skipping index persistence"
+            return Err(format!(
+                "postings lock for db {db} contended at aux save time"
             ));
-            return None;
         };
         // Nothing worth persisting: with no live series, the payload would only carry
         // stale leftovers that are dropped at save time anyway.
@@ -161,7 +161,7 @@ fn build_aux_payload() -> Option<Vec<u8>> {
     }
 
     if section_count == 0 {
-        return None;
+        return Ok(None);
     }
 
     let mut buf = Vec::with_capacity(sections.len() + 16);
@@ -169,7 +169,7 @@ fn build_aux_payload() -> Option<Vec<u8>> {
     write_u8(&mut buf, INDEX_AUX_VERSION);
     write_uvarint(&mut buf, section_count);
     buf.extend_from_slice(&sections);
-    Some(buf)
+    Ok(Some(buf))
 }
 
 fn parse_aux_payload(mut buf: &[u8]) -> PayloadResult<Vec<(i32, Postings)>> {
@@ -215,18 +215,35 @@ fn try_read_byte_slice_exact<'a>(buf: &mut &'a [u8], len: usize) -> PayloadResul
 
 /// `aux_save2` body. Runs in the BGSAVE fork child; must not block on locks.
 /// Writing nothing at all makes `aux_save2` omit the aux field from the RDB.
+///
+/// Counts into the shared save counters, which the server process can read after the child
+/// exits. Neither counts a save with nothing to write (persistence off, or no series).
 pub(crate) fn save_index_to_rdb(rdb: *mut RedisModuleIO) {
     if !is_index_persist_enabled() {
         return;
     }
-    let Some(payload) = build_aux_payload() else {
-        return;
+    let payload = match build_aux_payload() {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return,
+        Err(e) => {
+            log_warning(format!("Skipping index persistence: {e}"));
+            save_counters().failure.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
     log_debug(format!(
         "Persisting postings index aux payload ({} bytes)",
         payload.len()
     ));
     raw::save_slice(rdb, &payload);
+    // The server fails the whole save on a write error; this only says the payload was part
+    // of it.
+    let outcome = if raw::is_io_error(rdb) {
+        &save_counters().failure
+    } else {
+        &save_counters().success
+    };
+    outcome.fetch_add(1, Ordering::Relaxed);
 }
 
 /// `aux_load` body. Must consume exactly the string written by `save_index_to_rdb`; only a
@@ -235,6 +252,7 @@ pub(crate) fn save_index_to_rdb(rdb: *mut RedisModuleIO) {
 pub(crate) fn load_index_from_rdb(rdb: *mut RedisModuleIO) -> c_int {
     let Ok(buffer) = raw::load_string_buffer(rdb) else {
         log_warning("Failed to read postings index aux payload from RDB");
+        LOAD_FAILURE.fetch_add(1, Ordering::Relaxed);
         return raw::Status::Err as c_int;
     };
 
@@ -257,11 +275,13 @@ pub(crate) fn load_index_from_rdb(rdb: *mut RedisModuleIO) -> c_int {
                     "Preloaded postings index for db {db} ({series_count} series)"
                 ));
             }
+            LOAD_SUCCESS.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
             log_warning(format!(
                 "Discarding persisted postings index ({e}); falling back to per-key rebuild"
             ));
+            LOAD_FAILURE.fetch_add(1, Ordering::Relaxed);
         }
     }
     raw::Status::Ok as c_int

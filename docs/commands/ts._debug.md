@@ -273,6 +273,28 @@ On the wire (counted by the sender):
 The byte counts are the payloads this node handed to the cluster bus: the bus's own framing is
 not included, and a fan-out's local share never crosses the bus.
 
+#### `rdb`
+
+The RDB aux field that carries the postings index, counted once per RDB that has one (not per
+series). A save is counted wherever the server writes the RDB: `SAVE`, `BGSAVE`, a replica's full
+sync, an AOF rewrite's RDB preamble, `DEBUG RELOAD`. The fork child of a background save shares
+these counters with the server, so its saves are counted on the node that forked it.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `rdb_load_success_total` | counter | Loads that installed the postings index from the aux field |
+| `rdb_load_failure_total` | counter | Loads whose aux field was unreadable, of a foreign encoding version, or rejected by the parser; the index is rebuilt from the keys instead |
+| `rdb_save_success_total` | counter | Saves that wrote the aux field |
+| `rdb_save_failure_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
+
+Neither load counter moves when `ts-index-persist` is off and the payload is discarded, and neither
+save counter moves for a save with nothing to write (persistence off, or no series). A failed load
+of a foreign encoding fails the whole RDB load; every other failure falls back to rebuilding the
+index from the keys.
+
+The same metrics are in `INFO ts_rdb`, each prefixed `ts_` (`ts_rdb_load_success_total`), without
+the `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
+
 #### `read`
 
 Blocking reads (`TS.READ ... BLOCK`), counted on the node serving the client. A read without

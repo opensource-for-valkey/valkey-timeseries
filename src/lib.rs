@@ -156,6 +156,8 @@ compile_error!(
 
 fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     init_croaring_allocator();
+    // Before anything can fork: the save counters must be shared with the fork child.
+    common::metrics::rdb::init();
 
     // Declare this first: until the server knows the module handles IO errors, any short
     // read while loading a TSDB-TYPE payload panics the server from inside `rdb_load`

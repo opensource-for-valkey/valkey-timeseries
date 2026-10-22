@@ -113,7 +113,9 @@ sum, gauges are reported per node (Phase 6).
 **Count where the parent process can see it.** `rdb_save`, the index aux save
 (`build_aux_payload`), and `aof_rewrite` run in the `BGSAVE` / AOF-rewrite fork child — and the ASM
 snapshot path, which emits `TS._RESTORE`, is an AOF rewrite. A counter there is lost for every
-background save. Count on the receiving side (load, `TS._RESTORE`) instead.
+background save. Count on the receiving side (load, `TS._RESTORE`) instead — or, where only the
+child knows the outcome, in an anonymous `MAP_SHARED` page mapped at module init, which a fork
+shares rather than copies. The `rdb_save_*` counters (§3.11) are the one case so far.
 
 ## 3. The metrics
 
@@ -422,7 +424,19 @@ Gauges and counters outside the per-task records:
 ### 3.11 `load`, `restore` — persistence and recovery
 
 Save-side counters (`rdb_save`, `build_aux_payload`, `aof_rewrite`) are dropped: they run in the
-fork child (see §2). Everything here runs in the server process.
+fork child (see §2). Everything here runs in the server process, except the `rdb` section's save
+counters.
+
+**Done 2026-10-21 — the `rdb` section**, the equivalent of valkey-search's `rdb_load_*` /
+`rdb_save_*`: `rdb_load_success_total`, `rdb_load_failure_total`, `rdb_save_success_total`,
+`rdb_save_failure_total`, one per RDB carrying the index aux field (not per series). Load failure =
+unreadable payload, foreign encoding version, or parser rejection (it subsumes
+`load_index_read_failures_total`, `load_type_encver_rejected_total` and
+`load_index_payloads_rejected_total` below as one count); a payload discarded because
+`ts-index-persist` is off counts neither. Save failure = a contended postings lock or an IO error
+after the write; a save with nothing to write counts neither. The save pair lives in a `MAP_SHARED`
+page (`metrics::rdb`), so `BGSAVE`, full syncs and AOF-rewrite preambles are counted. Mirrored in
+`INFO ts_rdb`.
 
 | Metric | Kind | Hook |
 |---|---|---|

@@ -1,4 +1,4 @@
-//! The module's `INFO` sections: `ts_memory`, `ts_compaction` and `ts_read`.
+//! The module's `INFO` sections: `ts_memory`, `ts_compaction`, `ts_rdb` and `ts_read`.
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`/`INFO all`,
 //! or `INFO <section>` — never for a bare `INFO` — which is what makes it acceptable for the
@@ -13,17 +13,17 @@ use metered::Scalar;
 use valkey_module::{InfoContext, InfoContextBuilderFieldBottomLevelValue, ValkeyResult};
 use valkey_module_macros::info_command_handler;
 
-/// `INFO ts_memory`, `INFO ts_compaction` and `INFO ts_read`.
+/// `INFO ts_memory`, `INFO ts_compaction`, `INFO ts_rdb` and `INFO ts_read`.
 ///
 /// `ts_memory` is the module's global heap, which no per-key figure can show.
 /// `ts_compaction` counts the compaction rule applications that failed and the dirty rules that
-/// were rebuilt afterwards, since module start. `ts_read` mirrors the `read` (blocking
-/// `TS.READ`) metrics of `TS._DEBUG STATS`, under the
+/// were rebuilt afterwards, since module start. `ts_rdb` and `ts_read` mirror the `rdb` (index aux
+/// field loads and saves) and `read` (blocking `TS.READ`) metrics of `TS._DEBUG STATS`, under the
 /// same names but without the debug-mode gate, and since module start: `STATS RESET` doesn't move
 /// them.
 ///
-/// The sections are declared as `memory`, `compaction` and `read`; the server prefixes
-/// each with the module name, so they land as `# ts_memory`, `# ts_compaction` and
+/// The sections are declared as `memory`, `compaction`, `rdb` and `read`; the server prefixes
+/// each with the module name, so they land as `# ts_memory`, `# ts_compaction`, `# ts_rdb` and
 /// `# ts_read` with every field prefixed `ts_`.
 ///
 /// `MEMORY USAGE <key>` and `TS.INFO memoryUsage` report one series: its chunks, its labels'
@@ -82,7 +82,7 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
         )?
         .build_section()?;
 
-    for section in [Section::Read] {
+    for section in [Section::Rdb, Section::Read] {
         let mut fields = builder.add_section(section.as_str());
         for reading in metrics::current(&[section]) {
             if let Some(value) = info_value(&reading.value) {

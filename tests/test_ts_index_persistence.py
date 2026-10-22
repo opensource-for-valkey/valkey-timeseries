@@ -351,6 +351,87 @@ class TestIndexPersistenceDebugReload(ValkeyTimeSeriesTestCaseBase):
         assert len(client.execute_command("TS.QUERYINDEX", "service=api")) == 8
 
 
+class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
+    """`INFO ts_rdb`: aux-field loads and saves. The save counters live in memory shared
+    with the BGSAVE fork child, so a background save must show up in the server."""
+
+    def rdb_info(self, client):
+        parsed = client.execute_command("INFO", "ts_rdb")
+        return {name.removeprefix("ts_"): int(value) for name, value in parsed.items()}
+
+    def _create_series(self, client, count):
+        for i in range(count):
+            client.execute_command("TS.CREATE", f"ts:{i}", "LABELS", "service", "api")
+
+    def test_info_lists_the_counters(self):
+        client = self.server.get_new_client()
+        assert set(self.rdb_info(client)) == {
+            "rdb_load_success_total", "rdb_load_failure_total",
+            "rdb_save_success_total", "rdb_save_failure_total",
+        }
+
+    def test_bgsave_counts_the_fork_childs_save(self):
+        client = self.server.get_new_client()
+        self._create_series(client, 4)
+        before = self.rdb_info(client)
+
+        client.bgsave()
+        self.server.wait_for_save_done()
+
+        after = self.rdb_info(client)
+        assert after["rdb_save_success_total"] == before["rdb_save_success_total"] + 1
+        assert after["rdb_save_failure_total"] == before["rdb_save_failure_total"]
+
+    def test_save_with_no_series_counts_nothing(self):
+        """No series, no aux field: neither outcome is counted."""
+        client = self.server.get_new_client()
+        before = self.rdb_info(client)
+        client.bgsave()
+        self.server.wait_for_save_done()
+        assert self.rdb_info(client) == before
+
+    def test_debug_reload_counts_a_save_and_a_load(self):
+        client = self.server.get_new_client()
+        self._create_series(client, 4)
+        before = self.rdb_info(client)
+
+        client.execute_command("DEBUG", "RELOAD")
+
+        after = self.rdb_info(client)
+        assert after["rdb_save_success_total"] == before["rdb_save_success_total"] + 1
+        assert after["rdb_load_success_total"] == before["rdb_load_success_total"] + 1
+        assert after["rdb_load_failure_total"] == before["rdb_load_failure_total"]
+
+    def test_restart_counts_the_load(self):
+        client = self.server.get_new_client()
+        self._create_series(client, 4)
+        client.bgsave()
+        self.server.wait_for_save_done()
+
+        self.server.restart(remove_rdb=False, remove_nodes_conf=False, connect_client=True)
+        wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
+
+        info = self.rdb_info(self.server.get_new_client())
+        assert info["rdb_load_success_total"] == 1
+        assert info["rdb_load_failure_total"] == 0
+
+    def test_discarded_by_config_counts_nothing(self):
+        """A payload discarded because `ts-index-persist` is off is neither a success nor a
+        failure."""
+        client = self.server.get_new_client()
+        self._create_series(client, 4)
+        client.bgsave()
+        self.server.wait_for_save_done()
+        before = self.rdb_info(client)
+
+        client.config_set("ts.ts-index-persist", "no")
+        client.execute_command("DEBUG", "RELOAD", "NOSAVE")
+
+        after = self.rdb_info(client)
+        assert after["rdb_load_success_total"] == before["rdb_load_success_total"]
+        assert after["rdb_load_failure_total"] == before["rdb_load_failure_total"]
+
+
 class TestIndexPersistenceAof(ValkeyTimeSeriesTestCaseBase):
 
     AOF_REWRITE_DONE_LOG = "Background AOF rewrite finished successfully"

@@ -20,6 +20,9 @@ enum_dispatch = "0.3.13"
 get-size2 = { version = "0.11.0", features = ["derive"] }
 hashify = { version = "0.3" }
 itertools = "0.15.0"
+# `mmap` for the RDB save counters, which the BGSAVE fork child must share with the server
+# (`common::metrics::rdb`).
+libc = "0.2"
 linkme = "0.3"
 logos = "0.16"
 # Module metrics (`common::metrics`, `TS._DEBUG STATS`). Pinned: 0.10 is a release candidate,

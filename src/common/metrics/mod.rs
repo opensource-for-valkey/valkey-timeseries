@@ -29,13 +29,15 @@
 //!
 //! - Reading a metric must not walk the keyspace or the index. A gauge is a load, or a call
 //!   that is itself O(1).
-//! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`):
-//!   the parent never sees it. Count on the receiving side instead.
+//! - Nothing may be counted in a forked child (`rdb_save`, the index aux save, `aof_rewrite`)
+//!   through an ordinary static: the parent never sees it. Count on the receiving side instead,
+//!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
 
 pub mod clustermap;
 pub mod cron;
 pub mod exec;
 pub mod fanout;
+pub mod rdb;
 pub mod read;
 
 use crate::common::sync::lock;
@@ -78,6 +80,8 @@ pub enum Section {
     /// Cluster fanout: operations this node coordinates, requests it serves for peers, and the
     /// messages and bytes exchanged over the cluster bus.
     Fanout,
+    /// The RDB aux field that carries the postings index: loads and saves, and how they went.
+    Rdb,
     /// Blocking reads (`TS.READ ... BLOCK`): how many blocked, why they came back, how many
     /// are still waiting.
     Read,
@@ -90,6 +94,7 @@ impl Section {
         Section::Cron,
         Section::Exec,
         Section::Fanout,
+        Section::Rdb,
         Section::Read,
     ];
 
@@ -99,6 +104,7 @@ impl Section {
             Section::Cron => "cron",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
+            Section::Rdb => "rdb",
             Section::Read => "read",
         }
     }
@@ -120,6 +126,7 @@ fn build_registry(section: Section) -> Registry<'static> {
         Section::Cron => cron::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),
+        Section::Rdb => rdb::register(&mut registry),
         Section::Read => read::register(&mut registry),
     }
     registry
@@ -458,6 +465,25 @@ mod tests {
         wire.record(28);
         assert_eq!(wire.messages.load(Ordering::Relaxed), 2);
         assert_eq!(wire.bytes.load(Ordering::Relaxed), 128);
+    }
+
+    /// What the shared mapping is for: a fork child's increment reaches the parent.
+    #[test]
+    fn save_counters_see_a_fork_childs_increment() {
+        let counters = rdb::save_counters();
+        let before = counters.failure.load(Ordering::Relaxed);
+        // SAFETY: the child does nothing but an atomic add and `_exit`, both safe after a fork
+        // from a multithreaded process.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            counters.failure.fetch_add(1, Ordering::Relaxed);
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert!(counters.failure.load(Ordering::Relaxed) > before);
     }
 
     #[test]
