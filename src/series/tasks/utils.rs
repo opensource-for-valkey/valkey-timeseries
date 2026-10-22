@@ -63,9 +63,7 @@ pub(super) fn fetch_series_batch(
 
     if !stale_ids.is_empty() {
         let index = get_timeseries_index(ctx);
-        for id in stale_ids {
-            index.mark_id_as_stale(id)
-        }
+        index.mark_ids_as_stale(&stale_ids);
     }
 
     result
