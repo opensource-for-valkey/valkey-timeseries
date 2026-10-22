@@ -183,7 +183,7 @@ in [`task`](#task), prefixed `asm_` instead of `task_`:
 | `post_migration_cleanup` | Exporting | Mark the exported series stale once their slots have left |
 
 So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_inflight_total`,
-`asm_drain_panics_total`, `asm_drain_spawn_failures_total`, `asm_drain_running`,
+`asm_drain_spawn_failures_total`, `asm_drain_running`,
 `asm_drain_duration_seconds` and `asm_drain_last_completed_timestamp_seconds`, and the same for
 `asm_post_migration_cleanup_*`. Concurrent drains take disjoint slots and are not suppressed, so
 `asm_drain_running` can exceed one.
@@ -304,7 +304,6 @@ identity; otherwise they mean what the [`task`](#task) lifecycle names mean.
 | `index_reconciliation_started_total` | counter | Passes that entered the task body |
 | `index_reconciliation_completed_total` | counter | Passes that returned without a panic or shutdown abort |
 | `index_reconciliation_skipped_inflight_total` | counter | Always 0: passes are not single-flight |
-| `index_reconciliation_panics_total` | counter | Passes that unwound with a panic |
 | `index_reconciliation_spawn_failures_total` | counter | Threads that could not be started; these do not count as started passes |
 | `index_reconciliation_running` | gauge | Passes executing now |
 | `index_reconciliation_duration_seconds` | histogram | Pass time, including the keyspace sweep when the digest check does not skip it |
@@ -385,7 +384,7 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 
 | Task | Trigger |
 |------|---------|
-| `trim` | Periodic retention trimming (10 s) |
+| `retention_trim` | Periodic retention trimming (10 s) |
 | `tombstone_sweep` | Periodic stale-ID (tombstone) cleanup (20 s) |
 | `tombstone_full_sweep` | Full stale-ID (tombstone) cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
 | `optimize` | Periodic postings optimization (60 s) |
@@ -397,7 +396,6 @@ Each task exposes the following names, with `<task>` replaced by its identity:
 | `task_<task>_started_total` | counter | Runs that entered the task body |
 | `task_<task>_completed_total` | counter | Runs that returned without a panic or shutdown abort; recoverable per-item errors can still occur |
 | `task_<task>_skipped_inflight_total` | counter | Attempts skipped because another run holds the single-flight guard |
-| `task_<task>_panics_total` | counter | Runs that unwound with a panic |
 | `task_<task>_spawn_failures_total` | counter | Threads that could not be started; these do not count as started runs |
 | `task_<task>_running` | gauge | Task bodies executing, including time waiting for locks |
 | `task_<task>_duration_seconds` | histogram | Execution time including lock waits, panics and shutdown aborts |
@@ -411,9 +409,9 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 
 | Work counter | Description |
 |--------------|-------------|
-| `task_trim_series_processed_total` | Series attempted by background retention trimming |
-| `task_trim_samples_deleted_total` | Samples physically removed by background retention trimming |
-| `task_trim_errors_total` | Series trim failures or failures to select a database |
+| `task_retention_trim_series_processed_total` | Series attempted by background retention trimming |
+| `task_retention_trim_samples_deleted_total` | Samples physically removed by background retention trimming |
+| `task_retention_trim_errors_total` | Series trim failures or failures to select a database |
 | `task_tombstones_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
 | `task_tombstone_sweep_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
 | `task_optimize_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
@@ -428,7 +426,7 @@ the last completed database pass, or zero before any pass. A task invocation can
 part of a database; its completion does not imply a complete pass. These pass metrics do not
 claim that every database has been visited.
 
-The same metrics are in `INFO ts_task`, each prefixed `ts_` (`ts_task_trim_started_total`),
+The same metrics are in `INFO ts_task`, each prefixed `ts_` (`ts_task_retention_trim_started_total`),
 without the `debug-mode` gate, except the `task_<task>_duration_seconds` histograms, which INFO
 has no shape for. `INFO` counts since module start: `STATS RESET` doesn't move it.
 

@@ -41,7 +41,7 @@ pub fn process_series_trim() {
         return;
     }
     // Takes the GIL and fans out on the shared pool under it (R2): must not be a pool job.
-    spawn_task_single(&metrics::TRIM, &TRIM_RUN, process_trim_internal);
+    spawn_task_single(&metrics::RETENTION_TRIM, &TRIM_RUN, process_trim_internal);
 }
 
 fn process_trim_internal(run: &TaskRun<'_>) {
@@ -84,7 +84,7 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
     let save_db = get_current_db(ctx);
 
     if set_current_db(ctx, db) == Status::Err {
-        metrics::TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
+        metrics::RETENTION_TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
         log_warning(format!("Failed to select db {db}"));
         return (0, db);
     }
@@ -111,7 +111,7 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
         .map(|series| match series.trim() {
             Ok(deletes) => deletes,
             Err(_) => {
-                metrics::TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                metrics::RETENTION_TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
                 log_warning(format!(
                     "Failed to trim series {}",
                     series.prometheus_metric_name()
@@ -121,8 +121,8 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
         })
         .sum();
 
-    metrics::TRIM_SERIES_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
-    metrics::TRIM_SAMPLES_DELETED.fetch_add(total_deletes as u64, Ordering::Relaxed);
+    metrics::RETENTION_TRIM_SERIES_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
+    metrics::RETENTION_TRIM_SAMPLES_DELETED.fetch_add(total_deletes as u64, Ordering::Relaxed);
 
     let mut context = lock(&SERIES_TRIM_CURSORS);
     context.cursor = last_processed;

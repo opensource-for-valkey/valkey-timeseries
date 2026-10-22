@@ -16,7 +16,6 @@ pub struct TaskMetrics {
     started: AtomicU64,
     completed: AtomicU64,
     pub skipped_inflight: AtomicU64,
-    panics: AtomicU64,
     pub spawn_failures: AtomicU64,
     running: AtomicU64,
     last_completed: AtomicU64,
@@ -31,7 +30,6 @@ impl TaskMetrics {
             started: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             skipped_inflight: AtomicU64::new(0),
-            panics: AtomicU64::new(0),
             spawn_failures: AtomicU64::new(0),
             running: AtomicU64::new(0),
             last_completed: AtomicU64::new(0),
@@ -82,9 +80,8 @@ impl Drop for TaskRun<'_> {
     fn drop(&mut self) {
         let metrics = self.metrics;
         metrics.duration.observe_duration(self.start.elapsed());
-        if std::thread::panicking() {
-            metrics.panics.fetch_add(1, Ordering::Relaxed);
-        } else if !self.aborted.get() {
+        // A run that panicked or stopped at a shutdown check is not a completion.
+        if !std::thread::panicking() && !self.aborted.get() {
             metrics.completed.fetch_add(1, Ordering::Relaxed);
             // Concurrent ASM drains can finish in either order.
             metrics
@@ -95,17 +92,22 @@ impl Drop for TaskRun<'_> {
     }
 }
 
-pub static TRIM: TaskMetrics = TaskMetrics::new("trim", "ts-series-trim");
+pub static RETENTION_TRIM: TaskMetrics = TaskMetrics::new("retention_trim", "ts-retention-trim");
 pub static TOMBSTONE_SWEEP: TaskMetrics = TaskMetrics::new("tombstone_sweep", "ts-tombstone-sweep");
 pub static TOMBSTONE_FULL_SWEEP: TaskMetrics =
     TaskMetrics::new("tombstone_full_sweep", "ts-tombstone-full-sweep");
 pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-optimize-indices");
 
-static TASKS: &[&TaskMetrics] = &[&TRIM, &TOMBSTONE_SWEEP, &TOMBSTONE_FULL_SWEEP, &OPTIMIZE];
+static TASKS: &[&TaskMetrics] = &[
+    &RETENTION_TRIM,
+    &TOMBSTONE_SWEEP,
+    &TOMBSTONE_FULL_SWEEP,
+    &OPTIMIZE,
+];
 
-pub static TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
-pub static TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
-pub static TRIM_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RETENTION_TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
+pub static RETENTION_TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
+pub static RETENTION_TRIM_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static TOMBSTONES_RETIRED: AtomicU64 = AtomicU64::new(0);
 pub static TOMBSTONE_SWEEP_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
@@ -146,7 +148,6 @@ pub(super) fn register_task(registry: &mut Registry<'static>, task: &'static Tas
             &task.skipped_inflight,
             "Attempts skipped because a previous run holds the single-flight guard",
         ),
-        ("panics", &task.panics, "Runs that unwound with a panic"),
         (
             "spawn_failures",
             &task.spawn_failures,
@@ -187,18 +188,18 @@ pub(super) fn register(registry: &mut Registry<'static>) {
     }
     for (name, source, help) in [
         (
-            "trim_series_processed",
-            &TRIM_SERIES_PROCESSED,
+            "retention_trim_series_processed",
+            &RETENTION_TRIM_SERIES_PROCESSED,
             "Series attempted by background retention trimming",
         ),
         (
-            "trim_samples_deleted",
-            &TRIM_SAMPLES_DELETED,
+            "retention_trim_samples_deleted",
+            &RETENTION_TRIM_SAMPLES_DELETED,
             "Samples physically deleted by background retention trimming",
         ),
         (
-            "trim_errors",
-            &TRIM_ERRORS,
+            "retention_trim_errors",
+            &RETENTION_TRIM_ERRORS,
             "Series trim errors or failures to select a database",
         ),
         (
@@ -256,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn single_flight_skips_and_panics_are_counted_without_losing_the_flight() {
+    fn single_flight_skips_are_counted_and_a_panic_does_not_lose_the_flight() {
         static TASK: TaskMetrics = TaskMetrics::new("test_single", "test-task-metrics");
         static FLIGHT: SingleFlight = SingleFlight::new();
         let (started_tx, started_rx) = mpsc::channel();
@@ -274,7 +275,7 @@ mod tests {
         wait_until(|| TASK.completed.load(Ordering::Relaxed) == 1);
 
         spawn_task_single(&TASK, &FLIGHT, |_| panic!("caught task panic"));
-        wait_until(|| TASK.panics.load(Ordering::Relaxed) == 1);
+        wait_until(|| TASK.duration.snapshot().count == 2);
         wait_until(|| TASK.running.load(Ordering::Relaxed) == 0);
         assert_eq!(TASK.started.load(Ordering::Relaxed), 2);
         assert_eq!(TASK.completed.load(Ordering::Relaxed), 1);
@@ -315,7 +316,6 @@ mod tests {
         assert_eq!(task.running.load(Ordering::Relaxed), 0);
         assert_eq!(task.started.load(Ordering::Relaxed), 3);
         assert_eq!(task.completed.load(Ordering::Relaxed), 1);
-        assert_eq!(task.panics.load(Ordering::Relaxed), 1);
         assert_eq!(task.duration.snapshot().count, 3);
         assert_eq!(task.last_completed.load(Ordering::Relaxed), last);
     }

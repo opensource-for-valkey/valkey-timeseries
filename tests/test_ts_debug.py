@@ -1041,9 +1041,9 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                    'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize']
+    TASKS = ['retention_trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize']
     ASM_TASKS = ['drain', 'post_migration_cleanup']
-    TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total', 'panics_total',
+    TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
                    'last_completed_timestamp_seconds')
     HISTOGRAMS = {'fanout_duration_seconds'} | {
@@ -1182,20 +1182,23 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             values = self.stats('task')
             return all(values[f'task_{task}_completed_total'] > 0
                        and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
-                       for task in ('trim', 'tombstone_sweep', 'optimize'))
+                       for task in ('retention_trim', 'tombstone_sweep', 'optimize'))
         wait_for_true(completed)
         stats = self.stats('task')
-        for task in ('trim', 'tombstone_sweep', 'optimize'):
+        for task in ('retention_trim', 'tombstone_sweep', 'optimize'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
         # Empty-db cleanup is not a lifecycle task: only its removal count and running gauge.
         trim_dbs = sorted(n for n in stats if n.startswith('task_trim_unused_dbs_'))
         assert trim_dbs == ['task_trim_unused_dbs_removed_total', 'task_trim_unused_dbs_running']
         assert stats['task_trim_unused_dbs_running'] == 0
-        assert 'task_trim_samples_deleted_total' in stats
+        assert 'task_retention_trim_samples_deleted_total' in stats
         assert 'task_tombstones_retired_total' in stats
         assert 'task_tombstone_sweep_passes_completed_total' in stats
-        assert not any(name.startswith(('task_stale_ids', 'task_retention_'))
+        # No name from before the renames survives (`task_trim_unused_dbs_*` is not one).
+        retired = ('task_stale_ids', 'task_retention_sweep', 'task_retention_full_sweep')
+        assert not any(name.startswith(retired) for name in stats)
+        assert not any(name.startswith('task_trim_') and not name.startswith('task_trim_unused_dbs_')
                        for name in stats)
         assert 'task_optimize_passes_completed_total' in stats
 
@@ -1233,7 +1236,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert self.client.execute_command('TS.QUERYINDEX', 'service=api') == [b'task:keep']
 
     def test_histogram_shape(self):
-        task_duration = lambda: self.histogram(self.stats('task')['task_trim_duration_seconds'])
+        task_duration = lambda: self.histogram(self.stats('task')['task_retention_trim_duration_seconds'])
         wait_for_true(lambda: task_duration()['count'] > 0)
         hist = task_duration()
         buckets = hist['buckets']

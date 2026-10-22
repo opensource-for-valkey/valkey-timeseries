@@ -160,8 +160,8 @@ mod tests {
     #[test]
     fn task_section_leaves_out_duration_histograms() {
         let names = field_names(Section::Task);
-        assert!(names.contains(&"task_trim_started_total".to_owned()));
-        assert!(names.contains(&"task_trim_last_completed_timestamp_seconds".to_owned()));
+        assert!(names.contains(&"task_retention_trim_started_total".to_owned()));
+        assert!(names.contains(&"task_retention_trim_last_completed_timestamp_seconds".to_owned()));
         assert!(!names.iter().any(|n| n.ends_with("_duration_seconds")));
     }
 
