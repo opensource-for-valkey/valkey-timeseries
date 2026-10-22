@@ -134,6 +134,16 @@ snapshot — never later than its deadline, because each evaluation re-reads cur
 Pair `CONDITION` with a finite `BLOCK` rather than `BLOCK 0` on a series maintained purely by
 in-place updates.
 
+### Monitoring blocked reads
+
+`INFO ts_read` counts what happened to blocking reads on this node since module start: how many
+blocked (`ts_read_blocked_total`), were served at once (`ts_read_served_without_block_total`),
+were refused (`ts_read_block_refused_total`), timed out (`ts_read_block_timeouts_total`), were
+woken and stayed blocked (`ts_read_spurious_wakeups_total`), or were released by a deletion
+(`ts_read_unblocked_by_delete_total`), and how many are blocked now (`ts_read_blocked_clients`).
+These are the `read` metrics of [`TS._DEBUG STATS`](./ts._debug.md#metrics) with a `ts_` prefix,
+readable without `debug-mode`.
+
 ## Return Value
 
 A flat array of `[timestamp, value]` pairs in ascending timestamp order — the same shape as

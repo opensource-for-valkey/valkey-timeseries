@@ -1920,6 +1920,27 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
             for reader in readers:
                 reader.close(self.client)
 
+    def info(self):
+        """`INFO ts_read` without the server's `ts_` prefix, so the names match `STATS`."""
+        parsed = self.client.execute_command("INFO", "ts_read")
+        return {name.removeprefix("ts_"): int(value) for name, value in parsed.items()}
+
+    def test_info_reports_the_same_metrics(self):
+        assert set(self.info()) == self.METRICS
+
+    def test_info_counts_since_start_and_ignores_reset(self):
+        self.client.execute_command("TS.CREATE", "k")
+        reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 99)
+        try:
+            self.reset_stats()
+            info = self.info()
+            assert info["read_blocked_total"] >= 1
+            assert info["read_blocked_clients"] == 1
+            assert self.stat("read_blocked_total") == 0
+        finally:
+            reader.close(self.client)
+        wait_for_equal(lambda: self.info()["read_blocked_clients"], 0, timeout=REPLY_TIMEOUT)
+
     def test_reset_rebases_the_counters_and_leaves_the_gauge(self):
         self.client.execute_command("TS.CREATE", "k")
         reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 99)

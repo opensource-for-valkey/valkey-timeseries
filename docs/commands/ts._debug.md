@@ -295,6 +295,9 @@ by the server's free callback, which runs once per block however it ended, so it
 all of those cases. It can differ from the `blocked_clients` of `INFO clients`, which counts every
 blocked client of any command.
 
+The same metrics are in `INFO ts_read`, each prefixed `ts_` (`ts_read_blocked_total`), without the
+`debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
+
 ### Examples
 
 ```

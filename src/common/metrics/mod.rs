@@ -5,8 +5,9 @@
 //! `register` function that registers each with its help text and unit. Where the code
 //! already keeps the value, the registry reads that state directly: a std atomic is a metered
 //! counter or gauge as it stands, and an executor's own counts are read through a closure.
-//! `TS._DEBUG STATS` reports from the registries, and so will the `INFO ts_stats` mirror and any
-//! OpenMetrics export. The design and the roster of planned metrics are in
+//! `TS._DEBUG STATS` reports from the registries, and so does `INFO ts_read` (one section's
+//! mirror, see `common::module_info`); so will the `INFO ts_stats` mirror and any OpenMetrics
+//! export. The design and the roster of planned metrics are in
 //! `docs/plans/observability-metrics-plan.md`.
 //!
 //! Collection is always on: a counter is one relaxed atomic add, a histogram observation a
@@ -317,15 +318,22 @@ fn subtract_histogram(current: &HistogramSnapshot, base: &HistogramSnapshot) -> 
     )
 }
 
+/// Reads the metrics of the given sections as metered holds them, ignoring any [`reset`]: what
+/// `INFO` reports, since a scraper expects counters that never go backwards. Ordered as
+/// [`snapshot`].
+pub fn current(sections: &[Section]) -> Vec<MetricReading> {
+    REGISTRIES
+        .iter()
+        .filter(|(section, _)| sections.is_empty() || sections.contains(section))
+        .flat_map(|(section, registry)| read_registry(*section, registry))
+        .collect()
+}
+
 /// Reads the metrics of the given sections, section by section in [`Section::ALL`] order and by
 /// family name within each; every section when `sections` is empty. Counters and histograms
 /// count from the last [`reset`].
 pub fn snapshot(sections: &[Section]) -> Vec<MetricReading> {
-    let mut readings: Vec<_> = REGISTRIES
-        .iter()
-        .filter(|(section, _)| sections.is_empty() || sections.contains(section))
-        .flat_map(|(section, registry)| read_registry(*section, registry))
-        .collect();
+    let mut readings = current(sections);
     let baseline = lock(&BASELINE);
     for reading in &mut readings {
         baseline.apply(reading);

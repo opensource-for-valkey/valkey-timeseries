@@ -585,6 +585,9 @@ from §3.7:
   deny-blocking arm is tested through `MULTI` and Lua.
 - `read_served_without_block_total` counts only reads that carried `BLOCK`; a plain `TS.READ` counts
   nothing.
+- **2026-10-21:** `INFO ts_read` mirrors the whole section ahead of Phase 5, from
+  `metrics::current` (the registry without the `RESET` baseline), so INFO stays monotonic. Its
+  fields are the metric names with the server's `ts_` prefix. `ts_stats` can absorb it later.
 
 Original test list for §3.6 and §3.7. Tests: regex filter over N label values → `index_label_values_scanned_total` +N;
 `FILTER a=b c!=d` → `index_all_postings_base_total` ≥ 1; a literal set (`a=(x,y)`) does **not**
