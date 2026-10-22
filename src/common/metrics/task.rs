@@ -96,13 +96,13 @@ pub static RETENTION_TRIM: TaskMetrics = TaskMetrics::new("retention_trim", "ts-
 pub static TOMBSTONE_SWEEP: TaskMetrics = TaskMetrics::new("tombstone_sweep", "ts-tombstone-sweep");
 pub static TOMBSTONE_FULL_SWEEP: TaskMetrics =
     TaskMetrics::new("tombstone_full_sweep", "ts-tombstone-full-sweep");
-pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-optimize-indices");
+pub static OPTIMIZE_INDEX: TaskMetrics = TaskMetrics::new("optimize_index", "ts-optimize-indices");
 
 static TASKS: &[&TaskMetrics] = &[
     &RETENTION_TRIM,
     &TOMBSTONE_SWEEP,
     &TOMBSTONE_FULL_SWEEP,
-    &OPTIMIZE,
+    &OPTIMIZE_INDEX,
 ];
 
 pub static RETENTION_TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
@@ -110,8 +110,8 @@ pub static RETENTION_TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
 pub static RETENTION_TRIM_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static TOMBSTONES_RETIRED: AtomicU64 = AtomicU64::new(0);
 pub static TOMBSTONE_SWEEP_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
-pub static OPTIMIZE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
-pub static OPTIMIZE_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub static OPTIMIZE_INDEX_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub static OPTIMIZE_INDEX_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Empty-db cleanup is not a [`TaskMetrics`] task: it is a short inline pass on the main thread,
 /// so it reports only what it removed and whether it is running now.
 pub static TRIM_UNUSED_DBS_REMOVED: AtomicU64 = AtomicU64::new(0);
@@ -213,8 +213,8 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             "Postings passes that retired a stale-id snapshot for one database, across all cleanup paths",
         ),
         (
-            "optimize_passes_completed",
-            &OPTIMIZE_PASSES_COMPLETED,
+            "optimize_index_passes_completed",
+            &OPTIMIZE_INDEX_PASSES_COMPLETED,
             "Periodic optimizer traversals completed for one existing database",
         ),
         (
@@ -227,8 +227,8 @@ pub(super) fn register(registry: &mut Registry<'static>) {
     }
     registry
         .register(
-            gauge("optimize_last_pass_completed_timestamp_seconds")
-                .source(&OPTIMIZE_LAST_PASS_COMPLETED)
+            gauge("optimize_index_last_pass_completed_timestamp_seconds")
+                .source(&OPTIMIZE_INDEX_LAST_PASS_COMPLETED)
                 .unit("seconds")
                 .help(
                     "Unix timestamp of the last completed database pass, or zero before any pass",

@@ -1041,7 +1041,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                    'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['retention_trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize']
+    TASKS = ['retention_trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize_index']
     ASM_TASKS = ['drain', 'post_migration_cleanup']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
@@ -1182,10 +1182,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             values = self.stats('task')
             return all(values[f'task_{task}_completed_total'] > 0
                        and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
-                       for task in ('retention_trim', 'tombstone_sweep', 'optimize'))
+                       for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'))
         wait_for_true(completed)
         stats = self.stats('task')
-        for task in ('retention_trim', 'tombstone_sweep', 'optimize'):
+        for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
         # Empty-db cleanup is not a lifecycle task: only its removal count and running gauge.
@@ -1200,7 +1200,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert not any(name.startswith(retired) for name in stats)
         assert not any(name.startswith('task_trim_') and not name.startswith('task_trim_unused_dbs_')
                        for name in stats)
-        assert 'task_optimize_passes_completed_total' in stats
+        assert 'task_optimize_index_passes_completed_total' in stats
 
     def test_index_reconciliation_section(self):
         """The section is one task, so its lifecycle metrics carry no task name; nothing about
@@ -1252,14 +1252,14 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_reset_starts_counters_and_histograms_over_but_not_gauges(self):
         # The optimizer runs on tick zero and then only every 60 seconds.
-        wait_for_true(lambda: self.stats('task')['task_optimize_completed_total'] > 0)
+        wait_for_true(lambda: self.stats('task')['task_optimize_index_completed_total'] > 0)
         before = self.stats('task')
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
         after = self.stats('task')
-        assert after['task_optimize_completed_total'] == 0
-        assert self.histogram(after['task_optimize_duration_seconds'])['count'] == 0
-        assert after['task_optimize_last_completed_timestamp_seconds'] == (
-            before['task_optimize_last_completed_timestamp_seconds'])
+        assert after['task_optimize_index_completed_total'] == 0
+        assert self.histogram(after['task_optimize_index_duration_seconds'])['count'] == 0
+        assert after['task_optimize_index_last_completed_timestamp_seconds'] == (
+            before['task_optimize_index_last_completed_timestamp_seconds'])
 
     def test_reset_takes_no_arguments(self):
         with pytest.raises(ResponseError, match="no further arguments but a node target"):

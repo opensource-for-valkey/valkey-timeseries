@@ -387,7 +387,7 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 | `retention_trim` | Periodic retention trimming (10 s) |
 | `tombstone_sweep` | Periodic stale-ID (tombstone) cleanup (20 s) |
 | `tombstone_full_sweep` | Full stale-ID (tombstone) cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
-| `optimize` | Periodic postings optimization (60 s) |
+| `optimize_index` | Periodic postings optimization (60 s) |
 
 Each task exposes the following names, with `<task>` replaced by its identity:
 
@@ -414,14 +414,14 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 | `task_retention_trim_errors_total` | Series trim failures or failures to select a database |
 | `task_tombstones_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
 | `task_tombstone_sweep_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
-| `task_optimize_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
+| `task_optimize_index_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
 | `task_trim_unused_dbs_removed_total` | Empty database indexes removed by cron |
 
 Empty database index cleanup (every 300 s, inline on the main thread) is not one of the tasks
 above. It is a short pass, so it reports only `task_trim_unused_dbs_removed_total` and the gauge
 `task_trim_unused_dbs_running` (1 while a pass runs, else 0).
 
-`task_optimize_last_pass_completed_timestamp_seconds` is a gauge holding the Unix timestamp of
+`task_optimize_index_last_pass_completed_timestamp_seconds` is a gauge holding the Unix timestamp of
 the last completed database pass, or zero before any pass. A task invocation can process only
 part of a database; its completion does not imply a complete pass. These pass metrics do not
 claim that every database has been visited.

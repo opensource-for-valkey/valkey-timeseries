@@ -38,7 +38,7 @@ static OPTIMIZE_RUN: SingleFlight = SingleFlight::new();
 pub fn optimize_indices_for_db() {
     // On its own thread rather than the shared pool: it takes the postings write lock, and a
     // pool job may block only on its own pool (R1).
-    spawn_task_single(&metrics::OPTIMIZE, &OPTIMIZE_RUN, |_| {
+    spawn_task_single(&metrics::OPTIMIZE_INDEX, &OPTIMIZE_RUN, |_| {
         optimize_indices_internal();
     });
 }
@@ -93,8 +93,8 @@ pub(in crate::series) fn optimize_indices_internal() {
 
     if new_cursor.is_none() {
         metrics::complete_pass(
-            &metrics::OPTIMIZE_PASSES_COMPLETED,
-            &metrics::OPTIMIZE_LAST_PASS_COMPLETED,
+            &metrics::OPTIMIZE_INDEX_PASSES_COMPLETED,
+            &metrics::OPTIMIZE_INDEX_LAST_PASS_COMPLETED,
         );
     }
     set_optimize_cursor(db, new_cursor);
@@ -152,12 +152,13 @@ mod tests {
         populate_db(1, INDEX_OPTIMIZE_BATCH_SIZE + 25);
         populate_db(2, 5);
         set_context(1, None);
-        let before = metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
+        let before =
+            metrics::OPTIMIZE_INDEX_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
 
         optimize_indices_internal();
 
         assert_eq!(
-            metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
+            metrics::OPTIMIZE_INDEX_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
             before
         );
         let (db, cursor) = current_context();
@@ -172,16 +173,18 @@ mod tests {
         populate_db(1, 2);
         populate_db(2, 2);
         set_context(1, None);
-        let before = metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
+        let before =
+            metrics::OPTIMIZE_INDEX_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
 
         optimize_indices_internal();
 
         assert_eq!(
-            metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
+            metrics::OPTIMIZE_INDEX_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
             before + 1
         );
         assert!(
-            metrics::OPTIMIZE_LAST_PASS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed) > 0
+            metrics::OPTIMIZE_INDEX_LAST_PASS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed)
+                > 0
         );
         let (db, cursor) = current_context();
         assert_eq!(db, 2);

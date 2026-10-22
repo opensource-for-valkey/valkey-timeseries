@@ -575,12 +575,12 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         coordinator = self.client_for_primary(0)
         # The optimizer's tick-zero run supplies a nonzero histogram observation on every node,
         # stable for the next 60 seconds.
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
         local_tasks = [debug_stats(client, 'task') for client in self.all_nodes()]
         cluster_tasks = cluster_stats(coordinator, 'task')
-        assert histogram_count(cluster_tasks['task_optimize_duration_seconds']) == sum(
-            histogram_count(stats['task_optimize_duration_seconds']) for stats in local_tasks)
+        assert histogram_count(cluster_tasks['task_optimize_index_duration_seconds']) == sum(
+            histogram_count(stats['task_optimize_index_duration_seconds']) for stats in local_tasks)
         for client in self.all_nodes():
             client.execute_command('TS._DEBUG', 'STATS', 'RESET')
         coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
@@ -639,23 +639,23 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_reset_cluster_starts_every_node_over(self):
         coordinator = self.client_for_primary(0)
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER') == b'OK'
 
         for client in self.all_nodes():
-            assert debug_stats(client, 'task')['task_optimize_completed_total'] == 0
+            assert debug_stats(client, 'task')['task_optimize_index_completed_total'] == 0
 
     def test_reset_starts_only_this_node_over(self):
         coordinator, peer = self.client_for_primary(0), self.client_for_primary(1)
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in (coordinator, peer)))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
 
-        assert debug_stats(coordinator, 'task')['task_optimize_completed_total'] == 0
-        assert debug_stats(peer, 'task')['task_optimize_completed_total'] >= 1
+        assert debug_stats(coordinator, 'task')['task_optimize_index_completed_total'] == 0
+        assert debug_stats(peer, 'task')['task_optimize_index_completed_total'] >= 1
 
     def test_a_node_with_debug_mode_off_fails_the_command(self):
         replica = self.get_replication_group(1).get_replica_connection(0)
@@ -696,15 +696,15 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         coordinator = self.client_for_primary(0)
         replicas = [self.get_replication_group(i).get_replica_connection(0)
                     for i in range(self.CLUSTER_SIZE)]
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'PRIMARY') == b'OK'
 
         for i in range(self.CLUSTER_SIZE):
-            assert debug_stats(self.client_for_primary(i), 'task')['task_optimize_completed_total'] == 0
+            assert debug_stats(self.client_for_primary(i), 'task')['task_optimize_index_completed_total'] == 0
         for replica in replicas:
-            assert debug_stats(replica, 'task')['task_optimize_completed_total'] >= 1
+            assert debug_stats(replica, 'task')['task_optimize_index_completed_total'] >= 1
 
 
 def server_major_version():
