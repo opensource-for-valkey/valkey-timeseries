@@ -1725,18 +1725,18 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
     """`TS._DEBUG STATS read`: what happened to each blocking read.
 
     Counts are asserted exactly after a `STATS RESET` taken right before the action. Nothing but
-    the test's own readers touches these metrics. `read_blocked_clients` is a gauge: it survives
+    the test's own readers touches these metrics. `blocked_read_blocked_clients` is a gauge: it survives
     a reset, and is checked against the server's own `blocked_clients`.
     """
 
     METRICS = {
-        "read_block_refused_total",
-        "read_block_timeouts_total",
-        "read_blocked_clients",
-        "read_blocked_total",
-        "read_served_without_block_total",
-        "read_spurious_wakeups_total",
-        "read_unblocked_by_delete_total",
+        "blocked_read_block_refused_total",
+        "blocked_read_block_timeouts_total",
+        "blocked_read_blocked_clients",
+        "blocked_read_blocked_total",
+        "blocked_read_served_without_block_total",
+        "blocked_read_spurious_wakeups_total",
+        "blocked_read_unblocked_by_delete_total",
     }
 
     def stats(self):
@@ -1771,27 +1771,27 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         reply = self.client.execute_command("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 3)
         assert self.timestamps(reply) == [100, 200, 300]
         stats = self.stats()
-        assert stats["read_served_without_block_total"] == 1
-        assert stats["read_blocked_total"] == 0
-        assert stats["read_blocked_clients"] == 0
+        assert stats["blocked_read_served_without_block_total"] == 1
+        assert stats["blocked_read_blocked_total"] == 0
+        assert stats["blocked_read_blocked_clients"] == 0
 
     def test_blocked_reader_is_counted_and_woken(self):
         self.seed("k", [100])
         self.reset_stats()
         reader = self.reader("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 2)
         try:
-            assert self.stat("read_blocked_total") == 1
-            assert self.stat("read_blocked_clients") == 1
+            assert self.stat("blocked_read_blocked_total") == 1
+            assert self.stat("blocked_read_blocked_clients") == 1
             self.client.execute_command("TS.ADD", "k", 200, 20)
             assert self.timestamps(reader.result()) == [100, 200]
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
         stats = self.stats()
-        assert stats["read_blocked_total"] == 1
-        assert stats["read_block_timeouts_total"] == 0
-        assert stats["read_spurious_wakeups_total"] == 0
-        assert stats["read_unblocked_by_delete_total"] == 0
+        assert stats["blocked_read_blocked_total"] == 1
+        assert stats["blocked_read_block_timeouts_total"] == 0
+        assert stats["blocked_read_spurious_wakeups_total"] == 0
+        assert stats["blocked_read_unblocked_by_delete_total"] == 0
 
     def test_timeout_is_counted_and_releases_the_gauge(self):
         self.seed("k", [100])
@@ -1801,10 +1801,10 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
             assert reader.result() == [[100, b"10"]]
         finally:
             reader.close(self.client)
-        self.wait_for_stat("read_blocked_clients", 0)
+        self.wait_for_stat("blocked_read_blocked_clients", 0)
         stats = self.stats()
-        assert stats["read_block_timeouts_total"] == 1
-        assert stats["read_blocked_total"] == 1
+        assert stats["blocked_read_block_timeouts_total"] == 1
+        assert stats["blocked_read_blocked_total"] == 1
 
     def test_a_write_below_the_threshold_is_a_spurious_wakeup(self):
         """The write signals the key, the reader re-checks, and finds it still short."""
@@ -1813,18 +1813,18 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         reader = self.reader("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 3)
         try:
             self.client.execute_command("TS.ADD", "k", 200, 20)
-            self.wait_for_stat("read_spurious_wakeups_total", 1)
-            assert self.stat("read_blocked_clients") == 1
+            self.wait_for_stat("blocked_read_spurious_wakeups_total", 1)
+            assert self.stat("blocked_read_blocked_clients") == 1
             assert reader.is_pending()
 
             self.client.execute_command("TS.ADD", "k", 300, 30)
             assert self.timestamps(reader.result()) == [100, 200, 300]
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
         stats = self.stats()
-        assert stats["read_spurious_wakeups_total"] == 1
-        assert stats["read_blocked_total"] == 1
+        assert stats["blocked_read_spurious_wakeups_total"] == 1
+        assert stats["blocked_read_blocked_total"] == 1
 
     def test_deleting_the_key_is_counted_apart_from_a_wakeup(self):
         self.seed("k", [100])
@@ -1833,12 +1833,12 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         try:
             self.client.execute_command("DEL", "k")
             assert reader.result() == []
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
         stats = self.stats()
-        assert stats["read_unblocked_by_delete_total"] == 1
-        assert stats["read_spurious_wakeups_total"] == 0
+        assert stats["blocked_read_unblocked_by_delete_total"] == 1
+        assert stats["blocked_read_spurious_wakeups_total"] == 0
 
     def test_refusing_to_block_inside_multi_is_counted(self):
         self.seed("k", [100, 200, 300])
@@ -1848,9 +1848,9 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         with pytest.raises(ResponseError, match="not allowed inside MULTI"):
             pipe.execute()
         stats = self.stats()
-        assert stats["read_block_refused_total"] == 1
-        assert stats["read_blocked_total"] == 0
-        assert stats["read_blocked_clients"] == 0
+        assert stats["blocked_read_block_refused_total"] == 1
+        assert stats["blocked_read_blocked_total"] == 0
+        assert stats["blocked_read_blocked_clients"] == 0
 
     def test_refusing_to_block_inside_lua_is_counted(self):
         self.seed("k", [100])
@@ -1858,7 +1858,7 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         script = "return redis.call('TS.READ', KEYS[1], '$', 'BLOCK', '1000', '1')"
         with pytest.raises(ResponseError, match="not allowed inside MULTI"):
             self.client.eval(script, 1, "k")
-        assert self.stat("read_block_refused_total") == 1
+        assert self.stat("blocked_read_block_refused_total") == 1
 
     def test_client_unblock_timeout_counts_as_a_timeout(self):
         """`CLIENT UNBLOCK ... TIMEOUT` runs the same callback as a real deadline."""
@@ -1869,10 +1869,10 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
             client_id = reader.client_id()
             assert self.client.execute_command("CLIENT", "UNBLOCK", client_id, "TIMEOUT") == 1
             assert reader.result() == [[100, b"10"]]
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
-        assert self.stat("read_block_timeouts_total") == 1
+        assert self.stat("blocked_read_block_timeouts_total") == 1
 
     def test_client_unblock_error_releases_the_gauge_without_a_timeout(self):
         """Neither callback runs, but the private data is still reclaimed."""
@@ -1884,24 +1884,24 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
             assert self.client.execute_command("CLIENT", "UNBLOCK", client_id, "ERROR") == 1
             with pytest.raises(ResponseError, match="UNBLOCKED"):
                 reader.result()
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
-        assert self.stat("read_block_timeouts_total") == 0
-        assert self.stat("read_blocked_total") == 1
+        assert self.stat("blocked_read_block_timeouts_total") == 0
+        assert self.stat("blocked_read_blocked_total") == 1
 
     def test_disconnect_while_blocked_releases_the_gauge(self):
         self.client.execute_command("TS.CREATE", "k")
         self.reset_stats()
         reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 99)
         try:
-            assert self.stat("read_blocked_clients") == 1
+            assert self.stat("blocked_read_blocked_clients") == 1
             reader.client.connection_pool.disconnect()
             wait_for_equal(self.blocked_clients, 0, timeout=REPLY_TIMEOUT)
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             reader.close(self.client)
-        assert self.stat("read_block_timeouts_total") == 0
+        assert self.stat("blocked_read_block_timeouts_total") == 0
 
     def test_many_blocked_readers_move_the_gauge_together(self):
         self.client.execute_command("TS.CREATE", "k")
@@ -1910,19 +1910,19 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
             self.reader("TS.READ", "k", "-", "BLOCK", LONG_BLOCK_MS, 1) for _ in range(4)
         ]
         try:
-            assert self.stat("read_blocked_clients") == 4
-            assert self.stat("read_blocked_total") == 4
+            assert self.stat("blocked_read_blocked_clients") == 4
+            assert self.stat("blocked_read_blocked_total") == 4
             self.client.execute_command("TS.ADD", "k", 100, 1.0)
             for reader in readers:
                 assert reader.result() == [[100, b"1"]]
-            self.wait_for_stat("read_blocked_clients", 0)
+            self.wait_for_stat("blocked_read_blocked_clients", 0)
         finally:
             for reader in readers:
                 reader.close(self.client)
 
     def info(self):
-        """`INFO ts_read` without the server's `ts_` prefix, so the names match `STATS`."""
-        parsed = self.client.execute_command("INFO", "ts_read")
+        """`INFO ts_blocked_read` without the server's `ts_` prefix, so the names match `STATS`."""
+        parsed = self.client.execute_command("INFO", "ts_blocked_read")
         return {name.removeprefix("ts_"): int(value) for name, value in parsed.items()}
 
     def test_info_reports_the_same_metrics(self):
@@ -1934,21 +1934,21 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
         try:
             self.reset_stats()
             info = self.info()
-            assert info["read_blocked_total"] >= 1
-            assert info["read_blocked_clients"] == 1
-            assert self.stat("read_blocked_total") == 0
+            assert info["blocked_read_blocked_total"] >= 1
+            assert info["blocked_read_blocked_clients"] == 1
+            assert self.stat("blocked_read_blocked_total") == 0
         finally:
             reader.close(self.client)
-        wait_for_equal(lambda: self.info()["read_blocked_clients"], 0, timeout=REPLY_TIMEOUT)
+        wait_for_equal(lambda: self.info()["blocked_read_blocked_clients"], 0, timeout=REPLY_TIMEOUT)
 
     def test_reset_rebases_the_counters_and_leaves_the_gauge(self):
         self.client.execute_command("TS.CREATE", "k")
         reader = self.reader("TS.READ", "k", "-", "BLOCK", 0, 99)
         try:
-            assert self.stat("read_blocked_total") >= 1
+            assert self.stat("blocked_read_blocked_total") >= 1
             self.reset_stats()
             stats = self.stats()
-            assert stats["read_blocked_total"] == 0
-            assert stats["read_blocked_clients"] == 1
+            assert stats["blocked_read_blocked_total"] == 0
+            assert stats["blocked_read_blocked_clients"] == 1
         finally:
             reader.close(self.client)

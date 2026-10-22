@@ -5,7 +5,7 @@
 //! `register` function that registers each with its help text and unit. Where the code
 //! already keeps the value, the registry reads that state directly: a std atomic is a metered
 //! counter or gauge as it stands, and an executor's own counts are read through a closure.
-//! `TS._DEBUG STATS` reports from the registries, and so does `INFO ts_read` (one section's
+//! `TS._DEBUG STATS` reports from the registries, and so does `INFO ts_blocked_read` (one section's
 //! mirror, see `common::module_info`); so will the `INFO ts_stats` mirror and any OpenMetrics
 //! export. The design and the roster of planned metrics are in
 //! `docs/plans/observability-metrics-plan.md`.
@@ -37,6 +37,7 @@ pub mod asm;
 pub mod clustermap;
 pub mod exec;
 pub mod fanout;
+pub mod index_reconciliation;
 pub mod rdb;
 pub mod read;
 pub mod string_interning;
@@ -83,6 +84,8 @@ pub enum Section {
     /// Cluster fanout: operations this node coordinates, requests it serves for peers, and the
     /// messages and bytes exchanged over the cluster bus.
     Fanout,
+    /// The pass that checks a postings index preloaded from the RDB against the keys that loaded.
+    IndexReconciliation,
     /// The RDB aux field that carries the postings index: loads and saves, and how they went.
     Rdb,
     /// Blocking reads (`TS.READ ... BLOCK`): how many blocked, why they came back, how many
@@ -101,6 +104,7 @@ impl Section {
         Section::Clustermap,
         Section::Exec,
         Section::Fanout,
+        Section::IndexReconciliation,
         Section::Rdb,
         Section::Read,
         Section::StringInterning,
@@ -113,8 +117,9 @@ impl Section {
             Section::Clustermap => "clustermap",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
+            Section::IndexReconciliation => "index_reconciliation",
             Section::Rdb => "rdb",
-            Section::Read => "read",
+            Section::Read => "blocked_read",
             Section::StringInterning => "string_interning",
             Section::Task => "task",
         }
@@ -151,6 +156,7 @@ fn build_registry(section: Section) -> Registry<'static> {
         Section::Clustermap => clustermap::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),
+        Section::IndexReconciliation => index_reconciliation::register(&mut registry),
         Section::Rdb => rdb::register(&mut registry),
         Section::Read => read::register(&mut registry),
         Section::StringInterning => string_interning::register(&mut registry),
@@ -473,32 +479,47 @@ mod tests {
     /// The only test that resets the shared registries, so the counts it asserts are its own.
     #[test]
     fn reset_rebases_counters_and_histograms_but_not_gauges() {
-        // `reconcile` only runs after an RDB load, so no other unit test moves it.
-        let run = task::RECONCILE.start();
+        // Reconciliation only runs after an RDB load, so no other unit test moves it.
+        let run = index_reconciliation::RECONCILE.start();
+        let section = &[Section::IndexReconciliation];
         reset();
         assert_eq!(
-            reading(&[Section::Task], "task_reconcile_started_total").value,
+            reading(section, "index_reconciliation_started_total").value,
             MetricValue::Counter(0)
         );
         assert_eq!(
-            reading(&[Section::Task], "task_reconcile_running").value,
+            reading(section, "index_reconciliation_running").value,
             MetricValue::Gauge(Scalar::UInt(1))
         );
         drop(run);
         assert_eq!(
-            reading(&[Section::Task], "task_reconcile_completed_total").value,
+            reading(section, "index_reconciliation_completed_total").value,
             MetricValue::Counter(1)
         );
         assert_eq!(
-            reading(&[Section::Task], "task_reconcile_running").value,
+            reading(section, "index_reconciliation_running").value,
             MetricValue::Gauge(Scalar::UInt(0))
         );
         let MetricValue::Histogram(task_duration) =
-            reading(&[Section::Task], "task_reconcile_duration_seconds").value
+            reading(section, "index_reconciliation_duration_seconds").value
         else {
             panic!("not a histogram");
         };
         assert_eq!(task_duration.count, 1);
+    }
+
+    #[test]
+    fn fanout_error_total_sums_every_kind() {
+        let total = || match reading(&[Section::Fanout], "fanout_errors_total").value {
+            MetricValue::Counter(v) => v,
+            other => panic!("not a counter: {other:?}"),
+        };
+        let before = total();
+        fanout::record_error(crate::fanout::ErrorKind::Timeout);
+        fanout::record_error(crate::fanout::ErrorKind::Busy);
+        // Other tests may record errors too, so this is a lower bound.
+        assert!(total() >= before + 2);
+        assert!(fanout::total_errors() >= total());
     }
 
     #[test]

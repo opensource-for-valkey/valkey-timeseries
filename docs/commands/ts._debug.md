@@ -242,7 +242,8 @@ As coordinator:
 | `fanout_local_only_total` | counter | Operations whose only target was this node (no RPC) |
 | `fanout_duration_seconds` | histogram | Time from the start of an operation to its result |
 | `fanout_inflight` | gauge | RPCs with remote shares outstanding (see `TS._DEBUG INFLIGHT`) |
-| `fanout_errors_<kind>_total` | counter | Shard errors by kind, the local share included. Kinds: `invalid_message`, `node_unreachable`, `timeout`, `unknown_message_type`, `permissions`, `key_permissions`, `serialization`, `bad_request_id`, `internal`, `cluster_map_mismatch`, `unsupported_features`, `invalid_db`, `busy`, `custom` |
+| `fanout_errors_total` | counter | Shard errors of every kind, the local share included: the sum of the `fanout_errors_<kind>_total` counters |
+| `fanout_errors_<kind>_total` | counter | Shard errors by kind, the local share included. Kinds: `invalid_message`, `node_unreachable`, `timeout`, `unknown_message_type`, `permissions`, `key_permissions`, `serialization`, `bad_request_id`, `internal`, `cluster_map_mismatch`, `unsupported_features`, `invalid_db`, `busy`, `database_swapped`, `custom` |
 | `fanout_aborts_total` | counter | Operations ended early by an error returned as it is: a cluster-map mismatch, a permission denial, a busy shard |
 | `fanout_generic_error_replies_total` | counter | Operations answered with the generic "Internal error in fanout operation" reply after a shard failed with another kind |
 | `fanout_client_timeouts_total` | counter | Blocked clients answered with the timeout error |
@@ -291,6 +292,27 @@ On the wire (counted by the sender):
 The byte counts are the payloads this node handed to the cluster bus: the bus's own framing is
 not included, and a fan-out's local share never crosses the bus.
 
+#### `index_reconciliation`
+
+The background pass (`ts-index-sweep`) that runs after an RDB load whose index was preloaded from
+the aux field: it checks the index against the keys that actually loaded, marks dangling ids
+stale and re-indexes anything the preload missed. It is a single task, so its names carry no task
+identity; otherwise they mean what the [`task`](#task) lifecycle names mean.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `index_reconciliation_started_total` | counter | Passes that entered the task body |
+| `index_reconciliation_completed_total` | counter | Passes that returned without a panic or shutdown abort |
+| `index_reconciliation_skipped_inflight_total` | counter | Always 0: passes are not single-flight |
+| `index_reconciliation_panics_total` | counter | Passes that unwound with a panic |
+| `index_reconciliation_spawn_failures_total` | counter | Threads that could not be started; these do not count as started passes |
+| `index_reconciliation_running` | gauge | Passes executing now |
+| `index_reconciliation_duration_seconds` | histogram | Pass time, including the keyspace sweep when the digest check does not skip it |
+| `index_reconciliation_last_completed_timestamp_seconds` | gauge | Unix timestamp of the most recent completed pass, or zero before any |
+
+The same metrics, except the duration histogram, are in `INFO ts_index_reconciliation`, each
+prefixed `ts_`, without the `debug-mode` gate.
+
 #### `rdb`
 
 The RDB aux field that carries the postings index, counted once per RDB that has one (not per
@@ -313,29 +335,29 @@ index from the keys.
 The same metrics are in `INFO ts_rdb`, each prefixed `ts_` (`ts_rdb_load_success_total`), without
 the `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
-#### `read`
+#### `blocked_read`
 
 Blocking reads (`TS.READ ... BLOCK`), counted on the node serving the client. A read without
 `BLOCK` counts nothing.
 
 | Name | Kind | Description |
 |------|------|-------------|
-| `read_blocked_total` | counter | Reads the server blocked on a key |
-| `read_served_without_block_total` | counter | `BLOCK` reads served at once because enough qualifying samples already existed |
-| `read_block_refused_total` | counter | `BLOCK` reads that had to wait but could not: a context that forbids blocking (`MULTI`, a script), or the server declining to block the client |
-| `read_block_timeouts_total` | counter | Blocked reads released by the timeout callback: a deadline, or `CLIENT UNBLOCK ... TIMEOUT` |
-| `read_spurious_wakeups_total` | counter | Wakeups after which a blocked read re-checked its key and stayed blocked (a write that left it below `min_count`, or a condition no new sample met) |
-| `read_unblocked_by_delete_total` | counter | Blocked reads released with an empty reply because their key was deleted |
-| `read_blocked_clients` | gauge | Blocked reads the server still holds state for |
+| `blocked_read_blocked_total` | counter | Reads the server blocked on a key |
+| `blocked_read_served_without_block_total` | counter | `BLOCK` reads served at once because enough qualifying samples already existed |
+| `blocked_read_block_refused_total` | counter | `BLOCK` reads that had to wait but could not: a context that forbids blocking (`MULTI`, a script), or the server declining to block the client |
+| `blocked_read_block_timeouts_total` | counter | Blocked reads released by the timeout callback: a deadline, or `CLIENT UNBLOCK ... TIMEOUT` |
+| `blocked_read_spurious_wakeups_total` | counter | Wakeups after which a blocked read re-checked its key and stayed blocked (a write that left it below `min_count`, or a condition no new sample met) |
+| `blocked_read_unblocked_by_delete_total` | counter | Blocked reads released with an empty reply because their key was deleted |
+| `blocked_read_blocked_clients` | gauge | Blocked reads the server still holds state for |
 
 A blocked read ends in a reply from a wakeup, a timeout, a deletion, an error,
 `CLIENT UNBLOCK ... ERROR`, or a disconnect. Timeouts and deletions have counters of their own; the
-rest don't, so `read_blocked_total` is not the sum of the others. `read_blocked_clients` is moved
+rest don't, so `blocked_read_blocked_total` is not the sum of the others. `blocked_read_blocked_clients` is moved
 by the server's free callback, which runs once per block however it ended, so it returns to 0 in
 all of those cases. It can differ from the `blocked_clients` of `INFO clients`, which counts every
 blocked client of any command.
 
-The same metrics are in `INFO ts_read`, each prefixed `ts_` (`ts_read_blocked_total`), without the
+The same metrics are in `INFO ts_blocked_read`, each prefixed `ts_` (`ts_blocked_read_blocked_total`), without the
 `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
 #### `string_interning`
@@ -367,7 +389,6 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 | `stale_ids` | Periodic stale-ID cleanup (20 s) |
 | `stale_ids_full_sweep` | Full stale-ID cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
 | `optimize` | Periodic postings optimization (60 s) |
-| `reconcile` | Verify persisted index contents after loading |
 
 Each task exposes the following names, with `<task>` replaced by its identity:
 

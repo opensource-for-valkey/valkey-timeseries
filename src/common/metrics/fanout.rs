@@ -12,10 +12,10 @@
 
 use super::duration_histogram;
 use crate::fanout::{ErrorKind, inflight_request_count};
-use metered::entry::{counter, gauge_value, metric};
+use metered::entry::{counter, counter_value, gauge_value, metric};
 use metered::{BucketHistogram, Counter, Registry};
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // --- coordinator --------------------------------------------------------------------------
 
@@ -74,6 +74,15 @@ pub static FANOUT_ERRORS: [AtomicU64; ErrorKind::ALL.len()] =
 #[inline]
 pub fn record_error(kind: ErrorKind) {
     FANOUT_ERRORS[kind.metric_index()].incr();
+}
+
+/// Shard errors of every kind: the sum of [`FANOUT_ERRORS`], taken when read so the error path
+/// stays one increment.
+pub fn total_errors() -> u64 {
+    FANOUT_ERRORS
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
 }
 
 // --- serving ------------------------------------------------------------------------------
@@ -317,6 +326,11 @@ pub(super) fn register(registry: &mut Registry<'static>) {
     for &(name, source, help) in BYTE_COUNTERS {
         registry.register(counter(name).source(source).help(help).unit("bytes"));
     }
+    registry.register(
+        counter_value("errors")
+            .read(|_: &()| total_errors())
+            .help("Shard errors of every kind seen by this node as fanout coordinator (the sum of fanout_errors_<kind>)"),
+    );
     for kind in ErrorKind::ALL {
         registry.register(
             counter(format!("errors_{}", kind.metric_name()))

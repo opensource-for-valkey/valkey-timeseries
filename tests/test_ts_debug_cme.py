@@ -347,8 +347,9 @@ def histogram_count(value):
 
 
 def shard_errors(stats):
+    """The non-zero per-kind shard error counters (not their sum, `fanout_errors_total`)."""
     return {name: value for name, value in stats.items()
-            if name.startswith('fanout_errors_') and value}
+            if name.startswith('fanout_errors_') and name != 'fanout_errors_total' and value}
 
 
 class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
@@ -459,6 +460,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert set(errors) <= {'fanout_errors_key_permissions_total',
                                'fanout_errors_permissions_total'}, errors
         assert sum(errors.values()) >= 1
+        assert stats['fanout_errors_total'] == sum(errors.values())
 
     def test_timeouts(self):
         """A sleeping peer runs the fanout into both deadlines; its late answer is dropped."""
@@ -480,6 +482,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         stats = debug_stats(coordinator, 'fanout')
         assert stats['fanout_rpc_timeouts_total'] == 1
         assert stats['fanout_errors_timeout_total'] == 1
+        assert stats['fanout_errors_total'] == 1
         # The two deadlines race: the client's fires unless the RPC's result reached it first.
         assert stats['fanout_client_timeouts_total'] <= 1
         assert stats['fanout_inflight'] == 0

@@ -1,5 +1,5 @@
-//! The module's `INFO` sections: `ts_index`, `ts_compaction`, `ts_rdb`, `ts_read`,
-//! `ts_string_interning`, `ts_task`, `ts_asm` and `ts_fanout`.
+//! The module's `INFO` sections: `ts_index`, `ts_compaction`, `ts_rdb`, `ts_blocked_read`,
+//! `ts_string_interning`, `ts_task`, `ts_asm`, `ts_index_reconciliation` and `ts_fanout`.
 //!
 //! Module sections are emitted only for an explicit `INFO modules`, `INFO everything`/`INFO all`,
 //! or `INFO <section>` — never for a bare `INFO` — which is what makes it acceptable for the
@@ -16,8 +16,9 @@ use valkey_module::{
 };
 use valkey_module_macros::info_command_handler;
 
-/// `INFO ts_index`, `INFO ts_compaction`, `INFO ts_rdb`, `INFO ts_read`,
-/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm` and `INFO ts_fanout`.
+/// `INFO ts_index`, `INFO ts_compaction`, `INFO ts_rdb`, `INFO ts_blocked_read`,
+/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm`, `INFO ts_index_reconciliation` and
+/// `INFO ts_fanout`.
 ///
 /// The sections are declared without the module name; the server prefixes each with it, so they
 /// land as `# ts_index`, `# ts_compaction`, `# ts_rdb` and so on, with every field prefixed
@@ -74,6 +75,7 @@ const MIRRORED: &[Section] = &[
     Section::StringInterning,
     Section::Task,
     Section::Asm,
+    Section::IndexReconciliation,
     Section::Fanout,
 ];
 

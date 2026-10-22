@@ -1034,20 +1034,22 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['asm', 'clustermap', 'exec', 'fanout', 'rdb', 'read', 'string_interning', 'task']
+    SECTIONS = ['asm', 'clustermap', 'exec', 'fanout', 'index_reconciliation', 'rdb', 'blocked_read',
+                'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     RDB_METRICS = ['rdb_load_failure_total', 'rdb_load_success_total',
                    'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize', 'reconcile']
+    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize']
     ASM_TASKS = ['drain', 'post_migration_cleanup']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total', 'panics_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
                    'last_completed_timestamp_seconds')
     HISTOGRAMS = {'fanout_duration_seconds'} | {
         f'task_{task}_duration_seconds' for task in TASKS
-    } | {f'asm_{task}_duration_seconds' for task in ASM_TASKS}
+    } | {f'asm_{task}_duration_seconds' for task in ASM_TASKS} | {
+        'index_reconciliation_duration_seconds'}
     DOUBLE_GAUGES = {'clustermap_refresh_interval_seconds',
                      'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
@@ -1100,7 +1102,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*asm, clustermap, exec, fanout, rdb, read, string_interning, task"):
+                           match="unknown STATS section 'bogus'.*asm, clustermap, exec, fanout, index_reconciliation, rdb, blocked_read, string_interning, task"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'bogus')
 
     def test_string_interning(self):
@@ -1113,7 +1115,8 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert after['string_interning_strings'] >= before['string_interning_strings'] + 20
         assert after['string_interning_bytes'] > before['string_interning_bytes']
 
-    @pytest.mark.parametrize('section', ['rdb', 'read', 'string_interning', 'task', 'asm'])
+    @pytest.mark.parametrize('section', ['rdb', 'blocked_read', 'string_interning', 'task', 'asm',
+                                         'index_reconciliation'])
     def test_info_mirrors_the_section(self, section):
         """`INFO ts_<section>` carries the section's counters and gauges (and `_human` twins)
         under the same names with a `ts_` prefix; INFO has no shape for a histogram."""
@@ -1145,8 +1148,11 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert float(stats['clustermap_refresh_interval_seconds']) == 0
 
     def test_fanout_metrics_cover_every_error_kind(self):
-        errors = [n for n in self.stats('fanout') if n.startswith('fanout_errors_')]
+        stats = self.stats('fanout')
+        errors = [n for n in stats
+                  if n.startswith('fanout_errors_') and n != 'fanout_errors_total']
         assert len(errors) == 15, errors
+        assert stats['fanout_errors_total'] == sum(stats[n] for n in errors)
         assert 'fanout_errors_timeout_total' in errors
         assert 'fanout_errors_database_swapped_total' in errors
         assert 'fanout_errors_key_permissions_total' in errors
@@ -1190,31 +1196,37 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'task_stale_ids_retired_total' in stats
         assert 'task_optimize_passes_completed_total' in stats
 
-    def test_task_reconciliation_lifecycle_on_digest_fast_path(self):
-        self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
-        before = self.stats('task')
-        self.client.execute_command('DEBUG', 'RELOAD')
-        def finished():
-            values = self.stats('task')
-            return (values['task_reconcile_completed_total'] > before['task_reconcile_completed_total']
-                    and values['task_reconcile_running'] == 0)
-        wait_for_true(finished)
-        after = self.stats('task')
-        assert after['task_reconcile_running'] == 0
+    def test_index_reconciliation_section(self):
+        """The section is one task, so its lifecycle metrics carry no task name; nothing about
+        it is left in `task`."""
+        stats = self.stats('index_reconciliation')
+        assert set(stats) == {f'index_reconciliation_{suffix}' for suffix in self.TASK_FIELDS}
+        assert not any('reconcil' in name for name in self.stats('task'))
 
-    def test_task_reconciliation_lifecycle_on_dangling_id_sweep(self):
+    def reconciliation_finished(self, before):
+        values = self.stats('index_reconciliation')
+        return (values['index_reconciliation_completed_total']
+                > before['index_reconciliation_completed_total']
+                and values['index_reconciliation_running'] == 0)
+
+    def test_index_reconciliation_lifecycle_on_digest_fast_path(self):
+        self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
+        before = self.stats('index_reconciliation')
+        self.client.execute_command('DEBUG', 'RELOAD')
+        wait_for_true(lambda: self.reconciliation_finished(before))
+        after = self.stats('index_reconciliation')
+        assert after['index_reconciliation_started_total'] > before['index_reconciliation_started_total']
+        assert self.histogram(after['index_reconciliation_duration_seconds'])['count'] > 0
+
+    def test_index_reconciliation_lifecycle_on_dangling_id_sweep(self):
         self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
         self.client.execute_command('TS.CREATE', 'task:gone', 'LABELS', 'service', 'api')
         self.client.pexpire('task:gone', 1000)
         self.client.save()
         wait_for_true(lambda: self.client.pttl('task:gone') < 0)
-        before = self.stats('task')
+        before = self.stats('index_reconciliation')
         self.client.execute_command('DEBUG', 'RELOAD', 'NOSAVE')
-        def finished():
-            values = self.stats('task')
-            return (values['task_reconcile_completed_total'] > before['task_reconcile_completed_total']
-                    and values['task_reconcile_running'] == 0)
-        wait_for_true(finished)
+        wait_for_true(lambda: self.reconciliation_finished(before))
         assert self.client.execute_command('TS.QUERYINDEX', 'service=api') == [b'task:keep']
 
     def test_histogram_shape(self):

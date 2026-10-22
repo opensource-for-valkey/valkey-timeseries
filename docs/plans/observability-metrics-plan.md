@@ -281,13 +281,13 @@ from real distributions. Note the audit's file:line references point at the old 
 
 | Metric | Kind | Hook |
 |---|---|---|
-| `read_blocked_total` | counter | `block_client_on_key` success [block_on_keys.rs:135-140](../../src/common/block_on_keys.rs#L135-L140) |
-| `read_served_without_block_total` | counter | data already present [ts_read.rs:441](../../src/commands/ts_read.rs#L441) |
-| `read_block_refused_total` | counter | deny-blocking context [ts_read.rs:449-451](../../src/commands/ts_read.rs#L449-L451), server refusal [:462](../../src/commands/ts_read.rs#L462) |
-| `read_block_timeouts_total` | counter | `timeout_callback` [block_on_keys.rs:182-199](../../src/common/block_on_keys.rs#L182-L199) — also fires on `CLIENT UNBLOCK` |
-| `read_spurious_wakeups_total` | counter | `reply_callback` → `NotReady`, client stays blocked ([ts_read.rs:345](../../src/commands/ts_read.rs#L345), [:355](../../src/commands/ts_read.rs#L355)) |
-| `read_unblocked_by_delete_total` | counter | [ts_read.rs:347](../../src/commands/ts_read.rs#L347) |
-| `read_blocked_clients` | gauge | +1 at [block_on_keys.rs:140](../../src/common/block_on_keys.rs#L140); −1 in `free_privdata_callback` [:206-216](../../src/common/block_on_keys.rs#L206-L216), which runs exactly once per successful block. Not on wake/timeout: wakes can return `NotReady`, and disconnect/shutdown skip both callbacks |
+| `blocked_read_blocked_total` | counter | `block_client_on_key` success [block_on_keys.rs:135-140](../../src/common/block_on_keys.rs#L135-L140) |
+| `blocked_read_served_without_block_total` | counter | data already present [ts_read.rs:441](../../src/commands/ts_read.rs#L441) |
+| `blocked_read_block_refused_total` | counter | deny-blocking context [ts_read.rs:449-451](../../src/commands/ts_read.rs#L449-L451), server refusal [:462](../../src/commands/ts_read.rs#L462) |
+| `blocked_read_block_timeouts_total` | counter | `timeout_callback` [block_on_keys.rs:182-199](../../src/common/block_on_keys.rs#L182-L199) — also fires on `CLIENT UNBLOCK` |
+| `blocked_read_spurious_wakeups_total` | counter | `reply_callback` → `NotReady`, client stays blocked ([ts_read.rs:345](../../src/commands/ts_read.rs#L345), [:355](../../src/commands/ts_read.rs#L355)) |
+| `blocked_read_unblocked_by_delete_total` | counter | [ts_read.rs:347](../../src/commands/ts_read.rs#L347) |
+| `blocked_read_blocked_clients` | gauge | +1 at [block_on_keys.rs:140](../../src/common/block_on_keys.rs#L140); −1 in `free_privdata_callback` [:206-216](../../src/common/block_on_keys.rs#L206-L216), which runs exactly once per successful block. Not on wake/timeout: wakes can return `NotReady`, and disconnect/shutdown skip both callbacks |
 
 ### 3.8 `fanout` and `clustermap` — the cluster path
 
@@ -393,7 +393,9 @@ lifetime — a counter is the only way to see a rule being broken continuously.
 `spawn_task`, and inline database cleanup and nested full stale-ID sweeps start guards directly.
 Each task exposes `started_total`, `completed_total`, `skipped_inflight_total`, `panics_total`,
 `spawn_failures_total`, `running`, `duration_seconds`, and
-`last_completed_timestamp_seconds`. **2026-10-22:** the two ASM tasks moved to their own `asm`
+`last_completed_timestamp_seconds`. **2026-10-22:** `reconcile` moved to its own
+`index_reconciliation` section (`metrics::index_reconciliation`); as that section's only task its
+names carry no task identity (`index_reconciliation_started_total`, ...). The two ASM tasks moved to their own `asm`
 section (`metrics::asm`), with their work counters: `asm_drain_*`, `asm_post_migration_cleanup_*`,
 `asm_keys_indexed_total`, `asm_post_migration_cleanup_ids_marked_total`; the planned ASM gauges
 and counters below take the same `asm_` prefix. `stale_ids_full_sweep` stays in `task` (it shares
@@ -594,25 +596,25 @@ and write to the source → `compaction_rules_pruned_missing_total` = 1; a repli
 **§3.7 (`read`) done 2026-10-20**; §3.6 (`index`) is open.
 
 As built for §3.7: [metrics/read.rs](../../src/common/metrics/read.rs), hooks in
-[block_on_keys.rs](../../src/common/block_on_keys.rs) (`read_blocked_total`,
-`read_block_timeouts_total`, `read_blocked_clients`) and [ts_read.rs](../../src/commands/ts_read.rs)
+[block_on_keys.rs](../../src/common/block_on_keys.rs) (`blocked_read_blocked_total`,
+`blocked_read_block_timeouts_total`, `blocked_read_blocked_clients`) and [ts_read.rs](../../src/commands/ts_read.rs)
 (the rest); `TestTsReadMetrics` in [tests/test_ts_read.py](../../tests/test_ts_read.py). Differences
 from §3.7:
 
-- `read_blocked_clients` is a std `AtomicI64` registered as a gauge, so the plan's "+1 at block
+- `blocked_read_blocked_clients` is a std `AtomicI64` registered as a gauge, so the plan's "+1 at block
   success" is a `fetch_add` after the null check in `block_client_on_key`, and the "-1" a
   `fetch_sub` in `free_privdata_callback` (not on the null-privdata early return).
-- `read_block_timeouts_total` is counted on entry to `timeout_callback`, before the private data is
+- `blocked_read_block_timeouts_total` is counted on entry to `timeout_callback`, before the private data is
   looked up, so a timed-out client with no private data still counts.
-- `read_spurious_wakeups_total` covers both `NotReady` arms of `on_ready`: a key that exists but
+- `blocked_read_spurious_wakeups_total` covers both `NotReady` arms of `on_ready`: a key that exists but
   is empty for this cursor, and fewer qualifying samples than `min_count`. A reply with an error
   (wrong type, revoked ACL) is neither.
-- `read_block_refused_total`'s server-refusal arm (`block_client_on_key` returning `false`) has no
+- `blocked_read_block_refused_total`'s server-refusal arm (`block_client_on_key` returning `false`) has no
   integration test: the server only declines in conditions the test harness can't produce. The
   deny-blocking arm is tested through `MULTI` and Lua.
-- `read_served_without_block_total` counts only reads that carried `BLOCK`; a plain `TS.READ` counts
+- `blocked_read_served_without_block_total` counts only reads that carried `BLOCK`; a plain `TS.READ` counts
   nothing.
-- **2026-10-21:** `INFO ts_read` mirrors the whole section ahead of Phase 5, from
+- **2026-10-21:** `INFO ts_blocked_read` mirrors the whole section ahead of Phase 5, from
   `metrics::current` (the registry without the `RESET` baseline), so INFO stays monotonic. Its
   fields are the metric names with the server's `ts_` prefix. `ts_stats` can absorb it later.
 
@@ -621,8 +623,8 @@ Original test list for §3.6 and §3.7. Tests: regex filter over N label values 
 move the scan counter; delete a key underneath the index and query → some
 `index_stale_ids_marked_*_total` ≥ 1 and `index_stale_ids_pending` eventually back to 0 (assert ≥,
 never which self-healer won — the sweep races the trim cron); `TS.READ BLOCK` with a short timeout →
-`read_block_timeouts_total` +1 and `read_blocked_clients` back to 0; disconnect while blocked →
-`read_blocked_clients` back to 0.
+`blocked_read_block_timeouts_total` +1 and `blocked_read_blocked_clients` back to 0; disconnect while blocked →
+`blocked_read_blocked_clients` back to 0.
 
 ### Phase 3 — exec, tasks, persistence, recovery
 

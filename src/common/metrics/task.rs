@@ -100,15 +100,8 @@ pub static STALE_IDS: TaskMetrics = TaskMetrics::new("stale_ids", "ts-stale-ids"
 pub static STALE_IDS_FULL_SWEEP: TaskMetrics =
     TaskMetrics::new("stale_ids_full_sweep", "ts-stale-ids-full-sweep");
 pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-optimize-indices");
-pub static RECONCILE: TaskMetrics = TaskMetrics::new("reconcile", "ts-index-sweep");
 
-static TASKS: &[&TaskMetrics] = &[
-    &TRIM,
-    &STALE_IDS,
-    &STALE_IDS_FULL_SWEEP,
-    &OPTIMIZE,
-    &RECONCILE,
-];
+static TASKS: &[&TaskMetrics] = &[&TRIM, &STALE_IDS, &STALE_IDS_FULL_SWEEP, &OPTIMIZE];
 
 pub static TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 pub static TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
@@ -128,8 +121,18 @@ pub fn complete_pass(count: &AtomicU64, last_completed: &AtomicU64) {
     last_completed.fetch_max(now_seconds(), Ordering::Relaxed);
 }
 
-/// Registers one task's lifecycle metrics, each named `<task>_<metric>` under the registry's
-/// section prefix. Shared with sections that own tasks of their own (`asm`).
+/// A task metric's name under its section's prefix: `<task>_<metric>`, or just `<metric>` for a
+/// task with an empty name, which is the whole of its section (`index_reconciliation`).
+fn task_metric_name(task: &TaskMetrics, metric: &str) -> String {
+    if task.name.is_empty() {
+        metric.to_owned()
+    } else {
+        format!("{}_{metric}", task.name)
+    }
+}
+
+/// Registers one task's lifecycle metrics (see [`task_metric_name`]). Shared with sections that
+/// own tasks of their own (`asm`, `index_reconciliation`).
 pub(super) fn register_task(registry: &mut Registry<'static>, task: &'static TaskMetrics) {
     for (name, source, help) in [
         ("started", &task.started, "Runs that entered the task body"),
@@ -151,19 +154,19 @@ pub(super) fn register_task(registry: &mut Registry<'static>, task: &'static Tas
         ),
     ] {
         registry.register(
-            counter(format!("{}_{name}", task.name))
+            counter(task_metric_name(task, name))
                 .source(source)
                 .help(help),
         );
     }
     registry
         .register(
-            gauge(format!("{}_running", task.name))
+            gauge(task_metric_name(task, "running"))
                 .source(&task.running)
                 .help("Task bodies currently executing, including time waiting for locks"),
         )
         .register(
-            gauge(format!("{}_last_completed_timestamp_seconds", task.name))
+            gauge(task_metric_name(task, "last_completed_timestamp_seconds"))
                 .source(&task.last_completed)
                 .unit("seconds")
                 .help(
@@ -171,7 +174,7 @@ pub(super) fn register_task(registry: &mut Registry<'static>, task: &'static Tas
                 ),
         )
         .register(
-            metric(format!("{}_duration_seconds", task.name))
+            metric(task_metric_name(task, "duration_seconds"))
                 .source(LazyLock::force(&task.duration))
                 .unit("seconds")
                 .help("Task execution time including lock waits, panics and shutdown aborts"),

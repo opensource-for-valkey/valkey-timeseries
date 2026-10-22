@@ -1,4 +1,4 @@
-//! `read`: blocking reads (`TS.READ ... BLOCK`). Counted in `common::block_on_keys` for what the
+//! `blocked_read`: blocking reads (`TS.READ ... BLOCK`). Counted in `common::block_on_keys` for what the
 //! server does to a blocked client (blocking, timing out, releasing its state) and in
 //! `commands::ts_read` for what the command decides.
 

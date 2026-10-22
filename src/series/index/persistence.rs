@@ -18,8 +18,9 @@ use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uvarint};
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
+use crate::common::metrics::index_reconciliation::RECONCILE;
 use crate::common::metrics::rdb::{LOAD_FAILURE, LOAD_SUCCESS, save_counters};
-use crate::common::metrics::task::{self as metrics, TaskRun};
+use crate::common::metrics::task::TaskRun;
 use crate::common::sync::{read_lock, write_lock};
 use crate::common::threads::LockGil;
 use crate::config::is_index_persist_enabled;
@@ -477,7 +478,7 @@ fn reconcile_preloaded_indexes(force_sweep: bool) {
     // rather than the pool because it takes the module lock (see `spawn_background`), and
     // checks `is_shutting_down()` between batches — an aborted sweep is safe, since ids it
     // never reached are either valid or will be stale-marked by the query path's self-heal.
-    crate::common::threads::spawn_task(&metrics::RECONCILE, move |run| {
+    crate::common::threads::spawn_task(&RECONCILE, move |run| {
         for db in dbs {
             if run.check_shutdown() {
                 return;

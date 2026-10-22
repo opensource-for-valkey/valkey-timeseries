@@ -136,11 +136,11 @@ in-place updates.
 
 ### Monitoring blocked reads
 
-`INFO ts_read` counts what happened to blocking reads on this node since module start: how many
-blocked (`ts_read_blocked_total`), were served at once (`ts_read_served_without_block_total`),
-were refused (`ts_read_block_refused_total`), timed out (`ts_read_block_timeouts_total`), were
-woken and stayed blocked (`ts_read_spurious_wakeups_total`), or were released by a deletion
-(`ts_read_unblocked_by_delete_total`), and how many are blocked now (`ts_read_blocked_clients`).
+`INFO ts_blocked_read` counts what happened to blocking reads on this node since module start: how many
+blocked (`ts_blocked_read_blocked_total`), were served at once (`ts_blocked_read_served_without_block_total`),
+were refused (`ts_blocked_read_block_refused_total`), timed out (`ts_blocked_read_block_timeouts_total`), were
+woken and stayed blocked (`ts_blocked_read_spurious_wakeups_total`), or were released by a deletion
+(`ts_blocked_read_unblocked_by_delete_total`), and how many are blocked now (`ts_blocked_read_blocked_clients`).
 These are the `read` metrics of [`TS._DEBUG STATS`](./ts._debug.md#metrics) with a `ts_` prefix,
 readable without `debug-mode`.
 
