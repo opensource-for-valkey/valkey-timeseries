@@ -4,8 +4,8 @@
 //! the exported series stale.
 //!
 //! The full stale-ID sweep the cleanup requests afterwards stays in the `task` section, as
-//! `task_stale_ids_full_sweep_*`: it shares the periodic stale-ID cleanup's single-flight guard
-//! and its `stale_ids_retired` counter.
+//! `task_tombstone_full_sweep_*`: it shares the periodic stale-ID cleanup's single-flight guard
+//! and its `tombstones_retired` counter.
 
 use super::task::{TaskMetrics, register_task};
 use metered::Registry;

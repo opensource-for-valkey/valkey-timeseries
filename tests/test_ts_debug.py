@@ -1041,7 +1041,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                    'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize']
+    TASKS = ['trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize']
     ASM_TASKS = ['drain', 'post_migration_cleanup']
     TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total', 'panics_total',
                    'spawn_failures_total', 'running', 'duration_seconds',
@@ -1182,10 +1182,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             values = self.stats('task')
             return all(values[f'task_{task}_completed_total'] > 0
                        and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
-                       for task in ('trim', 'stale_ids', 'optimize'))
+                       for task in ('trim', 'tombstone_sweep', 'optimize'))
         wait_for_true(completed)
         stats = self.stats('task')
-        for task in ('trim', 'stale_ids', 'optimize'):
+        for task in ('trim', 'tombstone_sweep', 'optimize'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
         # Empty-db cleanup is not a lifecycle task: only its removal count and running gauge.
@@ -1193,7 +1193,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert trim_dbs == ['task_trim_unused_dbs_removed_total', 'task_trim_unused_dbs_running']
         assert stats['task_trim_unused_dbs_running'] == 0
         assert 'task_trim_samples_deleted_total' in stats
-        assert 'task_stale_ids_retired_total' in stats
+        assert 'task_tombstones_retired_total' in stats
+        assert 'task_tombstone_sweep_passes_completed_total' in stats
+        assert not any(name.startswith(('task_stale_ids', 'task_retention_'))
+                       for name in stats)
         assert 'task_optimize_passes_completed_total' in stats
 
     def test_index_reconciliation_section(self):

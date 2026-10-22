@@ -112,8 +112,8 @@ impl StaleSet {
             // Count the intersection: an id revoked since begin_pass is no longer retired.
             let retired = self.ids.and_cardinality(&pass);
             self.ids.andnot_inplace(&pass);
-            metrics::STALE_IDS_RETIRED.fetch_add(retired, Ordering::Relaxed);
-            metrics::STALE_IDS_PASSES_COMPLETED.fetch_add(1, Ordering::Relaxed);
+            metrics::TOMBSTONES_RETIRED.fetch_add(retired, Ordering::Relaxed);
+            metrics::TOMBSTONE_SWEEP_PASSES_COMPLETED.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -96,18 +96,18 @@ impl Drop for TaskRun<'_> {
 }
 
 pub static TRIM: TaskMetrics = TaskMetrics::new("trim", "ts-series-trim");
-pub static STALE_IDS: TaskMetrics = TaskMetrics::new("stale_ids", "ts-stale-ids");
-pub static STALE_IDS_FULL_SWEEP: TaskMetrics =
-    TaskMetrics::new("stale_ids_full_sweep", "ts-stale-ids-full-sweep");
+pub static TOMBSTONE_SWEEP: TaskMetrics = TaskMetrics::new("tombstone_sweep", "ts-tombstone-sweep");
+pub static TOMBSTONE_FULL_SWEEP: TaskMetrics =
+    TaskMetrics::new("tombstone_full_sweep", "ts-tombstone-full-sweep");
 pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-optimize-indices");
 
-static TASKS: &[&TaskMetrics] = &[&TRIM, &STALE_IDS, &STALE_IDS_FULL_SWEEP, &OPTIMIZE];
+static TASKS: &[&TaskMetrics] = &[&TRIM, &TOMBSTONE_SWEEP, &TOMBSTONE_FULL_SWEEP, &OPTIMIZE];
 
 pub static TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 pub static TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
 pub static TRIM_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static STALE_IDS_RETIRED: AtomicU64 = AtomicU64::new(0);
-pub static STALE_IDS_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub static TOMBSTONES_RETIRED: AtomicU64 = AtomicU64::new(0);
+pub static TOMBSTONE_SWEEP_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Empty-db cleanup is not a [`TaskMetrics`] task: it is a short inline pass on the main thread,
@@ -202,13 +202,13 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             "Series trim errors or failures to select a database",
         ),
         (
-            "stale_ids_retired",
-            &STALE_IDS_RETIRED,
+            "tombstones_retired",
+            &TOMBSTONES_RETIRED,
             "Tombstoned ids retired after a complete postings pass, across all cleanup paths",
         ),
         (
-            "stale_ids_passes_completed",
-            &STALE_IDS_PASSES_COMPLETED,
+            "tombstone_sweep_passes_completed",
+            &TOMBSTONE_SWEEP_PASSES_COMPLETED,
             "Postings passes that retired a stale-id snapshot for one database, across all cleanup paths",
         ),
         (

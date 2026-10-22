@@ -80,12 +80,12 @@ fn remove_stale_series_internal(run: &TaskRun<'_>) {
 /// Must be called in a separate thread to avoid blocking the main thread
 pub(in crate::series) fn remove_all_stale_series_internal() {
     let Some(_flight) = STALE_ID_CLEANUP.try_start() else {
-        metrics::STALE_IDS_FULL_SWEEP
+        metrics::TOMBSTONE_FULL_SWEEP
             .skipped_inflight
             .fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let run = metrics::STALE_IDS_FULL_SWEEP.start();
+    let run = metrics::TOMBSTONE_FULL_SWEEP.start();
 
     let index = TIMESERIES_INDEX.pin();
     let mut dbs: Vec<i32> = index.keys().copied().collect();
@@ -108,7 +108,7 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
 pub(crate) fn remove_stale_series_ids_incremental() {
     // Skipped, without spending a thread, while a cleanup is still running.
     spawn_task_single(
-        &metrics::STALE_IDS,
+        &metrics::TOMBSTONE_SWEEP,
         &STALE_ID_CLEANUP,
         remove_stale_series_internal,
     );
@@ -206,7 +206,7 @@ mod tests {
 
         populate_db_for_stale_batch(1, STALE_ID_BATCH_SIZE + 10);
 
-        let run = metrics::STALE_IDS.start();
+        let run = metrics::TOMBSTONE_SWEEP.start();
         let final_cursor = process_db_until_done(1, None, &run);
         assert_eq!(final_cursor, None);
     }

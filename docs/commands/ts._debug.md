@@ -194,7 +194,7 @@ So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_in
 | `asm_post_migration_cleanup_ids_marked_total` | Exported IDs marked stale during source cleanup |
 
 The cleanup then requests a full stale-ID sweep, which reports in `task` as
-`task_stale_ids_full_sweep_*`.
+`task_tombstone_full_sweep_*`.
 
 The same metrics are in `INFO ts_asm`, each prefixed `ts_`, without the `debug-mode` gate, except
 the duration histograms. `INFO` counts since module start: `STATS RESET` doesn't move it.
@@ -386,8 +386,8 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 | Task | Trigger |
 |------|---------|
 | `trim` | Periodic retention trimming (10 s) |
-| `stale_ids` | Periodic stale-ID cleanup (20 s) |
-| `stale_ids_full_sweep` | Full stale-ID cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
+| `tombstone_sweep` | Periodic stale-ID (tombstone) cleanup (20 s) |
+| `tombstone_full_sweep` | Full stale-ID (tombstone) cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
 | `optimize` | Periodic postings optimization (60 s) |
 
 Each task exposes the following names, with `<task>` replaced by its identity:
@@ -414,8 +414,8 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 | `task_trim_series_processed_total` | Series attempted by background retention trimming |
 | `task_trim_samples_deleted_total` | Samples physically removed by background retention trimming |
 | `task_trim_errors_total` | Series trim failures or failures to select a database |
-| `task_stale_ids_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
-| `task_stale_ids_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
+| `task_tombstones_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
+| `task_tombstone_sweep_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
 | `task_optimize_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
 | `task_trim_unused_dbs_removed_total` | Empty database indexes removed by cron |
 
