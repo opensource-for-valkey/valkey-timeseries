@@ -37,7 +37,6 @@ pub use labels::{Label, MetricName};
 pub mod tests;
 
 use crate::common::block_on_keys::check_blocking_module_apis;
-use crate::series::background_tasks::init_background_tasks;
 use crate::series::index::init_croaring_allocator;
 use crate::series::index::persistence::check_required_module_apis;
 use crate::series::index::server_events::{
@@ -193,7 +192,6 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
 
     init_thread_pool();
-    init_background_tasks(ctx);
 
     ctx.log_notice("valkey-timeseries module initialized");
     IS_MODULE_INITIALIZED.store(true, Ordering::Relaxed);

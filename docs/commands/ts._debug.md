@@ -389,6 +389,10 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 | `tombstone_full_sweep` | Full stale-ID (tombstone) cleanup requested after an atomic slot migration; shares the periodic cleanup's single-flight guard, so it stays here rather than in `asm` |
 | `optimize_index` | Periodic postings optimization (60 s) |
 
+Periodic intervals (and the 300 s empty-database cleanup) are elapsed time, independent of `hz` and
+`dynamic-hz`: the server cron frequency only bounds how late a run starts, by at most one cron
+period. The first cron tick after load runs every periodic task.
+
 Each task exposes the following names, with `<task>` replaced by its identity:
 
 | Name | Kind | Description |

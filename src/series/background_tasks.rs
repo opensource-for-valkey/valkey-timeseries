@@ -1,4 +1,3 @@
-use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::log_debug;
 use crate::common::metrics::task;
 use crate::is_shutting_down;
@@ -9,7 +8,7 @@ use crate::series::tasks::{
 };
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use valkey_module::Context;
 use valkey_module_macros::cron_event_handler;
 
@@ -17,8 +16,6 @@ const STALE_ID_CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
 const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const INDEX_OPTIMIZE_INTERVAL: Duration = Duration::from_secs(60);
 const DB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
-
-type DispatchMap = papaya::HashMap<u64, Vec<TaskType>, BuildNoHashHasher<u64>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskType {
@@ -28,97 +25,49 @@ pub enum TaskType {
     TrimUnusedDbs,
 }
 
-/// Tick count used to determine which periodic tasks are due.
-static CRON_TICKS: AtomicU64 = AtomicU64::new(0);
-static DISPATCH_MAP: LazyLock<DispatchMap> = LazyLock::new(DispatchMap::default);
-
-pub(crate) fn init_background_tasks(ctx: &Context) {
-    let interval_ms = get_ticks_interval(ctx);
-
-    let cron_interval = Duration::from_millis(interval_ms);
-
-    register_task(
-        ctx,
-        RETENTION_CLEANUP_INTERVAL,
-        cron_interval,
-        TaskType::TrimSeries,
-    );
-    register_task(
-        ctx,
-        STALE_ID_CLEANUP_INTERVAL,
-        cron_interval,
-        TaskType::RemoveStaleSeries,
-    );
-    register_task(
-        ctx,
-        INDEX_OPTIMIZE_INTERVAL,
-        cron_interval,
-        TaskType::OptimizeIndices,
-    );
-    register_task(
-        ctx,
-        DB_CLEANUP_INTERVAL,
-        cron_interval,
-        TaskType::TrimUnusedDbs,
-    );
+/// A periodic task's monotonic deadline, in milliseconds since [`TASK_EPOCH`]. Starts due.
+struct ScheduledTask {
+    task: TaskType,
+    interval_ms: u64,
+    next_due_ms: AtomicU64,
 }
 
-fn register_task(ctx: &Context, task_interval: Duration, cron_interval: Duration, task: TaskType) {
-    if cron_interval.is_zero() {
-        panic!("register_task: cron_interval is zero");
+impl ScheduledTask {
+    const fn new(task: TaskType, interval: Duration) -> Self {
+        Self {
+            task,
+            interval_ms: interval.as_millis() as u64,
+            next_due_ms: AtomicU64::new(0),
+        }
     }
 
-    let floored = floor_duration(task_interval, cron_interval);
-    if floored.is_zero() {
-        ctx.log_warning(&format!(
-            "register_task: interval is zero (task_interval={task_interval:?}, cron_interval={cron_interval:?})",
-        ));
-        return;
+    /// Returns whether the task is due at `now_ms`, advancing the deadline if so. Deadlines stay
+    /// on the interval grid; after a stall the task runs once and re-anchors instead of bursting.
+    fn poll(&self, now_ms: u64) -> bool {
+        let due = self.next_due_ms.load(Ordering::Relaxed);
+        if now_ms < due {
+            return false;
+        }
+        let mut next = due + self.interval_ms;
+        if next <= now_ms {
+            next = now_ms + self.interval_ms;
+        }
+        self.next_due_ms.store(next, Ordering::Relaxed);
+        true
     }
-
-    let interval_ticks = ticks_for_interval(floored, cron_interval);
-
-    let map = DISPATCH_MAP.pin();
-    map.update_or_insert_with(
-        interval_ticks,
-        |handlers| {
-            if handlers.contains(&task) {
-                handlers.clone()
-            } else {
-                let mut v = handlers.clone();
-                v.push(task);
-                v
-            }
-        },
-        || vec![task],
-    );
 }
 
-#[inline]
-fn ticks_for_interval(task_interval: Duration, cron_interval: Duration) -> u64 {
-    let task_ms = task_interval.as_millis() as u64;
-    let cron_ms = cron_interval.as_millis() as u64;
-    std::cmp::max(1, task_ms / cron_ms)
-}
+static TASK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-fn floor_duration(d: Duration, interval: Duration) -> Duration {
-    if interval.is_zero() {
-        return Duration::ZERO;
-    }
-    let nanos = d.as_nanos();
-    let int_nanos = interval.as_nanos();
-    let floored = (nanos / int_nanos) * int_nanos;
+static SCHEDULE: [ScheduledTask; 4] = [
+    ScheduledTask::new(TaskType::TrimSeries, RETENTION_CLEANUP_INTERVAL),
+    ScheduledTask::new(TaskType::RemoveStaleSeries, STALE_ID_CLEANUP_INTERVAL),
+    ScheduledTask::new(TaskType::OptimizeIndices, INDEX_OPTIMIZE_INTERVAL),
+    ScheduledTask::new(TaskType::TrimUnusedDbs, DB_CLEANUP_INTERVAL),
+];
 
-    if floored == 0 {
-        return Duration::ZERO;
-    }
-
-    // Saturate instead of truncating if it does not fit u64 nanos.
-    if floored > u64::MAX as u128 {
-        Duration::from_nanos(u64::MAX)
-    } else {
-        Duration::from_nanos(floored as u64)
-    }
+fn monotonic_ms() -> u64 {
+    TASK_EPOCH.elapsed().as_millis() as u64
 }
 
 fn trim_unused_dbs() {
@@ -153,32 +102,95 @@ fn __cron_event_handler(_ctx: &Context, _hz: u64) {
         return;
     }
 
-    let ticks = CRON_TICKS.fetch_add(1, Ordering::Relaxed);
-    let map = DISPATCH_MAP.pin();
-
-    for (&interval, handlers) in map.iter() {
-        if ticks.is_multiple_of(interval) {
-            for task in handlers {
-                dispatch_background_task(*task);
-            }
+    // Deadlines are in elapsed time; hz (static or dynamic) only sets how often they are polled.
+    let now = monotonic_ms();
+    for entry in &SCHEDULE {
+        if entry.poll(now) {
+            dispatch_background_task(entry.task);
         }
     }
 }
 
-fn get_hz(ctx: &Context) -> u64 {
-    let server_info = ctx.server_info("");
-    server_info
-        .field("hz")
-        .and_then(|v| v.parse_integer().ok())
-        .unwrap_or(10) as u64
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn get_ticks_interval(ctx: &Context) -> u64 {
-    get_ticks_interval_from_hz(get_hz(ctx))
-}
+    const INTERVAL_MS: u64 = 10_000;
 
-#[inline]
-fn get_ticks_interval_from_hz(hz: u64) -> u64 {
-    let hz = if hz == 0 { 10 } else { hz };
-    1000 / hz
+    fn simulate(interval_ms: u64, tick_times: impl IntoIterator<Item = u64>) -> Vec<u64> {
+        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(interval_ms));
+        tick_times
+            .into_iter()
+            .filter(|&now| task.poll(now))
+            .collect()
+    }
+
+    fn grid(firings: usize) -> Vec<u64> {
+        (0..firings as u64).map(|k| k * INTERVAL_MS).collect()
+    }
+
+    #[test]
+    fn first_poll_is_due() {
+        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        assert!(task.poll(0));
+        assert!(!task.poll(1));
+        assert!(!task.poll(9_999));
+        assert!(task.poll(10_000));
+    }
+
+    #[test]
+    fn fires_on_interval_regardless_of_cron_period() {
+        // hz 500, 300 (the server truncates to 3 ms), 100, 10 and 1.
+        for period in [2u64, 3, 10, 100, 1000] {
+            let fired = simulate(INTERVAL_MS, (0..=60_000).step_by(period as usize));
+            assert_eq!(fired.len(), 7, "period {period}");
+            for (k, &at) in fired.iter().enumerate() {
+                let target = k as u64 * INTERVAL_MS;
+                assert!(
+                    (target..target + period).contains(&at),
+                    "period {period}: firing {k} at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hz_change_mid_run_keeps_interval() {
+        // hz 10 until 25 s, hz 500 until 50 s, hz 1 until 90 s.
+        let ticks = (0..25_000)
+            .step_by(100)
+            .chain((25_000..50_000).step_by(2))
+            .chain((50_000..=90_000).step_by(1000));
+        assert_eq!(simulate(INTERVAL_MS, ticks), grid(10));
+    }
+
+    #[test]
+    fn jittered_cron_has_no_cumulative_drift() {
+        // dynamic-hz can change the period on every tick: seeded periods in [1, 1000] ms.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut now = 0;
+        let mut ticks = vec![now];
+        while now < 1_000_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            now += 1 + (state >> 33) % 1000;
+            ticks.push(now);
+        }
+        let fired = simulate(INTERVAL_MS, ticks);
+        assert_eq!(fired.len(), 101);
+        for (k, &at) in fired.iter().enumerate() {
+            let target = k as u64 * INTERVAL_MS;
+            assert!((target..target + 1000).contains(&at), "firing {k} at {at}");
+        }
+    }
+
+    #[test]
+    fn stall_fires_once_then_reanchors() {
+        let ticks = (0..=5_000)
+            .step_by(100)
+            .chain([35_000])
+            .chain((35_100..=50_000).step_by(100));
+        assert_eq!(simulate(INTERVAL_MS, ticks), vec![0, 35_000, 45_000]);
+    }
 }
