@@ -42,7 +42,7 @@ pub(super) fn index_memory(ctx: &Context, args: &mut CommandArgIterator) -> Valk
 }
 
 /// Writes a `TS._DEBUG INDEXMEMORY` reply. Shared by the local path and the cluster fan-out, so
-/// both reply with the same shape. The fields are those of `INFO ts_memory`'s `index_*` group;
+/// both reply with the same shape. The fields are those of `INFO ts_index`;
 /// `nodes` is how many nodes the figures were summed over. Each `*Bytes` field is followed by a
 /// `*BytesHuman` string rendering it as `INFO` does (`1.21M`).
 pub(super) fn reply_with_index_memory(ctx: &Context, memory: &IndexMemory, nodes: usize) {

@@ -38,6 +38,7 @@ pub mod exec;
 pub mod fanout;
 pub mod rdb;
 pub mod read;
+pub mod string_interning;
 pub mod task;
 
 use crate::common::sync::lock;
@@ -83,6 +84,8 @@ pub enum Section {
     /// Blocking reads (`TS.READ ... BLOCK`): how many blocked, why they came back, how many
     /// are still waiting.
     Read,
+    /// The pool of label strings every series shares: how many, and the heap they hold.
+    StringInterning,
     /// Maintenance task lifecycle, progress and completed database passes.
     Task,
 }
@@ -95,6 +98,7 @@ impl Section {
         Section::Fanout,
         Section::Rdb,
         Section::Read,
+        Section::StringInterning,
         Section::Task,
     ];
 
@@ -105,6 +109,7 @@ impl Section {
             Section::Fanout => "fanout",
             Section::Rdb => "rdb",
             Section::Read => "read",
+            Section::StringInterning => "string_interning",
             Section::Task => "task",
         }
     }
@@ -114,6 +119,20 @@ impl Section {
             .iter()
             .copied()
             .find(|section| name.eq_ignore_ascii_case(section.as_str().as_bytes()))
+    }
+
+    /// The section a metric name belongs to: the longest section name it starts with, followed
+    /// by `_`. A section name can itself contain `_` (`string_interning`), so the text before
+    /// the first one is not enough.
+    pub fn of_metric(name: &str) -> Option<Section> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|section| {
+                name.strip_prefix(section.as_str())
+                    .is_some_and(|rest| rest.starts_with('_'))
+            })
+            .max_by_key(|section| section.as_str().len())
     }
 }
 
@@ -127,6 +146,7 @@ fn build_registry(section: Section) -> Registry<'static> {
         Section::Fanout => fanout::register(&mut registry),
         Section::Rdb => rdb::register(&mut registry),
         Section::Read => read::register(&mut registry),
+        Section::StringInterning => string_interning::register(&mut registry),
         Section::Task => task::register(&mut registry),
     }
     registry
@@ -185,6 +205,23 @@ pub struct MetricReading {
     /// Whether the family's declared unit is bytes.
     pub is_bytes: bool,
     pub value: MetricValue,
+}
+
+impl MetricReading {
+    /// The value in bytes, for a counter or gauge declared in bytes; `None` for anything else,
+    /// a histogram of bytes included (it has no single figure).
+    pub fn bytes(&self) -> Option<u64> {
+        if !self.is_bytes {
+            return None;
+        }
+        match self.value {
+            MetricValue::Counter(v) => Some(v),
+            MetricValue::Gauge(Scalar::UInt(v)) => Some(v),
+            MetricValue::Gauge(Scalar::Int(v)) => Some(u64::try_from(v).unwrap_or(0)),
+            MetricValue::Gauge(Scalar::Float(v)) => Some(v as u64),
+            MetricValue::Histogram(_) => None,
+        }
+    }
 }
 
 fn sample_value(values: &MetricValues, name: &str) -> Option<MetricSampleValue> {
@@ -482,6 +519,24 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
         assert!(counters.failure.load(Ordering::Relaxed) > before);
+    }
+
+    #[test]
+    fn every_metric_maps_back_to_its_section() {
+        for reading in snapshot(&[]) {
+            assert_eq!(
+                Section::of_metric(&reading.name),
+                Some(reading.section),
+                "{}",
+                reading.name
+            );
+        }
+        assert_eq!(
+            Section::of_metric("string_interning_bytes"),
+            Some(Section::StringInterning)
+        );
+        assert_eq!(Section::of_metric("string_other"), None);
+        assert_eq!(Section::of_metric("read"), None);
     }
 
     #[test]

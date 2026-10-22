@@ -43,7 +43,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | `HELP`            | Display available subcommands and brief descriptions    |
 | `STATS`           | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
-| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_memory`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`) |
+| `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_index`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`) |
 | `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
 | `QUERYINDEX`      | Query this node's local index only, without cluster fan-out |
 | `LIST_CONFIGS`    | List module configuration parameters and current values |
@@ -311,6 +311,24 @@ blocked client of any command.
 The same metrics are in `INFO ts_read`, each prefixed `ts_` (`ts_read_blocked_total`), without the
 `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
+#### `string_interning`
+
+The pool of label strings every series shares. Both are O(1) reads; `STRINGPOOLSTATS` has the
+distribution and the savings figure, which cost a walk of the pool.
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `string_interning_bytes` | gauge | Heap held by the pool |
+| `string_interning_strings` | gauge | Distinct strings in the pool |
+
+`string_interning_bytes` is the pool total, which the `MEMORY USAGE` of the series holding those
+labels already divides among themselves: adding it to the sum of every key's `MEMORY USAGE`
+counts it twice.
+
+The same metrics are in `INFO ts_string_interning`, each prefixed `ts_`
+(`ts_string_interning_bytes`, with its `ts_string_interning_bytes_human` rendering), without the
+`debug-mode` gate.
+
 #### `task`
 
 Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
@@ -363,6 +381,10 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 the last completed database pass, or zero before any pass. A task invocation can process only
 part of a database; its completion does not imply a complete pass. These pass metrics do not
 claim that every database has been visited.
+
+The same metrics are in `INFO ts_task`, each prefixed `ts_` (`ts_task_trim_started_total`),
+without the `debug-mode` gate, except the `task_<task>_duration_seconds` histograms, which INFO
+has no shape for. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
 ### Examples
 

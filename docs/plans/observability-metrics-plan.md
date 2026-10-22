@@ -19,8 +19,8 @@ subcommand. What exists today:
 
 | Surface | Exposes | Gap |
 |---|---|---|
-| `INFO ts_memory` ([module_info.rs:25-53](../../src/common/module_info.rs#L25-L53)) | index bytes by component, term/series/db counts, interner count and bytes | memory only. **Not O(1) any more**: `index_memory_usage()` ([memory.rs:203-209](../../src/series/index/memory.rs#L203-L209)) walks every term and every id→key entry in 250 µs lock-released slices |
-| `TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]` ([ts_debug.rs:163-213](../../src/commands/debug/ts_debug.rs#L163-L213)) | same walk as `INFO ts_memory`, camelCase keys | node-local; `CLUSTER` fans out (`ReplicaPerShard`, summed) |
+| `INFO ts_index` (was `ts_memory`, renamed 2026-10-22) ([module_info.rs:25-53](../../src/common/module_info.rs#L25-L53)) | index bytes by component, term/series/db counts (the interner count and bytes moved to the `string_interning` STATS section, mirrored as `INFO ts_string_interning`, 2026-10-22) | memory only. **Not O(1) any more**: `index_memory_usage()` ([memory.rs:203-209](../../src/series/index/memory.rs#L203-L209)) walks every term and every id→key entry in 250 µs lock-released slices |
+| `TS._DEBUG INDEXMEMORY [ALLDBS] [CLUSTER]` ([ts_debug.rs:163-213](../../src/commands/debug/ts_debug.rs#L163-L213)) | same walk as `INFO ts_index`, camelCase keys | node-local; `CLUSTER` fans out (`ReplicaPerShard`, summed) |
 | `TS._DEBUG STRINGPOOLSTATS [TOPK] [CLUSTER]` | interner distribution, top-K | O(pool) walk; node-local, `CLUSTER` fans out |
 | `TS._DEBUG QUERYINDEX` | node-local index query | test hook, not a metric |
 | `TS._DEBUG LIST_CONFIGS [VERBOSE]` | config roster from `CONFIGS` | not metrics. HELP advertises `[APP\|DEV\|HIDDEN]`, which [debug/configs.rs:68-77](../../src/commands/debug/configs.rs#L68-L77) rejects |
@@ -71,7 +71,7 @@ diagnostics). Hot-path cost is one uncontended relaxed RMW per event; batch path
 
 **Snapshot cost is bounded.** No metric may require a keyspace or index walk at snapshot time. That
 rules out the index size gauges the first draft took from `index_memory_usage()`; they stay in
-`INDEXMEMORY` / `INFO ts_memory`.
+`INDEXMEMORY` / `INFO ts_index`.
 
 **One registry per section.** Each `Section` is a `metered::Registry<'static>` built with
 `Registry::with_prefix(section)` in `build_registry` ([metrics.rs](../../src/common/metrics.rs)),
@@ -269,7 +269,7 @@ Query entry points: `series_by_selectors`
 | `index_acl_omitted_total` | counter | series silently skipped by per-key ACL: QUERYLABELS [querier.rs:149](../../src/series/index/querier.rs#L149), `keys_for_selectors` [timeseries_index.rs:286-288](../../src/series/index/timeseries_index.rs#L286-L288) |
 
 Dropped from the first draft: `index_series` / `index_terms` / `index_databases` gauges (they need
-the O(n) walk, and already appear in `INFO ts_memory` and `INDEXMEMORY`).
+the O(n) walk, and already appear in `INFO ts_index` and `INDEXMEMORY`).
 
 Why: these are the pre-materialisation numbers [filter-dos-audit.md](../topics/filter-dos-audit.md)
 needs before choosing limits (F3, no scan budget, is still open). Ship the counters, pick bounds
@@ -742,7 +742,7 @@ an eleventh fanout op and a proto message (regenerate under `proto/v1/generated/
 | Double-counting one client-visible fanout timeout | Distinct names for client vs RPC timeouts; docs say not to sum them. |
 | `total_samples` / trimmed counts misread under lazy retention | Accepted counts come from add results, never from `total_samples` deltas; trims split lazy vs forced. |
 | Counters silently lost in fork children | Design rule in §2; roster review rejects counters in `rdb_save`/`aux_save`/`aof_rewrite`. |
-| `INFO ts_memory` already does an O(terms + series) walk | Out of this plan's scope, but `INFO` is scraped often; consider caching it or moving index sizes out of `INFO`. `INFO ts_stats` must not add another walk. |
+| `INFO ts_index` already does an O(terms + series) walk | Out of this plan's scope, but `INFO` is scraped often; consider caching it or moving index sizes out of `INFO`. `INFO ts_stats` must not add another walk. |
 | Docs drifting from the registry | Roster test in Phase 5. |
 | `SHOW_INFO` / `LIST_CONFIGS [APP\|DEV\|HIDDEN]` removal surprises someone | Neither ever worked; changelog note. |
 

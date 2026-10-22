@@ -499,7 +499,7 @@ fn main() {
             "           valkey-cli TS._DEBUG STRINGPOOLSTATS {}",
             cfg.top_k
         );
-        println!("           valkey-cli INFO ts_memory");
+        println!("           valkey-cli INFO ts_string_interning ts_index");
     }
 
     // Everything the report measured stays alive until here.

@@ -17,7 +17,7 @@
 #
 # --emit-commands writes one inline `TS.CREATE ... LABELS ...` per series, so
 # the same fleet can be loaded into a running server and read back with
-# `TS._DEBUG STRINGPOOLSTATS` / `INFO ts_memory`:
+# `TS._DEBUG STRINGPOOLSTATS` / `INFO ts_string_interning`:
 #
 #   valkey-cli --pipe < /tmp/fleet.txt
 #   valkey-cli CONFIG SET ts.debug-mode yes

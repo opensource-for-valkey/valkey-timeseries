@@ -170,9 +170,7 @@ impl ClusterStats {
                 if let ClusterValue::Gauge(per_node) = &mut value {
                     per_node.sort_by(|a, b| a.0.cmp(&b.0));
                 }
-                let section = name
-                    .split_once('_')
-                    .and_then(|(prefix, _)| Section::parse(prefix.as_bytes()));
+                let section = Section::of_metric(&name);
                 let known = local.get(name.as_str());
                 ClusterReading {
                     help: known.map(|r| r.help.clone()).unwrap_or_default(),

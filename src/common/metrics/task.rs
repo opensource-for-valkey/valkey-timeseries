@@ -131,6 +131,7 @@ pub static OPTIMIZE_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static TRIM_UNUSED_DBS_REMOVED: AtomicU64 = AtomicU64::new(0);
 pub static ASM_KEYS_INDEXED: AtomicU64 = AtomicU64::new(0);
 pub static POST_MIGRATION_CLEANUP_IDS_MARKED: AtomicU64 = AtomicU64::new(0);
+pub static UNUSED_DBS_TRIMMED: AtomicU64 = AtomicU64::new(0);
 
 /// Records a complete traversal of one database, rather than one bounded task invocation.
 pub fn complete_pass(count: &AtomicU64, last_completed: &AtomicU64) {

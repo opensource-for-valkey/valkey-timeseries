@@ -926,7 +926,7 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
             client.execute_command(
                 'TS.CREATE', f'idxmem:{db}:{i}', 'LABELS', 'env', f'db{db}', 'uniq', f's{i}')
 
-    def test_alldbs_matches_info_ts_memory(self):
+    def test_alldbs_matches_info_ts_index(self):
         client = self.server.get_new_client()
         assert self.index_memory(client, 'ALLDBS')['totalBytes'] == 0
 
@@ -934,7 +934,7 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
         self.populate(client, 1, 20)
 
         reply = self.index_memory(client, 'ALLDBS')
-        info = client.execute_command('INFO', 'ts_memory')
+        info = client.execute_command('INFO', 'ts_index')
         for field, info_field in self.INFO_FIELDS:
             assert reply[field] == int(info[info_field]), field
             if field.endswith('Bytes'):
@@ -1034,7 +1034,7 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['clustermap', 'exec', 'fanout', 'rdb', 'read', 'task']
+    SECTIONS = ['clustermap', 'exec', 'fanout', 'rdb', 'read', 'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     RDB_METRICS = ['rdb_load_failure_total', 'rdb_load_success_total',
                    'rdb_save_failure_total', 'rdb_save_success_total']
@@ -1056,6 +1056,11 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert len(names) == len(set(names)), names
         return {name: flat[i * 2 + 1] for i, name in enumerate(names)}
 
+    @classmethod
+    def section_of(cls, name):
+        """The longest section name `name` starts with: `string_interning` has a `_` of its own."""
+        return max((s for s in cls.SECTIONS if name.startswith(s + '_')), key=len)
+
     @staticmethod
     def family(name):
         name = name.removesuffix('_human')
@@ -1074,11 +1079,11 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_reports_sections_in_order_and_metrics_by_name(self):
         names = list(self.stats())
-        sections = [name.split('_')[0] for name in names]
+        sections = [self.section_of(name) for name in names]
         assert sorted(set(sections), key=sections.index) == self.SECTIONS
         assert sections == sorted(sections, key=self.SECTIONS.index), 'a section is split'
         for section in self.SECTIONS:
-            families = [self.family(n) for n in names if n.split('_')[0] == section]
+            families = [self.family(n) for n in names if self.section_of(n) == section]
             assert families == sorted(families), section
 
     def test_section_filter(self):
@@ -1092,8 +1097,26 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*clustermap, exec, fanout, rdb, read, task"):
+                           match="unknown STATS section 'bogus'.*clustermap, exec, fanout, rdb, read, string_interning, task"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'bogus')
+
+    def test_string_interning(self):
+        before = self.stats('string_interning')
+        assert list(before) == ['string_interning_bytes', 'string_interning_bytes_human',
+                                'string_interning_strings']
+        for i in range(20):
+            self.client.execute_command('TS.CREATE', f'intern:{i}', 'LABELS', 'uniq', f'never_seen_{i}')
+        after = self.stats('string_interning')
+        assert after['string_interning_strings'] >= before['string_interning_strings'] + 20
+        assert after['string_interning_bytes'] > before['string_interning_bytes']
+
+    @pytest.mark.parametrize('section', ['rdb', 'read', 'string_interning', 'task'])
+    def test_info_mirrors_the_section(self, section):
+        """`INFO ts_<section>` carries the section's counters and gauges (and `_human` twins)
+        under the same names with a `ts_` prefix; INFO has no shape for a histogram."""
+        stats = [name for name in self.stats(section) if name not in self.HISTOGRAMS]
+        info = self.client.execute_command('INFO', f'ts_{section}')
+        assert [name.removeprefix('ts_') for name in info] == stats
 
     def test_value_types(self):
         stats = self.stats()

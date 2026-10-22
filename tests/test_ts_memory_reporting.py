@@ -1,5 +1,5 @@
 # tests/test_ts_memory_reporting.py
-"""`MEMORY USAGE`, `TS.INFO memoryUsage` and `INFO ts_memory` must be usable for capacity
+"""`MEMORY USAGE`, `TS.INFO memoryUsage` and `INFO ts_index` must be usable for capacity
 planning (MEM-1).
 
 Three separate accounting defects made them not so:
@@ -50,10 +50,10 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         return [{c[i]: c[i + 1] for i in range(0, len(c), 2)} for c in info[b"Chunks"]]
 
     @staticmethod
-    def _ts_memory(client) -> dict:
-        """The `ts_memory` fields, as ints. The client parses INFO for us, but only into
-        `str -> str`; an absent section comes back as an empty mapping."""
-        parsed = client.execute_command("INFO", "ts_memory")
+    def _info_ints(client, section="ts_index") -> dict:
+        """An INFO section's integer fields (`ts_index` by default). The client parses INFO
+        for us, but only into `str -> str`; an absent section comes back as an empty mapping."""
+        parsed = client.execute_command("INFO", section)
         return {
             k: int(v)
             for k, v in parsed.items()
@@ -182,8 +182,8 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
 
     def test_info_reports_index_memory(self):
         client = self.server.get_new_client()
-        empty = self._ts_memory(client)
-        assert empty, "the module publishes no ts_memory INFO section"
+        empty = self._info_ints(client)
+        assert empty, "the module publishes no ts_index INFO section"
         assert empty["ts_index_total_bytes"] == 0
 
         for i in range(200):
@@ -191,7 +191,7 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
                 "TS.CREATE", f"mem:idx{i}", "LABELS", *LONG_LABELS, "uniq", f"series_{i}"
             )
 
-        filled = self._ts_memory(client)
+        filled = self._info_ints(client)
         assert filled["ts_index_series"] == 200
         assert filled["ts_index_terms"] > 0
         assert filled["ts_index_total_bytes"] > 0
@@ -203,11 +203,28 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         )
 
         # Every byte field has a `_human` twin rendering it as `used_memory_human` does.
-        info = client.execute_command("INFO", "ts_memory")
-        byte_fields = [k for k in filled if k.endswith("_bytes")]
-        assert "ts_interned_strings_bytes" in byte_fields
-        for field in byte_fields:
-            assert info[field + "_human"] == bytes_to_human(filled[field]), field
+        for section in ("ts_index", "ts_string_interning"):
+            ints = self._info_ints(client, section)
+            info = client.execute_command("INFO", section)
+            byte_fields = [k for k in ints if k.endswith("_bytes")]
+            assert byte_fields, section
+            for field in byte_fields:
+                assert info[field + "_human"] == bytes_to_human(ints[field]), field
+        assert not any("interned" in k for k in filled), "interning is in ts_string_interning"
+
+    def test_info_reports_string_interning(self):
+        client = self.server.get_new_client()
+        before = self._info_ints(client, "ts_string_interning")
+        assert set(before) == {"ts_string_interning_strings", "ts_string_interning_bytes"}
+
+        for i in range(50):
+            client.execute_command(
+                "TS.CREATE", f"mem:intern{i}", "LABELS", "uniq_label_value", f"never_seen_{i}"
+            )
+
+        after = self._info_ints(client, "ts_string_interning")
+        assert after["ts_string_interning_strings"] >= before["ts_string_interning_strings"] + 50
+        assert after["ts_string_interning_bytes"] > before["ts_string_interning_bytes"]
 
     def test_index_memory_is_released_on_flush(self):
         client = self.server.get_new_client()
@@ -215,11 +232,11 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
             client.execute_command(
                 "TS.CREATE", f"mem:drop{i}", "LABELS", *LONG_LABELS, "uniq", f"series_{i}"
             )
-        assert self._ts_memory(client)["ts_index_total_bytes"] > 0
+        assert self._info_ints(client)["ts_index_total_bytes"] > 0
 
         client.execute_command("FLUSHALL")
 
-        after = self._ts_memory(client)
+        after = self._info_ints(client)
         assert after["ts_index_total_bytes"] == 0
         assert after["ts_index_series"] == 0
 
@@ -232,6 +249,6 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
                     "TS.CREATE", f"mem:db{db}:{i}", "LABELS", *LONG_LABELS, "uniq", f"s{i}"
                 )
 
-        totals = self._ts_memory(client)
+        totals = self._info_ints(client)
         assert totals["ts_index_series"] == 100
         assert totals["ts_index_databases"] >= 2
