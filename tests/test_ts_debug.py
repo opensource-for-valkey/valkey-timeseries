@@ -120,7 +120,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         """Each subcommand writes its own reply; the handler must not add a Null after it"""
         self.set_debug_mode()
         for args in (('STRINGPOOLSTATS',), ('STRINGPOOLSTATS', 2), ('HELP',), ('LIST_CONFIGS',),
-                     ('STATS',), ('STATS', 'cron', 'VERBOSE'), ('STATS', 'RESET')):
+                     ('STATS',), ('STATS', 'rdb', 'VERBOSE'), ('STATS', 'RESET')):
             self.client.execute_command('TS._DEBUG', *args)
             # A stray Null would be read as the reply to the next command.
             assert self.client.execute_command('PING') is True, args
@@ -135,7 +135,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
             assert isinstance(map_reply, dict), map_reply
             assert list(map_reply) == flat_reply[0::2]
 
-        for args in (('HELP',), ('INDEXMEMORY',), ('STATS', 'cron')):
+        for args in (('HELP',), ('INDEXMEMORY',), ('STATS', 'rdb')):
             same_keys(resp3.execute_command('TS._DEBUG', *args),
                       self.client.execute_command('TS._DEBUG', *args))
 
@@ -159,10 +159,10 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert list(configs[0]) == [b'name', b'type', b'default', b'min', b'max', b'value',
                                     b'description', b'mutable']
 
-        verbose = {m[b'name']: m for m in resp3.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')}
-        assert list(verbose[b'cron_ticks_total']) == [b'name', b'section', b'kind', b'value',
+        verbose = {m[b'name']: m for m in resp3.execute_command('TS._DEBUG', 'STATS', 'fanout', 'VERBOSE')}
+        assert list(verbose[b'fanout_operations_total']) == [b'name', b'section', b'kind', b'value',
                                                       b'description']
-        histogram = verbose[b'cron_tick_duration_seconds'][b'value']
+        histogram = verbose[b'fanout_duration_seconds'][b'value']
         assert list(histogram) == [b'count', b'sum', b'buckets']
         assert isinstance(histogram[b'sum'], float)
 
@@ -1034,18 +1034,18 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout', 'rdb', 'read', 'task']
+    SECTIONS = ['clustermap', 'exec', 'fanout', 'rdb', 'read', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
-    CRON_METRICS = ['cron_interval_seconds', 'cron_tick_duration_seconds', 'cron_ticks_total',
-                    'cron_ticks_skipped_total']
+    RDB_METRICS = ['rdb_load_failure_total', 'rdb_load_success_total',
+                   'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
     TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize', 'trim_unused_dbs',
              'asm_drain', 'reconcile', 'post_migration_cleanup']
-    HISTOGRAMS = {'cron_tick_duration_seconds', 'fanout_duration_seconds'} | {
+    HISTOGRAMS = {'fanout_duration_seconds'} | {
         f'task_{task}_duration_seconds' for task in TASKS
     }
-    DOUBLE_GAUGES = {'cron_interval_seconds', 'clustermap_refresh_interval_seconds',
+    DOUBLE_GAUGES = {'clustermap_refresh_interval_seconds',
                      'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
 
@@ -1082,18 +1082,18 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             assert families == sorted(families), section
 
     def test_section_filter(self):
-        assert list(self.stats('cron')) == self.CRON_METRICS
+        assert list(self.stats('rdb')) == self.RDB_METRICS
         assert list(self.stats('EXEC')) == self.EXEC_METRICS
         for section in self.SECTIONS:
             names = list(self.stats(section))
             assert names and all(n.startswith(section + '_') for n in names), section
         # Request order and repeats don't change the reply.
-        assert list(self.stats('exec', 'cron', 'exec')) == self.CRON_METRICS + self.EXEC_METRICS
+        assert list(self.stats('exec', 'rdb', 'exec')) == self.EXEC_METRICS + self.RDB_METRICS
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout, rdb, read, task"):
-            self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'bogus')
+                           match="unknown STATS section 'bogus'.*clustermap, exec, fanout, rdb, read, task"):
+            self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'bogus')
 
     def test_value_types(self):
         stats = self.stats()
@@ -1107,7 +1107,6 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             else:
                 assert isinstance(value, int), (name, value)
                 assert value >= 0, (name, value)
-        assert float(stats['cron_interval_seconds']) > 0
         # Nothing has been sent to either lane, and a standalone server never fans out or
         # builds a cluster map.
         assert stats['exec_fanout_rejected_total'] == 0
@@ -1175,14 +1174,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         wait_for_true(finished)
         assert self.client.execute_command('TS.QUERYINDEX', 'service=api') == [b'task:keep']
 
-    def test_cron_ticks_advance(self):
-        start = self.stats('cron')['cron_ticks_total']
-        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > start + 2)
-
     def test_histogram_shape(self):
-        tick_duration = lambda: self.histogram(self.stats('cron')['cron_tick_duration_seconds'])
-        wait_for_true(lambda: tick_duration()['count'] > 0)
-        hist = tick_duration()
+        task_duration = lambda: self.histogram(self.stats('task')['task_trim_duration_seconds'])
+        wait_for_true(lambda: task_duration()['count'] > 0)
+        hist = task_duration()
         buckets = hist['buckets']
         assert len(buckets) == self.DURATION_BUCKETS
         # Powers of two from 1 us, in seconds.
@@ -1195,24 +1190,19 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert hist['sum'] >= 0
 
     def test_reset_starts_counters_and_histograms_over_but_not_gauges(self):
-        # Let the counter build up enough that a reset is unmistakable.
-        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] >= 20)
-        before = self.stats('cron')
-
+        # Empty-db cleanup runs on tick zero and then only every 300 seconds.
+        wait_for_true(lambda: self.stats('task')['task_trim_unused_dbs_completed_total'] > 0)
+        before = self.stats('task')
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
-        after = self.stats('cron')
-
-        # The cron keeps ticking, so allow the few ticks between the reset and the read.
-        assert after['cron_ticks_total'] < before['cron_ticks_total']
-        assert after['cron_ticks_total'] < 10
-        assert self.histogram(after['cron_tick_duration_seconds'])['count'] < 10
-        assert after['cron_interval_seconds'] == before['cron_interval_seconds']
-        # The reset is a view: the cron's own schedule carries on, and so does the count.
-        wait_for_true(lambda: self.stats('cron')['cron_ticks_total'] > after['cron_ticks_total'])
+        after = self.stats('task')
+        assert after['task_trim_unused_dbs_completed_total'] == 0
+        assert self.histogram(after['task_trim_unused_dbs_duration_seconds'])['count'] == 0
+        assert after['task_trim_unused_dbs_last_completed_timestamp_seconds'] == (
+            before['task_trim_unused_dbs_last_completed_timestamp_seconds'])
 
     def test_reset_takes_no_arguments(self):
         with pytest.raises(ResponseError, match="no further arguments but a node target"):
-            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'cron')
+            self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'rdb')
 
     def test_verbose(self):
         stats = self.stats()
@@ -1243,29 +1233,29 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                 assert isinstance(fields['value'], int), name
 
         # VERBOSE combines with a section filter, in either position.
-        cron = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'cron')
-        assert [e[1].decode() for e in cron] == self.CRON_METRICS
-        assert self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'VERBOSE')[0][1] == b'cron_interval_seconds'
+        rdb = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'rdb')
+        assert [e[1].decode() for e in rdb] == self.RDB_METRICS
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'VERBOSE')[0][1] == b'rdb_load_failure_total'
 
     def test_cluster_needs_cluster_mode(self):
         # The error names the keyword that was given.
-        for args, keyword in ((('CLUSTER',), 'CLUSTER'), (('cron', 'cluster'), 'CLUSTER'),
+        for args, keyword in ((('CLUSTER',), 'CLUSTER'), (('rdb', 'cluster'), 'CLUSTER'),
                               (('VERBOSE', 'CLUSTER'), 'CLUSTER'), (('RESET', 'CLUSTER'), 'CLUSTER'),
-                              (('PRIMARY',), 'PRIMARY'), (('cron', 'HASHTAG', 'a,b'), 'HASHTAG'),
+                              (('PRIMARY',), 'PRIMARY'), (('rdb', 'HASHTAG', 'a,b'), 'HASHTAG'),
                               (('RESET', 'primary'), 'PRIMARY'), (('RESET', 'HASHTAG', 'a'), 'HASHTAG')):
             with pytest.raises(ResponseError, match=f"{keyword} requires cluster mode"):
                 self.client.execute_command('TS._DEBUG', 'STATS', *args)
 
     def test_local_target_reports_this_node(self):
-        assert list(self.stats('LOCAL', 'cron')) == self.CRON_METRICS
-        assert list(self.stats('cron', 'local')) == self.CRON_METRICS
+        assert list(self.stats('LOCAL', 'rdb')) == self.RDB_METRICS
+        assert list(self.stats('rdb', 'local')) == self.RDB_METRICS
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
 
     @pytest.mark.parametrize('args', [
         ('CLUSTER', 'CLUSTER'),
         ('LOCAL', 'CLUSTER'),
         ('PRIMARY', 'HASHTAG', 'a'),
-        ('cron', 'LOCAL', 'VERBOSE', 'primary'),
+        ('rdb', 'LOCAL', 'VERBOSE', 'primary'),
     ])
     def test_rejects_a_second_target(self, args):
         """The second target is reported as such, not as an unknown STATS section"""
@@ -1275,11 +1265,11 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     @pytest.mark.parametrize('args', [
         ('HASHTAG',),
-        ('cron', 'HASHTAG', ''),
+        ('rdb', 'HASHTAG', ''),
         ('HASHTAG', 'VERBOSE'),
-        ('hashtag', 'verbose', 'cron'),
+        ('hashtag', 'verbose', 'rdb'),
         ('HASHTAG', 'CLUSTER'),
-        ('cron', 'HASHTAG', 'RESET'),
+        ('rdb', 'HASHTAG', 'RESET'),
     ])
     def test_hashtag_value_is_never_an_option_keyword(self, args):
         """`HASHTAG VERBOSE` is a missing tag; it must not hash "VERBOSE" and drop the option"""
@@ -1287,7 +1277,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', 'STATS', *args)
 
     def test_reset_takes_only_a_target(self):
-        for args in (('CLUSTER', 'CLUSTER'), ('LOCAL', 'cron')):
+        for args in (('CLUSTER', 'CLUSTER'), ('LOCAL', 'rdb')):
             with pytest.raises(ResponseError, match="no further arguments but a node target"):
                 self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', *args)
 

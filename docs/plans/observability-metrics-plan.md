@@ -1,7 +1,7 @@
 # Observability metrics plan
 
 Status: proposal (2026-09-05), **revised 2026-10-07** against `unstable` @ 6d83b5d75.
-**Phase 0 implemented 2026-10-07** (registry, `TS._DEBUG STATS`, cron and executor metrics),
+**Phase 0 implemented 2026-10-07** (registry, `TS._DEBUG STATS`, executor metrics),
 then rebuilt the same day on the [`metered`](https://crates.io/crates/metered) crate
 (`=0.10.0-rc.1`). Every
 file:line hook below was re-checked at that commit; the revision log at the end lists what changed
@@ -30,7 +30,6 @@ subcommand. What exists today:
 
 Values already computed at the call site and discarded — the cheapest hooks:
 
-- `CRON_TICKS` / `CRON_INTERVAL_MS` ([background_tasks.rs:30-31](../../src/series/background_tasks.rs#L30-L31)); ticks increment at `:153` only after the loading/shutdown early return.
 - `drain_buffers` count and elapsed ([bulk_build.rs:162-169](../../src/series/index/bulk_build.rs#L162-L169)).
 - `trim_series` `processed` / `total_deletes` ([series_trim.rs:93-117](../../src/series/tasks/series_trim.rs#L93-L117)).
 - `process_delayed_keys_for_db` `total` / `indexed` / `skipped` ([asm.rs:342-344](../../src/series/index/asm.rs#L342-L344)); note `indexed` includes skipped keys, so the real count is `indexed − skipped`.
@@ -82,8 +81,7 @@ each selected registry's `schema()` (for kind and help; metered keeps families s
 all read from the registries.
 
 **Metrics are state, not shadows.** Where the code already keeps a count, the registry reads it
-instead of copying it: the cron's tick count (which also schedules its tasks) is registered as a
-counter directly, and executor stats through `*_value(..).read(..)` closures.
+instead of copying it: executor stats are registered through `*_value(..).read(..)` closures.
 
 **`RESET` is a baseline view.** metered values are monotonic, as a scraper expects. `STATS RESET`
 records every counter and histogram's current value; `STATS` reports the difference. Nothing a
@@ -93,7 +91,7 @@ scraper would read goes backwards.
 deliberately differs from the camelCase keys of `INDEXMEMORY`/`STRINGPOOLSTATS`: metric names are
 shared with the `INFO ts_stats` mirror, and INFO fields are snake_case. Sections:
 `ingest`, `retention`, `chunk`, `compaction`, `replication`, `index`, `read`, `fanout`,
-`clustermap`, `exec`, `task`, `load`, `restore`, `cron`.
+`clustermap`, `exec`, `task`, `load`, `restore`.
 
 **Labels by name, not by discriminant.** Where a metric has a small fixed label set (fanout error
 kind, threading rule, prune reason), expand it to one counter per value at declaration time
@@ -430,9 +428,6 @@ Gauges and counters outside the per-task records:
 | `task_asm_importing_slots` | gauge | `IMPORTING_SLOTS` count [asm.rs:552-553](../../src/series/index/asm.rs#L552-L553) (replaces the old `IN_SLOT_IMPORT` bool) |
 | `task_asm_keys_discarded_total` | counter | `ImportAborted` → `discard_delayed_keys_in_slots` [asm.rs:564-569](../../src/series/index/asm.rs#L564-L569) (count is currently `let _`) |
 | `task_asm_id_collisions_remapped_total` | counter | imported-id collision branches [index/mod.rs:217-260](../../src/series/index/mod.rs#L217-L260); the branch at [:244-260](../../src/series/index/mod.rs#L244-L260) also drops compaction rules → `task_asm_compaction_links_dropped_total` |
-| `cron_ticks_total` / `cron_interval_seconds` | counter / gauge | **done (Phase 0)**: existing statics in [background_tasks.rs](../../src/series/background_tasks.rs); the tick count the cron schedules off is registered directly |
-| `cron_ticks_skipped_total` | counter | **done (Phase 0)**: loading/shutdown early return in `__cron_event_handler` |
-| `cron_tick_duration_seconds` | histogram | **done (Phase 0)**: main-thread time per tick spent dispatching (including the inline `trim_unused_dbs`) |
 
 ### 3.11 `load`, `restore` — persistence and recovery
 
@@ -557,8 +552,8 @@ section of [ts._debug.md](../commands/ts._debug.md). Differences from the list b
   them yet.
 - `Section` lists only sections that have metrics; a roster test fails on an empty one. Later
   phases add their variant with their first metric.
-- Two cron metrics came forward: `cron_ticks_skipped_total` (was Phase 3) and
-  `cron_tick_duration_seconds` (new — it exercises the histogram reply end to end).
+- Cron metrics were removed; the scheduler retains its internal tick count. Task lifecycle
+  and duration metrics cover the scheduled work.
 - The stale "two lanes" doc in `fanout/workers.rs` was fixed in passing.
 
 Original list:
@@ -570,11 +565,11 @@ Original list:
 2. Roster tests modelled on the `CONFIGS` tests ([config.rs:1339-1446](../../src/config.rs#L1339-L1446)):
    non-empty descriptions, unique snake_case names, counters end in `_total`, section prefix matches.
 3. `TS._DEBUG STATS` / `STATS RESET` / HELP cleanup in [ts_debug.rs](../../src/commands/debug/ts_debug.rs).
-   First metrics are the ones that already exist and cost nothing: `cron_ticks_total`,
-   `cron_interval_ms`, and the `exec_<lane>_{queued,running,rejected_total}` read from
+   First metrics are the ones that already exist and cost nothing:
+   `exec_<lane>_{queued,running,rejected_total}` read from
    `BoundedExecutor::stats()`.
 4. Integration tests in [tests/test_ts_debug.py](../../tests/test_ts_debug.py) (base
-   `ValkeyTimeSeriesTestCaseDebugMode`): even-length reply; `STATS cron` returns only its keys;
+   `ValkeyTimeSeriesTestCaseDebugMode`): even-length reply; `STATS exec` returns only its keys;
    unknown section errors; `RESET` zeroes a counter; rejected with `debug-mode` off; HELP lists the
    new entries and no phantoms.
 

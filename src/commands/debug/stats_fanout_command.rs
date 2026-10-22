@@ -440,23 +440,26 @@ mod tests {
                 reading("fanout_ticks_total", MetricValue::Counter(1)),
                 reading("zzz_from_a_newer_peer", MetricValue::Counter(1)),
                 reading("fanout_tick_seconds", MetricValue::Gauge(Scalar::Int(1))),
-                reading("cron_ticks_total", MetricValue::Counter(1)),
+                reading("exec_analysis_rejected_total", MetricValue::Counter(1)),
             ]),
         );
-        let local = [reading("cron_ticks_total", MetricValue::Counter(0))];
+        let local = [reading(
+            "exec_analysis_rejected_total",
+            MetricValue::Counter(0),
+        )];
         let readings = stats.into_readings(&local);
         let names: Vec<_> = readings.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             [
-                "cron_ticks_total",
+                "exec_analysis_rejected_total",
                 "fanout_tick_seconds",
                 "fanout_ticks_total",
                 "zzz_from_a_newer_peer"
             ]
         );
-        assert_eq!(readings[0].help, "help for cron_ticks_total");
-        assert_eq!(readings[0].section, Some(Section::Cron));
+        assert_eq!(readings[0].help, "help for exec_analysis_rejected_total");
+        assert_eq!(readings[0].section, Some(Section::Exec));
         assert_eq!(readings[3].section, None);
         assert_eq!(readings[3].help, "");
     }

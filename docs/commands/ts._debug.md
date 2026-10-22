@@ -188,15 +188,6 @@ counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
 | `clustermap_refresh_interval_seconds` | gauge | Current adaptive refresh interval (doubles while the topology is stable, up to 5 s) |
 | `clustermap_age_seconds` | gauge | Time since the map was last built or confirmed unchanged |
 
-#### `cron`
-
-| Name | Kind | Description |
-|------|------|-------------|
-| `cron_interval_seconds` | gauge | Time between cron ticks, derived from the server's `hz` (a double) |
-| `cron_tick_duration_seconds` | histogram | Main-thread time per cron tick spent dispatching background tasks |
-| `cron_ticks_total` | counter | Cron ticks that ran the background-task scheduler |
-| `cron_ticks_skipped_total` | counter | Cron ticks skipped because the server was loading or shutting down |
-
 #### `exec`
 
 | Name | Kind | Description |
@@ -376,25 +367,22 @@ claim that every database has been visited.
 ### Examples
 
 ```
-TS._DEBUG STATS cron
+TS._DEBUG STATS exec
 ```
 
 ```
-1) "cron_interval_seconds"
-2) "0.1"
-3) "cron_tick_duration_seconds"
-4) 1) "count"
-   2) (integer) 1843
-   3) "sum"
-   4) "4.16291e-4"
-   5) "buckets"
-   6)  1) 1) "0.000001"
-          2) (integer) 512
-       ...
-5) "cron_ticks_total"
-6) (integer) 1843
-7) "cron_ticks_skipped_total"
+1) "exec_analysis_queued"
+2) (integer) 0
+3) "exec_analysis_rejected_total"
+4) (integer) 0
+5) "exec_analysis_running"
+6) (integer) 0
+7) "exec_fanout_queued"
 8) (integer) 0
+9) "exec_fanout_rejected_total"
+10) (integer) 0
+11) "exec_fanout_running"
+12) (integer) 0
 ```
 
 Start a clean window, then read one section with descriptions:

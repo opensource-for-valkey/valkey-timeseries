@@ -570,12 +570,19 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_counters_and_histograms_sum_over_every_node(self):
         coordinator = self.client_for_primary(0)
+        # Initial cleanup supplies a stable, nonzero histogram observation on every node.
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_trim_unused_dbs_completed_total'] >= 1
+                                  for c in self.all_nodes()))
+        local_tasks = [debug_stats(client, 'task') for client in self.all_nodes()]
+        cluster_tasks = cluster_stats(coordinator, 'task')
+        assert histogram_count(cluster_tasks['task_trim_unused_dbs_duration_seconds']) == sum(
+            histogram_count(stats['task_trim_unused_dbs_duration_seconds']) for stats in local_tasks)
         for client in self.all_nodes():
             client.execute_command('TS._DEBUG', 'STATS', 'RESET')
         coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
 
-        local = [debug_stats(client, 'fanout', 'cron') for client in self.all_nodes()]
-        cluster = cluster_stats(coordinator, 'fanout', 'cron')
+        local = [debug_stats(client, 'fanout', 'clustermap') for client in self.all_nodes()]
+        cluster = cluster_stats(coordinator, 'fanout', 'clustermap')
 
         # INDEXMEMORY asked one node per shard, a replica where there is one, so never the
         # coordinator: every shard's answer was served remotely. The reading itself is served after
@@ -587,35 +594,31 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         sent = cluster['fanout_response_sent_bytes_total']
         assert sent >= sum(s['fanout_response_sent_bytes_total'] for s in local)
         assert cluster['fanout_response_sent_bytes_total_human'].decode() == bytes_to_human(sent)
-        # The cron keeps ticking between the reads, so the cluster view can only be ahead.
-        assert cluster['cron_ticks_total'] >= sum(s['cron_ticks_total'] for s in local)
-        assert histogram_count(cluster['cron_tick_duration_seconds']) >= sum(
-            histogram_count(s['cron_tick_duration_seconds']) for s in local)
 
     def test_gauges_are_listed_per_node(self):
-        cluster = cluster_stats(self.client_for_primary(0), 'cron', 'exec')
+        cluster = cluster_stats(self.client_for_primary(0), 'clustermap', 'exec')
 
-        for name in ('cron_interval_seconds', 'exec_fanout_queued'):
+        for name in ('clustermap_refresh_interval_seconds', 'exec_fanout_queued'):
             values = per_node(cluster[name])
             ports = {int(address.rsplit(':', 1)[1]) for address in values}
             assert ports == self.node_ports(), name
             assert list(values) == sorted(values), 'sorted by address'
-        assert all(float(v) > 0 for v in per_node(cluster['cron_interval_seconds']).values())
+        assert all(float(v) >= 0 for v in per_node(cluster['clustermap_refresh_interval_seconds']).values())
 
     def test_resp3_gauges_are_maps_of_nodes(self):
         server = self.replication_groups[0].primary.server
         resp3 = Valkey(host=server.bind_ip, port=server.port, protocol=3)
-        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'cron', 'CLUSTER')
+        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'clustermap', 'CLUSTER')
 
         assert isinstance(cluster, dict)
-        values = cluster[b'cron_interval_seconds']
+        values = cluster[b'clustermap_refresh_interval_seconds']
         assert isinstance(values, dict)
         assert {int(address.decode().rsplit(':', 1)[1]) for address in values} == self.node_ports()
         assert all(isinstance(value, float) for value in values.values())
 
     def test_default_reports_one_node_in_the_single_node_layout(self):
-        local = debug_stats(self.client_for_primary(0), 'cron')
-        assert float(local['cron_interval_seconds']) > 0  # a scalar, not a per-node list
+        local = debug_stats(self.client_for_primary(0), 'clustermap')
+        assert float(local['clustermap_refresh_interval_seconds']) >= 0  # a scalar, not a per-node list
 
     def test_verbose_and_section_order_match_a_single_node(self):
         coordinator = self.client_for_primary(0)
@@ -632,22 +635,23 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_reset_cluster_starts_every_node_over(self):
         coordinator = self.client_for_primary(0)
-        wait_for_true(lambda: all(debug_stats(c, 'cron')['cron_ticks_total'] >= 20
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_trim_unused_dbs_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER') == b'OK'
 
         for client in self.all_nodes():
-            assert debug_stats(client, 'cron')['cron_ticks_total'] < 10
+            assert debug_stats(client, 'task')['task_trim_unused_dbs_completed_total'] == 0
 
     def test_reset_starts_only_this_node_over(self):
         coordinator, peer = self.client_for_primary(0), self.client_for_primary(1)
-        wait_for_true(lambda: debug_stats(peer, 'cron')['cron_ticks_total'] >= 20)
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_trim_unused_dbs_completed_total'] >= 1
+                                  for c in (coordinator, peer)))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
 
-        assert debug_stats(coordinator, 'cron')['cron_ticks_total'] < 10
-        assert debug_stats(peer, 'cron')['cron_ticks_total'] >= 20
+        assert debug_stats(coordinator, 'task')['task_trim_unused_dbs_completed_total'] == 0
+        assert debug_stats(peer, 'task')['task_trim_unused_dbs_completed_total'] >= 1
 
     def test_a_node_with_debug_mode_off_fails_the_command(self):
         replica = self.get_replication_group(1).get_replica_connection(0)
@@ -656,10 +660,10 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             with pytest.raises(ResponseError):
                 cluster_stats(self.client_for_primary(0))
             # Without CLUSTER, only this node is asked.
-            assert debug_stats(self.client_for_primary(0), 'cron')
+            assert debug_stats(self.client_for_primary(0), 'clustermap')
             # PRIMARY never asks a replica.
-            targeted = self.targeted_stats(self.client_for_primary(0), 'PRIMARY', 'cron')
-            assert len(per_node(targeted['cron_interval_seconds'])) == self.CLUSTER_SIZE
+            targeted = self.targeted_stats(self.client_for_primary(0), 'PRIMARY', 'clustermap')
+            assert len(per_node(targeted['clustermap_refresh_interval_seconds'])) == self.CLUSTER_SIZE
         finally:
             replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
@@ -669,34 +673,34 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
     def test_primary_target_lists_primaries_only(self):
-        stats = self.targeted_stats(self.client_for_primary(0), 'cron', 'PRIMARY')
-        ports = {int(a.rsplit(':', 1)[1]) for a in per_node(stats['cron_interval_seconds'])}
+        stats = self.targeted_stats(self.client_for_primary(0), 'clustermap', 'PRIMARY')
+        ports = {int(a.rsplit(':', 1)[1]) for a in per_node(stats['clustermap_refresh_interval_seconds'])}
         assert ports == {self.get_primary_port(i) for i in range(self.CLUSTER_SIZE)}
 
     def test_hashtag_target_asks_the_owning_primary(self):
         owner = self.new_cluster_client().get_node_from_key('{stats}').port
         for _ in range(10):
-            stats = self.targeted_stats(self.client_for_primary(0), 'HASHTAG', 'stats', 'cron')
-            nodes = per_node(stats['cron_interval_seconds'])
+            stats = self.targeted_stats(self.client_for_primary(0), 'HASHTAG', 'stats', 'clustermap')
+            nodes = per_node(stats['clustermap_refresh_interval_seconds'])
             assert [int(a.rsplit(':', 1)[1]) for a in nodes] == [owner]
 
     def test_local_target_reports_this_node(self):
-        local = debug_stats(self.client_for_primary(0), 'cron', 'LOCAL')
-        assert float(local['cron_interval_seconds']) > 0  # the single-node layout
+        local = debug_stats(self.client_for_primary(0), 'clustermap', 'LOCAL')
+        assert float(local['clustermap_refresh_interval_seconds']) >= 0  # the single-node layout
 
     def test_reset_primary_leaves_replicas_alone(self):
         coordinator = self.client_for_primary(0)
         replicas = [self.get_replication_group(i).get_replica_connection(0)
                     for i in range(self.CLUSTER_SIZE)]
-        wait_for_true(lambda: all(debug_stats(c, 'cron')['cron_ticks_total'] >= 20
+        wait_for_true(lambda: all(debug_stats(c, 'task')['task_trim_unused_dbs_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
         assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'PRIMARY') == b'OK'
 
         for i in range(self.CLUSTER_SIZE):
-            assert debug_stats(self.client_for_primary(i), 'cron')['cron_ticks_total'] < 10
+            assert debug_stats(self.client_for_primary(i), 'task')['task_trim_unused_dbs_completed_total'] == 0
         for replica in replicas:
-            assert debug_stats(replica, 'cron')['cron_ticks_total'] >= 20
+            assert debug_stats(replica, 'task')['task_trim_unused_dbs_completed_total'] >= 1
 
 
 def server_major_version():

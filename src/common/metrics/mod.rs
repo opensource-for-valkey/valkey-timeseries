@@ -34,7 +34,6 @@
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
 
 pub mod clustermap;
-pub mod cron;
 pub mod exec;
 pub mod fanout;
 pub mod rdb;
@@ -74,8 +73,6 @@ fn new_duration_histogram() -> BucketHistogram {
 pub enum Section {
     /// The cluster map fanouts pick their targets from: refreshes, staleness, age.
     Clustermap,
-    /// The module's cron handler, which schedules the periodic background tasks.
-    Cron,
     /// Bounded executors: the lanes that run blocking, GIL-taking work off the main thread.
     Exec,
     /// Cluster fanout: operations this node coordinates, requests it serves for peers, and the
@@ -94,7 +91,6 @@ impl Section {
     /// Every section, in reporting order.
     pub const ALL: &'static [Section] = &[
         Section::Clustermap,
-        Section::Cron,
         Section::Exec,
         Section::Fanout,
         Section::Rdb,
@@ -105,7 +101,6 @@ impl Section {
     pub const fn as_str(self) -> &'static str {
         match self {
             Section::Clustermap => "clustermap",
-            Section::Cron => "cron",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
             Section::Rdb => "rdb",
@@ -128,7 +123,6 @@ fn build_registry(section: Section) -> Registry<'static> {
     let mut registry = Registry::with_prefix(section.as_str());
     match section {
         Section::Clustermap => clustermap::register(&mut registry),
-        Section::Cron => cron::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),
         Section::Rdb => rdb::register(&mut registry),
