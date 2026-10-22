@@ -7,6 +7,7 @@
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::{log_debug, log_notice};
+use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{lock, read_lock, write_lock};
 use crate::common::threads::LockGil;
@@ -331,7 +332,7 @@ fn take_delayed_keys_in_slots(db: i32, slots: &RangeSetBlaze<u16>) -> Vec<Box<[u
 }
 
 /// Indexes the keys of `db` queued during the import of `slots`. Returns how many were indexed.
-fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) -> usize {
+fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>, run: &TaskRun<'_>) -> usize {
     // Take ownership of this import's queued keys so we can index without holding the write
     // lock. Keys of an import still in progress stay queued for its own completion.
     let keys_vec = take_delayed_keys_in_slots(db, slots);
@@ -348,7 +349,7 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) -> usize {
         // remaining keys in this db un-indexed. That's acceptable on shutdown (the process is
         // about to exit; a restart re-derives the index from the RDB/AOF), but not otherwise, so
         // this only checks the shutdown flag, not e.g. a generic cancellation.
-        if crate::is_shutting_down() {
+        if run.check_shutdown() {
             log_debug(format!(
                 "ASM delayed indexing for db={db} aborted by shutdown; {} of {total} key(s) left un-indexed",
                 total - indexed
@@ -356,7 +357,10 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>) -> usize {
             return 0;
         }
         indexed += batch.len();
-        skipped += index_timeseries_in_batch(db, batch);
+        let batch_skipped = index_timeseries_in_batch(db, batch);
+        skipped += batch_skipped;
+        metrics::ASM_KEYS_INDEXED
+            .fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
     }
 
     if skipped > 0 {
@@ -389,15 +393,18 @@ fn process_delayed_indexing(slots: RangeSetBlaze<u16>) {
     // `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain
     // leaves the remaining dbs' keys un-indexed, which is fine on shutdown (see
     // `process_delayed_keys_for_db`) but must not happen otherwise.
-    crate::common::threads::spawn_background("ts-delayed-indexing", move || {
+    crate::common::threads::spawn_task(&metrics::ASM_DRAIN, move |run| {
         for db in dbs {
-            if crate::is_shutting_down() {
+            if run.check_shutdown() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");
                 return;
             }
             // The import added a slot's worth of series to the postings in one burst.
-            if process_delayed_keys_for_db(db, &slots) > 0 {
+            if process_delayed_keys_for_db(db, &slots, run) > 0 {
                 optimize_index_fully(db);
+                if run.check_shutdown() {
+                    return;
+                }
             }
         }
         log_debug("ASM delayed indexing drain finished");
@@ -523,7 +530,7 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
 
     // Spawn a background task so we don't block the main thread; this can take a while if there are
     // a lot of keys to clean up. Off the pool: it takes the module lock (see `spawn_background`).
-    crate::common::threads::spawn_background("ts-asm-cleanup", move || {
+    crate::common::threads::spawn_task(&metrics::POST_MIGRATION_CLEANUP, move |run| {
         let index = TIMESERIES_INDEX.pin();
         let mut dbs: Vec<i32> = index.keys().copied().collect();
         dbs.sort_unstable();
@@ -538,6 +545,7 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
         let mut touched_dbs = Vec::new();
         for db in dbs {
             let deleted = remove_non_owned_keys(db, &source_slots);
+            metrics::POST_MIGRATION_CLEANUP_IDS_MARKED.fetch_add(deleted as u64, Ordering::Relaxed);
             if deleted > 0 {
                 touched_dbs.push(db);
                 deleted_count += deleted;
@@ -546,12 +554,18 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
 
         if deleted_count > 0 {
             remove_all_stale_series_internal();
+            if run.check_shutdown() {
+                return;
+            }
             // Masking the exported ids out leaves the surviving posting lists sparse.
             for db in touched_dbs {
-                if crate::is_shutting_down() {
+                if run.check_shutdown() {
                     break;
                 }
                 optimize_index_fully(db);
+                if run.check_shutdown() {
+                    return;
+                }
             }
         }
 

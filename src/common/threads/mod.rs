@@ -76,6 +76,7 @@ mod orx_pool;
 mod role;
 mod single_flight;
 
+pub use crate::common::metrics::task::{TaskMetrics, TaskRun};
 pub use executor::{BoundedExecutor, Capacity, ExecutorStats, Rejected, Reservation};
 pub use gil::{
     GilGuard, GilSource, GilToken, LockGil, YieldMode, check_holds_gil, check_may_block,
@@ -143,12 +144,14 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// blocks, which no pool worker may do (R1).
 ///
 /// One thread per call, so only for jobs with a bounded number of callers: one-shot work, or
-/// a periodic task behind [`spawn_background_single`]. Per-request work goes to a
+/// a periodic task behind [`spawn_background_single`]. Maintenance work uses [`spawn_task`]
+/// or [`spawn_task_single`] to record lifecycle metrics. Per-request work goes to a
 /// [`BoundedExecutor`] instead. A thread that cannot be started is logged and `job` dropped.
 ///
 /// A panic in `job` is caught and logged to the server log, as a [`BoundedExecutor`] worker
 /// logs one; left alone it would reach only stderr, which a daemonized server discards.
-pub fn spawn_background<F: FnOnce() + Send + 'static>(name: &str, job: F) {
+/// Returns whether the thread was started; a spawn failure drops the captured job.
+pub fn spawn_background<F: FnOnce() + Send + 'static>(name: &str, job: F) -> bool {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let thread_name = name.to_string();
     if let Err(err) = std::thread::Builder::new()
@@ -164,7 +167,9 @@ pub fn spawn_background<F: FnOnce() + Send + 'static>(name: &str, job: F) {
         })
     {
         log_notice(format!("failed to spawn background thread {name}: {err}"));
+        return false;
     }
+    true
 }
 
 /// [`spawn_background`] for a periodic task: does nothing while the task's previous run is
@@ -180,6 +185,37 @@ pub fn spawn_background_single<F: FnOnce() + Send + 'static>(
     spawn_background(name, move || {
         let _run = run;
         job();
+    });
+}
+
+/// Spawns an instrumented maintenance task. The guard is created inside the thread, so a
+/// spawn failure counts no execution, and unwinding records a panic before the outer barrier.
+pub fn spawn_task<F>(task: &'static TaskMetrics, job: F)
+where
+    F: FnOnce(&TaskRun<'_>) + Send + 'static,
+{
+    if !spawn_background(task.thread_name, move || {
+        let run = task.start();
+        job(&run);
+    }) {
+        task.spawn_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A periodic task with metrics for attempts suppressed by its single-flight guard.
+pub fn spawn_task_single<F>(task: &'static TaskMetrics, flight: &'static SingleFlight, job: F)
+where
+    F: FnOnce(&TaskRun<'_>) + Send + 'static,
+{
+    let Some(flight) = flight.try_start() else {
+        task.skipped_inflight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    };
+    spawn_task(task, move |run| {
+        let _flight = flight;
+        job(run);
     });
 }
 

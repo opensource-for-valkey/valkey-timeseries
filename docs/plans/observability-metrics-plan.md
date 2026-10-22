@@ -390,23 +390,36 @@ lifetime — a counter is the only way to see a rule being broken continuously.
 
 ### 3.10 `task` — background work
 
-Every periodic task now runs through `spawn_background_single(name, &SingleFlight, job)`
-([threads/mod.rs:167-179](../../src/common/threads/mod.rs#L167-L179)), which **silently skips the
-tick** when the previous run is still in flight. That makes it the natural home for the generic
-part of the record: put the `TaskRun` guard inside it, keyed by task name, and every task gets
-`runs_total`, `skipped_total`, `panics_total`, `last_run_timestamp_seconds`, `last_duration_seconds`,
-`duration_seconds` (histogram), and `running` for free. Tasks only add `items_total` / `errors_total`.
+**Implemented 2026-10-21:** the `task` registry uses fixed `TaskMetrics` records and a
+`TaskRun` guard. Periodic work enters through `spawn_task_single`, event-driven work through
+`spawn_task`, and inline database cleanup and nested full stale-ID sweeps start guards directly.
+Each task exposes `started_total`, `completed_total`, `skipped_inflight_total`, `panics_total`,
+`aborted_shutdown_total`, `spawn_failures_total`, `running`, `duration_seconds`, and
+`last_completed_timestamp_seconds`. A run starts inside the thread; spawn failures count no run.
+Panics and explicit shutdown aborts record duration and release the running gauge without
+advancing completion freshness. Concurrent ASM drains use a count, not a boolean.
+
+Work counters cover trimmed series/samples/errors, retired stale IDs, removed empty databases,
+indexed import keys and exported IDs marked stale. Reconciliation exposes lifecycle metrics only.
+Stale-ID pass completion is recorded where its snapshot is retired (all cleanup paths); periodic
+optimization records the cursor reaching the end of an existing db.
+Both have pass counters, distinct from task invocations. The optimizer also reports its
+last-pass completion timestamp.
+The current metric names and semantics are listed in
+[`TS._DEBUG STATS`](../commands/ts._debug.md#task).
+
+Additional migration backlog/discard/collision and load-repair metrics below remain planned.
 
 Cron intervals are unchanged ([background_tasks.rs:15-18](../../src/series/background_tasks.rs#L15-L18)).
 
 | Task | Trigger / spawn | `items` means | Hooks |
 |---|---|---|---|
 | `trim` | cron 10 s, `ts-series-trim` ([series_trim.rs:27-33](../../src/series/tasks/series_trim.rs#L27-L33)) | samples deleted | body [:35-120](../../src/series/tasks/series_trim.rs#L35-L120); `processed` [:94](../../src/series/tasks/series_trim.rs#L94), `total_deletes` [:96-108](../../src/series/tasks/series_trim.rs#L96-L108), errors [:100-106](../../src/series/tasks/series_trim.rs#L100-L106). Role changed with lazy retention: it now reclaims deferred head data and idle series (see §3.2) |
-| `stale_ids` | cron 20 s, `ts-stale-ids` ([stale_ids.rs:99-106](../../src/series/tasks/stale_ids.rs#L99-L106)) | ids retired (§3.6, from `finish_pass`) | body [:57-69](../../src/series/tasks/stale_ids.rs#L57-L69). The full-sweep `remove_all_stale_series_internal` ([:76-97](../../src/series/tasks/stale_ids.rs#L76-L97)) shares the SingleFlight and silently returns if an incremental run holds it ([:77-79](../../src/series/tasks/stale_ids.rs#L77-L79)) — count that as `task_stale_ids_full_sweep_skipped_total` |
+| `stale_ids` | cron 20 s, `ts-stale-ids` ([stale_ids.rs:99-106](../../src/series/tasks/stale_ids.rs#L99-L106)) | ids retired (§3.6, from `finish_pass`) | body [:57-69](../../src/series/tasks/stale_ids.rs#L57-L69). The full-sweep `remove_all_stale_series_internal` ([:76-97](../../src/series/tasks/stale_ids.rs#L76-L97)) shares the SingleFlight and returns if an incremental run holds it ([:77-79](../../src/series/tasks/stale_ids.rs#L77-L79)) — count that as `task_stale_ids_full_sweep_skipped_inflight_total` |
 | `optimize` | cron 60 s, `ts-optimize-indices` ([optimize_indices.rs:34-42](../../src/series/tasks/optimize_indices.rs#L34-L42)) | — (only a cursor is returned) | body [:45-70](../../src/series/tasks/optimize_indices.rs#L45-L70); missing db [:56-64](../../src/series/tasks/optimize_indices.rs#L56-L64) |
-| `trim_unused_dbs` | cron 300 s, **inline on the main thread** ([background_tasks.rs:124-134](../../src/series/background_tasks.rs#L124-L134)) | dbs dropped (needs counting; only logged per db) | not spawned, so wrap with `TaskRun` by hand |
-| `asm_drain` | ASM `ImportCompleted`, `ts-delayed-indexing` via plain `spawn_background` ([asm.rs:375-400](../../src/series/index/asm.rs#L375-L400)) | keys indexed (`indexed − skipped`) | `process_delayed_keys_for_db` [asm.rs:333-368](../../src/series/index/asm.rs#L333-L368); shutdown abort [:350-356](../../src/series/index/asm.rs#L350-L356), [:392-395](../../src/series/index/asm.rs#L392-L395). The single-run guard was removed on purpose ([:372-374](../../src/series/index/asm.rs#L372-L374)): concurrent drains take disjoint slots, so `running` is a count, not 0/1 |
-| `reconcile` | load end, `ts-index-sweep` ([persistence.rs:448-502](../../src/series/index/persistence.rs#L448-L502)) | dangling ids | `reconcile_db` [:574-637](../../src/series/index/persistence.rs#L574-L637); `verify_and_repair_db` [:533-572](../../src/series/index/persistence.rs#L533-L572) → `load_repair_reindexed_total`. Skipped = digest match [:475-484](../../src/series/index/persistence.rs#L475-L484). Split the run reason ([:486-497](../../src/series/index/persistence.rs#L486-L497)): `digest_incomplete`, `keys_expired` (`force_sweep` from `rdb_last_load_keys_expired`, [server_events.rs:65](../../src/series/index/server_events.rs#L65), [:76-81](../../src/series/index/server_events.rs#L76-L81)), `mismatch` |
+| `trim_unused_dbs` | cron 300 s, **inline on the main thread** ([background_tasks.rs:124-134](../../src/series/background_tasks.rs#L124-L134)) | dbs dropped (counted) | not spawned; starts a `TaskRun` directly |
+| `asm_drain` | ASM `ImportCompleted`, `ts-delayed-indexing` via `spawn_task` ([asm.rs:375-400](../../src/series/index/asm.rs#L375-L400)) | keys indexed (`indexed − skipped`) | `process_delayed_keys_for_db` [asm.rs:333-368](../../src/series/index/asm.rs#L333-L368); shutdown abort [:350-356](../../src/series/index/asm.rs#L350-L356), [:392-395](../../src/series/index/asm.rs#L392-L395). The single-run guard was removed on purpose ([:372-374](../../src/series/index/asm.rs#L372-L374)): concurrent drains take disjoint slots, so `running` is a count, not 0/1 |
+| `reconcile` | load end, `ts-index-sweep` ([persistence.rs:448-502](../../src/series/index/persistence.rs#L448-L502)) | — (lifecycle only) | `reconcile_db` [:574-637](../../src/series/index/persistence.rs#L574-L637); `verify_and_repair_db` [:533-572](../../src/series/index/persistence.rs#L533-L572) → `load_repair_reindexed_total`. Skipped = digest match [:475-484](../../src/series/index/persistence.rs#L475-L484). Split the run reason ([:486-497](../../src/series/index/persistence.rs#L486-L497)): `digest_incomplete`, `keys_expired` (`force_sweep` from `rdb_last_load_keys_expired`, [server_events.rs:65](../../src/series/index/server_events.rs#L65), [:76-81](../../src/series/index/server_events.rs#L76-L81)), `mismatch` |
 | `post_migration_cleanup` | ASM, `ts-asm-cleanup` ([asm.rs:513-545](../../src/series/index/asm.rs#L513-L545)) | keys marked stale (`deleted_count` [:532-535](../../src/series/index/asm.rs#L532-L535)) | `remove_non_owned_keys` [:404-491](../../src/series/index/asm.rs#L404-L491). The follow-up full sweep ([:538](../../src/series/index/asm.rs#L538)) can be skipped by the SingleFlight above |
 
 Gauges and counters outside the per-task records:
@@ -613,7 +626,8 @@ never which self-healer won — the sweep races the trim cron); `TS.READ BLOCK` 
 
 ### Phase 3 — exec, tasks, persistence, recovery
 
-Sections 3.9–3.11. `TaskRun` inside `spawn_background_single`; replace the throw-away locals in §1.
+Sections 3.9–3.11. Task lifecycle and core progress counters are implemented through
+`spawn_task` / `spawn_task_single`; remaining executor, migration and recovery metrics follow §1.
 Tests: small retention, wait for `task_trim_runs_total` to advance instead of grepping logs;
 `DEBUG RELOAD` asserting `load_series_total` equals the series count and `load_index_payloads_total`
 equals the db count (no save-side assertion — `BGSAVE` counts would be lost in the child); malformed

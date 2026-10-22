@@ -11,9 +11,11 @@
 //! all — [`Postings::mark_ids_as_stale`] evicts from that set eagerly.
 
 use super::{IndexKey, Postings, PostingsBitmap};
+use crate::common::metrics::task as metrics;
 use crate::series::SeriesRef;
 use std::borrow::Cow;
 use std::ops::Bound;
+use std::sync::atomic::Ordering;
 
 /// The set of series ids that are marked for removal but still present in the label bitmaps.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -107,7 +109,11 @@ impl StaleSet {
     /// Ends a drain pass that has visited every label key: retire the snapshot.
     fn finish_pass(&mut self) {
         if let Some(pass) = self.pass.take() {
+            // Count the intersection: an id revoked since begin_pass is no longer retired.
+            let retired = self.ids.and_cardinality(&pass);
             self.ids.andnot_inplace(&pass);
+            metrics::STALE_IDS_RETIRED.fetch_add(retired, Ordering::Relaxed);
+            metrics::STALE_IDS_PASSES_COMPLETED.fetch_add(1, Ordering::Relaxed);
         }
     }
 

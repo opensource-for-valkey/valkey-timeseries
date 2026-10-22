@@ -1034,13 +1034,17 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout', 'rdb', 'read']
+    SECTIONS = ['clustermap', 'cron', 'exec', 'fanout', 'rdb', 'read', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     CRON_METRICS = ['cron_interval_seconds', 'cron_tick_duration_seconds', 'cron_ticks_total',
                     'cron_ticks_skipped_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    HISTOGRAMS = {'cron_tick_duration_seconds', 'fanout_duration_seconds'}
+    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize', 'trim_unused_dbs',
+             'asm_drain', 'reconcile', 'post_migration_cleanup']
+    HISTOGRAMS = {'cron_tick_duration_seconds', 'fanout_duration_seconds'} | {
+        f'task_{task}_duration_seconds' for task in TASKS
+    }
     DOUBLE_GAUGES = {'cron_interval_seconds', 'clustermap_refresh_interval_seconds',
                      'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
@@ -1088,7 +1092,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout, rdb, read"):
+                           match="unknown STATS section 'bogus'.*clustermap, cron, exec, fanout, rdb, read, task"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'cron', 'bogus')
 
     def test_value_types(self):
@@ -1121,6 +1125,55 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'fanout_errors_timeout_total' in errors
         assert 'fanout_errors_database_swapped_total' in errors
         assert 'fanout_errors_key_permissions_total' in errors
+
+    def test_task_lifecycle_and_progress_metrics(self):
+        stats = self.stats('task')
+        for task in self.TASKS:
+            for suffix in ('started_total', 'completed_total', 'skipped_inflight_total',
+                           'panics_total', 'aborted_shutdown_total', 'spawn_failures_total',
+                           'running', 'duration_seconds', 'last_completed_timestamp_seconds'):
+                assert f'task_{task}_{suffix}' in stats
+        # Tick zero schedules all four periodic tasks, so no long cron interval is needed.
+        def completed():
+            values = self.stats('task')
+            return all(values[f'task_{task}_completed_total'] > 0
+                       and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
+                       for task in ('trim', 'stale_ids', 'optimize', 'trim_unused_dbs'))
+        wait_for_true(completed)
+        stats = self.stats('task')
+        for task in ('trim', 'stale_ids', 'optimize', 'trim_unused_dbs'):
+            assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
+            assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
+        assert 'task_trim_samples_deleted_total' in stats
+        assert 'task_stale_ids_retired_total' in stats
+        assert 'task_optimize_passes_completed_total' in stats
+
+    def test_task_reconciliation_lifecycle_on_digest_fast_path(self):
+        self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
+        before = self.stats('task')
+        self.client.execute_command('DEBUG', 'RELOAD')
+        def finished():
+            values = self.stats('task')
+            return (values['task_reconcile_completed_total'] > before['task_reconcile_completed_total']
+                    and values['task_reconcile_running'] == 0)
+        wait_for_true(finished)
+        after = self.stats('task')
+        assert after['task_reconcile_running'] == 0
+
+    def test_task_reconciliation_lifecycle_on_dangling_id_sweep(self):
+        self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
+        self.client.execute_command('TS.CREATE', 'task:gone', 'LABELS', 'service', 'api')
+        self.client.pexpire('task:gone', 1000)
+        self.client.save()
+        wait_for_true(lambda: self.client.pttl('task:gone') < 0)
+        before = self.stats('task')
+        self.client.execute_command('DEBUG', 'RELOAD', 'NOSAVE')
+        def finished():
+            values = self.stats('task')
+            return (values['task_reconcile_completed_total'] > before['task_reconcile_completed_total']
+                    and values['task_reconcile_running'] == 0)
+        wait_for_true(finished)
+        assert self.client.execute_command('TS.QUERYINDEX', 'service=api') == [b'task:keep']
 
     def test_cron_ticks_advance(self):
         start = self.stats('cron')['cron_ticks_total']

@@ -320,6 +320,59 @@ blocked client of any command.
 The same metrics are in `INFO ts_read`, each prefixed `ts_` (`ts_read_blocked_total`), without the
 `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
+#### `task`
+
+Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
+`TS._DEBUG STATS task VERBOSE`. Task identities are fixed:
+
+| Task | Trigger |
+|------|---------|
+| `trim` | Periodic retention trimming (10 s) |
+| `stale_ids` | Periodic stale-ID cleanup (20 s) |
+| `stale_ids_full_sweep` | Full stale-ID cleanup requested after migration; shares the periodic cleanup's single-flight guard |
+| `optimize` | Periodic postings optimization (60 s) |
+| `trim_unused_dbs` | Empty database index cleanup (300 s), inline on the main thread |
+| `asm_drain` | Index keys deferred during an atomic slot import |
+| `reconcile` | Verify persisted index contents after loading |
+| `post_migration_cleanup` | Mark exported series IDs stale on the source node |
+
+Each task exposes the following names, with `<task>` replaced by its identity:
+
+| Name | Kind | Description |
+|------|------|-------------|
+| `task_<task>_started_total` | counter | Runs that entered the task body |
+| `task_<task>_completed_total` | counter | Runs that returned without a panic or shutdown abort; recoverable per-item errors can still occur |
+| `task_<task>_skipped_inflight_total` | counter | Attempts skipped because another run holds the single-flight guard |
+| `task_<task>_panics_total` | counter | Runs that unwound with a panic |
+| `task_<task>_aborted_shutdown_total` | counter | Runs interrupted at a shutdown cancellation point |
+| `task_<task>_spawn_failures_total` | counter | Threads that could not be started; these do not count as started runs |
+| `task_<task>_running` | gauge | Task bodies executing, including time waiting for locks; concurrent ASM drains can exceed one |
+| `task_<task>_duration_seconds` | histogram | Execution time including lock waits, panics and shutdown aborts |
+| `task_<task>_last_completed_timestamp_seconds` | gauge | Unix timestamp of the most recent normal completion, or zero before any completion |
+
+The periodic tasks skip an attempt while their previous run remains in flight. Inline tasks
+and concurrent ASM drains have no such suppression. The generic fields are present for every
+task; fields that cannot apply (such as spawn failures for inline cleanup) remain zero.
+A normal run can find nothing to do. Completion timestamps therefore show that a task is alive;
+work and pass counters show its progress. Timestamps and running gauges survive `STATS RESET`.
+
+| Work counter | Description |
+|--------------|-------------|
+| `task_trim_series_processed_total` | Series attempted by background retention trimming |
+| `task_trim_samples_deleted_total` | Samples physically removed by background retention trimming |
+| `task_trim_errors_total` | Series trim failures or failures to select a database |
+| `task_stale_ids_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
+| `task_stale_ids_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
+| `task_optimize_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
+| `task_trim_unused_dbs_removed_total` | Empty database indexes removed by cron |
+| `task_asm_keys_indexed_total` | Deferred import keys successfully indexed, including batches completed before shutdown |
+| `task_post_migration_cleanup_ids_marked_total` | Exported IDs marked stale during source cleanup |
+
+`task_optimize_last_pass_completed_timestamp_seconds` is a gauge holding the Unix timestamp of
+the last completed database pass, or zero before any pass. A task invocation can process only
+part of a database; its completion does not imply a complete pass. These pass metrics do not
+claim that every database has been visited.
+
 ### Examples
 
 ```

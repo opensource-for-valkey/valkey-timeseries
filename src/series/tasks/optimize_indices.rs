@@ -1,6 +1,7 @@
 use crate::common::logging::log_debug;
+use crate::common::metrics::task as metrics;
 use crate::common::sync::lock;
-use crate::common::threads::{SingleFlight, spawn_background_single};
+use crate::common::threads::{SingleFlight, spawn_task_single};
 use crate::is_shutting_down;
 use crate::series::index::{IndexKey, TIMESERIES_INDEX, get_db_index};
 use crate::series::tasks::utils::find_next_db;
@@ -37,11 +38,9 @@ static OPTIMIZE_RUN: SingleFlight = SingleFlight::new();
 pub fn optimize_indices_for_db() {
     // On its own thread rather than the shared pool: it takes the postings write lock, and a
     // pool job may block only on its own pool (R1).
-    spawn_background_single(
-        "ts-optimize-indices",
-        &OPTIMIZE_RUN,
-        optimize_indices_internal,
-    );
+    spawn_task_single(&metrics::OPTIMIZE, &OPTIMIZE_RUN, |_| {
+        optimize_indices_internal();
+    });
 }
 
 /// Optimizes all of `db`'s posting lists now, rather than leaving them to the periodic task.
@@ -92,6 +91,12 @@ pub(in crate::series) fn optimize_indices_internal() {
     let index = get_db_index(db);
     let new_cursor = index.optimize_incremental(cursor, INDEX_OPTIMIZE_BATCH_SIZE);
 
+    if new_cursor.is_none() {
+        metrics::complete_pass(
+            &metrics::OPTIMIZE_PASSES_COMPLETED,
+            &metrics::OPTIMIZE_LAST_PASS_COMPLETED,
+        );
+    }
     set_optimize_cursor(db, new_cursor);
 }
 
@@ -147,9 +152,14 @@ mod tests {
         populate_db(1, INDEX_OPTIMIZE_BATCH_SIZE + 25);
         populate_db(2, 5);
         set_context(1, None);
+        let before = metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
 
         optimize_indices_internal();
 
+        assert_eq!(
+            metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
         let (db, cursor) = current_context();
         assert_eq!(db, 1);
         assert!(cursor.is_some());
@@ -162,9 +172,17 @@ mod tests {
         populate_db(1, 2);
         populate_db(2, 2);
         set_context(1, None);
+        let before = metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed);
 
         optimize_indices_internal();
 
+        assert_eq!(
+            metrics::OPTIMIZE_PASSES_COMPLETED.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
+        assert!(
+            metrics::OPTIMIZE_LAST_PASS_COMPLETED.load(std::sync::atomic::Ordering::Relaxed) > 0
+        );
         let (db, cursor) = current_context();
         assert_eq!(db, 2);
         assert_eq!(cursor, None);

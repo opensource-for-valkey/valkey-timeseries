@@ -39,6 +39,7 @@ pub mod exec;
 pub mod fanout;
 pub mod rdb;
 pub mod read;
+pub mod task;
 
 use crate::common::sync::lock;
 use metered::{
@@ -85,6 +86,8 @@ pub enum Section {
     /// Blocking reads (`TS.READ ... BLOCK`): how many blocked, why they came back, how many
     /// are still waiting.
     Read,
+    /// Maintenance task lifecycle, progress and completed database passes.
+    Task,
 }
 
 impl Section {
@@ -96,6 +99,7 @@ impl Section {
         Section::Fanout,
         Section::Rdb,
         Section::Read,
+        Section::Task,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -106,6 +110,7 @@ impl Section {
             Section::Fanout => "fanout",
             Section::Rdb => "rdb",
             Section::Read => "read",
+            Section::Task => "task",
         }
     }
 
@@ -128,6 +133,7 @@ fn build_registry(section: Section) -> Registry<'static> {
         Section::Fanout => fanout::register(&mut registry),
         Section::Rdb => rdb::register(&mut registry),
         Section::Read => read::register(&mut registry),
+        Section::Task => task::register(&mut registry),
     }
     registry
 }
@@ -363,7 +369,6 @@ pub fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::series::background_tasks::cron_interval_ms;
     use metered::MetricSchema;
     use std::sync::atomic::Ordering;
 
@@ -430,32 +435,31 @@ mod tests {
     /// The only test that resets the shared registries, so the counts it asserts are its own.
     #[test]
     fn reset_rebases_counters_and_histograms_but_not_gauges() {
-        cron::TICKS_SKIPPED.fetch_add(5, Ordering::Relaxed);
-        cron::TICK_DURATION.observe_duration(Duration::from_micros(10));
+        let run = task::TRIM_UNUSED_DBS.start();
         reset();
-
         assert_eq!(
-            reading(&[Section::Cron], "cron_ticks_skipped_total").value,
+            reading(&[Section::Task], "task_trim_unused_dbs_started_total").value,
             MetricValue::Counter(0)
         );
-        let MetricValue::Histogram(snapshot) =
-            reading(&[Section::Cron], "cron_tick_duration_seconds").value
+        assert_eq!(
+            reading(&[Section::Task], "task_trim_unused_dbs_running").value,
+            MetricValue::Gauge(Scalar::UInt(1))
+        );
+        drop(run);
+        assert_eq!(
+            reading(&[Section::Task], "task_trim_unused_dbs_completed_total").value,
+            MetricValue::Counter(1)
+        );
+        assert_eq!(
+            reading(&[Section::Task], "task_trim_unused_dbs_running").value,
+            MetricValue::Gauge(Scalar::UInt(0))
+        );
+        let MetricValue::Histogram(task_duration) =
+            reading(&[Section::Task], "task_trim_unused_dbs_duration_seconds").value
         else {
             panic!("not a histogram");
         };
-        assert_eq!(snapshot.count, 0);
-
-        cron::TICKS_SKIPPED.fetch_add(3, Ordering::Relaxed);
-        assert_eq!(
-            reading(&[Section::Cron], "cron_ticks_skipped_total").value,
-            MetricValue::Counter(3)
-        );
-        // The value underneath keeps counting from where it was.
-        assert!(cron::TICKS_SKIPPED.load(Ordering::Relaxed) >= 8);
-        assert_eq!(
-            reading(&[Section::Cron], "cron_interval_seconds").value,
-            MetricValue::Gauge(Scalar::Float(cron_interval_ms() as f64 / 1000.0))
-        );
+        assert_eq!(task_duration.count, 1);
     }
 
     #[test]
@@ -523,26 +527,26 @@ mod tests {
 
     #[test]
     fn snapshot_filters_by_section() {
-        let cron_then_exec: Vec<_> = snapshot(&[Section::Cron, Section::Exec])
+        let exec_then_read: Vec<_> = snapshot(&[Section::Exec, Section::Read])
             .into_iter()
             .map(|r| r.name)
             .collect();
-        let cron = snapshot(&[Section::Cron]);
-        assert!(!cron.is_empty());
-        assert!(cron.iter().all(|r| r.section == Section::Cron));
+        let read = snapshot(&[Section::Read]);
+        assert!(!read.is_empty());
+        assert!(read.iter().all(|r| r.section == Section::Read));
 
         // Section order in the request doesn't reorder the reply.
-        let both: Vec<_> = snapshot(&[Section::Exec, Section::Cron])
+        let both: Vec<_> = snapshot(&[Section::Read, Section::Exec])
             .into_iter()
             .map(|r| r.name)
             .collect();
-        assert_eq!(both, cron_then_exec);
+        assert_eq!(both, exec_then_read);
     }
 
     #[test]
     fn duration_histograms_use_the_shared_buckets() {
         let MetricValue::Histogram(snapshot) =
-            reading(&[Section::Cron], "cron_tick_duration_seconds").value
+            reading(&[Section::Fanout], "fanout_duration_seconds").value
         else {
             panic!("not a histogram");
         };

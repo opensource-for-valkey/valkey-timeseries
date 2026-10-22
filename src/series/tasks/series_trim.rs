@@ -1,10 +1,12 @@
 use crate::common::context::{get_current_db, set_current_db};
 use crate::common::logging::{log_debug, log_warning};
+use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::lock;
-use crate::common::threads::{LockGil, ParMutRayon, SingleFlight, spawn_background_single};
+use crate::common::threads::{LockGil, ParMutRayon, SingleFlight, spawn_task_single};
 use crate::is_shutting_down;
 use crate::series::tasks::utils::{fetch_series_batch, find_next_db};
 use orx_parallel::Par;
+use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 use valkey_module::{Context, MODULE_CONTEXT, Status};
 
@@ -39,10 +41,10 @@ pub fn process_series_trim() {
         return;
     }
     // Takes the GIL and fans out on the shared pool under it (R2): must not be a pool job.
-    spawn_background_single("ts-series-trim", &TRIM_RUN, process_trim_internal);
+    spawn_task_single(&metrics::TRIM, &TRIM_RUN, process_trim_internal);
 }
 
-fn process_trim_internal() {
+fn process_trim_internal(run: &TaskRun<'_>) {
     let mut processed = 0;
     let start_db = {
         let context = lock(&SERIES_TRIM_CURSORS);
@@ -53,7 +55,7 @@ fn process_trim_internal() {
     let mut first_iteration = true;
 
     for _ in 0..MAX_TRIM_TURNS {
-        if is_shutting_down() {
+        if run.check_shutdown() {
             break;
         }
 
@@ -82,6 +84,7 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
     let save_db = get_current_db(ctx);
 
     if set_current_db(ctx, db) == Status::Err {
+        metrics::TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
         log_warning(format!("Failed to select db {db}"));
         return (0, db);
     }
@@ -103,11 +106,12 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
     let last_processed = batch.last().map(|s| s.id).unwrap_or(0);
     let processed = batch.len();
 
-    let total_deletes = batch
+    let total_deletes: usize = batch
         .par_mut_rayon()
         .map(|series| match series.trim() {
             Ok(deletes) => deletes,
             Err(_) => {
+                metrics::TRIM_ERRORS.fetch_add(1, Ordering::Relaxed);
                 log_warning(format!(
                     "Failed to trim series {}",
                     series.prometheus_metric_name()
@@ -116,6 +120,9 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
             }
         })
         .sum();
+
+    metrics::TRIM_SERIES_PROCESSED.fetch_add(processed as u64, Ordering::Relaxed);
+    metrics::TRIM_SAMPLES_DELETED.fetch_add(total_deletes as u64, Ordering::Relaxed);
 
     let mut context = lock(&SERIES_TRIM_CURSORS);
     context.cursor = last_processed;

@@ -19,6 +19,7 @@ use crate::common::encoding::{try_read_u8, try_read_uvarint, write_u8, write_uva
 use crate::common::hash::{BuildNoHashHasher, DeterministicHasher};
 use crate::common::logging::{log_debug, log_notice, log_warning};
 use crate::common::metrics::rdb::{LOAD_FAILURE, LOAD_SUCCESS, save_counters};
+use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::{read_lock, write_lock};
 use crate::common::threads::LockGil;
 use crate::config::is_index_persist_enabled;
@@ -476,9 +477,9 @@ fn reconcile_preloaded_indexes(force_sweep: bool) {
     // rather than the pool because it takes the module lock (see `spawn_background`), and
     // checks `is_shutting_down()` between batches — an aborted sweep is safe, since ids it
     // never reached are either valid or will be stale-marked by the query path's self-heal.
-    crate::common::threads::spawn_background("ts-index-sweep", move || {
+    crate::common::threads::spawn_task(&metrics::RECONCILE, move |run| {
         for db in dbs {
-            if crate::is_shutting_down() {
+            if run.check_shutdown() {
                 return;
             }
             // Absent from the map means zero series arrived for this db, not "unknown":
@@ -515,8 +516,11 @@ fn reconcile_preloaded_indexes(force_sweep: bool) {
                     ""
                 }
             ));
-            reconcile_db(db);
-            verify_and_repair_db(db, loaded.count);
+            reconcile_db(db, run);
+            if run.check_shutdown() {
+                return;
+            }
+            verify_and_repair_db(db, loaded.count, run);
         }
     });
 }
@@ -550,7 +554,7 @@ fn read_indexed_count(db: i32) -> u64 {
 /// removes a key and unindexes it; a TS.CREATE adds an id the loader never counted). That only
 /// makes the scan fire spuriously — `ensure_series_indexed_by_key` skips a key already indexed
 /// under its id, so the scan is always safe, just not free.
-fn verify_and_repair_db(db: i32, loaded_count: u64) {
+fn verify_and_repair_db(db: i32, loaded_count: u64, run: &TaskRun<'_>) {
     let indexed_count = read_indexed_count(db);
 
     if indexed_count == loaded_count {
@@ -571,7 +575,7 @@ fn verify_and_repair_db(db: i32, loaded_count: u64) {
     let cursor = KeysCursor::new();
     let mut more = true;
     while more {
-        if crate::is_shutting_down() {
+        if run.check_shutdown() {
             log_notice(format!(
                 "Postings index repair scan for db {db} aborted by shutdown"
             ));
@@ -591,13 +595,13 @@ fn verify_and_repair_db(db: i32, loaded_count: u64) {
     ));
 }
 
-fn reconcile_db(db: i32) {
+fn reconcile_db(db: i32, run: &TaskRun<'_>) {
     let mut cursor: SeriesRef = 0;
     let mut checked = 0usize;
     let mut dangling = 0usize;
 
     loop {
-        if crate::is_shutting_down() {
+        if run.check_shutdown() {
             log_notice(format!(
                 "Postings index reconciliation for db {db} aborted by shutdown after {checked} ids"
             ));

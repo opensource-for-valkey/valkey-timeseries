@@ -1,8 +1,9 @@
 use super::utils::find_next_db;
+use crate::common::metrics::task::{self as metrics, TaskRun};
 use crate::common::sync::lock;
-use crate::common::threads::{SingleFlight, spawn_background_single};
-use crate::is_shutting_down;
+use crate::common::threads::{SingleFlight, spawn_task_single};
 use crate::series::index::{IndexKey, TIMESERIES_INDEX};
+use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
 const STALE_ID_BATCH_SIZE: usize = 50;
@@ -37,11 +38,15 @@ fn process_stale_id_batch(db: i32, cursor: Option<IndexKey>) -> Option<IndexKey>
     })
 }
 
-fn process_db_until_done(db: i32, start_cursor: Option<IndexKey>) -> Option<IndexKey> {
+fn process_db_until_done(
+    db: i32,
+    start_cursor: Option<IndexKey>,
+    run: &TaskRun<'_>,
+) -> Option<IndexKey> {
     let mut cursor = start_cursor;
 
     loop {
-        if is_shutting_down() {
+        if run.check_shutdown() {
             return cursor;
         }
 
@@ -54,8 +59,8 @@ fn process_db_until_done(db: i32, start_cursor: Option<IndexKey>) -> Option<Inde
     }
 }
 
-fn remove_stale_series_internal() {
-    if is_shutting_down() {
+fn remove_stale_series_internal(run: &TaskRun<'_>) {
+    if run.check_shutdown() {
         return;
     }
 
@@ -64,7 +69,7 @@ fn remove_stale_series_internal() {
         (context.db, context.cursor.take())
     };
 
-    let new_cursor = process_db_until_done(db, cursor);
+    let new_cursor = process_db_until_done(db, cursor, run);
     set_stale_id_cleanup_cursor(db, new_cursor);
 }
 
@@ -74,9 +79,13 @@ fn remove_stale_series_internal() {
 /// ## Note
 /// Must be called in a separate thread to avoid blocking the main thread
 pub(in crate::series) fn remove_all_stale_series_internal() {
-    let Some(_run) = STALE_ID_CLEANUP.try_start() else {
+    let Some(_flight) = STALE_ID_CLEANUP.try_start() else {
+        metrics::STALE_IDS_FULL_SWEEP
+            .skipped_inflight
+            .fetch_add(1, Ordering::Relaxed);
         return;
     };
+    let run = metrics::STALE_IDS_FULL_SWEEP.start();
 
     let index = TIMESERIES_INDEX.pin();
     let mut dbs: Vec<i32> = index.keys().copied().collect();
@@ -84,11 +93,11 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
     drop(index);
 
     for db in dbs {
-        if is_shutting_down() {
+        if run.check_shutdown() {
             break;
         }
 
-        process_db_until_done(db, None);
+        process_db_until_done(db, None, &run);
     }
 
     let mut context = lock(&STALE_ID_CLEANUP_CONTEXT);
@@ -98,8 +107,8 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
 
 pub(crate) fn remove_stale_series_ids_incremental() {
     // Skipped, without spending a thread, while a cleanup is still running.
-    spawn_background_single(
-        "ts-stale-ids",
+    spawn_task_single(
+        &metrics::STALE_IDS,
         &STALE_ID_CLEANUP,
         remove_stale_series_internal,
     );
@@ -197,7 +206,8 @@ mod tests {
 
         populate_db_for_stale_batch(1, STALE_ID_BATCH_SIZE + 10);
 
-        let final_cursor = process_db_until_done(1, None);
+        let run = metrics::STALE_IDS.start();
+        let final_cursor = process_db_until_done(1, None, &run);
         assert_eq!(final_cursor, None);
     }
 }
