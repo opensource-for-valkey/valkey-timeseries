@@ -17,7 +17,6 @@ pub struct TaskMetrics {
     completed: AtomicU64,
     pub skipped_inflight: AtomicU64,
     panics: AtomicU64,
-    aborted_shutdown: AtomicU64,
     pub spawn_failures: AtomicU64,
     running: AtomicU64,
     last_completed: AtomicU64,
@@ -33,7 +32,6 @@ impl TaskMetrics {
             completed: AtomicU64::new(0),
             skipped_inflight: AtomicU64::new(0),
             panics: AtomicU64::new(0),
-            aborted_shutdown: AtomicU64::new(0),
             spawn_failures: AtomicU64::new(0),
             running: AtomicU64::new(0),
             last_completed: AtomicU64::new(0),
@@ -86,9 +84,7 @@ impl Drop for TaskRun<'_> {
         metrics.duration.observe_duration(self.start.elapsed());
         if std::thread::panicking() {
             metrics.panics.fetch_add(1, Ordering::Relaxed);
-        } else if self.aborted.get() {
-            metrics.aborted_shutdown.fetch_add(1, Ordering::Relaxed);
-        } else {
+        } else if !self.aborted.get() {
             metrics.completed.fetch_add(1, Ordering::Relaxed);
             // Concurrent ASM drains can finish in either order.
             metrics
@@ -104,21 +100,14 @@ pub static STALE_IDS: TaskMetrics = TaskMetrics::new("stale_ids", "ts-stale-ids"
 pub static STALE_IDS_FULL_SWEEP: TaskMetrics =
     TaskMetrics::new("stale_ids_full_sweep", "ts-stale-ids-full-sweep");
 pub static OPTIMIZE: TaskMetrics = TaskMetrics::new("optimize", "ts-optimize-indices");
-pub static TRIM_UNUSED_DBS: TaskMetrics = TaskMetrics::new("trim_unused_dbs", "ts-trim-unused-dbs");
-pub static ASM_DRAIN: TaskMetrics = TaskMetrics::new("asm_drain", "ts-delayed-indexing");
 pub static RECONCILE: TaskMetrics = TaskMetrics::new("reconcile", "ts-index-sweep");
-pub static POST_MIGRATION_CLEANUP: TaskMetrics =
-    TaskMetrics::new("post_migration_cleanup", "ts-asm-cleanup");
 
 static TASKS: &[&TaskMetrics] = &[
     &TRIM,
     &STALE_IDS,
     &STALE_IDS_FULL_SWEEP,
     &OPTIMIZE,
-    &TRIM_UNUSED_DBS,
-    &ASM_DRAIN,
     &RECONCILE,
-    &POST_MIGRATION_CLEANUP,
 ];
 
 pub static TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
@@ -128,10 +117,10 @@ pub static STALE_IDS_RETIRED: AtomicU64 = AtomicU64::new(0);
 pub static STALE_IDS_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
+/// Empty-db cleanup is not a [`TaskMetrics`] task: it is a short inline pass on the main thread,
+/// so it reports only what it removed and whether it is running now.
 pub static TRIM_UNUSED_DBS_REMOVED: AtomicU64 = AtomicU64::new(0);
-pub static ASM_KEYS_INDEXED: AtomicU64 = AtomicU64::new(0);
-pub static POST_MIGRATION_CLEANUP_IDS_MARKED: AtomicU64 = AtomicU64::new(0);
-pub static UNUSED_DBS_TRIMMED: AtomicU64 = AtomicU64::new(0);
+pub static TRIM_UNUSED_DBS_RUNNING: AtomicU64 = AtomicU64::new(0);
 
 /// Records a complete traversal of one database, rather than one bounded task invocation.
 pub fn complete_pass(count: &AtomicU64, last_completed: &AtomicU64) {
@@ -139,47 +128,59 @@ pub fn complete_pass(count: &AtomicU64, last_completed: &AtomicU64) {
     last_completed.fetch_max(now_seconds(), Ordering::Relaxed);
 }
 
+/// Registers one task's lifecycle metrics, each named `<task>_<metric>` under the registry's
+/// section prefix. Shared with sections that own tasks of their own (`asm`).
+pub(super) fn register_task(registry: &mut Registry<'static>, task: &'static TaskMetrics) {
+    for (name, source, help) in [
+        ("started", &task.started, "Runs that entered the task body"),
+        (
+            "completed",
+            &task.completed,
+            "Runs that returned normally without a shutdown abort",
+        ),
+        (
+            "skipped_inflight",
+            &task.skipped_inflight,
+            "Attempts skipped because a previous run holds the single-flight guard",
+        ),
+        ("panics", &task.panics, "Runs that unwound with a panic"),
+        (
+            "spawn_failures",
+            &task.spawn_failures,
+            "Task threads that could not be started; no run was counted",
+        ),
+    ] {
+        registry.register(
+            counter(format!("{}_{name}", task.name))
+                .source(source)
+                .help(help),
+        );
+    }
+    registry
+        .register(
+            gauge(format!("{}_running", task.name))
+                .source(&task.running)
+                .help("Task bodies currently executing, including time waiting for locks"),
+        )
+        .register(
+            gauge(format!("{}_last_completed_timestamp_seconds", task.name))
+                .source(&task.last_completed)
+                .unit("seconds")
+                .help(
+                    "Unix timestamp of the last normal completion, or zero before any completion",
+                ),
+        )
+        .register(
+            metric(format!("{}_duration_seconds", task.name))
+                .source(LazyLock::force(&task.duration))
+                .unit("seconds")
+                .help("Task execution time including lock waits, panics and shutdown aborts"),
+        );
+}
+
 pub(super) fn register(registry: &mut Registry<'static>) {
     for &task in TASKS {
-        for (name, source, help) in [
-            ("started", &task.started, "Runs that entered the task body"),
-            (
-                "completed",
-                &task.completed,
-                "Runs that returned normally without a shutdown abort",
-            ),
-            (
-                "skipped_inflight",
-                &task.skipped_inflight,
-                "Attempts skipped because a previous run holds the single-flight guard",
-            ),
-            ("panics", &task.panics, "Runs that unwound with a panic"),
-            (
-                "aborted_shutdown",
-                &task.aborted_shutdown,
-                "Runs interrupted at a shutdown cancellation point",
-            ),
-            (
-                "spawn_failures",
-                &task.spawn_failures,
-                "Task threads that could not be started; no run was counted",
-            ),
-        ] {
-            registry.register(
-                counter(format!("{}_{name}", task.name))
-                    .source(source)
-                    .help(help),
-            );
-        }
-        registry
-            .register(gauge(format!("{}_running", task.name)).source(&task.running)
-                .help("Task bodies currently executing, including time waiting for locks"))
-            .register(gauge(format!("{}_last_completed_timestamp_seconds", task.name))
-                .source(&task.last_completed).unit("seconds")
-                .help("Unix timestamp of the last normal completion, or zero before any completion"))
-            .register(metric(format!("{}_duration_seconds", task.name))
-                .source(LazyLock::force(&task.duration)).unit("seconds")
-                .help("Task execution time including lock waits, panics and shutdown aborts"));
+        register_task(registry, task);
     }
     for (name, source, help) in [
         (
@@ -217,25 +218,23 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             &TRIM_UNUSED_DBS_REMOVED,
             "Empty database indexes removed by cron",
         ),
-        (
-            "asm_keys_indexed",
-            &ASM_KEYS_INDEXED,
-            "Queued import keys successfully indexed, including progress before shutdown",
-        ),
-        (
-            "post_migration_cleanup_ids_marked",
-            &POST_MIGRATION_CLEANUP_IDS_MARKED,
-            "Exported ids marked stale by post-migration cleanup",
-        ),
     ] {
         registry.register(counter(name).source(source).help(help));
     }
-    registry.register(
-        gauge("optimize_last_pass_completed_timestamp_seconds")
-            .source(&OPTIMIZE_LAST_PASS_COMPLETED)
-            .unit("seconds")
-            .help("Unix timestamp of the last completed database pass, or zero before any pass"),
-    );
+    registry
+        .register(
+            gauge("optimize_last_pass_completed_timestamp_seconds")
+                .source(&OPTIMIZE_LAST_PASS_COMPLETED)
+                .unit("seconds")
+                .help(
+                    "Unix timestamp of the last completed database pass, or zero before any pass",
+                ),
+        )
+        .register(
+            gauge("trim_unused_dbs_running")
+                .source(&TRIM_UNUSED_DBS_RUNNING)
+                .help("Empty database index cleanups running now (inline on the main thread)"),
+        );
 }
 
 #[cfg(test)]
@@ -289,7 +288,7 @@ mod tests {
         assert_eq!(task.completed.load(Ordering::Relaxed), 0);
         assert_eq!(task.last_completed.load(Ordering::Relaxed), 0);
         assert_eq!(task.running.load(Ordering::Relaxed), 0);
-        assert_eq!(task.aborted_shutdown.load(Ordering::Relaxed), 1);
+        assert_eq!(task.duration.snapshot().count, 1);
     }
 
     #[test]
@@ -313,7 +312,6 @@ mod tests {
         assert_eq!(task.running.load(Ordering::Relaxed), 0);
         assert_eq!(task.started.load(Ordering::Relaxed), 3);
         assert_eq!(task.completed.load(Ordering::Relaxed), 1);
-        assert_eq!(task.aborted_shutdown.load(Ordering::Relaxed), 1);
         assert_eq!(task.panics.load(Ordering::Relaxed), 1);
         assert_eq!(task.duration.snapshot().count, 3);
         assert_eq!(task.last_completed.load(Ordering::Relaxed), last);

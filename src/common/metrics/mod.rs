@@ -33,6 +33,7 @@
 //!   through an ordinary static: the parent never sees it. Count on the receiving side instead,
 //!   or in memory shared with the child, as the `rdb` save counters are (see [`rdb`]).
 
+pub mod asm;
 pub mod clustermap;
 pub mod exec;
 pub mod fanout;
@@ -72,6 +73,9 @@ fn new_duration_histogram() -> BucketHistogram {
 /// name starts with its section's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    /// Atomic slot migration: draining the keys deferred during an import, and cleaning up the
+    /// index on the exporting node.
+    Asm,
     /// The cluster map fanouts pick their targets from: refreshes, staleness, age.
     Clustermap,
     /// Bounded executors: the lanes that run blocking, GIL-taking work off the main thread.
@@ -93,6 +97,7 @@ pub enum Section {
 impl Section {
     /// Every section, in reporting order.
     pub const ALL: &'static [Section] = &[
+        Section::Asm,
         Section::Clustermap,
         Section::Exec,
         Section::Fanout,
@@ -104,6 +109,7 @@ impl Section {
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Section::Asm => "asm",
             Section::Clustermap => "clustermap",
             Section::Exec => "exec",
             Section::Fanout => "fanout",
@@ -141,6 +147,7 @@ impl Section {
 fn build_registry(section: Section) -> Registry<'static> {
     let mut registry = Registry::with_prefix(section.as_str());
     match section {
+        Section::Asm => asm::register(&mut registry),
         Section::Clustermap => clustermap::register(&mut registry),
         Section::Exec => exec::register(&mut registry),
         Section::Fanout => fanout::register(&mut registry),
@@ -466,27 +473,28 @@ mod tests {
     /// The only test that resets the shared registries, so the counts it asserts are its own.
     #[test]
     fn reset_rebases_counters_and_histograms_but_not_gauges() {
-        let run = task::TRIM_UNUSED_DBS.start();
+        // `reconcile` only runs after an RDB load, so no other unit test moves it.
+        let run = task::RECONCILE.start();
         reset();
         assert_eq!(
-            reading(&[Section::Task], "task_trim_unused_dbs_started_total").value,
+            reading(&[Section::Task], "task_reconcile_started_total").value,
             MetricValue::Counter(0)
         );
         assert_eq!(
-            reading(&[Section::Task], "task_trim_unused_dbs_running").value,
+            reading(&[Section::Task], "task_reconcile_running").value,
             MetricValue::Gauge(Scalar::UInt(1))
         );
         drop(run);
         assert_eq!(
-            reading(&[Section::Task], "task_trim_unused_dbs_completed_total").value,
+            reading(&[Section::Task], "task_reconcile_completed_total").value,
             MetricValue::Counter(1)
         );
         assert_eq!(
-            reading(&[Section::Task], "task_trim_unused_dbs_running").value,
+            reading(&[Section::Task], "task_reconcile_running").value,
             MetricValue::Gauge(Scalar::UInt(0))
         );
         let MetricValue::Histogram(task_duration) =
-            reading(&[Section::Task], "task_trim_unused_dbs_duration_seconds").value
+            reading(&[Section::Task], "task_reconcile_duration_seconds").value
         else {
             panic!("not a histogram");
         };

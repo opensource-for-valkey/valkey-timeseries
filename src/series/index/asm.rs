@@ -7,7 +7,8 @@
 use crate::common::context::{create_key_string, get_current_db, set_current_db};
 use crate::common::hash::BuildNoHashHasher;
 use crate::common::logging::{log_debug, log_notice};
-use crate::common::metrics::task::{self as metrics, TaskRun};
+use crate::common::metrics::asm as metrics;
+use crate::common::metrics::task::TaskRun;
 use crate::common::module_options::{HANDLE_ATOMIC_SLOT_MIGRATION, declare_module_options};
 use crate::common::sync::{lock, read_lock, write_lock};
 use crate::common::threads::LockGil;
@@ -359,8 +360,7 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>, run: &TaskRu
         indexed += batch.len();
         let batch_skipped = index_timeseries_in_batch(db, batch);
         skipped += batch_skipped;
-        metrics::ASM_KEYS_INDEXED
-            .fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
+        metrics::KEYS_INDEXED.fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
     }
 
     if skipped > 0 {
@@ -393,7 +393,7 @@ fn process_delayed_indexing(slots: RangeSetBlaze<u16>) {
     // `spawn_background`), and checks `is_shutting_down()` between dbs — an aborted drain
     // leaves the remaining dbs' keys un-indexed, which is fine on shutdown (see
     // `process_delayed_keys_for_db`) but must not happen otherwise.
-    crate::common::threads::spawn_task(&metrics::ASM_DRAIN, move |run| {
+    crate::common::threads::spawn_task(&metrics::DRAIN, move |run| {
         for db in dbs {
             if run.check_shutdown() {
                 log_debug("ASM delayed indexing drain aborted by shutdown");

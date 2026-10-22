@@ -122,7 +122,7 @@ fn floor_duration(d: Duration, interval: Duration) -> Duration {
 }
 
 fn trim_unused_dbs() {
-    let _run = task::TRIM_UNUSED_DBS.start();
+    task::TRIM_UNUSED_DBS_RUNNING.fetch_add(1, Ordering::Relaxed);
     let index = TIMESERIES_INDEX.pin();
     index.retain(|db, ts_index| {
         if ts_index.is_empty() {
@@ -133,6 +133,7 @@ fn trim_unused_dbs() {
             true
         }
     });
+    task::TRIM_UNUSED_DBS_RUNNING.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn dispatch_background_task(task: TaskType) {

@@ -1034,17 +1034,20 @@ class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     """TS._DEBUG STATS: the module metrics registries."""
 
-    SECTIONS = ['clustermap', 'exec', 'fanout', 'rdb', 'read', 'string_interning', 'task']
+    SECTIONS = ['asm', 'clustermap', 'exec', 'fanout', 'rdb', 'read', 'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
     RDB_METRICS = ['rdb_load_failure_total', 'rdb_load_success_total',
                    'rdb_save_failure_total', 'rdb_save_success_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
-    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize', 'trim_unused_dbs',
-             'asm_drain', 'reconcile', 'post_migration_cleanup']
+    TASKS = ['trim', 'stale_ids', 'stale_ids_full_sweep', 'optimize', 'reconcile']
+    ASM_TASKS = ['drain', 'post_migration_cleanup']
+    TASK_FIELDS = ('started_total', 'completed_total', 'skipped_inflight_total', 'panics_total',
+                   'spawn_failures_total', 'running', 'duration_seconds',
+                   'last_completed_timestamp_seconds')
     HISTOGRAMS = {'fanout_duration_seconds'} | {
         f'task_{task}_duration_seconds' for task in TASKS
-    }
+    } | {f'asm_{task}_duration_seconds' for task in ASM_TASKS}
     DOUBLE_GAUGES = {'clustermap_refresh_interval_seconds',
                      'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
@@ -1097,7 +1100,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
-                           match="unknown STATS section 'bogus'.*clustermap, exec, fanout, rdb, read, string_interning, task"):
+                           match="unknown STATS section 'bogus'.*asm, clustermap, exec, fanout, rdb, read, string_interning, task"):
             self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'bogus')
 
     def test_string_interning(self):
@@ -1110,7 +1113,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert after['string_interning_strings'] >= before['string_interning_strings'] + 20
         assert after['string_interning_bytes'] > before['string_interning_bytes']
 
-    @pytest.mark.parametrize('section', ['rdb', 'read', 'string_interning', 'task'])
+    @pytest.mark.parametrize('section', ['rdb', 'read', 'string_interning', 'task', 'asm'])
     def test_info_mirrors_the_section(self, section):
         """`INFO ts_<section>` carries the section's counters and gauges (and `_human` twins)
         under the same names with a `ts_` prefix; INFO has no shape for a histogram."""
@@ -1148,24 +1151,41 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert 'fanout_errors_database_swapped_total' in errors
         assert 'fanout_errors_key_permissions_total' in errors
 
+    def test_asm_section(self):
+        """Both ASM tasks carry the full task lifecycle under `asm_`, next to their work
+        counters. A standalone server never migrates slots, so everything is zero."""
+        stats = self.stats('asm')
+        expected = {f'asm_{task}_{suffix}' for task in self.ASM_TASKS for suffix in self.TASK_FIELDS}
+        expected |= {'asm_keys_indexed_total', 'asm_post_migration_cleanup_ids_marked_total'}
+        assert set(stats) == expected
+        for name, value in stats.items():
+            if name in self.HISTOGRAMS:
+                assert self.histogram(value)['count'] == 0, name
+            else:
+                assert value == 0, name
+
     def test_task_lifecycle_and_progress_metrics(self):
         stats = self.stats('task')
         for task in self.TASKS:
-            for suffix in ('started_total', 'completed_total', 'skipped_inflight_total',
-                           'panics_total', 'aborted_shutdown_total', 'spawn_failures_total',
-                           'running', 'duration_seconds', 'last_completed_timestamp_seconds'):
+            for suffix in self.TASK_FIELDS:
                 assert f'task_{task}_{suffix}' in stats
+        assert not any(name.startswith(('task_asm_', 'task_post_migration_')) for name in stats), \
+            'ASM tasks report in the asm section'
         # Tick zero schedules all four periodic tasks, so no long cron interval is needed.
         def completed():
             values = self.stats('task')
             return all(values[f'task_{task}_completed_total'] > 0
                        and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
-                       for task in ('trim', 'stale_ids', 'optimize', 'trim_unused_dbs'))
+                       for task in ('trim', 'stale_ids', 'optimize'))
         wait_for_true(completed)
         stats = self.stats('task')
-        for task in ('trim', 'stale_ids', 'optimize', 'trim_unused_dbs'):
+        for task in ('trim', 'stale_ids', 'optimize'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
+        # Empty-db cleanup is not a lifecycle task: only its removal count and running gauge.
+        trim_dbs = sorted(n for n in stats if n.startswith('task_trim_unused_dbs_'))
+        assert trim_dbs == ['task_trim_unused_dbs_removed_total', 'task_trim_unused_dbs_running']
+        assert stats['task_trim_unused_dbs_running'] == 0
         assert 'task_trim_samples_deleted_total' in stats
         assert 'task_stale_ids_retired_total' in stats
         assert 'task_optimize_passes_completed_total' in stats
@@ -1213,15 +1233,15 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert hist['sum'] >= 0
 
     def test_reset_starts_counters_and_histograms_over_but_not_gauges(self):
-        # Empty-db cleanup runs on tick zero and then only every 300 seconds.
-        wait_for_true(lambda: self.stats('task')['task_trim_unused_dbs_completed_total'] > 0)
+        # The optimizer runs on tick zero and then only every 60 seconds.
+        wait_for_true(lambda: self.stats('task')['task_optimize_completed_total'] > 0)
         before = self.stats('task')
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
         after = self.stats('task')
-        assert after['task_trim_unused_dbs_completed_total'] == 0
-        assert self.histogram(after['task_trim_unused_dbs_duration_seconds'])['count'] == 0
-        assert after['task_trim_unused_dbs_last_completed_timestamp_seconds'] == (
-            before['task_trim_unused_dbs_last_completed_timestamp_seconds'])
+        assert after['task_optimize_completed_total'] == 0
+        assert self.histogram(after['task_optimize_duration_seconds'])['count'] == 0
+        assert after['task_optimize_last_completed_timestamp_seconds'] == (
+            before['task_optimize_last_completed_timestamp_seconds'])
 
     def test_reset_takes_no_arguments(self):
         with pytest.raises(ResponseError, match="no further arguments but a node target"):
