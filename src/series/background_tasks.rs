@@ -18,25 +18,17 @@ const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const INDEX_OPTIMIZE_INTERVAL: Duration = Duration::from_secs(60);
 const DB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskType {
-    TrimSeries,
-    RemoveStaleSeries,
-    OptimizeIndices,
-    TrimUnusedDbs,
-}
-
-/// A periodic task's monotonic deadline, in milliseconds since [`TASK_EPOCH`]. Starts due.
+/// A periodic task and its monotonic deadline, in milliseconds since [`TASK_EPOCH`]. Starts due.
 struct ScheduledTask {
-    task: TaskType,
+    run: fn(),
     interval_ms: u64,
     next_due_ms: AtomicU64,
 }
 
 impl ScheduledTask {
-    const fn new(task: TaskType, interval: Duration) -> Self {
+    const fn new(run: fn(), interval: Duration) -> Self {
         Self {
-            task,
+            run,
             interval_ms: interval.as_millis() as u64,
             next_due_ms: AtomicU64::new(0),
         }
@@ -101,10 +93,13 @@ static TASK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static LOAD_PAUSE: SchedulePause = SchedulePause::new();
 
 static SCHEDULE: [ScheduledTask; 4] = [
-    ScheduledTask::new(TaskType::TrimSeries, RETENTION_CLEANUP_INTERVAL),
-    ScheduledTask::new(TaskType::RemoveStaleSeries, STALE_ID_CLEANUP_INTERVAL),
-    ScheduledTask::new(TaskType::OptimizeIndices, INDEX_OPTIMIZE_INTERVAL),
-    ScheduledTask::new(TaskType::TrimUnusedDbs, DB_CLEANUP_INTERVAL),
+    ScheduledTask::new(process_series_trim, RETENTION_CLEANUP_INTERVAL),
+    ScheduledTask::new(
+        remove_stale_series_ids_incremental,
+        STALE_ID_CLEANUP_INTERVAL,
+    ),
+    ScheduledTask::new(optimize_indices_for_db, INDEX_OPTIMIZE_INTERVAL),
+    ScheduledTask::new(trim_unused_dbs, DB_CLEANUP_INTERVAL),
 ];
 
 fn monotonic_ms() -> u64 {
@@ -136,17 +131,6 @@ fn trim_unused_dbs() {
     task::TRIM_UNUSED_DBS_RUNNING.fetch_sub(1, Ordering::Relaxed);
 }
 
-fn dispatch_background_task(task: TaskType) {
-    match task {
-        TaskType::TrimSeries => process_series_trim(),
-        TaskType::RemoveStaleSeries => {
-            remove_stale_series_ids_incremental();
-        }
-        TaskType::OptimizeIndices => optimize_indices_for_db(),
-        TaskType::TrimUnusedDbs => trim_unused_dbs(),
-    }
-}
-
 #[cron_event_handler]
 fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     if is_shutting_down() || is_loading_active() {
@@ -157,7 +141,7 @@ fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     let now = monotonic_ms();
     for entry in &SCHEDULE {
         if entry.poll(now) {
-            dispatch_background_task(entry.task);
+            (entry.run)();
         }
     }
 }
@@ -186,8 +170,10 @@ mod tests {
 
     const INTERVAL_MS: u64 = 10_000;
 
+    fn noop() {}
+
     fn simulate(interval_ms: u64, tick_times: impl IntoIterator<Item = u64>) -> Vec<u64> {
-        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(interval_ms));
+        let task = ScheduledTask::new(noop, Duration::from_millis(interval_ms));
         tick_times
             .into_iter()
             .filter(|&now| task.poll(now))
@@ -200,7 +186,7 @@ mod tests {
 
     #[test]
     fn first_poll_is_due() {
-        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let task = ScheduledTask::new(noop, Duration::from_millis(INTERVAL_MS));
         assert!(task.poll(0));
         assert!(!task.poll(1));
         assert!(!task.poll(9_999));
@@ -279,7 +265,7 @@ mod tests {
 
     #[test]
     fn pause_keeps_phase_across_a_load() {
-        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let task = ScheduledTask::new(noop, Duration::from_millis(INTERVAL_MS));
         let pause = SchedulePause::new();
         assert!(task.poll(0));
         // 4 s into the interval, a 12 s load: 6 s remain once it ends.
@@ -292,7 +278,7 @@ mod tests {
 
     #[test]
     fn startup_load_still_runs_every_task_on_the_first_tick() {
-        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let task = ScheduledTask::new(noop, Duration::from_millis(INTERVAL_MS));
         let pause = SchedulePause::new();
         pause.pause(0);
         pause.resume(12_000, [&task]);
@@ -301,7 +287,7 @@ mod tests {
 
     #[test]
     fn resume_without_pause_and_repeated_pause_are_harmless() {
-        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let task = ScheduledTask::new(noop, Duration::from_millis(INTERVAL_MS));
         let pause = SchedulePause::new();
         assert!(task.poll(0));
         pause.resume(5_000, [&task]);
