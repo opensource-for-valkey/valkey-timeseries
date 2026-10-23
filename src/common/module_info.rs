@@ -94,7 +94,7 @@ fn write_section(
     })
 }
 
-/// The `TS._DEBUG STATS` sections `INFO` mirrors, each as a section of its own.
+/// The `TS._DEBUG METRICS` sections `INFO` mirrors, each as a section of its own.
 const MIRRORED: &[Section] = &[
     Section::Rdb,
     Section::Read,
@@ -106,8 +106,8 @@ const MIRRORED: &[Section] = &[
 ];
 
 /// A metrics section's `INFO` fields: each counter and gauge under its
-/// `TS._DEBUG STATS` name, a byte metric followed by its `_human` rendering. Histograms are left
-/// out (see [`info_value`]). Values are read without the `STATS RESET` baseline, so counters only
+/// `TS._DEBUG METRICS` name, a byte metric followed by its `_human` rendering. Histograms are left
+/// out (see [`info_value`]). Values are read without the `METRICS RESET` baseline, so counters only
 /// ever increase, as a scraper expects.
 ///
 /// Returning plain data keeps the conversion testable without a server.
@@ -128,7 +128,7 @@ fn info_fields(section: Section) -> Vec<(String, InfoValue)> {
 }
 
 /// A metric as an INFO field. INFO has no shape for a histogram, so those are left to
-/// `TS._DEBUG STATS`.
+/// `TS._DEBUG METRICS`.
 fn info_value(value: &MetricValue) -> Option<InfoValue> {
     Some(match *value {
         MetricValue::Counter(v) => v.into(),
@@ -151,7 +151,7 @@ mod tests {
             .collect()
     }
 
-    /// Every counter and gauge of the section, in `STATS` order, with a `_human` twin after each
+    /// Every counter and gauge of the section, in `METRICS` order, with a `_human` twin after each
     /// byte metric; no histogram.
     #[test]
     fn info_section_mirrors_the_metrics_section() {

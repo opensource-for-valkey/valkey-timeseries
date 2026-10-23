@@ -41,7 +41,7 @@ TS._DEBUG <subcommand> [arguments]</subcommand>
 | Subcommand        | Description                                             |
 |-------------------|---------------------------------------------------------|
 | `HELP`            | Display available subcommands and brief descriptions    |
-| `STATS`           | Report this node's module metrics, or reset them        |
+| `METRICS`         | Report this node's module metrics, or reset them        |
 | `STRINGPOOLSTATS` | Report statistics for the global string interning pool  |
 | `INDEXMEMORY`     | Report the label index's heap footprint (fields as in `INFO ts_index`; each `*Bytes` field is followed by a `*BytesHuman` string such as `1.21M`) |
 | `INFLIGHT`        | List this node's fan-out requests still waiting on peers |
@@ -55,7 +55,7 @@ Replies made of named fields are RESP3 maps. A RESP2 client gets the same pairs 
 of alternating keys and values, in the same order. Over RESP2, doubles arrive as bulk strings.
 
 Field names are camelCase, like `TS.INFO`'s. Sizes are in bytes, and a percentage (0–100) ends in
-`Pct`; any other unit is named at the end of the field (`ageMs`). Metric names in `STATS` are not
+`Pct`; any other unit is named at the end of the field (`ageMs`). Metric names in `METRICS` are not
 field names but [OpenMetrics](https://prometheus.io/docs/practices/naming/) identifiers,
 snake_case with a unit suffix (`_seconds`, `_bytes`) and `_total` on counters. They are the same
 everywhere a metric appears, including the `name` field of a `VERBOSE` entry. The `_human`
@@ -63,7 +63,7 @@ entries beside byte metrics are display strings, not metrics.
 
 ### Cluster scope
 
-Every subcommand reports, or acts on, the node you are connected to. `STATS`, `STATS RESET`,
+Every subcommand reports, or acts on, the node you are connected to. `METRICS`, `METRICS RESET`,
 `STRINGPOOLSTATS` and `INDEXMEMORY` also take a `CLUSTER` keyword, which fans the request out
 and combines the answers as each subcommand describes. Every node asked must have `debug-mode`
 enabled, or the command fails. On a standalone server `CLUSTER` is an error
@@ -92,22 +92,22 @@ TS._DEBUG HELP
 ```
 
 ```
- 1) "TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]"
+ 1) "TS._DEBUG METRICS [section ...] [VERBOSE] [CLUSTER]"
  2) "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node"
- 3) "TS._DEBUG STATS RESET [CLUSTER]"
+ 3) "TS._DEBUG METRICS RESET [CLUSTER]"
  4) "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER"
  ...
 ```
 
 ---
 
-### TS._DEBUG STATS
+### TS._DEBUG METRICS
 
 Reports module metrics: events that happen inside a command or in background work, which the
 server's own `INFO commandstats` / `latencystats` cannot see. Counters are collected whether or
 not `debug-mode` is on; only reading them needs it.
 
-Each node counts what happens on it, and `STATS` reports the connected node's metrics. With
+Each node counts what happens on it, and `METRICS` reports the connected node's metrics. With
 `CLUSTER` the command fans out to every node, replicas included, and combines their metrics:
 counters and histograms are summed, and each gauge's value becomes a map with one value per node
 (summing refresh intervals or queue depths across nodes would hide which node they describe).
@@ -120,8 +120,8 @@ straddle an update.
 ### Syntax
 
 ```bash
-TS._DEBUG STATS [section ...] [VERBOSE] [CLUSTER]
-TS._DEBUG STATS RESET [CLUSTER]
+TS._DEBUG METRICS [section ...] [VERBOSE] [CLUSTER]
+TS._DEBUG METRICS RESET [CLUSTER]
 ```
 
 ### Arguments
@@ -171,7 +171,7 @@ unit (durations are in seconds). The `_human` display entries are not metrics an
 exception.
 
 `RESET` does not change the values underneath, which only ever increase (as a Prometheus-style
-scraper expects). It records them as a baseline, and `STATS` reports counters and histograms
+scraper expects). It records them as a baseline, and `METRICS` reports counters and histograms
 relative to it.
 
 Metrics are grouped in sections; each name starts with its section.
@@ -201,7 +201,7 @@ The cleanup then requests a full stale-ID sweep, which reports in `task` as
 `task_tombstone_full_sweep_*`.
 
 The same metrics are in `INFO ts_asm`, each prefixed `ts_`, without the `debug-mode` gate, except
-the duration histograms. `INFO` counts since module start: `STATS RESET` doesn't move it.
+the duration histograms. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
 #### `clustermap`
 
@@ -337,7 +337,7 @@ of a foreign encoding fails the whole RDB load; every other failure falls back t
 index from the keys.
 
 The same metrics are in `INFO ts_rdb`, each prefixed `ts_` (`ts_rdb_loads_total`), without
-the `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
+the `debug-mode` gate. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
 #### `blocked_read`
 
@@ -362,7 +362,7 @@ all of those cases. It can differ from the `blocked_clients` of `INFO clients`, 
 blocked client of any command.
 
 The same metrics are in `INFO ts_blocked_read`, each prefixed `ts_` (`ts_blocked_read_blocked_total`), without the
-`debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
+`debug-mode` gate. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
 #### `string_interning`
 
@@ -384,8 +384,8 @@ The same metrics are in `INFO ts_string_interning`, each prefixed `ts_`
 
 #### `task`
 
-Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
-`TS._DEBUG STATS task VERBOSE`. Task identities are fixed:
+Maintenance work on this node. Select it with `TS._DEBUG METRICS task` or
+`TS._DEBUG METRICS task VERBOSE`. Task identities are fixed:
 
 | Task | Trigger |
 |------|---------|
@@ -416,7 +416,7 @@ The periodic tasks skip an attempt while their previous run remains in flight; t
 sweep, which runs on its caller's thread, shares that guard. The generic fields are present for
 every task; fields that cannot apply (such as spawn failures for the full sweep) remain zero.
 A normal run can find nothing to do. Completion timestamps therefore show that a task is alive;
-work and pass counters show its progress. Timestamps and running gauges survive `STATS RESET`.
+work and pass counters show its progress. Timestamps and running gauges survive `METRICS RESET`.
 
 | Work counter | Description |
 |--------------|-------------|
@@ -439,12 +439,12 @@ claim that every database has been visited.
 
 The same metrics are in `INFO ts_task`, each prefixed `ts_` (`ts_task_retention_trim_started_total`),
 without the `debug-mode` gate, except the `task_<task>_duration_seconds` histograms, which INFO
-has no shape for. `INFO` counts since module start: `STATS RESET` doesn't move it.
+has no shape for. `INFO` counts since module start: `METRICS RESET` doesn't move it.
 
 ### Examples
 
 ```
-TS._DEBUG STATS exec
+TS._DEBUG METRICS exec
 ```
 
 ```
@@ -465,8 +465,8 @@ TS._DEBUG STATS exec
 Start a clean window, then read one section with descriptions:
 
 ```
-TS._DEBUG STATS RESET
-TS._DEBUG STATS exec VERBOSE
+TS._DEBUG METRICS RESET
+TS._DEBUG METRICS exec VERBOSE
 ```
 
 ---

@@ -1,7 +1,7 @@
 """
 TS._DEBUG in cluster mode. Every subcommand reports the connected node unless given CLUSTER: then
 STRINGPOOLSTATS sums every primary's string pool, INDEXMEMORY sums one node per shard's label
-index, preferring replicas, and STATS covers every node.
+index, preferring replicas, and METRICS covers every node.
 """
 
 import threading
@@ -259,8 +259,8 @@ class TestIndexMemoryCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 
 def fanout_stats(client):
-    """This node's own `fanout` section of TS._DEBUG STATS, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', 'fanout')
+    """This node's own `fanout` section of TS._DEBUG METRICS, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'METRICS', 'fanout')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -280,7 +280,7 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'METRICS', 'RESET') == b'OK'
 
     def mrange(self, *filters):
         """Runs TS.MRANGE with node 0 as coordinator; returns each node's fanout stats."""
@@ -336,9 +336,9 @@ class TestFanoutWireStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert stats['fanout_responses_sent_total'] == 0
 
 
-def debug_stats(client, *sections):
-    """This node's own TS._DEBUG STATS for the given sections, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', *sections)
+def debug_metrics(client, *sections):
+    """This node's own TS._DEBUG METRICS for the given sections, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'METRICS', *sections)
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -362,7 +362,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def reset_all(self):
         for client in self.primaries():
-            assert client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+            assert client.execute_command('TS._DEBUG', 'METRICS', 'RESET') == b'OK'
 
     def tag_per_primary(self):
         """One hash tag per primary, in primary order."""
@@ -392,7 +392,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         coordinator.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
 
-        stats = debug_stats(coordinator, 'fanout')
+        stats = debug_metrics(coordinator, 'fanout')
         assert stats['fanout_operations_total'] == 1
         assert stats['fanout_targets_total'] == self.CLUSTER_SIZE
         assert stats['fanout_local_only_total'] == 0
@@ -403,7 +403,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert stats['fanout_generic_error_replies_total'] == 0
         assert stats['fanout_served_ok_total'] == 0
         for peer in peers:
-            peer_stats = debug_stats(peer, 'fanout')
+            peer_stats = debug_metrics(peer, 'fanout')
             assert peer_stats['fanout_served_ok_total'] == 1
             assert peer_stats['fanout_operations_total'] == 0
 
@@ -414,14 +414,14 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
         assert coordinator.execute_command('TS.CARD', 'HASHTAG', tags[0], 'FILTER', 'env=prod') == 3
 
-        stats = debug_stats(coordinator, 'fanout')
+        stats = debug_metrics(coordinator, 'fanout')
         assert stats['fanout_operations_total'] == 1
         assert stats['fanout_local_only_total'] == 1
         assert stats['fanout_targets_total'] == 1
         assert stats['fanout_requests_sent_total'] == 0
         assert histogram_count(stats['fanout_duration_seconds']) == 1
         for peer in peers:
-            assert debug_stats(peer, 'fanout')['fanout_served_ok_total'] == 0
+            assert debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 0
 
     def test_a_shard_failure_is_counted_by_kind_and_answered_generically(self):
         """A peer with debug-mode off fails its share of TS._DEBUG INDEXMEMORY."""
@@ -434,11 +434,11 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         finally:
             peer.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
-        stats = debug_stats(coordinator, 'fanout')
+        stats = debug_metrics(coordinator, 'fanout')
         assert sum(shard_errors(stats).values()) == 1, shard_errors(stats)
         assert stats['fanout_generic_error_replies_total'] == 1
         assert stats['fanout_aborts_total'] == 0
-        assert debug_stats(peer, 'fanout')['fanout_served_errors_total'] == 1
+        assert debug_metrics(peer, 'fanout')['fanout_served_errors_total'] == 1
 
     def test_a_key_permission_denial_aborts_the_fanout(self):
         tags = self.populate()
@@ -454,7 +454,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         with pytest.raises(ResponseError):
             limited.execute_command('TS.MRANGE', '-', '+', 'FILTER', 'env=prod')
 
-        stats = debug_stats(coordinator, 'fanout')
+        stats = debug_metrics(coordinator, 'fanout')
         assert stats['fanout_aborts_total'] == 1
         errors = shard_errors(stats)
         assert set(errors) <= {'fanout_errors_key_permissions_total',
@@ -479,7 +479,7 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             sleeper.join()
             coordinator.execute_command('CONFIG', 'SET', self.TIMEOUT_CONFIG, '5000ms')
 
-        stats = debug_stats(coordinator, 'fanout')
+        stats = debug_metrics(coordinator, 'fanout')
         assert stats['fanout_rpc_timeouts_total'] == 1
         assert stats['fanout_errors_timeout_total'] == 1
         assert stats['fanout_errors_total'] == 1
@@ -487,8 +487,8 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert stats['fanout_client_timeouts_total'] <= 1
         assert stats['fanout_inflight'] == 0
         # Once awake, the peer answers a request the coordinator no longer has.
-        wait_for_true(lambda: debug_stats(peer, 'fanout')['fanout_served_ok_total'] == 1)
-        wait_for_true(lambda: debug_stats(coordinator, 'fanout')[
+        wait_for_true(lambda: debug_metrics(peer, 'fanout')['fanout_served_ok_total'] == 1)
+        wait_for_true(lambda: debug_metrics(coordinator, 'fanout')[
             'fanout_ignored_unknown_request_total'] >= 1)
 
     def test_inflight_lists_a_request_waiting_on_a_peer(self):
@@ -516,19 +516,19 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert fields['remoteTargets'] == self.CLUSTER_SIZE - 1
             assert 1 <= fields['outstanding'] <= self.CLUSTER_SIZE - 1
             assert fields['ageMs'] >= 0
-            assert debug_stats(coordinator, 'fanout')['fanout_inflight'] == 1
+            assert debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 1
         finally:
             sleeper.join()
             query.join()
         assert len(result['reply']) == 3 * self.CLUSTER_SIZE
         wait_for_true(lambda: coordinator.execute_command('TS._DEBUG', 'INFLIGHT') == [])
-        assert debug_stats(coordinator, 'fanout')['fanout_inflight'] == 0
+        assert debug_metrics(coordinator, 'fanout')['fanout_inflight'] == 0
 
     def test_cluster_map_metrics(self):
         coordinator = self.primaries()[0]
         coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
 
-        stats = debug_stats(coordinator, 'clustermap')
+        stats = debug_metrics(coordinator, 'clustermap')
         assert stats['clustermap_refreshes_total'] >= 1
         assert stats['clustermap_refreshes_total'] == (
             stats['clustermap_refreshes_changed_total']
@@ -540,8 +540,8 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
 
 def cluster_stats(client, *args):
-    """TS._DEBUG STATS across the cluster, as a dict."""
-    flat = client.execute_command('TS._DEBUG', 'STATS', *args, 'CLUSTER')
+    """TS._DEBUG METRICS across the cluster, as a dict."""
+    flat = client.execute_command('TS._DEBUG', 'METRICS', *args, 'CLUSTER')
     return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
 
@@ -551,7 +551,7 @@ def per_node(gauge):
 
 
 class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
-    """TS._DEBUG STATS CLUSTER: every node, replicas included, summed or listed per node."""
+    """TS._DEBUG METRICS CLUSTER: every node, replicas included, summed or listed per node."""
 
     REPLICAS_COUNT = 1
 
@@ -575,17 +575,17 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         coordinator = self.client_for_primary(0)
         # The optimizer's tick-zero run supplies a nonzero histogram observation on every node,
         # stable for the next 60 seconds.
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_metrics(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
-        local_tasks = [debug_stats(client, 'task') for client in self.all_nodes()]
+        local_tasks = [debug_metrics(client, 'task') for client in self.all_nodes()]
         cluster_tasks = cluster_stats(coordinator, 'task')
         assert histogram_count(cluster_tasks['task_optimize_index_duration_seconds']) == sum(
             histogram_count(stats['task_optimize_index_duration_seconds']) for stats in local_tasks)
         for client in self.all_nodes():
-            client.execute_command('TS._DEBUG', 'STATS', 'RESET')
+            client.execute_command('TS._DEBUG', 'METRICS', 'RESET')
         coordinator.execute_command('TS._DEBUG', 'INDEXMEMORY', 'CLUSTER')
 
-        local = [debug_stats(client, 'fanout', 'clustermap') for client in self.all_nodes()]
+        local = [debug_metrics(client, 'fanout', 'clustermap') for client in self.all_nodes()]
         cluster = cluster_stats(coordinator, 'fanout', 'clustermap')
 
         # INDEXMEMORY asked one node per shard, a replica where there is one, so never the
@@ -612,7 +612,7 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
     def test_resp3_gauges_are_maps_of_nodes(self):
         server = self.replication_groups[0].primary.server
         resp3 = Valkey(host=server.bind_ip, port=server.port, protocol=3)
-        cluster = resp3.execute_command('TS._DEBUG', 'STATS', 'clustermap', 'CLUSTER')
+        cluster = resp3.execute_command('TS._DEBUG', 'METRICS', 'clustermap', 'CLUSTER')
 
         assert isinstance(cluster, dict)
         values = cluster[b'clustermap_refresh_interval_seconds']
@@ -621,13 +621,13 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         assert all(isinstance(value, float) for value in values.values())
 
     def test_default_reports_one_node_in_the_single_node_layout(self):
-        local = debug_stats(self.client_for_primary(0), 'clustermap')
+        local = debug_metrics(self.client_for_primary(0), 'clustermap')
         assert float(local['clustermap_refresh_interval_seconds']) >= 0  # a scalar, not a per-node list
 
     def test_verbose_and_section_order_match_a_single_node(self):
         coordinator = self.client_for_primary(0)
-        local_names = [n for n in debug_stats(coordinator) if not n.endswith('_human')]
-        entries = coordinator.execute_command('TS._DEBUG', 'STATS', 'VERBOSE', 'CLUSTER')
+        local_names = [n for n in debug_metrics(coordinator) if not n.endswith('_human')]
+        entries = coordinator.execute_command('TS._DEBUG', 'METRICS', 'VERBOSE', 'CLUSTER')
         assert [e[1].decode() for e in entries] == local_names
         for entry in entries:
             fields = {entry[i].decode(): entry[i + 1] for i in range(0, len(entry), 2)}
@@ -639,23 +639,23 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     def test_reset_cluster_starts_every_node_over(self):
         coordinator = self.client_for_primary(0)
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_metrics(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
-        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'CLUSTER') == b'OK'
+        assert coordinator.execute_command('TS._DEBUG', 'METRICS', 'RESET', 'CLUSTER') == b'OK'
 
         for client in self.all_nodes():
-            assert debug_stats(client, 'task')['task_optimize_index_completed_total'] == 0
+            assert debug_metrics(client, 'task')['task_optimize_index_completed_total'] == 0
 
     def test_reset_starts_only_this_node_over(self):
         coordinator, peer = self.client_for_primary(0), self.client_for_primary(1)
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_metrics(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in (coordinator, peer)))
 
-        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
+        assert coordinator.execute_command('TS._DEBUG', 'METRICS', 'RESET') == b'OK'
 
-        assert debug_stats(coordinator, 'task')['task_optimize_index_completed_total'] == 0
-        assert debug_stats(peer, 'task')['task_optimize_index_completed_total'] >= 1
+        assert debug_metrics(coordinator, 'task')['task_optimize_index_completed_total'] == 0
+        assert debug_metrics(peer, 'task')['task_optimize_index_completed_total'] >= 1
 
     def test_a_node_with_debug_mode_off_fails_the_command(self):
         replica = self.get_replication_group(1).get_replica_connection(0)
@@ -664,7 +664,7 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             with pytest.raises(ResponseError):
                 cluster_stats(self.client_for_primary(0))
             # Without CLUSTER, only this node is asked.
-            assert debug_stats(self.client_for_primary(0), 'clustermap')
+            assert debug_metrics(self.client_for_primary(0), 'clustermap')
             # PRIMARY never asks a replica.
             targeted = self.targeted_stats(self.client_for_primary(0), 'PRIMARY', 'clustermap')
             assert len(per_node(targeted['clustermap_refresh_interval_seconds'])) == self.CLUSTER_SIZE
@@ -673,7 +673,7 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
 
     @staticmethod
     def targeted_stats(client, *args):
-        flat = client.execute_command('TS._DEBUG', 'STATS', *args)
+        flat = client.execute_command('TS._DEBUG', 'METRICS', *args)
         return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
 
     def test_primary_target_lists_primaries_only(self):
@@ -689,22 +689,22 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert [int(a.rsplit(':', 1)[1]) for a in nodes] == [owner]
 
     def test_local_target_reports_this_node(self):
-        local = debug_stats(self.client_for_primary(0), 'clustermap', 'LOCAL')
+        local = debug_metrics(self.client_for_primary(0), 'clustermap', 'LOCAL')
         assert float(local['clustermap_refresh_interval_seconds']) >= 0  # the single-node layout
 
     def test_reset_primary_leaves_replicas_alone(self):
         coordinator = self.client_for_primary(0)
         replicas = [self.get_replication_group(i).get_replica_connection(0)
                     for i in range(self.CLUSTER_SIZE)]
-        wait_for_true(lambda: all(debug_stats(c, 'task')['task_optimize_index_completed_total'] >= 1
+        wait_for_true(lambda: all(debug_metrics(c, 'task')['task_optimize_index_completed_total'] >= 1
                                   for c in self.all_nodes()))
 
-        assert coordinator.execute_command('TS._DEBUG', 'STATS', 'RESET', 'PRIMARY') == b'OK'
+        assert coordinator.execute_command('TS._DEBUG', 'METRICS', 'RESET', 'PRIMARY') == b'OK'
 
         for i in range(self.CLUSTER_SIZE):
-            assert debug_stats(self.client_for_primary(i), 'task')['task_optimize_index_completed_total'] == 0
+            assert debug_metrics(self.client_for_primary(i), 'task')['task_optimize_index_completed_total'] == 0
         for replica in replicas:
-            assert debug_stats(replica, 'task')['task_optimize_index_completed_total'] >= 1
+            assert debug_metrics(replica, 'task')['task_optimize_index_completed_total'] >= 1
 
 
 def server_major_version():

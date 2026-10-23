@@ -14,7 +14,7 @@ class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
 
     def started(self):
         """Retention-trim dispatches, counting single-flight skips so they can't hide one."""
-        stats = self.debug_stats('task')
+        stats = self.debug_metrics('task')
         return (stats['task_retention_trim_started_total']
                 + stats['task_retention_trim_skipped_inflight_total'])
 

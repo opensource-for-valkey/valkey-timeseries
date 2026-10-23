@@ -141,7 +141,7 @@ blocked (`ts_blocked_read_blocked_total`), were served at once (`ts_blocked_read
 were refused (`ts_blocked_read_block_refused_total`), timed out (`ts_blocked_read_block_timeouts_total`), were
 woken and stayed blocked (`ts_blocked_read_spurious_wakeups_total`), or were released by a deletion
 (`ts_blocked_read_unblocked_by_delete_total`), and how many are blocked now (`ts_blocked_read_blocked_clients`).
-These are the `read` metrics of [`TS._DEBUG STATS`](./ts._debug.md#metrics) with a `ts_` prefix,
+These are the `read` metrics of [`TS._DEBUG METRICS`](./ts._debug.md#metrics) with a `ts_` prefix,
 readable without `debug-mode`.
 
 ## Return Value

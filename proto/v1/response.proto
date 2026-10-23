@@ -149,7 +149,7 @@ message IndexMemoryResponse {
 
 // A cumulative histogram: `bounds[i]` is bucket i's upper bound (the last one
 // is +Inf) and `cumulative_counts[i]` the observations at or below it.
-message DebugStatsHistogram {
+message DebugMetricHistogram {
   uint64 count = 1;
   double sum = 2;
   repeated double bounds = 3;
@@ -159,18 +159,18 @@ message DebugStatsHistogram {
 // One metric, by its sample name (a counter's ends in `_total`). The
 // coordinator sums counters and histograms across nodes and lists gauges per
 // node.
-message DebugStatsMetric {
+message DebugMetric {
   string name = 1;
   oneof value {
     uint64 counter = 2;
     sint64 gauge_int = 3;
     uint64 gauge_uint = 4;
     double gauge_float = 5;
-    DebugStatsHistogram histogram = 6;
+    DebugMetricHistogram histogram = 6;
   }
 }
 
-// A node's metrics, counted from its own last STATS RESET.
-message DebugStatsResponse {
-  repeated DebugStatsMetric metrics = 1;
+// A node's metrics, counted from its own last METRICS RESET.
+message DebugMetricsResponse {
+  repeated DebugMetric metrics = 1;
 }

@@ -75,8 +75,8 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
     destination replays it like a replication feed (`src/commands/ts_restore.rs`).
 - `src/fanout/` + `src/commands/**/*_fanout_command.rs` — cluster fanout over the protobuf
   contract in `proto/v1/`, registered via `register_fanout_operations` (11 ops: LabelStats, Card,
-  LabelSearch, MDel, MGet, MRange, QueryIndex, QueryLabels, StringPoolStats, IndexMemory, DebugStats
-  — the last three back `TS._DEBUG STRINGPOOLSTATS` / `INDEXMEMORY` / `STATS`).
+  LabelSearch, MDel, MGet, MRange, QueryIndex, QueryLabels, StringPoolStats, IndexMemory, DebugMetrics
+  — the last three back `TS._DEBUG STRINGPOOLSTATS` / `INDEXMEMORY` / `METRICS`).
 - Other command surfaces beyond RTS: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` + statistical machinery
   (`src/analysis/` — ESD/CUSUM/EWMA/IQR/MAD/z-score/RCF), `TS.ADDBULK`, `TS.LABELSTATS`,
   `TS.METRICNAMES`, `TS.MDEL`, Prometheus-style selectors (`src/parser/`).

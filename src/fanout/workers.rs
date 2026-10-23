@@ -23,7 +23,7 @@ pub(super) static PEER_REQUEST_EXECUTOR: BoundedExecutor = BoundedExecutor::new(
     Capacity::Fixed(QUEUE_CAPACITY),
 );
 
-/// The load on the fan-out lane, for `TS._DEBUG STATS`. Never starts the workers.
+/// The load on the fan-out lane, for `TS._DEBUG METRICS`. Never starts the workers.
 pub(crate) fn request_lane_stats() -> ExecutorStats {
     PEER_REQUEST_EXECUTOR.stats()
 }

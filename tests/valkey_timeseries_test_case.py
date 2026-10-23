@@ -686,9 +686,9 @@ class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
 
     MODULE_ARGS = "debug-mode yes"
 
-    def debug_stats(self, *args):
-        """`TS._DEBUG STATS [args]` as a dict of metric name to value; names must be unique."""
-        flat = self.client.execute_command('TS._DEBUG', 'STATS', *args)
+    def debug_metrics(self, *args):
+        """`TS._DEBUG METRICS [args]` as a dict of metric name to value; names must be unique."""
+        flat = self.client.execute_command('TS._DEBUG', 'METRICS', *args)
         assert len(flat) % 2 == 0, flat
         names = [flat[i].decode() for i in range(0, len(flat), 2)]
         assert len(names) == len(set(names)), names

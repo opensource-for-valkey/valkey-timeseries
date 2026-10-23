@@ -1,8 +1,8 @@
 use super::ensure_debug_enabled;
-use super::stats::reply_cluster_stats;
-use crate::commands::fanout_codec::generated::debug_stats_metric::Value;
+use super::metrics::reply_cluster_metrics;
+use crate::commands::fanout_codec::generated::debug_metric::Value;
 use crate::commands::fanout_codec::generated::{
-    DebugStatsHistogram, DebugStatsMetric, DebugStatsRequest, DebugStatsResponse,
+    DebugMetric, DebugMetricHistogram, DebugMetricsRequest, DebugMetricsResponse,
 };
 use crate::common::logging::log_warning;
 use crate::common::metrics::{self, MetricKind, MetricReading, MetricValue, Section};
@@ -14,14 +14,14 @@ use ahash::AHashMap;
 use metered::{Bucket, HistogramSnapshot, Scalar};
 use valkey_module::{Context, Status, ValkeyResult};
 
-impl From<&MetricReading> for DebugStatsMetric {
+impl From<&MetricReading> for DebugMetric {
     fn from(reading: &MetricReading) -> Self {
         let value = match &reading.value {
             MetricValue::Counter(v) => Value::Counter(*v),
             MetricValue::Gauge(Scalar::Int(v)) => Value::GaugeInt(*v),
             MetricValue::Gauge(Scalar::UInt(v)) => Value::GaugeUint(*v),
             MetricValue::Gauge(Scalar::Float(v)) => Value::GaugeFloat(*v),
-            MetricValue::Histogram(snapshot) => Value::Histogram(DebugStatsHistogram {
+            MetricValue::Histogram(snapshot) => Value::Histogram(DebugMetricHistogram {
                 count: snapshot.count,
                 sum: snapshot.sum,
                 bounds: snapshot.buckets.iter().map(|b| b.le).collect(),
@@ -39,7 +39,7 @@ impl From<&MetricReading> for DebugStatsMetric {
     }
 }
 
-fn histogram_snapshot(histogram: DebugStatsHistogram) -> HistogramSnapshot {
+fn histogram_snapshot(histogram: DebugMetricHistogram) -> HistogramSnapshot {
     let buckets = histogram
         .bounds
         .into_iter()
@@ -70,7 +70,7 @@ impl ClusterValue {
     }
 }
 
-/// One metric of the cluster view, as `TS._DEBUG STATS` reports it.
+/// One metric of the cluster view, as `TS._DEBUG METRICS` reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ClusterReading {
     pub name: String,
@@ -109,12 +109,12 @@ fn add_histogram(into: &mut HistogramSnapshot, other: &HistogramSnapshot) -> boo
 
 /// The metrics of every node that answered, merged by name.
 #[derive(Default)]
-struct ClusterStats {
+struct ClusterMetrics {
     values: AHashMap<String, ClusterValue>,
 }
 
-impl ClusterStats {
-    fn add_node(&mut self, node: &str, response: DebugStatsResponse) {
+impl ClusterMetrics {
+    fn add_node(&mut self, node: &str, response: DebugMetricsResponse) {
         for metric in response.metrics {
             let Some(value) = metric.value else {
                 continue;
@@ -152,7 +152,7 @@ impl ClusterStats {
         };
         if !merged {
             log_warning(format!(
-                "TS._DEBUG STATS: left node {node}'s {name} out of the cluster view: its kind or buckets differ from another node's"
+                "TS._DEBUG METRICS: left node {node}'s {name} out of the cluster view: its kind or buckets differ from another node's"
             ));
         }
     }
@@ -200,7 +200,7 @@ impl ClusterStats {
     }
 }
 
-/// `TS._DEBUG STATS` (and `STATS RESET`) across the cluster: each `target` node reports its own
+/// `TS._DEBUG METRICS` (and `METRICS RESET`) across the cluster: each `target` node reports its own
 /// metrics, since each counts only what happened on it, so `CLUSTER` asks every node, replicas
 /// included. The coordinator sums counters and histograms, and lists each gauge per node: a sum
 /// of refresh intervals or ages means nothing, and a per-node queue depth says where the queue
@@ -209,15 +209,15 @@ impl ClusterStats {
 /// Each node gates its own internals on `debug-mode`, as for a direct `TS._DEBUG` call, so one
 /// node with it off fails the command.
 #[derive(Default)]
-pub struct StatsFanoutCommand {
+pub struct MetricsFanoutCommand {
     sections: Vec<Section>,
     verbose: bool,
     reset: bool,
     target: FanoutTarget,
-    stats: ClusterStats,
+    cluster: ClusterMetrics,
 }
 
-impl StatsFanoutCommand {
+impl MetricsFanoutCommand {
     pub fn report(sections: Vec<Section>, verbose: bool, target: FanoutTarget) -> Self {
         Self {
             sections,
@@ -236,23 +236,23 @@ impl StatsFanoutCommand {
     }
 }
 
-impl FanoutClientCommand for StatsFanoutCommand {
-    type Request = DebugStatsRequest;
-    type Response = DebugStatsResponse;
+impl FanoutClientCommand for MetricsFanoutCommand {
+    type Request = DebugMetricsRequest;
+    type Response = DebugMetricsResponse;
 
     fn name() -> &'static str {
-        "cmd::debug_stats"
+        "cmd::debug_metrics"
     }
 
     /// Reads atomics and the registries; takes no GIL and holds no keys.
     fn get_local_response(
         _ctx: &FanoutContext,
-        req: DebugStatsRequest,
-    ) -> ValkeyResult<DebugStatsResponse> {
+        req: DebugMetricsRequest,
+    ) -> ValkeyResult<DebugMetricsResponse> {
         ensure_debug_enabled()?;
         if req.reset {
             metrics::reset();
-            return Ok(DebugStatsResponse::default());
+            return Ok(DebugMetricsResponse::default());
         }
         let sections: Vec<Section> = req
             .sections
@@ -262,18 +262,18 @@ impl FanoutClientCommand for StatsFanoutCommand {
         // Every name unknown here means none of the requested sections exist on this node: report
         // nothing rather than everything.
         if sections.is_empty() && !req.sections.is_empty() {
-            return Ok(DebugStatsResponse::default());
+            return Ok(DebugMetricsResponse::default());
         }
-        Ok(DebugStatsResponse {
+        Ok(DebugMetricsResponse {
             metrics: metrics::snapshot(&sections)
                 .iter()
-                .map(DebugStatsMetric::from)
+                .map(DebugMetric::from)
                 .collect(),
         })
     }
 
-    fn generate_request(&self) -> DebugStatsRequest {
-        DebugStatsRequest {
+    fn generate_request(&self) -> DebugMetricsRequest {
+        DebugMetricsRequest {
             sections: self
                 .sections
                 .iter()
@@ -288,7 +288,7 @@ impl FanoutClientCommand for StatsFanoutCommand {
     }
 
     fn on_response(&mut self, resp: Self::Response, target: &NodeInfo) -> FanoutCommandResult {
-        self.stats
+        self.cluster
             .add_node(&target.socket_address.to_string(), resp);
         Ok(())
     }
@@ -300,8 +300,8 @@ impl FanoutClientCommand for StatsFanoutCommand {
             return Status::Ok;
         }
         let local = metrics::snapshot(&self.sections);
-        let readings = std::mem::take(&mut self.stats).into_readings(&local);
-        reply_cluster_stats(ctx, &readings, self.verbose);
+        let readings = std::mem::take(&mut self.cluster).into_readings(&local);
+        reply_cluster_metrics(ctx, &readings, self.verbose);
         Status::Ok
     }
 }
@@ -335,9 +335,9 @@ mod tests {
         h.snapshot()
     }
 
-    fn node_response(readings: &[MetricReading]) -> DebugStatsResponse {
-        DebugStatsResponse {
-            metrics: readings.iter().map(DebugStatsMetric::from).collect(),
+    fn node_response(readings: &[MetricReading]) -> DebugMetricsResponse {
+        DebugMetricsResponse {
+            metrics: readings.iter().map(DebugMetric::from).collect(),
         }
     }
 
@@ -349,19 +349,19 @@ mod tests {
             MetricValue::Gauge(Scalar::UInt(9)),
             MetricValue::Gauge(Scalar::Float(0.25)),
         ] {
-            let metric = DebugStatsMetric::from(&reading("fanout_x", value.clone()));
-            let mut stats = ClusterStats::default();
-            stats.add("n1:1", metric.name, metric.value.unwrap());
+            let metric = DebugMetric::from(&reading("fanout_x", value.clone()));
+            let mut cluster = ClusterMetrics::default();
+            cluster.add("n1:1", metric.name, metric.value.unwrap());
             let expected = match value {
                 MetricValue::Counter(v) => ClusterValue::Counter(v),
                 MetricValue::Gauge(s) => ClusterValue::Gauge(vec![("n1:1".into(), s)]),
                 MetricValue::Histogram(_) => unreachable!(),
             };
-            assert_eq!(stats.values["fanout_x"], expected);
+            assert_eq!(cluster.values["fanout_x"], expected);
         }
 
         let snapshot = histogram(&[0.5, 3.0, 9.0]);
-        let DebugStatsMetric { value, .. } = DebugStatsMetric::from(&reading(
+        let DebugMetric { value, .. } = DebugMetric::from(&reading(
             "fanout_h",
             MetricValue::Histogram(snapshot.clone()),
         ));
@@ -373,12 +373,12 @@ mod tests {
 
     #[test]
     fn counters_and_histograms_sum_and_gauges_stay_per_node() {
-        let mut stats = ClusterStats::default();
+        let mut cluster = ClusterMetrics::default();
         for (node, n, gauge, observations) in [
             ("10.0.0.2:7001", 5, 1, &[0.5, 3.0][..]),
             ("10.0.0.1:7000", 2, 4, &[9.0][..]),
         ] {
-            stats.add_node(
+            cluster.add_node(
                 node,
                 node_response(&[
                     reading("fanout_operations_total", MetricValue::Counter(n)),
@@ -390,7 +390,7 @@ mod tests {
                 ]),
             );
         }
-        let readings = stats.into_readings(&[]);
+        let readings = cluster.into_readings(&[]);
         let by_name: AHashMap<_, _> = readings.iter().map(|r| (r.name.as_str(), r)).collect();
         assert_eq!(
             by_name["fanout_operations_total"].value,
@@ -411,28 +411,28 @@ mod tests {
 
     #[test]
     fn a_histogram_with_other_bounds_is_left_out() {
-        let mut stats = ClusterStats::default();
+        let mut cluster = ClusterMetrics::default();
         let ours = histogram(&[0.5]);
-        stats.add_node(
+        cluster.add_node(
             "a:1",
             node_response(&[reading("fanout_h", MetricValue::Histogram(ours.clone()))]),
         );
         let other = BucketHistogram::new(Buckets::custom([10.0]));
         other.observe(1.0);
-        stats.add_node(
+        cluster.add_node(
             "b:1",
             node_response(&[reading(
                 "fanout_h",
                 MetricValue::Histogram(other.snapshot()),
             )]),
         );
-        assert_eq!(stats.values["fanout_h"], ClusterValue::Histogram(ours));
+        assert_eq!(cluster.values["fanout_h"], ClusterValue::Histogram(ours));
     }
 
     #[test]
     fn readings_come_in_section_then_family_order_with_local_help() {
-        let mut stats = ClusterStats::default();
-        stats.add_node(
+        let mut cluster = ClusterMetrics::default();
+        cluster.add_node(
             "a:1",
             node_response(&[
                 reading("fanout_ticks_total", MetricValue::Counter(1)),
@@ -445,7 +445,7 @@ mod tests {
             "exec_analysis_rejected_total",
             MetricValue::Counter(0),
         )];
-        let readings = stats.into_readings(&local);
+        let readings = cluster.into_readings(&local);
         let names: Vec<_> = readings.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,

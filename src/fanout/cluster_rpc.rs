@@ -607,7 +607,7 @@ pub fn send_cluster_message(
     Status::Ok
 }
 
-/// Where a sent message of `msg_type` is counted (`TS._DEBUG STATS fanout`).
+/// Where a sent message of `msg_type` is counted (`TS._DEBUG METRICS fanout`).
 fn wire_counters(msg_type: u8) -> Option<&'static WireCounters> {
     match msg_type {
         FANOUT_REQUEST_MESSAGE => Some(&metrics::FANOUT_REQUESTS_SENT),

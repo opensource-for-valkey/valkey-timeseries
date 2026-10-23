@@ -582,17 +582,17 @@ pub struct IndexMemoryRequest {
     #[prost(bool, tag = "1")]
     pub all_dbs: bool,
 }
-/// TS._DEBUG STATS: each node reports its own module metrics, or starts them
+/// TS._DEBUG METRICS: each node reports its own module metrics, or starts them
 /// over. Metrics are per node and process-wide, so every node is asked (replicas
 /// included) and there is nothing to filter by key or database.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DebugStatsRequest {
+pub struct DebugMetricsRequest {
     /// Section names to report (`fanout`, `cron`, ...); empty reports every
     /// section. A node skips a name it does not know, so a newer coordinator's
     /// section does not fail an older node.
     #[prost(string, repeated, tag = "1")]
     pub sections: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Start this node's counters and histograms over (TS._DEBUG STATS RESET)
+    /// Start this node's counters and histograms over (TS._DEBUG METRICS RESET)
     /// instead of reporting; the response is then empty.
     #[prost(bool, tag = "2")]
     pub reset: bool,
@@ -940,7 +940,7 @@ pub struct IndexMemoryResponse {
 /// A cumulative histogram: `bounds\[i\]` is bucket i's upper bound (the last one
 /// is +Inf) and `cumulative_counts\[i\]` the observations at or below it.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DebugStatsHistogram {
+pub struct DebugMetricHistogram {
     #[prost(uint64, tag = "1")]
     pub count: u64,
     #[prost(double, tag = "2")]
@@ -954,14 +954,14 @@ pub struct DebugStatsHistogram {
 /// coordinator sums counters and histograms across nodes and lists gauges per
 /// node.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DebugStatsMetric {
+pub struct DebugMetric {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    #[prost(oneof = "debug_stats_metric::Value", tags = "2, 3, 4, 5, 6")]
-    pub value: ::core::option::Option<debug_stats_metric::Value>,
+    #[prost(oneof = "debug_metric::Value", tags = "2, 3, 4, 5, 6")]
+    pub value: ::core::option::Option<debug_metric::Value>,
 }
-/// Nested message and enum types in `DebugStatsMetric`.
-pub mod debug_stats_metric {
+/// Nested message and enum types in `DebugMetric`.
+pub mod debug_metric {
     #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Value {
         #[prost(uint64, tag = "2")]
@@ -973,12 +973,12 @@ pub mod debug_stats_metric {
         #[prost(double, tag = "5")]
         GaugeFloat(f64),
         #[prost(message, tag = "6")]
-        Histogram(super::DebugStatsHistogram),
+        Histogram(super::DebugMetricHistogram),
     }
 }
-/// A node's metrics, counted from its own last STATS RESET.
+/// A node's metrics, counted from its own last METRICS RESET.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DebugStatsResponse {
+pub struct DebugMetricsResponse {
     #[prost(message, repeated, tag = "1")]
-    pub metrics: ::prost::alloc::vec::Vec<DebugStatsMetric>,
+    pub metrics: ::prost::alloc::vec::Vec<DebugMetric>,
 }

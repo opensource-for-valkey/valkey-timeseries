@@ -1722,9 +1722,9 @@ class TestTsReadOnReplica(ReplicationTestCase):
 
 
 class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
-    """`TS._DEBUG STATS blocked_read`: what happened to each blocking read.
+    """`TS._DEBUG METRICS blocked_read`: what happened to each blocking read.
 
-    Counts are asserted exactly after a `STATS RESET` taken right before the action. Nothing but
+    Counts are asserted exactly after a `METRICS RESET` taken right before the action. Nothing but
     the test's own readers touches these metrics. `blocked_read_blocked_clients` is a gauge: it survives
     a reset, and is checked against the server's own `blocked_clients`.
     """
@@ -1740,10 +1740,10 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
     }
 
     def stats(self):
-        return self.debug_stats("blocked_read")
+        return self.debug_metrics("blocked_read")
 
     def reset_stats(self):
-        assert self.client.execute_command("TS._DEBUG", "STATS", "RESET") == b"OK"
+        assert self.client.execute_command("TS._DEBUG", "METRICS", "RESET") == b"OK"
 
     def stat(self, name):
         return self.stats()[name]
@@ -1919,7 +1919,7 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
                 reader.close(self.client)
 
     def info(self):
-        """`INFO ts_blocked_read` without the server's `ts_` prefix, so the names match `STATS`."""
+        """`INFO ts_blocked_read` without the server's `ts_` prefix, so the names match `METRICS`."""
         parsed = self.client.execute_command("INFO", "ts_blocked_read")
         return {name.removeprefix("ts_"): int(value) for name, value in parsed.items()}
 

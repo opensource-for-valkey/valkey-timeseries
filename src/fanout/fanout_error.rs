@@ -67,7 +67,7 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// Every kind, in the order `TS._DEBUG STATS fanout` reports `fanout_errors_<kind>_total`.
+    /// Every kind, in the order `TS._DEBUG METRICS fanout` reports `fanout_errors_<kind>_total`.
     pub(crate) const ALL: [ErrorKind; 15] = [
         ErrorKind::InvalidMessage,
         ErrorKind::NodeUnreachable,

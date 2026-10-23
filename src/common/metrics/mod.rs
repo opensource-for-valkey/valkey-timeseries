@@ -1,11 +1,11 @@
-//! Module metrics, built on [`metered`]: one registry per [`Section`], read by `TS._DEBUG STATS`.
+//! Module metrics, built on [`metered`]: one registry per [`Section`], read by `TS._DEBUG METRICS`.
 //!
 //! Each section is a `metered::Registry` that prefixes its metric names with the section's
 //! name, and a submodule of this one: it declares the section's metrics as statics, next to one
 //! `register` function that registers each with its help text and unit. Where the code
 //! already keeps the value, the registry reads that state directly: a std atomic is a metered
 //! counter or gauge as it stands, and an executor's own counts are read through a closure.
-//! `TS._DEBUG STATS` reports from the registries, and so does `INFO ts_blocked_read` (one section's
+//! `TS._DEBUG METRICS` reports from the registries, and so does `INFO ts_blocked_read` (one section's
 //! mirror, see `common::module_info`); so will the `INFO ts_stats` mirror and any OpenMetrics
 //! export. The design and the roster of planned metrics are in
 //! `docs/plans/observability-metrics-plan.md`.
@@ -18,7 +18,7 @@
 //! Naming follows OpenMetrics, as metered renders it: a counter is registered without its
 //! `_total` suffix, which its sample name gains, and a duration is a histogram in seconds.
 //!
-//! Metered values are monotonic, as a scraper expects. `TS._DEBUG STATS RESET` is a view over
+//! Metered values are monotonic, as a scraper expects. `TS._DEBUG METRICS RESET` is a view over
 //! them: it records the current counters and histograms as a baseline, and [`snapshot`] reports
 //! the difference. Nothing a scraper would read ever goes backwards.
 //!
@@ -70,7 +70,7 @@ fn new_duration_histogram() -> BucketHistogram {
     BucketHistogram::new(duration_buckets())
 }
 
-/// Groups of metrics, selectable in `TS._DEBUG STATS`. Each is one registry, and each metric's
+/// Groups of metrics, selectable in `TS._DEBUG METRICS`. Each is one registry, and each metric's
 /// name starts with its section's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -207,7 +207,7 @@ pub enum MetricValue {
     Histogram(HistogramSnapshot),
 }
 
-/// One metric's value, as `TS._DEBUG STATS` reports it.
+/// One metric's value, as `TS._DEBUG METRICS` reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricReading {
     /// The sample name: the family name, plus `_total` for a counter.
@@ -311,7 +311,7 @@ fn read_registry(section: Section, registry: &Registry<'static>) -> Vec<MetricRe
         .collect()
 }
 
-/// What the last `TS._DEBUG STATS RESET` read, keyed by sample name.
+/// What the last `TS._DEBUG METRICS RESET` read, keyed by sample name.
 #[derive(Default)]
 struct Baseline {
     counters: HashMap<String, u64>,
@@ -677,7 +677,7 @@ mod tests {
             for family in schema.families() {
                 assert!(
                     MetricKind::of(family.metric_type).is_some(),
-                    "{}: {:?} is not reported by TS._DEBUG STATS",
+                    "{}: {:?} is not reported by TS._DEBUG METRICS",
                     family.name,
                     family.metric_type
                 );
@@ -744,7 +744,7 @@ mod tests {
         }
     }
 
-    /// `TS._DEBUG STATS VERBOSE` reports the help text as the description.
+    /// `TS._DEBUG METRICS VERBOSE` reports the help text as the description.
     #[test]
     fn every_metric_has_help() {
         for reading in snapshot(&[]) {
@@ -756,7 +756,7 @@ mod tests {
         }
     }
 
-    /// A section with nothing in it would be accepted by `STATS` and report nothing.
+    /// A section with nothing in it would be accepted by `METRICS` and report nothing.
     #[test]
     fn every_section_has_a_metric() {
         for (section, schema) in schemas() {

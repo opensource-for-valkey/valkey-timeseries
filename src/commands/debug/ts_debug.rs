@@ -1,7 +1,7 @@
 use super::configs::list_configs_cmd;
 use super::ensure_debug_enabled;
 use super::index_memory::index_memory;
-use super::stats::stats_cmd;
+use super::metrics::metrics_cmd;
 use super::string_pool_stats::string_pool_stats;
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
@@ -66,11 +66,11 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
 
     const HELP_TEXT: &[(&str, &str)] = &[
         (
-            "TS._DEBUG STATS [section ...] [VERBOSE] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "TS._DEBUG METRICS [section ...] [VERBOSE] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
             "Show this node's module metrics, optionally for the named sections only (VERBOSE adds kind and description); CLUSTER sums counters and histograms over every node and lists gauges per node (PRIMARY over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
         ),
         (
-            "TS._DEBUG STATS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "TS._DEBUG METRICS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
             "Start this node's metric counters and histograms over (gauges are left alone), or every node's with CLUSTER (PRIMARY: shard primaries; HASHTAG: the primaries of the shards owning those tags)",
         ),
         (
@@ -129,7 +129,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let keyword = itr.next_str()?;
 
     let result = hashify::fnc_map_ignore_case!(keyword.as_bytes(),
-        "STATS" => stats_cmd(ctx, &mut itr),
+        "METRICS" => metrics_cmd(ctx, &mut itr),
         "STRINGPOOLSTATS" => string_pool_stats(ctx, &mut itr),
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
         "INFLIGHT" => inflight(ctx, &mut itr),

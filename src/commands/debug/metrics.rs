@@ -1,4 +1,4 @@
-use super::stats_fanout_command::{ClusterReading, ClusterValue, StatsFanoutCommand};
+use super::metrics_fanout_command::{ClusterReading, ClusterValue, MetricsFanoutCommand};
 use super::target::{parse_node_target, resolve_node_target};
 use crate::commands::CommandArgIterator;
 use crate::common::humanize::bytes_to_human;
@@ -148,8 +148,8 @@ fn reply_metric_verbose(ctx: &Context, reading: &MetricReading) {
     reply_with_bulk_string(ctx, &reading.help);
 }
 
-/// Writes the cluster view in the same layout as a single node's reply (see [`stats_cmd`]).
-pub(super) fn reply_cluster_stats(ctx: &Context, readings: &[ClusterReading], verbose: bool) {
+/// Writes the cluster view in the same layout as a single node's reply (see [`metrics_cmd`]).
+pub(super) fn reply_cluster_metrics(ctx: &Context, readings: &[ClusterReading], verbose: bool) {
     if verbose {
         reply_with_array(ctx, readings.len());
         for reading in readings {
@@ -199,7 +199,7 @@ fn is_keyword(arg: &[u8], keyword: &[u8]) -> bool {
 fn unknown_section(name: &str) -> ValkeyError {
     let valid: Vec<_> = Section::ALL.iter().map(|s| s.as_str()).collect();
     ValkeyError::String(format!(
-        "TSDB: unknown STATS section '{name}' (valid sections: {})",
+        "TSDB: unknown METRICS section '{name}' (valid sections: {})",
         valid.join(", ")
     ))
 }
@@ -207,8 +207,8 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// Reports module metrics, or starts them over.
 ///
 /// Syntax:
-/// - `TS._DEBUG STATS [section ...] [VERBOSE] [<target>]`
-/// - `TS._DEBUG STATS RESET [<target>]`
+/// - `TS._DEBUG METRICS [section ...] [VERBOSE] [<target>]`
+/// - `TS._DEBUG METRICS RESET [<target>]`
 ///
 /// where `<target>` is `LOCAL`, `PRIMARY`, `CLUSTER` or `HASHTAG <tag>[,<tag>...]`, at most once
 /// and, for the report, in any position. Both read, or reset, the connected node alone without
@@ -221,15 +221,15 @@ fn unknown_section(name: &str) -> ValkeyError {
 /// rendering it as `INFO` does (`1.21M`). With `VERBOSE`, replies with one map per metric: name,
 /// section, kind, value, `valueHuman` for a byte metric, description.
 ///
-/// `RESET` starts counters and histograms over from zero, as `STATS` reports them, and leaves
+/// `RESET` starts counters and histograms over from zero, as `METRICS` reports them, and leaves
 /// gauges alone. It is not replicated.
 ///
-/// With any other target both fan out to those nodes (see [`StatsFanoutCommand`]); `CLUSTER`
+/// With any other target both fan out to those nodes (see [`MetricsFanoutCommand`]); `CLUSTER`
 /// asks every node, replicas included, `PRIMARY` the shard primaries, and `HASHTAG` the primaries
 /// of the shards owning those tags. Counters and histograms are summed, and each gauge's value becomes an
 /// `address => value` map, one entry per node. Any target but `LOCAL` on a standalone server is
 /// an error.
-pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+pub(super) fn metrics_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
     if args
         .peek()
         .is_some_and(|arg| is_keyword(arg.as_slice(), b"RESET"))
@@ -239,11 +239,11 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
         parse_node_target(args, &mut target)?;
         if args.peek().is_some() {
             return Err(ValkeyError::Str(
-                "TSDB: STATS RESET takes no further arguments but a node target",
+                "TSDB: METRICS RESET takes no further arguments but a node target",
             ));
         }
         if let Some(target) = resolve_node_target(ctx, target, FanoutTarget::All)? {
-            StatsFanoutCommand::reset(target).exec(ctx)?;
+            MetricsFanoutCommand::reset(target).exec(ctx)?;
             return Ok(());
         }
         metrics::reset();
@@ -270,7 +270,7 @@ pub(super) fn stats_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyR
     }
 
     if let Some(target) = resolve_node_target(ctx, target, FanoutTarget::All)? {
-        StatsFanoutCommand::report(sections, verbose, target).exec(ctx)?;
+        MetricsFanoutCommand::report(sections, verbose, target).exec(ctx)?;
         return Ok(());
     }
 
