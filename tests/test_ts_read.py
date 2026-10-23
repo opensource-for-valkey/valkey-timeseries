@@ -1722,7 +1722,7 @@ class TestTsReadOnReplica(ReplicationTestCase):
 
 
 class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
-    """`TS._DEBUG STATS read`: what happened to each blocking read.
+    """`TS._DEBUG STATS blocked_read`: what happened to each blocking read.
 
     Counts are asserted exactly after a `STATS RESET` taken right before the action. Nothing but
     the test's own readers touches these metrics. `blocked_read_blocked_clients` is a gauge: it survives
