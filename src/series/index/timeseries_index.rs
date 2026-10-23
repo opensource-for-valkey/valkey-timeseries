@@ -97,7 +97,7 @@ impl TermFingerprints {
 /// How many times [`TimeSeriesIndex::read_without_swap`] runs a read that `SWAPDB` keeps
 /// exchanging the database under before it gives up. One swap during a read is rare; three
 /// in a row is not a workload worth more attempts.
-const SWAP_RETRY_ATTEMPTS: usize = 3;
+pub(super) const SWAP_RETRY_ATTEMPTS: usize = 3;
 
 pub struct TimeSeriesIndex {
     pub(crate) inner: RwLock<Postings>,

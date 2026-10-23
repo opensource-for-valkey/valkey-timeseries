@@ -6,9 +6,7 @@ use crate::commands::ts_querylabels_fanout_command::QueryLabelsFanoutCommand;
 use crate::common::replies::reply_with_string_set;
 use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
-use crate::series::index::{
-    SeriesCursor, query_labels_distinct, query_labels_distinct_planned, query_labels_selection,
-};
+use crate::series::index::{SeriesCursor, query_labels_distinct_planned, query_labels_selection};
 use std::collections::BTreeSet;
 use valkey_module::ValkeyError::WrongArity;
 use valkey_module::{Context, ValkeyResult, ValkeyString, ValkeyValue};
@@ -70,9 +68,5 @@ fn read_labels<S: GilSource + ?Sized>(
     plan: Option<SeriesCursor>,
     options: &QueryLabelsOptions,
 ) -> ValkeyResult<BTreeSet<String>> {
-    let label = options.label.as_deref();
-    match plan {
-        Some(cursor) => query_labels_distinct_planned(src, cursor, label),
-        None => query_labels_distinct(src, &options.matchers, label),
-    }
+    query_labels_distinct_planned(src, plan, &options.matchers, options.label.as_deref())
 }

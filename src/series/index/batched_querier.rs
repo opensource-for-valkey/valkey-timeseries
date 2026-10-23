@@ -21,6 +21,10 @@
 //! cross-shard atomicity to begin with. Do not use it where a command must be atomic, or
 //! for a mutation.
 //!
+//! A `SWAPDB` or flush is not skipped over: the plan's ids belong to the index it replaced,
+//! so the next batch fails with `DATABASE_SWAPPED_DURING_READ` rather than end the read
+//! short, and [`read_planned`] runs the read again over a new plan.
+//!
 //! # Why ids are resolved per batch
 //! Resolving every id to its key up front and opening the keys later would be cheaper, and
 //! wrong: if a key is renamed in between, its old name opens to nothing, the id is taken for
@@ -39,6 +43,7 @@
 
 use super::postings::Postings;
 use super::querier::{StaleIds, matches_date_range};
+use super::timeseries_index::SWAP_RETRY_ATTEMPTS;
 use super::{KeyList, PostingsBitmap, get_db_index};
 use crate::common::acl::KeyAccess;
 use crate::common::context::create_key_string;
@@ -233,13 +238,56 @@ pub fn collect_indexed_keys<S: GilSource + ?Sized>(
     while !cursor.is_done() {
         {
             let _ctx = src.lock()?;
-            cursor.next_key_batch(batch_size.get(), &mut keys);
+            cursor.next_key_batch(batch_size.get(), &mut keys)?;
         }
         if src.can_release() && !read_another_batch(src, &cursor)? {
             break;
         }
     }
     Ok(keys)
+}
+
+/// Fails with [`error_consts::DATABASE_SWAPPED_DURING_READ`] unless database `db`'s index is
+/// still at `generation`: a `SWAPDB` or a flush since then moved another database's postings
+/// in.
+///
+/// Batches check it under the module lock, which the index swap and the flush also run
+/// under, so a batch cannot straddle either.
+pub(crate) fn ensure_generation(db: i32, generation: u64) -> ValkeyResult<()> {
+    if get_db_index(db).generation() == generation {
+        Ok(())
+    } else {
+        Err(ValkeyError::Str(error_consts::DATABASE_SWAPPED_DURING_READ))
+    }
+}
+
+/// Run a planned read, and run it again over a new plan when the database was swapped
+/// under it ([`ensure_generation`]).
+///
+/// `read` gets `plan` when the caller planned already ([`plan_if_cheap`]), or else one from
+/// `replan`, and must start from scratch: each attempt discards what the last one read.
+/// After [`SWAP_RETRY_ATTEMPTS`] swapped attempts the error is returned, as
+/// [`TimeSeriesIndex::read_without_swap`](super::TimeSeriesIndex::read_without_swap) does.
+///
+/// The entry points that take a callback ([`for_each_series`] and the batch variants) leave
+/// this to their caller, whose callback owns what was read: they fail with the error instead.
+pub fn read_planned<T>(
+    plan: Option<SeriesCursor>,
+    mut replan: impl FnMut() -> ValkeyResult<SeriesCursor>,
+    mut read: impl FnMut(SeriesCursor) -> ValkeyResult<T>,
+) -> ValkeyResult<T> {
+    let mut plan = plan;
+    for _ in 0..SWAP_RETRY_ATTEMPTS {
+        let cursor = match plan.take() {
+            Some(cursor) => cursor,
+            None => replan()?,
+        };
+        match read(cursor) {
+            Err(ValkeyError::Str(msg)) if msg == error_consts::DATABASE_SWAPPED_DURING_READ => {}
+            result => return result,
+        }
+    }
+    Err(ValkeyError::Str(error_consts::DATABASE_SWAPPED_DURING_READ))
 }
 
 /// Which series a read visits.
@@ -411,6 +459,10 @@ pub struct SeriesCursor {
     range: Option<MetaDateRangeFilter>,
     /// Every id the plan matched, read or not.
     ids: PostingsBitmap,
+    /// The [`generation`](super::TimeSeriesIndex::generation) of the index `ids` came from.
+    /// Each batch checks it first: after a `SWAPDB` or a flush the database's index holds
+    /// other ids, so the rest of the plan would find nothing and the read would end short.
+    generation: u64,
     /// Where the next batch starts: the smallest id it may read.
     next: SeriesRef,
     /// Ids planned and not yet read.
@@ -433,40 +485,50 @@ impl SeriesCursor {
         selection: SeriesSelection<'_>,
         range: Option<MetaDateRangeFilter>,
     ) -> ValkeyResult<Self> {
+        let index = get_db_index(db);
+        // Read with the ids, under the same postings lock: `SWAPDB` changes both under the
+        // write lock.
+        let postings = index.get_postings();
+        let generation = index.generation();
         let ids = match selection {
             SeriesSelection::Matching([]) => PostingsBitmap::new(),
             SeriesSelection::Matching(selectors) => {
-                let index = get_db_index(db);
-                let postings = index.get_postings();
                 postings.postings_for_selectors(selectors)?.into_owned()
             }
-            SeriesSelection::All => {
-                let index = get_db_index(db);
-                let postings = index.get_postings();
-                postings.all_postings.clone()
-            }
+            SeriesSelection::All => postings.all_postings.clone(),
         };
-        Ok(Self::planned(db, range, ids))
+        Ok(Self::planned(db, range, ids, generation))
     }
 
     /// A plan of exactly `ids`, for tests that need one without a server-wide index.
     #[cfg(test)]
     pub(crate) fn from_ids(db: i32, ids: PostingsBitmap) -> Self {
-        Self::planned(db, None, ids)
+        Self::planned(db, None, ids, get_db_index(db).generation())
     }
 
-    fn planned(db: i32, range: Option<MetaDateRangeFilter>, ids: PostingsBitmap) -> Self {
-        // A plan cannot outgrow memory, so its ids fit a `usize`.
+    fn planned(
+        db: i32,
+        range: Option<MetaDateRangeFilter>,
+        ids: PostingsBitmap,
+        generation: u64,
+    ) -> Self {
         let remaining = ids.cardinality() as usize;
         Self {
             db,
             range,
             ids,
+            generation,
             next: 0,
             remaining,
             batch: Vec::new(),
             skip_unreadable: false,
         }
+    }
+
+    /// The index generation the plan was made against. A caller whose read goes on reading
+    /// the index after the series checks it again with [`ensure_generation`].
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Leave out the series the caller may not read, rather than failing the read on the
@@ -528,6 +590,7 @@ impl SeriesCursor {
         W: Fn(&TimeSeries) -> usize,
         F: for<'g> FnMut(&'g Context, &mut Vec<(SeriesGuard<'g>, ValkeyString)>) -> ValkeyResult<B>,
     {
+        ensure_generation(self.db, self.generation)?;
         // Taken in full unless the batch reports otherwise: a failed read stays consumed.
         if self.take_batch(limit.series.max(1)) == 0 {
             return Ok(None);
@@ -557,7 +620,8 @@ impl SeriesCursor {
     /// of the other batched reads. The cost is one module-lock acquisition per batch: about
     /// 2,000 for a million matched keys at the default 512 ids per batch, each held only for
     /// the copy. Going GIL-free would need `RENAME`'s index change made atomic first.
-    fn next_key_batch(&mut self, max: usize, keys: &mut KeyList) {
+    fn next_key_batch(&mut self, max: usize, keys: &mut KeyList) -> ValkeyResult<()> {
+        ensure_generation(self.db, self.generation)?;
         self.take_batch(max.max(1));
         let index = get_db_index(self.db);
         let mut stale = StaleIds::new();
@@ -568,6 +632,7 @@ impl SeriesCursor {
             });
         }
         index.mark_ids_as_stale(&stale);
+        Ok(())
     }
 
     /// Read up to `max` of the ids not yet read into `self.batch`, and count them as read.
@@ -630,7 +695,7 @@ where
     W: Fn(&TimeSeries) -> usize,
     F: for<'x> FnMut(&'x Context, &mut Vec<(SeriesGuard<'x>, ValkeyString)>) -> ValkeyResult<B>,
 {
-    // Looked up per batch rather than held: the guard pins the index map's reclamation.
+    // Looked up per batch rather than held.
     let index = get_db_index(db);
     let mut stale = StaleIds::new();
     let resolved = {
@@ -771,7 +836,7 @@ mod tests {
     #[test]
     fn a_cursor_pages_through_its_bitmap() {
         let ids = PostingsBitmap::from_iter([3, 5, 8, 13, 21, 1 << 40]);
-        let mut cursor = SeriesCursor::planned(0, None, ids);
+        let mut cursor = SeriesCursor::from_ids(0, ids);
         assert_eq!(cursor.remaining(), 6);
 
         let batches = drain(&mut cursor, 4);
@@ -783,7 +848,7 @@ mod tests {
 
     #[test]
     fn an_empty_plan_is_done_at_once() {
-        let mut cursor = SeriesCursor::planned(0, None, PostingsBitmap::new());
+        let mut cursor = SeriesCursor::from_ids(0, PostingsBitmap::new());
         assert!(cursor.is_done());
         assert_eq!(cursor.take_batch(4), 0);
     }
@@ -793,7 +858,7 @@ mod tests {
     #[test]
     fn ids_given_back_are_read_by_the_next_batch() {
         let ids = PostingsBitmap::from_iter([1, 2, 3, 4, 5]);
-        let mut cursor = SeriesCursor::planned(0, None, ids);
+        let mut cursor = SeriesCursor::from_ids(0, ids);
 
         assert_eq!(cursor.take_batch(3), 3);
         cursor.give_back(1);
@@ -805,7 +870,7 @@ mod tests {
     #[test]
     fn a_batch_read_in_full_gives_nothing_back() {
         let ids = PostingsBitmap::from_iter([1, 2, 3]);
-        let mut cursor = SeriesCursor::planned(0, None, ids);
+        let mut cursor = SeriesCursor::from_ids(0, ids);
 
         assert_eq!(cursor.take_batch(2), 2);
         cursor.give_back(2);
@@ -816,7 +881,7 @@ mod tests {
     #[test]
     fn finish_abandons_the_rest() {
         let ids = PostingsBitmap::from_iter([1, 2, 3]);
-        let mut cursor = SeriesCursor::planned(0, None, ids);
+        let mut cursor = SeriesCursor::from_ids(0, ids);
         cursor.take_batch(1);
         cursor.finish();
         assert!(cursor.is_done());
@@ -906,7 +971,7 @@ mod tests {
         let mut cursor = SeriesCursor::plan(DB, SeriesSelection::All, None).unwrap();
         let next_batch = |cursor: &mut SeriesCursor, max| {
             let mut keys = KeyList::new();
-            cursor.next_key_batch(max, &mut keys);
+            cursor.next_key_batch(max, &mut keys).unwrap();
             keys.into_vecs()
         };
 
@@ -926,9 +991,107 @@ mod tests {
         clear_timeseries_index(DB);
     }
 
+    /// Two databases no other test indexes into, with a series each.
+    fn swappable_dbs(a: i32, b: i32) {
+        for (db, id, key) in [(a, 1, "a"), (b, 2, "b")] {
+            clear_timeseries_index(db);
+            get_db_index(db).index_timeseries(&series(id, "cpu"), key.as_bytes());
+        }
+    }
+
+    fn swap_dbs(a: i32, b: i32) {
+        get_db_index(a).swap(&get_db_index(b));
+    }
+
+    /// Every key `cursor` resolves, a batch at a time.
+    fn read_keys(mut cursor: SeriesCursor) -> ValkeyResult<Vec<Vec<u8>>> {
+        let mut keys = KeyList::new();
+        while !cursor.is_done() {
+            cursor.next_key_batch(1, &mut keys)?;
+        }
+        Ok(keys.into_vecs())
+    }
+
+    fn assert_swapped<T: std::fmt::Debug>(result: ValkeyResult<T>) {
+        match result {
+            Err(ValkeyError::Str(msg)) => {
+                assert_eq!(msg, error_consts::DATABASE_SWAPPED_DURING_READ)
+            }
+            other => panic!("expected the swapped-database error, got {other:?}"),
+        }
+    }
+
+    /// A plan's ids are gone from its database's index after a `SWAPDB` or a flush: its next
+    /// batch fails rather than end the read short.
+    #[test]
+    fn a_plan_fails_its_next_batch_once_its_database_is_swapped_or_flushed() {
+        const A: i32 = 7303;
+        const B: i32 = 7304;
+        swappable_dbs(A, B);
+
+        let cursor = SeriesCursor::plan(A, SeriesSelection::All, None).unwrap();
+        swap_dbs(A, B);
+        assert_swapped(read_keys(cursor));
+
+        let cursor = SeriesCursor::plan(A, SeriesSelection::All, None).unwrap();
+        clear_timeseries_index(A);
+        assert_swapped(read_keys(cursor));
+
+        clear_timeseries_index(B);
+    }
+
+    /// The read is run again over a new plan, which reads what the database then holds.
+    #[test]
+    fn a_planned_read_is_planned_again_after_a_swap() {
+        const A: i32 = 7305;
+        const B: i32 = 7306;
+        swappable_dbs(A, B);
+        let stale = SeriesCursor::plan(A, SeriesSelection::All, None).unwrap();
+        swap_dbs(A, B);
+
+        let mut attempts = 0;
+        let keys = read_planned(
+            Some(stale),
+            || SeriesCursor::plan(A, SeriesSelection::All, None),
+            |cursor| {
+                attempts += 1;
+                read_keys(cursor)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(keys, vec![b"b".to_vec()]);
+        clear_timeseries_index(A);
+        clear_timeseries_index(B);
+    }
+
+    #[test]
+    fn a_planned_read_swapped_on_every_attempt_gives_up() {
+        const A: i32 = 7307;
+        const B: i32 = 7308;
+        swappable_dbs(A, B);
+
+        let mut attempts = 0;
+        let result = read_planned(
+            None,
+            || SeriesCursor::plan(A, SeriesSelection::All, None),
+            |cursor| {
+                attempts += 1;
+                swap_dbs(A, B);
+                read_keys(cursor)
+            },
+        );
+
+        assert_swapped(result);
+        assert_eq!(attempts, SWAP_RETRY_ATTEMPTS);
+        clear_timeseries_index(A);
+        clear_timeseries_index(B);
+    }
+
     /// A cursor with `ids` planned and none of them read yet.
     fn unread(ids: &[SeriesRef]) -> SeriesCursor {
-        SeriesCursor::planned(0, None, PostingsBitmap::from_iter(ids.iter().copied()))
+        SeriesCursor::from_ids(0, PostingsBitmap::from_iter(ids.iter().copied()))
     }
 
     #[test]

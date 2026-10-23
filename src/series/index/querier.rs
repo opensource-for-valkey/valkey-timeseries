@@ -24,7 +24,7 @@
 
 use super::{
     DEFAULT_SERIES_BATCH_SIZE, KeyList, SeriesCursor, SeriesSelection, collect_indexed_keys,
-    for_each_planned_series, get_db_index, get_timeseries_index,
+    for_each_planned_series, get_db_index, get_timeseries_index, read_planned,
 };
 use crate::common::Timestamp;
 use crate::common::acl::KeyAccess;
@@ -159,8 +159,7 @@ pub fn query_labels_distinct<S: GilSource + ?Sized>(
     selectors: &[SeriesSelector],
     label: Option<&str>,
 ) -> ValkeyResult<BTreeSet<String>> {
-    let cursor = SeriesCursor::plan(src.db(), query_labels_selection(selectors), None)?;
-    query_labels_distinct_planned(src, cursor, label)
+    query_labels_distinct_planned(src, None, selectors, label)
 }
 
 /// The series `TS.QUERYLABELS` reads for `selectors`: every indexed series when there are
@@ -173,44 +172,49 @@ pub fn query_labels_selection(selectors: &[SeriesSelector]) -> SeriesSelection<'
     }
 }
 
-/// [`query_labels_distinct`] over a read planned already, from [`query_labels_selection`].
-/// Unreadable series are omitted whatever the cursor was planned with.
+/// [`query_labels_distinct`] over `plan` when the caller planned already, from
+/// [`query_labels_selection`] of `selectors`, which plan it again after a `SWAPDB`
+/// ([`read_planned`]). Unreadable series are omitted whatever the cursor was planned with.
 pub fn query_labels_distinct_planned<S: GilSource + ?Sized>(
     src: &S,
-    cursor: SeriesCursor,
+    plan: Option<SeriesCursor>,
+    selectors: &[SeriesSelector],
     label: Option<&str>,
 ) -> ValkeyResult<BTreeSet<String>> {
-    let mut result: BTreeSet<String> = BTreeSet::new();
-    // TS.QUERYLABELS contract: series the caller may not read are skipped, not an error on
-    // the first one (that is the coarse gate the label-search commands use, and it is
-    // deliberately not applied here).
-    for_each_planned_series(
-        src,
-        cursor.skip_unreadable(),
-        DEFAULT_SERIES_BATCH_SIZE,
-        |_ctx, ts, _key| {
-            // Looked up before inserting: `insert(x.to_string())` would allocate for every
-            // label, seen or not.
-            match label {
-                None => {
-                    for lbl in ts.labels.iter() {
-                        if !result.contains(lbl.name) {
-                            result.insert(lbl.name.to_string());
+    let replan = || SeriesCursor::plan(src.db(), query_labels_selection(selectors), None);
+    read_planned(plan, replan, |cursor| {
+        let mut result: BTreeSet<String> = BTreeSet::new();
+        // TS.QUERYLABELS contract: series the caller may not read are skipped, not an error
+        // on the first one (that is the coarse gate the label-search commands use, and it is
+        // deliberately not applied here).
+        for_each_planned_series(
+            src,
+            cursor.skip_unreadable(),
+            DEFAULT_SERIES_BATCH_SIZE,
+            |_ctx, ts, _key| {
+                // Looked up before inserting: `insert(x.to_string())` would allocate for
+                // every label, seen or not.
+                match label {
+                    None => {
+                        for lbl in ts.labels.iter() {
+                            if !result.contains(lbl.name) {
+                                result.insert(lbl.name.to_string());
+                            }
+                        }
+                    }
+                    Some(name) => {
+                        if let Some(lbl) = ts.get_label(name)
+                            && !result.contains(lbl.value)
+                        {
+                            result.insert(lbl.value.to_string());
                         }
                     }
                 }
-                Some(name) => {
-                    if let Some(lbl) = ts.get_label(name)
-                        && !result.contains(lbl.value)
-                    {
-                        result.insert(lbl.value.to_string());
-                    }
-                }
-            }
-            Ok(ControlFlow::Continue(()))
-        },
-    )?;
-    Ok(result)
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(result)
+    })
 }
 
 /// Matching key names, copied out so they can outlive each batch's lock.
@@ -223,32 +227,37 @@ pub fn series_keys_by_selectors<S: GilSource + ?Sized>(
     selectors: &[SeriesSelector],
     range: Option<MetaDateRangeFilter>,
 ) -> ValkeyResult<KeyList> {
-    let cursor = SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range)?;
-    series_keys_by_selectors_planned(src, cursor)
+    series_keys_by_selectors_planned(src, None, selectors, range)
 }
 
-/// [`series_keys_by_selectors`] over a read planned already
-/// ([`plan_if_cheap`](super::plan_if_cheap)). A plan with a date range opens and checks every
-/// key as [`for_each_series`](super::for_each_series) does; otherwise the keys are what the
-/// index lists.
+/// [`series_keys_by_selectors`] over `plan` when the caller planned already
+/// ([`plan_if_cheap`](super::plan_if_cheap)) from `selectors` and `range`, which plan it again
+/// after a `SWAPDB` ([`read_planned`]). A plan with a date range opens and checks every key as
+/// [`for_each_series`](super::for_each_series) does; otherwise the keys are what the index
+/// lists.
 pub fn series_keys_by_selectors_planned<S: GilSource + ?Sized>(
     src: &S,
-    cursor: SeriesCursor,
+    plan: Option<SeriesCursor>,
+    selectors: &[SeriesSelector],
+    range: Option<MetaDateRangeFilter>,
 ) -> ValkeyResult<KeyList> {
-    if !cursor.has_date_range() {
-        return collect_indexed_keys(src, cursor, DEFAULT_SERIES_BATCH_SIZE);
-    }
-    let mut keys = KeyList::new();
-    for_each_planned_series(
-        src,
-        cursor,
-        DEFAULT_SERIES_BATCH_SIZE,
-        |_ctx, _series, key| {
-            keys.push(key.as_slice());
-            Ok(ControlFlow::Continue(()))
-        },
-    )?;
-    Ok(keys)
+    let replan = || SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range);
+    read_planned(plan, replan, |cursor| {
+        if !cursor.has_date_range() {
+            return collect_indexed_keys(src, cursor, DEFAULT_SERIES_BATCH_SIZE);
+        }
+        let mut keys = KeyList::new();
+        for_each_planned_series(
+            src,
+            cursor,
+            DEFAULT_SERIES_BATCH_SIZE,
+            |_ctx, _series, key| {
+                keys.push(key.as_slice());
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(keys)
+    })
 }
 
 /// Cardinality-only counterpart of [`series_by_selectors`].
@@ -261,26 +270,32 @@ pub fn count_series_by_selectors<S: GilSource + ?Sized>(
     selectors: &[SeriesSelector],
     range: Option<MetaDateRangeFilter>,
 ) -> ValkeyResult<usize> {
-    let cursor = SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range)?;
-    count_series_by_selectors_planned(src, cursor)
+    count_series_by_selectors_planned(src, None, selectors, range)
 }
 
-/// [`count_series_by_selectors`] using the same plan that sized the read for scheduling.
+/// [`count_series_by_selectors`] over `plan` when the caller planned already, to size the read
+/// for scheduling, from `selectors` and `range`, which plan it again after a `SWAPDB`
+/// ([`read_planned`]).
 pub fn count_series_by_selectors_planned<S: GilSource + ?Sized>(
     src: &S,
-    cursor: SeriesCursor,
+    plan: Option<SeriesCursor>,
+    selectors: &[SeriesSelector],
+    range: Option<MetaDateRangeFilter>,
 ) -> ValkeyResult<usize> {
-    let mut count = 0;
-    for_each_planned_series(
-        src,
-        cursor,
-        DEFAULT_SERIES_BATCH_SIZE,
-        |_ctx, _series, _key| {
-            count += 1;
-            Ok(ControlFlow::Continue(()))
-        },
-    )?;
-    Ok(count)
+    let replan = || SeriesCursor::plan(src.db(), SeriesSelection::Matching(selectors), range);
+    read_planned(plan, replan, |cursor| {
+        let mut count = 0;
+        for_each_planned_series(
+            src,
+            cursor,
+            DEFAULT_SERIES_BATCH_SIZE,
+            |_ctx, _series, _key| {
+                count += 1;
+                Ok(ControlFlow::Continue(()))
+            },
+        )?;
+        Ok(count)
+    })
 }
 
 fn collect_series_from_postings<'a>(

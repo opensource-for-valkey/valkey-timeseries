@@ -6,8 +6,7 @@ use crate::commands::command_parser::parse_metadata_command_args;
 use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::{
-    SeriesCursor, SeriesSelection, count_matched_series, count_series_by_selectors,
-    count_series_by_selectors_planned,
+    SeriesCursor, SeriesSelection, count_matched_series, count_series_by_selectors_planned,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
@@ -67,8 +66,5 @@ fn read_count<S: GilSource + ?Sized>(
     plan: Option<SeriesCursor>,
     options: &MatchFilterOptions,
 ) -> ValkeyResult<usize> {
-    match plan {
-        Some(cursor) => count_series_by_selectors_planned(src, cursor),
-        None => count_series_by_selectors(src, &options.matchers, options.date_range),
-    }
+    count_series_by_selectors_planned(src, plan, &options.matchers, options.date_range)
 }

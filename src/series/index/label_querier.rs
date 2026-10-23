@@ -16,7 +16,8 @@
 
 use super::{
     DEFAULT_SERIES_BATCH_SIZE, FuzzyFilter, IndexKey, PostingsBitmap, SeriesCursor,
-    SeriesSelection, SimilarityFilter, TimeSeriesIndex, for_each_planned_series, get_db_index,
+    SeriesSelection, SimilarityFilter, TimeSeriesIndex, ensure_generation, for_each_planned_series,
+    get_db_index, read_planned,
 };
 use crate::common::acl::check_metadata_permissions;
 use crate::common::constants::METRIC_NAME_LABEL;
@@ -150,17 +151,22 @@ impl SelectHints {
         self.selectors.is_empty() && self.date_range.is_none()
     }
 
-    /// The read these hints select in database `db`: the plan given with
-    /// [`Self::with_plan`], or a new one.
-    fn into_cursor(self, db: i32) -> TsdbResult<SeriesCursor> {
-        match self.planned {
-            Some(cursor) => Ok(cursor),
-            None => Ok(SeriesCursor::plan(
+    /// Run `read` over the series these hints select in database `db`: the plan given with
+    /// [`Self::with_plan`] first, and a new one when there is none or a `SWAPDB` moved the
+    /// database under it ([`read_planned`]).
+    fn read_planned<T>(
+        self,
+        db: i32,
+        read: impl FnMut(SeriesCursor) -> ValkeyResult<T>,
+    ) -> ValkeyResult<T> {
+        let replan = || {
+            SeriesCursor::plan(
                 db,
                 SeriesSelection::Matching(&self.selectors),
                 self.date_range,
-            )?),
-        }
+            )
+        };
+        read_planned(self.planned, replan, read)
     }
 }
 
@@ -1288,63 +1294,78 @@ fn collect_label_names<S: GilSource + ?Sized>(
     }
 
     // At this point we know we have non-empty selectors or a date range.
-    let cursor = select_hints.unwrap_or_default().into_cursor(src.db())?;
+    let db = src.db();
+    let result = select_hints
+        .unwrap_or_default()
+        .read_planned(db, |cursor| {
+            let generation = cursor.generation();
 
-    // Under the lock, only the distinct names are copied out: a hash lookup per label. The
-    // fuzzy filter and the cardinality lookups wait until the read is over.
-    //
-    // Still unbounded: every matched series is scanned, `names` holds every distinct name in
-    // the match, and on the main thread (`&Context`) the whole scan is one lock hold. The
-    // batched reader bounds only a fan-out share's lock holds, not the scan or the set.
-    let mut names: AHashSet<String> = AHashSet::with_capacity(DEFAULT_LIMIT);
-    for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
-        for label in ts.labels.iter() {
-            // Not `names.insert(label.name.to_string())`: that allocates for every
-            // label, seen or not.
-            if !names.contains(label.name) {
-                names.insert(label.name.to_string());
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
-
-    let need_cardinality = matches!(
-        hints.order_by,
-        SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
-    ) || hints.include_meta;
-
-    // A name's cardinality is its database-wide one, not the selection's. Each is read in
-    // bounded holds of the postings lock, taken only for names the filter accepts: one hold
-    // across every name would keep the lock for the sum of their values, a million entries
-    // for a name such as `instance`, while index writers wait. Never taken while the batched
-    // read runs either: it takes the postings lock itself, for writing when it has a stale id
-    // to record, and `RwLock` is not reentrant.
-    let index = need_cardinality.then(|| get_db_index(src.db()));
-
-    Ok(with_search_filter(hints, |filter| {
-        let mut result = Vec::with_capacity(names.len());
-        for name in names {
-            let (accepted, score) = filter.accept(&name);
-            if !accepted {
-                continue;
-            }
-            let cardinality = match index.as_ref() {
-                Some(index) => {
-                    match label_cardinality_in_holds(index, &name, LABEL_SCAN_ENTRIES_PER_HOLD) {
-                        0 => continue,
-                        cardinality => cardinality,
+            // Under the lock, only the distinct names are copied out: a hash lookup per label.
+            // The fuzzy filter and the cardinality lookups wait until the read is over.
+            //
+            // Still unbounded: every matched series is scanned, `names` holds every distinct
+            // name in the match, and on the main thread (`&Context`) the whole scan is one lock
+            // hold. The batched reader bounds only a fan-out share's lock holds, not the scan or
+            // the set.
+            let mut names: AHashSet<String> = AHashSet::with_capacity(DEFAULT_LIMIT);
+            for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
+                for label in ts.labels.iter() {
+                    // Not `names.insert(label.name.to_string())`: that allocates for every
+                    // label, seen or not.
+                    if !names.contains(label.name) {
+                        names.insert(label.name.to_string());
                     }
                 }
-                None => 0,
-            };
-            result.push(LabelSearchResult {
-                value: name,
-                score,
-                cardinality,
+                Ok(ControlFlow::Continue(()))
+            })?;
+
+            let need_cardinality = matches!(
+                hints.order_by,
+                SearchResultOrdering::CardinalityAsc | SearchResultOrdering::CardinalityDesc
+            ) || hints.include_meta;
+
+            // A name's cardinality is its database-wide one, not the selection's. Each is read in
+            // bounded holds of the postings lock, taken only for names the filter accepts: one
+            // hold across every name would keep the lock for the sum of their values, a million
+            // entries for a name such as `instance`, while index writers wait. Never taken while
+            // the batched read runs either: it takes the postings lock itself, for writing when it
+            // has a stale id to record, and `RwLock` is not reentrant.
+            let index = need_cardinality.then(|| get_db_index(db));
+
+            let result = with_search_filter(hints, |filter| {
+                let mut result = Vec::with_capacity(names.len());
+                for name in names {
+                    let (accepted, score) = filter.accept(&name);
+                    if !accepted {
+                        continue;
+                    }
+                    let cardinality = match index.as_ref() {
+                        Some(index) => match label_cardinality_in_holds(
+                            index,
+                            &name,
+                            LABEL_SCAN_ENTRIES_PER_HOLD,
+                        ) {
+                            0 => continue,
+                            cardinality => cardinality,
+                        },
+                        None => 0,
+                    };
+                    result.push(LabelSearchResult {
+                        value: name,
+                        score,
+                        cardinality,
+                    });
+                }
+                apply_search_hints(result, hints)
             });
-        }
-        apply_search_hints(result, hints)
-    }))
+            // The cardinalities are read after the scan, in holds of their own: they belong to
+            // the scanned database only if no `SWAPDB` came in between.
+            if index.is_some() {
+                ensure_generation(db, generation)?;
+            }
+            Ok(result)
+        })?;
+    Ok(result)
 }
 
 fn collect_label_values<S: GilSource + ?Sized>(
@@ -1369,25 +1390,29 @@ fn collect_label_values<S: GilSource + ?Sized>(
     }
 
     // At this point we know we have non-empty selectors or a date range.
-    let cursor = select_hints.unwrap_or_default().into_cursor(src.db())?;
-
+    //
     // Under the lock, only each distinct value and how many matched series carry it are
     // copied out. The filter then runs once per distinct value, after the read.
     //
     // Still unbounded, as in `collect_label_names`: `counts` holds every distinct value in
     // the match, and a main-thread scan is one lock hold.
-    let mut counts: AHashMap<String, usize> = AHashMap::with_capacity(DEFAULT_LIMIT);
-    for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
-        if let Some(label) = ts.get_label(label_name) {
-            match counts.get_mut(label.value) {
-                Some(count) => *count += 1,
-                None => {
-                    counts.insert(label.value.to_string(), 1);
+    let counts = select_hints
+        .unwrap_or_default()
+        .read_planned(src.db(), |cursor| {
+            let mut counts: AHashMap<String, usize> = AHashMap::with_capacity(DEFAULT_LIMIT);
+            for_each_planned_series(src, cursor, DEFAULT_SERIES_BATCH_SIZE, |_ctx, ts, _key| {
+                if let Some(label) = ts.get_label(label_name) {
+                    match counts.get_mut(label.value) {
+                        Some(count) => *count += 1,
+                        None => {
+                            counts.insert(label.value.to_string(), 1);
+                        }
+                    }
                 }
-            }
-        }
-        Ok(ControlFlow::Continue(()))
-    })?;
+                Ok(ControlFlow::Continue(()))
+            })?;
+            Ok(counts)
+        })?;
 
     let need_cardinality = matches!(
         search_hints.order_by,

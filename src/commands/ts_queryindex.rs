@@ -7,8 +7,7 @@ use crate::common::replies::{IntoRawCtx, reply_with_array, reply_with_slice};
 use crate::common::threads::GilSource;
 use crate::fanout::{FanoutClientCommand, is_clustered};
 use crate::series::index::{
-    KeyList, SeriesCursor, SeriesSelection, series_keys_by_selectors,
-    series_keys_by_selectors_planned,
+    KeyList, SeriesCursor, SeriesSelection, series_keys_by_selectors_planned,
 };
 use crate::series::request_types::MatchFilterOptions;
 use valkey_module::ValkeyError::WrongArity;
@@ -73,10 +72,7 @@ fn read_keys<S: GilSource + ?Sized>(
     plan: Option<SeriesCursor>,
     options: &MatchFilterOptions,
 ) -> ValkeyResult<KeyList> {
-    match plan {
-        Some(cursor) => series_keys_by_selectors_planned(src, cursor),
-        None => series_keys_by_selectors(src, &options.matchers, options.date_range),
-    }
+    series_keys_by_selectors_planned(src, plan, &options.matchers, options.date_range)
 }
 
 fn reply_with_keys<C: IntoRawCtx + Copy>(ctx: C, keys: &KeyList) {
