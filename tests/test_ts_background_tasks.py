@@ -34,3 +34,18 @@ class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
         self.client.config_set('hz', 1)
         before = self.started()
         wait_for_true(lambda: self.started() > before, timeout=15)
+
+    def test_load_pauses_task_schedule(self):
+        """Time spent loading does not count toward an interval: a task that came due during
+        the load does not run as soon as it ends, but once its remaining time has passed."""
+        wait_for_true(lambda: self.started() >= 1)
+        for i in range(100):
+            self.client.execute_command('TS.CREATE', f'ts:load:{i}')
+        # 100 keys x 120 ms: the reload outlasts the 10 s trim interval.
+        self.client.config_set('key-load-delay', 120_000)
+        before = self.started()
+        self.client.execute_command('DEBUG', 'RELOAD')
+        self.client.config_set('key-load-delay', 0)
+        time.sleep(3)
+        assert self.started() == before
+        wait_for_true(lambda: self.started() > before, timeout=15)

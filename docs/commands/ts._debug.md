@@ -391,7 +391,9 @@ Maintenance work on this node. Select it with `TS._DEBUG STATS task` or
 
 Periodic intervals (and the 300 s empty-database cleanup) are elapsed time, independent of `hz` and
 `dynamic-hz`: the server cron frequency only bounds how late a run starts, by at most one cron
-period. The first cron tick after load runs every periodic task.
+period. The first cron tick after startup runs every periodic task. Time spent loading (startup,
+replica full sync, `DEBUG RELOAD`) does not count toward an interval, so tasks resume on their own
+schedule after a load.
 
 Each task exposes the following names, with `<task>` replaced by its identity:
 

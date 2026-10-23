@@ -57,7 +57,45 @@ impl ScheduledTask {
     }
 }
 
+const NOT_PAUSED: u64 = u64::MAX;
+
+/// The cron skips its ticks while a load runs. Adding the load's duration to every deadline once
+/// it ends keeps each task on its own phase, rather than firing all of them on the first tick.
+struct SchedulePause {
+    started_ms: AtomicU64,
+}
+
+impl SchedulePause {
+    const fn new() -> Self {
+        Self {
+            started_ms: AtomicU64::new(NOT_PAUSED),
+        }
+    }
+
+    /// Repeated start events keep the earliest start.
+    fn pause(&self, now_ms: u64) {
+        let _ = self.started_ms.compare_exchange(
+            NOT_PAUSED,
+            now_ms,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn resume<'a>(&self, now_ms: u64, tasks: impl IntoIterator<Item = &'a ScheduledTask>) {
+        let started = self.started_ms.swap(NOT_PAUSED, Ordering::Relaxed);
+        if started == NOT_PAUSED {
+            return;
+        }
+        let paused = now_ms.saturating_sub(started);
+        for task in tasks {
+            task.next_due_ms.fetch_add(paused, Ordering::Relaxed);
+        }
+    }
+}
+
 static TASK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static LOAD_PAUSE: SchedulePause = SchedulePause::new();
 
 static SCHEDULE: [ScheduledTask; 4] = [
     ScheduledTask::new(TaskType::TrimSeries, RETENTION_CLEANUP_INTERVAL),
@@ -68,6 +106,16 @@ static SCHEDULE: [ScheduledTask; 4] = [
 
 fn monotonic_ms() -> u64 {
     TASK_EPOCH.elapsed().as_millis() as u64
+}
+
+/// Called when a load starts: time spent loading does not count toward any task's interval.
+pub(crate) fn pause_task_schedule() {
+    LOAD_PAUSE.pause(monotonic_ms());
+}
+
+/// Called when a load ends or fails.
+pub(crate) fn resume_task_schedule() {
+    LOAD_PAUSE.resume(monotonic_ms(), &SCHEDULE);
 }
 
 fn trim_unused_dbs() {
@@ -192,5 +240,41 @@ mod tests {
             .chain([35_000])
             .chain((35_100..=50_000).step_by(100));
         assert_eq!(simulate(INTERVAL_MS, ticks), vec![0, 35_000, 45_000]);
+    }
+
+    #[test]
+    fn pause_keeps_phase_across_a_load() {
+        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let pause = SchedulePause::new();
+        assert!(task.poll(0));
+        // 4 s into the interval, a 12 s load: 6 s remain once it ends.
+        pause.pause(4_000);
+        pause.resume(16_000, [&task]);
+        assert!(!task.poll(16_100));
+        assert!(!task.poll(21_999));
+        assert!(task.poll(22_000));
+    }
+
+    #[test]
+    fn startup_load_still_runs_every_task_on_the_first_tick() {
+        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let pause = SchedulePause::new();
+        pause.pause(0);
+        pause.resume(12_000, [&task]);
+        assert!(task.poll(12_000));
+    }
+
+    #[test]
+    fn resume_without_pause_and_repeated_pause_are_harmless() {
+        let task = ScheduledTask::new(TaskType::TrimSeries, Duration::from_millis(INTERVAL_MS));
+        let pause = SchedulePause::new();
+        assert!(task.poll(0));
+        pause.resume(5_000, [&task]);
+        // A second start event must not move the pause start forward.
+        pause.pause(2_000);
+        pause.pause(3_000);
+        pause.resume(7_000, [&task]);
+        assert!(!task.poll(14_999));
+        assert!(task.poll(15_000));
     }
 }

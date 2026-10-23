@@ -2,6 +2,7 @@
 //!
 use crate::common::context::{create_key_string, get_current_db, register_server_event_handler};
 use crate::common::sync::lock;
+use crate::series::background_tasks::{pause_task_schedule, resume_task_schedule};
 use crate::series::index::asm::{
     add_delayed_indexing_key, clear_delayed_keys_in_db, clear_delayed_keys_map,
     is_key_in_slot_import, register_asm_event_handler,
@@ -44,15 +45,17 @@ fn __persistence_event_handler(ctx: &Context, persistence_event: PersistenceSube
 /// opens the load window (enabling the loaded-series counter and the `loaded`-event fast path);
 /// after a successful load, preloaded indexes are swept for dangling ids and verified against
 /// the loaded count; after a failed load, the preloaded state cannot be trusted, so drop it and
-/// let the natural indexing paths rebuild.
+/// let the natural indexing paths rebuild. Maintenance task deadlines pause for the load's duration.
 #[loading_event_handler]
 fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
     match loading_event {
         LoadingSubevent::RdbStarted | LoadingSubevent::ReplStarted => {
+            pause_task_schedule();
             on_loading_started();
             bulk_build::on_load_started(false);
         }
         LoadingSubevent::AofStarted => {
+            pause_task_schedule();
             on_loading_started();
             // AOF loads keep the per-key indexing path (see bulk_build.rs module docs).
             bulk_build::on_load_started(true);
@@ -63,10 +66,12 @@ fn __loading_event_handler(ctx: &Context, loading_event: LoadingSubevent) {
             // background for dbs that took the preload fast path instead.
             bulk_build::on_load_ended();
             on_loading_ended(load_keys_expired(ctx));
+            resume_task_schedule();
         }
         LoadingSubevent::Failed => {
             bulk_build::on_load_failed();
             on_loading_failed();
+            resume_task_schedule();
         }
     }
 }
