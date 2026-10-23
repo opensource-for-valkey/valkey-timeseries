@@ -1194,7 +1194,9 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert stats['task_trim_unused_dbs_running'] == 0
         assert 'task_retention_trim_samples_deleted_total' in stats
         assert 'task_tombstones_retired_total' in stats
-        assert 'task_tombstone_sweep_passes_completed_total' in stats
+        # Counts passes of every cleanup path, so it carries no task identity.
+        assert 'task_tombstone_passes_completed_total' in stats
+        assert 'task_tombstone_sweep_passes_completed_total' not in stats
         # No name from before the renames survives (`task_trim_unused_dbs_*` is not one).
         retired = ('task_stale_ids', 'task_retention_sweep', 'task_retention_full_sweep')
         assert not any(name.startswith(retired) for name in stats)

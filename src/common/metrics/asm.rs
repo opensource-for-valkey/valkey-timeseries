@@ -5,7 +5,7 @@
 //!
 //! The full stale-ID sweep the cleanup requests afterwards stays in the `task` section, as
 //! `task_tombstone_full_sweep_*`: it shares the periodic stale-ID cleanup's single-flight guard
-//! and its `tombstones_retired` counter.
+//! and its `tombstones_retired` and `tombstone_passes_completed` counters.
 
 use super::task::{TaskMetrics, register_task};
 use metered::Registry;

@@ -109,7 +109,7 @@ pub static RETENTION_TRIM_SERIES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 pub static RETENTION_TRIM_SAMPLES_DELETED: AtomicU64 = AtomicU64::new(0);
 pub static RETENTION_TRIM_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static TOMBSTONES_RETIRED: AtomicU64 = AtomicU64::new(0);
-pub static TOMBSTONE_SWEEP_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
+pub static TOMBSTONE_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_INDEX_PASSES_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static OPTIMIZE_INDEX_LAST_PASS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 /// Empty-db cleanup is not a [`TaskMetrics`] task: it is a short inline pass on the main thread,
@@ -208,8 +208,8 @@ pub(super) fn register(registry: &mut Registry<'static>) {
             "Tombstoned ids retired after a complete postings pass, across all cleanup paths",
         ),
         (
-            "tombstone_sweep_passes_completed",
-            &TOMBSTONE_SWEEP_PASSES_COMPLETED,
+            "tombstone_passes_completed",
+            &TOMBSTONE_PASSES_COMPLETED,
             "Postings passes that retired a stale-id snapshot for one database, across all cleanup paths",
         ),
         (

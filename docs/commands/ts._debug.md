@@ -419,7 +419,7 @@ work and pass counters show its progress. Timestamps and running gauges survive 
 | `task_retention_trim_samples_deleted_total` | Samples physically removed by background retention trimming |
 | `task_retention_trim_errors_total` | Series trim failures or failures to select a database |
 | `task_tombstones_retired_total` | Tombstoned IDs retired at the end of a complete postings pass, across all cleanup paths; excludes IDs revoked or marked again during the pass |
-| `task_tombstone_sweep_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
+| `task_tombstone_passes_completed_total` | Completed postings passes that retired a stale-ID snapshot for one database, across all cleanup paths |
 | `task_optimize_index_passes_completed_total` | Periodic optimizer passes completed for one existing database; excludes full optimizations requested by migration |
 | `task_trim_unused_dbs_removed_total` | Empty database indexes removed by cron |
 
