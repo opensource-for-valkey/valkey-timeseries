@@ -82,7 +82,7 @@ pub(super) fn register(registry: &mut Registry<'static>) {
                 .read(|_: &()| {
                     LOAD_SUCCESS.load(Ordering::Relaxed) + LOAD_FAILURE.load(Ordering::Relaxed)
                 })
-                .help("RDB loads that carried the postings index aux field, failed ones included"),
+                .help("RDB loads that carried the postings index aux field, failed ones included (not counted while ts-index-persist is off)"),
         )
         .register(
             counter("load_failures")
