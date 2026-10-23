@@ -502,14 +502,6 @@ pub fn index_build_max_memory() -> i64 {
     INDEX_BUILD_MAX_MEMORY.load(Ordering::Relaxed)
 }
 
-/// Runtime toggle for developer-only `TS.INFO` output (`ts-info-developer-visible`,
-/// default off).
-pub static INFO_DEVELOPER_VISIBLE: AtomicBool = AtomicBool::new(false);
-
-pub fn is_info_developer_visible() -> bool {
-    INFO_DEVELOPER_VISIBLE.load(Ordering::Relaxed)
-}
-
 fn parse_duration_in_range(name: &str, value: &str, min: i64, max: i64) -> ValkeyResult<i64> {
     let duration = parse_duration_value(value).map_err(|_e| {
         ValkeyError::String(format!(
@@ -832,10 +824,6 @@ fn read_index_persist() -> ConfigValue {
     ConfigValue::Boolean(is_index_persist_enabled())
 }
 
-fn read_info_developer_visible() -> ConfigValue {
-    ConfigValue::Boolean(is_info_developer_visible())
-}
-
 fn read_debug_mode() -> ConfigValue {
     ConfigValue::Boolean(is_debug_mode_enabled())
 }
@@ -1116,19 +1104,6 @@ pub static CONFIGS: &[ConfigDesc] = &[
         },
     },
     ConfigDesc {
-        name: "ts-info-developer-visible",
-        read: read_info_developer_visible,
-        kind: ConfigType::Boolean,
-        default: ConfigValue::Boolean(false),
-        min: None,
-        max: None,
-        flags: ConfigurationFlags::DEFAULT,
-        description: "Include developer-only fields in TS.INFO output",
-        storage: ConfigStorage::Bool {
-            cell: || &INFO_DEVELOPER_VISIBLE,
-        },
-    },
-    ConfigDesc {
         name: "debug-mode",
         read: read_debug_mode,
         kind: ConfigType::Boolean,
@@ -1343,7 +1318,6 @@ mod tests {
         ("ts-index-build-max-memory", "268435456"),
         ("ts-fanout-aggregation-pushdown", "yes"),
         ("ts-index-persist", "yes"),
-        ("ts-info-developer-visible", "no"),
         ("debug-mode", "no"),
     ];
 
