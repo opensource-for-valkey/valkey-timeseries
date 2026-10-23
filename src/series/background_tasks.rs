@@ -13,7 +13,7 @@ use valkey_module::Context;
 use valkey_module::server_events::LoadingSubevent;
 use valkey_module_macros::{cron_event_handler, loading_event_handler};
 
-const STALE_ID_CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
+const TOMBSTONE_CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
 const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const INDEX_OPTIMIZE_INTERVAL: Duration = Duration::from_secs(60);
 const DB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
@@ -96,7 +96,7 @@ static SCHEDULE: [ScheduledTask; 4] = [
     ScheduledTask::new(process_series_trim, RETENTION_CLEANUP_INTERVAL),
     ScheduledTask::new(
         remove_stale_series_ids_incremental,
-        STALE_ID_CLEANUP_INTERVAL,
+        TOMBSTONE_CLEANUP_INTERVAL,
     ),
     ScheduledTask::new(optimize_indices_for_db, INDEX_OPTIMIZE_INTERVAL),
     ScheduledTask::new(trim_unused_dbs, DB_CLEANUP_INTERVAL),
