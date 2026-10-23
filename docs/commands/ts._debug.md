@@ -154,8 +154,8 @@ The `+Inf` bucket is not listed: its count is `count`.
 **With `CLUSTER`** the layout is the same, except that a gauge's value is a
 map from node address (`host:port`) to value, one entry per node, sorted by address (a byte
 gauge's `_human` entry is the same map of renderings).
-Counters and histogram counts are summed over the nodes. A histogram whose buckets differ from the others' (a node on another version) is left out of the sum, with a warning in
-that coordinator's log. Duration histograms are in seconds,
+Counters and histogram counts are summed over the nodes. A histogram whose buckets differ from the others' (a node on another version) is still summed, onto the union of both sets of bounds:
+at a bound a node lacks, it counts what it counted at its own next bound down. Duration histograms are in seconds,
 with 24 bounds at powers of two from 1 µs (`0.000001`) to 2²³ µs (about 8.4 s).
 
 **With `VERBOSE`:** an array with one map of 5 fields per metric:

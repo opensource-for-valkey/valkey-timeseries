@@ -84,27 +84,51 @@ pub(super) struct ClusterReading {
     pub value: ClusterValue,
 }
 
-/// Adds `other`'s observations to `into`. Both must come from histograms with the same bounds;
-/// a peer whose bounds differ (a different version) cannot be added bucket by bucket, so it is
-/// left out and `false` returned.
-fn add_histogram(into: &mut HistogramSnapshot, other: &HistogramSnapshot) -> bool {
+/// Adds `other`'s observations to `into`. Histograms with the same bounds add bucket by bucket.
+/// A peer whose bounds differ (a different version) is merged onto the union of both bounds:
+/// at each bound a histogram counts what it counted at its own largest bound not above it,
+/// which is exact at its own bounds and keeps every observation at or below the bound it was
+/// reported under. Both end in `+Inf`, so `count` and `sum` are always exact.
+fn add_histogram(into: &mut HistogramSnapshot, other: &HistogramSnapshot) {
     let same_bounds = into.buckets.len() == other.buckets.len()
         && into
             .buckets
             .iter()
             .zip(&other.buckets)
             .all(|(a, b)| a.le.total_cmp(&b.le).is_eq());
-    if !same_bounds {
-        return false;
-    }
-    for (bucket, theirs) in into.buckets.iter_mut().zip(&other.buckets) {
-        bucket.cumulative_count = bucket
-            .cumulative_count
-            .saturating_add(theirs.cumulative_count);
+    if same_bounds {
+        for (bucket, theirs) in into.buckets.iter_mut().zip(&other.buckets) {
+            bucket.cumulative_count = bucket
+                .cumulative_count
+                .saturating_add(theirs.cumulative_count);
+        }
+    } else {
+        let mut bounds: Vec<f64> = into
+            .buckets
+            .iter()
+            .chain(&other.buckets)
+            .map(|b| b.le)
+            .collect();
+        bounds.sort_by(f64::total_cmp);
+        bounds.dedup_by(|a, b| a.total_cmp(b).is_eq());
+        let cumulative_at = |buckets: &[Bucket], le: f64| {
+            buckets
+                .iter()
+                .take_while(|b| b.le.total_cmp(&le).is_le())
+                .last()
+                .map_or(0, |b| b.cumulative_count)
+        };
+        into.buckets = bounds
+            .into_iter()
+            .map(|le| {
+                let count = cumulative_at(&into.buckets, le)
+                    .saturating_add(cumulative_at(&other.buckets, le));
+                Bucket::new(le, count, None)
+            })
+            .collect();
     }
     into.count = into.count.saturating_add(other.count);
     into.sum += other.sum;
-    true
 }
 
 /// The metrics of every node that answered, merged by name.
@@ -146,13 +170,14 @@ impl ClusterMetrics {
                 true
             }
             (ClusterValue::Histogram(total), ClusterValue::Histogram(theirs)) => {
-                add_histogram(total, &theirs)
+                add_histogram(total, &theirs);
+                true
             }
             _ => false,
         };
         if !merged {
             log_warning(format!(
-                "TS._DEBUG METRICS: left node {node}'s {name} out of the cluster view: its kind or buckets differ from another node's"
+                "TS._DEBUG METRICS: left node {node}'s {name} out of the cluster view: its kind differs from another node's"
             ));
         }
     }
@@ -410,23 +435,38 @@ mod tests {
     }
 
     #[test]
-    fn a_histogram_with_other_bounds_is_left_out() {
-        let mut cluster = ClusterMetrics::default();
+    fn a_histogram_with_other_bounds_merges_onto_the_union_of_bounds() {
         let ours = histogram(&[0.5]);
-        cluster.add_node(
-            "a:1",
-            node_response(&[reading("fanout_h", MetricValue::Histogram(ours.clone()))]),
-        );
         let other = BucketHistogram::new(Buckets::custom([10.0]));
         other.observe(1.0);
-        cluster.add_node(
-            "b:1",
-            node_response(&[reading(
-                "fanout_h",
-                MetricValue::Histogram(other.snapshot()),
-            )]),
+        let other = other.snapshot();
+
+        // Ours at 1, 2, 4, +Inf: 1, 1, 1, 1. Theirs at 10, +Inf: 1, 1, so their 1.0 counts
+        // under 10, the bound it was reported under, and under no lower one.
+        let expected = HistogramSnapshot::new(
+            [(1.0, 1), (2.0, 1), (4.0, 1), (10.0, 2), (f64::INFINITY, 2)]
+                .into_iter()
+                .map(|(le, count)| Bucket::new(le, count, None))
+                .collect(),
+            1.5,
+            2,
         );
-        assert_eq!(cluster.values["fanout_h"], ClusterValue::Histogram(ours));
+        for (first, second) in [(&ours, &other), (&other, &ours)] {
+            let mut cluster = ClusterMetrics::default();
+            for (node, snapshot) in [("a:1", first), ("b:1", second)] {
+                cluster.add_node(
+                    node,
+                    node_response(&[reading(
+                        "fanout_h",
+                        MetricValue::Histogram(snapshot.clone()),
+                    )]),
+                );
+            }
+            assert_eq!(
+                cluster.values["fanout_h"],
+                ClusterValue::Histogram(expected.clone())
+            );
+        }
     }
 
     #[test]
