@@ -10,7 +10,8 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use valkey_module::Context;
-use valkey_module_macros::cron_event_handler;
+use valkey_module::server_events::LoadingSubevent;
+use valkey_module_macros::{cron_event_handler, loading_event_handler};
 
 const STALE_ID_CLEANUP_INTERVAL: Duration = Duration::from_secs(20);
 const RETENTION_CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -109,12 +110,12 @@ fn monotonic_ms() -> u64 {
 }
 
 /// Called when a load starts: time spent loading does not count toward any task's interval.
-pub(crate) fn pause_task_schedule() {
+fn pause_task_schedule() {
     LOAD_PAUSE.pause(monotonic_ms());
 }
 
 /// Called when a load ends or fails.
-pub(crate) fn resume_task_schedule() {
+fn resume_task_schedule() {
     LOAD_PAUSE.resume(monotonic_ms(), &SCHEDULE);
 }
 
@@ -155,6 +156,24 @@ fn __cron_event_handler(_ctx: &Context, _hz: u64) {
     for entry in &SCHEDULE {
         if entry.poll(now) {
             dispatch_background_task(entry.task);
+        }
+    }
+}
+
+#[loading_event_handler]
+fn __loading_event_handler(_ctx: &Context, loading_event: LoadingSubevent) {
+    match loading_event {
+        LoadingSubevent::RdbStarted | LoadingSubevent::ReplStarted => {
+            pause_task_schedule();
+        }
+        LoadingSubevent::AofStarted => {
+            pause_task_schedule();
+        }
+        LoadingSubevent::Ended => {
+            resume_task_schedule();
+        }
+        LoadingSubevent::Failed => {
+            resume_task_schedule();
         }
     }
 }
