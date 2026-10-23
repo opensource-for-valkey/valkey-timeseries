@@ -37,6 +37,32 @@ LONG_LABELS = [
 ]
 
 
+class TestModuleInfoSections(ValkeyTimeSeriesTestCaseBase):
+    SECTIONS = [
+        "ts_index", "ts_compaction", "ts_rdb", "ts_blocked_read", "ts_string_interning",
+        "ts_task", "ts_asm", "ts_index_reconciliation", "ts_fanout",
+    ]
+
+    def _raw_info(self, section):
+        client = self.server.get_new_client()
+        client.set_response_callback("INFO", lambda response: response)
+        return client.execute_command("INFO", section).decode().splitlines()
+
+    @pytest.mark.parametrize("section", SECTIONS)
+    def test_info_reports_only_requested_section(self, section):
+        lines = self._raw_info(section)
+        assert [line for line in lines if line.startswith("# ")] == [f"# {section}"]
+        assert any(line.startswith("ts_") for line in lines), "section has no fields"
+
+    @pytest.mark.parametrize("selector", ["modules", "everything"])
+    def test_info_reports_all_module_sections_once(self, selector):
+        sections = [line[2:] for line in self._raw_info(selector) if line.startswith("# ts_")]
+        assert sections == self.SECTIONS
+
+    def test_info_all_excludes_module_sections(self):
+        assert not any(line.startswith("# ts_") for line in self._raw_info("all"))
+
+
 class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
     @staticmethod
     def _ts_info(client, key: str) -> dict:
