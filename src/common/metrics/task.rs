@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct TaskMetrics {
     pub name: &'static str,
+    /// The thread [`spawn_task`](crate::common::threads::spawn_task) starts the task on.
     pub thread_name: &'static str,
     started: AtomicU64,
     completed: AtomicU64,
@@ -94,9 +95,10 @@ impl Drop for TaskRun<'_> {
 
 pub static RETENTION_TRIM: TaskMetrics = TaskMetrics::new("retention_trim", "ts-retention-trim");
 pub static TOMBSTONE_SWEEP: TaskMetrics = TaskMetrics::new("tombstone_sweep", "ts-tombstone-sweep");
+/// Not spawned: runs on the post-migration cleanup thread that requests it.
 pub static TOMBSTONE_FULL_SWEEP: TaskMetrics =
-    TaskMetrics::new("tombstone_full_sweep", "ts-tombstone-full-sweep");
-pub static OPTIMIZE_INDEX: TaskMetrics = TaskMetrics::new("optimize_index", "ts-optimize-indices");
+    TaskMetrics::new("tombstone_full_sweep", "ts-asm-cleanup");
+pub static OPTIMIZE_INDEX: TaskMetrics = TaskMetrics::new("optimize_index", "ts-optimize-index");
 
 static TASKS: &[&TaskMetrics] = &[
     &RETENTION_TRIM,
@@ -247,6 +249,20 @@ mod tests {
     use crate::common::threads::{SingleFlight, spawn_task_single};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn spawned_task_threads_are_named_after_the_task() {
+        for task in [&RETENTION_TRIM, &TOMBSTONE_SWEEP, &OPTIMIZE_INDEX] {
+            assert_eq!(
+                task.thread_name,
+                format!("ts-{}", task.name.replace('_', "-"))
+            );
+        }
+        assert_eq!(
+            TOMBSTONE_FULL_SWEEP.thread_name,
+            crate::common::metrics::asm::POST_MIGRATION_CLEANUP.thread_name
+        );
+    }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
