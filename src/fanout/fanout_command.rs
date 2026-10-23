@@ -116,6 +116,7 @@ where
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
     let op = command;
+    let started = Instant::now();
     let (targets, cluster_fingerprint) = get_fanout_targets(ctx, targets);
     metrics::FANOUT_OPERATIONS.incr();
     metrics::FANOUT_TARGETS.incr_by(targets.len() as u64);
@@ -138,10 +139,11 @@ where
         // without invoking it, as on an RPC setup failure below.
         Some(local) if outstanding == 1 => {
             metrics::FANOUT_LOCAL_ONLY.incr();
-            let state = Arc::new(FanoutState::new(op, outstanding, f));
+            let state = Arc::new(FanoutState::new(op, outstanding, f, started));
             return spawn_local_request(state, req, local, fanout_user, db, deadline).map_err(
                 |_| {
                     metrics::FANOUT_LOCAL_SHARE_BUSY.incr();
+                    metrics::FANOUT_DURATION.observe_duration(started.elapsed());
                     FanoutError::busy()
                 },
             );
@@ -150,7 +152,7 @@ where
         None => None,
     };
 
-    let state = Arc::new(FanoutState::new(op, outstanding, f));
+    let state = Arc::new(FanoutState::new(op, outstanding, f, started));
 
     let rpc_state = state.clone();
     let response_handler = move |res: Result<&[u8], FanoutError>, target: &NodeInfo| {
@@ -186,6 +188,7 @@ where
         // with this error right away instead of waiting on a local response
         // that would complete the fanout with a partial result.
         metrics::FANOUT_SETUP_FAILURES.incr();
+        metrics::FANOUT_DURATION.observe_duration(started.elapsed());
         return Err(FanoutError::from(e));
     }
 
@@ -406,7 +409,7 @@ where
     OP: FanoutCommand + 'static,
     F: FnOnce(OP, FanoutCommandResult) + Send + 'static,
 {
-    fn new(operation: OP, outstanding: usize, f: F) -> Self {
+    fn new(operation: OP, outstanding: usize, f: F, started: Instant) -> Self {
         Self {
             inner: Mutex::new(FanoutStateInner {
                 operation,
@@ -416,7 +419,7 @@ where
                 timed_out: false,
                 abort_error: None,
                 callback: Some(f),
-                started: Instant::now(),
+                started,
             }),
         }
     }
