@@ -307,12 +307,15 @@ fn normalize_response_series(
     options: &MRangeOptions,
     pushdown: bool,
 ) -> ValkeyResult<Vec<SeriesRangeResponse>> {
+    if pushdown {
+        // Counted for multi-aggregation too, whose raw series are aggregated later.
+        let unbucketed = series.iter().filter(|(_, bucketed)| !bucketed).count();
+        fanout_metrics::FANOUT_PUSHDOWN_FALLBACK_SERIES.incr_by(unbucketed as u64);
+    }
     let needs_bucketing = pushdown && !is_multi_aggregation(options);
     if !needs_bucketing {
         return Ok(series.into_iter().map(|(response, _)| response).collect());
     }
-    let unbucketed = series.iter().filter(|(_, bucketed)| !bucketed).count();
-    fanout_metrics::FANOUT_PUSHDOWN_FALLBACK_SERIES.incr_by(unbucketed as u64);
     // Aggregate exactly as the shard would have: ascending, unbounded —
     // reversal and COUNT are applied downstream by the coordinator.
     let mut shard_range = options.range.clone();
@@ -2199,6 +2202,20 @@ mod tests {
             )
             .unwrap();
         assert!(FANOUT_PUSHDOWN_FALLBACK_SERIES.get() >= before + 2);
+
+        // Multi-aggregation aggregates raw series lazily, but they are fallbacks all the same.
+        let mut multi = options.clone();
+        multi.range.aggregation = Some(multi_aggregation(100));
+        let before = FANOUT_PUSHDOWN_FALLBACK_SERIES.get();
+        let mut command = MRangeFanoutCommand::new(multi);
+        assert!(command.pushdown);
+        command
+            .process_responses(
+                vec![(to_response(series_result("a", None, raw.clone())), false)],
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(FANOUT_PUSHDOWN_FALLBACK_SERIES.get() > before);
 
         options.with_labels = true;
         options.grouping = Some(RangeGroupingOptions {
