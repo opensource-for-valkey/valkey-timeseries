@@ -1054,13 +1054,6 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                      'clustermap_age_seconds'}
     DURATION_BUCKETS = 24
 
-    def stats(self, *args):
-        flat = self.client.execute_command('TS._DEBUG', 'STATS', *args)
-        assert len(flat) % 2 == 0, flat
-        names = [flat[i].decode() for i in range(0, len(flat), 2)]
-        assert len(names) == len(set(names)), names
-        return {name: flat[i * 2 + 1] for i, name in enumerate(names)}
-
     @classmethod
     def section_of(cls, name):
         """The longest section name `name` starts with: `string_interning` has a `_` of its own."""
@@ -1083,7 +1076,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         }
 
     def test_reports_sections_in_order_and_metrics_by_name(self):
-        names = list(self.stats())
+        names = list(self.debug_stats())
         sections = [self.section_of(name) for name in names]
         assert sorted(set(sections), key=sections.index) == self.SECTIONS
         assert sections == sorted(sections, key=self.SECTIONS.index), 'a section is split'
@@ -1092,13 +1085,13 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             assert families == sorted(families), section
 
     def test_section_filter(self):
-        assert list(self.stats('rdb')) == self.RDB_METRICS
-        assert list(self.stats('EXEC')) == self.EXEC_METRICS
+        assert list(self.debug_stats('rdb')) == self.RDB_METRICS
+        assert list(self.debug_stats('EXEC')) == self.EXEC_METRICS
         for section in self.SECTIONS:
-            names = list(self.stats(section))
+            names = list(self.debug_stats(section))
             assert names and all(n.startswith(section + '_') for n in names), section
         # Request order and repeats don't change the reply.
-        assert list(self.stats('exec', 'rdb', 'exec')) == self.EXEC_METRICS + self.RDB_METRICS
+        assert list(self.debug_stats('exec', 'rdb', 'exec')) == self.EXEC_METRICS + self.RDB_METRICS
 
     def test_unknown_section_lists_valid_ones(self):
         with pytest.raises(ResponseError,
@@ -1106,12 +1099,12 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'bogus')
 
     def test_string_interning(self):
-        before = self.stats('string_interning')
+        before = self.debug_stats('string_interning')
         assert list(before) == ['string_interning_bytes', 'string_interning_bytes_human',
                                 'string_interning_strings']
         for i in range(20):
             self.client.execute_command('TS.CREATE', f'intern:{i}', 'LABELS', 'uniq', f'never_seen_{i}')
-        after = self.stats('string_interning')
+        after = self.debug_stats('string_interning')
         assert after['string_interning_strings'] >= before['string_interning_strings'] + 20
         assert after['string_interning_bytes'] > before['string_interning_bytes']
 
@@ -1120,12 +1113,12 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     def test_info_mirrors_the_section(self, section):
         """`INFO ts_<section>` carries the section's counters and gauges (and `_human` twins)
         under the same names with a `ts_` prefix; INFO has no shape for a histogram."""
-        stats = [name for name in self.stats(section) if name not in self.HISTOGRAMS]
+        stats = [name for name in self.debug_stats(section) if name not in self.HISTOGRAMS]
         info = self.client.execute_command('INFO', f'ts_{section}')
         assert [name.removeprefix('ts_') for name in info] == stats
 
     def test_value_types(self):
-        stats = self.stats()
+        stats = self.debug_stats()
         for name, value in stats.items():
             if name.endswith('_human'):
                 assert value.decode() == bytes_to_human(stats[name.removesuffix('_human')]), name
@@ -1148,7 +1141,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         assert float(stats['clustermap_refresh_interval_seconds']) == 0
 
     def test_fanout_metrics_cover_every_error_kind(self):
-        stats = self.stats('fanout')
+        stats = self.debug_stats('fanout')
         errors = [n for n in stats
                   if n.startswith('fanout_errors_') and n != 'fanout_errors_total']
         assert len(errors) == 15, errors
@@ -1160,7 +1153,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     def test_asm_section(self):
         """Both ASM tasks carry the full task lifecycle under `asm_`, next to their work
         counters. A standalone server never migrates slots, so everything is zero."""
-        stats = self.stats('asm')
+        stats = self.debug_stats('asm')
         expected = {f'asm_{task}_{suffix}' for task in self.ASM_TASKS for suffix in self.TASK_FIELDS}
         expected |= {'asm_keys_indexed_total', 'asm_post_migration_cleanup_ids_marked_total'}
         assert set(stats) == expected
@@ -1171,7 +1164,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                 assert value == 0, name
 
     def test_task_lifecycle_and_progress_metrics(self):
-        stats = self.stats('task')
+        stats = self.debug_stats('task')
         for task in self.TASKS:
             for suffix in self.TASK_FIELDS:
                 assert f'task_{task}_{suffix}' in stats
@@ -1179,12 +1172,12 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             'ASM tasks report in the asm section'
         # Tick zero schedules all four periodic tasks, so no long cron interval is needed.
         def completed():
-            values = self.stats('task')
+            values = self.debug_stats('task')
             return all(values[f'task_{task}_completed_total'] > 0
                        and values[f'task_{task}_last_completed_timestamp_seconds'] > 0
                        for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'))
         wait_for_true(completed)
-        stats = self.stats('task')
+        stats = self.debug_stats('task')
         for task in ('retention_trim', 'tombstone_sweep', 'optimize_index'):
             assert stats[f'task_{task}_last_completed_timestamp_seconds'] > 0
             assert self.histogram(stats[f'task_{task}_duration_seconds'])['count'] > 0
@@ -1207,22 +1200,22 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     def test_index_reconciliation_section(self):
         """The section is one task, so its lifecycle metrics carry no task name; nothing about
         it is left in `task`."""
-        stats = self.stats('index_reconciliation')
+        stats = self.debug_stats('index_reconciliation')
         assert set(stats) == {f'index_reconciliation_{suffix}' for suffix in self.TASK_FIELDS}
-        assert not any('reconcil' in name for name in self.stats('task'))
+        assert not any('reconcil' in name for name in self.debug_stats('task'))
 
     def reconciliation_finished(self, before):
-        values = self.stats('index_reconciliation')
+        values = self.debug_stats('index_reconciliation')
         return (values['index_reconciliation_completed_total']
                 > before['index_reconciliation_completed_total']
                 and values['index_reconciliation_running'] == 0)
 
     def test_index_reconciliation_lifecycle_on_digest_fast_path(self):
         self.client.execute_command('TS.CREATE', 'task:keep', 'LABELS', 'service', 'api')
-        before = self.stats('index_reconciliation')
+        before = self.debug_stats('index_reconciliation')
         self.client.execute_command('DEBUG', 'RELOAD')
         wait_for_true(lambda: self.reconciliation_finished(before))
-        after = self.stats('index_reconciliation')
+        after = self.debug_stats('index_reconciliation')
         assert after['index_reconciliation_started_total'] > before['index_reconciliation_started_total']
         assert self.histogram(after['index_reconciliation_duration_seconds'])['count'] > 0
 
@@ -1232,13 +1225,13 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         self.client.pexpire('task:gone', 1000)
         self.client.save()
         wait_for_true(lambda: self.client.pttl('task:gone') < 0)
-        before = self.stats('index_reconciliation')
+        before = self.debug_stats('index_reconciliation')
         self.client.execute_command('DEBUG', 'RELOAD', 'NOSAVE')
         wait_for_true(lambda: self.reconciliation_finished(before))
         assert self.client.execute_command('TS.QUERYINDEX', 'service=api') == [b'task:keep']
 
     def test_histogram_shape(self):
-        task_duration = lambda: self.histogram(self.stats('task')['task_retention_trim_duration_seconds'])
+        task_duration = lambda: self.histogram(self.debug_stats('task')['task_retention_trim_duration_seconds'])
         wait_for_true(lambda: task_duration()['count'] > 0)
         hist = task_duration()
         buckets = hist['buckets']
@@ -1254,10 +1247,10 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
 
     def test_reset_starts_counters_and_histograms_over_but_not_gauges(self):
         # The optimizer runs on tick zero and then only every 60 seconds.
-        wait_for_true(lambda: self.stats('task')['task_optimize_index_completed_total'] > 0)
-        before = self.stats('task')
+        wait_for_true(lambda: self.debug_stats('task')['task_optimize_index_completed_total'] > 0)
+        before = self.debug_stats('task')
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET') == b'OK'
-        after = self.stats('task')
+        after = self.debug_stats('task')
         assert after['task_optimize_index_completed_total'] == 0
         assert self.histogram(after['task_optimize_index_duration_seconds'])['count'] == 0
         assert after['task_optimize_index_last_completed_timestamp_seconds'] == (
@@ -1268,7 +1261,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
             self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'rdb')
 
     def test_verbose(self):
-        stats = self.stats()
+        stats = self.debug_stats()
         names = [n for n in stats if not n.endswith('_human')]
         entries = self.client.execute_command('TS._DEBUG', 'STATS', 'VERBOSE')
         assert [e[1].decode() for e in entries] == names
@@ -1310,8 +1303,8 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
                 self.client.execute_command('TS._DEBUG', 'STATS', *args)
 
     def test_local_target_reports_this_node(self):
-        assert list(self.stats('LOCAL', 'rdb')) == self.RDB_METRICS
-        assert list(self.stats('rdb', 'local')) == self.RDB_METRICS
+        assert list(self.debug_stats('LOCAL', 'rdb')) == self.RDB_METRICS
+        assert list(self.debug_stats('rdb', 'local')) == self.RDB_METRICS
         assert self.client.execute_command('TS._DEBUG', 'STATS', 'RESET', 'LOCAL') == b'OK'
 
     @pytest.mark.parametrize('args', [

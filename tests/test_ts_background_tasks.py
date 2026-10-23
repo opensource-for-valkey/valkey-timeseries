@@ -12,13 +12,9 @@ from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseDebugMode
 
 class TestTaskCadence(ValkeyTimeSeriesTestCaseDebugMode):
 
-    def stats(self, *args):
-        flat = self.client.execute_command('TS._DEBUG', 'STATS', *args)
-        return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
-
     def started(self):
         """Retention-trim dispatches, counting single-flight skips so they can't hide one."""
-        stats = self.stats('task')
+        stats = self.debug_stats('task')
         return (stats['task_retention_trim_started_total']
                 + stats['task_retention_trim_skipped_inflight_total'])
 

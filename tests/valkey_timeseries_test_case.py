@@ -686,6 +686,14 @@ class ValkeyTimeSeriesTestCaseDebugMode(ValkeyTimeSeriesTestCaseBase):
 
     MODULE_ARGS = "debug-mode yes"
 
+    def debug_stats(self, *args):
+        """`TS._DEBUG STATS [args]` as a dict of metric name to value; names must be unique."""
+        flat = self.client.execute_command('TS._DEBUG', 'STATS', *args)
+        assert len(flat) % 2 == 0, flat
+        names = [flat[i].decode() for i in range(0, len(flat), 2)]
+        assert len(names) == len(set(names)), names
+        return {name: flat[i * 2 + 1] for i, name in enumerate(names)}
+
     def arm_analysis_job_panic(self, client):
         """Arm the server's next analysis job, across all connections and databases."""
         client.execute_command('TS._DEBUG', 'PANIC_NEXT_ANALYSIS_JOB')

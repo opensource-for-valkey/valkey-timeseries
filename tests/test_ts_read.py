@@ -1740,9 +1740,7 @@ class TestTsReadMetrics(TsReadTestBase, ValkeyTimeSeriesTestCaseDebugMode):
     }
 
     def stats(self):
-        flat = self.client.execute_command("TS._DEBUG", "STATS", "blocked_read")
-        assert len(flat) % 2 == 0, flat
-        return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+        return self.debug_stats("blocked_read")
 
     def reset_stats(self):
         assert self.client.execute_command("TS._DEBUG", "STATS", "RESET") == b"OK"
