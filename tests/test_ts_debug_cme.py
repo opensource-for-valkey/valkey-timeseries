@@ -531,8 +531,8 @@ class TestFanoutStatsCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         stats = debug_stats(coordinator, 'clustermap')
         assert stats['clustermap_refreshes_total'] >= 1
         assert stats['clustermap_refreshes_total'] == (
-            stats['clustermap_refresh_changed_total']
-            + stats['clustermap_refresh_unchanged_total']
+            stats['clustermap_refreshes_changed_total']
+            + stats['clustermap_refreshes_unchanged_total']
             + stats['clustermap_refresh_failures_total'])
         assert stats['clustermap_refresh_failures_total'] == 0
         assert float(stats['clustermap_age_seconds']) >= 0

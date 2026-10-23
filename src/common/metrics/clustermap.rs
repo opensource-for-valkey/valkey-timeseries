@@ -26,12 +26,12 @@ static COUNTERS: &[(&str, &AtomicU64, &str)] = &[
         "Cluster map rebuilds from CLUSTER NODES, whatever their outcome",
     ),
     (
-        "refresh_unchanged",
+        "refreshes_unchanged",
         &REFRESH_UNCHANGED,
         "Cluster map rebuilds that found the topology unchanged (expiry extended)",
     ),
     (
-        "refresh_changed",
+        "refreshes_changed",
         &REFRESH_CHANGED,
         "Cluster map rebuilds that published a new map",
     ),

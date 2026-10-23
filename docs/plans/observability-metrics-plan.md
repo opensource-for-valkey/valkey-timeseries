@@ -352,8 +352,8 @@ Cluster map ([fanout/mod.rs](../../src/fanout/mod.rs)):
 | Metric | Kind | Hook |
 |---|---|---|
 | `clustermap_refreshes_total` | counter | `refresh_cluster_map` [mod.rs:138](../../src/fanout/mod.rs#L138) |
-| `clustermap_refresh_unchanged_total` | counter | unchanged branch [:143-148](../../src/fanout/mod.rs#L143-L148) (extends expiry, grows interval) |
-| `clustermap_refresh_changed_total` | counter | changed branch [:149-154](../../src/fanout/mod.rs#L149-L154) (also taken when either map is inconsistent) |
+| `clustermap_refreshes_unchanged_total` | counter | unchanged branch [:143-148](../../src/fanout/mod.rs#L143-L148) (extends expiry, grows interval) |
+| `clustermap_refreshes_changed_total` | counter | changed branch [:149-154](../../src/fanout/mod.rs#L149-L154) (also taken when either map is inconsistent) |
 | `clustermap_refresh_failures_total` | counter | [:156-159](../../src/fanout/mod.rs#L156-L159) |
 | `clustermap_forced_refreshes_total` | counter | fingerprint mismatch on the serving worker [cluster_rpc.rs:449](../../src/fanout/cluster_rpc.rs#L449) |
 | `clustermap_stale_marks_total` | counter | `mark_cluster_map_stale` [mod.rs:90-92](../../src/fanout/mod.rs#L90-L92) (only caller: a peer's `ClusterMapMismatch`, [cluster_rpc.rs:705](../../src/fanout/cluster_rpc.rs#L705)) |

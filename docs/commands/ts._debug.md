@@ -211,8 +211,8 @@ counters stay at zero, `refresh_interval_seconds` at 0 and `age_seconds` at -1.
 | Name | Kind | Description |
 |------|------|-------------|
 | `clustermap_refreshes_total` | counter | Rebuilds from `CLUSTER NODES`, whatever their outcome |
-| `clustermap_refresh_changed_total` | counter | Rebuilds that published a new map |
-| `clustermap_refresh_unchanged_total` | counter | Rebuilds that found the topology unchanged (expiry extended) |
+| `clustermap_refreshes_changed_total` | counter | Rebuilds that published a new map |
+| `clustermap_refreshes_unchanged_total` | counter | Rebuilds that found the topology unchanged (expiry extended) |
 | `clustermap_refresh_failures_total` | counter | Rebuilds that failed, leaving the previous map in place |
 | `clustermap_forced_refreshes_total` | counter | Rebuilds forced by a peer request carrying a different fingerprint |
 | `clustermap_stale_marks_total` | counter | Times a peer's cluster-map mismatch error marked this node's map stale |
