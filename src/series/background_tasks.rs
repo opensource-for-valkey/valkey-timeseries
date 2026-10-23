@@ -43,16 +43,18 @@ impl ScheduledTask {
     }
 
     /// Returns whether the task is due at `now_ms`, advancing the deadline if so. Deadlines stay
-    /// on the interval grid; after a stall the task runs once and re-anchors instead of bursting.
+    /// on the interval grid unless a run is more than half an interval late; then it re-anchors at
+    /// `now_ms`, so a stall yields one run rather than a burst or two runs a tick apart.
     fn poll(&self, now_ms: u64) -> bool {
         let due = self.next_due_ms.load(Ordering::Relaxed);
         if now_ms < due {
             return false;
         }
-        let mut next = due + self.interval_ms;
-        if next <= now_ms {
-            next = now_ms + self.interval_ms;
-        }
+        let next = if now_ms > due + self.interval_ms / 2 {
+            now_ms + self.interval_ms
+        } else {
+            due + self.interval_ms
+        };
         self.next_due_ms.store(next, Ordering::Relaxed);
         true
     }
@@ -259,6 +261,20 @@ mod tests {
             .chain([35_000])
             .chain((35_100..=50_000).step_by(100));
         assert_eq!(simulate(INTERVAL_MS, ticks), vec![0, 35_000, 45_000]);
+    }
+
+    #[test]
+    fn near_interval_stall_does_not_double_fire() {
+        // Due at 10 s, the main thread is blocked until 19.95 s: one run, not one at 19.95 s
+        // and another at the 20 s deadline a tick later.
+        let ticks = (0..=5_000)
+            .step_by(100)
+            .chain([19_950])
+            .chain((20_050..=40_000).step_by(100));
+        assert_eq!(
+            simulate(INTERVAL_MS, ticks),
+            vec![0, 19_950, 29_950, 39_950]
+        );
     }
 
     #[test]
