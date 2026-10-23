@@ -10,9 +10,9 @@
 
 use crate::common::logging::log_warning;
 use metered::Registry;
-use metered::entry::counter;
+use metered::entry::{counter, counter_value};
 use std::sync::LazyLock;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Aux payloads read and installed as the index.
 pub static LOAD_SUCCESS: AtomicU64 = AtomicU64::new(0);
@@ -72,26 +72,32 @@ pub fn init() {
     LazyLock::force(&SAVE);
 }
 
+/// Loads and saves are exported as a total and a failure count, as Prometheus recommends; the
+/// total is derived, so the counters bumped at each call site stay one per outcome.
 pub(super) fn register(registry: &mut Registry<'static>) {
     let save = save_counters();
     registry
         .register(
-            counter("load_success")
-                .source(&LOAD_SUCCESS)
-                .help("RDB loads that installed the postings index from the aux field"),
+            counter_value("loads")
+                .read(|_: &()| {
+                    LOAD_SUCCESS.load(Ordering::Relaxed) + LOAD_FAILURE.load(Ordering::Relaxed)
+                })
+                .help("RDB loads that carried the postings index aux field, failed ones included"),
         )
         .register(
-            counter("load_failure")
+            counter("load_failures")
                 .source(&LOAD_FAILURE)
                 .help("RDB loads whose index aux field was unreadable, of a foreign encoding, or rejected (the index is rebuilt from the keys)"),
         )
         .register(
-            counter("save_success")
-                .source(&save.success)
-                .help("RDB saves that wrote the postings index aux field, fork-child saves included"),
+            counter_value("saves")
+                .read(move |_: &()| {
+                    save.success.load(Ordering::Relaxed) + save.failure.load(Ordering::Relaxed)
+                })
+                .help("RDB saves with a postings index to write, fork-child saves and failed ones included"),
         )
         .register(
-            counter("save_failure")
+            counter("save_failures")
                 .source(&save.failure)
                 .help("RDB saves that left the index aux field out because the index was locked, or whose write failed"),
         );

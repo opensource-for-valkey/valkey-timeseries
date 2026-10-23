@@ -58,7 +58,8 @@ Field names are camelCase, like `TS.INFO`'s. Sizes are in bytes, and a percentag
 `Pct`; any other unit is named at the end of the field (`ageMs`). Metric names in `STATS` are not
 field names but [OpenMetrics](https://prometheus.io/docs/practices/naming/) identifiers,
 snake_case with a unit suffix (`_seconds`, `_bytes`) and `_total` on counters. They are the same
-everywhere a metric appears, including the `name` field of a `VERBOSE` entry.
+everywhere a metric appears, including the `name` field of a `VERBOSE` entry. The `_human`
+entries beside byte metrics are display strings, not metrics.
 
 ### Cluster scope
 
@@ -138,7 +139,9 @@ TS._DEBUG STATS RESET [CLUSTER]
 (by section, then by name within a section). Counters are integers; gauges are integers, or doubles when
 the unit is fractional (seconds). A counter or gauge whose unit is bytes is followed by a
 `<name>_human` entry, a string rendering it as `INFO` renders `used_memory_human` (`925B`, `1.21K`,
-`3.50M`). A histogram's value is a map:
+`3.50M`). A `_human` entry is a display field for people, not a metric: its value is a string, and
+its name is the metric's with `_human` appended, after `_total` on a counter
+(`fanout_request_sent_bytes_total_human`). A scraper should skip it. A histogram's value is a map:
 
 | Field     | Type    | Description                                                                         |
 |-----------|---------|-------------------------------------------------------------------------------------|
@@ -164,7 +167,8 @@ metric's map has a sixth, `valueHuman`, after `value`; there is no separate `_hu
 ### Metrics
 
 Names follow OpenMetrics conventions: counters end in `_total`, and a unit suffix names the
-unit (durations are in seconds).
+unit (durations are in seconds). The `_human` display entries are not metrics and are the one
+exception.
 
 `RESET` does not change the values underneath, which only ever increase (as a Prometheus-style
 scraper expects). It records them as a baseline, and `STATS` reports counters and histograms
@@ -321,17 +325,18 @@ these counters with the server, so its saves are counted on the node that forked
 
 | Name | Kind | Description |
 |------|------|-------------|
-| `rdb_load_success_total` | counter | Loads that installed the postings index from the aux field |
-| `rdb_load_failure_total` | counter | Loads whose aux field was unreadable, of a foreign encoding version, or rejected by the parser; the index is rebuilt from the keys instead |
-| `rdb_save_success_total` | counter | Saves that wrote the aux field |
-| `rdb_save_failure_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
+| `rdb_loads_total` | counter | Loads of an RDB carrying the aux field, failed ones included |
+| `rdb_load_failures_total` | counter | Loads whose aux field was unreadable, of a foreign encoding version, or rejected by the parser; the index is rebuilt from the keys instead |
+| `rdb_saves_total` | counter | Saves with an aux field to write, failed ones included |
+| `rdb_save_failures_total` | counter | Saves that left the aux field out because the index was locked at fork time, or whose write failed |
 
-Neither load counter moves when `ts-index-persist` is off and the payload is discarded, and neither
+Successful loads are `rdb_loads_total - rdb_load_failures_total`, and likewise for saves. Neither
+load counter moves when `ts-index-persist` is off and the payload is discarded, and neither
 save counter moves for a save with nothing to write (persistence off, or no series). A failed load
 of a foreign encoding fails the whole RDB load; every other failure falls back to rebuilding the
 index from the keys.
 
-The same metrics are in `INFO ts_rdb`, each prefixed `ts_` (`ts_rdb_load_success_total`), without
+The same metrics are in `INFO ts_rdb`, each prefixed `ts_` (`ts_rdb_loads_total`), without
 the `debug-mode` gate. `INFO` counts since module start: `STATS RESET` doesn't move it.
 
 #### `blocked_read`

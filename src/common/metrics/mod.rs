@@ -550,6 +550,25 @@ mod tests {
         assert!(counters.failure.load(Ordering::Relaxed) > before);
     }
 
+    /// `rdb_loads_total` counts every attempt, so a failed load moves it with the failure count.
+    #[test]
+    fn rdb_load_total_includes_failures() {
+        let read = |name: &str| {
+            current(&[Section::Rdb])
+                .into_iter()
+                .find(|r| r.name == name)
+                .map(|r| match r.value {
+                    MetricValue::Counter(v) => v,
+                    other => panic!("{name} is not a counter: {other:?}"),
+                })
+                .unwrap_or_else(|| panic!("{name} not registered"))
+        };
+        let (loads, failures) = (read("rdb_loads_total"), read("rdb_load_failures_total"));
+        rdb::LOAD_FAILURE.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(read("rdb_loads_total"), loads + 1);
+        assert_eq!(read("rdb_load_failures_total"), failures + 1);
+    }
+
     #[test]
     fn every_metric_maps_back_to_its_section() {
         for reading in snapshot(&[]) {

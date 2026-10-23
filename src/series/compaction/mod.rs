@@ -47,7 +47,7 @@ pub struct CompactionRule {
     /// source first (`rebuild_open_bucket_as_of`); a `RemoveRange` rebuilds it anyway. The rebuild
     /// covers the open bucket only: destination buckets the failed application lost or left stale
     /// (a bucket it should have closed, or one a failed removal should have recalculated) are not
-    /// repaired — `ts_compaction_failures` is how an operator learns of them. Node-local:
+    /// repaired — `ts_compaction_failures_total` is how an operator learns of them. Node-local:
     /// persisted, so a restart does not forget it, but not hashed into the digest, because a
     /// replica's application of the same write may well have succeeded.
     pub dirty: bool,
@@ -172,10 +172,10 @@ pub(super) fn rebuild_open_bucket_as_of(
     }
 }
 
-/// Rule applications that returned an error (`INFO ts_compaction` → `ts_compaction_failures`).
+/// Rule applications that returned an error (`INFO ts_compaction` → `ts_compaction_failures_total`).
 /// Non-zero means a destination may be missing a bucket its source should have produced.
 pub static COMPACTION_FAILURES: AtomicU64 = AtomicU64::new(0);
-/// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds`).
+/// Open-bucket rebuilds of `dirty` rules (`ts_compaction_state_rebuilds_total`).
 pub static COMPACTION_STATE_REBUILDS: AtomicU64 = AtomicU64::new(0);
 
 /// Resync `series`' rules after `[start, end]` was removed from it (stored under `key`). The
@@ -246,7 +246,7 @@ impl TimeSeries {
     /// and swallowed, as the write path does (`TS.ADD`/`TS.MADD`/`TS.ADDBULK`): an error here
     /// would skip the caller's replication and keyspace event, leaving the replica and the AOF
     /// with samples this node deleted. The failing rule is left `dirty` and counted in
-    /// `ts_compaction_failures` by the cascade.
+    /// `ts_compaction_failures_total` by the cascade.
     pub fn remove_range_with_compaction(
         &mut self,
         ctx: &Context,

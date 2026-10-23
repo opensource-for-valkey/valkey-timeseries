@@ -52,13 +52,13 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
     write_section(ctx, "compaction", || {
         vec![
             (
-                "compaction_failures".to_owned(),
+                "compaction_failures_total".to_owned(),
                 COMPACTION_FAILURES
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .into(),
             ),
             (
-                "compaction_state_rebuilds".to_owned(),
+                "compaction_state_rebuilds_total".to_owned(),
                 COMPACTION_STATE_REBUILDS
                     .load(std::sync::atomic::Ordering::Relaxed)
                     .into(),

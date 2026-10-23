@@ -1037,8 +1037,8 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
     SECTIONS = ['asm', 'clustermap', 'exec', 'fanout', 'index_reconciliation', 'rdb', 'blocked_read',
                 'string_interning', 'task']
     # Within a section, metrics are sorted by family name (a counter's name before `_total`).
-    RDB_METRICS = ['rdb_load_failure_total', 'rdb_load_success_total',
-                   'rdb_save_failure_total', 'rdb_save_success_total']
+    RDB_METRICS = ['rdb_load_failures_total', 'rdb_loads_total',
+                   'rdb_save_failures_total', 'rdb_saves_total']
     EXEC_METRICS = ['exec_analysis_queued', 'exec_analysis_rejected_total', 'exec_analysis_running',
                     'exec_fanout_queued', 'exec_fanout_rejected_total', 'exec_fanout_running']
     TASKS = ['retention_trim', 'tombstone_sweep', 'tombstone_full_sweep', 'optimize_index']
@@ -1291,7 +1291,7 @@ class TestDebugStats(ValkeyTimeSeriesTestCaseDebugMode):
         # VERBOSE combines with a section filter, in either position.
         rdb = self.client.execute_command('TS._DEBUG', 'STATS', 'verbose', 'rdb')
         assert [e[1].decode() for e in rdb] == self.RDB_METRICS
-        assert self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'VERBOSE')[0][1] == b'rdb_load_failure_total'
+        assert self.client.execute_command('TS._DEBUG', 'STATS', 'rdb', 'VERBOSE')[0][1] == b'rdb_load_failures_total'
 
     def test_cluster_needs_cluster_mode(self):
         # The error names the keyword that was given.

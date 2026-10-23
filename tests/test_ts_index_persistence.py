@@ -366,8 +366,8 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
     def test_info_lists_the_counters(self):
         client = self.server.get_new_client()
         assert set(self.rdb_info(client)) == {
-            "rdb_load_success_total", "rdb_load_failure_total",
-            "rdb_save_success_total", "rdb_save_failure_total",
+            "rdb_loads_total", "rdb_load_failures_total",
+            "rdb_saves_total", "rdb_save_failures_total",
         }
 
     def test_bgsave_counts_the_fork_childs_save(self):
@@ -379,8 +379,8 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
         self.server.wait_for_save_done()
 
         after = self.rdb_info(client)
-        assert after["rdb_save_success_total"] == before["rdb_save_success_total"] + 1
-        assert after["rdb_save_failure_total"] == before["rdb_save_failure_total"]
+        assert after["rdb_saves_total"] == before["rdb_saves_total"] + 1
+        assert after["rdb_save_failures_total"] == before["rdb_save_failures_total"]
 
     def test_save_with_no_series_counts_nothing(self):
         """No series, no aux field: neither outcome is counted."""
@@ -398,9 +398,9 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
         client.execute_command("DEBUG", "RELOAD")
 
         after = self.rdb_info(client)
-        assert after["rdb_save_success_total"] == before["rdb_save_success_total"] + 1
-        assert after["rdb_load_success_total"] == before["rdb_load_success_total"] + 1
-        assert after["rdb_load_failure_total"] == before["rdb_load_failure_total"]
+        assert after["rdb_saves_total"] == before["rdb_saves_total"] + 1
+        assert after["rdb_loads_total"] == before["rdb_loads_total"] + 1
+        assert after["rdb_load_failures_total"] == before["rdb_load_failures_total"]
 
     def test_restart_counts_the_load(self):
         client = self.server.get_new_client()
@@ -412,8 +412,8 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
         wait_for_equal(lambda: self.server.is_rdb_done_loading(), True)
 
         info = self.rdb_info(self.server.get_new_client())
-        assert info["rdb_load_success_total"] == 1
-        assert info["rdb_load_failure_total"] == 0
+        assert info["rdb_loads_total"] == 1
+        assert info["rdb_load_failures_total"] == 0
 
     def test_discarded_by_config_counts_nothing(self):
         """A payload discarded because `ts-index-persist` is off is neither a success nor a
@@ -428,8 +428,8 @@ class TestIndexPersistenceMetrics(ValkeyTimeSeriesTestCaseBase):
         client.execute_command("DEBUG", "RELOAD", "NOSAVE")
 
         after = self.rdb_info(client)
-        assert after["rdb_load_success_total"] == before["rdb_load_success_total"]
-        assert after["rdb_load_failure_total"] == before["rdb_load_failure_total"]
+        assert after["rdb_loads_total"] == before["rdb_loads_total"]
+        assert after["rdb_load_failures_total"] == before["rdb_load_failures_total"]
 
 
 class TestIndexPersistenceAof(ValkeyTimeSeriesTestCaseBase):

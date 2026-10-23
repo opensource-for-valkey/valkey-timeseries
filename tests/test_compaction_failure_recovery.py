@@ -13,7 +13,7 @@ class TestCompactionFailureRecovery(ValkeyTimeSeriesTestCaseDebugMode):
 
     def counters(self):
         info = self.client.info("ts_compaction")
-        return info["ts_compaction_failures"], info["ts_compaction_state_rebuilds"]
+        return info["ts_compaction_failures_total"], info["ts_compaction_state_rebuilds_total"]
 
     def make_rule(self, src, dst):
         c = self.client
