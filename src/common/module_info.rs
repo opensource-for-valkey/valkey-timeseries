@@ -17,8 +17,8 @@ use valkey_module::{
 use valkey_module_macros::info_command_handler;
 
 /// `INFO ts_index`, `INFO ts_compaction`, `INFO ts_rdb`, `INFO ts_blocked_read`,
-/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm`, `INFO ts_index_reconciliation` and
-/// `INFO ts_fanout`.
+/// `INFO ts_string_interning`, `INFO ts_task`, `INFO ts_asm`, `INFO ts_index_reconciliation`,
+/// `INFO ts_fanout` and `INFO ts_promql`.
 ///
 /// The sections are declared without the module name; the server prefixes each with it, so they
 /// land as `# ts_index`, `# ts_compaction`, `# ts_rdb` and so on, with every field prefixed
@@ -32,7 +32,7 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
         let index = index_memory_usage();
         let mut fields = Vec::new();
         for (name, bytes) in [
-            ("index_total_bytes", index.total_bytes()),
+            ("index_bytes", index.total_bytes()),
             ("index_terms_bytes", index.terms_bytes),
             ("index_postings_bytes", index.postings_bytes),
             ("index_id_to_key_bytes", index.id_to_key_bytes),
@@ -70,6 +70,7 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
     for &section in MIRRORED {
         write_section(ctx, section.as_str(), || info_fields(section))?;
     }
+    write_section(ctx, "promql", promql_fields)?;
 
     Ok(())
 }
@@ -142,39 +143,67 @@ fn info_value(value: &MetricValue) -> Option<InfoValue> {
 
 /// `INFO ts_promql`: the `TS.QUERY` / `TS.QUERYRANGE` worker pool.
 ///
-/// `queries_running` is at most `ts-promql-max-concurrent-queries`; `queries_queued` is
-/// at most `ts-promql-max-queued-queries`. `queries_rejected` counts, since startup, the
-/// queries refused on arrival because the backlog was full, and `queries_cancelled` those
-/// abandoned, queued or running, because their client disconnected. `samples_in_flight` is
-/// what running queries and the shard reads served for them have charged against
-/// `ts-promql-max-samples-in-flight`: running totals, not samples resident now. A non-zero,
-/// growing `queries_queued` with `queries_rejected` climbing is the pool being overrun:
-/// either the queries are too slow or there are too few workers for the load.
+/// The gauge `promql_queries_running` is at most `ts-promql-max-concurrent-queries`, and
+/// `promql_queries_queued` at most `ts-promql-max-queued-queries`. The counter
+/// `promql_queries_rejected_total` counts the queries refused on arrival because the backlog was
+/// full, and `promql_queries_cancelled_total` those abandoned, queued or running, because their
+/// client disconnected. `promql_samples_in_flight` is what running queries and the shard reads
+/// served for them have charged against `ts-promql-max-samples-in-flight`: running totals, not
+/// samples resident now. A non-zero, growing `promql_queries_queued` with
+/// `promql_queries_rejected_total` climbing is the pool being overrun: either the queries are
+/// too slow or there are too few workers for the load.
 ///
-/// The `query_cache_*` fields describe the parsed-query cache: `entries` and `bytes` (the
-/// estimated memory charged for them) now, and since startup the `hits` and `misses` of
-/// lookups made while it was enabled and the `evictions` that kept it within its limits.
-#[info_command_handler]
-fn promql_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
+/// The `promql_query_cache_*` fields describe the parsed-query cache: the gauges `entries` and
+/// `bytes` (the estimated memory charged for them), and the counters `hits_total` and
+/// `misses_total` of lookups made while it was enabled and `evictions_total` that kept it within
+/// its limits.
+fn promql_fields() -> Vec<(String, InfoValue)> {
     let pool = query_workers::stats();
     let cache = query_cache::stats();
-
-    ctx.builder()
-        .add_section("promql")
-        .field("queries_running", pool.running as u64)?
-        .field("queries_queued", pool.queued as u64)?
-        .field("queries_rejected", pool.rejected)?
-        .field("queries_cancelled", query_workers::cancelled_count())?
-        .field("samples_in_flight", admission::samples_in_flight() as u64)?
-        .field("query_cache_entries", cache.entries as u64)?
-        .field("query_cache_bytes", cache.bytes as u64)?
-        .field("query_cache_hits", cache.hits)?
-        .field("query_cache_misses", cache.misses)?
-        .field("query_cache_evictions", cache.evictions)?
-        .build_section()?
-        .build_info()?;
-
-    Ok(())
+    let cache_bytes = cache.bytes as u64;
+    vec![
+        (
+            "promql_queries_running".to_owned(),
+            (pool.running as u64).into(),
+        ),
+        (
+            "promql_queries_queued".to_owned(),
+            (pool.queued as u64).into(),
+        ),
+        (
+            "promql_queries_rejected_total".to_owned(),
+            pool.rejected.into(),
+        ),
+        (
+            "promql_queries_cancelled_total".to_owned(),
+            query_workers::cancelled_count().into(),
+        ),
+        (
+            "promql_samples_in_flight".to_owned(),
+            (admission::samples_in_flight() as u64).into(),
+        ),
+        (
+            "promql_query_cache_entries".to_owned(),
+            (cache.entries as u64).into(),
+        ),
+        ("promql_query_cache_bytes".to_owned(), cache_bytes.into()),
+        (
+            "promql_query_cache_bytes_human".to_owned(),
+            bytes_to_human(cache_bytes).into(),
+        ),
+        (
+            "promql_query_cache_hits_total".to_owned(),
+            cache.hits.into(),
+        ),
+        (
+            "promql_query_cache_misses_total".to_owned(),
+            cache.misses.into(),
+        ),
+        (
+            "promql_query_cache_evictions_total".to_owned(),
+            cache.evictions.into(),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -226,6 +255,28 @@ mod tests {
                 "string_interning_bytes",
                 "string_interning_bytes_human",
                 "string_interning_strings"
+            ]
+        );
+    }
+
+    /// Prefixed with the section, counters ending in `_total`, the byte gauge with its twin.
+    #[test]
+    fn promql_fields_follow_metric_naming() {
+        let names: Vec<String> = promql_fields().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            [
+                "promql_queries_running",
+                "promql_queries_queued",
+                "promql_queries_rejected_total",
+                "promql_queries_cancelled_total",
+                "promql_samples_in_flight",
+                "promql_query_cache_entries",
+                "promql_query_cache_bytes",
+                "promql_query_cache_bytes_human",
+                "promql_query_cache_hits_total",
+                "promql_query_cache_misses_total",
+                "promql_query_cache_evictions_total",
             ]
         );
     }

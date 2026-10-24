@@ -670,7 +670,8 @@ class TestPromqlQueryQueueConfig(ValkeyTimeSeriesTestCaseBase):
 
     def _promql_info(self) -> dict:
         parsed = self.client.execute_command("INFO", "ts_promql")
-        return {k: int(v) for k, v in parsed.items() if k.startswith("ts_")}
+        return {k: int(v) for k, v in parsed.items()
+                if k.startswith("ts_") and not k.endswith("_human")}
 
     def test_queue_limit_round_trips_and_is_range_checked(self):
         assert self.client.execute_command("CONFIG", "GET", self.NAME)[1] == b"128"
@@ -691,12 +692,13 @@ class TestPromqlQueryQueueConfig(ValkeyTimeSeriesTestCaseBase):
             self.client.execute_command("TS.QUERY", "cpu", "TIME", 1000)
             self.client.execute_command("TS.QUERYRANGE", "cpu", "START", 0, "END", 2000, "STEP", "1s")
         info = self._promql_info()
-        assert set(info) >= {"ts_queries_running", "ts_queries_queued", "ts_queries_rejected"}
+        assert set(info) >= {"ts_promql_queries_running", "ts_promql_queries_queued",
+                             "ts_promql_queries_rejected_total"}
         # Every query above was answered before its client got the reply, so nothing is
         # running or waiting, and none was refused.
-        assert info["ts_queries_running"] == 0
-        assert info["ts_queries_queued"] == 0
-        assert info["ts_queries_rejected"] == 0
+        assert info["ts_promql_queries_running"] == 0
+        assert info["ts_promql_queries_queued"] == 0
+        assert info["ts_promql_queries_rejected_total"] == 0
 
 
 class TestPromqlConfigIsLive(ValkeyTimeSeriesTestCaseBase):

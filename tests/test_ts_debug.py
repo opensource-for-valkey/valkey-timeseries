@@ -921,7 +921,7 @@ class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
 class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 
     INFO_FIELDS = (
-        ('totalBytes', 'ts_index_total_bytes'),
+        ('totalBytes', 'ts_index_bytes'),
         ('termsBytes', 'ts_index_terms_bytes'),
         ('postingsBytes', 'ts_index_postings_bytes'),
         ('idToKeyBytes', 'ts_index_id_to_key_bytes'),

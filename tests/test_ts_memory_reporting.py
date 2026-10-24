@@ -40,7 +40,7 @@ LONG_LABELS = [
 class TestModuleInfoSections(ValkeyTimeSeriesTestCaseBase):
     SECTIONS = [
         "ts_index", "ts_compaction", "ts_rdb", "ts_blocked_read", "ts_string_interning",
-        "ts_task", "ts_asm", "ts_index_reconciliation", "ts_fanout",
+        "ts_task", "ts_asm", "ts_index_reconciliation", "ts_fanout", "ts_promql",
     ]
 
     def _raw_info(self, section):
@@ -210,7 +210,7 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         client = self.server.get_new_client()
         empty = self._info_ints(client)
         assert empty, "the module publishes no ts_index INFO section"
-        assert empty["ts_index_total_bytes"] == 0
+        assert empty["ts_index_bytes"] == 0
 
         for i in range(200):
             client.execute_command(
@@ -220,8 +220,8 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
         filled = self._info_ints(client)
         assert filled["ts_index_series"] == 200
         assert filled["ts_index_terms"] > 0
-        assert filled["ts_index_total_bytes"] > 0
-        assert filled["ts_index_total_bytes"] == (
+        assert filled["ts_index_bytes"] > 0
+        assert filled["ts_index_bytes"] == (
             filled["ts_index_terms_bytes"]
             + filled["ts_index_postings_bytes"]
             + filled["ts_index_id_to_key_bytes"]
@@ -258,12 +258,12 @@ class TestMemoryReporting(ValkeyTimeSeriesTestCaseBase):
             client.execute_command(
                 "TS.CREATE", f"mem:drop{i}", "LABELS", *LONG_LABELS, "uniq", f"series_{i}"
             )
-        assert self._info_ints(client)["ts_index_total_bytes"] > 0
+        assert self._info_ints(client)["ts_index_bytes"] > 0
 
         client.execute_command("FLUSHALL")
 
         after = self._info_ints(client)
-        assert after["ts_index_total_bytes"] == 0
+        assert after["ts_index_bytes"] == 0
         assert after["ts_index_series"] == 0
 
     def test_index_memory_is_reported_across_databases(self):

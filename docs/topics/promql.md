@@ -379,9 +379,10 @@ longer than what was left of the query's `TIMEOUT` when it was sent. Each shard 
 share at that budget too: a request that waited it out in the shard's queue is dropped
 unrun, and a read past it stops before its next batch.
 
-`INFO ts_promql` shows the pool's state as `ts_queries_running`, `ts_queries_queued`, the
-cumulative `ts_queries_rejected`, and `ts_queries_cancelled`, the queries abandoned because
-their client disconnected. `ts_samples_in_flight` is what running queries, and the shard reads
+`INFO ts_promql` shows the pool's state as `ts_promql_queries_running`,
+`ts_promql_queries_queued`, the counters `ts_promql_queries_rejected_total` and
+`ts_promql_queries_cancelled_total`, the queries abandoned because their client disconnected.
+`ts_promql_samples_in_flight` is what running queries, and the shard reads
 this node serves for other nodes, have charged against `ts-promql-max-samples-in-flight`: their
 running totals, which include samples already dropped, not the samples resident now.
 
@@ -396,9 +397,10 @@ the cache and cannot push out the queries that repeat. The cache
 is bounded by `ts-promql-query-cache-max-entries` and `ts-promql-query-cache-max-bytes`,
 evicting the least recently used queries; lowering either trims it at once, and `0` empties
 and disables it. Its size is an estimate of the memory the parsed queries hold, compiled regex
-programs included, not an exact figure. `INFO ts_promql` reports it as `ts_query_cache_entries`
-and `ts_query_cache_bytes`, with the cumulative `ts_query_cache_hits`, `ts_query_cache_misses`
-and `ts_query_cache_evictions`. Text that differs only in spacing is a different entry.
+programs included, not an exact figure. `INFO ts_promql` reports it as `ts_promql_query_cache_entries`
+and `ts_promql_query_cache_bytes` (and `_bytes_human`), with the counters
+`ts_promql_query_cache_hits_total`, `ts_promql_query_cache_misses_total` and
+`ts_promql_query_cache_evictions_total`. Text that differs only in spacing is a different entry.
 
 The per-query limits bound each query alone. Three limits bound what all of them take
 together, and each refuses rather than waits, since a query that waited mid-evaluation would

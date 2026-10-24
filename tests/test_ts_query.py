@@ -829,8 +829,8 @@ class TestQueryCancellation(ValkeyTimeSeriesTestCaseBase):
         info = self.client.info('ts_promql')
         # `cancelled` defaults to 0 so that a build without the counter fails on the
         # behaviour below, not on the field.
-        return {name: info.get(f'ts_queries_{name}', 0)
-                for name in ('running', 'queued', 'cancelled')}
+        fields = {'running': 'running', 'queued': 'queued', 'cancelled': 'cancelled_total'}
+        return {name: info.get(f'ts_promql_queries_{field}', 0) for name, field in fields.items()}
 
     def _wait_for(self, predicate, timeout: float, what: str) -> dict:
         deadline = datetime.now() + timedelta(seconds=timeout)
@@ -888,7 +888,7 @@ class TestQueryAdmission(ValkeyTimeSeriesTestCaseBase):
         pipe.execute()
 
     def _in_flight(self) -> int:
-        return self.client.info('ts_promql')['ts_samples_in_flight']
+        return self.client.info('ts_promql')['ts_promql_samples_in_flight']
 
     def test_samples_held_by_all_queries_are_bounded(self):
         self._series(1, 2000)
@@ -966,8 +966,9 @@ class TestQueryCache(ValkeyTimeSeriesTestCaseBase):
 
     def _cache(self) -> dict:
         info = self.client.info('ts_promql')
-        return {key[len('ts_query_cache_'):]: value for key, value in info.items()
-                if key.startswith('ts_query_cache_')}
+        prefix = 'ts_promql_query_cache_'
+        return {key[len(prefix):].removesuffix('_total'): value for key, value in info.items()
+                if key.startswith(prefix)}
 
     def _add(self, key, labels, samples):
         args = ['TS.CREATE', key, 'LABELS']
