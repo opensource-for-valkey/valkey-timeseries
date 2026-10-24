@@ -19,7 +19,7 @@ pub static POST_MIGRATION_CLEANUP: TaskMetrics =
     TaskMetrics::new("post_migration_cleanup", "ts-asm-cleanup");
 
 /// Deferred import keys indexed by `drain`, including batches finished before a shutdown abort.
-pub static KEYS_INDEXED: AtomicU64 = AtomicU64::new(0);
+pub static DRAIN_KEYS_INDEXED: AtomicU64 = AtomicU64::new(0);
 /// Exported ids marked stale by `post_migration_cleanup`.
 pub static POST_MIGRATION_CLEANUP_IDS_MARKED: AtomicU64 = AtomicU64::new(0);
 
@@ -28,9 +28,11 @@ pub(super) fn register(registry: &mut Registry<'static>) {
     register_task(registry, &POST_MIGRATION_CLEANUP);
     registry
         .register(
-            counter("keys_indexed").source(&KEYS_INDEXED).help(
-                "Queued import keys successfully indexed, including progress before shutdown",
-            ),
+            counter("drain_keys_indexed")
+                .source(&DRAIN_KEYS_INDEXED)
+                .help(
+                    "Queued import keys successfully indexed, including progress before shutdown",
+                ),
         )
         .register(
             counter("post_migration_cleanup_ids_marked")
