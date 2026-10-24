@@ -360,7 +360,8 @@ fn process_delayed_keys_for_db(db: i32, slots: &RangeSetBlaze<u16>, run: &TaskRu
         indexed += batch.len();
         let batch_skipped = index_timeseries_in_batch(db, batch);
         skipped += batch_skipped;
-        metrics::KEYS_INDEXED.fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
+        metrics::DRAIN_KEYS_INDEXED
+            .fetch_add((batch.len() - batch_skipped) as u64, Ordering::Relaxed);
     }
 
     if skipped > 0 {

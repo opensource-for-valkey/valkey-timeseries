@@ -194,7 +194,7 @@ So `asm_drain_started_total`, `asm_drain_completed_total`, `asm_drain_skipped_in
 
 | Work counter | Description |
 |--------------|-------------|
-| `asm_keys_indexed_total` | Deferred import keys successfully indexed, including batches completed before shutdown |
+| `asm_drain_keys_indexed_total` | Deferred import keys successfully indexed, including batches completed before shutdown |
 | `asm_post_migration_cleanup_ids_marked_total` | Exported IDs marked stale during source cleanup |
 
 The cleanup then requests a full stale-ID sweep, which reports in `task` as

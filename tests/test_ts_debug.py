@@ -901,7 +901,7 @@ class TestStringPoolStatsLargeScale(ValkeyTimeSeriesTestCaseDebugMode):
 class TestIndexMemory(ValkeyTimeSeriesTestCaseDebugMode):
 
     INFO_FIELDS = (
-        ('totalBytes', 'ts_index_total_bytes'),
+        ('totalBytes', 'ts_index_bytes'),
         ('termsBytes', 'ts_index_terms_bytes'),
         ('postingsBytes', 'ts_index_postings_bytes'),
         ('idToKeyBytes', 'ts_index_id_to_key_bytes'),
@@ -1154,7 +1154,7 @@ class TestDebugMetrics(ValkeyTimeSeriesTestCaseDebugMode):
         counters. A standalone server never migrates slots, so everything is zero."""
         stats = self.debug_metrics('asm')
         expected = {f'asm_{task}_{suffix}' for task in self.ASM_TASKS for suffix in self.TASK_FIELDS}
-        expected |= {'asm_keys_indexed_total', 'asm_post_migration_cleanup_ids_marked_total'}
+        expected |= {'asm_drain_keys_indexed_total', 'asm_post_migration_cleanup_ids_marked_total'}
         assert set(stats) == expected
         for name, value in stats.items():
             if name in self.HISTOGRAMS:

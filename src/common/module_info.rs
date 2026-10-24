@@ -30,8 +30,10 @@ fn module_info(ctx: &InfoContext, _for_crash_report: bool) -> ValkeyResult<()> {
     write_section(ctx, "index", || {
         let index = index_memory_usage();
         let mut fields = Vec::new();
+        // `index_bytes` is the sum of the four parts. It is a gauge, so `total` stays out of
+        // its name: OpenMetrics reserves that for counters.
         for (name, bytes) in [
-            ("index_total_bytes", index.total_bytes()),
+            ("index_bytes", index.total_bytes()),
             ("index_terms_bytes", index.terms_bytes),
             ("index_postings_bytes", index.postings_bytes),
             ("index_id_to_key_bytes", index.id_to_key_bytes),
