@@ -7,7 +7,9 @@ use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
 use crate::commands::command_parser::parse_query_index_command_args;
 use crate::common::replies::*;
-use crate::fanout::inflight_requests;
+use crate::fanout::{
+    ClusterMapRefresh, get_cluster_map, inflight_requests, is_clustered, refresh_cluster_map,
+};
 use crate::series::index::series_keys_by_selectors;
 use valkey_module::{Context, NextArg, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
@@ -37,6 +39,44 @@ fn inflight(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         reply_with_str(ctx, "outstanding");
         reply_with_integer(ctx, request.outstanding.min(i64::MAX as u64) as i64);
     }
+    Ok(())
+}
+
+/// Rebuilds this node's cluster map from `CLUSTER NODES` now, instead of waiting for it to expire
+/// or be marked stale, and reports the map it ends up with: a map with `outcome` (`changed` when a
+/// new map was published, `unchanged` when the topology matched and only its expiry was
+/// extended), `consistent`, `shards` and `fingerprint` (a string: it spans the full `u64` range).
+///
+/// TS._DEBUG REFRESH_CLUSTERMAP
+///
+/// Node-local, and refused outside cluster mode. A failed rebuild keeps the previous map and
+/// errors.
+fn refresh_clustermap(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
+    args.done()?;
+    if !is_clustered(ctx) {
+        return Err(ValkeyError::Str(
+            "TSDB: REFRESH_CLUSTERMAP requires cluster mode",
+        ));
+    }
+    let outcome = match refresh_cluster_map(ctx) {
+        ClusterMapRefresh::Changed => "changed",
+        ClusterMapRefresh::Unchanged => "unchanged",
+        ClusterMapRefresh::Failed => {
+            return Err(ValkeyError::Str(
+                "TSDB: failed to rebuild the cluster map; the previous map is kept",
+            ));
+        }
+    };
+    let map = get_cluster_map();
+    reply_with_map(ctx, 4);
+    reply_with_str(ctx, "outcome");
+    reply_with_str(ctx, outcome);
+    reply_with_str(ctx, "consistent");
+    reply_with_bool(ctx, map.is_consistent);
+    reply_with_str(ctx, "shards");
+    reply_with_usize(ctx, map.all_shards().len());
+    reply_with_str(ctx, "fingerprint");
+    reply_with_bulk_string(ctx, &map.cluster_slots_fingerprint().to_string());
     Ok(())
 }
 
@@ -84,6 +124,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
         (
             "TS._DEBUG INDEXMEMORY [ALLDBS] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
             "Show this node's label index heap usage for the selected db, or every db with ALLDBS (CLUSTER sums it over one node per shard, replicas preferred; PRIMARY over shard primaries; HASHTAG over the primaries of the shards owning those tags)",
+        ),
+        (
+            "TS._DEBUG REFRESH_CLUSTERMAP",
+            "Rebuild this node's cluster map from CLUSTER NODES now and report the result (cluster mode only)",
         ),
         (
             "TS._DEBUG QUERYINDEX <filter> [<filter> ...]",
@@ -134,6 +178,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         "INDEXMEMORY" => index_memory(ctx, &mut itr),
         "INFLIGHT" => inflight(ctx, &mut itr),
         "QUERYINDEX" => local_query_index(ctx, &mut itr),
+        "REFRESH_CLUSTERMAP" => refresh_clustermap(ctx, &mut itr),
         "HELP" => help_cmd(ctx, &mut itr),
         "LIST_CONFIGS" => list_configs_cmd(ctx, &mut itr),
         "PANIC_NEXT_ANALYSIS_JOB" => {

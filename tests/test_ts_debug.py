@@ -33,6 +33,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         assert b'TS._DEBUG METRICS [section ...] [VERBOSE] [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]' in commands
         assert b'TS._DEBUG METRICS RESET [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]' in commands
         assert b'TS._DEBUG INFLIGHT' in commands
+        assert b'TS._DEBUG REFRESH_CLUSTERMAP' in commands
         # Every advertised subcommand is implemented: HELP once listed a SHOW_INFO that wasn't,
         # and LIST_CONFIGS arguments it rejects.
         assert not any(b'SHOW_INFO' in cmd for cmd in commands)
@@ -274,6 +275,14 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
         # registered parameter and nothing else.
         assert sorted(config_names) == sorted(expected_configs)
 
+    def test_debug_refresh_clustermap_needs_cluster_mode(self):
+        """REFRESH_CLUSTERMAP is refused outside cluster mode and takes no arguments"""
+        self.set_debug_mode()
+        with pytest.raises(ResponseError, match="REFRESH_CLUSTERMAP requires cluster mode"):
+            self.client.execute_command('TS._DEBUG', 'REFRESH_CLUSTERMAP')
+        with pytest.raises(ResponseError, match="wrong number of arguments"):
+            self.client.execute_command('TS._DEBUG', 'REFRESH_CLUSTERMAP', 'extra')
+
     def test_debug_unknown_subcommand(self):
         """Test TS._DEBUG with an unknown subcommand"""
         with pytest.raises(ResponseError, match="Unknown subcommand.*try HELP"):
@@ -363,6 +372,7 @@ class TestTimeSeriesDebug(ValkeyTimeSeriesTestCaseDebugMode):
                 ('STRINGPOOLSTATS',),
                 ('METRICS',),
                 ('METRICS', 'RESET'),
+                ('REFRESH_CLUSTERMAP',),
                 ('INVALID_SUBCOMMAND',),
                 (),
             ):
