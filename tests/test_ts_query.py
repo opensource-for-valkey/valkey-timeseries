@@ -12,7 +12,7 @@ from time import sleep
 from valkey import Connection, ResponseError
 from valkeytestframework.util.waiters import *
 from valkeytestframework.conftest import resource_port_tracker
-from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase
+from valkey_timeseries_test_case import ValkeyTimeSeriesTestCaseBase, ValkeyTimeSeriesTestCaseDebugMode
 from query_result import (
     QueryResult, QuerySample,
     VectorSample, MatrixSample,
@@ -1080,3 +1080,40 @@ class TestQueryCache(ValkeyTimeSeriesTestCaseBase):
         finally:
             self._set('ts.ts-promql-query-cache-max-entries', '1024')
             self._set('ts.ts-promql-query-cache-max-bytes', '67108864')
+
+
+class TestClearQueryCache(ValkeyTimeSeriesTestCaseDebugMode):
+    """`TS._DEBUG CLEAR_QUERY_CACHE` empties the parsed-query cache without touching its
+    counters, and forgets first sightings, so a cleared text is cached again only from its
+    second sighting after the clear."""
+
+    _cache = TestQueryCache._cache
+
+    def test_clear_empties_the_cache_and_keeps_the_counters(self):
+        for i in range(3):
+            for _ in range(2):
+                self.client.execute_command('TS.QUERY', f'vector({i})', 'TIME', '1')
+        self.client.execute_command('TS.QUERY', 'vector(9)', 'TIME', '1')
+        before = self._cache()
+        assert before['entries'] == 3
+
+        assert self.client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE') == 3
+        after = self._cache()
+        assert (after['entries'], after['bytes']) == (0, 0)
+        assert (after['hits'], after['misses'], after['evictions']) == \
+            (before['hits'], before['misses'], before['evictions'])
+        assert self.client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE') == 0
+
+        # The first sighting of vector(9) was forgotten: one more is still a first.
+        self.client.execute_command('TS.QUERY', 'vector(9)', 'TIME', '1')
+        assert self._cache()['entries'] == 0
+        self.client.execute_command('TS.QUERY', 'vector(9)', 'TIME', '1')
+        assert self._cache()['entries'] == 1
+
+    def test_clear_takes_only_a_node_target(self):
+        assert self.client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'LOCAL') == 0
+        with pytest.raises(ResponseError, match='takes no arguments but a node target'):
+            self.client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'extra')
+        for target in (['CLUSTER'], ['PRIMARY'], ['HASHTAG', 'a']):
+            with pytest.raises(ResponseError, match=f'{target[0]} requires cluster mode'):
+                self.client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', *target)

@@ -93,7 +93,10 @@ pub use ts_restore::*;
 use valkey_module::ValkeyResult;
 
 use crate::fanout::register_fanout_operation;
-use debug::{IndexMemoryFanoutCommand, MetricsFanoutCommand, StringPoolStatsFanoutCommand};
+use debug::{
+    ClearQueryCacheFanoutCommand, IndexMemoryFanoutCommand, MetricsFanoutCommand,
+    StringPoolStatsFanoutCommand,
+};
 use ts_card_fanout_command::CardFanoutCommand;
 use ts_label_search_fanout_command::LabelSearchFanoutCommand;
 use ts_labelstats_fanout_command::LabelStatsFanoutCommand;
@@ -115,6 +118,7 @@ pub(crate) fn register_fanout_operations() -> ValkeyResult<()> {
     register_fanout_operation::<StringPoolStatsFanoutCommand>()?;
     register_fanout_operation::<IndexMemoryFanoutCommand>()?;
     register_fanout_operation::<MetricsFanoutCommand>()?;
+    register_fanout_operation::<ClearQueryCacheFanoutCommand>()?;
     Ok(())
 }
 

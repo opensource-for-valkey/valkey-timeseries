@@ -1229,6 +1229,11 @@ pub struct DebugMetricsRequest {
     #[prost(bool, tag = "2")]
     pub reset: bool,
 }
+/// TS._DEBUG CLEAR_QUERY_CACHE: each node empties its own parsed PromQL query
+/// cache. The cache is per process and holds no keys, so every node is asked
+/// (replicas included) and there is nothing to filter.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearQueryCacheRequest {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum QueryLabelsSubtype {
@@ -1617,4 +1622,10 @@ pub mod debug_metric {
 pub struct DebugMetricsResponse {
     #[prost(message, repeated, tag = "1")]
     pub metrics: ::prost::alloc::vec::Vec<DebugMetric>,
+}
+/// How many entries a node's parsed-query cache held when it was cleared.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearQueryCacheResponse {
+    #[prost(uint64, tag = "1")]
+    pub cleared: u64,
 }

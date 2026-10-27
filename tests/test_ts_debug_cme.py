@@ -1,7 +1,7 @@
 """
 TS._DEBUG in cluster mode. Every subcommand reports the connected node unless given CLUSTER: then
 STRINGPOOLSTATS sums every primary's string pool, INDEXMEMORY sums one node per shard's label
-index, preferring replicas, and METRICS covers every node.
+index, preferring replicas, and METRICS and CLEAR_QUERY_CACHE cover every node.
 """
 
 import threading
@@ -705,6 +705,79 @@ class TestStatsClusterViewCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
             assert debug_metrics(self.client_for_primary(i), 'task')['task_optimize_index_completed_total'] == 0
         for replica in replicas:
             assert debug_metrics(replica, 'task')['task_optimize_index_completed_total'] >= 1
+
+
+def query_cache_entries(client):
+    return client.info('ts_promql')['ts_promql_query_cache_entries']
+
+
+class TestClearQueryCacheCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """TS._DEBUG CLEAR_QUERY_CACHE: the parsed-query cache is per process, so CLUSTER clears
+    every node, replicas included, and replies with the entries cleared summed over them."""
+
+    REPLICAS_COUNT = 1
+
+    def all_nodes(self):
+        nodes = []
+        for i in range(self.CLUSTER_SIZE):
+            nodes.append(self.client_for_primary(i))
+            nodes.append(self.get_replication_group(i).get_replica_connection(0))
+        return nodes
+
+    def fill(self):
+        """Caches a different number of queries on each node: the k-th node holds k + 1."""
+        counts = []
+        for k, client in enumerate(self.all_nodes()):
+            client.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE')
+            for i in range(k + 1):
+                for _ in range(2):  # kept from the second sighting
+                    client.execute_command('TS.QUERY', f'vector({i})', 'TIME', '1')
+            assert query_cache_entries(client) == k + 1
+            counts.append(k + 1)
+        return counts
+
+    def test_cluster_clears_every_node(self):
+        counts = self.fill()
+        reply = self.client_for_primary(0).execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'CLUSTER')
+        assert reply == sum(counts)
+        assert [query_cache_entries(c) for c in self.all_nodes()] == [0] * len(counts)
+
+    def test_default_clears_only_this_node(self):
+        counts = self.fill()
+        coordinator = self.client_for_primary(0)
+        assert coordinator.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE') == counts[0]
+        assert coordinator.execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'LOCAL') == 0
+        assert [query_cache_entries(c) for c in self.all_nodes()] == [0] + counts[1:]
+
+    def test_primary_leaves_replicas_alone(self):
+        counts = self.fill()
+        reply = self.client_for_primary(0).execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'PRIMARY')
+        # all_nodes alternates primary, replica.
+        assert reply == sum(counts[0::2])
+        assert [query_cache_entries(c) for c in self.all_nodes()] == \
+            [0 if k % 2 == 0 else n for k, n in enumerate(counts)]
+
+    def test_hashtag_clears_the_owning_primary(self):
+        counts = self.fill()
+        owner = self.new_cluster_client().get_node_from_key('{qcache}').port
+        shard = next(i for i in range(self.CLUSTER_SIZE) if self.get_primary_port(i) == owner)
+        reply = self.client_for_primary(0).execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE',
+                                                           'HASHTAG', 'qcache')
+        assert reply == counts[2 * shard]
+        expected = list(counts)
+        expected[2 * shard] = 0
+        assert [query_cache_entries(c) for c in self.all_nodes()] == expected
+
+    def test_a_node_with_debug_mode_off_fails_the_command(self):
+        replica = self.get_replication_group(1).get_replica_connection(0)
+        replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'no')
+        try:
+            with pytest.raises(ResponseError):
+                self.client_for_primary(0).execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'CLUSTER')
+            # PRIMARY never asks a replica.
+            self.client_for_primary(0).execute_command('TS._DEBUG', 'CLEAR_QUERY_CACHE', 'PRIMARY')
+        finally:
+            replica.execute_command('CONFIG', 'SET', 'ts.debug-mode', 'yes')
 
 
 def server_major_version():

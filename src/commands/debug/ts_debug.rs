@@ -2,6 +2,7 @@ use super::configs::list_configs_cmd;
 use super::ensure_debug_enabled;
 use super::index_memory::index_memory;
 use super::metrics::metrics_cmd;
+use super::query_cache::clear_query_cache;
 use super::string_pool_stats::string_pool_stats;
 use crate::commands::CommandArgIterator;
 use crate::commands::analysis_runner::panic_next_analysis_job;
@@ -96,6 +97,10 @@ fn help_cmd(ctx: &Context, args: &mut CommandArgIterator) -> ValkeyResult<()> {
             "Make the next PromQL evaluation panic (tests that a failed query still answers)",
         ),
         (
+            "TS._DEBUG CLEAR_QUERY_CACHE [LOCAL|PRIMARY|CLUSTER|HASHTAG <tags>]",
+            "Empty this node's parsed PromQL query cache and reply with how many entries it held, keeping the INFO counters (CLUSTER clears every node and sums the entries; PRIMARY: shard primaries; HASHTAG: the primaries of the shards owning those tags)",
+        ),
+        (
             "TS._DEBUG LIST_CONFIGS [VERBOSE]",
             "List config names (default) or VERBOSE details",
         ),
@@ -171,6 +176,7 @@ pub fn ts_debug_cmd(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             reply_with_simple_string(ctx, "OK");
             Ok(())
         },
+        "CLEAR_QUERY_CACHE" => clear_query_cache(ctx, &mut itr),
         "PANIC_NEXT_ANALYSIS_JOB" => {
             itr.done()?;
             panic_next_analysis_job();

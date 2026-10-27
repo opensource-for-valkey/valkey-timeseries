@@ -92,9 +92,10 @@ Valkey module (Rust crate) exposing `TS.*` commands via `valkey_module!` in `src
   - `optimizer/` (const folding, selector push-down), `binops/`, `functions/`, `promqltest/` (conformance
     DSL/runner).
 - `src/fanout/` + `src/commands/**/*_fanout_command.rs` — cluster fanout over the protobuf
-  contract in `proto/v1/`, registered via `register_fanout_operations` (11 ops: LabelStats, Card,
-  LabelSearch, MDel, MGet, MRange, QueryIndex, QueryLabels, StringPoolStats, IndexMemory, DebugMetrics
-  — the last three back `TS._DEBUG STRINGPOOLSTATS` / `INDEXMEMORY` / `METRICS`).
+  contract in `proto/v1/`, registered via `register_fanout_operations` (12 ops: LabelStats, Card,
+  LabelSearch, MDel, MGet, MRange, QueryIndex, QueryLabels, StringPoolStats, IndexMemory, DebugMetrics,
+  ClearQueryCache — the last four back `TS._DEBUG STRINGPOOLSTATS` / `INDEXMEMORY` / `METRICS` /
+  `CLEAR_QUERY_CACHE`).
 - Other command surfaces beyond RTS: `TS.JOIN` (`src/join/`), `TS.OUTLIERS` + statistical machinery
   (`src/analysis/` — ESD/CUSUM/EWMA/IQR/MAD/z-score/RCF), `TS.ADDBULK`, `TS.LABELSTATS`,
   `TS.METRICNAMES`, `TS.MDEL`, Prometheus-style selectors (`src/parser/`).

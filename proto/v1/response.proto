@@ -178,3 +178,8 @@ message DebugMetric {
 message DebugMetricsResponse {
   repeated DebugMetric metrics = 1;
 }
+
+// How many entries a node's parsed-query cache held when it was cleared.
+message ClearQueryCacheResponse {
+  uint64 cleared = 1;
+}

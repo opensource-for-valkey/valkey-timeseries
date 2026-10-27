@@ -129,3 +129,8 @@ message DebugMetricsRequest {
   // instead of reporting; the response is then empty.
   bool reset = 2;
 }
+
+// TS._DEBUG CLEAR_QUERY_CACHE: each node empties its own parsed PromQL query
+// cache. The cache is per process and holds no keys, so every node is asked
+// (replicas included) and there is nothing to filter.
+message ClearQueryCacheRequest {}
