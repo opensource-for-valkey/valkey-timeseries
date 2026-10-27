@@ -554,7 +554,6 @@ impl ClusterMap {
     }
 
     /// Get all shards
-    #[cfg(test)]
     pub fn all_shards(&self) -> &BTreeSet<ShardInfo> {
         &self.shards
     }

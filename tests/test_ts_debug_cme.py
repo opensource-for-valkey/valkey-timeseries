@@ -764,3 +764,34 @@ class TestIndexMemoryMultiDbCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
         # An empty database reports zero everywhere.
         coordinator.select(5)
         assert index_memory(coordinator, 'CLUSTER')['series'] == 0
+
+
+class TestRefreshClusterMapCME(ValkeyTimeSeriesClusterTestCaseDebugMode):
+    """TS._DEBUG REFRESH_CLUSTERMAP: rebuilds the connected node's map from CLUSTER NODES now."""
+
+    def refresh(self, client):
+        flat = client.execute_command('TS._DEBUG', 'REFRESH_CLUSTERMAP')
+        return {flat[i].decode(): flat[i + 1] for i in range(0, len(flat), 2)}
+
+    def test_refresh_reports_the_map_and_counts_as_a_refresh(self):
+        node = self.client_for_primary(0)
+        first = self.refresh(node)
+        assert list(first) == ['outcome', 'consistent', 'shards', 'fingerprint']
+        assert first['outcome'] in (b'changed', b'unchanged')
+        assert first['consistent'] == 1
+        assert first['shards'] == self.CLUSTER_SIZE
+        assert int(first['fingerprint']) != 0
+
+        before = debug_metrics(node, 'clustermap')
+        second = self.refresh(node)
+        # Nothing moved in between, so the published map is kept.
+        assert second['outcome'] == b'unchanged'
+        assert second['fingerprint'] == first['fingerprint']
+        after = debug_metrics(node, 'clustermap')
+        assert after['clustermap_refreshes_total'] == before['clustermap_refreshes_total'] + 1
+        assert after['clustermap_refreshes_unchanged_total'] == (
+            before['clustermap_refreshes_unchanged_total'] + 1)
+
+    def test_every_node_agrees_on_the_fingerprint(self):
+        replies = [self.refresh(self.client_for_primary(i)) for i in range(self.CLUSTER_SIZE)]
+        assert len({r['fingerprint'] for r in replies}) == 1

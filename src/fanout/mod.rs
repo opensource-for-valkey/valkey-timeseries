@@ -153,6 +153,17 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
     (map.get_targets(mode), map.cluster_slots_fingerprint())
 }
 
+/// What [`refresh_cluster_map`] did with the map it built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterMapRefresh {
+    /// The topology changed (or a map was inconsistent): a new map was published.
+    Changed,
+    /// The topology was unchanged: the published map was kept, its expiry extended.
+    Unchanged,
+    /// `CLUSTER NODES` gave no usable reply: the previous map stays in place.
+    Failed,
+}
+
 // Refresh the cluster map by creating a new one from the current cluster state.
 // When the rebuild shows the topology is unchanged, the published map is kept
 // and its expiration extended instead of swapping in an identical copy: this
@@ -163,7 +174,7 @@ pub fn get_fanout_targets(ctx: &Context, mode: FanoutTarget) -> (Arc<HashSet<Nod
 // `ctx` is a `Context` on the main thread or a `DetachedContext` on a worker;
 // the latter holds the GIL only for the `CLUSTER NODES` call (see
 // `ClusterNodesSource`).
-pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) {
+pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) -> ClusterMapRefresh {
     log_notice("Refreshing cluster map...");
     metrics::REFRESHES.incr();
     match ClusterMap::create(ctx) {
@@ -176,19 +187,23 @@ pub fn refresh_cluster_map(ctx: &impl ClusterNodesSource) {
                 current_map.extend_expiration(grow_refresh_interval());
                 metrics::REFRESH_UNCHANGED.incr();
                 log_notice("Cluster map unchanged; extended expiration");
+                mark_cluster_map_verified();
+                ClusterMapRefresh::Unchanged
             } else {
                 drop(current_map);
                 reset_refresh_interval();
                 update_cluster_map(new_map);
                 metrics::REFRESH_CHANGED.incr();
                 log_notice("Cluster map refreshed");
+                mark_cluster_map_verified();
+                ClusterMapRefresh::Changed
             }
-            mark_cluster_map_verified();
         }
         None => {
             metrics::REFRESH_FAILURES.incr();
             reset_refresh_interval();
             log_warning("Failed to build cluster map; keeping the previous map and retrying later");
+            ClusterMapRefresh::Failed
         }
     }
 }
