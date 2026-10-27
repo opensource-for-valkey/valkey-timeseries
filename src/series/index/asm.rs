@@ -555,18 +555,12 @@ fn handle_post_migration_cleanup(source_slots: RangeSetBlaze<u16>) {
 
         if deleted_count > 0 {
             remove_all_stale_series_internal();
-            if run.check_shutdown() {
-                return;
-            }
             // Masking the exported ids out leaves the surviving posting lists sparse.
             for db in touched_dbs {
                 if run.check_shutdown() {
                     break;
                 }
                 optimize_index_fully(db);
-                if run.check_shutdown() {
-                    return;
-                }
             }
         }
 

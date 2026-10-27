@@ -93,10 +93,6 @@ pub(in crate::series) fn remove_all_stale_series_internal() {
     drop(index);
 
     for db in dbs {
-        if run.check_shutdown() {
-            break;
-        }
-
         process_db_until_done(db, None, &run);
     }
 
