@@ -11,7 +11,7 @@ use std::sync::{LazyLock, Mutex};
 use valkey_module::{Context, MODULE_CONTEXT, Status};
 
 const MAX_TRIM_TURNS: usize = 5;
-const SERIES_TRIM_BATCH_SIZE: usize = 25;
+const SERIES_TRIM_BATCH_SIZE: usize = 40;
 
 #[derive(Default)]
 struct TrimContext {
@@ -89,7 +89,7 @@ fn trim_series(ctx: &Context, db: i32, cursor: u64) -> (usize, i32) {
         return (0, db);
     }
 
-    let mut batch = fetch_series_batch(ctx, cursor + 1, |series| {
+    let mut batch = fetch_series_batch(ctx, cursor + 1, SERIES_TRIM_BATCH_SIZE, |series| {
         !series.retention.is_zero() && !series.is_empty()
     });
 

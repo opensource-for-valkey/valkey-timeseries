@@ -10,15 +10,15 @@ pub(super) fn find_next_db(current: i32) -> Option<i32> {
     index.keys().filter(|&&db| db > current).min().copied()
 }
 
-const SERIES_TRIM_BATCH_SIZE: usize = 256;
-const SERIES_TRIM_SCAN_ROUNDS: usize = 3;
+const SCAN_ROUNDS: usize = 3;
+const BUF_SIZE: usize = 256;
 
 pub(super) fn fetch_series_batch(
     ctx: &'_ Context,
     start_id: SeriesRef,
+    batch_size: usize,
     pred: fn(&TimeSeries) -> bool,
 ) -> Vec<SeriesGuardMut<'_>> {
-    
     let mut stale_ids = SmallVec::<[SeriesRef; 8]>::new();
 
     // Resolve the ids to keys under the postings read guard, then open them *after* the guard is
@@ -31,9 +31,10 @@ pub(super) fn fetch_series_batch(
 
         // Read up to 3 batches worth of ids, so that entries skipped below (dangling keys, or
         // series rejected by `pred`) do not shrink the batch that is returned.
-        let mut resolved = Vec::with_capacity(SERIES_TRIM_BATCH_SIZE);
-        for _ in 0..SERIES_TRIM_SCAN_ROUNDS {
-            let mut buf = [0_u64; SERIES_TRIM_BATCH_SIZE];
+        let mut resolved = Vec::with_capacity(batch_size);
+
+        for _ in 0..SCAN_ROUNDS {
+            let mut buf = [0_u64; BUF_SIZE];
             let n = cursor.read_many(&mut buf);
             if n == 0 {
                 break;
@@ -42,6 +43,9 @@ pub(super) fn fetch_series_batch(
             for &id in &buf[..n] {
                 if let Some(k) = postings.get_key_by_id(id) {
                     resolved.push((id, create_key_string(ctx, k.as_ref())));
+                    if resolved.len() >= batch_size {
+                        break;
+                    }
                 } else {
                     stale_ids.push(id);
                 }
@@ -51,7 +55,7 @@ pub(super) fn fetch_series_batch(
         resolved
     });
 
-    let mut result = Vec::with_capacity(SERIES_TRIM_BATCH_SIZE);
+    let mut result = Vec::with_capacity(batch_size);
     for (id, key) in resolved {
         let Ok(Some(series)) = try_get_timeseries_mut(ctx, &key, None) else {
             stale_ids.push(id);
@@ -60,7 +64,7 @@ pub(super) fn fetch_series_batch(
 
         if pred(&series) {
             result.push(series);
-            if result.len() >= SERIES_TRIM_BATCH_SIZE {
+            if result.len() >= batch_size {
                 break;
             }
         }
