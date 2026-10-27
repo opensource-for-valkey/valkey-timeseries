@@ -1,6 +1,7 @@
 use crate::common::context::create_key_string;
 use crate::series::index::{TIMESERIES_INDEX, get_timeseries_index, with_timeseries_postings};
 use crate::series::{SeriesGuardMut, SeriesRef, TimeSeries, try_get_timeseries_mut};
+use smallvec::SmallVec;
 use valkey_module::Context;
 
 pub(super) fn find_next_db(current: i32) -> Option<i32> {
@@ -17,6 +18,9 @@ pub(super) fn fetch_series_batch(
     start_id: SeriesRef,
     pred: fn(&TimeSeries) -> bool,
 ) -> Vec<SeriesGuardMut<'_>> {
+    
+    let mut stale_ids = SmallVec::<[SeriesRef; 8]>::new();
+
     // Resolve the ids to keys under the postings read guard, then open them *after* the guard is
     // gone. Opening a key runs the server's lazy-expiry check, which reaps an expired series
     // through this module's `unlink` callback -- and that takes the postings write lock on this
@@ -38,6 +42,8 @@ pub(super) fn fetch_series_batch(
             for &id in &buf[..n] {
                 if let Some(k) = postings.get_key_by_id(id) {
                     resolved.push((id, create_key_string(ctx, k.as_ref())));
+                } else {
+                    stale_ids.push(id);
                 }
             }
         }
@@ -45,7 +51,6 @@ pub(super) fn fetch_series_batch(
         resolved
     });
 
-    let mut stale_ids = Vec::new();
     let mut result = Vec::with_capacity(SERIES_TRIM_BATCH_SIZE);
     for (id, key) in resolved {
         let Ok(Some(series)) = try_get_timeseries_mut(ctx, &key, None) else {
