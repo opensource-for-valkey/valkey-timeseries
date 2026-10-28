@@ -54,18 +54,26 @@ impl<'a> Terms<'a> {
             PredicateMatch::RegexEqual(re) if matches!(re.regex.as_str(), "" | ".*") => {
                 Cow::Owned(self.postings_for_all_label_values(&filter.label))
             }
+            // A series has at most one value per label, so "has the label, minus has a matching
+            // value" is the series whose value doesn't match: one scan, no difference.
             PredicateMatch::StartsWith(prefix) => {
-                let all = self.postings_for_all_label_values(&filter.label);
-                let matching_prefix = postings_by_prefix_value(self, &filter.label, prefix);
-                Cow::Owned(all.andnot(&matching_prefix))
+                let mut state = prefix;
+                Cow::Owned(self.postings_for_label_matching(
+                    &filter.label,
+                    &mut state,
+                    |value, prefix| !starts_with_any(prefix, value),
+                ))
             }
             PredicateMatch::NotStartsWith(prefix) => {
                 Cow::Owned(postings_by_prefix_value(self, &filter.label, prefix))
             }
             PredicateMatch::Contains(needle) => {
-                let all = self.postings_for_all_label_values(&filter.label);
-                let matching = handle_contains(self, &filter.label, needle).into_owned();
-                Cow::Owned(all.andnot(&matching))
+                let mut state = needle;
+                Cow::Owned(self.postings_for_label_matching(
+                    &filter.label,
+                    &mut state,
+                    |value, needle| !needle.matches_contains_any(value),
+                ))
             }
             PredicateMatch::NotContains(needle) => {
                 Cow::Owned(handle_contains(self, &filter.label, needle).into_owned())
@@ -258,6 +266,15 @@ fn postings_by_prefix_value(
     }
 }
 
+#[inline]
+fn starts_with_any(prefix: &PredicateValue, value: &str) -> bool {
+    match prefix {
+        PredicateValue::Empty => false,
+        PredicateValue::String(p) => value.starts_with(p.as_str()),
+        PredicateValue::List(prefixes) => prefixes.iter().any(|p| value.starts_with(p.as_str())),
+    }
+}
+
 fn handle_contains<'a>(
     postings: Terms<'a>,
     label: &str,
@@ -397,6 +414,50 @@ mod tests {
         assert!(result.contains(1));
         assert!(result.contains(2));
         assert!(!result.contains(3));
+    }
+
+    fn inverse_fixture() -> Postings {
+        let mut postings = Postings::default();
+        postings.add_posting_for_label_value(1, "instance", "server-1");
+        postings.add_posting_for_label_value(2, "instance", "client-1");
+        postings.add_posting_for_label_value(3, "instance", "proxy-server");
+        postings.add_posting_for_label_value(4, "other", "value");
+        postings
+    }
+
+    fn inverse_ids(postings: &Postings, matcher: PredicateMatch) -> Vec<u64> {
+        let filter = LabelFilter {
+            label: "instance".to_string(),
+            matcher,
+        };
+        let result = postings.terms().inverse_postings_for_filter(&filter);
+        result.iter().collect()
+    }
+
+    #[test]
+    fn test_inverse_starts_with_keeps_only_labelled_non_matching() {
+        let postings = inverse_fixture();
+        let single = PredicateMatch::StartsWith(PredicateValue::String("server".to_string()));
+        assert_eq!(inverse_ids(&postings, single), vec![2, 3]);
+
+        let list = PredicateMatch::StartsWith(PredicateValue::from(vec![
+            "server".to_string(),
+            "client".to_string(),
+        ]));
+        assert_eq!(inverse_ids(&postings, list), vec![3]);
+    }
+
+    #[test]
+    fn test_inverse_contains_keeps_only_labelled_non_matching() {
+        let postings = inverse_fixture();
+        let single = PredicateMatch::Contains(PredicateValue::String("server".to_string()));
+        assert_eq!(inverse_ids(&postings, single), vec![2]);
+
+        let list = PredicateMatch::Contains(PredicateValue::from(vec![
+            "proxy".to_string(),
+            "client".to_string(),
+        ]));
+        assert_eq!(inverse_ids(&postings, list), vec![1]);
     }
 
     #[test]
