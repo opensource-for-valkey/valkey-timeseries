@@ -112,12 +112,69 @@ pub fn get_10in(i: i32) -> Result<f64, ()> {
     Ok(MAP_10IN.get(i as usize).copied().unwrap_or(0.0))
 }
 
+/// `10^k` from the tables, or `None` past either end (`k` above 308 or below -323).
+#[inline(always)]
+fn pow10(k: i32) -> Option<f64> {
+    if k >= 0 {
+        MAP_10IP.get(k as usize).copied()
+    } else {
+        MAP_10IN.get(k.unsigned_abs() as usize).copied()
+    }
+}
+
+/// `floor(log10 v)` for a double the table scans do not cover (`v < 1e-10` or `v >= 1e9`),
+/// from its binary exponent and one compare, with no `log10`.
+///
+/// `v` in `[2^E, 2^(E+1))` has `log10 v` in `[E c, (E+1) c)`, `c = log10 2 < 1`, so its scale is
+/// `est = floor(E c)` or `est + 1`, and it is `est + 1` exactly when `v >= 10^(est+1)`. The
+/// compare is against the same correctly rounded table power the scans test, so the answer
+/// agrees with them at every boundary; `log10` does not (for the double just under `10^p` it
+/// can round up to `p`). `E c` is at least 4e-4 from an integer for every nonzero `E` in
+/// -1074..=1023 (closest at -485), so the f64 product cannot floor to the wrong side; the
+/// tests check every exponent.
+///
+/// `E` is exact for subnormals too (the top set bit of the mantissa). The smallest one,
+/// `5e-324`, is below `10^-323`'s table entry and gets -324. Zero, infinity and NaN keep the
+/// values `floor(log10)` saturated to (`i32::MIN`, `i32::MAX`, `0`), which the decoder's
+/// `recover` sees on corrupt input. `v` is expected to be non-negative; the sign bit is ignored.
+///
+/// Out of line: the code it replaced called `log10` out of line too, and nothing in the
+/// generator matrix reaches it. Inlined into `recover`, one decode row (drift, irregular)
+/// measured ~18 % slower in five of six interleaved rounds; out of line it matches the base.
+#[inline(never)]
+fn scale_from_exponent(v: f64) -> i32 {
+    let bits = v.to_bits() & (u64::MAX >> 1);
+    let biased = (bits >> 52) as i32;
+    let e = if biased == 0 {
+        if bits == 0 {
+            return i32::MIN;
+        }
+        // Subnormal: `v = bits * 2^-1074`, so `floor(log2 v)` is the top set bit's place.
+        63 - bits.leading_zeros() as i32 - 1074
+    } else if biased == 0x7ff {
+        return if bits == f64::INFINITY.to_bits() {
+            i32::MAX
+        } else {
+            0
+        };
+    } else {
+        biased - 1023
+    };
+    let est = (e as f64 * std::f64::consts::LOG10_2).floor() as i32;
+    // `est + 1` is in -323..=308 for every finite nonzero `v`, so the lookup always succeeds;
+    // the fallback only keeps a wrong table from panicking.
+    let next = pow10(est + 1).unwrap_or(f64::INFINITY);
+    est + i32::from(f64::from_bits(bits) >= next)
+}
+
 /// `getSP`: the decimal "scale position" of `|v|` (floor of log10 magnitude).
 ///
 /// A table scan, as in the reference. Deriving the scale from the binary exponent plus one
 /// corrective compare was tried (2026-09-16) and measured 8 % slower on encode, 35 % on
 /// erasable data: for values in the usual magnitudes this loop is one to three predicted
-/// compares, cheaper than the exponent arithmetic and two table loads.
+/// compares, cheaper than the exponent arithmetic and two table loads. Outside the scan's
+/// range (`< 1e-10`, `>= 1e9`) that arithmetic replaces a `log10` call: see
+/// [`scale_from_exponent`].
 #[inline(always)]
 pub fn get_sp(v: f64) -> i32 {
     if v >= 1.0 {
@@ -137,10 +194,14 @@ pub fn get_sp(v: f64) -> i32 {
             i += 1;
         }
     }
-    (v.log10()).floor() as i32
+    scale_from_exponent(v)
 }
 
 /// `getSPAnd10iNFlag`: returns `(sp, is_exact_power_of_10_le_1)`.
+///
+/// Below one the flag is the scan's (`v == 10^sp`); in `[1, 1e9)` it is `0`, as it always was.
+/// From `1e9` up and below `1e-10` it is `v == 10^sp` too, which is exact; the `log10` it
+/// replaces also flagged the doubles an ulp or two either side of a power of ten.
 fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
     if v >= 1.0 {
         let mut i = 0;
@@ -160,14 +221,8 @@ fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
             i += 1;
         }
     }
-    let log10v = v.log10();
-    let sp = log10v.floor() as i32;
-    let flag = if log10v == (log10v as i64) as f64 {
-        1
-    } else {
-        0
-    };
-    (sp, flag)
+    let sp = scale_from_exponent(v);
+    (sp, i32::from(pow10(sp) == Some(v)))
 }
 
 /// Most significant decimal digits the ELF layer counts. A value with more is stored raw: from
@@ -462,6 +517,155 @@ mod tests {
         assert_eq!(get_10in(324), Ok(0.0));
         assert_eq!(get_10ip(-1), Err(()));
         assert_eq!(get_10in(-1), Err(()));
+    }
+
+    /// `floor(log10 x)` read off the power tables: the largest `k` with `10^k <= x` for
+    /// `x >= 1`, else `-k` for the smallest `k >= 1` with `10^-k <= x`. Exact by construction
+    /// (`log10` itself is not: for `x` one ulp under `10^p` it can round up to `p`). `None`
+    /// for `x < 1e-323`, whose scale (-324) has no table entry.
+    fn table_sp(x: f64) -> Option<i32> {
+        if x >= 1.0 {
+            Some(MAP_10IP.partition_point(|&p| p <= x) as i32 - 1)
+        } else {
+            let k = MAP_10IN.partition_point(|&p| p > x);
+            (k < MAP_10IN.len()).then_some(-(k as i32))
+        }
+    }
+
+    /// The power-of-ten flag `get_sp_and_10in_flag` is specified to return: the table scan's
+    /// (`1` only for `10^-k` below one, never in `[1, 1e9)`), and for `x >= 1e9` whether `x` is
+    /// exactly `10^sp`.
+    fn expected_flag(x: f64, sp: i32) -> i32 {
+        i32::from(if x < 1.0 {
+            x == MAP_10IN[(-sp) as usize]
+        } else if x < 1e9 {
+            false
+        } else {
+            x == MAP_10IP[sp as usize]
+        })
+    }
+
+    /// Every input the scale functions are checked on: each power of ten, its neighbours at
+    /// +-1 ulp and three times it, then both ends of every binary exponent (normal and
+    /// subnormal), then random finite positive bit patterns. Finite, positive, `>= 1e-323`.
+    fn scale_inputs() -> Vec<f64> {
+        let mut bits: Vec<u64> = Vec::new();
+        for p in -323i32..=308 {
+            let v = if p >= 0 {
+                MAP_10IP[p as usize]
+            } else {
+                MAP_10IN[(-p) as usize]
+            };
+            bits.extend([v.to_bits(), v.to_bits() - 1, v.to_bits() + 1]);
+            bits.push((v * 3.0).to_bits());
+        }
+        for biased in 0..=0x7feu64 {
+            for mantissa in [
+                0,
+                1,
+                2,
+                (1 << 51) - 1,
+                1 << 51,
+                (1 << 52) - 2,
+                (1 << 52) - 1,
+            ] {
+                bits.push((biased << 52) | mantissa);
+            }
+        }
+        for bit in 0..52 {
+            bits.push(1 << bit);
+            bits.push((1 << bit) - 1);
+        }
+        // The subnormals at both ends, where the table's powers of ten are coarsest.
+        bits.extend(2..1 << 18);
+        bits.extend((1 << 52) - (1 << 18)..1 << 52);
+        let mut next = xorshift(0x0dd_ba11_f00d_cafe);
+        // Random patterns, and random powers of ten nudged by up to 8 ulps either way.
+        bits.extend((0..200_000).map(|_| next() & !(1 << 63)));
+        for _ in 0..200_000 {
+            let p = (next() % 632) as i32 - 323;
+            let v = if p >= 0 {
+                MAP_10IP[p as usize]
+            } else {
+                MAP_10IN[(-p) as usize]
+            };
+            bits.push((v.to_bits() + next() % 17).saturating_sub(8));
+        }
+        bits.into_iter()
+            .map(f64::from_bits)
+            .filter(|x| x.is_finite() && *x >= 1e-323)
+            .collect()
+    }
+
+    /// `get_sp` is the exact table `floor(log10)` for every finite positive input, including the
+    /// ones just under a power of ten that `log10` rounds up.
+    #[test]
+    fn get_sp_matches_the_table_oracle() {
+        let bad: Vec<String> = scale_inputs()
+            .into_iter()
+            .filter(|&x| Some(get_sp(x)) != table_sp(x))
+            .map(|x| {
+                format!(
+                    "{x:e} ({:#018x}): got {}, want {:?}",
+                    x.to_bits(),
+                    get_sp(x),
+                    table_sp(x)
+                )
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} disagreements, first: {:#?}",
+            bad.len(),
+            &bad[..bad.len().min(12)]
+        );
+    }
+
+    /// `get_sp_and_10in_flag` returns the same exact scale, and its flag is exact.
+    #[test]
+    fn get_sp_and_flag_match_the_table_oracle() {
+        let bad: Vec<String> = scale_inputs()
+            .into_iter()
+            .filter(|&x| {
+                let want = table_sp(x).unwrap();
+                get_sp_and_10in_flag(x) != (want, expected_flag(x, want))
+            })
+            .map(|x| {
+                let want = table_sp(x).unwrap();
+                format!(
+                    "{x:e} ({:#018x}): got {:?}, want {:?}",
+                    x.to_bits(),
+                    get_sp_and_10in_flag(x),
+                    (want, expected_flag(x, want))
+                )
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} disagreements, first: {:#?}",
+            bad.len(),
+            &bad[..bad.len().min(12)]
+        );
+    }
+
+    /// The smallest subnormal is the one double below `1e-323`; its scale is -324.
+    #[test]
+    fn get_sp_of_the_smallest_subnormal() {
+        assert_eq!(get_sp(5e-324), -324);
+        assert_eq!(get_sp_and_10in_flag(5e-324), (-324, 0));
+    }
+
+    /// Zero, infinity and NaN keep the values `floor(log10)` saturated to, which the decoder's
+    /// `recover` sees on corrupt input (it widens to i64 for them).
+    #[test]
+    fn get_sp_of_special_values_is_unchanged() {
+        assert_eq!(get_sp(0.0), i32::MIN);
+        assert_eq!(get_sp(-0.0), i32::MIN);
+        assert_eq!(get_sp(f64::INFINITY), i32::MAX);
+        assert_eq!(get_sp(f64::NAN), 0);
+        assert_eq!(get_sp_and_10in_flag(0.0), (i32::MIN, 0));
+        assert_eq!(get_sp_and_10in_flag(f64::INFINITY), (i32::MAX, 0));
+        assert_eq!(get_sp_and_10in_flag(f64::NAN), (0, 0));
     }
 
     /// Magnitudes whose scale needs a power of ten past `MAP_10IP` (|v| below ~1e-294) and
