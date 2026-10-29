@@ -61,9 +61,6 @@ use valkey_module::digest::Digest;
 use valkey_module::error::Error as ValkeyError;
 use valkey_module::raw;
 
-/// Prefix of the timestamp escape case (32- or 64-bit payload).
-const TS_ESCAPE_PREFIX: u64 = 0x0F;
-
 /// `last_alpha` before the first `11` header (and after `clear`).
 const NO_ALPHA: i32 = -1;
 
@@ -508,6 +505,22 @@ impl ChimpCompressor {
             .add_value_prefixed(&mut self.writer, 0, 1, v_prime_long)
     }
 
+    /// Writes the timestamp of the next sample. The first is a varint; after that, the
+    /// zig-zagged delta-of-delta `d` (`n` bits wide) is written as
+    ///
+    /// ```text
+    /// 0                  d = 0
+    /// 10     [d: 7]      n <= 7
+    /// 110    [d: 9]      n <= 9
+    /// 1110   [d: 12]     n <= 12
+    /// 11110  [d: 16]     n <= 16
+    /// 111110 [d: 32]     n <= 32
+    /// 111111 [d: 64]     otherwise
+    /// ```
+    ///
+    /// Every tier but the last is one `write_bits`: the prefix is OR-ed above the payload, so
+    /// the bits `d` does not use are the prefix's. Timestamps may go backwards; the
+    /// delta-of-delta is signed, so an out-of-order point costs bits but still round-trips.
     fn write_timestamp(&mut self, timestamp: Timestamp) -> io::Result<()> {
         if self.count == 0 {
             self.writer.write_varint(timestamp)?;
@@ -516,39 +529,29 @@ impl ChimpCompressor {
             self.last_delta = 0;
             return Ok(());
         }
-        // Timestamps may go backwards; the delta-of-delta is signed, so an
-        // out-of-order point costs bits but still round-trips.
         let new_delta = timestamp.wrapping_sub(self.last_timestamp);
         let delta_d = new_delta.wrapping_sub(self.last_delta);
 
         if delta_d == 0 {
             self.writer.write_bit(false);
         } else {
-            let mut enc = zigzag_encode(delta_d);
-            let mut length = 64 - enc.leading_zeros();
-
-            if length == 0 {
-                length = 1;
-            }
+            let enc = zigzag_encode(delta_d);
+            // A nonzero `delta_d` zig-zags to a nonzero value, so `length` is at least 1.
+            let length = 64 - enc.leading_zeros();
 
             if length <= 7 {
-                enc |= 0x02u64 << 7;
-                self.writer.write_bits(9, enc)?;
+                self.writer.write_bits(9, enc | (0b10 << 7))?;
             } else if length <= 9 {
-                enc |= 0x06u64 << 9;
-                self.writer.write_bits(12, enc)?;
+                self.writer.write_bits(12, enc | (0b110 << 9))?;
             } else if length <= 12 {
-                enc |= 0x0Eu64 << 12;
-                self.writer.write_bits(16, enc)?;
+                self.writer.write_bits(16, enc | (0b1110 << 12))?;
+            } else if length <= 16 {
+                self.writer.write_bits(21, enc | (0b11110 << 16))?;
+            } else if length <= 32 {
+                self.writer.write_bits(38, enc | (0b111110 << 32))?;
             } else {
-                self.writer.write_bits(4, TS_ESCAPE_PREFIX)?;
-                if length <= 32 {
-                    self.writer.write_bit(false);
-                    self.writer.write_bits(32, enc)?;
-                } else {
-                    self.writer.write_bit(true);
-                    self.writer.write_bits(64, enc)?;
-                }
+                self.writer.write_bits(6, 0b111111)?;
+                self.writer.write_bits(64, enc)?;
             }
         }
 
@@ -611,31 +614,32 @@ impl<'a> ChimpDecompressor<'a> {
             return Ok(timestamp);
         }
 
-        // The prefix is 1–4 bits, terminated by the first zero (`0`, `10`,
-        // `110`, `1110`) or the escape `1111`. One peek of four bits decides
-        // it, in place of a bit-by-bit loop; past the end of the stream the
-        // peek pads with zeros, and `skip` then reports the truncation.
-        let head = self.reader.peek_upto(4);
-        let delta_d = if head < 0b1000 {
+        // The prefix is 1-6 bits, terminated by the first zero (`0`, `10`, `110`, `1110`,
+        // `11110`, `111110`) or by `111111`. One peek of six bits decides it, in place of a
+        // bit-by-bit loop; past the end of the stream the peek pads with zeros, and `skip`
+        // then reports the truncation.
+        let head = self.reader.peek_upto(6);
+        let delta_d = if head < 0b10_0000 {
             self.reader.skip(1)?;
             0
-        } else if head < 0b1100 {
+        } else if head < 0b11_0000 {
             self.reader.skip(2)?;
             zigzag_decode(self.reader.read_bits(7)?)
-        } else if head < 0b1110 {
+        } else if head < 0b11_1000 {
             self.reader.skip(3)?;
             zigzag_decode(self.reader.read_bits(9)?)
-        } else if head == 0b1110 {
+        } else if head < 0b11_1100 {
             self.reader.skip(4)?;
             zigzag_decode(self.reader.read_bits(12)?)
+        } else if head < 0b11_1110 {
+            self.reader.skip(5)?;
+            zigzag_decode(self.reader.read_bits(16)?)
+        } else if head == 0b11_1110 {
+            self.reader.skip(6)?;
+            zigzag_decode(self.reader.read_bits(32)?)
         } else {
-            debug_assert_eq!(head, TS_ESCAPE_PREFIX);
-            self.reader.skip(4)?;
-            if self.reader.read_bit()? {
-                zigzag_decode(self.reader.read_bits(64)?)
-            } else {
-                zigzag_decode(self.reader.read_bits(32)?)
-            }
+            self.reader.skip(6)?;
+            zigzag_decode(self.reader.read_bits(64)?)
         };
 
         self.last_delta = self.last_delta.wrapping_add(delta_d);
@@ -847,6 +851,131 @@ mod tests {
             .map(|(i, ts)| Sample::new(*ts, i as f64 * 1.5))
             .collect();
         round_trip(&samples);
+    }
+
+    /// A delta-of-delta of `dod` after two regular samples, repeating the value: the stream
+    /// holds the timestamp code plus the 3-bit value repeat, so subtracting 3 leaves the
+    /// timestamp code's length.
+    fn timestamp_code_bits(dod: i64) -> u64 {
+        let mut c = ChimpCompressor::new();
+        c.add_sample(0, 1.0).unwrap();
+        c.add_sample(1000, 1.0).unwrap();
+        let before = c.len_bits();
+        c.add_sample(2000 + dod, 1.0).unwrap();
+        c.len_bits() - before - 3
+    }
+
+    #[test]
+    fn timestamp_tiers_cost_their_documented_bits() {
+        // (delta-of-delta, bits) at each bucket's upper edge and one past it.
+        for (dod, bits) in [
+            (0i64, 1),
+            (63, 9),
+            (-64, 9),
+            (64, 12),
+            (255, 12),
+            (256, 16),
+            (2047, 16),
+            (2048, 21),
+            (32767, 21),
+            (32768, 38),
+            (i64::from(i32::MAX), 38),
+            (i64::from(i32::MAX) + 1, 70),
+        ] {
+            assert_eq!(timestamp_code_bits(dod), bits, "dod {dod}");
+        }
+    }
+
+    /// The stream after the first sample is the timestamp codes spelled out in the grammar
+    /// (prefix, then the zig-zagged delta-of-delta in the tier's width), each followed by the
+    /// `000` of a repeated value. Spelling the bits out pins the prefixes, not just the lengths.
+    #[test]
+    fn timestamp_tiers_write_their_documented_bits() {
+        // (delta-of-delta, expected code); the payload is the zig-zag in the tier's width.
+        let cases: [(i64, &str, usize, u64); 12] = [
+            (1, "10", 7, 2),
+            (-1, "10", 7, 1),
+            (64, "110", 9, 128),
+            (-65, "110", 9, 129),
+            (256, "1110", 12, 512),
+            (-2048, "1110", 12, 4095),
+            (2048, "11110", 16, 4096),
+            (-32768, "11110", 16, 65535),
+            (32768, "111110", 32, 65536),
+            (-i64::from(i32::MAX) - 1, "111110", 32, (1 << 32) - 1),
+            (i64::from(i32::MAX) + 1, "111111", 64, 1 << 32),
+            (-i64::from(i32::MAX) - 2, "111111", 64, (1 << 32) + 1),
+        ];
+        let mut c = ChimpCompressor::new();
+        c.add_sample(1_000_000, 1.0).unwrap();
+        let start = c.len_bits() as usize;
+        // The second sample's delta-of-delta is its whole delta, 1000: zig-zag 2000, 12 bits.
+        c.add_sample(1_001_000, 1.0).unwrap();
+        let mut expected = format!("1110{:012b}000", zigzag_encode(1000));
+        let (mut ts, mut delta) = (1_001_000i64, 1000i64);
+        for (dod, prefix, width, zig) in cases {
+            assert_eq!(zigzag_encode(dod), zig, "dod {dod}");
+            delta += dod;
+            ts += delta;
+            c.add_sample(ts, 1.0).unwrap();
+            expected.push_str(&format!("{prefix}{zig:0width$b}000"));
+        }
+        let bytes = c.bytes();
+        let actual: String = (start..c.len_bits() as usize)
+            .map(|i| {
+                if bytes[i / 8] >> (7 - i % 8) & 1 == 1 {
+                    '1'
+                } else {
+                    '0'
+                }
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn timestamp_tier_edges_round_trip() {
+        // Every edge of every tier, both signs, in one stream so the delta state carries
+        // across tier changes. The deltas are cumulative, so each step lands on the intended
+        // delta-of-delta.
+        let edges: [i64; 13] = [
+            1,
+            63,
+            64,
+            255,
+            256,
+            2047,
+            2048,
+            32767,
+            32768,
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            1 << 40,
+            i64::MAX / 8,
+        ];
+        let mut dods = vec![0i64];
+        for e in edges {
+            dods.extend([e, -e, 0, e - 1, -(e - 1), -e - 1]);
+        }
+        let mut samples = vec![Sample::new(1_700_000_000_000, 1.0)];
+        let (mut ts, mut delta) = (1_700_000_000_000i64, 0i64);
+        for (i, dod) in dods.iter().enumerate() {
+            delta = delta.wrapping_add(*dod);
+            ts = ts.wrapping_add(delta);
+            samples.push(Sample::new(ts, i as f64));
+        }
+        round_trip(&samples);
+    }
+
+    #[test]
+    fn truncated_timestamp_escape_reports_eof() {
+        let mut c = ChimpCompressor::new();
+        c.add_sample(0, 1.0).unwrap();
+        c.add_sample(1000, 1.0).unwrap();
+        c.add_sample(2000 + (1i64 << 40), 1.0).unwrap();
+        let bytes = c.bytes();
+        let cut = &bytes[..bytes.len() - 4];
+        assert!(ChimpDecompressor::new(cut, 3).collect().is_err());
     }
 
     #[test]
@@ -1572,5 +1701,55 @@ mod tests {
         let mixed = pack(&mixed_dyadic_values());
         assert_eq!(mixed.len(), 13100);
         assert_eq!(fnv1a(&mixed), 0x4916_c241_acf0_c977);
+    }
+
+    /// Pins the timestamp grammar byte for byte (2026-10-29): delta-of-delta tiers of 7, 9, 12,
+    /// 16 and 32 bits, each written in one call, and the 64-bit escape. The values are the
+    /// `mixed` stream above, so only the timestamps differ from it. That stream's own
+    /// timestamps are regular (one 12-bit code, then dod `0`), which is why it did not move
+    /// when the 16-bit tier was added. The stream is the format: change it on purpose and
+    /// re-record.
+    #[test]
+    fn irregular_timestamp_stream_matches_the_tiered_encoder_byte_for_byte() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Each delta is 1000 plus a jitter spanning 2^scale values (none for scale 0), widths
+        // chosen so the delta-of-deltas land in every tier, `0` included.
+        const SCALES: [u32; 8] = [0, 5, 8, 10, 14, 30, 40, 5];
+        let mut compressor = ChimpCompressor::new();
+        let mut timestamp = 1_700_000_000_000i64;
+        let mut last_delta = 0i64;
+        // Which code each delta-of-delta takes: 0, then the 7/9/12/16/32/64-bit tiers.
+        let mut tiers = [0u32; 7];
+        for v in mixed_dyadic_values() {
+            let r = next();
+            let scale = SCALES[(r % 8) as usize];
+            let jitter = if scale == 0 {
+                0
+            } else {
+                ((r >> 8) % (1u64 << scale)) as i64 - (1i64 << (scale - 1))
+            };
+            let delta = 1000 + jitter;
+            let width = 64 - zigzag_encode(delta - last_delta).leading_zeros();
+            tiers[[0, 7, 9, 12, 16, 32]
+                .iter()
+                .take_while(|w| width > **w)
+                .count()] += 1;
+            last_delta = delta;
+            timestamp += delta;
+            compressor.add_sample(timestamp, v).unwrap();
+        }
+        assert!(
+            tiers.iter().all(|n| *n > 20),
+            "every tier is exercised: {tiers:?}"
+        );
+        let bytes = compressor.into_bytes();
+        assert_eq!(bytes.len(), 20559);
+        assert_eq!(fnv1a(&bytes), 0xf314_d841_933e_830a);
     }
 }
