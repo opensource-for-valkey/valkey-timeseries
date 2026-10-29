@@ -148,6 +148,14 @@ Transmitting α rather than β\* removes `get_sp` and the `β* == 0` special cas
 decoder, and α is invariant across magnitude boundaries for fixed-decimal data (β\* flips
 from 4 to 5 when a 2-decimal value crosses 100), so it also halves header churn there.
 
+> **Correction (Task 3, recorded in Task 13):** the `k ≤ 15` claim above is wrong. At large
+> magnitudes a double's shortest round-trip decimal can be shorter than its exact `k`-digit
+> decimal, so ELF finds `α < k` and erases real bits: `17582400172190.2` (`k = 8`) erases, and
+> random sweeps found erasing values for every `k` from 8 to 24. The sound bound is the 1/16
+> grid: for `k ≤ 4`, `α ≥ 1 ⇒ f(α) ≥ 4 ≥ k ⇒ erase_bits ≤ tz`, and `α = 0` cannot recover a
+> non-integer. The shipped classifier (`is_short_dyadic`) uses `k ≤ 4`. See
+> [the Chimp evaluation](../benchmarks/chimp-evaluation.md).
+
 **SIMD.** The crate uses no explicit SIMD; x86_64 builds get `+avx2,+bmi1,+bmi2` from
 `.cargo/config.toml`, aarch64 has baseline NEON (2 f64 lanes, no 64-bit lzcnt or
 multiply-high). Chimp's serial dependency (each field's position depends on earlier widths;

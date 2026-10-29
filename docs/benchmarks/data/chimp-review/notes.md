@@ -150,3 +150,5 @@ This was not exercised against a live server.
   repository files were modified. Only this ignored report directory was written.
 
 Validation: `cargo test --offline --features enable-system-alloc --lib series::chunks::chimp -q --jobs 1` passed all 45 existing Chimp tests. Worktree remains clean.
+
+Note (2026-10-29, added in Task 13): the paragraphs above describe the original probe run. The probe sources in `/tmp` were not retained, and this directory is now tracked; see the provenance line at the top and [the Chimp evaluation](../../chimp-evaluation.md).

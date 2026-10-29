@@ -9,7 +9,9 @@ Compression figures (sizes, ratios, winners) come from the committed baseline,
 Latency figures are historical: they predate the version-3 Chimp grammar and
 the Gorilla changes, and are marked where they appear. For the Gorilla changes
 and their fixed-sample A/B results, see
-[the Gorilla evaluation](../benchmarks/gorilla-evaluation.md).
+[the Gorilla evaluation](../benchmarks/gorilla-evaluation.md); for the version-3
+Chimp encoder changes, measured the same way, see
+[the Chimp evaluation](../benchmarks/chimp-evaluation.md).
 
 **Persistence.** New RDB, DUMP and rewritten AOF payloads use module encoding
 version **3**, and this build reads version 3 only. Version 3 changed the Chimp

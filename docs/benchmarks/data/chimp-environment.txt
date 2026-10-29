@@ -1,0 +1,11 @@
+macOS-15.3.1-arm64-arm-64bit
+cpu: Apple M2
+rustc 1.96.0 (ac68faa20 2026-05-25)
+baseline: f6e446a359a30d8748d99a3a7f39dc4a62d66ae2 (tools/gorilla_report.rs from the candidate built as examples/gorilla_report.rs)
+candidate: 9af061c18a1d7473aeb2b89a385422727c19f33b
+features: enable-system-alloc,test-utils (release profile, LTO, --jobs 1, --locked with the same Cargo.lock)
+architecture: arm64
+rounds: 3 interleaved, arm order rotated; 1000 samples x 1000 iterations, 10000 samples x 300 iterations; 50 warmups per operation
+arms: baseline/control (byte-identical copy)/candidate with --encoding chimp; gorilla-baseline/gorilla with --encoding gorilla from the baseline/candidate binaries
+load: browser and system daemons running (load average ~4); no concurrent compilation or tests; caffeinate -i -s -m
+date: 2026-10-29
