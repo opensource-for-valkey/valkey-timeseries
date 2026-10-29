@@ -1,5 +1,10 @@
 use super::ChimpChunk;
 use crate::common::Sample;
+use crate::common::encoding::{
+    try_read_f64_le, try_read_signed_varint, try_read_uvarint, write_f64_le, write_signed_varint,
+    write_uvarint,
+};
+use crate::error::TsdbError;
 use crate::series::DuplicatePolicy;
 use crate::series::chunks::chunk::Chunk;
 use crate::series::chunks::{ChunkOps, GorillaChunk};
@@ -346,6 +351,94 @@ fn test_deserialize_rejects_corrupt_codec_state() {
         let mut corrupt = buf.clone();
         corrupt[i] = corrupt[i].wrapping_add(0x5b);
         let _ = ChimpChunk::deserialize(&corrupt);
+    }
+
+    // Codec state the encoder could never have written is rejected on load, so a later
+    // append cannot write a stream the decoder misreads.
+    let header = CodecHeader::parse(&buf);
+    assert_eq!(ChimpChunk::deserialize(&header.write()).unwrap(), chunk);
+    assert_ne!(header.stored_lz, 64, "the fixture must have an open window");
+    let with = |last_alpha, stored_lz, stored_tz| CodecHeader {
+        last_alpha,
+        stored_lz,
+        stored_tz,
+        ..header.clone()
+    };
+    // Each case breaks one field; the same rewrite with valid values loads.
+    let alpha = header.last_alpha;
+    for (a, lz, tz) in [(alpha, 0, 0), (-1, 0, 0), (15, 24, 39), (alpha, 64, 0)] {
+        assert!(
+            ChimpChunk::deserialize(&with(a, lz, tz).write()).is_ok(),
+            "{a} {lz} {tz}"
+        );
+    }
+    let mut cases = vec![(-2, 0, 0), (16, 0, 0), (1 << 40, 0, 0)];
+    cases.extend([-1, 1, 25, 63, 65, i64::from(i32::MAX), (1 << 32) + 8].map(|lz| (alpha, lz, 0)));
+    cases.extend([-1, 64, (1 << 32) + 2].map(|tz| (alpha, 0, tz)));
+    cases.extend([(24, 40), (8, 56), (64, 1)].map(|(lz, tz)| (alpha, lz, tz)));
+    for (a, lz, tz) in cases {
+        let corrupt = with(a, lz, tz).write();
+        assert!(
+            matches!(
+                ChimpChunk::deserialize(&corrupt),
+                Err(TsdbError::ChunkDecoding)
+            ),
+            "last_alpha {a}, stored_lz {lz}, stored_tz {tz}"
+        );
+    }
+}
+
+/// The serialized Chimp chunk header, field by field, so a test can rewrite one.
+#[derive(Debug, Clone)]
+struct CodecHeader {
+    max_size: u64,
+    count: u64,
+    first_timestamp: i64,
+    last_timestamp: i64,
+    last_delta: i64,
+    last_value: f64,
+    last_alpha: i64,
+    stored_lz: i64,
+    stored_tz: i64,
+    stored_val: u64,
+    first: u64,
+    stream: Vec<u8>,
+}
+
+impl CodecHeader {
+    fn parse(mut buf: &[u8]) -> Self {
+        let buf = &mut buf;
+        Self {
+            max_size: try_read_uvarint(buf).ok().unwrap(),
+            count: try_read_uvarint(buf).ok().unwrap(),
+            first_timestamp: try_read_signed_varint(buf).ok().unwrap(),
+            last_timestamp: try_read_signed_varint(buf).ok().unwrap(),
+            last_delta: try_read_signed_varint(buf).ok().unwrap(),
+            last_value: try_read_f64_le(buf).ok().unwrap(),
+            last_alpha: try_read_signed_varint(buf).ok().unwrap(),
+            stored_lz: try_read_signed_varint(buf).ok().unwrap(),
+            stored_tz: try_read_signed_varint(buf).ok().unwrap(),
+            stored_val: try_read_uvarint(buf).ok().unwrap(),
+            first: try_read_uvarint(buf).ok().unwrap(),
+            stream: buf.to_vec(),
+        }
+    }
+
+    fn write(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_uvarint(&mut out, self.max_size);
+        write_uvarint(&mut out, self.count);
+        write_signed_varint(&mut out, self.first_timestamp);
+        write_signed_varint(&mut out, self.last_timestamp);
+        write_signed_varint(&mut out, self.last_delta);
+        write_f64_le(&mut out, self.last_value);
+        write_signed_varint(&mut out, self.last_alpha);
+        write_signed_varint(&mut out, self.stored_lz);
+        write_signed_varint(&mut out, self.stored_tz);
+        write_uvarint(&mut out, self.stored_val);
+        write_uvarint(&mut out, self.first);
+        out.extend_from_slice(&self.stream);
+        out
     }
 }
 

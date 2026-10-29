@@ -83,8 +83,8 @@ pub(crate) struct ElfStats {
     pub same_alpha: u32,
     /// Elf case `11`.
     pub new_alpha: u32,
-    /// Reserved for the Chimp window-reuse case; nothing counts it yet.
-    #[allow(dead_code)]
+    /// Chimp flag `10`: the value's XOR reused the stored window. Counted in the Chimp
+    /// encoder and copied here after each sample.
     pub window_reuse: u32,
 }
 
@@ -245,6 +245,10 @@ impl ChimpCompressor {
         self.write_value(value)?;
         self.last_value = value;
         self.count += 1;
+        #[cfg(test)]
+        {
+            self.stats.window_reuse = self.chimp.window_reuse.0;
+        }
         Ok(())
     }
 
@@ -272,6 +276,7 @@ impl ChimpCompressor {
         raw::save_signed(rdb, self.last_delta);
         raw::save_signed(rdb, self.last_alpha as i64);
         raw::save_signed(rdb, state.stored_lz as i64);
+        raw::save_signed(rdb, state.stored_tz as i64);
         raw::save_unsigned(rdb, state.stored_val);
         raw::save_unsigned(rdb, state.first as u64);
         self.writer.rdb_save(rdb);
@@ -283,17 +288,18 @@ impl ChimpCompressor {
         let last_timestamp = rdb_load_timestamp(rdb)?;
         let last_value = raw::load_double(rdb)?;
         let last_delta = raw::load_signed(rdb)?;
-        let last_alpha = raw::load_signed(rdb)? as i32;
-        let state = ChimpEncState {
-            stored_lz: raw::load_signed(rdb)? as i32,
-            stored_val: raw::load_unsigned(rdb)?,
-            first: raw::load_unsigned(rdb)? != 0,
-        };
+        let last_alpha = raw::load_signed(rdb)?;
+        let stored_lz = raw::load_signed(rdb)?;
+        let stored_tz = raw::load_signed(rdb)?;
+        let stored_val = raw::load_unsigned(rdb)?;
+        let first = raw::load_unsigned(rdb)? != 0;
+        let (last_alpha, chimp) = codec_state(last_alpha, stored_lz, stored_tz, stored_val, first)
+            .ok_or_else(|| ValkeyError::generic("Invalid chimp chunk codec state"))?;
         let writer = BitStream::rdb_load(rdb)?;
 
         Ok(Self {
             writer,
-            chimp: ChimpEnc::from_state(state),
+            chimp,
             last_alpha,
             count,
             first_timestamp,
@@ -317,6 +323,7 @@ impl ChimpCompressor {
         write_f64_le(buf, self.last_value);
         write_signed_varint(buf, self.last_alpha as i64);
         write_signed_varint(buf, state.stored_lz as i64);
+        write_signed_varint(buf, state.stored_tz as i64);
         write_uvarint(buf, state.stored_val);
         write_uvarint(buf, state.first as u64);
 
@@ -331,18 +338,19 @@ impl ChimpCompressor {
         let last_timestamp = read_signed_varint(&mut buf)?;
         let last_delta = read_signed_varint(&mut buf)?;
         let last_value = try_read_f64_le(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
-        let last_alpha = read_signed_varint(&mut buf)? as i32;
-        let state = ChimpEncState {
-            stored_lz: read_signed_varint(&mut buf)? as i32,
-            stored_val: read_uvarint(&mut buf)?,
-            first: read_uvarint(&mut buf)? != 0,
-        };
+        let last_alpha = read_signed_varint(&mut buf)?;
+        let stored_lz = read_signed_varint(&mut buf)?;
+        let stored_tz = read_signed_varint(&mut buf)?;
+        let stored_val = read_uvarint(&mut buf)?;
+        let first = read_uvarint(&mut buf)? != 0;
+        let (last_alpha, chimp) = codec_state(last_alpha, stored_lz, stored_tz, stored_val, first)
+            .ok_or(TsdbError::ChunkDecoding)?;
 
         let writer = BitStream::deserialize(&mut buf).map_err(|_| TsdbError::ChunkDecoding)?;
 
         Ok(Self {
             writer,
-            chimp: ChimpEnc::from_state(state),
+            chimp,
             last_alpha,
             count,
             first_timestamp,
@@ -364,6 +372,7 @@ impl ChimpCompressor {
         dig.add_long_long(self.last_value.to_bits() as c_longlong);
         dig.add_long_long(self.last_alpha.into());
         dig.add_long_long(state.stored_lz.into());
+        dig.add_long_long(state.stored_tz.into());
         dig.add_long_long(state.stored_val as c_longlong);
         dig.add_long_long(state.first as c_longlong);
     }
@@ -713,6 +722,29 @@ fn recover(v_prime_bits: u64, alpha: i32) -> io::Result<f64> {
 /// recovery failed (so the caller stores the raw value instead).
 pub(crate) fn try_recover(v_prime_long: u64, alpha: i32) -> Option<f64> {
     recover(v_prime_long, alpha).ok()
+}
+
+/// Validate persisted codec state: `last_alpha` is `NO_ALPHA` or fits the 4-bit header, and
+/// the Chimp window is one the encoder writes. `None` rejects the chunk. Range checks run on
+/// the persisted `i64`s, so a value that only truncates to a valid `i32` is rejected too.
+fn codec_state(
+    last_alpha: i64,
+    stored_lz: i64,
+    stored_tz: i64,
+    stored_val: u64,
+    first: bool,
+) -> Option<(i32, ChimpEnc)> {
+    let last_alpha = i32::try_from(last_alpha).ok()?;
+    if last_alpha != NO_ALPHA && !(0..=MAX_ALPHA).contains(&last_alpha) {
+        return None;
+    }
+    let chimp = ChimpEnc::from_state(ChimpEncState {
+        stored_lz: i32::try_from(stored_lz).ok()?,
+        stored_tz: i32::try_from(stored_tz).ok()?,
+        stored_val,
+        first,
+    })?;
+    Some((last_alpha, chimp))
 }
 
 fn read_uvarint(buf: &mut &[u8]) -> TsdbResult<u64> {
@@ -1265,6 +1297,47 @@ mod tests {
     }
 
     #[test]
+    fn append_after_reload_reuses_persisted_window() {
+        // Two 2-place values open a trailing window (flag 01); serialize mid-window, reload,
+        // append a third that fits, decode everything bit-exactly, and see one reuse.
+        // Erased to two places, 100.23 ^ 100.31 has 19 leading and 40 trailing zeros (window
+        // lz 18, tz 40); 100.31 ^ 100.26 has 22 and 40, so it fits. (100.27 would not: its XOR
+        // has 39 trailing zeros.)
+        let mut c = ChimpCompressor::new();
+        c.add_sample(1000, 100.23).unwrap();
+        c.add_sample(2000, 100.31).unwrap();
+        let mut buf = Vec::new();
+        c.serialize(&mut buf);
+        let mut r = ChimpCompressor::deserialize(&buf).unwrap();
+        assert_eq!(r, c);
+        r.add_sample(3000, 100.26).unwrap();
+        assert_eq!(r.stats.window_reuse, 1);
+        let got = ChimpDecompressor::new(r.bytes(), r.count())
+            .collect()
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|s| s.value.to_bits()).collect::<Vec<_>>(),
+            [100.23f64, 100.31, 100.26].map(f64::to_bits)
+        );
+    }
+
+    #[test]
+    fn quantized_drift_reuses_windows_and_shrinks() {
+        use crate::tests::generators::{
+            DatasetKey, TimestampModel, ValueWorkload, dataset_seed, generate_dataset,
+        };
+        let key = DatasetKey::new(ValueWorkload::DriftQuantized, TimestampModel::Regular);
+        let samples = generate_dataset(key, 1000, dataset_seed(key));
+        let mut c = ChimpCompressor::new();
+        for s in &samples {
+            c.add(*s).unwrap();
+        }
+        assert!(c.stats.window_reuse > 500, "{}", c.stats.window_reuse);
+        assert!(c.bytes().len() < 1_200, "{} bytes", c.bytes().len()); // probe: 997 B
+        round_trip(&samples);
+    }
+
+    #[test]
     fn tracks_first_and_last_timestamp() {
         let mut compressor = ChimpCompressor::new();
         for i in 0..10 {
@@ -1337,17 +1410,16 @@ mod tests {
         values
     }
 
-    /// Pins the Chimp stream byte for byte as of the alpha header (2026-10-29): the ELF case
-    /// `11` carries decimal places, not significant digits. Integers and short binary fractions
-    /// interleaved with decimals ELF erases.
+    /// Pins the Chimp stream byte for byte as of the full-window flag (2026-10-29): Chimp's
+    /// `10` reuses the stored leading *and* trailing zeros, taken whenever the XOR fits and it
+    /// is no longer than a fresh header. Underneath, the ELF case `11` carries decimal places.
+    /// Integers and short binary fractions interleaved with decimals ELF erases.
     ///
-    /// `small` differs from the beta* stream only in the one 4-bit header (`100.23`: beta* 5 ->
-    /// alpha 2). `mixed` went 13617 -> 13591 bytes: values with the same decimal places but
-    /// different magnitudes no longer need a new header. Then 13591 -> 13569 with the
-    /// previous-alpha hint: values with fewer places than `last_alpha` stay under case `0`.
+    /// History of `mixed`: 13617 -> 13591 bytes with the alpha header, 13591 -> 13569 with the
+    /// previous-alpha hint, 13569 -> 13169 with the full window (`small` 58 -> 57 bytes).
     /// A change here is a format change; make it on purpose and re-record.
     #[test]
-    fn streams_match_the_alpha_header_encoder_byte_for_byte() {
+    fn streams_match_the_full_window_encoder_byte_for_byte() {
         let small = pack(&[
             1.0,
             2.0,
@@ -1366,14 +1438,14 @@ mod tests {
             [
                 0x80, 0xa0, 0xab, 0xfe, 0xf9, 0x62, 0x8f, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x39, 0xf4, 0x24, 0x18, 0xff, 0xe9, 0x40, 0xd2, 0x0d, 0x7f, 0xea, 0x42, 0x0f, 0xf9,
-                0x29, 0x08, 0x40, 0x1a, 0xac, 0x41, 0x88, 0x35, 0xfa, 0x93, 0x1a, 0x00, 0x02, 0x29,
-                0xf2, 0xf1, 0xaf, 0xd4, 0x98, 0xd0, 0x00, 0x11, 0x20, 0xb7, 0xfa, 0x0c, 0x92, 0x8a,
-                0x48, 0x74
+                0x2a, 0x80, 0x35, 0x58, 0x83, 0x10, 0x6b, 0xf5, 0x26, 0x34, 0x00, 0x04, 0x53, 0xe5,
+                0xe3, 0x5f, 0xa9, 0x31, 0xa0, 0x00, 0x22, 0x41, 0x6f, 0xf4, 0x19, 0x25, 0x14, 0x90,
+                0xe8
             ]
         );
 
         let mixed = pack(&mixed_dyadic_values());
-        assert_eq!(mixed.len(), 13569);
-        assert_eq!(fnv1a(&mixed), 0xa59b_ad11_86ab_3370);
+        assert_eq!(mixed.len(), 13169);
+        assert_eq!(fnv1a(&mixed), 0xa825_7b0c_744b_c318);
     }
 }
