@@ -1462,7 +1462,7 @@ mod tests {
             c.add(*s).unwrap();
         }
         assert!(c.stats.window_reuse > 500, "{}", c.stats.window_reuse);
-        assert!(c.bytes().len() < 1_200, "{} bytes", c.bytes().len()); // probe: 997 B
+        assert!(c.bytes().len() < 1_200, "{} bytes", c.bytes().len()); // probe: 960 B
         round_trip(&samples);
     }
 
