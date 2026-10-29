@@ -94,22 +94,15 @@ pub fn get_f_alpha(alpha: i32) -> i32 {
     }
 }
 
-/// `get10iP`: 10^i for i >= 0 (`inf` once it overflows).
+/// `get10iP`: 10^i for i >= 0 (`inf` once it overflows). Only the frozen reference search
+/// uses it.
+#[cfg(test)]
 #[inline]
 fn get_10ip(i: i32) -> Result<f64, ()> {
     if i < 0 {
         return Err(());
     }
     Ok(MAP_10IP.get(i as usize).copied().unwrap_or(f64::INFINITY))
-}
-
-/// `get10iN`: 10^(-i) for i >= 0 (`0.0` once it underflows).
-#[inline]
-pub fn get_10in(i: i32) -> Result<f64, ()> {
-    if i < 0 {
-        return Err(());
-    }
-    Ok(MAP_10IN.get(i as usize).copied().unwrap_or(0.0))
 }
 
 /// `10^k` from the tables, or `None` past either end (`k` above 308 or below -323).
@@ -135,12 +128,13 @@ fn pow10(k: i32) -> Option<f64> {
 ///
 /// `E` is exact for subnormals too (the top set bit of the mantissa). The smallest one,
 /// `5e-324`, is below `10^-323`'s table entry and gets -324. Zero, infinity and NaN keep the
-/// values `floor(log10)` saturated to (`i32::MIN`, `i32::MAX`, `0`), which the decoder's
-/// `recover` sees on corrupt input. `v` is expected to be non-negative; the sign bit is ignored.
+/// values `floor(log10)` saturated to (`i32::MIN`, `i32::MAX`, `0`); the encoder never passes
+/// them. `v` is expected to be non-negative; the sign bit is ignored.
 ///
 /// Out of line: the code it replaced called `log10` out of line too, and nothing in the
-/// generator matrix reaches it. Inlined into `recover`, one decode row (drift, irregular)
-/// measured ~18 % slower in five of six interleaved rounds; out of line it matches the base.
+/// generator matrix reaches it. When the decoder's `recover` still called `get_sp`, inlining
+/// it there made one decode row (drift, irregular) ~18 % slower in five of six interleaved
+/// rounds; out of line it matched the base.
 #[inline(never)]
 fn scale_from_exponent(v: f64) -> i32 {
     let bits = v.to_bits() & (u64::MAX >> 1);
@@ -197,11 +191,14 @@ pub fn get_sp(v: f64) -> i32 {
     scale_from_exponent(v)
 }
 
-/// `getSPAnd10iNFlag`: returns `(sp, is_exact_power_of_10_le_1)`.
+/// `getSPAnd10iNFlag`: returns `(sp, is_exact_power_of_10_le_1)`. The encoder has not used
+/// the flag since the ELF header carries decimal places (`alpha`) instead of `beta_star`; the
+/// frozen reference search still does.
 ///
 /// Below one the flag is the scan's (`v == 10^sp`); in `[1, 1e9)` it is `0`, as it always was.
 /// From `1e9` up and below `1e-10` it is `v == 10^sp` too, which is exact; the `log10` it
 /// replaces also flagged the doubles an ulp or two either side of a power of ten.
+#[cfg(test)]
 fn get_sp_and_10in_flag(v: f64) -> (i32, i32) {
     if v >= 1.0 {
         let mut i = 0;
@@ -291,20 +288,32 @@ fn significant_count(v: f64, sp: i32) -> Result<i32, ()> {
     Ok(MAX_SIGNIFICANT_DIGITS - z as i32)
 }
 
-/// `getAlphaAndBetaStar`: returns `(alpha, beta_star)`.
+/// The decimal places `v` needs (`alpha = beta - sp - 1`), from the top-down digit count. The
+/// sign is ignored.
 ///
-/// `alpha` is negative only for a multiple of ten with fewer significant digits than integer
-/// places, i.e. an integer.
-pub fn get_alpha_and_beta_star(v: f64) -> Result<(i32, i32), ()> {
-    let v = if v < 0.0 { -v } else { v };
-    let (sp, flag) = get_sp_and_10in_flag(v);
+/// Negative only for a multiple of ten with fewer significant digits than integer places, i.e.
+/// an integer. The encoder erases only for `0..=MAX_ALPHA`.
+pub fn get_alpha(v: f64) -> Result<i32, ()> {
+    let v = v.abs();
+    let sp = get_sp(v);
     let beta = significant_count(v, sp)?;
-    let alpha = beta - sp - 1;
-    let beta_star = if flag == 1 { 0 } else { beta };
-    Ok((alpha, beta_star))
+    Ok(beta - sp - 1)
 }
 
-/// The search [`get_alpha_and_beta_star`] replaced (2026-10-29), kept for the equivalence
+/// Most decimal places the 4-bit ELF header can carry. A value that needs more is stored raw.
+pub const MAX_ALPHA: i32 = 15;
+
+/// `10^alpha` for `alpha` in `0..=MAX_ALPHA`, the scale recovery rounds at; `None` outside.
+#[inline(always)]
+pub fn alpha_scale(alpha: i32) -> Option<f64> {
+    if (0..=MAX_ALPHA).contains(&alpha) {
+        Some(MAP_10IP[alpha as usize])
+    } else {
+        None
+    }
+}
+
+/// The search [`get_alpha`]'s digit count replaced (2026-10-29), kept for the equivalence
 /// tests: a climb from the previous value's digit count, then a strip loop.
 #[cfg(test)]
 mod reference {
@@ -374,17 +383,6 @@ mod reference {
     }
 }
 
-/// `roundUp`: recover the original value from an erased `v_prime`.
-#[inline(always)]
-pub fn round_up(v: f64, alpha: i32) -> Result<f64, ()> {
-    let scale = get_10ip(alpha)?;
-    Ok(if v < 0.0 {
-        (v * scale).floor() / scale
-    } else {
-        (v * scale).ceil() / scale
-    })
-}
-
 /// Most fractional mantissa bits a value may have and still skip the ELF digit search.
 ///
 /// The bound is a proof, not a tuning knob: the first value ELF does erase has 8 fractional
@@ -405,7 +403,7 @@ const MAX_SHORT_DYADIC_FRACTION_BITS: i32 = 4;
 /// (`f(alpha) = ceil(alpha * log2 10)`, [`get_f_alpha`]). It stores the erased form only if
 /// those bits are not already zero (`delta != 0`), which needs `erase_bits > tz`, i.e.
 /// `f(alpha) < k`, and `erase_bits > 4`. Otherwise `write_value` stores the raw bit pattern,
-/// which is what the bypass writes, and `last_beta_star` is untouched on that path.
+/// which is what the bypass writes, and `last_alpha` is untouched on that path.
 ///
 /// * `alpha >= 1`: `f(alpha) >= f(1) = 4 >= k`, so `delta == 0`.
 /// * `alpha == 0` and `k <= 0` (an integer): `f(0) = 0` and `52 - E <= tz`, so `delta == 0`.
@@ -471,22 +469,23 @@ pub(crate) fn boundary_corpus() -> Vec<f64> {
 }
 
 /// The predicate `ChimpCompressor::write_value` evaluates before it chooses Elf case `0` or
-/// `11` over the raw case `10`: the same digit count, erase mask, `delta != 0 && erase_bits > 4`
-/// and recovery check, in the same order. Zero and the non-finite patterns never reach it.
+/// `11` over the raw case `10`: the same decimal-place count, `0..=MAX_ALPHA` range, erase
+/// mask, `delta != 0 && erase_bits > 4` and recovery check, in the same order (a copy: keep it
+/// in step with `write_value`). Zero and the non-finite patterns never reach it.
 #[cfg(test)]
 pub(crate) fn elf_would_erase(v: f64) -> bool {
-    v != 0.0 && v.is_finite() && erases_with(v, get_alpha_and_beta_star(v))
+    v != 0.0 && v.is_finite() && erases_with(v, get_alpha(v))
 }
 
-/// `write_value`'s erase decision for `v` given a digit count result `(alpha, beta_star)`.
+/// `write_value`'s erase decision for `v` given a decimal-place count result.
 #[cfg(test)]
-fn erases_with(v: f64, count: Result<(i32, i32), ()>) -> bool {
+fn erases_with(v: f64, count: Result<i32, ()>) -> bool {
     use super::compressor::try_recover;
 
-    let Ok((alpha, beta_star)) = count else {
+    let Ok(alpha) = count else {
         return false;
     };
-    if alpha < 0 {
+    if !(0..=MAX_ALPHA).contains(&alpha) {
         return false;
     }
     let v_long = v.to_bits();
@@ -495,7 +494,7 @@ fn erases_with(v: f64, count: Result<(i32, i32), ()>) -> bool {
     let mask = u64::MAX.wrapping_shl(erase_bits as u32);
     let delta = (!mask) & v_long;
     let v_prime_long = mask & v_long;
-    delta != 0 && erase_bits > 4 && try_recover(v_prime_long, beta_star) == Some(v)
+    delta != 0 && erase_bits > 4 && try_recover(v_prime_long, alpha) == Some(v)
 }
 
 #[cfg(test)]
@@ -514,9 +513,12 @@ mod tests {
             assert_eq!(entry.to_bits(), parsed.to_bits(), "10^-{i}");
         }
         assert_eq!(get_10ip(309), Ok(f64::INFINITY));
-        assert_eq!(get_10in(324), Ok(0.0));
         assert_eq!(get_10ip(-1), Err(()));
-        assert_eq!(get_10in(-1), Err(()));
+        for alpha in 0..=MAX_ALPHA {
+            assert_eq!(alpha_scale(alpha), Some(MAP_10IP[alpha as usize]));
+        }
+        assert_eq!(alpha_scale(-1), None);
+        assert_eq!(alpha_scale(MAX_ALPHA + 1), None);
     }
 
     /// `floor(log10 x)` read off the power tables: the largest `k` with `10^k <= x` for
@@ -655,8 +657,7 @@ mod tests {
         assert_eq!(get_sp_and_10in_flag(5e-324), (-324, 0));
     }
 
-    /// Zero, infinity and NaN keep the values `floor(log10)` saturated to, which the decoder's
-    /// `recover` sees on corrupt input (it widens to i64 for them).
+    /// Zero, infinity and NaN keep the values `floor(log10)` saturated to.
     #[test]
     fn get_sp_of_special_values_is_unchanged() {
         assert_eq!(get_sp(0.0), i32::MIN);
@@ -677,7 +678,7 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..5_000 {
             for v in cases {
-                assert_eq!(get_alpha_and_beta_star(v), Err(()), "{v:e}");
+                assert_eq!(get_alpha(v), Err(()), "{v:e}");
             }
         }
         let elapsed = start.elapsed();
@@ -689,22 +690,28 @@ mod tests {
 
     /// The count scales `v` to 15 digits with one table power of ten, so the smallest power of
     /// ten it can still count is `1e-294` (`10^(14 + 294)` is the last table entry). Anything
-    /// smaller is stored raw.
+    /// smaller fails the count. Both are stored raw: 294 places do not fit the header.
     #[test]
-    fn tiny_powers_of_ten_erase_when_the_scale_is_known() {
-        assert_eq!(get_alpha_and_beta_star(1e-300), Err(()));
-        assert_eq!(get_alpha_and_beta_star(1e-295), Err(()));
-        assert_eq!(get_alpha_and_beta_star(1e-294), Ok((294, 0)));
+    fn tiny_powers_of_ten_count_when_the_scale_is_known() {
+        assert_eq!(get_alpha(1e-300), Err(()));
+        assert_eq!(get_alpha(1e-295), Err(()));
+        assert_eq!(get_alpha(1e-294), Ok(294));
+        assert!(!elf_would_erase(1e-294));
     }
 
     /// Values in the range that used to go through the string-parse fallback still get
-    /// the same digit counts.
+    /// the same decimal-place counts; those within the header's 15 places erase.
     #[test]
     fn small_magnitudes_still_erase() {
-        assert_eq!(get_alpha_and_beta_star(1e-5), Ok((5, 0)));
-        assert_eq!(get_alpha_and_beta_star(1.5e-5), Ok((6, 2)));
-        assert_eq!(get_alpha_and_beta_star(1e-20), Ok((20, 0)));
-        assert_eq!(get_alpha_and_beta_star(123.456), Ok((3, 6)));
+        assert_eq!(get_alpha(1e-5), Ok(5));
+        assert_eq!(get_alpha(-1.5e-5), Ok(6));
+        assert_eq!(get_alpha(1e-20), Ok(20));
+        assert_eq!(get_alpha(123.456), Ok(3));
+        assert_eq!(get_alpha(1e-15), Ok(15));
+        for v in [1e-5, -1.5e-5, 123.456, 1e-15, -1e-15] {
+            assert!(elf_would_erase(v), "{v:e}");
+        }
+        assert!(!elf_would_erase(1e-20));
     }
 
     #[test]
@@ -749,44 +756,52 @@ mod tests {
 
     /// Whether erasing `v` to `alpha` decimal places with the `write_value` mask leaves a value
     /// the decoder's recovery turns back into `v`, bit for bit.
-    fn recovers(v: f64, alpha: i32, beta_star: i32) -> bool {
+    fn recovers(v: f64, alpha: i32) -> bool {
         use super::super::compressor::try_recover;
 
         let v_long = v.to_bits();
         let e = ((v_long >> 52) & 0x7ff) as i32;
         let erase_bits = 52 - (get_f_alpha(alpha) + e - 1023);
         let mask = u64::MAX.wrapping_shl(erase_bits as u32);
-        try_recover(mask & v_long, beta_star).map(f64::to_bits) == Some(v_long)
+        try_recover(mask & v_long, alpha).map(f64::to_bits) == Some(v_long)
     }
 
     #[test]
     fn top_down_count_never_erases_less_than_the_reference() {
-        // On every value the old encoder erased, the new count finds the same or fewer
-        // digits, and the erased value still recovers. (Not "every value the old search
-        // gave beta* <= 15": that includes its beta* = 0 answers for values just below a
-        // power of ten >= 1e9, where `log10` rounds up; those never recovered.)
+        // On every value the old search's decimal-place count erases (under today's alpha
+        // header and recovery), the new count finds the same or fewer places, and the erased
+        // value still recovers. Both counts share the scale `sp`, so comparing alpha is
+        // comparing the digit counts beta. (Conditioned on "erases", not on the old beta*:
+        // that includes its beta* = 0 answers for values just below a power of ten >= 1e9,
+        // where `log10` rounds up; those never recovered.)
         for v in boundary_corpus().into_iter().chain(matrix_values()) {
             if v == 0.0 || !v.is_finite() {
                 continue; // `write_value` never searches these
             }
             for last in [i32::MAX, 0, 3, 5, 15] {
-                let old = reference::get_alpha_and_beta_star(v, last);
-                if let Ok((_, beta_old)) = old
+                let old = reference::get_alpha_and_beta_star(v, last).map(|(alpha, _)| alpha);
+                if let Ok(alpha_old) = old
                     && erases_with(v, old)
                 {
-                    let Ok((alpha, beta_new)) = get_alpha_and_beta_star(v) else {
-                        // Past the power table: stored raw by design (see
-                        // `tiny_powers_of_ten_erase_when_the_scale_is_known`).
-                        assert!(v.abs() < 1e-294, "{v:e} (last {last}): new count failed");
-                        continue;
+                    let Ok(alpha) = get_alpha(v) else {
+                        panic!("{v:e} (last {last}): new count failed");
                     };
                     assert!(
-                        beta_new <= beta_old,
-                        "{v:e}: new {beta_new} > old {beta_old}"
+                        alpha <= alpha_old,
+                        "{v:e}: new {alpha} > old {alpha_old} places"
                     );
-                    assert!(recovers(v, alpha, beta_new), "{v:e} does not recover");
+                    assert!(recovers(v, alpha), "{v:e} does not recover");
+                    assert!(elf_would_erase(v), "{v:e} is no longer erased");
                 }
             }
+        }
+    }
+
+    /// Erasure works on the magnitude: `v` erases exactly when `-v` does.
+    #[test]
+    fn erasure_is_sign_symmetric() {
+        for v in boundary_corpus().into_iter().chain(matrix_values()) {
+            assert_eq!(elf_would_erase(v), elf_would_erase(-v), "{v:e}");
         }
     }
 

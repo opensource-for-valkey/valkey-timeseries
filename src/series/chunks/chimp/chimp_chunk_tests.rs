@@ -66,7 +66,7 @@ fn test_clear() {
     assert_eq!(chunk.last_timestamp(), 0);
 
     // A cleared chunk must be usable again, which means the Chimp XOR state and
-    // the ELF `beta_star` were reset along with the bit stream.
+    // the ELF `last_alpha` were reset along with the bit stream.
     let more = generate_samples(50);
     for sample in more.iter() {
         chunk.add_sample(sample).unwrap();
@@ -247,7 +247,7 @@ fn test_serialize_roundtrip() {
 }
 
 /// The codec carries state across samples on both layers: Chimp's previous
-/// value and rounded leading-zero count, and ELF's `beta_star`, plus the
+/// value and rounded leading-zero count, and ELF's `last_alpha`, plus the
 /// timestamp delta. If any of it is lost on the way through `serialize`,
 /// samples appended afterwards decode as garbage — so a restored chunk must
 /// produce the same stream as one that was never persisted.
@@ -285,7 +285,7 @@ fn test_append_after_serialize_roundtrip() {
 }
 
 /// Same contract as above, but across value shapes that keep switching ELF
-/// case: erasable decimals (which move `beta_star`), values ELF stores raw,
+/// case: erasable decimals (which move `last_alpha`), values ELF stores raw,
 /// and non-finite ones.
 #[test]
 fn test_append_after_serialize_roundtrip_mixed_cases() {

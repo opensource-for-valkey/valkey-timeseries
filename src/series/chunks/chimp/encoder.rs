@@ -250,7 +250,7 @@ impl ChimpDec {
 
     /// [`read_value`](Self::read_value), also reporting whether the value was
     /// unchanged (the `xor == 0` case). The Elf layer needs that flag to tell a
-    /// repeat apart from a value that merely shares the previous `beta_star`.
+    /// repeat apart from a value that merely shares the previous `alpha`.
     #[inline(always)]
     pub fn read_value_flagged(&mut self, inp: &mut BitStreamReader) -> io::Result<(u64, bool)> {
         let repeat = self.next(inp)?;
