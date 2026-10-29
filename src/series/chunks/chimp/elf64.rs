@@ -244,6 +244,116 @@ pub fn round_up(v: f64, alpha: i32) -> Result<f64, ()> {
     })
 }
 
+/// Most fractional mantissa bits a value may have and still skip the ELF digit search.
+///
+/// The bound is a proof, not a tuning knob: the first value ELF does erase has 8 fractional
+/// bits (`17582400172190.2`; see `fraction_bit_limit_is_tight`), and 15 changes bytes.
+const MAX_SHORT_DYADIC_FRACTION_BITS: i32 = 4;
+
+/// Whether `bits` is a normal, nonzero double that ELF can never erase because it has at most
+/// `MAX_SHORT_DYADIC_FRACTION_BITS` (4) fractional mantissa bits, i.e. is a multiple of 1/16:
+/// `52 - tz(mantissa) - (e - 1023) <= 4`, where an all-zero mantissa counts as 52 trailing
+/// zeros. Integers, halves, quarters and so on qualify. Zero, subnormal, infinite and NaN
+/// patterns return `false` and keep their existing paths.
+///
+/// # Why skipping the search is byte-neutral
+///
+/// Let `E` be the unbiased exponent, `tz` the trailing zero bits of the mantissa and
+/// `k = 52 - tz - E` the number of fractional bits, so `v = odd * 2^-k`. A decimal place count
+/// `alpha` makes ELF clear `erase_bits = 52 - f(alpha) - E = k + tz - f(alpha)` low bits
+/// (`f(alpha) = ceil(alpha * log2 10)`, [`get_f_alpha`]). It stores the erased form only if
+/// those bits are not already zero (`delta != 0`), which needs `erase_bits > tz`, i.e.
+/// `f(alpha) < k`, and `erase_bits > 4`. Otherwise `write_value` stores the raw bit pattern,
+/// which is what the bypass writes, and `last_beta_star` is untouched on that path.
+///
+/// * `alpha >= 1`: `f(alpha) >= f(1) = 4 >= k`, so `delta == 0`.
+/// * `alpha == 0` and `k <= 0` (an integer): `f(0) = 0` and `52 - E <= tz`, so `delta == 0`.
+/// * `alpha == 0` and `1 <= k <= 4` (a non-integer): every fractional bit is cleared, leaving
+///   `trunc(v) != v`, and a zero-place round-up in the recovery check returns an integer, so
+///   `try_recover` cannot give `v` back and the value is stored raw anyway.
+///
+/// A nonzero `v` with `k <= 4` is at least `2^-4`, so `erase_bits <= 56` and the shift in
+/// `write_value` never wraps. The argument stops at `k = 4`. Nothing with `k` of 5 to 7 has
+/// been seen to erase, but that is not proven; from `k = 8` it happens (`alpha = 1` for a
+/// value near `2^43`, see `fraction_bit_limit_is_tight`). The wider bound of 15 fractional bits
+/// this was first specified with skips values the encoder erases and changes the stream.
+///
+/// The body tests the same condition on the value: it is a multiple of 1/16 (integers included).
+pub(crate) fn is_short_dyadic(bits: u64) -> bool {
+    // Variants that select the same set and measured slower (chimp encode_bulk vs the
+    // search-everything baseline, non-dyadic workloads, geomean of medians of 3, 2026-10-29,
+    // M2): `52 - tz - E <= 4` on the raw fields +5.4 %, an exponent-range mask test +4.8 %,
+    // `(v * 16).trunc()` alone +4.2 %; this +2.9 %. Counter and discrete encode ran at
+    // 0.30-0.40x of the baseline with every one of them.
+    const SCALE: f64 = (1u32 << MAX_SHORT_DYADIC_FRACTION_BITS) as f64;
+    let v = f64::from_bits(bits);
+    v.is_normal() && (v.trunc() == v || (v * SCALE).trunc() == v * SCALE)
+}
+
+/// The 3,150-value set the 2026-10-29 encoder probe used for boundary checks: zero, the
+/// infinities, NaN, the extreme magnitudes, a binary grid around several bases, bit patterns
+/// at the exponent/mantissa edges, and every power of ten. Shared by the Chimp tests.
+#[cfg(test)]
+pub(crate) fn boundary_corpus() -> Vec<f64> {
+    let mut out = vec![
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7ff8_0000_0000_0001),
+        f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        f64::MAX,
+        -f64::MAX,
+    ];
+    for base in [0.0, 1.0, 1e6, 1e12, 1e14, 1e15, 1e18] {
+        for i in -64..=64 {
+            let step = i as f64 / 16.0;
+            out.push(base + step);
+            out.push(-base + step);
+        }
+    }
+    for exponent in [0u64, 1, 10, 512, 1000, 1023, 1030, 1074, 1075, 2046] {
+        for mantissa in [0u64, 1, 15, 16, 0x000f_ffff_ffff_ffff] {
+            for sign in [0u64, 1 << 63] {
+                out.push(f64::from_bits(sign | (exponent << 52) | mantissa));
+            }
+        }
+    }
+    for p in -308..=308 {
+        let pow: f64 = format!("1e{p}").parse().unwrap();
+        out.push(pow);
+        out.push(-pow);
+    }
+    out.push(1.0);
+    out
+}
+
+/// The predicate `ChimpCompressor::write_value` evaluates before it chooses Elf case `0` or
+/// `11` over the raw case `10`: the same digit search, erase mask, `delta != 0 && erase_bits > 4`
+/// and recovery check, in the same order. Zero and the non-finite patterns never reach it.
+#[cfg(test)]
+pub(crate) fn elf_would_erase(v: f64, last_beta_star: i32) -> bool {
+    use super::compressor::try_recover;
+
+    if v == 0.0 || !v.is_finite() {
+        return false;
+    }
+    let Ok((alpha, beta_star)) = get_alpha_and_beta_star(v, last_beta_star) else {
+        return false;
+    };
+    if alpha < 0 {
+        return false;
+    }
+    let v_long = v.to_bits();
+    let e = ((v_long >> 52) & 0x7ff) as i32;
+    let erase_bits = 52 - (get_f_alpha(alpha) + e - 1023);
+    let mask = u64::MAX.wrapping_shl(erase_bits as u32);
+    let delta = (!mask) & v_long;
+    let v_prime_long = mask & v_long;
+    delta != 0 && erase_bits > 4 && try_recover(v_prime_long, beta_star) == Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +423,155 @@ mod tests {
         assert_eq!(get_alpha_and_beta_star(1.5e-5, i32::MAX), Ok((6, 2)));
         assert_eq!(get_alpha_and_beta_star(1e-20, i32::MAX), Ok((20, 0)));
         assert_eq!(get_alpha_and_beta_star(123.456, i32::MAX), Ok((3, 6)));
+    }
+
+    #[test]
+    fn short_dyadic_values_never_erase() {
+        for v in boundary_corpus() {
+            for last in [i32::MAX, 0, 1, 2, 5, 15] {
+                if is_short_dyadic(v.to_bits()) {
+                    assert!(!elf_would_erase(v, last), "{v:e} (last {last}) would erase");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_accepts_integers_and_binary_grids() {
+        for v in [
+            1.0f64,
+            -7.0,
+            123456789.0,
+            0.5,
+            0.25,
+            0.0625,
+            12.5,
+            1e15 + 0.5,
+        ] {
+            assert!(is_short_dyadic(v.to_bits()), "{v}");
+        }
+        for v in [
+            0.1f64,
+            100.23,
+            2f64.powi(-20),
+            1e-300,
+            f64::MIN_POSITIVE,
+            0.0,
+            f64::NAN,
+        ] {
+            assert!(!is_short_dyadic(v.to_bits()), "{v:e}");
+        }
+    }
+
+    /// A xorshift64 stream: deterministic, no dependency.
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// A random double with exactly `k` fractional mantissa bits at unbiased exponent `e`,
+    /// or `None` when no such double exists.
+    fn dyadic_with_fraction_bits(next: &mut impl FnMut() -> u64, e: i32, k: i32) -> Option<f64> {
+        let tz = 52 - e - k;
+        if !(0..=52).contains(&tz) {
+            return None;
+        }
+        let mantissa = if tz == 52 {
+            0
+        } else {
+            (next() & ((1u64 << 52) - 1) & !((1u64 << tz) - 1)) | (1u64 << tz)
+        };
+        let sign = (next() & 1) << 63;
+        Some(f64::from_bits(
+            sign | (((e + 1023) as u64) << 52) | mantissa,
+        ))
+    }
+
+    /// The corpus above is hand-picked; this walks every fraction-bit count the classifier
+    /// accepts across the exponents where erasure is possible at all.
+    #[test]
+    fn short_dyadic_random_sweep_never_erases() {
+        let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
+        for k in 0..=MAX_SHORT_DYADIC_FRACTION_BITS {
+            for _ in 0..50_000 {
+                let e = (next() % 130) as i32 - 20; // 2^-20 .. 2^109
+                let Some(v) = dyadic_with_fraction_bits(&mut next, e, k) else {
+                    continue;
+                };
+                assert!(is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
+                for last in [i32::MAX, 0, 1, 3, 7] {
+                    assert!(!elf_would_erase(v, last), "{v:e} (k {k}, last {last})");
+                }
+            }
+        }
+    }
+
+    /// Why the limit is 4 and not 15: this value has 8 fractional bits, the search finds one
+    /// decimal place for it, and it is erased. Treating it as "dyadic" changes the stream.
+    #[test]
+    fn fraction_bit_limit_is_tight() {
+        let v = 17582400172190.2_f64;
+        assert!(elf_would_erase(v, i32::MAX));
+        assert!(!is_short_dyadic(v.to_bits()));
+
+        // And for every wider fraction-bit count some value is erased and rejected.
+        let mut next = xorshift(0x2545_f491_4f6c_dd1d);
+        for k in (MAX_SHORT_DYADIC_FRACTION_BITS + 1)..=15 {
+            let mut erased = 0;
+            for _ in 0..200_000 {
+                let e = (next() % 40) as i32 + 20;
+                let Some(v) = dyadic_with_fraction_bits(&mut next, e, k) else {
+                    continue;
+                };
+                assert!(!is_short_dyadic(v.to_bits()), "{v:e} (k {k})");
+                erased += usize::from(elf_would_erase(v, i32::MAX));
+            }
+            if k >= 8 {
+                assert!(erased > 0, "no erased value found at k = {k}");
+            }
+        }
+    }
+
+    /// The classifier is the fraction-bit definition written out: finite, normal, nonzero, and
+    /// `52 - tz(mantissa) - E <= 4`.
+    #[test]
+    fn classifier_matches_the_fraction_bit_definition() {
+        fn reference(bits: u64) -> bool {
+            let biased = ((bits >> 52) & 0x7ff) as i32;
+            if biased == 0 || biased == 0x7ff {
+                return false;
+            }
+            let mantissa = bits & ((1u64 << 52) - 1);
+            let tz = mantissa.trailing_zeros().min(52) as i32;
+            52 - tz - (biased - 1023) <= MAX_SHORT_DYADIC_FRACTION_BITS
+        }
+
+        let mut next = xorshift(0x1234_5678_9abc_def1);
+        let mut patterns: Vec<u64> = boundary_corpus().iter().map(|v| v.to_bits()).collect();
+        for biased in 0..=0x7ffu64 {
+            for sign in [0u64, 1 << 63] {
+                for mantissa in [0u64, 1, (1 << 52) - 1, 1 << 51, 1 << 47, 1 << 48, 1 << 49] {
+                    patterns.push(sign | (biased << 52) | mantissa);
+                }
+                // A single set bit at every mantissa position.
+                for bit in 0..52 {
+                    patterns.push(sign | (biased << 52) | (1 << bit));
+                }
+            }
+        }
+        patterns.extend((0..200_000).map(|_| next()));
+        for bits in patterns {
+            assert_eq!(
+                is_short_dyadic(bits),
+                reference(bits),
+                "{bits:#018x} ({:e})",
+                f64::from_bits(bits)
+            );
+        }
     }
 }

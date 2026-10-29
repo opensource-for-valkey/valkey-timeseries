@@ -30,7 +30,9 @@
 //! `write_value`.
 
 use super::chimp_iterator::ChimpIterator;
-use super::elf64::{get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, round_up};
+use super::elf64::{
+    get_10in, get_alpha_and_beta_star, get_f_alpha, get_sp, is_short_dyadic, round_up,
+};
 use super::encoder::{ChimpDec, ChimpEnc, ChimpEncState};
 use crate::common::encoding::{
     try_read_f64_le, try_read_signed_varint, try_read_uvarint, write_f64_le, write_signed_varint,
@@ -339,10 +341,11 @@ impl ChimpCompressor {
 
         let v_long = v.to_bits();
 
-        if v == 0.0 || !v.is_finite() {
-            // Zero, the infinities and NaN: Elf case `10`, bit pattern stored
-            // verbatim. ELF erasure is defined in terms of decimal
-            // significant digits, which none of these have.
+        if v == 0.0 || !v.is_finite() || is_short_dyadic(v_long) {
+            // Elf case `10`, bit pattern stored verbatim. Zero, the infinities and NaN
+            // have no decimal significant digits to erase. Integers and short binary
+            // fractions have digits but no erasable bits (proof on `is_short_dyadic`):
+            // the digit search would end in this same branch, so skip it.
             self.chimp
                 .add_value_prefixed(&mut self.writer, 0b10, 2, v_long)?;
         } else {
@@ -641,7 +644,7 @@ fn recover(v_prime_bits: u64, beta_star: i32) -> io::Result<f64> {
 /// Encode-side recoverability check: returns the value the decoder would
 /// reconstruct from an erased `v_prime` and `beta_star`, or `None` if the
 /// recovery failed (so the caller stores the raw value instead).
-fn try_recover(v_prime_long: u64, beta_star: i32) -> Option<f64> {
+pub(crate) fn try_recover(v_prime_long: u64, beta_star: i32) -> Option<f64> {
     recover(v_prime_long, beta_star).ok()
 }
 
@@ -984,5 +987,101 @@ mod tests {
         assert_eq!(compressor.first_timestamp(), 500);
         assert_eq!(compressor.last_timestamp(), 500 + 9 * 250);
         assert!(compressor.len_bits() > 0);
+    }
+
+    /// FNV-1a over the packed bytes: a stable fingerprint for the golden streams below.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn pack(values: &[f64]) -> Vec<u8> {
+        let mut compressor = ChimpCompressor::new();
+        for (i, v) in values.iter().enumerate() {
+            compressor
+                .add_sample(1_700_000_000_000 + i as Timestamp * 1000, *v)
+                .unwrap();
+        }
+        compressor.into_bytes()
+    }
+
+    /// Integers and short binary fractions interleaved with decimals, repeats and values the
+    /// ELF search does erase, so the bypass sits between `last_beta_star` updates.
+    fn mixed_dyadic_values() -> Vec<f64> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values = vec![
+            1.0,
+            2.0,
+            3.0,
+            0.5,
+            12.5,
+            -7.0,
+            123456789.0,
+            1e15 + 0.5,
+            0.0625,
+            4.0,
+            4.0,
+            100.23,
+            7.0,
+            0.25,
+            17582400172190.2,
+            1e18,
+            9430104406.3555,
+        ];
+        for _ in 0..2000 {
+            let r = next();
+            let n = (r >> 8) % 100_000;
+            values.push(match r % 7 {
+                0 => n as f64,
+                1 => -(n as f64),
+                2 => 1e6 + (n % 4096) as f64 / 16.0,
+                3 => n as f64 / 100.0,
+                4 => (n as f64) / 8.0 + 3.0,
+                5 => 1e11 + n as f64 / 1000.0,
+                _ => f64::from_bits(r),
+            });
+        }
+        values
+    }
+
+    /// Recorded from the encoder before the dyadic bypass existed: skipping the ELF search for
+    /// integers and short binary fractions must not change a single byte, including around
+    /// decimals the search does erase (the `mixed` stream has plenty of both).
+    #[test]
+    fn dyadic_streams_match_the_pre_bypass_encoder_byte_for_byte() {
+        let small = pack(&[
+            1.0,
+            2.0,
+            3.0,
+            0.5,
+            12.5,
+            -7.0,
+            1e15 + 0.5,
+            0.0625,
+            4.0,
+            4.0,
+            100.23,
+        ]);
+        assert_eq!(
+            small,
+            [
+                0x80, 0xa0, 0xab, 0xfe, 0xf9, 0x62, 0x8f, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x39, 0xf4, 0x24, 0x18, 0xff, 0xe9, 0x40, 0xd2, 0x0d, 0x7f, 0xea, 0x42, 0x0f, 0xf9,
+                0x29, 0x08, 0x40, 0x1a, 0xac, 0x41, 0x88, 0x35, 0xfa, 0x93, 0x1a, 0x00, 0x02, 0x29,
+                0xf2, 0xf1, 0xaf, 0xd4, 0x98, 0xd0, 0x00, 0x11, 0x20, 0xb7, 0xfa, 0x0d, 0x52, 0x8a,
+                0x48, 0x74
+            ]
+        );
+
+        let mixed = pack(&mixed_dyadic_values());
+        assert_eq!(mixed.len(), 13641);
+        assert_eq!(fnv1a(&mixed), 0xe64e_401f_c7af_ef31);
     }
 }
