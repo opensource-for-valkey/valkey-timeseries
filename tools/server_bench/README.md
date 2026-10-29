@@ -122,7 +122,10 @@ point / range / memory), `agg` (the core fixture; scan-only probe, count/min/sum
 `docs/plans/range-performance-plan.md`), `query` (aggregations, label queries at
 1/10/100 % selectivity, 10 and 100 groups), the encoding variants `core-gorilla` and `core-uncompressed`, and the
 dataset/shape variants `core-counter`, `core-noisy`, `core-jitter`, `core-shallow`
-(100,000 × 10) and `core-deep` (1 × 1,000,000). Run several and put them side by side with
+(100,000 × 10) and `core-deep` (1 × 1,000,000), and the value-shape pair `values-quantized`
+(`drift_q2`) and `values-counter` (`counter`): the core fixture with only the cases value shape
+moves — ADD/MADD encode, scan-only and raw ranges, sum/max aggregation, memory — and GET as a
+placement control. Run several and put them side by side with
 `server_bench compare --run-dir A --run-dir B ...`, which groups runs by deployment,
 limits, fixture shape/dataset, protocol and trial budget — only runs in one group are
 comparable — and lists each run's ratios as a column labelled by its encoding pair.
